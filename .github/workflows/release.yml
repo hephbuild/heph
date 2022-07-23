@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.18
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v2
+        with:
+          version: latest
+          args: release --rm-dist --snapshot
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload assets
+        uses: actions/upload-artifact@v2
+        with:
+          name: heph
+          path: dist/*
+
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v0'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v0'
+
+      - name: Copy to bucket
+        run: |
+          VERSION=${GITHUB_SHA::8}
+          NOCACHE="Cache-Control: no-cache, no-store"
+
+          echo $VERSION > ./latest_version
+
+          mkdir bucket
+          cp dist/heph_linux_amd64_v1/heph bucket/heph_linux_amd64
+          cp dist/heph_linux_arm64/heph bucket/heph_linux_arm64
+
+          cp dist/heph_darwin_arm64/heph bucket/heph_darwin_arm64
+          cp dist/heph_darwin_amd64_v1/heph bucket/heph_darwin_amd64          
+
+          gsutil -h "${NOCACHE}" rsync -r './bucket' gs://heph-build/${VERSION}
+          gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
+          gsutil -h "${NOCACHE}" cp './latest_version' gs://heph-build/latest_version
