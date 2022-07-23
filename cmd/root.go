@@ -16,7 +16,6 @@ import (
 )
 
 var isTerm bool
-var isStdinPipe bool
 
 var logLevel *string
 var profiles *[]string
@@ -33,14 +32,6 @@ func init() {
 		isTerm = isatty.IsTerminal(os.Stderr.Fd())
 	}
 
-	if os.Stdin != nil {
-		fi, err := os.Stdin.Stat()
-		if err != nil {
-			log.Fatal(err)
-		}
-		isStdinPipe = fi.Mode()&os.ModeNamedPipe != 0
-	}
-
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: isTerm,
 		ForceColors:      isTerm,
@@ -48,6 +39,7 @@ func init() {
 
 	log.SetLevel(log.InfoLevel)
 
+	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
 
@@ -66,6 +58,13 @@ var Engine *engine.Engine
 var rootCmd = &cobra.Command{
 	Use:           "heph",
 	Short:         "Efficient build system",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
+var runCmd = &cobra.Command{
+	Use:           "run",
+	Short:         "Run target",
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
@@ -94,7 +93,9 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
-		err = run(cmd.Context(), targets)
+		fromStdin := hasStdin(args)
+
+		err = run(cmd.Context(), targets, fromStdin)
 		if err != nil {
 			log.Fatal(err)
 		}

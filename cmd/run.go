@@ -9,7 +9,6 @@ import (
 	"heph/sandbox"
 	"heph/utils"
 	"heph/worker"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -21,15 +20,7 @@ type TargetInvocation struct {
 }
 
 func hasStdin(args []string) bool {
-	if isStdinPipe {
-		if len(args) > 0 {
-			log.Fatalf("cannot have stdin and args")
-		}
-
-		return true
-	}
-
-	return false
+	return len(args) == 1 && args[0] == "-"
 }
 
 func parseTargetsFromStdin() ([]*engine.Target, error) {
@@ -104,7 +95,7 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 	}}, nil
 }
 
-func run(ctx context.Context, targets []TargetInvocation) error {
+func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -112,7 +103,7 @@ func run(ctx context.Context, targets []TargetInvocation) error {
 	defer pool.Stop()
 
 	var inlineTarget *TargetInvocation
-	if len(targets) == 1 {
+	if len(targets) == 1 && !fromStdin {
 		inlineTarget = &targets[0]
 	}
 
