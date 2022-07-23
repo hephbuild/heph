@@ -309,6 +309,10 @@ func (e *Engine) CleanTarget(target *Target, async bool) error {
 	return nil
 }
 
+func (e *Engine) CleanTargetLock(target *Target) error {
+	return os.RemoveAll(e.lockPath(target))
+}
+
 func deleteDir(dir string, async bool) error {
 	rm, err := exec.LookPath("rm")
 	if err != nil {

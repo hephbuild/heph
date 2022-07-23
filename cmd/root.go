@@ -39,6 +39,8 @@ func init() {
 
 	log.SetLevel(log.InfoLevel)
 
+	cleanCmd.AddCommand(cleanLockCmd)
+
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
@@ -165,7 +167,7 @@ func preRun() error {
 var cleanCmd = &cobra.Command{
 	Use:   "clean",
 	Short: "Clean",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRun()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -207,6 +209,25 @@ var cleanCmd = &cobra.Command{
 		for _, target := range targets {
 			log.Tracef("Cleaning %v...", target.FQN)
 			err := Engine.CleanTarget(target, true)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	},
+}
+
+var cleanLockCmd = &cobra.Command{
+	Use:   "lock",
+	Short: "Clean locks",
+	Args:  cobra.NoArgs,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRun()
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		for _, target := range Engine.Targets {
+			err := Engine.CleanTargetLock(target)
 			if err != nil {
 				return err
 			}

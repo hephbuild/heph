@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/gofrs/flock"
 	log "github.com/sirupsen/logrus"
 	"heph/sandbox"
 	"heph/utils"
@@ -18,6 +19,8 @@ type TargetRunEngine struct {
 	Pool    *worker.Pool
 	Worker  *worker.Worker
 	Context context.Context
+
+	fileLock *flock.Flock
 }
 
 func (e *TargetRunEngine) Status(s string) {
@@ -53,9 +56,47 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	return false, nil
 }
 
+func (e *Engine) lockPath(target *Target) string {
+	return filepath.Join(e.sandboxRoot(target), "target.lock")
+}
+
+func (e *TargetRunEngine) lock(target *Target) error {
+	p := e.lockPath(target)
+
+	if dir := filepath.Dir(p); dir != "." {
+		err := os.MkdirAll(dir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	}
+	e.fileLock = flock.New(p)
+
+	return e.fileLock.Lock()
+}
+
+func (e *TargetRunEngine) unlock(target *Target) error {
+	err := e.fileLock.Unlock()
+	if err != nil {
+		return err
+	}
+
+	return os.RemoveAll(e.lockPath(target))
+}
+
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
 	log.Tracef("Target %v", target.FQN)
+
+	err := e.lock(target)
+	if err != nil {
+		return err
+	}
+
 	defer func() {
+		err := e.unlock(target)
+		if err != nil {
+			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
+		}
+
 		target.ran = true
 		close(target.ranCh)
 		log.Tracef("Target DONE %v", target.FQN)
