@@ -37,14 +37,19 @@ func Cp(from, to string) error {
 	}
 	defer tof.Close()
 
-	err = os.Chtimes(to, info.ModTime(), info.ModTime())
-	if err != nil {
-		return fmt.Errorf("cp5: %w", err)
-	}
-
 	_, err = io.Copy(tof, fromf)
 	if err != nil {
 		return fmt.Errorf("cp6: %w", err)
+	}
+
+	err = tof.Close()
+	if err != nil {
+		return err
+	}
+
+	err = os.Chtimes(to, info.ModTime(), info.ModTime())
+	if err != nil {
+		return fmt.Errorf("cp5: %w", err)
 	}
 
 	return nil
