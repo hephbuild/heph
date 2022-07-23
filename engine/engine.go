@@ -312,7 +312,17 @@ func (e *Engine) CleanTarget(target *Target, async bool) error {
 }
 
 func (e *Engine) CleanTargetLock(target *Target) error {
-	return os.RemoveAll(e.lockPath(target))
+	err := os.RemoveAll(target.runLock.Path())
+	if err != nil {
+		return err
+	}
+
+	err = os.RemoveAll(target.cacheLock.Path())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func deleteDir(dir string, async bool) error {

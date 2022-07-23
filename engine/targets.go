@@ -113,6 +113,9 @@ type Target struct {
 	ran    bool
 	ranCh  chan struct{}
 	m      sync.Mutex
+
+	runLock   *utils.Flock
+	cacheLock *utils.Flock
 }
 
 func (t *Target) ActualFilesOut() []PackagePath {
@@ -306,6 +309,8 @@ func (e *Engine) processTarget(t *Target) error {
 	}
 
 	t.ranCh = make(chan struct{})
+	t.runLock = utils.NewFlock(e.lockPath(t, "run"))
+	t.cacheLock = utils.NewFlock(e.lockPath(t, "cache"))
 
 	if t.Codegen != "" {
 		if t.Codegen != "link" {

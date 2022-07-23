@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/gofrs/flock"
 	log "github.com/sirupsen/logrus"
 	"heph/sandbox"
 	"heph/utils"
@@ -19,8 +18,6 @@ type TargetRunEngine struct {
 	Pool    *worker.Pool
 	Worker  *worker.Worker
 	Context context.Context
-
-	fileLock *flock.Flock
 }
 
 func (e *TargetRunEngine) Status(s string) {
@@ -32,6 +29,20 @@ func (e *TargetRunEngine) Status(s string) {
 }
 
 func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
+	log.Tracef("locking cache %v", target.FQN)
+
+	err := target.cacheLock.Lock()
+	if err != nil {
+		return false, err
+	}
+
+	defer func() {
+		err := target.cacheLock.Unlock()
+		if err != nil {
+			log.Errorf("unlocking cache %v %w", target.FQN, err)
+		}
+	}()
+
 	if target.ShouldCache {
 		e.Status(fmt.Sprintf("Pulling %v cache...", target.FQN))
 
@@ -56,57 +67,22 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	return false, nil
 }
 
-func (e *Engine) lockPath(target *Target) string {
-	return filepath.Join(e.sandboxRoot(target), "target.lock")
-}
-
-func (e *TargetRunEngine) lock(target *Target) error {
-	p := e.lockPath(target)
-
-	if dir := filepath.Dir(p); dir != "." {
-		err := os.MkdirAll(dir, os.ModePerm)
-		if err != nil {
-			return err
-		}
-	}
-	e.fileLock = flock.New(p)
-
-	log.Tracef("%v locking...", target.FQN)
-
-	err := e.fileLock.Lock()
-	if err != nil {
-		return fmt.Errorf("lock: %v", err)
-	}
-
-	return nil
-}
-
-func (e *TargetRunEngine) unlock(target *Target) error {
-	log.Tracef("%v unlocking...", target.FQN)
-
-	err := e.fileLock.Unlock()
-	if err != nil {
-		return fmt.Errorf("unlock: %v", err)
-	}
-
-	err = os.RemoveAll(e.lockPath(target))
-	if err != nil {
-		return fmt.Errorf("unlock: rm: %v", err)
-	}
-
-	return nil
+func (e *Engine) lockPath(target *Target, resource string) string {
+	return filepath.Join(e.sandboxRoot(target), resource+".lock")
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
 	log.Tracef("Target %v", target.FQN)
 
-	err := e.lock(target)
+	log.Tracef("%v locking run", target.FQN)
+	err := target.runLock.Lock()
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		err := e.unlock(target)
+		log.Tracef("%v unlocking run", target.FQN)
+		err := target.runLock.Unlock()
 		if err != nil {
 			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
 		}
