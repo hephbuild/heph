@@ -281,7 +281,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 					err = e.storeVfsCache(cache, target)
 					if err != nil {
-						return err
+						log.Errorf("store cache %v: %v %v", cache.Name, target.FQN, err)
+						return nil
 					}
 
 					return nil
