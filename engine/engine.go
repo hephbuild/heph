@@ -313,7 +313,14 @@ func deleteDir(dir string, async bool) error {
 	rm, err := exec.LookPath("rm")
 	if err != nil {
 		return err
-	} else if !utils.PathExists(dir) {
+	}
+
+	mv, err := exec.LookPath("mv")
+	if err != nil {
+		return err
+	}
+
+	if !utils.PathExists(dir) {
 		return nil // not an error, just don't need to do anything.
 	}
 
@@ -321,9 +328,9 @@ func deleteDir(dir string, async bool) error {
 
 	newDir := utils.RandPath("heph", "")
 
-	err = os.Rename(dir, newDir)
+	out, err := exec.Command(mv, dir, newDir).CombinedOutput()
 	if err != nil {
-		return err
+		return fmt.Errorf("mv: %v %v", err, string(out))
 	}
 
 	if async {
@@ -333,7 +340,7 @@ func deleteDir(dir string, async bool) error {
 		return err
 	}
 
-	out, err := exec.Command(rm, "-rf", newDir).CombinedOutput()
+	out, err = exec.Command(rm, "-rf", newDir).CombinedOutput()
 	if err != nil {
 		log.Error("Failed to remove directory: %s", string(out))
 	}
