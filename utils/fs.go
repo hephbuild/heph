@@ -2,6 +2,7 @@ package utils
 
 import (
 	"encoding/hex"
+	"errors"
 	"io"
 	"math/rand"
 	"os"
@@ -18,6 +19,10 @@ func RandPath(prefix, suffix string) string {
 func IsDirEmpty(name string) (bool, error) {
 	f, err := os.Open(name)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+
 		return false, err
 	}
 	defer f.Close()

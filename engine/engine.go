@@ -76,16 +76,18 @@ type RunStatus struct {
 func New(root string) *Engine {
 	homeDir := filepath.Join(root, ".heph")
 
+	log.Tracef("home dir %v", homeDir)
+
 	err := os.MkdirAll(homeDir, os.ModePerm)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(fmt.Errorf("create homedir %v: %w", homeDir, err))
 	}
 
 	cacheDir := filepath.Join(homeDir, "cache")
 
 	loc, err := vfssimple.NewLocation("file://" + cacheDir + "/")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(fmt.Errorf("cache location: %w", err))
 	}
 
 	return &Engine{
@@ -234,7 +236,7 @@ func (e *Engine) ScheduleTargetDeps(ctx context.Context, pool *worker.Pool, targ
 func (e *Engine) populateActualFilesOut(target *Target) error {
 	empty, err := utils.IsDirEmpty(target.OutRoot.Abs)
 	if err != nil {
-		return err
+		return fmt.Errorf("collect output: isempty: %w", err)
 	}
 
 	if empty {
@@ -275,7 +277,7 @@ func (e *Engine) populateActualFilesOut(target *Target) error {
 				return nil
 			})
 			if err != nil {
-				return err
+				return fmt.Errorf("collect output: %w", err)
 			}
 		} else {
 			target.actualFilesOut = append(target.actualFilesOut, file)
