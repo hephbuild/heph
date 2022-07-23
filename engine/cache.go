@@ -14,6 +14,7 @@ func (e *Engine) cacheDir(target *Target, inputHash string) string {
 	return filepath.Join(e.HomeDir, "cache", target.Package.FullName, target.Name, inputHash)
 }
 
+const versionFile = "version"
 const inputHashFile = "hash_input"
 const outputHashFile = "hash_output"
 const outputTarFile = "output.tar.gz"
@@ -37,7 +38,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	err = WriteFileSync(filepath.Join(dir, "version"), []byte("1"), os.ModePerm)
+	err = WriteFileSync(filepath.Join(dir, versionFile), []byte("1"), os.ModePerm)
 	if err != nil {
 		return err
 	}

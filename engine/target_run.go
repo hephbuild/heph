@@ -67,8 +67,12 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	return false, nil
 }
 
+func (e *Engine) locksRoot(target *Target) string {
+	return filepath.Join(e.HomeDir, "locks", target.Package.FullName, target.Name)
+}
+
 func (e *Engine) lockPath(target *Target, resource string) string {
-	return filepath.Join(e.sandboxRoot(target), resource+".lock")
+	return filepath.Join(e.locksRoot(target), resource+".lock")
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
@@ -151,6 +155,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		env[k] = v
 	}
 
+	sandboxRoot := e.sandboxRoot(target)
+
 	var sandboxSpec = sandbox.Spec{}
 	if target.Sandbox {
 		e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
@@ -174,7 +180,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 		var err error
 		sandboxSpec, err = sandbox.Make(ctx, sandbox.MakeConfig{
-			Root: e.sandboxRoot(target),
+			Root: sandboxRoot,
 			Bin:  bin,
 			Src:  src,
 		})
@@ -183,7 +189,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	} else {
 		sandboxSpec = sandbox.Spec{
-			Root: e.sandboxRoot(target),
+			Root: sandboxRoot,
 			Bin:  bin,
 		}
 

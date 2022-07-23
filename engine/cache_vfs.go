@@ -70,7 +70,7 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		return err
 	}
 
-	err = e.vfsCopyFile(localRoot, remoteRoot, "version")
+	err = e.vfsCopyFile(localRoot, remoteRoot, versionFile)
 	if err != nil {
 		return err
 	}
