@@ -284,6 +284,10 @@ func (e *Engine) populateActualFilesOut(target *Target) error {
 		}
 	}
 
+	sort.SliceStable(target.actualFilesOut, func(i, j int) bool {
+		return target.actualFilesOut[i].RelRoot() < target.actualFilesOut[j].RelRoot()
+	})
+
 	return nil
 }
 

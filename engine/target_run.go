@@ -30,13 +30,13 @@ func (e *TargetRunEngine) Status(s string) {
 
 func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	log.Tracef("locking cache %v", target.FQN)
-
 	err := target.cacheLock.Lock()
 	if err != nil {
 		return false, err
 	}
 
 	defer func() {
+		log.Tracef("unlocking cache %v", target.FQN)
 		err := target.cacheLock.Unlock()
 		if err != nil {
 			log.Errorf("unlocking cache %v %w", target.FQN, err)
