@@ -71,16 +71,30 @@ func (e *TargetRunEngine) lock(target *Target) error {
 	}
 	e.fileLock = flock.New(p)
 
-	return e.fileLock.Lock()
+	log.Tracef("%v locking...", target.FQN)
+
+	err := e.fileLock.Lock()
+	if err != nil {
+		return fmt.Errorf("lock: %v", err)
+	}
+
+	return nil
 }
 
 func (e *TargetRunEngine) unlock(target *Target) error {
+	log.Tracef("%v unlocking...", target.FQN)
+
 	err := e.fileLock.Unlock()
 	if err != nil {
-		return err
+		return fmt.Errorf("unlock: %v", err)
 	}
 
-	return os.RemoveAll(e.lockPath(target))
+	err = os.RemoveAll(e.lockPath(target))
+	if err != nil {
+		return fmt.Errorf("unlock: rm: %v", err)
+	}
+
+	return nil
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
