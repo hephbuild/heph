@@ -6,6 +6,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
 	"heph/utils"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -72,6 +73,7 @@ type TargetSpec struct {
 	Codegen     string
 	Labels      []string
 	Env         map[string]string
+	PassEnv     []string
 }
 
 type TargetTool struct {
@@ -98,6 +100,7 @@ type Target struct {
 	FilesOut []PackagePath
 	// Files that have been cached
 	actualFilesOut []PackagePath
+	Env            map[string]string
 
 	CodegenLink bool
 
@@ -453,6 +456,18 @@ func (e *Engine) linkTarget(t *Target) error {
 		sort.SliceStable(t.CachedFiles, func(i, j int) bool {
 			return t.CachedFiles[i].RelRoot() < t.CachedFiles[j].RelRoot()
 		})
+	}
+
+	t.Env = map[string]string{}
+	for _, name := range t.TargetSpec.PassEnv {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			continue
+		}
+		t.Env[name] = value
+	}
+	for k, v := range t.TargetSpec.Env {
+		t.Env[k] = v
 	}
 
 	e.registerLabels(t.Labels)

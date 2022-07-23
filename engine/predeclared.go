@@ -201,6 +201,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		labels         ArrayMap
 		out            StringArrayMap
 		env            ArrayMap
+		passEnv        ArrayMap
 	)
 
 	if err := starlark.UnpackArgs(
@@ -209,6 +210,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		"run?", &run,
 		"quiet?", &quiet,
 		"pass_args?", &passArgs,
+		"pass_env?", &passEnv,
 		"deps?", &deps,
 		"hash_deps?", &hashDeps,
 		"cache?", &cache,
@@ -243,6 +245,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		Codegen:     codegen,
 		Labels:      labels.Array,
 		Env:         env.IMap,
+		PassEnv:     passEnv.Array,
 	}
 
 	e.Targets = append(e.Targets, &Target{
