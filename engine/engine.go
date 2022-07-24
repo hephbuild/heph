@@ -2,24 +2,26 @@ package engine
 
 import (
 	"context"
-	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
+	"github.com/zeebo/xxh3"
 	"hash"
 	"heph/config"
 	"heph/sandbox"
 	"heph/utils"
 	"heph/vfssimple"
 	"heph/worker"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"syscall"
+	"time"
 )
 
 type SourceFile struct {
@@ -103,19 +105,25 @@ func (e *Engine) DAG() *DAG {
 }
 
 func (e *Engine) hashFile(h hash.Hash, file PackagePath) {
-	info, err := os.Stat(file.Abs())
+	f, err := os.Open(file.Abs())
 	if err != nil {
 		panic(fmt.Errorf("hashFile: %w", err))
 	}
+	defer f.Close()
 
-	// TODO: hash small file content
-
-	h.Write([]byte(file.RelRoot()))
-	h.Write([]byte(info.ModTime().String()))
+	_, err = io.Copy(h, f)
+	if err != nil {
+		panic(fmt.Errorf("hashFile: %w", err))
+	}
 }
 
 func (e *Engine) hashInput(target *Target) string {
-	h := sha512.New()
+	start := time.Now()
+	defer func() {
+		log.Tracef("hashinput %v took %v", target.FQN, time.Since(start))
+	}()
+
+	h := xxh3.New()
 
 	for _, dep := range target.Tools {
 		dh := e.hashOutput(dep.Target)
@@ -153,17 +161,26 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(e))
 	}
 
-	return hex.EncodeToString(h.Sum(nil))
+	hb := h.Sum128().Bytes()
+
+	return hex.EncodeToString(hb[:])
 }
 
 func (e *Engine) hashOutput(target *Target) string {
-	h := sha512.New()
+	start := time.Now()
+	defer func() {
+		log.Tracef("hashoutput %v took %v", target.FQN, time.Since(start))
+	}()
+
+	h := xxh3.New()
 
 	for _, file := range target.ActualFilesOut() {
 		e.hashFile(h, file)
 	}
 
-	return hex.EncodeToString(h.Sum(nil))
+	hb := h.Sum128().Bytes()
+
+	return hex.EncodeToString(hb[:])
 }
 
 type TargetFailedError struct {

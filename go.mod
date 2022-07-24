@@ -12,6 +12,7 @@ require (
 	github.com/mattn/go-isatty v0.0.14
 	github.com/sirupsen/logrus v1.8.1
 	github.com/spf13/cobra v1.5.0
+	github.com/zeebo/xxh3 v1.0.2
 	go.starlark.net v0.0.0-20220302181546-5411bad688d1
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -34,6 +35,7 @@ require (
 	github.com/googleapis/go-type-adapters v1.0.0 // indirect
 	github.com/inconshreveable/mousetrap v1.0.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	github.com/klauspost/cpuid/v2 v2.0.9 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.13 // indirect
