@@ -41,6 +41,7 @@ func (sf SourceFiles) Find(p string) *SourceFile {
 }
 
 type Engine struct {
+	Cwd        string
 	Root       string
 	HomeDir    string
 	Config     Config

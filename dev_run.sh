@@ -4,4 +4,4 @@ set -e
 
 CWD=$(pwd)
 
-cd HEPH_BUILD_ROOT && HEPH_ROOT="$CWD" go run . "$@"
+cd HEPH_BUILD_ROOT && HEPH_CWD="$CWD" go run . "$@"

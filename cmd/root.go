@@ -109,10 +109,6 @@ func preRunAutocomplete() error {
 }
 
 func findRoot() (string, error) {
-	if root := os.Getenv("HEPH_ROOT"); root != "" {
-		return root, nil
-	}
-
 	root, err := filepath.Abs(".")
 	if err != nil {
 		return "", err
@@ -122,7 +118,7 @@ func findRoot() (string, error) {
 	for len(parts) > 0 {
 		p := "/" + filepath.Join(parts...)
 
-		if _, err := os.Stat(filepath.Join(p, ".hephconfig")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(p, ".hephconfig")); err == nil {
 			return p, nil
 		}
 
@@ -148,10 +144,19 @@ func preRun() error {
 		log.SetLevel(log.WarnLevel)
 	}
 
+	if cwd := os.Getenv("HEPH_CWD"); cwd != "" {
+		err := os.Chdir(cwd)
+		if err != nil {
+			return err
+		}
+	}
+
 	root, err := findRoot()
 	if err != nil {
 		return err
 	}
+
+	log.Tracef("Root: %v", root)
 
 	Engine = engine.New(root)
 	Engine.Config.Profiles = *profiles

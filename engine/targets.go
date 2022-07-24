@@ -74,6 +74,7 @@ type TargetSpec struct {
 	Labels      []string
 	Env         map[string]string
 	PassEnv     []string
+	RunInCwd    bool
 }
 
 type TargetTool struct {
@@ -230,19 +231,26 @@ func (t Targets) WaitAllRan() <-chan struct{} {
 }
 
 func (e *Engine) Parse() error {
-	configStartTime := time.Now()
-	err := e.parseConfigs()
+	cwd, err := os.Getwd()
 	if err != nil {
 		return err
 	}
-	log.Tracef("ParseConfigs took %v", time.Now().Sub(configStartTime))
+
+	e.Cwd = cwd
+
+	configStartTime := time.Now()
+	err = e.parseConfigs()
+	if err != nil {
+		return err
+	}
+	log.Tracef("ParseConfigs took %v", time.Since(configStartTime))
 
 	runStartTime := time.Now()
 	err = e.runBuildFiles()
 	if err != nil {
 		return err
 	}
-	log.Tracef("RunBuildFiles took %v", time.Now().Sub(runStartTime))
+	log.Tracef("RunBuildFiles took %v", time.Since(runStartTime))
 
 	processStartTime := time.Now()
 	for _, target := range e.Targets {
@@ -251,7 +259,7 @@ func (e *Engine) Parse() error {
 			return fmt.Errorf("%v: %w", target.FQN, err)
 		}
 	}
-	log.Tracef("ProcessTargets took %v", time.Now().Sub(processStartTime))
+	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
 
 	e.dag = &DAG{dag.NewDAG()}
 
@@ -262,7 +270,7 @@ func (e *Engine) Parse() error {
 			return fmt.Errorf("linking %v: %w", target.FQN, err)
 		}
 	}
-	log.Tracef("LinkTargets took %v", time.Now().Sub(linkStartTime))
+	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
 	dagStartTime := time.Now()
 	for _, target := range e.Targets {
@@ -287,7 +295,7 @@ func (e *Engine) Parse() error {
 			}
 		}
 	}
-	log.Tracef("DAG took %v", time.Now().Sub(dagStartTime))
+	log.Tracef("DAG took %v", time.Since(dagStartTime))
 
 	return nil
 }

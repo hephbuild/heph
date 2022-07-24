@@ -190,6 +190,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 	var (
 		name           string
 		run            Runnable
+		runInCwd       bool
 		quiet          bool
 		passArgs       bool
 		cache          BoolArray
@@ -208,6 +209,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		"target", args, kwargs,
 		"name?", &name,
 		"run?", &run,
+		"run_in_cwd?", &runInCwd,
 		"quiet?", &quiet,
 		"pass_args?", &passArgs,
 		"pass_env?", &passEnv,
@@ -246,6 +248,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		Labels:      labels.Array,
 		Env:         env.IMap,
 		PassEnv:     passEnv.Array,
+		RunInCwd:    runInCwd,
 	}
 
 	e.Targets = append(e.Targets, &Target{

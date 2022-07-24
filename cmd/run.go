@@ -131,12 +131,12 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 
 	if err := pool.Err; err != nil {
 		if err, ok := err.(engine.TargetFailedError); ok {
-			fmt.Printf("%v failed:\n", err.Target.FQN)
+			fmt.Printf("%v failed: %v\n", err.Target.FQN, err)
 			logFile := err.Target.LogFile
 			if logFile != "" {
-				fmt.Println()
 				c := exec.Command("tail", "-n", "10", logFile)
 				output, _ := c.Output()
+				fmt.Println()
 				fmt.Println(string(output))
 				fmt.Printf("log file can be found at %v:\n", logFile)
 			}
@@ -145,35 +145,35 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		return err
 	}
 
-	if inlineTarget != nil {
-		target := inlineTarget.Target
-
-		fmt.Println(target.FQN)
-
-		e := engine.TargetRunEngine{
-			Engine:  Engine,
-			Pool:    pool,
-			Context: ctx,
-		}
-
-		err := e.Run(target, sandbox.IOConfig{
-			Stdin:  os.Stdin,
-			Stdout: os.Stdout,
-			Stderr: os.Stderr,
-		}, inlineTarget.Args...)
-		if err != nil {
-			var eerr *exec.ExitError
-			if errors.As(err, &eerr) {
-				os.Exit(eerr.ExitCode())
-			}
-
-			return fmt.Errorf("%v: %w", target.FQN, err)
-		}
-
-		<-pool.Done()
-
+	if inlineTarget == nil {
 		return nil
 	}
+
+	target := inlineTarget.Target
+
+	fmt.Println(target.FQN)
+
+	e := engine.TargetRunEngine{
+		Engine:  Engine,
+		Pool:    pool,
+		Context: ctx,
+	}
+
+	err := e.Run(target, sandbox.IOConfig{
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}, inlineTarget.Args...)
+	if err != nil {
+		var eerr *exec.ExitError
+		if errors.As(err, &eerr) {
+			os.Exit(eerr.ExitCode())
+		}
+
+		return fmt.Errorf("%v: %w", target.FQN, err)
+	}
+
+	<-pool.Done()
 
 	return nil
 }

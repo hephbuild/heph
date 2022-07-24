@@ -104,9 +104,9 @@ type IOConfig struct {
 }
 
 type ExecConfig struct {
-	Spec
 	IOConfig
 	Context context.Context
+	BinDir  string
 	Dir     string
 	Cmd     string
 	Env     map[string]string
@@ -129,9 +129,9 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 
 	pathStr := func(path string) string {
 		if isolatePath {
-			return "PATH=/usr/sbin:/usr/bin:/sbin:/bin:" + cfg.Spec.BinDir()
+			return "PATH=/usr/sbin:/usr/bin:/sbin:/bin:" + cfg.BinDir
 		} else {
-			return "PATH=" + cfg.Spec.BinDir() + ":" + path
+			return "PATH=" + cfg.BinDir + ":" + path
 		}
 	}
 

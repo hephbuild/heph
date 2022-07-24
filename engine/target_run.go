@@ -190,7 +190,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	} else {
 		sandboxSpec = sandbox.Spec{
 			Root: sandboxRoot,
-			Bin:  bin,
 		}
 
 		err := sandbox.MakeBin(sandbox.MakeBinConfig{
@@ -242,10 +241,19 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	for _, c := range cmds {
+		dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.Root.RelRoot)
+		if target.RunInCwd {
+			if target.ShouldCache {
+				return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
+			}
+
+			dir = e.Cwd
+		}
+
 		cmd := sandbox.Exec(sandbox.ExecConfig{
 			Context:  ctx,
-			Spec:     sandboxSpec,
-			Dir:      filepath.Join(target.WorkdirRoot.Abs, target.Package.Root.RelRoot),
+			BinDir:   sandboxSpec.BinDir(),
+			Dir:      dir,
 			Cmd:      c,
 			Env:      env,
 			IOConfig: iocfg,
