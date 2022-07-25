@@ -151,7 +151,9 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 
 	target := inlineTarget.Target
 
-	fmt.Println(target.FQN)
+	if !*porcelain {
+		fmt.Println(target.FQN)
+	}
 
 	e := engine.TargetRunEngine{
 		Engine:  Engine,

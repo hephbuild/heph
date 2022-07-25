@@ -20,7 +20,7 @@ var isTerm bool
 var logLevel *string
 var profiles *[]string
 var plain *bool
-var quiet *bool
+var porcelain *bool
 var workers *int
 
 func init() {
@@ -47,12 +47,13 @@ func init() {
 
 	logLevel = rootCmd.PersistentFlags().String("log_level", log.InfoLevel.String(), "log level")
 	profiles = rootCmd.PersistentFlags().StringArray("profile", nil, "config profiles")
-	quiet = rootCmd.PersistentFlags().Bool("quiet", false, "Quiet")
+	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU()/2, "Number of workers")
 
 	rootCmd.Flags().SetInterspersed(false)
+	setupRootUsage()
 }
 
 var Engine *engine.Engine
@@ -62,6 +63,61 @@ var rootCmd = &cobra.Command{
 	Short:         "Efficient build system",
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	Args:          cobra.ArbitraryArgs,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		lvl, err := log.ParseLevel(*logLevel)
+		if err != nil {
+			return err
+		}
+
+		log.SetLevel(lvl)
+
+		if *porcelain {
+			switchToPorcelain()
+		}
+
+		return nil
+	},
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		err := preRunAutocomplete()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
+		aliases := Engine.GetTargetShortcuts()
+
+		names := make([]string, 0)
+		for _, target := range aliases {
+			names = append(names, target.Name)
+		}
+
+		return names, cobra.ShellCompDirectiveNoFileComp
+	},
+	Run: func(cmd *cobra.Command, args []string) {
+		if len(args) == 0 {
+			_ = cmd.Help()
+			return
+		}
+
+		err := preRun()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		alias := args[0]
+
+		target := Engine.Targets.Find("//:" + alias)
+		if target == nil {
+			log.Fatalf("alias %v not defined\n", alias)
+		}
+
+		switchToPorcelain()
+
+		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, false)
+		if err != nil {
+			log.Fatal(err)
+		}
+	},
 }
 
 var runCmd = &cobra.Command{
@@ -88,10 +144,7 @@ var runCmd = &cobra.Command{
 		}
 
 		if len(targets) == 0 {
-			err := cmd.Help()
-			if err != nil {
-				log.Fatal(err)
-			}
+			_ = cmd.Help()
 			return
 		}
 
@@ -102,6 +155,13 @@ var runCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 	},
+}
+
+func switchToPorcelain() {
+	log.Tracef("Switching to porcelain")
+	*porcelain = true
+	*plain = true
+	log.SetLevel(log.ErrorLevel)
 }
 
 func preRunAutocomplete() error {
@@ -131,17 +191,6 @@ func findRoot() (string, error) {
 func preRun() error {
 	if Engine != nil {
 		return nil
-	}
-
-	lvl, err := log.ParseLevel(*logLevel)
-	if err != nil {
-		return err
-	}
-
-	log.SetLevel(lvl)
-
-	if *quiet {
-		log.SetLevel(log.WarnLevel)
 	}
 
 	if cwd := os.Getenv("HEPH_CWD"); cwd != "" {

@@ -211,8 +211,6 @@ func (e *Engine) ScheduleTarget(ctx context.Context, pool *worker.Pool, target *
 			return
 		},
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			w.Status(target.FQN)
-
 			e := TargetRunEngine{
 				Engine:  e,
 				Pool:    pool,
@@ -461,4 +459,14 @@ func (e *Engine) registerLabels(labels []string) {
 			e.Labels = append(e.Labels, label)
 		}
 	}
+}
+
+func (e *Engine) GetTargetShortcuts() []*Target {
+	aliases := make([]*Target, 0)
+	for _, target := range e.Targets {
+		if target.Package.FullName == "" {
+			aliases = append(aliases, target)
+		}
+	}
+	return aliases
 }

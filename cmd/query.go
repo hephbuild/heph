@@ -168,6 +168,8 @@ var outdirCmd = &cobra.Command{
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		switchToPorcelain()
+
 		target := Engine.Targets.Find(args[0])
 		if target == nil {
 			return fmt.Errorf("target %v not found", args[0])

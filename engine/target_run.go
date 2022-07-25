@@ -76,7 +76,7 @@ func (e *Engine) lockPath(target *Target, resource string) string {
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
-	log.Tracef("Target %v", target.FQN)
+	e.Status(target.FQN)
 
 	log.Tracef("%v locking run", target.FQN)
 	err := target.runLock.Lock()

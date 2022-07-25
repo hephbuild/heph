@@ -86,13 +86,13 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 				return
 			}
 
-			if !log.StandardLogger().IsLevelEnabled(entry.Level) {
+			if !entry.Logger.IsLevelEnabled(entry.Level) {
 				return
 			}
 
-			b, err := log.StandardLogger().Formatter.Format(entry)
+			b, err := entry.Logger.Formatter.Format(entry)
 			if err != nil {
-				fmt.Println(fmt.Errorf("logger fmt error: %v", err))
+				fmt.Fprintln(os.Stderr, fmt.Errorf("logger fmt error: %v", err))
 				return
 			}
 
