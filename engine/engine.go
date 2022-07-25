@@ -133,6 +133,10 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(dh))
 	}
 
+	for _, tool := range target.HostTools {
+		h.Write([]byte(tool.Name))
+	}
+
 	for _, dep := range target.HashDeps.Targets {
 		dh := e.hashOutput(dep)
 

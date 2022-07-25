@@ -7,6 +7,7 @@ import (
 	"go.starlark.net/starlark"
 	"heph/utils"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -83,6 +84,11 @@ type TargetTool struct {
 	RelPath string
 }
 
+type HostTool struct {
+	Name    string
+	BinPath string
+}
+
 func (tt TargetTool) AbsPath() string {
 	return filepath.Join(tt.Target.OutRoot.Abs, tt.Target.Package.Root.RelRoot, tt.RelPath)
 }
@@ -95,10 +101,11 @@ type TargetDeps struct {
 type Target struct {
 	TargetSpec
 
-	Tools    []TargetTool
-	Deps     TargetDeps
-	HashDeps TargetDeps
-	FilesOut []PackagePath
+	Tools     []TargetTool
+	HostTools []HostTool
+	Deps      TargetDeps
+	HashDeps  TargetDeps
+	FilesOut  []PackagePath
 	// Files that have been cached
 	actualFilesOut []PackagePath
 	Env            map[string]string
@@ -373,7 +380,16 @@ func (e *Engine) linkTarget(t *Target) error {
 	for _, tool := range t.TargetSpec.Tools.Array {
 		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
 		if err != nil {
-			return err
+			binPath, err := exec.LookPath(tool)
+			if err != nil {
+				return fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
+			}
+
+			t.HostTools = append(t.HostTools, HostTool{
+				Name:    tool,
+				BinPath: binPath,
+			})
+			continue
 		}
 
 		tt := e.Targets.Find(tp.Full())
@@ -416,6 +432,10 @@ func (e *Engine) linkTarget(t *Target) error {
 			return fmt.Errorf("target %v output must be a string, map[string]string, got %#v", tt.Name, tt.Out)
 		}
 	}
+
+	sort.SliceStable(t.HostTools, func(i, j int) bool {
+		return t.HostTools[i].Name < t.HostTools[j].Name
+	})
 
 	sort.SliceStable(t.Tools, func(i, j int) bool {
 		return t.Tools[i].Name < t.Tools[j].Name

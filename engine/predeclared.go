@@ -5,6 +5,7 @@ import (
 	"go.starlark.net/starlark"
 	"heph/utils"
 	"io/fs"
+	"path/filepath"
 	"runtime"
 )
 
@@ -278,8 +279,11 @@ func (e *runBuildEngine) glob(thread *starlark.Thread, fn *starlark.Builtin, arg
 		return nil, err
 	}
 
+	allExclude := exclude.Array
+	allExclude = append(allExclude, filepath.Base(e.HomeDir))
+
 	elems := make([]starlark.Value, 0)
-	err := utils.StarWalk(pkg.Root.Abs, pattern, exclude.Array, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(pkg.Root.Abs, pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

@@ -141,21 +141,14 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		bin[t.Name] = t.AbsPath()
 	}
 
+	for _, t := range target.HostTools {
+		bin[t.Name] = t.BinPath
+	}
+
 	log.Tracef("Bin %#v", bin)
 
-	ex, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
-	env := make(map[string]string) // TODO
-	env["HEPH"] = ex
-	env["TARGET"] = target.FQN
-	for k, v := range target.Env {
-		env[k] = v
-	}
-
 	sandboxRoot := e.sandboxRoot(target)
+	srcFiles := make([]string, 0)
 
 	var sandboxSpec = sandbox.Spec{}
 	if target.Sandbox {
@@ -168,6 +161,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 					From: file.Abs(),
 					To:   file.RelRoot(),
 				})
+				srcFiles = append(srcFiles, file.RelRoot())
 			}
 		}
 
@@ -176,6 +170,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 				From: dep.Abs(),
 				To:   dep.RelRoot(),
 			})
+			srcFiles = append(srcFiles, dep.RelRoot())
 		}
 
 		var err error
@@ -224,6 +219,19 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			iocfg.Stderr = f
 		}
 	}
+
+	ex, err := os.Executable()
+	if err != nil {
+		return err
+	}
+
+	env := make(map[string]string) // TODO
+	env["HEPH"] = ex
+	env["TARGET"] = target.FQN
+	for k, v := range target.Env {
+		env[k] = v
+	}
+	env["SRCS"] = strings.Join(srcFiles, " ")
 
 	cmds := target.Runnable.Cmds
 	if len(args) > 0 {
