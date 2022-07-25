@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -20,6 +21,7 @@ func init() {
 	queryCmd.AddCommand(configCmd)
 	queryCmd.AddCommand(alltargetsCmd)
 	queryCmd.AddCommand(graphCmd)
+	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(outdirCmd)
 
@@ -45,12 +47,15 @@ func init() {
 var queryCmd = &cobra.Command{
 	Use:   "query",
 	Short: "Filter targets",
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		switchToPorcelain()
+	},
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRun()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		targets := Engine.Targets
-		if len(args) > 0 && args[0] == "-" {
+		if hasStdin(args) {
 			var err error
 			targets, err = parseTargetsFromStdin()
 			if err != nil {
@@ -152,6 +157,64 @@ var graphCmd = &cobra.Command{
 	},
 }
 
+var graphDotCmd = &cobra.Command{
+	Use:   "graphdot",
+	Short: "Outputs graph do",
+	Args:  cobra.ArbitraryArgs,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRun()
+	},
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		err := preRunAutocomplete()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
+		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Printf(`
+digraph G  {
+	fontname="Helvetica,Arial,sans-serif"
+	node [fontname="Helvetica,Arial,sans-serif"]
+	edge [fontname="Helvetica,Arial,sans-serif"]
+	rankdir="LR"
+	node [fontsize=10, shape=box, height=0.25]
+	edge [fontsize=10]
+`)
+		id := func(target *engine.Target) string {
+			return strconv.Quote(target.FQN)
+		}
+
+		targets := Engine.Targets
+
+		if hasStdin(args) {
+			var err error
+			targets, err = parseTargetsFromStdin()
+			if err != nil {
+				return nil
+			}
+		}
+
+		for _, target := range targets {
+			parents, err := Engine.DAG().GetParents(target)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("    %v [label=\"%v\"];\n", id(target), target.FQN)
+
+			for _, ancestor := range parents {
+				fmt.Printf("    %v -> %v;\n", id(ancestor), id(target))
+			}
+			fmt.Println()
+		}
+
+		fmt.Println("}")
+
+		return nil
+	},
+}
+
 var outdirCmd = &cobra.Command{
 	Use:   "outdir <target>",
 	Short: "Prints target outdir",
@@ -168,8 +231,6 @@ var outdirCmd = &cobra.Command{
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		switchToPorcelain()
-
 		target := Engine.Targets.Find(args[0])
 		if target == nil {
 			return fmt.Errorf("target %v not found", args[0])

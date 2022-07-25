@@ -113,65 +113,69 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vl, ok := v.(*starlark.List)
-	if !ok {
+	vs, ok := v.(starlark.String)
+	if ok {
 		*d = ArrayMap{
-			Array: arr,
-			Map:   mapp,
+			Array: []string{string(vs)},
 		}
 		return nil
 	}
 
-	err := listForeach(vl, func(i int, value starlark.Value) error {
-		switch e := value.(type) {
-		case starlark.String:
-			arr = append(arr, string(e))
-			return nil
-		case starlark.Tuple:
-			keyv := e.Index(0)
-			key, ok := keyv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("key must be string, got %v", keyv.Type())
-			}
-
-			depv := e.Index(1)
-			dep, ok := depv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("dep must be string, got %v", depv.Type())
-			}
-
-			arr = append(arr, string(dep))
-			mapp[string(dep)] = string(key)
-			return nil
-		case *starlark.List:
-			if e.Len() == 0 {
+	vl, ok := v.(*starlark.List)
+	if ok {
+		err := listForeach(vl, func(i int, value starlark.Value) error {
+			switch e := value.(type) {
+			case starlark.String:
+				arr = append(arr, string(e))
 				return nil
-			}
-
-			err := listForeach(e, func(i int, value starlark.Value) error {
-				dep, ok := value.(starlark.String)
+			case starlark.Tuple:
+				keyv := e.Index(0)
+				key, ok := keyv.(starlark.String)
 				if !ok {
-					return fmt.Errorf("dep must be string, got %v", dep.Type())
+					return fmt.Errorf("key must be string, got %v", keyv.Type())
+				}
+
+				depv := e.Index(1)
+				dep, ok := depv.(starlark.String)
+				if !ok {
+					return fmt.Errorf("dep must be string, got %v", depv.Type())
 				}
 
 				arr = append(arr, string(dep))
+				mapp[string(dep)] = string(key)
 				return nil
-			})
+			case *starlark.List:
+				if e.Len() == 0 {
+					return nil
+				}
+
+				err := listForeach(e, func(i int, value starlark.Value) error {
+					dep, ok := value.(starlark.String)
+					if !ok {
+						return fmt.Errorf("dep must be string, got %v", dep.Type())
+					}
+
+					arr = append(arr, string(dep))
+					return nil
+				})
+				return err
+			}
+
+			return fmt.Errorf("element at index %v must be string or (string, string), is %v", i, value.Type())
+		})
+		if err != nil {
 			return err
 		}
 
-		return fmt.Errorf("element at index %v must be string or (string, string), is %v", i, value.Type())
-	})
-	if err != nil {
-		return err
+		*d = ArrayMap{
+			Array: arr,
+			Map:   mapp,
+		}
+
+		return nil
 	}
 
-	*d = ArrayMap{
-		Array: arr,
-		Map:   mapp,
-	}
-
-	return nil
+	return fmt.Errorf("must be dict, list or string, got %v", v.Type())
 }
 
 func (e *runBuildEngine) getPackage(thread *starlark.Thread) *Package {

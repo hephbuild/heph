@@ -252,6 +252,10 @@ func (e *Engine) Parse() error {
 	}
 	log.Tracef("RunBuildFiles took %v", time.Since(runStartTime))
 
+	sort.SliceStable(e.Targets, func(i, j int) bool {
+		return e.Targets[i].FQN < e.Targets[j].FQN
+	})
+
 	processStartTime := time.Now()
 	for _, target := range e.Targets {
 		err := e.processTarget(target)

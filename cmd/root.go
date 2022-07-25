@@ -99,6 +99,8 @@ var rootCmd = &cobra.Command{
 			return
 		}
 
+		switchToPorcelain()
+
 		err := preRun()
 		if err != nil {
 			log.Fatal(err)
@@ -110,8 +112,6 @@ var rootCmd = &cobra.Command{
 		if target == nil {
 			log.Fatalf("alias %v not defined\n", alias)
 		}
-
-		switchToPorcelain()
 
 		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, false)
 		if err != nil {
