@@ -409,7 +409,7 @@ func (e *Engine) linkTarget(t *Target) error {
 		} else if out := tt.Out.String; out != "" {
 			t.Tools = append(t.Tools, TargetTool{
 				Target:  tt,
-				Name:    filepath.Base(out),
+				Name:    tt.Name,
 				RelPath: out,
 			})
 		} else {
