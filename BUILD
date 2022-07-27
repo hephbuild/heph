@@ -22,7 +22,7 @@ for os in ["linux", "darwin"]:
         name = "heph_{}_{}".format(os, arch)
         t = target(
             name="build_{}_{}".format(os, arch),
-            run="CGO_ENABLED=0 go build -o {} .".format(name),
+            run="CGO_ENABLED=0 go build -ldflags='-s -w' -o {} .".format(name),
             out=name,
             deps=glob("**/*.go") + extra_src,
             env={
