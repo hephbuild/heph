@@ -16,9 +16,11 @@ func init() {
 	resolve.AllowGlobalReassign = true
 }
 
+const buildFilesPattern = "**/{BUILD,BUILD.heph}"
+
 func (e *Engine) runBuildFiles() error {
 	walkStartTime := time.Now()
-	err := utils.StarWalk(e.Root, "**/{BUILD,BUILD.heph}", e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(e.Root, buildFilesPattern, e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}
@@ -58,6 +60,16 @@ func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
 	re := runBuildEngine{
 		Engine: e,
 		pkg:    pkg,
+		registerTarget: func(t TargetSpec) error {
+			e.TargetsLock.Lock()
+			defer e.TargetsLock.Unlock()
+
+			e.Targets = append(e.Targets, &Target{
+				TargetSpec: t,
+			})
+
+			return nil
+		},
 	}
 
 	err := re.runBuildFiles()
@@ -70,7 +82,8 @@ func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
 
 type runBuildEngine struct {
 	*Engine
-	pkg *Package
+	pkg            *Package
+	registerTarget func(TargetSpec) error
 }
 
 func (e *Engine) populatePkg(file *SourceFile) *Package {
@@ -97,30 +110,7 @@ func (e *Engine) populatePkg(file *SourceFile) *Package {
 			RelRoot: relRoot,
 			Abs:     root,
 		},
-		Thread: &starlark.Thread{
-			Name: fullname,
-			Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
-				p, err := utils.TargetParse(fullname, module)
-				if err != nil {
-					return nil, err
-				}
-
-				pkg, ok := e.Packages[p.Package]
-				if !ok {
-					return nil, fmt.Errorf("pkg not found")
-				}
-
-				err = e.runBuildFilesForPackage(pkg)
-				if err != nil {
-					return nil, fmt.Errorf("load: %w", err)
-				}
-
-				return pkg.Globals, nil
-			},
-		},
 	}
-
-	pkg.Thread.SetLocal("pkg", pkg)
 
 	e.Packages[pkg.FullName] = pkg
 
@@ -128,16 +118,9 @@ func (e *Engine) populatePkg(file *SourceFile) *Package {
 }
 
 func (e *runBuildEngine) runBuildFiles() error {
-	predeclared := starlark.StringDict{}
-	predeclared["target"] = starlark.NewBuiltin("target", e.addTarget)
-	predeclared["glob"] = starlark.NewBuiltin("glob", e.glob)
-	predeclared["package_name"] = starlark.NewBuiltin("package_name", e.package_name)
-	predeclared["get_os"] = starlark.NewBuiltin("get_os", e.get_os)
-	predeclared["get_arch"] = starlark.NewBuiltin("get_arch", e.get_arch)
-
 	e.pkg.Globals = starlark.StringDict{}
 	for _, file := range e.pkg.SourceFiles {
-		globals, err := starlark.ExecFile(e.pkg.Thread, file.Path, nil, predeclared)
+		globals, err := e.runBuildFile(file.Path)
 		if err != nil {
 			return err
 		}
@@ -148,4 +131,42 @@ func (e *runBuildEngine) runBuildFiles() error {
 	}
 
 	return nil
+}
+
+func (e *runBuildEngine) predeclared() starlark.StringDict {
+	predeclared := starlark.StringDict{}
+	predeclared["target"] = starlark.NewBuiltin("target", e.target)
+	predeclared["glob"] = starlark.NewBuiltin("glob", e.glob)
+	predeclared["package_name"] = starlark.NewBuiltin("package_name", e.package_name)
+	predeclared["get_os"] = starlark.NewBuiltin("get_os", e.get_os)
+	predeclared["get_arch"] = starlark.NewBuiltin("get_arch", e.get_arch)
+	predeclared["set_deps"] = starlark.NewBuiltin("set_deps", e.set_deps)
+
+	return predeclared
+}
+
+func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
+	thread := &starlark.Thread{
+		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
+			p, err := utils.TargetParse(e.pkg.FullName, module)
+			if err != nil {
+				return nil, err
+			}
+
+			pkg, ok := e.Packages[p.Package]
+			if !ok {
+				return nil, fmt.Errorf("pkg not found")
+			}
+
+			err = e.runBuildFilesForPackage(pkg)
+			if err != nil {
+				return nil, fmt.Errorf("load: %w", err)
+			}
+
+			return pkg.Globals, nil
+		},
+	}
+	thread.SetLocal("pkg", e.pkg)
+
+	return starlark.ExecFile(thread, path, nil, e.predeclared())
 }

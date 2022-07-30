@@ -9,6 +9,7 @@ import (
 	"heph/utils"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -50,7 +51,7 @@ func init() {
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
-	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU()/2, "Number of workers")
+	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
 
 	rootCmd.Flags().SetInterspersed(false)
 	setupRootUsage()
@@ -127,7 +128,7 @@ var runCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -212,6 +213,21 @@ func preRun() error {
 
 	err = Engine.Parse()
 	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func preRunWithStaticAnalysis() error {
+	err := preRun()
+	if err != nil {
+		return err
+	}
+
+	err = Engine.RunStaticAnalysis()
+	if err != nil {
+		printTargetErr(err)
 		return err
 	}
 
@@ -306,4 +322,22 @@ func Execute() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func printTargetErr(err error) bool {
+	if err, ok := err.(engine.TargetFailedError); ok {
+		fmt.Printf("%v failed: %v\n", err.Target.FQN, err)
+		logFile := err.Target.LogFile
+		if logFile != "" {
+			c := exec.Command("tail", "-n", "10", logFile)
+			output, _ := c.Output()
+			fmt.Println()
+			fmt.Println(string(output))
+			fmt.Printf("log file can be found at %v:\n", logFile)
+		}
+
+		return true
+	}
+
+	return false
 }

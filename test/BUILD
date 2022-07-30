@@ -20,4 +20,5 @@ def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_out
         run=test_cmd,
         labels=["e2e_test"],
         sandbox=True,
+        pass_env=["PATH"],
     )

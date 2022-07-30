@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -52,8 +53,9 @@ type Engine struct {
 	SourceFiles SourceFiles
 	Packages    map[string]*Package
 
-	Targets Targets
-	Labels  []string
+	TargetsLock sync.Mutex
+	Targets     Targets
+	Labels      []string
 
 	dag *DAG
 }
@@ -166,6 +168,10 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(e))
 	}
 
+	if target.Gen {
+		h.Write([]byte{1})
+	}
+
 	hb := h.Sum128().Bytes()
 
 	return hex.EncodeToString(hb[:])
@@ -262,6 +268,39 @@ func (e *Engine) populateActualFilesOut(target *Target) error {
 	if empty {
 		target.actualFilesOut = make([]PackagePath, 0)
 		return nil
+	}
+
+	if len(target.FilesOut) == 1 {
+		if target.FilesOut[0].Path == "*" {
+			target.actualFilesOut = make([]PackagePath, 0)
+			err := filepath.WalkDir(target.OutRoot.Abs, func(path string, info os.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+
+				if info.IsDir() {
+					return nil
+				}
+
+				rel, err := filepath.Rel(target.OutRoot.Abs, path)
+				if err != nil {
+					return err
+				}
+
+				target.actualFilesOut = append(target.actualFilesOut, PackagePath{
+					Package: e.Packages[""],
+					Path:    rel,
+					Root:    target.OutRoot.Abs,
+				})
+
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("collect output *: %w", err)
+			}
+
+			return nil
+		}
 	}
 
 	outfiles := target.OutFilesInOutRoot()
@@ -457,6 +496,21 @@ func (e *Engine) HasLabel(label string) bool {
 	return false
 }
 
+func (e *Engine) GeneratedTargets() Targets {
+	targets := make(Targets, 0)
+
+	for _, target := range e.Targets {
+		target := target
+		if !target.Gen {
+			continue
+		}
+
+		targets = append(targets, target)
+	}
+
+	return targets
+}
+
 func (e *Engine) registerLabels(labels []string) {
 	for _, label := range labels {
 		if !e.HasLabel(label) {
@@ -473,4 +527,70 @@ func (e *Engine) GetTargetShortcuts() []*Target {
 		}
 	}
 	return aliases
+}
+
+func (e *Engine) runGenerated(target *Target) error {
+	log.Tracef("run generated %v", target.FQN)
+
+	start := time.Now()
+	defer func() {
+		log.Tracef("runGenerated %v took %v", target.FQN, time.Since(start))
+	}()
+
+	files := target.ActualFilesOut()
+
+	buildFile, ok := files.Find("BUILD")
+	if !ok {
+		return fmt.Errorf("%v must output `BUILD` file", target.FQN)
+	}
+
+	targets := make(Targets, 0)
+
+	re := &runBuildEngine{
+		Engine: e,
+		pkg:    e.Packages[""],
+		registerTarget: func(spec TargetSpec) error {
+			e.TargetsLock.Lock()
+			defer e.TargetsLock.Unlock()
+
+			if t := e.Targets.Find(spec.FQN); t != nil {
+				// TODO handle already registered
+
+				targets = append(targets, t)
+				return nil
+			}
+
+			t := &Target{
+				TargetSpec: spec,
+			}
+
+			targets = append(targets, t)
+			e.Targets = append(e.Targets, t)
+
+			return nil
+		},
+	}
+
+	_, err := re.runBuildFile(buildFile.Abs())
+	if err != nil {
+		return err
+	}
+
+	log.Tracef("run generated got %v targets", len(targets))
+
+	for _, t := range targets {
+		err := e.processTarget(t)
+		if err != nil {
+			return fmt.Errorf("process: %v: %w", t.FQN, err)
+		}
+	}
+
+	for _, t := range targets {
+		err := e.linkTarget(t)
+		if err != nil {
+			return fmt.Errorf("link: %v: %w", target.FQN, err)
+		}
+	}
+
+	return nil
 }

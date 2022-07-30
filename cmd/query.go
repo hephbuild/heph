@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	"heph/engine"
+	"heph/utils"
 	"heph/worker"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +48,7 @@ func init() {
 var queryCmd = &cobra.Command{
 	Use:   "query",
 	Short: "Filter targets",
+	Args:  cobra.ArbitraryArgs,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		switchToPorcelain()
 	},
@@ -141,7 +143,12 @@ var graphCmd = &cobra.Command{
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target := Engine.Targets.Find(args[0])
+		tp, err := utils.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
 			return fmt.Errorf("target %v not found", args[0])
 		}
@@ -247,6 +254,11 @@ var outdirCmd = &cobra.Command{
 		}
 		<-pool.Done()
 
+		if err := pool.Err; err != nil {
+			printTargetErr(err)
+			return err
+		}
+
 		e := engine.TargetRunEngine{
 			Engine:  Engine,
 			Pool:    pool,
@@ -258,6 +270,11 @@ var outdirCmd = &cobra.Command{
 			return err
 		}
 		<-pool.Done()
+
+		if err := pool.Err; err != nil {
+			printTargetErr(err)
+			return err
+		}
 
 		fmt.Println(filepath.Join(target.OutRoot.Abs, target.Package.Root.RelRoot))
 

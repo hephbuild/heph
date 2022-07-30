@@ -1,14 +1,17 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
 	"heph/utils"
+	"heph/worker"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -19,7 +22,6 @@ type Package struct {
 	Name        string
 	FullName    string
 	Root        Path
-	Thread      *starlark.Thread
 	Globals     starlark.StringDict
 	SourceFiles SourceFiles
 }
@@ -76,6 +78,7 @@ type TargetSpec struct {
 	Env         map[string]string
 	PassEnv     []string
 	RunInCwd    bool
+	Gen         bool
 }
 
 type TargetTool struct {
@@ -126,7 +129,7 @@ type Target struct {
 	cacheLock *utils.Flock
 }
 
-func (t *Target) ActualFilesOut() []PackagePath {
+func (t *Target) ActualFilesOut() PackagePaths {
 	if t.actualFilesOut == nil {
 		panic("actualFilesOut is nil for " + t.FQN)
 	}
@@ -165,6 +168,18 @@ func (fp PackagePath) WithRoot(root string) PackagePath {
 	fp.Root = root
 
 	return fp
+}
+
+type PackagePaths []PackagePath
+
+func (p PackagePaths) Find(s string) (PackagePath, bool) {
+	for _, path := range p {
+		if path.Path == s {
+			return path, true
+		}
+	}
+
+	return PackagePath{}, false
 }
 
 func (t *Target) OutFilesInOutRoot() []PackagePath {
@@ -272,8 +287,6 @@ func (e *Engine) Parse() error {
 	}
 	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
 
-	e.dag = &DAG{dag.NewDAG()}
-
 	linkStartTime := time.Now()
 	for _, target := range e.Targets {
 		err := e.linkTarget(target)
@@ -283,9 +296,108 @@ func (e *Engine) Parse() error {
 	}
 	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
+	err = e.createDag()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *Engine) RunStaticAnalysis() error {
+	if genTargets := e.GeneratedTargets(); len(genTargets) > 0 {
+		log.Tracef("Run static analysis")
+
+		ctx := context.Background()
+
+		pool := worker.NewPool(ctx, runtime.NumCPU())
+		defer pool.Stop()
+
+		for _, target := range genTargets {
+			target := target
+			_, err := e.ScheduleTargetDeps(ctx, pool, target)
+			if err != nil {
+				return err
+			}
+
+			err = e.ScheduleTarget(ctx, pool, target)
+			if err != nil {
+				return err
+			}
+
+			err = e.ScheduleRunGenerated(pool, target)
+			if err != nil {
+				return err
+			}
+		}
+
+		<-pool.Done()
+
+		if err := pool.Err; err != nil {
+			return err
+		}
+
+		err := e.createDag()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target) error {
+	ancestors, err := e.DAG().GetAncestors(target)
+	if err != nil {
+		return err
+	}
+
+	deps := append(ancestors, target)
+
+	log.Tracef("Scheduling rungen %v", target.FQN)
+
+	pool.Schedule(&worker.Job{
+		ID: "rungen-" + target.FQN,
+		Wait: func(ctx context.Context) {
+			select {
+			case <-ctx.Done():
+			case <-deps.WaitAllRan():
+			}
+			return
+		},
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			w.Status(fmt.Sprintf("Static analysis on %v...", target.FQN))
+
+			err := e.runGenerated(target)
+			if err != nil {
+				return TargetFailedError{
+					Target: target,
+					Err:    err,
+				}
+			}
+
+			return nil
+		},
+	})
+
+	return nil
+}
+
+func isEdgeDuplicateError(err error) bool {
+	_, is := err.(dag.EdgeDuplicateError)
+	return is
+}
+
+func TargetNotFoundError(target string) error {
+	return fmt.Errorf("target %v not found", target)
+}
+
+func (e *Engine) createDag() error {
+	e.dag = &DAG{dag.NewDAG()}
+
 	dagStartTime := time.Now()
 	for _, target := range e.Targets {
-		err = e.dag.AddVertexByID(target.FQN, target)
+		err := e.dag.AddVertexByID(target.FQN, target)
 		if err != nil {
 			return err
 		}
@@ -309,15 +421,6 @@ func (e *Engine) Parse() error {
 	log.Tracef("DAG took %v", time.Since(dagStartTime))
 
 	return nil
-}
-
-func isEdgeDuplicateError(err error) bool {
-	_, is := err.(dag.EdgeDuplicateError)
-	return is
-}
-
-func TargetNotFoundError(target string) error {
-	return fmt.Errorf("target %v not found", target)
 }
 
 func (e *Engine) processTarget(t *Target) error {
@@ -347,12 +450,13 @@ func (e *Engine) processTarget(t *Target) error {
 }
 
 func (e *Engine) linkTarget(t *Target) error {
+	t.m.Lock()
 	if t.linked {
+		t.m.Unlock()
 		return nil
 	}
-	defer func() {
-		t.linked = true
-	}()
+	t.linked = true
+	t.m.Unlock()
 
 	var err error
 
@@ -462,6 +566,7 @@ func (e *Engine) linkTarget(t *Target) error {
 		}
 	}
 
+	t.FilesOut = []PackagePath{}
 	if s := t.TargetSpec.Out.String; s != "" {
 		t.FilesOut = append(t.FilesOut, createOutFile(t, s))
 	}
@@ -488,11 +593,11 @@ func (e *Engine) linkTarget(t *Target) error {
 					Path:    p,
 				})
 			}
-		}
 
-		sort.SliceStable(t.CachedFiles, func(i, j int) bool {
-			return t.CachedFiles[i].RelRoot() < t.CachedFiles[j].RelRoot()
-		})
+			sort.SliceStable(t.CachedFiles, func(i, j int) bool {
+				return t.CachedFiles[i].RelRoot() < t.CachedFiles[j].RelRoot()
+			})
+		}
 	}
 
 	t.Env = map[string]string{}

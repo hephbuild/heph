@@ -130,18 +130,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	<-pool.Done()
 
 	if err := pool.Err; err != nil {
-		if err, ok := err.(engine.TargetFailedError); ok {
-			fmt.Printf("%v failed: %v\n", err.Target.FQN, err)
-			logFile := err.Target.LogFile
-			if logFile != "" {
-				c := exec.Command("tail", "-n", "10", logFile)
-				output, _ := c.Output()
-				fmt.Println()
-				fmt.Println(string(output))
-				fmt.Printf("log file can be found at %v:\n", logFile)
-			}
-		}
-
+		printTargetErr(err)
 		return err
 	}
 
@@ -176,6 +165,11 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	}
 
 	<-pool.Done()
+
+	if err := pool.Err; err != nil {
+		printTargetErr(err)
+		return err
+	}
 
 	return nil
 }

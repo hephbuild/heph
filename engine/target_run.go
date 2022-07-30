@@ -67,12 +67,12 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	return false, nil
 }
 
-func (e *Engine) locksRoot(target *Target) string {
-	return filepath.Join(e.HomeDir, "locks", target.Package.FullName, target.Name)
+func (e *Engine) tmpRoot(target *Target) string {
+	return filepath.Join(e.HomeDir, "tmp", target.Package.FullName, target.Name)
 }
 
 func (e *Engine) lockPath(target *Target, resource string) string {
-	return filepath.Join(e.locksRoot(target), resource+".lock")
+	return filepath.Join(e.tmpRoot(target), resource+".lock")
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
@@ -84,6 +84,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		return err
 	}
 
+	notifyRan := false
 	defer func() {
 		log.Tracef("%v unlocking run", target.FQN)
 		err := target.runLock.Unlock()
@@ -91,10 +92,12 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
 		}
 
-		target.ran = true
-		close(target.ranCh)
-		log.Tracef("Target DONE %v", target.FQN)
-		e.Status(fmt.Sprintf("%v done", target.FQN))
+		if notifyRan {
+			target.ran = true
+			close(target.ranCh)
+			log.Tracef("Target DONE %v", target.FQN)
+			e.Status(fmt.Sprintf("%v done", target.FQN))
+		}
 	}()
 
 	ctx := e.Context
@@ -102,6 +105,12 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	if target.ran {
+		return nil
+	}
+
+	notifyRan = true
 
 	cached, err := e.WarmTargetCache(target)
 	if err != nil {
@@ -161,6 +170,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 					From: file.Abs(),
 					To:   file.RelRoot(),
 				})
+
 				srcFiles = append(srcFiles, file.RelRoot())
 			}
 		}
@@ -228,10 +238,12 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	env := make(map[string]string) // TODO
 	env["HEPH"] = ex
 	env["TARGET"] = target.FQN
+	env["ROOT"] = target.WorkdirRoot.Abs
+	env["SRCS"] = strings.Join(srcFiles, " ")
+
 	for k, v := range target.Env {
 		env[k] = v
 	}
-	env["SRCS"] = strings.Join(srcFiles, " ")
 
 	cmds := target.Runnable.Cmds
 	if len(args) > 0 {
@@ -248,7 +260,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	}
 
-	for _, c := range cmds {
+	_, hasPathInEnv := env["PATH"]
+
+	for i, c := range cmds {
 		dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.Root.RelRoot)
 		if target.RunInCwd {
 			if target.ShouldCache {
@@ -265,7 +279,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			Cmd:      c,
 			Env:      env,
 			IOConfig: iocfg,
-		}, target.Sandbox)
+		}, target.Sandbox && !hasPathInEnv)
+
+		log.Tracef("Run %v #%v", target.FQN, i)
 
 		err := cmd.Run()
 		if err != nil {
@@ -312,13 +328,13 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			})
 		}
 
-		if target.Sandbox {
-			e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
-			err = deleteDir(target.WorkdirRoot.Abs, true)
-			if err != nil {
-				return err
-			}
-		}
+		//if target.Sandbox {
+		//	e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
+		//	err = deleteDir(target.WorkdirRoot.Abs, true)
+		//	if err != nil {
+		//		return err
+		//	}
+		//}
 	}
 
 	err = e.codegenLink(target)

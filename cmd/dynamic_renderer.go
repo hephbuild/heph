@@ -119,6 +119,7 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 	}
 
 	if ctx.Err() != nil {
+		p.RestoreTerminal()
 		os.Exit(1)
 	}
 
@@ -167,9 +168,9 @@ func (r renderer) View() string {
 	for _, w := range r.workers {
 		var runtime string
 		state := "I"
-		if w.CurrentJob != nil {
+		if j := w.CurrentJob; j != nil {
 			state = "R"
-			runtime = " " + round(time.Now().Sub(w.CurrentJob.TimeStart), 1).String()
+			runtime = " " + round(time.Now().Sub(j.TimeStart), 1).String()
 		}
 
 		status := w.GetStatus()

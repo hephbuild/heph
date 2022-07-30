@@ -9,15 +9,19 @@ import (
 )
 
 func Cp(from, to string) error {
+	logerr := func(id string, err error) error {
+		return fmt.Errorf("%v %v to %v: %w", id, from, to, err)
+	}
+
 	fromf, err := os.Open(from)
 	if err != nil {
-		return fmt.Errorf("cp1: %w", err)
+		return logerr("cp1", err)
 	}
 	defer fromf.Close()
 
 	info, err := fromf.Stat()
 	if err != nil {
-		return fmt.Errorf("cp3: %w", err)
+		return logerr("cp3", err)
 	}
 
 	if info.IsDir() {
@@ -27,19 +31,19 @@ func Cp(from, to string) error {
 	if dir := filepath.Dir(to); dir != "." {
 		err = os.MkdirAll(dir, os.ModePerm)
 		if err != nil {
-			return fmt.Errorf("cp2: %w", err)
+			return logerr("cp2", err)
 		}
 	}
 
 	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
 	if err != nil {
-		return fmt.Errorf("cp4: %w", err)
+		return logerr("cp4", err)
 	}
 	defer tof.Close()
 
 	_, err = io.Copy(tof, fromf)
 	if err != nil {
-		return fmt.Errorf("cp6: %w", err)
+		return logerr("cp6", err)
 	}
 
 	err = tof.Close()
@@ -49,7 +53,7 @@ func Cp(from, to string) error {
 
 	err = os.Chtimes(to, info.ModTime(), info.ModTime())
 	if err != nil {
-		return fmt.Errorf("cp5: %w", err)
+		return logerr("cp5", err)
 	}
 
 	return nil

@@ -189,7 +189,7 @@ func (e *runBuildEngine) getPackage(thread *starlark.Thread) *Package {
 	return pkg
 }
 
-func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := e.getPackage(thread)
 
 	var (
@@ -200,6 +200,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		passArgs       bool
 		cache          BoolArray
 		sandboxEnabled bool
+		gen            bool
 		codegen        string
 		deps           ArrayMap
 		hashDeps       ArrayMap
@@ -227,6 +228,7 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		"labels?", &labels,
 		"out?", &out,
 		"env?", &env,
+		"gen?", &gen,
 	); err != nil {
 		if name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(name), err)
@@ -254,11 +256,13 @@ func (e *runBuildEngine) addTarget(thread *starlark.Thread, fn *starlark.Builtin
 		Env:         env.IMap,
 		PassEnv:     passEnv.Array,
 		RunInCwd:    runInCwd,
+		Gen:         gen,
 	}
 
-	e.Targets = append(e.Targets, &Target{
-		TargetSpec: t,
-	})
+	err := e.registerTarget(t)
+	if err != nil {
+		return nil, err
+	}
 
 	return starlark.String(t.FQN), nil
 }
@@ -311,4 +315,33 @@ func (e *runBuildEngine) get_os(thread *starlark.Thread, fn *starlark.Builtin, a
 
 func (e *runBuildEngine) get_arch(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	return starlark.String(runtime.GOARCH), nil
+}
+
+func (e *runBuildEngine) set_deps(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		fqn  string
+		deps ArrayMap
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"target", &fqn,
+		"deps", &deps,
+	); err != nil {
+		return nil, err
+	}
+
+	target := e.Targets.Find(fqn)
+	if target == nil {
+		return nil, TargetNotFoundError(fqn)
+	}
+
+	var err error
+
+	target.Deps, err = e.linkTargetDeps(target, deps)
+	if err != nil {
+		return nil, err
+	}
+
+	return starlark.None, nil
 }

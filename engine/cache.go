@@ -25,7 +25,6 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	log.Tracef("Store Cache %v %v", target.FQN, inputHash)
 
-	// TODO: store at `hash` and create a link to `latest`
 	dir := e.cacheDir(target, inputHash)
 
 	err := os.RemoveAll(dir)
@@ -52,6 +51,9 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	if len(target.ActualFilesOut()) > 0 {
 		cache := target.CachedFilesInOutRoot()
+		if len(cache) == 1 && cache[0].Path == "*" {
+			cache = target.ActualFilesOut()
+		}
 
 		log.Tracef("Copying to cache %v", target.FQN)
 
