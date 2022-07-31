@@ -104,6 +104,18 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
+	latestDir := e.cacheDir(target, "latest")
+
+	err = os.RemoveAll(latestDir)
+	if err != nil {
+		return err
+	}
+
+	err = os.Symlink(dir, latestDir)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 

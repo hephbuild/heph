@@ -40,7 +40,7 @@ for os in ["linux", "darwin"]:
 
 target(
     name="cp_builds",
-    run="cp $SRCS $1",
+    run="cp * $1",
     deps=[builds],
     sandbox=True,
     pass_args=True,
