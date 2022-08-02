@@ -131,7 +131,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		log.Tracef("Tool %v", tool.Target.FQN)
 
 		if !tool.Target.ran {
-			panic(fmt.Sprintf("%v did not run being being used as a tool", tool.Target.FQN))
+			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
@@ -139,7 +139,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		log.Tracef("Dep %v", dep.FQN)
 
 		if !dep.ran {
-			panic(fmt.Sprintf("%v did not run being being used as a dep", dep.FQN))
+			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.FQN))
 		}
 	}
 
@@ -164,14 +164,20 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
 		src := make([]utils.TarFile, 0)
+		srcTar := make([]string, 0)
 		for _, dep := range target.Deps.Targets {
-			for _, file := range dep.ActualFilesOut() {
-				src = append(src, utils.TarFile{
-					From: file.Abs(),
-					To:   file.RelRoot(),
-				})
+			tarFile := e.targetOutputTarFile(target, e.hashInput(target))
+			if utils.PathExists(tarFile) {
+				srcTar = append(srcTar, tarFile)
+			} else {
+				for _, file := range dep.ActualFilesOut() {
+					src = append(src, utils.TarFile{
+						From: file.Abs(),
+						To:   file.RelRoot(),
+					})
 
-				srcFiles = append(srcFiles, file.RelRoot())
+					srcFiles = append(srcFiles, file.RelRoot())
+				}
 			}
 		}
 
@@ -185,9 +191,10 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 		var err error
 		sandboxSpec, err = sandbox.Make(ctx, sandbox.MakeConfig{
-			Root: sandboxRoot,
-			Bin:  bin,
-			Src:  src,
+			Root:   sandboxRoot,
+			Bin:    bin,
+			Src:    src,
+			SrcTar: srcTar,
 		})
 		if err != nil {
 			return err

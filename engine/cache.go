@@ -14,6 +14,10 @@ func (e *Engine) cacheDir(target *Target, inputHash string) string {
 	return filepath.Join(e.HomeDir, "cache", target.Package.FullName, target.Name, inputHash)
 }
 
+func (e *Engine) targetOutputTarFile(target *Target, inputHash string) string {
+	return filepath.Join(e.cacheDir(target, inputHash), outputTarFile)
+}
+
 const versionFile = "version"
 const inputHashFile = "hash_input"
 const outputHashFile = "hash_output"
@@ -72,7 +76,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 		log.Tracef("Creating archive %v", target.FQN)
 
-		err = utils.Tar(ctx, files, filepath.Join(dir, outputTarFile))
+		err = utils.Tar(ctx, files, e.targetOutputTarFile(target, inputHash))
 		if err != nil {
 			return err
 		}

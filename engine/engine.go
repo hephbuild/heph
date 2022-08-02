@@ -58,6 +58,11 @@ type Engine struct {
 	Labels      []string
 
 	dag *DAG
+
+	cacheHashInputMutex  sync.RWMutex
+	cacheHashInput       map[string]string
+	cacheHashOutputMutex sync.RWMutex
+	cacheHashOutput      map[string]string
 }
 
 type Config struct {
@@ -96,10 +101,12 @@ func New(root string) *Engine {
 	}
 
 	return &Engine{
-		Root:       root,
-		HomeDir:    homeDir,
-		Context:    context.Background(),
-		LocalCache: loc.(*vfsos.Location),
+		Root:            root,
+		HomeDir:         homeDir,
+		Context:         context.Background(),
+		LocalCache:      loc.(*vfsos.Location),
+		cacheHashInput:  map[string]string{},
+		cacheHashOutput: map[string]string{},
 	}
 }
 
@@ -121,6 +128,14 @@ func (e *Engine) hashFile(h hash.Hash, file PackagePath) {
 }
 
 func (e *Engine) hashInput(target *Target) string {
+	cacheId := target.FQN
+	e.cacheHashInputMutex.RLock()
+	if h, ok := e.cacheHashInput[cacheId]; ok {
+		e.cacheHashInputMutex.RUnlock()
+		return h
+	}
+	e.cacheHashInputMutex.RUnlock()
+
 	start := time.Now()
 	defer func() {
 		log.Tracef("hashinput %v took %v", target.FQN, time.Since(start))
@@ -174,10 +189,24 @@ func (e *Engine) hashInput(target *Target) string {
 
 	hb := h.Sum128().Bytes()
 
-	return hex.EncodeToString(hb[:])
+	sh := hex.EncodeToString(hb[:])
+
+	e.cacheHashInputMutex.Lock()
+	e.cacheHashInput[cacheId] = sh
+	e.cacheHashInputMutex.Unlock()
+
+	return sh
 }
 
 func (e *Engine) hashOutput(target *Target) string {
+	cacheId := target.FQN + "_" + e.hashInput(target)
+	e.cacheHashOutputMutex.RLock()
+	if h, ok := e.cacheHashOutput[cacheId]; ok {
+		e.cacheHashOutputMutex.RUnlock()
+		return h
+	}
+	e.cacheHashOutputMutex.RUnlock()
+
 	start := time.Now()
 	defer func() {
 		log.Tracef("hashoutput %v took %v", target.FQN, time.Since(start))
@@ -191,7 +220,13 @@ func (e *Engine) hashOutput(target *Target) string {
 
 	hb := h.Sum128().Bytes()
 
-	return hex.EncodeToString(hb[:])
+	sh := hex.EncodeToString(hb[:])
+
+	e.cacheHashOutputMutex.Lock()
+	e.cacheHashOutput[cacheId] = sh
+	e.cacheHashOutputMutex.Unlock()
+
+	return sh
 }
 
 type TargetFailedError struct {
@@ -582,13 +617,6 @@ func (e *Engine) runGenerated(target *Target) error {
 		err := e.processTarget(t)
 		if err != nil {
 			return fmt.Errorf("process: %v: %w", t.FQN, err)
-		}
-	}
-
-	for _, t := range targets {
-		err := e.linkTarget(t)
-		if err != nil {
-			return fmt.Errorf("link: %v: %w", target.FQN, err)
 		}
 	}
 

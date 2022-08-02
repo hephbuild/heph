@@ -56,6 +56,11 @@ var queryCmd = &cobra.Command{
 		return preRun()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithStaticAnalysis()
+		if err != nil {
+			return err
+		}
+
 		targets := Engine.Targets
 		if hasStdin(args) {
 			var err error
@@ -169,7 +174,7 @@ var graphDotCmd = &cobra.Command{
 	Short: "Outputs graph do",
 	Args:  cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -193,7 +198,7 @@ digraph G  {
 			return strconv.Quote(target.FQN)
 		}
 
-		targets := Engine.Targets
+		targets := Engine.DAG().GetVertices()
 
 		if hasStdin(args) {
 			var err error
@@ -203,18 +208,28 @@ digraph G  {
 			}
 		}
 
-		for _, target := range targets {
+		Engine.DAG().DFSWalk(engine.Walker(func(target *engine.Target) {
+			if targets.Find(target.FQN) == nil {
+				return
+			}
+
 			parents, err := Engine.DAG().GetParents(target)
 			if err != nil {
-				return err
+				panic(err)
 			}
-			fmt.Printf("    %v [label=\"%v\"];\n", id(target), target.FQN)
+			extra := ""
+			if target.IsGroup() {
+				//extra = ` color="red"`
+				return
+			}
+
+			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.FQN, extra)
 
 			for _, ancestor := range parents {
 				fmt.Printf("    %v -> %v;\n", id(ancestor), id(target))
 			}
 			fmt.Println()
-		}
+		}))
 
 		fmt.Println("}")
 

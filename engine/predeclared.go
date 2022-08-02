@@ -336,12 +336,7 @@ func (e *runBuildEngine) set_deps(thread *starlark.Thread, fn *starlark.Builtin,
 		return nil, TargetNotFoundError(fqn)
 	}
 
-	var err error
-
-	target.Deps, err = e.linkTargetDeps(target, deps)
-	if err != nil {
-		return nil, err
-	}
+	target.TargetSpec.Deps = deps
 
 	return starlark.None, nil
 }

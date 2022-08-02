@@ -9,12 +9,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 type MakeConfig struct {
-	Root string
-	Bin  map[string]string
-	Src  []utils.TarFile
+	Root   string
+	Bin    map[string]string
+	Src    []utils.TarFile
+	SrcTar []string
 }
 
 func (c MakeConfig) Dir() string {
@@ -33,7 +35,11 @@ type MakeBinConfig struct {
 type Spec = MakeConfig
 
 func MakeBin(cfg MakeBinConfig) error {
+	start := time.Now()
 	log.Tracef("MakeBin %#v", cfg)
+	defer func() {
+		log.Tracef("MakeBin %v took %v", cfg.Dir, time.Since(start))
+	}()
 
 	_ = os.RemoveAll(cfg.Dir)
 
@@ -60,7 +66,11 @@ func MakeBin(cfg MakeBinConfig) error {
 }
 
 func Make(ctx context.Context, cfg MakeConfig) (Spec, error) {
-	log.Tracef("MakeBin linking %v", cfg.Root)
+	start := time.Now()
+	log.Tracef("Make %v", cfg.Root)
+	defer func() {
+		log.Tracef("Make %v took %v", cfg.Root, time.Since(start))
+	}()
 
 	err := os.RemoveAll(cfg.Root)
 	if err != nil {
@@ -85,12 +95,17 @@ func Make(ctx context.Context, cfg MakeConfig) (Spec, error) {
 		return Spec{}, err
 	}
 
-	if len(cfg.Src) > 0 {
-		for _, file := range cfg.Src {
-			err := utils.Cp(file.From, filepath.Join(cfg.Dir(), file.To))
-			if err != nil {
-				return Spec{}, fmt.Errorf("make: %w", err)
-			}
+	for _, file := range cfg.Src {
+		err := utils.Cp(file.From, filepath.Join(cfg.Dir(), file.To))
+		if err != nil {
+			return Spec{}, fmt.Errorf("make: %w", err)
+		}
+	}
+
+	for _, tarFile := range cfg.SrcTar {
+		err := utils.Untar(ctx, tarFile, cfg.Dir())
+		if err != nil {
+			return Spec{}, fmt.Errorf("make: untar: %w", err)
 		}
 	}
 

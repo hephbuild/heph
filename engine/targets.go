@@ -120,10 +120,11 @@ type Target struct {
 	CachedFiles []PackagePath
 	LogFile     string
 
-	linked bool
-	ran    bool
-	ranCh  chan struct{}
-	m      sync.Mutex
+	processed bool
+	linked    bool
+	ran       bool
+	ranCh     chan struct{}
+	m         sync.Mutex
 
 	runLock   *utils.Flock
 	cacheLock *utils.Flock
@@ -139,6 +140,10 @@ func (t *Target) ActualFilesOut() PackagePaths {
 
 func (t *Target) String() string {
 	return t.FQN
+}
+
+func (t *Target) IsGroup() bool {
+	return len(t.Runnable.Cmds) == 0 && len(t.FilesOut) == 1 && t.FilesOut[0].Path == "*"
 }
 
 type Path struct {
@@ -252,6 +257,15 @@ func (t Targets) WaitAllRan() <-chan struct{} {
 	return doneCh
 }
 
+func (t Targets) FQNs() []string {
+	fqns := make([]string, 0)
+	for _, target := range t {
+		fqns = append(fqns, target.FQN)
+	}
+
+	return fqns
+}
+
 func (e *Engine) Parse() error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -289,7 +303,7 @@ func (e *Engine) Parse() error {
 
 	linkStartTime := time.Now()
 	for _, target := range e.Targets {
-		err := e.linkTarget(target)
+		err := e.linkTarget(target, false)
 		if err != nil {
 			return fmt.Errorf("linking %v: %w", target.FQN, err)
 		}
@@ -299,6 +313,22 @@ func (e *Engine) Parse() error {
 	err = e.createDag()
 	if err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (e *Engine) Simplify() error {
+	// Relink all
+	for _, t := range e.Targets {
+		t.linked = false
+	}
+
+	for _, t := range e.Targets {
+		err := e.linkTarget(t, true)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -314,7 +344,6 @@ func (e *Engine) RunStaticAnalysis() error {
 		defer pool.Stop()
 
 		for _, target := range genTargets {
-			target := target
 			_, err := e.ScheduleTargetDeps(ctx, pool, target)
 			if err != nil {
 				return err
@@ -337,7 +366,12 @@ func (e *Engine) RunStaticAnalysis() error {
 			return err
 		}
 
-		err := e.createDag()
+		err := e.Simplify()
+		if err != nil {
+			return err
+		}
+
+		err = e.createDag()
 		if err != nil {
 			return err
 		}
@@ -407,14 +441,14 @@ func (e *Engine) createDag() error {
 		for _, dep := range target.Deps.Targets {
 			err := e.dag.AddEdge(dep.FQN, target.FQN)
 			if err != nil && !isEdgeDuplicateError(err) {
-				return fmt.Errorf("dep: %w", err)
+				return fmt.Errorf("dep: %v to %v: %w", dep.FQN, target.FQN, err)
 			}
 		}
 
 		for _, tool := range target.Tools {
 			err := e.dag.AddEdge(tool.Target.FQN, target.FQN)
 			if err != nil && !isEdgeDuplicateError(err) {
-				return fmt.Errorf("tool: %w", err)
+				return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, target.FQN, err)
 			}
 		}
 	}
@@ -446,10 +480,12 @@ func (e *Engine) processTarget(t *Target) error {
 		t.CodegenLink = true
 	}
 
+	t.processed = true
+
 	return nil
 }
 
-func (e *Engine) linkTarget(t *Target) error {
+func (e *Engine) linkTarget(t *Target, simplify bool) error {
 	t.m.Lock()
 	if t.linked {
 		t.m.Unlock()
@@ -457,6 +493,10 @@ func (e *Engine) linkTarget(t *Target) error {
 	}
 	t.linked = true
 	t.m.Unlock()
+
+	if !t.processed {
+		panic(fmt.Sprintf("%v has not been processed", t.FQN))
+	}
 
 	var err error
 
@@ -501,7 +541,7 @@ func (e *Engine) linkTarget(t *Target) error {
 			return TargetNotFoundError(tool)
 		}
 
-		err = e.linkTarget(tt)
+		err = e.linkTarget(tt, simplify)
 		if err != nil {
 			return err
 		}
@@ -545,13 +585,13 @@ func (e *Engine) linkTarget(t *Target) error {
 		return t.Tools[i].Name < t.Tools[j].Name
 	})
 
-	t.Deps, err = e.linkTargetDeps(t, t.TargetSpec.Deps)
+	t.Deps, err = e.linkTargetDeps(t, t.TargetSpec.Deps, simplify)
 	if err != nil {
 		return err
 	}
 
 	if t.TargetSpec.HashDeps.Array != nil {
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps)
+		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, simplify)
 		if err != nil {
 			return err
 		}
@@ -587,6 +627,7 @@ func (e *Engine) linkTarget(t *Target) error {
 		if len(t.TargetSpec.CachedFiles) == 0 {
 			t.CachedFiles = t.FilesOut
 		} else {
+			t.CachedFiles = []PackagePath{}
 			for _, p := range t.TargetSpec.CachedFiles {
 				t.CachedFiles = append(t.CachedFiles, PackagePath{
 					Package: t.Package,
@@ -617,7 +658,7 @@ func (e *Engine) linkTarget(t *Target) error {
 	return nil
 }
 
-func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap) (TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, dep := range deps.Array {
@@ -636,12 +677,25 @@ func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap) (TargetDeps, error) {
 			return TargetDeps{}, TargetNotFoundError(dtp.Full())
 		}
 
-		err = e.linkTarget(dt)
+		err = e.linkTarget(dt, simplify)
 		if err != nil {
 			return TargetDeps{}, err
 		}
 
 		td.Targets = append(td.Targets, dt)
+	}
+
+	if simplify {
+		targets := make(Targets, 0)
+		for _, dep := range td.Targets {
+			if dep.IsGroup() {
+				targets = append(targets, dep.Deps.Targets...)
+				td.Files = append(td.Files, dep.Deps.Files...)
+			} else {
+				targets = append(targets, dep)
+			}
+		}
+		td.Targets = targets
 	}
 
 	sort.SliceStable(td.Targets, func(i, j int) bool {

@@ -329,7 +329,7 @@ func printTargetErr(err error) bool {
 		fmt.Printf("%v failed: %v\n", err.Target.FQN, err)
 		logFile := err.Target.LogFile
 		if logFile != "" {
-			c := exec.Command("tail", "-n", "10", logFile)
+			c := exec.Command("cat", logFile)
 			output, _ := c.Output()
 			fmt.Println()
 			fmt.Println(string(output))

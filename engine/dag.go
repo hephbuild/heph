@@ -27,6 +27,21 @@ func (e *DAG) GetParents(target *Target) (Targets, error) {
 	return e.mapToArray(ancestors), nil
 }
 
+func (e *DAG) GetVertices() Targets {
+	vertices := e.DAG.GetVertices()
+
+	return e.mapToArray(vertices)
+}
+
+func (e *DAG) GetChildren(target *Target) (Targets, error) {
+	ancestors, err := e.DAG.GetChildren(target.FQN)
+	if err != nil {
+		return nil, err
+	}
+
+	return e.mapToArray(ancestors), nil
+}
+
 func (e *DAG) GetLeaves() Targets {
 	leaves := e.DAG.GetLeaves()
 
@@ -45,4 +60,11 @@ func (e *DAG) mapToArray(m map[string]interface{}) Targets {
 	})
 
 	return a
+}
+
+type Walker func(target *Target)
+
+func (w Walker) Visit(vertexer dag.Vertexer) {
+	_, t := vertexer.Vertex()
+	w(t.(*Target))
 }

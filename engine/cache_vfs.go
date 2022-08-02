@@ -127,7 +127,7 @@ func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, err
 
 	dir := e.cacheDir(target, inputHash)
 
-	err = utils.Untar(context.Background(), filepath.Join(dir, outputTarFile), filepath.Join(dir, outputDir))
+	err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), filepath.Join(dir, outputDir))
 	if err != nil {
 		return false, err
 	}

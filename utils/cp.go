@@ -43,7 +43,7 @@ func Cp(from, to string) error {
 
 	_, err = io.Copy(tof, fromf)
 	if err != nil {
-		return logerr("cp6", err)
+		return logerr("cp5", err)
 	}
 
 	err = tof.Close()
@@ -53,7 +53,7 @@ func Cp(from, to string) error {
 
 	err = os.Chtimes(to, info.ModTime(), info.ModTime())
 	if err != nil {
-		return logerr("cp5", err)
+		return logerr("cp6", err)
 	}
 
 	return nil
