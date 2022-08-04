@@ -55,7 +55,7 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 			log.Debugf("Using cache %v", target.FQN)
 
 			target.OutRoot = dir
-			err := e.populateActualFilesOut(target)
+			err := e.populateActualFiles(target)
 			if err != nil {
 				return false, err
 			}
@@ -301,7 +301,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	e.Status(fmt.Sprintf("Collecting %v output...", target.FQN))
 
 	target.OutRoot = &target.WorkdirRoot
-	err = e.populateActualFilesOut(target)
+	err = e.populateActualFiles(target)
 	if err != nil {
 		return fmt.Errorf("popfilesout: %w", err)
 	}

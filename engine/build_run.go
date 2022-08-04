@@ -86,6 +86,35 @@ type runBuildEngine struct {
 	registerTarget func(TargetSpec) error
 }
 
+func (e *Engine) createPkg(path string) *Package {
+	e.packagesMutex.Lock()
+	defer e.packagesMutex.Unlock()
+
+	fullname := strings.Trim(path, "/.")
+
+	if pkg, ok := e.Packages[fullname]; ok {
+		return pkg
+	}
+
+	name := filepath.Base(fullname)
+	if name == "." {
+		name = ""
+	}
+
+	pkg := &Package{
+		Name:     name,
+		FullName: fullname,
+		Root: Path{
+			RelRoot: path,
+			Abs:     filepath.Join(e.Root, path),
+		},
+	}
+
+	e.Packages[pkg.FullName] = pkg
+
+	return pkg
+}
+
 func (e *Engine) populatePkg(file *SourceFile) *Package {
 	root := filepath.Dir(file.Path)
 
@@ -93,28 +122,8 @@ func (e *Engine) populatePkg(file *SourceFile) *Package {
 	if err != nil {
 		panic(err)
 	}
-	if relRoot == "." { // filepath.Rel may return .
-		relRoot = ""
-	}
 
-	fullname := strings.Trim(relRoot, "/")
-
-	if pkg, ok := e.Packages[fullname]; ok {
-		return pkg
-	}
-
-	pkg := &Package{
-		Name:     filepath.Base(root),
-		FullName: fullname,
-		Root: Path{
-			RelRoot: relRoot,
-			Abs:     root,
-		},
-	}
-
-	e.Packages[pkg.FullName] = pkg
-
-	return pkg
+	return e.createPkg(relRoot)
 }
 
 func (e *runBuildEngine) runBuildFiles() error {

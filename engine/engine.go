@@ -16,10 +16,12 @@ import (
 	"heph/vfssimple"
 	"heph/worker"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -50,8 +52,9 @@ type Engine struct {
 
 	Context context.Context
 
-	SourceFiles SourceFiles
-	Packages    map[string]*Package
+	SourceFiles   SourceFiles
+	packagesMutex sync.Mutex
+	Packages      map[string]*Package
 
 	TargetsLock sync.Mutex
 	Targets     Targets
@@ -294,93 +297,133 @@ func (e *Engine) ScheduleTargetDeps(ctx context.Context, pool *worker.Pool, targ
 	return ancestors, nil
 }
 
-func (e *Engine) populateActualFilesOut(target *Target) error {
-	empty, err := utils.IsDirEmpty(target.OutRoot.Abs)
-	if err != nil {
-		return fmt.Errorf("collect output: isempty: %w", err)
+func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, error) {
+	out := make(PackagePaths, 0)
+
+	if len(files) == 1 && files[0].Path == "*" {
+		err := filepath.WalkDir(target.OutRoot.Abs, func(path string, d fs.DirEntry, err error) error {
+			if d.IsDir() {
+				return nil
+			}
+
+			relRoot, err := filepath.Rel(target.OutRoot.Abs, path)
+			if err != nil {
+				return err
+			}
+
+			out = append(out, PackagePath{
+				Package: e.createPkg(""),
+				Path:    relRoot,
+				Root:    target.OutRoot.Abs,
+			})
+
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("collect output *: %w", err)
+		}
+
+		return out, nil
 	}
 
-	if empty {
-		target.actualFilesOut = make([]PackagePath, 0)
-		return nil
-	}
+	for _, file := range files {
+		file = file.WithRoot(target.OutRoot.Abs)
 
-	if len(target.FilesOut) == 1 {
-		if target.FilesOut[0].Path == "*" {
-			target.actualFilesOut = make([]PackagePath, 0)
-			err := filepath.WalkDir(target.OutRoot.Abs, func(path string, info os.DirEntry, err error) error {
+		abs := strings.HasPrefix(file.Path, "/")
+		path := strings.TrimPrefix(file.Path, "/")
+		pkg := target.Package
+		if abs {
+			pkg = e.createPkg("")
+		}
+
+		if strings.Contains(path, "*") {
+			pattern := path
+			if !abs {
+				pattern = filepath.Join(pkg.Root.RelRoot, path)
+			}
+
+			err := utils.StarWalkAbs(target.OutRoot.Abs, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.Root.RelRoot), path)
 				if err != nil {
 					return err
 				}
 
-				if info.IsDir() {
-					return nil
-				}
-
-				rel, err := filepath.Rel(target.OutRoot.Abs, path)
-				if err != nil {
-					return err
-				}
-
-				target.actualFilesOut = append(target.actualFilesOut, PackagePath{
-					Package: e.Packages[""],
-					Path:    rel,
+				out = append(out, PackagePath{
+					Package: pkg,
+					Path:    relPkg,
 					Root:    target.OutRoot.Abs,
 				})
 
 				return nil
 			})
 			if err != nil {
-				return fmt.Errorf("collect output *: %w", err)
+				return nil, fmt.Errorf("collect output %v: %w", file.Path, err)
 			}
 
-			return nil
+			return out, nil
 		}
-	}
 
-	outfiles := target.OutFilesInOutRoot()
-
-	target.actualFilesOut = make([]PackagePath, 0)
-	for _, file := range outfiles {
 		f, err := os.Stat(file.Abs())
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		if f.IsDir() {
-			err := filepath.WalkDir(file.Abs(), func(path string, info os.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-
-				if info.IsDir() {
+			err := filepath.WalkDir(file.Abs(), func(path string, d fs.DirEntry, err error) error {
+				if d.IsDir() {
 					return nil
 				}
 
-				rel, err := filepath.Rel(file.Abs(), path)
+				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.Root.RelRoot), path)
 				if err != nil {
 					return err
 				}
 
-				target.actualFilesOut = append(target.actualFilesOut, PackagePath{
-					Package: file.Package,
-					Path:    filepath.Join(file.Path, rel),
-					Root:    file.Root,
+				out = append(out, PackagePath{
+					Package: pkg,
+					Path:    relPkg,
+					Root:    target.OutRoot.Abs,
 				})
 
 				return nil
 			})
 			if err != nil {
-				return fmt.Errorf("collect output: %w", err)
+				return nil, fmt.Errorf("collect output: %v %w", file.Path, err)
 			}
 		} else {
-			target.actualFilesOut = append(target.actualFilesOut, file)
+			out = append(out, file)
 		}
 	}
 
-	sort.SliceStable(target.actualFilesOut, func(i, j int) bool {
-		return target.actualFilesOut[i].RelRoot() < target.actualFilesOut[j].RelRoot()
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].RelRoot() < out[j].RelRoot()
 	})
+
+	return out, nil
+}
+
+func (e *Engine) populateActualFiles(target *Target) (err error) {
+	empty, err := utils.IsDirEmpty(target.OutRoot.Abs)
+	if err != nil {
+		return fmt.Errorf("collect output: isempty: %w", err)
+	}
+
+	target.actualFilesOut = make([]PackagePath, 0)
+	target.actualcachedFiles = make([]PackagePath, 0)
+
+	if empty {
+		return nil
+	}
+
+	target.actualcachedFiles, err = e.collectOut(target, target.CachedFiles)
+	if err != nil {
+		return fmt.Errorf("cached: %w", err)
+	}
+
+	target.actualFilesOut, err = e.collectOut(target, target.FilesOut)
+	if err != nil {
+		return fmt.Errorf("out: %w", err)
+	}
 
 	return nil
 }
@@ -572,43 +615,40 @@ func (e *Engine) runGenerated(target *Target) error {
 		log.Tracef("runGenerated %v took %v", target.FQN, time.Since(start))
 	}()
 
-	files := target.ActualFilesOut()
-
-	buildFile, ok := files.Find("BUILD")
-	if !ok {
-		return fmt.Errorf("%v must output `BUILD` file", target.FQN)
-	}
-
 	targets := make(Targets, 0)
 
-	re := &runBuildEngine{
-		Engine: e,
-		pkg:    e.Packages[""],
-		registerTarget: func(spec TargetSpec) error {
-			e.TargetsLock.Lock()
-			defer e.TargetsLock.Unlock()
+	files := target.ActualFilesOut()
 
-			if t := e.Targets.Find(spec.FQN); t != nil {
-				// TODO handle already registered
+	for _, file := range files {
+		re := &runBuildEngine{
+			Engine: e,
+			pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
+			registerTarget: func(spec TargetSpec) error {
+				e.TargetsLock.Lock()
+				defer e.TargetsLock.Unlock()
+
+				if t := e.Targets.Find(spec.FQN); t != nil {
+					// TODO handle already registered
+
+					targets = append(targets, t)
+					return nil
+				}
+
+				t := &Target{
+					TargetSpec: spec,
+				}
 
 				targets = append(targets, t)
+				e.Targets = append(e.Targets, t)
+
 				return nil
-			}
+			},
+		}
 
-			t := &Target{
-				TargetSpec: spec,
-			}
-
-			targets = append(targets, t)
-			e.Targets = append(e.Targets, t)
-
-			return nil
-		},
-	}
-
-	_, err := re.runBuildFile(buildFile.Abs())
-	if err != nil {
-		return err
+		_, err := re.runBuildFile(file.Abs())
+		if err != nil {
+			return err
+		}
 	}
 
 	log.Tracef("run generated got %v targets", len(targets))

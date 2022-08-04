@@ -104,21 +104,21 @@ type TargetDeps struct {
 type Target struct {
 	TargetSpec
 
-	Tools     []TargetTool
-	HostTools []HostTool
-	Deps      TargetDeps
-	HashDeps  TargetDeps
-	FilesOut  []PackagePath
-	// Files that have been cached
+	Tools          []TargetTool
+	HostTools      []HostTool
+	Deps           TargetDeps
+	HashDeps       TargetDeps
+	FilesOut       []PackagePath
 	actualFilesOut []PackagePath
 	Env            map[string]string
 
 	CodegenLink bool
 
-	WorkdirRoot Path
-	OutRoot     *Path
-	CachedFiles []PackagePath
-	LogFile     string
+	WorkdirRoot       Path
+	OutRoot           *Path
+	CachedFiles       []PackagePath
+	actualcachedFiles []PackagePath
+	LogFile           string
 
 	processed bool
 	linked    bool
@@ -158,11 +158,16 @@ type PackagePath struct {
 }
 
 func (fp PackagePath) Abs() string {
+	return filepath.Join(fp.PkgRootAbs(), fp.Path)
+}
+
+// PkgRootAbs is the absolute path to the package root
+func (fp PackagePath) PkgRootAbs() string {
 	if fp.Root != "" {
-		return filepath.Join(fp.Root, fp.Package.Root.RelRoot, fp.Path)
+		return filepath.Join(fp.Root, fp.Package.Root.RelRoot)
 	}
 
-	return filepath.Join(fp.Package.Root.Abs, fp.Path)
+	return fp.Package.Root.Abs
 }
 
 func (fp PackagePath) RelRoot() string {
@@ -196,13 +201,12 @@ func (t *Target) OutFilesInOutRoot() []PackagePath {
 	return out
 }
 
-func (t *Target) CachedFilesInOutRoot() []PackagePath {
-	out := make([]PackagePath, 0)
-	for _, file := range t.CachedFiles {
-		out = append(out, file.WithRoot(t.OutRoot.Abs))
+func (t *Target) ActualCachedFiles() []PackagePath {
+	if t.actualcachedFiles == nil {
+		panic("actualcachedFiles is nil for " + t.FQN)
 	}
 
-	return out
+	return t.actualcachedFiles
 }
 
 func (t *Target) Private() bool {

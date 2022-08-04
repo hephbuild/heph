@@ -53,12 +53,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	if len(target.ActualFilesOut()) > 0 {
-		cache := target.CachedFilesInOutRoot()
-		if len(cache) == 1 && cache[0].Path == "*" {
-			cache = target.ActualFilesOut()
-		}
-
+	if cache := target.ActualCachedFiles(); len(cache) > 0 {
 		log.Tracef("Copying to cache %v", target.FQN)
 
 		files := make([]utils.TarFile, 0)
@@ -94,6 +89,10 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	for i, file := range target.actualFilesOut {
 		target.actualFilesOut[i] = file.WithRoot(target.OutRoot.Abs)
+	}
+
+	for i, file := range target.actualcachedFiles {
+		target.actualcachedFiles[i] = file.WithRoot(target.OutRoot.Abs)
 	}
 
 	outputHash := e.hashOutput(target)
