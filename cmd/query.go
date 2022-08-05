@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -50,14 +51,35 @@ var queryCmd = &cobra.Command{
 	Short: "Filter targets",
 	Args:  cobra.ArbitraryArgs,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		switchToPorcelain()
-	},
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		//switchToPorcelain()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithStaticAnalysis()
+		err := preRun()
 		if err != nil {
+			return err
+		}
+
+		ctx, cancel := context.WithCancel(cmd.Context())
+		defer cancel()
+
+		pool := worker.NewPool(ctx, *workers)
+		defer pool.Stop()
+
+		err = Engine.ScheduleStaticAnalysis(ctx, pool)
+		if err != nil {
+			return err
+		}
+
+		if isTerm && !*plain {
+			err := DynamicRenderer(ctx, cancel, pool)
+			if err != nil {
+				return fmt.Errorf("dynamic renderer: %w", err)
+			}
+		}
+		<-pool.Done()
+
+		if err := pool.Err; err != nil {
+			printTargetErr(err)
 			return err
 		}
 

@@ -94,6 +94,11 @@ func Tar(ctx context.Context, files []TarFile, out string) error {
 	}
 	defer tarf.Close()
 
+	go func() {
+		<-ctx.Done()
+		tarf.Close()
+	}()
+
 	gw := gzip.NewWriter(tarf)
 	defer gw.Close()
 
@@ -137,6 +142,11 @@ func Untar(ctx context.Context, in, to string) error {
 		return fmt.Errorf("untar: %w", err)
 	}
 	defer tarf.Close()
+
+	go func() {
+		<-ctx.Done()
+		tarf.Close()
+	}()
 
 	gr, err := gzip.NewReader(tarf)
 	if err != nil {

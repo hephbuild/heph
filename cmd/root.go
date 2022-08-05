@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"heph/engine"
 	"heph/utils"
+	"heph/worker"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -128,7 +130,7 @@ var runCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis()
+		return preRun()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -144,7 +146,7 @@ var runCmd = &cobra.Command{
 			log.Fatal(err)
 		}
 
-		if len(targets) == 0 {
+		if !hasStdin(args) && len(targets) == 0 {
 			_ = cmd.Help()
 			return
 		}
@@ -225,8 +227,26 @@ func preRunWithStaticAnalysis() error {
 		return err
 	}
 
-	err = Engine.RunStaticAnalysis()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pool := worker.NewPool(ctx, runtime.NumCPU())
+	defer pool.Stop()
+
+	err = Engine.ScheduleStaticAnalysis(ctx, pool)
 	if err != nil {
+		return err
+	}
+
+	if isTerm && !*plain {
+		err := DynamicRenderer(ctx, cancel, pool)
+		if err != nil {
+			return fmt.Errorf("dynamic renderer: %w", err)
+		}
+	}
+	<-pool.Done()
+
+	if err := pool.Err; err != nil {
 		printTargetErr(err)
 		return err
 	}
@@ -331,9 +351,9 @@ func printTargetErr(err error) bool {
 		if logFile != "" {
 			c := exec.Command("cat", logFile)
 			output, _ := c.Output()
-			fmt.Println()
-			fmt.Println(string(output))
-			fmt.Printf("log file can be found at %v:\n", logFile)
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, string(output))
+			fmt.Fprintf(os.Stderr, "log file can be found at %v:\n", logFile)
 		}
 
 		return true

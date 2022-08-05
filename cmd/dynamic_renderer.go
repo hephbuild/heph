@@ -53,7 +53,7 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 			done:    pool.DoneCount,
 			workers: pool.Workers,
 		},
-	})
+	}, tea.WithOutput(os.Stderr))
 
 	go func() {
 		for {
@@ -118,8 +118,9 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 		return err
 	}
 
-	if ctx.Err() != nil {
+	if err := ctx.Err(); err != nil {
 		p.RestoreTerminal()
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 

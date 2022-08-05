@@ -96,6 +96,10 @@ func Make(ctx context.Context, cfg MakeConfig) (Spec, error) {
 	}
 
 	for _, file := range cfg.Src {
+		if err := ctx.Err(); err != nil {
+			return Spec{}, err
+		}
+
 		err := utils.Cp(file.From, filepath.Join(cfg.Dir(), file.To))
 		if err != nil {
 			return Spec{}, fmt.Errorf("make: %w", err)

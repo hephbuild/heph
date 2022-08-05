@@ -58,6 +58,10 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 		files := make([]utils.TarFile, 0)
 		for _, file := range cache {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
 			err := utils.Cp(file.Abs(), filepath.Join(outFilesDir, file.RelRoot()))
 			if err != nil {
 				return err

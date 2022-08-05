@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -338,14 +337,11 @@ func (e *Engine) Simplify() error {
 	return nil
 }
 
-func (e *Engine) RunStaticAnalysis() error {
+func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) error {
 	if genTargets := e.GeneratedTargets(); len(genTargets) > 0 {
 		log.Tracef("Run static analysis")
 
-		ctx := context.Background()
-
-		pool := worker.NewPool(ctx, runtime.NumCPU())
-		defer pool.Stop()
+		var wg utils.WaitGroupChan
 
 		for _, target := range genTargets {
 			_, err := e.ScheduleTargetDeps(ctx, pool, target)
@@ -358,33 +354,40 @@ func (e *Engine) RunStaticAnalysis() error {
 				return err
 			}
 
-			err = e.ScheduleRunGenerated(pool, target)
+			err = e.ScheduleRunGenerated(pool, target, &wg)
 			if err != nil {
 				return err
 			}
 		}
 
-		<-pool.Done()
+		pool.Schedule(&worker.Job{
+			ID: "post static analysis",
+			Wait: func(ctx context.Context) {
+				select {
+				case <-ctx.Done():
+				case <-wg.Done():
+				}
+			},
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				err := e.Simplify()
+				if err != nil {
+					return err
+				}
 
-		if err := pool.Err; err != nil {
-			return err
-		}
+				err = e.createDag()
+				if err != nil {
+					return err
+				}
 
-		err := e.Simplify()
-		if err != nil {
-			return err
-		}
-
-		err = e.createDag()
-		if err != nil {
-			return err
-		}
+				return nil
+			},
+		})
 	}
 
 	return nil
 }
 
-func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target) error {
+func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target, wg *utils.WaitGroupChan) error {
 	ancestors, err := e.DAG().GetAncestors(target)
 	if err != nil {
 		return err
@@ -393,6 +396,8 @@ func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target) error {
 	deps := append(ancestors, target)
 
 	log.Tracef("Scheduling rungen %v", target.FQN)
+
+	wg.Add()
 
 	pool.Schedule(&worker.Job{
 		ID: "rungen-" + target.FQN,
@@ -413,6 +418,8 @@ func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target) error {
 					Err:    err,
 				}
 			}
+
+			wg.Sub()
 
 			return nil
 		},
