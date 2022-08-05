@@ -246,6 +246,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	env["HEPH"] = ex
 	env["TARGET"] = target.FQN
 	env["ROOT"] = target.WorkdirRoot.Abs
+	env["SANDBOX"] = filepath.Join(e.sandboxRoot(target), "_dir")
 	// TODO: figure out causes /bin/bash: argument list too long
 	// https://unix.stackexchange.com/a/357859
 	//env["SRCS"] = strings.Join(srcFiles, " ")
