@@ -20,6 +20,19 @@ import (
 const baseUrl = "https://storage.googleapis.com/heph-build"
 
 func CheckAndUpdate(cfg config.Config) {
+	homeDir, err := homeDir(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lock := utils.NewFlock(filepath.Join(homeDir, "update.lock"))
+	err = lock.Lock()
+	if err != nil {
+		log.Fatalf("Failed to lock %v", err)
+	}
+
+	defer lock.Unlock()
+
 	if !shouldUpdate(cfg) {
 		return
 	}
