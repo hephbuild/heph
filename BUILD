@@ -7,7 +7,7 @@ target(
 go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
-    name="build_all_arch",
+    name="build_all",
     run="$HEPH query --include build | $HEPH run -",
     pass_env=go_env_vars,
 )
@@ -18,14 +18,25 @@ extra_src = [
     "cmd/root_usage_template.gotpl"
 ]
 
+version = target(
+    name="version",
+    run="echo ${GITHUB_SHA::8} > version && cat version",
+    out="version",
+    pass_env=["GITHUB_SHA"],
+    sandbox=True,
+)
+
 for os in ["linux", "darwin"]:
     for arch in ["amd64", "arm64"]:
         name = "heph_{}_{}".format(os, arch)
         t = target(
             name="build_{}_{}".format(os, arch),
-            run="CGO_ENABLED=0 go build -ldflags='-s -w' -o {} .".format(name),
+            run=[
+                "mv version utils/version",
+                "pwd && CGO_ENABLED=0 go build -tags release -ldflags='-s -w' -o {} .".format(name)
+            ],
             out=name,
-            deps=glob("**/*.go") + extra_src,
+            deps=["go.mod", "go.sum"] + glob("**/*.go") + extra_src + [version],
             env={
                 "GOOS": os,
                 "GOARCH": arch,

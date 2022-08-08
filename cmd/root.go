@@ -64,6 +64,7 @@ var Engine *engine.Engine
 var rootCmd = &cobra.Command{
 	Use:           "heph",
 	Short:         "Efficient build system",
+	Version:       utils.Version,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,

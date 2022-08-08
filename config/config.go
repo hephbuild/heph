@@ -1,19 +1,53 @@
 package config
 
 import (
+	"github.com/coreos/go-semver/semver"
 	"io"
 	"os"
+	"strings"
 )
 import (
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Version    string
+	Version    Version
 	Cache      map[string]Cache `yaml:",omitempty"`
 	BuildFiles struct {
 		Ignore []string `yaml:",omitempty"`
 	} `yaml:"build_files"`
+}
+
+type Version struct {
+	String string
+	Semver *semver.Version
+	GTE    bool
+}
+
+func (e *Version) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	err := unmarshal(&e.String)
+	if err != nil {
+		return err
+	}
+
+	e.String = strings.TrimSpace(e.String)
+
+	version := e.String
+	if strings.HasPrefix(version, ">=") {
+		e.GTE = true
+		version = strings.TrimPrefix(version, ">=")
+		version = strings.TrimSpace(version)
+	}
+
+	e.Semver, err = semver.NewVersion(version)
+	if err != nil {
+		if e.GTE {
+			// If its gte, it has to be a semver, report errors if not
+			return err
+		}
+	}
+
+	return nil
 }
 
 type Cache struct {
@@ -60,7 +94,7 @@ func Parse(name string) (Config, error) {
 }
 
 func (cc Config) Merge(nc Config) Config {
-	if nc.Version != "" {
+	if nc.Version.String != "" {
 		cc.Version = nc.Version
 	}
 

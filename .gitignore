@@ -79,3 +79,4 @@ fabric.properties
 dist/
 
 .heph
+utils/version

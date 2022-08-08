@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -u
+
+# Inspired by https://github.com/thought-machine/please/blob/master/pleasew
+
+RED="\x1B[31m"
+GREEN="\x1B[32m"
+YELLOW="\x1B[33m"
+RESET="\x1B[0m"
+
+DEFAULT_URL_BASE="https://storage.googleapis.com/heph-build"
+
+OS="$(uname)"
+ARCH="$(uname -m)"
+
+# Find the os / arch to download. You can do this quite nicely with go env
+# but we use this script on machines that don't necessarily have Go itself.
+if [ "$OS" = "Linux" ]; then
+    GOOS="linux"
+elif [ "$OS" = "Darwin" ]; then
+    GOOS="darwin"
+elif [ "$OS" = "FreeBSD" ]; then
+    GOOS="freebsd"
+else
+    echo -e >&2 "${RED}Unknown operating system $OS${RESET}"
+    exit 1
+fi
+
+# Check HEPH_CONFIG_PROFILE or fall back to arguments for a profile.
+PROFILE="${HEPH_CONFIG_PROFILE:-$(sed -E 's/.*--profile[= ]([^ ]+).*/\1/g' <<< "$*")}"
+
+# Config files on order of precedence high to low.
+CONFIGS=(
+  ".hephconfig.local"
+  "${PROFILE:+.hephconfig.$PROFILE}"
+  ".hephconfig_${GOOS}_${ARCH}"
+  ".hephconfig"
+  "$HOME/.config/heph/hephconfig"
+  "/etc/heph/hephconfig"
+)
+
+function read_config() {
+   grep -i "$1" "${CONFIGS[@]}" 2>/dev/null | head -n 1
+}
+
+# We might already have it downloaded...
+LOCATION="$(read_config "^location" | cut -d ':' -f 2 | tr -d ' ')"
+if [ -z "$LOCATION" ]; then
+    if [ -z "$HOME" ]; then
+        echo -e >&2 "${RED}\$HOME not set, not sure where to look for Heph.${RESET}"
+        exit 1
+    fi
+    LOCATION="${HOME}/.heph"
+else
+    # It can contain a literal ~, need to explicitly handle that.
+    LOCATION="${LOCATION/\~/$HOME}"
+fi
+# If this exists at any version, let it handle any update.
+TARGET="${LOCATION}/heph"
+if [ -f "$TARGET" ]; then
+    exec "$TARGET" ${HEPH_ARGS:-} "$@"
+fi
+
+URL_BASE="$(read_config "^downloadlocation" | cut -d ':' -f 2 | tr -d ' ')"
+if [ -z "$URL_BASE" ]; then
+    URL_BASE=$DEFAULT_URL_BASE
+fi
+URL_BASE="${URL_BASE%/}"
+
+VERSION="$(read_config "^version[^\n]")"
+VERSION="${VERSION#*:}"    # Strip until after first :, remove filename
+VERSION="${VERSION#*:}"    # Strip until after first :, remove key
+VERSION="${VERSION/ /}"    # Remove all spaces
+VERSION="${VERSION#>=}"    # Strip any initial >=
+if [ "$VERSION" = "latest" ]; then
+    VERSION=$(curl -fsSL ${URL_BASE}/latest_version)
+elif [ -z "$VERSION" ]; then
+    echo -e >&2 "${YELLOW}Can't determine version, will use latest.${RESET}"
+    VERSION=$(curl -fsSL ${URL_BASE}/latest_version)
+fi
+
+HEPH_URL="$DEFAULT_URL_BASE/${VERSION}/heph_${GOOS}_${ARCH}"
+DIR="${LOCATION}/${VERSION}"
+# Potentially we could reuse this but it's easier not to really.
+if [ ! -d "$DIR" ]; then
+    rm -rf "$DIR"
+fi
+echo -e >&2 "${GREEN}Downloading Heph ${VERSION} to ${DIR}...${RESET}"
+mkdir -p "$DIR"
+curl -fsSL -o "$DIR/heph" "${HEPH_URL}"
+# Link it all back up a dir
+for x in $(ls "$DIR"); do
+    ln -sf "${DIR}/${x}" "$LOCATION"
+done
+echo -e >&2 "${GREEN}Should be good to go now, running heph...${RESET}"
+chmod +x "$TARGET"
+exec "$TARGET" ${HEPH_ARGS:-} "$@"

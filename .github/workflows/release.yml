@@ -61,7 +61,7 @@ jobs:
 
       - name: Copy to bucket
         run: |
-          VERSION=${GITHUB_SHA::8}
+          VERSION=$(./heph run --porcelain //:version)
           NOCACHE="Cache-Control: no-cache, no-store"
           
           echo $VERSION
@@ -70,4 +70,5 @@ jobs:
 
           gsutil -h "${NOCACHE}" rsync -r './dist' gs://heph-build/${VERSION}
           gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
+          gsutil -h "${NOCACHE}" cp './hephw' gs://heph-build/hephw
           gsutil -h "${NOCACHE}" cp './latest_version' gs://heph-build/latest_version

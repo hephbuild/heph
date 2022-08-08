@@ -6,6 +6,7 @@ import (
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
+	"heph/upgrade"
 	"heph/utils"
 	"heph/worker"
 	"os"
@@ -283,6 +284,8 @@ func (e *Engine) Parse() error {
 		return err
 	}
 	log.Tracef("ParseConfigs took %v", time.Since(configStartTime))
+
+	upgrade.CheckAndUpdate(e.Config.Config)
 
 	runStartTime := time.Now()
 	err = e.runBuildFiles()
