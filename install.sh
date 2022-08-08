@@ -37,13 +37,13 @@ DIR="${LOCATION}/${VERSION}"
 mkdir -p "$DIR"
 mkdir -p "${LOCATION}/bin"
 
-if [ $1 = "--dev" ]; then
+if [ "$1" = "--dev" ]; then
     # For local consumption only
     echo "Dev mode"
     cp dev_run.sh /tmp/heph
 	  sed -i "" "s|HEPH_BUILD_ROOT|$(pwd)|g" /tmp/heph
 	  mv /tmp/heph "$LOCATION/bin/heph"
-elif [ $1 = "--build" ]; then
+elif [ "$1" = "--build" ]; then
     # For local consumption only
     echo "Building..."
     go build -o /tmp/heph .
