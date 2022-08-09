@@ -215,6 +215,20 @@ func (e *Engine) hashOutput(target *Target) string {
 		log.Tracef("hashoutput %v took %v", target.FQN, time.Since(start))
 	}()
 
+	file := filepath.Join(e.cacheDir(target, e.hashInput(target)), outputHashFile)
+	b, err := os.ReadFile(file)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Errorf("reading %v: %v", file, err)
+	}
+
+	if sh := strings.TrimSpace(string(b)); len(sh) > 0 {
+		e.cacheHashOutputMutex.Lock()
+		e.cacheHashOutput[cacheId] = sh
+		e.cacheHashOutputMutex.Unlock()
+
+		return sh
+	}
+
 	h := xxh3.New()
 
 	for _, file := range target.ActualFilesOut() {
