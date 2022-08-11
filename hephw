@@ -26,6 +26,15 @@ else
     exit 1
 fi
 
+if [ "$ARCH" = "x86_64" ]; then
+    ARCH="amd64"
+elif [ "$ARCH" = "arm64" ]; then
+    :
+else
+    echo -e >&2 "${RED}Unknown cpu arch $ARCH${RESET}"
+    exit 1
+fi
+
 # Check HEPH_CONFIG_PROFILE or fall back to arguments for a profile.
 PROFILE="${HEPH_CONFIG_PROFILE:-$(sed -E 's/.*--profile[= ]([^ ]+).*/\1/g' <<< "$*")}"
 
