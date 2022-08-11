@@ -12,6 +12,7 @@ import (
 
 type Config struct {
 	Version    Version
+	Location   string
 	Cache      map[string]Cache `yaml:",omitempty"`
 	BuildFiles struct {
 		Ignore []string `yaml:",omitempty"`
@@ -96,6 +97,10 @@ func Parse(name string) (Config, error) {
 func (cc Config) Merge(nc Config) Config {
 	if nc.Version.String != "" {
 		cc.Version = nc.Version
+	}
+
+	if nc.Location != "" {
+		cc.Location = nc.Location
 	}
 
 	if cc.Cache == nil {

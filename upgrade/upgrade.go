@@ -97,6 +97,10 @@ func findLatestVersion() (string, error) {
 }
 
 func homeDir(cfg config.Config) (string, error) {
+	if cfg.Location != "" {
+		return cfg.Location, nil
+	}
+
 	home, err := homedir.Dir()
 	if err != nil {
 		return "", err

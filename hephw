@@ -40,7 +40,7 @@ CONFIGS=(
 )
 
 function read_config() {
-   grep -i "$1" "${CONFIGS[@]}" 2>/dev/null | head -n 1
+   grep --no-filename -i "$1" "${CONFIGS[@]}" 2>/dev/null | head -n 1
 }
 
 # We might already have it downloaded...
@@ -68,8 +68,7 @@ fi
 URL_BASE="${URL_BASE%/}"
 
 VERSION="$(read_config "^version[^\n]")"
-VERSION="${VERSION#*:}"    # Strip until after first :, remove filename
-VERSION="${VERSION#*:}"    # Strip until after first :, remove key
+VERSION="${VERSION#*:}"    # Strip until after first :
 VERSION="${VERSION/ /}"    # Remove all spaces
 VERSION="${VERSION#>=}"    # Strip any initial >=
 if [ "$VERSION" = "latest" ]; then
