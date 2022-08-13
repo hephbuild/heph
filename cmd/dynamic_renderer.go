@@ -42,10 +42,11 @@ func (h hookFunc) Fire(entry *log.Entry) error {
 	return nil
 }
 
-func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) error {
+func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *worker.Pool) error {
 	doneCh := pool.Done()
 
 	p := tea.NewProgram(renderer{
+		name:   name,
 		start:  time.Now(),
 		cancel: cancel,
 		UpdateMessage: UpdateMessage{
@@ -53,18 +54,10 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 			done:    pool.DoneCount,
 			workers: pool.Workers,
 		},
-	}, tea.WithOutput(os.Stderr))
+	}, tea.WithOutput(os.Stderr), tea.WithoutCatchPanics())
 
 	go func() {
 		for {
-			time.Sleep(50 * time.Millisecond)
-
-			p.Send(UpdateMessage{
-				jobs:    pool.JobCount,
-				done:    pool.DoneCount,
-				workers: pool.Workers,
-			})
-
 			select {
 			case <-doneCh:
 				p.Send(UpdateMessage{
@@ -74,7 +67,12 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 				})
 				p.Quit()
 				return
-			default:
+			case <-time.After(50 * time.Millisecond):
+				p.Send(UpdateMessage{
+					jobs:    pool.JobCount,
+					done:    pool.DoneCount,
+					workers: pool.Workers,
+				})
 			}
 		}
 	}()
@@ -119,7 +117,6 @@ func DynamicRenderer(ctx context.Context, cancel func(), pool *worker.Pool) erro
 	}
 
 	if err := ctx.Err(); err != nil {
-		p.RestoreTerminal()
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -134,6 +131,7 @@ type UpdateMessage struct {
 }
 
 type renderer struct {
+	name   string
 	start  time.Time
 	cancel func()
 	UpdateMessage
@@ -160,11 +158,11 @@ func (r renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (r renderer) View() string {
 	if r.done == r.jobs {
-		return fmt.Sprintf("Ran %v jobs in %v\n", r.done, round(time.Now().Sub(r.start), 1).String())
+		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, r.done, round(time.Now().Sub(r.start), 1).String())
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v/%v %v\n", r.done, r.jobs, round(time.Now().Sub(r.start), 1).String()))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.done, r.jobs, round(time.Now().Sub(r.start), 1).String()))
 
 	for _, w := range r.workers {
 		var runtime string

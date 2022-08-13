@@ -3,17 +3,18 @@ package utils
 import (
 	"encoding/hex"
 	"errors"
+	"github.com/bmatcuk/doublestar/v4"
 	"io"
 	"math/rand"
 	"os"
 	"path/filepath"
 )
 
-func RandPath(prefix, suffix string) string {
+func RandPath(base, prefix, suffix string) string {
 	randBytes := make([]byte, 16)
 	rand.Read(randBytes)
 
-	return filepath.Join(os.TempDir(), prefix+hex.EncodeToString(randBytes)+suffix)
+	return filepath.Join(base, prefix+hex.EncodeToString(randBytes)+suffix)
 }
 
 func IsDirEmpty(name string) (bool, error) {
@@ -40,4 +41,8 @@ func IsDirEmpty(name string) (bool, error) {
 func PathExists(filename string) bool {
 	_, err := os.Lstat(filename)
 	return err == nil
+}
+
+func PathMatches(pattern, file string) (bool, error) {
+	return doublestar.PathMatch(pattern, file)
 }

@@ -148,7 +148,7 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 
 	pathStr := func(path string) string {
 		if isolatePath {
-			return "PATH=/usr/sbin:/usr/bin:/sbin:/bin:" + cfg.BinDir
+			return "PATH=" + cfg.BinDir + ":/usr/sbin:/usr/bin:/sbin:/bin"
 		} else {
 			return "PATH=" + cfg.BinDir + ":" + path
 		}

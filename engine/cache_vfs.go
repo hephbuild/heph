@@ -106,17 +106,12 @@ func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, err
 		return false, err
 	}
 
-	err = e.vfsCopyFile(remoteRoot, localRoot, inputHashFile)
+	err = e.vfsCopyFile(remoteRoot, localRoot, outputHashFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 
-		return false, err
-	}
-
-	err = e.vfsCopyFile(remoteRoot, localRoot, outputHashFile)
-	if err != nil {
 		return false, err
 	}
 
@@ -128,6 +123,11 @@ func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, err
 	dir := e.cacheDir(target, inputHash)
 
 	err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), filepath.Join(dir, outputDir))
+	if err != nil {
+		return false, err
+	}
+
+	err = e.vfsCopyFile(remoteRoot, localRoot, inputHashFile)
 	if err != nil {
 		return false, err
 	}

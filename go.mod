@@ -9,8 +9,10 @@ require (
 	github.com/coreos/go-semver v0.3.0
 	github.com/gofrs/flock v0.8.1
 	github.com/heimdalr/dag v1.2.1
+	github.com/json-iterator/go v1.1.12
 	github.com/lithammer/fuzzysearch v1.1.5
 	github.com/mattn/go-isatty v0.0.14
+	github.com/mitchellh/go-homedir v1.1.0
 	github.com/sirupsen/logrus v1.8.1
 	github.com/spf13/cobra v1.5.0
 	github.com/zeebo/xxh3 v1.0.2
@@ -40,7 +42,8 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
 	github.com/mattn/go-runewidth v0.0.13 // indirect
-	github.com/mitchellh/go-homedir v1.1.0 // indirect
+	github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421 // indirect
+	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/muesli/ansi v0.0.0-20211018074035-2e021307bc4b // indirect
 	github.com/muesli/cancelreader v0.2.1 // indirect
 	github.com/muesli/reflow v0.3.0 // indirect

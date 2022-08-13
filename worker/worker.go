@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	log "github.com/sirupsen/logrus"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,17 @@ type Pool struct {
 	mJobs   sync.Mutex
 }
 
+func safelyJobDo(j *Job, w *Worker) (err error) {
+	defer func() {
+		if rerr := recover(); rerr != nil {
+			log.Tracef("%v failed: %v", j.ID, rerr)
+			err = fmt.Errorf("panic in %v: %v", j.ID, rerr)
+		}
+	}()
+
+	return j.Do(w, j.ctx)
+}
+
 func NewPool(ctx context.Context, n int) *Pool {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -81,7 +93,10 @@ func NewPool(ctx context.Context, n int) *Pool {
 				j.TimeStart = time.Now()
 				w.CurrentJob = j
 
-				err := j.Do(w, j.ctx)
+				err := safelyJobDo(j, w)
+				if err != nil {
+					log.Errorf("%v failed: %v", j.ID, err)
+				}
 
 				j.TimeEnd = time.Now()
 				w.CurrentJob = nil

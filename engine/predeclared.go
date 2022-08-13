@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
 	"heph/utils"
 	"io/fs"
@@ -237,6 +238,13 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		return nil, err
 	}
 
+	cs := thread.CallStack()
+
+	var source []string
+	for _, c := range cs {
+		source = append(source, fmt.Sprintf("%v %v", c.Name, c.Pos.String()))
+	}
+
 	t := TargetSpec{
 		FQN:         pkg.TargetPath(name),
 		Name:        name,
@@ -257,6 +265,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		PassEnv:     passEnv.Array,
 		RunInCwd:    runInCwd,
 		Gen:         gen,
+		Source:      source,
 	}
 
 	err := e.registerTarget(t)
@@ -309,6 +318,12 @@ func (e *runBuildEngine) package_name(thread *starlark.Thread, fn *starlark.Buil
 	return starlark.String(pkg.Name), nil
 }
 
+func (e *runBuildEngine) package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := e.getPackage(thread)
+
+	return starlark.String("//" + pkg.FullName), nil
+}
+
 func (e *runBuildEngine) get_os(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	return starlark.String(runtime.GOOS), nil
 }
@@ -339,4 +354,17 @@ func (e *runBuildEngine) set_deps(thread *starlark.Thread, fn *starlark.Builtin,
 	target.TargetSpec.Deps = deps
 
 	return starlark.None, nil
+}
+
+func (e *runBuildEngine) to_json(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	value := args[0]
+
+	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+	b, err := json.Marshal(utils.FromStarlark(value))
+	if err != nil {
+		return nil, err
+	}
+
+	return starlark.String(b), nil
 }

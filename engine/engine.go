@@ -66,6 +66,8 @@ type Engine struct {
 	cacheHashInput       map[string]string
 	cacheHashOutputMutex sync.RWMutex
 	cacheHashOutput      map[string]string
+	ranStatAn            bool
+	codegenPaths         map[string]*Target
 }
 
 type Config struct {
@@ -117,7 +119,20 @@ func (e *Engine) DAG() *DAG {
 	return e.dag
 }
 
+func (e *Engine) CodegenPaths() map[string]*Target {
+	return e.codegenPaths
+}
+
 func (e *Engine) hashFile(h hash.Hash, file PackagePath) {
+	info, err := os.Lstat(file.Abs())
+	if err != nil {
+		panic(fmt.Errorf("hashFile: %w", err))
+	}
+
+	if info.Mode().Type() == os.ModeSymlink {
+		panic(fmt.Errorf("hashFile: %v symlink cannot be hashed", file.Abs()))
+	}
+
 	f, err := os.Open(file.Abs())
 	if err != nil {
 		panic(fmt.Errorf("hashFile: %w", err))
@@ -484,38 +499,39 @@ func deleteDir(dir string, async bool) error {
 	rm, err := exec.LookPath("rm")
 	if err != nil {
 		return err
-	}
-
-	mv, err := exec.LookPath("mv")
-	if err != nil {
-		return err
-	}
-
-	if !utils.PathExists(dir) {
+	} else if !utils.PathExists(dir) {
 		return nil // not an error, just don't need to do anything.
 	}
 
 	log.Tracef("Deleting %v", dir)
 
-	newDir := utils.RandPath("heph", "")
-
-	out, err := exec.Command(mv, dir, newDir).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("mv: %v %v", err, string(out))
-	}
-
 	if async {
+		newDir := utils.RandPath(os.TempDir(), filepath.Base(dir), "")
+
+		err = os.Rename(dir, newDir)
+		if err != nil {
+			// May be because os.TempDir() and the current dir aren't on the same device, try a sibling folder
+			newDir = utils.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
+
+			err1 := os.Rename(dir, newDir)
+			if err1 != nil {
+				log.Warnf("rename failed %v, deleting synchronously", err)
+				return deleteDir(dir, false)
+			}
+		}
+
 		// Note that we can't fork() directly and continue running Go code, but ForkExec() works okay.
 		// Hence why we're using rm rather than fork() + os.RemoveAll.
 		_, err = syscall.ForkExec(rm, []string{rm, "-rf", newDir}, nil)
 		return err
 	}
 
-	out, err = exec.Command(rm, "-rf", newDir).CombinedOutput()
+	out, err := exec.Command(rm, "-rf", dir).CombinedOutput()
 	if err != nil {
-		log.Error("Failed to remove directory: %s", string(out))
+		return fmt.Errorf("failed to remove directory: %s", string(out))
 	}
-	return err
+
+	return nil
 }
 
 func (e *Engine) parseConfigs() error {

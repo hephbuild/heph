@@ -24,7 +24,31 @@ func hasStdin(args []string) bool {
 }
 
 func parseTargetsFromStdin() ([]*engine.Target, error) {
+	tps, err := parseTargetPathsFromStdin()
+	if err != nil {
+		return nil, err
+	}
+
 	targets := make([]*engine.Target, 0)
+
+	for _, tp := range tps {
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return nil, engine.TargetNotFoundError(tp.Full())
+		}
+
+		targets = append(targets, target)
+	}
+
+	return targets, nil
+}
+
+var targetsFromStdin []utils.TargetPath
+
+func parseTargetPathsFromStdin() ([]utils.TargetPath, error) {
+	if targetsFromStdin != nil {
+		return targetsFromStdin, nil
+	}
 
 	s := bufio.NewScanner(os.Stdin)
 	for s.Scan() {
@@ -40,15 +64,10 @@ func parseTargetsFromStdin() ([]*engine.Target, error) {
 			return nil, err
 		}
 
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return nil, engine.TargetNotFoundError(tp.Full())
-		}
-
-		targets = append(targets, target)
+		targetsFromStdin = append(targetsFromStdin, tp)
 	}
 
-	return targets, nil
+	return targetsFromStdin, nil
 }
 
 func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
@@ -108,7 +127,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	}
 
 	if isTerm && !*plain {
-		err := DynamicRenderer(ctx, cancel, pool)
+		err := DynamicRenderer("Run Static Analysis", ctx, cancel, pool)
 		if err != nil {
 			return fmt.Errorf("dynamic renderer: %w", err)
 		}
@@ -140,7 +159,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	}
 
 	if isTerm && !*plain {
-		err := DynamicRenderer(ctx, cancel, pool)
+		err := DynamicRenderer("Run", ctx, cancel, pool)
 		if err != nil {
 			return fmt.Errorf("dynamic renderer: %w", err)
 		}

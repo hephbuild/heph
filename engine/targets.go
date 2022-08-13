@@ -79,6 +79,7 @@ type TargetSpec struct {
 	PassEnv     []string
 	RunInCwd    bool
 	Gen         bool
+	Source      []string
 }
 
 type TargetTool struct {
@@ -122,6 +123,7 @@ type Target struct {
 
 	processed bool
 	linked    bool
+	linkingCh chan struct{}
 	ran       bool
 	ranCh     chan struct{}
 	m         sync.Mutex
@@ -308,11 +310,9 @@ func (e *Engine) Parse() error {
 	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
 
 	linkStartTime := time.Now()
-	for _, target := range e.Targets {
-		err := e.linkTarget(target, false)
-		if err != nil {
-			return fmt.Errorf("linking %v: %w", target.FQN, err)
-		}
+	err = e.linkTargets(false)
+	if err != nil {
+		return fmt.Errorf("linking %w", err)
 	}
 	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
@@ -325,22 +325,14 @@ func (e *Engine) Parse() error {
 }
 
 func (e *Engine) Simplify() error {
-	// Relink all
-	for _, t := range e.Targets {
-		t.linked = false
-	}
-
-	for _, t := range e.Targets {
-		err := e.linkTarget(t, true)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return e.linkTargets(true)
 }
 
 func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) error {
+	if e.ranStatAn {
+		return nil
+	}
+
 	if genTargets := e.GeneratedTargets(); len(genTargets) > 0 {
 		log.Tracef("Run static analysis")
 
@@ -385,6 +377,8 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 				return nil
 			},
 		})
+
+		e.ranStatAn = true
 	}
 
 	return nil
@@ -411,8 +405,11 @@ func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target, wg *uti
 			}
 			return
 		},
-		Do: func(w *worker.Worker, ctx context.Context) error {
+		Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
 			w.Status(fmt.Sprintf("Static analysis on %v...", target.FQN))
+			defer func() {
+				w.Status(fmt.Sprintf("Static analysis on %v done: %v", target.FQN, ferr))
+			}()
 
 			err := e.runGenerated(target)
 			if err != nil {
@@ -499,13 +496,52 @@ func (e *Engine) processTarget(t *Target) error {
 	return nil
 }
 
+func (e *Engine) linkTargets(simplify bool) error {
+	for _, target := range e.Targets {
+		target.linked = false
+	}
+
+	for _, target := range e.Targets {
+		err := e.linkTarget(target, simplify)
+		if err != nil {
+			return fmt.Errorf("%v: %w", target.FQN, err)
+		}
+	}
+
+	for _, target := range e.Targets {
+		target.Deps = e.filterOutCodegenFromDeps(target, target.Deps)
+		target.HashDeps = e.filterOutCodegenFromDeps(target, target.HashDeps)
+	}
+
+	return nil
+}
+
+func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
+	files := make(PackagePaths, 0)
+	for _, file := range td.Files {
+		if dep, ok := e.codegenPaths[file.RelRoot()]; ok {
+			log.Tracef("%v: %v removed from deps, and %v outputs it", t.FQN, file.RelRoot(), dep.FQN)
+		} else {
+			files = append(files, file)
+		}
+	}
+	td.Files = files
+
+	return td
+}
+
 func (e *Engine) linkTarget(t *Target, simplify bool) error {
 	t.m.Lock()
 	if t.linked {
 		t.m.Unlock()
+		<-t.linkingCh
 		return nil
 	}
+	t.linkingCh = make(chan struct{})
 	t.linked = true
+	defer func() {
+		close(t.linkingCh)
+	}()
 	t.m.Unlock()
 
 	if !t.processed {
@@ -542,6 +578,8 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 			if err != nil {
 				return fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
 			}
+
+			log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
 
 			t.HostTools = append(t.HostTools, HostTool{
 				Name:    tool,
@@ -669,6 +707,26 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 
 	e.registerLabels(t.Labels)
 
+	if t.CodegenLink {
+		for _, file := range t.FilesOut {
+			if strings.Contains(file.Path, "*") {
+				return fmt.Errorf("codegen must not have glob outputs")
+			}
+
+			if e.codegenPaths == nil {
+				e.codegenPaths = map[string]*Target{}
+			}
+
+			p := file.RelRoot()
+
+			if ct, ok := e.codegenPaths[p]; ok && ct != t {
+				return fmt.Errorf("%v: target %v codegen alredy outputs %v", t.FQN, ct.FQN, p)
+			}
+
+			e.codegenPaths[p] = t
+		}
+	}
+
 	return nil
 }
 
@@ -676,27 +734,79 @@ func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool) (Target
 	td := TargetDeps{}
 
 	for _, dep := range deps.Array {
-		// TODO: support named output
-		dtp, err := utils.TargetParse(t.Package.FullName, dep)
-		if err != nil { // Is probably file
-			td.Files = append(td.Files, PackagePath{
-				Package: t.Package,
-				Path:    dep,
-			})
+		if expr, err := utils.ExprParse(dep); err == nil {
+			switch expr.Function {
+			case "collect":
+				pkgMatcher := ParseTargetSelector(t.Package.FullName, expr.PosArgs[0])
+
+				var includeMatchers TargetMatchers
+				var excludeMatchers TargetMatchers
+
+				for _, arg := range expr.NamedArgs {
+					switch arg.Name {
+					case "include", "exclude":
+						m := ParseTargetSelector(t.Package.FullName, arg.Value)
+						if arg.Name == "exclude" {
+							excludeMatchers = append(excludeMatchers, m)
+						} else {
+							includeMatchers = append(includeMatchers, m)
+						}
+					default:
+						return TargetDeps{}, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
+					}
+				}
+
+				matchers := TargetMatchers{
+					pkgMatcher,
+				}
+				if len(includeMatchers) > 0 {
+					matchers = append(matchers, OrMatcher(includeMatchers...))
+				}
+				if len(excludeMatchers) > 0 {
+					matchers = append(matchers, NotMatcher(OrMatcher(excludeMatchers...)))
+				}
+
+				matcher := AndMatcher(matchers...)
+
+				for _, target := range e.Targets {
+					if !matcher(target) {
+						continue
+					}
+
+					err = e.linkTarget(target, simplify)
+					if err != nil {
+						return TargetDeps{}, err
+					}
+
+					td.Targets = append(td.Targets, target)
+				}
+			default:
+				return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
+			}
 			continue
 		}
 
-		dt := e.Targets.Find(dtp.Full())
-		if dt == nil {
-			return TargetDeps{}, TargetNotFoundError(dtp.Full())
+		// TODO: support named output
+		if dtp, err := utils.TargetParse(t.Package.FullName, dep); err == nil {
+			dt := e.Targets.Find(dtp.Full())
+			if dt == nil {
+				return TargetDeps{}, TargetNotFoundError(dtp.Full())
+			}
+
+			err = e.linkTarget(dt, simplify)
+			if err != nil {
+				return TargetDeps{}, err
+			}
+
+			td.Targets = append(td.Targets, dt)
+			continue
 		}
 
-		err = e.linkTarget(dt, simplify)
-		if err != nil {
-			return TargetDeps{}, err
-		}
-
-		td.Targets = append(td.Targets, dt)
+		// Is probably file
+		td.Files = append(td.Files, PackagePath{
+			Package: t.Package,
+			Path:    dep,
+		})
 	}
 
 	if simplify {
@@ -711,6 +821,13 @@ func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool) (Target
 		}
 		td.Targets = targets
 	}
+
+	td.Targets = utils.DedupKeepLast(td.Targets, func(t *Target) string {
+		return t.FQN
+	})
+	td.Files = utils.DedupKeepLast(td.Files, func(t PackagePath) string {
+		return t.RelRoot()
+	})
 
 	sort.SliceStable(td.Targets, func(i, j int) bool {
 		return td.Targets[i].FQN < td.Targets[j].FQN

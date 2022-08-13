@@ -147,9 +147,11 @@ func (e *runBuildEngine) predeclared() starlark.StringDict {
 	predeclared["target"] = starlark.NewBuiltin("target", e.target)
 	predeclared["glob"] = starlark.NewBuiltin("glob", e.glob)
 	predeclared["package_name"] = starlark.NewBuiltin("package_name", e.package_name)
+	predeclared["package_fqn"] = starlark.NewBuiltin("package_fqn", e.package_fqn)
 	predeclared["get_os"] = starlark.NewBuiltin("get_os", e.get_os)
 	predeclared["get_arch"] = starlark.NewBuiltin("get_arch", e.get_arch)
 	predeclared["set_deps"] = starlark.NewBuiltin("set_deps", e.set_deps)
+	predeclared["to_json"] = starlark.NewBuiltin("to_json", e.to_json)
 
 	return predeclared
 }

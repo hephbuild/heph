@@ -22,6 +22,17 @@ func FromStarlark(v starlark.Value) interface{} {
 		}
 
 		return data
+	case *starlark.List:
+		data := []interface{}{}
+
+		it := v.Iterate()
+		var value starlark.Value
+		for it.Next(&value) {
+			value := value
+			data = append(data, value)
+		}
+
+		return data
 	default:
 		panic(fmt.Sprintf("FromStarlark: unhandled type %T", v))
 	}

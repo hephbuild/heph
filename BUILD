@@ -33,7 +33,7 @@ for os in ["linux", "darwin"]:
             name="build_{}_{}".format(os, arch),
             run=[
                 "mv version utils/version",
-                "pwd && CGO_ENABLED=0 go build -tags release -ldflags='-s -w' -o {} .".format(name)
+                "pwd && go version && CGO_ENABLED=0 go build -tags release -ldflags='-s -w' -o {} .".format(name)
             ],
             out=name,
             deps=["go.mod", "go.sum"] + glob("**/*.go") + extra_src + [version],

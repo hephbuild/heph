@@ -130,9 +130,6 @@ var runCmd = &cobra.Command{
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
-	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
 		if err != nil {
@@ -142,6 +139,22 @@ var runCmd = &cobra.Command{
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	Run: func(cmd *cobra.Command, args []string) {
+		if hasStdin(args) {
+			tps, err := parseTargetPathsFromStdin()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if len(tps) == 0 {
+				return
+			}
+		}
+
+		err := preRunWithStaticAnalysis()
+		if err != nil {
+			log.Fatal(err)
+		}
+
 		targets, err := parseTargetsAndArgs(args)
 		if err != nil {
 			log.Fatal(err)
@@ -240,7 +253,7 @@ func preRunWithStaticAnalysis() error {
 	}
 
 	if isTerm && !*plain {
-		err := DynamicRenderer(ctx, cancel, pool)
+		err := DynamicRenderer("PreRun Static Analysis", ctx, cancel, pool)
 		if err != nil {
 			return fmt.Errorf("dynamic renderer: %w", err)
 		}

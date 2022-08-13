@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -9,23 +10,30 @@ import (
 	"heph/engine"
 	"heph/utils"
 	"heph/worker"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 var include []string
 var exclude []string
+var spec bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
+	queryCmd.AddCommand(codegenCmd)
 	queryCmd.AddCommand(alltargetsCmd)
 	queryCmd.AddCommand(graphCmd)
 	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(outdirCmd)
+	queryCmd.AddCommand(targetCmd)
+
+	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 
 	queryCmd.Flags().StringArrayVar(&include, "include", nil, "Labels to include")
 	queryCmd.Flags().StringArrayVar(&exclude, "exclude", nil, "Labels to exclude, takes precedence over --include")
@@ -71,7 +79,7 @@ var queryCmd = &cobra.Command{
 		}
 
 		if isTerm && !*plain {
-			err := DynamicRenderer(ctx, cancel, pool)
+			err := DynamicRenderer("Query Static Analysis", ctx, cancel, pool)
 			if err != nil {
 				return fmt.Errorf("dynamic renderer: %w", err)
 			}
@@ -154,12 +162,36 @@ var configCmd = &cobra.Command{
 	},
 }
 
+var codegenCmd = &cobra.Command{
+	Use:   "codegen",
+	Short: "Prints codegen paths",
+	Args:  cobra.NoArgs,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRunWithStaticAnalysis()
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		paths := make([]string, 0)
+
+		for p, t := range Engine.CodegenPaths() {
+			paths = append(paths, fmt.Sprintf("%v: %v", p, t.FQN))
+		}
+
+		sort.Strings(paths)
+
+		for _, s := range paths {
+			fmt.Println(s)
+		}
+
+		return nil
+	},
+}
+
 var graphCmd = &cobra.Command{
 	Use:   "graph <target>",
 	Short: "Prints deps target graph",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -365,6 +397,57 @@ var changesCmd = &cobra.Command{
 
 		for _, t := range affectedTargets {
 			fmt.Println(t.FQN)
+		}
+
+		return nil
+	},
+}
+
+var targetCmd = &cobra.Command{
+	Use:   "target <target>",
+	Short: "Prints target details",
+	Args:  cobra.ExactValidArgs(1),
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRunWithStaticAnalysis()
+	},
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		err := preRunAutocomplete()
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
+		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+	},
+	RunE: func(_ *cobra.Command, args []string) error {
+		tp, err := utils.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		if spec {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetEscapeHTML(false)
+			enc.SetIndent("", "    ")
+			if err := enc.Encode(target.TargetSpec); err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		fmt.Println(target.FQN)
+		fmt.Println("Deps - Targets")
+		for _, t := range target.Deps.Targets {
+			fmt.Printf("  %v\n", t.FQN)
+		}
+		fmt.Println("Deps - Files")
+		for _, t := range target.Deps.Files {
+			fmt.Printf("  %v\n", t.RelRoot())
 		}
 
 		return nil
