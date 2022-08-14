@@ -283,6 +283,18 @@ func (e *Engine) Parse() error {
 	}
 	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
 
+	linkStartTime := time.Now()
+	err = e.linkTargets(false, e.noRequireGenTargets())
+	if err != nil {
+		return err
+	}
+	log.Tracef("ProcessTargets took %v", time.Since(linkStartTime))
+
+	err = e.createDag()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -305,7 +317,7 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 		}
 		log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
-		err = e.createDag(nil)
+		err = e.createDag()
 		if err != nil {
 			return err
 		}
@@ -322,7 +334,7 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 	}
 	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
-	err = e.createDag(e.linkedTargets())
+	err = e.createDag()
 	if err != nil {
 		return err
 	}
@@ -362,7 +374,7 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 				return err
 			}
 
-			err = e.createDag(nil)
+			err = e.createDag()
 			if err != nil {
 				return err
 			}
@@ -433,10 +445,8 @@ func TargetNotFoundError(target string) error {
 	return fmt.Errorf("target %v not found", target)
 }
 
-func (e *Engine) createDag(targets Targets) error {
-	if targets == nil {
-		targets = e.Targets
-	}
+func (e *Engine) createDag() error {
+	targets := e.linkedTargets()
 
 	e.dag = &DAG{dag.NewDAG()}
 
@@ -511,17 +521,31 @@ func (e *Engine) processTarget(t *Target) error {
 }
 
 func (e *Engine) linkedTargets() Targets {
-	linkedTargets := make(Targets, 0)
+	targets := make(Targets, 0)
 
 	for _, target := range e.Targets {
 		if !target.linked {
 			continue
 		}
 
-		linkedTargets = append(linkedTargets, target)
+		targets = append(targets, target)
 	}
 
-	return linkedTargets
+	return targets
+}
+
+func (e *Engine) noRequireGenTargets() Targets {
+	targets := make(Targets, 0)
+
+	for _, target := range e.Targets {
+		if target.RequireGen {
+			continue
+		}
+
+		targets = append(targets, target)
+	}
+
+	return targets
 }
 
 func (e *Engine) linkTargets(simplify bool, targets Targets) error {

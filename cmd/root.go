@@ -23,6 +23,7 @@ var isTerm bool
 var logLevel *string
 var profiles *[]string
 var plain *bool
+var noGen *bool
 var porcelain *bool
 var workers *int
 
@@ -54,6 +55,7 @@ func init() {
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
+	noGen = rootCmd.PersistentFlags().Bool("no-gen", false, "Disable generated targets")
 
 	rootCmd.Flags().SetInterspersed(false)
 	setupRootUsage()
@@ -105,7 +107,7 @@ var rootCmd = &cobra.Command{
 
 		switchToPorcelain()
 
-		err := preRun()
+		err := preRunWithStaticAnalysis(false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -150,7 +152,7 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		err := preRunWithStaticAnalysis()
+		err := preRunWithStaticAnalysis(false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -182,7 +184,7 @@ func switchToPorcelain() {
 }
 
 func preRunAutocomplete() error {
-	return preRunWithStaticAnalysisRenderer(true)
+	return preRunWithStaticAnalysis(true)
 }
 
 func findRoot() (string, error) {
@@ -205,11 +207,7 @@ func findRoot() (string, error) {
 	return "", fmt.Errorf("root not found")
 }
 
-func preRun() error {
-	return preRunWithStaticAnalysis()
-}
-
-func _preRun() error {
+func engineInit() error {
 	if Engine != nil {
 		return nil
 	}
@@ -239,14 +237,15 @@ func _preRun() error {
 	return nil
 }
 
-func preRunWithStaticAnalysis() error {
-	return preRunWithStaticAnalysisRenderer(false)
-}
-
-func preRunWithStaticAnalysisRenderer(silent bool) error {
-	err := _preRun()
+func preRunWithStaticAnalysis(silent bool) error {
+	err := engineInit()
 	if err != nil {
 		return err
+	}
+
+	if *noGen {
+		log.Info("Generated targets disabled")
+		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -280,7 +279,7 @@ var cleanCmd = &cobra.Command{
 	Use:   "clean",
 	Short: "Clean",
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return _preRun()
+		return engineInit()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -335,7 +334,7 @@ var cleanLockCmd = &cobra.Command{
 	Short: "Clean locks",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return _preRun()
+		return engineInit()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range Engine.Targets {

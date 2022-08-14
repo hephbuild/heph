@@ -59,7 +59,7 @@ var queryCmd = &cobra.Command{
 	Short: "Filter targets",
 	Args:  cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRun()
+		err := engineInit()
 		if err != nil {
 			return err
 		}
@@ -70,22 +70,24 @@ var queryCmd = &cobra.Command{
 		pool := worker.NewPool(ctx, *workers)
 		defer pool.Stop()
 
-		err = Engine.ScheduleStaticAnalysis(ctx, pool)
-		if err != nil {
-			return err
-		}
-
-		if isTerm && !*plain {
-			err := DynamicRenderer("Query Static Analysis", ctx, cancel, pool)
+		if !*noGen {
+			err = Engine.ScheduleStaticAnalysis(ctx, pool)
 			if err != nil {
-				return fmt.Errorf("dynamic renderer: %w", err)
+				return err
 			}
-		}
-		<-pool.Done()
 
-		if err := pool.Err; err != nil {
-			printTargetErr(err)
-			return err
+			if isTerm && !*plain {
+				err := DynamicRenderer("Query Static Analysis", ctx, cancel, pool)
+				if err != nil {
+					return fmt.Errorf("dynamic renderer: %w", err)
+				}
+			}
+			<-pool.Done()
+
+			if err := pool.Err; err != nil {
+				printTargetErr(err)
+				return err
+			}
 		}
 
 		targets := Engine.Targets
@@ -129,7 +131,7 @@ var alltargetsCmd = &cobra.Command{
 	Short: "Prints all targets",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis(false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range sortedTargets(Engine.Targets, false) {
@@ -145,7 +147,7 @@ var configCmd = &cobra.Command{
 	Short: "Prints config",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis(false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		b, err := yaml.Marshal(Engine.Config)
@@ -164,7 +166,7 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return _preRun()
+		return engineInit()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		paths := make([]string, 0)
@@ -188,7 +190,7 @@ var graphCmd = &cobra.Command{
 	Short: "Prints deps target graph",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis()
+		return preRunWithStaticAnalysis(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -225,7 +227,7 @@ var graphDotCmd = &cobra.Command{
 	Short: "Outputs graph do",
 	Args:  cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis()
+		return preRunWithStaticAnalysis(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -293,7 +295,7 @@ var outdirCmd = &cobra.Command{
 	Short: "Prints target outdir",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -353,7 +355,7 @@ var changesCmd = &cobra.Command{
 	Short: "Prints deps target changes",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return preRunWithStaticAnalysis(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -406,9 +408,9 @@ var targetCmd = &cobra.Command{
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		if spec {
-			return _preRun()
+			return engineInit()
 		} else {
-			return preRunWithStaticAnalysis()
+			return preRunWithStaticAnalysis(false)
 		}
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {

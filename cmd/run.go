@@ -121,22 +121,26 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	pool := worker.NewPool(ctx, *workers)
 	defer pool.Stop()
 
-	err := Engine.ScheduleStaticAnalysis(ctx, pool)
-	if err != nil {
-		return err
-	}
-
-	if isTerm && !*plain {
-		err := DynamicRenderer("Run Static Analysis", ctx, cancel, pool)
+	if !*noGen {
+		err := Engine.ScheduleStaticAnalysis(ctx, pool)
 		if err != nil {
-			return fmt.Errorf("dynamic renderer: %w", err)
+			return err
 		}
-	}
-	<-pool.Done()
 
-	if err := pool.Err; err != nil {
-		printTargetErr(err)
-		return err
+		if isTerm && !*plain {
+			err := DynamicRenderer("Run Static Analysis", ctx, cancel, pool)
+			if err != nil {
+				return fmt.Errorf("dynamic renderer: %w", err)
+			}
+		}
+		<-pool.Done()
+
+		if err := pool.Err; err != nil {
+			printTargetErr(err)
+			return err
+		}
+	} else {
+
 	}
 
 	var inlineTarget *TargetInvocation
@@ -187,7 +191,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		Context: ctx,
 	}
 
-	err = e.Run(target, sandbox.IOConfig{
+	err := e.Run(target, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,

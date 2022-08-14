@@ -25,6 +25,7 @@ type starlarkTargetArgs struct {
 	env            ArrayMap
 	passEnv        ArrayMap
 	provide        ArrayMap
+	requireGen     bool
 }
 
 func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
@@ -45,6 +46,7 @@ func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
 		RunInCwd:    args.runInCwd,
 		Gen:         args.gen,
 		Provide:     args.provide.Map,
+		RequireGen:  args.requireGen,
 	}
 
 	var err error
@@ -161,6 +163,7 @@ type TargetSpec struct {
 	Gen               bool
 	Source            []string
 	Provide           map[string]string
+	RequireGen        bool
 }
 
 func (t TargetSpec) IsNamedOutput() bool {

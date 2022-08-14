@@ -193,6 +193,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		"env?", &sargs.env,
 		"gen?", &sargs.gen,
 		"provide?", &sargs.provide,
+		"require_gen?", &sargs.requireGen,
 	); err != nil {
 		if sargs.name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.name), err)
