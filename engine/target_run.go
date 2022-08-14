@@ -151,7 +151,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	for _, t := range target.HostTools {
-		bin[t.Name] = t.BinPath
+		bin[t.Name] = t.Path
 	}
 
 	log.Tracef("Bin %#v", bin)
@@ -281,7 +281,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		env[k] = v
 	}
 
-	cmds := target.Runnable.Cmds
+	cmds := target.Cmds
 	if len(args) > 0 {
 		if len(cmds) > 1 {
 			return fmt.Errorf("args are supported only with a single cmd")

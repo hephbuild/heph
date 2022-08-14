@@ -112,6 +112,7 @@ func New(root string) *Engine {
 		LocalCache:      loc.(*vfsos.Location),
 		cacheHashInput:  map[string]string{},
 		cacheHashOutput: map[string]string{},
+		codegenPaths:    map[string]*Target{},
 	}
 }
 
@@ -182,7 +183,7 @@ func (e *Engine) hashInput(target *Target) string {
 		e.hashFile(h, dep)
 	}
 
-	for _, cmd := range target.Runnable.Cmds {
+	for _, cmd := range target.Cmds {
 		h.Write([]byte(cmd))
 	}
 
@@ -449,7 +450,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return fmt.Errorf("cached: %w", err)
 	}
 
-	target.actualFilesOut, err = e.collectOut(target, target.FilesOut)
+	target.actualFilesOut, err = e.collectOut(target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}

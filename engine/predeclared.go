@@ -59,33 +59,14 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 	return fmt.Errorf("must be bool or array, got %v", v.Type())
 }
 
-type StringArrayMap struct {
-	String string
-	ArrayMap
-}
-
-func (d *StringArrayMap) Unpack(v starlark.Value) error {
-	switch e := v.(type) {
-	case starlark.String:
-		*d = StringArrayMap{
-			String: e.GoString(),
-		}
-		return nil
-	}
-
-	return d.ArrayMap.Unpack(v)
-}
-
 type ArrayMap struct {
 	Array []string
 	Map   map[string]string
-	IMap  map[string]string
 }
 
 func (d *ArrayMap) Unpack(v starlark.Value) error {
 	arr := make([]string, 0)
 	mapp := map[string]string{}
-	imapp := map[string]string{}
 
 	vd, ok := v.(*starlark.Dict)
 	if ok {
@@ -96,21 +77,19 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				return fmt.Errorf("key must be string, got %v", keyv.Type())
 			}
 
-			depv := e.Index(1)
-			dep, ok := depv.(starlark.String)
+			valv := e.Index(1)
+			val, ok := valv.(starlark.String)
 			if !ok {
-				return fmt.Errorf("dep must be string, got %v", depv.Type())
+				return fmt.Errorf("val must be string, got %v", valv.Type())
 			}
 
-			arr = append(arr, string(dep))
-			mapp[string(dep)] = string(key)
-			imapp[string(key)] = string(dep)
+			arr = append(arr, string(val))
+			mapp[string(key)] = string(val)
 		}
 
 		*d = ArrayMap{
 			Array: arr,
 			Map:   mapp,
-			IMap:  imapp,
 		}
 		return nil
 	}
@@ -193,85 +172,48 @@ func (e *runBuildEngine) getPackage(thread *starlark.Thread) *Package {
 func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := e.getPackage(thread)
 
-	var (
-		name           string
-		run            Runnable
-		runInCwd       bool
-		quiet          bool
-		passArgs       bool
-		cache          BoolArray
-		sandboxEnabled bool
-		gen            bool
-		codegen        string
-		deps           ArrayMap
-		hashDeps       ArrayMap
-		tools          ArrayMap
-		labels         ArrayMap
-		out            StringArrayMap
-		env            ArrayMap
-		passEnv        ArrayMap
-		provide        ArrayMap
-	)
+	var sargs starlarkTargetArgs
 
 	if err := starlark.UnpackArgs(
 		"target", args, kwargs,
-		"name?", &name,
-		"run?", &run,
-		"run_in_cwd?", &runInCwd,
-		"quiet?", &quiet,
-		"pass_args?", &passArgs,
-		"pass_env?", &passEnv,
-		"deps?", &deps,
-		"hash_deps?", &hashDeps,
-		"cache?", &cache,
-		"sandbox?", &sandboxEnabled,
-		"codegen?", &codegen,
-		"tools?", &tools,
-		"labels?", &labels,
-		"out?", &out,
-		"env?", &env,
-		"gen?", &gen,
-		"provide?", &provide,
+		"name?", &sargs.name,
+		"run?", &sargs.run,
+		"run_in_cwd?", &sargs.runInCwd,
+		"quiet?", &sargs.quiet,
+		"pass_args?", &sargs.passArgs,
+		"pass_env?", &sargs.passEnv,
+		"deps?", &sargs.deps,
+		"hash_deps?", &sargs.hashDeps,
+		"cache?", &sargs.cache,
+		"sandbox?", &sargs.sandboxEnabled,
+		"codegen?", &sargs.codegen,
+		"tools?", &sargs.tools,
+		"labels?", &sargs.labels,
+		"out?", &sargs.out,
+		"env?", &sargs.env,
+		"gen?", &sargs.gen,
+		"provide?", &sargs.provide,
 	); err != nil {
-		if name != "" {
-			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(name), err)
+		if sargs.name != "" {
+			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.name), err)
 		}
 
 		return nil, err
 	}
 
-	cs := thread.CallStack()
+	t, err := specFromArgs(sargs, pkg)
+	if err != nil {
+		return nil, err
+	}
 
 	var source []string
-	for _, c := range cs {
+	for _, c := range thread.CallStack() {
 		source = append(source, fmt.Sprintf("%v %v", c.Name, c.Pos.String()))
 	}
 
-	t := TargetSpec{
-		FQN:         pkg.TargetPath(name),
-		Name:        name,
-		Runnable:    run,
-		Package:     pkg,
-		PassArgs:    passArgs,
-		Deps:        deps,
-		HashDeps:    hashDeps,
-		Quiet:       quiet,
-		ShouldCache: cache.Bool,
-		CachedFiles: cache.Array,
-		Sandbox:     sandboxEnabled,
-		Tools:       tools,
-		Out:         out,
-		Codegen:     codegen,
-		Labels:      labels.Array,
-		Env:         env.IMap,
-		PassEnv:     passEnv.Array,
-		RunInCwd:    runInCwd,
-		Gen:         gen,
-		Source:      source,
-		Provide:     provide.IMap,
-	}
+	t.Source = source
 
-	err := e.registerTarget(t)
+	err = e.registerTarget(t)
 	if err != nil {
 		return nil, err
 	}
@@ -333,30 +275,6 @@ func (e *runBuildEngine) get_os(thread *starlark.Thread, fn *starlark.Builtin, a
 
 func (e *runBuildEngine) get_arch(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	return starlark.String(runtime.GOARCH), nil
-}
-
-func (e *runBuildEngine) set_deps(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	var (
-		fqn  string
-		deps ArrayMap
-	)
-
-	if err := starlark.UnpackArgs(
-		fn.Name(), args, kwargs,
-		"target", &fqn,
-		"deps", &deps,
-	); err != nil {
-		return nil, err
-	}
-
-	target := e.Targets.Find(fqn)
-	if target == nil {
-		return nil, TargetNotFoundError(fqn)
-	}
-
-	target.TargetSpec.Deps = deps
-
-	return starlark.None, nil
 }
 
 func (e *runBuildEngine) to_json(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {

@@ -10,7 +10,6 @@ import (
 	"heph/utils"
 	"heph/worker"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -57,32 +56,6 @@ func (r *Runnable) Unpack(v starlark.Value) error {
 	return fmt.Errorf("must be string or []string, is %v", v.Type())
 }
 
-type TargetSpec struct {
-	Name    string
-	FQN     string
-	Package *Package
-
-	Runnable    Runnable `json:"-"`
-	Quiet       bool
-	Dir         string
-	PassArgs    bool
-	Deps        ArrayMap
-	HashDeps    ArrayMap
-	Tools       ArrayMap
-	Out         StringArrayMap
-	ShouldCache bool
-	CachedFiles []string
-	Sandbox     bool
-	Codegen     string
-	Labels      []string
-	Env         map[string]string
-	PassEnv     []string
-	RunInCwd    bool
-	Gen         bool
-	Source      []string
-	Provide     map[string]string
-}
-
 type TargetTool struct {
 	Target  *Target
 	Name    string
@@ -107,10 +80,9 @@ type Target struct {
 	TargetSpec
 
 	Tools          []TargetTool
-	HostTools      []HostTool
 	Deps           TargetDeps
 	HashDeps       TargetDeps
-	FilesOut       []PackagePath
+	Out            []PackagePath
 	actualFilesOut []PackagePath
 	Env            map[string]string
 
@@ -147,7 +119,7 @@ func (t *Target) String() string {
 }
 
 func (t *Target) IsGroup() bool {
-	return len(t.Runnable.Cmds) == 0 && len(t.FilesOut) == 1 && t.FilesOut[0].Path == "*"
+	return len(t.Cmds) == 0 && len(t.Out) == 1 && t.Out[0].Path == "*"
 }
 
 type Path struct {
@@ -198,7 +170,7 @@ func (p PackagePaths) Find(s string) (PackagePath, bool) {
 
 func (t *Target) OutFilesInOutRoot() []PackagePath {
 	out := make([]PackagePath, 0)
-	for _, file := range t.FilesOut {
+	for _, file := range t.Out {
 		out = append(out, file.WithRoot(t.OutRoot.Abs))
 	}
 
@@ -350,14 +322,7 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 	}
 	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
-	linkedTargets := make(Targets, 0)
-	for _, target := range e.Targets {
-		if target.linked {
-			linkedTargets = append(linkedTargets, target)
-		}
-	}
-
-	err = e.createDag(linkedTargets)
+	err = e.createDag(e.linkedTargets())
 	if err != nil {
 		return err
 	}
@@ -524,6 +489,20 @@ func (e *Engine) processTarget(t *Target) error {
 		}
 
 		t.CodegenLink = true
+
+		for _, file := range t.TargetSpec.Out {
+			if strings.Contains(file.Path, "*") {
+				return fmt.Errorf("codegen must not have glob outputs")
+			}
+
+			p := filepath.Join(file.Package.Root.RelRoot, file.Path)
+
+			if ct, ok := e.codegenPaths[p]; ok && ct != t {
+				return fmt.Errorf("%v: target %v codegen already outputs %v", t.FQN, ct.FQN, p)
+			}
+
+			e.codegenPaths[p] = t
+		}
 	}
 
 	t.processed = true
@@ -531,13 +510,27 @@ func (e *Engine) processTarget(t *Target) error {
 	return nil
 }
 
-func (e *Engine) linkTargets(simplify bool, targets Targets) error {
-	if targets == nil {
-		targets = e.Targets
+func (e *Engine) linkedTargets() Targets {
+	linkedTargets := make(Targets, 0)
+
+	for _, target := range e.Targets {
+		if !target.linked {
+			continue
+		}
+
+		linkedTargets = append(linkedTargets, target)
 	}
 
-	for _, target := range targets {
+	return linkedTargets
+}
+
+func (e *Engine) linkTargets(simplify bool, targets Targets) error {
+	for _, target := range e.Targets {
 		target.linked = false
+	}
+
+	if targets == nil {
+		targets = e.Targets
 	}
 
 	for i, target := range targets {
@@ -546,11 +539,6 @@ func (e *Engine) linkTargets(simplify bool, targets Targets) error {
 		if err != nil {
 			return fmt.Errorf("%v: %w", target.FQN, err)
 		}
-	}
-
-	for _, target := range targets {
-		target.Deps = e.filterOutCodegenFromDeps(target, target.Deps)
-		target.HashDeps = e.filterOutCodegenFromDeps(target, target.HashDeps)
 	}
 
 	return nil
@@ -627,30 +615,13 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		}
 	}
 
-	t.Tools = []TargetTool{}
-
 	log.Tracef(logPrefix + "Linking tools")
 
-	for _, tool := range t.TargetSpec.Tools.Array {
-		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
-		if err != nil {
-			binPath, err := exec.LookPath(tool)
-			if err != nil {
-				return fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
-			}
-
-			log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
-
-			t.HostTools = append(t.HostTools, HostTool{
-				Name:    tool,
-				BinPath: binPath,
-			})
-			continue
-		}
-
-		tt := e.Targets.Find(tp.Full())
+	t.Tools = []TargetTool{}
+	for _, tool := range t.TargetSpec.TargetTools {
+		tt := e.Targets.Find(tool.Target)
 		if tt == nil {
-			return TargetNotFoundError(tool)
+			return TargetNotFoundError(tool.Target)
 		}
 
 		err = e.linkTarget(tt, simplify, breadcrumb)
@@ -658,34 +629,42 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 			return fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
-		if tp.Output != "" {
-			if len(tt.Out.IMap) == 0 {
-				return fmt.Errorf("target %v output must have named output", tt.Name)
-			}
+		if len(tt.Out) == 0 {
+			return fmt.Errorf("%v does not output anything", tt.FQN)
 		}
 
-		if len(tt.Out.IMap) > 0 {
-			for name, path := range tt.Out.IMap {
-				if tp.Output != "" {
-					if name != tp.Output {
-						continue
+		if tool.Output != "" {
+			if !tt.IsNamedOutput() {
+				return fmt.Errorf("%v must have named output", tt.FQN)
+			}
+
+			file := tt.FindNamedOutput(tool.Output)
+
+			if file == nil {
+				return fmt.Errorf("%v does not have any output named %v", tt.FQN, tool.Output)
+			}
+
+			t.Tools = append(t.Tools, TargetTool{
+				Target:  tt,
+				Name:    file.Name,
+				RelPath: file.Path,
+			})
+		} else {
+			for _, file := range tt.TargetSpec.Out {
+				name := file.Name
+				if name == "" {
+					if len(tt.TargetSpec.Out) == 1 {
+						name = tt.Name
+					} else {
+						name = filepath.Base(file.Path)
 					}
 				}
-
 				t.Tools = append(t.Tools, TargetTool{
 					Target:  tt,
 					Name:    name,
-					RelPath: path,
+					RelPath: file.Path,
 				})
 			}
-		} else if out := tt.Out.String; out != "" {
-			t.Tools = append(t.Tools, TargetTool{
-				Target:  tt,
-				Name:    tt.Name,
-				RelPath: out,
-			})
-		} else {
-			return fmt.Errorf("target %v output must be a string, map[string]string, got %#v", tt.Name, tt.Out)
 		}
 	}
 
@@ -703,36 +682,29 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
+	t.Deps = e.filterOutCodegenFromDeps(t, t.Deps)
 
-	log.Tracef(logPrefix + "Linking hashdeps")
-
-	if t.TargetSpec.HashDeps.Array != nil {
+	if t.TargetSpec.DifferentHashDeps {
+		log.Tracef(logPrefix + "Linking hashdeps")
 		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, simplify, breadcrumb)
 		if err != nil {
 			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
 		}
+		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
 	} else {
 		t.HashDeps = t.Deps
 	}
 
-	createOutFile := func(t *Target, file string) PackagePath {
-		return PackagePath{
-			Package: t.Package,
-			Path:    file,
-		}
+	t.Out = []PackagePath{}
+	for _, file := range t.TargetSpec.Out {
+		t.Out = append(t.Out, PackagePath{
+			Package: file.Package,
+			Path:    file.Path,
+		})
 	}
 
-	t.FilesOut = []PackagePath{}
-	if s := t.TargetSpec.Out.String; s != "" {
-		t.FilesOut = append(t.FilesOut, createOutFile(t, s))
-	}
-
-	for _, file := range t.TargetSpec.Out.Array {
-		t.FilesOut = append(t.FilesOut, createOutFile(t, file))
-	}
-
-	sort.SliceStable(t.FilesOut, func(i, j int) bool {
-		return t.FilesOut[i].RelRoot() < t.FilesOut[j].RelRoot()
+	sort.SliceStable(t.Out, func(i, j int) bool {
+		return t.Out[i].RelRoot() < t.Out[j].RelRoot()
 	})
 
 	if t.TargetSpec.ShouldCache {
@@ -740,8 +712,8 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 
-		if len(t.TargetSpec.CachedFiles) == 0 {
-			t.CachedFiles = t.FilesOut
+		if t.TargetSpec.CachedFiles == nil {
+			t.CachedFiles = t.Out
 		} else {
 			t.CachedFiles = []PackagePath{}
 			for _, p := range t.TargetSpec.CachedFiles {
@@ -771,87 +743,65 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 
 	e.registerLabels(t.Labels)
 
-	if t.CodegenLink {
-		for _, file := range t.FilesOut {
-			if strings.Contains(file.Path, "*") {
-				return fmt.Errorf("codegen must not have glob outputs")
-			}
-
-			if e.codegenPaths == nil {
-				e.codegenPaths = map[string]*Target{}
-			}
-
-			p := file.RelRoot()
-
-			if ct, ok := e.codegenPaths[p]; ok && ct != t {
-				return fmt.Errorf("%v: target %v codegen alredy outputs %v", t.FQN, ct.FQN, p)
-			}
-
-			e.codegenPaths[p] = t
-		}
-	}
-
 	return nil
 }
 
-func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool, breadcrumb Targets) (TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
-	for _, dep := range deps.Array {
-		if expr, err := utils.ExprParse(dep); err == nil {
-			switch expr.Function {
-			case "collect":
-				targets, err := e.collect(t, expr)
-				if err != nil {
-					return TargetDeps{}, err
-				}
+	for _, expr := range deps.Exprs {
+		expr := expr.Expr
 
-				for _, target := range targets {
-					err := e.linkTarget(target, simplify, breadcrumb)
-					if err != nil {
-						return TargetDeps{}, fmt.Errorf("collect: %w", err)
-					}
-
-					td.Targets = append(td.Targets, target)
-				}
-			case "find_parent":
-				target, err := e.findParent(t, expr)
-				if err != nil {
-					return TargetDeps{}, err
-				}
-
-				err = e.linkTarget(target, simplify, breadcrumb)
-				if err != nil {
-					return TargetDeps{}, fmt.Errorf("find_parent: %w", err)
-				}
-
-				td.Targets = append(td.Targets, target)
-			default:
-				return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
-			}
-			continue
-		}
-
-		// TODO: support named output
-		if dtp, err := utils.TargetParse(t.Package.FullName, dep); err == nil {
-			dt := e.Targets.Find(dtp.Full())
-			if dt == nil {
-				return TargetDeps{}, TargetNotFoundError(dtp.Full())
-			}
-
-			err = e.linkTarget(dt, simplify, breadcrumb)
+		switch expr.Function {
+		case "collect":
+			targets, err := e.collect(t, expr)
 			if err != nil {
 				return TargetDeps{}, err
 			}
 
-			td.Targets = append(td.Targets, dt)
-			continue
+			for _, target := range targets {
+				err := e.linkTarget(target, simplify, breadcrumb)
+				if err != nil {
+					return TargetDeps{}, fmt.Errorf("collect: %w", err)
+				}
+
+				td.Targets = append(td.Targets, target)
+			}
+		case "find_parent":
+			target, err := e.findParent(t, expr)
+			if err != nil {
+				return TargetDeps{}, err
+			}
+
+			err = e.linkTarget(target, simplify, breadcrumb)
+			if err != nil {
+				return TargetDeps{}, fmt.Errorf("find_parent: %w", err)
+			}
+
+			td.Targets = append(td.Targets, target)
+		default:
+			return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
+		}
+	}
+
+	for _, target := range deps.Targets {
+		dt := e.Targets.Find(target.Target)
+		if dt == nil {
+			return TargetDeps{}, TargetNotFoundError(target.Target)
 		}
 
-		// Is probably file
+		err := e.linkTarget(dt, simplify, breadcrumb)
+		if err != nil {
+			return TargetDeps{}, err
+		}
+
+		td.Targets = append(td.Targets, dt)
+	}
+
+	for _, file := range deps.Files {
 		td.Files = append(td.Files, PackagePath{
-			Package: t.Package,
-			Path:    dep,
+			Package: file.Package,
+			Path:    file.Path,
 		})
 	}
 

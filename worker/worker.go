@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,8 +60,7 @@ type Pool struct {
 func safelyJobDo(j *Job, w *Worker) (err error) {
 	defer func() {
 		if rerr := recover(); rerr != nil {
-			log.Tracef("%v failed: %v", j.ID, rerr)
-			err = fmt.Errorf("panic in %v: %v", j.ID, rerr)
+			err = fmt.Errorf("panic in %v: %v => %v", j.ID, rerr, string(debug.Stack()))
 		}
 	}()
 

@@ -192,6 +192,18 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 		return nil, err
 	}
 
+	latestDir := e.cacheDir(target, "latest")
+
+	err = os.RemoveAll(latestDir)
+	if err != nil {
+		return nil, err
+	}
+
+	err = os.Symlink(dir, latestDir)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Path{
 		Abs:     outDir,
 		RelRoot: rel,

@@ -164,7 +164,7 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis()
+		return _preRun()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		paths := make([]string, 0)
@@ -405,7 +405,11 @@ var targetCmd = &cobra.Command{
 	Short: "Prints target details",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis()
+		if spec {
+			return _preRun()
+		} else {
+			return preRunWithStaticAnalysis()
+		}
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
