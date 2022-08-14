@@ -182,7 +182,7 @@ func switchToPorcelain() {
 }
 
 func preRunAutocomplete() error {
-	return preRun()
+	return preRunWithStaticAnalysisRenderer(true)
 }
 
 func findRoot() (string, error) {
@@ -206,6 +206,10 @@ func findRoot() (string, error) {
 }
 
 func preRun() error {
+	return preRunWithStaticAnalysis()
+}
+
+func _preRun() error {
 	if Engine != nil {
 		return nil
 	}
@@ -236,7 +240,11 @@ func preRun() error {
 }
 
 func preRunWithStaticAnalysis() error {
-	err := preRun()
+	return preRunWithStaticAnalysisRenderer(false)
+}
+
+func preRunWithStaticAnalysisRenderer(silent bool) error {
+	err := _preRun()
 	if err != nil {
 		return err
 	}
@@ -244,7 +252,7 @@ func preRunWithStaticAnalysis() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := worker.NewPool(ctx, runtime.NumCPU())
+	pool := worker.NewPool(ctx, *workers)
 	defer pool.Stop()
 
 	err = Engine.ScheduleStaticAnalysis(ctx, pool)
@@ -252,7 +260,7 @@ func preRunWithStaticAnalysis() error {
 		return err
 	}
 
-	if isTerm && !*plain {
+	if !silent && isTerm && !*plain {
 		err := DynamicRenderer("PreRun Static Analysis", ctx, cancel, pool)
 		if err != nil {
 			return fmt.Errorf("dynamic renderer: %w", err)
@@ -272,7 +280,7 @@ var cleanCmd = &cobra.Command{
 	Use:   "clean",
 	Short: "Clean",
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return _preRun()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -327,7 +335,7 @@ var cleanLockCmd = &cobra.Command{
 	Short: "Clean locks",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRun()
+		return _preRun()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range Engine.Targets {

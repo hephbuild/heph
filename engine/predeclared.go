@@ -210,6 +210,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		out            StringArrayMap
 		env            ArrayMap
 		passEnv        ArrayMap
+		provide        ArrayMap
 	)
 
 	if err := starlark.UnpackArgs(
@@ -230,6 +231,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		"out?", &out,
 		"env?", &env,
 		"gen?", &gen,
+		"provide?", &provide,
 	); err != nil {
 		if name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(name), err)
@@ -266,6 +268,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		RunInCwd:    runInCwd,
 		Gen:         gen,
 		Source:      source,
+		Provide:     provide.IMap,
 	}
 
 	err := e.registerTarget(t)

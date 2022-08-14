@@ -169,7 +169,7 @@ func (r renderer) View() string {
 		state := "I"
 		if j := w.CurrentJob; j != nil {
 			state = "R"
-			runtime = " " + round(time.Now().Sub(j.TimeStart), 1).String()
+			runtime = fmt.Sprintf(" %v", round(time.Now().Sub(j.TimeStart), 1).String())
 		}
 
 		status := w.GetStatus()

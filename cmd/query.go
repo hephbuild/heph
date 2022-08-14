@@ -58,9 +58,6 @@ var queryCmd = &cobra.Command{
 	Use:   "query",
 	Short: "Filter targets",
 	Args:  cobra.ArbitraryArgs,
-	PersistentPreRun: func(cmd *cobra.Command, args []string) {
-		//switchToPorcelain()
-	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := preRun()
 		if err != nil {

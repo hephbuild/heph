@@ -80,6 +80,7 @@ type TargetSpec struct {
 	RunInCwd    bool
 	Gen         bool
 	Source      []string
+	Provide     map[string]string
 }
 
 type TargetTool struct {
@@ -123,6 +124,7 @@ type Target struct {
 
 	processed bool
 	linked    bool
+	linking   bool
 	linkingCh chan struct{}
 	ran       bool
 	ranCh     chan struct{}
@@ -309,23 +311,11 @@ func (e *Engine) Parse() error {
 	}
 	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
 
-	linkStartTime := time.Now()
-	err = e.linkTargets(false)
-	if err != nil {
-		return fmt.Errorf("linking %w", err)
-	}
-	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
-
-	err = e.createDag()
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
 func (e *Engine) Simplify() error {
-	return e.linkTargets(true)
+	return e.linkTargets(true, nil)
 }
 
 func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) error {
@@ -333,53 +323,90 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 		return nil
 	}
 
-	if genTargets := e.GeneratedTargets(); len(genTargets) > 0 {
-		log.Tracef("Run static analysis")
+	genTargets := e.GeneratedTargets()
 
-		var wg utils.WaitGroupChan
+	if len(genTargets) == 0 {
+		linkStartTime := time.Now()
+		err := e.linkTargets(false, nil)
+		if err != nil {
+			return fmt.Errorf("linking %w", err)
+		}
+		log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
 
-		for _, target := range genTargets {
-			_, err := e.ScheduleTargetDeps(ctx, pool, target)
-			if err != nil {
-				return err
-			}
-
-			err = e.ScheduleTarget(ctx, pool, target)
-			if err != nil {
-				return err
-			}
-
-			err = e.ScheduleRunGenerated(pool, target, &wg)
-			if err != nil {
-				return err
-			}
+		err = e.createDag(nil)
+		if err != nil {
+			return err
 		}
 
-		pool.Schedule(&worker.Job{
-			ID: "post static analysis",
-			Wait: func(ctx context.Context) {
-				select {
-				case <-ctx.Done():
-				case <-wg.Done():
-				}
-			},
-			Do: func(w *worker.Worker, ctx context.Context) error {
-				err := e.Simplify()
-				if err != nil {
-					return err
-				}
-
-				err = e.createDag()
-				if err != nil {
-					return err
-				}
-
-				return nil
-			},
-		})
-
-		e.ranStatAn = true
+		return nil
 	}
+
+	log.Tracef("Run static analysis")
+
+	linkStartTime := time.Now()
+	err := e.linkTargets(false, genTargets)
+	if err != nil {
+		return fmt.Errorf("linking %w", err)
+	}
+	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
+
+	linkedTargets := make(Targets, 0)
+	for _, target := range e.Targets {
+		if target.linked {
+			linkedTargets = append(linkedTargets, target)
+		}
+	}
+
+	err = e.createDag(linkedTargets)
+	if err != nil {
+		return err
+	}
+
+	var wg utils.WaitGroupChan
+
+	for _, target := range genTargets {
+		_, err := e.ScheduleTargetDeps(ctx, pool, target)
+		if err != nil {
+			return err
+		}
+
+		err = e.ScheduleTarget(ctx, pool, target)
+		if err != nil {
+			return err
+		}
+
+		err = e.ScheduleRunGenerated(pool, target, &wg)
+		if err != nil {
+			return err
+		}
+	}
+
+	pool.Schedule(&worker.Job{
+		ID: "post static analysis",
+		Wait: func(ctx context.Context) {
+			select {
+			case <-ctx.Done():
+			case <-wg.Done():
+			}
+		},
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			w.Status("Finalize static analysis...")
+
+			err := e.Simplify()
+			if err != nil {
+				return err
+			}
+
+			err = e.createDag(nil)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		},
+	})
+
+	e.ranStatAn = true
 
 	return nil
 }
@@ -394,36 +421,40 @@ func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target, wg *uti
 
 	log.Tracef("Scheduling rungen %v", target.FQN)
 
-	wg.Add()
-
-	pool.Schedule(&worker.Job{
-		ID: "rungen-" + target.FQN,
-		Wait: func(ctx context.Context) {
-			select {
-			case <-ctx.Done():
-			case <-deps.WaitAllRan():
-			}
-			return
+	pool.ScheduleWith(
+		worker.ScheduleOptions{
+			OnSchedule: func() {
+				wg.Add()
+			},
 		},
-		Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
-			w.Status(fmt.Sprintf("Static analysis on %v...", target.FQN))
-			defer func() {
-				w.Status(fmt.Sprintf("Static analysis on %v done: %v", target.FQN, ferr))
-			}()
-
-			err := e.runGenerated(target)
-			if err != nil {
-				return TargetFailedError{
-					Target: target,
-					Err:    err,
+		&worker.Job{
+			ID: "rungen-" + target.FQN,
+			Wait: func(ctx context.Context) {
+				select {
+				case <-ctx.Done():
+				case <-deps.WaitAllRan():
 				}
-			}
+				return
+			},
+			Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
+				w.Status(fmt.Sprintf("Static analysis on %v...", target.FQN))
+				defer func() {
+					w.Status(fmt.Sprintf("Static analysis on %v done: %v", target.FQN, ferr))
+				}()
 
-			wg.Sub()
+				err := e.runGenerated(target)
+				if err != nil {
+					return TargetFailedError{
+						Target: target,
+						Err:    err,
+					}
+				}
 
-			return nil
-		},
-	})
+				wg.Sub()
+
+				return nil
+			},
+		})
 
 	return nil
 }
@@ -437,18 +468,22 @@ func TargetNotFoundError(target string) error {
 	return fmt.Errorf("target %v not found", target)
 }
 
-func (e *Engine) createDag() error {
+func (e *Engine) createDag(targets Targets) error {
+	if targets == nil {
+		targets = e.Targets
+	}
+
 	e.dag = &DAG{dag.NewDAG()}
 
 	dagStartTime := time.Now()
-	for _, target := range e.Targets {
+	for _, target := range targets {
 		err := e.dag.AddVertexByID(target.FQN, target)
 		if err != nil {
 			return err
 		}
 	}
 
-	for _, target := range e.Targets {
+	for _, target := range targets {
 		for _, dep := range target.Deps.Targets {
 			err := e.dag.AddEdge(dep.FQN, target.FQN)
 			if err != nil && !isEdgeDuplicateError(err) {
@@ -496,19 +531,24 @@ func (e *Engine) processTarget(t *Target) error {
 	return nil
 }
 
-func (e *Engine) linkTargets(simplify bool) error {
-	for _, target := range e.Targets {
+func (e *Engine) linkTargets(simplify bool, targets Targets) error {
+	if targets == nil {
+		targets = e.Targets
+	}
+
+	for _, target := range targets {
 		target.linked = false
 	}
 
-	for _, target := range e.Targets {
-		err := e.linkTarget(target, simplify)
+	for i, target := range targets {
+		log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
+		err := e.linkTarget(target, simplify, nil)
 		if err != nil {
 			return fmt.Errorf("%v: %w", target.FQN, err)
 		}
 	}
 
-	for _, target := range e.Targets {
+	for _, target := range targets {
 		target.Deps = e.filterOutCodegenFromDeps(target, target.Deps)
 		target.HashDeps = e.filterOutCodegenFromDeps(target, target.HashDeps)
 	}
@@ -530,27 +570,45 @@ func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	return td
 }
 
-func (e *Engine) linkTarget(t *Target, simplify bool) error {
-	t.m.Lock()
-	if t.linked {
-		t.m.Unlock()
-		<-t.linkingCh
-		return nil
-	}
-	t.linkingCh = make(chan struct{})
-	t.linked = true
-	defer func() {
-		close(t.linkingCh)
-	}()
-	t.m.Unlock()
-
+func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
 	}
 
+	for _, target := range breadcrumb {
+		if target.FQN == t.FQN {
+			breadcrumb = append(breadcrumb, t)
+			return fmt.Errorf("linking cycle: %v", breadcrumb.FQNs())
+		}
+	}
+	breadcrumb = append(breadcrumb, t)
+
+	logPrefix := strings.Repeat("|", len(breadcrumb)-1)
+
+	t.m.Lock()
+	if t.linked {
+		t.m.Unlock()
+		return nil
+	} else if t.linking {
+		t.m.Unlock()
+		<-t.linkingCh
+		return nil
+	}
+	t.linking = true
+	t.linkingCh = make(chan struct{})
+	defer func() {
+		t.linked = true
+		t.linking = false
+		close(t.linkingCh)
+	}()
+	t.m.Unlock()
+
 	var err error
 
-	log.Tracef("Linking %v", t.FQN)
+	log.Tracef(logPrefix+"Linking %v", t.FQN)
+	defer func() {
+		log.Tracef(logPrefix+"Linking %v done", t.FQN)
+	}()
 
 	t.WorkdirRoot = Path{
 		Abs:     e.Root,
@@ -570,6 +628,8 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 	}
 
 	t.Tools = []TargetTool{}
+
+	log.Tracef(logPrefix + "Linking tools")
 
 	for _, tool := range t.TargetSpec.Tools.Array {
 		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
@@ -593,9 +653,9 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 			return TargetNotFoundError(tool)
 		}
 
-		err = e.linkTarget(tt, simplify)
+		err = e.linkTarget(tt, simplify, breadcrumb)
 		if err != nil {
-			return err
+			return fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
 		if tp.Output != "" {
@@ -637,15 +697,19 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 		return t.Tools[i].Name < t.Tools[j].Name
 	})
 
-	t.Deps, err = e.linkTargetDeps(t, t.TargetSpec.Deps, simplify)
+	log.Tracef(logPrefix + "Linking deps")
+
+	t.Deps, err = e.linkTargetDeps(t, t.TargetSpec.Deps, simplify, breadcrumb)
 	if err != nil {
-		return err
+		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
 
+	log.Tracef(logPrefix + "Linking hashdeps")
+
 	if t.TargetSpec.HashDeps.Array != nil {
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, simplify)
+		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, simplify, breadcrumb)
 		if err != nil {
-			return err
+			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
 		}
 	} else {
 		t.HashDeps = t.Deps
@@ -730,56 +794,38 @@ func (e *Engine) linkTarget(t *Target, simplify bool) error {
 	return nil
 }
 
-func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool) (TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool, breadcrumb Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, dep := range deps.Array {
 		if expr, err := utils.ExprParse(dep); err == nil {
 			switch expr.Function {
 			case "collect":
-				pkgMatcher := ParseTargetSelector(t.Package.FullName, expr.PosArgs[0])
-
-				var includeMatchers TargetMatchers
-				var excludeMatchers TargetMatchers
-
-				for _, arg := range expr.NamedArgs {
-					switch arg.Name {
-					case "include", "exclude":
-						m := ParseTargetSelector(t.Package.FullName, arg.Value)
-						if arg.Name == "exclude" {
-							excludeMatchers = append(excludeMatchers, m)
-						} else {
-							includeMatchers = append(includeMatchers, m)
-						}
-					default:
-						return TargetDeps{}, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
-					}
+				targets, err := e.collect(t, expr)
+				if err != nil {
+					return TargetDeps{}, err
 				}
 
-				matchers := TargetMatchers{
-					pkgMatcher,
-				}
-				if len(includeMatchers) > 0 {
-					matchers = append(matchers, OrMatcher(includeMatchers...))
-				}
-				if len(excludeMatchers) > 0 {
-					matchers = append(matchers, NotMatcher(OrMatcher(excludeMatchers...)))
-				}
-
-				matcher := AndMatcher(matchers...)
-
-				for _, target := range e.Targets {
-					if !matcher(target) {
-						continue
-					}
-
-					err = e.linkTarget(target, simplify)
+				for _, target := range targets {
+					err := e.linkTarget(target, simplify, breadcrumb)
 					if err != nil {
-						return TargetDeps{}, err
+						return TargetDeps{}, fmt.Errorf("collect: %w", err)
 					}
 
 					td.Targets = append(td.Targets, target)
 				}
+			case "find_parent":
+				target, err := e.findParent(t, expr)
+				if err != nil {
+					return TargetDeps{}, err
+				}
+
+				err = e.linkTarget(target, simplify, breadcrumb)
+				if err != nil {
+					return TargetDeps{}, fmt.Errorf("find_parent: %w", err)
+				}
+
+				td.Targets = append(td.Targets, target)
 			default:
 				return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
 			}
@@ -793,7 +839,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps ArrayMap, simplify bool) (Target
 				return TargetDeps{}, TargetNotFoundError(dtp.Full())
 			}
 
-			err = e.linkTarget(dt, simplify)
+			err = e.linkTarget(dt, simplify, breadcrumb)
 			if err != nil {
 				return TargetDeps{}, err
 			}

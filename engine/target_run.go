@@ -251,6 +251,32 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	// https://unix.stackexchange.com/a/357859
 	//env["SRCS"] = strings.Join(srcFiles, " ")
 
+	for _, t := range target.Tools {
+		if t.Target == nil {
+			continue
+		}
+
+		for k, expr := range t.Target.Provide {
+			expr, err := utils.ExprParse(expr)
+			if err != nil {
+				return err
+			}
+
+			switch expr.Function {
+			case "outdir":
+				outdir, err := e.outdir(t.Target, expr)
+				if err != nil {
+					return err
+				}
+
+				env[strings.ToUpper(t.Target.Name+"_"+k)] = outdir
+			default:
+				return fmt.Errorf("unhandled function %v", expr.Function)
+
+			}
+		}
+	}
+
 	for k, v := range target.Env {
 		env[k] = v
 	}

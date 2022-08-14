@@ -123,7 +123,15 @@ func NewPool(ctx context.Context, n int) *Pool {
 	return p
 }
 
+type ScheduleOptions struct {
+	OnSchedule func()
+}
+
 func (p *Pool) Schedule(job *Job) {
+	p.ScheduleWith(ScheduleOptions{}, job)
+}
+
+func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) {
 	p.wg.Add(1)
 
 	p.mJobs.Lock()
@@ -138,6 +146,10 @@ func (p *Pool) Schedule(job *Job) {
 	atomic.AddUint64(&p.JobCount, 1)
 
 	p.jobs[job.ID] = job
+
+	if f := opt.OnSchedule; f != nil {
+		f()
+	}
 
 	go func() {
 		if job.Wait != nil {

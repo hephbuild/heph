@@ -15,17 +15,16 @@ func (wg *WaitGroupChan) once() {
 		go func() {
 			wg.wg.Wait()
 			close(wg.ch)
+			wg.o = sync.Once{}
 		}()
 	})
 }
 
 func (wg *WaitGroupChan) Add() {
-	wg.once()
 	wg.wg.Add(1)
 }
 
 func (wg *WaitGroupChan) Sub() {
-	wg.once()
 	wg.wg.Done()
 }
 
