@@ -364,13 +364,13 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			})
 		}
 
-		//if target.Sandbox {
-		//	e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
-		//	err = deleteDir(target.WorkdirRoot.Abs, true)
-		//	if err != nil {
-		//		return err
-		//	}
-		//}
+		if !e.Config.KeepSandbox && target.Sandbox {
+			e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
+			err = deleteDir(target.WorkdirRoot.Abs, false)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	err = e.codegenLink(target)

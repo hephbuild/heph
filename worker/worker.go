@@ -46,7 +46,6 @@ type Pool struct {
 	DoneCount uint64
 
 	doneCh chan struct{}
-	mDone  sync.Mutex
 	o      sync.Once
 
 	jobsCh  chan *Job
@@ -54,7 +53,7 @@ type Pool struct {
 	stopped bool
 	mErr    sync.Mutex
 	jobs    map[string]*Job
-	mJobs   sync.Mutex
+	m       sync.Mutex
 }
 
 func safelyJobDo(j *Job, w *Worker) (err error) {
@@ -84,11 +83,14 @@ func NewPool(ctx context.Context, n int) *Pool {
 
 		go func() {
 			for j := range p.jobsCh {
+				p.m.Lock()
 				if p.stopped {
+					p.m.Unlock()
 					// Drain chan
 					p.wg.Done()
 					continue
 				}
+				p.m.Unlock()
 
 				j.TimeStart = time.Now()
 				w.CurrentJob = j
@@ -106,7 +108,7 @@ func NewPool(ctx context.Context, n int) *Pool {
 				if err != nil && p.Err == nil {
 					p.Err = err
 					p.mErr.Unlock()
-					go p.Stop()
+					p.Stop()
 				} else {
 					p.mErr.Unlock()
 				}
@@ -134,8 +136,8 @@ func (p *Pool) Schedule(job *Job) {
 func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) {
 	p.wg.Add(1)
 
-	p.mJobs.Lock()
-	defer p.mJobs.Unlock()
+	p.m.Lock()
+	defer p.m.Unlock()
 
 	if _, ok := p.jobs[job.ID]; ok {
 		p.wg.Done()
@@ -156,18 +158,21 @@ func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) {
 			job.Wait(job.ctx)
 		}
 
+		p.m.Lock()
 		if p.stopped {
+			p.m.Unlock()
 			p.wg.Done()
 			return
 		}
+		p.m.Unlock()
 
 		p.jobsCh <- job
 	}()
 }
 
 func (p *Pool) Done() <-chan struct{} {
-	p.mDone.Lock()
-	defer p.mDone.Unlock()
+	p.m.Lock()
+	defer p.m.Unlock()
 
 	p.o.Do(func() {
 		p.doneCh = make(chan struct{})
@@ -175,8 +180,8 @@ func (p *Pool) Done() <-chan struct{} {
 		go func() {
 			p.wg.Wait()
 
-			p.mDone.Lock()
-			defer p.mDone.Unlock()
+			p.m.Lock()
+			defer p.m.Unlock()
 
 			close(p.doneCh)
 			p.o = sync.Once{}
@@ -187,6 +192,9 @@ func (p *Pool) Done() <-chan struct{} {
 }
 
 func (p *Pool) Stop() {
+	p.m.Lock()
+	defer p.m.Unlock()
+
 	if p.stopped {
 		return
 	}

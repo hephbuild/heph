@@ -12,8 +12,6 @@ import (
 	"heph/worker"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +28,6 @@ func init() {
 	queryCmd.AddCommand(graphCmd)
 	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
-	queryCmd.AddCommand(outdirCmd)
 	queryCmd.AddCommand(targetCmd)
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
@@ -285,66 +282,6 @@ digraph G  {
 		}))
 
 		fmt.Println("}")
-
-		return nil
-	},
-}
-
-var outdirCmd = &cobra.Command{
-	Use:   "outdir <target>",
-	Short: "Prints target outdir",
-	Args:  cobra.ExactValidArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
-	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		target := Engine.Targets.Find(args[0])
-		if target == nil {
-			return fmt.Errorf("target %v not found", args[0])
-		}
-
-		ctx := cmd.Context()
-
-		pool := worker.NewPool(ctx, runtime.NumCPU()/2)
-		defer pool.Stop()
-
-		_, err := Engine.ScheduleTargetDeps(ctx, pool, target)
-		if err != nil {
-			return err
-		}
-		<-pool.Done()
-
-		if err := pool.Err; err != nil {
-			printTargetErr(err)
-			return err
-		}
-
-		e := engine.TargetRunEngine{
-			Engine:  Engine,
-			Pool:    pool,
-			Context: ctx,
-		}
-
-		_, err = e.WarmTargetCache(target)
-		if err != nil {
-			return err
-		}
-		<-pool.Done()
-
-		if err := pool.Err; err != nil {
-			printTargetErr(err)
-			return err
-		}
-
-		fmt.Println(filepath.Join(target.OutRoot.Abs, target.Package.Root.RelRoot))
 
 		return nil
 	},

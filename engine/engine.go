@@ -124,26 +124,28 @@ func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
 }
 
-func (e *Engine) hashFile(h hash.Hash, file PackagePath) {
+func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
 	info, err := os.Lstat(file.Abs())
 	if err != nil {
-		panic(fmt.Errorf("hashFile: %w", err))
+		return fmt.Errorf("stat: %w", err)
 	}
 
 	if info.Mode().Type() == os.ModeSymlink {
-		panic(fmt.Errorf("hashFile: %v symlink cannot be hashed", file.Abs()))
+		return fmt.Errorf("symlink cannot be hashed")
 	}
 
 	f, err := os.Open(file.Abs())
 	if err != nil {
-		panic(fmt.Errorf("hashFile: %w", err))
+		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
 	_, err = io.Copy(h, f)
 	if err != nil {
-		panic(fmt.Errorf("hashFile: %w", err))
+		return fmt.Errorf("copy: %w", err)
 	}
+
+	return nil
 }
 
 func (e *Engine) hashInput(target *Target) string {
@@ -180,7 +182,10 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	for _, dep := range target.HashDeps.Files {
-		e.hashFile(h, dep)
+		err := e.hashFile(h, dep)
+		if err != nil {
+			panic(fmt.Errorf("%v: hashFile %v %w", target.FQN, dep.Abs(), err))
+		}
 	}
 
 	for _, cmd := range target.Cmds {
@@ -248,7 +253,10 @@ func (e *Engine) hashOutput(target *Target) string {
 	h := xxh3.New()
 
 	for _, file := range target.ActualFilesOut() {
-		e.hashFile(h, file)
+		err := e.hashFile(h, file)
+		if err != nil {
+			panic(fmt.Errorf("%v: hashFile %v %w", target.FQN, file.Abs(), err))
+		}
 	}
 
 	hb := h.Sum128().Bytes()
@@ -329,6 +337,12 @@ func (e *Engine) ScheduleTargetDeps(ctx context.Context, pool *worker.Pool, targ
 
 func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, error) {
 	out := make(PackagePaths, 0)
+
+	defer func() {
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].RelRoot() < out[j].RelRoot()
+		})
+	}()
 
 	if len(files) == 1 && files[0].Path == "*" {
 		err := filepath.WalkDir(target.OutRoot.Abs, func(path string, d fs.DirEntry, err error) error {
@@ -424,10 +438,6 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 			out = append(out, file)
 		}
 	}
-
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].RelRoot() < out[j].RelRoot()
-	})
 
 	return out, nil
 }
@@ -660,8 +670,6 @@ func (e *Engine) runGenerated(target *Target) error {
 
 				if t := e.Targets.Find(spec.FQN); t != nil {
 					// TODO handle already registered
-
-					targets = append(targets, t)
 					return nil
 				}
 

@@ -17,6 +17,7 @@ type Config struct {
 	BuildFiles struct {
 		Ignore []string `yaml:",omitempty"`
 	} `yaml:"build_files"`
+	KeepSandbox bool `yaml:"keep_sandbox"`
 }
 
 type Version struct {

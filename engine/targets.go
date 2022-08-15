@@ -328,7 +328,7 @@ func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) 
 	log.Tracef("Run static analysis")
 
 	linkStartTime := time.Now()
-	err := e.linkTargets(false, genTargets)
+	err := e.linkTargets(true, genTargets)
 	if err != nil {
 		return fmt.Errorf("linking %w", err)
 	}
@@ -479,6 +479,10 @@ func (e *Engine) createDag() error {
 }
 
 func (e *Engine) processTarget(t *Target) error {
+	if t.processed {
+		panic(fmt.Errorf("%v has already been processed", t.FQN))
+	}
+
 	// Validate FQN
 	_, err := utils.TargetParse("", t.FQN)
 	if err != nil {
