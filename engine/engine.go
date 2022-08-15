@@ -163,7 +163,7 @@ func (e *Engine) hashInput(target *Target) string {
 	h := xxh3.New()
 
 	for _, dep := range target.Tools {
-		dh := e.hashOutputLocked(dep.Target)
+		dh := e.hashOutput(dep.Target)
 
 		h.Write([]byte(dep.Name))
 		h.Write([]byte(dh))
@@ -174,7 +174,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	for _, dep := range target.HashDeps.Targets {
-		dh := e.hashOutputLocked(dep)
+		dh := e.hashOutput(dep)
 
 		h.Write([]byte(dh))
 	}
@@ -218,24 +218,6 @@ func (e *Engine) hashInput(target *Target) string {
 	e.cacheHashInputMutex.Unlock()
 
 	return sh
-}
-
-func (e *Engine) hashOutputLocked(target *Target) string {
-	return e.hashOutput(target)
-
-	err := target.runLock.Lock()
-	if err != nil {
-		panic(fmt.Errorf("%v: hashOutput lock: %v", target.FQN, err))
-	}
-
-	defer func() {
-		err = target.runLock.Unlock()
-		if err != nil {
-			log.Errorf("%v: hashOutput unlock: %v", target.FQN, err)
-		}
-	}()
-
-	return e.hashOutput(target)
 }
 
 func (e *Engine) hashOutput(target *Target) string {

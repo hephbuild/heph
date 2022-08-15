@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
@@ -169,7 +170,16 @@ func (e *runBuildEngine) getPackage(thread *starlark.Thread) *Package {
 	return pkg
 }
 
-func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func stackTrace(thread *starlark.Thread) []string {
+	var source []string
+	for _, c := range thread.CallStack() {
+		source = append(source, fmt.Sprintf("%v %v", c.Name, c.Pos.String()))
+	}
+
+	return source
+}
+
+func (e *runBuildEngine) internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := e.getPackage(thread)
 
 	var sargs starlarkTargetArgs
@@ -207,12 +217,7 @@ func (e *runBuildEngine) target(thread *starlark.Thread, fn *starlark.Builtin, a
 		return nil, err
 	}
 
-	var source []string
-	for _, c := range thread.CallStack() {
-		source = append(source, fmt.Sprintf("%v %v", c.Name, c.Pos.String()))
-	}
-
-	t.Source = source
+	t.Source = stackTrace(thread)
 
 	err = e.registerTarget(t)
 	if err != nil {
@@ -289,4 +294,20 @@ func (e *runBuildEngine) to_json(thread *starlark.Thread, fn *starlark.Builtin, 
 	}
 
 	return starlark.String(b), nil
+}
+
+func (e *runBuildEngine) fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	value := args[0]
+
+	trace := stackTrace(thread)
+	for i, s := range trace {
+		trace[i] = "  " + s
+	}
+	traceStr := strings.Join(trace, "\n")
+
+	if s, ok := value.(starlark.String); ok {
+		return nil, fmt.Errorf("%v\n%v", s.GoString(), traceStr)
+	}
+
+	return nil, fmt.Errorf("%s\n%v", value, traceStr)
 }

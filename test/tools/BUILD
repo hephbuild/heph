@@ -4,7 +4,7 @@ target(
     name="echoer",
     run="./echo.sh",
     deps=["echo.sh"],
-    sandbox=True,
+    cache=False,
 )
 
 e2e_test(

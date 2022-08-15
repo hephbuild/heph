@@ -1,0 +1,24 @@
+def _fail_if_present(kwargs, key):
+    if key in kwargs:
+        fail("argument `{}` is not allowed".format(key))
+
+def target(sandbox=True, cache=True, *args, **kwargs):
+    return internal_target(
+        sandbox=sandbox,
+        cache=cache,
+        *args, **kwargs,
+    )
+
+
+def group(*args, **kwargs):
+    _fail_if_present(kwargs, "sandbox")
+    _fail_if_present(kwargs, "cache")
+    _fail_if_present(kwargs, "out")
+    _fail_if_present(kwargs, "run")
+
+    return target(
+        out='*',
+        sandbox=True,
+        cache=True,
+        *args, **kwargs
+    )
