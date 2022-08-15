@@ -1,12 +1,19 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 	"github.com/gofrs/flock"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+type Locker interface {
+	Lock() error
+	Unlock() error
+	Clean() error
+}
 
 func NewFlock(p string) *Flock {
 	return &Flock{Flock: flock.New(p)}
@@ -48,6 +55,15 @@ func (l *Flock) Unlock() error {
 	err = os.RemoveAll(l.Flock.Path())
 	if err != nil {
 		return fmt.Errorf("rm: %v", err)
+	}
+
+	return nil
+}
+
+func (l *Flock) Clean() error {
+	err := os.RemoveAll(l.Path())
+	if err != nil && errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 
 	return nil

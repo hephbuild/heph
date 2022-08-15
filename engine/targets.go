@@ -102,8 +102,8 @@ type Target struct {
 	ranCh     chan struct{}
 	m         sync.Mutex
 
-	runLock   *utils.Flock
-	cacheLock *utils.Flock
+	runLock   utils.Locker
+	cacheLock utils.Locker
 }
 
 func (t *Target) ActualFilesOut() PackagePaths {

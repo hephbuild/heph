@@ -507,12 +507,12 @@ func (e *Engine) CleanTarget(target *Target, async bool) error {
 }
 
 func (e *Engine) CleanTargetLock(target *Target) error {
-	err := os.RemoveAll(target.runLock.Path())
+	err := target.runLock.Clean()
 	if err != nil {
 		return err
 	}
 
-	err = os.RemoveAll(target.cacheLock.Path())
+	err = target.cacheLock.Clean()
 	if err != nil {
 		return err
 	}
