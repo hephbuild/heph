@@ -21,7 +21,8 @@ type Config struct {
 	BuildFiles struct {
 		Ignore []string `yaml:""`
 	} `yaml:"build_files"`
-	KeepSandbox bool `yaml:"keep_sandbox"`
+	KeepSandbox bool   `yaml:"keep_sandbox"`
+	Locker      string `yaml:"locker"`
 
 	Sources []FileConfig `yaml:"-"`
 }

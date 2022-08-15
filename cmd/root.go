@@ -10,13 +10,11 @@ import (
 	"heph/engine"
 	"heph/utils"
 	"heph/worker"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 )
 
 var isTerm bool
@@ -358,7 +356,7 @@ func execute() error {
 }
 
 func Execute() {
-	rand.Seed(int64(time.Now().Nanosecond()))
+	utils.Seed()
 
 	if err := execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

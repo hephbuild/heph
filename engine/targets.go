@@ -478,6 +478,19 @@ func (e *Engine) createDag() error {
 	return nil
 }
 
+func (e *Engine) lockFactory(t *Target, resource string) utils.Locker {
+	p := e.lockPath(t, resource)
+
+	switch e.Config.Locker {
+	case "flock":
+		return utils.NewFlock(p)
+	case "fslock":
+		return utils.NewFSLock(p)
+	default:
+		panic(fmt.Errorf("unhandled locker `%v`", e.Config.Locker))
+	}
+}
+
 func (e *Engine) processTarget(t *Target) error {
 	if t.processed {
 		panic(fmt.Errorf("%v has already been processed", t.FQN))
@@ -490,8 +503,8 @@ func (e *Engine) processTarget(t *Target) error {
 	}
 
 	t.ranCh = make(chan struct{})
-	t.runLock = utils.NewFlock(e.lockPath(t, "run"))
-	t.cacheLock = utils.NewFlock(e.lockPath(t, "cache"))
+	t.runLock = e.lockFactory(t, "run")
+	t.cacheLock = e.lockFactory(t, "cache")
 
 	if t.Codegen != "" {
 		if t.Codegen != "link" {

@@ -41,7 +41,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	err = WriteFileSync(filepath.Join(dir, versionFile), []byte("1"), os.ModePerm)
+	err = utils.WriteFileSync(filepath.Join(dir, versionFile), []byte("1"), os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -101,12 +101,12 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	outputHash := e.hashOutput(target)
 
-	err = WriteFileSync(filepath.Join(dir, outputHashFile), []byte(outputHash), os.ModePerm)
+	err = utils.WriteFileSync(filepath.Join(dir, outputHashFile), []byte(outputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	err = WriteFileSync(filepath.Join(dir, inputHashFile), []byte(inputHash), os.ModePerm)
+	err = utils.WriteFileSync(filepath.Join(dir, inputHashFile), []byte(inputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -208,19 +208,4 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 		Abs:     outDir,
 		RelRoot: rel,
 	}, nil
-}
-
-func WriteFileSync(name string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(data)
-	if err1 := f.Sync(); err1 != nil && err == nil {
-		err = err1
-	}
-	if err1 := f.Close(); err1 != nil && err == nil {
-		err = err1
-	}
-	return err
 }
