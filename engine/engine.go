@@ -221,6 +221,8 @@ func (e *Engine) hashInput(target *Target) string {
 }
 
 func (e *Engine) hashOutputLocked(target *Target) string {
+	return e.hashOutput(target)
+
 	err := target.runLock.Lock()
 	if err != nil {
 		panic(fmt.Errorf("%v: hashOutput lock: %v", target.FQN, err))

@@ -6,6 +6,7 @@ import (
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
+	"heph/config"
 	"heph/upgrade"
 	"heph/utils"
 	"heph/worker"
@@ -481,14 +482,7 @@ func (e *Engine) createDag() error {
 func (e *Engine) lockFactory(t *Target, resource string) utils.Locker {
 	p := e.lockPath(t, resource)
 
-	switch e.Config.Locker {
-	case "flock":
-		return utils.NewFlock(p)
-	case "fslock":
-		return utils.NewFSLock(p)
-	default:
-		panic(fmt.Errorf("unhandled locker `%v`", e.Config.Locker))
-	}
+	return config.Locker(e.Config.Config, p)
 }
 
 func (e *Engine) processTarget(t *Target) error {
