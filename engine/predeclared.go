@@ -1,6 +1,7 @@
 package engine
 
 import (
+	_ "embed"
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
@@ -10,6 +11,44 @@ import (
 	"runtime"
 	"strings"
 )
+
+//go:embed predeclared.gotpl
+var predeclaredSrc []byte
+var predeclaredMod *starlark.Program
+
+func init() {
+	_, mod, err := starlark.SourceProgram("<builtin>", predeclaredSrc, predeclared(nil).Has)
+	if err != nil {
+		panic(err)
+	}
+	predeclaredMod = mod
+}
+
+func predeclared(globals starlark.StringDict) starlark.StringDict {
+	p := starlark.StringDict{}
+	p["internal_target"] = starlark.NewBuiltin("internal_target", internal_target)
+	p["glob"] = starlark.NewBuiltin("glob", glob)
+	p["package_name"] = starlark.NewBuiltin("package_name", package_name)
+	p["package_fqn"] = starlark.NewBuiltin("package_fqn", package_fqn)
+	p["get_os"] = starlark.NewBuiltin("get_os", get_os)
+	p["get_arch"] = starlark.NewBuiltin("get_arch", get_arch)
+	p["to_json"] = starlark.NewBuiltin("to_json", to_json)
+	p["fail"] = starlark.NewBuiltin("fail", fail)
+
+	for name, value := range globals {
+		if strings.HasPrefix(name, "_") {
+			continue
+		}
+
+		if _, ok := p[name]; ok {
+			panic(fmt.Sprintf("%v is already delcared", name))
+		}
+
+		p[name] = value
+	}
+
+	return p
+}
 
 func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
 	iter := l.Iterate()
@@ -28,143 +67,15 @@ func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
 	return nil
 }
 
-type BoolArray struct {
-	Bool  bool
-	Array []string
+func getPackage(thread *starlark.Thread) *Package {
+	return getEngine(thread).pkg
 }
 
-func (d *BoolArray) Unpack(v starlark.Value) error {
-	switch e := v.(type) {
-	case starlark.Bool:
-		*d = BoolArray{
-			Bool: bool(e),
-		}
-		return nil
-	case *starlark.List:
-		arr := make([]string, 0)
-		err := listForeach(e, func(i int, value starlark.Value) error {
-			arr = append(arr, value.(starlark.String).GoString())
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		*d = BoolArray{
-			Bool:  true,
-			Array: arr,
-		}
-		return nil
-	}
-
-	return fmt.Errorf("must be bool or array, got %v", v.Type())
-}
-
-type ArrayMap struct {
-	Array []string
-	Map   map[string]string
-}
-
-func (d *ArrayMap) Unpack(v starlark.Value) error {
-	arr := make([]string, 0)
-	mapp := map[string]string{}
-
-	vd, ok := v.(*starlark.Dict)
-	if ok {
-		for _, e := range vd.Items() {
-			keyv := e.Index(0)
-			key, ok := keyv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("key must be string, got %v", keyv.Type())
-			}
-
-			valv := e.Index(1)
-			val, ok := valv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("val must be string, got %v", valv.Type())
-			}
-
-			arr = append(arr, string(val))
-			mapp[string(key)] = string(val)
-		}
-
-		*d = ArrayMap{
-			Array: arr,
-			Map:   mapp,
-		}
-		return nil
-	}
-
-	vs, ok := v.(starlark.String)
-	if ok {
-		*d = ArrayMap{
-			Array: []string{string(vs)},
-		}
-		return nil
-	}
-
-	vl, ok := v.(*starlark.List)
-	if ok {
-		err := listForeach(vl, func(i int, value starlark.Value) error {
-			switch e := value.(type) {
-			case starlark.String:
-				arr = append(arr, string(e))
-				return nil
-			case starlark.Tuple:
-				keyv := e.Index(0)
-				key, ok := keyv.(starlark.String)
-				if !ok {
-					return fmt.Errorf("key must be string, got %v", keyv.Type())
-				}
-
-				depv := e.Index(1)
-				dep, ok := depv.(starlark.String)
-				if !ok {
-					return fmt.Errorf("dep must be string, got %v", depv.Type())
-				}
-
-				arr = append(arr, string(dep))
-				mapp[string(dep)] = string(key)
-				return nil
-			case *starlark.List:
-				if e.Len() == 0 {
-					return nil
-				}
-
-				err := listForeach(e, func(i int, value starlark.Value) error {
-					dep, ok := value.(starlark.String)
-					if !ok {
-						return fmt.Errorf("dep must be string, got %v", dep.Type())
-					}
-
-					arr = append(arr, string(dep))
-					return nil
-				})
-				return err
-			}
-
-			return fmt.Errorf("element at index %v must be string or (string, string), is %v", i, value.Type())
-		})
-		if err != nil {
-			return err
-		}
-
-		*d = ArrayMap{
-			Array: arr,
-			Map:   mapp,
-		}
-
-		return nil
-	}
-
-	return fmt.Errorf("must be dict, list or string, got %v", v.Type())
-}
-
-func (e *runBuildEngine) getPackage(thread *starlark.Thread) *Package {
-	pkg := thread.Local("pkg").(*Package)
+func getEngine(thread *starlark.Thread) *runBuildEngine {
+	pkg := thread.Local("engine").(*runBuildEngine)
 
 	if pkg == nil {
-		panic("pkg is nil, not supposed to happen")
+		panic("engine is nil, not supposed to happen")
 	}
 
 	return pkg
@@ -179,34 +90,35 @@ func stackTrace(thread *starlark.Thread) []string {
 	return source
 }
 
-func (e *runBuildEngine) internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	pkg := e.getPackage(thread)
+func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := getPackage(thread)
+	e := getEngine(thread)
 
-	var sargs starlarkTargetArgs
+	var sargs TargetArgs
 
 	if err := starlark.UnpackArgs(
 		"target", args, kwargs,
-		"name?", &sargs.name,
-		"run?", &sargs.run,
-		"run_in_cwd?", &sargs.runInCwd,
-		"quiet?", &sargs.quiet,
-		"pass_args?", &sargs.passArgs,
-		"pass_env?", &sargs.passEnv,
-		"deps?", &sargs.deps,
-		"hash_deps?", &sargs.hashDeps,
-		"cache?", &sargs.cache,
-		"sandbox?", &sargs.sandboxEnabled,
-		"codegen?", &sargs.codegen,
-		"tools?", &sargs.tools,
-		"labels?", &sargs.labels,
-		"out?", &sargs.out,
-		"env?", &sargs.env,
-		"gen?", &sargs.gen,
-		"provide?", &sargs.provide,
-		"require_gen?", &sargs.requireGen,
+		"name?", &sargs.Name,
+		"run?", &sargs.Run,
+		"run_in_cwd?", &sargs.RunInCwd,
+		"quiet?", &sargs.Quiet,
+		"pass_args?", &sargs.PassArgs,
+		"pass_env?", &sargs.PassEnv,
+		"deps?", &sargs.Deps,
+		"hash_deps?", &sargs.HashDeps,
+		"cache?", &sargs.Cache,
+		"sandbox?", &sargs.SandboxEnabled,
+		"codegen?", &sargs.Codegen,
+		"tools?", &sargs.Tools,
+		"labels?", &sargs.Labels,
+		"out?", &sargs.Out,
+		"env?", &sargs.Env,
+		"gen?", &sargs.Gen,
+		"provide?", &sargs.Provide,
+		"require_gen?", &sargs.RequireGen,
 	); err != nil {
-		if sargs.name != "" {
-			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.name), err)
+		if sargs.Name != "" {
+			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.Name), err)
 		}
 
 		return nil, err
@@ -227,8 +139,9 @@ func (e *runBuildEngine) internal_target(thread *starlark.Thread, fn *starlark.B
 	return starlark.String(t.FQN), nil
 }
 
-func (e *runBuildEngine) glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	pkg := e.getPackage(thread)
+func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := getPackage(thread)
+	e := getEngine(thread)
 
 	var (
 		pattern string
@@ -263,27 +176,27 @@ func (e *runBuildEngine) glob(thread *starlark.Thread, fn *starlark.Builtin, arg
 	return starlark.NewList(elems), nil
 }
 
-func (e *runBuildEngine) package_name(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	pkg := e.getPackage(thread)
+func package_name(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := getPackage(thread)
 
 	return starlark.String(pkg.Name), nil
 }
 
-func (e *runBuildEngine) package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	pkg := e.getPackage(thread)
+func package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := getPackage(thread)
 
 	return starlark.String("//" + pkg.FullName), nil
 }
 
-func (e *runBuildEngine) get_os(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func get_os(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	return starlark.String(runtime.GOOS), nil
 }
 
-func (e *runBuildEngine) get_arch(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func get_arch(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	return starlark.String(runtime.GOARCH), nil
 }
 
-func (e *runBuildEngine) to_json(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func to_json(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	value := args[0]
 
 	var json = jsoniter.ConfigCompatibleWithStandardLibrary
@@ -296,7 +209,7 @@ func (e *runBuildEngine) to_json(thread *starlark.Thread, fn *starlark.Builtin, 
 	return starlark.String(b), nil
 }
 
-func (e *runBuildEngine) fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	value := args[0]
 
 	trace := stackTrace(thread)

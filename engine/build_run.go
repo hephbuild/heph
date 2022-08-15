@@ -1,7 +1,6 @@
 package engine
 
 import (
-	_ "embed"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/resolve"
@@ -143,35 +142,6 @@ func (e *runBuildEngine) runBuildFiles() error {
 	return nil
 }
 
-func (e *runBuildEngine) predeclared(globals starlark.StringDict) starlark.StringDict {
-	predeclared := starlark.StringDict{}
-	predeclared["internal_target"] = starlark.NewBuiltin("internal_target", e.internal_target)
-	predeclared["glob"] = starlark.NewBuiltin("glob", e.glob)
-	predeclared["package_name"] = starlark.NewBuiltin("package_name", e.package_name)
-	predeclared["package_fqn"] = starlark.NewBuiltin("package_fqn", e.package_fqn)
-	predeclared["get_os"] = starlark.NewBuiltin("get_os", e.get_os)
-	predeclared["get_arch"] = starlark.NewBuiltin("get_arch", e.get_arch)
-	predeclared["to_json"] = starlark.NewBuiltin("to_json", e.to_json)
-	predeclared["fail"] = starlark.NewBuiltin("fail", e.fail)
-
-	for name, value := range globals {
-		if strings.HasPrefix(name, "_") {
-			continue
-		}
-
-		if _, ok := predeclared[name]; ok {
-			panic(fmt.Sprintf("%v is already delcared in predeclared", name))
-		}
-
-		predeclared[name] = value
-	}
-
-	return predeclared
-}
-
-//go:embed predeclared.gotpl
-var predeclaredSrc []byte
-
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
 	thread := &starlark.Thread{
 		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
@@ -193,12 +163,12 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 			return pkg.Globals, nil
 		},
 	}
-	thread.SetLocal("pkg", e.pkg)
+	thread.SetLocal("engine", e)
 
-	globals, err := starlark.ExecFile(thread, "<builtin>", predeclaredSrc, e.predeclared(nil))
+	globals, err := predeclaredMod.Init(thread, predeclared(nil))
 	if err != nil {
 		return nil, err
 	}
 
-	return starlark.ExecFile(thread, path, nil, e.predeclared(globals))
+	return starlark.ExecFile(thread, path, nil, predeclared(globals))
 }

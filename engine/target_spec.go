@@ -7,51 +7,30 @@ import (
 	"os/exec"
 )
 
-type starlarkTargetArgs struct {
-	name           string
-	run            Runnable
-	runInCwd       bool
-	quiet          bool
-	passArgs       bool
-	cache          BoolArray
-	sandboxEnabled bool
-	gen            bool
-	codegen        string
-	deps           ArrayMap
-	hashDeps       ArrayMap
-	tools          ArrayMap
-	labels         ArrayMap
-	out            ArrayMap
-	env            ArrayMap
-	passEnv        ArrayMap
-	provide        ArrayMap
-	requireGen     bool
-}
-
-func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
+func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	t := TargetSpec{
-		FQN:         pkg.TargetPath(args.name),
-		Name:        args.name,
-		Cmds:        args.run.Cmds,
+		FQN:         pkg.TargetPath(args.Name),
+		Name:        args.Name,
+		Cmds:        args.Run.Cmds,
 		Package:     pkg,
-		PassArgs:    args.passArgs,
-		Quiet:       args.quiet,
-		ShouldCache: args.cache.Bool,
-		CachedFiles: args.cache.Array,
-		Sandbox:     args.sandboxEnabled,
-		Codegen:     args.codegen,
-		Labels:      args.labels.Array,
-		Env:         args.env.Map,
-		PassEnv:     args.passEnv.Array,
-		RunInCwd:    args.runInCwd,
-		Gen:         args.gen,
-		Provide:     args.provide.Map,
-		RequireGen:  args.requireGen,
+		PassArgs:    args.PassArgs,
+		Quiet:       args.Quiet,
+		ShouldCache: args.Cache.Bool,
+		CachedFiles: args.Cache.Array,
+		Sandbox:     args.SandboxEnabled,
+		Codegen:     args.Codegen,
+		Labels:      args.Labels.Array,
+		Env:         args.Env.Map,
+		PassEnv:     args.PassEnv.Array,
+		RunInCwd:    args.RunInCwd,
+		Gen:         args.Gen,
+		Provide:     args.Provide.Map,
+		RequireGen:  args.RequireGen,
 	}
 
 	var err error
 
-	for _, tool := range args.tools.Array {
+	for _, tool := range args.Tools.Array {
 		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
 		if err != nil {
 			binPath, err := exec.LookPath(tool)
@@ -74,13 +53,13 @@ func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
 		})
 	}
 
-	t.Deps, err = depsSpecFromArgs(t, args.deps)
+	t.Deps, err = depsSpecFromArgs(t, args.Deps)
 	if err != nil {
 		return TargetSpec{}, err
 	}
-	if args.hashDeps.Array != nil {
+	if args.HashDeps.Array != nil {
 		t.DifferentHashDeps = true
-		t.HashDeps, err = depsSpecFromArgs(t, args.hashDeps)
+		t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
 		if err != nil {
 			return TargetSpec{}, err
 		}
@@ -88,8 +67,8 @@ func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
 		t.HashDeps = t.Deps
 	}
 
-	if len(args.out.Map) > 0 {
-		for k, v := range args.out.Map {
+	if len(args.Out.Map) > 0 {
+		for k, v := range args.Out.Map {
 			t.Out = append(t.Out, TargetSpecOutFile{
 				Name:    k,
 				Package: pkg,
@@ -97,7 +76,7 @@ func specFromArgs(args starlarkTargetArgs, pkg *Package) (TargetSpec, error) {
 			})
 		}
 	} else {
-		for _, file := range args.out.Array {
+		for _, file := range args.Out.Array {
 			t.Out = append(t.Out, TargetSpecOutFile{
 				Package: pkg,
 				Path:    file,
