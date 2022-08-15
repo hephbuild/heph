@@ -7,7 +7,6 @@ require (
 	github.com/c2fo/vfs/v6 v6.5.1
 	github.com/charmbracelet/bubbletea v0.22.0
 	github.com/coreos/go-semver v0.3.0
-	github.com/gofrs/flock v0.8.1
 	github.com/heimdalr/dag v1.2.1
 	github.com/json-iterator/go v1.1.12
 	github.com/lithammer/fuzzysearch v1.1.5
