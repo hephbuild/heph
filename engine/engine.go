@@ -71,16 +71,14 @@ type Engine struct {
 }
 
 type Config struct {
-	Profiles []string
 	config.Config
-	Cache []CacheConfig
+	Profiles []string
+	Cache    []CacheConfig
 }
 
 type CacheConfig struct {
+	Name string
 	config.Cache
-	Name     string
-	Read     bool
-	Write    bool
 	Location vfs.Location `yaml:"-"`
 }
 
@@ -564,41 +562,24 @@ func deleteDir(dir string, async bool) error {
 func (e *Engine) parseConfigs() error {
 	log.Tracef("Profiles: %v", e.Config.Profiles)
 
-	mainCfg, err := config.Parse(filepath.Join(e.Root, ".hephconfig"))
+	var cfg config.Config
+	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, ".heph")
+
+	err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig"), &cfg)
 	if err != nil {
 		return err
 	}
 
-	localCfg, err := config.Parse(filepath.Join(e.Root, ".hephconfig.local"))
+	err = config.ParseAndApply(filepath.Join(e.Root, ".hephconfig.local"), &cfg)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
-	cfg := mainCfg.Merge(localCfg)
-
 	for _, profile := range e.Config.Profiles {
-		profileCfg, err := config.Parse(filepath.Join(e.Root, ".hephconfig."+profile))
+		err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig."+profile), &cfg)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
-
-		cfg = cfg.Merge(profileCfg)
-	}
-
-	// Finalize config
-
-	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, ".heph")
-
-	for k, cache := range cfg.Cache {
-		if cache.Read == nil {
-			v := true
-			cache.Read = &v
-		}
-		if cache.Write == nil {
-			v := false
-			cache.Write = &v
-		}
-		cfg.Cache[k] = cache
 	}
 
 	e.Config.Config = cfg
@@ -612,8 +593,6 @@ func (e *Engine) parseConfigs() error {
 		e.Config.Cache = append(e.Config.Cache, CacheConfig{
 			Name:     name,
 			Cache:    cache,
-			Read:     *cache.Read,
-			Write:    *cache.Write,
 			Location: loc,
 		})
 	}

@@ -1,122 +1,67 @@
 package config
 
 import (
-	"github.com/coreos/go-semver/semver"
+	log "github.com/sirupsen/logrus"
 	"io"
 	"os"
-	"strings"
+	"path/filepath"
 )
 import (
 	"gopkg.in/yaml.v3"
 )
 
+type BaseConfig struct {
+	Version  Version
+	Location string
+}
+
 type Config struct {
-	Version    Version
-	Location   string
-	Cache      map[string]Cache `yaml:",omitempty"`
+	BaseConfig `yaml:",inline"`
+	Cache      map[string]Cache
 	BuildFiles struct {
-		Ignore []string `yaml:",omitempty"`
+		Ignore []string `yaml:""`
 	} `yaml:"build_files"`
 	KeepSandbox bool `yaml:"keep_sandbox"`
-}
 
-type Version struct {
-	String string
-	Semver *semver.Version
-	GTE    bool
-}
-
-func (e *Version) UnmarshalYAML(unmarshal func(interface{}) error) error {
-	err := unmarshal(&e.String)
-	if err != nil {
-		return err
-	}
-
-	e.String = strings.TrimSpace(e.String)
-
-	version := e.String
-	if strings.HasPrefix(version, ">=") {
-		e.GTE = true
-		version = strings.TrimPrefix(version, ">=")
-		version = strings.TrimSpace(version)
-	}
-
-	e.Semver, err = semver.NewVersion(version)
-	if err != nil {
-		if e.GTE {
-			// If its gte, it has to be a semver, report errors if not
-			return err
-		}
-	}
-
-	return nil
+	Sources []FileConfig `yaml:"-"`
 }
 
 type Cache struct {
 	URI   string
-	Read  *bool `yaml:",omitempty"`
-	Write *bool `yaml:",omitempty"`
+	Read  bool
+	Write bool
 }
 
-func (c Cache) Merge(nc Cache) Cache {
-	if nc.URI != "" {
-		c.URI = nc.URI
-	}
-
-	if nc.Read != nil {
-		c.Read = nc.Read
-	}
-
-	if nc.Write != nil {
-		c.Write = nc.Write
-	}
-
-	return c
-}
-
-func Parse(name string) (Config, error) {
+func Parse(name string) (FileConfig, error) {
 	f, err := os.Open(name)
 	if err != nil {
-		return Config{}, err
+		return FileConfig{}, err
 	}
 	defer f.Close()
 
 	b, err := io.ReadAll(f)
 	if err != nil {
-		return Config{}, err
+		return FileConfig{}, err
 	}
 
-	var cfg Config
+	var cfg FileConfig
 	err = yaml.Unmarshal(b, &cfg)
 	if err != nil {
-		return Config{}, err
+		return FileConfig{}, err
 	}
 
 	return cfg, err
 }
 
-func (cc Config) Merge(nc Config) Config {
-	if nc.Version.String != "" {
-		cc.Version = nc.Version
+func ParseAndApply(name string, cfg *Config) error {
+	fcfg, err := Parse(name)
+	if err != nil {
+		return err
 	}
 
-	if nc.Location != "" {
-		cc.Location = nc.Location
-	}
+	log.Tracef("config %v %#v", filepath.Base(name), cfg)
 
-	if cc.Cache == nil {
-		cc.Cache = map[string]Cache{}
-	}
+	*cfg = fcfg.ApplyTo(*cfg)
 
-	if len(nc.Cache) == 0 && nc.Cache != nil {
-		cc.Cache = nil
-	} else {
-		for k, newCache := range nc.Cache {
-			cc.Cache[k] = cc.Cache[k].Merge(newCache)
-		}
-	}
-
-	cc.BuildFiles.Ignore = append(cc.BuildFiles.Ignore, nc.BuildFiles.Ignore...)
-
-	return cc
+	return nil
 }

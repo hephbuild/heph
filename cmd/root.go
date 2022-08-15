@@ -6,6 +6,7 @@ import (
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"heph/config"
 	"heph/engine"
 	"heph/utils"
 	"heph/worker"
@@ -50,7 +51,7 @@ func init() {
 	rootCmd.AddCommand(queryCmd)
 
 	logLevel = rootCmd.PersistentFlags().String("log_level", log.InfoLevel.String(), "log level")
-	profiles = rootCmd.PersistentFlags().StringArray("profile", nil, "config profiles")
+	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")

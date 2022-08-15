@@ -144,7 +144,7 @@ var configCmd = &cobra.Command{
 	Short: "Prints config",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
+		return engineInit()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		b, err := yaml.Marshal(Engine.Config)
