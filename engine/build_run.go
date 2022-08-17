@@ -16,7 +16,7 @@ func init() {
 	resolve.AllowGlobalReassign = true
 }
 
-const buildFilesPattern = "**/{BUILD,BUILD.heph}"
+const buildFilesPattern = "**/{BUILD,BUILD.*}"
 
 func (e *Engine) runBuildFiles() error {
 	walkStartTime := time.Now()
@@ -35,7 +35,6 @@ func (e *Engine) runBuildFiles() error {
 	}
 	log.Tracef("RunBuildFiles:walk took %v", time.Now().Sub(walkStartTime))
 
-	e.Packages = map[string]*Package{}
 	for _, file := range e.SourceFiles {
 		pkg := e.populatePkg(file)
 
@@ -142,6 +141,18 @@ func (e *runBuildEngine) runBuildFiles() error {
 	return nil
 }
 
+func (e *runBuildEngine) config() starlark.StringDict {
+	cfg := &starlark.Dict{}
+	cfg.SetKey(starlark.String("version"), starlark.String(e.Config.Version.String))
+	for k, v := range e.Config.Extras {
+		cfg.SetKey(starlark.String(k), utils.FromGo(v))
+	}
+
+	return starlark.StringDict{
+		"CONFIG": cfg,
+	}
+}
+
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
 	thread := &starlark.Thread{
 		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
@@ -165,10 +176,12 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	}
 	thread.SetLocal("engine", e)
 
-	globals, err := predeclaredMod.Init(thread, predeclared(nil))
+	config := e.config()
+
+	globals, err := predeclaredMod.Init(thread, predeclared(config))
 	if err != nil {
 		return nil, err
 	}
 
-	return starlark.ExecFile(thread, path, nil, predeclared(globals))
+	return starlark.ExecFile(thread, path, nil, predeclared(globals, config))
 }

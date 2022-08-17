@@ -170,5 +170,7 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 		cmd.Env = append(cmd.Env, pathStr(os.Getenv("PATH")))
 	}
 
+	cmd.SysProcAttr = sysProcAttr()
+
 	return cmd
 }

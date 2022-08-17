@@ -68,13 +68,13 @@ var queryCmd = &cobra.Command{
 		defer pool.Stop()
 
 		if !*noGen {
-			err = Engine.ScheduleStaticAnalysis(ctx, pool)
+			err = Engine.ScheduleGenPass(pool)
 			if err != nil {
 				return err
 			}
 
 			if isTerm && !*plain {
-				err := DynamicRenderer("Query Static Analysis", ctx, cancel, pool)
+				err := DynamicRenderer("Query Gen", ctx, cancel, pool)
 				if err != nil {
 					return fmt.Errorf("dynamic renderer: %w", err)
 				}
@@ -128,7 +128,7 @@ var alltargetsCmd = &cobra.Command{
 	Short: "Prints all targets",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
+		return preRunWithGen(false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range sortedTargets(Engine.Targets, false) {
@@ -187,7 +187,7 @@ var graphCmd = &cobra.Command{
 	Short: "Prints deps target graph",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
+		return preRunWithGen(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -224,7 +224,7 @@ var graphDotCmd = &cobra.Command{
 	Short: "Outputs graph do",
 	Args:  cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
+		return preRunWithGen(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -292,7 +292,7 @@ var changesCmd = &cobra.Command{
 	Short: "Prints deps target changes",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithStaticAnalysis(false)
+		return preRunWithGen(false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -347,7 +347,7 @@ var targetCmd = &cobra.Command{
 		if spec {
 			return engineInit()
 		} else {
-			return preRunWithStaticAnalysis(false)
+			return preRunWithGen(false)
 		}
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
@@ -383,7 +383,7 @@ var targetCmd = &cobra.Command{
 		fmt.Println(target.FQN)
 		fmt.Println("Deps - Targets")
 		for _, t := range target.Deps.Targets {
-			fmt.Printf("  %v\n", t.FQN)
+			fmt.Printf("  %v\n", t.Target.FQN)
 		}
 		fmt.Println("Deps - Files")
 		for _, t := range target.Deps.Files {

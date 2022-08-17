@@ -80,3 +80,4 @@ dist/
 
 .heph
 utils/version
+.hephconfig.local

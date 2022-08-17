@@ -20,11 +20,11 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		Sandbox:     args.SandboxEnabled,
 		Codegen:     args.Codegen,
 		Labels:      args.Labels.Array,
-		Env:         args.Env.Map,
+		Env:         args.Env.StrMap,
 		PassEnv:     args.PassEnv.Array,
 		RunInCwd:    args.RunInCwd,
 		Gen:         args.Gen,
-		Provide:     args.Provide.Map,
+		Provide:     args.Provide.StrMap,
 		RequireGen:  args.RequireGen,
 	}
 
@@ -67,8 +67,22 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		t.HashDeps = t.Deps
 	}
 
-	if len(args.Out.Map) > 0 {
-		for k, v := range args.Out.Map {
+	if len(args.Out.ArrMap) > 0 {
+		for k, vs := range args.Out.ArrMap {
+			if k == "" {
+				return t, fmt.Errorf("named output must not be empty")
+			}
+
+			for _, v := range vs {
+				t.Out = append(t.Out, TargetSpecOutFile{
+					Name:    k,
+					Package: pkg,
+					Path:    v,
+				})
+			}
+		}
+	} else if len(args.Out.StrMap) > 0 {
+		for k, v := range args.Out.StrMap {
 			t.Out = append(t.Out, TargetSpecOutFile{
 				Name:    k,
 				Package: pkg,
@@ -98,10 +112,10 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 			continue
 		}
 
-		// TODO: support named output
-		if dtp, err := utils.TargetParse(t.Package.FullName, dep); err == nil {
+		if dtp, err := utils.TargetOutputParse(t.Package.FullName, dep); err == nil {
 			td.Targets = append(td.Targets, TargetSpecDepTarget{
 				Target: dtp.Full(),
+				Output: dtp.Output,
 			})
 			continue
 		}
@@ -182,6 +196,7 @@ type TargetSpecDeps struct {
 }
 
 type TargetSpecDepTarget struct {
+	Output string
 	Target string
 }
 

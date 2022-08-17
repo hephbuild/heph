@@ -66,7 +66,7 @@ type Engine struct {
 	cacheHashInput       map[string]string
 	cacheHashOutputMutex sync.RWMutex
 	cacheHashOutput      map[string]string
-	ranStatAn            bool
+	ranGenPass           bool
 	codegenPaths         map[string]*Target
 }
 
@@ -108,6 +108,7 @@ func New(root string) *Engine {
 		HomeDir:         homeDir,
 		Context:         context.Background(),
 		LocalCache:      loc.(*vfsos.Location),
+		Packages:        map[string]*Package{},
 		cacheHashInput:  map[string]string{},
 		cacheHashOutput: map[string]string{},
 		codegenPaths:    map[string]*Target{},
@@ -131,6 +132,8 @@ func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
 	if info.Mode().Type() == os.ModeSymlink {
 		return fmt.Errorf("symlink cannot be hashed")
 	}
+
+	h.Write([]byte(fmt.Sprint(info.Mode().Perm())))
 
 	f, err := os.Open(file.Abs())
 	if err != nil {
@@ -163,7 +166,7 @@ func (e *Engine) hashInput(target *Target) string {
 	h := xxh3.New()
 
 	for _, dep := range target.Tools {
-		dh := e.hashOutput(dep.Target)
+		dh := e.hashOutput(dep.Target, "")
 
 		h.Write([]byte(dep.Name))
 		h.Write([]byte(dh))
@@ -174,7 +177,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	for _, dep := range target.HashDeps.Targets {
-		dh := e.hashOutput(dep)
+		dh := e.hashOutput(dep.Target, dep.Output)
 
 		h.Write([]byte(dh))
 	}
@@ -220,7 +223,7 @@ func (e *Engine) hashInput(target *Target) string {
 	return sh
 }
 
-func (e *Engine) hashOutput(target *Target) string {
+func (e *Engine) hashOutput(target *Target, output string) string {
 	cacheId := target.FQN + "_" + e.hashInput(target)
 	e.cacheHashOutputMutex.RLock()
 	if h, ok := e.cacheHashOutput[cacheId]; ok {
@@ -250,7 +253,12 @@ func (e *Engine) hashOutput(target *Target) string {
 
 	h := xxh3.New()
 
-	for _, file := range target.ActualFilesOut() {
+	actualOut := target.NamedActualFilesOut().All()
+	if output != "" {
+		actualOut = target.NamedActualFilesOut().Name(output)
+	}
+
+	for _, file := range actualOut {
 		err := e.hashFile(h, file)
 		if err != nil {
 			panic(fmt.Errorf("%v: hashFile %v %w", target.FQN, file.Abs(), err))
@@ -277,7 +285,7 @@ func (t TargetFailedError) Error() string {
 	return t.Err.Error()
 }
 
-func (e *Engine) ScheduleTarget(ctx context.Context, pool *worker.Pool, target *Target) error {
+func (e *Engine) ScheduleTarget(pool *worker.Pool, target *Target) error {
 	ancestors, err := e.DAG().GetAncestors(target)
 	if err != nil {
 		return err
@@ -317,20 +325,37 @@ func (e *Engine) ScheduleTarget(ctx context.Context, pool *worker.Pool, target *
 	return nil
 }
 
-func (e *Engine) ScheduleTargetDeps(ctx context.Context, pool *worker.Pool, target *Target) (Targets, error) {
+func (e *Engine) ScheduleTargetDeps(pool *worker.Pool, target *Target) (Targets, error) {
 	ancestors, err := e.DAG().GetAncestors(target)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, target := range ancestors {
-		err := e.ScheduleTarget(ctx, pool, target)
+		err := e.ScheduleTarget(pool, target)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	return ancestors, nil
+}
+
+func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
+	tp := &TargetNamedPackagePath{}
+
+	for name, paths := range namedPaths.Named() {
+		files, err := e.collectOut(target, paths)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, file := range files {
+			tp.Add(name, file)
+		}
+	}
+
+	return tp, nil
 }
 
 func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, error) {
@@ -341,32 +366,6 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 			return out[i].RelRoot() < out[j].RelRoot()
 		})
 	}()
-
-	if len(files) == 1 && files[0].Path == "*" {
-		err := filepath.WalkDir(target.OutRoot.Abs, func(path string, d fs.DirEntry, err error) error {
-			if d.IsDir() {
-				return nil
-			}
-
-			relRoot, err := filepath.Rel(target.OutRoot.Abs, path)
-			if err != nil {
-				return err
-			}
-
-			out = append(out, PackagePath{
-				Package: e.createPkg(""),
-				Path:    relRoot,
-				Root:    target.OutRoot.Abs,
-			})
-
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("collect output *: %w", err)
-		}
-
-		return out, nil
-	}
 
 	for _, file := range files {
 		file = file.WithRoot(target.OutRoot.Abs)
@@ -402,7 +401,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 				return nil, fmt.Errorf("collect output %v: %w", file.Path, err)
 			}
 
-			return out, nil
+			continue
 		}
 
 		f, err := os.Stat(file.Abs())
@@ -446,8 +445,8 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return fmt.Errorf("collect output: isempty: %w", err)
 	}
 
-	target.actualFilesOut = make([]PackagePath, 0)
-	target.actualcachedFiles = make([]PackagePath, 0)
+	target.actualFilesOut = &TargetNamedPackagePath{}
+	target.actualcachedFiles = make(PackagePaths, 0)
 
 	if empty {
 		return nil
@@ -458,7 +457,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return fmt.Errorf("cached: %w", err)
 	}
 
-	target.actualFilesOut, err = e.collectOut(target, target.Out)
+	target.actualFilesOut, err = e.collectNamedOut(target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}
@@ -627,58 +626,4 @@ func (e *Engine) GetTargetShortcuts() []*Target {
 		}
 	}
 	return aliases
-}
-
-func (e *Engine) runGenerated(target *Target) error {
-	log.Tracef("run generated %v", target.FQN)
-
-	start := time.Now()
-	defer func() {
-		log.Tracef("runGenerated %v took %v", target.FQN, time.Since(start))
-	}()
-
-	targets := make(Targets, 0)
-
-	files := target.ActualFilesOut()
-
-	for _, file := range files {
-		re := &runBuildEngine{
-			Engine: e,
-			pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-			registerTarget: func(spec TargetSpec) error {
-				e.TargetsLock.Lock()
-				defer e.TargetsLock.Unlock()
-
-				if t := e.Targets.Find(spec.FQN); t != nil {
-					// TODO handle already registered
-					return nil
-				}
-
-				t := &Target{
-					TargetSpec: spec,
-				}
-
-				targets = append(targets, t)
-				e.Targets = append(e.Targets, t)
-
-				return nil
-			},
-		}
-
-		_, err := re.runBuildFile(file.Abs())
-		if err != nil {
-			return err
-		}
-	}
-
-	log.Tracef("run generated got %v targets", len(targets))
-
-	for _, t := range targets {
-		err := e.processTarget(t)
-		if err != nil {
-			return fmt.Errorf("process: %v: %w", t.FQN, err)
-		}
-	}
-
-	return nil
 }

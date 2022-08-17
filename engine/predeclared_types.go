@@ -87,43 +87,66 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 
 type ArrayMap struct {
 	Array []string
-	Map   map[string]string
+	// TODO Separate StrMap and ArrMap
+	StrMap map[string]string
+	ArrMap map[string][]string
 }
 
 func (d *ArrayMap) Unpack(v starlark.Value) error {
+	vs, ok := v.(starlark.String)
+	if ok {
+		*d = ArrayMap{
+			Array: []string{string(vs)},
+		}
+		return nil
+	}
+
 	arr := make([]string, 0)
-	mapp := map[string]string{}
+	arrMap := map[string][]string{}
+	strMap := map[string]string{}
 
 	vd, ok := v.(*starlark.Dict)
 	if ok {
 		for _, e := range vd.Items() {
 			keyv := e.Index(0)
-			key, ok := keyv.(starlark.String)
+			skey, ok := keyv.(starlark.String)
 			if !ok {
 				return fmt.Errorf("key must be string, got %v", keyv.Type())
 			}
 
+			key := string(skey)
+
 			valv := e.Index(1)
-			val, ok := valv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("val must be string, got %v", valv.Type())
+			switch val := valv.(type) {
+			case starlark.String:
+				arr = append(arr, string(val))
+				strMap[key] = string(val)
+				arrMap[key] = append(arrMap[key], string(val))
+			case *starlark.List:
+				err := listForeach(val, func(i int, value starlark.Value) error {
+					val, ok := value.(starlark.String)
+					if !ok {
+						return fmt.Errorf("value must be string, got %v", keyv.Type())
+					}
+
+					arr = append(arr, string(val))
+					strMap[key] = string(val)
+					arrMap[key] = append(arrMap[key], string(val))
+
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("val must be string or []string, got %v", valv.Type())
 			}
-
-			arr = append(arr, string(val))
-			mapp[string(key)] = string(val)
 		}
 
 		*d = ArrayMap{
-			Array: arr,
-			Map:   mapp,
-		}
-		return nil
-	}
-
-	vs, ok := v.(starlark.String)
-	if ok {
-		*d = ArrayMap{
-			Array: []string{string(vs)},
+			Array:  arr,
+			StrMap: strMap,
+			ArrMap: arrMap,
 		}
 		return nil
 	}
@@ -149,7 +172,7 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				}
 
 				arr = append(arr, string(dep))
-				mapp[string(dep)] = string(key)
+				strMap[string(dep)] = string(key)
 				return nil
 			case *starlark.List:
 				if e.Len() == 0 {
@@ -175,8 +198,8 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 		}
 
 		*d = ArrayMap{
-			Array: arr,
-			Map:   mapp,
+			Array:  arr,
+			StrMap: strMap,
 		}
 
 		return nil

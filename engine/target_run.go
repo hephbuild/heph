@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
@@ -136,10 +137,10 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	for _, dep := range target.Deps.Targets {
-		log.Tracef("Dep %v", dep.FQN)
+		log.Tracef("Dep %v", dep.Target.FQN)
 
-		if !dep.ran {
-			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.FQN))
+		if !dep.Target.ran {
+			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
 
@@ -167,10 +168,14 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		srcTar := make([]string, 0)
 		for _, dep := range target.Deps.Targets {
 			tarFile := e.targetOutputTarFile(target, e.hashInput(target))
-			if utils.PathExists(tarFile) {
+			if utils.PathExists(tarFile) && dep.Output == "" {
 				srcTar = append(srcTar, tarFile)
 			} else {
-				for _, file := range dep.ActualFilesOut() {
+				files := dep.Target.ActualFilesOut()
+				if dep.Output != "" {
+					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
+				}
+				for _, file := range files {
 					src = append(src, utils.TarFile{
 						From: file.Abs(),
 						To:   file.RelRoot(),
@@ -215,12 +220,23 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 	e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
+	targetSpecFile, err := os.Create(filepath.Join(sandboxSpec.Root, "target.json"))
+	if err != nil {
+		return err
+	}
+	defer targetSpecFile.Close()
+
+	enc := json.NewEncoder(targetSpecFile)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "    ")
+	if err := enc.Encode(target.TargetSpec); err != nil {
+		return err
+	}
+
+	targetSpecFile.Close()
+
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
 		target.LogFile = filepath.Join(sandboxSpec.Root, "log.txt")
-		err := os.RemoveAll(target.LogFile)
-		if err != nil {
-			return err
-		}
 
 		f, err := os.Create(target.LogFile)
 		if err != nil {
@@ -245,6 +261,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	env := make(map[string]string) // TODO
 	env["HEPH"] = ex
 	env["TARGET"] = target.FQN
+	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs
 	env["SANDBOX"] = filepath.Join(e.sandboxRoot(target), "_dir")
 	// TODO: figure out causes /bin/bash: argument list too long

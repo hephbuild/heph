@@ -91,15 +91,10 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		RelRoot: rel,
 	}
 
-	for i, file := range target.actualFilesOut {
-		target.actualFilesOut[i] = file.WithRoot(target.OutRoot.Abs)
-	}
+	target.actualFilesOut = target.actualFilesOut.WithRoot(target.OutRoot.Abs)
+	target.actualcachedFiles = target.actualcachedFiles.WithRoot(target.OutRoot.Abs)
 
-	for i, file := range target.actualcachedFiles {
-		target.actualcachedFiles[i] = file.WithRoot(target.OutRoot.Abs)
-	}
-
-	outputHash := e.hashOutput(target)
+	outputHash := e.hashOutput(target, "")
 
 	err = utils.WriteFileSync(filepath.Join(dir, outputHashFile), []byte(outputHash), os.ModePerm)
 	if err != nil {

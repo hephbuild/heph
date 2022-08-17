@@ -122,13 +122,13 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	defer pool.Stop()
 
 	if !*noGen {
-		err := Engine.ScheduleStaticAnalysis(ctx, pool)
+		err := Engine.ScheduleGenPass(pool)
 		if err != nil {
 			return err
 		}
 
 		if isTerm && !*plain {
-			err := DynamicRenderer("Run Static Analysis", ctx, cancel, pool)
+			err := DynamicRenderer("Run gen", ctx, cancel, pool)
 			if err != nil {
 				return fmt.Errorf("dynamic renderer: %w", err)
 			}
@@ -149,13 +149,13 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 	}
 
 	for _, inv := range targets {
-		_, err := Engine.ScheduleTargetDeps(ctx, pool, inv.Target)
+		_, err := Engine.ScheduleTargetDeps(pool, inv.Target)
 		if err != nil {
 			return err
 		}
 
 		if inlineTarget == nil || inv.Target != inlineTarget.Target {
-			err := Engine.ScheduleTarget(ctx, pool, inv.Target)
+			err := Engine.ScheduleTarget(pool, inv.Target)
 			if err != nil {
 				return err
 			}

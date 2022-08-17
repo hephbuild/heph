@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"fmt"
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
@@ -9,7 +8,6 @@ import (
 	"heph/config"
 	"heph/upgrade"
 	"heph/utils"
-	"heph/worker"
 	"os"
 	"path/filepath"
 	"sort"
@@ -46,8 +44,70 @@ func (tt TargetTool) AbsPath() string {
 }
 
 type TargetDeps struct {
-	Targets Targets
+	Targets []TargetWithOutput
 	Files   []PackagePath
+}
+
+type TargetNamedPackagePath struct {
+	names []string
+	named map[string]PackagePaths
+	all   PackagePaths
+}
+
+func (tp *TargetNamedPackagePath) Named() map[string]PackagePaths {
+	return tp.named
+}
+
+func (tp *TargetNamedPackagePath) All() PackagePaths {
+	return tp.all
+}
+
+func (tp *TargetNamedPackagePath) Name(name string) PackagePaths {
+	if tp.named == nil {
+		return nil
+	}
+
+	return tp.named[name]
+}
+
+func (tp *TargetNamedPackagePath) Add(name string, p PackagePath) {
+	if tp.named == nil {
+		tp.named = map[string]PackagePaths{}
+	}
+
+	if _, ok := tp.named[name]; !ok {
+		tp.names = append(tp.names, name)
+		tp.named[name] = make(PackagePaths, 0)
+	}
+
+	tp.named[name] = append(tp.named[name], p)
+	tp.all = append(tp.all, p)
+}
+
+func (tp *TargetNamedPackagePath) Sort() {
+	sort.SliceStable(tp.all, func(i, j int) bool {
+		return tp.all[i].RelRoot() < tp.all[j].RelRoot()
+	})
+
+	for name := range tp.named {
+		sort.SliceStable(tp.named[name], func(i, j int) bool {
+			return tp.named[name][i].RelRoot() < tp.named[name][j].RelRoot()
+		})
+	}
+}
+
+func (tp TargetNamedPackagePath) WithRoot(root string) *TargetNamedPackagePath {
+	ntp := &TargetNamedPackagePath{
+		names: tp.names,
+		named: map[string]PackagePaths{},
+		all:   tp.all.WithRoot(root),
+	}
+
+	for name, paths := range tp.named {
+		ntp.named[name] = paths.WithRoot(root)
+	}
+
+	return ntp
 }
 
 type Target struct {
@@ -56,16 +116,16 @@ type Target struct {
 	Tools          []TargetTool
 	Deps           TargetDeps
 	HashDeps       TargetDeps
-	Out            []PackagePath
-	actualFilesOut []PackagePath
+	Out            *TargetNamedPackagePath
+	actualFilesOut *TargetNamedPackagePath
 	Env            map[string]string
 
 	CodegenLink bool
 
 	WorkdirRoot       Path
 	OutRoot           *Path
-	CachedFiles       []PackagePath
-	actualcachedFiles []PackagePath
+	CachedFiles       PackagePaths
+	actualcachedFiles PackagePaths
 	LogFile           string
 
 	processed bool
@@ -85,6 +145,14 @@ func (t *Target) ActualFilesOut() PackagePaths {
 		panic("actualFilesOut is nil for " + t.FQN)
 	}
 
+	return t.actualFilesOut.all
+}
+
+func (t *Target) NamedActualFilesOut() *TargetNamedPackagePath {
+	if t.actualFilesOut == nil {
+		panic("actualFilesOut is nil for " + t.FQN)
+	}
+
 	return t.actualFilesOut
 }
 
@@ -93,7 +161,7 @@ func (t *Target) String() string {
 }
 
 func (t *Target) IsGroup() bool {
-	return len(t.Cmds) == 0 && len(t.Out) == 1 && t.Out[0].Path == "*"
+	return len(t.Cmds) == 0
 }
 
 type Path struct {
@@ -142,9 +210,19 @@ func (p PackagePaths) Find(s string) (PackagePath, bool) {
 	return PackagePath{}, false
 }
 
+func (p PackagePaths) WithRoot(root string) PackagePaths {
+	np := make(PackagePaths, 0, len(p))
+
+	for _, path := range p {
+		np = append(np, path.WithRoot(root))
+	}
+
+	return np
+}
+
 func (t *Target) OutFilesInOutRoot() []PackagePath {
 	out := make([]PackagePath, 0)
-	for _, file := range t.Out {
+	for _, file := range t.Out.All() {
 		out = append(out, file.WithRoot(t.OutRoot.Abs))
 	}
 
@@ -177,6 +255,11 @@ func (t *Target) HasAnyLabel(labels []string) bool {
 	}
 
 	return false
+}
+
+type TargetWithOutput struct {
+	Target *Target
+	Output string
 }
 
 type Targets []*Target
@@ -276,140 +359,6 @@ func (e *Engine) Simplify() error {
 	return e.linkTargets(true, nil)
 }
 
-func (e *Engine) ScheduleStaticAnalysis(ctx context.Context, pool *worker.Pool) error {
-	if e.ranStatAn {
-		return nil
-	}
-
-	genTargets := e.GeneratedTargets()
-
-	if len(genTargets) == 0 {
-		linkStartTime := time.Now()
-		err := e.linkTargets(false, nil)
-		if err != nil {
-			return fmt.Errorf("linking %w", err)
-		}
-		log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
-
-		err = e.createDag()
-		if err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	log.Tracef("Run static analysis")
-
-	linkStartTime := time.Now()
-	err := e.linkTargets(true, genTargets)
-	if err != nil {
-		return fmt.Errorf("linking %w", err)
-	}
-	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
-
-	err = e.createDag()
-	if err != nil {
-		return err
-	}
-
-	var wg utils.WaitGroupChan
-
-	for _, target := range genTargets {
-		_, err := e.ScheduleTargetDeps(ctx, pool, target)
-		if err != nil {
-			return err
-		}
-
-		err = e.ScheduleTarget(ctx, pool, target)
-		if err != nil {
-			return err
-		}
-
-		err = e.ScheduleRunGenerated(pool, target, &wg)
-		if err != nil {
-			return err
-		}
-	}
-
-	pool.Schedule(&worker.Job{
-		ID: "post static analysis",
-		Wait: func(ctx context.Context) {
-			select {
-			case <-ctx.Done():
-			case <-wg.Done():
-			}
-		},
-		Do: func(w *worker.Worker, ctx context.Context) error {
-			w.Status("Finalize static analysis...")
-
-			err := e.Simplify()
-			if err != nil {
-				return err
-			}
-
-			err = e.createDag()
-			if err != nil {
-				return err
-			}
-
-			return nil
-		},
-	})
-
-	e.ranStatAn = true
-
-	return nil
-}
-
-func (e *Engine) ScheduleRunGenerated(pool *worker.Pool, target *Target, wg *utils.WaitGroupChan) error {
-	ancestors, err := e.DAG().GetAncestors(target)
-	if err != nil {
-		return err
-	}
-
-	deps := append(ancestors, target)
-
-	log.Tracef("Scheduling rungen %v", target.FQN)
-
-	pool.ScheduleWith(
-		worker.ScheduleOptions{
-			OnSchedule: func() {
-				wg.Add()
-			},
-		},
-		&worker.Job{
-			ID: "rungen-" + target.FQN,
-			Wait: func(ctx context.Context) {
-				select {
-				case <-ctx.Done():
-				case <-deps.WaitAllRan():
-				}
-				return
-			},
-			Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
-				w.Status(fmt.Sprintf("Static analysis on %v...", target.FQN))
-				defer func() {
-					w.Status(fmt.Sprintf("Static analysis on %v done: %v", target.FQN, ferr))
-				}()
-
-				err := e.runGenerated(target)
-				if err != nil {
-					return TargetFailedError{
-						Target: target,
-						Err:    err,
-					}
-				}
-
-				wg.Sub()
-
-				return nil
-			},
-		})
-
-	return nil
-}
-
 func isEdgeDuplicateError(err error) bool {
 	_, is := err.(dag.EdgeDuplicateError)
 	return is
@@ -434,9 +383,9 @@ func (e *Engine) createDag() error {
 
 	for _, target := range targets {
 		for _, dep := range target.Deps.Targets {
-			err := e.dag.AddEdge(dep.FQN, target.FQN)
+			err := e.dag.AddEdge(dep.Target.FQN, target.FQN)
 			if err != nil && !isEdgeDuplicateError(err) {
-				return fmt.Errorf("dep: %v to %v: %w", dep.FQN, target.FQN, err)
+				return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
 			}
 		}
 
@@ -637,7 +586,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 			return fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
-		if len(tt.Out) == 0 {
+		if len(tt.Out.All()) == 0 {
 			return fmt.Errorf("%v does not output anything", tt.FQN)
 		}
 
@@ -703,17 +652,15 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		t.HashDeps = t.Deps
 	}
 
-	t.Out = []PackagePath{}
+	t.Out = &TargetNamedPackagePath{}
 	for _, file := range t.TargetSpec.Out {
-		t.Out = append(t.Out, PackagePath{
+		t.Out.Add(file.Name, PackagePath{
 			Package: file.Package,
 			Path:    file.Path,
 		})
 	}
 
-	sort.SliceStable(t.Out, func(i, j int) bool {
-		return t.Out[i].RelRoot() < t.Out[j].RelRoot()
-	})
+	t.Out.Sort()
 
 	if t.TargetSpec.ShouldCache {
 		if !t.TargetSpec.Sandbox {
@@ -721,7 +668,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		}
 
 		if t.TargetSpec.CachedFiles == nil {
-			t.CachedFiles = t.Out
+			t.CachedFiles = t.Out.All()
 		} else {
 			t.CachedFiles = []PackagePath{}
 			for _, p := range t.TargetSpec.CachedFiles {
@@ -773,7 +720,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 					return TargetDeps{}, fmt.Errorf("collect: %w", err)
 				}
 
-				td.Targets = append(td.Targets, target)
+				td.Targets = append(td.Targets, TargetWithOutput{Target: target})
 			}
 		case "find_parent":
 			target, err := e.findParent(t, expr)
@@ -786,7 +733,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 				return TargetDeps{}, fmt.Errorf("find_parent: %w", err)
 			}
 
-			td.Targets = append(td.Targets, target)
+			td.Targets = append(td.Targets, TargetWithOutput{Target: target})
 		default:
 			return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
 		}
@@ -803,7 +750,10 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 			return TargetDeps{}, err
 		}
 
-		td.Targets = append(td.Targets, dt)
+		td.Targets = append(td.Targets, TargetWithOutput{
+			Target: dt,
+			Output: target.Output,
+		})
 	}
 
 	for _, file := range deps.Files {
@@ -814,11 +764,11 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 	}
 
 	if simplify {
-		targets := make(Targets, 0)
+		targets := make([]TargetWithOutput, 0)
 		for _, dep := range td.Targets {
-			if dep.IsGroup() {
-				targets = append(targets, dep.Deps.Targets...)
-				td.Files = append(td.Files, dep.Deps.Files...)
+			if dep.Target.IsGroup() {
+				targets = append(targets, dep.Target.Deps.Targets...)
+				td.Files = append(td.Files, dep.Target.Deps.Files...)
 			} else {
 				targets = append(targets, dep)
 			}
@@ -826,15 +776,15 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 		td.Targets = targets
 	}
 
-	td.Targets = utils.DedupKeepLast(td.Targets, func(t *Target) string {
-		return t.FQN
+	td.Targets = utils.DedupKeepLast(td.Targets, func(t TargetWithOutput) string {
+		return t.Target.FQN
 	})
 	td.Files = utils.DedupKeepLast(td.Files, func(t PackagePath) string {
 		return t.RelRoot()
 	})
 
 	sort.SliceStable(td.Targets, func(i, j int) bool {
-		return td.Targets[i].FQN < td.Targets[j].FQN
+		return td.Targets[i].Target.FQN < td.Targets[j].Target.FQN
 	})
 	sort.SliceStable(td.Files, func(i, j int) bool {
 		return td.Files[i].RelRoot() < td.Files[j].RelRoot()

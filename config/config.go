@@ -23,6 +23,7 @@ type Config struct {
 	} `yaml:"build_files"`
 	KeepSandbox bool   `yaml:"keep_sandbox"`
 	Locker      string `yaml:"locker"`
+	Extras      `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`
 }

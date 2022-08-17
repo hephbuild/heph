@@ -106,7 +106,7 @@ var rootCmd = &cobra.Command{
 
 		switchToPorcelain()
 
-		err := preRunWithStaticAnalysis(false)
+		err := preRunWithGen(false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -151,7 +151,7 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		err := preRunWithStaticAnalysis(false)
+		err := preRunWithGen(false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -183,7 +183,7 @@ func switchToPorcelain() {
 }
 
 func preRunAutocomplete() error {
-	return preRunWithStaticAnalysis(true)
+	return preRunWithGen(true)
 }
 
 func findRoot() (string, error) {
@@ -236,7 +236,7 @@ func engineInit() error {
 	return nil
 }
 
-func preRunWithStaticAnalysis(silent bool) error {
+func preRunWithGen(silent bool) error {
 	err := engineInit()
 	if err != nil {
 		return err
@@ -253,13 +253,13 @@ func preRunWithStaticAnalysis(silent bool) error {
 	pool := worker.NewPool(ctx, *workers)
 	defer pool.Stop()
 
-	err = Engine.ScheduleStaticAnalysis(ctx, pool)
+	err = Engine.ScheduleGenPass(pool)
 	if err != nil {
 		return err
 	}
 
 	if !silent && isTerm && !*plain {
-		err := DynamicRenderer("PreRun Static Analysis", ctx, cancel, pool)
+		err := DynamicRenderer("PreRun gen", ctx, cancel, pool)
 		if err != nil {
 			return fmt.Errorf("dynamic renderer: %w", err)
 		}

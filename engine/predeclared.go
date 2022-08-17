@@ -24,7 +24,7 @@ func init() {
 	predeclaredMod = mod
 }
 
-func predeclared(globals starlark.StringDict) starlark.StringDict {
+func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	p := starlark.StringDict{}
 	p["internal_target"] = starlark.NewBuiltin("internal_target", internal_target)
 	p["glob"] = starlark.NewBuiltin("glob", glob)
@@ -35,16 +35,18 @@ func predeclared(globals starlark.StringDict) starlark.StringDict {
 	p["to_json"] = starlark.NewBuiltin("to_json", to_json)
 	p["fail"] = starlark.NewBuiltin("fail", fail)
 
-	for name, value := range globals {
-		if strings.HasPrefix(name, "_") {
-			continue
-		}
+	for _, globals := range globals {
+		for name, value := range globals {
+			if strings.HasPrefix(name, "_") {
+				continue
+			}
 
-		if _, ok := p[name]; ok {
-			panic(fmt.Sprintf("%v is already delcared", name))
-		}
+			if _, ok := p[name]; ok {
+				panic(fmt.Sprintf("%v is already delcared", name))
+			}
 
-		p[name] = value
+			p[name] = value
+		}
 	}
 
 	return p

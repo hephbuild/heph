@@ -1,5 +1,7 @@
 package config
 
+type Extras map[string]interface{}
+
 type FileConfig struct {
 	BaseConfig `yaml:",inline"`
 	Cache      map[string]FileCache `yaml:",omitempty"`
@@ -8,6 +10,7 @@ type FileConfig struct {
 	} `yaml:"build_files"`
 	KeepSandbox *bool  `yaml:"keep_sandbox"`
 	Locker      string `yaml:"locker"`
+	Extras      `yaml:",inline"`
 }
 
 func (fc FileConfig) ApplyTo(c Config) Config {
@@ -42,6 +45,14 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	}
 
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)
+
+	if c.Extras == nil {
+		c.Extras = map[string]interface{}{}
+	}
+
+	for k, v := range fc.Extras {
+		c.Extras[k] = v
+	}
 
 	return c
 }

@@ -31,7 +31,7 @@ func setupRootUsage() {
 			return defUsage(cmd)
 		}
 
-		err := preRunWithStaticAnalysis(false)
+		err := preRunWithGen(false)
 		if err != nil {
 			return err
 		}
