@@ -30,14 +30,18 @@ var libTplStr = `
 
 go = "{{.Config.Go}}"
 
-gen_importcfg = [
-	'echo $SANDBOX',
-	'cat "$SANDBOX/{{.Config.StdPkgsListFile}}" | xargs -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > $SANDBOX/importconfig',
-	'find "$SANDBOX" -name "importcfg" | xargs -I{} cat {} | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'
-]
+xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s")+" 100000"
+
+def gen_importcfg():
+	return [
+		'echo "Gen importconfig..."',
+		'echo "std: $SANDBOX/{{.Config.StdPkgsListFile}}"',
+		'cat "$SANDBOX/{{.Config.StdPkgsListFile}}" | '+xargs+' -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > $SANDBOX/importconfig',
+		'find "$SANDBOX" -name "importcfg" | '+xargs+' -I{} cat {} | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig',
+	]
 
 def compile_cmd(files, dir=None):
-    return gen_importcfg + [
+    return [
 		'echo "Compiling ({})..."'.format(dir),
         ('cd '+dir+' && ' if dir else '') + 'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o lib.a -pack '+files,
 		'echo "packagefile {{.ImportPath}}=$PACKAGE/lib.a" > importcfg',
@@ -46,7 +50,7 @@ def compile_cmd(files, dir=None):
 target(
     name="{{.Target.Name}}",
     deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
-    run=compile_cmd("{{.CompileFiles}}"),
+    run=gen_importcfg()+compile_cmd("{{.CompileFiles}}"),
     out=['lib.a', 'importcfg'],
     tools=[go],
     env={

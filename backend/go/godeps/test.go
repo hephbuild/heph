@@ -45,7 +45,7 @@ test_build = target(
     run=[
 		'generate_testmain {{.ImportPath}} {{.TestFilesForAnalysis}}',
 		'mkdir -p testmain && mv _testmain.go testmain',
-	] + compile_cmd("*.go") + compile_cmd("*.go", "testmain") + [
+	] + gen_importcfg() + compile_cmd("*.go") + compile_cmd("*.go", "testmain") + [
 		'echo Linking bin...',
         'go tool link -importcfg "$SANDBOX/importconfig" -o pkg.test testmain/lib.a',
 	],

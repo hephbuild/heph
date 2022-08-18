@@ -149,6 +149,11 @@ func goListWithTransitiveTestDeps() Packages {
 			pkg.IsPartOfModule = len(rel) > 0 && !strings.Contains(rel, "..")
 		}
 
+		if !StdPackages.Includes(pkg.ImportPath) {
+			fmt.Println(pkg.Dir)
+			fmt.Printf("Attr IsPartOfTree: %v IsPartOfModule: %v\n", pkg.IsPartOfTree, pkg.IsPartOfModule)
+		}
+
 		if pkg.IsPartOfModule {
 			// We only care about transitive test deps of the stuff we will test
 

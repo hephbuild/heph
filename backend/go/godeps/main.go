@@ -17,8 +17,11 @@ func thirdpartyDownloadTarget(pkg *Package) Target {
 
 func libTarget(pkg *Package) Target {
 	if pkg.IsPartOfTree {
-		pkgName := filepath.Join(Env.Package, strings.TrimPrefix(pkg.ImportPath, filepath.Base(Env.Package)))
-		pkgName = strings.TrimPrefix(pkgName, "/")
+		rel, err := filepath.Rel(Env.Sandbox, pkg.Dir)
+		if err != nil {
+			panic(err)
+		}
+		pkgName := strings.Trim(rel, "/")
 
 		return Target{
 			Name:    "_go_lib",
@@ -99,16 +102,15 @@ func generate() []RenderUnit {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
 				_, pkgDeps := splitOutPkgs(pkg.Imports)
 
-				// tests depend on self lib
+				imports := append(pkgTestDeps, pkgDeps...)
 				imports = append(imports, pkg.ImportPath)
 
 				deps := make([]string, 0)
-
 				deps = append(deps, pkg.GoFiles...)
 				deps = append(deps, pkg.TestGoFiles...)
 				deps = append(deps, pkg.XTestGoFiles...)
 
-				for _, p := range append(pkgTestDeps, pkgDeps...) {
+				for _, p := range imports {
 					t := libTarget(pkgs.Find(p))
 
 					deps = append(deps, t.Full())
