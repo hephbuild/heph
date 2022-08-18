@@ -16,7 +16,7 @@ func thirdpartyDownloadTarget(pkg *Package) Target {
 }
 
 func libTarget(pkg *Package) Target {
-	if pkg.IsPartOfModule {
+	if pkg.IsPartOfTree {
 		pkgName := filepath.Join(Env.Package, strings.TrimPrefix(pkg.ImportPath, filepath.Base(Env.Package)))
 		pkgName = strings.TrimPrefix(pkgName, "/")
 
@@ -72,7 +72,7 @@ func generate() []RenderUnit {
 
 		_, imports := splitOutPkgs(pkg.Imports)
 
-		if pkg.IsPartOfModule {
+		if pkg.IsPartOfTree {
 			deps := make([]string, 0)
 			deps = append(deps, pkg.GoFiles...)
 
@@ -97,7 +97,7 @@ func generate() []RenderUnit {
 				Package: lib.Target.Package,
 			})
 
-			if len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0 {
+			if pkg.IsPartOfModule && len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0 {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
 				_, pkgDeps := splitOutPkgs(pkg.Imports)
 

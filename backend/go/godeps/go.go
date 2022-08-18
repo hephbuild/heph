@@ -37,6 +37,7 @@ type Package struct {
 
 	// Part of our own module
 	IsPartOfModule bool     `json:"-"`
+	IsPartOfTree   bool     `json:"-"`
 	TestDeps       []string `json:"-"`
 }
 
@@ -132,12 +133,19 @@ func goListWithTransitiveTestDeps() Packages {
 	pkgs := goList("./...")
 
 	for _, pkg := range pkgs[:] {
-		var modrel string
 		if pkg.Module != nil {
-			modrel, _ = filepath.Rel(os.Getenv("SANDBOX"), pkg.Module.Dir)
+			if replace := pkg.Module.Replace; replace != nil {
+				pkg.IsPartOfTree = strings.Contains(replace.Dir, "..")
+			}
 		}
 
-		pkg.IsPartOfModule = len(modrel) > 0 && !strings.Contains(modrel, "..")
+		if pkg.IsPartOfTree {
+			var modrel string
+			if pkg.Module != nil {
+				modrel, _ = filepath.Rel(Env.Sandbox, pkg.Module.Dir)
+			}
+			pkg.IsPartOfModule = len(modrel) > 0 && !strings.Contains(modrel, "..")
+		}
 
 		if pkg.IsPartOfModule {
 			// We only care about transitive test deps of the stuff we will test
