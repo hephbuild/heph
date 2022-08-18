@@ -29,6 +29,7 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	p["internal_target"] = starlark.NewBuiltin("internal_target", internal_target)
 	p["glob"] = starlark.NewBuiltin("glob", glob)
 	p["package_name"] = starlark.NewBuiltin("package_name", package_name)
+	p["package_dir"] = starlark.NewBuiltin("package_dir", package_dir)
 	p["package_fqn"] = starlark.NewBuiltin("package_fqn", package_fqn)
 	p["get_os"] = starlark.NewBuiltin("get_os", get_os)
 	p["get_arch"] = starlark.NewBuiltin("get_arch", get_arch)
@@ -182,6 +183,12 @@ func package_name(thread *starlark.Thread, fn *starlark.Builtin, args starlark.T
 	pkg := getPackage(thread)
 
 	return starlark.String(pkg.Name), nil
+}
+
+func package_dir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	pkg := getPackage(thread)
+
+	return starlark.String(pkg.FullName), nil
 }
 
 func package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {

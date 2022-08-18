@@ -61,12 +61,13 @@ generate_testmain = target(
     },
 )
 
-std_importcfg = target(
-    name="_std_importcfg",
+std_pkgs = target(
+    name="_std_pkgs",
     tools=[go],
-    run='go list std | xargs -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > importconfig',
-    out="importcfg",
+    run='export CGO_ENABLED=1 && go list std > std_list',
+    out="std_list",
 )
+backend_dir = package_dir()
 
 def go_install(name, pkg, version, bin_name):
     return target(
@@ -104,6 +105,8 @@ def go_mod(mod_pkgs=[], test={}):
         'go': go,
         'godeps': godeps,
         'generate_testmain': generate_testmain,
+        'std_pkgs_target': std_pkgs,
+        'std_pkgs_list_file': backend_dir+"/std_list",
     }
 
     target(

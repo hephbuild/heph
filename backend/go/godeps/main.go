@@ -70,13 +70,13 @@ func generate() []RenderUnit {
 			continue
 		}
 
-		std, other := splitOutPkgs(pkg.Imports)
+		_, imports := splitOutPkgs(pkg.Imports)
 
 		if pkg.IsPartOfModule {
 			deps := make([]string, 0)
 			deps = append(deps, pkg.GoFiles...)
 
-			for _, p := range other {
+			for _, p := range imports {
 				t := libTarget(pkgs.Find(p))
 
 				deps = append(deps, t.Full())
@@ -87,8 +87,6 @@ func generate() []RenderUnit {
 				ImportPath:   pkg.ImportPath,
 				ModRoot:      modRoot,
 				Deps:         deps,
-				StdPkgs:      std,
-				Pkgs:         other,
 				CompileFiles: []string{"*.go"},
 			}
 
@@ -100,17 +98,19 @@ func generate() []RenderUnit {
 			})
 
 			if len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0 {
-				std, other := splitOutPkgs(pkg.TestDeps)
+				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
+				_, pkgDeps := splitOutPkgs(pkg.Imports)
 
 				// tests depend on self lib
-				other = append(other, pkg.ImportPath)
+				imports = append(imports, pkg.ImportPath)
 
 				deps := make([]string, 0)
 
+				deps = append(deps, pkg.GoFiles...)
 				deps = append(deps, pkg.TestGoFiles...)
 				deps = append(deps, pkg.XTestGoFiles...)
 
-				for _, p := range other {
+				for _, p := range append(pkgTestDeps, pkgDeps...) {
 					t := libTarget(pkgs.Find(p))
 
 					deps = append(deps, t.Full())
@@ -123,8 +123,6 @@ func generate() []RenderUnit {
 					PreRun:        Config.Test.PreRun,
 					TestFiles:     pkg.TestGoFiles,
 					XTestFiles:    pkg.XTestGoFiles,
-					StdPkgs:       std,
-					Pkgs:          other,
 				}
 
 				units = append(units, RenderUnit{
@@ -160,7 +158,7 @@ func generate() []RenderUnit {
 
 			deps := make([]string, 0)
 			deps = append(deps, moddl.Target.Full())
-			for _, p := range other {
+			for _, p := range imports {
 				t := libTarget(pkgs.Find(p))
 
 				deps = append(deps, t.Full())
@@ -172,8 +170,6 @@ func generate() []RenderUnit {
 				ModRoot:      modRoot,
 				Deps:         deps,
 				CompileFiles: pkg.GoFiles,
-				Pkgs:         other,
-				StdPkgs:      std,
 			}
 
 			units = append(units, RenderUnit{

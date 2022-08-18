@@ -13,8 +13,6 @@ type LibTest struct {
 	PreRun        string
 	TestFiles     []string
 	XTestFiles    []string
-	StdPkgs       []string
-	Pkgs          []string
 }
 
 func (t LibTest) Data() interface{} {
@@ -30,8 +28,6 @@ func (t LibTest) Data() interface{} {
 		"Config":               Config,
 		"ImportPath":           t.ImportPath,
 		"Deps":                 genArray(t.Deps, 2),
-		"Pkgs":                 genArray(t.Pkgs, 3),
-		"StdPkgs":              genArray(t.StdPkgs, 3),
 		"PreRun":               t.PreRun,
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
 	}
@@ -43,52 +39,9 @@ var testTplStr = `
 go = "{{.Config.Go}}"
 generate_testmain = "{{.Config.GenerateTestMain}}"
 
-test_std_pkgs = [
-	"os",
-	"reflect",
-	"testing",
-	"testing/internal/testdeps",
-    "flag",
-    "internal/sysinfo",
-    "strings",
-    "bytes",
-    "path/filepath",
-    "math/rand",
-    "runtime/debug",
-    "runtime/trace",
-    "bufio",
-    "context",
-    "internal/fuzz",
-    "os/signal",
-    "regexp",
-    "runtime/pprof",
-	"go/ast",
-	"go/parser",
-	"go/token",
-	"crypto/sha256",
-	"internal/godebug",
-	"io/ioutil",
-	"encoding/binary",
-	"os/exec",
-	"encoding/json",
-	"regexp/syntax",
-	"text/tabwriter",
-	"compress/gzip",
-	"go/scanner",
-	"go/internal/typeparams",
-	"crypto",
-	"hash",
-	"encoding",
-	"encoding/base64",
-	"unicode/utf16",
-	"compress/flate",
-	"hash/crc32",
-	"runtime/cgo",
-]
-
 test_build = target(
     name="go_test#build",
-    deps={{.Deps}},
+    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
     run=[
 		'generate_testmain {{.ImportPath}} {{.TestFilesForAnalysis}}',
 		'mkdir -p testmain && mv _testmain.go testmain',
@@ -101,8 +54,6 @@ test_build = target(
     env={
         "OS": get_os(),
         "ARCH": get_arch(),
-        "PKGS": " ".join({{.Pkgs}}),
-        "STD_PKGS": " ".join({{.StdPkgs}}+test_std_pkgs),
     },
 )
 

@@ -12,8 +12,6 @@ type Lib struct {
 	ModRoot      string
 	Deps         []string
 	CompileFiles []string
-	StdPkgs      []string
-	Pkgs         []string
 }
 
 func (l Lib) Data() map[string]interface{} {
@@ -23,8 +21,6 @@ func (l Lib) Data() map[string]interface{} {
 		"ImportPath":   l.ImportPath,
 		"Target":       l.Target,
 		"Deps":         genArray(l.Deps, 2),
-		"Pkgs":         genArray(l.Pkgs, 3),
-		"StdPkgs":      genArray(l.StdPkgs, 3),
 		"CompileFiles": strings.Join(l.CompileFiles, " "),
 	}
 }
@@ -36,7 +32,7 @@ go = "{{.Config.Go}}"
 
 gen_importcfg = [
 	'echo $SANDBOX',
-    'echo "$STD_PKGS" | tr " " "\n" | xargs -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > $SANDBOX/importconfig',
+	'cat "$SANDBOX/{{.Config.StdPkgsListFile}}" | xargs -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > $SANDBOX/importconfig',
 	'find "$SANDBOX" -name "importcfg" | xargs -I{} cat {} | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'
 ]
 
@@ -49,15 +45,13 @@ def compile_cmd(files, dir=None):
 
 target(
     name="{{.Target.Name}}",
-    deps={{.Deps}},
+    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
     run=compile_cmd("{{.CompileFiles}}"),
     out=['lib.a', 'importcfg'],
     tools=[go],
     env={
         "OS": get_os(),
         "ARCH": get_arch(),
-        "PKGS": " ".join({{.Pkgs}}),
-        "STD_PKGS": " ".join({{.StdPkgs}}),
     },
 )
 
