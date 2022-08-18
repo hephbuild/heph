@@ -134,17 +134,19 @@ func goListWithTransitiveTestDeps() Packages {
 
 	for _, pkg := range pkgs[:] {
 		if pkg.Module != nil {
-			if replace := pkg.Module.Replace; replace != nil {
-				pkg.IsPartOfTree = strings.Contains(replace.Dir, "..")
+			var rel string
+			if pkg.Module != nil {
+				rel, _ = filepath.Rel(Env.Sandbox, pkg.Module.Dir)
 			}
+			pkg.IsPartOfTree = len(rel) > 0 && !strings.Contains(rel, "..")
 		}
 
 		if pkg.IsPartOfTree {
-			var modrel string
+			var rel string
 			if pkg.Module != nil {
-				modrel, _ = filepath.Rel(Env.Sandbox, pkg.Module.Dir)
+				rel, _ = filepath.Rel(filepath.Join(Env.Sandbox, Env.Package), pkg.Dir)
 			}
-			pkg.IsPartOfModule = len(modrel) > 0 && !strings.Contains(modrel, "..")
+			pkg.IsPartOfModule = len(rel) > 0 && !strings.Contains(rel, "..")
 		}
 
 		if pkg.IsPartOfModule {

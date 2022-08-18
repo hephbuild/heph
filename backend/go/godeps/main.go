@@ -63,10 +63,8 @@ func generate() []RenderUnit {
 
 	modRoot := filepath.Dir(Env.Package)
 
-	stdPkgs := goListStd()
-
 	for _, pkg := range pkgs {
-		if stdPkgs.Includes(pkg.ImportPath) {
+		if StdPackages.Includes(pkg.ImportPath) {
 			continue
 		}
 
