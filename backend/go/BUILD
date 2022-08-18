@@ -39,9 +39,9 @@ target(
 
 godeps = target(
     name="_godeps#build",
-    deps=glob("**/*.go")+["go.mod"],
-    run="go build -o godeps .",
-    out={"godeps": "godeps"},
+    deps=glob("godeps/**/*.go")+["godeps/go.mod"],
+    run="cd godeps && go build -o godeps .",
+    out={"godeps": "godeps/godeps"},
     tools=[go],
     env={
         "OS": get_os(),
@@ -59,6 +59,13 @@ generate_testmain = target(
         "OS": get_os(),
         "ARCH": get_arch(),
     },
+)
+
+std_importcfg = target(
+    name="_std_importcfg",
+    tools=[go],
+    run='go list std | xargs -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > importconfig',
+    out="importcfg",
 )
 
 def go_install(name, pkg, version, bin_name):
@@ -102,7 +109,7 @@ def go_mod(mod_pkgs=[], test={}):
     target(
         name="_go_mod_gen",
         run="godeps \"$TARGET\" mod '{}'".format(to_json(godeps_cfg)),
-        out="/**/BUILD.gen",
+        out="/**/BUILD",
         deps=[src]+mod_pkg_srcs,
         tools=[go, godeps],
         env={

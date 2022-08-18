@@ -16,7 +16,7 @@ func (p TargetPath) Full() string {
 	return fmt.Sprintf("//%v:%v", p.Package, p.Name)
 }
 
-var packageRegex = regexp.MustCompile(`^[A-Za-z\d\-_/]*$`)
+var packageRegex = regexp.MustCompile(`^[A-Za-z\d\-._/]*$`)
 var targetNameRegex = regexp.MustCompile(`^[A-Za-z\d\-.+_#]*$`)
 var outputNameRegex = regexp.MustCompile(`^[A-Za-z\d\-_]*$`)
 
