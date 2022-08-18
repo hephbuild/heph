@@ -8,7 +8,7 @@ target(
 
 target(
     name="intg_test",
-    run="$HEPH query --include //test/... | #HEPH query --include test - | $HEPH run -",
+    run="$HEPH query --include //test/... | $HEPH query --include test - | $HEPH run -",
     pass_env=["PATH"],
     sandbox=False,
     cache=False,

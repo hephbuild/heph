@@ -4,10 +4,15 @@ on:
   push:
     branches: [ master ]
 
+env:
+  NOCACHE: "Cache-Control: no-cache, no-store"
+
 jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v2
 
@@ -31,9 +36,13 @@ jobs:
       - name: intg ReTest
         run: "./heph intg_test"
 
-  release:
-    name: Release
+  build:
+    name: Build
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    outputs:
+      version: ${{ steps.upload.outputs.version }}
     steps:
       - uses: actions/checkout@v2
 
@@ -66,15 +75,34 @@ jobs:
         uses: 'google-github-actions/setup-gcloud@v0'
 
       - name: Copy to bucket
+        id: upload
         run: |
-          VERSION=$(./heph run --porcelain //:version)
-          NOCACHE="Cache-Control: no-cache, no-store"
-          
-          echo $VERSION
+          VERSION=$(./heph run --porcelain //:version)          
+          echo "::set-output name=version::$VERSION"
 
-          echo $VERSION > ./latest_version
+          echo $VERSION
 
           gsutil -h "${NOCACHE}" rsync -r './dist' gs://heph-build/${VERSION}
           gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
           gsutil -h "${NOCACHE}" cp './hephw' gs://heph-build/hephw
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [ build, test ]
+    steps:
+      - name: 'Authenticate to Google Cloud'
+        uses: 'google-github-actions/auth@v0'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: 'Set up Cloud SDK'
+        uses: 'google-github-actions/setup-gcloud@v0'
+
+      - name: Copy to bucket
+        run: |
+          VERSION=${{needs.build.outputs.version}}
+          
+          echo $VERSION > ./latest_version
+          
           gsutil -h "${NOCACHE}" cp './latest_version' gs://heph-build/latest_version
