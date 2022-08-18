@@ -1,6 +1,14 @@
 target(
-    name="test",
+    name="e2e_test",
     run="$HEPH query --include e2e_test | $HEPH run -",
+    pass_env=["PATH"],
+    sandbox=False,
+    cache=False,
+)
+
+target(
+    name="intg_test",
+    run="$HEPH query --include //test/... | #HEPH query --include test - | $HEPH run -",
     pass_env=["PATH"],
     sandbox=False,
     cache=False,

@@ -19,11 +19,17 @@ jobs:
       - name: Build
         run: go build -v -o heph .
 
-      - name: Test
-        run: "./heph test"
+      - name: E2E Test
+        run: "./heph e2e_test"
 
-      - name: ReTest
-        run: "./heph test"
+      - name: E2E ReTest
+        run: "./heph e2e_test"
+
+      - name: intg Test
+        run: "./heph intg_test"
+
+      - name: intg ReTest
+        run: "./heph intg_test"
 
   release:
     name: Release
