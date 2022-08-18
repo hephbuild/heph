@@ -69,7 +69,7 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 }
 
 func (e *Engine) tmpRoot(target *Target) string {
-	return filepath.Join(e.HomeDir, "tmp", target.Package.FullName, target.Name)
+	return filepath.Join(e.HomeDir, "tmp", target.Package.FullName, "__target_"+target.Name)
 }
 
 func (e *Engine) lockPath(target *Target, resource string) string {

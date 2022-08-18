@@ -2,6 +2,8 @@ target(
     name="test",
     run="$HEPH query --include e2e_test | $HEPH run -",
     pass_env=["PATH"],
+    sandbox=False,
+    cache=False,
 )
 
 go_env_vars = ["GOROOT", "GOPATH", "HOME"]

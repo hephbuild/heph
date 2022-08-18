@@ -11,7 +11,7 @@ import (
 )
 
 func (e *Engine) cacheDir(target *Target, inputHash string) string {
-	return filepath.Join(e.HomeDir, "cache", target.Package.FullName, target.Name, inputHash)
+	return filepath.Join(e.HomeDir, "cache", target.Package.FullName, "__target_"+target.Name, inputHash)
 }
 
 func (e *Engine) targetOutputTarFile(target *Target, inputHash string) string {

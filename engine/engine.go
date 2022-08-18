@@ -466,7 +466,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 }
 
 func (e *Engine) sandboxRoot(target *Target) string { // TODO: PackagePath
-	return filepath.Join(e.HomeDir, "sandbox", target.Package.FullName, target.Name)
+	return filepath.Join(e.HomeDir, "sandbox", target.Package.FullName, "__target_"+target.Name)
 }
 
 func (e *Engine) Clean(async bool) error {

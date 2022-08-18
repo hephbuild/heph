@@ -2,8 +2,10 @@ package utils
 
 import (
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"syscall"
 )
@@ -40,11 +42,27 @@ func (l *Flock) Lock() error {
 		return fmt.Errorf("open %s to acquire lock: %w", l.path, err)
 	}
 
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("acquire lock for %s: %w", l.path, err)
+	log.Debug("Attempting to acquire lock for %s...", f.Name())
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		pid, err := os.ReadFile(f.Name())
+		if err == nil && len(pid) > 0 {
+			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), f.Name())
+		} else {
+			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", f.Name())
+		}
+
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			return fmt.Errorf("acquire lock for %s: %w", l.path, err)
+		}
 	}
+	log.Debug("Acquired lock for %s", f.Name())
 
 	l.f = f
+
+	if err := f.Truncate(0); err == nil {
+		f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+	}
 
 	return nil
 }
