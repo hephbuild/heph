@@ -18,30 +18,50 @@ func init() {
 
 const buildFilesPattern = "**/{BUILD,BUILD.*}"
 
-func (e *Engine) runBuildFiles() error {
+func (e *Engine) collectBuildFiles(root string) (SourceFiles, error) {
+	files := make(SourceFiles, 0)
+
 	walkStartTime := time.Now()
-	err := utils.StarWalk(e.Root, buildFilesPattern, e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(root, buildFilesPattern, e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}
 
-		e.SourceFiles = append(e.SourceFiles, &SourceFile{
-			Path: filepath.Join(e.Root, path),
+		files = append(files, &SourceFile{
+			Path: filepath.Join(root, path),
 		})
 		return nil
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	log.Tracef("RunBuildFiles:walk took %v", time.Now().Sub(walkStartTime))
 
-	for _, file := range e.SourceFiles {
-		pkg := e.populatePkg(file)
+	return files, err
+}
 
+func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *Package) error {
+	files, err := e.collectBuildFiles(root)
+	if err != nil {
+		return err
+	}
+
+	pkgs := make([]*Package, 0)
+	for _, file := range files {
+		relRoot, err := filepath.Rel(e.Root, filepath.Dir(file.Path))
+		if err != nil {
+			panic(err)
+		}
+
+		pkg := pkgProvider(relRoot)
+
+		pkgs = append(pkgs, pkg)
+
+		e.SourceFiles = append(e.SourceFiles, file)
 		pkg.SourceFiles = append(pkg.SourceFiles, file)
 	}
 
-	for _, pkg := range e.Packages {
+	for _, pkg := range pkgs {
 		err := e.runBuildFilesForPackage(pkg)
 		if err != nil {
 			return err
@@ -85,7 +105,7 @@ type runBuildEngine struct {
 	registerTarget func(TargetSpec) error
 }
 
-func (e *Engine) createPkg(path string) *Package {
+func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *Package) *Package {
 	e.packagesMutex.Lock()
 	defer e.packagesMutex.Unlock()
 
@@ -100,18 +120,28 @@ func (e *Engine) createPkg(path string) *Package {
 		name = ""
 	}
 
-	pkg := &Package{
-		Name:     name,
-		FullName: fullname,
-		Root: Path{
-			RelRoot: path,
-			Abs:     filepath.Join(e.Root, path),
-		},
+	pkg := fn(fullname, name)
+
+	if fullname != pkg.FullName {
+		panic(fmt.Sprintf("pkg fullname don't match, %v %v", fullname, pkg.FullName))
 	}
 
-	e.Packages[pkg.FullName] = pkg
+	e.Packages[fullname] = pkg
 
 	return pkg
+}
+
+func (e *Engine) createPkg(path string) *Package {
+	return e.getOrCreatePkg(path, func(fullname, name string) *Package {
+		return &Package{
+			Name:     name,
+			FullName: fullname,
+			Root: Path{
+				RelRoot: path,
+				Abs:     filepath.Join(e.Root, path),
+			},
+		}
+	})
 }
 
 func (e *Engine) populatePkg(file *SourceFile) *Package {
@@ -153,26 +183,34 @@ func (e *runBuildEngine) config() starlark.StringDict {
 	}
 }
 
+func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.StringDict, error) {
+	p, err := utils.TargetParse(e.pkg.FullName, module)
+	if err != nil {
+		return nil, err
+	}
+
+	pkg, err := e.loadFromRoots(p.Package)
+	if err != nil {
+		return nil, err
+	}
+
+	if pkg == nil {
+		pkg = e.createPkg(p.Package)
+	}
+
+	err = e.runBuildFilesForPackage(pkg)
+	if err != nil {
+		return nil, fmt.Errorf("load: %w", err)
+	}
+
+	return pkg.Globals, nil
+}
+
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
+	log.Tracef("BUILD: running %v", path)
+
 	thread := &starlark.Thread{
-		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
-			p, err := utils.TargetParse(e.pkg.FullName, module)
-			if err != nil {
-				return nil, err
-			}
-
-			pkg, ok := e.Packages[p.Package]
-			if !ok {
-				return nil, fmt.Errorf("pkg not found")
-			}
-
-			err = e.runBuildFilesForPackage(pkg)
-			if err != nil {
-				return nil, fmt.Errorf("load: %w", err)
-			}
-
-			return pkg.Globals, nil
-		},
+		Load: e.load,
 	}
 	thread.SetLocal("engine", e)
 
@@ -182,6 +220,7 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	if err != nil {
 		return nil, err
 	}
+	globals.Freeze()
 
 	return starlark.ExecFile(thread, path, nil, predeclared(globals, config))
 }

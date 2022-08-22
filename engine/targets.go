@@ -169,6 +169,13 @@ type Path struct {
 	RelRoot string
 }
 
+func (p Path) Join(elem ...string) Path {
+	return Path{
+		Abs:     filepath.Join(append([]string{p.Abs}, elem...)...),
+		RelRoot: filepath.Join(append([]string{p.RelRoot}, elem...)...),
+	}
+}
+
 type PackagePath struct {
 	Package *Package
 	Path    string
@@ -189,7 +196,7 @@ func (fp PackagePath) PkgRootAbs() string {
 }
 
 func (fp PackagePath) RelRoot() string {
-	return filepath.Join(fp.Package.Root.RelRoot, fp.Path)
+	return filepath.Join(fp.Package.FullName, fp.Path)
 }
 
 func (fp PackagePath) WithRoot(root string) PackagePath {
@@ -321,7 +328,9 @@ func (e *Engine) Parse() error {
 	upgrade.CheckAndUpdate(e.Config.Config)
 
 	runStartTime := time.Now()
-	err = e.runBuildFiles()
+	err = e.runBuildFiles(e.Root, func(dir string) *Package {
+		return e.createPkg(dir)
+	})
 	if err != nil {
 		return err
 	}

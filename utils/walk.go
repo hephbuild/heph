@@ -7,13 +7,19 @@ import (
 	"strings"
 )
 
-func isIgnored(s string, ignored []string) bool {
-	parts := strings.Split(s, string(filepath.Separator))
+func isIgnored(path string, ignored []string) bool {
+	parts := strings.Split(path, string(filepath.Separator))
 
-	for _, p := range parts {
-		for _, i := range ignored {
-			if i == p {
+	for _, i := range ignored {
+		if strings.HasPrefix(i, string(filepath.Separator)) {
+			if strings.HasPrefix(path, strings.TrimLeft(i, "/")) {
 				return true
+			}
+		} else {
+			for _, p := range parts {
+				if i == p {
+					return true
+				}
 			}
 		}
 	}
@@ -27,17 +33,17 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			return err
 		}
 
-		if isIgnored(path, ignore) {
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+
+		if isIgnored(rel, ignore) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			} else {
 				return nil
 			}
-		}
-
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
 		}
 
 		ok, err := doublestar.PathMatch(pattern, rel)

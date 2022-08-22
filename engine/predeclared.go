@@ -7,7 +7,6 @@ import (
 	"go.starlark.net/starlark"
 	"heph/utils"
 	"io/fs"
-	"path/filepath"
 	"runtime"
 	"strings"
 )
@@ -49,6 +48,7 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 			p[name] = value
 		}
 	}
+	p.Freeze()
 
 	return p
 }
@@ -144,7 +144,6 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 
 func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
-	e := getEngine(thread)
 
 	var (
 		pattern string
@@ -159,11 +158,8 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	allExclude := exclude.Array
-	allExclude = append(allExclude, filepath.Base(e.HomeDir))
-
 	elems := make([]starlark.Value, 0)
-	err := utils.StarWalk(pkg.Root.Abs, pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(pkg.Root.Abs, pattern, exclude.Array, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

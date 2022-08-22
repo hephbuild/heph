@@ -64,6 +64,7 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 					jobs:    pool.JobCount,
 					done:    pool.DoneCount,
 					workers: pool.Workers,
+					summary: true,
 				})
 				p.Quit()
 				return
@@ -128,6 +129,7 @@ type UpdateMessage struct {
 	workers []*worker.Worker
 	jobs    uint64
 	done    uint64
+	summary bool
 }
 
 type renderer struct {
@@ -157,8 +159,12 @@ func (r renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (r renderer) View() string {
-	if r.done == r.jobs {
-		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, r.done, round(time.Now().Sub(r.start), 1).String())
+	if r.summary {
+		count := fmt.Sprint(r.done)
+		if r.done != r.jobs {
+			count = fmt.Sprintf("%v/%v", r.done, r.jobs)
+		}
+		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, count, round(time.Now().Sub(r.start), 1).String())
 	}
 
 	var s strings.Builder

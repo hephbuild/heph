@@ -19,7 +19,8 @@ type Config struct {
 	BaseConfig `yaml:",inline"`
 	Cache      map[string]Cache
 	BuildFiles struct {
-		Ignore []string `yaml:""`
+		Ignore []string        `yaml:"ignore"`
+		Roots  map[string]Root `yaml:"roots"`
 	} `yaml:"build_files"`
 	KeepSandbox bool   `yaml:"keep_sandbox"`
 	Locker      string `yaml:"locker"`
@@ -32,6 +33,10 @@ type Cache struct {
 	URI   string
 	Read  bool
 	Write bool
+}
+
+type Root struct {
+	URI string
 }
 
 func Parse(name string) (FileConfig, error) {

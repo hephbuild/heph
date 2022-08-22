@@ -107,7 +107,8 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 	for _, dep := range deps.Array {
 		if expr, err := utils.ExprParse(dep); err == nil {
 			td.Exprs = append(td.Exprs, TargetSpecDepExpr{
-				Expr: expr,
+				Package: t.Package,
+				Expr:    expr,
 			})
 			continue
 		}
@@ -201,7 +202,8 @@ type TargetSpecDepTarget struct {
 }
 
 type TargetSpecDepExpr struct {
-	Expr *utils.Expr
+	Package *Package
+	Expr    *utils.Expr
 }
 
 type TargetSpecDepFile struct {

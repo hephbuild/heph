@@ -42,7 +42,7 @@ func (l *Flock) Lock() error {
 		return fmt.Errorf("open %s to acquire lock: %w", l.path, err)
 	}
 
-	log.Debug("Attempting to acquire lock for %s...", f.Name())
+	log.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		pid, err := os.ReadFile(f.Name())
@@ -56,7 +56,7 @@ func (l *Flock) Lock() error {
 			return fmt.Errorf("acquire lock for %s: %w", l.path, err)
 		}
 	}
-	log.Debug("Acquired lock for %s", f.Name())
+	log.Debugf("Acquired lock for %s", f.Name())
 
 	l.f = f
 

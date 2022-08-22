@@ -29,6 +29,7 @@ func init() {
 	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(targetCmd)
+	queryCmd.AddCommand(pkgsCmd)
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 
@@ -390,6 +391,40 @@ var targetCmd = &cobra.Command{
 			fmt.Printf("  %v\n", t.RelRoot())
 		}
 
+		return nil
+	},
+}
+
+var pkgsCmd = &cobra.Command{
+	Use:   "pkgs",
+	Short: "Prints pkgs details",
+	Args:  cobra.NoArgs,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		if spec {
+			return engineInit()
+		} else {
+			return preRunWithGen(false)
+		}
+	},
+	RunE: func(_ *cobra.Command, args []string) error {
+		pkgs := make([]*engine.Package, 0)
+		for _, p := range Engine.Packages {
+			pkgs = append(pkgs, p)
+		}
+		sort.SliceStable(pkgs, func(i, j int) bool {
+			return pkgs[i].FullName < pkgs[j].FullName
+		})
+
+		for _, p := range pkgs {
+			fullname := p.FullName
+			if fullname == "" {
+				fullname = "<root>"
+			}
+
+			fmt.Printf("%v\n", fullname)
+			fmt.Printf("  %v\n", p.Root.RelRoot)
+			fmt.Println()
+		}
 		return nil
 	},
 }

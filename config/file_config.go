@@ -6,7 +6,8 @@ type FileConfig struct {
 	BaseConfig `yaml:",inline"`
 	Cache      map[string]FileCache `yaml:",omitempty"`
 	BuildFiles struct {
-		Ignore []string `yaml:",omitempty"`
+		Ignore []string            `yaml:",omitempty"`
+		Roots  map[string]FileRoot `yaml:",omitempty"`
 	} `yaml:"build_files"`
 	KeepSandbox *bool  `yaml:"keep_sandbox"`
 	Locker      string `yaml:"locker"`
@@ -44,6 +45,14 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		}
 	}
 
+	if c.BuildFiles.Roots == nil {
+		c.BuildFiles.Roots = map[string]Root{}
+	}
+
+	for k, newRoot := range fc.BuildFiles.Roots {
+		c.BuildFiles.Roots[k] = newRoot.ApplyTo(c.BuildFiles.Roots[k])
+	}
+
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)
 
 	if c.Extras == nil {
@@ -74,6 +83,18 @@ func (fc FileCache) ApplyTo(c Cache) Cache {
 
 	if fc.Write != nil {
 		c.Write = *fc.Write
+	}
+
+	return c
+}
+
+type FileRoot struct {
+	URI string `yaml:"uri"`
+}
+
+func (fc FileRoot) ApplyTo(c Root) Root {
+	if fc.URI != "" {
+		c.URI = fc.URI
 	}
 
 	return c

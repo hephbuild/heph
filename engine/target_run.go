@@ -158,8 +158,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	log.Tracef("Bin %#v", bin)
 
 	sandboxRoot := e.sandboxRoot(target)
-	srcFiles := make([]string, 0)
-
 	var sandboxSpec = sandbox.Spec{}
 	if target.Sandbox {
 		e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
@@ -180,8 +178,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 						From: file.Abs(),
 						To:   file.RelRoot(),
 					})
-
-					srcFiles = append(srcFiles, file.RelRoot())
 				}
 			}
 		}
@@ -191,7 +187,10 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 				From: dep.Abs(),
 				To:   dep.RelRoot(),
 			})
-			srcFiles = append(srcFiles, dep.RelRoot())
+		}
+
+		for _, file := range src {
+			log.Tracef("src: %v", file.To)
 		}
 
 		var err error

@@ -548,7 +548,7 @@ func (e *Engine) parseConfigs() error {
 	cfg := config.Config{
 		Locker: "flock",
 	}
-	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, ".heph")
+	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
 
 	err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig"), &cfg)
 	if err != nil {
