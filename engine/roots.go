@@ -7,6 +7,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/config"
+	"heph/utils"
 	"io/fs"
 	"net/url"
 	"os"
@@ -17,11 +18,8 @@ import (
 )
 
 var cloneScript = `
-git clone {{.URL}} --no-checkout {{.Into}} --depth 1
-cd {{.Into}}
-#git sparse-checkout init --cone # to fetch only root files
-#git sparse-checkout set {{.Dirs}} # etc, to list sub-folders to checkout
-git checkout
+git clone {{.URL}} {{.Tmp}} --depth 1
+cp -r {{.Tmp}}/{{.Dir}}/. {{.Into}}
 `
 
 type RootConfig struct {
@@ -72,9 +70,10 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
 
 	var b bytes.Buffer
 	err = tpl.Execute(&b, map[string]interface{}{
+		"Tmp":  utils.RandPath(os.TempDir(), "heph_root", ""),
 		"URL":  guri.Repo,
 		"Into": srcRoot.Abs,
-		"Dirs": guri.Path,
+		"Dir":  guri.Path,
 	})
 	if err != nil {
 		return Path{}, err
@@ -86,20 +85,16 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
 		return Path{}, fmt.Errorf("%v: %s", err, ob)
 	}
 
-	return srcRoot.Join(guri.Path), nil
+	return srcRoot, nil
 }
 
-func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Package, error) {
+func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
 	p, err := e.fetchRoot(rootName, cfg)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	rootName, rest := e.splitRootNameFromPkgName(pkgName)
-
-	pkgPath := p.Join(rest)
-
-	err = e.runBuildFiles(pkgPath.Abs, func(dir string) *Package {
+	err = e.runBuildFiles(p.Abs, func(dir string) *Package {
 		rel, err := filepath.Rel(p.Abs, filepath.Join(e.Root, dir))
 		if err != nil {
 			panic(err)
@@ -114,8 +109,21 @@ func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Packa
 		})
 	})
 	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Package, error) {
+	p, err := e.fetchRoot(rootName, cfg)
+	if err != nil {
 		return nil, err
 	}
+
+	rootName, rest := e.splitRootNameFromPkgName(pkgName)
+
+	pkgPath := p.Join(rest)
 
 	pkg := e.getOrCreatePkg(pkgName, func(fullname, name string) *Package {
 		return &Package{

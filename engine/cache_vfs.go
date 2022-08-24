@@ -17,7 +17,12 @@ func (e *Engine) vfsCachePath(target *Target, inputHash string) string {
 }
 
 func (e *Engine) localCacheLocation(target *Target, inputHash string) (vfs.Location, error) {
-	return e.LocalCache.NewLocation(e.vfsCachePath(target, inputHash))
+	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target, inputHash))
+	if err != nil {
+		return nil, err
+	}
+
+	return e.LocalCache.NewLocation(rel + "/")
 }
 
 func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target, inputHash string) (vfs.Location, error) {

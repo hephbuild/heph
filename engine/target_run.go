@@ -174,6 +174,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
 				}
 				for _, file := range files {
+					file = file.WithPackagePath(true)
+
 					src = append(src, utils.TarFile{
 						From: file.Abs(),
 						To:   file.RelRoot(),
@@ -185,7 +187,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		for _, dep := range target.Deps.Files {
 			src = append(src, utils.TarFile{
 				From: dep.Abs(),
-				To:   dep.RelRoot(),
+				To:   dep.WithPackagePath(true).RelRoot(),
 			})
 		}
 
@@ -315,7 +317,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	_, hasPathInEnv := env["PATH"]
 
 	for i, c := range cmds {
-		dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.Root.RelRoot)
+		dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.FullName)
 		if target.RunInCwd {
 			if target.ShouldCache {
 				return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)

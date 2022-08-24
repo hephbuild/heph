@@ -1,3 +1,3 @@
-load("//go_backend/backend/go", "go_mod")
+load("//go_backend", "go_mod")
 
 go_mod()

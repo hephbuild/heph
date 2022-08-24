@@ -21,21 +21,14 @@ func (m ModDl) Data() interface{} {
 }
 
 var modTplStr = `
-# mod
+# mod {{.Path}}@{{.Version}}
 
-go = "{{.Config.Go}}"
-godeps = "{{.Config.GoDeps}}"
+load("{{.Config.BackendPkg}}", "go_mod_download")
 
-target(
+go_mod_download(
 	name="{{.Target.Name}}",
-	run=[
-		'echo module heph_ignore > go.mod', # stops go reading the main go.mod, and downloading all of those too
-		"go mod download -modcacherw -json {{.Path}}@{{.Version}} | tee mod.json",
-		'rm go.mod',
-		'export MOD_DIR=$(cat mod.json | awk -F\\" \'/"Dir": / { print $4 }\') && cp -r "$MOD_DIR/." .',
-	],
-	tools=[go],
-	out=["."],
+	path="{{.Path}}",
+	version="{{.Version}}",
 )
 
 # end mod

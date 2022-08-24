@@ -40,7 +40,7 @@ type HostTool struct {
 }
 
 func (tt TargetTool) AbsPath() string {
-	return filepath.Join(tt.Target.OutRoot.Abs, tt.Target.Package.Root.RelRoot, tt.RelPath)
+	return filepath.Join(tt.Target.OutRoot.Abs, tt.Target.Package.FullName, tt.RelPath)
 }
 
 type TargetDeps struct {
@@ -178,29 +178,47 @@ func (p Path) Join(elem ...string) Path {
 
 type PackagePath struct {
 	Package *Package
-	Path    string
-	Root    string
+	// Use Package.Fullname instead of Package.Root.RelRoot
+	PackagePath bool
+	Path        string
+	Root        string
 }
 
 func (fp PackagePath) Abs() string {
-	return filepath.Join(fp.PkgRootAbs(), fp.Path)
-}
-
-// PkgRootAbs is the absolute path to the package root
-func (fp PackagePath) PkgRootAbs() string {
+	var repoRoot string
 	if fp.Root != "" {
-		return filepath.Join(fp.Root, fp.Package.Root.RelRoot)
+		repoRoot = fp.Root
+	} else {
+		// TODO figure out a better way to get the repo root here
+		repoRoot = strings.TrimSuffix(fp.Package.Root.Abs, fp.Package.Root.RelRoot)
 	}
 
-	return fp.Package.Root.Abs
+	var pkgRoot string
+	if fp.PackagePath {
+		pkgRoot = filepath.Join(repoRoot, fp.Package.FullName)
+	} else {
+		pkgRoot = filepath.Join(repoRoot, fp.Package.Root.RelRoot)
+	}
+
+	return filepath.Join(pkgRoot, fp.Path)
 }
 
 func (fp PackagePath) RelRoot() string {
-	return filepath.Join(fp.Package.FullName, fp.Path)
+	base := fp.Package.Root.RelRoot
+	if fp.PackagePath {
+		base = fp.Package.FullName
+	}
+	return filepath.Join(base, fp.Path)
 }
 
 func (fp PackagePath) WithRoot(root string) PackagePath {
 	fp.Root = root
+
+	return fp
+}
+
+func (fp PackagePath) WithPackagePath(v bool) PackagePath {
+	fp.PackagePath = v
 
 	return fp
 }
@@ -326,6 +344,13 @@ func (e *Engine) Parse() error {
 	log.Tracef("ParseConfigs took %v", time.Since(configStartTime))
 
 	upgrade.CheckAndUpdate(e.Config.Config)
+
+	for name, cfg := range e.Config.BuildFiles.Roots {
+		err := e.runRootBuildFiles(name, cfg)
+		if err != nil {
+			return fmt.Errorf("root %v: %w", name, err)
+		}
+	}
 
 	runStartTime := time.Now()
 	err = e.runBuildFiles(e.Root, func(dir string) *Package {
@@ -664,8 +689,9 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	t.Out = &TargetNamedPackagePath{}
 	for _, file := range t.TargetSpec.Out {
 		t.Out.Add(file.Name, PackagePath{
-			Package: file.Package,
-			Path:    file.Path,
+			Package:     file.Package,
+			Path:        file.Path,
+			PackagePath: true,
 		})
 	}
 
@@ -682,8 +708,9 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 			t.CachedFiles = []PackagePath{}
 			for _, p := range t.TargetSpec.CachedFiles {
 				t.CachedFiles = append(t.CachedFiles, PackagePath{
-					Package: t.Package,
-					Path:    p,
+					Package:     t.Package,
+					Path:        p,
+					PackagePath: true,
 				})
 			}
 

@@ -368,7 +368,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 	}()
 
 	for _, file := range files {
-		file = file.WithRoot(target.OutRoot.Abs)
+		file = file.WithRoot(target.OutRoot.Abs).WithPackagePath(true)
 
 		abs := strings.HasPrefix(file.Path, "/")
 		path := strings.TrimPrefix(file.Path, "/")
@@ -380,19 +380,20 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 		if strings.Contains(path, "*") {
 			pattern := path
 			if !abs {
-				pattern = filepath.Join(pkg.Root.RelRoot, path)
+				pattern = filepath.Join(pkg.FullName, path)
 			}
 
 			err := utils.StarWalkAbs(target.OutRoot.Abs, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.Root.RelRoot), path)
+				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.FullName), path)
 				if err != nil {
 					return err
 				}
 
 				out = append(out, PackagePath{
-					Package: pkg,
-					Path:    relPkg,
-					Root:    target.OutRoot.Abs,
+					Package:     pkg,
+					Path:        relPkg,
+					Root:        target.OutRoot.Abs,
+					PackagePath: file.PackagePath,
 				})
 
 				return nil
@@ -415,15 +416,16 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 					return nil
 				}
 
-				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.Root.RelRoot), path)
+				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.FullName), path)
 				if err != nil {
 					return err
 				}
 
 				out = append(out, PackagePath{
-					Package: pkg,
-					Path:    relPkg,
-					Root:    target.OutRoot.Abs,
+					Package:     pkg,
+					Path:        relPkg,
+					Root:        target.OutRoot.Abs,
+					PackagePath: file.PackagePath,
 				})
 
 				return nil

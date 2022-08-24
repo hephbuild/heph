@@ -26,37 +26,15 @@ func (l Lib) Data() map[string]interface{} {
 }
 
 var libTplStr = `
-# lib
+# lib {{.ImportPath}}
 
-go = "{{.Config.Go}}"
+load("{{.Config.BackendPkg}}", "go_library")
 
-xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s")+" 100000"
-
-def gen_importcfg():
-	return [
-		'echo "Gen importconfig..."',
-		'echo "std: $SANDBOX/{{.Config.StdPkgsListFile}}"',
-		'cat "$SANDBOX/{{.Config.StdPkgsListFile}}" | '+xargs+' -I{} echo "packagefile {}=$GO_OUTDIR/go/pkg/${OS}_${ARCH}/{}.a" | sort -u > $SANDBOX/importconfig',
-		'find "$SANDBOX" -name "importcfg" | '+xargs+' -I{} cat {} | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig',
-	]
-
-def compile_cmd(files, dir=None):
-    return [
-		'echo "Compiling ({})..."'.format(dir),
-        ('cd '+dir+' && ' if dir else '') + 'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o lib.a -pack '+files,
-		'echo "packagefile {{.ImportPath}}=$PACKAGE/lib.a" > importcfg',
-    ]
-
-target(
-    name="{{.Target.Name}}",
-    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
-    run=gen_importcfg()+compile_cmd("{{.CompileFiles}}"),
-    out=['lib.a', 'importcfg'],
-    tools=[go],
-    env={
-        "OS": get_os(),
-        "ARCH": get_arch(),
-    },
+go_library(
+	name="{{.Target.Name}}",
+	deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
+	files="{{.CompileFiles}}",
+	import_path="{{.ImportPath}}",
 )
 
 # end lib

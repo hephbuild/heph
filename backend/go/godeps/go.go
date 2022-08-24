@@ -34,6 +34,9 @@ type Package struct {
 	IgnoredGoFiles []string
 	TestGoFiles    []string
 	XTestGoFiles   []string
+	CFiles         []string
+	CXXFiles       []string
+	SFiles         []string
 
 	// Part of our own module
 	IsPartOfModule bool     `json:"-"`

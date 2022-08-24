@@ -37,6 +37,7 @@ type Cfg struct {
 	StdPkgsTarget     string `json:"std_pkgs_target"`
 	StdPkgsListFile   string `json:"std_pkgs_list_file"`
 	ThirdpartyPackage string `json:"thirdparty_package"`
+	BackendPkg        string `json:"backend_pkg"`
 }
 
 func (c Cfg) IsTestSkipped(pkg string) bool {

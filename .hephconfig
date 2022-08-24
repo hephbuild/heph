@@ -2,9 +2,9 @@ version: latest
 build_files:
   roots:
     go_backend:
-      uri: git://github.com/hephbuild/heph.git@master
+      uri: git://github.com/hephbuild/heph.git@master:/backend/go
 
 go_backend:
   version: 1.18.4
-  go: //backend/go:go|go
-  gofmt: //backend/go:go|gofmt
+  go: //go_backend:go|go
+  gofmt: //go_backend:go|gofmt

@@ -8,9 +8,18 @@ import (
 	"strings"
 )
 
+// Build pipeline from:
+// https://github.com/golang/go/blob/2c46cc8b8997f4f5cdb7766e4e2bdf8e57f67c76/src/cmd/go/internal/work/exec.go
+
+func normalizePackage(p string) string {
+	p = strings.ReplaceAll(p, "+", "_")
+
+	return p
+}
+
 func thirdpartyDownloadTarget(pkg *Package) Target {
 	return Target{
-		Name:    "_go_mod_download",
+		Name:    "_go_mod_download_" + normalizePackage(pkg.Module.Version),
 		Package: filepath.Join(Config.ThirdpartyPackage, pkg.Module.Path),
 	}
 }
@@ -29,7 +38,7 @@ func libTarget(pkg *Package) Target {
 		}
 	} else {
 		return Target{
-			Name:    "_go_lib",
+			Name:    "_go_lib_" + normalizePackage(pkg.Module.Version),
 			Package: filepath.Join(Config.ThirdpartyPackage, pkg.ImportPath),
 		}
 	}
@@ -74,8 +83,14 @@ func generate() []RenderUnit {
 		_, imports := splitOutPkgs(pkg.Imports)
 
 		if pkg.IsPartOfTree {
+			libSrc := make([]string, 0)
+			libSrc = append(libSrc, pkg.GoFiles...)
+			libSrc = append(libSrc, pkg.SFiles...)
+			libSrc = append(libSrc, pkg.CFiles...)
+			libSrc = append(libSrc, pkg.CXXFiles...)
+
 			deps := make([]string, 0)
-			deps = append(deps, pkg.GoFiles...)
+			deps = append(deps, libSrc...)
 
 			for _, p := range imports {
 				t := libTarget(pkgs.Find(p))
@@ -88,7 +103,7 @@ func generate() []RenderUnit {
 				ImportPath:   pkg.ImportPath,
 				ModRoot:      modRoot,
 				Deps:         deps,
-				CompileFiles: []string{"*.go"},
+				CompileFiles: libSrc,
 			}
 
 			units = append(units, RenderUnit{
@@ -98,15 +113,15 @@ func generate() []RenderUnit {
 				Package: lib.Target.Package,
 			})
 
-			if pkg.IsPartOfModule && len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0 {
+			if pkg.IsPartOfModule && !Config.IsTestSkipped(pkg.ImportPath) && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
-				_, pkgDeps := splitOutPkgs(pkg.Imports)
+				_, pkgDeps := splitOutPkgs(pkg.Deps)
 
 				imports := append(pkgTestDeps, pkgDeps...)
 				imports = append(imports, pkg.ImportPath)
 
 				deps := make([]string, 0)
-				deps = append(deps, pkg.GoFiles...)
+				deps = append(deps, libSrc...)
 				deps = append(deps, pkg.TestGoFiles...)
 				deps = append(deps, pkg.XTestGoFiles...)
 
@@ -138,12 +153,19 @@ func generate() []RenderUnit {
 				continue
 			}
 
-			moddl, exists := modsm[pkg.Module.Path]
+			id := pkg.Module.Path + pkg.Module.Version
+
+			moddl, exists := modsm[id]
 			if !exists {
 				moddl = &ModDl{
 					Target:  thirdpartyDownloadTarget(pkg),
 					Path:    pkg.Module.Path,
 					Version: pkg.Module.Version,
+				}
+
+				if mod := pkg.Module.Replace; mod != nil {
+					moddl.Path = mod.Path
+					moddl.Version = mod.Version
 				}
 
 				units = append(units, RenderUnit{
@@ -153,7 +175,7 @@ func generate() []RenderUnit {
 					Package: moddl.Target.Package,
 				})
 
-				modsm[pkg.Module.Path] = moddl
+				modsm[id] = moddl
 			}
 
 			deps := make([]string, 0)

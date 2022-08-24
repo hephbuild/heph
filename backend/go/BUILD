@@ -68,6 +68,7 @@ std_pkgs = target(
     out="std_list",
 )
 backend_dir = package_dir()
+backend_pkg = package_fqn()
 
 def go_install(name, pkg, version, bin_name):
     return target(
@@ -107,6 +108,7 @@ def go_mod(mod_pkgs=[], test={}):
         'generate_testmain': generate_testmain,
         'std_pkgs_target': std_pkgs,
         'std_pkgs_list_file': backend_dir+"/std_list",
+        'backend_pkg': backend_pkg,
     }
 
     target(
@@ -154,6 +156,67 @@ def go_mod(mod_pkgs=[], test={}):
         deps=[src],
         sandbox=False,
         cache=False,
+    )
+def go_gen_importcfg():
+    xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s")+" 100000"
+    std_file = backend_dir+"/std_list"
+
+    return [
+        'echo "Gen importconfig..."',
+        'echo "std: $SANDBOX/{}"'.format(std_file),
+        'cat "$SANDBOX/{}" | {} -I[] echo "packagefile []=$GO_OUTDIR/go/pkg/${{OS}}_${{ARCH}}/[].a" | sort -u > $SANDBOX/importconfig'.format(std_file, xargs),
+        'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
+    ]
+
+def go_compile_cmd(import_path, files, dir=None):
+    cd = ('cd '+dir+' && ' if dir else '')
+    dir = dir+"/" if dir else ""
+
+    return [
+        'echo "Compiling ({})..."'.format(dir),
+        cd + 'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o lib.a -pack '+files,
+        'echo "packagefile {}=$PACKAGE/lib.a" > {}importcfg'.format(import_path, dir),
+    ]
+
+def go_mod_download(name, path, version):
+    return target(
+        name=name,
+        run=[
+            'echo module heph_ignore > go.mod', # stops go reading the main go.mod, and downloading all of those too
+            "go mod download -modcacherw -json {}@{} | tee mod.json".format(path, version),
+            'rm go.mod',
+            'export MOD_DIR=$(cat mod.json | awk -F\\" \'/"Dir": / { print $4 }\') && cp -r "$MOD_DIR/." .',
+        ],
+        tools=[go],
+        out=["."],
+    )
+
+def go_library(name, import_path, deps, files, dir=None):
+    p = dir+"/" if dir else ""
+
+    return target(
+        name=name,
+        deps=deps,
+        run=go_gen_importcfg()+go_compile_cmd(import_path, files, dir),
+        out=[p+'lib.a', p+'importcfg'],
+        tools=[go],
+        env={
+            "OS": get_os(),
+            "ARCH": get_arch(),
+        },
+    )
+
+def go_bin_link(name, path, deps, out):
+    return target(
+        name=name,
+        deps=deps,
+        run=go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o {} {}'.format(out, path)],
+        tools=[go],
+        out=out,
+        env={
+            "OS": get_os(),
+            "ARCH": get_arch(),
+        },
     )
 
 def go_bin(name, pkg, build_deps=[], *args, **kwargs):

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var include []string
@@ -260,18 +261,26 @@ digraph G  {
 		}
 
 		Engine.DAG().DFSWalk(engine.Walker(func(target *engine.Target) {
-			if targets.Find(target.FQN) == nil {
-				return
-			}
-
-			parents, err := Engine.DAG().GetParents(target)
-			if err != nil {
-				panic(err)
-			}
 			extra := ""
 			if target.IsGroup() {
 				//extra = ` color="red"`
 				return
+			}
+
+			log.Tracef("walk %v", target.FQN)
+
+			findStart := time.Now()
+			if targets.Find(target.FQN) == nil {
+				log.Tracef("find took %v", time.Since(findStart))
+				return
+			}
+			log.Tracef("find took %v", time.Since(findStart))
+
+			parentsStart := time.Now()
+			parents, err := Engine.DAG().GetParents(target)
+			log.Tracef("parents took %v (got %v)", time.Since(parentsStart), len(parents))
+			if err != nil {
+				panic(err)
 			}
 
 			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.FQN, extra)

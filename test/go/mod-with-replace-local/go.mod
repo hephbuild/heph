@@ -1,4 +1,4 @@
-module mod-with-replace
+module mod-with-replace-local
 
 go 1.18
 
