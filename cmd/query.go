@@ -392,11 +392,11 @@ var targetCmd = &cobra.Command{
 
 		fmt.Println(target.FQN)
 		fmt.Println("Deps - Targets")
-		for _, t := range target.Deps.Targets {
+		for _, t := range target.Deps.All().Targets {
 			fmt.Printf("  %v\n", t.Target.FQN)
 		}
 		fmt.Println("Deps - Files")
-		for _, t := range target.Deps.Files {
+		for _, t := range target.Deps.All().Files {
 			fmt.Printf("  %v\n", t.RelRoot())
 		}
 

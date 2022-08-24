@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/resolve"
@@ -222,5 +223,14 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	}
 	globals.Freeze()
 
-	return starlark.ExecFile(thread, path, nil, predeclared(globals, config))
+	res, err := starlark.ExecFile(thread, path, nil, predeclared(globals, config))
+	if err != nil {
+		var eerr *starlark.EvalError
+		if errors.As(err, &eerr) {
+			return nil, fmt.Errorf("%v: %v", eerr.Msg, eerr.Backtrace())
+		}
+		return nil, err
+	}
+
+	return res, nil
 }

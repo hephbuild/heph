@@ -185,7 +185,7 @@ func (e *Engine) hashInput(target *Target) string {
 	for _, dep := range target.HashDeps.Files {
 		err := e.hashFile(h, dep)
 		if err != nil {
-			panic(fmt.Errorf("%v: hashFile %v %w", target.FQN, dep.Abs(), err))
+			panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
 		}
 	}
 
@@ -261,7 +261,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	for _, file := range actualOut {
 		err := e.hashFile(h, file)
 		if err != nil {
-			panic(fmt.Errorf("%v: hashFile %v %w", target.FQN, file.Abs(), err))
+			panic(fmt.Errorf("actualOut: %v: hashFile %v %w", target.FQN, file.Abs(), err))
 		}
 	}
 

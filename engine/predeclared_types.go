@@ -24,6 +24,8 @@ type TargetArgs struct {
 	PassEnv        ArrayMap
 	Provide        ArrayMap
 	RequireGen     bool
+	SrcEnv         string
+	OutEnv         string
 }
 
 type Runnable struct {

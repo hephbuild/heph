@@ -110,11 +110,51 @@ func (tp TargetNamedPackagePath) WithRoot(root string) *TargetNamedPackagePath {
 	return ntp
 }
 
+type TargetNamedDeps struct {
+	names []string
+	named map[string]TargetDeps
+	all   TargetDeps
+}
+
+func (tp *TargetNamedDeps) Set(name string, p TargetDeps) {
+	if tp.named == nil {
+		tp.named = map[string]TargetDeps{}
+	}
+
+	tp.named[name] = p
+	tp.all.Targets = append(tp.all.Targets, p.Targets...)
+	tp.all.Files = append(tp.all.Files, p.Files...)
+}
+
+func (tp *TargetNamedDeps) Named() map[string]TargetDeps {
+	return tp.named
+}
+
+func (tp *TargetNamedDeps) All() TargetDeps {
+	return tp.all
+}
+
+func (tp *TargetNamedDeps) Name(name string) TargetDeps {
+	if tp.named == nil {
+		return TargetDeps{}
+	}
+
+	return tp.named[name]
+}
+
+func (tp TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {
+	for name, deps := range tp.named {
+		tp.named[name] = fn(deps)
+	}
+
+	tp.all = fn(tp.all)
+}
+
 type Target struct {
 	TargetSpec
 
 	Tools          []TargetTool
-	Deps           TargetDeps
+	Deps           TargetNamedDeps
 	HashDeps       TargetDeps
 	Out            *TargetNamedPackagePath
 	actualFilesOut *TargetNamedPackagePath
@@ -416,7 +456,7 @@ func (e *Engine) createDag() error {
 	}
 
 	for _, target := range targets {
-		for _, dep := range target.Deps.Targets {
+		for _, dep := range target.Deps.All().Targets {
 			err := e.dag.AddEdge(dep.Target.FQN, target.FQN)
 			if err != nil && !isEdgeDuplicateError(err) {
 				return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
@@ -668,12 +708,13 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	})
 
 	log.Tracef(logPrefix + "Linking deps")
-
-	t.Deps, err = e.linkTargetDeps(t, t.TargetSpec.Deps, simplify, breadcrumb)
+	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, simplify, breadcrumb)
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
-	t.Deps = e.filterOutCodegenFromDeps(t, t.Deps)
+	t.Deps.Map(func(deps TargetDeps) TargetDeps {
+		return e.filterOutCodegenFromDeps(t, deps)
+	})
 
 	if t.TargetSpec.DifferentHashDeps {
 		log.Tracef(logPrefix + "Linking hashdeps")
@@ -683,7 +724,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		}
 		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
 	} else {
-		t.HashDeps = t.Deps
+		t.HashDeps = t.Deps.All()
 	}
 
 	t.Out = &TargetNamedPackagePath{}
@@ -735,6 +776,39 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	e.registerLabels(t.Labels)
 
 	return nil
+}
+
+func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetNamedDeps, error) {
+	m := map[string]TargetSpecDeps{}
+	for _, itm := range deps.Targets {
+		a := m[itm.Name]
+		a.Targets = append(m[itm.Name].Targets, itm)
+		m[itm.Name] = a
+	}
+
+	for _, itm := range deps.Exprs {
+		a := m[itm.Name]
+		a.Exprs = append(m[itm.Name].Exprs, itm)
+		m[itm.Name] = a
+	}
+
+	for _, itm := range deps.Files {
+		a := m[itm.Name]
+		a.Files = append(m[itm.Name].Files, itm)
+		m[itm.Name] = a
+	}
+
+	td := TargetNamedDeps{}
+	for name, deps := range m {
+		ldeps, err := e.linkTargetDeps(t, deps, simplify, breadcrumb)
+		if err != nil {
+			return TargetNamedDeps{}, err
+		}
+
+		td.Set(name, ldeps)
+	}
+
+	return td, nil
 }
 
 func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetDeps, error) {
@@ -803,8 +877,8 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 		targets := make([]TargetWithOutput, 0)
 		for _, dep := range td.Targets {
 			if dep.Target.IsGroup() {
-				targets = append(targets, dep.Target.Deps.Targets...)
-				td.Files = append(td.Files, dep.Target.Deps.Files...)
+				targets = append(targets, dep.Target.Deps.All().Targets...)
+				td.Files = append(td.Files, dep.Target.Deps.All().Files...)
 			} else {
 				targets = append(targets, dep)
 			}

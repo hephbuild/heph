@@ -139,8 +139,6 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 			printTargetErr(err)
 			return err
 		}
-	} else {
-
 	}
 
 	var inlineTarget *TargetInvocation

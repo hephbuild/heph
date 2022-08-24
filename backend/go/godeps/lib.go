@@ -2,26 +2,29 @@ package main
 
 import (
 	"io"
-	"strings"
 	"text/template"
 )
 
 type Lib struct {
-	Target       Target
-	ImportPath   string
-	ModRoot      string
-	Deps         []string
-	CompileFiles []string
+	Target     Target
+	ImportPath string
+	ModRoot    string
+	Deps       []string
+	Libs       []string
+	GoFiles    []string
+	SFiles     []string
 }
 
 func (l Lib) Data() map[string]interface{} {
 	return map[string]interface{}{
-		"Config":       Config,
-		"ModRoot":      l.ModRoot,
-		"ImportPath":   l.ImportPath,
-		"Target":       l.Target,
-		"Deps":         genArray(l.Deps, 2),
-		"CompileFiles": strings.Join(l.CompileFiles, " "),
+		"Config":     Config,
+		"ModRoot":    l.ModRoot,
+		"ImportPath": l.ImportPath,
+		"Target":     l.Target,
+		"Libs":       genArray(l.Libs, 2),
+		"GoFiles":    genArray(l.GoFiles, 2),
+		"SFiles":     genArray(l.SFiles, 2),
+		"Deps":       genArrayNone(l.Deps, 2),
 	}
 }
 
@@ -32,9 +35,11 @@ load("{{.Config.BackendPkg}}", "go_library")
 
 go_library(
 	name="{{.Target.Name}}",
-	deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
-	files="{{.CompileFiles}}",
 	import_path="{{.ImportPath}}",
+	deps={{.Deps}},
+	libs={{.Libs}},
+	go_files={{.GoFiles}},
+	s_files={{.SFiles}},
 )
 
 # end lib

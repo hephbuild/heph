@@ -139,7 +139,7 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 		panic(err)
 	}
 
-	cmd := exec.CommandContext(cfg.Context, "bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", cfg.Cmd)
+	cmd := exec.CommandContext(cfg.Context, "bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", cfg.Cmd)
 	cmd.Dir = cfg.Dir
 
 	cmd.Stdin = cfg.Stdin

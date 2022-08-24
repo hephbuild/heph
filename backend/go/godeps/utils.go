@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+func genArrayNone(es []string, l int) string {
+	if es == nil {
+		return "None"
+	}
+
+	return genArray(es, l)
+}
+
 func genArray(es []string, l int) string {
 	if len(es) == 0 {
 		return "[]"

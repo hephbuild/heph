@@ -168,14 +168,11 @@ def go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def go_compile_cmd(import_path, files, dir=None):
-    cd = ('cd '+dir+' && ' if dir else '')
-    dir = dir+"/" if dir else ""
-
+def go_compile_cmd(import_path, files):
     return [
-        'echo "Compiling ({})..."'.format(dir),
-        cd + 'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o lib.a -pack '+files,
-        'echo "packagefile {}=$PACKAGE/lib.a" > {}importcfg'.format(import_path, dir),
+        'echo "Compiling (out: $OUT_IMPORTCFG)..."',
+        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o $SANDBOX/$OUT_LIB -pack {}'.format(' '.join(files)),
+        'echo "packagefile {}=$OUT_LIB" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
     ]
 
 def go_mod_download(name, path, version):
@@ -191,14 +188,66 @@ def go_mod_download(name, path, version):
         out=["."],
     )
 
-def go_library(name, import_path, deps, files, dir=None):
+def go_library(name, import_path, go_files, libs=[], s_files=[], deps=None, dir=None):
     p = dir+"/" if dir else ""
+
+    if len(s_files) > 0:
+        abi = target(
+            name="_"+name+"#abi",
+            deps=s_files,
+            cmd = 'eval `go env` && go tool asm -D GOOS_${OS} -D GOARCH_${ARCH} -gensymabis -o "$OUT" "$SRC"',
+            tools=[go],
+            out=p+'lib.abi',
+            env={
+                "OS": get_os(),
+                "ARCH": get_arch(),
+            },
+        )
+        lib = go_library(
+            name="_"+name+"#lib",
+            import_path=import_path,
+            libs=libs,
+            go_files=go_files,
+            dir=dir,
+        )
+        asm = target(
+            name="_"+name+"#asm",
+            deps={
+                'lib': lib,
+                'asm': s_files,
+            },
+            cmd = 'cp $SRC_LIB $OUT && chmod +w $OUT && go tool pack r $OUT $SRC_ASM',
+            tools=[go],
+            out = p+'asm.a',
+            env={
+                "OS": get_os(),
+                "ARCH": get_arch(),
+            },
+        )
+        return target(
+            name=name,
+            tools=[go],
+            env={
+                "OS": get_os(),
+                "ARCH": get_arch(),
+            },
+        )
+
+    files = go_files
+    if dir:
+        files = [p+dep for dep in files]
+
+    if not deps:
+        deps = files+libs
+
+    deps.append(std_pkgs)
 
     return target(
         name=name,
         deps=deps,
-        run=go_gen_importcfg()+go_compile_cmd(import_path, files, dir),
-        out=[p+'lib.a', p+'importcfg'],
+        run=go_gen_importcfg()+go_compile_cmd(import_path, files),
+        out={'lib': p+'lib.a', 'importcfg': p+'importcfg'},
+        out_env='rel_root',
         tools=[go],
         env={
             "OS": get_os(),
@@ -209,8 +258,9 @@ def go_library(name, import_path, deps, files, dir=None):
 def go_bin_link(name, path, deps, out):
     return target(
         name=name,
-        deps=deps,
-        run=go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o {} {}'.format(out, path)],
+        deps=deps+[std_pkgs],
+        run=go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {}'.format(path)],
+        out_env='rel_root',
         tools=[go],
         out=out,
         env={

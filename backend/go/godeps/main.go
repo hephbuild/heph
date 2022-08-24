@@ -83,27 +83,18 @@ func generate() []RenderUnit {
 		_, imports := splitOutPkgs(pkg.Imports)
 
 		if pkg.IsPartOfTree {
-			libSrc := make([]string, 0)
-			libSrc = append(libSrc, pkg.GoFiles...)
-			libSrc = append(libSrc, pkg.SFiles...)
-			libSrc = append(libSrc, pkg.CFiles...)
-			libSrc = append(libSrc, pkg.CXXFiles...)
-
-			deps := make([]string, 0)
-			deps = append(deps, libSrc...)
+			lib := &Lib{
+				Target:     libTarget(pkg),
+				ImportPath: pkg.ImportPath,
+				ModRoot:    modRoot,
+				GoFiles:    pkg.GoFiles,
+				SFiles:     pkg.SFiles,
+			}
 
 			for _, p := range imports {
 				t := libTarget(pkgs.Find(p))
 
-				deps = append(deps, t.Full())
-			}
-
-			lib := &Lib{
-				Target:       libTarget(pkg),
-				ImportPath:   pkg.ImportPath,
-				ModRoot:      modRoot,
-				Deps:         deps,
-				CompileFiles: libSrc,
+				lib.Libs = append(lib.Libs, t.Full())
 			}
 
 			units = append(units, RenderUnit{
@@ -120,24 +111,25 @@ func generate() []RenderUnit {
 				imports := append(pkgTestDeps, pkgDeps...)
 				imports = append(imports, pkg.ImportPath)
 
-				deps := make([]string, 0)
-				deps = append(deps, libSrc...)
-				deps = append(deps, pkg.TestGoFiles...)
-				deps = append(deps, pkg.XTestGoFiles...)
-
-				for _, p := range imports {
-					t := libTarget(pkgs.Find(p))
-
-					deps = append(deps, t.Full())
-				}
+				goFiles := make([]string, 0)
+				goFiles = append(goFiles, lib.GoFiles...)
+				goFiles = append(goFiles, pkg.TestGoFiles...)
+				goFiles = append(goFiles, pkg.XTestGoFiles...)
 
 				test := &LibTest{
 					ImportPath:    pkg.ImportPath,
 					TargetPackage: lib.Target.Package,
-					Deps:          deps,
+					GoFiles:       goFiles,
+					SFiles:        lib.SFiles,
 					PreRun:        Config.Test.PreRun,
 					TestFiles:     pkg.TestGoFiles,
 					XTestFiles:    pkg.XTestGoFiles,
+				}
+
+				for _, p := range imports {
+					t := libTarget(pkgs.Find(p))
+
+					test.Libs = append(test.Libs, t.Full())
 				}
 
 				units = append(units, RenderUnit{
@@ -187,11 +179,18 @@ func generate() []RenderUnit {
 			}
 
 			lib := &Lib{
-				Target:       libTarget(pkg),
-				ImportPath:   pkg.ImportPath,
-				ModRoot:      modRoot,
-				Deps:         deps,
-				CompileFiles: pkg.GoFiles,
+				Target:     libTarget(pkg),
+				ImportPath: pkg.ImportPath,
+				ModRoot:    modRoot,
+				Deps:       deps,
+				GoFiles:    pkg.GoFiles,
+				SFiles:     pkg.SFiles,
+			}
+
+			for _, p := range imports {
+				t := libTarget(pkgs.Find(p))
+
+				lib.Libs = append(lib.Libs, t.Full())
 			}
 
 			units = append(units, RenderUnit{

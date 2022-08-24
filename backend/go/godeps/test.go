@@ -9,10 +9,14 @@ import (
 type LibTest struct {
 	ImportPath    string
 	TargetPackage string
-	Deps          []string
-	PreRun        string
-	TestFiles     []string
-	XTestFiles    []string
+
+	Libs    []string
+	GoFiles []string
+	SFiles  []string
+
+	PreRun     string
+	TestFiles  []string
+	XTestFiles []string
 }
 
 func (t LibTest) Data() interface{} {
@@ -27,7 +31,9 @@ func (t LibTest) Data() interface{} {
 	return map[string]interface{}{
 		"Config":               Config,
 		"ImportPath":           t.ImportPath,
-		"Deps":                 genArray(t.Deps, 2),
+		"Libs":                 genArray(t.Libs, 2),
+		"GoFiles":              genArray(t.GoFiles, 2),
+		"SFiles":               genArray(t.SFiles, 2),
 		"PreRun":               t.PreRun,
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
 	}
@@ -44,19 +50,20 @@ load("{{.Config.BackendPkg}}", "go_bin_link")
 
 test_lib = go_library(
 	name="_go_lib_test",
-    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
-	files="*.go",
 	import_path="{{.ImportPath}}",
+	libs={{.Libs}},
+	go_files={{.GoFiles}},
+	s_files={{.SFiles}},
 )
 
 gen_testmain = target(
     name="_go_gen_testmain",
-    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}"],
+    deps={{.GoFiles}},
     run=[
 		'generate_testmain {{.ImportPath}} {{.TestFilesForAnalysis}}',
-		'mkdir -p testmain && mv _testmain.go testmain',
+		'mkdir -p testmain && mv _testmain.go $OUT',
 	],
-    out=['testmain'],
+    out=['testmain/_testmain.go'],
     tools=[go, generate_testmain],
     env={
         "OS": get_os(),
@@ -66,15 +73,16 @@ gen_testmain = target(
 
 testmain_lib = go_library(
 	name="_go_testmain_lib",
-    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}", test_lib, gen_testmain],
-	files="*.go",
+	deps=[gen_testmain, test_lib]+{{.Libs}},
+	libs={{.Libs}}+[test_lib],
+	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",
 	dir="testmain",
 )
 
 test_build = go_bin_link(
     name="go_test#build",
-    deps={{.Deps}}+["{{.Config.StdPkgsTarget}}", test_lib, testmain_lib],
+    deps={{.Libs}}+[test_lib, testmain_lib],
 	path="testmain/lib.a",
 	out="pkg.test",
 )

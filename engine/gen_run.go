@@ -218,7 +218,7 @@ func (e *runGenEngine) runGenerated(target *Target) error {
 
 		_, err := re.runBuildFile(file.Abs())
 		if err != nil {
-			return err
+			return fmt.Errorf("%v: %w", file.Abs(), err)
 		}
 	}
 

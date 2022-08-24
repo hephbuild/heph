@@ -26,6 +26,8 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		Gen:         args.Gen,
 		Provide:     args.Provide.StrMap,
 		RequireGen:  args.RequireGen,
+		SrcEnv:      args.SrcEnv,
+		OutEnv:      args.OutEnv,
 	}
 
 	var err error
@@ -98,15 +100,34 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		}
 	}
 
+	validateEnv := func(v string) bool {
+		return v == "ignore" || v == "rel_root" || v == "rel_pkg" || v == "abs"
+	}
+
+	if t.SrcEnv == "" {
+		t.SrcEnv = "rel_pkg"
+	}
+	if !validateEnv(t.SrcEnv) {
+		return TargetSpec{}, fmt.Errorf("src_env must be one of `ignore`, `rel_root`, got %v", t.SrcEnv)
+	}
+
+	if t.OutEnv == "" {
+		t.OutEnv = "rel_pkg"
+	}
+	if !validateEnv(t.OutEnv) {
+		return TargetSpec{}, fmt.Errorf("out_env must be one of `ignore`, `rel_root`, got %v", t.OutEnv)
+	}
+
 	return t, nil
 }
 
-func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
+func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	td := TargetSpecDeps{}
 
-	for _, dep := range deps.Array {
+	for _, dep := range arr {
 		if expr, err := utils.ExprParse(dep); err == nil {
 			td.Exprs = append(td.Exprs, TargetSpecDepExpr{
+				Name:    name,
 				Package: t.Package,
 				Expr:    expr,
 			})
@@ -115,6 +136,7 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 
 		if dtp, err := utils.TargetOutputParse(t.Package.FullName, dep); err == nil {
 			td.Targets = append(td.Targets, TargetSpecDepTarget{
+				Name:   name,
 				Target: dtp.Full(),
 				Output: dtp.Output,
 			})
@@ -123,9 +145,30 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 
 		// Is probably file
 		td.Files = append(td.Files, TargetSpecDepFile{
+			Name:    name,
 			Package: t.Package,
 			Path:    dep,
 		})
+	}
+
+	return td
+}
+
+func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
+	td := TargetSpecDeps{}
+
+	if len(deps.ArrMap) > 0 {
+		for name, arr := range deps.ArrMap {
+			d := depsSpecFromArr(t, arr, name)
+			td.Targets = append(td.Targets, d.Targets...)
+			td.Exprs = append(td.Exprs, d.Exprs...)
+			td.Files = append(td.Files, d.Files...)
+		}
+	} else {
+		d := depsSpecFromArr(t, deps.Array, "")
+		td.Targets = append(td.Targets, d.Targets...)
+		td.Exprs = append(td.Exprs, d.Exprs...)
+		td.Files = append(td.Files, d.Files...)
 	}
 
 	return td, nil
@@ -158,6 +201,8 @@ type TargetSpec struct {
 	Source            []string
 	Provide           map[string]string
 	RequireGen        bool
+	SrcEnv            string
+	OutEnv            string
 }
 
 func (t TargetSpec) IsNamedOutput() bool {
@@ -197,16 +242,19 @@ type TargetSpecDeps struct {
 }
 
 type TargetSpecDepTarget struct {
+	Name   string
 	Output string
 	Target string
 }
 
 type TargetSpecDepExpr struct {
+	Name    string
 	Package *Package
 	Expr    *utils.Expr
 }
 
 type TargetSpecDepFile struct {
+	Name    string
 	Package *Package
 	Path    string
 }

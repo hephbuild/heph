@@ -136,7 +136,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	}
 
-	for _, dep := range target.Deps.Targets {
+	for _, dep := range target.Deps.All().Targets {
 		log.Tracef("Dep %v", dep.Target.FQN)
 
 		if !dep.Target.ran {
@@ -157,6 +157,13 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 	log.Tracef("Bin %#v", bin)
 
+	namedDeps := map[string][]string{}
+	addNamedDep := func(name string, file string) {
+		a := namedDeps[name]
+		a = append(a, file)
+		namedDeps[name] = a
+	}
+
 	sandboxRoot := e.sandboxRoot(target)
 	var sandboxSpec = sandbox.Spec{}
 	if target.Sandbox {
@@ -164,31 +171,40 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 		src := make([]utils.TarFile, 0)
 		srcTar := make([]string, 0)
-		for _, dep := range target.Deps.Targets {
-			tarFile := e.targetOutputTarFile(target, e.hashInput(target))
-			if utils.PathExists(tarFile) && dep.Output == "" {
-				srcTar = append(srcTar, tarFile)
-			} else {
-				files := dep.Target.ActualFilesOut()
-				if dep.Output != "" {
-					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
-				}
-				for _, file := range files {
-					file = file.WithPackagePath(true)
+		for name, deps := range target.Deps.Named() {
+			for _, dep := range deps.Targets {
+				tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
+				if utils.PathExists(tarFile) && dep.Output == "" {
+					srcTar = append(srcTar, tarFile)
+					for _, file := range dep.Target.ActualFilesOut() {
+						file = file.WithPackagePath(true)
+						addNamedDep(name, file.RelRoot())
+					}
+				} else {
+					files := dep.Target.ActualFilesOut()
+					if dep.Output != "" {
+						files = dep.Target.NamedActualFilesOut().Name(dep.Output)
+					}
+					for _, file := range files {
+						file = file.WithPackagePath(true)
 
-					src = append(src, utils.TarFile{
-						From: file.Abs(),
-						To:   file.RelRoot(),
-					})
+						src = append(src, utils.TarFile{
+							From: file.Abs(),
+							To:   file.RelRoot(),
+						})
+						addNamedDep(name, file.RelRoot())
+					}
 				}
 			}
-		}
 
-		for _, dep := range target.Deps.Files {
-			src = append(src, utils.TarFile{
-				From: dep.Abs(),
-				To:   dep.WithPackagePath(true).RelRoot(),
-			})
+			for _, file := range deps.Files {
+				to := file.WithPackagePath(true).RelRoot()
+				src = append(src, utils.TarFile{
+					From: file.Abs(),
+					To:   to,
+				})
+				addNamedDep(name, to)
+			}
 		}
 
 		for _, file := range src {
@@ -254,20 +270,106 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	}
 
+	dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.FullName)
+	if target.RunInCwd {
+		if target.ShouldCache {
+			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
+		}
+
+		dir = e.Cwd
+	}
+
 	ex, err := os.Executable()
 	if err != nil {
 		return err
 	}
 
-	env := make(map[string]string) // TODO
+	env := make(map[string]string)
 	env["HEPH"] = ex
 	env["TARGET"] = target.FQN
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs
 	env["SANDBOX"] = filepath.Join(e.sandboxRoot(target), "_dir")
-	// TODO: figure out causes /bin/bash: argument list too long
-	// https://unix.stackexchange.com/a/357859
-	//env["SRCS"] = strings.Join(srcFiles, " ")
+	if target.SrcEnv != "ignore" {
+		for name, paths := range namedDeps {
+			k := "SRC_" + strings.ToUpper(name)
+			if name == "" {
+				k = "SRC"
+			}
+			spaths := make([]string, 0)
+			for _, path := range paths {
+				switch target.SrcEnv {
+				case "abs":
+					spaths = append(spaths, filepath.Join(target.WorkdirRoot.Abs, path))
+				case "rel_root":
+					spaths = append(spaths, path)
+				case "rel_pkg":
+					p := "/root"
+					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path))
+					if err != nil {
+						return err
+					}
+					rel = strings.TrimPrefix(rel, p)
+					rel = strings.TrimPrefix(rel, "/")
+					spaths = append(spaths, rel)
+				default:
+					panic("unhandled src_env: " + target.SrcEnv)
+				}
+			}
+			env[k] = strings.Join(spaths, " ")
+		}
+	}
+
+	if target.OutEnv != "ignore" {
+		namedOut := map[string][]string{}
+		for name, paths := range target.Out.WithRoot(target.WorkdirRoot.Abs).Named() {
+			for _, path := range paths {
+				if strings.Contains(path.Path, "*") {
+					// Skip glob
+					continue
+				}
+
+				if filepath.Base(path.Path) == "." {
+					// Skip dot folder
+					continue
+				}
+
+				path = path.WithPackagePath(true)
+
+				var pathv string
+				switch target.OutEnv {
+				case "abs":
+					pathv = path.Abs()
+				case "rel_root":
+					pathv = path.RelRoot()
+				case "rel_pkg":
+					p := "/root"
+					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path.RelRoot()))
+					if err != nil {
+						return err
+					}
+					rel = strings.TrimPrefix(rel, p)
+					rel = strings.TrimPrefix(rel, "/")
+					pathv = rel
+				default:
+					panic("unhandled out_env: " + target.OutEnv)
+				}
+
+				a := namedOut[name]
+				a = append(a, pathv)
+				namedOut[name] = a
+			}
+		}
+
+		for name, paths := range namedOut {
+			k := "OUT_" + strings.ToUpper(name)
+			if name == "" {
+				k = "OUT"
+			}
+
+			env[k] = strings.Join(paths, " ")
+		}
+	}
 
 	for _, t := range target.Tools {
 		if t.Target == nil {
@@ -317,15 +419,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	_, hasPathInEnv := env["PATH"]
 
 	for i, c := range cmds {
-		dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.FullName)
-		if target.RunInCwd {
-			if target.ShouldCache {
-				return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
-			}
-
-			dir = e.Cwd
-		}
-
 		cmd := sandbox.Exec(sandbox.ExecConfig{
 			Context:  ctx,
 			BinDir:   sandboxSpec.BinDir(),
