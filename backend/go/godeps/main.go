@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -24,7 +26,22 @@ func thirdpartyDownloadTarget(pkg *Package) Target {
 	}
 }
 
-func libTarget(pkg *Package) Target {
+func libTarget(pkgs Packages, pkg *Package, imports []string) Target {
+	if imports == nil {
+		imports = pkg.Deps
+	}
+
+	_, imports = splitOutPkgs(imports)
+
+	sort.Strings(imports)
+
+	h := sha256.New()
+	for _, p := range getImportsPackages(pkgs, imports) {
+		h.Write([]byte(p.Module.Path))
+		h.Write([]byte(p.Module.Version))
+	}
+	suffix := fmt.Sprintf("_%.7x", h.Sum(nil))
+
 	if pkg.IsPartOfTree {
 		rel, err := filepath.Rel(Env.Sandbox, pkg.Dir)
 		if err != nil {
@@ -33,12 +50,12 @@ func libTarget(pkg *Package) Target {
 		pkgName := strings.Trim(rel, "/")
 
 		return Target{
-			Name:    "_go_lib",
+			Name:    "_go_lib" + suffix,
 			Package: pkgName,
 		}
 	} else {
 		return Target{
-			Name:    "_go_lib_" + normalizePackage(pkg.Module.Version),
+			Name:    "_go_lib_" + normalizePackage(pkg.Module.Version) + suffix,
 			Package: filepath.Join(Config.ThirdpartyPackage, pkg.ImportPath),
 		}
 	}
@@ -67,6 +84,18 @@ type RenderUnit struct {
 	Package string
 }
 
+func getImportsPackages(pkgs Packages, imports []string) []*Package {
+	depsPkgs := make(Packages, 0)
+
+	for _, p := range imports {
+		pkg := pkgs.Find(p)
+
+		depsPkgs = append(depsPkgs, pkg)
+	}
+
+	return depsPkgs
+}
+
 func generate() []RenderUnit {
 	pkgs := goListWithTransitiveTestDeps()
 
@@ -84,7 +113,7 @@ func generate() []RenderUnit {
 
 		if pkg.IsPartOfTree {
 			lib := &Lib{
-				Target:     libTarget(pkg),
+				Target:     libTarget(pkgs, pkg, nil),
 				ImportPath: pkg.ImportPath,
 				ModRoot:    modRoot,
 				GoFiles:    pkg.GoFiles,
@@ -92,7 +121,7 @@ func generate() []RenderUnit {
 			}
 
 			for _, p := range imports {
-				t := libTarget(pkgs.Find(p))
+				t := libTarget(pkgs, pkgs.Find(p), nil)
 
 				lib.Libs = append(lib.Libs, t.Full())
 			}
@@ -127,7 +156,7 @@ func generate() []RenderUnit {
 				}
 
 				for _, p := range imports {
-					t := libTarget(pkgs.Find(p))
+					t := libTarget(pkgs, pkgs.Find(p), nil)
 
 					test.Libs = append(test.Libs, t.Full())
 				}
@@ -171,7 +200,7 @@ func generate() []RenderUnit {
 			}
 
 			lib := &Lib{
-				Target:     libTarget(pkg),
+				Target:     libTarget(pkgs, pkg, nil),
 				ImportPath: pkg.ImportPath,
 				ModRoot:    modRoot,
 				GoFiles:    pkg.GoFiles,
@@ -180,7 +209,7 @@ func generate() []RenderUnit {
 			}
 
 			for _, p := range imports {
-				t := libTarget(pkgs.Find(p))
+				t := libTarget(pkgs, pkgs.Find(p), nil)
 
 				lib.Libs = append(lib.Libs, t.Full())
 			}
