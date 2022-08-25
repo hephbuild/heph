@@ -170,21 +170,13 @@ func generate() []RenderUnit {
 				modsm[id] = moddl
 			}
 
-			deps := make([]string, 0)
-			deps = append(deps, moddl.Target.Full())
-			for _, p := range imports {
-				t := libTarget(pkgs.Find(p))
-
-				deps = append(deps, t.Full())
-			}
-
 			lib := &Lib{
 				Target:     libTarget(pkg),
 				ImportPath: pkg.ImportPath,
 				ModRoot:    modRoot,
-				Deps:       deps,
 				GoFiles:    pkg.GoFiles,
 				SFiles:     pkg.SFiles,
+				SrcDep:     moddl.Target.Full(),
 			}
 
 			for _, p := range imports {

@@ -15,6 +15,7 @@ import (
 
 func init() {
 	resolve.AllowGlobalReassign = true
+	resolve.AllowRecursion = true
 }
 
 const buildFilesPattern = "**/{BUILD,BUILD.*}"

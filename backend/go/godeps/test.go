@@ -73,7 +73,7 @@ gen_testmain = target(
 
 testmain_lib = go_library(
 	name="_go_testmain_lib",
-	deps=[gen_testmain, test_lib]+{{.Libs}},
+	src_dep=gen_testmain,
 	libs={{.Libs}}+[test_lib],
 	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",

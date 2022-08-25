@@ -402,6 +402,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	cmds := target.Cmds
+	var cmdArgs []string
 	if len(args) > 0 {
 		if len(cmds) > 1 {
 			return fmt.Errorf("args are supported only with a single cmd")
@@ -411,9 +412,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			return fmt.Errorf("args are not supported with cache")
 		}
 
-		for i := range cmds {
-			cmds[i] += " " + strings.Join(args, " ")
-		}
+		log.Tracef("Adding args %v", args)
+
+		cmdArgs = args
 	}
 
 	_, hasPathInEnv := env["PATH"]
@@ -426,6 +427,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			Cmd:      c,
 			Env:      env,
 			IOConfig: iocfg,
+			Args:     cmdArgs,
 		}, target.Sandbox && !hasPathInEnv)
 
 		log.Tracef("Run %v #%v", target.FQN, i)

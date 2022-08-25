@@ -168,11 +168,18 @@ def go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def go_compile_cmd(import_path, files):
+def go_compile_cmd(import_path, files, abi=None, complete=True):
+    extra = ""
+    if abi:
+        extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
+
+    if complete:
+        extra += ' -complete'
+
     return [
         'echo "Compiling (out: $OUT_IMPORTCFG)..."',
-        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o $SANDBOX/$OUT_LIB -pack {}'.format(' '.join(files)),
-        'echo "packagefile {}=$OUT_LIB" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
+        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o $SANDBOX/$OUT_A -pack{} {}'.format(extra, ' '.join(files)),
+        'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
     ]
 
 def go_mod_download(name, path, version):
@@ -188,24 +195,31 @@ def go_mod_download(name, path, version):
         out=["."],
     )
 
-def go_library(name, import_path, go_files, libs=[], s_files=[], deps=None, dir=None):
+def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], abi=None, dir=None, src_dep=None):
     p = dir+"/" if dir else ""
+
+    if dir:
+        s_files = [p+dep for dep in s_files]
 
     if len(s_files) > 0:
         abi = target(
             name="_"+name+"#abi",
-            deps=s_files,
-            cmd = 'eval `go env` && go tool asm -D GOOS_${OS} -D GOARCH_${ARCH} -gensymabis -o "$OUT" "$SRC"',
+            deps=src_dep if src_dep else s_files,
+            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -D GOOS_$OS -D GOARCH_$ARCH -p {} -gensymabis -o "$OUT" $SRC'.format(import_path),
             tools=[go],
             out=p+'lib.abi',
             env={
                 "OS": get_os(),
                 "ARCH": get_arch(),
+                "SRC": ' '.join(s_files)
             },
         )
         lib = go_library(
             name="_"+name+"#lib",
             import_path=import_path,
+            src_dep=src_dep,
+            complete=False,
+            abi=abi,
             libs=libs,
             go_files=go_files,
             dir=dir,
@@ -213,40 +227,59 @@ def go_library(name, import_path, go_files, libs=[], s_files=[], deps=None, dir=
         asm = target(
             name="_"+name+"#asm",
             deps={
-                'lib': lib,
-                'asm': s_files,
+                'lib': lib+"|a",
+                'hdr': lib+"|h",
+                'asm': src_dep if src_dep else s_files,
             },
-            cmd = 'cp $SRC_LIB $OUT && chmod +w $OUT && go tool pack r $OUT $SRC_ASM',
+            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -o "$OUT" $SRC_ASM'.format(import_path),
             tools=[go],
-            out = p+'asm.a',
+            out=p+'asm.o',
             env={
                 "OS": get_os(),
                 "ARCH": get_arch(),
+                "SRC_ASM": ' '.join(s_files)
             },
         )
         return target(
             name=name,
             tools=[go],
+            deps={
+                'lib': lib+"|a",
+                'asm': asm,
+            },
+            run=[
+                'cp $SRC_LIB "$SANDBOX/$OUT_A" && chmod +w "$SANDBOX/$OUT_A" && go tool pack r "$SANDBOX/$OUT_A" $SRC_ASM',
+                'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
+            ],
+            out_env='rel_root',
+            out={'a': p+'asm_lib.a', 'importcfg': p+'importcfg'},
             env={
                 "OS": get_os(),
                 "ARCH": get_arch(),
             },
         )
 
-    files = go_files
+    src_files = go_files
     if dir:
-        files = [p+dep for dep in files]
+        src_files = [p+dep for dep in src_files]
 
-    if not deps:
-        deps = files+libs
+    if src_dep:
+        deps = {'src': [src_dep], 'libs': libs}
+    else:
+        deps = {'src': src_files, 'libs': libs}
 
-    deps.append(std_pkgs)
+    deps["std"] = std_pkgs
+
+    out = {'a': p+'lib.a', 'importcfg': p+'importcfg'}
+    if abi:
+        deps["abi"] = abi
+        out["h"] = 'lib.h'
 
     return target(
         name=name,
         deps=deps,
-        run=go_gen_importcfg()+go_compile_cmd(import_path, files),
-        out={'lib': p+'lib.a', 'importcfg': p+'importcfg'},
+        run=go_gen_importcfg()+go_compile_cmd(import_path, src_files, abi, complete),
+        out=out,
         out_env='rel_root',
         tools=[go],
         env={

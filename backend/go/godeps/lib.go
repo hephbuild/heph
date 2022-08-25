@@ -9,10 +9,10 @@ type Lib struct {
 	Target     Target
 	ImportPath string
 	ModRoot    string
-	Deps       []string
 	Libs       []string
 	GoFiles    []string
 	SFiles     []string
+	SrcDep     string
 }
 
 func (l Lib) Data() map[string]interface{} {
@@ -24,7 +24,7 @@ func (l Lib) Data() map[string]interface{} {
 		"Libs":       genArray(l.Libs, 2),
 		"GoFiles":    genArray(l.GoFiles, 2),
 		"SFiles":     genArray(l.SFiles, 2),
-		"Deps":       genArrayNone(l.Deps, 2),
+		"SrcDep":     l.SrcDep,
 	}
 }
 
@@ -36,7 +36,7 @@ load("{{.Config.BackendPkg}}", "go_library")
 go_library(
 	name="{{.Target.Name}}",
 	import_path="{{.ImportPath}}",
-	deps={{.Deps}},
+{{if .SrcDep}}	src_dep="{{.SrcDep}}",{{end}}
 	libs={{.Libs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},

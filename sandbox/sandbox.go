@@ -129,6 +129,7 @@ type ExecConfig struct {
 	Dir     string
 	Cmd     string
 	Env     map[string]string
+	Args    []string
 }
 
 func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
@@ -139,7 +140,10 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 		panic(err)
 	}
 
-	cmd := exec.CommandContext(cfg.Context, "bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", cfg.Cmd)
+	args := []string{"--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", cfg.Cmd}
+	args = append(args, cfg.Args...)
+
+	cmd := exec.CommandContext(cfg.Context, "bash", args...)
 	cmd.Dir = cfg.Dir
 
 	cmd.Stdin = cfg.Stdin

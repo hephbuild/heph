@@ -354,7 +354,7 @@ var targetCmd = &cobra.Command{
 	Short: "Prints target details",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		if spec {
+		if *noGen {
 			return engineInit()
 		} else {
 			return preRunWithGen(false)

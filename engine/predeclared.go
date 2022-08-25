@@ -160,8 +160,11 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
+	allExclude := exclude.Array
+	allExclude = append(allExclude, ".heph")
+
 	elems := make([]starlark.Value, 0)
-	err := utils.StarWalk(pkg.Root.Abs, pattern, exclude.Array, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(pkg.Root.Abs, pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

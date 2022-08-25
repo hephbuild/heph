@@ -193,6 +193,17 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(cmd))
 	}
 
+	outEntries := make([]string, 0)
+	for _, file := range target.TargetSpec.Out {
+		outEntries = append(outEntries, file.Name+file.Path)
+	}
+
+	sort.Strings(outEntries)
+
+	for _, entry := range outEntries {
+		h.WriteString(entry)
+	}
+
 	for _, file := range target.CachedFiles {
 		h.Write([]byte(file.RelRoot()))
 	}
@@ -211,6 +222,9 @@ func (e *Engine) hashInput(target *Target) string {
 	if target.Gen {
 		h.Write([]byte{1})
 	}
+
+	h.WriteString(target.SrcEnv)
+	h.WriteString(target.OutEnv)
 
 	hb := h.Sum128().Bytes()
 
