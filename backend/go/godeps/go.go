@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -44,16 +45,31 @@ type Package struct {
 	TestDeps       []string `json:"-"`
 }
 
-type Packages []*Package
+type Packages struct {
+	m map[string]*Package
+	a []*Package
+}
 
-func (p Packages) Find(importPath string) *Package {
-	for _, p := range p {
-		if p.ImportPath == importPath {
-			return p
-		}
+func (p *Packages) Array() []*Package {
+	return p.a
+}
+
+func (p *Packages) Sort() {
+	sort.SliceStable(p.a, func(i, j int) bool {
+		return p.a[i].ImportPath < p.a[j].ImportPath
+	})
+}
+
+func (p *Packages) Add(pkg *Package) {
+	if p.m == nil {
+		p.m = map[string]*Package{}
 	}
+	p.m[pkg.ImportPath] = pkg
+	p.a = append(p.a, pkg)
+}
 
-	return nil
+func (p *Packages) Find(importPath string) *Package {
+	return p.m[importPath]
 }
 
 type Strings []string
@@ -95,7 +111,7 @@ func goListStd() Strings {
 	return strings.Split(s, "\n")
 }
 
-func goList(pkg string) Packages {
+func goList(pkg string) *Packages {
 	cmd := exec.Command("go", "list", "-e", "-json", "-deps", pkg)
 
 	b, err := cmd.Output()
@@ -107,7 +123,7 @@ func goList(pkg string) Packages {
 		panic(err)
 	}
 
-	pkgs := make(Packages, 0)
+	pkgs := &Packages{}
 
 	cwd, _ := os.Getwd()
 	fmt.Println("### go list ", pkg, cwd)
@@ -126,16 +142,16 @@ func goList(pkg string) Packages {
 			panic(err)
 		}
 
-		pkgs = append(pkgs, &pkg)
+		pkgs.Add(&pkg)
 	}
 
 	return pkgs
 }
 
-func goListWithTransitiveTestDeps() Packages {
+func goListWithTransitiveTestDeps() *Packages {
 	pkgs := goList("./...")
 
-	for _, pkg := range pkgs[:] {
+	for _, pkg := range pkgs.Array()[:] {
 		if pkg.Module != nil {
 			var rel string
 			if pkg.Module != nil {
@@ -164,11 +180,11 @@ func goListWithTransitiveTestDeps() Packages {
 
 			for _, depPath := range pkg.TestImports {
 				testDeps = append(testDeps, depPath)
-				for _, p := range goList(depPath) {
+				for _, p := range goList(depPath).Array() {
 					testDeps = append(testDeps, p.ImportPath)
 
 					if pkgs.Find(p.ImportPath) == nil {
-						pkgs = append(pkgs, p)
+						pkgs.Add(p)
 					}
 				}
 			}
@@ -176,6 +192,8 @@ func goListWithTransitiveTestDeps() Packages {
 			pkg.TestDeps = testDeps
 		}
 	}
+
+	pkgs.Sort()
 
 	return pkgs
 }

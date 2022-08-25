@@ -26,7 +26,7 @@ func thirdpartyDownloadTarget(pkg *Package) Target {
 	}
 }
 
-func libTarget(pkgs Packages, pkg *Package, imports []string) Target {
+func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 	if imports == nil {
 		imports = pkg.Deps
 	}
@@ -84,8 +84,8 @@ type RenderUnit struct {
 	Package string
 }
 
-func getImportsPackages(pkgs Packages, imports []string) []*Package {
-	depsPkgs := make(Packages, 0)
+func getImportsPackages(pkgs *Packages, imports []string) []*Package {
+	depsPkgs := make([]*Package, 0)
 
 	for _, p := range imports {
 		pkg := pkgs.Find(p)
@@ -104,7 +104,7 @@ func generate() []RenderUnit {
 
 	modRoot := filepath.Dir(Env.Package)
 
-	for _, pkg := range pkgs {
+	for _, pkg := range pkgs.Array() {
 		if StdPackages.Includes(pkg.ImportPath) {
 			continue
 		}
