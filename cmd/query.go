@@ -21,6 +21,7 @@ import (
 var include []string
 var exclude []string
 var spec bool
+var transitive bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -31,8 +32,10 @@ func init() {
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(targetCmd)
 	queryCmd.AddCommand(pkgsCmd)
+	queryCmd.AddCommand(whatInputsCmd)
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
+	whatInputsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 
 	queryCmd.Flags().StringArrayVar(&include, "include", nil, "Labels to include")
 	queryCmd.Flags().StringArrayVar(&exclude, "exclude", nil, "Labels to exclude, takes precedence over --include")
@@ -224,7 +227,7 @@ var graphCmd = &cobra.Command{
 var graphDotCmd = &cobra.Command{
 	Use:   "graphdot",
 	Short: "Outputs graph do",
-	Args:  cobra.ArbitraryArgs,
+	Args:  cobra.MaximumNArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(false)
 	},
@@ -250,17 +253,17 @@ digraph G  {
 			return strconv.Quote(target.FQN)
 		}
 
-		targets := Engine.DAG().GetVertices()
-
-		if hasStdin(args) {
-			var err error
-			targets, err = parseTargetsFromStdin()
+		dag := Engine.DAG()
+		if len(args) > 0 {
+			gdag, _, err := Engine.DAG().GetAncestorsGraph(args[0])
 			if err != nil {
-				return nil
+				return err
 			}
+
+			dag = &engine.DAG{DAG: gdag}
 		}
 
-		Engine.DAG().DFSWalk(engine.Walker(func(target *engine.Target) {
+		dag.DFSWalk(engine.Walker(func(target *engine.Target) {
 			extra := ""
 			if target.IsGroup() {
 				//extra = ` color="red"`
@@ -269,15 +272,8 @@ digraph G  {
 
 			log.Tracef("walk %v", target.FQN)
 
-			findStart := time.Now()
-			if targets.Find(target.FQN) == nil {
-				log.Tracef("find took %v", time.Since(findStart))
-				return
-			}
-			log.Tracef("find took %v", time.Since(findStart))
-
 			parentsStart := time.Now()
-			parents, err := Engine.DAG().GetParents(target)
+			parents, err := dag.GetParents(target)
 			log.Tracef("parents took %v (got %v)", time.Since(parentsStart), len(parents))
 			if err != nil {
 				panic(err)
@@ -434,6 +430,60 @@ var pkgsCmd = &cobra.Command{
 			fmt.Printf("  %v\n", p.Root.RelRoot)
 			fmt.Println()
 		}
+		return nil
+	},
+}
+
+var whatInputsCmd = &cobra.Command{
+	Use:   "whatinputs <target>",
+	Short: "Prints target dependees",
+	Args:  cobra.ExactArgs(1),
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRunWithGen(false)
+	},
+	RunE: func(_ *cobra.Command, args []string) error {
+		tp, err := utils.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		dependees := make([]string, 0)
+
+		for _, t := range Engine.DAG().GetVertices() {
+			for _, dep := range t.Deps.All().Targets {
+				if dep.Target.FQN == target.FQN {
+					dependees = append(dependees, t.FQN)
+					break
+				}
+			}
+		}
+
+		if transitive {
+			for _, dependee := range dependees {
+				ancs, err := Engine.DAG().GetDescendantsOfFQN(dependee)
+				if err != nil {
+					return err
+				}
+				for _, anc := range ancs {
+					dependees = append(dependees, anc.FQN)
+				}
+			}
+		}
+
+		dependees = utils.DedupKeepLast(dependees, func(s string) string {
+			return s
+		})
+		sort.Strings(dependees)
+
+		for _, fqn := range dependees {
+			fmt.Println(fqn)
+		}
+
 		return nil
 	},
 }

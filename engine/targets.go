@@ -142,12 +142,26 @@ func (tp *TargetNamedDeps) Name(name string) TargetDeps {
 	return tp.named[name]
 }
 
-func (tp TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {
+func (tp *TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {
 	for name, deps := range tp.named {
 		tp.named[name] = fn(deps)
 	}
 
 	tp.all = fn(tp.all)
+}
+
+func (tp *TargetNamedDeps) Sort() {
+	tp.Map(func(deps TargetDeps) TargetDeps {
+		sort.SliceStable(deps.Targets, func(i, j int) bool {
+			return deps.Targets[i].Target.FQN < deps.Targets[j].Target.FQN
+		})
+
+		sort.SliceStable(deps.Files, func(i, j int) bool {
+			return deps.Files[i].Path < deps.Files[j].Path
+		})
+
+		return deps
+	})
 }
 
 type Target struct {
@@ -178,6 +192,10 @@ type Target struct {
 
 	runLock   utils.Locker
 	cacheLock utils.Locker
+}
+
+func (t *Target) ID() string {
+	return t.FQN
 }
 
 func (t *Target) ActualFilesOut() PackagePaths {
@@ -449,7 +467,7 @@ func (e *Engine) createDag() error {
 
 	dagStartTime := time.Now()
 	for _, target := range targets {
-		err := e.dag.AddVertexByID(target.FQN, target)
+		_, err := e.dag.AddVertex(target)
 		if err != nil {
 			return err
 		}
@@ -807,6 +825,8 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 
 		td.Set(name, ldeps)
 	}
+
+	td.Sort()
 
 	return td, nil
 }

@@ -10,7 +10,24 @@ type DAG struct {
 }
 
 func (e *DAG) GetAncestors(target *Target) (Targets, error) {
-	ancestors, err := e.DAG.GetAncestors(target.FQN)
+	return e.GetAncestorsOfFQN(target.FQN)
+}
+
+func (e *DAG) GetAncestorsOfFQN(fqn string) (Targets, error) {
+	ancestors, err := e.DAG.GetAncestors(fqn)
+	if err != nil {
+		return nil, err
+	}
+
+	return e.mapToArray(ancestors), nil
+}
+
+func (e *DAG) GetDescendants(target *Target) (Targets, error) {
+	return e.GetDescendantsOfFQN(target.FQN)
+}
+
+func (e *DAG) GetDescendantsOfFQN(fqn string) (Targets, error) {
+	ancestors, err := e.DAG.GetDescendants(fqn)
 	if err != nil {
 		return nil, err
 	}

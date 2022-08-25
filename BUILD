@@ -28,7 +28,7 @@ builds = []
 
 version = target(
     name="version",
-    run="echo ${GITHUB_SHA::8} > version && cat version",
+    run="echo ${GITHUB_SHA::7} > version && cat version",
     out="version",
     pass_env=["GITHUB_SHA"],
     cache=False,

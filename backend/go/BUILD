@@ -168,7 +168,7 @@ def go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def go_compile_cmd(import_path, files, abi=None, complete=True):
+def go_compile_cmd(name, import_path, files, abi=None, complete=True):
     extra = ""
     if abi:
         extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
@@ -179,7 +179,8 @@ def go_compile_cmd(import_path, files, abi=None, complete=True):
     return [
         'echo "Compiling (out: $OUT_IMPORTCFG)..."',
         'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o $SANDBOX/$OUT_A -pack{} {}'.format(extra, ' '.join(files)),
-        'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
+        'echo "# {} {}" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path, name),
+        'echo "packagefile {}=$OUT_A" >> $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
     ]
 
 def go_mod_download(name, path, version):
@@ -249,7 +250,8 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
             },
             run=[
                 'cp $SRC_LIB "$SANDBOX/$OUT_A" && chmod +w "$SANDBOX/$OUT_A" && go tool pack r "$SANDBOX/$OUT_A" $SRC_ASM',
-                'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
+                'echo "# {} {}" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path, name),
+                'echo "packagefile {}=$OUT_A" >> $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
             ],
             out_env='rel_root',
             out={'a': p+'asm_lib.a', 'importcfg': p+'importcfg'},
@@ -268,6 +270,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     else:
         deps = {'src': src_files, 'libs': libs}
 
+    deps['src'].append('$(collect "{}/." include="go_src")'.format(package_fqn()))
     deps["std"] = std_pkgs
 
     out = {'a': p+'lib.a', 'importcfg': p+'importcfg'}
@@ -278,13 +281,14 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     return target(
         name=name,
         deps=deps,
-        run=go_gen_importcfg()+go_compile_cmd(import_path, src_files, abi, complete),
+        run=go_gen_importcfg()+go_compile_cmd(name, import_path, src_files, abi, complete),
         out=out,
         out_env='rel_root',
         tools=[go],
         env={
             "OS": get_os(),
             "ARCH": get_arch(),
+            "SRC_SRC": "", # override src env var
         },
     )
 
