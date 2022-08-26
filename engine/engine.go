@@ -149,6 +149,22 @@ func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
 	return nil
 }
 
+func (e *Engine) hashFileModTime(h hash.Hash, file PackagePath) error {
+	info, err := os.Lstat(file.Abs())
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+
+	if info.Mode().Type() == os.ModeSymlink {
+		return fmt.Errorf("symlink cannot be hashed")
+	}
+
+	h.Write([]byte(fmt.Sprint(info.Mode().Perm())))
+	h.Write([]byte(fmt.Sprint(info.ModTime())))
+
+	return nil
+}
+
 func (e *Engine) hashInput(target *Target) string {
 	cacheId := target.FQN
 	e.cacheHashInputMutex.RLock()
@@ -160,7 +176,7 @@ func (e *Engine) hashInput(target *Target) string {
 
 	start := time.Now()
 	defer func() {
-		log.Tracef("hashinput %v took %v", target.FQN, time.Since(start))
+		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
 	}()
 
 	h := xxh3.New()
@@ -183,9 +199,19 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	for _, dep := range target.HashDeps.Files {
-		err := e.hashFile(h, dep)
-		if err != nil {
-			panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+		switch target.HashFile {
+		case HashInputContent:
+			err := e.hashFile(h, dep)
+			if err != nil {
+				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+			}
+		case HashInputModTime:
+			err := e.hashFileModTime(h, dep)
+			if err != nil {
+				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+			}
+		default:
+			panic(fmt.Sprintf("unhandled hash_input: %v", target.HashFile))
 		}
 	}
 
@@ -248,7 +274,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	start := time.Now()
 	defer func() {
-		log.Tracef("hashoutput %v took %v", target.FQN, time.Since(start))
+		log.Debugf("hashoutput %v took %v", target.FQN, time.Since(start))
 	}()
 
 	file := filepath.Join(e.cacheDir(target, e.hashInput(target)), outputHashFile)

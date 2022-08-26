@@ -399,7 +399,7 @@ func (e *Engine) Parse() error {
 	if err != nil {
 		return err
 	}
-	log.Tracef("ParseConfigs took %v", time.Since(configStartTime))
+	log.Debugf("ParseConfigs took %v", time.Since(configStartTime))
 
 	upgrade.CheckAndUpdate(e.Config.Config)
 
@@ -417,7 +417,7 @@ func (e *Engine) Parse() error {
 	if err != nil {
 		return err
 	}
-	log.Tracef("RunBuildFiles took %v", time.Since(runStartTime))
+	log.Debugf("RunBuildFiles took %v", time.Since(runStartTime))
 
 	sort.SliceStable(e.Targets, func(i, j int) bool {
 		return e.Targets[i].FQN < e.Targets[j].FQN
@@ -430,14 +430,14 @@ func (e *Engine) Parse() error {
 			return fmt.Errorf("%v: %w", target.FQN, err)
 		}
 	}
-	log.Tracef("ProcessTargets took %v", time.Since(processStartTime))
+	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
 	linkStartTime := time.Now()
 	err = e.linkTargets(false, e.noRequireGenTargets())
 	if err != nil {
 		return err
 	}
-	log.Tracef("ProcessTargets took %v", time.Since(linkStartTime))
+	log.Debugf("ProcessTargets took %v", time.Since(linkStartTime))
 
 	err = e.createDag()
 	if err != nil {
@@ -449,11 +449,6 @@ func (e *Engine) Parse() error {
 
 func (e *Engine) Simplify() error {
 	return e.linkTargets(true, nil)
-}
-
-func isEdgeDuplicateError(err error) bool {
-	_, is := err.(dag.EdgeDuplicateError)
-	return is
 }
 
 func TargetNotFoundError(target string) error {
@@ -473,22 +468,31 @@ func (e *Engine) createDag() error {
 		}
 	}
 
+	addEdge := func(src, dst *Target) error {
+		ok, err := e.dag.IsEdge(src.FQN, dst.FQN)
+		if ok || err != nil {
+			return err
+		}
+
+		return e.dag.AddEdge(src.FQN, dst.FQN)
+	}
+
 	for _, target := range targets {
 		for _, dep := range target.Deps.All().Targets {
-			err := e.dag.AddEdge(dep.Target.FQN, target.FQN)
-			if err != nil && !isEdgeDuplicateError(err) {
+			err := addEdge(dep.Target, target)
+			if err != nil {
 				return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
 			}
 		}
 
 		for _, tool := range target.Tools {
-			err := e.dag.AddEdge(tool.Target.FQN, target.FQN)
-			if err != nil && !isEdgeDuplicateError(err) {
+			err := addEdge(tool.Target, target)
+			if err != nil {
 				return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, target.FQN, err)
 			}
 		}
 	}
-	log.Tracef("DAG took %v", time.Since(dagStartTime))
+	log.Debugf("DAG took %v", time.Since(dagStartTime))
 
 	return nil
 }

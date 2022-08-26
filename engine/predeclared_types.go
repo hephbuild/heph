@@ -26,6 +26,7 @@ type TargetArgs struct {
 	RequireGen     bool
 	SrcEnv         string
 	OutEnv         string
+	HashFile       string
 }
 
 type Runnable struct {

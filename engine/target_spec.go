@@ -5,6 +5,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
 	"os/exec"
+	"strings"
 )
 
 func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
@@ -28,6 +29,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		RequireGen:  args.RequireGen,
 		SrcEnv:      args.SrcEnv,
 		OutEnv:      args.OutEnv,
+		HashFile:    args.HashFile,
 	}
 
 	var err error
@@ -108,22 +110,25 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		}
 	}
 
-	validateEnv := func(v string) bool {
-		return v == "ignore" || v == "rel_root" || v == "rel_pkg" || v == "abs"
-	}
-
 	if t.SrcEnv == "" {
-		t.SrcEnv = "rel_pkg"
+		t.SrcEnv = FileEnvRelPkg
 	}
-	if !validateEnv(t.SrcEnv) {
-		return TargetSpec{}, fmt.Errorf("src_env must be one of `ignore`, `rel_root`, got %v", t.SrcEnv)
+	if !validate(t.SrcEnv, FileEnvValues) {
+		return TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(FileEnvValues), t.SrcEnv)
 	}
 
 	if t.OutEnv == "" {
-		t.OutEnv = "rel_pkg"
+		t.OutEnv = FileEnvRelPkg
 	}
-	if !validateEnv(t.OutEnv) {
-		return TargetSpec{}, fmt.Errorf("out_env must be one of `ignore`, `rel_root`, got %v", t.OutEnv)
+	if !validate(t.OutEnv, FileEnvValues) {
+		return TargetSpec{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(FileEnvValues), t.OutEnv)
+	}
+
+	if t.HashFile == "" {
+		t.HashFile = HashInputContent
+	}
+	if !validate(t.HashFile, HashInputValues) {
+		return TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(HashInputValues), t.HashFile)
 	}
 
 	return t, nil
@@ -182,6 +187,40 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 	return td, nil
 }
 
+func printOneOf(valid []string) string {
+	for i, s := range valid {
+		valid[i] = fmt.Sprintf("`%v`", s)
+	}
+
+	return strings.Join(valid, ", ")
+}
+
+func validate(s string, valid []string) bool {
+	for _, vs := range valid {
+		if vs == s {
+			return true
+		}
+	}
+
+	return false
+}
+
+var (
+	FileEnvIgnore  = "ignore"
+	FileEnvRelRoot = "rel_root"
+	FileEnvRelPkg  = "rel_pkg"
+	FileEnvAbs     = "abs"
+
+	FileEnvValues = []string{FileEnvIgnore, FileEnvRelRoot, FileEnvRelPkg, FileEnvAbs}
+)
+
+var (
+	HashInputContent = "content"
+	HashInputModTime = "mod_time"
+
+	HashInputValues = []string{HashInputContent, HashInputModTime}
+)
+
 type TargetSpec struct {
 	Name    string
 	FQN     string
@@ -212,6 +251,7 @@ type TargetSpec struct {
 	RequireGen        bool
 	SrcEnv            string
 	OutEnv            string
+	HashFile          string
 }
 
 func (t TargetSpec) IsNamedOutput() bool {

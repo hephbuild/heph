@@ -32,13 +32,16 @@ func init() {
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(targetCmd)
 	queryCmd.AddCommand(pkgsCmd)
-	queryCmd.AddCommand(whatInputsCmd)
+	queryCmd.AddCommand(depsOnCmd)
+	queryCmd.AddCommand(depsCmd)
+
+	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
+	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
-	whatInputsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 
-	queryCmd.Flags().StringArrayVar(&include, "include", nil, "Labels to include")
-	queryCmd.Flags().StringArrayVar(&exclude, "exclude", nil, "Labels to exclude, takes precedence over --include")
+	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Labels to include")
+	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Labels to exclude, takes precedence over --include")
 
 	autocompleteTargetOrLabel := func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -225,9 +228,9 @@ var graphCmd = &cobra.Command{
 }
 
 var graphDotCmd = &cobra.Command{
-	Use:   "graphdot",
+	Use:   "graphdot [ancestors|descendants <target>]",
 	Short: "Outputs graph do",
-	Args:  cobra.MaximumNArgs(1),
+	Args:  cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(false)
 	},
@@ -255,26 +258,40 @@ digraph G  {
 
 		dag := Engine.DAG()
 		if len(args) > 0 {
-			gdag, _, err := Engine.DAG().GetAncestorsGraph(args[0])
-			if err != nil {
-				return err
+			if len(args) < 2 {
+				return fmt.Errorf("requires two args")
 			}
 
-			dag = &engine.DAG{DAG: gdag}
+			switch args[0] {
+			case "ancestors":
+				gdag, _, err := Engine.DAG().GetAncestorsGraph(args[1])
+				if err != nil {
+					return err
+				}
+				dag = &engine.DAG{DAG: gdag}
+			case "descendants":
+				gdag, _, err := Engine.DAG().GetDescendantsGraph(args[1])
+				if err != nil {
+					return err
+				}
+				dag = &engine.DAG{DAG: gdag}
+			default:
+				return fmt.Errorf("must be one of ancestors, descendants")
+			}
 		}
 
-		dag.DFSWalk(engine.Walker(func(target *engine.Target) {
+		for _, target := range dag.GetVertices() {
 			extra := ""
 			if target.IsGroup() {
 				//extra = ` color="red"`
-				return
+				continue
 			}
 
 			log.Tracef("walk %v", target.FQN)
 
 			parentsStart := time.Now()
 			parents, err := dag.GetParents(target)
-			log.Tracef("parents took %v (got %v)", time.Since(parentsStart), len(parents))
+			log.Debugf("parents took %v (got %v)", time.Since(parentsStart), len(parents))
 			if err != nil {
 				panic(err)
 			}
@@ -285,7 +302,7 @@ digraph G  {
 				fmt.Printf("    %v -> %v;\n", id(ancestor), id(target))
 			}
 			fmt.Println()
-		}))
+		}
 
 		fmt.Println("}")
 
@@ -434,9 +451,55 @@ var pkgsCmd = &cobra.Command{
 	},
 }
 
-var whatInputsCmd = &cobra.Command{
-	Use:   "whatinputs <target>",
-	Short: "Prints target dependees",
+var depsCmd = &cobra.Command{
+	Use:   "deps <target>",
+	Short: "Prints target dependencies",
+	Args:  cobra.ExactArgs(1),
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRunWithGen(false)
+	},
+
+	RunE: func(_ *cobra.Command, args []string) error {
+		tp, err := utils.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		fn := Engine.DAG().GetParents
+		if transitive {
+			fn = Engine.DAG().GetAncestors
+		}
+
+		ancestors := make([]string, 0)
+		ancs, err := fn(target)
+		if err != nil {
+			return err
+		}
+		for _, anc := range ancs {
+			ancestors = append(ancestors, anc.FQN)
+		}
+
+		ancestors = utils.DedupKeepLast(ancestors, func(s string) string {
+			return s
+		})
+		sort.Strings(ancestors)
+
+		for _, fqn := range ancestors {
+			fmt.Println(fqn)
+		}
+
+		return nil
+	},
+}
+
+var depsOnCmd = &cobra.Command{
+	Use:   "depson <target>",
+	Short: "Prints targets dependent on",
 	Args:  cobra.ExactArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(false)
@@ -452,35 +515,27 @@ var whatInputsCmd = &cobra.Command{
 			return engine.TargetNotFoundError(tp.Full())
 		}
 
-		dependees := make([]string, 0)
-
-		for _, t := range Engine.DAG().GetVertices() {
-			for _, dep := range t.Deps.All().Targets {
-				if dep.Target.FQN == target.FQN {
-					dependees = append(dependees, t.FQN)
-					break
-				}
-			}
-		}
-
+		fn := Engine.DAG().GetChildren
 		if transitive {
-			for _, dependee := range dependees {
-				ancs, err := Engine.DAG().GetDescendantsOfFQN(dependee)
-				if err != nil {
-					return err
-				}
-				for _, anc := range ancs {
-					dependees = append(dependees, anc.FQN)
-				}
-			}
+			fn = Engine.DAG().GetDescendants
 		}
 
-		dependees = utils.DedupKeepLast(dependees, func(s string) string {
+		descendants := make([]string, 0)
+
+		ancs, err := fn(target)
+		if err != nil {
+			return err
+		}
+		for _, anc := range ancs {
+			descendants = append(descendants, anc.FQN)
+		}
+
+		descendants = utils.DedupKeepLast(descendants, func(s string) string {
 			return s
 		})
-		sort.Strings(dependees)
+		sort.Strings(descendants)
 
-		for _, fqn := range dependees {
+		for _, fqn := range descendants {
 			fmt.Println(fqn)
 		}
 

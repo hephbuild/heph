@@ -57,7 +57,7 @@ func (e *Engine) vfsCopyFile(from, to vfs.Location, path string) error {
 	}
 	defer df.Close()
 
-	log.Tracef("vfs copy to %v took %v", to.URI(), time.Since(start).String())
+	log.Debugf("vfs copy to %v took %v", to.URI(), time.Since(start).String())
 
 	return nil
 }

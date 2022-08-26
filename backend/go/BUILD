@@ -113,6 +113,7 @@ def go_mod(mod_pkgs=[], test={}):
 
     target(
         name="_go_mod_gen",
+        hash_file="mod_time",
         run="godeps \"$TARGET\" mod '{}'".format(to_json(godeps_cfg)),
         out="/**/BUILD",
         deps=[src]+mod_pkg_srcs,
@@ -193,6 +194,7 @@ def go_mod_download(name, path, version):
         ],
         tools=[go],
         out=["."],
+        labels=['thirdparty'],
     )
 
 def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], abi=None, dir=None, src_dep=None):
@@ -257,6 +259,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
                 "OS": get_os(),
                 "ARCH": get_arch(),
             },
+            labels=['go_lib'],
         )
 
     src_files = go_files
@@ -288,6 +291,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
             "ARCH": get_arch(),
             "SRC_SRC": "", # override src env var
         },
+        labels=['go_lib'],
     )
 
 def go_build_bin(name, main, libs=[], out=None):

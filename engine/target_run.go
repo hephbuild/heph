@@ -297,7 +297,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs
 	env["SANDBOX"] = filepath.Join(e.sandboxRoot(target), "_dir")
-	if target.SrcEnv != "ignore" {
+	if target.SrcEnv != FileEnvIgnore {
 		for name, paths := range namedDeps {
 			k := "SRC_" + strings.ToUpper(name)
 			if name == "" {
@@ -306,11 +306,11 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			spaths := make([]string, 0)
 			for _, path := range paths {
 				switch target.SrcEnv {
-				case "abs":
+				case FileEnvAbs:
 					spaths = append(spaths, filepath.Join(target.WorkdirRoot.Abs, path))
-				case "rel_root":
+				case FileEnvRelRoot:
 					spaths = append(spaths, path)
-				case "rel_pkg":
+				case FileEnvRelPkg:
 					p := "/root"
 					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path))
 					if err != nil {
@@ -327,7 +327,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	}
 
-	if target.OutEnv != "ignore" {
+	if target.OutEnv != FileEnvIgnore {
 		namedOut := map[string][]string{}
 		for name, paths := range target.Out.WithRoot(target.WorkdirRoot.Abs).Named() {
 			for _, path := range paths {
@@ -345,11 +345,11 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 				var pathv string
 				switch target.OutEnv {
-				case "abs":
+				case FileEnvAbs:
 					pathv = path.Abs()
-				case "rel_root":
+				case FileEnvRelRoot:
 					pathv = path.RelRoot()
-				case "rel_pkg":
+				case FileEnvRelPkg:
 					p := "/root"
 					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path.RelRoot()))
 					if err != nil {

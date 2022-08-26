@@ -38,7 +38,7 @@ func MakeBin(cfg MakeBinConfig) error {
 	start := time.Now()
 	log.Tracef("MakeBin %#v", cfg)
 	defer func() {
-		log.Tracef("MakeBin %v took %v", cfg.Dir, time.Since(start))
+		log.Debugf("MakeBin %v took %v", cfg.Dir, time.Since(start))
 	}()
 
 	_ = os.RemoveAll(cfg.Dir)
@@ -69,7 +69,7 @@ func Make(ctx context.Context, cfg MakeConfig) (Spec, error) {
 	start := time.Now()
 	log.Tracef("Make %v", cfg.Root)
 	defer func() {
-		log.Tracef("Make %v took %v", cfg.Root, time.Since(start))
+		log.Debugf("Make %v took %v", cfg.Root, time.Since(start))
 	}()
 
 	err := os.RemoveAll(cfg.Root)

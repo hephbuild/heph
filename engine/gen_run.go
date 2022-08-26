@@ -24,12 +24,14 @@ func (e *Engine) ScheduleGenPass(pool *worker.Pool) error {
 	genTargets := e.GeneratedTargets()
 
 	if len(genTargets) == 0 {
+		log.Debugf("No gen targets, skip gen pass")
+
 		linkStartTime := time.Now()
 		err := e.linkTargets(false, nil)
 		if err != nil {
 			return fmt.Errorf("linking %w", err)
 		}
-		log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
+		log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
 
 		err = e.createDag()
 		if err != nil {
@@ -39,7 +41,7 @@ func (e *Engine) ScheduleGenPass(pool *worker.Pool) error {
 		return nil
 	}
 
-	log.Tracef("Run gen pass")
+	log.Debugf("Run gen pass")
 
 	ge := runGenEngine{
 		Engine: e,
@@ -166,7 +168,7 @@ func (e *runGenEngine) linkAndDagGenTargets() error {
 	if err != nil {
 		return fmt.Errorf("linking %w", err)
 	}
-	log.Tracef("LinkTargets took %v", time.Since(linkStartTime))
+	log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
 
 	err = e.createDag()
 	if err != nil {
@@ -181,7 +183,7 @@ func (e *runGenEngine) runGenerated(target *Target) error {
 
 	start := time.Now()
 	defer func() {
-		log.Tracef("runGenerated %v took %v", target.FQN, time.Since(start))
+		log.Debugf("runGenerated %v took %v", target.FQN, time.Since(start))
 	}()
 
 	targets := make(Targets, 0)

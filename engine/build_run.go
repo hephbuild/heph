@@ -37,7 +37,7 @@ func (e *Engine) collectBuildFiles(root string) (SourceFiles, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Tracef("RunBuildFiles:walk took %v", time.Now().Sub(walkStartTime))
+	log.Debugf("RunBuildFiles:walk took %v", time.Now().Sub(walkStartTime))
 
 	return files, err
 }

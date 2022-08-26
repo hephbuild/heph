@@ -121,6 +121,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"require_gen?", &sargs.RequireGen,
 		"src_env?", &sargs.SrcEnv,
 		"out_env?", &sargs.OutEnv,
+		"hash_file?", &sargs.HashFile,
 	); err != nil {
 		if sargs.Name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.Name), err)
