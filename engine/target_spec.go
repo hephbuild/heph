@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -110,6 +112,15 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		}
 	}
 
+	sort.SliceStable(t.Out, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(t.Out[i].Path, t.Out[j].Path)
+		},
+		func(i, j int) int {
+			return strings.Compare(t.Out[i].Name, t.Out[j].Name)
+		},
+	))
+
 	if t.SrcEnv == "" {
 		t.SrcEnv = FileEnvRelPkg
 	}
@@ -140,6 +151,7 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	for _, dep := range arr {
 		if expr, err := utils.ExprParse(dep); err == nil {
 			td.Exprs = append(td.Exprs, TargetSpecDepExpr{
+				String:  dep,
 				Name:    name,
 				Package: t.Package,
 				Expr:    expr,
@@ -183,6 +195,33 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 		td.Exprs = append(td.Exprs, d.Exprs...)
 		td.Files = append(td.Files, d.Files...)
 	}
+
+	sort.SliceStable(td.Exprs, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(td.Exprs[i].String, td.Exprs[j].String)
+		},
+		func(i, j int) int {
+			return strings.Compare(td.Exprs[i].Name, td.Exprs[j].Name)
+		},
+	))
+
+	sort.SliceStable(td.Targets, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(td.Targets[i].Target, td.Targets[j].Target)
+		},
+		func(i, j int) int {
+			return strings.Compare(td.Targets[i].Name, td.Targets[j].Name)
+		},
+	))
+
+	sort.SliceStable(td.Files, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(td.Files[i].Path, td.Files[j].Path)
+		},
+		func(i, j int) int {
+			return strings.Compare(td.Files[i].Name, td.Files[j].Name)
+		},
+	))
 
 	return td, nil
 }
@@ -274,6 +313,35 @@ func (t TargetSpec) FindNamedOutput(name string) *TargetSpecOutFile {
 	return nil
 }
 
+func (t TargetSpec) json() []byte {
+	t.Package = nil
+	t.Source = nil
+
+	b, err := json.Marshal(t)
+	if err != nil {
+		panic(err)
+	}
+
+	return b
+}
+
+func (t TargetSpec) Equal(spec TargetSpec) bool {
+	tj := t.json()
+	sj := spec.json()
+
+	if len(tj) != len(sj) {
+		return false
+	}
+
+	for i := 0; i < len(tj); i++ {
+		if tj[i] != sj[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
 type TargetSpecTargetTool struct {
 	Target string
 	Output string
@@ -302,6 +370,7 @@ type TargetSpecDepTarget struct {
 }
 
 type TargetSpecDepExpr struct {
+	String  string
 	Name    string
 	Package *Package
 	Expr    *utils.Expr

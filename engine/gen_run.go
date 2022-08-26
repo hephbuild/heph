@@ -203,7 +203,10 @@ func (e *runGenEngine) runGenerated(target *Target) error {
 						return fmt.Errorf("cannot replace gen target")
 					}
 
-					// TODO implement conflict policy
+					if !t.TargetSpec.Equal(spec) {
+						return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n%s", spec.FQN, t.Source, t.json(), spec.json())
+					}
+
 					return nil
 				}
 

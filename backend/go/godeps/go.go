@@ -21,6 +21,14 @@ type Mod struct {
 	Replace *Mod
 }
 
+func (m *Mod) Actual() *Mod {
+	if m.Replace != nil {
+		return m.Replace
+	}
+
+	return m
+}
+
 type Package struct {
 	Dir            string
 	Root           string

@@ -20,9 +20,11 @@ func normalizePackage(p string) string {
 }
 
 func thirdpartyDownloadTarget(pkg *Package) Target {
+	module := pkg.Module.Actual()
+
 	return Target{
-		Name:    "_go_mod_download_" + normalizePackage(pkg.Module.Version),
-		Package: filepath.Join(Config.ThirdpartyPackage, pkg.Module.Path),
+		Name:    "_go_mod_download_" + normalizePackage(module.Version),
+		Package: filepath.Join(Config.ThirdpartyPackage, module.Path),
 	}
 }
 
@@ -37,8 +39,9 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 
 	h := sha256.New()
 	for _, p := range getImportsPackages(pkgs, imports) {
-		h.Write([]byte(p.Module.Path))
-		h.Write([]byte(p.Module.Version))
+		module := p.Module.Actual()
+		h.Write([]byte(module.Path))
+		h.Write([]byte(module.Version))
 	}
 	suffix := fmt.Sprintf("_%.7x", h.Sum(nil))
 
@@ -54,9 +57,16 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 			Package: pkgName,
 		}
 	} else {
+		module := pkg.Module.Actual()
+
+		importPath := pkg.ImportPath
+		if pkg.Module.Replace != nil {
+			importPath = strings.ReplaceAll(importPath, pkg.Module.Path, pkg.Module.Replace.Path)
+		}
+
 		return Target{
-			Name:    "_go_lib_" + normalizePackage(pkg.Module.Version) + suffix,
-			Package: filepath.Join(Config.ThirdpartyPackage, pkg.ImportPath),
+			Name:    "_go_lib_" + normalizePackage(module.Version) + suffix,
+			Package: filepath.Join(Config.ThirdpartyPackage, importPath),
 		}
 	}
 }
@@ -196,19 +206,16 @@ func generate() []RenderUnit {
 				continue
 			}
 
-			id := pkg.Module.Path + pkg.Module.Version
+			module := pkg.Module.Actual()
 
-			moddl, exists := modsm[id]
+			target := thirdpartyDownloadTarget(pkg)
+
+			moddl, exists := modsm[target.Full()]
 			if !exists {
 				moddl = &ModDl{
-					Target:  thirdpartyDownloadTarget(pkg),
-					Path:    pkg.Module.Path,
-					Version: pkg.Module.Version,
-				}
-
-				if mod := pkg.Module.Replace; mod != nil {
-					moddl.Path = mod.Path
-					moddl.Version = mod.Version
+					Target:  target,
+					Path:    module.Path,
+					Version: module.Version,
 				}
 
 				units = append(units, RenderUnit{
@@ -218,7 +225,7 @@ func generate() []RenderUnit {
 					Package: moddl.Target.Package,
 				})
 
-				modsm[id] = moddl
+				modsm[target.Full()] = moddl
 			}
 
 			lib := &Lib{
