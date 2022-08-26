@@ -7,7 +7,8 @@ import (
 
 type TargetArgs struct {
 	Name           string
-	Run            Runnable
+	Run            ArrayMap
+	Executor       string
 	RunInCwd       bool
 	Quiet          bool
 	PassArgs       bool
@@ -27,33 +28,6 @@ type TargetArgs struct {
 	SrcEnv         string
 	OutEnv         string
 	HashFile       string
-}
-
-type Runnable struct {
-	Cmds     []string
-	Callable starlark.Callable
-}
-
-func (r *Runnable) Unpack(v starlark.Value) error {
-	switch v := v.(type) {
-	case starlark.Callable:
-		r.Callable = v
-		return nil
-	case starlark.String:
-		r.Cmds = []string{string(v)}
-		return nil
-	case *starlark.List:
-		var a ArrayMap
-		err := a.Unpack(v)
-		if err != nil {
-			return err
-		}
-
-		r.Cmds = a.Array
-		return nil
-	}
-
-	return fmt.Errorf("must be string or []string, is %v", v.Type())
 }
 
 type BoolArray struct {

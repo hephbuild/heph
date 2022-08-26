@@ -219,7 +219,7 @@ func (t *Target) String() string {
 }
 
 func (t *Target) IsGroup() bool {
-	return len(t.Cmds) == 0 && len(t.Out.All()) == 1 && (t.Out.All()[0].Path == "*" || t.Out.All()[0].Path == "/")
+	return len(t.Run) == 0 && len(t.Out.All()) == 1 && (t.Out.All()[0].Path == "*" || t.Out.All()[0].Path == "/")
 }
 
 type Path struct {

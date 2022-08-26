@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -122,30 +123,50 @@ type IOConfig struct {
 	Stderr io.Writer
 }
 
+func BashArgs(cmds []string) []string {
+	args := []string{"bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
+	//args = append(args, "-x")
+	args = append(args, "-c", strings.Join(cmds, "\n"))
+
+	return args
+}
+
+func ExecArgs(args []string, env map[string]string) ([]string, error) {
+	for i, arg := range args {
+		if strings.HasPrefix(arg, "$") {
+			v, ok := env[strings.TrimPrefix(arg, "$")]
+			if !ok {
+				return nil, fmt.Errorf("%v is unbound", arg)
+			}
+			args[i] = v
+		}
+	}
+
+	return args, nil
+}
+
 type ExecConfig struct {
 	IOConfig
-	Context context.Context
-	BinDir  string
-	Dir     string
-	Cmd     string
-	Env     map[string]string
-	Args    []string
+	Context  context.Context
+	BinDir   string
+	Dir      string
+	Env      map[string]string
+	ExecArgs []string
+	CmdArgs  []string
 }
 
 func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
-	log.Tracef("Exec: %v %v", cfg.Cmd, cfg.Dir)
+	args := cfg.ExecArgs
+	args = append(args, cfg.CmdArgs...)
+
+	log.Tracef("Exec in %v: %v", cfg.Dir, args)
 
 	err := os.MkdirAll(cfg.Dir, os.ModePerm)
 	if err != nil {
 		panic(err)
 	}
 
-	args := []string{"--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
-	//args = append(args, "-x")
-	args = append(args, "-c", cfg.Cmd)
-	args = append(args, cfg.Args...)
-
-	cmd := exec.CommandContext(cfg.Context, "bash", args...)
+	cmd := exec.CommandContext(cfg.Context, args[0], args[1:]...)
 	cmd.Dir = cfg.Dir
 
 	cmd.Stdin = cfg.Stdin

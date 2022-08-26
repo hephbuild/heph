@@ -103,6 +103,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"target", args, kwargs,
 		"name?", &sargs.Name,
 		"run?", &sargs.Run,
+		"executor?", &sargs.Executor,
 		"run_in_cwd?", &sargs.RunInCwd,
 		"quiet?", &sargs.Quiet,
 		"pass_args?", &sargs.PassArgs,

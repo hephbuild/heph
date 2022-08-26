@@ -14,7 +14,8 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	t := TargetSpec{
 		FQN:         pkg.TargetPath(args.Name),
 		Name:        args.Name,
-		Cmds:        args.Run.Cmds,
+		Run:         args.Run.Array,
+		Executor:    args.Executor,
 		Package:     pkg,
 		PassArgs:    args.PassArgs,
 		Quiet:       args.Quiet,
@@ -136,10 +137,17 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	}
 
 	if t.HashFile == "" {
-		t.HashFile = HashInputContent
+		t.HashFile = HashFileContent
 	}
-	if !validate(t.HashFile, HashInputValues) {
-		return TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(HashInputValues), t.HashFile)
+	if !validate(t.HashFile, HashFileValues) {
+		return TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(HashFileValues), t.HashFile)
+	}
+
+	if t.Executor == "" {
+		t.Executor = ExecutorBash
+	}
+	if !validate(t.Executor, ExecutorValues) {
+		return TargetSpec{}, fmt.Errorf("executor must be one of %v, got %v", printOneOf(ExecutorValues), t.Executor)
 	}
 
 	return t, nil
@@ -254,10 +262,17 @@ var (
 )
 
 var (
-	HashInputContent = "content"
-	HashInputModTime = "mod_time"
+	HashFileContent = "content"
+	HashFileModTime = "mod_time"
 
-	HashInputValues = []string{HashInputContent, HashInputModTime}
+	HashFileValues = []string{HashFileContent, HashFileModTime}
+)
+
+var (
+	ExecutorBash = "bash"
+	ExecutorExec = "exec"
+
+	ExecutorValues = []string{ExecutorBash, ExecutorExec}
 )
 
 type TargetSpec struct {
@@ -265,7 +280,8 @@ type TargetSpec struct {
 	FQN     string
 	Package *Package
 
-	Cmds              []string
+	Run               []string
+	Executor          string
 	Quiet             bool
 	Dir               string
 	PassArgs          bool

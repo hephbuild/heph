@@ -414,40 +414,43 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		env[k] = v
 	}
 
-	cmds := target.Cmds
-	var cmdArgs []string
+	_, hasPathInEnv := env["PATH"]
+
 	if len(args) > 0 {
-		if len(cmds) > 1 {
+		if target.Executor == ExecutorBash && len(target.Run) > 1 {
 			return fmt.Errorf("args are supported only with a single cmd")
 		}
 
 		if target.ShouldCache {
 			return fmt.Errorf("args are not supported with cache")
 		}
-
-		log.Tracef("Adding args %v", args)
-
-		cmdArgs = args
 	}
 
-	_, hasPathInEnv := env["PATH"]
+	if len(target.Run) > 0 {
+		var execArgs []string
+		switch target.Executor {
+		case ExecutorBash:
+			execArgs = sandbox.BashArgs(target.Run)
+		case ExecutorExec:
+			execArgs, err = sandbox.ExecArgs(target.Run, env)
+			if err != nil {
+				return err
+			}
+		}
 
-	for i, c := range cmds {
 		cmd := sandbox.Exec(sandbox.ExecConfig{
 			Context:  ctx,
 			BinDir:   sandboxSpec.BinDir(),
 			Dir:      dir,
-			Cmd:      c,
 			Env:      env,
 			IOConfig: iocfg,
-			Args:     cmdArgs,
+			ExecArgs: execArgs,
+			CmdArgs:  args,
 		}, target.Sandbox && !hasPathInEnv)
 
-		log.Tracef("Run %v #%v", target.FQN, i)
-
-		err := cmd.Run()
+		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("exec: %v => %w", c, err)
+			return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
 		}
 	}
 

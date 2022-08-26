@@ -181,6 +181,7 @@ func (e *Engine) hashInput(target *Target) string {
 
 	h := xxh3.New()
 
+	h.WriteString("=")
 	for _, dep := range target.Tools {
 		dh := e.hashOutput(dep.Target, "")
 
@@ -188,37 +189,43 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(dh))
 	}
 
+	h.WriteString("=")
 	for _, tool := range target.HostTools {
 		h.Write([]byte(tool.Name))
 	}
 
+	h.WriteString("=")
 	for _, dep := range target.HashDeps.Targets {
 		dh := e.hashOutput(dep.Target, dep.Output)
 
 		h.Write([]byte(dh))
 	}
 
+	h.WriteString("=")
 	for _, dep := range target.HashDeps.Files {
 		switch target.HashFile {
-		case HashInputContent:
+		case HashFileContent:
 			err := e.hashFile(h, dep)
 			if err != nil {
 				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
 			}
-		case HashInputModTime:
+		case HashFileModTime:
 			err := e.hashFileModTime(h, dep)
 			if err != nil {
-				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+				panic(fmt.Errorf("hashDeps: %v: hashFileModTime %v %w", target.FQN, dep.Abs(), err))
 			}
 		default:
 			panic(fmt.Sprintf("unhandled hash_input: %v", target.HashFile))
 		}
 	}
 
-	for _, cmd := range target.Cmds {
+	h.WriteString("=")
+	for _, cmd := range target.Run {
 		h.Write([]byte(cmd))
 	}
+	h.Write([]byte(target.Executor))
 
+	h.WriteString("=")
 	outEntries := make([]string, 0)
 	for _, file := range target.TargetSpec.Out {
 		outEntries = append(outEntries, file.Name+file.Path)
@@ -230,10 +237,12 @@ func (e *Engine) hashInput(target *Target) string {
 		h.WriteString(entry)
 	}
 
+	h.WriteString("=")
 	for _, file := range target.CachedFiles {
 		h.Write([]byte(file.RelRoot()))
 	}
 
+	h.WriteString("=")
 	envEntries := make([]string, 0)
 	for k, v := range target.Env {
 		envEntries = append(envEntries, k+v)
@@ -245,10 +254,14 @@ func (e *Engine) hashInput(target *Target) string {
 		h.Write([]byte(e))
 	}
 
+	h.WriteString("=")
 	if target.Gen {
 		h.Write([]byte{1})
+	} else {
+		h.Write([]byte{0})
 	}
 
+	h.WriteString("=")
 	h.WriteString(target.SrcEnv)
 	h.WriteString(target.OutEnv)
 
