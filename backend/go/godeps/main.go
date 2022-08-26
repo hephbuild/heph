@@ -133,6 +133,28 @@ func generate() []RenderUnit {
 				Package: lib.Target.Package,
 			})
 
+			if pkg.IsPartOfModule && pkg.Name == "main" {
+				bin := &Bin{
+					TargetPackage: lib.Target.Package,
+					MainLib:       lib.Target.Full(),
+				}
+
+				_, deps := splitOutPkgs(pkg.Deps)
+
+				for _, p := range deps {
+					t := libTarget(pkgs, pkgs.Find(p), nil)
+
+					bin.Libs = append(bin.Libs, t.Full())
+				}
+
+				units = append(units, RenderUnit{
+					Render: func(w io.Writer) {
+						RenderBin(w, bin)
+					},
+					Package: bin.TargetPackage,
+				})
+			}
+
 			if pkg.IsPartOfModule && !Config.IsTestSkipped(pkg.ImportPath) && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
 				_, pkgDeps := splitOutPkgs(pkg.Deps)

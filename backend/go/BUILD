@@ -157,7 +157,7 @@ def go_mod(mod_pkgs=[], test={}):
         sandbox=False,
         cache=False,
     )
-def go_gen_importcfg():
+def _go_gen_importcfg():
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s")+" 100000"
     std_file = backend_dir+"/std_list"
 
@@ -168,7 +168,7 @@ def go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def go_compile_cmd(name, import_path, files, abi=None, complete=True):
+def _go_compile_cmd(name, import_path, files, abi=None, complete=True):
     extra = ""
     if abi:
         extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
@@ -279,7 +279,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     return target(
         name=name,
         deps=deps,
-        run=go_gen_importcfg()+go_compile_cmd(name, import_path, src_files, abi, complete),
+        run=_go_gen_importcfg()+_go_compile_cmd(name, import_path, src_files, abi, complete),
         out=out,
         out_env='rel_root',
         tools=[go],
@@ -290,13 +290,24 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
         },
     )
 
-def go_bin_link(name, path, deps, out):
+def go_build_bin(name, main, libs=[], out=None):
+    if not out:
+        out = package_name()
+
+    if "|" not in main:
+        main = main+"|a"
+
     return target(
         name=name,
-        deps=deps+[std_pkgs],
-        run=go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {}'.format(path)],
+        deps={
+            'libs': libs,
+            'main': main,
+            'std': [std_pkgs],
+        },
+        run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT $SRC_MAIN'],
         out_env='rel_root',
         tools=[go],
+        labels=['go_build_bin'],
         out=out,
         env={
             "OS": get_os(),
@@ -304,34 +315,15 @@ def go_bin_link(name, path, deps, out):
         },
     )
 
-def go_bin(name, pkg, build_deps=[], *args, **kwargs):
-    return
-    out = "_out_"+name
-
-    pkg_path = ""
-    if pkg:
-        pkg_path = "/"+pkg
-
-    build = target(
-        name="_"+name+"#build",
-        run=['GOPATH="$SANDBOX/thirdparty/go/gopath" go build -mod=readonly -o {} .{}'.format(out, pkg_path)],
-        deps=[
-                 package_fqn()+pkg_path+':_go_pkg',
-                 '$(find_parent ":_mod")',
-                 ]+build_deps,
-        tools=[go],
-        out={name: out},
-        env={
-            "OS": get_os(),
-            "ARCH": get_arch(),
-        },
-        require_gen=True,
-    )
+def go_bin(name, pkg=None, *args, **kwargs):
+    out = package_name()
+    if not pkg:
+        pkg = package_fqn()
 
     return target(
         name=name,
-        tools=[build],
-        run=name,
+        tools='$(collect "{}/." must=1 include="go_build_bin")'.format(pkg),
+        run="$TOOL_GO_BIN_BUILD",
         sandbox=False,
         cache=False,
         pass_args=True,

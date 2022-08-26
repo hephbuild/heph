@@ -667,6 +667,13 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	log.Tracef(logPrefix + "Linking tools")
 
 	t.Tools = []TargetTool{}
+
+	type targetTool struct {
+		Target *Target
+		Output string
+	}
+
+	targetTools := make([]targetTool, 0)
 	for _, tool := range t.TargetSpec.TargetTools {
 		tt := e.Targets.Find(tool.Target)
 		if tt == nil {
@@ -677,6 +684,30 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		if err != nil {
 			return fmt.Errorf("tool: %v: %w", tool, err)
 		}
+
+		targetTools = append(targetTools, targetTool{
+			Target: tt,
+			Output: tool.Output,
+		})
+	}
+
+	for _, tool := range t.TargetSpec.ExprTools {
+		expr := tool.Expr
+
+		targets, err := e.targetExpr(t, expr, simplify, breadcrumb)
+		if err != nil {
+			return err
+		}
+
+		for _, target := range targets {
+			targetTools = append(targetTools, targetTool{
+				Target: target,
+			})
+		}
+	}
+
+	for _, tool := range targetTools {
+		tt := tool.Target
 
 		if len(tt.Out.All()) == 0 {
 			return fmt.Errorf("%v does not output anything", tt.FQN)
@@ -831,41 +862,52 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 	return td, nil
 }
 
+func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcrumb Targets) (Targets, error) {
+	switch expr.Function {
+	case "collect":
+		targets, err := e.collect(t, expr)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, target := range targets {
+			err := e.linkTarget(target, simplify, breadcrumb)
+			if err != nil {
+				return nil, fmt.Errorf("collect: %w", err)
+			}
+		}
+
+		return targets, nil
+	case "find_parent":
+		target, err := e.findParent(t, expr)
+		if err != nil {
+			return nil, err
+		}
+
+		err = e.linkTarget(target, simplify, breadcrumb)
+		if err != nil {
+			return nil, fmt.Errorf("find_parent: %w", err)
+		}
+
+		return Targets{target}, nil
+	default:
+		return nil, fmt.Errorf("unhandled function %v", expr.Function)
+	}
+}
+
 func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {
 		expr := expr.Expr
 
-		switch expr.Function {
-		case "collect":
-			targets, err := e.collect(t, expr)
-			if err != nil {
-				return TargetDeps{}, err
-			}
+		targets, err := e.targetExpr(t, expr, simplify, breadcrumb)
+		if err != nil {
+			return TargetDeps{}, err
+		}
 
-			for _, target := range targets {
-				err := e.linkTarget(target, simplify, breadcrumb)
-				if err != nil {
-					return TargetDeps{}, fmt.Errorf("collect: %w", err)
-				}
-
-				td.Targets = append(td.Targets, TargetWithOutput{Target: target})
-			}
-		case "find_parent":
-			target, err := e.findParent(t, expr)
-			if err != nil {
-				return TargetDeps{}, err
-			}
-
-			err = e.linkTarget(target, simplify, breadcrumb)
-			if err != nil {
-				return TargetDeps{}, fmt.Errorf("find_parent: %w", err)
-			}
-
+		for _, target := range targets {
 			td.Targets = append(td.Targets, TargetWithOutput{Target: target})
-		default:
-			return TargetDeps{}, fmt.Errorf("unhandled function %v", expr.Function)
 		}
 	}
 

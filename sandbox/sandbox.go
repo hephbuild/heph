@@ -140,7 +140,9 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 		panic(err)
 	}
 
-	args := []string{"--noprofile", "--norc", "-e", "-u", "-o", "pipefail", "-c", cfg.Cmd}
+	args := []string{"--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
+	//args = append(args, "-x")
+	args = append(args, "-c", cfg.Cmd)
 	args = append(args, cfg.Args...)
 
 	cmd := exec.CommandContext(cfg.Context, "bash", args...)

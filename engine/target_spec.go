@@ -33,25 +33,33 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	var err error
 
 	for _, tool := range args.Tools.Array {
-		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
-		if err != nil {
-			binPath, err := exec.LookPath(tool)
-			if err != nil {
-				return TargetSpec{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
-			}
-
-			log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
-
-			t.HostTools = append(t.HostTools, TargetSpecHostTool{
-				Name: tool,
-				Path: binPath,
+		expr, err := utils.ExprParse(tool)
+		if err == nil {
+			t.ExprTools = append(t.ExprTools, TargetSpecExprTool{
+				Expr: expr,
 			})
 			continue
 		}
 
-		t.TargetTools = append(t.TargetTools, TargetSpecTargetTool{
-			Target: tp.Full(),
-			Output: tp.Output,
+		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
+		if err == nil {
+			t.TargetTools = append(t.TargetTools, TargetSpecTargetTool{
+				Target: tp.Full(),
+				Output: tp.Output,
+			})
+			continue
+		}
+
+		binPath, err := exec.LookPath(tool)
+		if err != nil {
+			return TargetSpec{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
+		}
+
+		log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
+
+		t.HostTools = append(t.HostTools, TargetSpecHostTool{
+			Name: tool,
+			Path: binPath,
 		})
 	}
 
@@ -186,6 +194,7 @@ type TargetSpec struct {
 	Deps              TargetSpecDeps
 	HashDeps          TargetSpecDeps
 	DifferentHashDeps bool
+	ExprTools         []TargetSpecExprTool
 	TargetTools       []TargetSpecTargetTool
 	HostTools         []TargetSpecHostTool
 	Out               []TargetSpecOutFile
@@ -227,6 +236,11 @@ func (t TargetSpec) FindNamedOutput(name string) *TargetSpecOutFile {
 
 type TargetSpecTargetTool struct {
 	Target string
+	Output string
+}
+
+type TargetSpecExprTool struct {
+	Expr   *utils.Expr
 	Output string
 }
 

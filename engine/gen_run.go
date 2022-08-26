@@ -138,9 +138,9 @@ func (e *runGenEngine) ScheduleRunGenerated(target *Target) error {
 				return
 			},
 			Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
-				w.Status(fmt.Sprintf("Running gen target %v...", target.FQN))
+				w.Status(fmt.Sprintf("Gen target from %v...", target.FQN))
 				defer func() {
-					w.Status(fmt.Sprintf("Running gen target %v done: %v", target.FQN, ferr))
+					w.Status(fmt.Sprintf("Gen target from %v done: %v", target.FQN, ferr))
 				}()
 
 				err := e.runGenerated(target)

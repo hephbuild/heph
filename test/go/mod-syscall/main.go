@@ -20,5 +20,5 @@ func Processes() []int32 {
 }
 
 func main() {
-	fmt.Println("Hello world", Processes())
+	fmt.Printf("Hello world :): %v processes\n", len(Processes()))
 }

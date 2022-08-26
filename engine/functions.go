@@ -16,9 +16,12 @@ func (e *Engine) collect(t *Target, expr *utils.Expr) (Targets, error) {
 
 	var includeMatchers TargetMatchers
 	var excludeMatchers TargetMatchers
+	must := false
 
 	for _, arg := range expr.NamedArgs {
 		switch arg.Name {
+		case "must":
+			must = true
 		case "include", "exclude":
 			m := ParseTargetSelector(t.Package.FullName, arg.Value)
 			if arg.Name == "exclude" {
@@ -50,6 +53,10 @@ func (e *Engine) collect(t *Target, expr *utils.Expr) (Targets, error) {
 		}
 
 		targets = append(targets, target)
+	}
+
+	if must && len(targets) == 0 {
+		return nil, fmt.Errorf("must match a target, found none")
 	}
 
 	return targets, nil

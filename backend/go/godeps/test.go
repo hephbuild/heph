@@ -46,7 +46,7 @@ go = "{{.Config.Go}}"
 generate_testmain = "{{.Config.GenerateTestMain}}"
 
 load("{{.Config.BackendPkg}}", "go_library")
-load("{{.Config.BackendPkg}}", "go_bin_link")
+load("{{.Config.BackendPkg}}", "go_build_bin")
 
 test_lib = go_library(
 	name="_go_lib_test",
@@ -80,10 +80,10 @@ testmain_lib = go_library(
 	dir="testmain",
 )
 
-test_build = go_bin_link(
+test_build = go_build_bin(
     name="go_test#build",
-    deps={{.Libs}}+[test_lib, testmain_lib],
-	path="testmain/lib.a",
+	main=testmain_lib,
+    libs={{.Libs}}+[test_lib],
 	out="pkg.test",
 )
 

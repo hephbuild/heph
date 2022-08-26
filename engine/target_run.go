@@ -11,6 +11,7 @@ import (
 	"heph/worker"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -74,6 +75,12 @@ func (e *Engine) tmpRoot(target *Target) string {
 
 func (e *Engine) lockPath(target *Target, resource string) string {
 	return filepath.Join(e.tmpRoot(target), resource+".lock")
+}
+
+var envRegex = regexp.MustCompile(`[^A-Za-z0-9_]+`)
+
+func normalizeEnv(k string) string {
+	return envRegex.ReplaceAllString(k, "_")
 }
 
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
@@ -316,7 +323,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 					panic("unhandled src_env: " + target.SrcEnv)
 				}
 			}
-			env[k] = strings.Join(spaths, " ")
+			env[normalizeEnv(k)] = strings.Join(spaths, " ")
 		}
 	}
 
@@ -367,11 +374,17 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 				k = "OUT"
 			}
 
-			env[k] = strings.Join(paths, " ")
+			env[normalizeEnv(k)] = strings.Join(paths, " ")
 		}
 	}
 
 	for _, t := range target.Tools {
+		k := "TOOL_" + strings.ToUpper(t.Name)
+		if t.Name == "" {
+			k = "TOOL"
+		}
+		env[normalizeEnv(k)] = t.AbsPath()
+
 		if t.Target == nil {
 			continue
 		}
