@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/utils"
 	"os"
 	"path/filepath"

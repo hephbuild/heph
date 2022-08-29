@@ -5,7 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"io"
 	"io/fs"
 	"os"

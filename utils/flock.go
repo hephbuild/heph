@@ -2,7 +2,7 @@ package utils
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"os"
 	"path/filepath"
 	"strconv"

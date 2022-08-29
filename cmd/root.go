@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"github.com/mattn/go-isatty"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"heph/config"
 	"heph/engine"
+	"heph/log"
 	"heph/utils"
 	"heph/worker"
 	"os"
@@ -27,20 +27,14 @@ var porcelain *bool
 var workers *int
 
 func init() {
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
-	log.SetOutput(os.Stderr)
-
 	if os.Stderr != nil {
 		isTerm = isatty.IsTerminal(os.Stderr.Fd())
 	}
 
-	log.SetFormatter(&log.TextFormatter{
-		DisableTimestamp: isTerm,
-		ForceColors:      isTerm,
-	})
-
-	log.SetLevel(log.InfoLevel)
+	err := log.Init(isTerm)
+	if err != nil {
+		panic(err)
+	}
 
 	cleanCmd.AddCommand(cleanLockCmd)
 
@@ -359,9 +353,12 @@ func Execute() {
 	utils.Seed()
 
 	if err := execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error(err)
+		_ = log.Cleanup()
 		os.Exit(1)
 	}
+
+	_ = log.Cleanup()
 }
 
 func printTargetErr(err error) bool {

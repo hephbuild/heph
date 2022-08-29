@@ -1,13 +1,11 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/worker"
-	"io"
 	"os"
 	"strings"
 	"time"
@@ -26,20 +24,6 @@ func round(d time.Duration, digits int) time.Duration {
 		d = d.Round(time.Microsecond / divs[digits])
 	}
 	return d
-}
-
-type hookFunc struct {
-	f func(*log.Entry)
-}
-
-func (h hookFunc) Levels() []log.Level {
-	return log.AllLevels
-}
-
-func (h hookFunc) Fire(entry *log.Entry) error {
-	h.f(entry)
-
-	return nil
 }
 
 func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *worker.Pool) error {
@@ -78,40 +62,14 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 		}
 	}()
 
-	running := true
-	log.AddHook(hookFunc{
-		f: func(entry *log.Entry) {
-			if !running {
-				return
-			}
-
-			if !entry.Logger.IsLevelEnabled(entry.Level) {
-				return
-			}
-
-			b, err := entry.Logger.Formatter.Format(entry)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, fmt.Errorf("logger fmt error: %v", err))
-				return
-			}
-
-			p.Printf("%s", bytes.TrimSpace(b))
-		},
-	})
-
-	prevOut := log.StandardLogger().Out
-	log.SetOutput(io.Discard)
-	defer func() {
-		running = false
-		log.SetOutput(prevOut)
-	}()
-
 	go func() {
 		<-ctx.Done()
 		p.Quit()
 	}()
 
+	log.SetPrintfFunc(p.Printf)
 	err := p.Start()
+	log.SetPrintfFunc(nil)
 	if err != nil {
 		return err
 	}

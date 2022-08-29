@@ -3,7 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/utils"
 	"os"
 	"os/exec"

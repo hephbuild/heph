@@ -3,7 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"

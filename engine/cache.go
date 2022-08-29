@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/utils"
 	"heph/vfssimple"
 	"os"

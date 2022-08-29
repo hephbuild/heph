@@ -3,8 +3,8 @@ package engine
 import (
 	"fmt"
 	"github.com/heimdalr/dag"
-	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
+	"heph/log"
 	"heph/upgrade"
 	"heph/utils"
 	"os"

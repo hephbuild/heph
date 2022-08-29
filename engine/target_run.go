@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/sandbox"
 	"heph/utils"
 	"heph/worker"

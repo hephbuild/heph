@@ -3,9 +3,9 @@ package engine
 import (
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
+	"heph/log"
 	"heph/utils"
 	"io/fs"
 	"path/filepath"

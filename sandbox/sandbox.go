@@ -3,7 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"heph/log"
 	"heph/utils"
 	"io"
 	"os"
