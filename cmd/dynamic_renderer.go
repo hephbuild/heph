@@ -78,7 +78,7 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 		}
 	}()
 
-	running := false
+	running := true
 	log.AddHook(hookFunc{
 		f: func(entry *log.Entry) {
 			if !running {
@@ -111,7 +111,6 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 		p.Quit()
 	}()
 
-	running = true
 	err := p.Start()
 	if err != nil {
 		return err

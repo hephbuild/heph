@@ -1,8 +1,7 @@
 target(
     name="e2e_test",
-    run="heph --log_level=trace query --include e2e_test | heph run -",
+    run="heph --log_level=debug query --include e2e_test",
     tools=['heph'],
-    pass_env=["PATH"],
     sandbox=False,
     cache=False,
 )
@@ -11,7 +10,6 @@ target(
     name="intg_test",
     run="heph query --include //test/... | heph query --include test - | heph run -",
     tools=['heph'],
-    pass_env=["PATH"],
     sandbox=False,
     cache=False,
 )

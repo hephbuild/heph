@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -21,14 +22,15 @@ func NewFlock(p string) *Flock {
 }
 
 type Flock struct {
-	m    sync.Mutex
+	lm   sync.Mutex
+	fm   sync.Mutex
 	path string
 	f    *os.File
 }
 
 func (l *Flock) Lock() error {
-	l.m.Lock()
-	defer l.m.Unlock()
+	l.lm.Lock()
+	defer l.lm.Unlock()
 
 	if dir := filepath.Dir(l.path); dir != "." {
 		err := os.MkdirAll(dir, os.ModePerm)
@@ -58,6 +60,9 @@ func (l *Flock) Lock() error {
 	}
 	log.Debugf("Acquired lock for %s", f.Name())
 
+	l.fm.Lock()
+	defer l.fm.Unlock()
+
 	l.f = f
 
 	if err := f.Truncate(0); err == nil {
@@ -68,19 +73,39 @@ func (l *Flock) Lock() error {
 }
 
 func (l *Flock) Unlock() error {
-	l.m.Lock()
-	defer l.m.Unlock()
+	l.fm.Lock()
+	defer l.fm.Unlock()
 
+	if l.f == nil {
+		return nil
+	}
+
+	var errs []error
 	if err := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN); err != nil {
-		return fmt.Errorf("release lock for %s: %s", l.path, err)
+		errs = append(errs, fmt.Errorf("release lock for %s: %s", l.path, err))
 	}
 	if err := l.f.Close(); err != nil {
-		return fmt.Errorf("close lock file %s: %s", l.path, err)
+		errs = append(errs, fmt.Errorf("close lock file %s: %s", l.path, err))
+	}
+
+	if err := l.Clean(); err != nil {
+		errs = append(errs, fmt.Errorf("clean lock file for %v: %w", l.path, err))
 	}
 
 	l.f = nil
 
-	return l.Clean()
+	errstr := make([]string, 0)
+	for _, err := range errs {
+		if err != nil {
+			errstr = append(errstr, err.Error())
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%v", strings.Join(errstr, ", "))
+	}
+
+	return nil
 }
 
 func (l *Flock) Clean() error {
