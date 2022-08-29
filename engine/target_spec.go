@@ -5,6 +5,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
+	"os"
 	"os/exec"
 	"sort"
 	"strings"
@@ -55,7 +56,14 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 			continue
 		}
 
-		binPath, err := exec.LookPath(tool)
+		lookPath := exec.LookPath
+		if tool == "heph" {
+			lookPath = func(file string) (string, error) {
+				return os.Executable()
+			}
+		}
+
+		binPath, err := lookPath(tool)
 		if err != nil {
 			return TargetSpec{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
 		}

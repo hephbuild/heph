@@ -9,8 +9,7 @@ type FileConfig struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
 	} `yaml:"build_files"`
-	KeepSandbox *bool  `yaml:"keep_sandbox"`
-	Locker      string `yaml:"locker"`
+	KeepSandbox *bool `yaml:"keep_sandbox"`
 	Extras      `yaml:",inline"`
 }
 
@@ -23,10 +22,6 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Location != "" {
 		c.Location = fc.Location
-	}
-
-	if fc.Locker != "" {
-		c.Locker = fc.Locker
 	}
 
 	if fc.KeepSandbox != nil {

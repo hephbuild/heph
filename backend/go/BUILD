@@ -179,7 +179,7 @@ def _go_compile_cmd(name, import_path, files, abi=None, complete=True):
 
     return [
         'echo "Compiling (out: $OUT_IMPORTCFG)..."',
-        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT" -o $SANDBOX/$OUT_A -pack{} {}'.format(extra, ' '.join(files)),
+        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT;$GO_OUTDIR" -o $SANDBOX/$OUT_A -pack{} {}'.format(extra, ' '.join(files)),
         'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
     ]
 
@@ -207,7 +207,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
         abi = target(
             name="_"+name+"#abi",
             deps=src_dep if src_dep else s_files,
-            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT" -D GOOS_$OS -D GOARCH_$ARCH -p {} -gensymabis -o "$OUT" $SRC'.format(import_path),
+            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$OS -D GOARCH_$ARCH -p {} -gensymabis -o "$OUT" $SRC'.format(import_path),
             tools=[go],
             out=p+'lib.abi',
             env={
@@ -233,7 +233,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
                 'hdr': lib+"|h",
                 'asm': src_dep if src_dep else s_files,
             },
-            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -o "$OUT" $SRC_ASM'.format(import_path),
+            run='eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -o "$OUT" $SRC_ASM'.format(import_path),
             tools=[go],
             out=p+'asm.o',
             env={

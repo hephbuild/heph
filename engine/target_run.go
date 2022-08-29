@@ -286,13 +286,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		dir = e.Cwd
 	}
 
-	ex, err := os.Executable()
-	if err != nil {
-		return err
-	}
-
 	env := make(map[string]string)
-	env["HEPH"] = ex
 	env["TARGET"] = target.FQN
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs

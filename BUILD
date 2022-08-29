@@ -1,6 +1,7 @@
 target(
     name="e2e_test",
-    run="$HEPH query --include e2e_test | $HEPH run -",
+    run="heph --log_level=trace query --include e2e_test | heph run -",
+    tools=['heph'],
     pass_env=["PATH"],
     sandbox=False,
     cache=False,
@@ -8,7 +9,8 @@ target(
 
 target(
     name="intg_test",
-    run="$HEPH query --include //test/... | $HEPH query --include test - | $HEPH run -",
+    run="heph query --include //test/... | heph query --include test - | heph run -",
+    tools=['heph'],
     pass_env=["PATH"],
     sandbox=False,
     cache=False,
@@ -18,7 +20,8 @@ go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
     name="build_all",
-    run="$HEPH query --include build | $HEPH run -",
+    run="heph query --include build | heph run -",
+    tools=['heph'],
     pass_env=go_env_vars,
     sandbox=False,
     cache=False,

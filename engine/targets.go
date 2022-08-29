@@ -5,7 +5,6 @@ import (
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/starlark"
-	"heph/config"
 	"heph/upgrade"
 	"heph/utils"
 	"os"
@@ -500,7 +499,7 @@ func (e *Engine) createDag() error {
 func (e *Engine) lockFactory(t *Target, resource string) utils.Locker {
 	p := e.lockPath(t, resource)
 
-	return config.Locker(e.Config.Config, p)
+	return utils.NewFlock(p)
 }
 
 func (e *Engine) processTarget(t *Target) error {

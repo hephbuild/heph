@@ -30,12 +30,13 @@ func CheckAndUpdate(cfg config.Config) {
 	if err != nil {
 		log.Fatalf("Failed to lock %v", err)
 	}
-
 	defer lock.Unlock()
 
 	if !shouldUpdate(cfg) {
 		return
 	}
+
+	log.Infof("Updating to %v", cfg.Version.String)
 
 	newHeph, err := downloadAndLink(cfg)
 	if err != nil {
@@ -123,6 +124,13 @@ func downloadAndLink(cfg config.Config) (string, error) {
 	}
 
 	dstPath := filepath.Join(dir, "heph")
+
+	if utils.PathExists(dstPath) {
+		log.Tracef("%v already exists", dstPath)
+
+		return dstPath, nil
+	}
+
 	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0744)
 	if err != nil {
 		return "", err

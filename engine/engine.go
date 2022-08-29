@@ -600,9 +600,7 @@ func deleteDir(dir string, async bool) error {
 func (e *Engine) parseConfigs() error {
 	log.Tracef("Profiles: %v", e.Config.Profiles)
 
-	cfg := config.Config{
-		Locker: "flock",
-	}
+	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
 
 	err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig"), &cfg)

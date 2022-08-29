@@ -1,0 +1,25 @@
+load("//test", "e2e_test")
+
+e2e_test(
+    name="sanity_echo",
+    cmd="heph run //test/sanity:echo",
+    expected_output="Hello world",
+)
+
+e2e_test(
+    name="sanity_count-lorem",
+    cmd="heph run //test/sanity:count-lorem",
+    expected_output="69",
+)
+
+e2e_test(
+    name="basic_query_sanity",
+    cmd="heph query alltargets | grep '//test/sanity'",
+    expected_output="""
+//test/sanity:basic_query_sanity
+//test/sanity:count-lorem
+//test/sanity:echo
+//test/sanity:sanity_count-lorem
+//test/sanity:sanity_echo
+""".strip(),
+)
