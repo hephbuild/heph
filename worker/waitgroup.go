@@ -86,6 +86,9 @@ func (wg *WaitGroup) broadcast() {
 		return
 	}
 
+	wg.cond.L.Lock()
+	defer wg.cond.L.Unlock()
+
 	wg.cond.Broadcast()
 }
 

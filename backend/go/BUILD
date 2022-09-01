@@ -32,7 +32,7 @@ target(
         "gofmt": "go/bin/gofmt",
     },
     cache=["go", "go.sh"],
-    provide={
+    runtime_env={
         "OUTDIR": "$(outdir)",
     },
 )

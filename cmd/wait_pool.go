@@ -159,12 +159,12 @@ type renderer struct {
 	UpdateMessage
 }
 
-func (r renderer) Init() tea.Cmd {
+func (r *renderer) Init() tea.Cmd {
 	r.running = true
 	return nil
 }
 
-func (r renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case UpdateMessage:
 		r.UpdateMessage = msg
@@ -179,7 +179,7 @@ func (r renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return r, nil
 }
 
-func (r renderer) View() string {
+func (r *renderer) View() string {
 	if r.summary {
 		count := fmt.Sprint(r.success)
 		if r.success != r.jobs {

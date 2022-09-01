@@ -50,7 +50,7 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *Packag
 
 	pkgs := make([]*Package, 0)
 	for _, file := range files {
-		relRoot, err := filepath.Rel(e.Root, filepath.Dir(file.Path))
+		relRoot, err := filepath.Rel(e.Root.Abs(), filepath.Dir(file.Path))
 		if err != nil {
 			panic(err)
 		}
@@ -140,7 +140,7 @@ func (e *Engine) createPkg(path string) *Package {
 			FullName: fullname,
 			Root: Path{
 				RelRoot: path,
-				Abs:     filepath.Join(e.Root, path),
+				Root:    e.Root.Abs(),
 			},
 		}
 	})
@@ -149,7 +149,7 @@ func (e *Engine) createPkg(path string) *Package {
 func (e *Engine) populatePkg(file *SourceFile) *Package {
 	root := filepath.Dir(file.Path)
 
-	relRoot, err := filepath.Rel(e.Root, root)
+	relRoot, err := filepath.Rel(e.Root.Abs(), root)
 	if err != nil {
 		panic(err)
 	}

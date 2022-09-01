@@ -17,7 +17,7 @@ func (e *Engine) vfsCachePath(target *Target, inputHash string) string {
 }
 
 func (e *Engine) localCacheLocation(target *Target, inputHash string) (vfs.Location, error) {
-	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target, inputHash))
+	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target, inputHash).Abs())
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, err
 
 	dir := e.cacheDir(target, inputHash)
 
-	err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), filepath.Join(dir, outputDir))
+	err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
 	if err != nil {
 		return false, err
 	}

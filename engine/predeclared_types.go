@@ -23,7 +23,7 @@ type TargetArgs struct {
 	Out            ArrayMap
 	Env            ArrayMap
 	PassEnv        ArrayMap
-	Provide        ArrayMap
+	RuntimeEnv     ArrayMap
 	RequireGen     bool
 	SrcEnv         string
 	OutEnv         string

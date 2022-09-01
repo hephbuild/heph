@@ -14,18 +14,11 @@ import (
 )
 
 type MakeConfig struct {
-	Root   string
+	Dir    string
+	BinDir string
 	Bin    map[string]string
 	Src    []utils.TarFile
 	SrcTar []string
-}
-
-func (c MakeConfig) Dir() string {
-	return filepath.Join(c.Root, "_dir")
-}
-
-func (c MakeConfig) BinDir() string {
-	return filepath.Join(c.Root, "_bin")
 }
 
 type MakeBinConfig struct {
@@ -66,55 +59,50 @@ func MakeBin(cfg MakeBinConfig) error {
 	return nil
 }
 
-func Make(ctx context.Context, cfg MakeConfig) (Spec, error) {
+func Make(ctx context.Context, cfg MakeConfig) error {
 	start := time.Now()
-	log.Tracef("Make %v", cfg.Root)
+	log.Tracef("Make %v", cfg.Dir)
 	defer func() {
-		log.Debugf("Make %v took %v", cfg.Root, time.Since(start))
+		log.Debugf("Make %v took %v", cfg.Dir, time.Since(start))
 	}()
 
-	err := os.RemoveAll(cfg.Root)
+	err := os.RemoveAll(cfg.Dir)
 	if err != nil {
-		return Spec{}, err
+		return err
 	}
 
-	err = os.MkdirAll(cfg.Root, os.ModePerm)
+	err = os.MkdirAll(cfg.Dir, os.ModePerm)
 	if err != nil {
-		return Spec{}, err
-	}
-
-	err = os.MkdirAll(cfg.Dir(), os.ModePerm)
-	if err != nil {
-		return Spec{}, err
+		return err
 	}
 
 	err = MakeBin(MakeBinConfig{
-		Dir: cfg.BinDir(),
+		Dir: cfg.BinDir,
 		Bin: cfg.Bin,
 	})
 	if err != nil {
-		return Spec{}, err
+		return err
 	}
 
 	for _, file := range cfg.Src {
 		if err := ctx.Err(); err != nil {
-			return Spec{}, err
+			return err
 		}
 
-		err := utils.Cp(file.From, filepath.Join(cfg.Dir(), file.To))
+		err := utils.Cp(file.From, filepath.Join(cfg.Dir, file.To))
 		if err != nil {
-			return Spec{}, fmt.Errorf("make: %w", err)
+			return fmt.Errorf("make: %w", err)
 		}
 	}
 
 	for _, tarFile := range cfg.SrcTar {
-		err := utils.Untar(ctx, tarFile, cfg.Dir())
+		err := utils.Untar(ctx, tarFile, cfg.Dir)
 		if err != nil {
-			return Spec{}, fmt.Errorf("make: untar: %w", err)
+			return fmt.Errorf("make: untar: %w", err)
 		}
 	}
 
-	return cfg, nil
+	return nil
 }
 
 type IOConfig struct {

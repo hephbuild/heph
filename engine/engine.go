@@ -45,8 +45,8 @@ func (sf SourceFiles) Find(p string) *SourceFile {
 
 type Engine struct {
 	Cwd        string
-	Root       string
-	HomeDir    string
+	Root       Path
+	HomeDir    Path
 	Config     Config
 	LocalCache *vfsos.Location
 
@@ -87,19 +87,21 @@ type RunStatus struct {
 	Description string
 }
 
-func New(root string, ctx context.Context) *Engine {
-	homeDir := filepath.Join(root, ".heph")
+func New(rootPath string, ctx context.Context) *Engine {
+	root := Path{Root: rootPath}
+
+	homeDir := root.Join(".heph")
 
 	log.Tracef("home dir %v", homeDir)
 
-	err := os.MkdirAll(homeDir, os.ModePerm)
+	err := os.MkdirAll(homeDir.Abs(), os.ModePerm)
 	if err != nil {
 		log.Fatal(fmt.Errorf("create homedir %v: %w", homeDir, err))
 	}
 
-	cacheDir := filepath.Join(homeDir, "cache")
+	cacheDir := homeDir.Join("cache")
 
-	loc, err := vfssimple.NewLocation("file://" + cacheDir + "/")
+	loc, err := vfssimple.NewLocation("file://" + cacheDir.Abs() + "/")
 	if err != nil {
 		log.Fatal(fmt.Errorf("cache location: %w", err))
 	}
@@ -291,7 +293,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		log.Debugf("hashoutput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	file := filepath.Join(e.cacheDir(target, e.hashInput(target)), outputHashFile)
+	file := e.cacheDir(target, e.hashInput(target)).Join(outputHashFile).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -437,7 +439,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 	}()
 
 	for _, file := range files {
-		file = file.WithRoot(target.OutRoot.Abs).WithPackagePath(true)
+		file = file.WithRoot(target.OutRoot.Abs()).WithPackagePath(true)
 
 		abs := strings.HasPrefix(file.Path, "/")
 		path := strings.TrimPrefix(file.Path, "/")
@@ -452,8 +454,8 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 				pattern = filepath.Join(pkg.FullName, path)
 			}
 
-			err := utils.StarWalkAbs(target.OutRoot.Abs, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.FullName), path)
+			err := utils.StarWalkAbs(target.OutRoot.Abs(), pattern, nil, func(path string, d fs.DirEntry, err error) error {
+				relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
 				if err != nil {
 					return err
 				}
@@ -461,7 +463,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 				out = append(out, PackagePath{
 					Package:     pkg,
 					Path:        relPkg,
-					Root:        target.OutRoot.Abs,
+					Root:        target.OutRoot.Abs(),
 					PackagePath: file.PackagePath,
 				})
 
@@ -485,7 +487,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 					return nil
 				}
 
-				relPkg, err := filepath.Rel(filepath.Join(target.OutRoot.Abs, pkg.FullName), path)
+				relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
 				if err != nil {
 					return err
 				}
@@ -493,7 +495,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 				out = append(out, PackagePath{
 					Package:     pkg,
 					Path:        relPkg,
-					Root:        target.OutRoot.Abs,
+					Root:        target.OutRoot.Abs(),
 					PackagePath: file.PackagePath,
 				})
 
@@ -503,6 +505,9 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 				return nil, fmt.Errorf("collect output: %v %w", file.Path, err)
 			}
 		} else {
+			if !utils.PathExists(file.Abs()) {
+				return nil, fmt.Errorf("%v: %w", file.Abs(), fs.ErrNotExist)
+			}
 			out = append(out, file)
 		}
 	}
@@ -511,7 +516,7 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 }
 
 func (e *Engine) populateActualFiles(target *Target) (err error) {
-	empty, err := utils.IsDirEmpty(target.OutRoot.Abs)
+	empty, err := utils.IsDirEmpty(target.OutRoot.Abs())
 	if err != nil {
 		return fmt.Errorf("collect output: isempty: %w", err)
 	}
@@ -536,23 +541,23 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 	return nil
 }
 
-func (e *Engine) sandboxRoot(target *Target) string { // TODO: PackagePath
-	return filepath.Join(e.HomeDir, "sandbox", target.Package.FullName, "__target_"+target.Name)
+func (e *Engine) sandboxRoot(target *Target) Path {
+	return e.HomeDir.Join("sandbox", target.Package.FullName, "__target_"+target.Name)
 }
 
 func (e *Engine) Clean(async bool) error {
-	return deleteDir(e.HomeDir, async)
+	return deleteDir(e.HomeDir.Abs(), async)
 }
 
 func (e *Engine) CleanTarget(target *Target, async bool) error {
 	sandboxDir := e.sandboxRoot(target)
-	err := deleteDir(sandboxDir, async)
+	err := deleteDir(sandboxDir.Abs(), async)
 	if err != nil {
 		return err
 	}
 
 	cacheDir := e.cacheDir(target, "")
-	err = deleteDir(cacheDir, async)
+	err = deleteDir(cacheDir.Abs(), async)
 	if err != nil {
 		return err
 	}
@@ -619,18 +624,18 @@ func (e *Engine) parseConfigs() error {
 	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
 
-	err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig"), &cfg)
+	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {
 		return err
 	}
 
-	err = config.ParseAndApply(filepath.Join(e.Root, ".hephconfig.local"), &cfg)
+	err = config.ParseAndApply(e.Root.Join(".hephconfig.local").Abs(), &cfg)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
 	for _, profile := range e.Config.Profiles {
-		err := config.ParseAndApply(filepath.Join(e.Root, ".hephconfig."+profile), &cfg)
+		err := config.ParseAndApply(e.Root.Join(".hephconfig."+profile).Abs(), &cfg)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

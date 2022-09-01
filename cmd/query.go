@@ -314,7 +314,7 @@ var changesCmd = &cobra.Command{
 		since := args[0]
 
 		cmd := exec.Command("git", "--no-pager", "diff", "--name-only", since+"...HEAD")
-		cmd.Dir = Engine.Root
+		cmd.Dir = Engine.Root.Abs()
 		out, err := cmd.Output()
 		if err != nil {
 			return err

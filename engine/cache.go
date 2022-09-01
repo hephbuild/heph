@@ -7,15 +7,14 @@ import (
 	"heph/utils"
 	"heph/vfssimple"
 	"os"
-	"path/filepath"
 )
 
-func (e *Engine) cacheDir(target *Target, inputHash string) string {
-	return filepath.Join(e.HomeDir, "cache", target.Package.FullName, "__target_"+target.Name, inputHash)
+func (e *Engine) cacheDir(target *Target, inputHash string) Path {
+	return e.HomeDir.Join("cache", target.Package.FullName, "__target_"+target.Name, inputHash)
 }
 
 func (e *Engine) targetOutputTarFile(target *Target, inputHash string) string {
-	return filepath.Join(e.cacheDir(target, inputHash), outputTarFile)
+	return e.cacheDir(target, inputHash).Join(outputTarFile).Abs()
 }
 
 const versionFile = "version"
@@ -31,24 +30,24 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	dir := e.cacheDir(target, inputHash)
 
-	err := os.RemoveAll(dir)
+	err := os.RemoveAll(dir.Abs())
 	if err != nil {
 		return err
 	}
 
-	err = os.MkdirAll(dir, os.ModePerm)
+	err = os.MkdirAll(dir.Abs(), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	err = utils.WriteFileSync(filepath.Join(dir, versionFile), []byte("1"), os.ModePerm)
+	err = utils.WriteFileSync(dir.Join(versionFile).Abs(), []byte("1"), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	outFilesDir := filepath.Join(dir, outputDir)
+	outFilesDir := dir.Join(outputDir)
 
-	err = os.MkdirAll(outFilesDir, os.ModePerm)
+	err = os.MkdirAll(outFilesDir.Abs(), os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -62,7 +61,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 				return err
 			}
 
-			err := utils.Cp(file.Abs(), filepath.Join(outFilesDir, file.RelRoot()))
+			err := utils.Cp(file.Abs(), outFilesDir.Join(file.RelRoot()).Abs())
 			if err != nil {
 				return err
 			}
@@ -79,41 +78,35 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		if err != nil {
 			return err
 		}
+	} else {
+		log.Tracef("%v output no files, skipping archive", target.FQN)
 	}
 
-	rel, err := filepath.Rel(e.Root, outFilesDir)
-	if err != nil {
-		return err
-	}
+	target.OutRoot = &outFilesDir
 
-	target.OutRoot = &Path{
-		Abs:     outFilesDir,
-		RelRoot: rel,
-	}
-
-	target.actualFilesOut = target.actualFilesOut.WithRoot(target.OutRoot.Abs)
-	target.actualcachedFiles = target.actualcachedFiles.WithRoot(target.OutRoot.Abs)
+	target.actualFilesOut = target.actualFilesOut.WithRoot(target.OutRoot.Abs())
+	target.actualcachedFiles = target.actualcachedFiles.WithRoot(target.OutRoot.Abs())
 
 	outputHash := e.hashOutput(target, "")
 
-	err = utils.WriteFileSync(filepath.Join(dir, outputHashFile), []byte(outputHash), os.ModePerm)
+	err = utils.WriteFileSync(dir.Join(outputHashFile).Abs(), []byte(outputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	err = utils.WriteFileSync(filepath.Join(dir, inputHashFile), []byte(inputHash), os.ModePerm)
+	err = utils.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
 	latestDir := e.cacheDir(target, "latest")
 
-	err = os.RemoveAll(latestDir)
+	err = os.RemoveAll(latestDir.Abs())
 	if err != nil {
 		return err
 	}
 
-	err = os.Symlink(dir, latestDir)
+	err = os.Symlink(dir.Abs(), latestDir.Abs())
 	if err != nil {
 		return err
 	}
@@ -164,7 +157,7 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 
 	dir := e.cacheDir(target, hash)
 
-	cacheHashb, err := os.ReadFile(filepath.Join(dir, inputHashFile))
+	cacheHashb, err := os.ReadFile(dir.Join(inputHashFile).Abs())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -180,27 +173,19 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 		return nil, nil
 	}
 
-	outDir := filepath.Join(dir, outputDir)
-
-	rel, err := filepath.Rel(e.Root, outDir)
-	if err != nil {
-		return nil, err
-	}
+	outDir := dir.Join(outputDir)
 
 	latestDir := e.cacheDir(target, "latest")
 
-	err = os.RemoveAll(latestDir)
+	err = os.RemoveAll(latestDir.Abs())
 	if err != nil {
 		return nil, err
 	}
 
-	err = os.Symlink(dir, latestDir)
+	err = os.Symlink(dir.Abs(), latestDir.Abs())
 	if err != nil {
 		return nil, err
 	}
 
-	return &Path{
-		Abs:     outDir,
-		RelRoot: rel,
-	}, nil
+	return &outDir, nil
 }

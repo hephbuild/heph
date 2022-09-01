@@ -118,7 +118,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"out?", &sargs.Out,
 		"env?", &sargs.Env,
 		"gen?", &sargs.Gen,
-		"provide?", &sargs.Provide,
+		"runtime_env?", &sargs.RuntimeEnv,
 		"require_gen?", &sargs.RequireGen,
 		"src_env?", &sargs.SrcEnv,
 		"out_env?", &sargs.OutEnv,
@@ -166,7 +166,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 	allExclude = append(allExclude, ".heph")
 
 	elems := make([]starlark.Value, 0)
-	err := utils.StarWalk(pkg.Root.Abs, pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

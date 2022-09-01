@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
@@ -70,7 +69,7 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 }
 
 func (e *Engine) tmpRoot(target *Target) string {
-	return filepath.Join(e.HomeDir, "tmp", target.Package.FullName, "__target_"+target.Name)
+	return filepath.Join(e.HomeDir.Abs(), "tmp", target.Package.FullName, "__target_"+target.Name)
 }
 
 func (e *Engine) lockPath(target *Target, resource string) string {
@@ -92,7 +91,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		return err
 	}
 
-	notifyRan := false
 	defer func() {
 		log.Tracef("%v unlocking run", target.FQN)
 		err := target.runLock.Unlock()
@@ -100,12 +98,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
 		}
 
-		if notifyRan {
-			target.ran = true
-			close(target.ranCh)
-			log.Tracef("Target DONE %v", target.FQN)
-			e.Status(fmt.Sprintf("%v done", target.FQN))
-		}
+		target.ran = true
+		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
 	ctx := e.Context
@@ -118,7 +112,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		return nil
 	}
 
-	notifyRan = true
+	defer func() {
+		e.Status(fmt.Sprintf("%v done", target.FQN))
+	}()
 
 	cached, err := e.WarmTargetCache(target)
 	if err != nil {
@@ -172,7 +168,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	sandboxRoot := e.sandboxRoot(target)
-	var sandboxSpec = sandbox.Spec{}
+	binDir := sandboxRoot.Join("_bin").Abs()
+
 	if target.Sandbox {
 		e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
@@ -218,9 +215,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			log.Tracef("src: %v", file.To)
 		}
 
-		var err error
-		sandboxSpec, err = sandbox.Make(ctx, sandbox.MakeConfig{
-			Root:   sandboxRoot,
+		err = sandbox.Make(ctx, sandbox.MakeConfig{
+			Dir:    target.SandboxRoot.Abs(),
+			BinDir: binDir,
 			Bin:    bin,
 			Src:    src,
 			SrcTar: srcTar,
@@ -229,12 +226,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			return err
 		}
 	} else {
-		sandboxSpec = sandbox.Spec{
-			Root: sandboxRoot,
-		}
-
-		err := sandbox.MakeBin(sandbox.MakeBinConfig{
-			Dir: sandboxSpec.BinDir(),
+		err = sandbox.MakeBin(sandbox.MakeBinConfig{
+			Dir: binDir,
 			Bin: bin,
 		})
 		if err != nil {
@@ -244,23 +237,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 	e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-	targetSpecFile, err := os.Create(filepath.Join(sandboxSpec.Root, "target.json"))
-	if err != nil {
-		return err
-	}
-	defer targetSpecFile.Close()
-
-	enc := json.NewEncoder(targetSpecFile)
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "    ")
-	if err := enc.Encode(target.TargetSpec); err != nil {
-		return err
-	}
-
-	targetSpecFile.Close()
-
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
-		target.LogFile = filepath.Join(sandboxSpec.Root, "log.txt")
+		target.LogFile = sandboxRoot.Join("log.txt").Abs()
 
 		f, err := os.Create(target.LogFile)
 		if err != nil {
@@ -277,7 +255,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		}
 	}
 
-	dir := filepath.Join(target.WorkdirRoot.Abs, target.Package.FullName)
+	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.FullName)
 	if target.RunInCwd {
 		if target.ShouldCache {
 			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
@@ -289,8 +267,8 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	env := make(map[string]string)
 	env["TARGET"] = target.FQN
 	env["PACKAGE"] = target.Package.FullName
-	env["ROOT"] = target.WorkdirRoot.Abs
-	env["SANDBOX"] = filepath.Join(e.sandboxRoot(target), "_dir")
+	env["ROOT"] = target.WorkdirRoot.Abs()
+	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if target.SrcEnv != FileEnvIgnore {
 		for name, paths := range namedDeps {
 			k := "SRC_" + strings.ToUpper(name)
@@ -301,7 +279,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			for _, path := range paths {
 				switch target.SrcEnv {
 				case FileEnvAbs:
-					spaths = append(spaths, filepath.Join(target.WorkdirRoot.Abs, path))
+					spaths = append(spaths, target.WorkdirRoot.Join(path).Abs())
 				case FileEnvRelRoot:
 					spaths = append(spaths, path)
 				case FileEnvRelPkg:
@@ -323,7 +301,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 	if target.OutEnv != FileEnvIgnore {
 		namedOut := map[string][]string{}
-		for name, paths := range target.Out.WithRoot(target.WorkdirRoot.Abs).Named() {
+		for name, paths := range target.Out.WithRoot(target.WorkdirRoot.Abs()).Named() {
 			for _, path := range paths {
 				if strings.Contains(path.Path, "*") {
 					// Skip glob
@@ -383,7 +361,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			continue
 		}
 
-		for k, expr := range t.Target.Provide {
+		for rk, expr := range t.Target.RuntimeEnv {
 			expr, err := utils.ExprParse(expr)
 			if err != nil {
 				return err
@@ -396,10 +374,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 					return err
 				}
 
-				env[strings.ToUpper(t.Target.Name+"_"+k)] = outdir
+				env[normalizeEnv(strings.ToUpper(t.Target.Name+"_"+rk))] = outdir
 			default:
 				return fmt.Errorf("unhandled function %v", expr.Function)
-
 			}
 		}
 	}
@@ -434,7 +411,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 		cmd := sandbox.Exec(sandbox.ExecConfig{
 			Context:  ctx,
-			BinDir:   sandboxSpec.BinDir(),
+			BinDir:   binDir,
 			Dir:      dir,
 			Env:      env,
 			IOConfig: iocfg,
@@ -478,7 +455,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 					err = e.storeVfsCache(cache, target)
 					if err != nil {
-						log.Errorf("store cache %v: %v %v", cache.Name, target.FQN, err)
+						log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
 						return nil
 					}
 
@@ -489,7 +466,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 
 		if !e.Config.KeepSandbox && target.Sandbox {
 			e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
-			err = deleteDir(target.WorkdirRoot.Abs, false)
+			err = deleteDir(target.WorkdirRoot.Abs(), false)
 			if err != nil {
 				return err
 			}
@@ -512,7 +489,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 	e.Status(fmt.Sprintf("Linking %v output", target.FQN))
 
 	for _, file := range target.OutFilesInOutRoot() {
-		target := filepath.Join(e.Root, file.RelRoot())
+		target := e.Root.Join(file.RelRoot()).Abs()
 
 		info, err := os.Lstat(target)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {

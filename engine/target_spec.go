@@ -29,7 +29,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		PassEnv:     args.PassEnv.Array,
 		RunInCwd:    args.RunInCwd,
 		Gen:         args.Gen,
-		Provide:     args.Provide.StrMap,
+		RuntimeEnv:  args.RuntimeEnv.StrMap,
 		RequireGen:  args.RequireGen,
 		SrcEnv:      args.SrcEnv,
 		OutEnv:      args.OutEnv,
@@ -310,7 +310,7 @@ type TargetSpec struct {
 	RunInCwd          bool
 	Gen               bool
 	Source            []string
-	Provide           map[string]string
+	RuntimeEnv        map[string]string
 	RequireGen        bool
 	SrcEnv            string
 	OutEnv            string

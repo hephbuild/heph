@@ -18,7 +18,8 @@ import (
 )
 
 var cloneScript = `
-git clone {{.URL}} {{.Tmp}} --depth 1
+git clone {{.URL}} {{.Tmp}}
+cd {{.Tmp}} && git reset --hard {{.Ref}}
 cp -r {{.Tmp}}/{{.Dir}}/. {{.Into}}
 `
 
@@ -27,12 +28,7 @@ type RootConfig struct {
 }
 
 func (e *Engine) rootRoot(name string) Path {
-	rel, _ := filepath.Rel(e.Root, e.HomeDir)
-
-	return Path{
-		Abs:     filepath.Join(e.HomeDir, "root", name),
-		RelRoot: filepath.Join(rel, "root", name),
-	}
+	return e.HomeDir.Join("root", name)
 }
 
 type GitURI struct {
@@ -58,6 +54,11 @@ func parseGitURI(uri *url.URL) (GitURI, error) {
 }
 
 func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
+	err := os.MkdirAll(srcRoot.Abs(), os.ModePerm)
+	if err != nil {
+		return Path{}, err
+	}
+
 	guri, err := parseGitURI(uri)
 	if err != nil {
 		return Path{}, err
@@ -68,12 +69,16 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
 		return Path{}, err
 	}
 
+	tmp := utils.RandPath(os.TempDir(), "heph_root", "")
+	defer os.RemoveAll(tmp)
+
 	var b bytes.Buffer
 	err = tpl.Execute(&b, map[string]interface{}{
-		"Tmp":  utils.RandPath(os.TempDir(), "heph_root", ""),
+		"Tmp":  tmp,
 		"URL":  guri.Repo,
-		"Into": srcRoot.Abs,
+		"Into": srcRoot.Abs(),
 		"Dir":  guri.Path,
+		"Ref":  guri.Ref,
 	})
 	if err != nil {
 		return Path{}, err
@@ -88,14 +93,25 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
 	return srcRoot, nil
 }
 
+func (e *Engine) fetchFsRoot(uri *url.URL, srcRoot Path) (Path, error) {
+	p := filepath.Join(e.Root.Abs(), uri.Path)
+
+	err := utils.Cp(p, srcRoot.Abs())
+	if err != nil {
+		return Path{}, err
+	}
+
+	return srcRoot, err
+}
+
 func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
 	p, err := e.fetchRoot(rootName, cfg)
 	if err != nil {
 		return err
 	}
 
-	err = e.runBuildFiles(p.Abs, func(dir string) *Package {
-		rel, err := filepath.Rel(p.Abs, filepath.Join(e.Root, dir))
+	err = e.runBuildFiles(p.Abs(), func(dir string) *Package {
+		rel, err := filepath.Rel(p.Abs(), e.Root.Join(dir).Abs())
 		if err != nil {
 			panic(err)
 		}
@@ -141,7 +157,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	root := e.rootRoot(name)
 	srcRoot := root.Join("src")
-	metaPath := root.Join("meta").Abs
+	metaPath := root.Join("meta").Abs()
 
 	b, err := os.ReadFile(metaPath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -162,12 +178,12 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	log.Infof("Fetch root %v from %v", name, cfg.URI)
 
-	err = os.RemoveAll(root.Abs)
+	err = os.RemoveAll(root.Abs())
 	if err != nil {
 		return Path{}, err
 	}
 
-	err = os.MkdirAll(srcRoot.Abs, os.ModePerm)
+	err = os.MkdirAll(root.Abs(), os.ModePerm)
 	if err != nil {
 		return Path{}, err
 	}
@@ -181,6 +197,11 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 	switch u.Scheme {
 	case "git":
 		backendRoot, err = e.fetchGitRoot(u, srcRoot)
+		if err != nil {
+			return Path{}, err
+		}
+	case "file":
+		backendRoot, err = e.fetchFsRoot(u, srcRoot)
 		if err != nil {
 			return Path{}, err
 		}

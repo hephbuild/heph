@@ -8,7 +8,7 @@ import (
 )
 
 func (e *Engine) outdir(t *Target, expr *utils.Expr) (string, error) {
-	return filepath.Join(t.OutRoot.Abs, t.Package.FullName), nil
+	return filepath.Join(t.OutRoot.Abs(), t.Package.FullName), nil
 }
 
 func (e *Engine) collect(t *Target, expr *utils.Expr) (Targets, error) {

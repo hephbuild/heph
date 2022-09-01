@@ -39,7 +39,7 @@ type HostTool struct {
 }
 
 func (tt TargetTool) AbsPath() string {
-	return filepath.Join(tt.Target.OutRoot.Abs, tt.Target.Package.FullName, tt.RelPath)
+	return filepath.Join(tt.Target.OutRoot.Abs(), tt.Target.Package.FullName, tt.RelPath)
 }
 
 type TargetDeps struct {
@@ -176,6 +176,7 @@ type Target struct {
 	CodegenLink bool
 
 	WorkdirRoot       Path
+	SandboxRoot       Path
 	OutRoot           *Path
 	CachedFiles       PackagePaths
 	actualcachedFiles PackagePaths
@@ -186,7 +187,6 @@ type Target struct {
 	linking   bool
 	linkingCh chan struct{}
 	ran       bool
-	ranCh     chan struct{}
 	m         sync.Mutex
 
 	runLock   utils.Locker
@@ -222,13 +222,17 @@ func (t *Target) IsGroup() bool {
 }
 
 type Path struct {
-	Abs     string
+	Root    string
 	RelRoot string
+}
+
+func (p Path) Abs() string {
+	return filepath.Join(p.Root, p.RelRoot)
 }
 
 func (p Path) Join(elem ...string) Path {
 	return Path{
-		Abs:     filepath.Join(append([]string{p.Abs}, elem...)...),
+		Root:    p.Root,
 		RelRoot: filepath.Join(append([]string{p.RelRoot}, elem...)...),
 	}
 }
@@ -246,8 +250,7 @@ func (fp PackagePath) Abs() string {
 	if fp.Root != "" {
 		repoRoot = fp.Root
 	} else {
-		// TODO figure out a better way to get the repo root here
-		repoRoot = strings.TrimSuffix(fp.Package.Root.Abs, fp.Package.Root.RelRoot)
+		repoRoot = fp.Package.Root.Root
 	}
 
 	var pkgRoot string
@@ -305,7 +308,7 @@ func (p PackagePaths) WithRoot(root string) PackagePaths {
 func (t *Target) OutFilesInOutRoot() []PackagePath {
 	out := make([]PackagePath, 0)
 	for _, file := range t.Out.All() {
-		out = append(out, file.WithRoot(t.OutRoot.Abs))
+		out = append(out, file.WithRoot(t.OutRoot.Abs()))
 	}
 
 	return out
@@ -321,10 +324,6 @@ func (t *Target) ActualCachedFiles() []PackagePath {
 
 func (t *Target) Private() bool {
 	return strings.HasPrefix(t.Name, "_")
-}
-
-func (t *Target) WaitRan() <-chan struct{} {
-	return t.ranCh
 }
 
 func (t *Target) HasAnyLabel(labels []string) bool {
@@ -354,26 +353,6 @@ func (t Targets) Find(fqn string) *Target {
 	}
 
 	return nil
-}
-
-func (t Targets) WaitAllRan() <-chan struct{} {
-	doneCh := make(chan struct{})
-	var wg sync.WaitGroup
-
-	for _, target := range t {
-		wg.Add(1)
-		go func(target *Target) {
-			<-target.WaitRan()
-			wg.Done()
-		}(target)
-	}
-
-	go func() {
-		wg.Wait()
-		close(doneCh)
-	}()
-
-	return doneCh
 }
 
 func (t Targets) FQNs() []string {
@@ -410,7 +389,7 @@ func (e *Engine) Parse() error {
 	}
 
 	runStartTime := time.Now()
-	err = e.runBuildFiles(e.Root, func(dir string) *Package {
+	err = e.runBuildFiles(e.Root.Abs(), func(dir string) *Package {
 		return e.createPkg(dir)
 	})
 	if err != nil {
@@ -513,7 +492,6 @@ func (e *Engine) processTarget(t *Target) error {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
 
-	t.ranCh = make(chan struct{})
 	t.runLock = e.lockFactory(t, "run")
 	t.cacheLock = e.lockFactory(t, "cache")
 
@@ -650,21 +628,15 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 		log.Tracef(logPrefix+"Linking %v done", t.FQN)
 	}()
 
+	t.SandboxRoot = e.sandboxRoot(t).Join("_dir")
+
 	t.WorkdirRoot = Path{
-		Abs:     e.Root,
+		Root:    e.Root.Abs(),
 		RelRoot: "",
 	}
-	if t.Sandbox {
-		abs := filepath.Join(e.sandboxRoot(t), "_dir")
-		rel, err := filepath.Rel(e.Root, abs)
-		if err != nil {
-			return err
-		}
 
-		t.WorkdirRoot = Path{
-			Abs:     abs,
-			RelRoot: rel,
-		}
+	if t.Sandbox {
+		t.WorkdirRoot = t.SandboxRoot
 	}
 
 	log.Tracef(logPrefix + "Linking tools")
