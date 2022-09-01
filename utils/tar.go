@@ -88,7 +88,9 @@ func tarWriteDir(file TarFile, tw *tar.Writer) error {
 }
 
 func Tar(ctx context.Context, files []TarFile, out string) error {
-	tarf, err := os.Create(out)
+	outTmp := out + ".tmp"
+
+	tarf, err := os.Create(outTmp)
 	if err != nil {
 		return fmt.Errorf("tar: %w", err)
 	}
@@ -102,7 +104,17 @@ func Tar(ctx context.Context, files []TarFile, out string) error {
 	gw := gzip.NewWriter(tarf)
 	defer gw.Close()
 
-	return doTar(gw, files)
+	err = doTar(gw, files)
+	if err != nil {
+		return err
+	}
+
+	err = os.Rename(outTmp, out)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func doTar(w io.Writer, files []TarFile) error {
