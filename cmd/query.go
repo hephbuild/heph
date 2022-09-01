@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	log "github.com/sirupsen/logrus"
@@ -9,7 +8,6 @@ import (
 	"gopkg.in/yaml.v3"
 	"heph/engine"
 	"heph/utils"
-	"heph/worker"
 	"os"
 	"os/exec"
 	"sort"
@@ -69,27 +67,14 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		ctx, cancel := context.WithCancel(cmd.Context())
-		defer cancel()
-
-		pool := worker.NewPool(ctx, *workers)
-		defer pool.Stop()
-
 		if !*noGen {
-			err = Engine.ScheduleGenPass(pool)
+			deps, err := Engine.ScheduleGenPass()
 			if err != nil {
 				return err
 			}
 
-			if isTerm && !*plain {
-				err := DynamicRenderer("Query Gen", ctx, cancel, pool)
-				if err != nil {
-					return fmt.Errorf("dynamic renderer: %w", err)
-				}
-			}
-			<-pool.Done()
-
-			if err := pool.Err; err != nil {
+			err = WaitPool("Query Gen", deps, false)
+			if err != nil {
 				printTargetErr(err)
 				return err
 			}

@@ -115,27 +115,16 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 }
 
 func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	pool := worker.NewPool(ctx, *workers)
-	defer pool.Stop()
+	pool := Engine.Pool
 
 	if !*noGen {
-		err := Engine.ScheduleGenPass(pool)
+		deps, err := Engine.ScheduleGenPass()
 		if err != nil {
 			return err
 		}
 
-		if isTerm && !*plain {
-			err := DynamicRenderer("Run gen", ctx, cancel, pool)
-			if err != nil {
-				return fmt.Errorf("dynamic renderer: %w", err)
-			}
-		}
-		<-pool.Done()
-
-		if err := pool.Err; err != nil {
+		err = WaitPool("Run gen", deps, false)
+		if err != nil {
 			printTargetErr(err)
 			return err
 		}
@@ -146,29 +135,30 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		inlineTarget = &targets[0]
 	}
 
+	deps := &worker.WaitGroup{}
+
 	for _, inv := range targets {
-		_, err := Engine.ScheduleTargetDeps(pool, inv.Target)
+		tdeps, err := Engine.ScheduleTargetDeps(inv.Target)
 		if err != nil {
 			return err
 		}
+		deps.AddFrom(tdeps)
 
 		if inlineTarget == nil || inv.Target != inlineTarget.Target {
-			err := Engine.ScheduleTarget(pool, inv.Target)
+			j, err := Engine.ScheduleTarget(inv.Target)
 			if err != nil {
 				return err
 			}
+			deps.Add(j)
 		}
 	}
 
-	if isTerm && !*plain {
-		err := DynamicRenderer("Run", ctx, cancel, pool)
-		if err != nil {
-			return fmt.Errorf("dynamic renderer: %w", err)
-		}
+	err := WaitPool("Run", deps, false)
+	if err != nil {
+		return fmt.Errorf("dynamic renderer: %w", err)
 	}
-	<-pool.Done()
 
-	if err := pool.Err; err != nil {
+	if err != nil {
 		printTargetErr(err)
 		return err
 	}
@@ -189,7 +179,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		Context: ctx,
 	}
 
-	err := e.Run(target, sandbox.IOConfig{
+	err = e.Run(target, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
@@ -205,7 +195,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 
 	<-pool.Done()
 
-	if err := pool.Err; err != nil {
+	if err := pool.Err(); err != nil {
 		printTargetErr(err)
 		return err
 	}

@@ -6,18 +6,69 @@ import (
 	log "github.com/sirupsen/logrus"
 	"runtime/debug"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-type Job struct {
-	ID   string
-	Do   func(w *Worker, ctx context.Context) error
-	Wait func(ctx context.Context)
+type JobState int8
 
-	ctx       context.Context
+const (
+	StateUnknown JobState = iota - 1
+	StatePending
+	StateRunning
+	StateSuccess
+	StateFailure
+	StateSkipped
+)
+
+func (s JobState) String() string {
+	switch s {
+	case StatePending:
+		return "pending"
+	case StateRunning:
+		return "running"
+	case StateSuccess:
+		return "success"
+	case StateFailure:
+		return "failure"
+	case StateSkipped:
+		return "skipped"
+	case StateUnknown:
+		fallthrough
+	default:
+		return "unknown"
+	}
+}
+
+type Job struct {
+	ID    string
+	Do    func(w *Worker, ctx context.Context) error
+	State JobState
+	Deps  *WaitGroup
+
+	ctx    context.Context
+	done   bool
+	doneCh chan struct{}
+	err    error
+
 	TimeStart time.Time
 	TimeEnd   time.Time
+}
+
+func (j *Job) Done() {
+	log.Tracef("job %v done", j.ID)
+	j.doneWithState(StateSuccess)
+}
+
+func (j *Job) DoneWithErr(err error, state JobState) {
+	log.Tracef("job %v done with err %v", j.ID, err)
+	j.err = err
+	j.doneWithState(state)
+}
+
+func (j *Job) doneWithState(state JobState) {
+	j.State = state
+	j.done = true
+	close(j.doneCh)
 }
 
 type Worker struct {
@@ -40,19 +91,16 @@ type Pool struct {
 	ctx     context.Context
 	cancel  func()
 	Workers []*Worker
-	Err     error
-
-	JobCount  uint64
-	DoneCount uint64
 
 	doneCh chan struct{}
 	o      sync.Once
+	cond   sync.Cond
 
 	jobsCh  chan *Job
 	wg      sync.WaitGroup
 	stopped bool
-	mErr    sync.Mutex
-	jobs    map[string]*Job
+	stopErr error
+	jobs    *WaitGroup
 	m       sync.Mutex
 }
 
@@ -74,8 +122,13 @@ func NewPool(ctx context.Context, n int) *Pool {
 		cancel: cancel,
 		jobsCh: make(chan *Job),
 		doneCh: make(chan struct{}),
-		jobs:   map[string]*Job{},
+		jobs:   &WaitGroup{},
 	}
+
+	go func() {
+		<-ctx.Done()
+		p.Stop(ctx.Err())
+	}()
 
 	for i := 0; i < n; i++ {
 		w := &Worker{}
@@ -83,41 +136,22 @@ func NewPool(ctx context.Context, n int) *Pool {
 
 		go func() {
 			for j := range p.jobsCh {
-				p.m.Lock()
 				if p.stopped {
-					p.m.Unlock()
 					// Drain chan
-					p.wg.Done()
+					p.finalize(j, fmt.Errorf("pool stopped"), true)
 					continue
 				}
-				p.m.Unlock()
 
 				j.TimeStart = time.Now()
 				w.CurrentJob = j
 
 				err := safelyJobDo(j, w)
-				if err != nil {
-					log.Errorf("%v failed: %v", j.ID, err)
-				}
 
 				j.TimeEnd = time.Now()
 				w.CurrentJob = nil
 				w.Status("")
 
-				p.mErr.Lock()
-				if err != nil && p.Err == nil {
-					p.Err = err
-					p.mErr.Unlock()
-					p.Stop()
-				} else {
-					p.mErr.Unlock()
-				}
-
-				if err == nil {
-					atomic.AddUint64(&p.DoneCount, 1)
-				}
-
-				p.wg.Done()
+				p.finalize(j, err, false)
 			}
 		}()
 	}
@@ -129,45 +163,80 @@ type ScheduleOptions struct {
 	OnSchedule func()
 }
 
-func (p *Pool) Schedule(job *Job) {
-	p.ScheduleWith(ScheduleOptions{}, job)
+func (p *Pool) Schedule(job *Job) *Job {
+	return p.ScheduleWith(ScheduleOptions{}, job)
 }
 
-func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) {
+func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) *Job {
 	p.wg.Add(1)
 
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	if _, ok := p.jobs[job.ID]; ok {
+	if j := p.jobs.Job(job.ID); j != nil {
 		p.wg.Done()
-		return
+		return j
 	}
 
-	job.ctx = p.ctx
-	atomic.AddUint64(&p.JobCount, 1)
+	log.Tracef("Scheduling %v", job.ID)
 
-	p.jobs[job.ID] = job
+	job.State = StatePending
+	job.ctx = p.ctx
+	job.doneCh = make(chan struct{})
+	if job.Deps == nil {
+		job.Deps = &WaitGroup{}
+	}
+
+	p.jobs.Add(job)
 
 	if f := opt.OnSchedule; f != nil {
 		f()
 	}
 
 	go func() {
-		if job.Wait != nil {
-			job.Wait(job.ctx)
-		}
-
-		p.m.Lock()
-		if p.stopped {
-			p.m.Unlock()
-			p.wg.Done()
+		select {
+		case <-job.ctx.Done():
+			p.finalize(job, job.ctx.Err(), true)
 			return
+		case <-job.Deps.Done():
+			if err := job.Deps.Err(); err != nil {
+				p.finalize(job, err, true)
+				return
+			}
 		}
-		p.m.Unlock()
 
 		p.jobsCh <- job
 	}()
+
+	return job
+}
+
+func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	if err == nil {
+		job.Done()
+		log.Debugf("finalize job: %v %v", job.ID, job.State.String())
+	} else {
+		if skippedOnErr {
+			job.DoneWithErr(err, StateSkipped)
+		} else {
+			job.DoneWithErr(err, StateFailure)
+		}
+		log.Debugf("finalize job err: %v %v: %v", job.ID, job.State.String(), err)
+
+		go p.Stop(fmt.Errorf("%v: %v", job.ID, err))
+	}
+
+	p.wg.Done()
+}
+
+func (p *Pool) Job(id string) *Job {
+	p.m.Lock()
+	defer p.m.Unlock()
+
+	return p.jobs.Job(id)
 }
 
 func (p *Pool) Done() <-chan struct{} {
@@ -191,7 +260,11 @@ func (p *Pool) Done() <-chan struct{} {
 	return p.doneCh
 }
 
-func (p *Pool) Stop() {
+func (p *Pool) Err() error {
+	return p.stopErr
+}
+
+func (p *Pool) Stop(err error) {
 	p.m.Lock()
 	defer p.m.Unlock()
 
@@ -199,6 +272,7 @@ func (p *Pool) Stop() {
 		return
 	}
 	p.stopped = true
+	p.stopErr = err
 
 	p.cancel()
 }

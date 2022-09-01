@@ -19,6 +19,15 @@ target(
 go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
+    name="go_test",
+    run="go test -v ./...",
+    tools=["go"],
+    cache=False,
+    sandbox=False,
+    pass_env=go_env_vars,
+)
+
+target(
     name="build_all",
     run="heph query --include build | heph run -",
     tools=['heph'],
