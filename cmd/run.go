@@ -114,36 +114,28 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 	}}, nil
 }
 
-func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error {
+func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) error {
 	pool := Engine.Pool
 
-	if !*noGen {
-		deps, err := Engine.ScheduleGenPass()
-		if err != nil {
-			return err
-		}
-
-		err = WaitPool("Run gen", deps, false)
-		if err != nil {
-			printTargetErr(err)
-			return err
-		}
+	var inlineTarget *TargetInvocation
+	if len(targetInvs) == 1 && !fromStdin {
+		inlineTarget = &targetInvs[0]
 	}
 
-	var inlineTarget *TargetInvocation
-	if len(targets) == 1 && !fromStdin {
-		inlineTarget = &targets[0]
+	targets := make(engine.Targets, 0)
+	for _, inv := range targetInvs {
+		targets = append(targets, inv.Target)
 	}
 
 	deps := &worker.WaitGroup{}
 
-	for _, inv := range targets {
-		tdeps, err := Engine.ScheduleTargetDeps(inv.Target)
-		if err != nil {
-			return err
-		}
-		deps.AddFrom(tdeps)
+	tdeps, err := Engine.ScheduleTargetsDeps(targets)
+	if err != nil {
+		return err
+	}
+	deps.AddChild(tdeps)
 
+	for _, inv := range targetInvs {
 		if inlineTarget == nil || inv.Target != inlineTarget.Target {
 			j, err := Engine.ScheduleTarget(inv.Target)
 			if err != nil {
@@ -153,7 +145,7 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		}
 	}
 
-	err := WaitPool("Run", deps, false)
+	err = WaitPool("Run", deps, false)
 	if err != nil {
 		return fmt.Errorf("dynamic renderer: %w", err)
 	}
@@ -191,13 +183,6 @@ func run(ctx context.Context, targets []TargetInvocation, fromStdin bool) error 
 		}
 
 		return fmt.Errorf("%v: %w", target.FQN, err)
-	}
-
-	<-pool.Done()
-
-	if err := pool.Err(); err != nil {
-		printTargetErr(err)
-		return err
 	}
 
 	return nil
