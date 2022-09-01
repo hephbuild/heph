@@ -68,6 +68,7 @@ type Engine struct {
 	cacheHashOutput      map[string]string
 	ranGenPass           bool
 	codegenPaths         map[string]*Target
+	Pool                 *worker.Pool
 }
 
 type Config struct {
@@ -338,27 +339,19 @@ func (t TargetFailedError) Error() string {
 	return t.Err.Error()
 }
 
-func (e *Engine) ScheduleTarget(pool *worker.Pool, target *Target) error {
-	ancestors, err := e.DAG().GetAncestors(target)
+func (e *Engine) ScheduleTarget(target *Target) (*worker.Job, error) {
+	parents, err := e.DAG().GetParents(target)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	log.Tracef("Scheduling %v", target.FQN)
-
-	pool.Schedule(&worker.Job{
-		ID: target.FQN,
-		Wait: func(ctx context.Context) {
-			select {
-			case <-ctx.Done():
-			case <-ancestors.WaitAllRan():
-			}
-			return
-		},
+	j := e.Pool.Schedule(&worker.Job{
+		ID:   target.FQN,
+		Deps: jobs(parents, e.Pool),
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine:  e,
-				Pool:    pool,
+				Pool:    e.Pool,
 				Worker:  w,
 				Context: ctx,
 			}
@@ -375,23 +368,47 @@ func (e *Engine) ScheduleTarget(pool *worker.Pool, target *Target) error {
 		},
 	})
 
-	return nil
+	return j, nil
 }
 
-func (e *Engine) ScheduleTargetDeps(pool *worker.Pool, target *Target) (Targets, error) {
-	ancestors, err := e.DAG().GetAncestors(target)
+func jobs(targets []*Target, pool *worker.Pool) *worker.WaitGroup {
+	deps := &worker.WaitGroup{}
+
+	for _, target := range targets {
+		j := pool.Job(target.FQN)
+		if j == nil {
+			panic(fmt.Sprintf("job is nil for %v", target.FQN))
+		}
+
+		deps.Add(j)
+	}
+
+	return deps
+}
+
+func (e *Engine) ScheduleTargetDeps(target *Target) (*worker.WaitGroup, error) {
+	parents, err := e.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, target := range ancestors {
-		err := e.ScheduleTarget(pool, target)
+	deps := &worker.WaitGroup{}
+
+	for _, parent := range parents {
+		_, err := e.ScheduleTargetDeps(parent)
 		if err != nil {
 			return nil, err
 		}
+
+		j, err := e.ScheduleTarget(parent)
+		if err != nil {
+			return nil, err
+		}
+
+		deps.Add(j)
 	}
 
-	return ancestors, nil
+	return deps, nil
 }
 
 func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {

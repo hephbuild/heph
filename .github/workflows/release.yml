@@ -24,6 +24,9 @@ jobs:
       - name: Build
         run: go build -v -o heph .
 
+      - name: Go Tests
+        run: "./heph go_test"
+
       - name: E2E Test
         run: "./heph e2e_test"
 

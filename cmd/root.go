@@ -12,9 +12,11 @@ import (
 	"heph/worker"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 var isTerm bool
@@ -82,6 +84,16 @@ var rootCmd = &cobra.Command{
 		}
 
 		return nil
+	},
+	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		if Engine == nil {
+			return nil
+		}
+
+		log.Tracef("Waiting for all pool items to finish")
+		<-Engine.Pool.Done()
+
+		return Engine.Pool.Err()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -225,8 +237,22 @@ func engineInit() error {
 
 	log.Tracef("Root: %v", root)
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		defer func() {
+			signal.Stop(sig)
+		}()
+
+		<-sig
+		cancel()
+	}()
+
 	Engine = engine.New(root)
 	Engine.Config.Profiles = *profiles
+	Engine.Pool = worker.NewPool(ctx, *workers)
 
 	err = Engine.Parse()
 	if err != nil {
@@ -247,26 +273,13 @@ func preRunWithGen(silent bool) error {
 		return nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	pool := worker.NewPool(ctx, *workers)
-	defer pool.Stop()
-
-	err = Engine.ScheduleGenPass(pool)
+	deps, err := Engine.ScheduleGenPass()
 	if err != nil {
 		return err
 	}
 
-	if !silent && isTerm && !*plain {
-		err := DynamicRenderer("PreRun gen", ctx, cancel, pool)
-		if err != nil {
-			return fmt.Errorf("dynamic renderer: %w", err)
-		}
-	}
-	<-pool.Done()
-
-	if err := pool.Err; err != nil {
+	err = WaitPool("PreRun gen", deps, silent)
+	if err != nil {
 		printTargetErr(err)
 		return err
 	}

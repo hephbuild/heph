@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
@@ -42,46 +41,65 @@ func (h hookFunc) Fire(entry *log.Entry) error {
 	return nil
 }
 
-func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *worker.Pool) error {
-	doneCh := pool.Done()
+func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
+	log.Tracef("WaitPool %v", name)
 
-	p := tea.NewProgram(renderer{
-		name:   name,
-		start:  time.Now(),
-		cancel: cancel,
-		UpdateMessage: UpdateMessage{
-			jobs:    pool.JobCount,
-			done:    pool.DoneCount,
+	if !forceSilent && isTerm && !*plain {
+		err := PoolUI(name, deps, Engine.Pool)
+		if err != nil {
+			return fmt.Errorf("dynamic renderer: %w", err)
+		}
+	} else {
+		<-deps.Done()
+	}
+
+	if err := Engine.Pool.Err(); err != nil {
+		return fmt.Errorf("pool: %w", err)
+	}
+
+	return deps.Err()
+}
+
+func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+	log.Tracef("POOL UI %v", name)
+
+	msg := func() UpdateMessage {
+		return UpdateMessage{
+			jobs:    deps.TransitiveJobCount(),
+			success: deps.TransitiveSuccessCount(),
 			workers: pool.Workers,
+		}
+	}
+
+	r := &renderer{
+		name:  name,
+		start: time.Now(),
+		cancel: func() {
+			pool.Stop(fmt.Errorf("user canceled"))
 		},
-	}, tea.WithOutput(os.Stderr), tea.WithoutCatchPanics())
+		UpdateMessage: msg(),
+	}
+
+	p := tea.NewProgram(r, tea.WithOutput(os.Stderr))
 
 	go func() {
 		for {
 			select {
-			case <-doneCh:
-				p.Send(UpdateMessage{
-					jobs:    pool.JobCount,
-					done:    pool.DoneCount,
-					workers: pool.Workers,
-					summary: true,
-				})
+			case <-deps.Done():
+				m := msg()
+				m.summary = true
+				p.Send(m)
 				p.Quit()
 				return
 			case <-time.After(50 * time.Millisecond):
-				p.Send(UpdateMessage{
-					jobs:    pool.JobCount,
-					done:    pool.DoneCount,
-					workers: pool.Workers,
-				})
+				p.Send(msg())
 			}
 		}
 	}()
 
-	running := false
 	log.AddHook(hookFunc{
 		f: func(entry *log.Entry) {
-			if !running {
+			if !r.running {
 				return
 			}
 
@@ -91,7 +109,7 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 
 			b, err := entry.Logger.Formatter.Format(entry)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, fmt.Errorf("logger fmt error: %v", err))
+				p.Printf(fmt.Sprintf("logger fmt error: %v", err))
 				return
 			}
 
@@ -101,26 +119,16 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 
 	prevOut := log.StandardLogger().Out
 	log.SetOutput(io.Discard)
-	defer func() {
-		running = false
-		log.SetOutput(prevOut)
-	}()
 
-	go func() {
-		<-ctx.Done()
-		p.Quit()
-	}()
-
-	running = true
 	err := p.Start()
+	r.running = false
+	log.SetOutput(prevOut)
 	if err != nil {
 		return err
 	}
 
-	if err := ctx.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	// Make sure all is done
+	<-deps.Done()
 
 	return nil
 }
@@ -128,18 +136,20 @@ func DynamicRenderer(name string, ctx context.Context, cancel func(), pool *work
 type UpdateMessage struct {
 	workers []*worker.Worker
 	jobs    uint64
-	done    uint64
+	success uint64
 	summary bool
 }
 
 type renderer struct {
-	name   string
-	start  time.Time
-	cancel func()
+	name    string
+	running bool
+	start   time.Time
+	cancel  func()
 	UpdateMessage
 }
 
 func (r renderer) Init() tea.Cmd {
+	r.running = true
 	return nil
 }
 
@@ -160,15 +170,15 @@ func (r renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (r renderer) View() string {
 	if r.summary {
-		count := fmt.Sprint(r.done)
-		if r.done != r.jobs {
-			count = fmt.Sprintf("%v/%v", r.done, r.jobs)
+		count := fmt.Sprint(r.success)
+		if r.success != r.jobs {
+			count = fmt.Sprintf("%v/%v", r.success, r.jobs)
 		}
 		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, count, round(time.Now().Sub(r.start), 1).String())
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.done, r.jobs, round(time.Now().Sub(r.start), 1).String()))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.success, r.jobs, round(time.Now().Sub(r.start), 1).String()))
 
 	for _, w := range r.workers {
 		var runtime string

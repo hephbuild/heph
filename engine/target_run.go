@@ -41,7 +41,7 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 		log.Tracef("unlocking cache %v", target.FQN)
 		err := target.cacheLock.Unlock()
 		if err != nil {
-			log.Errorf("unlocking cache %v %w", target.FQN, err)
+			log.Errorf("unlocking cache %v %v", target.FQN, err)
 		}
 	}()
 
