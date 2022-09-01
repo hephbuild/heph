@@ -8,8 +8,10 @@ import (
 )
 
 type WaitGroup struct {
-	m      sync.Mutex
+	m      sync.RWMutex
+	wgs    []*WaitGroup
 	jobs   []*Job
+	jobsm  map[string]*Job
 	doneCh chan struct{}
 	err    error
 	cond   *sync.Cond
@@ -25,7 +27,11 @@ func (wg *WaitGroup) Add(job *Job) {
 	wg.m.Lock()
 	defer wg.m.Unlock()
 
-	if wg.Job(job.ID) != nil {
+	if wg.jobsm == nil {
+		wg.jobsm = map[string]*Job{}
+	}
+
+	if wg.job(job.ID, false) != nil {
 		return
 	}
 
@@ -34,19 +40,41 @@ func (wg *WaitGroup) Add(job *Job) {
 		wg.broadcast()
 	}()
 
+	wg.jobsm[job.ID] = job
 	wg.jobs = append(wg.jobs, job)
 }
 
-func (wg *WaitGroup) AddFrom(deps *WaitGroup) {
-	for _, job := range deps.Jobs() {
-		wg.Add(job)
-	}
+func (wg *WaitGroup) AddChild(child *WaitGroup) {
+	wg.m.Lock()
+	defer wg.m.Unlock()
+
+	go func() {
+		<-child.Done()
+		wg.broadcast()
+	}()
+
+	wg.wgs = append(wg.wgs, child)
 }
 
-func (wg *WaitGroup) Job(id string) *Job {
-	for _, job := range wg.jobs[:] {
-		if job.ID == id {
-			return job
+func (wg *WaitGroup) Job(id string, transitive bool) *Job {
+	wg.m.RLock()
+	defer wg.m.RUnlock()
+
+	return wg.job(id, transitive)
+}
+
+func (wg *WaitGroup) job(id string, transitive bool) *Job {
+	if wg.jobsm != nil {
+		if j := wg.jobsm[id]; j != nil {
+			return j
+		}
+	}
+
+	if transitive {
+		for _, wg := range wg.wgs {
+			if job := wg.Job(id, transitive); job != nil {
+				return job
+			}
 		}
 	}
 
@@ -54,9 +82,6 @@ func (wg *WaitGroup) Job(id string) *Job {
 }
 
 func (wg *WaitGroup) broadcast() {
-	wg.m.Lock()
-	defer wg.m.Unlock()
-
 	if wg.cond == nil {
 		return
 	}
@@ -85,11 +110,8 @@ func (wg *WaitGroup) wait() {
 }
 
 func (wg *WaitGroup) Done() <-chan struct{} {
-	wg.m.Lock()
-	defer wg.m.Unlock()
-
 	wg.oSetup.Do(func() {
-		wg.cond = sync.NewCond(&wg.m)
+		wg.cond = sync.NewCond(&sync.Mutex{})
 	})
 
 	wg.oDone.Do(func() {
@@ -104,13 +126,6 @@ func (wg *WaitGroup) Err() error {
 	return wg.err
 }
 
-func (wg *WaitGroup) Jobs() []*Job {
-	wg.m.Lock()
-	defer wg.m.Unlock()
-
-	return wg.jobs[:]
-}
-
 func (wg *WaitGroup) walkerTransitiveCount(c *uint64, m map[string]struct{}, f func(j *Job) bool) {
 	for _, job := range wg.jobs[:] {
 		if _, ok := m[job.ID]; ok {
@@ -123,6 +138,10 @@ func (wg *WaitGroup) walkerTransitiveCount(c *uint64, m map[string]struct{}, f f
 		}
 
 		job.Deps.walkerTransitiveCount(c, m, f)
+	}
+
+	for _, wg := range wg.wgs {
+		wg.walkerTransitiveCount(c, m, f)
 	}
 }
 
@@ -150,6 +169,13 @@ var ErrPending = fmt.Errorf("pending")
 
 // keepWaiting returns ErrPending if it should keep waiting, nil represents no jobs error
 func (wg *WaitGroup) keepWaiting() error {
+	for _, wg := range wg.wgs[:] {
+		err := wg.keepWaiting()
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, job := range wg.jobs[:] {
 		if !job.done {
 			return fmt.Errorf("%v is %w", job.ID, ErrPending)

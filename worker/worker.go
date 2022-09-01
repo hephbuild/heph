@@ -159,21 +159,13 @@ func NewPool(ctx context.Context, n int) *Pool {
 	return p
 }
 
-type ScheduleOptions struct {
-	OnSchedule func()
-}
-
 func (p *Pool) Schedule(job *Job) *Job {
-	return p.ScheduleWith(ScheduleOptions{}, job)
-}
-
-func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) *Job {
 	p.wg.Add(1)
 
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	if j := p.jobs.Job(job.ID); j != nil {
+	if j := p.jobs.Job(job.ID, true); j != nil {
 		p.wg.Done()
 		return j
 	}
@@ -188,10 +180,6 @@ func (p *Pool) ScheduleWith(opt ScheduleOptions, job *Job) *Job {
 	}
 
 	p.jobs.Add(job)
-
-	if f := opt.OnSchedule; f != nil {
-		f()
-	}
 
 	go func() {
 		select {
@@ -236,7 +224,7 @@ func (p *Pool) Job(id string) *Job {
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	return p.jobs.Job(id)
+	return p.jobs.Job(id, true)
 }
 
 func (p *Pool) Done() <-chan struct{} {

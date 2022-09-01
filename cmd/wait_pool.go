@@ -43,6 +43,9 @@ func (h hookFunc) Fire(entry *log.Entry) error {
 
 func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 	log.Tracef("WaitPool %v", name)
+	defer func() {
+		log.Tracef("WaitPool %v DONE", name)
+	}()
 
 	if !forceSilent && isTerm && !*plain {
 		err := PoolUI(name, deps, Engine.Pool)
@@ -50,7 +53,17 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 			return fmt.Errorf("dynamic renderer: %w", err)
 		}
 	} else {
-		<-deps.Done()
+		for {
+			select {
+			case <-time.After(time.Second):
+				log.Infof("Progress %v: %v/%v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount())
+				continue
+			case <-deps.Done():
+				// will break
+			}
+
+			break
+		}
 	}
 
 	if err := Engine.Pool.Err(); err != nil {
@@ -61,8 +74,6 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 }
 
 func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
-	log.Tracef("POOL UI %v", name)
-
 	msg := func() UpdateMessage {
 		return UpdateMessage{
 			jobs:    deps.TransitiveJobCount(),

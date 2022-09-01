@@ -87,7 +87,7 @@ type RunStatus struct {
 	Description string
 }
 
-func New(root string) *Engine {
+func New(root string, ctx context.Context) *Engine {
 	homeDir := filepath.Join(root, ".heph")
 
 	log.Tracef("home dir %v", homeDir)
@@ -107,7 +107,7 @@ func New(root string) *Engine {
 	return &Engine{
 		Root:            root,
 		HomeDir:         homeDir,
-		Context:         context.Background(),
+		Context:         ctx,
 		LocalCache:      loc.(*vfsos.Location),
 		Packages:        map[string]*Package{},
 		cacheHashInput:  map[string]string{},
@@ -386,21 +386,16 @@ func jobs(targets []*Target, pool *worker.Pool) *worker.WaitGroup {
 	return deps
 }
 
-func (e *Engine) ScheduleTargetDeps(target *Target) (*worker.WaitGroup, error) {
-	parents, err := e.DAG().GetParents(target)
+func (e *Engine) ScheduleTargetsDeps(targets Targets) (*worker.WaitGroup, error) {
+	parents, err := e.DAG().GetOrderedAncestors(targets)
 	if err != nil {
 		return nil, err
 	}
 
 	deps := &worker.WaitGroup{}
 
-	for _, parent := range parents {
-		_, err := e.ScheduleTargetDeps(parent)
-		if err != nil {
-			return nil, err
-		}
-
-		j, err := e.ScheduleTarget(parent)
+	for _, ancestor := range parents {
+		j, err := e.ScheduleTarget(ancestor)
 		if err != nil {
 			return nil, err
 		}
@@ -409,6 +404,10 @@ func (e *Engine) ScheduleTargetDeps(target *Target) (*worker.WaitGroup, error) {
 	}
 
 	return deps, nil
+}
+
+func (e *Engine) ScheduleTargetDeps(target *Target) (*worker.WaitGroup, error) {
+	return e.ScheduleTargetsDeps(Targets{target})
 }
 
 func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {

@@ -51,11 +51,9 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 		return nil, err
 	}
 
-	for _, target := range genTargets {
-		err := ge.ScheduleGeneratedPipeline(target)
-		if err != nil {
-			return nil, err
-		}
+	err = ge.ScheduleGeneratedPipeline(genTargets)
+	if err != nil {
+		return nil, err
 	}
 
 	j := e.Pool.Schedule(&worker.Job{
@@ -81,47 +79,43 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 	e.ranGenPass = true
 
 	deps := &worker.WaitGroup{}
-	deps.AddFrom(ge.deps)
 	deps.Add(j)
 
 	return deps, nil
 }
 
-func (e *runGenEngine) ScheduleGeneratedPipeline(target *Target) error {
-	if !target.Gen {
-		panic(fmt.Errorf("%v is not a gen target", target.FQN))
+func (e *runGenEngine) ScheduleGeneratedPipeline(targets Targets) error {
+	for _, target := range targets {
+		if !target.Gen {
+			panic(fmt.Errorf("%v is not a gen target", target.FQN))
+		}
 	}
 
-	_, err := e.ScheduleTargetDeps(target)
+	_, err := e.ScheduleTargetsDeps(targets)
 	if err != nil {
 		return err
 	}
 
-	_, err = e.ScheduleTarget(target)
-	if err != nil {
-		return err
-	}
+	for _, target := range targets {
+		_, err = e.ScheduleTarget(target)
+		if err != nil {
+			return err
+		}
 
-	err = e.ScheduleRunGenerated(target)
-	if err != nil {
-		return err
+		err = e.ScheduleRunGenerated(target)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func (e *runGenEngine) ScheduleRunGenerated(target *Target) error {
-	ancestors, err := e.DAG().GetParents(target)
-	if err != nil {
-		return err
-	}
-
-	deps := append(ancestors, target)
-
 	j := e.Pool.Schedule(
 		&worker.Job{
 			ID:   "rungen-" + target.FQN,
-			Deps: jobs(deps, e.Pool),
+			Deps: jobs([]*Target{target}, e.Pool),
 			Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
 				w.Status(fmt.Sprintf("Run generated targets from %v...", target.FQN))
 				defer func() {
@@ -229,11 +223,9 @@ func (e *runGenEngine) runGenerated(target *Target) error {
 			return err
 		}
 
-		for _, t := range genTargets {
-			err := e.ScheduleGeneratedPipeline(t)
-			if err != nil {
-				return err
-			}
+		err = e.ScheduleGeneratedPipeline(genTargets)
+		if err != nil {
+			return err
 		}
 	}
 

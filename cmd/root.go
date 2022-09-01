@@ -239,9 +239,10 @@ func engineInit() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 		defer func() {
 			signal.Stop(sig)
 		}()
@@ -250,7 +251,7 @@ func engineInit() error {
 		cancel()
 	}()
 
-	Engine = engine.New(root)
+	Engine = engine.New(root, ctx)
 	Engine.Config.Profiles = *profiles
 	Engine.Pool = worker.NewPool(ctx, *workers)
 
@@ -306,12 +307,17 @@ var cleanCmd = &cobra.Command{
 			return Engine.Clean(true)
 		}
 
+		err := preRunWithGen(false)
+		if err != nil {
+			return err
+		}
+
 		var targets []*engine.Target
 		if hasStdin(args) {
 			var err error
 			targets, err = parseTargetsFromStdin()
 			if err != nil {
-				return nil
+				return err
 			}
 		} else {
 			for _, arg := range args {
