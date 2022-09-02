@@ -115,8 +115,6 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 }
 
 func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) error {
-	pool := Engine.Pool
-
 	var inlineTarget *TargetInvocation
 	if len(targetInvs) == 1 && !fromStdin {
 		inlineTarget = &targetInvs[0]
@@ -147,10 +145,6 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) err
 
 	err = WaitPool("Run", deps, false)
 	if err != nil {
-		return fmt.Errorf("dynamic renderer: %w", err)
-	}
-
-	if err != nil {
 		printTargetErr(err)
 		return err
 	}
@@ -167,7 +161,6 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) err
 
 	e := engine.TargetRunEngine{
 		Engine:  Engine,
-		Pool:    pool,
 		Context: ctx,
 	}
 

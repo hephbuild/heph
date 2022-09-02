@@ -94,7 +94,7 @@ func (ss Strings) Includes(s string) bool {
 
 var StdPackages Strings
 
-func init() {
+func InitStd() {
 	StdPackages = goListStd()
 }
 

@@ -214,7 +214,7 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 		}
 		log.Debugf("finalize job err: %v %v: %v", job.ID, job.State.String(), err)
 
-		go p.Stop(fmt.Errorf("%v: %v", job.ID, err))
+		go p.Stop(fmt.Errorf("%v: %w", job.ID, err))
 	}
 
 	p.wg.Done()

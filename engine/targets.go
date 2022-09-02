@@ -463,6 +463,15 @@ func (e *Engine) createDag() error {
 			}
 		}
 
+		if target.DifferentHashDeps {
+			for _, dep := range target.HashDeps.Targets {
+				err := addEdge(dep.Target, target)
+				if err != nil {
+					return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
+				}
+			}
+		}
+
 		for _, tool := range target.Tools {
 			err := addEdge(tool.Target, target)
 			if err != nil {

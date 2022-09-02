@@ -256,27 +256,12 @@ func generate() []RenderUnit {
 }
 
 func main() {
-	unitsPerPackage := map[string][]RenderUnit{}
-
-	for _, unit := range generate() {
-		unitsPerPackage[unit.Package] = append(unitsPerPackage[unit.Package], unit)
-	}
-
-	for pkg, units := range unitsPerPackage {
-		err := os.MkdirAll(filepath.Join(Env.Sandbox, pkg), os.ModePerm)
-		if err != nil {
-			panic(err)
-		}
-
-		f, err := os.Create(filepath.Join(Env.Sandbox, pkg, "BUILD"))
-		if err != nil {
-			panic(err)
-		}
-
-		for _, unit := range units {
-			unit.Render(f)
-		}
-
-		f.Close()
+	switch os.Args[1] {
+	case "mod":
+		genBuild()
+	case "imports":
+		listImports()
+	default:
+		panic("unhandled mode")
 	}
 }
