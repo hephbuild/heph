@@ -98,7 +98,7 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 	return nil
 }
 
-func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, error) {
+func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string, target *Target) (bool, error) {
 	inputHash := e.hashInput(target)
 
 	localRoot, err := e.localCacheLocation(target, inputHash)
@@ -119,6 +119,8 @@ func (e *Engine) getVfsCache(remoteRoot vfs.Location, target *Target) (bool, err
 
 		return false, err
 	}
+
+	e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
 
 	err = e.vfsCopyFile(remoteRoot, localRoot, outputTarFile)
 	if err != nil {

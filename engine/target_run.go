@@ -45,8 +45,6 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	}()
 
 	if target.ShouldCache {
-		e.Status(fmt.Sprintf("Pulling %v cache...", target.FQN))
-
 		dir, err := e.getCache(target)
 		if err != nil {
 			return false, err
@@ -451,7 +449,7 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			e.Pool.Schedule(&worker.Job{
 				ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
 				Do: func(w *worker.Worker, ctx context.Context) error {
-					w.Status(fmt.Sprintf("Pushing %v cache to %v...", target.FQN, cache.Name))
+					w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
 
 					err = e.storeVfsCache(cache, target)
 					if err != nil {

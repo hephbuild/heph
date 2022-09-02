@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
 	"heph/vfssimple"
@@ -99,14 +100,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	latestDir := e.cacheDir(target, "latest")
-
-	err = os.RemoveAll(latestDir.Abs())
-	if err != nil {
-		return err
-	}
-
-	err = os.Symlink(dir.Abs(), latestDir.Abs())
+	err = e.linkLatestCache(target, dir.Abs())
 	if err != nil {
 		return err
 	}
@@ -114,14 +108,14 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *Engine) getCache(target *Target) (*Path, error) {
+func (e *TargetRunEngine) getCache(target *Target) (*Path, error) {
 	p, err := e.getLocalCache(target)
 	if err != nil {
 		return nil, err
 	}
 
 	if p != nil {
-		log.Debugf("%v local cache hit", target.FQN)
+		e.Status(fmt.Sprintf("Using local %v cache...", target.FQN))
 		return p, nil
 	}
 
@@ -135,7 +129,7 @@ func (e *Engine) getCache(target *Target) (*Path, error) {
 			return nil, err
 		}
 
-		ok, err := e.getVfsCache(loc, target)
+		ok, err := e.getVfsCache(loc, cache.Name, target)
 		if err != nil {
 			log.Errorf("cache %v: %v", cache.Name, err)
 			continue
@@ -175,17 +169,26 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 
 	outDir := dir.Join(outputDir)
 
-	latestDir := e.cacheDir(target, "latest")
-
-	err = os.RemoveAll(latestDir.Abs())
-	if err != nil {
-		return nil, err
-	}
-
-	err = os.Symlink(dir.Abs(), latestDir.Abs())
+	err = e.linkLatestCache(target, dir.Abs())
 	if err != nil {
 		return nil, err
 	}
 
 	return &outDir, nil
+}
+
+func (e *Engine) linkLatestCache(target *Target, from string) error {
+	latestDir := e.cacheDir(target, "latest")
+
+	err := os.RemoveAll(latestDir.Abs())
+	if err != nil {
+		return err
+	}
+
+	err = os.Symlink(from, latestDir.Abs())
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
