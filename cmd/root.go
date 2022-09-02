@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
@@ -384,9 +385,10 @@ func Execute() {
 }
 
 func printTargetErr(err error) bool {
-	if err, ok := err.(engine.TargetFailedError); ok {
-		fmt.Printf("%v failed: %v\n", err.Target.FQN, err)
-		logFile := err.Target.LogFile
+	var terr engine.TargetFailedError
+	if errors.As(err, &terr) {
+		fmt.Printf("%v failed: %v\n", terr.Target.FQN, err)
+		logFile := terr.Target.LogFile
 		if logFile != "" {
 			c := exec.Command("cat", logFile)
 			output, _ := c.Output()

@@ -97,6 +97,10 @@ def go_mod(mod_pkgs=[], test={}):
         ]+glob("**/*.go"),
     )
 
+    mod_pkg_modsums = []
+    for pkg in mod_pkgs:
+        mod_pkg_modsums.append(pkg+":_mod")
+
     mod_pkg_srcs = []
     for pkg in mod_pkgs:
         mod_pkg_srcs.append(pkg+":_src")
@@ -111,12 +115,24 @@ def go_mod(mod_pkgs=[], test={}):
         'backend_pkg': backend_pkg,
     }
 
+    godeps_deps = [src]+mod_pkg_srcs+mod_pkg_modsums
+
+    imports = target(
+        name="_go_mod_gen_imports",
+        hash_file="mod_time",
+        run="godeps imports > $OUT",
+        out="imports",
+        deps=godeps_deps,
+        tools=[go, godeps],
+    )
+
     target(
         name="_go_mod_gen",
         hash_file="mod_time",
-        run="godeps \"$TARGET\" mod '{}'".format(to_json(godeps_cfg)),
+        run="godeps mod '{}'".format(to_json(godeps_cfg)),
         out="/**/BUILD",
-        deps=[src]+mod_pkg_srcs,
+        deps=godeps_deps,
+        hash_deps=[imports, gomodsum],
         tools=[go, godeps],
         env={
             "OS": get_os(),

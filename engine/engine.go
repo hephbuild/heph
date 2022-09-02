@@ -341,6 +341,12 @@ func (t TargetFailedError) Error() string {
 	return t.Err.Error()
 }
 
+func (t TargetFailedError) Is(target error) bool {
+	_, ok := target.(TargetFailedError)
+
+	return ok
+}
+
 func (e *Engine) ScheduleTarget(target *Target) (*worker.Job, error) {
 	parents, err := e.DAG().GetParents(target)
 	if err != nil {
@@ -353,7 +359,6 @@ func (e *Engine) ScheduleTarget(target *Target) (*worker.Job, error) {
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine:  e,
-				Pool:    e.Pool,
 				Worker:  w,
 				Context: ctx,
 			}
@@ -406,10 +411,6 @@ func (e *Engine) ScheduleTargetsDeps(targets Targets) (*worker.WaitGroup, error)
 	}
 
 	return deps, nil
-}
-
-func (e *Engine) ScheduleTargetDeps(target *Target) (*worker.WaitGroup, error) {
-	return e.ScheduleTargetsDeps(Targets{target})
 }
 
 func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {

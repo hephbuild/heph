@@ -16,7 +16,6 @@ import (
 
 type TargetRunEngine struct {
 	*Engine
-	Pool    *worker.Pool
 	Worker  *worker.Worker
 	Context context.Context
 }
