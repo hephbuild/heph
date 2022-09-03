@@ -31,6 +31,7 @@ var porcelain *bool
 var workers *int
 var cpuprofile *string
 var memprofile *string
+var shell *bool
 
 func init() {
 	// Output to stdout instead of the default stderr
@@ -49,6 +50,8 @@ func init() {
 	log.SetLevel(log.InfoLevel)
 
 	cleanCmd.AddCommand(cleanLockCmd)
+
+	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)
@@ -169,7 +172,7 @@ var rootCmd = &cobra.Command{
 			log.Fatalf("alias %v not defined\n", alias)
 		}
 
-		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, false)
+		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, false, false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -219,7 +222,7 @@ var runCmd = &cobra.Command{
 
 		fromStdin := hasStdin(args)
 
-		err = run(cmd.Context(), targets, fromStdin)
+		err = run(cmd.Context(), targets, fromStdin, *shell)
 		if err != nil {
 			log.Fatal(err)
 		}

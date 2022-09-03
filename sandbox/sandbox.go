@@ -111,8 +111,14 @@ type IOConfig struct {
 	Stderr io.Writer
 }
 
+var bashArgs = []string{"bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
+
+func BashShellArgs() []string {
+	return bashArgs
+}
+
 func BashArgs(cmds []string) []string {
-	args := []string{"bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
+	args := bashArgs
 	//args = append(args, "-x")
 	args = append(args, "-c", strings.Join(cmds, "\n"))
 
@@ -186,6 +192,11 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 	}
 
 	cmd.SysProcAttr = sysProcAttr()
+
+	// Attaching to stdin or stdout doesn't seem to work with setPgid
+	if cmd.Stdin == os.Stdin || cmd.Stdout == os.Stdout || cmd.Stderr == os.Stderr {
+		cmd.SysProcAttr.Setpgid = false
+	}
 
 	return cmd
 }

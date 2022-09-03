@@ -80,7 +80,15 @@ func normalizeEnv(k string) string {
 	return envRegex.ReplaceAllString(k, "_")
 }
 
+func (e *TargetRunEngine) RunShell(target *Target, iocfg sandbox.IOConfig, args ...string) error {
+	return e.run(target, iocfg, true, args...)
+}
+
 func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
+	return e.run(target, iocfg, false, args...)
+}
+
+func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool, args ...string) error {
 	e.Status(target.FQN)
 
 	log.Tracef("%v locking run", target.FQN)
@@ -110,23 +118,25 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		return nil
 	}
 
-	start := time.Now()
-	defer func() {
-		e.Status(fmt.Sprintf("%v done in %v", target.FQN, time.Since(start)))
-	}()
+	if !shell {
+		start := time.Now()
+		defer func() {
+			e.Status(fmt.Sprintf("%v done in %v", target.FQN, time.Since(start)))
+		}()
 
-	cached, err := e.WarmTargetCache(target)
-	if err != nil {
-		return err
-	}
-
-	if cached {
-		err = e.codegenLink(target)
+		cached, err := e.WarmTargetCache(target)
 		if err != nil {
 			return err
 		}
 
-		return nil
+		if cached {
+			err = e.codegenLink(target)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
 	}
 
 	// Sanity checks
@@ -233,8 +243,6 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 			return err
 		}
 	}
-
-	e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
 		target.LogFile = sandboxRoot.Join("log.txt").Abs()
@@ -397,14 +405,22 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	}
 
 	if len(target.Run) > 0 {
+		e.Status(fmt.Sprintf("Running %v...", target.FQN))
+
 		var execArgs []string
-		switch target.Executor {
-		case ExecutorBash:
-			execArgs = sandbox.BashArgs(target.Run)
-		case ExecutorExec:
-			execArgs, err = sandbox.ExecArgs(target.Run, env)
-			if err != nil {
-				return err
+		if shell {
+			log.Info("Shell mode enabled, exit the shell to terminate")
+			log.Infof("Command: %v", strings.Join(target.Run, " "))
+			execArgs = sandbox.BashShellArgs()
+		} else {
+			switch target.Executor {
+			case ExecutorBash:
+				execArgs = sandbox.BashArgs(target.Run)
+			case ExecutorExec:
+				execArgs, err = sandbox.ExecArgs(target.Run, env)
+				if err != nil {
+					return err
+				}
 			}
 		}
 
@@ -422,6 +438,10 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		if err != nil {
 			return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
 		}
+	}
+
+	if shell {
+		return nil
 	}
 
 	e.Status(fmt.Sprintf("Collecting %v output...", target.FQN))

@@ -114,10 +114,14 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 	}}, nil
 }
 
-func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) error {
+func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, shell bool) error {
 	var inlineTarget *TargetInvocation
 	if len(targetInvs) == 1 && !fromStdin {
 		inlineTarget = &targetInvs[0]
+	}
+
+	if shell && inlineTarget == nil {
+		return fmt.Errorf("shell mode is only compatible with running a single target")
 	}
 
 	targets := make([]*engine.Target, 0)
@@ -164,7 +168,12 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) err
 		Context: ctx,
 	}
 
-	err = e.Run(target, sandbox.IOConfig{
+	runner := e.Run
+	if shell {
+		runner = e.RunShell
+	}
+
+	err = runner(target, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
