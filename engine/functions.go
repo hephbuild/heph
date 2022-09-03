@@ -11,7 +11,7 @@ func (e *Engine) outdir(t *Target, expr *utils.Expr) (string, error) {
 	return filepath.Join(t.OutRoot.Abs(), t.Package.FullName), nil
 }
 
-func (e *Engine) collect(t *Target, expr *utils.Expr) (Targets, error) {
+func (e *Engine) collect(t *Target, expr *utils.Expr) ([]*Target, error) {
 	pkgMatcher := ParseTargetSelector(t.Package.FullName, expr.PosArgs[0])
 
 	var includeMatchers TargetMatchers
@@ -46,8 +46,8 @@ func (e *Engine) collect(t *Target, expr *utils.Expr) (Targets, error) {
 
 	matcher := AndMatcher(matchers...)
 
-	targets := make(Targets, 0)
-	for _, target := range e.Targets {
+	targets := make([]*Target, 0)
+	for _, target := range e.Targets.Slice() {
 		if !matcher(target) {
 			continue
 		}

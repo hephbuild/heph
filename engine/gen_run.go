@@ -10,8 +10,9 @@ import (
 )
 
 type runGenEngine struct {
-	*Engine
+	Name string
 	deps *worker.WaitGroup
+	*Engine
 }
 
 func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
@@ -42,6 +43,7 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 	log.Debugf("Run gen pass")
 
 	ge := runGenEngine{
+		Name:   "Main",
 		Engine: e,
 		deps:   &worker.WaitGroup{},
 	}
@@ -84,12 +86,17 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 	return deps, nil
 }
 
-func (e *runGenEngine) ScheduleGeneratedPipeline(targets Targets) error {
+func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
 	for _, target := range targets {
 		if !target.Gen {
 			panic(fmt.Errorf("%v is not a gen target", target.FQN))
 		}
 	}
+
+	start := time.Now()
+
+	deps := &worker.WaitGroup{}
+	newTargets := NewTargets(0)
 
 	_, err := e.ScheduleTargetsDeps(targets)
 	if err != nil {
@@ -102,37 +109,47 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(targets Targets) error {
 			return err
 		}
 
-		err = e.ScheduleRunGenerated(target)
+		err = e.scheduleRunGenerated(target, deps, newTargets)
 		if err != nil {
 			return err
 		}
 	}
 
-	return nil
-}
+	j := e.Pool.Schedule(&worker.Job{
+		ID:   fmt.Sprintf("ScheduleGeneratedPipeline_%v", e.Name),
+		Deps: deps,
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			w.Status(fmt.Sprintf("Finalizing generated %v...", e.Name))
 
-func (e *runGenEngine) ScheduleRunGenerated(target *Target) error {
-	j := e.Pool.Schedule(
-		&worker.Job{
-			ID:   "rungen-" + target.FQN,
-			Deps: jobs([]*Target{target}, e.Pool),
-			Do: func(w *worker.Worker, ctx context.Context) (ferr error) {
-				w.Status(fmt.Sprintf("Run generated targets from %v...", target.FQN))
-				defer func() {
-					w.Status(fmt.Sprintf("Run generated targets %v done: %v", target.FQN, ferr))
-				}()
+			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
-				err := e.runGenerated(target)
+			genTargets := make([]*Target, 0)
+			for _, t := range newTargets.Slice() {
+				err := e.processTarget(t)
 				if err != nil {
-					return TargetFailedError{
-						Target: target,
-						Err:    err,
-					}
+					return fmt.Errorf("process: %v: %w", t.FQN, err)
 				}
 
-				return nil
-			},
-		})
+				if t.Gen {
+					genTargets = append(genTargets, t)
+				}
+			}
+
+			if len(genTargets) > 0 {
+				err := e.linkAndDagGenTargets()
+				if err != nil {
+					return err
+				}
+
+				err = e.ScheduleGeneratedPipeline(genTargets)
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		},
+	})
 	e.deps.Add(j)
 
 	return nil
@@ -154,79 +171,68 @@ func (e *runGenEngine) linkAndDagGenTargets() error {
 	return nil
 }
 
-func (e *runGenEngine) runGenerated(target *Target) error {
-	log.Tracef("run generated %v", target.FQN)
+func (e *runGenEngine) scheduleRunGenerated(target *Target, deps *worker.WaitGroup, targets *Targets) error {
+	j := e.Pool.Schedule(&worker.Job{
+		ID:   "rungen_" + target.FQN,
+		Deps: jobs([]*Target{target}, e.Pool),
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			return e.scheduleRunGeneratedFiles(target, deps, targets)
+		},
+	})
+	deps.Add(j)
 
-	start := time.Now()
-	defer func() {
-		log.Debugf("runGenerated %v took %v", target.FQN, time.Since(start))
-	}()
+	return nil
+}
 
-	targets := make(Targets, 0)
-
+func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.WaitGroup, targets *Targets) error {
 	files := target.ActualFilesOut()
 
 	for _, file := range files {
-		re := &runBuildEngine{
-			Engine: e.Engine,
-			pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-			registerTarget: func(spec TargetSpec) error {
-				e.TargetsLock.Lock()
-				defer e.TargetsLock.Unlock()
+		file := file
+		j := e.Pool.Schedule(&worker.Job{
+			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				w.StatusQuiet(fmt.Sprintf("Running %v", file.RelRoot()))
 
-				if t := e.Targets.Find(spec.FQN); t != nil {
-					if t.Gen {
-						return fmt.Errorf("cannot replace gen target")
-					}
+				re := &runBuildEngine{
+					Engine: e.Engine,
+					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
+					registerTarget: func(spec TargetSpec) error {
+						e.TargetsLock.Lock()
+						defer e.TargetsLock.Unlock()
 
-					if !t.TargetSpec.Equal(spec) {
-						return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n%s", spec.FQN, t.Source, t.json(), spec.json())
-					}
+						if t := e.Targets.Find(spec.FQN); t != nil {
+							if t.Gen {
+								return fmt.Errorf("cannot replace gen target")
+							}
 
-					return nil
+							if !t.TargetSpec.Equal(spec) {
+								return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n%s", spec.FQN, t.Source, t.json(), spec.json())
+							}
+
+							return nil
+						}
+
+						t := &Target{
+							TargetSpec: spec,
+						}
+
+						targets.Add(t)
+						e.Targets.Add(t)
+
+						return nil
+					},
 				}
 
-				t := &Target{
-					TargetSpec: spec,
+				_, err := re.runBuildFile(file.Abs())
+				if err != nil {
+					return fmt.Errorf("%v: %w", file.Abs(), err)
 				}
-
-				targets = append(targets, t)
-				e.Targets = append(e.Targets, t)
 
 				return nil
 			},
-		}
-
-		_, err := re.runBuildFile(file.Abs())
-		if err != nil {
-			return fmt.Errorf("%v: %w", file.Abs(), err)
-		}
-	}
-
-	log.Tracef("run generated got %v targets", len(targets))
-
-	genTargets := make(Targets, 0)
-	for _, t := range targets {
-		err := e.processTarget(t)
-		if err != nil {
-			return fmt.Errorf("process: %v: %w", t.FQN, err)
-		}
-
-		if t.Gen {
-			genTargets = append(genTargets, t)
-		}
-	}
-
-	if len(genTargets) > 0 {
-		err := e.linkAndDagGenTargets()
-		if err != nil {
-			return err
-		}
-
-		err = e.ScheduleGeneratedPipeline(genTargets)
-		if err != nil {
-			return err
-		}
+		})
+		deps.Add(j)
 	}
 
 	return nil

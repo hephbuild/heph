@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type TargetRunEngine struct {
@@ -109,8 +110,9 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 		return nil
 	}
 
+	start := time.Now()
 	defer func() {
-		e.Status(fmt.Sprintf("%v done", target.FQN))
+		e.Status(fmt.Sprintf("%v done in %v", target.FQN, time.Since(start)))
 	}()
 
 	cached, err := e.WarmTargetCache(target)

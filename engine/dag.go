@@ -9,7 +9,7 @@ type DAG struct {
 	*dag.DAG
 }
 
-func (e *DAG) ancestorsWalker(target *Target, ancs *Targets, ancsm map[string]struct{}, depth int) error {
+func (e *DAG) ancestorsWalker(target *Target, ancs *[]*Target, ancsm map[string]struct{}, depth int) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -34,8 +34,8 @@ func (e *DAG) ancestorsWalker(target *Target, ancs *Targets, ancsm map[string]st
 	return nil
 }
 
-func (e *DAG) GetOrderedAncestors(targets Targets) (Targets, error) {
-	ancs := make(Targets, 0)
+func (e *DAG) GetOrderedAncestors(targets []*Target) ([]*Target, error) {
+	ancs := make([]*Target, 0)
 	ancsm := map[string]struct{}{}
 
 	for _, target := range targets {
@@ -48,11 +48,11 @@ func (e *DAG) GetOrderedAncestors(targets Targets) (Targets, error) {
 	return ancs, nil
 }
 
-func (e *DAG) GetAncestors(target *Target) (Targets, error) {
+func (e *DAG) GetAncestors(target *Target) ([]*Target, error) {
 	return e.GetAncestorsOfFQN(target.FQN)
 }
 
-func (e *DAG) GetAncestorsOfFQN(fqn string) (Targets, error) {
+func (e *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
 	ancestors, err := e.DAG.GetAncestors(fqn)
 	if err != nil {
 		return nil, err
@@ -61,11 +61,11 @@ func (e *DAG) GetAncestorsOfFQN(fqn string) (Targets, error) {
 	return e.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetDescendants(target *Target) (Targets, error) {
+func (e *DAG) GetDescendants(target *Target) ([]*Target, error) {
 	return e.GetDescendantsOfFQN(target.FQN)
 }
 
-func (e *DAG) GetDescendantsOfFQN(fqn string) (Targets, error) {
+func (e *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
 	ancestors, err := e.DAG.GetDescendants(fqn)
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func (e *DAG) GetDescendantsOfFQN(fqn string) (Targets, error) {
 	return e.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetParents(target *Target) (Targets, error) {
+func (e *DAG) GetParents(target *Target) ([]*Target, error) {
 	ancestors, err := e.DAG.GetParents(target.FQN)
 	if err != nil {
 		return nil, err
@@ -83,13 +83,13 @@ func (e *DAG) GetParents(target *Target) (Targets, error) {
 	return e.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetVertices() Targets {
+func (e *DAG) GetVertices() []*Target {
 	vertices := e.DAG.GetVertices()
 
 	return e.mapToArray(vertices)
 }
 
-func (e *DAG) GetChildren(target *Target) (Targets, error) {
+func (e *DAG) GetChildren(target *Target) ([]*Target, error) {
 	ancestors, err := e.DAG.GetChildren(target.FQN)
 	if err != nil {
 		return nil, err
@@ -98,14 +98,14 @@ func (e *DAG) GetChildren(target *Target) (Targets, error) {
 	return e.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetLeaves() Targets {
+func (e *DAG) GetLeaves() []*Target {
 	leaves := e.DAG.GetLeaves()
 
 	return e.mapToArray(leaves)
 }
 
-func (e *DAG) mapToArray(m map[string]interface{}) Targets {
-	a := make(Targets, 0)
+func (e *DAG) mapToArray(m map[string]interface{}) []*Target {
+	a := make([]*Target, 0)
 	for _, anci := range m {
 		anc := anci.(*Target)
 		a = append(a, anc)

@@ -120,7 +120,7 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool) err
 		inlineTarget = &targetInvs[0]
 	}
 
-	targets := make(engine.Targets, 0)
+	targets := make([]*engine.Target, 0)
 	for _, inv := range targetInvs {
 		targets = append(targets, inv.Target)
 	}

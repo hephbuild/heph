@@ -5,27 +5,13 @@ import (
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
+	"heph/utils"
 	"heph/worker"
 	"io"
 	"os"
 	"strings"
 	"time"
 )
-
-var divs = []time.Duration{
-	time.Duration(1), time.Duration(10), time.Duration(100), time.Duration(1000)}
-
-func round(d time.Duration, digits int) time.Duration {
-	switch {
-	case d > time.Second:
-		d = d.Round(time.Second / divs[digits])
-	case d > time.Millisecond:
-		d = d.Round(time.Millisecond / divs[digits])
-	case d > time.Microsecond:
-		d = d.Round(time.Microsecond / divs[digits])
-	}
-	return d
-}
 
 type hookFunc struct {
 	f func(*log.Entry)
@@ -47,26 +33,32 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
 
+	pool := Engine.Pool
+
 	if !forceSilent && isTerm && !*plain {
-		err := PoolUI(name, deps, Engine.Pool)
+		err := PoolUI(name, deps, pool)
 		if err != nil {
-			return fmt.Errorf("dynamic renderer: %w", err)
+			return fmt.Errorf("poolui: %w", err)
 		}
 	} else {
+		printProgress := func() {
+			log.Infof("Progress %v: %v/%v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount())
+		}
 		for {
 			select {
 			case <-time.After(time.Second):
-				log.Infof("Progress %v: %v/%v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount())
+				printProgress()
 				continue
 			case <-deps.Done():
 				// will break
 			}
 
+			printProgress()
 			break
 		}
 	}
 
-	if err := Engine.Pool.Err(); err != nil {
+	if err := pool.Err(); err != nil {
 		return fmt.Errorf("pool: %w", err)
 	}
 
@@ -84,6 +76,7 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 
 	r := &renderer{
 		name:  name,
+		pool:  pool,
 		start: time.Now(),
 		cancel: func() {
 			pool.Stop(fmt.Errorf("user canceled"))
@@ -138,8 +131,9 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 		return err
 	}
 
-	// Make sure all is done
-	<-deps.Done()
+	if !deps.IsDone() {
+		pool.Stop(fmt.Errorf("TUI exited unexpectedly"))
+	}
 
 	return nil
 }
@@ -156,12 +150,35 @@ type renderer struct {
 	running bool
 	start   time.Time
 	cancel  func()
+	sb      strings.Builder
+	pool    *worker.Pool
 	UpdateMessage
 }
 
 func (r *renderer) Init() tea.Cmd {
 	r.running = true
 	return nil
+}
+
+func printJobsWaitStack(jobs []*worker.Job, d int) []string {
+	prefix := strings.Repeat("  ", d+1)
+
+	strs := make([]string, 0)
+	for _, j := range jobs {
+		if j.IsDone() {
+			continue
+		}
+
+		strs = append(strs, fmt.Sprintf("%v- %v (%v)", prefix, j.ID, j.State.String()))
+
+		deps := j.Deps.Jobs()
+		if len(deps) > 0 {
+			strs = append(strs, prefix+fmt.Sprintf("  deps: (%v)", len(deps)))
+			strs = append(strs, printJobsWaitStack(deps, d+1)...)
+		}
+	}
+
+	return strs
 }
 
 func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -172,7 +189,17 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyBreak:
 			r.cancel()
-			return r, tea.Quit
+			return r, nil
+		case tea.KeyRunes:
+			switch msg.String() {
+			case "p":
+				strs := make([]string, 0)
+				strs = append(strs, "Unfinished jobs:")
+
+				strs = append(strs, printJobsWaitStack(r.pool.Jobs(), 0)...)
+
+				return r, tea.Batch(tea.Println(strings.Join(strs, "\n")))
+			}
 		}
 	}
 
@@ -180,23 +207,25 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (r *renderer) View() string {
+	start := utils.RoundTime(time.Since(r.start), 1).String()
+
 	if r.summary {
 		count := fmt.Sprint(r.success)
 		if r.success != r.jobs {
 			count = fmt.Sprintf("%v/%v", r.success, r.jobs)
 		}
-		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, count, round(time.Now().Sub(r.start), 1).String())
+		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, count, start)
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.success, r.jobs, round(time.Now().Sub(r.start), 1).String()))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.success, r.jobs, start))
 
 	for _, w := range r.workers {
 		var runtime string
 		state := "I"
 		if j := w.CurrentJob; j != nil {
 			state = "R"
-			runtime = fmt.Sprintf(" %v", round(time.Now().Sub(j.TimeStart), 1).String())
+			runtime = fmt.Sprintf(" %v", utils.RoundTime(time.Since(j.TimeStart), 1).String())
 		}
 
 		status := w.GetStatus()

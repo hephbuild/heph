@@ -41,9 +41,9 @@ func (s JobState) String() string {
 
 type Job struct {
 	ID    string
+	Deps  *WaitGroup
 	Do    func(w *Worker, ctx context.Context) error
 	State JobState
-	Deps  *WaitGroup
 
 	ctx    context.Context
 	done   bool
@@ -71,6 +71,10 @@ func (j *Job) doneWithState(state JobState) {
 	close(j.doneCh)
 }
 
+func (j *Job) IsDone() bool {
+	return j.done
+}
+
 type Worker struct {
 	status     string
 	CurrentJob *Job
@@ -78,6 +82,10 @@ type Worker struct {
 
 func (w *Worker) GetStatus() string {
 	return w.status
+}
+
+func (w *Worker) StatusQuiet(status string) {
+	w.status = status
 }
 
 func (w *Worker) Status(status string) {
@@ -221,10 +229,15 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 }
 
 func (p *Pool) Job(id string) *Job {
-	p.m.Lock()
-	defer p.m.Unlock()
-
 	return p.jobs.Job(id, true)
+}
+
+func (p *Pool) Jobs() []*Job {
+	return p.jobs.jobs[:]
+}
+
+func (p *Pool) IsDone() bool {
+	return p.jobs.IsDone()
 }
 
 func (p *Pool) Done() <-chan struct{} {
@@ -259,6 +272,7 @@ func (p *Pool) Stop(err error) {
 	if p.stopped {
 		return
 	}
+
 	p.stopped = true
 	p.stopErr = err
 

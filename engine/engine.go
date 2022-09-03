@@ -57,7 +57,7 @@ type Engine struct {
 	Packages      map[string]*Package
 
 	TargetsLock sync.Mutex
-	Targets     Targets
+	Targets     *Targets
 	Labels      []string
 
 	dag *DAG
@@ -111,6 +111,7 @@ func New(rootPath string, ctx context.Context) *Engine {
 		HomeDir:         homeDir,
 		Context:         ctx,
 		LocalCache:      loc.(*vfsos.Location),
+		Targets:         NewTargets(0),
 		Packages:        map[string]*Package{},
 		cacheHashInput:  map[string]string{},
 		cacheHashOutput: map[string]string{},
@@ -393,7 +394,7 @@ func jobs(targets []*Target, pool *worker.Pool) *worker.WaitGroup {
 	return deps
 }
 
-func (e *Engine) ScheduleTargetsDeps(targets Targets) (*worker.WaitGroup, error) {
+func (e *Engine) ScheduleTargetsDeps(targets []*Target) (*worker.WaitGroup, error) {
 	parents, err := e.DAG().GetOrderedAncestors(targets)
 	if err != nil {
 		return nil, err
@@ -670,10 +671,10 @@ func (e *Engine) HasLabel(label string) bool {
 	return false
 }
 
-func (e *Engine) GeneratedTargets() Targets {
-	targets := make(Targets, 0)
+func (e *Engine) GeneratedTargets() []*Target {
+	targets := make([]*Target, 0)
 
-	for _, target := range e.Targets {
+	for _, target := range e.Targets.Slice() {
 		target := target
 		if !target.Gen {
 			continue
@@ -695,7 +696,7 @@ func (e *Engine) registerLabels(labels []string) {
 
 func (e *Engine) GetTargetShortcuts() []*Target {
 	aliases := make([]*Target, 0)
-	for _, target := range e.Targets {
+	for _, target := range e.Targets.Slice() {
 		if target.Package.FullName == "" {
 			aliases = append(aliases, target)
 		}

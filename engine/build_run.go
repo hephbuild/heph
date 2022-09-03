@@ -85,7 +85,7 @@ func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
 			e.TargetsLock.Lock()
 			defer e.TargetsLock.Unlock()
 
-			e.Targets = append(e.Targets, &Target{
+			e.Targets.Add(&Target{
 				TargetSpec: t,
 			})
 

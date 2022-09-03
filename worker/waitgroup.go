@@ -13,6 +13,7 @@ type WaitGroup struct {
 	jobs   []*Job
 	jobsm  map[string]*Job
 	doneCh chan struct{}
+	done   bool
 	err    error
 	cond   *sync.Cond
 	oSetup sync.Once
@@ -54,6 +55,15 @@ func (wg *WaitGroup) AddChild(child *WaitGroup) {
 	}()
 
 	wg.wgs = append(wg.wgs, child)
+}
+
+func (wg *WaitGroup) Jobs() []*Job {
+	jobs := wg.jobs[:]
+	for _, wg := range wg.wgs[:] {
+		jobs = append(jobs, wg.Jobs()...)
+	}
+
+	return jobs
 }
 
 func (wg *WaitGroup) Job(id string, transitive bool) *Job {
@@ -107,6 +117,7 @@ func (wg *WaitGroup) wait() {
 	if wg.err == nil {
 		wg.err = err
 	}
+	wg.done = true
 	close(wg.doneCh)
 
 	wg.cond.L.Unlock()
@@ -114,7 +125,7 @@ func (wg *WaitGroup) wait() {
 
 func (wg *WaitGroup) Done() <-chan struct{} {
 	wg.oSetup.Do(func() {
-		wg.cond = sync.NewCond(&sync.Mutex{})
+		wg.cond = sync.NewCond(&wg.m)
 	})
 
 	wg.oDone.Do(func() {
@@ -123,6 +134,10 @@ func (wg *WaitGroup) Done() <-chan struct{} {
 	})
 
 	return wg.doneCh
+}
+
+func (wg *WaitGroup) IsDone() bool {
+	return wg.done
 }
 
 func (wg *WaitGroup) Err() error {

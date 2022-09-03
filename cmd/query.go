@@ -38,8 +38,8 @@ func init() {
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 
-	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Labels to include")
-	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Labels to exclude, takes precedence over --include")
+	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
+	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 
 	autocompleteTargetOrLabel := func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete()
@@ -80,7 +80,7 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		targets := Engine.Targets
+		targets := Engine.Targets.Slice()
 		if hasStdin(args) {
 			var err error
 			targets, err = parseTargetsFromStdin()
@@ -124,7 +124,7 @@ var alltargetsCmd = &cobra.Command{
 		return preRunWithGen(false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		for _, target := range sortedTargets(Engine.Targets, false) {
+		for _, target := range sortedTargets(Engine.Targets.Slice(), false) {
 			fmt.Println(target.FQN)
 		}
 
@@ -320,10 +320,10 @@ var changesCmd = &cobra.Command{
 			return err
 		}
 
-		affectedTargets := make(engine.Targets, 0)
+		affectedTargets := make([]*engine.Target, 0)
 		affectedFiles := strings.Split(string(out), "\n")
 
-		allTargets := Engine.Targets
+		allTargets := Engine.Targets.Slice()
 
 		for _, affectedFile := range affectedFiles {
 		targets:

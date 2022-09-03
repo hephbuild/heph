@@ -343,25 +343,87 @@ type TargetWithOutput struct {
 	Output string
 }
 
-type Targets []*Target
-
-func (t Targets) Find(fqn string) *Target {
-	for _, target := range t {
-		if target.FQN == fqn {
-			return target
-		}
-	}
-
-	return nil
+type Targets struct {
+	mu sync.Mutex
+	m  map[string]*Target
+	a  []*Target
 }
 
-func (t Targets) FQNs() []string {
+func NewTargets(cap int) *Targets {
+	t := &Targets{}
+	t.m = make(map[string]*Target, cap)
+	t.a = make([]*Target, 0, cap)
+
+	return t
+}
+
+func (ts *Targets) Add(t *Target) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if _, ok := ts.m[t.FQN]; ok {
+		return
+	}
+
+	ts.m[t.FQN] = t
+	ts.a = append(ts.a, t)
+}
+
+func (ts *Targets) Find(fqn string) *Target {
+	if ts == nil {
+		return nil
+	}
+
+	return ts.m[fqn]
+}
+
+func (ts *Targets) FQNs() []string {
+	if ts == nil {
+		return nil
+	}
+
 	fqns := make([]string, 0)
-	for _, target := range t {
+	for _, target := range ts.a {
 		fqns = append(fqns, target.FQN)
 	}
 
 	return fqns
+}
+
+func (ts *Targets) Sort() {
+	if ts == nil {
+		return
+	}
+
+	sort.SliceStable(ts.a, func(i, j int) bool {
+		return ts.a[i].FQN < ts.a[j].FQN
+	})
+}
+
+func (ts *Targets) Slice() []*Target {
+	if ts == nil {
+		return nil
+	}
+
+	return ts.a[:]
+}
+
+func (ts *Targets) Len() int {
+	if ts == nil {
+		return 0
+	}
+
+	return len(ts.a)
+}
+
+func (ts *Targets) Copy() *Targets {
+	t := NewTargets(ts.Len())
+
+	for _, target := range ts.Slice() {
+		t.Add(target)
+	}
+
+	return t
 }
 
 func (e *Engine) Parse() error {
@@ -397,12 +459,10 @@ func (e *Engine) Parse() error {
 	}
 	log.Debugf("RunBuildFiles took %v", time.Since(runStartTime))
 
-	sort.SliceStable(e.Targets, func(i, j int) bool {
-		return e.Targets[i].FQN < e.Targets[j].FQN
-	})
+	e.Targets.Sort()
 
 	processStartTime := time.Now()
-	for _, target := range e.Targets {
+	for _, target := range e.Targets.Slice() {
 		err := e.processTarget(target)
 		if err != nil {
 			return fmt.Errorf("%v: %w", target.FQN, err)
@@ -439,7 +499,7 @@ func (e *Engine) createDag() error {
 	e.dag = &DAG{dag.NewDAG()}
 
 	dagStartTime := time.Now()
-	for _, target := range targets {
+	for _, target := range targets.Slice() {
 		_, err := e.dag.AddVertex(target)
 		if err != nil {
 			return err
@@ -455,7 +515,7 @@ func (e *Engine) createDag() error {
 		return e.dag.AddEdge(src.FQN, dst.FQN)
 	}
 
-	for _, target := range targets {
+	for _, target := range targets.Slice() {
 		for _, dep := range target.Deps.All().Targets {
 			err := addEdge(dep.Target, target)
 			if err != nil {
@@ -535,24 +595,24 @@ func (e *Engine) processTarget(t *Target) error {
 	return nil
 }
 
-func (e *Engine) linkedTargets() Targets {
-	targets := make(Targets, 0)
+func (e *Engine) linkedTargets() *Targets {
+	targets := NewTargets(e.Targets.Len())
 
-	for _, target := range e.Targets {
+	for _, target := range e.Targets.Slice() {
 		if !target.linked {
 			continue
 		}
 
-		targets = append(targets, target)
+		targets.Add(target)
 	}
 
 	return targets
 }
 
-func (e *Engine) noRequireGenTargets() Targets {
-	targets := make(Targets, 0)
+func (e *Engine) noRequireGenTargets() []*Target {
+	targets := make([]*Target, 0)
 
-	for _, target := range e.Targets {
+	for _, target := range e.Targets.Slice() {
 		if target.RequireGen {
 			continue
 		}
@@ -563,13 +623,13 @@ func (e *Engine) noRequireGenTargets() Targets {
 	return targets
 }
 
-func (e *Engine) linkTargets(simplify bool, targets Targets) error {
-	for _, target := range e.Targets {
+func (e *Engine) linkTargets(simplify bool, targets []*Target) error {
+	for _, target := range e.Targets.Slice() {
 		target.linked = false
 	}
 
 	if targets == nil {
-		targets = e.Targets
+		targets = e.Targets.Slice()
 	}
 
 	for i, target := range targets {
@@ -584,7 +644,7 @@ func (e *Engine) linkTargets(simplify bool, targets Targets) error {
 }
 
 func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
-	files := make(PackagePaths, 0)
+	files := make(PackagePaths, 0, len(td.Files))
 	for _, file := range td.Files {
 		if dep, ok := e.codegenPaths[file.RelRoot()]; ok {
 			log.Tracef("%v: %v removed from deps, and %v outputs it", t.FQN, file.RelRoot(), dep.FQN)
@@ -597,20 +657,19 @@ func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	return td
 }
 
-func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error {
+func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
 	}
 
-	for _, target := range breadcrumb {
-		if target.FQN == t.FQN {
-			breadcrumb = append(breadcrumb, t)
-			return fmt.Errorf("linking cycle: %v", breadcrumb.FQNs())
-		}
+	if breadcrumb.Find(t.FQN) != nil {
+		breadcrumb.Add(t)
+		return fmt.Errorf("linking cycle: %v", breadcrumb.FQNs())
 	}
-	breadcrumb = append(breadcrumb, t)
+	breadcrumb = breadcrumb.Copy()
+	breadcrumb.Add(t)
 
-	logPrefix := strings.Repeat("|", len(breadcrumb)-1)
+	logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
 	t.m.Lock()
 	if t.linked {
@@ -811,7 +870,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb Targets) error 
 	return nil
 }
 
-func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetNamedDeps, error) {
+func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb *Targets) (TargetNamedDeps, error) {
 	m := map[string]TargetSpecDeps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
@@ -846,7 +905,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 	return td, nil
 }
 
-func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcrumb Targets) (Targets, error) {
+func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcrumb *Targets) ([]*Target, error) {
 	switch expr.Function {
 	case "collect":
 		targets, err := e.collect(t, expr)
@@ -873,13 +932,13 @@ func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcru
 			return nil, fmt.Errorf("find_parent: %w", err)
 		}
 
-		return Targets{target}, nil
+		return []*Target{target}, nil
 	default:
 		return nil, fmt.Errorf("unhandled function %v", expr.Function)
 	}
 }
 
-func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb Targets) (TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb *Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {

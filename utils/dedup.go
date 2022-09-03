@@ -1,8 +1,8 @@
 package utils
 
 func DedupKeepLast[T any](as []T, id func(T) string) []T {
-	value := map[string]T{}
-	pos := map[string]int{}
+	value := make(map[string]T, len(as))
+	pos := make(map[string]int, len(as))
 
 	for i, a := range as {
 		a := a

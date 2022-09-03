@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"syscall"
 )
@@ -28,6 +29,8 @@ var plain *bool
 var noGen *bool
 var porcelain *bool
 var workers *int
+var cpuprofile *string
+var memprofile *string
 
 func init() {
 	// Output to stdout instead of the default stderr
@@ -51,6 +54,8 @@ func init() {
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
 
+	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
+	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
 	logLevel = rootCmd.PersistentFlags().String("log_level", log.InfoLevel.String(), "log level")
 	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
@@ -62,6 +67,8 @@ func init() {
 	rootCmd.Flags().SetInterspersed(false)
 	setupRootUsage()
 }
+
+var cpuProfileFile *os.File
 
 var Engine *engine.Engine
 
@@ -84,15 +91,46 @@ var rootCmd = &cobra.Command{
 			switchToPorcelain()
 		}
 
+		if *cpuprofile != "" {
+			cpuProfileFile, err = os.Create(*cpuprofile)
+			if err != nil {
+				return fmt.Errorf("could not create CPU profile: %w", err)
+			}
+			if err := pprof.StartCPUProfile(cpuProfileFile); err != nil {
+				return fmt.Errorf("could not start CPU profile: %w", err)
+			}
+		}
+
 		return nil
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
+		defer func() {
+			if cpuProfileFile != nil {
+				pprof.StopCPUProfile()
+				defer cpuProfileFile.Close()
+			}
+
+			if *memprofile != "" {
+				f, err := os.Create(*memprofile)
+				if err != nil {
+					log.Fatalf("could not create memory profile: %v", err)
+				}
+				defer f.Close()
+				runtime.GC() // get up-to-date statistics
+				if err := pprof.WriteHeapProfile(f); err != nil {
+					log.Fatalf("could not write memory profile: %v", err)
+				}
+			}
+		}()
+
 		if Engine == nil {
 			return nil
 		}
 
-		log.Tracef("Waiting for all pool items to finish")
-		<-Engine.Pool.Done()
+		if !Engine.Pool.IsDone() {
+			log.Tracef("Waiting for all pool items to finish")
+			<-Engine.Pool.Done()
+		}
 
 		return Engine.Pool.Err()
 	},
@@ -249,6 +287,7 @@ func engineInit() error {
 		}()
 
 		<-sig
+
 		cancel()
 	}()
 
@@ -356,7 +395,7 @@ var cleanLockCmd = &cobra.Command{
 		return engineInit()
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		for _, target := range Engine.Targets {
+		for _, target := range Engine.Targets.Slice() {
 			err := Engine.CleanTargetLock(target)
 			if err != nil {
 				return err
