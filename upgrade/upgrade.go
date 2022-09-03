@@ -131,12 +131,6 @@ func downloadAndLink(cfg config.Config) (string, error) {
 		return dstPath, nil
 	}
 
-	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0744)
-	if err != nil {
-		return "", err
-	}
-	defer dst.Close()
-
 	url := fmt.Sprintf("%v/%v/heph_%v_%v", baseUrl, cfg.Version.String, runtime.GOOS, runtime.GOARCH)
 
 	res, err := http.Get(url)
@@ -149,8 +143,15 @@ func downloadAndLink(cfg config.Config) (string, error) {
 		return "", fmt.Errorf("%v: status: %v", url, res.StatusCode)
 	}
 
+	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0744)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+
 	_, err = io.Copy(dst, res.Body)
 	if err != nil {
+		_ = os.RemoveAll(dir)
 		return "", err
 	}
 
