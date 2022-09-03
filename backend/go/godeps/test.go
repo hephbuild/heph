@@ -89,7 +89,10 @@ test_build = go_build_bin(
 
 target(
     name="go_test",
-    deps=test_build,
+    deps=[
+		test_build,
+		'$(collect "{}/." include="go_test_data")'.format(package_fqn()),
+	],
     run='{{.PreRun}} ./pkg.test -test.v 2>&1 | tee test_out',
     out=['test_out'],
     labels=["test"],

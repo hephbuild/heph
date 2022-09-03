@@ -122,28 +122,33 @@ func generate() []RenderUnit {
 		_, imports := splitOutPkgs(pkg.Imports)
 
 		if pkg.IsPartOfTree {
-			lib := &Lib{
-				Target:     libTarget(pkgs, pkg, nil),
-				ImportPath: pkg.ImportPath,
-				ModRoot:    modRoot,
-				GoFiles:    pkg.GoFiles,
-				SFiles:     pkg.SFiles,
+			libPkg := libTarget(pkgs, pkg, nil).Package
+
+			var lib *Lib
+			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
+				lib = &Lib{
+					Target:     libTarget(pkgs, pkg, nil),
+					ImportPath: pkg.ImportPath,
+					ModRoot:    modRoot,
+					GoFiles:    pkg.GoFiles,
+					SFiles:     pkg.SFiles,
+				}
+
+				for _, p := range imports {
+					t := libTarget(pkgs, pkgs.Find(p), nil)
+
+					lib.Libs = append(lib.Libs, t.Full())
+				}
+
+				units = append(units, RenderUnit{
+					Render: func(w io.Writer) {
+						RenderLib(w, lib)
+					},
+					Package: lib.Target.Package,
+				})
 			}
 
-			for _, p := range imports {
-				t := libTarget(pkgs, pkgs.Find(p), nil)
-
-				lib.Libs = append(lib.Libs, t.Full())
-			}
-
-			units = append(units, RenderUnit{
-				Render: func(w io.Writer) {
-					RenderLib(w, lib)
-				},
-				Package: lib.Target.Package,
-			})
-
-			if pkg.IsPartOfModule && pkg.Name == "main" {
+			if lib != nil && pkg.IsPartOfModule && pkg.Name == "main" {
 				bin := &Bin{
 					TargetPackage: lib.Target.Package,
 					MainLib:       lib.Target.Full(),
@@ -170,18 +175,24 @@ func generate() []RenderUnit {
 				_, pkgDeps := splitOutPkgs(pkg.Deps)
 
 				imports := append(pkgTestDeps, pkgDeps...)
-				imports = append(imports, pkg.ImportPath)
 
 				goFiles := make([]string, 0)
-				goFiles = append(goFiles, lib.GoFiles...)
+				if lib != nil {
+					goFiles = append(goFiles, lib.GoFiles...)
+				}
 				goFiles = append(goFiles, pkg.TestGoFiles...)
 				goFiles = append(goFiles, pkg.XTestGoFiles...)
 
+				sFiles := make([]string, 0)
+				if lib != nil {
+					sFiles = append(sFiles, lib.SFiles...)
+				}
+
 				test := &LibTest{
 					ImportPath:    pkg.ImportPath,
-					TargetPackage: lib.Target.Package,
+					TargetPackage: libPkg,
 					GoFiles:       goFiles,
-					SFiles:        lib.SFiles,
+					SFiles:        sFiles,
 					PreRun:        Config.Test.PreRun,
 					TestFiles:     pkg.TestGoFiles,
 					XTestFiles:    pkg.XTestGoFiles,

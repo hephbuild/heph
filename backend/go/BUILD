@@ -185,7 +185,7 @@ def _go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def _go_compile_cmd(name, import_path, files, abi=None, complete=True):
+def _go_compile_cmd(name, import_path, abi=None, complete=True):
     extra = ""
     if abi:
         extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
@@ -195,7 +195,7 @@ def _go_compile_cmd(name, import_path, files, abi=None, complete=True):
 
     return [
         'echo "Compiling (out: $OUT_IMPORTCFG)..."',
-        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT;$GO_OUTDIR" -o $SANDBOX/$OUT_A -pack{} {}'.format(extra, ' '.join(files)),
+        'go tool compile -importcfg $SANDBOX/importconfig -trimpath "$ROOT;$GO_OUTDIR" -o $SANDBOX/$OUT_A -pack{} $SRC_SRC'.format(extra),
         'echo "packagefile {}=$OUT_A" > $SANDBOX/$OUT_IMPORTCFG'.format(import_path),
     ]
 
@@ -278,12 +278,18 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
             labels=['go_lib'],
         )
 
+    env = {
+        "OS": get_os(),
+        "ARCH": get_arch(),
+    }
+
     src_files = go_files
     if dir:
         src_files = [p+dep for dep in src_files]
 
     if src_dep:
         deps = {'src': [src_dep], 'libs': libs}
+        env["SRC_SRC"] = ' '.join(src_files)
     else:
         deps = {'src': src_files, 'libs': libs}
 
@@ -298,15 +304,11 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     return target(
         name=name,
         deps=deps,
-        run=_go_gen_importcfg()+_go_compile_cmd(name, import_path, src_files, abi, complete),
+        run=_go_gen_importcfg()+_go_compile_cmd(name, import_path, abi, complete),
         out=out,
         out_env='rel_root',
         tools=[go],
-        env={
-            "OS": get_os(),
-            "ARCH": get_arch(),
-            "SRC_SRC": "", # override src env var
-        },
+        env=env,
         labels=['go_lib'],
     )
 
