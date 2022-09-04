@@ -98,7 +98,7 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string, target *Target) (bool, error) {
+func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string, target *Target, onlyMeta bool) (bool, error) {
 	inputHash := e.hashInput(target)
 
 	localRoot, err := e.localCacheLocation(target, inputHash)
@@ -120,18 +120,20 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 		return false, err
 	}
 
-	e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
+	if !onlyMeta {
+		e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
 
-	err = e.vfsCopyFile(remoteRoot, localRoot, outputTarFile)
-	if err != nil {
-		return false, err
-	}
+		err = e.vfsCopyFile(remoteRoot, localRoot, outputTarFile)
+		if err != nil {
+			return false, err
+		}
 
-	dir := e.cacheDir(target, inputHash)
+		dir := e.cacheDir(target, inputHash)
 
-	err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
-	if err != nil {
-		return false, err
+		err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
+		if err != nil {
+			return false, err
+		}
 	}
 
 	err = e.vfsCopyFile(remoteRoot, localRoot, inputHashFile)

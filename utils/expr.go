@@ -5,20 +5,20 @@ import (
 	"strings"
 )
 
-// $(collect "." include="go_src")
-
 type ExprArg struct {
 	Name  string
 	Value string
 }
 
 type Expr struct {
+	String    string
 	Function  string
 	PosArgs   []string
 	NamedArgs []ExprArg
 }
 
-func ExprParse(s string) (*Expr, error) {
+func ExprParse(str string) (*Expr, error) {
+	s := str
 	if !strings.HasPrefix(s, "$(") {
 		return nil, fmt.Errorf("unhandled expr")
 	}
@@ -56,6 +56,8 @@ func ExprParse(s string) (*Expr, error) {
 			})
 		}
 	}
+
+	e.String = str
 
 	return e, nil
 }

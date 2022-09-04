@@ -18,6 +18,7 @@ type WaitGroup struct {
 	cond   *sync.Cond
 	oSetup sync.Once
 	oDone  sync.Once
+	sem    int64
 }
 
 func (wg *WaitGroup) Add(job *Job) {
@@ -55,6 +56,17 @@ func (wg *WaitGroup) AddChild(child *WaitGroup) {
 	}()
 
 	wg.wgs = append(wg.wgs, child)
+}
+
+func (wg *WaitGroup) AddSem() {
+	atomic.AddInt64(&wg.sem, 1)
+}
+
+func (wg *WaitGroup) DoneSem() {
+	if atomic.AddInt64(&wg.sem, -1) < 0 {
+		panic("too many calls to DoneSem")
+	}
+	wg.broadcast()
 }
 
 func (wg *WaitGroup) Jobs() []*Job {
@@ -183,10 +195,18 @@ func (wg *WaitGroup) TransitiveSuccessCount() uint64 {
 	})
 }
 
-var ErrPending = fmt.Errorf("pending")
+var ErrPending = errors.New("pending")
 
 // keepWaiting returns ErrPending if it should keep waiting, nil represents no jobs error
 func (wg *WaitGroup) keepWaiting() error {
+	if wg.done {
+		return nil
+	}
+
+	if atomic.LoadInt64(&wg.sem) > 0 {
+		return fmt.Errorf("sem is > 0: %w", ErrPending)
+	}
+
 	for _, wg := range wg.wgs[:] {
 		err := wg.keepWaiting()
 		if err != nil {
@@ -195,6 +215,8 @@ func (wg *WaitGroup) keepWaiting() error {
 	}
 
 	for _, job := range wg.jobs[:] {
+		job := job
+
 		if !job.done {
 			return fmt.Errorf("%v is %w", job.ID, ErrPending)
 		}

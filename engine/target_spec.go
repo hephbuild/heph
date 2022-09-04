@@ -167,7 +167,6 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	for _, dep := range arr {
 		if expr, err := utils.ExprParse(dep); err == nil {
 			td.Exprs = append(td.Exprs, TargetSpecDepExpr{
-				String:  dep,
 				Name:    name,
 				Package: t.Package,
 				Expr:    expr,
@@ -214,7 +213,7 @@ func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {
 
 	sort.SliceStable(td.Exprs, utils.MultiLess(
 		func(i, j int) int {
-			return strings.Compare(td.Exprs[i].String, td.Exprs[j].String)
+			return strings.Compare(td.Exprs[i].Expr.String, td.Exprs[j].Expr.String)
 		},
 		func(i, j int) int {
 			return strings.Compare(td.Exprs[i].Name, td.Exprs[j].Name)
@@ -394,7 +393,6 @@ type TargetSpecDepTarget struct {
 }
 
 type TargetSpecDepExpr struct {
-	String  string
 	Name    string
 	Package *Package
 	Expr    *utils.Expr

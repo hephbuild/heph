@@ -344,7 +344,7 @@ type TargetWithOutput struct {
 }
 
 type Targets struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 	m  map[string]*Target
 	a  []*Target
 }
@@ -373,6 +373,9 @@ func (ts *Targets) Find(fqn string) *Target {
 	if ts == nil {
 		return nil
 	}
+
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return ts.m[fqn]
 }
@@ -910,7 +913,7 @@ func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcru
 	case "collect":
 		targets, err := e.collect(t, expr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("`%v`: %w", expr.String, err)
 		}
 
 		for _, target := range targets {
@@ -924,7 +927,7 @@ func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcru
 	case "find_parent":
 		target, err := e.findParent(t, expr)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("`%v`: %w", expr.String, err)
 		}
 
 		err = e.linkTarget(target, simplify, breadcrumb)
@@ -979,7 +982,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 	}
 
 	if simplify {
-		targets := make([]TargetWithOutput, 0)
+		targets := make([]TargetWithOutput, 0, len(td.Targets))
 		for _, dep := range td.Targets {
 			if dep.Target.IsGroup() {
 				targets = append(targets, dep.Target.Deps.All().Targets...)

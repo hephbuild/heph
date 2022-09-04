@@ -348,15 +348,190 @@ func (t TargetFailedError) Is(target error) bool {
 	return ok
 }
 
-func (e *Engine) ScheduleTarget(target *Target) (*worker.Job, error) {
-	parents, err := e.DAG().GetParents(target)
+func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*Target]*worker.WaitGroup, error) {
+	ancestors, err := e.DAG().GetOrderedAncestors(targets)
 	if err != nil {
 		return nil, err
 	}
 
+	needRun := NewTargets(0)
+	needCacheWarm := NewTargets(0)
+
+	toAssess := ancestors
+	toAssess = append(toAssess, targets...)
+
+	deps := map[*Target]*worker.WaitGroup{}
+
+	pullMetadeps := &worker.WaitGroup{}
+
+	for _, target := range targets {
+		if skip != nil && skip.FQN == target.FQN {
+			parents, err := e.DAG().GetParents(target)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, parent := range parents {
+				needCacheWarm.Add(parent)
+			}
+			needRun.Add(target)
+		} else {
+			needCacheWarm.Add(target)
+		}
+	}
+
+	schedId := fmt.Sprintf("_%v", time.Now().Nanosecond())
+
+	for _, target := range toAssess {
+		target := target
+
+		parents, err := e.DAG().GetParents(target)
+		if err != nil {
+			return nil, err
+		}
+
+		pj := e.Pool.Schedule(&worker.Job{
+			ID: "pull_meta_" + target.FQN + schedId,
+			Deps: jobs(parents, e.Pool, func(target *Target) string {
+				return "pull_meta_" + target.FQN + schedId
+			}),
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				w.StatusQuiet(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
+
+				hasParentCacheMiss := false
+				for _, parent := range parents {
+					if needRun.Find(parent.FQN) != nil {
+						hasParentCacheMiss = true
+						break
+					}
+				}
+
+				if !hasParentCacheMiss && target.ShouldCache {
+					w.Status(fmt.Sprintf("Pulling meta %v...", target.FQN))
+
+					e := TargetRunEngine{
+						Engine:  e,
+						Worker:  w,
+						Context: ctx,
+					}
+
+					cached, err := e.PullTargetMeta(target)
+					if err != nil {
+						return err
+					}
+
+					if cached {
+						return nil
+					}
+				}
+
+				for _, parent := range parents {
+					needCacheWarm.Add(parent)
+				}
+				needRun.Add(target)
+
+				return nil
+			},
+		})
+
+		deps[target] = &worker.WaitGroup{}
+		pullMetadeps.Add(pj)
+	}
+
+	for _, target := range toAssess {
+		target := target
+
+		targetDeps := deps[target]
+		targetDeps.AddSem()
+
+		parents, err := e.DAG().GetParents(target)
+		if err != nil {
+			return nil, err
+		}
+
+		scheduleDeps := jobs(parents, e.Pool, func(target *Target) string {
+			return "schedule_" + target.FQN + schedId
+		})
+		scheduleDeps.AddChild(pullMetadeps)
+
+		sj := e.Pool.Schedule(&worker.Job{
+			ID:   "schedule_" + target.FQN + schedId,
+			Deps: scheduleDeps,
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				w.StatusQuiet(fmt.Sprintf("Scheduling %v...", target.FQN))
+
+				wdeps := &worker.WaitGroup{}
+				for _, parent := range parents {
+					pdeps := deps[parent]
+					wdeps.AddChild(pdeps)
+				}
+
+				if skip != nil && target.FQN == skip.FQN {
+					log.Debugf("%v skip", target.FQN)
+					targetDeps.AddChild(wdeps)
+
+					return nil
+				}
+
+				if needRun.Find(target.FQN) != nil {
+					j, err := e.ScheduleTarget(target, wdeps)
+					if err != nil {
+						return err
+					}
+					targetDeps.Add(j)
+				} else if needCacheWarm.Find(target.FQN) != nil {
+					j, err := e.ScheduleTargetCacheWarm(target, wdeps)
+					if err != nil {
+						return err
+					}
+					targetDeps.Add(j)
+				}
+
+				log.Debugf("%v nothing to do", target.FQN)
+
+				return nil
+			},
+		})
+		targetDeps.Add(sj)
+		targetDeps.DoneSem()
+	}
+
+	return deps, nil
+}
+
+func (e *Engine) ScheduleTargetCacheWarm(target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
+	j := e.Pool.Schedule(&worker.Job{
+		ID:   "warm_" + target.FQN,
+		Deps: deps,
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			e := TargetRunEngine{
+				Engine:  e,
+				Worker:  w,
+				Context: ctx,
+			}
+
+			w.Status(fmt.Sprintf("Fetching cache %v...", target.FQN))
+
+			cached, err := e.WarmTargetCache(target)
+			if err != nil {
+				return err
+			}
+
+			if !cached {
+				return fmt.Errorf("%v expected cache pull to succeed", target.FQN)
+			}
+
+			return nil
+		},
+	})
+
+	return j, nil
+}
+
+func (e *Engine) ScheduleTarget(target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(&worker.Job{
 		ID:   target.FQN,
-		Deps: jobs(parents, e.Pool),
+		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine:  e,
@@ -379,11 +554,11 @@ func (e *Engine) ScheduleTarget(target *Target) (*worker.Job, error) {
 	return j, nil
 }
 
-func jobs(targets []*Target, pool *worker.Pool) *worker.WaitGroup {
+func jobs(targets []*Target, pool *worker.Pool, idProvider func(*Target) string) *worker.WaitGroup {
 	deps := &worker.WaitGroup{}
 
 	for _, target := range targets {
-		j := pool.Job(target.FQN)
+		j := pool.Job(idProvider(target))
 		if j == nil {
 			panic(fmt.Sprintf("job is nil for %v", target.FQN))
 		}
@@ -392,26 +567,6 @@ func jobs(targets []*Target, pool *worker.Pool) *worker.WaitGroup {
 	}
 
 	return deps
-}
-
-func (e *Engine) ScheduleTargetsDeps(targets []*Target) (*worker.WaitGroup, error) {
-	parents, err := e.DAG().GetOrderedAncestors(targets)
-	if err != nil {
-		return nil, err
-	}
-
-	deps := &worker.WaitGroup{}
-
-	for _, ancestor := range parents {
-		j, err := e.ScheduleTarget(ancestor)
-		if err != nil {
-			return nil, err
-		}
-
-		deps.Add(j)
-	}
-
-	return deps, nil
 }
 
 func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {

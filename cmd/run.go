@@ -115,12 +115,14 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 }
 
 func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, shell bool) error {
-	var inlineTarget *TargetInvocation
+	var inlineInvocationTarget *TargetInvocation
+	var inlineTarget *engine.Target
 	if len(targetInvs) == 1 && !fromStdin {
-		inlineTarget = &targetInvs[0]
+		inlineInvocationTarget = &targetInvs[0]
+		inlineTarget = inlineInvocationTarget.Target
 	}
 
-	if shell && inlineTarget == nil {
+	if shell && inlineInvocationTarget == nil {
 		return fmt.Errorf("shell mode is only compatible with running a single target")
 	}
 
@@ -129,22 +131,14 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, she
 		targets = append(targets, inv.Target)
 	}
 
-	deps := &worker.WaitGroup{}
-
-	tdeps, err := Engine.ScheduleTargetsDeps(targets)
+	tdeps, err := Engine.ScheduleTargetsWithDeps(targets, inlineTarget)
 	if err != nil {
 		return err
 	}
-	deps.AddChild(tdeps)
 
-	for _, inv := range targetInvs {
-		if inlineTarget == nil || inv.Target != inlineTarget.Target {
-			j, err := Engine.ScheduleTarget(inv.Target)
-			if err != nil {
-				return err
-			}
-			deps.Add(j)
-		}
+	deps := &worker.WaitGroup{}
+	for _, target := range targets {
+		deps.AddChild(tdeps[target])
 	}
 
 	err = WaitPool("Run", deps, false)
@@ -153,14 +147,15 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, she
 		return err
 	}
 
-	if inlineTarget == nil {
+	if inlineInvocationTarget == nil {
 		return nil
 	}
 
-	target := inlineTarget.Target
+	ideps := tdeps[inlineTarget]
+	_ = ideps
 
 	if !*porcelain {
-		fmt.Println(target.FQN)
+		fmt.Println(inlineTarget.FQN)
 	}
 
 	e := engine.TargetRunEngine{
@@ -173,18 +168,18 @@ func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, she
 		runner = e.RunShell
 	}
 
-	err = runner(target, sandbox.IOConfig{
+	err = runner(inlineTarget, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
-	}, inlineTarget.Args...)
+	}, inlineInvocationTarget.Args...)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {
 			os.Exit(eerr.ExitCode())
 		}
 
-		return fmt.Errorf("%v: %w", target.FQN, err)
+		return fmt.Errorf("%v: %w", inlineTarget.FQN, err)
 	}
 
 	return nil

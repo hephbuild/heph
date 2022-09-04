@@ -29,7 +29,15 @@ func (e *TargetRunEngine) Status(s string) {
 	}
 }
 
+func (e *TargetRunEngine) PullTargetMeta(target *Target) (bool, error) {
+	return e.warmTargetCache(target, true)
+}
+
 func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
+	return e.warmTargetCache(target, false)
+}
+
+func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, error) {
 	log.Tracef("locking cache %v", target.FQN)
 	err := target.cacheLock.Lock()
 	if err != nil {
@@ -45,18 +53,24 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 	}()
 
 	if target.ShouldCache {
-		dir, err := e.getCache(target)
+		ok, dir, err := e.getCache(target, onlyMeta)
 		if err != nil {
 			return false, err
 		}
 
-		if dir != nil {
+		if ok {
 			log.Debugf("Using cache %v", target.FQN)
 
-			target.OutRoot = dir
-			err := e.populateActualFiles(target)
-			if err != nil {
-				return false, err
+			if !onlyMeta {
+				if dir == nil {
+					panic("dir is nil")
+				}
+
+				target.OutRoot = dir
+				err := e.populateActualFiles(target)
+				if err != nil {
+					return false, err
+				}
 			}
 
 			return true, err
@@ -141,17 +155,13 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	// Sanity checks
 	for _, tool := range target.Tools {
-		log.Tracef("Tool %v", tool.Target.FQN)
-
-		if !tool.Target.ran {
+		if tool.Target.actualFilesOut == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		log.Tracef("Dep %v", dep.Target.FQN)
-
-		if !dep.Target.ran {
+		if dep.Target.actualFilesOut == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}

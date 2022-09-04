@@ -169,6 +169,47 @@ func Untar(ctx context.Context, in, to string) error {
 	return doUntar(gr, to)
 }
 
+func TarList(ctx context.Context, in string) ([]string, error) {
+	tarf, err := os.Open(in)
+	if err != nil {
+		return nil, fmt.Errorf("untar: %w", err)
+	}
+	defer tarf.Close()
+
+	go func() {
+		<-ctx.Done()
+		tarf.Close()
+	}()
+
+	gr, err := gzip.NewReader(tarf)
+	if err != nil {
+		return nil, fmt.Errorf("untar: %w", err)
+	}
+	defer gr.Close()
+
+	tr := tar.NewReader(gr)
+
+	paths := make([]string, 0)
+
+	for {
+		hdr, err := tr.Next()
+		if err != nil {
+			if err == io.EOF {
+				break // End of archive
+			}
+
+			return nil, fmt.Errorf("untar: %w", err)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeReg:
+			paths = append(paths, hdr.Name)
+		}
+	}
+
+	return paths, nil
+}
+
 func doUntar(r io.Reader, to string) error {
 	tr := tar.NewReader(r)
 

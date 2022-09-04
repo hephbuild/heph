@@ -95,24 +95,15 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
 
 	start := time.Now()
 
-	deps := &worker.WaitGroup{}
-	newTargets := NewTargets(0)
-
-	_, err := e.ScheduleTargetsDeps(targets)
+	sdeps, err := e.ScheduleTargetsWithDeps(targets, nil)
 	if err != nil {
 		return err
 	}
 
+	newTargets := NewTargets(0)
+	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		_, err = e.ScheduleTarget(target)
-		if err != nil {
-			return err
-		}
-
-		err = e.scheduleRunGenerated(target, deps, newTargets)
-		if err != nil {
-			return err
-		}
+		e.scheduleRunGenerated(target, sdeps[target], deps, newTargets)
 	}
 
 	j := e.Pool.Schedule(&worker.Job{
@@ -171,17 +162,15 @@ func (e *runGenEngine) linkAndDagGenTargets() error {
 	return nil
 }
 
-func (e *runGenEngine) scheduleRunGenerated(target *Target, deps *worker.WaitGroup, targets *Targets) error {
+func (e *runGenEngine) scheduleRunGenerated(target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *Targets) {
 	j := e.Pool.Schedule(&worker.Job{
 		ID:   "rungen_" + target.FQN,
-		Deps: jobs([]*Target{target}, e.Pool),
+		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			return e.scheduleRunGeneratedFiles(target, deps, targets)
 		},
 	})
 	deps.Add(j)
-
-	return nil
 }
 
 func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.WaitGroup, targets *Targets) error {

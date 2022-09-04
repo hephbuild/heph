@@ -108,15 +108,15 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) getCache(target *Target) (*Path, error) {
-	p, err := e.getLocalCache(target)
+func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *Path, error) {
+	ok, p, err := e.getLocalCache(target, onlyMeta)
 	if err != nil {
-		return nil, err
+		return false, nil, err
 	}
 
-	if p != nil {
+	if ok {
 		e.Status(fmt.Sprintf("Using local %v cache...", target.FQN))
-		return p, nil
+		return true, p, nil
 	}
 
 	for _, cache := range e.Config.Cache {
@@ -126,10 +126,10 @@ func (e *TargetRunEngine) getCache(target *Target) (*Path, error) {
 
 		loc, err := vfssimple.NewLocation(cache.URI)
 		if err != nil {
-			return nil, err
+			return false, nil, err
 		}
 
-		ok, err := e.getVfsCache(loc, cache.Name, target)
+		ok, err := e.getVfsCache(loc, cache.Name, target, onlyMeta)
 		if err != nil {
 			log.Errorf("cache %v: %v", cache.Name, err)
 			continue
@@ -137,16 +137,16 @@ func (e *TargetRunEngine) getCache(target *Target) (*Path, error) {
 
 		if ok {
 			log.Debugf("%v %v cache hit", target.FQN, cache.Name)
-			return e.getLocalCache(target)
+			return e.getLocalCache(target, onlyMeta)
 		} else {
 			log.Debugf("%v %v cache miss", target.FQN, cache.Name)
 		}
 	}
 
-	return nil, nil
+	return false, nil, nil
 }
 
-func (e *Engine) getLocalCache(target *Target) (*Path, error) {
+func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *Path, error) {
 	hash := e.hashInput(target)
 
 	dir := e.cacheDir(target, hash)
@@ -154,27 +154,39 @@ func (e *Engine) getLocalCache(target *Target) (*Path, error) {
 	cacheHashb, err := os.ReadFile(dir.Join(inputHashFile).Abs())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return false, nil, nil
 		}
 
-		return nil, err
+		return false, nil, err
 	}
 	cacheHash := string(cacheHashb)
 
 	log.Tracef("Cache %v: %v %v", target.FQN, hash, cacheHash)
 
 	if cacheHash != hash {
-		return nil, nil
+		return false, nil, nil
+	}
+
+	if !utils.PathExists(dir.Join(outputHashFile).Abs()) {
+		return false, nil, nil
+	}
+
+	if onlyMeta {
+		return true, nil, nil
 	}
 
 	outDir := dir.Join(outputDir)
 
-	err = e.linkLatestCache(target, dir.Abs())
-	if err != nil {
-		return nil, err
+	if !utils.PathExists(outDir.Abs()) {
+		return false, nil, nil
 	}
 
-	return &outDir, nil
+	err = e.linkLatestCache(target, dir.Abs())
+	if err != nil {
+		return false, nil, err
+	}
+
+	return true, &outDir, nil
 }
 
 func (e *Engine) linkLatestCache(target *Target, from string) error {

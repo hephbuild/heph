@@ -133,6 +133,7 @@ var rootCmd = &cobra.Command{
 		if !Engine.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
 			<-Engine.Pool.Done()
+			log.Tracef("All pool items finished")
 		}
 
 		return Engine.Pool.Err()

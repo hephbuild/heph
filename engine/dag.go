@@ -9,7 +9,7 @@ type DAG struct {
 	*dag.DAG
 }
 
-func (e *DAG) ancestorsWalker(target *Target, ancs *[]*Target, ancsm map[string]struct{}, depth int) error {
+func (e *DAG) orderedAncestorsWalker(target *Target, ancs *[]*Target, ancsm map[string]struct{}, depth int) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -21,7 +21,7 @@ func (e *DAG) ancestorsWalker(target *Target, ancs *[]*Target, ancsm map[string]
 	}
 
 	for _, parent := range parents {
-		err := e.ancestorsWalker(parent, ancs, ancsm, depth+1)
+		err := e.orderedAncestorsWalker(parent, ancs, ancsm, depth+1)
 		if err != nil {
 			return err
 		}
@@ -39,7 +39,7 @@ func (e *DAG) GetOrderedAncestors(targets []*Target) ([]*Target, error) {
 	ancsm := map[string]struct{}{}
 
 	for _, target := range targets {
-		err := e.ancestorsWalker(target, &ancs, ancsm, 0)
+		err := e.orderedAncestorsWalker(target, &ancs, ancsm, 0)
 		if err != nil {
 			return nil, err
 		}

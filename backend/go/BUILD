@@ -344,7 +344,7 @@ def go_bin(name, pkg=None, *args, **kwargs):
 
     return target(
         name=name,
-        tools='$(collect "{}/." must=1 include="go_build_bin")'.format(pkg),
+        tools='{}:go_bin#build'.format(pkg),
         run="$TOOL_GO_BIN_BUILD",
         executor="exec",
         sandbox=False,
