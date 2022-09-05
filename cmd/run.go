@@ -114,10 +114,10 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 	}}, nil
 }
 
-func run(ctx context.Context, targetInvs []TargetInvocation, fromStdin bool, shell bool) error {
+func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, shell bool) error {
 	var inlineInvocationTarget *TargetInvocation
 	var inlineTarget *engine.Target
-	if len(targetInvs) == 1 && !fromStdin {
+	if len(targetInvs) == 1 && inlineSingle {
 		inlineInvocationTarget = &targetInvs[0]
 		inlineTarget = inlineInvocationTarget.Target
 	}

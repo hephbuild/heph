@@ -173,7 +173,7 @@ var rootCmd = &cobra.Command{
 			log.Fatalf("alias %v not defined\n", alias)
 		}
 
-		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, false, false)
+		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, true, false)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -223,7 +223,7 @@ var runCmd = &cobra.Command{
 
 		fromStdin := hasStdin(args)
 
-		err = run(cmd.Context(), targets, fromStdin, *shell)
+		err = run(cmd.Context(), targets, !fromStdin, *shell)
 		if err != nil {
 			log.Fatal(err)
 		}

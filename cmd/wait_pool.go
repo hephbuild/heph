@@ -87,6 +87,9 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	p := tea.NewProgram(r, tea.WithOutput(os.Stderr))
 
 	go func() {
+		t := time.NewTicker(50 * time.Millisecond)
+		defer t.Stop()
+
 		for {
 			select {
 			case <-deps.Done():
@@ -95,7 +98,7 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				p.Send(m)
 				p.Quit()
 				return
-			case <-time.After(50 * time.Millisecond):
+			case <-t.C:
 				p.Send(msg())
 			}
 		}

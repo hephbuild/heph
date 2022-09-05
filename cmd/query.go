@@ -32,6 +32,7 @@ func init() {
 	queryCmd.AddCommand(pkgsCmd)
 	queryCmd.AddCommand(depsOnCmd)
 	queryCmd.AddCommand(depsCmd)
+	queryCmd.AddCommand(outCmd)
 
 	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
@@ -522,6 +523,37 @@ var depsOnCmd = &cobra.Command{
 
 		for _, fqn := range descendants {
 			fmt.Println(fqn)
+		}
+
+		return nil
+	},
+}
+
+var outCmd = &cobra.Command{
+	Use:   "out <target>",
+	Short: "Prints targets output path",
+	Args:  cobra.ExactArgs(1),
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return preRunWithGen(false)
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		tp, err := utils.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		err = run(cmd.Context(), []TargetInvocation{{Target: target}}, false, false)
+		if err != nil {
+			return err
+		}
+
+		for _, path := range target.ActualFilesOut() {
+			fmt.Println(path.Abs())
 		}
 
 		return nil
