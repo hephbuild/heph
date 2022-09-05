@@ -1,8 +1,10 @@
 package utils
 
 import (
+	"errors"
 	"github.com/bmatcuk/doublestar/v4"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -27,10 +29,51 @@ func isIgnored(path string, ignored []string) bool {
 	return false
 }
 
+// From doublestar package
+
+var metaReplacer = strings.NewReplacer("\\*", "*", "\\?", "?", "\\[", "[", "\\]", "]", "\\{", "{", "\\}", "}")
+
+// Unescapes meta characters (*?[]{})
+func unescapeMeta(pattern string) string {
+	return metaReplacer.Replace(pattern)
+}
+
+func indexMeta(s string) int {
+	var c byte
+	l := len(s)
+	for i := 0; i < l; i++ {
+		c = s[i]
+		if c == '*' || c == '?' || c == '[' || c == '{' {
+			return i
+		} else if c == '\\' {
+			// skip next byte
+			i++
+		}
+	}
+	return -1
+}
+
 func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
+	i := indexMeta(pattern)
+
+	if i == -1 {
+		rel := unescapeMeta(pattern)
+		abs := filepath.Join(root, rel)
+		info, err := os.Stat(abs)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+
+			return err
+		}
+
+		return fn(rel, fs.FileInfoToDirEntry(info), nil)
+	}
+
 	walkRoot := root
-	if i := strings.Index(pattern, "**/"); i > 0 {
-		walkRoot = filepath.Join(root, pattern[:i])
+	if i > 0 {
+		walkRoot = filepath.Join(root, unescapeMeta(pattern[:i]))
 		pattern = pattern[i:]
 	}
 
