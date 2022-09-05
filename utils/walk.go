@@ -28,7 +28,13 @@ func isIgnored(path string, ignored []string) bool {
 }
 
 func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	walkRoot := root
+	if i := strings.Index(pattern, "**/"); i > 0 {
+		walkRoot = filepath.Join(root, pattern[:i])
+		pattern = pattern[i:]
+	}
+
+	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}

@@ -41,8 +41,9 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 			return fmt.Errorf("poolui: %w", err)
 		}
 	} else {
+		start := time.Now()
 		printProgress := func() {
-			log.Infof("Progress %v: %v/%v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount())
+			log.Infof("Progress %v: %v/%v %v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount(), time.Since(start).String())
 		}
 
 		t := time.NewTicker(time.Second)
