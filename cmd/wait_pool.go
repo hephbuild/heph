@@ -44,15 +44,18 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 		printProgress := func() {
 			log.Infof("Progress %v: %v/%v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount())
 		}
+
+		t := time.NewTicker(time.Second)
 		for {
 			select {
-			case <-time.After(time.Second):
+			case <-t.C:
 				printProgress()
 				continue
 			case <-deps.Done():
 				// will break
 			}
 
+			t.Stop()
 			printProgress()
 			break
 		}

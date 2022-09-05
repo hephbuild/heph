@@ -175,10 +175,23 @@ func (e *runBuildEngine) runBuildFiles() error {
 
 func (e *runBuildEngine) config() starlark.StringDict {
 	cfg := &starlark.Dict{}
+
 	cfg.SetKey(starlark.String("version"), starlark.String(e.Config.Version.String))
-	for k, v := range e.Config.Extras {
-		cfg.SetKey(starlark.String(k), utils.FromGo(v))
+
+	profiles := starlark.NewList(nil)
+	for _, profile := range e.Config.Profiles {
+		profiles.Append(starlark.String(profile))
 	}
+	profiles.Freeze()
+	cfg.SetKey(starlark.String("profiles"), profiles)
+
+	for k, v := range e.Config.Extras {
+		sv := utils.FromGo(v)
+		sv.Freeze()
+		cfg.SetKey(starlark.String(k), sv)
+	}
+
+	cfg.Freeze()
 
 	return starlark.StringDict{
 		"CONFIG": cfg,

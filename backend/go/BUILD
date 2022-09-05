@@ -119,7 +119,6 @@ def go_mod(mod_pkgs=[], test={}):
 
     imports = target(
         name="_go_mod_gen_imports",
-        hash_file="mod_time",
         run="godeps imports > $OUT",
         out="imports",
         deps=godeps_deps,
@@ -128,7 +127,6 @@ def go_mod(mod_pkgs=[], test={}):
 
     target(
         name="_go_mod_gen",
-        hash_file="mod_time",
         run="godeps mod '{}'".format(to_json(godeps_cfg)),
         out="/**/BUILD",
         deps=godeps_deps,
@@ -146,11 +144,7 @@ def go_mod(mod_pkgs=[], test={}):
         labels=["mod_tidy"],
         run='GOPATH="$SANDBOX/thirdparty/go/gopath" go mod tidy -v',
         tools=[go],
-        deps=[
-            gomodsum,
-            '$(collect {}/... include="go_pkg")'.format(package_fqn()),
-            '$(collect {}/... include="go_pkg_test")'.format(package_fqn()),
-        ],
+        deps=[imports, gomodsum],
         sandbox=False,
         cache=False,
     )
