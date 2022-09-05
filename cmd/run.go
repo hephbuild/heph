@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"heph/engine"
 	"heph/sandbox"
 	"heph/utils"
@@ -161,6 +162,9 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 	e := engine.TargetRunEngine{
 		Engine:  Engine,
 		Context: ctx,
+		Print: func(s string) {
+			log.Debug(s)
+		},
 	}
 
 	runner := e.Run

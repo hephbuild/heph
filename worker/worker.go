@@ -84,14 +84,10 @@ func (w *Worker) GetStatus() string {
 	return w.status
 }
 
-func (w *Worker) StatusQuiet(status string) {
-	w.status = status
-}
-
 func (w *Worker) Status(status string) {
 	w.status = status
 	if status != "" {
-		log.Info(status)
+		log.Debug(status)
 	}
 }
 

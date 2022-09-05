@@ -396,7 +396,7 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 				return "pull_meta_" + target.FQN + schedId
 			}),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.StatusQuiet(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
+				w.Status(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
 
 				hasParentCacheMiss := false
 				for _, parent := range parents {
@@ -411,7 +411,7 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 
 					e := TargetRunEngine{
 						Engine:  e,
-						Worker:  w,
+						Print:   w.Status,
 						Context: ctx,
 					}
 
@@ -458,7 +458,7 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 			ID:   "schedule_" + target.FQN + schedId,
 			Deps: scheduleDeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.StatusQuiet(fmt.Sprintf("Scheduling %v...", target.FQN))
+				w.Status(fmt.Sprintf("Scheduling %v...", target.FQN))
 
 				wdeps := &worker.WaitGroup{}
 				for _, parent := range parents {
@@ -506,7 +506,7 @@ func (e *Engine) ScheduleTargetCacheWarm(target *Target, deps *worker.WaitGroup)
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine:  e,
-				Worker:  w,
+				Print:   w.Status,
 				Context: ctx,
 			}
 
@@ -535,7 +535,7 @@ func (e *Engine) ScheduleTarget(target *Target, deps *worker.WaitGroup) (*worker
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine:  e,
-				Worker:  w,
+				Print:   w.Status,
 				Context: ctx,
 			}
 

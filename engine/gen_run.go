@@ -181,7 +181,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.Wa
 		j := e.Pool.Schedule(&worker.Job{
 			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.StatusQuiet(fmt.Sprintf("Running %v", file.RelRoot()))
+				w.Status(fmt.Sprintf("Running %v", file.RelRoot()))
 
 				re := &runBuildEngine{
 					Engine: e.Engine,

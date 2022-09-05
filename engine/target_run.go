@@ -17,16 +17,12 @@ import (
 
 type TargetRunEngine struct {
 	*Engine
-	Worker  *worker.Worker
+	Print   func(s string)
 	Context context.Context
 }
 
 func (e *TargetRunEngine) Status(s string) {
-	if e.Worker != nil {
-		e.Worker.Status(s)
-	} else {
-		log.Info(s)
-	}
+	e.Print(s)
 }
 
 func (e *TargetRunEngine) PullTargetMeta(target *Target) (bool, error) {
@@ -135,7 +131,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	if !shell {
 		start := time.Now()
 		defer func() {
-			e.Status(fmt.Sprintf("%v done in %v", target.FQN, time.Since(start)))
+			log.Debugf("%v done in %v", target.FQN, time.Since(start))
 		}()
 
 		cached, err := e.WarmTargetCache(target)

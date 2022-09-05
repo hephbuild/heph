@@ -156,43 +156,47 @@ func (wg *WaitGroup) Err() error {
 	return wg.err
 }
 
-func (wg *WaitGroup) walkerTransitiveCount(c *uint64, m map[string]struct{}, f func(j *Job) bool) {
+func (wg *WaitGroup) walkerTransitiveCount(mj map[string]struct{}, mwg map[*WaitGroup]struct{}, fs ...func(j *Job)) {
+	if _, ok := mwg[wg]; ok {
+		return
+	}
+	mwg[wg] = struct{}{}
+
 	for _, job := range wg.jobs[:] {
-		if _, ok := m[job.ID]; ok {
+		if _, ok := mj[job.ID]; ok {
 			continue
 		}
-		m[job.ID] = struct{}{}
+		mj[job.ID] = struct{}{}
 
-		if f(job) {
-			atomic.AddUint64(c, 1)
+		for _, f := range fs {
+			f(job)
 		}
 
-		job.Deps.walkerTransitiveCount(c, m, f)
+		job.Deps.walkerTransitiveCount(mj, mwg, fs...)
 	}
 
 	for _, wg := range wg.wgs {
-		wg.walkerTransitiveCount(c, m, f)
+		wg.walkerTransitiveCount(mj, mwg, fs...)
 	}
 }
 
-func (wg *WaitGroup) transitiveCount(f func(j *Job) bool) uint64 {
-	var c uint64
-	m := map[string]struct{}{}
-	wg.walkerTransitiveCount(&c, m, f)
+func (wg *WaitGroup) TransitiveCount() (uint64, uint64) {
+	var all, success uint64
 
-	return c
-}
+	mj := map[string]struct{}{}
+	mwg := map[*WaitGroup]struct{}{}
+	wg.walkerTransitiveCount(mj, mwg,
+		func(j *Job) {
+			atomic.AddUint64(&all, 1)
+		},
+		func(j *Job) {
+			if j.State == StateSuccess {
+				atomic.AddUint64(&success, 1)
+			}
+		},
+	)
 
-func (wg *WaitGroup) TransitiveJobCount() uint64 {
-	return wg.transitiveCount(func(j *Job) bool {
-		return true
-	})
-}
-
-func (wg *WaitGroup) TransitiveSuccessCount() uint64 {
-	return wg.transitiveCount(func(j *Job) bool {
-		return j.State == StateSuccess
-	})
+	return all, success
 }
 
 var ErrPending = errors.New("pending")

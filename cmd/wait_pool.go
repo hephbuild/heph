@@ -43,7 +43,8 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 	} else {
 		start := time.Now()
 		printProgress := func() {
-			log.Infof("Progress %v: %v/%v %v", name, deps.TransitiveSuccessCount(), deps.TransitiveJobCount(), time.Since(start).String())
+			all, success := deps.TransitiveCount()
+			log.Infof("Progress %v: %v/%v %v", name, success, all, time.Since(start).String())
 		}
 
 		t := time.NewTicker(time.Second)
@@ -71,9 +72,11 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 
 func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
+		all, success := deps.TransitiveCount()
+
 		return UpdateMessage{
-			jobs:    deps.TransitiveJobCount(),
-			success: deps.TransitiveSuccessCount(),
+			jobs:    all,
+			success: success,
 			workers: pool.Workers,
 		}
 	}
