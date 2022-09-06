@@ -168,7 +168,7 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 	_ = ideps
 
 	if !*porcelain {
-		fmt.Fprint(os.Stderr, inlineTarget.FQN)
+		fmt.Fprintln(os.Stderr, inlineTarget.FQN)
 	}
 
 	e := engine.TargetRunEngine{

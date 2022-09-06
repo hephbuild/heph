@@ -111,7 +111,7 @@ type IOConfig struct {
 	Stderr io.Writer
 }
 
-var bashArgs = []string{"bash", "--noprofile", "--norc", "-e", "-u", "-o", "pipefail"}
+var bashArgs = []string{"bash", "--noprofile", "--norc", "-u", "-o", "pipefail"}
 
 func BashShellArgs() []string {
 	return bashArgs
@@ -120,6 +120,7 @@ func BashShellArgs() []string {
 func BashArgs(cmds []string) []string {
 	args := bashArgs
 	//args = append(args, "-x")
+	args = append(args, "-e")
 	args = append(args, "-c", strings.Join(cmds, "\n"))
 
 	return args

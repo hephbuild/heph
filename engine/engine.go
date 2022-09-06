@@ -113,6 +113,34 @@ func (e *Engine) hashFile(h utils.Hash, file PackagePath) error {
 	return e.hashFilePath(h, file.Abs())
 }
 
+func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
+	for _, dep := range targets {
+		dh := e.hashOutput(dep.Target, dep.Output)
+
+		h.String(dh)
+	}
+}
+func (e *Engine) hashDepsFiles(h utils.Hash, target *Target, files []PackagePath) {
+	for _, dep := range files {
+		h.String(dep.RelRoot())
+
+		switch target.HashFile {
+		case HashFileContent:
+			err := e.hashFile(h, dep)
+			if err != nil {
+				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+			}
+		case HashFileModTime:
+			err := e.hashFileModTime(h, dep)
+			if err != nil {
+				panic(fmt.Errorf("hashDeps: %v: hashFileModTime %v %w", target.FQN, dep.Abs(), err))
+			}
+		default:
+			panic(fmt.Sprintf("unhandled hash_input: %v", target.HashFile))
+		}
+	}
+}
+
 func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -189,27 +217,21 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, dep := range target.HashDeps.Targets {
-		dh := e.hashOutput(dep.Target, dep.Output)
+	if target.DifferentHashDeps {
+		h.String("=")
+		e.hashDepsTargets(h, target.HashDeps.Targets)
 
-		h.String(dh)
-	}
+		e.hashDepsFiles(h, target, target.HashDeps.Files)
+	} else {
+		h.String("=")
+		for _, name := range target.Deps.Names() {
+			h.String("=")
+			h.String(name)
 
-	h.String("=")
-	for _, dep := range target.HashDeps.Files {
-		switch target.HashFile {
-		case HashFileContent:
-			err := e.hashFile(h, dep)
-			if err != nil {
-				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
-			}
-		case HashFileModTime:
-			err := e.hashFileModTime(h, dep)
-			if err != nil {
-				panic(fmt.Errorf("hashDeps: %v: hashFileModTime %v %w", target.FQN, dep.Abs(), err))
-			}
-		default:
-			panic(fmt.Sprintf("unhandled hash_input: %v", target.HashFile))
+			deps := target.Deps.Name(name)
+
+			e.hashDepsTargets(h, deps.Targets)
+			e.hashDepsFiles(h, target, deps.Files)
 		}
 	}
 
@@ -293,6 +315,8 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	}
 
 	h := utils.NewHash()
+
+	h.String(output)
 
 	actualOut := target.NamedActualFilesOut().All()
 	if output != "" {

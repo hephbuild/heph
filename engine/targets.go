@@ -97,7 +97,6 @@ func (tp TargetNamedPackagePath) WithRoot(root string) *TargetNamedPackagePath {
 }
 
 type TargetNamedDeps struct {
-	names []string
 	named map[string]TargetDeps
 	all   TargetDeps
 }
@@ -126,6 +125,15 @@ func (tp *TargetNamedDeps) Name(name string) TargetDeps {
 	}
 
 	return tp.named[name]
+}
+
+func (tp *TargetNamedDeps) Names() []string {
+	names := make([]string, 0, len(tp.named))
+	for name := range tp.named {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (tp *TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {

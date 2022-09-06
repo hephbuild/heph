@@ -239,7 +239,7 @@ func (wg *WaitGroup) keepWaiting() error {
 
 		jerr := job.err
 		if jerr != nil {
-			return fmt.Errorf("%v is %v: %v", job.ID, job.State.String(), jerr)
+			return fmt.Errorf("%v is %v: %w", job.ID, job.State.String(), jerr)
 		}
 
 		return fmt.Errorf("%v is %v", job.ID, job.State.String())
