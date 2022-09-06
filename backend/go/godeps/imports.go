@@ -17,8 +17,6 @@ func listImports() {
 		panic(err)
 	}
 
-	importsm := map[string]struct{}{}
-
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -30,7 +28,7 @@ func listImports() {
 
 		fmt.Fprintf(os.Stderr, "DIR: %v\n", path)
 
-		p, err := build.Default.Import(".", path, 0)
+		p, err := build.Default.ImportDir(path, 0)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "import: %v\n", err)
 			return nil
@@ -38,6 +36,15 @@ func listImports() {
 
 		fmt.Fprintf(os.Stderr, "found %v imports\n", len(p.Imports))
 		fmt.Fprintf(os.Stderr, "found %v test imports\n", len(p.TestImports))
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("PKG", rel)
+
+		importsm := map[string]struct{}{}
 
 		for _, i := range p.Imports {
 			importsm[i] = struct{}{}
@@ -47,21 +54,21 @@ func listImports() {
 			importsm[i] = struct{}{}
 		}
 
+		imports := make([]string, 0)
+		for i := range importsm {
+			imports = append(imports, i)
+		}
+
+		sort.Strings(imports)
+
+		for _, i := range imports {
+			fmt.Println(i)
+		}
+
 		return nil
 	})
 
 	if err != nil {
 		panic(err)
-	}
-
-	imports := make([]string, 0)
-	for i := range importsm {
-		imports = append(imports, i)
-	}
-
-	sort.Strings(imports)
-
-	for _, i := range imports {
-		fmt.Println(i)
 	}
 }
