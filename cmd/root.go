@@ -116,12 +116,13 @@ var rootCmd = &cobra.Command{
 			if *memprofile != "" {
 				f, err := os.Create(*memprofile)
 				if err != nil {
-					log.Fatalf("could not create memory profile: %v", err)
+					log.Errorf("could not create memory profile: %v", err)
+					return
 				}
 				defer f.Close()
 				runtime.GC() // get up-to-date statistics
 				if err := pprof.WriteHeapProfile(f); err != nil {
-					log.Fatalf("could not write memory profile: %v", err)
+					log.Errorf("could not write memory profile: %v", err)
 				}
 			}
 		}()
@@ -153,30 +154,32 @@ var rootCmd = &cobra.Command{
 
 		return names, cobra.ShellCompDirectiveNoFileComp
 	},
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			_ = cmd.Help()
-			return
+			return nil
 		}
 
 		switchToPorcelain()
 
 		err := preRunWithGen(false)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		alias := args[0]
 
 		target := Engine.Targets.Find("//:" + alias)
 		if target == nil {
-			log.Fatalf("alias %v not defined\n", alias)
+			return fmt.Errorf("alias %v not defined\n", alias)
 		}
 
 		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, true, false)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
+
+		return nil
 	},
 }
 
@@ -194,39 +197,45 @@ var runCmd = &cobra.Command{
 
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if hasStdin(args) {
 			tps, err := parseTargetPathsFromStdin()
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
 
 			if len(tps) == 0 {
-				return
+				return nil
+			}
+		} else {
+			if len(args) == 0 {
+				return nil
 			}
 		}
 
 		err := preRunWithGen(false)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		targets, err := parseTargetsAndArgs(args)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 
 		if !hasStdin(args) && len(targets) == 0 {
 			_ = cmd.Help()
-			return
+			return nil
 		}
 
 		fromStdin := hasStdin(args)
 
 		err = run(cmd.Context(), targets, !fromStdin, *shell)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
+
+		return nil
 	},
 }
 
@@ -325,7 +334,6 @@ func preRunWithGen(silent bool) error {
 
 	err = WaitPool("PreRun gen", deps, silent)
 	if err != nil {
-		printTargetErr(err)
 		return err
 	}
 
@@ -422,26 +430,29 @@ func Execute() {
 	utils.Seed()
 
 	if err := execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-}
 
-func printTargetErr(err error) bool {
-	var terr engine.TargetFailedError
-	if errors.As(err, &terr) {
-		fmt.Printf("%v failed: %v\n", terr.Target.FQN, err)
-		logFile := terr.Target.LogFile
-		if logFile != "" {
-			c := exec.Command("cat", logFile)
-			output, _ := c.Output()
-			fmt.Fprintln(os.Stderr)
-			fmt.Fprintln(os.Stderr, string(output))
-			fmt.Fprintf(os.Stderr, "log file can be found at %v:\n", logFile)
+		var terr engine.TargetFailedError
+		if errors.As(err, &terr) {
+			log.Errorf("%v failed", terr.Target.FQN)
+			log.Error(terr.Error())
+			logFile := terr.Target.LogFile
+			if logFile != "" {
+				log.Error("Log:")
+				fmt.Fprintln(os.Stderr)
+				c := exec.Command("cat", logFile)
+				c.Stdout = os.Stderr
+				_ = c.Run()
+				fmt.Fprintln(os.Stderr)
+				fmt.Fprintf(os.Stderr, "The log file can be found at %v:\n", logFile)
+			}
+		} else {
+			log.Error(err)
 		}
 
-		return true
+		var eerr ErrorWithExitCode
+		if errors.As(err, &eerr) {
+			os.Exit(eerr.ExitCode)
+		}
+		os.Exit(1)
 	}
-
-	return false
 }

@@ -11,3 +11,9 @@ target(
     out=['count'],
     cache=False,
 )
+
+target(
+    name="custom-exit-code",
+    run='echo "Byebye" && exit 42',
+    cache=False,
+)

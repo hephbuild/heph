@@ -18,8 +18,17 @@ e2e_test(
     expected_output="""
 //test/sanity:basic_query_sanity
 //test/sanity:count-lorem
+//test/sanity:custom-exit-code
 //test/sanity:echo
 //test/sanity:sanity_count-lorem
 //test/sanity:sanity_echo
+//test/sanity:sanity_exit-code
 """.strip(),
+)
+
+e2e_test(
+    name="sanity_exit-code",
+    cmd="heph run //test/sanity:custom-exit-code",
+    expected_failure=True,
+    expected_exit_code=42,
 )

@@ -19,35 +19,35 @@ import (
 
 const baseUrl = "https://storage.googleapis.com/heph-build"
 
-func CheckAndUpdate(cfg config.Config) {
+func CheckAndUpdate(cfg config.Config) error {
 	homeDir, err := homeDir(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	lock := utils.NewFlock(filepath.Join(homeDir, "update.lock"))
 	err = lock.Lock()
 	if err != nil {
-		log.Fatalf("Failed to lock %v", err)
+		return fmt.Errorf("Failed to lock %v", err)
 	}
 	defer lock.Unlock()
 
 	if !shouldUpdate(cfg) {
-		return
+		return nil
 	}
 
 	log.Infof("Updating to %v", cfg.Version.String)
 
 	newHeph, err := downloadAndLink(cfg)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	// Now run the new one.
 	args := append([]string{newHeph}, os.Args[1:]...)
 	log.Infof("Executing %s", strings.Join(args, " "))
 	if err := syscall.Exec(newHeph, args, os.Environ()); err != nil {
-		log.Fatalf("Failed to exec new Heph version %s: %s", newHeph, err)
+		return fmt.Errorf("Failed to exec new Heph version %s: %s", newHeph, err)
 	}
 	// Shouldn't ever get here. We should have either exec'd or died above.
 	panic("heph update failed in an an unexpected and exciting way")

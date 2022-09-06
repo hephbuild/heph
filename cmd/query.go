@@ -76,7 +76,6 @@ var queryCmd = &cobra.Command{
 
 			err = WaitPool("Query Gen", deps, false)
 			if err != nil {
-				printTargetErr(err)
 				return err
 			}
 		}

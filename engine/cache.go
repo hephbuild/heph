@@ -198,7 +198,7 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 	}
 
 	err = os.Symlink(from, latestDir.Abs())
-	if err != nil {
+	if err != nil && !errors.Is(err, os.ErrExist) {
 		return err
 	}
 

@@ -115,6 +115,19 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 	}}, nil
 }
 
+type ErrorWithExitCode struct {
+	Err      error
+	ExitCode int
+}
+
+func (e ErrorWithExitCode) Error() string {
+	return e.Err.Error()
+}
+
+func (e ErrorWithExitCode) Unwrap() error {
+	return e.Err
+}
+
 func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, shell bool) error {
 	var inlineInvocationTarget *TargetInvocation
 	var inlineTarget *engine.Target
@@ -144,7 +157,6 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 
 	err = WaitPool("Run", deps, false)
 	if err != nil {
-		printTargetErr(err)
 		return err
 	}
 
@@ -156,7 +168,7 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 	_ = ideps
 
 	if !*porcelain {
-		fmt.Println(inlineTarget.FQN)
+		fmt.Fprint(os.Stderr, inlineTarget.FQN)
 	}
 
 	e := engine.TargetRunEngine{
@@ -180,7 +192,10 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {
-			os.Exit(eerr.ExitCode())
+			return ErrorWithExitCode{
+				Err:      err,
+				ExitCode: eerr.ExitCode(),
+			}
 		}
 
 		return fmt.Errorf("%v: %w", inlineTarget.FQN, err)

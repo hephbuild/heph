@@ -415,7 +415,10 @@ func (e *Engine) Parse() error {
 	}
 	log.Debugf("ParseConfigs took %v", time.Since(configStartTime))
 
-	upgrade.CheckAndUpdate(e.Config.Config)
+	err = upgrade.CheckAndUpdate(e.Config.Config)
+	if err != nil {
+		return fmt.Errorf("upgrade: %w", err)
+	}
 
 	for name, cfg := range e.Config.BuildFiles.Roots {
 		err := e.runRootBuildFiles(name, cfg)
