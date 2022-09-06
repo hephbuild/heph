@@ -349,6 +349,10 @@ func (t TargetSpec) json() []byte {
 }
 
 func (t TargetSpec) Equal(spec TargetSpec) bool {
+	return t.equalJson(spec)
+}
+
+func (t TargetSpec) equalJson(spec TargetSpec) bool {
 	tj := t.json()
 	sj := spec.json()
 

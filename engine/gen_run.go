@@ -188,9 +188,10 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.Wa
 					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
 					registerTarget: func(spec TargetSpec) error {
 						e.TargetsLock.Lock()
-						defer e.TargetsLock.Unlock()
 
 						if t := e.Targets.Find(spec.FQN); t != nil {
+							e.TargetsLock.Unlock()
+
 							if t.Gen {
 								return fmt.Errorf("cannot replace gen target")
 							}
@@ -206,9 +207,10 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.Wa
 							TargetSpec: spec,
 						}
 
-						targets.Add(t)
 						e.Targets.Add(t)
+						e.TargetsLock.Unlock()
 
+						targets.Add(t)
 						return nil
 					},
 				}

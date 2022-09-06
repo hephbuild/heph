@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
-	"go.starlark.net/starlark"
 	"heph/upgrade"
 	"heph/utils"
 	"os"
@@ -14,18 +13,6 @@ import (
 	"sync"
 	"time"
 )
-
-type Package struct {
-	Name        string
-	FullName    string
-	Root        Path
-	Globals     starlark.StringDict
-	SourceFiles SourceFiles
-}
-
-func (p Package) TargetPath(name string) string {
-	return "//" + p.FullName + ":" + name
-}
 
 type TargetTool struct {
 	Target  *Target
@@ -219,22 +206,6 @@ func (t *Target) String() string {
 
 func (t *Target) IsGroup() bool {
 	return len(t.Run) == 0 && len(t.Out.All()) == 1 && (t.Out.All()[0].Path == "*" || t.Out.All()[0].Path == "/")
-}
-
-type Path struct {
-	Root    string
-	RelRoot string
-}
-
-func (p Path) Abs() string {
-	return filepath.Join(p.Root, p.RelRoot)
-}
-
-func (p Path) Join(elem ...string) Path {
-	return Path{
-		Root:    p.Root,
-		RelRoot: filepath.Join(append([]string{p.RelRoot}, elem...)...),
-	}
 }
 
 type PackagePath struct {

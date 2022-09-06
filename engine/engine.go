@@ -2,14 +2,12 @@ package engine
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
-	"github.com/zeebo/xxh3"
-	"hash"
 	"heph/config"
 	"heph/sandbox"
 	"heph/utils"
@@ -26,22 +24,6 @@ import (
 	"syscall"
 	"time"
 )
-
-type SourceFile struct {
-	Path string
-}
-
-type SourceFiles []*SourceFile
-
-func (sf SourceFiles) Find(p string) *SourceFile {
-	for _, file := range sf {
-		if file.Path == p {
-			return file
-		}
-	}
-
-	return nil
-}
 
 type Engine struct {
 	Cwd        string
@@ -127,8 +109,12 @@ func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
 }
 
-func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
-	info, err := os.Lstat(file.Abs())
+func (e *Engine) hashFile(h utils.Hash, file PackagePath) error {
+	return e.hashFilePath(h, file.Abs())
+}
+
+func (e *Engine) hashFilePath(h utils.Hash, path string) error {
+	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
@@ -137,9 +123,9 @@ func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
 		return fmt.Errorf("symlink cannot be hashed")
 	}
 
-	h.Write([]byte(fmt.Sprint(info.Mode().Perm())))
+	h.UI32(uint32(info.Mode().Perm()))
 
-	f, err := os.Open(file.Abs())
+	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
@@ -153,8 +139,12 @@ func (e *Engine) hashFile(h hash.Hash, file PackagePath) error {
 	return nil
 }
 
-func (e *Engine) hashFileModTime(h hash.Hash, file PackagePath) error {
-	info, err := os.Lstat(file.Abs())
+func (e *Engine) hashFileModTime(h utils.Hash, file PackagePath) error {
+	return e.hashFileModTimePath(h, file.Abs())
+}
+
+func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
+	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
 	}
@@ -163,8 +153,8 @@ func (e *Engine) hashFileModTime(h hash.Hash, file PackagePath) error {
 		return fmt.Errorf("symlink cannot be hashed")
 	}
 
-	h.Write([]byte(fmt.Sprint(info.Mode().Perm())))
-	h.Write([]byte(fmt.Sprint(info.ModTime())))
+	h.UI32(uint32(info.Mode().Perm()))
+	h.I64(info.ModTime().UnixNano())
 
 	return nil
 }
@@ -183,29 +173,29 @@ func (e *Engine) hashInput(target *Target) string {
 		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	h := xxh3.New()
+	h := utils.NewHash()
 
-	h.WriteString("=")
+	h.String("=")
 	for _, dep := range target.Tools {
 		dh := e.hashOutput(dep.Target, "")
 
-		h.Write([]byte(dep.Name))
-		h.Write([]byte(dh))
+		h.String(dep.Name)
+		h.String(dh)
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	for _, tool := range target.HostTools {
-		h.Write([]byte(tool.Name))
+		h.String(tool.Name)
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	for _, dep := range target.HashDeps.Targets {
 		dh := e.hashOutput(dep.Target, dep.Output)
 
-		h.Write([]byte(dh))
+		h.String(dh)
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	for _, dep := range target.HashDeps.Files {
 		switch target.HashFile {
 		case HashFileContent:
@@ -223,13 +213,13 @@ func (e *Engine) hashInput(target *Target) string {
 		}
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	for _, cmd := range target.Run {
-		h.Write([]byte(cmd))
+		h.String(cmd)
 	}
-	h.Write([]byte(target.Executor))
+	h.String(target.Executor)
 
-	h.WriteString("=")
+	h.String("=")
 	outEntries := make([]string, 0)
 	for _, file := range target.TargetSpec.Out {
 		outEntries = append(outEntries, file.Name+file.Path)
@@ -238,15 +228,15 @@ func (e *Engine) hashInput(target *Target) string {
 	sort.Strings(outEntries)
 
 	for _, entry := range outEntries {
-		h.WriteString(entry)
+		h.String(entry)
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	for _, file := range target.CachedFiles {
-		h.Write([]byte(file.RelRoot()))
+		h.String(file.RelRoot())
 	}
 
-	h.WriteString("=")
+	h.String("=")
 	envEntries := make([]string, 0)
 	for k, v := range target.Env {
 		envEntries = append(envEntries, k+v)
@@ -255,23 +245,17 @@ func (e *Engine) hashInput(target *Target) string {
 	sort.Strings(envEntries)
 
 	for _, e := range envEntries {
-		h.Write([]byte(e))
+		h.String(e)
 	}
 
-	h.WriteString("=")
-	if target.Gen {
-		h.Write([]byte{1})
-	} else {
-		h.Write([]byte{0})
-	}
+	h.String("=")
+	h.Bool(target.Gen)
 
-	h.WriteString("=")
-	h.WriteString(target.SrcEnv)
-	h.WriteString(target.OutEnv)
+	h.String("=")
+	h.String(target.SrcEnv)
+	h.String(target.OutEnv)
 
-	hb := h.Sum128().Bytes()
-
-	sh := hex.EncodeToString(hb[:])
+	sh := h.Sum()
 
 	e.cacheHashInputMutex.Lock()
 	e.cacheHashInput[cacheId] = sh
@@ -308,7 +292,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		return sh
 	}
 
-	h := xxh3.New()
+	h := utils.NewHash()
 
 	actualOut := target.NamedActualFilesOut().All()
 	if output != "" {
@@ -322,9 +306,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		}
 	}
 
-	hb := h.Sum128().Bytes()
-
-	sh := hex.EncodeToString(hb[:])
+	sh := h.Sum()
 
 	e.cacheHashOutputMutex.Lock()
 	e.cacheHashOutput[cacheId] = sh
@@ -569,6 +551,51 @@ func jobs(targets []*Target, pool *worker.Pool, idProvider func(*Target) string)
 	return deps
 }
 
+func (e *Engine) collectNamedOutFromActualFiles(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
+	tp := &TargetNamedPackagePath{}
+
+	for _, filePath := range target.actualcachedFiles {
+		for name, paths := range namedPaths.Named() {
+			for _, file := range paths {
+				file = file.WithRoot(target.OutRoot.Abs()).WithPackagePath(true)
+
+				abs := strings.HasPrefix(file.Path, "/")
+				path := strings.TrimPrefix(file.Path, "/")
+				pkg := target.Package
+				if abs {
+					pkg = e.createPkg("")
+				}
+				pattern := filepath.Join(pkg.FullName, path)
+
+				relRoot := filePath.RelRoot()
+
+				match, err := doublestar.PathMatch(pattern, relRoot)
+				if err != nil {
+					return nil, err
+				}
+
+				if match {
+					relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), filePath.Abs())
+					if err != nil {
+						return nil, err
+					}
+
+					tp.Add(name, PackagePath{
+						Package:     pkg,
+						Path:        relPkg,
+						Root:        target.OutRoot.Abs(),
+						PackagePath: file.PackagePath,
+					})
+				}
+			}
+		}
+	}
+
+	tp.Sort()
+
+	return tp, nil
+}
+
 func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
 	tp := &TargetNamedPackagePath{}
 
@@ -690,7 +717,12 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return fmt.Errorf("cached: %w", err)
 	}
 
-	target.actualFilesOut, err = e.collectNamedOut(target, target.Out)
+	collector := e.collectNamedOutFromActualFiles
+	if !target.ShouldCache {
+		collector = e.collectNamedOut
+	}
+
+	target.actualFilesOut, err = collector(target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}

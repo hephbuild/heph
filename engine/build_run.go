@@ -235,7 +235,6 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	if err != nil {
 		return nil, err
 	}
-	globals.Freeze()
 
 	res, err := starlark.ExecFile(thread, path, nil, predeclared(globals, config))
 	if err != nil {
