@@ -74,3 +74,9 @@ func (h *hasher) Sum() string {
 	hb := h.h.Sum128().Bytes()
 	return hex.EncodeToString(hb[:])
 }
+
+func HashString(s string) string {
+	h := NewHash()
+	h.String(s)
+	return h.Sum()
+}

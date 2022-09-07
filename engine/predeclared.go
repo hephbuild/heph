@@ -2,6 +2,7 @@ package engine
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
@@ -9,18 +10,37 @@ import (
 	"io/fs"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 //go:embed predeclared.gotpl
 var predeclaredSrc []byte
-var predeclaredMod *starlark.Program
+var predeclaredGlobals starlark.StringDict
+var predeclaredOnce sync.Once
 
-func init() {
+func predeclaredGlobalsOnce(config starlark.StringDict) {
+	predeclaredOnce.Do(func() {
+		computePredeclaredGlobals(config)
+	})
+}
+
+func computePredeclaredGlobals(config starlark.StringDict) {
 	_, mod, err := starlark.SourceProgram("<builtin>", predeclaredSrc, predeclared(nil).Has)
 	if err != nil {
 		panic(err)
 	}
-	predeclaredMod = mod
+
+	thread := &starlark.Thread{}
+
+	globals, err := mod.Init(thread, predeclared(config))
+	if err != nil {
+		var eerr *starlark.EvalError
+		if errors.As(err, &eerr) {
+			panic(fmt.Errorf("%v: %v", eerr.Msg, eerr.Backtrace()))
+		}
+		panic(err)
+	}
+	predeclaredGlobals = globals
 }
 
 func predeclared(globals ...starlark.StringDict) starlark.StringDict {
@@ -46,6 +66,7 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 			}
 
 			p[name] = value
+			value.Freeze()
 		}
 	}
 	p.Freeze()

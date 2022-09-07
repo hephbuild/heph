@@ -8,6 +8,7 @@ import (
 	"go.starlark.net/starlark"
 	"heph/utils"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -221,6 +222,55 @@ func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.
 	return pkg.Globals, nil
 }
 
+func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDict) (*starlark.Program, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	h := utils.NewHash()
+	h.I64(info.ModTime().Unix())
+	h.UI32(uint32(info.Mode().Perm()))
+
+	cachePath := e.HomeDir.Join("tmp", "__BUILD", utils.HashString(path), h.Sum()).Abs()
+
+	err = os.MkdirAll(filepath.Dir(cachePath), os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(cachePath)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return nil, err
+	}
+
+	if f != nil {
+		mod, err := starlark.CompiledProgram(f)
+		_ = f.Close()
+		if err == nil {
+			return mod, nil
+		}
+	}
+
+	_, mod, err := starlark.SourceProgram(path, nil, predeclared.Has)
+	if err != nil {
+		return nil, err
+	}
+
+	f, err = os.Create(cachePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	err = mod.Write(f)
+	if err != nil {
+		log.Error(err)
+	}
+
+	return mod, err
+}
+
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
 	log.Tracef("BUILD: running %v", path)
 
@@ -231,12 +281,20 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 
 	config := e.config()
 
-	globals, err := predeclaredMod.Init(thread, predeclared(config))
+	predeclaredGlobalsOnce(config)
+
+	universe := predeclared(predeclaredGlobals, config)
+
+	prog, err := e.buildProgram(path, universe)
 	if err != nil {
+		var eerr *starlark.EvalError
+		if errors.As(err, &eerr) {
+			return nil, fmt.Errorf("%v: %v", eerr.Msg, eerr.Backtrace())
+		}
 		return nil, err
 	}
 
-	res, err := starlark.ExecFile(thread, path, nil, predeclared(globals, config))
+	res, err := prog.Init(thread, universe)
 	if err != nil {
 		var eerr *starlark.EvalError
 		if errors.As(err, &eerr) {
