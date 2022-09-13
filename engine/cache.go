@@ -119,6 +119,10 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *Path, 
 		return true, p, nil
 	}
 
+	if e.DisableRemoteCache {
+		return false, nil, nil
+	}
+
 	for _, cache := range e.Config.Cache {
 		if !cache.Read {
 			continue

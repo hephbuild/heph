@@ -43,7 +43,7 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 
 	autocompleteTargetOrLabel := func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -69,7 +69,7 @@ var queryCmd = &cobra.Command{
 		}
 
 		if !*noGen {
-			deps, err := Engine.ScheduleGenPass()
+			deps, err := Engine.ScheduleGenPass(cmd.Context())
 			if err != nil {
 				return err
 			}
@@ -121,7 +121,7 @@ var alltargetsCmd = &cobra.Command{
 	Short: "Prints all targets",
 	Args:  cobra.NoArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range sortedTargets(Engine.Targets.Slice(), false) {
@@ -180,10 +180,10 @@ var graphCmd = &cobra.Command{
 	Short: "Prints deps target graph",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -217,10 +217,10 @@ var graphDotCmd = &cobra.Command{
 	Short: "Outputs graph do",
 	Args:  cobra.ArbitraryArgs,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -249,13 +249,13 @@ digraph G  {
 
 			switch args[0] {
 			case "ancestors":
-				gdag, _, err := Engine.DAG().GetAncestorsGraph(args[1])
+				gdag, _, err := dag.GetAncestorsGraph(args[1])
 				if err != nil {
 					return err
 				}
 				dag = &engine.DAG{DAG: gdag}
 			case "descendants":
-				gdag, _, err := Engine.DAG().GetDescendantsGraph(args[1])
+				gdag, _, err := dag.GetDescendantsGraph(args[1])
 				if err != nil {
 					return err
 				}
@@ -300,10 +300,10 @@ var changesCmd = &cobra.Command{
 	Short: "Prints deps target changes",
 	Args:  cobra.ExactValidArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -355,11 +355,11 @@ var targetCmd = &cobra.Command{
 		if *noGen {
 			return engineInit()
 		} else {
-			return preRunWithGen(false)
+			return preRunWithGen(cmd.Context(), false)
 		}
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -410,7 +410,7 @@ var pkgsCmd = &cobra.Command{
 		if spec {
 			return engineInit()
 		} else {
-			return preRunWithGen(false)
+			return preRunWithGen(cmd.Context(), false)
 		}
 	},
 	RunE: func(_ *cobra.Command, args []string) error {
@@ -441,7 +441,7 @@ var depsCmd = &cobra.Command{
 	Short: "Prints target dependencies",
 	Args:  cobra.ExactArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 
 	RunE: func(_ *cobra.Command, args []string) error {
@@ -487,7 +487,7 @@ var depsOnCmd = &cobra.Command{
 	Short: "Prints targets dependent on",
 	Args:  cobra.ExactArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	RunE: func(_ *cobra.Command, args []string) error {
 		tp, err := utils.TargetParse("", args[0])
@@ -533,7 +533,7 @@ var outCmd = &cobra.Command{
 	Short: "Prints targets output path",
 	Args:  cobra.ExactArgs(1),
 	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(false)
+		return preRunWithGen(cmd.Context(), false)
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := utils.TargetParse("", args[0])

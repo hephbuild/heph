@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/bep/debounce"
+	"github.com/fsnotify/fsnotify"
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -19,6 +21,7 @@ import (
 	"runtime/pprof"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var isTerm bool
@@ -54,6 +57,7 @@ func init() {
 	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
 
 	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(watchCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
 
@@ -137,10 +141,12 @@ var rootCmd = &cobra.Command{
 			log.Tracef("All pool items finished")
 		}
 
+		Engine.Pool.Stop(nil)
+
 		return Engine.Pool.Err()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -162,7 +168,7 @@ var rootCmd = &cobra.Command{
 
 		switchToPorcelain()
 
-		err := preRunWithGen(false)
+		err := preRunWithGen(cmd.Context(), false)
 		if err != nil {
 			return err
 		}
@@ -190,7 +196,7 @@ var runCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -213,7 +219,7 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		err := preRunWithGen(false)
+		err := preRunWithGen(cmd.Context(), false)
 		if err != nil {
 			return err
 		}
@@ -239,6 +245,188 @@ var runCmd = &cobra.Command{
 	},
 }
 
+type watchRun struct {
+	ctx   context.Context
+	files []string
+}
+
+var watchCmd = &cobra.Command{
+	Use:           "watch",
+	Short:         "Watch target",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Args:          cobra.ArbitraryArgs,
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		err := preRunAutocomplete(cmd.Context())
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
+		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		if hasStdin(args) {
+			tps, err := parseTargetPathsFromStdin()
+			if err != nil {
+				return err
+			}
+
+			if len(tps) == 0 {
+				return nil
+			}
+		} else {
+			if len(args) == 0 {
+				return nil
+			}
+		}
+
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
+		targetInvs, err := parseTargetsAndArgs(args)
+		if err != nil {
+			return err
+		}
+
+		if !hasStdin(args) && len(targetInvs) == 0 {
+			_ = cmd.Help()
+			return nil
+		}
+
+		fromStdin := hasStdin(args)
+
+		targets := make([]*engine.Target, 0, len(targetInvs))
+		for _, inv := range targetInvs {
+			targets = append(targets, inv.Target)
+		}
+
+		allTargets, err := Engine.DAG().GetOrderedAncestors(targets, true)
+		if err != nil {
+			return err
+		}
+
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer watcher.Close()
+
+		files := Engine.GetFileDeps(allTargets...)
+		for _, file := range files {
+			err := watcher.Add(file.Abs())
+			if err != nil {
+				return err
+			}
+		}
+
+		var runCancel context.CancelFunc
+		sigsCh := make(chan watchRun)
+		errCh := make(chan error)
+
+		debounced := debounce.New(time.Second)
+
+		eventFiles := make([]string, 0)
+
+		go func() {
+			for {
+				select {
+				case event, ok := <-watcher.Events:
+					if !ok {
+						errCh <- nil
+						return
+					}
+
+					log.Debug(event)
+
+					rel, err := filepath.Rel(Engine.Root.Abs(), event.Name)
+					if err != nil {
+						errCh <- err
+						return
+					}
+
+					eventFiles = append(eventFiles, rel)
+					currentEventFiles := eventFiles
+
+					debounced(func() {
+						if runCancel != nil {
+							runCancel()
+						}
+						rctx, cancel := context.WithCancel(ctx)
+						sigsCh <- watchRun{
+							ctx:   rctx,
+							files: currentEventFiles,
+						}
+						runCancel = cancel
+					})
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						errCh <- nil
+						return
+					}
+
+					errCh <- err
+					return
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+			}
+		}()
+
+		go func() {
+			sigsCh <- watchRun{ctx: ctx}
+		}()
+
+		for {
+			select {
+			case r := <-sigsCh:
+				fmt.Fprintln(os.Stderr)
+				log.Infof("Got change...")
+				if r.files != nil {
+					allTargets, err := Engine.DAG().GetOrderedAncestors(targets, true)
+					if err != nil {
+						return err
+					}
+
+					fileDescendantsTargets, err := Engine.GetFileDescendants(r.files, allTargets)
+					if err != nil {
+						return err
+					}
+
+					descendants, err := Engine.DAG().GetOrderedDescendants(fileDescendantsTargets, true)
+					if err != nil {
+						return err
+					}
+
+					if len(descendants) == 0 {
+						continue
+					}
+
+					for _, target := range descendants {
+						Engine.ResetCacheHashInput(target)
+					}
+				}
+				err = run(r.ctx, targetInvs, !fromStdin, false)
+				if err != nil {
+					if !printTargetError(err) {
+						log.Error(err)
+					}
+				} else {
+					log.Info("Completed successfully")
+				}
+				// Allow first run to use remote cache, subsequent ones will skip remote cache
+				Engine.DisableRemoteCache = true
+			case err := <-errCh:
+				return err
+			}
+		}
+	},
+}
+
 func switchToPorcelain() {
 	log.Tracef("Switching to porcelain")
 	*porcelain = true
@@ -246,8 +434,8 @@ func switchToPorcelain() {
 	log.SetLevel(log.ErrorLevel)
 }
 
-func preRunAutocomplete() error {
-	return preRunWithGen(true)
+func preRunAutocomplete(ctx context.Context) error {
+	return preRunWithGen(ctx, true)
 }
 
 func findRoot() (string, error) {
@@ -289,24 +477,9 @@ func engineInit() error {
 
 	log.Tracef("Root: %v", root)
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		defer func() {
-			signal.Stop(sig)
-		}()
-
-		<-sig
-
-		cancel()
-	}()
-
-	Engine = engine.New(root, ctx)
+	Engine = engine.New(root)
 	Engine.Config.Profiles = *profiles
-	Engine.Pool = worker.NewPool(ctx, *workers)
+	Engine.Pool = worker.NewPool(*workers)
 
 	err = Engine.Parse()
 	if err != nil {
@@ -316,7 +489,7 @@ func engineInit() error {
 	return nil
 }
 
-func preRunWithGen(silent bool) error {
+func preRunWithGen(ctx context.Context, silent bool) error {
 	err := engineInit()
 	if err != nil {
 		return err
@@ -327,7 +500,7 @@ func preRunWithGen(silent bool) error {
 		return nil
 	}
 
-	deps, err := Engine.ScheduleGenPass()
+	deps, err := Engine.ScheduleGenPass(ctx)
 	if err != nil {
 		return err
 	}
@@ -347,7 +520,7 @@ var cleanCmd = &cobra.Command{
 		return engineInit()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete()
+		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -359,7 +532,7 @@ var cleanCmd = &cobra.Command{
 			return Engine.Clean(true)
 		}
 
-		err := preRunWithGen(false)
+		err := preRunWithGen(cmd.Context(), false)
 		if err != nil {
 			return err
 		}
@@ -419,25 +592,40 @@ var cleanLockCmd = &cobra.Command{
 }
 
 func execute() error {
-	if err := rootCmd.Execute(); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sig
+		go func() {
+			<-time.After(time.Second)
+			log.Warnf("Attempting to soft cancel... ctrl+c one more time to force")
+		}()
+		cancel()
+
+		<-sig
+		os.Exit(1)
+	}()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func Execute() {
-	utils.Seed()
-
-	if err := execute(); err != nil {
-
-		var terr engine.TargetFailedError
-		if errors.As(err, &terr) {
-			log.Errorf("%v failed", terr.Target.FQN)
-			log.Error(terr.Error())
-			logFile := terr.Target.LogFile
-			if logFile != "" {
-				log.Error("Log:")
+func printTargetError(err error) bool {
+	var terr engine.TargetFailedError
+	if errors.As(err, &terr) {
+		log.Errorf("%v failed", terr.Target.FQN)
+		log.Error(terr.Error())
+		logFile := terr.Target.LogFile
+		if logFile != "" {
+			log.Error("Log:")
+			info, _ := os.Stat(logFile)
+			if info.Size() > 0 {
 				fmt.Fprintln(os.Stderr)
 				c := exec.Command("cat", logFile)
 				c.Stdout = os.Stderr
@@ -445,7 +633,18 @@ func Execute() {
 				fmt.Fprintln(os.Stderr)
 				fmt.Fprintf(os.Stderr, "The log file can be found at %v:\n", logFile)
 			}
-		} else {
+		}
+		return true
+	}
+
+	return false
+}
+
+func Execute() {
+	utils.Seed()
+
+	if err := execute(); err != nil {
+		if !printTargetError(err) {
 			log.Error(err)
 		}
 

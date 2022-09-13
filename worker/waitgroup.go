@@ -11,7 +11,6 @@ type WaitGroup struct {
 	m      sync.RWMutex
 	wgs    []*WaitGroup
 	jobs   []*Job
-	jobsm  map[string]*Job
 	doneCh chan struct{}
 	done   bool
 	err    error
@@ -29,20 +28,11 @@ func (wg *WaitGroup) Add(job *Job) {
 	wg.m.Lock()
 	defer wg.m.Unlock()
 
-	if wg.jobsm == nil {
-		wg.jobsm = map[string]*Job{}
-	}
-
-	if wg.job(job.ID, false) != nil {
-		return
-	}
-
 	go func() {
 		<-job.doneCh
-		wg.broadcast()
+		wg.handleDone(job.err)
 	}()
 
-	wg.jobsm[job.ID] = job
 	wg.jobs = append(wg.jobs, job)
 }
 
@@ -52,10 +42,17 @@ func (wg *WaitGroup) AddChild(child *WaitGroup) {
 
 	go func() {
 		<-child.Done()
-		wg.broadcast()
+		wg.handleDone(child.Err())
 	}()
 
 	wg.wgs = append(wg.wgs, child)
+}
+
+func (wg *WaitGroup) handleDone(err error) {
+	if err != nil {
+		wg.err = err
+	}
+	wg.broadcast()
 }
 
 func (wg *WaitGroup) AddSem() {
@@ -76,31 +73,6 @@ func (wg *WaitGroup) Jobs() []*Job {
 	}
 
 	return jobs
-}
-
-func (wg *WaitGroup) Job(id string, transitive bool) *Job {
-	wg.m.RLock()
-	defer wg.m.RUnlock()
-
-	return wg.job(id, transitive)
-}
-
-func (wg *WaitGroup) job(id string, transitive bool) *Job {
-	if wg.jobsm != nil {
-		if j := wg.jobsm[id]; j != nil {
-			return j
-		}
-	}
-
-	if transitive {
-		for _, wg := range wg.wgs {
-			if job := wg.Job(id, transitive); job != nil {
-				return job
-			}
-		}
-	}
-
-	return nil
 }
 
 func (wg *WaitGroup) broadcast() {
@@ -205,6 +177,10 @@ var ErrPending = errors.New("pending")
 func (wg *WaitGroup) keepWaiting() error {
 	if wg.done {
 		return nil
+	}
+
+	if wg.err != nil {
+		return wg.err
 	}
 
 	if atomic.LoadInt64(&wg.sem) > 0 {

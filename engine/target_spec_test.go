@@ -128,6 +128,8 @@ func genTargetSpec(name string, factor int) TargetSpec {
 var equal bool
 
 func TestTargetSpec_Equal(t *testing.T) {
+	t.Parallel()
+
 	t1 := genTargetSpec("aaa", 2)
 	t2 := genTargetSpec("aaa", 2)
 

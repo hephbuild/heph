@@ -9,37 +9,61 @@ type DAG struct {
 	*dag.DAG
 }
 
-func (e *DAG) orderedAncestorsWalker(target *Target, ancs *[]*Target, ancsm map[string]struct{}, depth int) error {
+func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancs *[]*Target, ancsm map[string]struct{}, minDepth, depth int) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
 	ancsm[target.FQN] = struct{}{}
 
-	parents, err := e.GetParents(target)
+	parents, err := rel(target)
 	if err != nil {
 		return err
 	}
 
 	for _, parent := range parents {
-		err := e.orderedAncestorsWalker(parent, ancs, ancsm, depth+1)
+		err := e.orderedWalker(parent, rel, ancs, ancsm, minDepth, depth+1)
 		if err != nil {
 			return err
 		}
 	}
 
-	if depth > 0 {
+	if depth >= minDepth {
 		*ancs = append(*ancs, target)
 	}
 
 	return nil
 }
 
-func (e *DAG) GetOrderedAncestors(targets []*Target) ([]*Target, error) {
+func (e *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Target, error) {
 	ancs := make([]*Target, 0)
 	ancsm := map[string]struct{}{}
 
+	minDepth := 1
+	if includeRoot {
+		minDepth = 0
+	}
+
 	for _, target := range targets {
-		err := e.orderedAncestorsWalker(target, &ancs, ancsm, 0)
+		err := e.orderedWalker(target, e.GetParents, &ancs, ancsm, minDepth, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return ancs, nil
+}
+
+func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Target, error) {
+	ancs := make([]*Target, 0)
+	ancsm := map[string]struct{}{}
+
+	minDepth := 1
+	if includeRoot {
+		minDepth = 0
+	}
+
+	for _, target := range targets {
+		err := e.orderedWalker(target, e.GetChildren, &ancs, ancsm, minDepth, 0)
 		if err != nil {
 			return nil, err
 		}

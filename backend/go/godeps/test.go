@@ -10,9 +10,10 @@ type LibTest struct {
 	ImportPath    string
 	TargetPackage string
 
-	Libs    []string
-	GoFiles []string
-	SFiles  []string
+	ImportLibs []string
+	DepsLibs   []string
+	GoFiles    []string
+	SFiles     []string
 
 	PreRun     string
 	TestFiles  []string
@@ -31,7 +32,8 @@ func (t LibTest) Data() interface{} {
 	return map[string]interface{}{
 		"Config":               Config,
 		"ImportPath":           t.ImportPath,
-		"Libs":                 genArray(t.Libs, 2),
+		"ImportLibs":           genArray(t.ImportLibs, 2),
+		"DepsLibs":             genArray(t.DepsLibs, 2),
 		"GoFiles":              genArray(t.GoFiles, 2),
 		"SFiles":               genArray(t.SFiles, 2),
 		"PreRun":               t.PreRun,
@@ -51,7 +53,7 @@ load("{{.Config.BackendPkg}}", "go_build_bin")
 test_lib = go_library(
 	name="_go_lib_test",
 	import_path="{{.ImportPath}}",
-	libs={{.Libs}},
+	libs={{.ImportLibs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
 )
@@ -74,7 +76,7 @@ gen_testmain = target(
 testmain_lib = go_library(
 	name="_go_testmain_lib",
 	src_dep=gen_testmain,
-	libs={{.Libs}}+[test_lib],
+	libs={{.ImportLibs}}+[test_lib],
 	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",
 	dir="testmain",
@@ -83,7 +85,7 @@ testmain_lib = go_library(
 test_build = go_build_bin(
     name="go_test#build",
 	main=testmain_lib,
-    libs={{.Libs}}+[test_lib],
+    libs={{.DepsLibs}}+[test_lib],
 	out="pkg.test",
 )
 

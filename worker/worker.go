@@ -46,6 +46,7 @@ type Job struct {
 	State JobState
 
 	ctx    context.Context
+	cancel context.CancelFunc
 	done   bool
 	doneCh chan struct{}
 	err    error
@@ -118,8 +119,8 @@ func safelyJobDo(j *Job, w *Worker) (err error) {
 	return j.Do(w, j.ctx)
 }
 
-func NewPool(ctx context.Context, n int) *Pool {
-	ctx, cancel := context.WithCancel(ctx)
+func NewPool(n int) *Pool {
+	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Pool{
 		ctx:    ctx,
@@ -128,11 +129,6 @@ func NewPool(ctx context.Context, n int) *Pool {
 		doneCh: make(chan struct{}),
 		jobs:   &WaitGroup{},
 	}
-
-	go func() {
-		<-ctx.Done()
-		p.Stop(ctx.Err())
-	}()
 
 	for i := 0; i < n; i++ {
 		w := &Worker{}
@@ -163,21 +159,23 @@ func NewPool(ctx context.Context, n int) *Pool {
 	return p
 }
 
-func (p *Pool) Schedule(job *Job) *Job {
+func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	p.wg.Add(1)
 
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	if j := p.jobs.Job(job.ID, true); j != nil {
-		p.wg.Done()
-		return j
-	}
-
 	log.Tracef("Scheduling %v", job.ID)
 
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		<-p.ctx.Done()
+		cancel()
+	}()
+
 	job.State = StatePending
-	job.ctx = p.ctx
+	job.ctx = ctx
+	job.cancel = cancel
 	job.doneCh = make(chan struct{})
 	if job.Deps == nil {
 		job.Deps = &WaitGroup{}
@@ -217,15 +215,9 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 			job.DoneWithErr(err, StateFailure)
 		}
 		log.Debugf("finalize job err: %v %v: %v", job.ID, job.State.String(), err)
-
-		go p.Stop(fmt.Errorf("%v: %w", job.ID, err))
 	}
 
 	p.wg.Done()
-}
-
-func (p *Pool) Job(id string) *Job {
-	return p.jobs.Job(id, true)
 }
 
 func (p *Pool) Jobs() []*Job {

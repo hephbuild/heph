@@ -34,12 +34,15 @@ func job(t *testing.T, tr *tracker, id string, d time.Duration) *Job {
 }
 
 func TestSanity(t *testing.T) {
-	p := NewPool(context.Background(), 1)
+	t.Parallel()
+
+	p := NewPool(1)
 	defer p.Stop(nil)
+	ctx := context.Background()
 
 	tr := &tracker{}
 
-	j := p.Schedule(job(t, tr, "j1", time.Second))
+	j := p.Schedule(ctx, job(t, tr, "j1", time.Second))
 
 	deps := &WaitGroup{}
 	deps.Add(j)
@@ -51,14 +54,17 @@ func TestSanity(t *testing.T) {
 }
 
 func TestStress(t *testing.T) {
-	p := NewPool(context.Background(), 1000)
+	t.Parallel()
+
+	p := NewPool(1000)
 	defer p.Stop(nil)
+	ctx := context.Background()
 
 	tr := &tracker{}
 
 	g1 := &WaitGroup{}
 	for i := 0; i < 200; i++ {
-		j := p.Schedule(job(t, tr, fmt.Sprintf("g1f%v", i), time.Second))
+		j := p.Schedule(ctx, job(t, tr, fmt.Sprintf("g1f%v", i), time.Second))
 		g1.Add(j)
 	}
 
@@ -66,7 +72,7 @@ func TestStress(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		j := job(t, tr, fmt.Sprintf("g2f%v", i), time.Second)
 		j.Deps = g1
-		j = p.Schedule(j)
+		j = p.Schedule(ctx, j)
 		g2.Add(j)
 	}
 

@@ -174,7 +174,11 @@ func generate() []RenderUnit {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
 				_, pkgDeps := splitOutPkgs(pkg.Deps)
 
-				imports := append(pkgTestDeps, pkgDeps...)
+				_, pkgTestImports := splitOutPkgs(pkg.TestImports)
+				_, pkgImports := splitOutPkgs(pkg.Imports)
+
+				deps := append(pkgTestDeps, pkgDeps...)
+				imports := append(pkgTestImports, pkgImports...)
 
 				goFiles := make([]string, 0)
 				if lib != nil {
@@ -201,7 +205,13 @@ func generate() []RenderUnit {
 				for _, p := range imports {
 					t := libTarget(pkgs, pkgs.Find(p), nil)
 
-					test.Libs = append(test.Libs, t.Full())
+					test.ImportLibs = append(test.ImportLibs, t.Full())
+				}
+
+				for _, p := range deps {
+					t := libTarget(pkgs, pkgs.Find(p), nil)
+
+					test.DepsLibs = append(test.DepsLibs, t.Full())
 				}
 
 				units = append(units, RenderUnit{

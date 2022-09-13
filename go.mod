@@ -3,10 +3,12 @@ module heph
 go 1.19
 
 require (
+	github.com/bep/debounce v1.2.1
 	github.com/bmatcuk/doublestar/v4 v4.2.0
 	github.com/c2fo/vfs/v6 v6.5.1
 	github.com/charmbracelet/bubbletea v0.22.0
 	github.com/coreos/go-semver v0.3.0
+	github.com/fsnotify/fsnotify v1.5.5-0.20220908164714-85acde25252d
 	github.com/heimdalr/dag v1.2.1
 	github.com/json-iterator/go v1.1.12
 	github.com/lithammer/fuzzysearch v1.1.5
@@ -60,7 +62,7 @@ require (
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
 	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e // indirect
 	golang.org/x/oauth2 v0.0.0-20220622183110-fd043fe589d2 // indirect
-	golang.org/x/sys v0.0.0-20220811171246-fbc7d0a398ab // indirect
+	golang.org/x/sys v0.0.0-20220908164124-27713097b956 // indirect
 	golang.org/x/term v0.0.0-20210927222741-03fcf44c2211 // indirect
 	golang.org/x/text v0.3.7 // indirect
 	golang.org/x/xerrors v0.0.0-20220609144429-65e65417b02f // indirect

@@ -1,9 +1,9 @@
 package utils
 
 import (
+	"bytes"
 	"fmt"
 	"path"
-	"regexp"
 	"strings"
 )
 
@@ -16,17 +16,34 @@ func (p TargetPath) Full() string {
 	return fmt.Sprintf("//%v:%v", p.Package, p.Name)
 }
 
-var packageRegex = regexp.MustCompile(`^[A-Za-z\d\-._/]*$`)
-var targetNameRegex = regexp.MustCompile(`^[A-Za-z\d\-.+_#]*$`)
-var outputNameRegex = regexp.MustCompile(`^[A-Za-z\d\-_]*$`)
+const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
+const numbers = `0123456789`
+const packageRegex = letters + numbers + `-._/`
+const targetNameRegex = letters + numbers + `-.+_#`
+const outputNameRegex = letters + numbers + `-_`
 
-func (p TargetPath) validate() error {
-	if !packageRegex.MatchString(p.Package) {
-		return fmt.Errorf("package name must match: %v (got %v)", packageRegex.String(), p.Package)
+func containsOnly(s, chars string) bool {
+	if len(s) == 0 {
+		return true
 	}
 
-	if !targetNameRegex.MatchString(p.Name) {
-		return fmt.Errorf("target name must match: %v (got %v)", targetNameRegex.String(), p.Name)
+	charsb := []byte(chars)
+	for _, r := range s {
+		if !bytes.ContainsRune(charsb, r) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (p TargetPath) validate() error {
+	if !containsOnly(p.Package, packageRegex) {
+		return fmt.Errorf("package name must match: %v (got %v)", packageRegex, p.Package)
+	}
+
+	if !containsOnly(p.Name, targetNameRegex) {
+		return fmt.Errorf("target name must match: %v (got %v)", targetNameRegex, p.Name)
 	}
 
 	return nil
@@ -93,8 +110,8 @@ func (p TargetOutputPath) validate() error {
 		return err
 	}
 
-	if !outputNameRegex.MatchString(p.Output) {
-		return fmt.Errorf("package name must match: %v (got %v)", outputNameRegex.String(), p.Output)
+	if !containsOnly(p.Output, outputNameRegex) {
+		return fmt.Errorf("package name must match: %v (got %v)", outputNameRegex, p.Output)
 	}
 
 	return nil

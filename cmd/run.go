@@ -145,14 +145,14 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 		targets = append(targets, inv.Target)
 	}
 
-	tdeps, err := Engine.ScheduleTargetsWithDeps(targets, inlineTarget)
+	tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, targets, inlineTarget)
 	if err != nil {
 		return err
 	}
 
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		deps.AddChild(tdeps[target])
+		deps.AddChild(tdeps.Get(target.FQN))
 	}
 
 	err = WaitPool("Run", deps, false)
@@ -163,9 +163,6 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 	if inlineInvocationTarget == nil {
 		return nil
 	}
-
-	ideps := tdeps[inlineTarget]
-	_ = ideps
 
 	if !*porcelain {
 		fmt.Fprintln(os.Stderr, inlineTarget.FQN)

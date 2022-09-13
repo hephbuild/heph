@@ -32,7 +32,7 @@ type Engine struct {
 	Config     Config
 	LocalCache *vfsos.Location
 
-	Context context.Context
+	DisableRemoteCache bool
 
 	SourceFiles   SourceFiles
 	packagesMutex sync.Mutex
@@ -44,13 +44,15 @@ type Engine struct {
 
 	dag *DAG
 
-	cacheHashInputMutex  sync.RWMutex
-	cacheHashInput       map[string]string
-	cacheHashOutputMutex sync.RWMutex
-	cacheHashOutput      map[string]string
-	ranGenPass           bool
-	codegenPaths         map[string]*Target
-	Pool                 *worker.Pool
+	cacheHashInputTargetMutex  utils.KMutex
+	cacheHashInputMutex        sync.RWMutex
+	cacheHashInput             map[string]string
+	cacheHashOutputTargetMutex utils.KMutex
+	cacheHashOutputMutex       sync.RWMutex
+	cacheHashOutput            map[string]string // TODO: LRU
+	ranGenPass                 bool
+	codegenPaths               map[string]*Target
+	Pool                       *worker.Pool
 }
 
 type Config struct {
@@ -69,7 +71,7 @@ type RunStatus struct {
 	Description string
 }
 
-func New(rootPath string, ctx context.Context) *Engine {
+func New(rootPath string) *Engine {
 	root := Path{Root: rootPath}
 
 	homeDir := root.Join(".heph")
@@ -91,7 +93,6 @@ func New(rootPath string, ctx context.Context) *Engine {
 	return &Engine{
 		Root:            root,
 		HomeDir:         homeDir,
-		Context:         ctx,
 		LocalCache:      loc.(*vfsos.Location),
 		Targets:         NewTargets(0),
 		Packages:        map[string]*Package{},
@@ -187,7 +188,22 @@ func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
 	return nil
 }
 
+func (e *Engine) GetHashInputCache() map[string]string {
+	return e.cacheHashInput
+}
+
+func (e *Engine) ResetCacheHashInput(target *Target) {
+	e.cacheHashInputMutex.Lock()
+	defer e.cacheHashInputMutex.Unlock()
+
+	delete(e.cacheHashInput, target.FQN)
+}
+
 func (e *Engine) hashInput(target *Target) string {
+	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
+	mu.Lock()
+	defer mu.Unlock()
+
 	cacheId := target.FQN
 	e.cacheHashInputMutex.RLock()
 	if h, ok := e.cacheHashInput[cacheId]; ok {
@@ -220,7 +236,6 @@ func (e *Engine) hashInput(target *Target) string {
 	if target.DifferentHashDeps {
 		h.String("=")
 		e.hashDepsTargets(h, target.HashDeps.Targets)
-
 		e.hashDepsFiles(h, target, target.HashDeps.Files)
 	} else {
 		h.String("=")
@@ -287,7 +302,13 @@ func (e *Engine) hashInput(target *Target) string {
 }
 
 func (e *Engine) hashOutput(target *Target, output string) string {
-	cacheId := target.FQN + "_" + e.hashInput(target)
+	mu := e.cacheHashOutputTargetMutex.Get(target.FQN)
+	mu.Lock()
+	defer mu.Unlock()
+
+	hashInput := e.hashInput(target)
+	cacheId := target.FQN + "_" + hashInput
+
 	e.cacheHashOutputMutex.RLock()
 	if h, ok := e.cacheHashOutput[cacheId]; ok {
 		e.cacheHashOutputMutex.RUnlock()
@@ -300,7 +321,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		log.Debugf("hashoutput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	file := e.cacheDir(target, e.hashInput(target)).Join(outputHashFile).Abs()
+	file := e.cacheDir(target, hashInput).Join(outputHashFile).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -354,8 +375,31 @@ func (t TargetFailedError) Is(target error) bool {
 	return ok
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*Target]*worker.WaitGroup, error) {
-	ancestors, err := e.DAG().GetOrderedAncestors(targets)
+type WaitGroupMap struct {
+	mu sync.Mutex
+	m  map[string]*worker.WaitGroup
+}
+
+func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
+	wgm.mu.Lock()
+	defer wgm.mu.Unlock()
+
+	if wg, ok := wgm.m[s]; ok {
+		return wg
+	}
+
+	if wgm.m == nil {
+		wgm.m = map[string]*worker.WaitGroup{}
+	}
+
+	wg := &worker.WaitGroup{}
+	wgm.m[s] = wg
+
+	return wg
+}
+
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target, skip *Target) (*WaitGroupMap, error) {
+	ancestors, err := e.DAG().GetOrderedAncestors(targets, false)
 	if err != nil {
 		return nil, err
 	}
@@ -365,10 +409,6 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 
 	toAssess := ancestors
 	toAssess = append(toAssess, targets...)
-
-	deps := map[*Target]*worker.WaitGroup{}
-
-	pullMetadeps := &worker.WaitGroup{}
 
 	for _, target := range targets {
 		if skip != nil && skip.FQN == target.FQN {
@@ -388,21 +428,23 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 
 	schedId := fmt.Sprintf("_%v", time.Now().Nanosecond())
 
+	deps := &WaitGroupMap{}
+	pullMetaDeps := &WaitGroupMap{}
+	pullAllMetaDeps := &worker.WaitGroup{}
+
 	for _, target := range toAssess {
 		target := target
 
-		parents, err := e.DAG().GetParents(target)
-		if err != nil {
-			return nil, err
-		}
-
-		pj := e.Pool.Schedule(&worker.Job{
-			ID: "pull_meta_" + target.FQN + schedId,
-			Deps: jobs(parents, e.Pool, func(target *Target) string {
-				return "pull_meta_" + target.FQN + schedId
-			}),
+		pj := e.Pool.Schedule(ctx, &worker.Job{
+			ID:   "pull_meta_" + target.FQN + schedId,
+			Deps: pullMetaDeps.Get(target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
+
+				parents, err := e.DAG().GetParents(target)
+				if err != nil {
+					return err
+				}
 
 				hasParentCacheMiss := false
 				for _, parent := range parents {
@@ -439,36 +481,45 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 				return nil
 			},
 		})
+		pullAllMetaDeps.Add(pj)
 
-		deps[target] = &worker.WaitGroup{}
-		pullMetadeps.Add(pj)
-	}
-
-	for _, target := range toAssess {
-		target := target
-
-		targetDeps := deps[target]
-		targetDeps.AddSem()
-
-		parents, err := e.DAG().GetParents(target)
+		children, err := e.DAG().GetChildren(target)
 		if err != nil {
 			return nil, err
 		}
 
-		scheduleDeps := jobs(parents, e.Pool, func(target *Target) string {
-			return "schedule_" + target.FQN + schedId
-		})
-		scheduleDeps.AddChild(pullMetadeps)
+		for _, child := range children {
+			pullMetaDeps.Get(child.FQN).Add(pj)
+		}
+	}
 
-		sj := e.Pool.Schedule(&worker.Job{
+	scheduleDeps := &WaitGroupMap{}
+
+	for _, target := range toAssess {
+		target := target
+
+		targetDeps := deps.Get(target.FQN)
+		targetDeps.AddSem()
+
+		sdeps := &worker.WaitGroup{}
+		// TODO: Replace with waiting for all dependants pull meta of target.FQN in the list of all ancestors
+		sdeps.AddChild(pullAllMetaDeps)
+		sdeps.AddChild(scheduleDeps.Get(target.FQN))
+
+		sj := e.Pool.Schedule(ctx, &worker.Job{
 			ID:   "schedule_" + target.FQN + schedId,
-			Deps: scheduleDeps,
+			Deps: sdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Scheduling %v...", target.FQN))
 
+				parents, err := e.DAG().GetParents(target)
+				if err != nil {
+					return err
+				}
+
 				wdeps := &worker.WaitGroup{}
 				for _, parent := range parents {
-					pdeps := deps[parent]
+					pdeps := deps.Get(parent.FQN)
 					wdeps.AddChild(pdeps)
 				}
 
@@ -480,13 +531,13 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 				}
 
 				if needRun.Find(target.FQN) != nil {
-					j, err := e.ScheduleTarget(target, wdeps)
+					j, err := e.ScheduleTarget(ctx, target, wdeps)
 					if err != nil {
 						return err
 					}
 					targetDeps.Add(j)
 				} else if needCacheWarm.Find(target.FQN) != nil {
-					j, err := e.ScheduleTargetCacheWarm(target, wdeps)
+					j, err := e.ScheduleTargetCacheWarm(ctx, target, wdeps)
 					if err != nil {
 						return err
 					}
@@ -498,6 +549,16 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 				return nil
 			},
 		})
+
+		children, err := e.DAG().GetChildren(target)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, child := range children {
+			scheduleDeps.Get(child.FQN).Add(sj)
+		}
+
 		targetDeps.Add(sj)
 		targetDeps.DoneSem()
 	}
@@ -505,8 +566,8 @@ func (e *Engine) ScheduleTargetsWithDeps(targets []*Target, skip *Target) (map[*
 	return deps, nil
 }
 
-func (e *Engine) ScheduleTargetCacheWarm(target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
-	j := e.Pool.Schedule(&worker.Job{
+func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
+	j := e.Pool.Schedule(ctx, &worker.Job{
 		ID:   "warm_" + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -534,8 +595,8 @@ func (e *Engine) ScheduleTargetCacheWarm(target *Target, deps *worker.WaitGroup)
 	return j, nil
 }
 
-func (e *Engine) ScheduleTarget(target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
-	j := e.Pool.Schedule(&worker.Job{
+func (e *Engine) ScheduleTarget(ctx context.Context, target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
+	j := e.Pool.Schedule(ctx, &worker.Job{
 		ID:   target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -558,21 +619,6 @@ func (e *Engine) ScheduleTarget(target *Target, deps *worker.WaitGroup) (*worker
 	})
 
 	return j, nil
-}
-
-func jobs(targets []*Target, pool *worker.Pool, idProvider func(*Target) string) *worker.WaitGroup {
-	deps := &worker.WaitGroup{}
-
-	for _, target := range targets {
-		j := pool.Job(idProvider(target))
-		if j == nil {
-			panic(fmt.Sprintf("job is nil for %v", target.FQN))
-		}
-
-		deps.Add(j)
-	}
-
-	return deps
 }
 
 func (e *Engine) collectNamedOutFromActualFiles(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
@@ -913,4 +959,48 @@ func (e *Engine) GetTargetShortcuts() []*Target {
 		}
 	}
 	return aliases
+}
+
+func (e *Engine) GetFileDeps(targets ...*Target) []PackagePath {
+	filesm := map[string]PackagePath{}
+	for _, target := range targets {
+		for _, file := range target.HashDeps.Files {
+			filesm[file.Abs()] = file
+		}
+	}
+
+	files := make([]PackagePath, 0, len(filesm))
+	for _, file := range filesm {
+		files = append(files, file)
+	}
+
+	sort.SliceStable(files, func(i, j int) bool {
+		return files[i].RelRoot() < files[j].RelRoot()
+	})
+
+	return files
+}
+
+func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {
+	descendants := NewTargets(0)
+
+	for _, path := range paths {
+		for _, target := range targets {
+			for _, file := range target.HashDeps.Files {
+				match, err := doublestar.PathMatch(file.RelRoot(), path)
+				if err != nil {
+					return nil, err
+				}
+
+				if match {
+					descendants.Add(target)
+					break
+				}
+			}
+		}
+	}
+
+	descendants.Sort()
+
+	return descendants.Slice(), nil
 }

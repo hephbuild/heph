@@ -114,7 +114,6 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
 		}
 
-		target.ran = true
 		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
@@ -122,10 +121,6 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-
-	if target.ran {
-		return nil
 	}
 
 	if !shell {
@@ -466,27 +461,29 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			return fmt.Errorf("cache: store: %w", err)
 		}
 
-		for _, cache := range e.Config.Cache {
-			cache := cache
+		if !e.DisableRemoteCache {
+			for _, cache := range e.Config.Cache {
+				cache := cache
 
-			if !cache.Write {
-				continue
-			}
+				if !cache.Write {
+					continue
+				}
 
-			e.Pool.Schedule(&worker.Job{
-				ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
-				Do: func(w *worker.Worker, ctx context.Context) error {
-					w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
+				e.Pool.Schedule(ctx, &worker.Job{
+					ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
+					Do: func(w *worker.Worker, ctx context.Context) error {
+						w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
 
-					err = e.storeVfsCache(cache, target)
-					if err != nil {
-						log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
+						err = e.storeVfsCache(cache, target)
+						if err != nil {
+							log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
+							return nil
+						}
+
 						return nil
-					}
-
-					return nil
-				},
-			})
+					},
+				})
+			}
 		}
 
 		if !e.Config.KeepSandbox && target.Sandbox {

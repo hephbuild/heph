@@ -231,6 +231,7 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 	h := utils.NewHash()
 	h.I64(info.ModTime().Unix())
 	h.UI32(uint32(info.Mode().Perm()))
+	h.String(utils.Version)
 
 	cachePath := e.HomeDir.Join("tmp", "__BUILD", utils.HashString(path), h.Sum()).Abs()
 

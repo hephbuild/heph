@@ -181,7 +181,6 @@ type Target struct {
 	linked    bool
 	linking   bool
 	linkingCh chan struct{}
-	ran       bool
 	m         sync.Mutex
 
 	runLock   utils.Locker

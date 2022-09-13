@@ -15,7 +15,7 @@ type runGenEngine struct {
 	*Engine
 }
 
-func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
+func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error) {
 	if e.ranGenPass {
 		return &worker.WaitGroup{}, nil
 	}
@@ -53,12 +53,12 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 		return nil, err
 	}
 
-	err = ge.ScheduleGeneratedPipeline(genTargets)
+	err = ge.ScheduleGeneratedPipeline(ctx, genTargets)
 	if err != nil {
 		return nil, err
 	}
 
-	j := e.Pool.Schedule(&worker.Job{
+	j := e.Pool.Schedule(ctx, &worker.Job{
 		ID:   "finalize gen",
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -86,7 +86,7 @@ func (e *Engine) ScheduleGenPass() (*worker.WaitGroup, error) {
 	return deps, nil
 }
 
-func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
+func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []*Target) error {
 	for _, target := range targets {
 		if !target.Gen {
 			panic(fmt.Errorf("%v is not a gen target", target.FQN))
@@ -95,7 +95,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
 
 	start := time.Now()
 
-	sdeps, err := e.ScheduleTargetsWithDeps(targets, nil)
+	sdeps, err := e.ScheduleTargetsWithDeps(ctx, targets, nil)
 	if err != nil {
 		return err
 	}
@@ -103,10 +103,10 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
 	newTargets := NewTargets(0)
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		e.scheduleRunGenerated(target, sdeps[target], deps, newTargets)
+		e.scheduleRunGenerated(ctx, target, sdeps.Get(target.FQN), deps, newTargets)
 	}
 
-	j := e.Pool.Schedule(&worker.Job{
+	j := e.Pool.Schedule(ctx, &worker.Job{
 		ID:   fmt.Sprintf("ScheduleGeneratedPipeline_%v", e.Name),
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -132,7 +132,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(targets []*Target) error {
 					return err
 				}
 
-				err = e.ScheduleGeneratedPipeline(genTargets)
+				err = e.ScheduleGeneratedPipeline(ctx, genTargets)
 				if err != nil {
 					return err
 				}
@@ -162,23 +162,23 @@ func (e *runGenEngine) linkAndDagGenTargets() error {
 	return nil
 }
 
-func (e *runGenEngine) scheduleRunGenerated(target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *Targets) {
-	j := e.Pool.Schedule(&worker.Job{
+func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *Targets) {
+	j := e.Pool.Schedule(ctx, &worker.Job{
 		ID:   "rungen_" + target.FQN,
 		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			return e.scheduleRunGeneratedFiles(target, deps, targets)
+			return e.scheduleRunGeneratedFiles(ctx, target, deps, targets)
 		},
 	})
 	deps.Add(j)
 }
 
-func (e *runGenEngine) scheduleRunGeneratedFiles(target *Target, deps *worker.WaitGroup, targets *Targets) error {
+func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *Targets) error {
 	files := target.ActualFilesOut()
 
 	for _, file := range files {
 		file := file
-		j := e.Pool.Schedule(&worker.Job{
+		j := e.Pool.Schedule(ctx, &worker.Job{
 			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Running %v", file.RelRoot()))
