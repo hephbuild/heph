@@ -42,7 +42,18 @@ func listImports() {
 			return err
 		}
 
+		fmt.Println("===")
 		fmt.Println("PKG", rel)
+
+		allFiles := p.GoFiles
+		allFiles = append(allFiles, p.TestGoFiles...)
+		allFiles = append(allFiles, p.XTestGoFiles...)
+
+		for _, file := range allFiles {
+			fmt.Println(file)
+		}
+
+		fmt.Println("+++")
 
 		importsm := map[string]struct{}{}
 
