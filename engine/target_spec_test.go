@@ -91,6 +91,11 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		env[fmt.Sprintf("ENV%v", i)] = "aaa"
 	}
 
+	var passEnv []string
+	for i := 0; i < factor; i++ {
+		passEnv = append(passEnv, fmt.Sprintf("ENV%v", i))
+	}
+
 	return TargetSpec{
 		Name:              name,
 		FQN:               "//:" + name,
@@ -113,7 +118,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		Codegen:           "",
 		Labels:            labels,
 		Env:               env,
-		PassEnv:           nil,
+		PassEnv:           passEnv,
 		RunInCwd:          false,
 		Gen:               false,
 		Source:            []string{"some_source" + time.Now().String()},
@@ -155,7 +160,18 @@ func benchmarkTargetSpecEqualJson(b *testing.B, factor int) {
 	})
 }
 
+func benchmarkTargetSpecEqualStruct(b *testing.B, factor int) {
+	benchmarkTargetSpecEqual(b, factor, func(t1, t2 TargetSpec) bool {
+		return t1.equalStruct(t2)
+	})
+}
+
 func BenchmarkTargetSpec_EqualJson1(b *testing.B)    { benchmarkTargetSpecEqualJson(b, 1) }
 func BenchmarkTargetSpec_EqualJson10(b *testing.B)   { benchmarkTargetSpecEqualJson(b, 10) }
 func BenchmarkTargetSpec_EqualJson100(b *testing.B)  { benchmarkTargetSpecEqualJson(b, 100) }
 func BenchmarkTargetSpec_EqualJson1000(b *testing.B) { benchmarkTargetSpecEqualJson(b, 1000) }
+
+func BenchmarkTargetSpec_EqualStruct1(b *testing.B)    { benchmarkTargetSpecEqualStruct(b, 1) }
+func BenchmarkTargetSpec_EqualStruct10(b *testing.B)   { benchmarkTargetSpecEqualStruct(b, 10) }
+func BenchmarkTargetSpec_EqualStruct100(b *testing.B)  { benchmarkTargetSpecEqualStruct(b, 100) }
+func BenchmarkTargetSpec_EqualStruct1000(b *testing.B) { benchmarkTargetSpecEqualStruct(b, 1000) }

@@ -37,6 +37,10 @@ func (wg *WaitGroup) Add(job *Job) {
 }
 
 func (wg *WaitGroup) AddChild(child *WaitGroup) {
+	if child == nil {
+		panic("child cannot be nil")
+	}
+
 	wg.m.Lock()
 	defer wg.m.Unlock()
 

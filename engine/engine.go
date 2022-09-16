@@ -142,6 +142,12 @@ func (e *Engine) hashDepsFiles(h utils.Hash, target *Target, files []PackagePath
 	}
 }
 
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 1000)
+	},
+}
+
 func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -160,7 +166,10 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	}
 	defer f.Close()
 
-	_, err = io.Copy(h, f)
+	buf := copyBufPool.Get().([]byte)
+	defer copyBufPool.Put(buf)
+
+	_, err = io.CopyBuffer(h, f, buf)
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}

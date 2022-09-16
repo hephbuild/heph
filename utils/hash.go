@@ -47,16 +47,18 @@ var buf8Pool = sync.Pool{
 
 func (h *hasher) I64(val int64) {
 	b := buf8Pool.Get().([]byte)
+	defer buf8Pool.Put(b)
+
 	binary.BigEndian.PutUint64(b, uint64(val))
 	h.Write(b)
-	buf8Pool.Put(b)
 }
 
 func (h *hasher) UI32(val uint32) {
 	b := buf8Pool.Get().([]byte)
+	defer buf8Pool.Put(b)
+
 	binary.BigEndian.PutUint32(b, val)
 	h.Write(b[:4])
-	buf8Pool.Put(b)
 }
 
 var bytesTrue = []byte{1}

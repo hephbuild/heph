@@ -39,7 +39,7 @@ type Path struct {
 }
 
 func (p Path) Abs() string {
-	return filepath.Join(p.Root, p.RelRoot)
+	return p.Root + "/" + p.RelRoot
 }
 
 func (p Path) Join(elem ...string) Path {

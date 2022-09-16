@@ -251,6 +251,10 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 		if err == nil {
 			return mod, nil
 		}
+
+		log.Debugf("BUILD: compiled: %v %v", path, err)
+	} else {
+		log.Debugf("BUILD: no cache: %v", path)
 	}
 
 	_, mod, err := starlark.SourceProgram(path, nil, predeclared.Has)

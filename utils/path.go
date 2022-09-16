@@ -13,23 +13,23 @@ type TargetPath struct {
 }
 
 func (p TargetPath) Full() string {
-	return fmt.Sprintf("//%v:%v", p.Package, p.Name)
+	return "//" + p.Package + ":" + p.Name
 }
 
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
 const numbers = `0123456789`
-const packageRegex = letters + numbers + `-._/`
-const targetNameRegex = letters + numbers + `-.+_#`
-const outputNameRegex = letters + numbers + `-_`
 
-func containsOnly(s, chars string) bool {
+var packageRegex = []byte(letters + numbers + `-._/`)
+var targetNameRegex = []byte(letters + numbers + `-.+_#`)
+var outputNameRegex = []byte(letters + numbers + `-_`)
+
+func containsOnly(s string, chars []byte) bool {
 	if len(s) == 0 {
 		return true
 	}
 
-	charsb := []byte(chars)
 	for _, r := range s {
-		if !bytes.ContainsRune(charsb, r) {
+		if !bytes.ContainsRune(chars, r) {
 			return false
 		}
 	}

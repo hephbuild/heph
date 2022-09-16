@@ -349,7 +349,7 @@ func (t TargetSpec) json() []byte {
 }
 
 func (t TargetSpec) Equal(spec TargetSpec) bool {
-	return t.equalJson(spec)
+	return t.equalStruct(spec)
 }
 
 func (t TargetSpec) equalJson(spec TargetSpec) bool {

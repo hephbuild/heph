@@ -64,6 +64,11 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			w.Status("Finalizing gen...")
 
+			// free references to starlark
+			for _, p := range e.Packages {
+				p.Globals = nil
+			}
+
 			err := e.Simplify()
 			if err != nil {
 				return err

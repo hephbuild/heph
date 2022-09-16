@@ -2,7 +2,6 @@ package utils
 
 import (
 	"errors"
-	"github.com/bmatcuk/doublestar/v4"
 	"io"
 	"os"
 	"path/filepath"
@@ -36,10 +35,6 @@ func IsDirEmpty(name string) (bool, error) {
 func PathExists(filename string) bool {
 	_, err := os.Lstat(filename)
 	return err == nil
-}
-
-func PathMatches(pattern, file string) (bool, error) {
-	return doublestar.PathMatch(pattern, file)
 }
 
 func WriteFileSync(name string, data []byte, perm os.FileMode) error {
