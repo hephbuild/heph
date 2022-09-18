@@ -19,7 +19,7 @@ require (
 	github.com/stretchr/testify v1.7.5
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	github.com/zeebo/xxh3 v1.0.2
-	go.starlark.net v0.0.0-20220302181546-5411bad688d1
+	go.starlark.net v0.0.0-20220817180228-f738f5508c12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
