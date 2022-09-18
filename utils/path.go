@@ -39,11 +39,11 @@ func containsOnly(s string, chars []byte) bool {
 
 func (p TargetPath) validate() error {
 	if !containsOnly(p.Package, packageRegex) {
-		return fmt.Errorf("package name must match: %v (got %v)", packageRegex, p.Package)
+		return fmt.Errorf("package name must match: %s (got %v)", packageRegex, p.Package)
 	}
 
 	if !containsOnly(p.Name, targetNameRegex) {
-		return fmt.Errorf("target name must match: %v (got %v)", targetNameRegex, p.Name)
+		return fmt.Errorf("target name must match: %s (got %v)", targetNameRegex, p.Name)
 	}
 
 	return nil
@@ -111,7 +111,7 @@ func (p TargetOutputPath) validate() error {
 	}
 
 	if !containsOnly(p.Output, outputNameRegex) {
-		return fmt.Errorf("package name must match: %v (got %v)", outputNameRegex, p.Output)
+		return fmt.Errorf("package name must match: %s (got %v)", outputNameRegex, p.Output)
 	}
 
 	return nil

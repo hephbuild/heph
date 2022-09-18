@@ -6,6 +6,7 @@ import (
 	"fmt"
 	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkstruct"
 	"heph/utils"
 	"io/fs"
 	"runtime"
@@ -54,6 +55,7 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	p["get_arch"] = starlark.NewBuiltin("get_arch", get_arch)
 	p["to_json"] = starlark.NewBuiltin("to_json", to_json)
 	p["fail"] = starlark.NewBuiltin("fail", fail)
+	p["struct"] = starlark.NewBuiltin("struct", starlarkstruct.Make)
 
 	for _, globals := range globals {
 		for name, value := range globals {
