@@ -17,6 +17,7 @@ import (
 //go:embed predeclared.gotpl
 var predeclaredSrc []byte
 var predeclaredGlobals starlark.StringDict
+var predeclaredHash string
 var predeclaredOnce sync.Once
 
 func predeclaredGlobalsOnce(config starlark.StringDict) {
@@ -42,6 +43,7 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 		panic(err)
 	}
 	predeclaredGlobals = globals
+	predeclaredHash = utils.HashBytes(predeclaredSrc)
 }
 
 func predeclared(globals ...starlark.StringDict) starlark.StringDict {

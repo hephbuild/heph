@@ -82,3 +82,9 @@ func HashString(s string) string {
 	h.String(s)
 	return h.Sum()
 }
+
+func HashBytes(s []byte) string {
+	h := NewHash()
+	h.Write(s)
+	return h.Sum()
+}

@@ -623,9 +623,9 @@ func printTargetError(err error) bool {
 		log.Error(terr.Error())
 		logFile := terr.Target.LogFile
 		if logFile != "" {
-			log.Error("Log:")
 			info, _ := os.Stat(logFile)
 			if info.Size() > 0 {
+				log.Error("Log:")
 				fmt.Fprintln(os.Stderr)
 				c := exec.Command("cat", logFile)
 				c.Stdout = os.Stderr
