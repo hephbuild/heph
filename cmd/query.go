@@ -68,6 +68,14 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
+		if hasStdin(args) {
+			// Block and read stdin here to prevent multiple bubbletea running at the same time
+			_, err := parseTargetPathsFromStdin()
+			if err != nil {
+				return err
+			}
+		}
+
 		if !*noGen {
 			deps, err := Engine.ScheduleGenPass(cmd.Context())
 			if err != nil {

@@ -2,17 +2,117 @@ package engine
 
 import (
 	"fmt"
-	"heph/utils"
+	"heph/exprs"
 	"path/filepath"
 	"strings"
 )
 
-func (e *Engine) outdir(t *Target, expr *utils.Expr) (string, error) {
-	return filepath.Join(t.OutRoot.Abs(), t.Package.FullName), nil
+var utilFunctions = map[string]exprs.Func{
+	"printf": func(expr exprs.Expr) (string, error) {
+		f, err := expr.MustPosArg(0)
+		if err != nil {
+			return "", err
+		}
+
+		args := make([]any, 0, len(expr.PosArgs))
+		for _, v := range expr.PosArgs[1:] {
+			args = append(args, v)
+		}
+		return fmt.Sprintf(f, args...), nil
+	},
 }
 
-func (e *Engine) collect(t *Target, expr *utils.Expr) ([]*Target, error) {
-	pkgMatcher := ParseTargetSelector(t.Package.FullName, expr.PosArgs[0])
+func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
+	getTarget := func(expr exprs.Expr) (*Target, error) {
+		fqn := expr.PosArg(0, t.FQN)
+
+		target := e.Targets.Find(fqn)
+		if target == nil {
+			return nil, TargetNotFoundError(fqn)
+		}
+
+		return target, nil
+	}
+
+	m := map[string]exprs.Func{
+		"target_fqn": func(expr exprs.Expr) (string, error) {
+			return t.FQN, nil
+		},
+		"outdir": func(expr exprs.Expr) (string, error) {
+			t, err := getTarget(expr)
+			if err != nil {
+				return "", err
+			}
+
+			universe, err := e.DAG().GetParents(t)
+			if err != nil {
+				return "", err
+			}
+			universe = append(universe, t)
+
+			if !Contains(universe, t.FQN) {
+				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
+			}
+
+			return filepath.Join(t.OutRoot.Abs(), t.Package.FullName), nil
+		},
+		"hash_input": func(expr exprs.Expr) (string, error) {
+			t, err := getTarget(expr)
+			if err != nil {
+				return "", err
+			}
+
+			universe, err := e.DAG().GetParents(t)
+			if err != nil {
+				return "", err
+			}
+			universe = append(universe, t)
+
+			if !Contains(universe, t.FQN) {
+				return "", fmt.Errorf("cannot get input of %v", t.FQN)
+			}
+
+			return e.hashInput(t), nil
+		},
+		"hash_output": func(expr exprs.Expr) (string, error) {
+			fqn, err := expr.MustPosArg(0)
+			if err != nil {
+				return "", err
+			}
+
+			t := e.Targets.Find(fqn)
+			if t == nil {
+				return "", TargetNotFoundError(fqn)
+			}
+
+			universe, err := e.DAG().GetParents(t)
+			if err != nil {
+				return "", err
+			}
+
+			if !Contains(universe, t.FQN) {
+				return "", fmt.Errorf("cannot get output of %v", t.FQN)
+			}
+
+			output := expr.PosArg(1, "")
+			return e.hashOutput(t, output), nil
+		},
+	}
+
+	for k, v := range utilFunctions {
+		m[k] = v
+	}
+
+	return m
+}
+
+func (e *Engine) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
+	s, err := expr.MustPosArg(0)
+	if err != nil {
+		return nil, err
+	}
+
+	pkgMatcher := ParseTargetSelector(t.Package.FullName, s)
 
 	var includeMatchers TargetMatchers
 	var excludeMatchers TargetMatchers
@@ -62,8 +162,11 @@ func (e *Engine) collect(t *Target, expr *utils.Expr) ([]*Target, error) {
 	return targets, nil
 }
 
-func (e *Engine) findParent(t *Target, expr *utils.Expr) (*Target, error) {
-	selector := expr.PosArgs[0]
+func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
+	selector, err := expr.MustPosArg(0)
+	if err != nil {
+		return nil, err
+	}
 
 	if !strings.HasPrefix(selector, ":") {
 		return nil, fmt.Errorf("must be a target selector, got `%v`", selector)

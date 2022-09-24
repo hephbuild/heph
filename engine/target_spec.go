@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"heph/exprs"
 	"heph/utils"
 	"os"
 	"os/exec"
@@ -21,7 +22,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		PassArgs:    args.PassArgs,
 		Quiet:       args.Quiet,
 		ShouldCache: args.Cache.Bool,
-		CachedFiles: args.Cache.Array,
+		Cache:       args.Cache.Array,
 		Sandbox:     args.SandboxEnabled,
 		Codegen:     args.Codegen,
 		Labels:      args.Labels.Array,
@@ -39,7 +40,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	var err error
 
 	for _, tool := range args.Tools.Array {
-		expr, err := utils.ExprParse(tool)
+		expr, err := exprs.Parse(tool)
 		if err == nil {
 			t.ExprTools = append(t.ExprTools, TargetSpecExprTool{
 				Expr: expr,
@@ -165,7 +166,7 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	td := TargetSpecDeps{}
 
 	for _, dep := range arr {
-		if expr, err := utils.ExprParse(dep); err == nil {
+		if expr, err := exprs.Parse(dep); err == nil {
 			td.Exprs = append(td.Exprs, TargetSpecDepExpr{
 				Name:    name,
 				Package: t.Package,
@@ -300,7 +301,7 @@ type TargetSpec struct {
 	HostTools         []TargetSpecHostTool
 	Out               []TargetSpecOutFile
 	ShouldCache       bool
-	CachedFiles       []string
+	Cache             []string
 	Sandbox           bool
 	Codegen           string
 	Labels            []string
@@ -375,7 +376,7 @@ type TargetSpecTargetTool struct {
 }
 
 type TargetSpecExprTool struct {
-	Expr   *utils.Expr
+	Expr   exprs.Expr
 	Output string
 }
 
@@ -399,7 +400,7 @@ type TargetSpecDepTarget struct {
 type TargetSpecDepExpr struct {
 	Name    string
 	Package *Package
-	Expr    *utils.Expr
+	Expr    exprs.Expr
 }
 
 type TargetSpecDepFile struct {

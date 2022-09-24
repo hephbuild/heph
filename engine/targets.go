@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
+	"heph/exprs"
 	"heph/upgrade"
 	"heph/utils"
 	"os"
@@ -173,7 +174,7 @@ type Target struct {
 	WorkdirRoot       Path
 	SandboxRoot       Path
 	OutRoot           *Path
-	CachedFiles       PackagePaths
+	CacheFiles        PackagePaths
 	actualcachedFiles PackagePaths
 	LogFile           string
 
@@ -213,6 +214,16 @@ func (t *Target) String() string {
 
 func (t *Target) IsGroup() bool {
 	return len(t.Run) == 0 && len(t.Out.All()) == 1 && (t.Out.All()[0].Path == "*" || t.Out.All()[0].Path == "/")
+}
+
+func Contains(ts []*Target, fqn string) bool {
+	for _, t := range ts {
+		if t.FQN == fqn {
+			return true
+		}
+	}
+
+	return false
 }
 
 type PackagePath struct {
@@ -819,20 +830,20 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 
-		if t.TargetSpec.CachedFiles == nil {
-			t.CachedFiles = t.Out.All()
+		if t.TargetSpec.Cache == nil {
+			t.CacheFiles = t.Out.All()
 		} else {
-			t.CachedFiles = []PackagePath{}
-			for _, p := range t.TargetSpec.CachedFiles {
-				t.CachedFiles = append(t.CachedFiles, PackagePath{
+			t.CacheFiles = []PackagePath{}
+			for _, p := range t.TargetSpec.Cache {
+				t.CacheFiles = append(t.CacheFiles, PackagePath{
 					Package:     t.Package,
 					Path:        p,
 					PackagePath: true,
 				})
 			}
 
-			sort.SliceStable(t.CachedFiles, func(i, j int) bool {
-				return t.CachedFiles[i].RelRoot() < t.CachedFiles[j].RelRoot()
+			sort.SliceStable(t.CacheFiles, func(i, j int) bool {
+				return t.CacheFiles[i].RelRoot() < t.CacheFiles[j].RelRoot()
 			})
 		}
 	}
@@ -889,7 +900,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 	return td, nil
 }
 
-func (e *Engine) targetExpr(t *Target, expr *utils.Expr, simplify bool, breadcrumb *Targets) ([]*Target, error) {
+func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrumb *Targets) ([]*Target, error) {
 	switch expr.Function {
 	case "collect":
 		targets, err := e.collect(t, expr)

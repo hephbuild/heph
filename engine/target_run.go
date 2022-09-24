@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"heph/exprs"
 	"heph/sandbox"
 	"heph/utils"
 	"heph/worker"
@@ -330,12 +331,12 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 				case FileEnvRelRoot:
 					pathv = path.RelRoot()
 				case FileEnvRelPkg:
-					p := "/root"
-					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path.RelRoot()))
+					fakeRoot := "/root"
+					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.FullName), filepath.Join(fakeRoot, path.RelRoot()))
 					if err != nil {
 						return err
 					}
-					rel = strings.TrimPrefix(rel, p)
+					rel = strings.TrimPrefix(rel, fakeRoot)
 					rel = strings.TrimPrefix(rel, "/")
 					pathv = rel
 				default:
@@ -358,34 +359,24 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	for _, t := range target.Tools {
-		k := "TOOL_" + strings.ToUpper(t.Name)
-		if t.Name == "" {
+	for _, tool := range target.Tools {
+		k := "TOOL_" + strings.ToUpper(tool.Name)
+		if tool.Name == "" {
 			k = "TOOL"
 		}
-		env[normalizeEnv(k)] = t.AbsPath()
+		env[normalizeEnv(k)] = tool.AbsPath()
 
-		if t.Target == nil {
+		if tool.Target == nil {
 			continue
 		}
 
-		for rk, expr := range t.Target.RuntimeEnv {
-			expr, err := utils.ExprParse(expr)
+		for rk, expr := range tool.Target.RuntimeEnv {
+			val, err := exprs.Exec(expr, e.queryFunctions(tool.Target))
 			if err != nil {
-				return err
+				return fmt.Errorf("runtime env `%v`: %w", expr, err)
 			}
 
-			switch expr.Function {
-			case "outdir":
-				outdir, err := e.outdir(t.Target, expr)
-				if err != nil {
-					return err
-				}
-
-				env[normalizeEnv(strings.ToUpper(t.Target.Name+"_"+rk))] = outdir
-			default:
-				return fmt.Errorf("unhandled function %v", expr.Function)
-			}
+			env[normalizeEnv(strings.ToUpper(tool.Target.Name+"_"+rk))] = val
 		}
 	}
 
@@ -396,10 +387,6 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	_, hasPathInEnv := env["PATH"]
 
 	if len(args) > 0 {
-		if target.Executor == ExecutorBash && len(target.Run) > 1 {
-			return fmt.Errorf("args are supported only with a single cmd")
-		}
-
 		if target.ShouldCache {
 			return fmt.Errorf("args are not supported with cache")
 		}
@@ -408,21 +395,39 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	if len(target.Run) > 0 {
 		e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-		var execArgs []string
-		if shell {
-			log.Info("Shell mode enabled, exit the shell to terminate")
-			log.Infof("Command: %v", strings.Join(target.Run, " "))
-			execArgs = sandbox.BashShellArgs()
-		} else {
-			switch target.Executor {
-			case ExecutorBash:
-				execArgs = sandbox.BashArgs(target.Run)
-			case ExecutorExec:
-				execArgs, err = sandbox.ExecArgs(target.Run, env)
-				if err != nil {
-					return err
-				}
+		var executor sandbox.Executor
+		switch target.Executor {
+		case ExecutorBash:
+			executor = sandbox.BashExecutor
+		case ExecutorExec:
+			executor = sandbox.ExecExecutor
+		default:
+			panic("unhandled executor: " + target.Executor)
+		}
+
+		run := make([]string, 0)
+		for _, s := range target.Run {
+			out, err := exprs.Exec(s, e.queryFunctions(target))
+			if err != nil {
+				return fmt.Errorf("run `%v`: %w", s, err)
 			}
+
+			run = append(run, out)
+		}
+
+		if shell {
+			fmt.Println("Shell mode enabled, exit the shell to terminate")
+			fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
+
+			executor = sandbox.BashShellExecutor
+		}
+
+		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
+			Args: run,
+			Env:  env,
+		})
+		if err != nil {
+			return err
 		}
 
 		cmd := sandbox.Exec(sandbox.ExecConfig{

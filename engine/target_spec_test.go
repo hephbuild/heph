@@ -3,7 +3,7 @@ package engine
 import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
-	"heph/utils"
+	"heph/exprs"
 	"testing"
 	"time"
 )
@@ -29,7 +29,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		deps.Exprs = append(deps.Exprs, TargetSpecDepExpr{
 			Name:    "aaa",
 			Package: pkg,
-			Expr: &utils.Expr{
+			Expr: exprs.Expr{
 				String:    "$(aaa)",
 				Function:  "aaa",
 				PosArgs:   nil,
@@ -41,7 +41,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 	var exprTools []TargetSpecExprTool
 	for i := 0; i < factor; i++ {
 		exprTools = append(exprTools, TargetSpecExprTool{
-			Expr: &utils.Expr{
+			Expr: exprs.Expr{
 				String:    "$(aaa)",
 				Function:  "aaa",
 				PosArgs:   nil,
@@ -76,9 +76,9 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		})
 	}
 
-	var cachedFiles []string
+	var cache []string
 	for i := 0; i < factor; i++ {
-		cachedFiles = append(cachedFiles, "aaa")
+		cache = append(cache, "aaa")
 	}
 
 	var labels []string
@@ -113,7 +113,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		HostTools:         hostTools,
 		Out:               out,
 		ShouldCache:       false,
-		CachedFiles:       cachedFiles,
+		Cache:             cache,
 		Sandbox:           false,
 		Codegen:           "",
 		Labels:            labels,

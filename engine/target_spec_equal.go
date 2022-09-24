@@ -107,7 +107,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if !arrEqual(t.CachedFiles, spec.CachedFiles) {
+	if !arrEqual(t.Cache, spec.Cache) {
 		return false
 	}
 

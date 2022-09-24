@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -109,35 +108,6 @@ type IOConfig struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
-}
-
-var bashArgs = []string{"bash", "--noprofile", "--norc", "-u", "-o", "pipefail"}
-
-func BashShellArgs() []string {
-	return bashArgs
-}
-
-func BashArgs(cmds []string) []string {
-	args := bashArgs
-	//args = append(args, "-x")
-	args = append(args, "-e")
-	args = append(args, "-c", strings.Join(cmds, "\n"))
-
-	return args
-}
-
-func ExecArgs(args []string, env map[string]string) ([]string, error) {
-	for i, arg := range args {
-		if strings.HasPrefix(arg, "$") {
-			v, ok := env[strings.TrimPrefix(arg, "$")]
-			if !ok {
-				return nil, fmt.Errorf("%v is unbound", arg)
-			}
-			args[i] = v
-		}
-	}
-
-	return args, nil
 }
 
 type ExecConfig struct {

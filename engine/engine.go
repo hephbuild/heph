@@ -278,7 +278,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, file := range target.CachedFiles {
+	for _, file := range target.CacheFiles {
 		h.String(file.RelRoot())
 	}
 
@@ -791,7 +791,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return nil
 	}
 
-	target.actualcachedFiles, err = e.collectOut(target, target.CachedFiles)
+	target.actualcachedFiles, err = e.collectOut(target, target.CacheFiles)
 	if err != nil {
 		return fmt.Errorf("cached: %w", err)
 	}
