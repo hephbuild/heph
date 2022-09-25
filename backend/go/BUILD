@@ -67,8 +67,8 @@ std_pkgs = target(
     run='export CGO_ENABLED=1 && go list std > std_list',
     out="std_list",
 )
-backend_dir = package_dir()
-backend_pkg = package_fqn()
+backend_dir = heph.pkg.dir()
+backend_pkg = heph.pkg.addr()
 
 def go_install(name, pkg, version, bin_name):
     return target(
@@ -92,8 +92,8 @@ def go_mod(mod_pkgs=[], test={}):
         name="_src",
         deps=[
             gomodsum,
-            '$(collect "{}/..." include="go_src")'.format(package_fqn()),
-            '$(collect "{}/..." include="go_test_src")'.format(package_fqn()),
+            '$(collect "{}/..." include="go_src")'.format(heph.pkg.addr()),
+            '$(collect "{}/..." include="go_test_src")'.format(heph.pkg.addr()),
         ]+glob("**/*.go"),
     )
 
@@ -127,9 +127,9 @@ def go_mod(mod_pkgs=[], test={}):
 
     target(
         name="_go_mod_gen",
-        run="godeps mod '{}'".format(to_json(godeps_cfg)),
+        run="godeps mod $SRC_CFG",
         out="/**/BUILD",
-        deps=godeps_deps,
+        deps={'deps': godeps_deps, 'cfg': json_file(name="godeps_cfg", data=godeps_cfg)},
         hash_deps=[imports, gomodsum],
         tools=[go, godeps],
         env={
@@ -287,7 +287,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     else:
         deps = {'src': src_files, 'libs': libs}
 
-    deps['src'].append('$(collect "{}/." include="go_src")'.format(package_fqn()))
+    deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
     deps["std"] = std_pkgs
 
     out = {'a': p+'lib.a', 'importcfg': p+'importcfg'}
@@ -308,9 +308,10 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
 
 def go_build_bin(name, main, libs=[], out=None):
     if not out:
-        out = package_name()
+        out = heph.pkg.name()
 
-    if "|" not in main:
+    _, _, output = heph.split(main)
+    if not output:
         main = main+"|a"
 
     return target(
@@ -318,7 +319,7 @@ def go_build_bin(name, main, libs=[], out=None):
         deps={
             'libs': libs,
             'main': main,
-            'std': [std_pkgs],
+            'std': std_pkgs,
         },
         run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT $SRC_MAIN'],
         out_env='rel_root',
@@ -331,14 +332,17 @@ def go_build_bin(name, main, libs=[], out=None):
         },
     )
 
+def go_bin_build(pkg):
+    return heph.canonicalize(pkg+":go_bin#build")
+
 def go_bin(name, pkg=None, *args, **kwargs):
-    out = package_name()
+    out = heph.pkg.name()
     if not pkg:
-        pkg = package_fqn()
+        pkg = heph.pkg.addr()
 
     return target(
         name=name,
-        tools='{}:go_bin#build'.format(pkg),
+        tools=go_bin_build(pkg),
         run="$TOOL_GO_BIN_BUILD",
         executor="exec",
         sandbox=False,

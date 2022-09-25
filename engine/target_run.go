@@ -395,54 +395,66 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	if len(target.Run) > 0 {
 		e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-		var executor sandbox.Executor
-		switch target.Executor {
-		case ExecutorBash:
-			executor = sandbox.BashExecutor
-		case ExecutorExec:
-			executor = sandbox.ExecExecutor
-		default:
-			panic("unhandled executor: " + target.Executor)
-		}
-
-		run := make([]string, 0)
-		for _, s := range target.Run {
-			out, err := exprs.Exec(s, e.queryFunctions(target))
+		if target.IsTextFile() {
+			err := os.MkdirAll(dir, os.ModePerm)
 			if err != nil {
-				return fmt.Errorf("run `%v`: %w", s, err)
+				return err
 			}
 
-			run = append(run, out)
-		}
+			err = os.WriteFile(target.Out.All()[0].WithRoot(target.WorkdirRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
+			if err != nil {
+				return err
+			}
+		} else {
+			var executor sandbox.Executor
+			switch target.Executor {
+			case ExecutorBash:
+				executor = sandbox.BashExecutor
+			case ExecutorExec:
+				executor = sandbox.ExecExecutor
+			default:
+				panic("unhandled executor: " + target.Executor)
+			}
 
-		if shell {
-			fmt.Println("Shell mode enabled, exit the shell to terminate")
-			fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
+			run := make([]string, 0)
+			for _, s := range target.Run {
+				out, err := exprs.Exec(s, e.queryFunctions(target))
+				if err != nil {
+					return fmt.Errorf("run `%v`: %w", s, err)
+				}
 
-			executor = sandbox.BashShellExecutor
-		}
+				run = append(run, out)
+			}
 
-		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
-			Args: run,
-			Env:  env,
-		})
-		if err != nil {
-			return err
-		}
+			if shell {
+				fmt.Println("Shell mode enabled, exit the shell to terminate")
+				fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
 
-		cmd := sandbox.Exec(sandbox.ExecConfig{
-			Context:  ctx,
-			BinDir:   binDir,
-			Dir:      dir,
-			Env:      env,
-			IOConfig: iocfg,
-			ExecArgs: execArgs,
-			CmdArgs:  args,
-		}, target.Sandbox && !hasPathInEnv)
+				executor = sandbox.BashShellExecutor
+			}
 
-		err = cmd.Run()
-		if err != nil {
-			return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
+			execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
+				Args: run,
+				Env:  env,
+			})
+			if err != nil {
+				return err
+			}
+
+			cmd := sandbox.Exec(sandbox.ExecConfig{
+				Context:  ctx,
+				BinDir:   binDir,
+				Dir:      dir,
+				Env:      env,
+				IOConfig: iocfg,
+				ExecArgs: execArgs,
+				CmdArgs:  args,
+			}, target.Sandbox && !hasPathInEnv)
+
+			err = cmd.Run()
+			if err != nil {
+				return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
+			}
 		}
 	}
 

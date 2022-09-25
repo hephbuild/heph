@@ -48,16 +48,23 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 
 func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	p := starlark.StringDict{}
-	p["internal_target"] = starlark.NewBuiltin("internal_target", internal_target)
+	p["_internal_target"] = starlark.NewBuiltin("_internal_target", internal_target)
 	p["glob"] = starlark.NewBuiltin("glob", glob)
-	p["package_name"] = starlark.NewBuiltin("package_name", package_name)
-	p["package_dir"] = starlark.NewBuiltin("package_dir", package_dir)
-	p["package_fqn"] = starlark.NewBuiltin("package_fqn", package_fqn)
 	p["get_os"] = starlark.NewBuiltin("get_os", get_os)
 	p["get_arch"] = starlark.NewBuiltin("get_arch", get_arch)
 	p["to_json"] = starlark.NewBuiltin("to_json", to_json)
 	p["fail"] = starlark.NewBuiltin("fail", fail)
 	p["struct"] = starlark.NewBuiltin("struct", starlarkstruct.Make)
+	p["heph"] = starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
+		"canonicalize": starlark.NewBuiltin("canonicalize", canonicalize),
+		"is_target":    starlark.NewBuiltin("is_target", is_target),
+		"split":        starlark.NewBuiltin("split", split),
+		"pkg": starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
+			"name": starlark.NewBuiltin("name", package_name),
+			"dir":  starlark.NewBuiltin("dir", package_dir),
+			"addr": starlark.NewBuiltin("addr", package_fqn),
+		}),
+	})
 
 	for _, globals := range globals {
 		for name, value := range globals {
@@ -70,7 +77,6 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 			}
 
 			p[name] = value
-			value.Freeze()
 		}
 	}
 	p.Freeze()
@@ -128,6 +134,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"target", args, kwargs,
 		"name?", &sargs.Name,
 		"run?", &sargs.Run,
+		"_file_content?", &sargs.FileContent,
 		"executor?", &sargs.Executor,
 		"run_in_cwd?", &sargs.RunInCwd,
 		"quiet?", &sargs.Quiet,
@@ -260,4 +267,67 @@ func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 	}
 
 	return nil, fmt.Errorf("%s\n%v", value, traceStr)
+}
+
+func canonicalize(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		value string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"value", &value,
+	); err != nil {
+		return nil, err
+	}
+
+	pkg := getPackage(thread)
+
+	tp, err := utils.TargetParse(pkg.FullName, value)
+	if err != nil {
+		return nil, err
+	}
+
+	return starlark.String(tp.Full()), nil
+}
+
+func is_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		value string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"value", &value,
+	); err != nil {
+		return nil, err
+	}
+
+	return starlark.Bool(strings.HasPrefix(value, ":") || strings.HasPrefix(value, "//")), nil
+}
+
+func split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		value string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"value", &value,
+	); err != nil {
+		return nil, err
+	}
+
+	pkg := getPackage(thread)
+
+	tp, err := utils.TargetOutputParse(pkg.FullName, value)
+	if err != nil {
+		return nil, err
+	}
+
+	return starlark.Tuple{
+		starlark.String(tp.Package),
+		starlark.String(tp.Name),
+		starlark.String(tp.Output),
+	}, nil
 }

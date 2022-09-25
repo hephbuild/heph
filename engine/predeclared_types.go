@@ -8,6 +8,7 @@ import (
 type TargetArgs struct {
 	Name           string
 	Run            ArrayMap
+	FileContent    string
 	Executor       string
 	RunInCwd       bool
 	Quiet          bool

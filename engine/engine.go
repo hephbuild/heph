@@ -265,6 +265,11 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 	h.String(target.Executor)
 
+	if target.IsTextFile() {
+		h.String("=")
+		h.Write(target.FileContent)
+	}
+
 	h.String("=")
 	outEntries := make([]string, 0)
 	for _, file := range target.TargetSpec.Out {

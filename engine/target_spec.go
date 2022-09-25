@@ -17,6 +17,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		FQN:         pkg.TargetPath(args.Name),
 		Name:        args.Name,
 		Run:         args.Run.Array,
+		FileContent: []byte(args.FileContent),
 		Executor:    args.Executor,
 		Package:     pkg,
 		PassArgs:    args.PassArgs,
@@ -289,6 +290,7 @@ type TargetSpec struct {
 	Package *Package
 
 	Run               []string
+	FileContent       []byte // Used by special target `text_file`
 	Executor          string
 	Quiet             bool
 	Dir               string
@@ -315,6 +317,10 @@ type TargetSpec struct {
 	SrcEnv            string
 	OutEnv            string
 	HashFile          string
+}
+
+func (t TargetSpec) IsTextFile() bool {
+	return len(t.Run) == 1 && t.Run[0] == "text_file"
 }
 
 func (t TargetSpec) IsNamedOutput() bool {

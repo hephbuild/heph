@@ -3,12 +3,11 @@ def _fail_if_present(kwargs, key):
         fail("argument `{}` is not allowed".format(key))
 
 def target(sandbox=True, cache=True, *args, **kwargs):
-    return internal_target(
+    return _internal_target(
         sandbox=sandbox,
         cache=cache,
         *args, **kwargs,
     )
-
 
 def group(*args, **kwargs):
     _fail_if_present(kwargs, "sandbox")
@@ -20,5 +19,22 @@ def group(*args, **kwargs):
         out='*',
         sandbox=True,
         cache=True,
+        *args, **kwargs
+    )
+
+def text_file(name, text, out=None, *args, **kwargs):
+    _fail_if_present(kwargs, "run")
+
+    return target(
+        name=name,
+        out=out or name,
+        run='text_file',
+        _file_content=text,
+        *args, **kwargs
+    )
+
+def json_file(data, *args, **kwargs):
+    return text_file(
+        text=to_json(data),
         *args, **kwargs
     )

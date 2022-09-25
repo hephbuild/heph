@@ -243,13 +243,25 @@ func (p *executor) parseIdent() string {
 	return string(p.s[start:end])
 }
 
-func unexpected(r rune, at int) error {
-	s := fmt.Sprintf("`%v`", string(r))
-	if r == EOF {
+type unexpectedErr struct {
+	r  rune
+	at int
+}
+
+func (e unexpectedErr) Error() string {
+	s := fmt.Sprintf("`%v`", string(e.r))
+	if e.r == EOF {
 		s = "EOF"
 	}
 
-	return fmt.Errorf("unexpected %v at %v", s, at)
+	return fmt.Sprintf("unexpected %v at %v", s, e.at)
+}
+
+func unexpected(r rune, at int) error {
+	return unexpectedErr{
+		r:  r,
+		at: at,
+	}
 }
 
 func (p *executor) parseExpr(allowExpr bool) (Expr, error) {

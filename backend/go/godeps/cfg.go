@@ -12,15 +12,19 @@ var Env struct {
 
 var Config Cfg
 
-func ParseConfig(cfg string) {
-	err := json.Unmarshal([]byte(cfg), &Config)
+func ParseConfig(cfgPath string) {
+	cfg, err := os.ReadFile(cfgPath)
+	if err != nil {
+		panic(err)
+	}
+
+	err = json.Unmarshal(cfg, &Config)
 	if err != nil {
 		panic(err)
 	}
 }
 
 func init() {
-
 	if Config.ThirdpartyPackage == "" {
 		Config.ThirdpartyPackage = "thirdparty/go"
 	}
