@@ -14,28 +14,29 @@ import (
 
 func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	t := TargetSpec{
-		FQN:         pkg.TargetPath(args.Name),
-		Name:        args.Name,
-		Run:         args.Run.Array,
-		FileContent: []byte(args.FileContent),
-		Executor:    args.Executor,
-		Package:     pkg,
-		PassArgs:    args.PassArgs,
-		Quiet:       args.Quiet,
-		ShouldCache: args.Cache.Bool,
-		Cache:       args.Cache.Array,
-		Sandbox:     args.SandboxEnabled,
-		Codegen:     args.Codegen,
-		Labels:      args.Labels.Array,
-		Env:         args.Env.StrMap,
-		PassEnv:     args.PassEnv.Array,
-		RunInCwd:    args.RunInCwd,
-		Gen:         args.Gen,
-		RuntimeEnv:  args.RuntimeEnv.StrMap,
-		RequireGen:  args.RequireGen,
-		SrcEnv:      args.SrcEnv,
-		OutEnv:      args.OutEnv,
-		HashFile:    args.HashFile,
+		FQN:          pkg.TargetPath(args.Name),
+		Name:         args.Name,
+		Run:          args.Run.Array,
+		FileContent:  []byte(args.FileContent),
+		Executor:     args.Executor,
+		Package:      pkg,
+		PassArgs:     args.PassArgs,
+		Quiet:        args.Quiet,
+		ShouldCache:  args.Cache.Bool,
+		Cache:        args.Cache.Array,
+		Sandbox:      args.SandboxEnabled,
+		OutInSandbox: args.OutInSandbox,
+		Codegen:      args.Codegen,
+		Labels:       args.Labels.Array,
+		Env:          args.Env.StrMap,
+		PassEnv:      args.PassEnv.Array,
+		RunInCwd:     args.RunInCwd,
+		Gen:          args.Gen,
+		RuntimeEnv:   args.RuntimeEnv.StrMap,
+		RequireGen:   args.RequireGen,
+		SrcEnv:       args.SrcEnv,
+		OutEnv:       args.OutEnv,
+		HashFile:     args.HashFile,
 	}
 
 	var err error
@@ -133,14 +134,22 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	))
 
 	if t.SrcEnv == "" {
-		t.SrcEnv = FileEnvRelPkg
+		if t.OutInSandbox {
+			t.SrcEnv = FileEnvAbs
+		} else {
+			t.SrcEnv = FileEnvRelPkg
+		}
 	}
 	if !validate(t.SrcEnv, FileEnvValues) {
 		return TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(FileEnvValues), t.SrcEnv)
 	}
 
 	if t.OutEnv == "" {
-		t.OutEnv = FileEnvRelPkg
+		if t.OutInSandbox {
+			t.OutEnv = FileEnvAbs
+		} else {
+			t.OutEnv = FileEnvRelPkg
+		}
 	}
 	if !validate(t.OutEnv, FileEnvValues) {
 		return TargetSpec{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(FileEnvValues), t.OutEnv)
@@ -305,6 +314,7 @@ type TargetSpec struct {
 	ShouldCache       bool
 	Cache             []string
 	Sandbox           bool
+	OutInSandbox      bool
 	Codegen           string
 	Labels            []string
 	Env               map[string]string

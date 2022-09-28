@@ -826,7 +826,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 	t.Out.Sort()
 
 	if t.TargetSpec.ShouldCache {
-		if !t.TargetSpec.Sandbox {
+		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 
@@ -922,12 +922,16 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrum
 			return nil, fmt.Errorf("`%v`: %w", expr.String, err)
 		}
 
-		err = e.linkTarget(target, simplify, breadcrumb)
-		if err != nil {
-			return nil, fmt.Errorf("find_parent: %w", err)
+		if target != nil {
+			err = e.linkTarget(target, simplify, breadcrumb)
+			if err != nil {
+				return nil, fmt.Errorf("find_parent: %w", err)
+			}
+
+			return []*Target{target}, nil
 		}
 
-		return []*Target{target}, nil
+		return []*Target{}, nil
 	default:
 		return nil, fmt.Errorf("unhandled function %v", expr.Function)
 	}

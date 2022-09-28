@@ -20,7 +20,7 @@ func (m ModDl) Data() interface{} {
 	}
 }
 
-var modTplStr = `
+var modDlTplStr = `
 # mod {{.Path}}@{{.Version}}
 
 load("{{.Config.BackendPkg}}", "go_mod_download")
@@ -34,18 +34,18 @@ go_mod_download(
 # end mod
 `
 
-var modTpl *template.Template
+var modDlTpl *template.Template
 
 func init() {
 	var err error
-	modTpl, err = template.New("mod").Parse(modTplStr)
+	modDlTpl, err = template.New("mod").Parse(modDlTplStr)
 	if err != nil {
 		panic(err)
 	}
 }
 
 func RenderModDl(w io.Writer, m *ModDl) {
-	err := modTpl.Execute(w, m.Data())
+	err := modDlTpl.Execute(w, m.Data())
 	if err != nil {
 		panic(err)
 	}

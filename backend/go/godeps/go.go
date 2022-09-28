@@ -22,6 +22,16 @@ type Mod struct {
 	Replace *Mod
 }
 
+type Error struct {
+	ImportStack []string
+	Pos         string
+	Err         string
+}
+
+func (e Error) String() string {
+	return fmt.Sprintf("%v %v %v", e.Err, e.Pos, strings.Join(e.ImportStack, " "))
+}
+
 type Package struct {
 	Dir            string
 	Root           string
@@ -44,6 +54,9 @@ type Package struct {
 	IsPartOfModule bool     `json:"-"`
 	IsPartOfTree   bool     `json:"-"`
 	TestDeps       []string `json:"-"`
+
+	DepsErrors []Error
+	Error      *Error
 }
 
 func (p *Package) ActualModule() *Mod {
@@ -135,6 +148,16 @@ func goListStd() Strings {
 	return strings.Split(s, "\n")
 }
 
+func goEnv(name string) string {
+	cmd := exec.Command("go", "env", name)
+	b, err := cmd.Output()
+	if err != nil {
+		panic(err)
+	}
+
+	return strings.TrimSpace(string(b))
+}
+
 func goList(pkg string) *Packages {
 	cmd := exec.Command("go", "list", "-e", "-json", "-deps", pkg)
 
@@ -174,24 +197,24 @@ func goList(pkg string) *Packages {
 	return pkgs
 }
 
+func isPathUnder(path, under string) bool {
+	rel, _ := filepath.Rel(under, path)
+	return len(rel) > 0 && !strings.Contains(rel, "..")
+}
+
 func goListWithTransitiveTestDeps() *Packages {
 	pkgs := goList("./...")
 
 	for _, pkg := range pkgs.Array()[:] {
 		if pkg.Module != nil {
-			var rel string
-			if pkg.Module != nil {
-				rel, _ = filepath.Rel(Env.Sandbox, pkg.Module.Dir)
-			}
-			pkg.IsPartOfTree = len(rel) > 0 && !strings.Contains(rel, "..")
+			partOfTree := isPathUnder(pkg.Module.Dir, Env.Root)
+			thirdparty := isPathUnder(pkg.Module.Dir, Env.GOPATH)
+
+			pkg.IsPartOfTree = partOfTree && !thirdparty
 		}
 
 		if pkg.IsPartOfTree {
-			var rel string
-			if pkg.Module != nil {
-				rel, _ = filepath.Rel(filepath.Join(Env.Sandbox, Env.Package), pkg.Dir)
-			}
-			pkg.IsPartOfModule = len(rel) > 0 && !strings.Contains(rel, "..")
+			pkg.IsPartOfModule = isPathUnder(pkg.Dir, filepath.Join(Env.Root, Env.Package))
 		}
 
 		if !StdPackages.Includes(pkg.ImportPath) {

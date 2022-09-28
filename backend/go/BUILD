@@ -136,10 +136,12 @@ def go_mod(mod_pkgs=[], test={}):
         hash_deps=[imports, gomodsum],
         tools=[go, godeps],
         env={
-            "OS": get_os(),
-            "ARCH": get_arch(),
+            "GOOS": get_os(),
+            "GOARCH": get_arch(),
         },
         gen=True,
+        sandbox=False,
+        out_in_sandbox=True,
     )
 
     target(
@@ -170,6 +172,12 @@ def go_mod(mod_pkgs=[], test={}):
         deps=[src],
         sandbox=False,
         cache=False,
+    )
+
+def go_work():
+    group(
+        name="_go_work",
+        deps="go.work",
     )
 
 def _go_gen_importcfg():

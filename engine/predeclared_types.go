@@ -15,6 +15,7 @@ type TargetArgs struct {
 	PassArgs       bool
 	Cache          BoolArray
 	SandboxEnabled bool
+	OutInSandbox   bool
 	Gen            bool
 	Codegen        string
 	Deps           ArrayMap

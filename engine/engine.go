@@ -282,6 +282,10 @@ func (e *Engine) hashInput(target *Target) string {
 		h.String(entry)
 	}
 
+	if target.OutInSandbox {
+		h.Bool(target.OutInSandbox)
+	}
+
 	h.String("=")
 	for _, file := range target.CacheFiles {
 		h.String(file.RelRoot())

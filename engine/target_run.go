@@ -181,69 +181,59 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
-	if target.Sandbox {
-		e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
+	e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
-		src := make([]utils.TarFile, 0)
-		srcTar := make([]string, 0)
-		for name, deps := range target.Deps.Named() {
-			for _, dep := range deps.Targets {
-				tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
-				if utils.PathExists(tarFile) && dep.Output == "" {
-					srcTar = append(srcTar, tarFile)
-					for _, file := range dep.Target.ActualFilesOut() {
-						file = file.WithPackagePath(true)
-						addNamedDep(name, file.RelRoot())
-					}
-				} else {
-					files := dep.Target.ActualFilesOut()
-					if dep.Output != "" {
-						files = dep.Target.NamedActualFilesOut().Name(dep.Output)
-					}
-					for _, file := range files {
-						file = file.WithPackagePath(true)
+	src := make([]utils.TarFile, 0)
+	srcTar := make([]string, 0)
+	for name, deps := range target.Deps.Named() {
+		for _, dep := range deps.Targets {
+			tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
+			if utils.PathExists(tarFile) && dep.Output == "" {
+				srcTar = append(srcTar, tarFile)
+				for _, file := range dep.Target.ActualFilesOut() {
+					file = file.WithPackagePath(true)
+					addNamedDep(name, file.RelRoot())
+				}
+			} else {
+				files := dep.Target.ActualFilesOut()
+				if dep.Output != "" {
+					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
+				}
+				for _, file := range files {
+					file = file.WithPackagePath(true)
 
-						src = append(src, utils.TarFile{
-							From: file.Abs(),
-							To:   file.RelRoot(),
-						})
-						addNamedDep(name, file.RelRoot())
-					}
+					src = append(src, utils.TarFile{
+						From: file.Abs(),
+						To:   file.RelRoot(),
+					})
+					addNamedDep(name, file.RelRoot())
 				}
 			}
-
-			for _, file := range deps.Files {
-				to := file.WithPackagePath(true).RelRoot()
-				src = append(src, utils.TarFile{
-					From: file.Abs(),
-					To:   to,
-				})
-				addNamedDep(name, to)
-			}
 		}
 
-		for _, file := range src {
-			log.Tracef("src: %v", file.To)
+		for _, file := range deps.Files {
+			to := file.WithPackagePath(true).RelRoot()
+			src = append(src, utils.TarFile{
+				From: file.Abs(),
+				To:   to,
+			})
+			addNamedDep(name, to)
 		}
+	}
 
-		err = sandbox.Make(ctx, sandbox.MakeConfig{
-			Dir:    target.SandboxRoot.Abs(),
-			BinDir: binDir,
-			Bin:    bin,
-			Src:    src,
-			SrcTar: srcTar,
-		})
-		if err != nil {
-			return err
-		}
-	} else {
-		err = sandbox.MakeBin(sandbox.MakeBinConfig{
-			Dir: binDir,
-			Bin: bin,
-		})
-		if err != nil {
-			return err
-		}
+	for _, file := range src {
+		log.Tracef("src: %v", file.To)
+	}
+
+	err = sandbox.Make(ctx, sandbox.MakeConfig{
+		Dir:    target.SandboxRoot.Abs(),
+		BinDir: binDir,
+		Bin:    bin,
+		Src:    src,
+		SrcTar: srcTar,
+	})
+	if err != nil {
+		return err
 	}
 
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
@@ -288,7 +278,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			for _, path := range paths {
 				switch target.SrcEnv {
 				case FileEnvAbs:
-					spaths = append(spaths, target.WorkdirRoot.Join(path).Abs())
+					spaths = append(spaths, target.SandboxRoot.Join(path).Abs())
 				case FileEnvRelRoot:
 					spaths = append(spaths, path)
 				case FileEnvRelPkg:
@@ -310,7 +300,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	if target.OutEnv != FileEnvIgnore {
 		namedOut := map[string][]string{}
-		for name, paths := range target.Out.WithRoot(target.WorkdirRoot.Abs()).Named() {
+		for name, paths := range target.Out.WithRoot(target.SandboxRoot.Abs()).Named() {
 			for _, path := range paths {
 				if strings.Contains(path.Path, "*") {
 					// Skip glob
@@ -401,7 +391,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 				return err
 			}
 
-			err = os.WriteFile(target.Out.All()[0].WithRoot(target.WorkdirRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
+			err = os.WriteFile(target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
 			if err != nil {
 				return err
 			}
@@ -465,6 +455,10 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	e.Status(fmt.Sprintf("Collecting %v output...", target.FQN))
 
 	target.OutRoot = &target.WorkdirRoot
+	if target.OutInSandbox {
+		target.OutRoot = &target.SandboxRoot
+	}
+
 	err = e.populateActualFiles(target)
 	if err != nil {
 		return fmt.Errorf("popfilesout: %w", err)
@@ -503,9 +497,9 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			}
 		}
 
-		if !e.Config.KeepSandbox && target.Sandbox {
+		if !e.Config.KeepSandbox {
 			e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
-			err = deleteDir(target.WorkdirRoot.Abs(), false)
+			err = deleteDir(target.SandboxRoot.Abs(), false)
 			if err != nil {
 				return err
 			}

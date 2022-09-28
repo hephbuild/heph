@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"heph/exprs"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -168,6 +169,8 @@ func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
 		return nil, err
 	}
 
+	must, _ := strconv.ParseBool(expr.NamedArg("must"))
+
 	if !strings.HasPrefix(selector, ":") {
 		return nil, fmt.Errorf("must be a target selector, got `%v`", selector)
 	}
@@ -178,7 +181,13 @@ func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
 		if t != nil {
 			return t, nil
 		}
+
+		parts = parts[:len(parts)-1]
 	}
 
-	return nil, fmt.Errorf("not target matching %v found in parent of %v", selector, t.FQN)
+	if must {
+		return nil, fmt.Errorf("not target matching %v found in parent of %v", selector, t.FQN)
+	}
+
+	return nil, nil
 }

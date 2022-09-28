@@ -6,8 +6,10 @@ import (
 )
 
 var Env struct {
-	Package string
+	Root    string
 	Sandbox string
+	Package string
+	GOPATH  string
 }
 
 var Config Cfg
@@ -29,8 +31,10 @@ func init() {
 		Config.ThirdpartyPackage = "thirdparty/go"
 	}
 
+	Env.Root = os.Getenv("ROOT")
 	Env.Sandbox = os.Getenv("SANDBOX")
 	Env.Package = os.Getenv("PACKAGE")
+	Env.GOPATH = goEnv("GOPATH")
 }
 
 type Cfg struct {

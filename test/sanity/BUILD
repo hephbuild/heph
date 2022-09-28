@@ -17,3 +17,9 @@ target(
     run='echo "Byebye" && exit 42',
     cache=False,
 )
+
+target(
+    name="echo-hash-input",
+    run='echo $(hash_input)',
+    cache=False,
+)

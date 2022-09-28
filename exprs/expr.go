@@ -33,6 +33,16 @@ func (e Expr) MustPosArg(n int) (string, error) {
 	return e.PosArgs[n], nil
 }
 
+func (e Expr) NamedArg(name string) string {
+	for _, arg := range e.NamedArgs {
+		if arg.Name == name {
+			return arg.Value
+		}
+	}
+
+	return ""
+}
+
 type Func func(expr Expr) (string, error)
 
 const EOF = rune(-1)

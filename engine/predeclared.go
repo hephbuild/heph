@@ -144,6 +144,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"hash_deps?", &sargs.HashDeps,
 		"cache?", &sargs.Cache,
 		"sandbox?", &sargs.SandboxEnabled,
+		"out_in_sandbox?", &sargs.OutInSandbox,
 		"codegen?", &sargs.Codegen,
 		"tools?", &sargs.Tools,
 		"labels?", &sargs.Labels,

@@ -46,7 +46,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 	suffix := fmt.Sprintf("_%.7x", h.Sum(nil))
 
 	if pkg.IsPartOfTree {
-		rel, err := filepath.Rel(Env.Sandbox, pkg.Dir)
+		rel, err := filepath.Rel(Env.Root, pkg.Dir)
 		if err != nil {
 			panic(err)
 		}
@@ -119,6 +119,19 @@ func generate() []RenderUnit {
 	modRoot := filepath.Dir(Env.Package)
 
 	for _, pkg := range pkgs.Array() {
+		if len(pkg.DepsErrors) > 0 {
+			errs := make([]string, 0)
+			for _, err := range pkg.DepsErrors {
+				errs = append(errs, err.String())
+			}
+
+			panic(fmt.Errorf("deps errors:\n%v", strings.Join(errs, "\n")))
+		}
+
+		if pkg.Error != nil {
+			panic(fmt.Errorf("err: %v", pkg.Error.String()))
+		}
+
 		if StdPackages.Includes(pkg.ImportPath) {
 			continue
 		}
@@ -287,6 +300,6 @@ func main() {
 	case "imports":
 		listImports()
 	default:
-		panic("unhandled mode")
+		panic("unhandled mode " + os.Args[1])
 	}
 }

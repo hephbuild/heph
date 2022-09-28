@@ -10,6 +10,10 @@ import (
 )
 
 func isIgnored(path string, ignored []string) bool {
+	if len(ignored) == 0 {
+		return false
+	}
+
 	parts := strings.Split(path, string(filepath.Separator))
 
 	for _, i := range ignored {
