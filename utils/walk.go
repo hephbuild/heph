@@ -83,8 +83,8 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 
 	walkRoot := root
 	if i > 0 {
-		walkRoot = filepath.Join(root, unescapeMeta(pattern[:i]))
-		pattern = pattern[i:]
+		p := unescapeMeta(pattern[:i])
+		walkRoot = filepath.Join(root, p)
 	}
 
 	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
