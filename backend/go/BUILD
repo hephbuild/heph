@@ -82,6 +82,9 @@ def go_install(name, pkg, version, bin_name):
         },
     )
 
+def go_mod_gen_addr(pkg):
+    return heph.canonicalize(pkg+":_go_mod_gen")
+
 def go_mod(mod_pkgs=[], test={}):
     gomodsum = group(
         name="_mod",
@@ -105,7 +108,7 @@ def go_mod(mod_pkgs=[], test={}):
     for pkg in mod_pkgs:
         mod_pkg_srcs.append(pkg+":_src")
 
-    godeps_cfg = {
+    godeps_cfg = json_file(name="godeps_cfg", data={
         'test': test,
         'go': go,
         'godeps': godeps,
@@ -113,7 +116,7 @@ def go_mod(mod_pkgs=[], test={}):
         'std_pkgs_target': std_pkgs,
         'std_pkgs_list_file': backend_dir+"/std_list",
         'backend_pkg': backend_pkg,
-    }
+    })
 
     godeps_deps = [src]+mod_pkg_srcs+mod_pkg_modsums
 
@@ -129,7 +132,7 @@ def go_mod(mod_pkgs=[], test={}):
         name="_go_mod_gen",
         run="godeps mod $SRC_CFG",
         out="/**/BUILD",
-        deps={'deps': godeps_deps, 'cfg': json_file(name="godeps_cfg", data=godeps_cfg)},
+        deps={'deps': godeps_deps, 'cfg': godeps_cfg},
         hash_deps=[imports, gomodsum],
         tools=[go, godeps],
         env={
@@ -144,7 +147,7 @@ def go_mod(mod_pkgs=[], test={}):
         labels=["mod_tidy"],
         run='GOPATH="$SANDBOX/thirdparty/go/gopath" go mod tidy -v',
         tools=[go],
-        deps=[imports, gomodsum],
+        deps=[gomodsum],
         sandbox=False,
         cache=False,
     )
@@ -168,6 +171,7 @@ def go_mod(mod_pkgs=[], test={}):
         sandbox=False,
         cache=False,
     )
+
 def _go_gen_importcfg():
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s")+" 100000"
     std_file = backend_dir+"/std_list"
@@ -332,22 +336,28 @@ def go_build_bin(name, main, libs=[], out=None):
         },
     )
 
-def go_bin_build(pkg):
+def go_bin_build_addr(pkg):
     return heph.canonicalize(pkg+":go_bin#build")
 
 def go_bin(name, pkg=None, *args, **kwargs):
-    out = heph.pkg.name()
     if not pkg:
         pkg = heph.pkg.addr()
 
+    kwargs = {
+        "name": name,
+        "tools": go_bin_build_addr(pkg),
+        "sandbox": False,
+        "cache": False,
+        "pass_args": True,
+        "require_gen": True,
+    } | kwargs
+
+    if "run" not in kwargs and "executor" not in kwargs:
+        kwargs = {
+            "run": "$TOOL_GO_BIN_BUILD",
+            "executor": "exec",
+        } | kwargs
+
     return target(
-        name=name,
-        tools=go_bin_build(pkg),
-        run="$TOOL_GO_BIN_BUILD",
-        executor="exec",
-        sandbox=False,
-        cache=False,
-        pass_args=True,
-        require_gen=True,
         *args, **kwargs,
     )

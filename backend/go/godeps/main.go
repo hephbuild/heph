@@ -20,7 +20,7 @@ func normalizePackage(p string) string {
 }
 
 func thirdpartyDownloadTarget(pkg *Package) Target {
-	module := pkg.Module.Actual()
+	module := pkg.ActualModule()
 
 	return Target{
 		Name:    "_go_mod_download_" + normalizePackage(module.Version),
@@ -39,7 +39,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 
 	h := sha256.New()
 	for _, p := range getImportsPackages(pkgs, imports) {
-		module := p.Module.Actual()
+		module := p.ActualModule()
 		h.Write([]byte(module.Path))
 		h.Write([]byte(module.Version))
 	}
@@ -57,7 +57,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 			Package: pkgName,
 		}
 	} else {
-		module := pkg.Module.Actual()
+		module := pkg.ActualModule()
 
 		importPath := pkg.ImportPath
 		if pkg.Module.Replace != nil {
@@ -99,6 +99,10 @@ func getImportsPackages(pkgs *Packages, imports []string) []*Package {
 
 	for _, p := range imports {
 		pkg := pkgs.Find(p)
+		if pkg == nil {
+			fmt.Println("missing pkg for", p)
+			continue
+		}
 
 		depsPkgs = append(depsPkgs, pkg)
 	}
@@ -135,7 +139,7 @@ func generate() []RenderUnit {
 				}
 
 				for _, p := range imports {
-					t := libTarget(pkgs, pkgs.Find(p), nil)
+					t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
 					lib.Libs = append(lib.Libs, t.Full())
 				}
@@ -157,7 +161,7 @@ func generate() []RenderUnit {
 				_, deps := splitOutPkgs(pkg.Deps)
 
 				for _, p := range deps {
-					t := libTarget(pkgs, pkgs.Find(p), nil)
+					t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
 					bin.Libs = append(bin.Libs, t.Full())
 				}
@@ -203,13 +207,13 @@ func generate() []RenderUnit {
 				}
 
 				for _, p := range imports {
-					t := libTarget(pkgs, pkgs.Find(p), nil)
+					t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
 					test.ImportLibs = append(test.ImportLibs, t.Full())
 				}
 
 				for _, p := range deps {
-					t := libTarget(pkgs, pkgs.Find(p), nil)
+					t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
 					test.DepsLibs = append(test.DepsLibs, t.Full())
 				}
@@ -227,7 +231,7 @@ func generate() []RenderUnit {
 				continue
 			}
 
-			module := pkg.Module.Actual()
+			module := pkg.ActualModule()
 
 			target := thirdpartyDownloadTarget(pkg)
 
@@ -259,7 +263,7 @@ func generate() []RenderUnit {
 			}
 
 			for _, p := range imports {
-				t := libTarget(pkgs, pkgs.Find(p), nil)
+				t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
 				lib.Libs = append(lib.Libs, t.Full())
 			}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gobackend/log"
 	"io"
 	"os"
 	"os/exec"
@@ -19,14 +20,6 @@ type Mod struct {
 	Dir     string
 	Version string
 	Replace *Mod
-}
-
-func (m *Mod) Actual() *Mod {
-	if m.Replace != nil {
-		return m.Replace
-	}
-
-	return m
 }
 
 type Package struct {
@@ -53,6 +46,19 @@ type Package struct {
 	TestDeps       []string `json:"-"`
 }
 
+func (p *Package) ActualModule() *Mod {
+	if p.Module == nil {
+		fmt.Println(p.ImportPath, "does not have a module, try running go mod tidy ?")
+		os.Exit(1)
+	}
+
+	if p.Module.Replace != nil {
+		return p.Module.Replace
+	}
+
+	return p.Module
+}
+
 type Packages struct {
 	m map[string]*Package
 	a []*Package
@@ -74,6 +80,16 @@ func (p *Packages) Add(pkg *Package) {
 	}
 	p.m[pkg.ImportPath] = pkg
 	p.a = append(p.a, pkg)
+}
+
+func (p *Packages) MustFind(importPath string) *Package {
+	pkg := p.Find(importPath)
+	if pkg == nil {
+		fmt.Println("unable to find packfor for module", importPath)
+		os.Exit(1)
+	}
+
+	return pkg
 }
 
 func (p *Packages) Find(importPath string) *Package {
@@ -99,7 +115,7 @@ func InitStd() {
 }
 
 func goListStd() Strings {
-	fmt.Println("go list std")
+	log.Debug("go list std")
 	cmd := exec.Command("go", "list", "std")
 
 	b, err := cmd.Output()
@@ -114,7 +130,7 @@ func goListStd() Strings {
 	s := string(b)
 	s = strings.TrimSpace(s)
 
-	fmt.Println(s)
+	log.Debug(s)
 
 	return strings.Split(s, "\n")
 }
@@ -133,9 +149,11 @@ func goList(pkg string) *Packages {
 
 	pkgs := &Packages{}
 
-	cwd, _ := os.Getwd()
-	fmt.Println("### go list ", pkg, cwd)
-	fmt.Println(string(b))
+	if log.Enabled() {
+		cwd, _ := os.Getwd()
+		log.Debug("### go list ", pkg, cwd)
+		log.Debug(string(b))
+	}
 
 	dec := json.NewDecoder(bytes.NewReader(b))
 	for {
@@ -177,8 +195,8 @@ func goListWithTransitiveTestDeps() *Packages {
 		}
 
 		if !StdPackages.Includes(pkg.ImportPath) {
-			fmt.Println(pkg.Dir)
-			fmt.Printf("Attr IsPartOfTree: %v IsPartOfModule: %v\n", pkg.IsPartOfTree, pkg.IsPartOfModule)
+			log.Debugln(pkg.Dir)
+			log.Debugf("  IsPartOfTree: %v IsPartOfModule: %v\n", pkg.IsPartOfTree, pkg.IsPartOfModule)
 		}
 
 		if pkg.IsPartOfModule {
