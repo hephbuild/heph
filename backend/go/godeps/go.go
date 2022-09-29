@@ -32,6 +32,8 @@ func (e Error) String() string {
 	return fmt.Sprintf("%v %v %v", e.Err, e.Pos, strings.Join(e.ImportStack, " "))
 }
 
+// https://pkg.go.dev/cmd/go#hdr-List_packages_or_modules
+
 type Package struct {
 	Dir            string
 	Root           string
@@ -49,6 +51,10 @@ type Package struct {
 	CFiles         []string
 	CXXFiles       []string
 	SFiles         []string
+
+	EmbedPatterns      []string
+	TestEmbedPatterns  []string
+	XTestEmbedPatterns []string
 
 	// Part of our own module
 	IsPartOfModule bool     `json:"-"`

@@ -1,18 +1,30 @@
 package main
 
 import (
+	"fmt"
 	"io"
+	"strconv"
 	"text/template"
 )
 
 type Lib struct {
-	Target     Target
-	ImportPath string
-	ModRoot    string
-	Libs       []string
-	GoFiles    []string
-	SFiles     []string
-	SrcDep     string
+	Target        Target
+	ImportPath    string
+	ModRoot       string
+	Libs          []string
+	GoFiles       []string
+	SFiles        []string
+	EmbedPatterns []string
+	SrcDep        string
+}
+
+func EmbedPatternsGlobs(ps []string) string {
+	embedGlobs := make([]string, 0, len(ps))
+	for _, p := range ps {
+		embedGlobs = append(embedGlobs, fmt.Sprintf(`glob(%v)`, strconv.Quote(p)))
+	}
+
+	return joinedArrays(embedGlobs)
 }
 
 func (l Lib) Data() map[string]interface{} {
@@ -21,9 +33,10 @@ func (l Lib) Data() map[string]interface{} {
 		"ModRoot":    l.ModRoot,
 		"ImportPath": l.ImportPath,
 		"Target":     l.Target,
-		"Libs":       genArray(l.Libs, 2),
-		"GoFiles":    genArray(l.GoFiles, 2),
-		"SFiles":     genArray(l.SFiles, 2),
+		"Libs":       genStringArray(l.Libs, 2),
+		"GoFiles":    genStringArray(l.GoFiles, 2),
+		"SFiles":     genStringArray(l.SFiles, 2),
+		"EmbedGlobs": EmbedPatternsGlobs(l.EmbedPatterns),
 		"SrcDep":     l.SrcDep,
 	}
 }
@@ -40,6 +53,7 @@ go_library(
 	libs={{.Libs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
+	resources={{.EmbedGlobs}},
 )
 
 # end lib

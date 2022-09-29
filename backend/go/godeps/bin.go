@@ -17,7 +17,7 @@ func (l Bin) Data() map[string]interface{} {
 	return map[string]interface{}{
 		"Config":     Config,
 		"ImportPath": l.ImportPath,
-		"Libs":       genArray(l.Libs, 2),
+		"Libs":       genStringArray(l.Libs, 2),
 		"MainLib":    l.MainLib,
 	}
 }

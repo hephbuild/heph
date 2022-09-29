@@ -144,11 +144,12 @@ func generate() []RenderUnit {
 			var lib *Lib
 			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
 				lib = &Lib{
-					Target:     libTarget(pkgs, pkg, nil),
-					ImportPath: pkg.ImportPath,
-					ModRoot:    modRoot,
-					GoFiles:    pkg.GoFiles,
-					SFiles:     pkg.SFiles,
+					Target:        libTarget(pkgs, pkg, nil),
+					ImportPath:    pkg.ImportPath,
+					ModRoot:       modRoot,
+					GoFiles:       pkg.GoFiles,
+					SFiles:        pkg.SFiles,
+					EmbedPatterns: pkg.EmbedPatterns,
 				}
 
 				for _, p := range imports {
@@ -209,6 +210,10 @@ func generate() []RenderUnit {
 					sFiles = append(sFiles, lib.SFiles...)
 				}
 
+				embed := pkg.EmbedPatterns
+				embed = append(embed, pkg.TestEmbedPatterns...)
+				embed = append(embed, pkg.XTestEmbedPatterns...)
+
 				test := &LibTest{
 					ImportPath:    pkg.ImportPath,
 					TargetPackage: libPkg,
@@ -217,6 +222,7 @@ func generate() []RenderUnit {
 					PreRun:        Config.Test.PreRun,
 					TestFiles:     pkg.TestGoFiles,
 					XTestFiles:    pkg.XTestGoFiles,
+					EmbedPatterns: embed,
 				}
 
 				for _, p := range imports {
@@ -299,6 +305,8 @@ func main() {
 		genBuild()
 	case "imports":
 		listImports()
+	case "embed":
+		genEmbed()
 	default:
 		panic("unhandled mode " + os.Args[1])
 	}

@@ -191,10 +191,13 @@ def _go_gen_importcfg():
         'find "$SANDBOX" -name "importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
     ]
 
-def _go_compile_cmd(name, import_path, abi=None, complete=True):
+def _go_compile_cmd(name, import_path, abi, complete, embed_cfg):
     extra = ""
     if abi:
         extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
+
+    if embed_cfg:
+        extra += ' -embedcfg $SRC_EMBED'
 
     if complete:
         extra += ' -complete'
@@ -219,7 +222,7 @@ def go_mod_download(name, path, version):
         labels=['thirdparty'],
     )
 
-def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], abi=None, dir=None, src_dep=None):
+def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], resources=[], abi=None, dir=None, src_dep=None):
     p = dir+"/" if dir else ""
 
     if dir:
@@ -246,6 +249,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
             abi=abi,
             libs=libs,
             go_files=go_files,
+            resources=resources,
             dir=dir,
         )
         asm = target(
@@ -292,6 +296,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     src_files = go_files
     if dir:
         src_files = [p+dep for dep in src_files]
+        resources = [p+dep for dep in resources]
 
     if src_dep:
         deps = {'src': [src_dep], 'libs': libs}
@@ -299,8 +304,24 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     else:
         deps = {'src': src_files, 'libs': libs}
 
+    if len(resources) > 0:
+        embed_cfg = target(
+            name="_"+name+"#embedcfg",
+            run='godeps embed $SRC_SRC > $OUT',
+            deps={'src': deps["src"], 'res': resources},
+            out=p+name+'.embedcfg',
+            tools=[go, godeps],
+            env=env,
+        )
+    else:
+        embed_cfg = None
+
     deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
-    deps["std"] = std_pkgs
+    deps = deps | {
+        'std': std_pkgs,
+        'res': resources,
+        'embed': embed_cfg,
+    }
 
     out = {'a': p+'lib.a', 'importcfg': p+'importcfg'}
     if abi:
@@ -310,7 +331,7 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     return target(
         name=name,
         deps=deps,
-        run=_go_gen_importcfg()+_go_compile_cmd(name, import_path, abi, complete),
+        run=_go_gen_importcfg()+_go_compile_cmd(name, import_path, abi, complete, embed_cfg),
         out=out,
         out_env='rel_root',
         tools=[go],

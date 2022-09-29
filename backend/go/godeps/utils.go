@@ -5,14 +5,6 @@ import (
 	"strings"
 )
 
-func genArrayNone(es []string, l int) string {
-	if es == nil {
-		return "None"
-	}
-
-	return genArray(es, l)
-}
-
 func genArray(es []string, l int) string {
 	if len(es) == 0 {
 		return "[]"
@@ -31,7 +23,7 @@ func genArray(es []string, l int) string {
 		for i := 0; i < l; i++ {
 			sb.WriteString("    ")
 		}
-		sb.WriteString(strconv.Quote(e))
+		sb.WriteString(e)
 		sb.WriteString(",\n")
 	}
 	for i := 0; i < l-1; i++ {
@@ -39,4 +31,21 @@ func genArray(es []string, l int) string {
 	}
 	sb.WriteString("]")
 	return sb.String()
+}
+
+func genStringArray(es []string, l int) string {
+	qes := make([]string, 0, len(es))
+	for _, e := range es {
+		qes = append(qes, strconv.Quote(e))
+	}
+
+	return genArray(qes, l)
+}
+
+func joinedArrays(es []string) string {
+	if len(es) == 0 {
+		return "[]"
+	}
+
+	return strings.Join(es, "+")
 }

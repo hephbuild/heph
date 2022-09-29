@@ -18,6 +18,8 @@ type LibTest struct {
 	PreRun     string
 	TestFiles  []string
 	XTestFiles []string
+
+	EmbedPatterns []string
 }
 
 func (t LibTest) Data() interface{} {
@@ -32,10 +34,11 @@ func (t LibTest) Data() interface{} {
 	return map[string]interface{}{
 		"Config":               Config,
 		"ImportPath":           t.ImportPath,
-		"ImportLibs":           genArray(t.ImportLibs, 2),
-		"DepsLibs":             genArray(t.DepsLibs, 2),
-		"GoFiles":              genArray(t.GoFiles, 2),
-		"SFiles":               genArray(t.SFiles, 2),
+		"ImportLibs":           genStringArray(t.ImportLibs, 2),
+		"DepsLibs":             genStringArray(t.DepsLibs, 2),
+		"GoFiles":              genStringArray(t.GoFiles, 2),
+		"SFiles":               genStringArray(t.SFiles, 2),
+		"EmbedGlobs":           EmbedPatternsGlobs(t.EmbedPatterns),
 		"PreRun":               t.PreRun,
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
 	}
@@ -56,6 +59,7 @@ test_lib = go_library(
 	libs={{.ImportLibs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
+	resources={{.EmbedGlobs}},
 )
 
 gen_testmain = target(

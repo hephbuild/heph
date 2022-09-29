@@ -72,6 +72,10 @@ type ArrayMap struct {
 }
 
 func (d *ArrayMap) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
 	vs, ok := v.(starlark.String)
 	if ok {
 		*d = ArrayMap{
@@ -97,6 +101,8 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 
 			valv := e.Index(1)
 			switch val := valv.(type) {
+			case starlark.NoneType:
+				continue
 			case starlark.String:
 				arr = append(arr, string(val))
 				strMap[key] = string(val)
@@ -134,6 +140,9 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 	if ok {
 		err := listForeach(vl, func(i int, value starlark.Value) error {
 			switch e := value.(type) {
+			case starlark.NoneType:
+				// ignore
+				return nil
 			case starlark.String:
 				arr = append(arr, string(e))
 				return nil
