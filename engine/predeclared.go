@@ -55,16 +55,23 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	p["to_json"] = starlark.NewBuiltin("to_json", to_json)
 	p["fail"] = starlark.NewBuiltin("fail", fail)
 	p["struct"] = starlark.NewBuiltin("struct", starlarkstruct.Make)
-	p["heph"] = starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
-		"canonicalize": starlark.NewBuiltin("canonicalize", canonicalize),
-		"is_target":    starlark.NewBuiltin("is_target", is_target),
-		"split":        starlark.NewBuiltin("split", split),
-		"pkg": starlarkstruct.FromStringDict(starlarkstruct.Default, starlark.StringDict{
-			"name": starlark.NewBuiltin("name", package_name),
-			"dir":  starlark.NewBuiltin("dir", package_dir),
-			"addr": starlark.NewBuiltin("addr", package_fqn),
-		}),
-	})
+	p["heph"] = &starlarkstruct.Module{
+		Name: "heph",
+		Members: starlark.StringDict{
+			"canonicalize": starlark.NewBuiltin("heph.canonicalize", canonicalize),
+			"is_target":    starlark.NewBuiltin("heph.is_target", is_target),
+			"split":        starlark.NewBuiltin("heph.split", split),
+			"cache":        starlark.NewBuiltin("heph.cache", starlarkstruct.Make),
+			"pkg": &starlarkstruct.Module{
+				Name: "heph.pkg",
+				Members: starlark.StringDict{
+					"name": starlark.NewBuiltin("heph.pkg.name", package_name),
+					"dir":  starlark.NewBuiltin("heph.pkg.dir", package_dir),
+					"addr": starlark.NewBuiltin("heph.pkg.addr", package_fqn),
+				},
+			},
+		},
+	}
 
 	for _, globals := range globals {
 		for name, value := range globals {

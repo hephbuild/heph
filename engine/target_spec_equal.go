@@ -1,6 +1,10 @@
 package engine
 
 func arrEqual[T comparable](a, b []T) bool {
+	if (a == nil || b == nil) && (a != nil || b != nil) {
+		return false
+	}
+
 	if len(a) != len(b) {
 		return false
 	}
@@ -103,11 +107,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.ShouldCache != spec.ShouldCache {
-		return false
-	}
-
-	if !arrEqual(t.Cache, spec.Cache) {
+	if !t.Cache.Equal(spec.Cache) {
 		return false
 	}
 

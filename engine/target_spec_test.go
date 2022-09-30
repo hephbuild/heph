@@ -1,9 +1,17 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.starlark.net/starlark"
 	"heph/exprs"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,9 +84,14 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		})
 	}
 
-	var cache []string
+	var cacheFiles []string
 	for i := 0; i < factor; i++ {
-		cache = append(cache, "aaa")
+		cacheFiles = append(cacheFiles, "aaa")
+	}
+
+	var cacheNames []string
+	for i := 0; i < factor; i++ {
+		cacheNames = append(cacheNames, "aaa")
 	}
 
 	var labels []string
@@ -112,21 +125,24 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		TargetTools:       targetTools,
 		HostTools:         hostTools,
 		Out:               out,
-		ShouldCache:       false,
-		Cache:             cache,
-		Sandbox:           false,
-		Codegen:           "",
-		Labels:            labels,
-		Env:               env,
-		PassEnv:           passEnv,
-		RunInCwd:          false,
-		Gen:               false,
-		Source:            []string{"some_source" + time.Now().String()},
-		RuntimeEnv:        nil,
-		RequireGen:        false,
-		SrcEnv:            "",
-		OutEnv:            "",
-		HashFile:          "",
+		Cache: TargetSpecCache{
+			Enabled: true,
+			Named:   cacheNames,
+			Files:   cacheFiles,
+		},
+		Sandbox:    false,
+		Codegen:    "",
+		Labels:     labels,
+		Env:        env,
+		PassEnv:    passEnv,
+		RunInCwd:   false,
+		Gen:        false,
+		Source:     []string{"some_source" + time.Now().String()},
+		RuntimeEnv: nil,
+		RequireGen: false,
+		SrcEnv:     "",
+		OutEnv:     "",
+		HashFile:   "",
 	}
 }
 
@@ -175,3 +191,71 @@ func BenchmarkTargetSpec_EqualStruct1(b *testing.B)    { benchmarkTargetSpecEqua
 func BenchmarkTargetSpec_EqualStruct10(b *testing.B)   { benchmarkTargetSpecEqualStruct(b, 10) }
 func BenchmarkTargetSpec_EqualStruct100(b *testing.B)  { benchmarkTargetSpecEqualStruct(b, 100) }
 func BenchmarkTargetSpec_EqualStruct1000(b *testing.B) { benchmarkTargetSpecEqualStruct(b, 1000) }
+
+func TestTargetSpec(t *testing.T) {
+	files := make([]string, 0)
+	err := filepath.WalkDir("testdata", func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			return nil
+		}
+
+		files = append(files, path)
+		return nil
+	})
+	require.NoError(t, err)
+
+	// Just sanity check
+	assert.Equal(t, 6, len(files))
+
+	for _, file := range files {
+		t.Log(file)
+
+		t.Run(file, func(t *testing.T) {
+			f, err := os.Open(file)
+			require.NoError(t, err)
+			defer f.Close()
+
+			b, err := io.ReadAll(f)
+			require.NoError(t, err)
+
+			parts := strings.SplitN(string(b), "===\n", 2)
+			build := parts[0]
+			expected := strings.TrimSpace(parts[1])
+
+			var spec TargetSpec
+
+			e := &runBuildEngine{
+				pkg: &Package{
+					Name:     "test",
+					FullName: "some/test",
+					Root: Path{
+						Root:    "/tmp/some/test",
+						RelRoot: "some/test",
+					},
+				},
+				registerTarget: func(rspec TargetSpec) error {
+					spec = rspec
+
+					return nil
+				},
+			}
+
+			thread := &starlark.Thread{}
+			thread.SetLocal("engine", e)
+
+			predeclaredGlobalsOnce(nil)
+
+			_, err = starlark.ExecFile(thread, file, build, predeclared(predeclaredGlobals))
+			require.NoError(t, err)
+
+			spec.Source = nil
+
+			actual, err := json.MarshalIndent(spec, "", "    ")
+			require.NoError(t, err)
+
+			t.Log(string(actual))
+
+			assert.JSONEq(t, expected, string(actual))
+		})
+	}
+}

@@ -825,16 +825,16 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 
 	t.Out.Sort()
 
-	if t.TargetSpec.ShouldCache {
+	if t.TargetSpec.Cache.Enabled {
 		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 
-		if t.TargetSpec.Cache == nil {
+		if t.TargetSpec.Cache.Files == nil {
 			t.CacheFiles = t.Out.All()
 		} else {
 			t.CacheFiles = []PackagePath{}
-			for _, p := range t.TargetSpec.Cache {
+			for _, p := range t.TargetSpec.Cache.Files {
 				t.CacheFiles = append(t.CacheFiles, PackagePath{
 					Package:     t.Package,
 					Path:        p,

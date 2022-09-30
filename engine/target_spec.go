@@ -14,16 +14,19 @@ import (
 
 func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	t := TargetSpec{
-		FQN:          pkg.TargetPath(args.Name),
-		Name:         args.Name,
-		Run:          args.Run.Array,
-		FileContent:  []byte(args.FileContent),
-		Executor:     args.Executor,
-		Package:      pkg,
-		PassArgs:     args.PassArgs,
-		Quiet:        args.Quiet,
-		ShouldCache:  args.Cache.Bool,
-		Cache:        args.Cache.Array,
+		FQN:         pkg.TargetPath(args.Name),
+		Name:        args.Name,
+		Run:         args.Run.Array,
+		FileContent: []byte(args.FileContent),
+		Executor:    args.Executor,
+		Package:     pkg,
+		PassArgs:    args.PassArgs,
+		Quiet:       args.Quiet,
+		Cache: TargetSpecCache{
+			Enabled: args.Cache.Enabled,
+			Named:   args.Cache.Named,
+			Files:   args.Cache.Files,
+		},
 		Sandbox:      args.SandboxEnabled,
 		OutInSandbox: args.OutInSandbox,
 		Codegen:      args.Codegen,
@@ -311,8 +314,7 @@ type TargetSpec struct {
 	TargetTools       []TargetSpecTargetTool
 	HostTools         []TargetSpecHostTool
 	Out               []TargetSpecOutFile
-	ShouldCache       bool
-	Cache             []string
+	Cache             TargetSpecCache
 	Sandbox           bool
 	OutInSandbox      bool
 	Codegen           string
@@ -429,4 +431,40 @@ type TargetSpecOutFile struct {
 	Name    string
 	Package *Package
 	Path    string
+}
+
+type TargetSpecCache struct {
+	Enabled bool
+	Named   []string
+	Files   []string
+}
+
+func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
+	if this.Enabled != that.Enabled {
+		return false
+	}
+
+	if !arrEqual(this.Files, that.Files) {
+		return false
+	}
+
+	if !arrEqual(this.Named, that.Named) {
+		return false
+	}
+
+	return true
+}
+
+func (c TargetSpecCache) NamedEnabled(name string) bool {
+	if c.Named == nil {
+		return true
+	}
+
+	for _, n := range c.Named {
+		if n == name {
+			return true
+		}
+	}
+
+	return false
 }

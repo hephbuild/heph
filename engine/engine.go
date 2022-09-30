@@ -32,7 +32,7 @@ type Engine struct {
 	Config     Config
 	LocalCache *vfsos.Location
 
-	DisableRemoteCache bool
+	DisableNamedCache bool
 
 	SourceFiles   SourceFiles
 	packagesMutex sync.Mutex
@@ -472,7 +472,7 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 					}
 				}
 
-				if !hasParentCacheMiss && target.ShouldCache {
+				if !hasParentCacheMiss && target.Cache.Enabled {
 					w.Status(fmt.Sprintf("Pulling meta %v...", target.FQN))
 
 					e := TargetRunEngine{
@@ -806,7 +806,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 	}
 
 	collector := e.collectNamedOutFromActualFiles
-	if !target.ShouldCache {
+	if !target.Cache.Enabled {
 		collector = e.collectNamedOut
 	}
 

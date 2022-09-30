@@ -418,8 +418,8 @@ var watchCmd = &cobra.Command{
 				} else {
 					log.Info("Completed successfully")
 				}
-				// Allow first run to use remote cache, subsequent ones will skip remote cache
-				Engine.DisableRemoteCache = true
+				// Allow first run to use named cache, subsequent ones will skip them
+				Engine.DisableNamedCache = true
 			case err := <-errCh:
 				return err
 			}

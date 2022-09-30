@@ -49,7 +49,7 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 		}
 	}()
 
-	if target.ShouldCache {
+	if target.Cache.Enabled {
 		ok, dir, err := e.getCache(target, onlyMeta)
 		if err != nil {
 			return false, err
@@ -256,7 +256,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.FullName)
 	if target.RunInCwd {
-		if target.ShouldCache {
+		if target.Cache.Enabled {
 			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
 		}
 
@@ -377,7 +377,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	_, hasPathInEnv := env["PATH"]
 
 	if len(args) > 0 {
-		if target.ShouldCache {
+		if target.Cache.Enabled {
 			return fmt.Errorf("args are not supported with cache")
 		}
 	}
@@ -464,7 +464,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		return fmt.Errorf("popfilesout: %w", err)
 	}
 
-	if target.ShouldCache {
+	if target.Cache.Enabled {
 		e.Status(fmt.Sprintf("Caching %v output...", target.FQN))
 
 		err := e.storeCache(ctx, target)
@@ -472,11 +472,15 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			return fmt.Errorf("cache: store: %w", err)
 		}
 
-		if !e.DisableRemoteCache {
+		if !e.DisableNamedCache {
 			for _, cache := range e.Config.Cache {
 				cache := cache
 
 				if !cache.Write {
+					continue
+				}
+
+				if !target.Cache.NamedEnabled(cache.Name) {
 					continue
 				}
 
