@@ -27,7 +27,6 @@ type TargetArgs struct {
 	Env            ArrayMap
 	PassEnv        ArrayMap
 	RuntimeEnv     ArrayMap
-	RequireGen     bool
 	SrcEnv         string
 	OutEnv         string
 	HashFile       string

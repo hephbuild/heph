@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
@@ -178,14 +179,33 @@ type Target struct {
 	actualcachedFiles PackagePaths
 	LogFile           string
 
-	processed bool
-	linked    bool
-	linking   bool
-	linkingCh chan struct{}
-	m         sync.Mutex
+	processed  bool
+	linked     bool
+	deeplinked bool
+	linking    bool
+	linkingCh  chan struct{}
+	linkingErr error
+	deps       *Targets // keep track of all target deps for linking
+	m          sync.Mutex
 
 	runLock   utils.Locker
 	cacheLock utils.Locker
+}
+
+func (t *Target) resetLinking() {
+	t.deeplinked = false
+
+	spec := t.TargetSpec
+
+	if t.linkingErr != nil || len(spec.Deps.Exprs) > 0 || len(spec.HashDeps.Exprs) > 0 || len(spec.ExprTools) > 0 {
+		depsCap := 0
+		if t.deps != nil {
+			depsCap = len(t.deps.Slice())
+		}
+		t.deps = NewTargets(depsCap)
+		t.linked = false
+		t.linkingErr = nil
+	}
 }
 
 func (t *Target) ID() string {
@@ -213,7 +233,7 @@ func (t *Target) String() string {
 }
 
 func (t *Target) IsGroup() bool {
-	return len(t.Run) == 0 && len(t.Out.All()) == 1 && (t.Out.All()[0].Path == "*" || t.Out.All()[0].Path == "/")
+	return len(t.Run) == 0 && len(t.Out.All()) == 1 && t.Out.All()[0].Path == "/"
 }
 
 func Contains(ts []*Target, fqn string) bool {
@@ -466,7 +486,7 @@ func (e *Engine) Parse() error {
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
 	linkStartTime := time.Now()
-	err = e.linkTargets(false, e.noRequireGenTargets())
+	err = e.linkTargets(true, nil)
 	if err != nil {
 		return err
 	}
@@ -480,12 +500,18 @@ func (e *Engine) Parse() error {
 	return nil
 }
 
-func (e *Engine) Simplify() error {
-	return e.linkTargets(true, nil)
+type targetNotFoundError struct {
+	target string
+}
+
+func (e targetNotFoundError) Error() string {
+	return fmt.Sprintf("target %v not found", e.target)
 }
 
 func TargetNotFoundError(target string) error {
-	return fmt.Errorf("target %v not found", target)
+	return targetNotFoundError{
+		target: target,
+	}
 }
 
 func (e *Engine) createDag() error {
@@ -604,23 +630,9 @@ func (e *Engine) linkedTargets() *Targets {
 	return targets
 }
 
-func (e *Engine) noRequireGenTargets() []*Target {
-	targets := make([]*Target, 0)
-
+func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error {
 	for _, target := range e.Targets.Slice() {
-		if target.RequireGen {
-			continue
-		}
-
-		targets = append(targets, target)
-	}
-
-	return targets
-}
-
-func (e *Engine) linkTargets(simplify bool, targets []*Target) error {
-	for _, target := range e.Targets.Slice() {
-		target.linked = false
+		target.resetLinking()
 	}
 
 	if targets == nil {
@@ -629,9 +641,11 @@ func (e *Engine) linkTargets(simplify bool, targets []*Target) error {
 
 	for i, target := range targets {
 		log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
-		err := e.linkTarget(target, simplify, nil)
+		err := e.linkTarget(target, nil)
 		if err != nil {
-			return fmt.Errorf("%v: %w", target.FQN, err)
+			if !ignoreNotFoundError || (ignoreNotFoundError && errors.Is(err, targetNotFoundError{})) {
+				return fmt.Errorf("%v: %w", target.FQN, err)
+			}
 		}
 	}
 
@@ -652,7 +666,7 @@ func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	return td
 }
 
-func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error {
+func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
 	}
@@ -667,22 +681,49 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 	logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
 	t.m.Lock()
-	if t.linked {
+	if t.deps == nil {
+		t.deps = NewTargets(0)
+	}
+
+	if t.deeplinked {
 		t.m.Unlock()
 		return nil
+	} else if t.linked {
+		t.m.Unlock()
+
+		for _, dep := range t.deps.Slice() {
+			err := e.linkTarget(dep, breadcrumb)
+			if err != nil {
+				t.linkingErr = err
+				t.linked = false
+				return err
+			}
+		}
+
+		t.deeplinked = true
+
+		return nil
+	} else if t.linkingErr != nil {
+		t.m.Unlock()
+		return t.linkingErr
 	} else if t.linking {
 		t.m.Unlock()
 		<-t.linkingCh
-		return nil
+		return t.linkingErr
 	}
 	t.linking = true
 	t.linkingCh = make(chan struct{})
-	defer func() {
-		t.linked = true
-		t.linking = false
-		close(t.linkingCh)
-	}()
 	t.m.Unlock()
+
+	defer func() {
+		t.linkingErr = rerr
+		close(t.linkingCh)
+		t.linking = false
+		if rerr == nil {
+			t.linked = true
+			t.deeplinked = true
+		}
+	}()
 
 	var err error
 
@@ -718,7 +759,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 			return TargetNotFoundError(tool.Target)
 		}
 
-		err = e.linkTarget(tt, simplify, breadcrumb)
+		err = e.linkTarget(tt, breadcrumb)
 		if err != nil {
 			return fmt.Errorf("tool: %v: %w", tool, err)
 		}
@@ -732,7 +773,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 	for _, tool := range t.TargetSpec.ExprTools {
 		expr := tool.Expr
 
-		targets, err := e.targetExpr(t, expr, simplify, breadcrumb)
+		targets, err := e.targetExpr(t, expr, breadcrumb)
 		if err != nil {
 			return err
 		}
@@ -795,7 +836,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 	})
 
 	log.Tracef(logPrefix + "Linking deps")
-	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, simplify, breadcrumb)
+	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, breadcrumb)
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
@@ -805,7 +846,7 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 
 	if t.TargetSpec.DifferentHashDeps {
 		log.Tracef(logPrefix + "Linking hashdeps")
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, simplify, breadcrumb)
+		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
 		if err != nil {
 			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
 		}
@@ -862,10 +903,24 @@ func (e *Engine) linkTarget(t *Target, simplify bool, breadcrumb *Targets) error
 
 	e.registerLabels(t.Labels)
 
+	for _, dep := range t.Deps.All().Targets {
+		t.deps.Add(dep.Target)
+	}
+
+	if t.DifferentHashDeps {
+		for _, dep := range t.HashDeps.Targets {
+			t.deps.Add(dep.Target)
+		}
+	}
+
+	for _, dep := range t.Tools {
+		t.deps.Add(dep.Target)
+	}
+
 	return nil
 }
 
-func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb *Targets) (TargetNamedDeps, error) {
+func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targets) (TargetNamedDeps, error) {
 	m := map[string]TargetSpecDeps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
@@ -887,7 +942,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 
 	td := TargetNamedDeps{}
 	for name, deps := range m {
-		ldeps, err := e.linkTargetDeps(t, deps, simplify, breadcrumb)
+		ldeps, err := e.linkTargetDeps(t, deps, breadcrumb)
 		if err != nil {
 			return TargetNamedDeps{}, err
 		}
@@ -900,7 +955,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, simplify bo
 	return td, nil
 }
 
-func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrumb *Targets) ([]*Target, error) {
+func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]*Target, error) {
 	switch expr.Function {
 	case "collect":
 		targets, err := e.collect(t, expr)
@@ -909,7 +964,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrum
 		}
 
 		for _, target := range targets {
-			err := e.linkTarget(target, simplify, breadcrumb)
+			err := e.linkTarget(target, breadcrumb)
 			if err != nil {
 				return nil, fmt.Errorf("collect: %w", err)
 			}
@@ -923,7 +978,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrum
 		}
 
 		if target != nil {
-			err = e.linkTarget(target, simplify, breadcrumb)
+			err = e.linkTarget(target, breadcrumb)
 			if err != nil {
 				return nil, fmt.Errorf("find_parent: %w", err)
 			}
@@ -937,13 +992,15 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, simplify bool, breadcrum
 	}
 }
 
-func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, breadcrumb *Targets) (TargetDeps, error) {
+var Simplify = true
+
+func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {
 		expr := expr.Expr
 
-		targets, err := e.targetExpr(t, expr, simplify, breadcrumb)
+		targets, err := e.targetExpr(t, expr, breadcrumb)
 		if err != nil {
 			return TargetDeps{}, err
 		}
@@ -959,7 +1016,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 			return TargetDeps{}, TargetNotFoundError(target.Target)
 		}
 
-		err := e.linkTarget(dt, simplify, breadcrumb)
+		err := e.linkTarget(dt, breadcrumb)
 		if err != nil {
 			return TargetDeps{}, err
 		}
@@ -977,7 +1034,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, simplify bool, b
 		})
 	}
 
-	if simplify {
+	if Simplify {
 		targets := make([]TargetWithOutput, 0, len(td.Targets))
 		for _, dep := range td.Targets {
 			if dep.Target.IsGroup() {

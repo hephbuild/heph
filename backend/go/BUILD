@@ -387,7 +387,6 @@ def go_bin(name, pkg=None, *args, **kwargs):
         "sandbox": False,
         "cache": False,
         "pass_args": True,
-        "require_gen": True,
     } | kwargs
 
     if "run" not in kwargs and "executor" not in kwargs:

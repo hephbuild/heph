@@ -159,7 +159,6 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"env?", &sargs.Env,
 		"gen?", &sargs.Gen,
 		"runtime_env?", &sargs.RuntimeEnv,
-		"require_gen?", &sargs.RequireGen,
 		"src_env?", &sargs.SrcEnv,
 		"out_env?", &sargs.OutEnv,
 		"hash_file?", &sargs.HashFile,

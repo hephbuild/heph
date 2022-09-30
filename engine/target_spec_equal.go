@@ -143,10 +143,6 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.RequireGen != spec.RequireGen {
-		return false
-	}
-
 	if t.SrcEnv != spec.SrcEnv {
 		return false
 	}

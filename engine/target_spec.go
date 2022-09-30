@@ -36,7 +36,6 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		RunInCwd:     args.RunInCwd,
 		Gen:          args.Gen,
 		RuntimeEnv:   args.RuntimeEnv.StrMap,
-		RequireGen:   args.RequireGen,
 		SrcEnv:       args.SrcEnv,
 		OutEnv:       args.OutEnv,
 		HashFile:     args.HashFile,
@@ -325,7 +324,6 @@ type TargetSpec struct {
 	Gen               bool
 	Source            []string
 	RuntimeEnv        map[string]string
-	RequireGen        bool
 	SrcEnv            string
 	OutEnv            string
 	HashFile          string

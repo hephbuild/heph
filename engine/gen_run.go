@@ -26,7 +26,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		log.Debugf("No gen targets, skip gen pass")
 
 		linkStartTime := time.Now()
-		err := e.linkTargets(false, nil)
+		err := e.linkTargets(true, nil)
 		if err != nil {
 			return nil, fmt.Errorf("linking %w", err)
 		}
@@ -69,7 +69,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 				p.Globals = nil
 			}
 
-			err := e.Simplify()
+			err := e.linkTargets(false, nil)
 			if err != nil {
 				return err
 			}
