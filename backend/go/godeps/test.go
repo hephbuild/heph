@@ -7,19 +7,17 @@ import (
 )
 
 type LibTest struct {
-	ImportPath    string
-	TargetPackage string
+	TestLib  *Lib
+	XTestLib *Lib
 
 	ImportLibs []string
 	DepsLibs   []string
-	GoFiles    []string
-	SFiles     []string
 
+	ImportPath string
 	PreRun     string
+
 	TestFiles  []string
 	XTestFiles []string
-
-	EmbedPatterns []string
 }
 
 func (t LibTest) Data() interface{} {
@@ -32,15 +30,18 @@ func (t LibTest) Data() interface{} {
 	}
 
 	return map[string]interface{}{
-		"Config":               Config,
-		"ImportPath":           t.ImportPath,
-		"ImportLibs":           genStringArray(t.ImportLibs, 2),
-		"DepsLibs":             genStringArray(t.DepsLibs, 2),
-		"GoFiles":              genStringArray(t.GoFiles, 2),
-		"SFiles":               genStringArray(t.SFiles, 2),
-		"EmbedGlobs":           EmbedPatternsGlobs(t.EmbedPatterns),
+		"Config": Config,
+
+		"ImportPath": t.ImportPath,
+		"ImportLibs": genStringArray(t.ImportLibs, 2),
+		"DepsLibs":   genStringArray(t.DepsLibs, 2),
+
 		"PreRun":               t.PreRun,
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
+
+		"TestLib":  RenderLibCall(t.TestLib),
+		"XTestLib": RenderLibCall(t.XTestLib),
+		"GoFiles":  genStringArray(append(t.TestFiles, t.XTestFiles...), 2),
 	}
 }
 
@@ -53,14 +54,8 @@ generate_testmain = "{{.Config.GenerateTestMain}}"
 load("{{.Config.BackendPkg}}", "go_library")
 load("{{.Config.BackendPkg}}", "go_build_bin")
 
-test_lib = go_library(
-	name="_go_lib_test",
-	import_path="{{.ImportPath}}",
-	libs={{.ImportLibs}},
-	go_files={{.GoFiles}},
-	s_files={{.SFiles}},
-	resources={{.EmbedGlobs}},
-)
+test_lib = {{.TestLib}}
+xtest_lib = {{.XTestLib}}
 
 gen_testmain = target(
     name="_go_gen_testmain",
@@ -80,7 +75,7 @@ gen_testmain = target(
 testmain_lib = go_library(
 	name="_go_testmain_lib",
 	src_dep=gen_testmain,
-	libs={{.ImportLibs}}+[test_lib],
+	libs={{.ImportLibs}}+[test_lib, xtest_lib],
 	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",
 	dir="testmain",
@@ -89,7 +84,7 @@ testmain_lib = go_library(
 test_build = go_build_bin(
     name="go_test#build",
 	main=testmain_lib,
-    libs={{.DepsLibs}}+[test_lib],
+    libs={{.DepsLibs}}+[test_lib, xtest_lib],
 	out="pkg.test",
 )
 
@@ -99,7 +94,10 @@ target(
 		test_build,
 		'$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
 	],
-    run='{{.PreRun}} ./pkg.test -test.v 2>&1 | tee test_out',
+    run=[
+		{{- if .PreRun}}'{{.PreRun}}',{{end}}
+		'./pkg.test -test.v 2>&1 | tee test_out',
+	],
     out=['test_out'],
     labels=["test"],
 )

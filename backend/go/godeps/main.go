@@ -90,8 +90,8 @@ func splitOutPkgs(pkgs []string) (stdPkgs []string, otherPkgs []string) {
 }
 
 type RenderUnit struct {
-	Render  func(w io.Writer)
-	Package string
+	Render func(w io.Writer)
+	Dir    string
 }
 
 func getImportsPackages(pkgs *Packages, imports []string) []*Package {
@@ -108,6 +108,38 @@ func getImportsPackages(pkgs *Packages, imports []string) []*Package {
 	}
 
 	return depsPkgs
+}
+
+func testLibFactory(name string, importLibs []string, importPath string, pkg *Package, lib *Lib, testGoFiles, testEmbedPatterns []string, libPkg string) *Lib {
+	if testGoFiles == nil {
+		return nil
+	}
+
+	goFiles := make([]string, 0)
+	if lib != nil {
+		goFiles = append(goFiles, lib.GoFiles...)
+	}
+	goFiles = append(goFiles, testGoFiles...)
+
+	sFiles := make([]string, 0)
+	if lib != nil {
+		sFiles = append(sFiles, lib.SFiles...)
+	}
+
+	embed := pkg.EmbedPatterns
+	embed = append(embed, testEmbedPatterns...)
+
+	return &Lib{
+		Target: Target{
+			Name:    name,
+			Package: libPkg,
+		},
+		ImportPath:    importPath,
+		GoFiles:       goFiles,
+		SFiles:        sFiles,
+		EmbedPatterns: embed,
+		Libs:          importLibs,
+	}
 }
 
 func generate() []RenderUnit {
@@ -162,7 +194,7 @@ func generate() []RenderUnit {
 					Render: func(w io.Writer) {
 						RenderLib(w, lib)
 					},
-					Package: lib.Target.Package,
+					Dir: lib.Target.Package,
 				})
 			}
 
@@ -184,7 +216,7 @@ func generate() []RenderUnit {
 					Render: func(w io.Writer) {
 						RenderBin(w, bin)
 					},
-					Package: bin.TargetPackage,
+					Dir: bin.TargetPackage,
 				})
 			}
 
@@ -198,37 +230,23 @@ func generate() []RenderUnit {
 				deps := append(pkgTestDeps, pkgDeps...)
 				imports := append(pkgTestImports, pkgImports...)
 
-				goFiles := make([]string, 0)
-				if lib != nil {
-					goFiles = append(goFiles, lib.GoFiles...)
-				}
-				goFiles = append(goFiles, pkg.TestGoFiles...)
-				goFiles = append(goFiles, pkg.XTestGoFiles...)
-
-				sFiles := make([]string, 0)
-				if lib != nil {
-					sFiles = append(sFiles, lib.SFiles...)
-				}
-
-				embed := pkg.EmbedPatterns
-				embed = append(embed, pkg.TestEmbedPatterns...)
-				embed = append(embed, pkg.XTestEmbedPatterns...)
-
-				test := &LibTest{
-					ImportPath:    pkg.ImportPath,
-					TargetPackage: libPkg,
-					GoFiles:       goFiles,
-					SFiles:        sFiles,
-					PreRun:        Config.Test.PreRun,
-					TestFiles:     pkg.TestGoFiles,
-					XTestFiles:    pkg.XTestGoFiles,
-					EmbedPatterns: embed,
-				}
-
+				importLibs := make([]string, 0)
 				for _, p := range imports {
 					t := libTarget(pkgs, pkgs.MustFind(p), nil)
 
-					test.ImportLibs = append(test.ImportLibs, t.Full())
+					importLibs = append(importLibs, t.Full())
+				}
+
+				testlib := testLibFactory("_go_test_lib", importLibs, pkg.ImportPath, pkg, lib, pkg.TestGoFiles, pkg.TestEmbedPatterns, libPkg)
+				xtestlib := testLibFactory("_go_xtest_lib", importLibs, pkg.ImportPath+"_test", pkg, lib, pkg.XTestGoFiles, pkg.XTestEmbedPatterns, libPkg)
+
+				test := &LibTest{
+					TestLib:    testlib,
+					XTestLib:   xtestlib,
+					ImportPath: pkg.ImportPath,
+					PreRun:     Config.Test.PreRun,
+					TestFiles:  pkg.TestGoFiles,
+					XTestFiles: pkg.XTestGoFiles,
 				}
 
 				for _, p := range deps {
@@ -241,7 +259,7 @@ func generate() []RenderUnit {
 					Render: func(w io.Writer) {
 						RenderTest(w, test)
 					},
-					Package: test.TargetPackage,
+					Dir: libPkg,
 				})
 			}
 		} else {
@@ -266,7 +284,7 @@ func generate() []RenderUnit {
 					Render: func(w io.Writer) {
 						RenderModDl(w, moddl)
 					},
-					Package: moddl.Target.Package,
+					Dir: moddl.Target.Package,
 				})
 
 				modsm[target.Full()] = moddl
@@ -291,7 +309,7 @@ func generate() []RenderUnit {
 				Render: func(w io.Writer) {
 					RenderLib(w, lib)
 				},
-				Package: lib.Target.Package,
+				Dir: lib.Target.Package,
 			})
 		}
 	}

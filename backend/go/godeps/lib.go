@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"text/template"
 )
 
@@ -41,24 +43,29 @@ func (l Lib) Data() map[string]interface{} {
 	}
 }
 
-var libTplStr = `
-# lib {{.ImportPath}}
-
-load("{{.Config.BackendPkg}}", "go_library")
-
+var libCallTplStr = `
 go_library(
 	name="{{.Target.Name}}",
-	import_path="{{.ImportPath}}",
-{{if .SrcDep}}	src_dep="{{.SrcDep}}",{{end}}
+	import_path="{{.ImportPath}}",{{if .SrcDep}}
+	src_dep="{{.SrcDep}}",{{end}}
 	libs={{.Libs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
 	resources={{.EmbedGlobs}},
 )
+`
+
+var libTplStr = `
+# lib {{.ImportPath}}
+
+load("{{.Config.BackendPkg}}", "go_library")
+
+{{.Lib}}
 
 # end lib
 `
 
+var libCallTpl *template.Template
 var libTpl *template.Template
 
 func init() {
@@ -67,11 +74,33 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
-}
-
-func RenderLib(w io.Writer, l *Lib) {
-	err := libTpl.Execute(w, l.Data())
+	libCallTpl, err = template.New("lib").Parse(libCallTplStr)
 	if err != nil {
 		panic(err)
 	}
+}
+
+func RenderLib(w io.Writer, l *Lib) {
+	data := l.Data()
+
+	data["Lib"] = RenderLibCall(l)
+
+	err := libTpl.Execute(w, data)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func RenderLibCall(l *Lib) string {
+	if l == nil {
+		return "None"
+	}
+
+	var buf bytes.Buffer
+	err := libCallTpl.Execute(&buf, l.Data())
+	if err != nil {
+		panic(err)
+	}
+
+	return strings.TrimSpace(buf.String())
 }

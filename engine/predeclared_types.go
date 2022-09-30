@@ -109,9 +109,13 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				arrMap[key] = append(arrMap[key], string(val))
 			case *starlark.List:
 				err := listForeach(val, func(i int, value starlark.Value) error {
+					if _, ok := value.(starlark.NoneType); ok {
+						return nil
+					}
+
 					val, ok := value.(starlark.String)
 					if !ok {
-						return fmt.Errorf("value must be string, got %v", keyv.Type())
+						return fmt.Errorf("value must be string, got %v", value.Type())
 					}
 
 					arr = append(arr, string(val))
@@ -168,9 +172,13 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				}
 
 				err := listForeach(e, func(i int, value starlark.Value) error {
+					if _, ok := value.(starlark.NoneType); ok {
+						return nil
+					}
+
 					dep, ok := value.(starlark.String)
 					if !ok {
-						return fmt.Errorf("dep must be string, got %v", dep.Type())
+						return fmt.Errorf("dep must be string, got %v", value.Type())
 					}
 
 					arr = append(arr, string(dep))

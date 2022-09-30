@@ -9,19 +9,19 @@ func genBuild() {
 	ParseConfig(os.Args[2])
 	InitStd()
 
-	unitsPerPackage := map[string][]RenderUnit{}
+	unitsPerDir := map[string][]RenderUnit{}
 
 	for _, unit := range generate() {
-		unitsPerPackage[unit.Package] = append(unitsPerPackage[unit.Package], unit)
+		unitsPerDir[unit.Dir] = append(unitsPerDir[unit.Dir], unit)
 	}
 
-	for pkg, units := range unitsPerPackage {
-		err := os.MkdirAll(filepath.Join(Env.Sandbox, pkg), os.ModePerm)
+	for dir, units := range unitsPerDir {
+		err := os.MkdirAll(filepath.Join(Env.Sandbox, dir), os.ModePerm)
 		if err != nil {
 			panic(err)
 		}
 
-		f, err := os.Create(filepath.Join(Env.Sandbox, pkg, "BUILD"))
+		f, err := os.Create(filepath.Join(Env.Sandbox, dir, "BUILD"))
 		if err != nil {
 			panic(err)
 		}
