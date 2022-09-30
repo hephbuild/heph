@@ -205,7 +205,7 @@ func TestTargetSpec(t *testing.T) {
 	require.NoError(t, err)
 
 	// Just sanity check
-	assert.Equal(t, 6, len(files))
+	assert.Equal(t, 7, len(files))
 
 	for _, file := range files {
 		t.Log(file)
