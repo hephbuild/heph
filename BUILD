@@ -36,36 +36,44 @@ target(
     cache=False,
 )
 
-builds = []
-
-version = target(
-    name="version",
-    run="echo ${GITHUB_SHA::7} > version && cat version",
-    out="version",
-    pass_env=["GITHUB_SHA"],
-    cache=False,
-)
-
 extra_src = [
     "cmd/root_usage_template.gotpl",
     "engine/predeclared.gotpl",
-    version,
 ]
+deps = ["go.mod", "go.sum"] + glob("**/*.go") + extra_src
 
+release = "release" in CONFIG["profiles"]
+
+build_flags=""
+if release:
+    version = target(
+        name="version",
+        run="mkdir utils && echo ${GITHUB_SHA::7} > $OUT && cat $OUT",
+        out="utils/version",
+        pass_env=["GITHUB_SHA"],
+        cache=False,
+    )
+    deps.append(version)
+
+    build_flags = "-tags release"
+
+builds = []
 for os in ["linux", "darwin"]:
     for arch in ["amd64", "arm64"]:
-        name = "heph_{}_{}".format(os, arch)
+        out = "heph_{}_{}".format(os, arch)
         t = target(
             name="build_{}_{}".format(os, arch),
             run=[
-                "mv version utils/version",
-                "pwd && go version && CGO_ENABLED=0 go build -tags release -ldflags='-s -w' -o {} .".format(name)
+                "go version",
+                "pwd",
+                "go build {} -ldflags='-s -w' -o $OUT .".format(build_flags)
             ],
-            out=name,
-            deps=["go.mod", "go.sum"] + glob("**/*.go") + extra_src,
+            out=out,
+            deps=deps,
             env={
                 "GOOS": os,
                 "GOARCH": arch,
+                "CGO_ENABLED": "0",
             },
             tools=["go"],
             labels=["build"],

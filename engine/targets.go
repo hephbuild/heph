@@ -997,7 +997,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]
 	}
 }
 
-var Simplify = true
+const InlineGroups = true
 
 func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targets) (TargetDeps, error) {
 	td := TargetDeps{}
@@ -1039,7 +1039,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targ
 		})
 	}
 
-	if Simplify {
+	if InlineGroups {
 		targets := make([]TargetWithOutput, 0, len(td.Targets))
 		for _, dep := range td.Targets {
 			if dep.Target.IsGroup() {

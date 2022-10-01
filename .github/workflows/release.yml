@@ -45,6 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
+      HEPH_PROFILES: "release"
     outputs:
       version: ${{ steps.upload.outputs.version }}
     steps:
