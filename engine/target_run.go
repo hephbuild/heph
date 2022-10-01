@@ -385,7 +385,9 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	if len(target.Run) > 0 {
 		e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-		if target.IsTextFile() {
+		if target.IsGroup() {
+			// Ignore
+		} else if target.IsTextFile() {
 			err := os.MkdirAll(dir, os.ModePerm)
 			if err != nil {
 				return err

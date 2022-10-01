@@ -329,6 +329,10 @@ type TargetSpec struct {
 	HashFile          string
 }
 
+func (t TargetSpec) IsGroup() bool {
+	return len(t.Run) == 1 && t.Run[0] == "group"
+}
+
 func (t TargetSpec) IsTextFile() bool {
 	return len(t.Run) == 1 && t.Run[0] == "text_file"
 }

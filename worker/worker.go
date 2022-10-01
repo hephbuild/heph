@@ -5,6 +5,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 )
@@ -82,7 +83,7 @@ type Worker struct {
 }
 
 func (w *Worker) GetStatus() string {
-	return w.status
+	return strings.Clone(w.status)
 }
 
 func (w *Worker) Status(status string) {

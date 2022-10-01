@@ -60,7 +60,8 @@ func indexMeta(s string) int {
 func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 	i := indexMeta(pattern)
 
-	patternAlwaysMatch := false
+	alwaysMatch := false
+	walkRoot := root
 
 	if i == -1 {
 		// Pattern is actually a path
@@ -82,11 +83,9 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		}
 
 		// All files recursively in the dir would match
-		patternAlwaysMatch = true
-	}
-
-	walkRoot := root
-	if i > 0 {
+		alwaysMatch = true
+		walkRoot = filepath.Join(root, pattern)
+	} else if i > 0 {
 		p := unescapeMeta(pattern[:i])
 		walkRoot = filepath.Join(root, p)
 	}
@@ -109,15 +108,22 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			}
 		}
 
+		if d.IsDir() {
+			// Only match files
+			return nil
+		}
+
 		var match bool
-		if !patternAlwaysMatch {
+		if alwaysMatch {
+			match = true
+		} else {
 			match, err = doublestar.PathMatch(pattern, rel)
 			if err != nil {
 				return err
 			}
 		}
 
-		if patternAlwaysMatch || match {
+		if match {
 			err := fn(rel, d, err)
 			if err != nil {
 				return err

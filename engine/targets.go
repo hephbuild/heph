@@ -40,6 +40,7 @@ type TargetNamedPackagePath struct {
 	names []string
 	named map[string]PackagePaths
 	all   PackagePaths
+	allm  map[string]struct{}
 }
 
 func (tp *TargetNamedPackagePath) Named() map[string]PackagePaths {
@@ -67,9 +68,17 @@ func (tp *TargetNamedPackagePath) Add(name string, p PackagePath) {
 		tp.names = append(tp.names, name)
 		tp.named[name] = make(PackagePaths, 0)
 	}
-
 	tp.named[name] = append(tp.named[name], p)
-	tp.all = append(tp.all, p)
+
+	if tp.allm == nil {
+		tp.allm = map[string]struct{}{}
+	}
+
+	prr := p.RelRoot()
+	if _, ok := tp.allm[prr]; !ok {
+		tp.all = append(tp.all, p)
+		tp.allm[prr] = struct{}{}
+	}
 }
 
 func (tp *TargetNamedPackagePath) Sort() {
@@ -230,10 +239,6 @@ func (t *Target) NamedActualFilesOut() *TargetNamedPackagePath {
 
 func (t *Target) String() string {
 	return t.FQN
-}
-
-func (t *Target) IsGroup() bool {
-	return len(t.Run) == 0 && len(t.Out.All()) == 1 && t.Out.All()[0].Path == "/"
 }
 
 func Contains(ts []*Target, fqn string) bool {

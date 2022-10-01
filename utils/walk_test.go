@@ -26,6 +26,15 @@ func assertWalk1(t *testing.T, pattern string) {
 	assertWalk(t, pattern, []string{"testdata/some_files/a.txt", "testdata/some_files/b.txt"})
 }
 
+func assertWalkAll(t *testing.T, pattern string) {
+	assertWalk(t, pattern, []string{
+		"testdata/more_files/c.txt",
+		"testdata/more_files/d.txt",
+		"testdata/some_files/a.txt",
+		"testdata/some_files/b.txt",
+	})
+}
+
 func TestStarWalk_1Star(t *testing.T) {
 	t.Parallel()
 
@@ -41,18 +50,17 @@ func TestStarWalk_1StarStar(t *testing.T) {
 func TestStarWalk_2Star(t *testing.T) {
 	t.Parallel()
 
-	assertWalk(t, "testdata/*", []string{"testdata/more_files", "testdata/some_files"})
+	assertWalk(t, "testdata/*", []string{})
 }
 
 func TestStarWalk_2StarStar(t *testing.T) {
 	t.Parallel()
 
-	assertWalk(t, "testdata/**/*", []string{
-		"testdata/more_files",
-		"testdata/more_files/c.txt",
-		"testdata/more_files/d.txt",
-		"testdata/some_files",
-		"testdata/some_files/a.txt",
-		"testdata/some_files/b.txt",
-	})
+	assertWalkAll(t, "testdata/**/*")
+}
+
+func TestStarWalk_Dir(t *testing.T) {
+	t.Parallel()
+
+	assertWalkAll(t, "testdata")
 }

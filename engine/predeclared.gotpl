@@ -16,7 +16,8 @@ def group(*args, **kwargs):
     _fail_if_present(kwargs, "run")
 
     return target(
-        out='/',
+        run='group',
+        out='/**/*',
         sandbox=True,
         cache=True,
         *args, **kwargs

@@ -720,67 +720,28 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 			pkg = e.createPkg("")
 		}
 
-		if strings.Contains(path, "*") {
-			pattern := path
-			if !abs {
-				pattern = filepath.Join(pkg.FullName, path)
-			}
-
-			err := utils.StarWalkAbs(target.OutRoot.Abs(), pattern, nil, func(path string, d fs.DirEntry, err error) error {
-				relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
-				if err != nil {
-					return err
-				}
-
-				out = append(out, PackagePath{
-					Package:     pkg,
-					Path:        relPkg,
-					Root:        target.OutRoot.Abs(),
-					PackagePath: file.PackagePath,
-				})
-
-				return nil
-			})
-			if err != nil {
-				return nil, fmt.Errorf("collect output %v: %w", file.Path, err)
-			}
-
-			continue
+		pattern := path
+		if !abs {
+			pattern = filepath.Join(pkg.FullName, path)
 		}
 
-		f, err := os.Stat(file.Abs())
+		err := utils.StarWalkAbs(target.OutRoot.Abs(), pattern, nil, func(path string, d fs.DirEntry, err error) error {
+			relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
+			if err != nil {
+				return err
+			}
+
+			out = append(out, PackagePath{
+				Package:     pkg,
+				Path:        relPkg,
+				Root:        target.OutRoot.Abs(),
+				PackagePath: file.PackagePath,
+			})
+
+			return nil
+		})
 		if err != nil {
-			return nil, err
-		}
-
-		if f.IsDir() {
-			err := filepath.WalkDir(file.Abs(), func(path string, d fs.DirEntry, err error) error {
-				if d.IsDir() {
-					return nil
-				}
-
-				relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
-				if err != nil {
-					return err
-				}
-
-				out = append(out, PackagePath{
-					Package:     pkg,
-					Path:        relPkg,
-					Root:        target.OutRoot.Abs(),
-					PackagePath: file.PackagePath,
-				})
-
-				return nil
-			})
-			if err != nil {
-				return nil, fmt.Errorf("collect output: %v %w", file.Path, err)
-			}
-		} else {
-			if !utils.PathExists(file.Abs()) {
-				return nil, fmt.Errorf("%v: %w", file.Abs(), fs.ErrNotExist)
-			}
-			out = append(out, file)
+			return nil, fmt.Errorf("collect output %v: %w", file.Path, err)
 		}
 	}
 
