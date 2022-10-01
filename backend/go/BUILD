@@ -85,7 +85,7 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg+":_go_mod_gen")
 
-def go_mod(mod_pkgs=[], test={}):
+def go_mod(mod_pkgs=[], test={}, sandbox=True):
     gomodsum = group(
         name="_mod",
         deps=glob("go.mod")+glob("go.sum"),
@@ -128,6 +128,13 @@ def go_mod(mod_pkgs=[], test={}):
         tools=[go, godeps],
     )
 
+    mod_gen_kwargs={}
+    if not sandbox:
+        mod_gen_kwargs={
+            "sandbox": False,
+            "out_in_sandbox": True
+        }
+
     target(
         name="_go_mod_gen",
         run="godeps mod $SRC_CFG",
@@ -140,8 +147,7 @@ def go_mod(mod_pkgs=[], test={}):
             "GOARCH": get_arch(),
         },
         gen=True,
-        sandbox=False,
-        out_in_sandbox=True,
+        **mod_gen_kwargs,
     )
 
     target(
