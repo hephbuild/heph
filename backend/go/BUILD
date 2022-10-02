@@ -140,7 +140,7 @@ def go_mod(mod_pkgs=[], test={}, sandbox=True):
         run="godeps mod $SRC_CFG",
         out="/**/BUILD",
         deps={'deps': godeps_deps, 'cfg': godeps_cfg},
-        hash_deps=[imports, gomodsum],
+        hash_deps=[imports, gomodsum, godeps_cfg],
         tools=[go, godeps],
         env={
             "GOOS": get_os(),
@@ -155,7 +155,7 @@ def go_mod(mod_pkgs=[], test={}, sandbox=True):
         labels=["mod_tidy"],
         run='GOPATH="$SANDBOX/thirdparty/go/gopath" go mod tidy -v',
         tools=[go],
-        deps=[gomodsum],
+        deps=[src],
         sandbox=False,
         cache=False,
     )

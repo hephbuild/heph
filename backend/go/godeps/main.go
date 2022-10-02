@@ -110,24 +110,10 @@ func getImportsPackages(pkgs *Packages, imports []string) []*Package {
 	return depsPkgs
 }
 
-func testLibFactory(name string, importLibs []string, importPath string, pkg *Package, lib *Lib, testGoFiles, testEmbedPatterns []string, libPkg string) *Lib {
-	if testGoFiles == nil {
+func testLibFactory(name string, importLibs []string, importPath string, enabled bool, goFiles, sFiles, embedPatterns []string, libPkg string) *Lib {
+	if !enabled {
 		return nil
 	}
-
-	goFiles := make([]string, 0)
-	if lib != nil {
-		goFiles = append(goFiles, lib.GoFiles...)
-	}
-	goFiles = append(goFiles, testGoFiles...)
-
-	sFiles := make([]string, 0)
-	if lib != nil {
-		sFiles = append(sFiles, lib.SFiles...)
-	}
-
-	embed := pkg.EmbedPatterns
-	embed = append(embed, testEmbedPatterns...)
 
 	return &Lib{
 		Target: Target{
@@ -137,7 +123,7 @@ func testLibFactory(name string, importLibs []string, importPath string, pkg *Pa
 		ImportPath:    importPath,
 		GoFiles:       goFiles,
 		SFiles:        sFiles,
-		EmbedPatterns: embed,
+		EmbedPatterns: embedPatterns,
 		Libs:          importLibs,
 	}
 }
@@ -237,8 +223,26 @@ func generate() []RenderUnit {
 					importLibs = append(importLibs, t.Full())
 				}
 
-				testlib := testLibFactory("_go_test_lib", importLibs, pkg.ImportPath, pkg, lib, pkg.TestGoFiles, pkg.TestEmbedPatterns, libPkg)
-				xtestlib := testLibFactory("_go_xtest_lib", importLibs, pkg.ImportPath+"_test", pkg, lib, pkg.XTestGoFiles, pkg.XTestEmbedPatterns, libPkg)
+				depsLibs := make([]string, 0)
+				for _, p := range deps {
+					t := libTarget(pkgs, pkgs.MustFind(p), nil)
+
+					depsLibs = append(depsLibs, t.Full())
+				}
+
+				testlib := testLibFactory("_go_test_lib", importLibs, pkg.ImportPath, len(pkg.TestGoFiles) > 0, append(pkg.GoFiles, pkg.TestGoFiles...), pkg.SFiles, append(pkg.EmbedPatterns, pkg.TestEmbedPatterns...), libPkg)
+				xtestImportLibs := importLibs
+				if testlib != nil {
+					xtestImportLibs = append(xtestImportLibs, testlib.Target.Full())
+					depsLibs = append(depsLibs, testlib.Target.Full())
+				} else if lib != nil {
+					xtestImportLibs = append(xtestImportLibs, lib.Target.Full())
+					depsLibs = append(depsLibs, lib.Target.Full())
+				}
+				xtestlib := testLibFactory("_go_xtest_lib", xtestImportLibs, pkg.ImportPath+"_test", len(pkg.XTestGoFiles) > 0, pkg.XTestGoFiles, nil, pkg.XTestEmbedPatterns, libPkg)
+				if xtestlib != nil {
+					depsLibs = append(depsLibs, xtestlib.Target.Full())
+				}
 
 				test := &LibTest{
 					TestLib:    testlib,
@@ -247,12 +251,7 @@ func generate() []RenderUnit {
 					PreRun:     Config.Test.PreRun,
 					TestFiles:  pkg.TestGoFiles,
 					XTestFiles: pkg.XTestGoFiles,
-				}
-
-				for _, p := range deps {
-					t := libTarget(pkgs, pkgs.MustFind(p), nil)
-
-					test.DepsLibs = append(test.DepsLibs, t.Full())
+					DepsLibs:   depsLibs,
 				}
 
 				units = append(units, RenderUnit{

@@ -44,14 +44,45 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 		start := time.Now()
 		printProgress := func() {
 			all, success := deps.TransitiveCount()
-			log.Infof("Progress %v: %v/%v %v", name, success, all, time.Since(start).String())
+			log.Infof("Progress %v: %v/%v %v", name, success, all, utils.RoundTime(time.Since(start), 1).String())
+		}
+
+		printWorkersStatus := func() {
+			for _, w := range pool.Workers {
+				j := w.CurrentJob
+				if j == nil {
+					continue
+				}
+
+				duration := time.Since(j.TimeStart)
+
+				if duration < 5*time.Second {
+					// Skip printing short jobs
+					continue
+				}
+
+				status := w.GetStatus()
+				if status == "" {
+					status = "Waiting..."
+				}
+
+				runtime := fmt.Sprintf("%v", utils.RoundTime(duration, 1).String())
+
+				fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
+			}
 		}
 
 		t := time.NewTicker(time.Second)
+		c := 1
 		for {
 			select {
 			case <-t.C:
 				printProgress()
+				if c >= 5 {
+					c = 1
+					printWorkersStatus()
+				}
+				c++
 				continue
 			case <-deps.Done():
 				// will break

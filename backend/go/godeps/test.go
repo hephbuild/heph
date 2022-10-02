@@ -10,8 +10,7 @@ type LibTest struct {
 	TestLib  *Lib
 	XTestLib *Lib
 
-	ImportLibs []string
-	DepsLibs   []string
+	DepsLibs []string
 
 	ImportPath string
 	PreRun     string
@@ -33,7 +32,6 @@ func (t LibTest) Data() interface{} {
 		"Config": Config,
 
 		"ImportPath": t.ImportPath,
-		"ImportLibs": genStringArray(t.ImportLibs, 2),
 		"DepsLibs":   genStringArray(t.DepsLibs, 2),
 
 		"PreRun":               t.PreRun,
@@ -75,7 +73,7 @@ gen_testmain = target(
 testmain_lib = go_library(
 	name="_go_testmain_lib",
 	src_dep=gen_testmain,
-	libs={{.ImportLibs}}+[test_lib, xtest_lib],
+	libs=[test_lib, xtest_lib],
 	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",
 	dir="testmain",
@@ -84,19 +82,19 @@ testmain_lib = go_library(
 test_build = go_build_bin(
     name="go_test#build",
 	main=testmain_lib,
-    libs={{.DepsLibs}}+[test_lib, xtest_lib],
+    libs={{.DepsLibs}},
 	out="pkg.test",
 )
 
 target(
     name="go_test",
-    deps=[
-		test_build,
-		'$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
-	],
+    deps={
+		'bin': test_build,
+		'src': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
+	},
     run=[
 		{{- if .PreRun}}'{{.PreRun}}',{{end}}
-		'./pkg.test -test.v 2>&1 | tee test_out',
+		'./$SRC_BIN -test.v 2>&1 | tee test_out',
 	],
     out=['test_out'],
     labels=["test"],

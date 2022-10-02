@@ -1,4 +1,4 @@
-package main
+package xtest
 
 import (
 	"github.com/stretchr/testify/assert"
@@ -6,7 +6,7 @@ import (
 )
 
 func TestSanity(t *testing.T) {
-	t.Log("Hello world")
+	Hello()
 
 	// :)
 	assert.Equal(t, 1, 1)
