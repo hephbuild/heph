@@ -51,6 +51,16 @@ func (tp *TargetNamedPackagePath) All() PackagePaths {
 	return tp.all
 }
 
+func (tp *TargetNamedPackagePath) HasName(name string) bool {
+	for _, n := range tp.names {
+		if n == name {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (tp *TargetNamedPackagePath) Name(name string) PackagePaths {
 	if tp.named == nil {
 		return nil
@@ -199,6 +209,42 @@ type Target struct {
 
 	runLock   utils.Locker
 	cacheLock utils.Locker
+}
+
+var ErrStopWalk = errors.New("stop walk")
+
+func (t *Target) transitivelyWalk(m map[string]struct{}, f func(t *Target) error) error {
+	targets := append([]*Target{t}, t.deps.Slice()...)
+
+	for _, t := range targets {
+		if _, ok := m[t.FQN]; ok {
+			continue
+		}
+		m[t.FQN] = struct{}{}
+
+		err := f(t)
+		if err != nil {
+			return err
+		}
+
+		err = t.transitivelyWalk(m, f)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (t *Target) TransitivelyWalk(f func(t *Target) error) error {
+	m := map[string]struct{}{}
+
+	err := t.transitivelyWalk(m, f)
+	if err != nil && !errors.Is(err, ErrStopWalk) {
+		return err
+	}
+
+	return nil
 }
 
 func (t *Target) resetLinking() {

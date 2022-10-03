@@ -20,6 +20,7 @@ var include []string
 var exclude []string
 var spec bool
 var transitive bool
+var output string
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -36,6 +37,8 @@ func init() {
 
 	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
+
+	outCmd.Flags().StringVar(&output, "output", "", "Output name")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 
@@ -559,7 +562,15 @@ var outCmd = &cobra.Command{
 			return err
 		}
 
-		for _, path := range target.ActualFilesOut() {
+		paths := target.ActualFilesOut()
+		if output != "" {
+			if !target.NamedActualFilesOut().HasName(output) {
+				return fmt.Errorf("output %v does not exist", output)
+			}
+			paths = target.NamedActualFilesOut().Name(output)
+		}
+
+		for _, path := range paths {
 			fmt.Println(path.Abs())
 		}
 
