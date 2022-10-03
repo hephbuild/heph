@@ -54,6 +54,7 @@ type Engine struct {
 	cacheHashOutput            map[string]string // TODO: LRU
 	ranGenPass                 bool
 	codegenPaths               map[string]*Target
+	fetchRootCache             map[string]Path
 	Pool                       *worker.Pool
 }
 
@@ -101,6 +102,7 @@ func New(rootPath string) *Engine {
 		cacheHashInput:  map[string]string{},
 		cacheHashOutput: map[string]string{},
 		codegenPaths:    map[string]*Target{},
+		fetchRootCache:  map[string]Path{},
 	}
 }
 

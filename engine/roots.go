@@ -153,6 +153,17 @@ func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Packa
 }
 
 func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
+	if p, ok := e.fetchRootCache[name]; ok {
+		return p, nil
+	}
+
+	lock := utils.NewFlock(filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
+	err := lock.Lock()
+	if err != nil {
+		return Path{}, fmt.Errorf("Failed to lock %v", err)
+	}
+	defer lock.Unlock()
+
 	log.Tracef("fetchRoot %v", name)
 
 	root := e.rootRoot(name)
@@ -173,17 +184,11 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 	}
 
 	if fileCfg.URI == cfg.URI {
+		e.fetchRootCache[name] = srcRoot
 		return srcRoot, nil
 	}
 
 	log.Infof("Fetch root %v from %v", name, cfg.URI)
-
-	lock := utils.NewFlock(filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
-	err = lock.Lock()
-	if err != nil {
-		return Path{}, fmt.Errorf("Failed to lock %v", err)
-	}
-	defer lock.Unlock()
 
 	err = os.RemoveAll(root.Abs())
 	if err != nil {
@@ -229,6 +234,8 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 	if err != nil {
 		return Path{}, err
 	}
+
+	e.fetchRootCache[name] = backendRoot
 
 	return backendRoot, nil
 }
