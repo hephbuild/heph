@@ -61,6 +61,7 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 			"canonicalize": starlark.NewBuiltin("heph.canonicalize", canonicalize),
 			"is_target":    starlark.NewBuiltin("heph.is_target", is_target),
 			"split":        starlark.NewBuiltin("heph.split", split),
+			"param":        starlark.NewBuiltin("heph.param", param),
 			"cache":        starlark.NewBuiltin("heph.cache", starlarkstruct.Make),
 			"pkg": &starlarkstruct.Module{
 				Name: "heph.pkg",
@@ -337,4 +338,21 @@ func split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 		starlark.String(tp.Name),
 		starlark.String(tp.Output),
 	}, nil
+}
+
+func param(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		name string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"name", &name,
+	); err != nil {
+		return nil, err
+	}
+
+	engine := getEngine(thread)
+
+	return starlark.String(engine.Params[name]), nil
 }

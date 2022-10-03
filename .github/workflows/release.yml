@@ -82,7 +82,7 @@ jobs:
       - name: Copy to bucket
         id: upload
         run: |
-          VERSION=$(./heph run --porcelain //:version)          
+          VERSION=$(cat $(./heph query out //:version))          
           echo "::set-output name=version::$VERSION"
 
           echo $VERSION

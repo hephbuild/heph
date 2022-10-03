@@ -35,6 +35,7 @@ var workers *int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
+var params *[]string
 
 func init() {
 	// Output to stdout instead of the default stderr
@@ -70,6 +71,7 @@ func init() {
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
 	noGen = rootCmd.PersistentFlags().Bool("no-gen", false, "Disable generated targets")
+	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Set parameter name=value")
 
 	rootCmd.Flags().SetInterspersed(false)
 	setupRootUsage()
@@ -194,7 +196,7 @@ var runCmd = &cobra.Command{
 	Short:         "Run target",
 	SilenceUsage:  true,
 	SilenceErrors: true,
-	Args:          cobra.ArbitraryArgs,
+	Args:          cobra.MinimumNArgs(1),
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
@@ -211,10 +213,6 @@ var runCmd = &cobra.Command{
 			}
 
 			if len(tps) == 0 {
-				return nil
-			}
-		} else {
-			if len(args) == 0 {
 				return nil
 			}
 		}
@@ -480,6 +478,17 @@ func engineInit() error {
 	Engine = engine.New(root)
 	Engine.Config.Profiles = *profiles
 	Engine.Pool = worker.NewPool(*workers)
+
+	paramsm := map[string]string{}
+	for _, s := range *params {
+		parts := strings.SplitN(s, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("parameter must be name=value, got `%v`", s)
+		}
+
+		paramsm[parts[0]] = parts[1]
+	}
+	Engine.Params = paramsm
 
 	err = Engine.Parse()
 	if err != nil {

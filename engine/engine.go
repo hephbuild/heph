@@ -42,6 +42,8 @@ type Engine struct {
 	Targets     *Targets
 	Labels      []string
 
+	Params map[string]string
+
 	dag *DAG
 
 	cacheHashInputTargetMutex  utils.KMutex
@@ -213,7 +215,13 @@ func (e *Engine) hashInput(target *Target) string {
 	mu.Lock()
 	defer mu.Unlock()
 
-	cacheId := target.FQN
+	idh := utils.NewHash()
+	for _, fqn := range target.deps.FQNs() {
+		idh.String(fqn)
+	}
+
+	cacheId := target.FQN + idh.Sum()
+
 	e.cacheHashInputMutex.RLock()
 	if h, ok := e.cacheHashInput[cacheId]; ok {
 		e.cacheHashInputMutex.RUnlock()

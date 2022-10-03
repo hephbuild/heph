@@ -178,6 +178,13 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	log.Infof("Fetch root %v from %v", name, cfg.URI)
 
+	lock := utils.NewFlock(filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
+	err = lock.Lock()
+	if err != nil {
+		return Path{}, fmt.Errorf("Failed to lock %v", err)
+	}
+	defer lock.Unlock()
+
 	err = os.RemoveAll(root.Abs())
 	if err != nil {
 		return Path{}, err

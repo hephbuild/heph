@@ -922,6 +922,8 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		t.deps.Add(dep.Target)
 	}
 
+	t.deps.Sort()
+
 	return nil
 }
 

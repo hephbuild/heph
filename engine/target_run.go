@@ -35,8 +35,13 @@ func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
 }
 
 func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, error) {
+	err := e.linkTarget(target, NewTargets(0))
+	if err != nil {
+		return false, err
+	}
+
 	log.Tracef("locking cache %v", target.FQN)
-	err := target.cacheLock.Lock()
+	err = target.cacheLock.Lock()
 	if err != nil {
 		return false, err
 	}
@@ -70,7 +75,7 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 				}
 			}
 
-			return true, err
+			return true, nil
 		}
 	}
 
@@ -102,8 +107,13 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool, args ...string) error {
 	e.Status(target.FQN)
 
+	err := e.linkTarget(target, NewTargets(0))
+	if err != nil {
+		return err
+	}
+
 	log.Tracef("%v locking run", target.FQN)
-	err := target.runLock.Lock()
+	err = target.runLock.Lock()
 	if err != nil {
 		return err
 	}
