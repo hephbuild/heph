@@ -128,6 +128,11 @@ func downloadAndLink(cfg config.Config) (string, error) {
 	if utils.PathExists(dstPath) {
 		log.Tracef("%v already exists", dstPath)
 
+		err = linkNew(dir, cfg)
+		if err != nil {
+			return "", err
+		}
+
 		return dstPath, nil
 	}
 
