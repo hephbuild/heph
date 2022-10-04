@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"sort"
+	"strings"
 )
 
 var Env struct {
@@ -37,26 +39,61 @@ func init() {
 	Env.GOPATH = goEnv("GOPATH")
 }
 
-type Cfg struct {
+type PkgCfg struct {
 	Test struct {
-		Skip   []string `json:"skip"`
-		PreRun string   `json:"pre_run"`
+		Skip   bool   `json:"skip"`
+		PreRun string `json:"pre_run"`
 	} `json:"test"`
-	Go                string `json:"go"`
-	GoDeps            string `json:"godeps"`
-	GenerateTestMain  string `json:"generate_testmain"`
-	StdPkgsTarget     string `json:"std_pkgs_target"`
-	StdPkgsListFile   string `json:"std_pkgs_list_file"`
-	ThirdpartyPackage string `json:"thirdparty_package"`
-	BackendPkg        string `json:"backend_pkg"`
 }
 
-func (c Cfg) IsTestSkipped(pkg string) bool {
-	for _, s := range c.Test.Skip {
-		if s == pkg {
-			return true
+type Cfg struct {
+	Pkg               map[string]PkgCfg `json:"pkg"`
+	Go                string            `json:"go"`
+	GoDeps            string            `json:"godeps"`
+	GenerateTestMain  string            `json:"generate_testmain"`
+	StdPkgsTarget     string            `json:"std_pkgs_target"`
+	StdPkgsListFile   string            `json:"std_pkgs_list_file"`
+	ThirdpartyPackage string            `json:"thirdparty_package"`
+	BackendPkg        string            `json:"backend_pkg"`
+}
+
+func (c Cfg) GetPkgCfg(pkg string) PkgCfg {
+	candidates := make([]string, 0)
+	for matcher, cfg := range c.Pkg {
+		if matcher == "..." {
+			continue
+		} else if strings.HasSuffix(matcher, "/...") {
+			root := strings.TrimSuffix(matcher, "/...")
+
+			if root == pkg || strings.HasPrefix(pkg, root+"/") {
+				candidates = append(candidates, matcher)
+			}
+		} else {
+			if matcher == pkg {
+				return cfg
+			}
 		}
 	}
 
-	return false
+	if len(candidates) == 0 {
+		if cfg, ok := c.Pkg["..."]; ok {
+			return cfg
+		}
+
+		// Default
+		return PkgCfg{}
+	}
+
+	// Precision score
+	candidateScore := func(candidate string) int {
+		p := strings.Split(candidate, "/")
+		return len(p)
+	}
+
+	sort.SliceStable(candidates, func(i, j int) bool {
+		// sort reversed
+		return candidateScore(candidates[i]) > candidateScore(candidates[j])
+	})
+
+	return c.Pkg[candidates[0]]
 }

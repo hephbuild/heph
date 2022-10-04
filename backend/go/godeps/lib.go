@@ -18,6 +18,7 @@ type Lib struct {
 	SFiles        []string
 	EmbedPatterns []string
 	SrcDep        string
+	GenEmbed      bool
 }
 
 func EmbedPatternsGlobs(ps []string) string {
@@ -39,6 +40,7 @@ func (l Lib) Data() map[string]interface{} {
 		"GoFiles":    genStringArray(l.GoFiles, 2),
 		"SFiles":     genStringArray(l.SFiles, 2),
 		"EmbedGlobs": EmbedPatternsGlobs(l.EmbedPatterns),
+		"GenEmbed":   l.GenEmbed,
 		"SrcDep":     l.SrcDep,
 	}
 }
@@ -52,6 +54,7 @@ go_library(
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
 	resources={{.EmbedGlobs}},
+	{{if .GenEmbed}}gen_embed=True,{{end}}
 )
 `
 

@@ -940,11 +940,13 @@ func (e *Engine) registerLabels(labels []string) {
 	}
 }
 
-func (e *Engine) GetTargetShortcuts() []*Target {
-	aliases := make([]*Target, 0)
+func (e *Engine) GetTargetShortcuts() []TargetSpec {
+	aliases := make([]TargetSpec, 0)
 	for _, target := range e.Targets.Slice() {
-		if target.Package.FullName == "" {
-			aliases = append(aliases, target)
+		spec := target.TargetSpec
+
+		if spec.Package.FullName == "" {
+			aliases = append(aliases, spec)
 		}
 	}
 	return aliases

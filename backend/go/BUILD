@@ -85,7 +85,7 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg+":_go_mod_gen")
 
-def go_mod(mod_pkgs=[], test={}, sandbox=True):
+def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
     gomodsum = group(
         name="_mod",
         deps=glob("go.mod")+glob("go.sum"),
@@ -109,7 +109,7 @@ def go_mod(mod_pkgs=[], test={}, sandbox=True):
         mod_pkg_srcs.append(pkg+":_src")
 
     godeps_cfg = json_file(name="godeps_cfg", data={
-        'test': test,
+        'pkg': cfg,
         'go': go,
         'godeps': godeps,
         'generate_testmain': generate_testmain,

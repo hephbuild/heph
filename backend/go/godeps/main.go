@@ -15,6 +15,7 @@ import (
 
 func normalizePackage(p string) string {
 	p = strings.ReplaceAll(p, "+", "_")
+	p = strings.ReplaceAll(p, "~", "_")
 
 	return p
 }
@@ -24,7 +25,7 @@ func thirdpartyDownloadTarget(pkg *Package) Target {
 
 	return Target{
 		Name:    "_go_mod_download_" + normalizePackage(module.Version),
-		Package: filepath.Join(Config.ThirdpartyPackage, module.Path),
+		Package: filepath.Join(Config.ThirdpartyPackage, normalizePackage(module.Path)),
 	}
 }
 
@@ -54,7 +55,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 
 		return Target{
 			Name:    "_go_lib" + suffix,
-			Package: pkgName,
+			Package: normalizePackage(pkgName),
 		}
 	} else {
 		module := pkg.ActualModule()
@@ -66,7 +67,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 
 		return Target{
 			Name:    "_go_lib_" + normalizePackage(module.Version) + suffix,
-			Package: filepath.Join(Config.ThirdpartyPackage, importPath),
+			Package: filepath.Join(Config.ThirdpartyPackage, normalizePackage(importPath)),
 		}
 	}
 }
@@ -143,11 +144,13 @@ func generate() []RenderUnit {
 				errs = append(errs, err.String())
 			}
 
-			panic(fmt.Errorf("deps errors:\n%v", strings.Join(errs, "\n")))
+			fmt.Println(fmt.Errorf("deps errors:\n%v", strings.Join(errs, "\n")))
+			continue
 		}
 
 		if pkg.Error != nil {
-			panic(fmt.Errorf("err: %v", pkg.Error.String()))
+			fmt.Println(fmt.Errorf("err: %v", pkg.Error.String()))
+			continue
 		}
 
 		if StdPackages.Includes(pkg.ImportPath) {
@@ -158,6 +161,7 @@ func generate() []RenderUnit {
 
 		if pkg.IsPartOfTree {
 			libPkg := libTarget(pkgs, pkg, nil).Package
+			pkgCfg := Config.GetPkgCfg(pkg.ImportPath)
 
 			var lib *Lib
 			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
@@ -206,7 +210,7 @@ func generate() []RenderUnit {
 				})
 			}
 
-			if pkg.IsPartOfModule && !Config.IsTestSkipped(pkg.ImportPath) && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
+			if pkg.IsPartOfModule && !pkgCfg.Test.Skip && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
 				_, pkgTestDeps := splitOutPkgs(pkg.TestDeps)
 				_, pkgDeps := splitOutPkgs(pkg.Deps)
 
@@ -248,7 +252,7 @@ func generate() []RenderUnit {
 					TestLib:    testlib,
 					XTestLib:   xtestlib,
 					ImportPath: pkg.ImportPath,
-					PreRun:     Config.Test.PreRun,
+					PreRun:     pkgCfg.Test.PreRun,
 					TestFiles:  pkg.TestGoFiles,
 					XTestFiles: pkg.XTestGoFiles,
 					DepsLibs:   depsLibs,
@@ -296,6 +300,7 @@ func generate() []RenderUnit {
 				GoFiles:    pkg.GoFiles,
 				SFiles:     pkg.SFiles,
 				SrcDep:     moddl.Target.Full(),
+				GenEmbed:   len(pkg.EmbedPatterns) > 0,
 			}
 
 			for _, p := range imports {

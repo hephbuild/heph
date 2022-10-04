@@ -9,6 +9,7 @@ import (
 	"go.starlark.net/starlarkstruct"
 	"heph/utils"
 	"io/fs"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -69,6 +70,15 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 					"name": starlark.NewBuiltin("heph.pkg.name", package_name),
 					"dir":  starlark.NewBuiltin("heph.pkg.dir", package_dir),
 					"addr": starlark.NewBuiltin("heph.pkg.addr", package_fqn),
+				},
+			},
+			"path": &starlarkstruct.Module{
+				Name: "heph.path",
+				Members: starlark.StringDict{
+					"base":  starlark.NewBuiltin("heph.path.base", path_base),
+					"dir":   starlark.NewBuiltin("heph.path.dir", path_dir),
+					"join":  starlark.NewBuiltin("heph.path.join", path_join),
+					"split": starlark.NewBuiltin("heph.path.split", path_split),
 				},
 			},
 		},
@@ -355,4 +365,63 @@ func param(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 	engine := getEngine(thread)
 
 	return starlark.String(engine.Params[name]), nil
+}
+
+func path_base(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		path string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"path", &path,
+	); err != nil {
+		return nil, err
+	}
+
+	return starlark.String(filepath.Base(path)), nil
+}
+
+func path_dir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		path string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"path", &path,
+	); err != nil {
+		return nil, err
+	}
+
+	return starlark.String(filepath.Dir(path)), nil
+}
+
+func path_join(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		parts = append(parts, string(arg.(starlark.String)))
+	}
+	return starlark.String(filepath.Join(parts...)), nil
+}
+
+func path_split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		path string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"path", &path,
+	); err != nil {
+		return nil, err
+	}
+
+	l := &starlark.List{}
+
+	for _, s := range filepath.SplitList(path) {
+		l.Append(starlark.String(s))
+	}
+
+	return l, nil
 }

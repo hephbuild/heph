@@ -31,7 +31,7 @@ func setupRootUsage() {
 			return defUsage(cmd)
 		}
 
-		err := preRunWithGen(cmd.Context(), false)
+		err := engineInit()
 		if err != nil {
 			return err
 		}
