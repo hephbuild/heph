@@ -126,7 +126,7 @@ func downloadAndLink(cfg config.Config) (string, error) {
 	dstPath := filepath.Join(dir, "heph")
 
 	if utils.PathExists(dstPath) {
-		log.Tracef("%v already exists", dstPath)
+		log.Debugf("%v already exists", dstPath)
 
 		err = linkNew(dir, cfg)
 		if err != nil {

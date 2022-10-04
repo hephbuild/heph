@@ -229,7 +229,7 @@ def go_mod_download(name, path, version):
         labels=['thirdparty'],
     )
 
-def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], resources=[], abi=None, dir=None, src_dep=None):
+def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], resources=[], abi=None, dir=None, src_dep=None, gen_embed=False):
     p = dir+"/" if dir else ""
 
     if not import_path:
@@ -316,14 +316,20 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     if src_dep:
         deps = {'src': [src_dep], 'libs': libs}
         env["SRC_SRC"] = ' '.join(src_files)
+        env["SRC_RES"] = ' '.join(resources)
     else:
-        deps = {'src': src_files, 'libs': libs}
+        deps = {'src': src_files, 'libs': libs, 'res': resources}
 
-    if len(resources) > 0:
+    deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
+
+    if len(resources) > 0 or gen_embed:
+        embed_deps = deps | {}
+        embed_deps['libs'] = []
+
         embed_cfg = target(
             name="_"+name+"#embedcfg",
             run='godeps embed $SRC_SRC > $OUT',
-            deps={'src': deps["src"], 'res': resources},
+            deps=embed_deps,
             out=p+pkg_name+'.embedcfg',
             tools=[go, godeps],
             env=env,
@@ -331,10 +337,8 @@ def go_library(name, import_path, go_files, complete=True, libs=[], s_files=[], 
     else:
         embed_cfg = None
 
-    deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
     deps = deps | {
         'std': std_pkgs,
-        'res': resources,
         'embed': embed_cfg,
     }
 
