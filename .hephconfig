@@ -7,5 +7,10 @@ build_files:
 
 go_backend:
   version: 1.18.4
-  go: //go_backend:go|go
-  gofmt: //go_backend:go|gofmt
+  go: //backend/go:go|go
+  gofmt: //backend/go:go|gofmt
+
+node_backend:
+  version: v16.15.1
+  node: //backend/node:node
+  yarn: //backend/node:yarn

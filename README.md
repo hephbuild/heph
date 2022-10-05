@@ -1,5 +1,5 @@
 # heph
 
-## Install
+> ⚠️ heph is under heavy development, breaking changes may arise.
 
-    curl -s https://storage.googleapis.com/heph-build/install.sh | bash -s
+Docs available at https://hephbuild.github.io/heph

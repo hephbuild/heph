@@ -12,17 +12,10 @@ go_version = cfg["version"]
 if not go_version:
     fail("set go_backend.go_version")
 
-sedi = target(
-    name="sedi",
-    deps=["sedi.sh"],
-    out='sedi.sh',
-)
-
 target(
     name="go",
     run="./go_install.sh '{}'".format(go_version),
     deps=["go_install.sh", "go.sh"],
-    tools=[sedi],
     env={
         "OS": get_os(),
         "ARCH": get_arch(),

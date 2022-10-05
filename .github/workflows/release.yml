@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - '*'
+    paths:
+      - '**'
+      - '!website/**'
 
 env:
   NOCACHE: "Cache-Control: no-cache, no-store"
