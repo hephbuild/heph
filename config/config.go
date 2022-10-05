@@ -22,7 +22,8 @@ type Config struct {
 		Ignore []string        `yaml:"ignore"`
 		Roots  map[string]Root `yaml:"roots"`
 	} `yaml:"build_files"`
-	KeepSandbox bool `yaml:"keep_sandbox"`
+	KeepSandbox bool              `yaml:"keep_sandbox"`
+	Params      map[string]string `yaml:"params"`
 	Extras      `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`

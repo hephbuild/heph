@@ -9,7 +9,8 @@ type FileConfig struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
 	} `yaml:"build_files"`
-	KeepSandbox *bool `yaml:"keep_sandbox"`
+	KeepSandbox *bool             `yaml:"keep_sandbox"`
+	Params      map[string]string `yaml:"params"`
 	Extras      `yaml:",inline"`
 }
 
@@ -43,7 +44,6 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	if c.BuildFiles.Roots == nil {
 		c.BuildFiles.Roots = map[string]Root{}
 	}
-
 	for k, newRoot := range fc.BuildFiles.Roots {
 		c.BuildFiles.Roots[k] = newRoot.ApplyTo(c.BuildFiles.Roots[k])
 	}
@@ -53,9 +53,15 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	if c.Extras == nil {
 		c.Extras = map[string]interface{}{}
 	}
-
 	for k, v := range fc.Extras {
 		c.Extras[k] = v
+	}
+
+	if c.Params == nil {
+		c.Params = map[string]string{}
+	}
+	for k, v := range fc.Params {
+		c.Params[k] = v
 	}
 
 	return c

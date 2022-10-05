@@ -2,7 +2,7 @@ import CodeBlock from '@theme/CodeBlock';
 import React, {useEffect, useState} from "react";
 
 export default function HephConfig() {
-    const [version, setVersion] = useState('Loading...');
+    const [version, setVersion] = useState('VERSION');
 
     async function fetchVersion() {
         const res = await fetch('https://storage.googleapis.com/heph-build/latest_version');
@@ -18,7 +18,7 @@ export default function HephConfig() {
 
     return (
         <CodeBlock language="yaml" title=".hephconfig">
-            version: {version}
+            {`version: ${version}`}
         </CodeBlock>
     )
 }

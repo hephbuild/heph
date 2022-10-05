@@ -477,9 +477,16 @@ func engineInit() error {
 
 	Engine = engine.New(root)
 	Engine.Config.Profiles = *profiles
-	Engine.Pool = worker.NewPool(*workers)
+
+	err = Engine.Init()
+	if err != nil {
+		return err
+	}
 
 	paramsm := map[string]string{}
+	for k, v := range Engine.Config.Params {
+		paramsm[k] = v
+	}
 	for _, s := range *params {
 		parts := strings.SplitN(s, "=", 2)
 		if len(parts) != 2 {
@@ -489,6 +496,7 @@ func engineInit() error {
 		paramsm[parts[0]] = parts[1]
 	}
 	Engine.Params = paramsm
+	Engine.Pool = worker.NewPool(*workers)
 
 	err = Engine.Parse()
 	if err != nil {

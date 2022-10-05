@@ -489,7 +489,7 @@ func (ts *Targets) Copy() *Targets {
 	return t
 }
 
-func (e *Engine) Parse() error {
+func (e *Engine) Init() error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -509,6 +509,10 @@ func (e *Engine) Parse() error {
 		return fmt.Errorf("upgrade: %w", err)
 	}
 
+	return nil
+}
+
+func (e *Engine) Parse() error {
 	for name, cfg := range e.Config.BuildFiles.Roots {
 		err := e.runRootBuildFiles(name, cfg)
 		if err != nil {
@@ -517,7 +521,7 @@ func (e *Engine) Parse() error {
 	}
 
 	runStartTime := time.Now()
-	err = e.runBuildFiles(e.Root.Abs(), func(dir string) *Package {
+	err := e.runBuildFiles(e.Root.Abs(), func(dir string) *Package {
 		return e.createPkg(dir)
 	})
 	if err != nil {
