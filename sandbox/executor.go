@@ -47,6 +47,13 @@ var ExecExecutor = Executor{
 			}
 		}
 
+		path := ctx.Env["PATH"]
+		p, err := LookPath(path, ctx.Args[0])
+		if err != nil {
+			return nil, err
+		}
+		ctx.Args[0] = p
+
 		return ctx.Args, nil
 	},
 	ShellPrint: func(args []string) string {

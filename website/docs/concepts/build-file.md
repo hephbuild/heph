@@ -88,6 +88,6 @@ heph.pkg.name() # dir
 Gets current package address
 
 ```python
-heph.pkg.addr() # //some/addr
+heph.pkg.addr() # //some/dir
 ```
 
