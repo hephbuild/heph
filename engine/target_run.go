@@ -170,12 +170,16 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	log.Debugf("Running %v: %v", target.FQN, target.WorkdirRoot.RelRoot)
 
+	if target.FQN == "//test/go/mod-simple:_go_mod_gen_imports" {
+		fmt.Println()
+	}
+
 	bin := map[string]string{}
 	for _, t := range target.Tools {
 		bin[t.Name] = t.AbsPath()
 	}
-
-	for _, t := range target.HostTools {
+	
+	for _, t := range target.TargetSpec.Tools.Hosts {
 		bin[t.Name] = t.Path
 	}
 
@@ -201,7 +205,6 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			if utils.PathExists(tarFile) && dep.Output == "" {
 				srcTar = append(srcTar, tarFile)
 				for _, file := range dep.Target.ActualFilesOut() {
-					file = file.WithPackagePath(true)
 					addNamedDep(name, file.RelRoot())
 				}
 			} else {
@@ -210,8 +213,6 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
 				}
 				for _, file := range files {
-					file = file.WithPackagePath(true)
-
 					src = append(src, utils.TarFile{
 						From: file.Abs(),
 						To:   file.RelRoot(),
@@ -222,7 +223,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 
 		for _, file := range deps.Files {
-			to := file.WithPackagePath(true).RelRoot()
+			to := file.RelRoot()
 			src = append(src, utils.TarFile{
 				From: file.Abs(),
 				To:   to,
@@ -312,17 +313,15 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		namedOut := map[string][]string{}
 		for name, paths := range target.Out.WithRoot(target.SandboxRoot.Abs()).Named() {
 			for _, path := range paths {
-				if strings.Contains(path.Path, "*") {
+				if strings.Contains(path.RelRoot(), "*") {
 					// Skip glob
 					continue
 				}
 
-				if filepath.Base(path.Path) == "." {
+				if filepath.Base(path.RelRoot()) == "." {
 					// Skip dot folder
 					continue
 				}
-
-				path = path.WithPackagePath(true)
 
 				var pathv string
 				switch target.OutEnv {
@@ -392,71 +391,69 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	if len(target.Run) > 0 {
-		e.Status(fmt.Sprintf("Running %v...", target.FQN))
+	e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-		if target.IsGroup() {
-			// Ignore
-		} else if target.IsTextFile() {
-			err := os.MkdirAll(dir, os.ModePerm)
+	if target.IsGroup() {
+		// Ignore
+	} else if target.IsTextFile() {
+		err := os.MkdirAll(dir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+
+		err = os.WriteFile(target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	} else if len(target.Run) > 0 {
+		var executor sandbox.Executor
+		switch target.Executor {
+		case ExecutorBash:
+			executor = sandbox.BashExecutor
+		case ExecutorExec:
+			executor = sandbox.ExecExecutor
+		default:
+			panic("unhandled executor: " + target.Executor)
+		}
+
+		run := make([]string, 0)
+		for _, s := range target.Run {
+			out, err := exprs.Exec(s, e.queryFunctions(target))
 			if err != nil {
-				return err
+				return fmt.Errorf("run `%v`: %w", s, err)
 			}
 
-			err = os.WriteFile(target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
-			if err != nil {
-				return err
-			}
-		} else {
-			var executor sandbox.Executor
-			switch target.Executor {
-			case ExecutorBash:
-				executor = sandbox.BashExecutor
-			case ExecutorExec:
-				executor = sandbox.ExecExecutor
-			default:
-				panic("unhandled executor: " + target.Executor)
-			}
+			run = append(run, out)
+		}
 
-			run := make([]string, 0)
-			for _, s := range target.Run {
-				out, err := exprs.Exec(s, e.queryFunctions(target))
-				if err != nil {
-					return fmt.Errorf("run `%v`: %w", s, err)
-				}
+		if shell {
+			fmt.Println("Shell mode enabled, exit the shell to terminate")
+			fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
 
-				run = append(run, out)
-			}
+			executor = sandbox.BashShellExecutor
+		}
 
-			if shell {
-				fmt.Println("Shell mode enabled, exit the shell to terminate")
-				fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
+		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
+			Args: run,
+			Env:  env,
+		})
+		if err != nil {
+			return err
+		}
 
-				executor = sandbox.BashShellExecutor
-			}
+		cmd := sandbox.Exec(sandbox.ExecConfig{
+			Context:  ctx,
+			BinDir:   binDir,
+			Dir:      dir,
+			Env:      env,
+			IOConfig: iocfg,
+			ExecArgs: execArgs,
+			CmdArgs:  args,
+		}, target.Sandbox && !hasPathInEnv)
 
-			execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
-				Args: run,
-				Env:  env,
-			})
-			if err != nil {
-				return err
-			}
-
-			cmd := sandbox.Exec(sandbox.ExecConfig{
-				Context:  ctx,
-				BinDir:   binDir,
-				Dir:      dir,
-				Env:      env,
-				IOConfig: iocfg,
-				ExecArgs: execArgs,
-				CmdArgs:  args,
-			}, target.Sandbox && !hasPathInEnv)
-
-			err = cmd.Run()
-			if err != nil {
-				return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
-			}
+		err = cmd.Run()
+		if err != nil {
+			return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
 		}
 	}
 

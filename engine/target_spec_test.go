@@ -30,9 +30,8 @@ func genTargetSpec(name string, factor int) TargetSpec {
 			Target: "//aaa",
 		})
 		deps.Files = append(deps.Files, TargetSpecDepFile{
-			Name:    "aaa",
-			Package: pkg,
-			Path:    "aaa",
+			Name: "aaa",
+			Path: "aaa",
 		})
 		deps.Exprs = append(deps.Exprs, TargetSpecDepExpr{
 			Name:    "aaa",
@@ -121,10 +120,12 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		Deps:              deps,
 		HashDeps:          deps,
 		DifferentHashDeps: true,
-		ExprTools:         exprTools,
-		TargetTools:       targetTools,
-		HostTools:         hostTools,
-		Out:               out,
+		Tools: TargetSpecTools{
+			Targets: targetTools,
+			Hosts:   hostTools,
+			Exprs:   exprTools,
+		},
+		Out: out,
 		Cache: TargetSpecCache{
 			Enabled: true,
 			Named:   cacheNames,
@@ -228,8 +229,8 @@ func TestTargetSpec(t *testing.T) {
 					Name:     "test",
 					FullName: "some/test",
 					Root: Path{
-						Root:    "/tmp/some/test",
-						RelRoot: "some/test",
+						root:    "/tmp/some/test",
+						relRoot: "some/test",
 					},
 				},
 				registerTarget: func(rspec TargetSpec) error {

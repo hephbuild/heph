@@ -63,6 +63,10 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
+	if !arrEqual(t.FileContent, spec.FileContent) {
+		return false
+	}
+
 	if t.Executor != spec.Executor {
 		return false
 	}
@@ -91,15 +95,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if !arrEqualFunc(t.ExprTools, spec.ExprTools) {
-		return false
-	}
-
-	if !arrEqual(t.TargetTools, spec.TargetTools) {
-		return false
-	}
-
-	if !arrEqual(t.HostTools, spec.HostTools) {
+	if !t.Tools.Equal(spec.Tools) {
 		return false
 	}
 
@@ -158,6 +154,38 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 	return true
 }
 
+func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
+	if this.Enabled != that.Enabled {
+		return false
+	}
+
+	if !arrEqual(this.Files, that.Files) {
+		return false
+	}
+
+	if !arrEqual(this.Named, that.Named) {
+		return false
+	}
+
+	return true
+}
+
+func (this TargetSpecTools) Equal(that TargetSpecTools) bool {
+	if !arrEqual(this.Targets, that.Targets) {
+		return false
+	}
+
+	if !arrEqual(this.Hosts, that.Hosts) {
+		return false
+	}
+
+	if !arrEqualFunc(this.Exprs, that.Exprs) {
+		return false
+	}
+
+	return true
+}
+
 func (this TargetSpecDeps) Equal(that TargetSpecDeps) bool {
 	if !arrEqual(this.Targets, that.Targets) {
 		return false
@@ -180,10 +208,6 @@ func (this TargetSpecDepFile) Equal(that TargetSpecDepFile) bool {
 	}
 
 	if this.Name != that.Name {
-		return false
-	}
-
-	if this.Package.FullName != that.Package.FullName {
 		return false
 	}
 

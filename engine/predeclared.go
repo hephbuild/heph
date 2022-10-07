@@ -64,6 +64,9 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 			"split":        starlark.NewBuiltin("heph.split", split),
 			"param":        starlark.NewBuiltin("heph.param", param),
 			"cache":        starlark.NewBuiltin("heph.cache", starlarkstruct.Make),
+			"target_spec":  starlark.NewBuiltin("heph.target_spec", starlarkstruct.Make),
+			//"normalize_target_name": starlark.NewBuiltin("heph.normalize_target_name", normalize_target_name),
+			//"normalize_pkg_name":    starlark.NewBuiltin("heph.normalize_target_name", normalize_pkg_name),
 			"pkg": &starlarkstruct.Module{
 				Name: "heph.pkg",
 				Members: starlark.StringDict{

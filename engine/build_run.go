@@ -56,6 +56,10 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *Packag
 			panic(err)
 		}
 
+		if relRoot == "." {
+			relRoot = ""
+		}
+
 		pkg := pkgProvider(relRoot)
 
 		pkgs = append(pkgs, pkg)
@@ -112,7 +116,11 @@ func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *Pac
 	e.packagesMutex.Lock()
 	defer e.packagesMutex.Unlock()
 
-	fullname := strings.Trim(path, "/.")
+	if strings.HasPrefix(path, "./") || strings.HasSuffix(path, "/") {
+		panic("path must be clean")
+	}
+
+	fullname := path
 
 	if pkg, ok := e.Packages[fullname]; ok {
 		return pkg
@@ -140,8 +148,8 @@ func (e *Engine) createPkg(path string) *Package {
 			Name:     name,
 			FullName: fullname,
 			Root: Path{
-				RelRoot: path,
-				Root:    e.Root.Abs(),
+				relRoot: path,
+				root:    e.Root.Abs(),
 			},
 		}
 	})
