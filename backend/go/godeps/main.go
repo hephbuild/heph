@@ -44,6 +44,7 @@ func libTarget(pkgs *Packages, pkg *Package, imports []string) Target {
 		h.Write([]byte(module.Path))
 		h.Write([]byte(module.Version))
 	}
+	//h.Write([]byte(Config.StdPkgsTarget)) // Allow different backends at the same time
 	suffix := fmt.Sprintf("_%.7x", h.Sum(nil))
 
 	if pkg.IsPartOfTree {

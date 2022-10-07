@@ -46,7 +46,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	for _, tool := range args.Tools.Array {
 		expr, err := exprs.Parse(tool)
 		if err == nil {
-			t.ExprTools = append(t.ExprTools, TargetSpecExprTool{
+			t.Tools.Exprs = append(t.Tools.Exprs, TargetSpecExprTool{
 				Expr: expr,
 			})
 			continue
@@ -54,7 +54,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 
 		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
 		if err == nil {
-			t.TargetTools = append(t.TargetTools, TargetSpecTargetTool{
+			t.Tools.Targets = append(t.Tools.Targets, TargetSpecTargetTool{
 				Target: tp.Full(),
 				Output: tp.Output,
 			})
@@ -75,7 +75,7 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 
 		log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
 
-		t.HostTools = append(t.HostTools, TargetSpecHostTool{
+		t.Tools.Hosts = append(t.Tools.Hosts, TargetSpecHostTool{
 			Name: tool,
 			Path: binPath,
 		})
@@ -198,9 +198,8 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 
 		// Is probably file
 		td.Files = append(td.Files, TargetSpecDepFile{
-			Name:    name,
-			Package: t.Package,
-			Path:    dep,
+			Name: name,
+			Path: dep,
 		})
 	}
 
@@ -301,7 +300,7 @@ type TargetSpec struct {
 	Package *Package
 
 	Run               []string
-	FileContent       []byte // Used by special target `text_file`
+	FileContent       []byte `json:"-"` // Used by special target `text_file`
 	Executor          string
 	Quiet             bool
 	Dir               string
@@ -309,9 +308,7 @@ type TargetSpec struct {
 	Deps              TargetSpecDeps
 	HashDeps          TargetSpecDeps
 	DifferentHashDeps bool
-	ExprTools         []TargetSpecExprTool
-	TargetTools       []TargetSpecTargetTool
-	HostTools         []TargetSpecHostTool
+	Tools             TargetSpecTools
 	Out               []TargetSpecOutFile
 	Cache             TargetSpecCache
 	Sandbox           bool
@@ -327,6 +324,14 @@ type TargetSpec struct {
 	SrcEnv            string
 	OutEnv            string
 	HashFile          string
+	Transitive        TransitiveTargetSpec
+}
+
+type TransitiveTargetSpec struct {
+	Deps    TargetSpecDeps
+	Tools   TargetSpecTools
+	Env     map[string]string
+	PassEnv []string
 }
 
 func (t TargetSpec) IsGroup() bool {
@@ -335,26 +340,6 @@ func (t TargetSpec) IsGroup() bool {
 
 func (t TargetSpec) IsTextFile() bool {
 	return len(t.Run) == 1 && t.Run[0] == "text_file"
-}
-
-func (t TargetSpec) IsNamedOutput() bool {
-	for _, file := range t.Out {
-		if len(file.Name) > 0 {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (t TargetSpec) FindNamedOutput(name string) *TargetSpecOutFile {
-	for _, file := range t.Out {
-		if file.Name == name {
-			return &file
-		}
-	}
-
-	return nil
 }
 
 func (t TargetSpec) json() []byte {
@@ -411,6 +396,12 @@ type TargetSpecDeps struct {
 	Exprs   []TargetSpecDepExpr
 }
 
+type TargetSpecTools struct {
+	Targets []TargetSpecTargetTool
+	Hosts   []TargetSpecHostTool
+	Exprs   []TargetSpecExprTool
+}
+
 type TargetSpecDepTarget struct {
 	Name   string
 	Output string
@@ -424,9 +415,8 @@ type TargetSpecDepExpr struct {
 }
 
 type TargetSpecDepFile struct {
-	Name    string
-	Package *Package
-	Path    string
+	Name string
+	Path string
 }
 
 type TargetSpecOutFile struct {
@@ -439,22 +429,6 @@ type TargetSpecCache struct {
 	Enabled bool
 	Named   []string
 	Files   []string
-}
-
-func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
-	if this.Enabled != that.Enabled {
-		return false
-	}
-
-	if !arrEqual(this.Files, that.Files) {
-		return false
-	}
-
-	if !arrEqual(this.Named, that.Named) {
-		return false
-	}
-
-	return true
 }
 
 func (c TargetSpecCache) NamedEnabled(name string) bool {

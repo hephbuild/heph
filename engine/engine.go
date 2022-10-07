@@ -75,7 +75,7 @@ type RunStatus struct {
 }
 
 func New(rootPath string) *Engine {
-	root := Path{Root: rootPath}
+	root := Path{root: rootPath}
 
 	homeDir := root.Join(".heph")
 
@@ -114,7 +114,7 @@ func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
 }
 
-func (e *Engine) hashFile(h utils.Hash, file PackagePath) error {
+func (e *Engine) hashFile(h utils.Hash, file Path) error {
 	return e.hashFilePath(h, file.Abs())
 }
 
@@ -125,7 +125,7 @@ func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 		h.String(dh)
 	}
 }
-func (e *Engine) hashDepsFiles(h utils.Hash, target *Target, files []PackagePath) {
+func (e *Engine) hashDepsFiles(h utils.Hash, target *Target, files Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
 
@@ -181,7 +181,7 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	return nil
 }
 
-func (e *Engine) hashFileModTime(h utils.Hash, file PackagePath) error {
+func (e *Engine) hashFileModTime(h utils.Hash, file Path) error {
 	return e.hashFileModTimePath(h, file.Abs())
 }
 
@@ -247,7 +247,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, tool := range target.HostTools {
+	for _, tool := range target.TargetSpec.Tools.Hosts {
 		h.String(tool.Name)
 	}
 
@@ -649,21 +649,17 @@ func (e *Engine) ScheduleTarget(ctx context.Context, target *Target, deps *worke
 	return j, nil
 }
 
-func (e *Engine) collectNamedOutFromActualFiles(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
-	tp := &TargetNamedPackagePath{}
+func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+	tp := &ActualOutNamedPaths{}
 
 	for _, filePath := range target.actualcachedFiles {
-		for name, paths := range namedPaths.Named() {
-			for _, file := range paths {
-				file = file.WithRoot(target.OutRoot.Abs()).WithPackagePath(true)
-
-				abs := strings.HasPrefix(file.Path, "/")
-				path := strings.TrimPrefix(file.Path, "/")
-				pkg := target.Package
-				if abs {
-					pkg = e.createPkg("")
+		for name, opaths := range outNamedPaths.Named() {
+			for _, opath := range opaths {
+				path := opath.RelRoot()
+				if strings.HasPrefix(opath.RelRoot(), "/") {
+					path = strings.TrimPrefix(path, "/")
 				}
-				pattern := filepath.Join(pkg.FullName, path)
+				pattern := path
 
 				relRoot := filePath.RelRoot()
 
@@ -673,17 +669,7 @@ func (e *Engine) collectNamedOutFromActualFiles(target *Target, namedPaths *Targ
 				}
 
 				if match {
-					relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), filePath.Abs())
-					if err != nil {
-						return nil, err
-					}
-
-					tp.Add(name, PackagePath{
-						Package:     pkg,
-						Path:        relPkg,
-						Root:        target.OutRoot.Abs(),
-						PackagePath: file.PackagePath,
-					})
+					tp.Add(name, filePath)
 				}
 			}
 		}
@@ -694,8 +680,8 @@ func (e *Engine) collectNamedOutFromActualFiles(target *Target, namedPaths *Targ
 	return tp, nil
 }
 
-func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackagePath) (*TargetNamedPackagePath, error) {
-	tp := &TargetNamedPackagePath{}
+func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
 		files, err := e.collectOut(target, paths)
@@ -711,8 +697,8 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *TargetNamedPackageP
 	return tp, nil
 }
 
-func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, error) {
-	out := make(PackagePaths, 0)
+func (e *Engine) collectOut(target *Target, files RelPaths) (Paths, error) {
+	out := make(Paths, 0)
 
 	defer func() {
 		sort.SliceStable(out, func(i, j int) bool {
@@ -721,37 +707,20 @@ func (e *Engine) collectOut(target *Target, files PackagePaths) (PackagePaths, e
 	}()
 
 	for _, file := range files {
-		file = file.WithRoot(target.OutRoot.Abs()).WithPackagePath(true)
+		pattern := file.RelRoot()
 
-		abs := strings.HasPrefix(file.Path, "/")
-		path := strings.TrimPrefix(file.Path, "/")
-		pkg := target.Package
-		if abs {
-			pkg = e.createPkg("")
-		}
+		file := file.WithRoot(target.OutRoot.Abs())
 
-		pattern := path
-		if !abs {
-			pattern = filepath.Join(pkg.FullName, path)
-		}
-
-		err := utils.StarWalkAbs(target.OutRoot.Abs(), pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			relPkg, err := filepath.Rel(target.OutRoot.Join(pkg.FullName).Abs(), path)
-			if err != nil {
-				return err
-			}
-
-			out = append(out, PackagePath{
-				Package:     pkg,
-				Path:        relPkg,
-				Root:        target.OutRoot.Abs(),
-				PackagePath: file.PackagePath,
+		err := utils.StarWalk(file.root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+			out = append(out, Path{
+				root:    file.root,
+				relRoot: path,
 			})
 
 			return nil
 		})
 		if err != nil {
-			return nil, fmt.Errorf("collect output %v: %w", file.Path, err)
+			return nil, fmt.Errorf("collect output %v: %w", file.RelRoot(), err)
 		}
 	}
 
@@ -764,8 +733,8 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 		return fmt.Errorf("collect output: isempty: %w", err)
 	}
 
-	target.actualFilesOut = &TargetNamedPackagePath{}
-	target.actualcachedFiles = make(PackagePaths, 0)
+	target.actualFilesOut = &ActualOutNamedPaths{}
+	target.actualcachedFiles = make(Paths, 0)
 
 	if empty {
 		return nil
@@ -952,15 +921,15 @@ func (e *Engine) GetTargetShortcuts() []TargetSpec {
 	return aliases
 }
 
-func (e *Engine) GetFileDeps(targets ...*Target) []PackagePath {
-	filesm := map[string]PackagePath{}
+func (e *Engine) GetFileDeps(targets ...*Target) []Path {
+	filesm := map[string]Path{}
 	for _, target := range targets {
 		for _, file := range target.HashDeps.Files {
 			filesm[file.Abs()] = file
 		}
 	}
 
-	files := make([]PackagePath, 0, len(filesm))
+	files := make([]Path, 0, len(filesm))
 	for _, file := range filesm {
 		files = append(files, file)
 	}
