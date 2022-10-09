@@ -79,14 +79,21 @@ func (j *Job) IsDone() bool {
 
 type Worker struct {
 	status     string
+	statusm    sync.Mutex
 	CurrentJob *Job
 }
 
 func (w *Worker) GetStatus() string {
+	w.statusm.Lock()
+	defer w.statusm.Unlock()
+
 	return strings.Clone(w.status)
 }
 
 func (w *Worker) Status(status string) {
+	w.statusm.Lock()
+	defer w.statusm.Unlock()
+
 	w.status = status
 	if status != "" {
 		log.Debug(status)

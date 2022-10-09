@@ -30,6 +30,58 @@ type TargetArgs struct {
 	SrcEnv         string
 	OutEnv         string
 	HashFile       string
+	Transitive     TargetArgsTransitive
+}
+
+type TargetArgsTransitive struct {
+	Deps    ArrayMap
+	Tools   ArrayMap
+	Env     ArrayMap
+	PassEnv ArrayMap
+}
+
+func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
+	d, ok := v.(*starlarkstruct.Struct)
+	if ok {
+		cs := TargetArgsTransitive{}
+
+		for _, n := range d.AttrNames() {
+			v, err := d.Attr(n)
+			if err != nil {
+				return err
+			}
+
+			switch n {
+			case "deps":
+				err := cs.Deps.Unpack(v)
+				if err != nil {
+					return err
+				}
+			case "tools":
+				err := cs.Tools.Unpack(v)
+				if err != nil {
+					return err
+				}
+			case "env":
+				err := cs.Env.Unpack(v)
+				if err != nil {
+					return err
+				}
+			case "pass_env":
+				err := cs.PassEnv.Unpack(v)
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("invalid arg %v, call heph.target_spec()", n)
+			}
+		}
+
+		*c = cs
+		return nil
+	}
+
+	return fmt.Errorf("transitive must call heph.target_spec()")
 }
 
 type TargetArgsCache struct {
@@ -53,23 +105,17 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 
 			switch n {
 			case "named":
-				var named Array
-				err := named.Unpack(v)
+				err := cs.Named.Unpack(v)
 				if err != nil {
 					return err
 				}
-
-				cs.Named = named
 			case "files":
-				var files Array
-				err := files.Unpack(v)
+				err := cs.Files.Unpack(v)
 				if err != nil {
 					return err
 				}
-
-				cs.Files = files
 			default:
-				return fmt.Errorf("invalid arg, call heph.cache()")
+				return fmt.Errorf("invalid arg %v, call heph.cache()", n)
 			}
 		}
 

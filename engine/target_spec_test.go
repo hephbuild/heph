@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -221,6 +222,11 @@ func TestTargetSpec(t *testing.T) {
 			parts := strings.SplitN(string(b), "===\n", 2)
 			build := parts[0]
 			expected := strings.TrimSpace(parts[1])
+
+			lspath, err := exec.LookPath("ls")
+			require.NoError(t, err)
+			
+			expected = strings.ReplaceAll(expected, "REPLACE_LS_BIN", lspath)
 
 			var spec TargetSpec
 

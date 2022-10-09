@@ -2,9 +2,9 @@ def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_out
     cmd = cmd.replace("heph ", "heph --porcelain ")
 
     if expected_failure:
-        test_cmd = '%s 2>&1 | tee output && RC=$? || RC=$?; if [ $RC -eq 0 ]; then exit 1; fi; ' % cmd
+        test_cmd = '%s | tee output && RC=$? || RC=$?; if [ $RC -eq 0 ]; then exit 1; fi; ' % cmd
     else:
-        test_cmd = '%s 2>&1 | tee output && RC=$? ' % cmd
+        test_cmd = '%s | tee output && RC=$? ' % cmd
 
     if expected_output:
         test_cmd += "echo '%s' > expected_output && diff -au output expected_output" % expected_output
