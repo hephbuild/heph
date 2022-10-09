@@ -1108,12 +1108,28 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 	}, nil
 }
 
+var allEnv = map[string]string{}
+
+func init() {
+	for _, e := range os.Environ() {
+		parts := strings.SplitN(e, "=", 2)
+		allEnv[parts[0]] = parts[1]
+	}
+}
+
 func (e *Engine) applyEnv(t *Target, passEnv []string, env map[string]string) {
 	if t.Env == nil {
 		t.Env = map[string]string{}
 	}
 
 	for _, name := range passEnv {
+		if name == "*" {
+			for k, v := range allEnv {
+				t.Env[k] = v
+			}
+			break
+		}
+
 		value, ok := os.LookupEnv(name)
 		if !ok {
 			continue
