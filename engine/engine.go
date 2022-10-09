@@ -445,9 +445,7 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 				return nil, err
 			}
 
-			for _, parent := range parents {
-				needCacheWarm.Add(parent)
-			}
+			needCacheWarm.AddAll(parents)
 			needRun.Add(target)
 		} else {
 			needCacheWarm.Add(target)
@@ -501,9 +499,7 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 					}
 				}
 
-				for _, parent := range parents {
-					needCacheWarm.Add(parent)
-				}
+				needCacheWarm.AddAll(parents)
 				needRun.Add(target)
 
 				return nil

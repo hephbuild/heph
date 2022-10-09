@@ -233,13 +233,14 @@ type ActualOutNamedPaths = NamedPaths[Paths, Path]
 type Target struct {
 	TargetSpec
 
-	Tools                 TargetTools
-	Deps                  TargetNamedDeps
-	HashDeps              TargetDeps
-	Out                   *OutNamedPaths
-	actualFilesOut        *ActualOutNamedPaths
-	Env                   map[string]string
-	Transitive            TargetTransitive
+	Tools          TargetTools
+	Deps           TargetNamedDeps
+	HashDeps       TargetDeps
+	Out            *OutNamedPaths
+	actualFilesOut *ActualOutNamedPaths
+	Env            map[string]string
+	Transitive     TargetTransitive
+
 	RequireTransitive     TargetTransitive
 	DeepRequireTransitive TargetTransitive
 
@@ -447,12 +448,25 @@ func (ts *Targets) Add(t *Target) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	ts.add(t)
+}
+
+func (ts *Targets) add(t *Target) {
 	if _, ok := ts.m[t.FQN]; ok {
 		return
 	}
 
 	ts.m[t.FQN] = t
 	ts.a = append(ts.a, t)
+}
+
+func (ts *Targets) AddAll(ats []*Target) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	for _, t := range ats {
+		ts.add(t)
+	}
 }
 
 func (ts *Targets) Find(fqn string) *Target {
@@ -507,10 +521,7 @@ func (ts *Targets) Len() int {
 
 func (ts *Targets) Copy() *Targets {
 	t := NewTargets(ts.Len())
-
-	for _, target := range ts.Slice() {
-		t.Add(target)
-	}
+	t.AddAll(ts.Slice())
 
 	return t
 }
@@ -839,6 +850,18 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
 
+	// Resolve hash deps specs
+	if t.TargetSpec.DifferentHashDeps {
+		log.Tracef(logPrefix + "Linking hashdeps")
+		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
+		if err != nil {
+			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
+		}
+		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
+	} else {
+		t.HashDeps = t.Deps.All()
+	}
+
 	// Resolve transitive specs
 	t.RequireTransitive = TargetTransitive{}
 	t.RequireTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
@@ -894,16 +917,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	t.Env = map[string]string{}
-	for _, name := range t.TargetSpec.PassEnv {
-		value, ok := os.LookupEnv(name)
-		if !ok {
-			continue
-		}
-		t.Env[name] = value
-	}
-	for k, v := range t.TargetSpec.Env {
-		t.Env[k] = v
-	}
+	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
 
 	t.DeepRequireTransitive, err = e.computeDeepTransitive(t, breadcrumb)
 	if err != nil {
@@ -923,30 +937,15 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	if !t.Transitive.Deps.Empty() {
 		t.Deps = t.Deps.Merge(t.Transitive.Deps)
+
+		if t.DifferentHashDeps {
+			t.HashDeps = t.HashDeps.Merge(t.Transitive.Deps.All())
+		} else {
+			t.HashDeps = t.Deps.All()
+		}
 	}
 
-	for _, name := range t.Transitive.PassEnv {
-		value, ok := os.LookupEnv(name)
-		if !ok {
-			continue
-		}
-		t.Env[name] = value
-	}
-	for k, v := range t.Transitive.Env {
-		t.Env[k] = v
-	}
-
-	// Resolve hash deps specs
-	if t.TargetSpec.DifferentHashDeps {
-		log.Tracef(logPrefix + "Linking hashdeps")
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
-		if err != nil {
-			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
-		}
-		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
-	} else {
-		t.HashDeps = t.Deps.All()
-	}
+	e.applyEnv(t, t.Transitive.PassEnv, t.Transitive.Env)
 
 	e.registerLabels(t.Labels)
 
@@ -1107,6 +1106,23 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 		Targets:          tools,
 		Hosts:            toolsSpecs.Hosts,
 	}, nil
+}
+
+func (e *Engine) applyEnv(t *Target, passEnv []string, env map[string]string) {
+	if t.Env == nil {
+		t.Env = map[string]string{}
+	}
+
+	for _, name := range passEnv {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			continue
+		}
+		t.Env[name] = value
+	}
+	for k, v := range env {
+		t.Env[k] = v
+	}
 }
 
 func (e *Engine) computeDeepTransitive(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
