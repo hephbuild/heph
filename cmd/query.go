@@ -362,13 +362,6 @@ var targetCmd = &cobra.Command{
 	Use:   "target <target>",
 	Short: "Prints target details",
 	Args:  cobra.ExactValidArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		if *noGen {
-			return engineInit()
-		} else {
-			return preRunWithGen(cmd.Context(), false)
-		}
-	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		err := preRunAutocomplete(cmd.Context())
 		if err != nil {
@@ -377,10 +370,22 @@ var targetCmd = &cobra.Command{
 
 		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
-	RunE: func(_ *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := utils.TargetParse("", args[0])
 		if err != nil {
 			return err
+		}
+
+		if *noGen {
+			err := engineInit()
+			if err != nil {
+				return err
+			}
+		} else {
+			err := preRunWithGen(cmd.Context(), false)
+			if err != nil {
+				return err
+			}
 		}
 
 		target := Engine.Targets.Find(tp.Full())
@@ -400,17 +405,43 @@ var targetCmd = &cobra.Command{
 		}
 
 		fmt.Println(target.FQN)
-		fmt.Println("Deps - Targets")
-		for _, t := range target.Deps.All().Targets {
-			fmt.Printf("  %v\n", t.Target.FQN)
-		}
-		fmt.Println("Deps - Files")
-		for _, t := range target.Deps.All().Files {
-			fmt.Printf("  %v\n", t.RelRoot())
-		}
+
+		fmt.Println("Require Transitive:")
+		printTools("    ", target.RequireTransitive.Tools)
+		printDeps("    ", target.RequireTransitive.Deps)
+
+		fmt.Println("Deps:")
+		printTools("    ", target.Tools)
+		printDeps("    ", target.Deps)
+
+		fmt.Println("Transitive Deps:")
+		printTools("    ", target.Transitive.Tools)
+		printDeps("    ", target.Transitive.Deps)
 
 		return nil
 	},
+}
+
+func printDeps(indent string, deps engine.TargetNamedDeps) {
+	fmt.Println(indent + "Targets:")
+	for _, t := range deps.All().Targets {
+		fmt.Printf(indent+"  %v\n", t.Target.FQN)
+	}
+	fmt.Println(indent + "Files:")
+	for _, t := range deps.All().Files {
+		fmt.Printf(indent+"  %v\n", t.RelRoot())
+	}
+}
+
+func printTools(indent string, tools engine.TargetTools) {
+	fmt.Println(indent + "Tools:")
+	for _, t := range tools.Targets {
+		fmt.Printf(indent+"  %v\n", t.Target.FQN)
+	}
+	fmt.Println(indent + "Host tools:")
+	for _, t := range tools.Hosts {
+		fmt.Printf(indent+"  %v\n", t.Name)
+	}
 }
 
 var pkgsCmd = &cobra.Command{
@@ -440,7 +471,7 @@ var pkgsCmd = &cobra.Command{
 			}
 
 			fmt.Printf("%v\n", fullname)
-			fmt.Printf("  %v\n", p.Root.RelRoot)
+			fmt.Printf("  %v\n", p.Root.RelRoot())
 			fmt.Println()
 		}
 		return nil

@@ -156,7 +156,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	}
 
 	// Sanity checks
-	for _, tool := range target.Tools {
+	for _, tool := range target.Tools.Targets {
 		if tool.Target.actualFilesOut == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
@@ -168,18 +168,14 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	log.Debugf("Running %v: %v", target.FQN, target.WorkdirRoot.RelRoot)
-
-	if target.FQN == "//test/go/mod-simple:_go_mod_gen_imports" {
-		fmt.Println()
-	}
+	log.Debugf("Running %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
 
 	bin := map[string]string{}
-	for _, t := range target.Tools {
+	for _, t := range target.Tools.Targets {
 		bin[t.Name] = t.AbsPath()
 	}
-	
-	for _, t := range target.TargetSpec.Tools.Hosts {
+
+	for _, t := range target.Tools.Hosts {
 		bin[t.Name] = t.Path
 	}
 
@@ -358,7 +354,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	for _, tool := range target.Tools {
+	for _, tool := range target.Tools.Targets {
 		k := "TOOL_" + strings.ToUpper(tool.Name)
 		if tool.Name == "" {
 			k = "TOOL"
@@ -377,6 +373,10 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 			env[normalizeEnv(strings.ToUpper(tool.Target.Name+"_"+rk))] = val
 		}
+	}
+	for _, tool := range target.Tools.Hosts {
+		k := "TOOL_" + strings.ToUpper(tool.Name)
+		env[normalizeEnv(k)] = tool.Path
 	}
 
 	for k, v := range target.Env {

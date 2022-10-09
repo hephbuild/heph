@@ -218,7 +218,7 @@ func (e *Engine) hashInput(target *Target) string {
 	defer mu.Unlock()
 
 	idh := utils.NewHash()
-	for _, fqn := range target.deps.FQNs() {
+	for _, fqn := range target.linkingDeps.FQNs() {
 		idh.String(fqn)
 	}
 
@@ -239,7 +239,7 @@ func (e *Engine) hashInput(target *Target) string {
 	h := utils.NewHash()
 
 	h.String("=")
-	for _, dep := range target.Tools {
+	for _, dep := range target.Tools.Targets {
 		dh := e.hashOutput(dep.Target, "")
 
 		h.String(dep.Name)
@@ -247,7 +247,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, tool := range target.TargetSpec.Tools.Hosts {
+	for _, tool := range target.Tools.Hosts {
 		h.String(tool.Name)
 	}
 

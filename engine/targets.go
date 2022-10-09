@@ -16,6 +16,25 @@ import (
 	"time"
 )
 
+type TargetTools struct {
+	// Holds targets references that do not have output (for transitive for ex)
+	TargetReferences []*Target
+	Targets          []TargetTool
+	Hosts            []TargetSpecHostTool
+}
+
+func (t TargetTools) Merge(tools TargetTools) TargetTools {
+	return TargetTools{
+		TargetReferences: append(t.TargetReferences, tools.TargetReferences...),
+		Targets:          append(t.Targets, tools.Targets...),
+		Hosts:            append(t.Hosts, tools.Hosts...),
+	}
+}
+
+func (t TargetTools) Empty() bool {
+	return len(t.Targets) == 0 && len(t.Hosts) == 0
+}
+
 type TargetTool struct {
 	Target *Target
 	Name   string
@@ -29,6 +48,14 @@ func (tt TargetTool) AbsPath() string {
 type TargetDeps struct {
 	Targets []TargetWithOutput
 	Files   []Path
+}
+
+func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
+	nd := TargetDeps{}
+	nd.Targets = append(d.Targets, deps.Targets...)
+	nd.Files = append(d.Files, deps.Files...)
+
+	return nd
 }
 
 type NamedPaths[TS ~[]T, T RelablePath] struct {
@@ -183,19 +210,38 @@ func (tp *TargetNamedDeps) Sort() {
 	})
 }
 
+func (tp *TargetNamedDeps) Merge(deps TargetNamedDeps) TargetNamedDeps {
+	ntp := TargetNamedDeps{}
+	for name, deps := range tp.Named() {
+		ntp.Set(name, deps)
+	}
+
+	for name, deps := range deps.Named() {
+		ntp.Set(name, ntp.Name(name).Merge(deps))
+	}
+
+	return ntp
+}
+
+func (tp *TargetNamedDeps) Empty() bool {
+	return len(tp.All().Targets) == 0 && len(tp.All().Files) == 0
+}
+
 type OutNamedPaths = NamedPaths[RelPaths, RelPath]
 type ActualOutNamedPaths = NamedPaths[Paths, Path]
 
 type Target struct {
 	TargetSpec
 
-	Tools          []TargetTool
-	Deps           TargetNamedDeps
-	HashDeps       TargetDeps
-	Out            *OutNamedPaths
-	actualFilesOut *ActualOutNamedPaths
-	Env            map[string]string
-	Transitive     TargetTransitive
+	Tools                 TargetTools
+	Deps                  TargetNamedDeps
+	HashDeps              TargetDeps
+	Out                   *OutNamedPaths
+	actualFilesOut        *ActualOutNamedPaths
+	Env                   map[string]string
+	Transitive            TargetTransitive
+	RequireTransitive     TargetTransitive
+	DeepRequireTransitive TargetTransitive
 
 	CodegenLink bool
 
@@ -212,22 +258,57 @@ type Target struct {
 	linking    bool
 	linkingCh  chan struct{}
 	linkingErr error
-	deps       *Targets // keep track of all target deps for linking
-	m          sync.Mutex
+	// Deps + HashDeps + TargetTools
+	linkingDeps *Targets
+	m           sync.Mutex
 
 	runLock   utils.Locker
 	cacheLock utils.Locker
 }
 
 type TargetTransitive struct {
-	Tools []TargetTool
-	Deps  TargetNamedDeps
+	Tools   TargetTools
+	Deps    TargetNamedDeps
+	Env     map[string]string
+	PassEnv []string
+}
+
+func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
+	ntr := TargetTransitive{
+		Env: map[string]string{},
+	}
+
+	if otr.Tools.Empty() {
+		ntr.Tools = tr.Tools
+	} else {
+		ntr.Tools = tr.Tools.Merge(otr.Tools)
+	}
+
+	if otr.Deps.Empty() {
+		ntr.Deps = tr.Deps
+	} else {
+		ntr.Deps = tr.Deps.Merge(otr.Deps)
+	}
+
+	for k, v := range tr.Env {
+		ntr.Env[k] = v
+	}
+	for k, v := range otr.Env {
+		ntr.Env[k] = v
+	}
+	ntr.PassEnv = append(tr.PassEnv, otr.PassEnv...)
+
+	return ntr
+}
+
+func (tr TargetTransitive) Empty() bool {
+	return tr.Tools.Empty() && tr.Deps.Empty() && len(tr.Env) == 0 && len(tr.PassEnv) == 0
 }
 
 var ErrStopWalk = errors.New("stop walk")
 
 func (t *Target) transitivelyWalk(m map[string]struct{}, f func(t *Target) error) error {
-	targets := append([]*Target{t}, t.deps.Slice()...)
+	targets := append([]*Target{t}, t.linkingDeps.Slice()...)
 
 	for _, t := range targets {
 		if _, ok := m[t.FQN]; ok {
@@ -267,10 +348,10 @@ func (t *Target) resetLinking() {
 
 	if t.linkingErr != nil || len(spec.Deps.Exprs) > 0 || len(spec.HashDeps.Exprs) > 0 || len(spec.Tools.Exprs) > 0 {
 		depsCap := 0
-		if t.deps != nil {
-			depsCap = len(t.deps.Slice())
+		if t.linkingDeps != nil {
+			depsCap = len(t.linkingDeps.Slice())
 		}
-		t.deps = NewTargets(depsCap)
+		t.linkingDeps = NewTargets(depsCap)
 		t.linked = false
 		t.linkingErr = nil
 	}
@@ -558,7 +639,7 @@ func (e *Engine) createDag() error {
 			}
 		}
 
-		for _, tool := range target.Tools {
+		for _, tool := range target.Tools.Targets {
 			err := addEdge(tool.Target, target)
 			if err != nil {
 				return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, target.FQN, err)
@@ -686,8 +767,8 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
 	t.m.Lock()
-	if t.deps == nil {
-		t.deps = NewTargets(0)
+	if t.linkingDeps == nil {
+		t.linkingDeps = NewTargets(0)
 	}
 
 	if t.deeplinked {
@@ -696,7 +777,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	} else if t.linked {
 		t.m.Unlock()
 
-		for _, dep := range t.deps.Slice() {
+		for _, dep := range t.linkingDeps.Slice() {
 			err := e.linkTarget(dep, breadcrumb)
 			if err != nil {
 				t.linkingErr = err
@@ -747,115 +828,29 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	log.Tracef(logPrefix + "Linking tools")
 
-	t.Tools = []TargetTool{}
-
-	type targetTool struct {
-		Target *Target
-		Output string
+	t.Tools, err = e.linkTargetTools(t, t.TargetSpec.Tools, breadcrumb)
+	if err != nil {
+		return err
 	}
-
-	targetTools := make([]targetTool, 0)
-	for _, tool := range t.TargetSpec.Tools.Targets {
-		tt := e.Targets.Find(tool.Target)
-		if tt == nil {
-			return TargetNotFoundError(tool.Target)
-		}
-
-		err = e.linkTarget(tt, breadcrumb)
-		if err != nil {
-			return fmt.Errorf("tool: %v: %w", tool, err)
-		}
-
-		targetTools = append(targetTools, targetTool{
-			Target: tt,
-			Output: tool.Output,
-		})
-	}
-
-	for _, tool := range t.TargetSpec.Tools.Exprs {
-		expr := tool.Expr
-
-		targets, err := e.targetExpr(t, expr, breadcrumb)
-		if err != nil {
-			return err
-		}
-
-		for _, target := range targets {
-			targetTools = append(targetTools, targetTool{
-				Target: target,
-			})
-		}
-	}
-
-	for _, tool := range targetTools {
-		tt := tool.Target
-
-		var paths map[string]RelPaths
-		if tool.Output != "" {
-			npaths := tt.Out.Name(tool.Output)
-
-			if len(npaths) == 0 {
-				return fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
-			}
-
-			paths = map[string]RelPaths{
-				tool.Output: npaths,
-			}
-		} else {
-			paths = tt.Out.Named()
-
-			if len(paths) == 0 {
-				return fmt.Errorf("%v has no output", tt.FQN)
-			}
-		}
-
-		for name, paths := range paths {
-			if len(paths) > 1 {
-				return fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.FQN)
-			}
-
-			path := paths[0]
-
-			if name == "" {
-				name = filepath.Base(path.RelRoot())
-			}
-
-			t.Tools = append(t.Tools, TargetTool{
-				Target: tt,
-				Name:   name,
-				File:   path,
-			})
-		}
-	}
-
-	sort.SliceStable(t.TargetSpec.Tools.Hosts, func(i, j int) bool {
-		ts := t.TargetSpec.Tools.Hosts
-		return ts[i].Name < ts[j].Name
-	})
-
-	sort.SliceStable(t.Tools, func(i, j int) bool {
-		return t.Tools[i].Name < t.Tools[j].Name
-	})
 
 	log.Tracef(logPrefix + "Linking deps")
 	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, breadcrumb)
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
-	t.Deps.Map(func(deps TargetDeps) TargetDeps {
-		return e.filterOutCodegenFromDeps(t, deps)
-	})
 
-	if t.TargetSpec.DifferentHashDeps {
-		log.Tracef(logPrefix + "Linking hashdeps")
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
-		if err != nil {
-			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
-		}
-		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
-	} else {
-		t.HashDeps = t.Deps.All()
+	// Resolve transitive specs
+	t.RequireTransitive = TargetTransitive{}
+	t.RequireTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
+	if err != nil {
+		return err
 	}
+	t.RequireTransitive.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Transitive.Deps, breadcrumb)
+	if err != nil {
+		return err
+	}
+	t.RequireTransitive.Env = t.TargetSpec.Transitive.Env
+	t.RequireTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
 
 	relPathFactory := func(p string) RelPath {
 		abs := strings.HasPrefix(p, "/")
@@ -910,23 +905,66 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		t.Env[k] = v
 	}
 
+	t.DeepRequireTransitive, err = e.computeDeepTransitive(t, breadcrumb)
+	if err != nil {
+		return err
+	}
+
+	// Apply transitive deps
+	log.Tracef(logPrefix + "Linking transitive")
+	t.Transitive, err = e.collectDepsTransitive(t, breadcrumb)
+	if err != nil {
+		return err
+	}
+
+	if !t.Transitive.Tools.Empty() {
+		t.Tools = t.Tools.Merge(t.Transitive.Tools)
+	}
+
+	if !t.Transitive.Deps.Empty() {
+		t.Deps = t.Deps.Merge(t.Transitive.Deps)
+	}
+
+	for _, name := range t.Transitive.PassEnv {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			continue
+		}
+		t.Env[name] = value
+	}
+	for k, v := range t.Transitive.Env {
+		t.Env[k] = v
+	}
+
+	// Resolve hash deps specs
+	if t.TargetSpec.DifferentHashDeps {
+		log.Tracef(logPrefix + "Linking hashdeps")
+		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
+		if err != nil {
+			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
+		}
+		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
+	} else {
+		t.HashDeps = t.Deps.All()
+	}
+
 	e.registerLabels(t.Labels)
 
 	for _, dep := range t.Deps.All().Targets {
-		t.deps.Add(dep.Target)
+		t.linkingDeps.Add(dep.Target)
 	}
 
 	if t.DifferentHashDeps {
 		for _, dep := range t.HashDeps.Targets {
-			t.deps.Add(dep.Target)
+			t.linkingDeps.Add(dep.Target)
 		}
 	}
 
-	for _, dep := range t.Tools {
-		t.deps.Add(dep.Target)
+	for _, dep := range t.Tools.Targets {
+		t.linkingDeps.Add(dep.Target)
 	}
 
-	t.deps.Sort()
+	t.linkingDeps.Sort()
 
 	return nil
 }
@@ -961,9 +999,169 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, breadcrumb 
 		td.Set(name, ldeps)
 	}
 
+	td.Map(func(deps TargetDeps) TargetDeps {
+		return e.filterOutCodegenFromDeps(t, deps)
+	})
+
 	td.Sort()
 
 	return td, nil
+}
+
+func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcrumb *Targets) (TargetTools, error) {
+	type targetTool struct {
+		Target *Target
+		Output string
+	}
+
+	refs := make([]*Target, 0, len(toolsSpecs.Targets))
+	targetTools := make([]targetTool, 0)
+	for _, tool := range toolsSpecs.Targets {
+		tt := e.Targets.Find(tool.Target)
+		if tt == nil {
+			return TargetTools{}, TargetNotFoundError(tool.Target)
+		}
+
+		err := e.linkTarget(tt, breadcrumb)
+		if err != nil {
+			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
+		}
+
+		targetTools = append(targetTools, targetTool{
+			Target: tt,
+			Output: tool.Output,
+		})
+		refs = append(refs, tt)
+	}
+
+	for _, tool := range toolsSpecs.Exprs {
+		expr := tool.Expr
+
+		targets, err := e.targetExpr(t, expr, breadcrumb)
+		if err != nil {
+			return TargetTools{}, err
+		}
+
+		for _, target := range targets {
+			targetTools = append(targetTools, targetTool{
+				Target: target,
+			})
+			refs = append(refs, target)
+		}
+	}
+
+	tools := make([]TargetTool, 0, len(toolsSpecs.Targets))
+
+	for _, tool := range targetTools {
+		tt := tool.Target
+
+		var paths map[string]RelPaths
+		if tool.Output != "" {
+			npaths := tt.Out.Name(tool.Output)
+
+			if len(npaths) == 0 {
+				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
+			}
+
+			paths = map[string]RelPaths{
+				tool.Output: npaths,
+			}
+		} else {
+			paths = tt.Out.Named()
+
+			if len(paths) == 0 && tool.Target.DeepRequireTransitive.Empty() {
+				return TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
+			}
+		}
+
+		for name, paths := range paths {
+			if len(paths) != 1 {
+				return TargetTools{}, fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.FQN)
+			}
+
+			path := paths[0]
+
+			if name == "" {
+				name = filepath.Base(path.RelRoot())
+			}
+
+			tools = append(tools, TargetTool{
+				Target: tt,
+				Name:   name,
+				File:   path,
+			})
+		}
+	}
+
+	sort.SliceStable(toolsSpecs.Hosts, func(i, j int) bool {
+		ts := toolsSpecs.Hosts
+		return ts[i].Name < ts[j].Name
+	})
+
+	sort.SliceStable(tools, func(i, j int) bool {
+		return tools[i].Name < tools[j].Name
+	})
+
+	return TargetTools{
+		TargetReferences: refs,
+		Targets:          tools,
+		Hosts:            toolsSpecs.Hosts,
+	}, nil
+}
+
+func (e *Engine) computeDeepTransitive(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
+	tr := t.RequireTransitive
+	targets := make([]*Target, 0, len(tr.Deps.All().Targets)+len(tr.Tools.Targets))
+	for _, dep := range tr.Deps.All().Targets {
+		targets = append(targets, dep.Target)
+	}
+	for _, dep := range tr.Tools.Targets {
+		targets = append(targets, dep.Target)
+	}
+
+	dtr, err := e.collectTransitive(targets, breadcrumb)
+	if err != nil {
+		return TargetTransitive{}, err
+	}
+	dtr = dtr.Merge(tr)
+
+	return dtr, nil
+}
+
+func (e *Engine) collectDepsTransitive(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
+	targets := make([]*Target, 0, len(t.Deps.All().Targets)+len(t.Tools.TargetReferences))
+	for _, dep := range t.Deps.All().Targets {
+		targets = append(targets, dep.Target)
+	}
+	for _, t := range t.Tools.TargetReferences {
+		targets = append(targets, t)
+	}
+
+	return e.collectTransitive(targets, breadcrumb)
+}
+
+func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (TargetTransitive, error) {
+	tt := TargetTransitive{}
+
+	for _, dep := range deps {
+		tt = tt.Merge(dep.DeepRequireTransitive)
+	}
+
+	for _, dep := range tt.Deps.All().Targets {
+		err := e.linkTarget(dep.Target, breadcrumb)
+		if err != nil {
+			return TargetTransitive{}, err
+		}
+	}
+
+	for _, t := range tt.Tools.TargetReferences {
+		err := e.linkTarget(t, breadcrumb)
+		if err != nil {
+			return TargetTransitive{}, err
+		}
+	}
+
+	return tt, nil
 }
 
 func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]*Target, error) {

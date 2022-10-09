@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"go.starlark.net/starlark"
 	"path/filepath"
 )
@@ -50,6 +51,18 @@ type Path struct {
 	root    string
 	relRoot string
 	abs     string
+}
+
+func (p *Path) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		Root    string
+		RelRoot string
+		Abs     string `json:",omitempty"`
+	}{
+		Root:    p.root,
+		RelRoot: p.relRoot,
+		Abs:     p.abs,
+	})
 }
 
 func (p Path) WithRoot(root string) Path {

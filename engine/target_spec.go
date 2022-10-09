@@ -43,42 +43,9 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 
 	var err error
 
-	for _, tool := range args.Tools.Array {
-		expr, err := exprs.Parse(tool)
-		if err == nil {
-			t.Tools.Exprs = append(t.Tools.Exprs, TargetSpecExprTool{
-				Expr: expr,
-			})
-			continue
-		}
-
-		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
-		if err == nil {
-			t.Tools.Targets = append(t.Tools.Targets, TargetSpecTargetTool{
-				Target: tp.Full(),
-				Output: tp.Output,
-			})
-			continue
-		}
-
-		lookPath := exec.LookPath
-		if tool == "heph" {
-			lookPath = func(file string) (string, error) {
-				return os.Executable()
-			}
-		}
-
-		binPath, err := lookPath(tool)
-		if err != nil {
-			return TargetSpec{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
-		}
-
-		log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
-
-		t.Tools.Hosts = append(t.Tools.Hosts, TargetSpecHostTool{
-			Name: tool,
-			Path: binPath,
-		})
+	t.Tools, err = toolsSpecFromArgs(t, args.Tools)
+	if err != nil {
+		return TargetSpec{}, err
 	}
 
 	t.Deps, err = depsSpecFromArgs(t, args.Deps)
@@ -94,6 +61,19 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 	} else {
 		t.HashDeps = t.Deps
 	}
+
+	t.Transitive.Tools, err = toolsSpecFromArgs(t, args.Transitive.Tools)
+	if err != nil {
+		return TargetSpec{}, err
+	}
+
+	t.Transitive.Deps, err = depsSpecFromArgs(t, args.Transitive.Deps)
+	if err != nil {
+		return TargetSpec{}, err
+	}
+
+	t.Transitive.Env = args.Transitive.Env.StrMap
+	t.Transitive.PassEnv = args.Transitive.PassEnv.Array
 
 	if len(args.Out.ArrMap) > 0 {
 		for k, vs := range args.Out.ArrMap {
@@ -204,6 +184,50 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	}
 
 	return td
+}
+
+func toolsSpecFromArgs(t TargetSpec, tools ArrayMap) (TargetSpecTools, error) {
+	ts := TargetSpecTools{}
+
+	for _, tool := range tools.Array {
+		expr, err := exprs.Parse(tool)
+		if err == nil {
+			ts.Exprs = append(ts.Exprs, TargetSpecExprTool{
+				Expr: expr,
+			})
+			continue
+		}
+
+		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
+		if err == nil {
+			ts.Targets = append(ts.Targets, TargetSpecTargetTool{
+				Target: tp.Full(),
+				Output: tp.Output,
+			})
+			continue
+		}
+
+		lookPath := exec.LookPath
+		if tool == "heph" {
+			lookPath = func(file string) (string, error) {
+				return os.Executable()
+			}
+		}
+
+		binPath, err := lookPath(tool)
+		if err != nil {
+			return TargetSpecTools{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
+		}
+
+		log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
+
+		ts.Hosts = append(ts.Hosts, TargetSpecHostTool{
+			Name: tool,
+			Path: binPath,
+		})
+	}
+
+	return ts, nil
 }
 
 func depsSpecFromArgs(t TargetSpec, deps ArrayMap) (TargetSpecDeps, error) {

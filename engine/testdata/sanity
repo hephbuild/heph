@@ -1,5 +1,7 @@
 target(
     name="a",
+    deps=['some_file.txt', ':some_target'],
+    tools=['ls', ':some_tool_target'],
 )
 ===
 {
@@ -15,25 +17,58 @@ target(
         "SourceFiles": null
     },
     "Run": null,
-    "FileContent": "",
     "Executor": "bash",
     "Quiet": false,
     "Dir": "",
     "PassArgs": false,
     "Deps": {
-        "Targets": null,
-        "Files": null,
+        "Targets": [
+            {
+                "Name": "",
+                "Output": "",
+                "Target": "//some/test:some_target"
+            }
+        ],
+        "Files": [
+            {
+                "Name": "",
+                "Path": "some_file.txt"
+            }
+        ],
         "Exprs": null
     },
     "HashDeps": {
-        "Targets": null,
-        "Files": null,
+        "Targets": [
+            {
+                "Name": "",
+                "Output": "",
+                "Target": "//some/test:some_target"
+            }
+        ],
+        "Files": [
+            {
+                "Name": "",
+                "Path": "some_file.txt"
+            }
+        ],
         "Exprs": null
     },
     "DifferentHashDeps": false,
-    "ExprTools": null,
-    "TargetTools": null,
-    "HostTools": null,
+    "Tools": {
+        "Targets": [
+            {
+                "Target": "//some/test:some_tool_target",
+                "Output": ""
+            }
+        ],
+        "Hosts": [
+            {
+                "Name": "ls",
+                "Path": "REPLACE_LS_BIN"
+            }
+        ],
+        "Exprs": null
+    },
     "Out": null,
     "Cache": {
         "Enabled": true,
@@ -52,5 +87,19 @@ target(
     "RuntimeEnv": null,
     "SrcEnv": "rel_pkg",
     "OutEnv": "rel_pkg",
-    "HashFile": "content"
+    "HashFile": "content",
+    "Transitive": {
+        "Deps": {
+            "Targets": null,
+            "Files": null,
+            "Exprs": null
+        },
+        "Tools": {
+            "Targets": null,
+            "Hosts": null,
+            "Exprs": null
+        },
+        "Env": null,
+        "PassEnv": null
+    }
 }
