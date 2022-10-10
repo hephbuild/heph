@@ -1290,7 +1290,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targ
 	}
 
 	td.Targets = utils.DedupKeepLast(td.Targets, func(t TargetWithOutput) string {
-		return t.Target.FQN
+		return t.Target.FQN + t.Output
 	})
 	td.Files = utils.DedupKeepLast(td.Files, func(t Path) string {
 		return t.RelRoot()

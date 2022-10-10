@@ -27,7 +27,7 @@ target(
 
 e2e_test(
     name="sanity_transitive_deps",
-    cmd="heph run //test/sanity:tr_deps",
+    cmd="heph run //test/features:tr_deps",
     expected_output="""
 tr_base
 tr_deps_mid
@@ -52,7 +52,7 @@ target(
 
 e2e_test(
     name="sanity_transitive_tools",
-    cmd="heph run //test/sanity:tr_tools",
+    cmd="heph run //test/features:tr_tools",
     expected_output="""
 tr_base
 ===

@@ -31,13 +31,6 @@ e2e_test(
 //test/sanity:sanity_echo
 //test/sanity:sanity_echo-hash-input
 //test/sanity:sanity_exit-code
-//test/sanity:sanity_transitive_deps
-//test/sanity:sanity_transitive_tools
-//test/sanity:tr_base
-//test/sanity:tr_deps
-//test/sanity:tr_deps_mid
-//test/sanity:tr_tools
-//test/sanity:tr_tools_mid
 """.strip(),
 )
 
