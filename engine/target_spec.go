@@ -91,6 +91,10 @@ func specFromArgs(args TargetArgs, pkg *Package) (TargetSpec, error) {
 		}
 	} else if len(args.Out.StrMap) > 0 {
 		for k, v := range args.Out.StrMap {
+			if k == "" {
+				return t, fmt.Errorf("named output must not be empty")
+			}
+
 			t.Out = append(t.Out, TargetSpecOutFile{
 				Name:    k,
 				Package: pkg,
@@ -186,45 +190,69 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 	return td
 }
 
+func toolsSpecFromString(t TargetSpec, ts *TargetSpecTools, name, tool string) error {
+	expr, err := exprs.Parse(tool)
+	if err == nil {
+		ts.Exprs = append(ts.Exprs, TargetSpecExprTool{
+			Name: name,
+			Expr: expr,
+		})
+		return nil
+	}
+
+	tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
+	if err == nil {
+		ts.Targets = append(ts.Targets, TargetSpecTargetTool{
+			Name:   name,
+			Target: tp.Full(),
+			Output: tp.Output,
+		})
+		return nil
+	}
+
+	lookPath := exec.LookPath
+	if tool == "heph" {
+		lookPath = func(file string) (string, error) {
+			return os.Executable()
+		}
+	}
+
+	binPath, err := lookPath(tool)
+	if err != nil {
+		return fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
+	}
+
+	log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
+
+	if name == "" {
+		name = tool
+	}
+
+	ts.Hosts = append(ts.Hosts, TargetSpecHostTool{
+		Name: name,
+		Path: binPath,
+	})
+
+	return nil
+}
+
 func toolsSpecFromArgs(t TargetSpec, tools ArrayMap) (TargetSpecTools, error) {
 	ts := TargetSpecTools{}
 
-	for _, tool := range tools.Array {
-		expr, err := exprs.Parse(tool)
-		if err == nil {
-			ts.Exprs = append(ts.Exprs, TargetSpecExprTool{
-				Expr: expr,
-			})
-			continue
-		}
-
-		tp, err := utils.TargetOutputParse(t.Package.FullName, tool)
-		if err == nil {
-			ts.Targets = append(ts.Targets, TargetSpecTargetTool{
-				Target: tp.Full(),
-				Output: tp.Output,
-			})
-			continue
-		}
-
-		lookPath := exec.LookPath
-		if tool == "heph" {
-			lookPath = func(file string) (string, error) {
-				return os.Executable()
+	if len(tools.StrMap) > 0 {
+		for name, s := range tools.StrMap {
+			err := toolsSpecFromString(t, &ts, name, s)
+			if err != nil {
+				return TargetSpecTools{}, err
 			}
 		}
-
-		binPath, err := lookPath(tool)
-		if err != nil {
-			return TargetSpecTools{}, fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
+	} else {
+		for _, s := range tools.Array {
+			err := toolsSpecFromString(t, &ts, "", s)
+			if err != nil {
+				return TargetSpecTools{}, err
+			}
 		}
-
-		log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
-
-		ts.Hosts = append(ts.Hosts, TargetSpecHostTool{
-			Name: tool,
-			Path: binPath,
-		})
 	}
 
 	return ts, nil
@@ -400,11 +428,13 @@ func (t TargetSpec) equalJson(spec TargetSpec) bool {
 }
 
 type TargetSpecTargetTool struct {
+	Name   string
 	Target string
 	Output string
 }
 
 type TargetSpecExprTool struct {
+	Name   string
 	Expr   exprs.Expr
 	Output string
 }

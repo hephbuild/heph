@@ -306,8 +306,9 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	}
 
 	if target.OutEnv != FileEnvIgnore {
+		out := target.Out.WithRoot(target.SandboxRoot.Abs()).Named()
 		namedOut := map[string][]string{}
-		for name, paths := range target.Out.WithRoot(target.SandboxRoot.Abs()).Named() {
+		for name, paths := range out {
 			for _, path := range paths {
 				if strings.Contains(path.RelRoot(), "*") {
 					// Skip glob

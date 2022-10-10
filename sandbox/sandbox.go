@@ -42,6 +42,10 @@ func MakeBin(cfg MakeBinConfig) error {
 	}
 
 	for name, p := range cfg.Bin {
+		if name == "" {
+			panic("bin name cannot be empty: " + p)
+		}
+
 		log.Tracef("MakeBin linking %v: %v", name, p)
 
 		_, err := os.Stat(p)

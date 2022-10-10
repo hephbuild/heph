@@ -1,6 +1,6 @@
 target(
     name="e2e_test",
-    run="heph --log_level=trace query --include e2e_test | heph run -",
+    run="heph query --include e2e_test | heph run -",
     tools=['heph'],
     pass_env=["PATH"],
     sandbox=False,

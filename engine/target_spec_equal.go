@@ -1,11 +1,19 @@
 package engine
 
-func arrEqual[T comparable](a, b []T) bool {
+func basicArrEqual[T any](a, b []T) bool {
 	if (a == nil || b == nil) && (a != nil || b != nil) {
 		return false
 	}
 
 	if len(a) != len(b) {
+		return false
+	}
+
+	return true
+}
+
+func arrEqual[T comparable](a, b []T) bool {
+	if !basicArrEqual(a, b) {
 		return false
 	}
 
@@ -19,7 +27,7 @@ func arrEqual[T comparable](a, b []T) bool {
 }
 
 func arrEqualFunc[T interface{ Equal(T) bool }](a, b []T) bool {
-	if len(a) != len(b) {
+	if !basicArrEqual(a, b) {
 		return false
 	}
 
@@ -33,6 +41,10 @@ func arrEqualFunc[T interface{ Equal(T) bool }](a, b []T) bool {
 }
 
 func mapEqual(a, b map[string]string) bool {
+	if (a == nil || b == nil) && (a != nil || b != nil) {
+		return false
+	}
+
 	if len(a) != len(b) {
 		return false
 	}

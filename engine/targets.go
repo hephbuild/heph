@@ -119,8 +119,10 @@ func (tp *NamedPaths[TS, T]) Sort() {
 	})
 
 	for name := range tp.named {
+		named := tp.named[name]
+
 		sort.SliceStable(tp.named[name], func(i, j int) bool {
-			return tp.named[name][i].RelRoot() < tp.named[name][j].RelRoot()
+			return named[i].RelRoot() < named[j].RelRoot()
 		})
 	}
 }
@@ -1011,6 +1013,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 	type targetTool struct {
 		Target *Target
 		Output string
+		Name   string
 	}
 
 	refs := make([]*Target, 0, len(toolsSpecs.Targets))
@@ -1029,6 +1032,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 		targetTools = append(targetTools, targetTool{
 			Target: tt,
 			Output: tool.Output,
+			Name:   tool.Name,
 		})
 		refs = append(refs, tt)
 	}
@@ -1044,6 +1048,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 		for _, target := range targets {
 			targetTools = append(targetTools, targetTool{
 				Target: target,
+				Name:   tool.Name,
 			})
 			refs = append(refs, target)
 		}
@@ -1054,6 +1059,13 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 	for _, tool := range targetTools {
 		tt := tool.Target
 
+		var name string
+		if tool.Name != "" {
+			name = tool.Name
+		} else {
+			name = tool.Output
+		}
+
 		var paths map[string]RelPaths
 		if tool.Output != "" {
 			npaths := tt.Out.Name(tool.Output)
@@ -1063,13 +1075,25 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 			}
 
 			paths = map[string]RelPaths{
-				tool.Output: npaths,
+				name: npaths,
 			}
 		} else {
 			paths = tt.Out.Named()
 
 			if len(paths) == 0 && tool.Target.DeepRequireTransitive.Empty() {
 				return TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
+			}
+
+			if name != "" {
+				npaths := map[string]RelPaths{}
+				for k, v := range paths {
+					nk := name
+					if k != "" {
+						nk = name + "_" + k
+					}
+					npaths[nk] = v
+				}
+				paths = npaths
 			}
 		}
 

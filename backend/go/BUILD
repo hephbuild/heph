@@ -389,7 +389,7 @@ def go_bin(name, pkg=None, *args, **kwargs):
 
     kwargs = {
         "name": name,
-        "tools": go_bin_build_addr(pkg),
+        "tools": {'bin': go_bin_build_addr(pkg)},
         "sandbox": False,
         "cache": False,
         "pass_args": True,
@@ -397,7 +397,7 @@ def go_bin(name, pkg=None, *args, **kwargs):
 
     if "run" not in kwargs and "executor" not in kwargs:
         kwargs = {
-            "run": "$TOOL_GO_BIN_BUILD",
+            "run": "$TOOL_BIN",
             "executor": "exec",
         } | kwargs
 

@@ -57,6 +57,7 @@ target(
     "Tools": {
         "Targets": [
             {
+                "Name": "",
                 "Target": "//some/test:some_tool_target",
                 "Output": ""
             }
