@@ -348,10 +348,10 @@ type TargetSpec struct {
 	SrcEnv            string
 	OutEnv            string
 	HashFile          string
-	Transitive        TransitiveTargetSpec
+	Transitive        TargetSpecTransitive
 }
 
-type TransitiveTargetSpec struct {
+type TargetSpecTransitive struct {
 	Deps    TargetSpecDeps
 	Tools   TargetSpecTools
 	Env     map[string]string

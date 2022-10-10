@@ -36,6 +36,9 @@ godeps = target(
     run="cd godeps && go build -o godeps .",
     out={"godeps": "godeps/godeps"},
     tools=[go],
+    transitive=heph.target_spec(
+        tools=go,
+    ),
     env={
         "OS": get_os(),
         "ARCH": get_arch(),
@@ -118,7 +121,7 @@ def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
         run="godeps imports > $OUT",
         out="imports",
         deps=godeps_deps,
-        tools=[go, godeps],
+        tools=godeps,
     )
 
     mod_gen_kwargs={}
@@ -134,7 +137,7 @@ def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
         out="/**/BUILD",
         deps={'deps': godeps_deps, 'cfg': godeps_cfg},
         hash_deps=[imports, gomodsum, godeps_cfg],
-        tools=[go, godeps],
+        tools=godeps,
         env={
             "GOOS": get_os(),
             "GOARCH": get_arch(),

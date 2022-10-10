@@ -453,7 +453,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("exec: %v %v => %w", execArgs, args, err)
+			return fmt.Errorf("exec: %w", err)
 		}
 	}
 

@@ -95,6 +95,10 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
+	if !t.Transitive.Equal(spec.Transitive) {
+		return false
+	}
+
 	if !t.Tools.Equal(spec.Tools) {
 		return false
 	}
@@ -236,6 +240,26 @@ func (this TargetSpecExprTool) Equal(that TargetSpecExprTool) bool {
 	}
 
 	if this.Output != that.Output {
+		return false
+	}
+
+	return true
+}
+
+func (this TargetSpecTransitive) Equal(that TargetSpecTransitive) bool {
+	if !this.Deps.Equal(that.Deps) {
+		return false
+	}
+
+	if !this.Tools.Equal(that.Tools) {
+		return false
+	}
+
+	if !arrEqual(this.PassEnv, that.PassEnv) {
+		return false
+	}
+
+	if !mapEqual(this.Env, that.Env) {
 		return false
 	}
 
