@@ -48,7 +48,7 @@ var ExecExecutor = Executor{
 		}
 
 		path := ctx.Env["PATH"]
-		p, err := LookPath(path, ctx.Args[0])
+		p, err := LookPath(ctx.Args[0], path)
 		if err != nil {
 			return nil, err
 		}
