@@ -25,6 +25,7 @@ var output string
 func init() {
 	queryCmd.AddCommand(configCmd)
 	queryCmd.AddCommand(codegenCmd)
+	queryCmd.AddCommand(fzfCmd)
 	queryCmd.AddCommand(alltargetsCmd)
 	queryCmd.AddCommand(graphCmd)
 	queryCmd.AddCommand(graphDotCmd)
@@ -59,9 +60,10 @@ func init() {
 }
 
 var queryCmd = &cobra.Command{
-	Use:   "query",
-	Short: "Filter targets",
-	Args:  cobra.ArbitraryArgs,
+	Use:     "query",
+	Aliases: []string{"q"},
+	Short:   "Filter targets",
+	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := engineInit()
 		if err != nil {
@@ -134,6 +136,26 @@ var alltargetsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		for _, target := range sortedTargets(Engine.Targets.Slice(), false) {
 			fmt.Println(target.FQN)
+		}
+
+		return nil
+	},
+}
+
+var fzfCmd = &cobra.Command{
+	Use:   "fzf",
+	Short: "Fuzzy search targets",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		targets, _, err := preRunAutocomplete(cmd.Context())
+		if err != nil {
+			return err
+		}
+
+		sugestions := autocompleteTargetName(targets, args[0])
+
+		for _, target := range sugestions {
+			fmt.Println(target)
 		}
 
 		return nil

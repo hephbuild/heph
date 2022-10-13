@@ -193,6 +193,7 @@ var rootCmd = &cobra.Command{
 
 var runCmd = &cobra.Command{
 	Use:           "run",
+	Aliases:       []string{"r"},
 	Short:         "Run target",
 	SilenceUsage:  true,
 	SilenceErrors: true,
