@@ -148,7 +148,7 @@ var rootCmd = &cobra.Command{
 		return Engine.Pool.Err()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete(cmd.Context())
+		_, _, err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
@@ -198,12 +198,12 @@ var runCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.MinimumNArgs(1),
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete(cmd.Context())
+		targets, _, err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
 
-		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if hasStdin(args) {
@@ -255,12 +255,12 @@ var watchCmd = &cobra.Command{
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete(cmd.Context())
+		targets, _, err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
 
-		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
@@ -432,8 +432,24 @@ func switchToPorcelain() {
 	log.SetLevel(log.ErrorLevel)
 }
 
-func preRunAutocomplete(ctx context.Context) error {
-	return preRunWithGen(ctx, true)
+func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
+	err := engineInit()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cache, _ := Engine.LoadAutocompleteCache()
+
+	if cache != nil {
+		return cache.Targets, cache.Labels, nil
+	}
+
+	err = preRunWithGen(ctx, true)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return Engine.Targets.FQNs(), Engine.Labels, nil
 }
 
 func findRoot() (string, error) {
@@ -537,12 +553,12 @@ var cleanCmd = &cobra.Command{
 		return engineInit()
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		err := preRunAutocomplete(cmd.Context())
+		targets, _, err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveError
 		}
 
-		return autocompleteTargetName(Engine.Targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {

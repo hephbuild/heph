@@ -49,6 +49,10 @@ func (p TargetPath) validate() error {
 	return nil
 }
 
+func (p TargetPath) IsPrivate() bool {
+	return strings.HasPrefix(p.Name, "_")
+}
+
 func TargetParse(pkg string, s string) (TargetPath, error) {
 	tp, err := targetParse(pkg, s)
 	if err != nil {

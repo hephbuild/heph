@@ -6,23 +6,10 @@ import (
 	"sort"
 )
 
-func targetNames(targets []*engine.Target) []string {
-	stargets := make([]string, 0)
-	for _, target := range targets {
-		if target.Private() {
-			continue
-		}
-
-		stargets = append(stargets, target.FQN)
-	}
-
-	return stargets
-}
-
 func sortedTargets(targets []*engine.Target, skipPrivate bool) []*engine.Target {
 	stargets := make([]*engine.Target, 0)
 	for _, target := range targets {
-		if skipPrivate && target.Private() {
+		if skipPrivate && target.IsPrivate() {
 			continue
 		}
 
@@ -45,12 +32,12 @@ func sortedTargetNames(targets []*engine.Target, skipPrivate bool) []string {
 	return names
 }
 
-func autocompleteTargetName(targets *engine.Targets, s string) []string {
+func autocompleteTargetName(targets []string, s string) []string {
 	if s == "" {
-		return sortedTargetNames(targets.Slice(), true)
+		return targets
 	}
 
-	matches := fuzzy.RankFindNormalizedFold(s, targetNames(targets.Slice()))
+	matches := fuzzy.RankFindNormalizedFold(s, targets)
 	sort.Sort(matches)
 
 	suggestions := make([]string, 0)
@@ -61,18 +48,33 @@ func autocompleteTargetName(targets *engine.Targets, s string) []string {
 	return suggestions
 }
 
-func autocompleteLabel(s string) []string {
+func autocompleteLabel(labels []string, s string) []string {
 	if s == "" {
-		return Engine.Labels
+		return labels
 	}
 
-	matches := fuzzy.RankFindNormalizedFold(s, Engine.Labels)
+	matches := fuzzy.RankFindNormalizedFold(s, labels)
 	sort.Sort(matches)
 
 	suggestions := make([]string, 0)
 	for _, s := range matches {
 		suggestions = append(suggestions, s.Target)
 	}
+
+	return suggestions
+}
+
+func autocompleteLabelOrTarget(targets, labels []string, s string) []string {
+	tch := make(chan []string)
+	lch := make(chan []string)
+	go func() {
+		tch <- autocompleteTargetName(targets, s)
+	}()
+	go func() {
+		lch <- autocompleteLabel(labels, s)
+	}()
+	suggestions := <-tch
+	suggestions = append(suggestions, <-lch...)
 
 	return suggestions
 }

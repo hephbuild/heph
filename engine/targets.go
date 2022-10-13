@@ -411,7 +411,7 @@ func (t *Target) ActualCachedFiles() Paths {
 	return t.actualcachedFiles
 }
 
-func (t *Target) Private() bool {
+func (t *Target) IsPrivate() bool {
 	return strings.HasPrefix(t.Name, "_")
 }
 
@@ -587,6 +587,11 @@ func (e *Engine) Parse() error {
 	log.Debugf("ProcessTargets took %v", time.Since(linkStartTime))
 
 	err = e.createDag()
+	if err != nil {
+		return err
+	}
+
+	e.autocompleteHash, err = e.computeAutocompleteHash()
 	if err != nil {
 		return err
 	}

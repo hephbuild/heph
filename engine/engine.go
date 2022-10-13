@@ -46,6 +46,8 @@ type Engine struct {
 
 	dag *DAG
 
+	autocompleteHash string
+
 	cacheHashInputTargetMutex  utils.KMutex
 	cacheHashInputMutex        sync.RWMutex
 	cacheHashInput             map[string]string
@@ -125,23 +127,23 @@ func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 		h.String(dh)
 	}
 }
-func (e *Engine) hashDepsFiles(h utils.Hash, target *Target, files Paths) {
+func (e *Engine) hashFiles(h utils.Hash, hashMethod string, files Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
 
-		switch target.HashFile {
+		switch hashMethod {
 		case HashFileContent:
 			err := e.hashFile(h, dep)
 			if err != nil {
-				panic(fmt.Errorf("hashDeps: %v: hashFile %v %w", target.FQN, dep.Abs(), err))
+				panic(fmt.Errorf("hashDeps: hashFile %v %w", dep.Abs(), err))
 			}
 		case HashFileModTime:
 			err := e.hashFileModTime(h, dep)
 			if err != nil {
-				panic(fmt.Errorf("hashDeps: %v: hashFileModTime %v %w", target.FQN, dep.Abs(), err))
+				panic(fmt.Errorf("hashDeps: hashFileModTime %v %w", dep.Abs(), err))
 			}
 		default:
-			panic(fmt.Sprintf("unhandled hash_input: %v", target.HashFile))
+			panic(fmt.Sprintf("unhandled hash_input: %v", hashMethod))
 		}
 	}
 }
@@ -212,6 +214,30 @@ func (e *Engine) ResetCacheHashInput(target *Target) {
 	delete(e.cacheHashInput, target.FQN)
 }
 
+func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
+	e.hashFiles(h, HashFileModTime, target.Deps.All().Files)
+
+	for _, dep := range target.Deps.All().Targets {
+		err := e.hashInputFiles(h, dep.Target)
+		if ErrStopWalk != nil {
+			return err
+		}
+	}
+
+	if target.DifferentHashDeps {
+		e.hashFiles(h, HashFileModTime, target.HashDeps.Files)
+
+		for _, dep := range target.HashDeps.Targets {
+			err := e.hashInputFiles(h, dep.Target)
+			if ErrStopWalk != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (e *Engine) hashInput(target *Target) string {
 	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
 	mu.Lock()
@@ -255,7 +281,7 @@ func (e *Engine) hashInput(target *Target) string {
 	if target.DifferentHashDeps {
 		h.String("=")
 		e.hashDepsTargets(h, target.HashDeps.Targets)
-		e.hashDepsFiles(h, target, target.HashDeps.Files)
+		e.hashFiles(h, target.HashFile, target.HashDeps.Files)
 	} else {
 		h.String("=")
 		for _, name := range target.Deps.Names() {
@@ -265,7 +291,7 @@ func (e *Engine) hashInput(target *Target) string {
 			deps := target.Deps.Name(name)
 
 			e.hashDepsTargets(h, deps.Targets)
-			e.hashDepsFiles(h, target, deps.Files)
+			e.hashFiles(h, target.HashFile, deps.Files)
 		}
 	}
 

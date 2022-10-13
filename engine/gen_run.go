@@ -79,6 +79,8 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 				return err
 			}
 
+			_ = e.StoreAutocompleteCache()
+
 			return nil
 		},
 	})
