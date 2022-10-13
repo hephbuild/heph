@@ -152,9 +152,14 @@ var fzfCmd = &cobra.Command{
 			return err
 		}
 
-		sugestions := autocompleteTargetName(targets, args[0])
+		suggestions := autocompleteTargetName(targets, args[0])
+		if len(suggestions) > 10 {
+			l := len(suggestions)
+			suggestions = suggestions[:10]
+			suggestions = append(suggestions, fmt.Sprintf("%v more", l-10))
+		}
 
-		for _, target := range sugestions {
+		for _, target := range suggestions {
 			fmt.Println(target)
 		}
 
