@@ -251,7 +251,8 @@ type watchRun struct {
 
 var watchCmd = &cobra.Command{
 	Use:           "watch",
-	Short:         "Watch target",
+	Aliases:       []string{"w"},
+	Short:         "Watch targets",
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Args:          cobra.ArbitraryArgs,

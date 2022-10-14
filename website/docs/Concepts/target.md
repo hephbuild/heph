@@ -40,6 +40,7 @@ target(
 | `src_env`        | `'ignore'`, `'rel_root'`, `'rel_pkg'`, `'abs'` | `'rel_pkg'`                                       | See [`src_env/out_env`](#src_env-out_env)                                                    |
 | `out_env`        | `'ignore'`, `'rel_root'`, `'rel_pkg'`, `'abs'` | `'rel_pkg'`                                       | See [`src_env/out_env`](#src_env-out_env)                                                    |
 | `hash_file`      | `'content'`, `'mod_time'`,                     | `'content'`                                       | Method to hash dependencies                                                                  |
+| `transitive`     | `heph.target_spec()`                           | `None`                                            | See [`transitive`](#transitive)                                                              |
 
 ### `executor`
 
@@ -70,6 +71,44 @@ When setting dependencies/output heph will expose those paths as environment var
 - For output: `OUT_<NAME>` in case of named output, or just `OUT`
 
 By default the value will be the path relative to the package
+
+### `transitive`
+
+You can optionally specify `deps`, `tools`, `env` and `pass_env` that will be transitively applied when the current target is required as `tools` or `deps`:
+This si especially useful if a tool requires at runtime another tool to function.
+
+Example:
+
+```python
+target(
+    name="tool_1",
+)
+
+target(
+    name="tool_2",
+    transitive=heph.target_spec(
+        # deps=[],
+        tools=[':tool_1'],
+        env={'TOOL_1_TOKEN': '1234'},
+        # pass_env=[],
+    )
+)
+
+target(
+    name="example",
+    tools=[':tool_2'],
+)
+
+# This is equivalent to declaring example as:
+
+target(
+    name="example",
+    tools=[':tool_2', ':tool_1'],
+    env={'TOOL_1_TOKEN': '1234'},
+)
+
+
+```
 
 ## Helper functions
 

@@ -34,7 +34,10 @@ const config = {
           sidebarPath: require.resolve('./sidebars.js'),
         },
         theme: {
-          customCss: require.resolve('./src/css/custom.css'),
+          customCss: [
+            require.resolve('./src/css/custom.css'),
+            require.resolve('./src/css/custom.scss')
+          ],
         },
       }),
     ],
@@ -49,6 +52,7 @@ const config = {
           alt: 'heph Logo',
           src: 'img/logo.png',
         },
+        hideOnScroll: true,
         items: [
           {
             type: 'doc',
@@ -56,7 +60,13 @@ const config = {
             position: 'left',
             label: 'Docs',
           },
-        ],
+          {
+            href: 'https://github.com/hephbuild/heph',
+            'aria-label': 'GitHub repository',
+            position: 'right',
+            className: 'navbar-github-link',
+          },
+        ]
       },
       footer: {
         style: 'dark',
@@ -87,7 +97,10 @@ const config = {
         darkTheme: darkCodeTheme,
       },
     }),
-  plugins: [require.resolve("@cmfcmf/docusaurus-search-local")],
+  plugins: [
+      require.resolve("@cmfcmf/docusaurus-search-local"),
+      'docusaurus-plugin-sass',
+  ],
 };
 
 module.exports = config;

@@ -62,7 +62,7 @@ func init() {
 var queryCmd = &cobra.Command{
 	Use:     "query",
 	Aliases: []string{"q"},
-	Short:   "Filter targets",
+	Short:   "Query the graph",
 	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := engineInit()
