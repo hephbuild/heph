@@ -1,3 +1,3 @@
-module mod-simple
+module mod-with-root
 
 go 1.18

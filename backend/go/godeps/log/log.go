@@ -4,9 +4,10 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
-var enabled = false
+var enabled bool
 
 func init() {
 	enabled, _ = strconv.ParseBool(os.Getenv("DEBUG"))
@@ -31,6 +32,10 @@ func Debugln(args ...interface{}) {
 func Debugf(f string, args ...interface{}) {
 	if !enabled {
 		return
+	}
+
+	if !strings.HasSuffix(f, "\n") {
+		f += "\n"
 	}
 
 	fmt.Printf(f, args...)

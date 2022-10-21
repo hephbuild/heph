@@ -174,7 +174,7 @@ func depsSpecFromArr(t TargetSpec, arr []string, name string) TargetSpecDeps {
 		if dtp, err := utils.TargetOutputParse(t.Package.FullName, dep); err == nil {
 			td.Targets = append(td.Targets, TargetSpecDepTarget{
 				Name:   name,
-				Target: dtp.Full(),
+				Target: dtp.TargetPath.Full(),
 				Output: dtp.Output,
 			})
 			continue
@@ -204,7 +204,7 @@ func toolsSpecFromString(t TargetSpec, ts *TargetSpecTools, name, tool string) e
 	if err == nil {
 		ts.Targets = append(ts.Targets, TargetSpecTargetTool{
 			Name:   name,
-			Target: tp.Full(),
+			Target: tp.TargetPath.Full(),
 			Output: tp.Output,
 		})
 		return nil

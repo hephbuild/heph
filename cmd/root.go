@@ -204,7 +204,7 @@ var runCmd = &cobra.Command{
 			return nil, cobra.ShellCompDirectiveError
 		}
 
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
+		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if hasStdin(args) {

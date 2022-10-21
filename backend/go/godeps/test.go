@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"strings"
 	"text/template"
@@ -28,6 +29,13 @@ func (t LibTest) Data() interface{} {
 		testFilesForAnalysis = append(testFilesForAnalysis, "_xtest:"+file)
 	}
 
+	var variant PkgCfgVariant
+	if t.TestLib != nil {
+		variant = t.TestLib.Variant
+	} else if t.XTestLib != nil {
+		variant = t.XTestLib.Variant
+	}
+
 	return map[string]interface{}{
 		"Config": Config,
 
@@ -40,11 +48,16 @@ func (t LibTest) Data() interface{} {
 		"TestLib":  RenderLibCall(t.TestLib),
 		"XTestLib": RenderLibCall(t.XTestLib),
 		"GoFiles":  genStringArray(append(t.TestFiles, t.XTestFiles...), 2),
+
+		"VID":        VID(variant),
+		"Variant":    genVariant(variant, false),
+		"VariantBin": genVariant(variant, true),
+		"IfTest":     fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
 	}
 }
 
 var testTplStr = `
-# test
+# test {{.ImportPath}}
 
 go = "{{.Config.Go}}"
 generate_testmain = "{{.Config.GenerateTestMain}}"
@@ -56,7 +69,7 @@ test_lib = {{.TestLib}}
 xtest_lib = {{.XTestLib}}
 
 gen_testmain = target(
-    name="_go_gen_testmain",
+    name="_go_gen_testmain@{{.VID}}",
     deps={{.GoFiles}},
     run=[
 		'generate_testmain {{.ImportPath}} {{.TestFilesForAnalysis}}',
@@ -71,34 +84,37 @@ gen_testmain = target(
 )
 
 testmain_lib = go_library(
-	name="_go_testmain_lib",
+	name="_go_testmain_lib@{{.VID}}",
 	src_dep=gen_testmain,
 	libs=[test_lib, xtest_lib],
 	go_files=['_testmain.go'],
 	import_path="{{.ImportPath}}/testmain",
 	dir="testmain",
+	{{.Variant}}
 )
 
 test_build = go_build_bin(
-    name="go_test#build",
+    name="go_test#build@{{.VID}}",
 	main=testmain_lib,
     libs={{.DepsLibs}},
 	out="pkg.test",
+	{{.VariantBin}}
 )
 
-target(
-    name="go_test",
-    deps={
-		'bin': test_build,
-		'src': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
-	},
-    run=[
-		{{- if .PreRun}}'{{.PreRun}}',{{end}}
-		'./$SRC_BIN -test.v 2>&1 | tee test_out',
-	],
-    out=['test_out'],
-    labels=["test"],
-)
+if {{.IfTest}}:
+	target(
+		name="go_test@{{.VID}}",
+		deps={
+			'bin': test_build,
+			'data': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
+		},
+		run=[
+			{{- if .PreRun}}'{{.PreRun}}',{{end}}
+			'./$SRC_BIN -test.v 2>&1 | tee test_out',
+		],
+		out=['test_out'],
+		labels=["test"],
+	)
 
 # end test
 `

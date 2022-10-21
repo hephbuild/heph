@@ -2,6 +2,10 @@ module heph
 
 go 1.19
 
+replace github.com/spf13/cobra v1.6.0 => github.com/raphaelvigee/cobra v0.0.0-20221020122344-217ca52feee0
+
+//replace github.com/spf13/cobra v1.6.0 => ../cobra
+
 require (
 	github.com/bep/debounce v1.2.1
 	github.com/bmatcuk/doublestar/v4 v4.2.0

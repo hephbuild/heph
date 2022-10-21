@@ -12,6 +12,8 @@ var Env struct {
 	Sandbox string
 	Package string
 	GOPATH  string
+	GOOS    string
+	GOARCH  string
 }
 
 var Config Cfg
@@ -37,6 +39,14 @@ func init() {
 	Env.Sandbox = os.Getenv("SANDBOX")
 	Env.Package = os.Getenv("PACKAGE")
 	Env.GOPATH = goEnv("GOPATH")
+	Env.GOOS = goEnv("GOOS")
+	Env.GOARCH = goEnv("GOARCH")
+}
+
+type PkgCfgVariant struct {
+	OS   string   `json:"os"`
+	ARCH string   `json:"arch"`
+	Tags []string `json:"tags"`
 }
 
 type PkgCfg struct {
@@ -44,6 +54,7 @@ type PkgCfg struct {
 		Skip   bool   `json:"skip"`
 		PreRun string `json:"pre_run"`
 	} `json:"test"`
+	Variants []PkgCfgVariant `json:"variants"`
 }
 
 type Cfg struct {
@@ -51,8 +62,6 @@ type Cfg struct {
 	Go                string            `json:"go"`
 	GoDeps            string            `json:"godeps"`
 	GenerateTestMain  string            `json:"generate_testmain"`
-	StdPkgsTarget     string            `json:"std_pkgs_target"`
-	StdPkgsListFile   string            `json:"std_pkgs_list_file"`
 	ThirdpartyPackage string            `json:"thirdparty_package"`
 	BackendPkg        string            `json:"backend_pkg"`
 }

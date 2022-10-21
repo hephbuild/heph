@@ -19,11 +19,13 @@ func (p TargetPath) Full() string {
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
 const numbers = `0123456789`
 
-var packageRegex = []byte(letters + numbers + `-._/`)
-var targetNameRegex = []byte(letters + numbers + `-.+_#`)
-var outputNameRegex = []byte(letters + numbers + `-_`)
+var Alphanum = letters + numbers
 
-func containsOnly(s string, chars []byte) bool {
+var packageRegex = []byte(Alphanum + `-._/`)
+var targetNameRegex = []byte(Alphanum + `-.+_#@=,{}`)
+var outputNameRegex = []byte(Alphanum + `-_`)
+
+func ContainsOnly(s string, chars []byte) bool {
 	if len(s) == 0 {
 		return true
 	}
@@ -38,11 +40,11 @@ func containsOnly(s string, chars []byte) bool {
 }
 
 func (p TargetPath) validate() error {
-	if !containsOnly(p.Package, packageRegex) {
+	if !ContainsOnly(p.Package, packageRegex) {
 		return fmt.Errorf("package name must match: %s (got %v)", packageRegex, p.Package)
 	}
 
-	if !containsOnly(p.Name, targetNameRegex) {
+	if !ContainsOnly(p.Name, targetNameRegex) {
 		return fmt.Errorf("target name must match: %s (got %v)", targetNameRegex, p.Name)
 	}
 
@@ -69,12 +71,13 @@ func TargetParse(pkg string, s string) (TargetPath, error) {
 
 func targetParse(pkg string, s string) (TargetPath, error) {
 	if strings.Contains(s, "|") {
-		return TargetPath{}, fmt.Errorf("cannot reference a named output")
+		return TargetPath{}, fmt.Errorf("cannot reference a named output: %v", s)
 	}
 
 	if strings.HasPrefix(s, "//") {
+		s := s[2:]
 		if strings.Contains(s, ":") {
-			parts := strings.Split(s[2:], ":")
+			parts := strings.Split(s, ":")
 			if len(parts) != 2 {
 				return TargetPath{}, fmt.Errorf("invalid target, got multiple `:`")
 			}
@@ -84,9 +87,16 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 				Name:    parts[1],
 			}, nil
 		} else {
+			pkg := s
+
+			name := ""
+			if pkg != "" {
+				name = path.Base(pkg)
+			}
+
 			return TargetPath{
-				Package: s[2:],
-				Name:    path.Base(s),
+				Package: pkg,
+				Name:    name,
 			}, nil
 		}
 	} else if strings.HasPrefix(s, ":") {
@@ -108,13 +118,21 @@ type TargetOutputPath struct {
 	Output string
 }
 
+func (p TargetOutputPath) Full() string {
+	if p.Output != "" {
+		return p.TargetPath.Full() + "|" + p.Output
+	}
+
+	return p.TargetPath.Full()
+}
+
 func (p TargetOutputPath) validate() error {
 	err := p.TargetPath.validate()
 	if err != nil {
 		return err
 	}
 
-	if !containsOnly(p.Output, outputNameRegex) {
+	if !ContainsOnly(p.Output, outputNameRegex) {
 		return fmt.Errorf("package name must match: %s (got %v)", outputNameRegex, p.Output)
 	}
 

@@ -1,4 +1,4 @@
-module mod-xtest
+module tags
 
 go 1.18
 

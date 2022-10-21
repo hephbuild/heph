@@ -1,3 +1,3 @@
-module mod-simple
+module mod-http
 
 go 1.18

@@ -7,7 +7,6 @@ import (
 
 func genBuild() {
 	ParseConfig(os.Args[2])
-	InitStd()
 
 	unitsPerDir := map[string][]RenderUnit{}
 

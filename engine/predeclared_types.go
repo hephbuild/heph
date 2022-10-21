@@ -8,6 +8,7 @@ import (
 
 type TargetArgs struct {
 	Name           string
+	Pkg            string
 	Run            ArrayMap
 	FileContent    string
 	Executor       string

@@ -22,7 +22,7 @@ glob('**/*', exclude='some/file.txt')
 Returns the string representation of a Starlark object
 
 ```python
-to_json(['hello']) # => ['hello']
+to_json(['hello']) # => ["hello"]
 ```
 
 ### `fail`

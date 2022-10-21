@@ -11,6 +11,7 @@ import (
 
 type Lib struct {
 	Target        Target
+	Variant       PkgCfgVariant
 	ImportPath    string
 	ModRoot       string
 	Libs          []string
@@ -42,6 +43,7 @@ func (l Lib) Data() map[string]interface{} {
 		"EmbedGlobs": EmbedPatternsGlobs(l.EmbedPatterns),
 		"GenEmbed":   l.GenEmbed,
 		"SrcDep":     l.SrcDep,
+		"Variant":    genVariant(l.Variant, false),
 	}
 }
 
@@ -55,6 +57,7 @@ go_library(
 	s_files={{.SFiles}},
 	resources={{.EmbedGlobs}},
 	{{if .GenEmbed}}gen_embed=True,{{end}}
+	{{.Variant}},
 )
 `
 
