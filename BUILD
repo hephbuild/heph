@@ -1,3 +1,13 @@
+load("//backend/go", "go_toolchain")
+
+go_toolchain(
+    name="go",
+    architectures=[
+        "darwin_amd64", "darwin_arm64",
+        "linux_amd64", "linux_arm64",
+    ],
+)
+
 target(
     name="e2e_test",
     run="heph query --include e2e_test | heph run -",

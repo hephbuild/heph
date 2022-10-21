@@ -52,7 +52,7 @@ func init() {
 			return nil, cobra.ShellCompDirectiveError
 		}
 
-		return autocompleteLabelOrTarget(targets, labels, toComplete), cobra.ShellCompDirectiveNoFileComp
+		return autocompleteLabelOrTarget(targets, labels, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
 	}
 
 	queryCmd.RegisterFlagCompletionFunc("include", autocompleteTargetOrLabel)

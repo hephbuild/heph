@@ -153,6 +153,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	if err := starlark.UnpackArgs(
 		"target", args, kwargs,
 		"name?", &sargs.Name,
+		"pkg?", &sargs.Pkg,
 		"run?", &sargs.Run,
 		"_file_content?", &sargs.FileContent,
 		"executor?", &sargs.Executor,
@@ -182,6 +183,15 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		}
 
 		return nil, err
+	}
+
+	if sargs.Pkg != "" {
+		tp, err := utils.TargetParse("", sargs.Pkg)
+		if err != nil {
+			return nil, err
+		}
+
+		pkg = e.createPkg(tp.Package)
 	}
 
 	t, err := specFromArgs(sargs, pkg)
@@ -304,7 +314,7 @@ func canonicalize(thread *starlark.Thread, fn *starlark.Builtin, args starlark.T
 
 	pkg := getPackage(thread)
 
-	tp, err := utils.TargetParse(pkg.FullName, value)
+	tp, err := utils.TargetOutputParse(pkg.FullName, value)
 	if err != nil {
 		return nil, err
 	}

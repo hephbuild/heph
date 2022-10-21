@@ -2,7 +2,7 @@ package xtest_test
 
 import (
 	"github.com/stretchr/testify/assert"
-	xtest "mod-simple"
+	xtest "mod-xtest"
 	"testing"
 )
 

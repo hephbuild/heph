@@ -28,10 +28,10 @@ func FromStarlark(v starlark.Value) interface{} {
 		data := []interface{}{}
 
 		it := v.Iterate()
+		defer it.Done()
 		var value starlark.Value
 		for it.Next(&value) {
-			value := value
-			data = append(data, value)
+			data = append(data, FromStarlark(value))
 		}
 
 		return data

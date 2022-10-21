@@ -1,4 +1,4 @@
-module mod-simple
+module mod-embed
 
 go 1.18
 
