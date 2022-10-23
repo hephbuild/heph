@@ -164,7 +164,7 @@ def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
     target(
         name="mod_tidy",
         labels=["mod_tidy"],
-        run='GOPATH="$SANDBOX/thirdparty/go/gopath" go mod tidy -v',
+        run='go mod tidy -v',
         tools=[go],
         deps=[src],
         sandbox=False,
@@ -263,6 +263,9 @@ def go_library(
     if not pkg_name:
         fail("pkg_name cannot be empty")
 
+    if type(src_dep) != "list":
+        src_dep = [src_dep]
+
     if dir:
         s_files = [p+dep for dep in s_files]
 
@@ -340,7 +343,7 @@ def go_library(
         resources = [p+dep for dep in resources]
 
     if src_dep:
-        deps = {'src': [src_dep], 'libs': libs}
+        deps = {'src': src_dep, 'libs': libs, 'res': resources}
         env["SRC_SRC"] = ' '.join(src_files)
         env["SRC_RES"] = ' '.join(resources)
     else:
@@ -349,8 +352,8 @@ def go_library(
     deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
 
     if len(resources) > 0 or gen_embed:
-        embed_deps = deps | {}
-        embed_deps['libs'] = []
+        embed_deps = deps | {} # copy deps
+        embed_deps['libs'] = [] # remove libs from deps
 
         embed_cfg = target(
             name="_"+name+"#embedcfg",

@@ -601,6 +601,14 @@ var outCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(cmd.Context(), false)
 	},
+	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		targets, _, err := preRunAutocomplete(cmd.Context())
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
+		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
+	},
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := utils.TargetParse("", args[0])
 		if err != nil {

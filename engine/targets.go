@@ -432,6 +432,14 @@ type TargetWithOutput struct {
 	Output string
 }
 
+func (t TargetWithOutput) Full() string {
+	if t.Output == "" {
+		return t.Target.FQN
+	}
+
+	return t.Target.FQN + "|" + t.Output
+}
+
 type Targets struct {
 	mu sync.RWMutex
 	m  map[string]*Target

@@ -2,33 +2,21 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"text/template"
 )
 
 type Lib struct {
-	Target        Target
-	Variant       PkgCfgVariant
-	ImportPath    string
-	ModRoot       string
-	Libs          []string
-	GoFiles       []string
-	SFiles        []string
-	EmbedPatterns []string
-	SrcDep        string
-	GenEmbed      bool
-}
-
-func EmbedPatternsGlobs(ps []string) string {
-	embedGlobs := make([]string, 0, len(ps))
-	for _, p := range ps {
-		embedGlobs = append(embedGlobs, fmt.Sprintf(`glob(%v)`, strconv.Quote(p)))
-	}
-
-	return joinedArrays(embedGlobs)
+	Target     Target
+	Variant    PkgCfgVariant
+	ImportPath string
+	ModRoot    string
+	Libs       []string
+	GoFiles    []string
+	SFiles     []string
+	SrcDep     []string
+	GenEmbed   bool
 }
 
 func (l Lib) Data() map[string]interface{} {
@@ -40,9 +28,8 @@ func (l Lib) Data() map[string]interface{} {
 		"Libs":       genStringArray(l.Libs, 2),
 		"GoFiles":    genStringArray(l.GoFiles, 2),
 		"SFiles":     genStringArray(l.SFiles, 2),
-		"EmbedGlobs": EmbedPatternsGlobs(l.EmbedPatterns),
 		"GenEmbed":   l.GenEmbed,
-		"SrcDep":     l.SrcDep,
+		"SrcDep":     genStringArray(l.SrcDep, 2),
 		"Variant":    genVariant(l.Variant, false),
 	}
 }
@@ -51,11 +38,10 @@ var libCallTplStr = `
 go_library(
 	name="{{.Target.Name}}",
 	import_path="{{.ImportPath}}",{{if .SrcDep}}
-	src_dep="{{.SrcDep}}",{{end}}
+	src_dep={{.SrcDep}},{{end}}
 	libs={{.Libs}},
 	go_files={{.GoFiles}},
 	s_files={{.SFiles}},
-	resources={{.EmbedGlobs}},
 	{{if .GenEmbed}}gen_embed=True,{{end}}
 	{{.Variant}},
 )
