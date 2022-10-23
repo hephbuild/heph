@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
@@ -182,6 +183,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	log.Tracef("Bin %#v", bin)
 
 	namedDeps := map[string][]string{}
+	filesOrigin := map[string]string{}
 	addNamedDep := func(name string, file string) {
 		a := namedDeps[name]
 		a = append(a, file)
@@ -202,6 +204,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 				srcTar = append(srcTar, tarFile)
 				for _, file := range dep.Target.ActualFilesOut() {
 					addNamedDep(name, file.RelRoot())
+					filesOrigin[file.RelRoot()] = dep.Full()
 				}
 			} else {
 				files := dep.Target.ActualFilesOut()
@@ -214,6 +217,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 						To:   file.RelRoot(),
 					})
 					addNamedDep(name, file.RelRoot())
+					filesOrigin[file.RelRoot()] = dep.Full()
 				}
 			}
 		}
@@ -228,9 +232,23 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	for _, file := range src {
-		log.Tracef("src: %v", file.To)
+	f, err := os.Create(filepath.Join(e.tmpRoot(target), "_files_origin"))
+	if err != nil {
+		return err
 	}
+
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	if err := json.NewEncoder(f).Encode(filesOrigin); err != nil {
+		return err
+	}
+	f.Close()
+	src = append(src, utils.TarFile{
+		From: f.Name(),
+		To:   ".heph/files_origin.json",
+	})
+	addNamedDep("files_origin", ".heph/files_origin.json")
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
 		Dir:    target.SandboxRoot.Abs(),

@@ -11,3 +11,9 @@ e2e_test(
     cmd="heph run //test/go/mod-simple:run",
     expect_output_contains="Hello from mod-simple/hello",
 )
+
+e2e_test(
+    name="sanity_count_tests",
+    cmd="heph query //test/go/... | heph query -i test - | wc -l | xargs",
+    expected_output="18",
+)

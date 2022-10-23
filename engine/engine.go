@@ -122,6 +122,7 @@ func (e *Engine) hashFile(h utils.Hash, file Path) error {
 
 func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 	for _, dep := range targets {
+		h.String(dep.Target.FQN)
 		dh := e.hashOutput(dep.Target, dep.Output)
 
 		h.String(dh)
@@ -728,14 +729,14 @@ func (e *Engine) collectOut(target *Target, files RelPaths) (Paths, error) {
 		})
 	}()
 
+	root := target.OutRoot.Abs()
+
 	for _, file := range files {
 		pattern := file.RelRoot()
 
-		file := file.WithRoot(target.OutRoot.Abs())
-
-		err := utils.StarWalk(file.root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
 			out = append(out, Path{
-				root:    file.root,
+				root:    root,
 				relRoot: path,
 			})
 
