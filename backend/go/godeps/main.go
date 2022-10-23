@@ -116,18 +116,59 @@ func testLibFactory(name string, importLibs []string, importPath string, enabled
 		return nil
 	}
 
-	return &Lib{
+	lib := &Lib{
 		Target: Target{
 			Name:    name,
 			Package: libPkg,
 		},
-		ImportPath:    importPath,
-		GoFiles:       goFiles,
-		SFiles:        sFiles,
-		EmbedPatterns: embedPatterns,
-		Libs:          importLibs,
-		Variant:       variant,
+		ImportPath: importPath,
+		GoFiles:    goFiles,
+		SFiles:     sFiles,
+		GenEmbed:   len(embedPatterns) > 0,
+		Libs:       importLibs,
+		Variant:    variant,
 	}
+	lib.SrcDep = srcDepForLib(lib, embedPatterns)
+
+	return lib
+}
+
+func srcDepForLib(lib *Lib, embedPatterns []string) []string {
+	allFiles := make([]string, 0)
+	allFiles = append(allFiles, lib.GoFiles...)
+	allFiles = append(allFiles, lib.SFiles...)
+
+	srcDep := make([]string, 0)
+	for _, p := range allFiles {
+		relRoot := filepath.Join(lib.Target.Package, p)
+		if o, ok := FilesOrigin[relRoot]; ok {
+			srcDep = append(srcDep, o)
+		} else {
+			srcDep = append(srcDep, p)
+		}
+	}
+
+	root := filepath.Join(Env.Root, lib.Target.Package)
+
+	for _, pattern := range embedPatterns {
+		files, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil {
+			panic(err)
+		}
+
+		for _, file := range files {
+			relRoot, _ := filepath.Rel(Env.Root, file)
+			relPkg, _ := filepath.Rel(root, file)
+
+			if o, ok := FilesOrigin[relRoot]; ok {
+				srcDep = append(srcDep, o)
+			} else {
+				srcDep = append(srcDep, relPkg)
+			}
+		}
+	}
+
+	return srcDep
 }
 
 func generate() []RenderUnit {
@@ -169,14 +210,15 @@ func generate() []RenderUnit {
 			var lib *Lib
 			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
 				lib = &Lib{
-					Target:        libTarget(pkgs, pkg),
-					ImportPath:    pkg.ImportPath,
-					ModRoot:       modRoot,
-					GoFiles:       pkg.GoFiles,
-					SFiles:        pkg.SFiles,
-					EmbedPatterns: pkg.EmbedPatterns,
-					Variant:       pkg.Variant,
+					Target:     libTarget(pkgs, pkg),
+					ImportPath: pkg.ImportPath,
+					ModRoot:    modRoot,
+					GoFiles:    pkg.GoFiles,
+					SFiles:     pkg.SFiles,
+					GenEmbed:   len(pkg.EmbedPatterns) > 0,
+					Variant:    pkg.Variant,
 				}
+				lib.SrcDep = srcDepForLib(lib, pkg.EmbedPatterns)
 
 				for _, p := range imports {
 					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
@@ -305,7 +347,7 @@ func generate() []RenderUnit {
 				ModRoot:    modRoot,
 				GoFiles:    pkg.GoFiles,
 				SFiles:     pkg.SFiles,
-				SrcDep:     moddl.Target.Full(),
+				SrcDep:     []string{moddl.Target.Full()},
 				GenEmbed:   len(pkg.EmbedPatterns) > 0,
 				Variant:    pkg.Variant,
 			}

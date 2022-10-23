@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/build"
 	"io/fs"
@@ -16,6 +17,10 @@ func listImports() {
 	if err != nil {
 		panic(err)
 	}
+
+	json.NewEncoder(os.Stdout).Encode(FilesOrigin)
+	fmt.Println()
+	fmt.Println(os.Getenv("SRC"))
 
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

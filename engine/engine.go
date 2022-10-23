@@ -122,6 +122,7 @@ func (e *Engine) hashFile(h utils.Hash, file Path) error {
 
 func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 	for _, dep := range targets {
+		h.String(dep.Target.FQN)
 		dh := e.hashOutput(dep.Target, dep.Output)
 
 		h.String(dh)
