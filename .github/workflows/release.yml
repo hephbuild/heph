@@ -86,7 +86,7 @@ jobs:
         id: upload
         run: |
           VERSION=$(cat $(./heph query out //:version))          
-          echo "::set-output name=version::$VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
           echo $VERSION
 

@@ -44,7 +44,7 @@ func init() {
 	Env.GOOS = goEnv("GOOS")
 	Env.GOARCH = goEnv("GOARCH")
 
-	if p := os.Getenv("SRC_FILES_ORIGIN"); p != "" {
+	if p := os.Getenv("SRC_HEPH_FILES_ORIGIN"); p != "" {
 		f, err := os.Open(p)
 		if err != nil {
 			panic(err)
@@ -55,6 +55,8 @@ func init() {
 		if err != nil {
 			panic(err)
 		}
+	} else {
+		panic("SRC_HEPH_FILES_ORIGIN is not defined")
 	}
 }
 
