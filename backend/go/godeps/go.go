@@ -208,7 +208,7 @@ func goEnv(name string) string {
 }
 
 func goListImportPaths(pkg string) []string {
-	cmd := exec.Command("go", "list", "-e", pkg)
+	cmd := exec.Command("go", "list", "-e", "-find", "-a", pkg)
 
 	b, err := cmd.Output()
 	if err != nil {
@@ -223,11 +223,15 @@ func goListImportPaths(pkg string) []string {
 }
 
 func goList(pkg string, variant PkgCfgVariant) []*Package {
+	return goListm([]string{pkg}, variant)
+}
+
+func goListm(pkg []string, variant PkgCfgVariant) []*Package {
 	args := []string{"list", "-e", "-json", "-deps"}
 	if len(variant.Tags) > 0 {
 		args = append(args, "-tags", strings.Join(variant.Tags, ","))
 	}
-	args = append(args, pkg)
+	args = append(args, pkg...)
 	cmd := exec.Command("go", args...)
 	cmd.Env = append(os.Environ(), []string{
 		"GOOS=" + variant.OS,
@@ -296,10 +300,15 @@ func analyzePkg(pkg *Package) {
 }
 
 func goListWithTransitiveTestDeps() *Packages {
-	allPkgs := &Packages{}
+	type variantPkgs struct {
+		variant PkgCfgVariant
+		pkgs    []string
+	}
 
-	for _, impPath := range goListImportPaths("./...") {
-		cfg := Config.GetPkgCfg(impPath)
+	pkgsPerVariant := map[string]variantPkgs{}
+
+	for _, pkg := range goListImportPaths("./...") {
+		cfg := Config.GetPkgCfg(pkg)
 
 		variants := cfg.Variants
 		if len(variants) == 0 {
@@ -310,37 +319,53 @@ func goListWithTransitiveTestDeps() *Packages {
 		}
 
 		for _, variant := range variants {
-			log.Debugf("VARIANT %v", VID(variant))
-			pkgs := goList(impPath, variant)
+			vid := VID(variant)
 
-			for _, pkg := range pkgs {
-				if allPkgs.Find(pkg.ImportPath, pkg.Variant) != nil {
-					continue
-				}
+			pv := pkgsPerVariant[vid]
+			pv.variant = variant
+			pv.pkgs = append(pv.pkgs, pkg)
+			pkgsPerVariant[vid] = pv
+		}
+	}
 
-				analyzePkg(pkg)
-				allPkgs.Add(pkg)
+	allPkgs := &Packages{}
 
-				if pkg.IsPartOfModule {
-					// We only care about transitive test deps of the stuff we will test
+	for _, pv := range pkgsPerVariant {
+		pkgs := goListm(pv.pkgs, pv.variant)
 
-					testDeps := make([]string, 0)
+		for _, pkg := range pkgs {
+			if allPkgs.Find(pkg.ImportPath, pkg.Variant) != nil {
+				continue
+			}
 
-					for _, depPath := range pkg.TestImports {
-						testDeps = append(testDeps, depPath)
-						for _, p := range goList(depPath, pkg.Variant) {
-							testDeps = append(testDeps, p.ImportPath)
+			analyzePkg(pkg)
+			allPkgs.Add(pkg)
+		}
+	}
 
-							if allPkgs.Find(p.ImportPath, p.Variant) == nil {
-								analyzePkg(p)
-								allPkgs.Add(p)
-							}
+	for _, pkg := range allPkgs.Array()[:] {
+		if pkg.IsPartOfModule {
+			// We only care about transitive test deps of the stuff we will test
+
+			testDeps := make([]string, 0)
+
+			for _, depPath := range pkg.TestImports {
+				if dpkg := allPkgs.Find(depPath, pkg.Variant); dpkg != nil {
+					testDeps = append(testDeps, dpkg.ImportPath)
+					testDeps = append(testDeps, dpkg.Deps...)
+				} else {
+					for _, p := range goList(depPath, pkg.Variant) {
+						testDeps = append(testDeps, p.ImportPath)
+
+						if allPkgs.Find(p.ImportPath, p.Variant) == nil {
+							analyzePkg(p)
+							allPkgs.Add(p)
 						}
 					}
-
-					pkg.TestDeps = testDeps
 				}
 			}
+
+			pkg.TestDeps = testDeps
 		}
 	}
 
