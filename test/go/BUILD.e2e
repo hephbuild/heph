@@ -11,3 +11,26 @@ e2e_test(
     cmd="heph run //test/go/mod-simple:run",
     expect_output_contains="Hello from mod-simple/hello",
 )
+
+e2e_test(
+    name="sanity_count_tests",
+    cmd="heph query //test/go/... | heph query -i test",
+    expected_output="""
+//test/go/mod-cfg/child1:go_test@os=darwin,arch=arm64
+//test/go/mod-cfg/child2:go_test@os=darwin,arch=arm64
+//test/go/mod-cfg:go_test@os=darwin,arch=arm64
+//test/go/mod-embed:go_test@os=darwin,arch=arm64
+//test/go/mod-gen-src:go_test@os=darwin,arch=arm64
+//test/go/mod-simple/hello:go_test@os=darwin,arch=arm64
+//test/go/mod-simple:go_test@os=darwin,arch=arm64
+//test/go/mod-syscall:go_test@os=darwin,arch=arm64
+//test/go/mod-testdata:go_test@os=darwin,arch=arm64
+//test/go/mod-transitive-gen:test
+//test/go/mod-with-deps:go_test@os=darwin,arch=arm64
+//test/go/mod-with-replace-deps:go_test@os=darwin,arch=arm64
+//test/go/mod-with-replace-local:go_test@os=darwin,arch=arm64
+//test/go/mod-with-root:go_test@os=darwin,arch=arm64
+//test/go/mod-xtest:go_test@os=darwin,arch=arm64
+//test/go/tags:go_test@os=darwin,arch=arm64
+//test/go/tags:go_test@os=darwin,arch=arm64,tags={cooltag}""".strip(),
+)

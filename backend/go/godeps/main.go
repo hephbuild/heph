@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -171,8 +172,58 @@ func srcDepForLib(lib *Lib, embedPatterns []string) []string {
 	return srcDep
 }
 
-func generate() []RenderUnit {
-	pkgs := goListWithTransitiveTestDeps()
+func generatePkgGen() []RenderUnit {
+	units := make([]RenderUnit, 0)
+
+	root := Env.Sandbox
+
+	err := filepath.WalkDir(filepath.Join(root, Env.Package), func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !d.IsDir() {
+			return nil
+		}
+
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+
+		hasGo := false
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".go") {
+				hasGo = true
+				break
+			}
+		}
+
+		if hasGo {
+			dir, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+
+			units = append(units, RenderUnit{
+				Render: func(w io.Writer) {
+					RenderGodepsLib(w, &GodepsLib{})
+				},
+				Dir: dir,
+			})
+		}
+
+		return nil
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	return units
+}
+
+func generate(pkg string) []RenderUnit {
+	pkgs := goListWithTransitiveTestDeps(pkg)
 
 	units := make([]RenderUnit, 0)
 	modsm := map[string]*ModDl{}
@@ -373,7 +424,11 @@ func generate() []RenderUnit {
 func main() {
 	switch os.Args[1] {
 	case "mod":
-		genBuild()
+		genBuild(generatePkgGen)
+	case "pkg":
+		genBuild(func() []RenderUnit {
+			return generate(".")
+		})
 	case "imports":
 		listImports()
 	case "embed":

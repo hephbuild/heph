@@ -19,6 +19,7 @@ var Env struct {
 var Config Cfg
 
 var FilesOrigin map[string]string
+var Deps map[string][]string
 
 func ParseConfig(cfgPath string) {
 	cfg, err := os.ReadFile(cfgPath)
@@ -44,7 +45,7 @@ func init() {
 	Env.GOOS = goEnv("GOOS")
 	Env.GOARCH = goEnv("GOARCH")
 
-	if p := os.Getenv("SRC_FILES_ORIGIN"); p != "" {
+	if p := os.Getenv("SRC_HEPH_FILES_ORIGIN"); p != "" {
 		f, err := os.Open(p)
 		if err != nil {
 			panic(err)
@@ -52,6 +53,19 @@ func init() {
 		defer f.Close()
 
 		err = json.NewDecoder(f).Decode(&FilesOrigin)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	if p := os.Getenv("SRC_HEPH_DEPS"); p != "" {
+		f, err := os.Open(p)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+
+		err = json.NewDecoder(f).Decode(&Deps)
 		if err != nil {
 			panic(err)
 		}

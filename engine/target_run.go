@@ -10,6 +10,7 @@ import (
 	"heph/sandbox"
 	"heph/utils"
 	"heph/worker"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -105,6 +106,29 @@ func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...st
 	return e.run(target, iocfg, false, args...)
 }
 
+func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
+	f, err := os.Create(filepath.Join(e.tmpRoot(target), name))
+	if err != nil {
+		return err, func() {}
+	}
+
+	cleanup := func() {
+		f.Close()
+		os.Remove(f.Name())
+	}
+
+	err = fun(f)
+	if err != nil {
+		return err, cleanup
+	}
+
+	f.Close()
+
+	rec.Add(name, f.Name(), path, "")
+
+	return nil, cleanup
+}
+
 func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool, args ...string) error {
 	e.Status(target.FQN)
 
@@ -182,29 +206,19 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	log.Tracef("Bin %#v", bin)
 
-	namedDeps := map[string][]string{}
-	filesOrigin := map[string]string{}
-	addNamedDep := func(name string, file string) {
-		a := namedDeps[name]
-		a = append(a, file)
-		namedDeps[name] = a
-	}
-
+	srcRec := &SrcRecorder{}
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
 	e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
-	src := make([]utils.TarFile, 0)
-	srcTar := make([]string, 0)
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
 			tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
 			if utils.PathExists(tarFile) && dep.Output == "" {
-				srcTar = append(srcTar, tarFile)
+				srcRec.AddTar(tarFile)
 				for _, file := range dep.Target.ActualFilesOut() {
-					addNamedDep(name, file.RelRoot())
-					filesOrigin[file.RelRoot()] = dep.Full()
+					srcRec.AddNamed(name, file.RelRoot(), dep.Full())
 				}
 			} else {
 				files := dep.Target.ActualFilesOut()
@@ -212,50 +226,54 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
 				}
 				for _, file := range files {
-					src = append(src, utils.TarFile{
-						From: file.Abs(),
-						To:   file.RelRoot(),
-					})
-					addNamedDep(name, file.RelRoot())
-					filesOrigin[file.RelRoot()] = dep.Full()
+					srcRec.Add(name, file.Abs(), file.RelRoot(), dep.Full())
 				}
 			}
 		}
 
 		for _, file := range deps.Files {
-			to := file.RelRoot()
-			src = append(src, utils.TarFile{
-				From: file.Abs(),
-				To:   to,
-			})
-			addNamedDep(name, to)
+			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
 	}
 
-	f, err := os.Create(filepath.Join(e.tmpRoot(target), "_files_origin"))
+	err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
+		m := map[string]interface{}{}
+
+		for name, deps := range target.Deps.Named() {
+			a := make([]string, 0)
+
+			for _, dep := range deps.Targets {
+				a = append(a, dep.Full())
+			}
+
+			for _, file := range deps.Files {
+				a = append(a, file.RelRoot())
+			}
+
+			m[name] = a
+		}
+
+		return json.NewEncoder(f).Encode(m)
+	})
+	defer cleanDeps()
 	if err != nil {
 		return err
 	}
 
-	defer os.Remove(f.Name())
-	defer f.Close()
-
-	if err := json.NewEncoder(f).Encode(filesOrigin); err != nil {
+	err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
+		return json.NewEncoder(f).Encode(srcRec.Origin())
+	})
+	defer cleanOrigin()
+	if err != nil {
 		return err
 	}
-	f.Close()
-	src = append(src, utils.TarFile{
-		From: f.Name(),
-		To:   ".heph/files_origin.json",
-	})
-	addNamedDep("files_origin", ".heph/files_origin.json")
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
 		Dir:    target.SandboxRoot.Abs(),
 		BinDir: binDir,
 		Bin:    bin,
-		Src:    src,
-		SrcTar: srcTar,
+		Src:    srcRec.Src(),
+		SrcTar: srcRec.SrcTar(),
 	})
 	if err != nil {
 		return err
@@ -294,7 +312,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if target.SrcEnv != FileEnvIgnore {
-		for name, paths := range namedDeps {
+		for name, paths := range srcRec.Named() {
 			k := "SRC_" + strings.ToUpper(name)
 			if name == "" {
 				k = "SRC"

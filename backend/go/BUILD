@@ -97,6 +97,21 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg+":_go_mod_gen")
 
+def go_pkg(deps=[], cfg=None):
+    target(
+        name="_go_pkg_gen",
+        run="godeps pkg $SRC_CFG",
+        out="/**/BUILD",
+        deps={'deps': deps, 'cfg': cfg},
+        tools=godeps,
+        env={
+            "GOOS": get_os(),
+            "GOARCH": get_arch(),
+            # "DEBUG": "1",
+        },
+        gen=True,
+    )
+
 def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
     gomodsum = group(
         name="_mod",
@@ -150,7 +165,7 @@ def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
         run="godeps mod $SRC_CFG",
         out="/**/BUILD",
         deps={'deps': godeps_deps, 'cfg': godeps_cfg},
-        hash_deps=[imports, gomodsum, godeps_cfg],
+        hash_deps=[imports, godeps_cfg],
         tools=godeps,
         env={
             "GOOS": get_os(),

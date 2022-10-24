@@ -1306,11 +1306,19 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targ
 	}
 
 	for _, file := range deps.Files {
-		td.Files = append(td.Files, Path{
-			root:    t.Package.Root.root,
-			relRoot: filepath.Join(t.Package.FullName, file.Path),
-			abs:     t.Package.Root.Join(file.Path).Abs(),
-		})
+		if strings.HasPrefix(file.Path, "/") {
+			td.Files = append(td.Files, Path{
+				root:    t.Package.Root.root,
+				relRoot: file.Path[1:],
+				abs:     e.Root.Join(file.Path[1:]).Abs(),
+			})
+		} else {
+			td.Files = append(td.Files, Path{
+				root:    t.Package.Root.root,
+				relRoot: filepath.Join(t.Package.FullName, file.Path),
+				abs:     t.Package.Root.Join(file.Path).Abs(),
+			})
+		}
 	}
 
 	if InlineGroups {

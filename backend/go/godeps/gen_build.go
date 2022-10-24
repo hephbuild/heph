@@ -5,12 +5,12 @@ import (
 	"path/filepath"
 )
 
-func genBuild() {
+func genBuild(f func() []RenderUnit) {
 	ParseConfig(os.Args[2])
 
 	unitsPerDir := map[string][]RenderUnit{}
 
-	for _, unit := range generate() {
+	for _, unit := range f() {
 		unitsPerDir[unit.Dir] = append(unitsPerDir[unit.Dir], unit)
 	}
 

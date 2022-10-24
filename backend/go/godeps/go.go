@@ -295,10 +295,10 @@ func analyzePkg(pkg *Package) {
 	}
 }
 
-func goListWithTransitiveTestDeps() *Packages {
+func goListWithTransitiveTestDeps(pkg string) *Packages {
 	allPkgs := &Packages{}
 
-	for _, impPath := range goListImportPaths("./...") {
+	for _, impPath := range goListImportPaths(pkg) {
 		cfg := Config.GetPkgCfg(impPath)
 
 		variants := cfg.Variants

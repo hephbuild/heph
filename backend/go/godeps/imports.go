@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"go/build"
@@ -10,6 +12,43 @@ import (
 	"sort"
 )
 
+func hashString(s string) string {
+	return hashBytes([]byte(s))
+}
+
+func hashBytes(b []byte) string {
+	h := sha1.New()
+	h.Write(b)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func hashFile(path string) string {
+	b, _ := os.ReadFile(path)
+	if len(b) == 0 {
+		return ""
+	}
+
+	return hashBytes(b)
+}
+
+func findGoModRoot() string {
+	dir, _ := os.Getwd()
+
+	for {
+		_, err := os.Stat(filepath.Join(dir, "go.mod"))
+		if err == nil {
+			return dir
+		}
+
+		dir = filepath.Dir(dir)
+		if dir == "" {
+			panic("go.mod not found")
+		}
+	}
+
+	return ""
+}
+
 func listImports() {
 	root := os.Getenv("ROOT")
 
@@ -18,9 +57,12 @@ func listImports() {
 		panic(err)
 	}
 
-	json.NewEncoder(os.Stdout).Encode(FilesOrigin)
-	fmt.Println()
-	fmt.Println(os.Getenv("SRC"))
+	b, _ := json.Marshal(FilesOrigin)
+	fmt.Println("files origin:", hashBytes(b))
+	fmt.Println("src:", hashString(os.Getenv("SRC")))
+	modRoot := findGoModRoot()
+	fmt.Println("gomod:", hashFile(filepath.Join(modRoot, "go.mod")))
+	fmt.Println("gosum:", hashFile(filepath.Join(modRoot, "go.sum")))
 
 	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

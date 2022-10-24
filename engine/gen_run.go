@@ -155,7 +155,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 
 func (e *runGenEngine) linkAndDagGenTargets() error {
 	linkStartTime := time.Now()
-	err := e.linkTargets(true, e.GeneratedTargets())
+	err := e.linkTargets(false, e.GeneratedTargets())
 	if err != nil {
 		return fmt.Errorf("linking %w", err)
 	}
@@ -198,10 +198,6 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 
 						if t := e.Targets.Find(spec.FQN); t != nil {
 							e.TargetsLock.Unlock()
-
-							if t.Gen {
-								return fmt.Errorf("cannot replace gen target")
-							}
 
 							if !t.TargetSpec.Equal(spec) {
 								return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n%s", spec.FQN, t.Source, t.json(), spec.json())
