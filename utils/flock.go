@@ -45,6 +45,8 @@ func (l *Flock) Lock() error {
 	log.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
+		l.m.Unlock()
+
 		pid, err := os.ReadFile(f.Name())
 		if err == nil && len(pid) > 0 {
 			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), f.Name())
@@ -53,8 +55,10 @@ func (l *Flock) Lock() error {
 		}
 
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+			l.m.Lock()
 			return fmt.Errorf("acquire lock for %s: %w", l.path, err)
 		}
+		l.m.Lock()
 	}
 	log.Debugf("Acquired lock for %s", f.Name())
 
@@ -71,14 +75,15 @@ func (l *Flock) Unlock() error {
 	l.m.Lock()
 	defer l.m.Unlock()
 
-	if err := syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN); err != nil {
+	f := l.f
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
 		return fmt.Errorf("release lock for %s: %s", l.path, err)
 	}
-	if err := l.f.Close(); err != nil {
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("close lock file %s: %s", l.path, err)
 	}
 
-	l.f = nil
+	f = nil
 
 	return l.Clean()
 }

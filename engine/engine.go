@@ -54,7 +54,7 @@ type Engine struct {
 	cacheHashOutputTargetMutex utils.KMutex
 	cacheHashOutputMutex       sync.RWMutex
 	cacheHashOutput            map[string]string // TODO: LRU
-	ranGenPass                 bool
+	RanGenPass                 bool
 	codegenPaths               map[string]*Target
 	fetchRootCache             map[string]Path
 	Pool                       *worker.Pool
@@ -212,7 +212,7 @@ func (e *Engine) ResetCacheHashInput(target *Target) {
 	e.cacheHashInputMutex.Lock()
 	defer e.cacheHashInputMutex.Unlock()
 
-	delete(e.cacheHashInput, target.FQN)
+	delete(e.cacheHashInput, hashCacheId(target))
 }
 
 func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
@@ -239,17 +239,21 @@ func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
 	return nil
 }
 
-func (e *Engine) hashInput(target *Target) string {
-	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
-	mu.Lock()
-	defer mu.Unlock()
-
+func hashCacheId(target *Target) string {
 	idh := utils.NewHash()
 	for _, fqn := range target.linkingDeps.FQNs() {
 		idh.String(fqn)
 	}
 
-	cacheId := target.FQN + idh.Sum()
+	return target.FQN + idh.Sum()
+}
+
+func (e *Engine) hashInput(target *Target) string {
+	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
+	mu.Lock()
+	defer mu.Unlock()
+
+	cacheId := hashCacheId(target)
 
 	e.cacheHashInputMutex.RLock()
 	if h, ok := e.cacheHashInput[cacheId]; ok {

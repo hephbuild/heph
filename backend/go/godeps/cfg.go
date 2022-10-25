@@ -19,6 +19,7 @@ var Env struct {
 var Config Cfg
 
 var FilesOrigin map[string]string
+var Deps map[string][]string
 
 func ParseConfig(cfgPath string) {
 	cfg, err := os.ReadFile(cfgPath)
@@ -57,6 +58,21 @@ func init() {
 		}
 	} else {
 		panic("SRC_HEPH_FILES_ORIGIN is not defined")
+	}
+
+	if p := os.Getenv("SRC_HEPH_DEPS"); p != "" {
+		f, err := os.Open(p)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+
+		err = json.NewDecoder(f).Decode(&Deps)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		panic("SRC_HEPH_DEPS is not defined")
 	}
 }
 

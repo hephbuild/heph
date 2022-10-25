@@ -11,16 +11,19 @@ import (
 )
 
 func listImports() {
-	root := os.Getenv("ROOT")
+	root := Env.Root
 
 	err := os.Chdir(root)
 	if err != nil {
 		panic(err)
 	}
 
-	json.NewEncoder(os.Stdout).Encode(FilesOrigin)
-	fmt.Println()
-	fmt.Println(os.Getenv("SRC"))
+	b, _ := json.Marshal(FilesOrigin)
+	fmt.Println("files origin:", hashBytes(b))
+	fmt.Println("src:", hashString(os.Getenv("SRC")))
+	modRoot := findGoModRoot(root)
+	fmt.Println("gomod:", hashFile(filepath.Join(modRoot, "go.mod")))
+	fmt.Println("gosum:", hashFile(filepath.Join(modRoot, "go.sum")))
 
 	build.Default.UseAllFiles = true
 
