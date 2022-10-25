@@ -1,4 +1,4 @@
-package engine
+package targetspec
 
 func basicArrEqual[T any](a, b []T) bool {
 	if (a == nil || b == nil) && (a != nil || b != nil) {

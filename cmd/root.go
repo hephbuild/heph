@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 	"heph/config"
 	"heph/engine"
+	"heph/targetspec"
 	"heph/utils"
 	"heph/worker"
 	"os"
@@ -613,7 +614,7 @@ var cleanCmd = &cobra.Command{
 			}
 		} else {
 			for _, arg := range args {
-				tp, err := utils.TargetParse("", arg)
+				tp, err := targetspec.TargetParse("", arg)
 				if err != nil {
 					return err
 				}

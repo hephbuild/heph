@@ -7,6 +7,8 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+	"heph/packages"
+	"heph/targetspec"
 	"heph/utils"
 	"io/fs"
 	"path/filepath"
@@ -121,7 +123,7 @@ func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
 	return nil
 }
 
-func getPackage(thread *starlark.Thread) *Package {
+func getPackage(thread *starlark.Thread) *packages.Package {
 	return getEngine(thread).pkg
 }
 
@@ -186,7 +188,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	}
 
 	if sargs.Pkg != "" {
-		tp, err := utils.TargetParse("", sargs.Pkg)
+		tp, err := targetspec.TargetParse("", sargs.Pkg)
 		if err != nil {
 			return nil, err
 		}
@@ -314,7 +316,7 @@ func canonicalize(thread *starlark.Thread, fn *starlark.Builtin, args starlark.T
 
 	pkg := getPackage(thread)
 
-	tp, err := utils.TargetOutputParse(pkg.FullName, value)
+	tp, err := targetspec.TargetOutputParse(pkg.FullName, value)
 	if err != nil {
 		return nil, err
 	}
@@ -351,7 +353,7 @@ func split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 
 	pkg := getPackage(thread)
 
-	tp, err := utils.TargetOutputParse(pkg.FullName, value)
+	tp, err := targetspec.TargetOutputParse(pkg.FullName, value)
 	if err != nil {
 		return nil, err
 	}

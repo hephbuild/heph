@@ -6,7 +6,10 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
+	"heph/packages"
+	"heph/targetspec"
 	"heph/utils"
+	fs2 "heph/utils/fs"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -21,8 +24,8 @@ func init() {
 
 const buildFilesPattern = "**/{BUILD,BUILD.*}"
 
-func (e *Engine) collectBuildFiles(root string) (SourceFiles, error) {
-	files := make(SourceFiles, 0)
+func (e *Engine) collectBuildFiles(root string) (packages.SourceFiles, error) {
+	files := make(packages.SourceFiles, 0)
 
 	walkStartTime := time.Now()
 	err := utils.StarWalk(root, buildFilesPattern, e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
@@ -30,7 +33,7 @@ func (e *Engine) collectBuildFiles(root string) (SourceFiles, error) {
 			return nil
 		}
 
-		files = append(files, &SourceFile{
+		files = append(files, &packages.SourceFile{
 			Path: filepath.Join(root, path),
 		})
 		return nil
@@ -43,13 +46,13 @@ func (e *Engine) collectBuildFiles(root string) (SourceFiles, error) {
 	return files, err
 }
 
-func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *Package) error {
+func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *packages.Package) error {
 	files, err := e.collectBuildFiles(root)
 	if err != nil {
 		return err
 	}
 
-	pkgs := make([]*Package, 0)
+	pkgs := make([]*packages.Package, 0)
 	for _, file := range files {
 		relRoot, err := filepath.Rel(e.Root.Abs(), filepath.Dir(file.Path))
 		if err != nil {
@@ -78,7 +81,7 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *Packag
 	return nil
 }
 
-func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
+func (e *Engine) runBuildFilesForPackage(pkg *packages.Package) error {
 	if pkg.Globals != nil {
 		return nil
 	}
@@ -86,7 +89,7 @@ func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
 	re := runBuildEngine{
 		Engine: e,
 		pkg:    pkg,
-		registerTarget: func(t TargetSpec) error {
+		registerTarget: func(t targetspec.TargetSpec) error {
 			e.TargetsLock.Lock()
 			defer e.TargetsLock.Unlock()
 
@@ -108,11 +111,11 @@ func (e *Engine) runBuildFilesForPackage(pkg *Package) error {
 
 type runBuildEngine struct {
 	*Engine
-	pkg            *Package
-	registerTarget func(TargetSpec) error
+	pkg            *packages.Package
+	registerTarget func(targetspec.TargetSpec) error
 }
 
-func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *Package) *Package {
+func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *packages.Package) *packages.Package {
 	e.packagesMutex.Lock()
 	defer e.packagesMutex.Unlock()
 
@@ -142,20 +145,17 @@ func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *Pac
 	return pkg
 }
 
-func (e *Engine) createPkg(path string) *Package {
-	return e.getOrCreatePkg(path, func(fullname, name string) *Package {
-		return &Package{
+func (e *Engine) createPkg(path string) *packages.Package {
+	return e.getOrCreatePkg(path, func(fullname, name string) *packages.Package {
+		return &packages.Package{
 			Name:     name,
 			FullName: fullname,
-			Root: Path{
-				relRoot: path,
-				root:    e.Root.Abs(),
-			},
+			Root:     fs2.NewPath(e.Root.Abs(), path),
 		}
 	})
 }
 
-func (e *Engine) populatePkg(file *SourceFile) *Package {
+func (e *Engine) populatePkg(file *packages.SourceFile) *packages.Package {
 	root := filepath.Dir(file.Path)
 
 	relRoot, err := filepath.Rel(e.Root.Abs(), root)
@@ -208,7 +208,7 @@ func (e *runBuildEngine) config() starlark.StringDict {
 }
 
 func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.StringDict, error) {
-	p, err := utils.TargetParse(e.pkg.FullName, module)
+	p, err := targetspec.TargetParse(e.pkg.FullName, module)
 	if err != nil {
 		return nil, err
 	}

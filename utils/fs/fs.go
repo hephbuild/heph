@@ -1,14 +1,15 @@
-package utils
+package fs
 
 import (
 	"errors"
+	"heph/utils"
 	"io"
 	"os"
 	"path/filepath"
 )
 
 func RandPath(base, prefix, suffix string) string {
-	return filepath.Join(base, prefix+RandStr(16)+suffix)
+	return filepath.Join(base, prefix+utils.RandStr(16)+suffix)
 }
 
 func IsDirEmpty(name string) (bool, error) {

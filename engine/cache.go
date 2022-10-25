@@ -6,11 +6,12 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
+	"heph/utils/fs"
 	"heph/vfssimple"
 	"os"
 )
 
-func (e *Engine) cacheDir(target *Target, inputHash string) Path {
+func (e *Engine) cacheDir(target *Target, inputHash string) fs.Path {
 	return e.HomeDir.Join("cache", target.Package.FullName, "__target_"+target.Name, inputHash)
 }
 
@@ -41,7 +42,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	err = utils.WriteFileSync(dir.Join(versionFile).Abs(), []byte("1"), os.ModePerm)
+	err = fs.WriteFileSync(dir.Join(versionFile).Abs(), []byte("1"), os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -90,12 +91,12 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 	outputHash := e.hashOutput(target, "")
 
-	err = utils.WriteFileSync(dir.Join(outputHashFile).Abs(), []byte(outputHash), os.ModePerm)
+	err = fs.WriteFileSync(dir.Join(outputHashFile).Abs(), []byte(outputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
 
-	err = utils.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
+	err = fs.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -108,7 +109,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *Path, error) {
+func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *fs.Path, error) {
 	ok, p, err := e.getLocalCache(target, onlyMeta)
 	if err != nil {
 		return false, nil, err
@@ -154,7 +155,7 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *Path, 
 	return false, nil, nil
 }
 
-func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *Path, error) {
+func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *fs.Path, error) {
 	hash := e.hashInput(target)
 
 	dir := e.cacheDir(target, hash)
@@ -175,7 +176,7 @@ func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *Path, erro
 		return false, nil, nil
 	}
 
-	if !utils.PathExists(dir.Join(outputHashFile).Abs()) {
+	if !fs.PathExists(dir.Join(outputHashFile).Abs()) {
 		return false, nil, nil
 	}
 
@@ -185,7 +186,7 @@ func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *Path, erro
 
 	outDir := dir.Join(outputDir)
 
-	if !utils.PathExists(outDir.Abs()) {
+	if !fs.PathExists(outDir.Abs()) {
 		return false, nil, nil
 	}
 

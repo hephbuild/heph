@@ -6,8 +6,11 @@ import (
 	"github.com/heimdalr/dag"
 	log "github.com/sirupsen/logrus"
 	"heph/exprs"
+	"heph/packages"
+	"heph/targetspec"
 	"heph/upgrade"
 	"heph/utils"
+	"heph/utils/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,7 +23,7 @@ type TargetTools struct {
 	// Holds targets references that do not have output (for transitive for ex)
 	TargetReferences []*Target
 	Targets          []TargetTool
-	Hosts            []TargetSpecHostTool
+	Hosts            []targetspec.TargetSpecHostTool
 }
 
 func (t TargetTools) Merge(tools TargetTools) TargetTools {
@@ -38,7 +41,7 @@ func (t TargetTools) Empty() bool {
 type TargetTool struct {
 	Target *Target
 	Name   string
-	File   RelPath
+	File   fs.RelPath
 }
 
 func (tt TargetTool) AbsPath() string {
@@ -47,7 +50,7 @@ func (tt TargetTool) AbsPath() string {
 
 type TargetDeps struct {
 	Targets []TargetWithOutput
-	Files   []Path
+	Files   []fs.Path
 }
 
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
@@ -58,7 +61,7 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	return nd
 }
 
-type NamedPaths[TS ~[]T, T RelablePath] struct {
+type NamedPaths[TS ~[]T, T fs.RelablePath] struct {
 	names []string
 	named map[string]TS
 	all   TS
@@ -127,8 +130,8 @@ func (tp *NamedPaths[TS, T]) Sort() {
 	}
 }
 
-func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) Paths {
-	ps := make(Paths, 0, len(paths))
+func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) fs.Paths {
+	ps := make(fs.Paths, 0, len(paths))
 	for _, path := range paths {
 		ps = append(ps, path.WithRoot(root))
 	}
@@ -136,10 +139,10 @@ func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) Paths {
 	return ps
 }
 
-func (tp NamedPaths[TS, T]) WithRoot(root string) *NamedPaths[Paths, Path] {
-	ntp := &NamedPaths[Paths, Path]{
+func (tp NamedPaths[TS, T]) WithRoot(root string) *NamedPaths[fs.Paths, fs.Path] {
+	ntp := &NamedPaths[fs.Paths, fs.Path]{
 		names: tp.names,
-		named: map[string]Paths{},
+		named: map[string]fs.Paths{},
 		all:   tp.withRoot(tp.all, root),
 	}
 
@@ -229,11 +232,11 @@ func (tp *TargetNamedDeps) Empty() bool {
 	return len(tp.All().Targets) == 0 && len(tp.All().Files) == 0
 }
 
-type OutNamedPaths = NamedPaths[RelPaths, RelPath]
-type ActualOutNamedPaths = NamedPaths[Paths, Path]
+type OutNamedPaths = NamedPaths[fs.RelPaths, fs.RelPath]
+type ActualOutNamedPaths = NamedPaths[fs.Paths, fs.Path]
 
 type Target struct {
-	TargetSpec
+	targetspec.TargetSpec
 
 	Tools          TargetTools
 	Deps           TargetNamedDeps
@@ -248,11 +251,11 @@ type Target struct {
 
 	CodegenLink bool
 
-	WorkdirRoot       Path
-	SandboxRoot       Path
-	OutRoot           *Path
-	CacheFiles        RelPaths
-	actualcachedFiles Paths
+	WorkdirRoot       fs.Path
+	SandboxRoot       fs.Path
+	OutRoot           *fs.Path
+	CacheFiles        fs.RelPaths
+	actualcachedFiles fs.Paths
 	LogFile           string
 
 	processed  bool
@@ -364,7 +367,7 @@ func (t *Target) ID() string {
 	return t.FQN
 }
 
-func (t *Target) ActualFilesOut() Paths {
+func (t *Target) ActualFilesOut() fs.Paths {
 	if t.actualFilesOut == nil {
 		panic("actualFilesOut is nil for " + t.FQN)
 	}
@@ -372,7 +375,7 @@ func (t *Target) ActualFilesOut() Paths {
 	return t.actualFilesOut.all
 }
 
-func (t *Target) NamedActualFilesOut() *NamedPaths[Paths, Path] {
+func (t *Target) NamedActualFilesOut() *NamedPaths[fs.Paths, fs.Path] {
 	if t.actualFilesOut == nil {
 		panic("actualFilesOut is nil for " + t.FQN)
 	}
@@ -394,8 +397,8 @@ func Contains(ts []*Target, fqn string) bool {
 	return false
 }
 
-func (t *Target) OutFilesInOutRoot() Paths {
-	out := make(Paths, 0)
+func (t *Target) OutFilesInOutRoot() fs.Paths {
+	out := make(fs.Paths, 0)
 	for _, file := range t.Out.All() {
 		out = append(out, file.WithRoot(t.OutRoot.Abs()))
 	}
@@ -403,7 +406,7 @@ func (t *Target) OutFilesInOutRoot() Paths {
 	return out
 }
 
-func (t *Target) ActualCachedFiles() Paths {
+func (t *Target) ActualCachedFiles() fs.Paths {
 	if t.actualcachedFiles == nil {
 		panic("actualcachedFiles is nil for " + t.FQN)
 	}
@@ -568,7 +571,7 @@ func (e *Engine) Parse() error {
 	}
 
 	runStartTime := time.Now()
-	err := e.runBuildFiles(e.Root.Abs(), func(dir string) *Package {
+	err := e.runBuildFiles(e.Root.Abs(), func(dir string) *packages.Package {
 		return e.createPkg(dir)
 	})
 	if err != nil {
@@ -689,7 +692,7 @@ func (e *Engine) processTarget(t *Target) error {
 	}
 
 	// Validate FQN
-	_, err := utils.TargetParse("", t.FQN)
+	_, err := targetspec.TargetParse("", t.FQN)
 	if err != nil {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
@@ -765,7 +768,7 @@ func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error 
 }
 
 func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
-	files := make(Paths, 0, len(td.Files))
+	files := make(fs.Paths, 0, len(td.Files))
 	for _, file := range td.Files {
 		if dep, ok := e.codegenPaths[file.RelRoot()]; ok {
 			log.Tracef("%v: %v removed from deps, and %v outputs it", t.FQN, file.RelRoot(), dep.FQN)
@@ -890,7 +893,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	t.RequireTransitive.Env = t.TargetSpec.Transitive.Env
 	t.RequireTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
 
-	relPathFactory := func(p string) RelPath {
+	relPathFactory := func(p string) fs.RelPath {
 		abs := strings.HasPrefix(p, "/")
 
 		var relRoot string
@@ -900,9 +903,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 			relRoot = filepath.Join(t.Package.FullName, p)
 		}
 
-		return RelPath{
-			relRoot: relRoot,
-		}
+		return fs.NewRelPath(relRoot)
 	}
 
 	t.Out = &OutNamedPaths{}
@@ -920,7 +921,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		if t.TargetSpec.Cache.Files == nil {
 			t.CacheFiles = t.Out.All()
 		} else {
-			t.CacheFiles = RelPaths{}
+			t.CacheFiles = fs.RelPaths{}
 			for _, p := range t.TargetSpec.Cache.Files {
 				t.CacheFiles = append(t.CacheFiles, relPathFactory(p))
 			}
@@ -983,8 +984,8 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	return nil
 }
 
-func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targets) (TargetNamedDeps, error) {
-	m := map[string]TargetSpecDeps{}
+func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *Targets) (TargetNamedDeps, error) {
+	m := map[string]targetspec.TargetSpecDeps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
 		a.Targets = append(m[itm.Name].Targets, itm)
@@ -1022,7 +1023,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps TargetSpecDeps, breadcrumb 
 	return td, nil
 }
 
-func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcrumb *Targets) (TargetTools, error) {
+func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTools, breadcrumb *Targets) (TargetTools, error) {
 	type targetTool struct {
 		Target *Target
 		Output string
@@ -1079,7 +1080,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 			name = tool.Output
 		}
 
-		var paths map[string]RelPaths
+		var paths map[string]fs.RelPaths
 		if tool.Output != "" {
 			npaths := tt.Out.Name(tool.Output)
 
@@ -1087,7 +1088,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
 			}
 
-			paths = map[string]RelPaths{
+			paths = map[string]fs.RelPaths{
 				name: npaths,
 			}
 		} else {
@@ -1098,7 +1099,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs TargetSpecTools, breadcru
 			}
 
 			if name != "" {
-				npaths := map[string]RelPaths{}
+				npaths := map[string]fs.RelPaths{}
 				for k, v := range paths {
 					nk := name
 					if k != "" {
@@ -1272,7 +1273,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]
 
 const InlineGroups = true
 
-func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targets) (TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *Targets) (TargetDeps, error) {
 	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {
@@ -1307,17 +1308,17 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targ
 
 	for _, file := range deps.Files {
 		if strings.HasPrefix(file.Path, "/") {
-			td.Files = append(td.Files, Path{
-				root:    t.Package.Root.root,
-				relRoot: file.Path[1:],
-				abs:     e.Root.Join(file.Path[1:]).Abs(),
-			})
+			td.Files = append(td.Files, fs.NewPathAbs(
+				t.Package.Root.Root(),
+				file.Path[1:],
+				e.Root.Join(file.Path[1:]).Abs(),
+			))
 		} else {
-			td.Files = append(td.Files, Path{
-				root:    t.Package.Root.root,
-				relRoot: filepath.Join(t.Package.FullName, file.Path),
-				abs:     t.Package.Root.Join(file.Path).Abs(),
-			})
+			td.Files = append(td.Files, fs.NewPathAbs(
+				t.Package.Root.Root(),
+				filepath.Join(t.Package.FullName, file.Path),
+				t.Package.Root.Join(file.Path).Abs(),
+			))
 		}
 	}
 
@@ -1337,7 +1338,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps TargetSpecDeps, breadcrumb *Targ
 	td.Targets = utils.DedupKeepLast(td.Targets, func(t TargetWithOutput) string {
 		return t.Target.FQN + t.Output
 	})
-	td.Files = utils.DedupKeepLast(td.Files, func(t Path) string {
+	td.Files = utils.DedupKeepLast(td.Files, func(t fs.Path) string {
 		return t.RelRoot()
 	})
 

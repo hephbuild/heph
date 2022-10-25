@@ -8,7 +8,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/exprs"
 	"heph/sandbox"
-	"heph/utils"
+	"heph/targetspec"
+	"heph/utils/fs"
 	"heph/worker"
 	"io"
 	"os"
@@ -217,7 +218,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
 			tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
-			if utils.PathExists(tarFile) && dep.Output == "" {
+			if fs.PathExists(tarFile) && dep.Output == "" {
 				srcRec.AddTar(tarFile)
 				for _, file := range dep.Target.ActualFilesOut() {
 					srcRec.AddNamed(name, file.RelRoot(), dep.Full())
@@ -313,7 +314,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
-	if target.SrcEnv != FileEnvIgnore {
+	if target.SrcEnv != targetspec.FileEnvIgnore {
 		for name, paths := range srcRec.Named() {
 			k := "SRC_" + strings.ToUpper(name)
 			if name == "" {
@@ -322,11 +323,11 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			spaths := make([]string, 0)
 			for _, path := range paths {
 				switch target.SrcEnv {
-				case FileEnvAbs:
+				case targetspec.FileEnvAbs:
 					spaths = append(spaths, target.SandboxRoot.Join(path).Abs())
-				case FileEnvRelRoot:
+				case targetspec.FileEnvRelRoot:
 					spaths = append(spaths, path)
-				case FileEnvRelPkg:
+				case targetspec.FileEnvRelPkg:
 					p := "/root"
 					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path))
 					if err != nil {
@@ -343,7 +344,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	if target.OutEnv != FileEnvIgnore {
+	if target.OutEnv != targetspec.FileEnvIgnore {
 		out := target.Out.WithRoot(target.SandboxRoot.Abs()).Named()
 		namedOut := map[string][]string{}
 		for name, paths := range out {
@@ -360,11 +361,11 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 				var pathv string
 				switch target.OutEnv {
-				case FileEnvAbs:
+				case targetspec.FileEnvAbs:
 					pathv = path.Abs()
-				case FileEnvRelRoot:
+				case targetspec.FileEnvRelRoot:
 					pathv = path.RelRoot()
-				case FileEnvRelPkg:
+				case targetspec.FileEnvRelPkg:
 					fakeRoot := "/root"
 					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.FullName), filepath.Join(fakeRoot, path.RelRoot()))
 					if err != nil {
@@ -447,9 +448,9 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 	} else if len(target.Run) > 0 {
 		var executor sandbox.Executor
 		switch target.Executor {
-		case ExecutorBash:
+		case targetspec.ExecutorBash:
 			executor = sandbox.BashExecutor
-		case ExecutorExec:
+		case targetspec.ExecutorExec:
 			executor = sandbox.ExecExecutor
 		default:
 			panic("unhandled executor: " + target.Executor)

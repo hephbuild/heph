@@ -1,38 +1,9 @@
-package engine
+package fs
 
 import (
 	"encoding/json"
-	"go.starlark.net/starlark"
 	"path/filepath"
 )
-
-type Package struct {
-	Name        string
-	FullName    string
-	Root        Path
-	Globals     starlark.StringDict `json:"-" msgpack:"-"`
-	SourceFiles SourceFiles
-}
-
-func (p Package) TargetPath(name string) string {
-	return "//" + p.FullName + ":" + name
-}
-
-type SourceFile struct {
-	Path string
-}
-
-type SourceFiles []*SourceFile
-
-func (sf SourceFiles) Find(p string) *SourceFile {
-	for _, file := range sf {
-		if file.Path == p {
-			return file
-		}
-	}
-
-	return nil
-}
 
 type Paths []Path
 type RelPaths []RelPath
@@ -51,6 +22,21 @@ type Path struct {
 	root    string
 	relRoot string
 	abs     string
+}
+
+func NewPath(root, relRoot string) Path {
+	return Path{
+		root:    root,
+		relRoot: relRoot,
+	}
+}
+
+func NewPathAbs(root, relRoot, abs string) Path {
+	return Path{
+		root:    root,
+		relRoot: relRoot,
+		abs:     abs,
+	}
 }
 
 func (p *Path) MarshalJSON() ([]byte, error) {
@@ -82,6 +68,10 @@ func (p Path) Abs() string {
 	return p.abs
 }
 
+func (p Path) Root() string {
+	return p.root
+}
+
 func (p Path) RelRoot() string {
 	return p.relRoot
 }
@@ -108,6 +98,10 @@ type RelablePath interface {
 
 type RelPath struct {
 	relRoot string
+}
+
+func NewRelPath(relRoot string) RelPath {
+	return RelPath{relRoot: relRoot}
 }
 
 func (p RelPath) RelRoot() string {

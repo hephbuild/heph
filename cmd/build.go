@@ -3,7 +3,7 @@ package cmd
 import (
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"heph/engine"
-	"heph/utils"
+	"heph/targetspec"
 	"sort"
 	"strings"
 )
@@ -68,14 +68,14 @@ func autocompleteTargetName(targets []string, s string) []string {
 	return suggestions
 }
 
-var labelChars = []byte(utils.Alphanum + `_`)
+var labelChars = []byte(targetspec.Alphanum + `_`)
 
 func autocompleteLabel(labels []string, s string) []string {
 	if s == "" {
 		return labels
 	}
 
-	if !utils.ContainsOnly(s, labelChars) {
+	if !targetspec.ContainsOnly(s, labelChars) {
 		return nil
 	}
 
