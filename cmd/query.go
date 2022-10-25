@@ -7,6 +7,8 @@ import (
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	"heph/engine"
+	"heph/packages"
+	"heph/targetspec"
 	"heph/utils"
 	"os"
 	"os/exec"
@@ -226,7 +228,7 @@ var graphCmd = &cobra.Command{
 		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		tp, err := utils.TargetParse("", args[0])
+		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}
@@ -395,7 +397,7 @@ var targetCmd = &cobra.Command{
 		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		tp, err := utils.TargetParse("", args[0])
+		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}
@@ -480,7 +482,7 @@ var pkgsCmd = &cobra.Command{
 		}
 	},
 	RunE: func(_ *cobra.Command, args []string) error {
-		pkgs := make([]*engine.Package, 0)
+		pkgs := make([]*packages.Package, 0)
 		for _, p := range Engine.Packages {
 			pkgs = append(pkgs, p)
 		}
@@ -511,7 +513,7 @@ var depsCmd = &cobra.Command{
 	},
 
 	RunE: func(_ *cobra.Command, args []string) error {
-		tp, err := utils.TargetParse("", args[0])
+		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}
@@ -556,7 +558,7 @@ var depsOnCmd = &cobra.Command{
 		return preRunWithGen(cmd.Context(), false)
 	},
 	RunE: func(_ *cobra.Command, args []string) error {
-		tp, err := utils.TargetParse("", args[0])
+		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}
@@ -610,7 +612,7 @@ var outCmd = &cobra.Command{
 		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		tp, err := utils.TargetParse("", args[0])
+		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}

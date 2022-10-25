@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"heph/utils"
+	"heph/targetspec"
 	"strings"
 )
 
@@ -66,7 +66,7 @@ func ParseTargetSelector(pkg, s string) TargetMatcher {
 		s = strings.TrimSuffix(s, "/")
 	}
 
-	tp, err := utils.TargetParse(pkg, s)
+	tp, err := targetspec.TargetParse(pkg, s)
 	if err == nil {
 		if isAllDeep {
 			return func(target *Target) bool {

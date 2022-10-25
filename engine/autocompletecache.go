@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/json"
+	"heph/targetspec"
 	"heph/utils"
 	"os"
 	"path/filepath"
@@ -40,7 +41,7 @@ func (e *Engine) computeAutocompleteHash() (string, error) {
 func (e *Engine) StoreAutocompleteCache() error {
 	targets := make([]string, 0, len(e.Targets.FQNs()))
 	for _, fqn := range e.Targets.FQNs() {
-		tp, _ := utils.TargetParse("", fqn)
+		tp, _ := targetspec.TargetParse("", fqn)
 
 		if tp.IsPrivate() {
 			continue

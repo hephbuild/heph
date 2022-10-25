@@ -7,6 +7,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/config"
 	"heph/utils"
+	"heph/utils/fs"
 	"io"
 	"net/http"
 	"os"
@@ -125,7 +126,7 @@ func downloadAndLink(cfg config.Config) (string, error) {
 
 	dstPath := filepath.Join(dir, "heph")
 
-	if utils.PathExists(dstPath) {
+	if fs.PathExists(dstPath) {
 		log.Debugf("%v already exists", dstPath)
 
 		err = linkNew(dir, cfg)

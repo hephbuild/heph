@@ -8,7 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/engine"
 	"heph/sandbox"
-	"heph/utils"
+	"heph/targetspec"
 	"heph/worker"
 	"os"
 	"os/exec"
@@ -44,9 +44,9 @@ func parseTargetsFromStdin() ([]*engine.Target, error) {
 	return targets, nil
 }
 
-var targetsFromStdin []utils.TargetPath
+var targetsFromStdin []targetspec.TargetPath
 
-func parseTargetPathsFromStdin() ([]utils.TargetPath, error) {
+func parseTargetPathsFromStdin() ([]targetspec.TargetPath, error) {
 	if targetsFromStdin != nil {
 		return targetsFromStdin, nil
 	}
@@ -60,7 +60,7 @@ func parseTargetPathsFromStdin() ([]utils.TargetPath, error) {
 			continue
 		}
 
-		tp, err := utils.TargetParse("", t)
+		tp, err := targetspec.TargetParse("", t)
 		if err != nil {
 			return nil, err
 		}
@@ -93,7 +93,7 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 		return nil, nil
 	}
 
-	tp, err := utils.TargetParse("", args[0])
+	tp, err := targetspec.TargetParse("", args[0])
 	if err != nil {
 		return nil, err
 	}

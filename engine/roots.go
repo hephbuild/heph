@@ -7,7 +7,9 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/config"
+	"heph/packages"
 	"heph/utils"
+	fs2 "heph/utils/fs"
 	"io/fs"
 	"net/url"
 	"os"
@@ -27,7 +29,7 @@ type RootConfig struct {
 	*url.URL
 }
 
-func (e *Engine) rootRoot(name string) Path {
+func (e *Engine) rootRoot(name string) fs2.Path {
 	return e.HomeDir.Join("root", name)
 }
 
@@ -53,23 +55,23 @@ func parseGitURI(uri *url.URL) (GitURI, error) {
 	}, nil
 }
 
-func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
+func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
 	err := os.MkdirAll(srcRoot.Abs(), os.ModePerm)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	guri, err := parseGitURI(uri)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	tpl, err := template.New("clone").Parse(cloneScript)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
-	tmp := utils.RandPath(os.TempDir(), "heph_root", "")
+	tmp := fs2.RandPath(os.TempDir(), "heph_root", "")
 	defer os.RemoveAll(tmp)
 
 	var b bytes.Buffer
@@ -81,24 +83,24 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot Path) (Path, error) {
 		"Ref":  guri.Ref,
 	})
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	cmd := exec.Command("bash", "-eux", "-c", b.String())
 	ob, err := cmd.CombinedOutput()
 	if err != nil {
-		return Path{}, fmt.Errorf("%v: %s", err, ob)
+		return fs2.Path{}, fmt.Errorf("%v: %s", err, ob)
 	}
 
 	return srcRoot, nil
 }
 
-func (e *Engine) fetchFsRoot(uri *url.URL, srcRoot Path) (Path, error) {
+func (e *Engine) fetchFsRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
 	p := filepath.Join(e.Root.Abs(), uri.Path)
 
 	err := utils.Cp(p, srcRoot.Abs())
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	return srcRoot, err
@@ -110,14 +112,14 @@ func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
 		return err
 	}
 
-	err = e.runBuildFiles(p.Abs(), func(dir string) *Package {
+	err = e.runBuildFiles(p.Abs(), func(dir string) *packages.Package {
 		rel, err := filepath.Rel(p.Abs(), e.Root.Join(dir).Abs())
 		if err != nil {
 			panic(err)
 		}
 
-		return e.getOrCreatePkg(filepath.Join(rootName, rel), func(fullname, name string) *Package {
-			return &Package{
+		return e.getOrCreatePkg(filepath.Join(rootName, rel), func(fullname, name string) *packages.Package {
+			return &packages.Package{
 				Name:     name,
 				FullName: fullname,
 				Root:     p.Join(rel),
@@ -131,7 +133,7 @@ func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
 	return nil
 }
 
-func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Package, error) {
+func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*packages.Package, error) {
 	p, err := e.fetchRoot(rootName, cfg)
 	if err != nil {
 		return nil, err
@@ -141,8 +143,8 @@ func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Packa
 
 	pkgPath := p.Join(rest)
 
-	pkg := e.getOrCreatePkg(pkgName, func(fullname, name string) *Package {
-		return &Package{
+	pkg := e.getOrCreatePkg(pkgName, func(fullname, name string) *packages.Package {
+		return &packages.Package{
 			Name:     name,
 			FullName: fullname,
 			Root:     pkgPath,
@@ -152,7 +154,7 @@ func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*Packa
 	return pkg, nil
 }
 
-func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
+func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 	if p, ok := e.fetchRootCache[name]; ok {
 		return p, nil
 	}
@@ -160,7 +162,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 	lock := utils.NewFlock(filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
 	err := lock.Lock()
 	if err != nil {
-		return Path{}, fmt.Errorf("Failed to lock %v", err)
+		return fs2.Path{}, fmt.Errorf("Failed to lock %v", err)
 	}
 	defer lock.Unlock()
 
@@ -172,7 +174,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	b, err := os.ReadFile(metaPath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	var fileCfg config.Root
@@ -192,38 +194,38 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	err = os.RemoveAll(root.Abs())
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	err = os.MkdirAll(root.Abs(), os.ModePerm)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	u, err := url.Parse(cfg.URI)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
-	var backendRoot Path
+	var backendRoot fs2.Path
 	switch u.Scheme {
 	case "git":
 		backendRoot, err = e.fetchGitRoot(u, srcRoot)
 		if err != nil {
-			return Path{}, err
+			return fs2.Path{}, err
 		}
 	case "file":
 		backendRoot, err = e.fetchFsRoot(u, srcRoot)
 		if err != nil {
-			return Path{}, err
+			return fs2.Path{}, err
 		}
 	default:
-		return Path{}, fmt.Errorf("unsupported scheme %v", u.Scheme)
+		return fs2.Path{}, fmt.Errorf("unsupported scheme %v", u.Scheme)
 	}
 
 	metaFile, err := os.Create(metaPath)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 	defer metaFile.Close()
 
@@ -232,7 +234,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (Path, error) {
 
 	err = enc.Encode(cfg)
 	if err != nil {
-		return Path{}, err
+		return fs2.Path{}, err
 	}
 
 	e.fetchRootCache[name] = backendRoot
@@ -249,7 +251,7 @@ func (e *Engine) splitRootNameFromPkgName(pkgName string) (root string, rest str
 	return parts[0], strings.Join(parts[1:], "/")
 }
 
-func (e *Engine) loadFromRoots(pkgName string) (*Package, error) {
+func (e *Engine) loadFromRoots(pkgName string) (*packages.Package, error) {
 	rootName, _ := e.splitRootNameFromPkgName(pkgName)
 	if len(rootName) == 0 {
 		return nil, nil

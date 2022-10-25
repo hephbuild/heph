@@ -9,8 +9,11 @@ import (
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
 	"heph/config"
+	"heph/packages"
 	"heph/sandbox"
+	"heph/targetspec"
 	"heph/utils"
+	fs2 "heph/utils/fs"
 	"heph/vfssimple"
 	"heph/worker"
 	"io"
@@ -27,16 +30,16 @@ import (
 
 type Engine struct {
 	Cwd        string
-	Root       Path
-	HomeDir    Path
+	Root       fs2.Path
+	HomeDir    fs2.Path
 	Config     Config
 	LocalCache *vfsos.Location
 
 	DisableNamedCache bool
 
-	SourceFiles   SourceFiles
+	SourceFiles   packages.SourceFiles
 	packagesMutex sync.Mutex
-	Packages      map[string]*Package
+	Packages      map[string]*packages.Package
 
 	TargetsLock sync.Mutex
 	Targets     *Targets
@@ -56,7 +59,7 @@ type Engine struct {
 	cacheHashOutput            map[string]string // TODO: LRU
 	RanGenPass                 bool
 	codegenPaths               map[string]*Target
-	fetchRootCache             map[string]Path
+	fetchRootCache             map[string]fs2.Path
 	Pool                       *worker.Pool
 }
 
@@ -77,7 +80,7 @@ type RunStatus struct {
 }
 
 func New(rootPath string) *Engine {
-	root := Path{root: rootPath}
+	root := fs2.NewPath(rootPath, "")
 
 	homeDir := root.Join(".heph")
 
@@ -100,11 +103,11 @@ func New(rootPath string) *Engine {
 		HomeDir:         homeDir,
 		LocalCache:      loc.(*vfsos.Location),
 		Targets:         NewTargets(0),
-		Packages:        map[string]*Package{},
+		Packages:        map[string]*packages.Package{},
 		cacheHashInput:  map[string]string{},
 		cacheHashOutput: map[string]string{},
 		codegenPaths:    map[string]*Target{},
-		fetchRootCache:  map[string]Path{},
+		fetchRootCache:  map[string]fs2.Path{},
 	}
 }
 
@@ -116,7 +119,7 @@ func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
 }
 
-func (e *Engine) hashFile(h utils.Hash, file Path) error {
+func (e *Engine) hashFile(h utils.Hash, file fs2.Path) error {
 	return e.hashFilePath(h, file.Abs())
 }
 
@@ -128,17 +131,17 @@ func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 		h.String(dh)
 	}
 }
-func (e *Engine) hashFiles(h utils.Hash, hashMethod string, files Paths) {
+func (e *Engine) hashFiles(h utils.Hash, hashMethod string, files fs2.Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
 
 		switch hashMethod {
-		case HashFileContent:
+		case targetspec.HashFileContent:
 			err := e.hashFile(h, dep)
 			if err != nil {
 				panic(fmt.Errorf("hashDeps: hashFile %v %w", dep.Abs(), err))
 			}
-		case HashFileModTime:
+		case targetspec.HashFileModTime:
 			err := e.hashFileModTime(h, dep)
 			if err != nil {
 				panic(fmt.Errorf("hashDeps: hashFileModTime %v %w", dep.Abs(), err))
@@ -184,7 +187,7 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	return nil
 }
 
-func (e *Engine) hashFileModTime(h utils.Hash, file Path) error {
+func (e *Engine) hashFileModTime(h utils.Hash, file fs2.Path) error {
 	return e.hashFileModTimePath(h, file.Abs())
 }
 
@@ -216,7 +219,7 @@ func (e *Engine) ResetCacheHashInput(target *Target) {
 }
 
 func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
-	e.hashFiles(h, HashFileModTime, target.Deps.All().Files)
+	e.hashFiles(h, targetspec.HashFileModTime, target.Deps.All().Files)
 
 	for _, dep := range target.Deps.All().Targets {
 		err := e.hashInputFiles(h, dep.Target)
@@ -226,7 +229,7 @@ func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
 	}
 
 	if target.DifferentHashDeps {
-		e.hashFiles(h, HashFileModTime, target.HashDeps.Files)
+		e.hashFiles(h, targetspec.HashFileModTime, target.HashDeps.Files)
 
 		for _, dep := range target.HashDeps.Targets {
 			err := e.hashInputFiles(h, dep.Target)
@@ -724,8 +727,8 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*Ac
 	return tp, nil
 }
 
-func (e *Engine) collectOut(target *Target, files RelPaths) (Paths, error) {
-	out := make(Paths, 0)
+func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, error) {
+	out := make(fs2.Paths, 0)
 
 	defer func() {
 		sort.SliceStable(out, func(i, j int) bool {
@@ -739,10 +742,7 @@ func (e *Engine) collectOut(target *Target, files RelPaths) (Paths, error) {
 		pattern := file.RelRoot()
 
 		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			out = append(out, Path{
-				root:    root,
-				relRoot: path,
-			})
+			out = append(out, fs2.NewPath(root, path))
 
 			return nil
 		})
@@ -755,13 +755,13 @@ func (e *Engine) collectOut(target *Target, files RelPaths) (Paths, error) {
 }
 
 func (e *Engine) populateActualFiles(target *Target) (err error) {
-	empty, err := utils.IsDirEmpty(target.OutRoot.Abs())
+	empty, err := fs2.IsDirEmpty(target.OutRoot.Abs())
 	if err != nil {
 		return fmt.Errorf("collect output: isempty: %w", err)
 	}
 
 	target.actualFilesOut = &ActualOutNamedPaths{}
-	target.actualcachedFiles = make(Paths, 0)
+	target.actualcachedFiles = make(fs2.Paths, 0)
 
 	if empty {
 		return nil
@@ -785,7 +785,7 @@ func (e *Engine) populateActualFiles(target *Target) (err error) {
 	return nil
 }
 
-func (e *Engine) sandboxRoot(target *Target) Path {
+func (e *Engine) sandboxRoot(target *Target) fs2.Path {
 	return e.HomeDir.Join("sandbox", target.Package.FullName, "__target_"+target.Name)
 }
 
@@ -827,19 +827,19 @@ func deleteDir(dir string, async bool) error {
 	rm, err := exec.LookPath("rm")
 	if err != nil {
 		return err
-	} else if !utils.PathExists(dir) {
+	} else if !fs2.PathExists(dir) {
 		return nil // not an error, just don't need to do anything.
 	}
 
 	log.Tracef("Deleting %v", dir)
 
 	if async {
-		newDir := utils.RandPath(os.TempDir(), filepath.Base(dir), "")
+		newDir := fs2.RandPath(os.TempDir(), filepath.Base(dir), "")
 
 		err = os.Rename(dir, newDir)
 		if err != nil {
 			// May be because os.TempDir() and the current dir aren't on the same device, try a sibling folder
-			newDir = utils.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
+			newDir = fs2.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
 
 			err1 := os.Rename(dir, newDir)
 			if err1 != nil {
@@ -936,8 +936,8 @@ func (e *Engine) registerLabels(labels []string) {
 	}
 }
 
-func (e *Engine) GetTargetShortcuts() []TargetSpec {
-	aliases := make([]TargetSpec, 0)
+func (e *Engine) GetTargetShortcuts() []targetspec.TargetSpec {
+	aliases := make([]targetspec.TargetSpec, 0)
 	for _, target := range e.Targets.Slice() {
 		spec := target.TargetSpec
 
@@ -948,15 +948,15 @@ func (e *Engine) GetTargetShortcuts() []TargetSpec {
 	return aliases
 }
 
-func (e *Engine) GetFileDeps(targets ...*Target) []Path {
-	filesm := map[string]Path{}
+func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
+	filesm := map[string]fs2.Path{}
 	for _, target := range targets {
 		for _, file := range target.HashDeps.Files {
 			filesm[file.Abs()] = file
 		}
 	}
 
-	files := make([]Path, 0, len(filesm))
+	files := make([]fs2.Path, 0, len(filesm))
 	for _, file := range filesm {
 		files = append(files, file)
 	}

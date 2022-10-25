@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"heph/targetspec"
 	"heph/worker"
 	"path/filepath"
 	"time"
@@ -193,7 +194,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 				re := &runBuildEngine{
 					Engine: e.Engine,
 					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-					registerTarget: func(spec TargetSpec) error {
+					registerTarget: func(spec targetspec.TargetSpec) error {
 						e.TargetsLock.Lock()
 
 						if t := e.Targets.Find(spec.FQN); t != nil {
@@ -204,7 +205,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 							}
 
 							if !t.TargetSpec.Equal(spec) {
-								return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n%s", spec.FQN, t.Source, t.json(), spec.json())
+								return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
 							}
 
 							return nil

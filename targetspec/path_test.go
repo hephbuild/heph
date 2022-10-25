@@ -1,4 +1,4 @@
-package utils
+package targetspec
 
 import (
 	"github.com/stretchr/testify/assert"
