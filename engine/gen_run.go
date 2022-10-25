@@ -16,7 +16,7 @@ type runGenEngine struct {
 }
 
 func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error) {
-	if e.ranGenPass {
+	if e.RanGenPass {
 		return &worker.WaitGroup{}, nil
 	}
 
@@ -85,7 +85,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		},
 	})
 
-	e.ranGenPass = true
+	e.RanGenPass = true
 
 	deps := &worker.WaitGroup{}
 	deps.Add(j)

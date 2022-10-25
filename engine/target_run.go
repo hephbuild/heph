@@ -153,6 +153,8 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
+	target.LogFile = ""
+	target.OutRoot = nil
 	ctx := e.Context
 
 	if err := ctx.Err(); err != nil {

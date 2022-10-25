@@ -299,12 +299,13 @@ var watchCmd = &cobra.Command{
 
 		fromStdin := hasStdin(args)
 
-		targets := make([]*engine.Target, 0, len(targetInvs))
+		targets := engine.NewTargets(len(targetInvs))
 		for _, inv := range targetInvs {
-			targets = append(targets, inv.Target)
+			targets.Add(inv.Target)
 		}
 
-		allTargets, err := Engine.DAG().GetOrderedAncestors(targets, true)
+		// TODO reload files on BUILD change
+		allTargets, err := Engine.DAG().GetOrderedAncestors(targets.Slice(), true)
 		if err != nil {
 			return err
 		}
@@ -381,13 +382,16 @@ var watchCmd = &cobra.Command{
 			sigsCh <- watchRun{ctx: ctx}
 		}()
 
+	loop:
 		for {
 			select {
 			case r := <-sigsCh:
 				fmt.Fprintln(os.Stderr)
 				log.Infof("Got change...")
+
+				localTargetInvs := targetInvs
 				if r.files != nil {
-					allTargets, err := Engine.DAG().GetOrderedAncestors(targets, true)
+					allTargets, err := Engine.DAG().GetOrderedAncestors(targets.Slice(), true)
 					if err != nil {
 						return err
 					}
@@ -402,22 +406,50 @@ var watchCmd = &cobra.Command{
 						return err
 					}
 
-					if len(descendants) == 0 {
-						continue
-					}
-
+					localTargetInvs = make([]TargetInvocation, 0)
 					for _, target := range descendants {
 						Engine.ResetCacheHashInput(target)
+
+						if target.Gen {
+							Engine.RanGenPass = false
+							Engine.DisableNamedCache = false
+						} else {
+							if targets.Find(target.FQN) != nil {
+								localTargetInvs = append(localTargetInvs, TargetInvocation{Target: target})
+							}
+						}
+					}
+
+					if !Engine.RanGenPass {
+						wg, err := Engine.ScheduleGenPass(r.ctx)
+						if err != nil {
+							log.Error(err)
+							continue loop
+						}
+
+						select {
+						case <-r.ctx.Done():
+							log.Error(r.ctx.Err())
+							continue loop
+						case <-wg.Done():
+							if err := wg.Err(); err != nil {
+								log.Error(err)
+								continue loop
+							}
+						}
 					}
 				}
-				err = run(r.ctx, targetInvs, !fromStdin, false)
+
+				err = run(r.ctx, localTargetInvs, !fromStdin, false)
 				if err != nil {
 					if !printTargetError(err) {
 						log.Error(err)
+						continue loop
 					}
-				} else {
-					log.Info("Completed successfully")
 				}
+
+				log.Info("Completed successfully")
+
 				// Allow first run to use named cache, subsequent ones will skip them
 				Engine.DisableNamedCache = true
 			case err := <-errCh:
