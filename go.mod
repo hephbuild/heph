@@ -10,6 +10,7 @@ require (
 	github.com/bep/debounce v1.2.1
 	github.com/bmatcuk/doublestar/v4 v4.2.0
 	github.com/c2fo/vfs/v6 v6.5.1
+	github.com/charmbracelet/bubbles v0.14.0
 	github.com/charmbracelet/bubbletea v0.22.0
 	github.com/coreos/go-semver v0.3.0
 	github.com/fsnotify/fsnotify v1.5.5-0.20220908164714-85acde25252d
@@ -32,7 +33,9 @@ require (
 	cloud.google.com/go/compute v1.7.0 // indirect
 	cloud.google.com/go/iam v0.3.0 // indirect
 	cloud.google.com/go/storage v1.23.0 // indirect
+	github.com/atotto/clipboard v0.1.4 // indirect
 	github.com/aws/aws-sdk-go v1.44.43 // indirect
+	github.com/charmbracelet/lipgloss v0.5.0 // indirect
 	github.com/containerd/console v1.0.3 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect

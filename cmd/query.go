@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	tea "github.com/charmbracelet/bubbletea"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -148,11 +149,19 @@ var alltargetsCmd = &cobra.Command{
 var fzfCmd = &cobra.Command{
 	Use:   "fzf",
 	Short: "Fuzzy search targets",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		targets, _, err := preRunAutocomplete(cmd.Context())
 		if err != nil {
 			return err
+		}
+
+		if len(args) == 0 {
+			p := tea.NewProgram(newBbtFzf(targets))
+			if err := p.Start(); err != nil {
+				return err
+			}
+			return nil
 		}
 
 		suggestions := autocompleteTargetName(targets, args[0])
