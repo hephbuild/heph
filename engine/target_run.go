@@ -99,23 +99,15 @@ func normalizeEnv(k string) string {
 	return envRegex.ReplaceAllString(k, "_")
 }
 
-func (e *TargetRunEngine) RunShell(target *Target, iocfg sandbox.IOConfig, args ...string) error {
-	return e.run(target, iocfg, true, args...)
-}
-
-func (e *TargetRunEngine) Run(target *Target, iocfg sandbox.IOConfig, args ...string) error {
-	return e.run(target, iocfg, false, args...)
-}
-
 func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
 	f, err := os.Create(filepath.Join(e.tmpRoot(target), name))
 	if err != nil {
 		return err, func() {}
 	}
+	defer f.Close()
 
 	cleanup := func() {
-		f.Close()
-		os.Remove(f.Name())
+		_ = os.Remove(f.Name())
 	}
 
 	err = fun(f)
@@ -123,14 +115,13 @@ func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *Src
 		return err, cleanup
 	}
 
-	f.Close()
-
 	rec.Add(name, f.Name(), path, "")
 
 	return nil, cleanup
 }
 
-func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool, args ...string) error {
+func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error {
+	target := rr.Target
 	e.Status(target.FQN)
 
 	err := e.linkTarget(target, NewTargets(0))
@@ -162,7 +153,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		return err
 	}
 
-	if !shell {
+	if !rr.Shell && !rr.NoCache {
 		start := time.Now()
 		defer func() {
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
@@ -425,7 +416,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 
 	_, hasPathInEnv := env["PATH"]
 
-	if len(args) > 0 {
+	if len(rr.Args) > 0 {
 		if target.Cache.Enabled {
 			return fmt.Errorf("args are not supported with cache")
 		}
@@ -466,7 +457,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			run = append(run, out)
 		}
 
-		if shell {
+		if rr.Shell {
 			fmt.Println("Shell mode enabled, exit the shell to terminate")
 			fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
 
@@ -488,7 +479,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 			Env:      env,
 			IOConfig: iocfg,
 			ExecArgs: execArgs,
-			CmdArgs:  args,
+			CmdArgs:  rr.Args,
 		}, target.Sandbox && !hasPathInEnv)
 
 		err = cmd.Run()
@@ -497,7 +488,7 @@ func (e *TargetRunEngine) run(target *Target, iocfg sandbox.IOConfig, shell bool
 		}
 	}
 
-	if shell {
+	if rr.Shell {
 		return nil
 	}
 

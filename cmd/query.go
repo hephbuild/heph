@@ -622,7 +622,7 @@ var outCmd = &cobra.Command{
 			return engine.TargetNotFoundError(tp.Full())
 		}
 
-		err = run(cmd.Context(), []TargetInvocation{{Target: target}}, false, false)
+		err = run(cmd.Context(), []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}

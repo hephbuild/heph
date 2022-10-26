@@ -15,11 +15,6 @@ import (
 	"strings"
 )
 
-type TargetInvocation struct {
-	Target *engine.Target
-	Args   []string
-}
-
 func hasStdin(args []string) bool {
 	return len(args) == 1 && args[0] == "-"
 }
@@ -71,22 +66,24 @@ func parseTargetPathsFromStdin() ([]targetspec.TargetPath, error) {
 	return targetsFromStdin, nil
 }
 
-func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
+func parseTargetsAndArgs(args []string) ([]engine.TargetRunRequest, error) {
 	if hasStdin(args) {
 		targets, err := parseTargetsFromStdin()
 		if err != nil {
 			return nil, err
 		}
 
-		targetInvs := make([]TargetInvocation, 0)
+		rrs := make([]engine.TargetRunRequest, 0)
 		for _, target := range targets {
-			targetInvs = append(targetInvs, TargetInvocation{
-				Target: target,
-				Args:   nil, // TODO
+			rrs = append(rrs, engine.TargetRunRequest{
+				Target:  target,
+				Args:    nil, // TODO
+				NoCache: *nocache,
+				Shell:   *shell,
 			})
 		}
 
-		return targetInvs, nil
+		return rrs, nil
 	}
 
 	if len(args) == 0 {
@@ -109,9 +106,11 @@ func parseTargetsAndArgs(args []string) ([]TargetInvocation, error) {
 		return nil, fmt.Errorf("%v does not allow args", target.FQN)
 	}
 
-	return []TargetInvocation{{
-		Target: target,
-		Args:   targs,
+	return []engine.TargetRunRequest{{
+		Target:  target,
+		Args:    targs,
+		NoCache: *nocache,
+		Shell:   *shell,
 	}}, nil
 }
 
@@ -128,24 +127,31 @@ func (e ErrorWithExitCode) Unwrap() error {
 	return e.Err
 }
 
-func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, shell bool) error {
-	var inlineInvocationTarget *TargetInvocation
+func run(ctx context.Context, rrs engine.TargetRunRequests, inlineSingle bool) error {
+	shellCount := rrs.Count(func(rr engine.TargetRunRequest) bool {
+		return rr.Shell
+	})
+
+	if shellCount > 0 {
+		if shellCount > 1 {
+			return fmt.Errorf("shell mode is only compatible with running a single target")
+		}
+
+		if !inlineSingle {
+			return fmt.Errorf("target invocation must be inlined to enable shell")
+		}
+	}
+
+	var inlineInvocationTarget *engine.TargetRunRequest
 	var inlineTarget *engine.Target
-	if len(targetInvs) == 1 && inlineSingle {
-		inlineInvocationTarget = &targetInvs[0]
+	if len(rrs) == 1 && inlineSingle {
+		inlineInvocationTarget = &rrs[0]
 		inlineTarget = inlineInvocationTarget.Target
 	}
 
-	if shell && inlineInvocationTarget == nil {
-		return fmt.Errorf("shell mode is only compatible with running a single target")
-	}
+	targets := rrs.Targets()
 
-	targets := make([]*engine.Target, 0)
-	for _, inv := range targetInvs {
-		targets = append(targets, inv.Target)
-	}
-
-	tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, targets, inlineTarget)
+	tdeps, err := Engine.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
 	if err != nil {
 		return err
 	}
@@ -164,10 +170,6 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 		return nil
 	}
 
-	if !*porcelain {
-		fmt.Fprintln(os.Stderr, inlineTarget.FQN)
-	}
-
 	e := engine.TargetRunEngine{
 		Engine:  Engine,
 		Context: ctx,
@@ -176,16 +178,11 @@ func run(ctx context.Context, targetInvs []TargetInvocation, inlineSingle bool, 
 		},
 	}
 
-	runner := e.Run
-	if shell {
-		runner = e.RunShell
-	}
-
-	err = runner(inlineTarget, sandbox.IOConfig{
+	err = e.Run(*inlineInvocationTarget, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
-	}, inlineInvocationTarget.Args...)
+	})
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {

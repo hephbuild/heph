@@ -36,6 +36,7 @@ var workers *int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
+var nocache *bool
 var params *[]string
 
 func init() {
@@ -68,6 +69,7 @@ func init() {
 	logLevel = rootCmd.PersistentFlags().String("log_level", log.InfoLevel.String(), "log level")
 	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
+	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
@@ -183,7 +185,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("alias %v not defined\n", alias)
 		}
 
-		err = run(cmd.Context(), []TargetInvocation{{Target: target, Args: args[1:]}}, true, false)
+		err = run(cmd.Context(), []engine.TargetRunRequest{{Target: target, Args: args[1:]}}, true)
 		if err != nil {
 			return err
 		}
@@ -224,19 +226,19 @@ var runCmd = &cobra.Command{
 			return err
 		}
 
-		targets, err := parseTargetsAndArgs(args)
+		rrs, err := parseTargetsAndArgs(args)
 		if err != nil {
 			return err
 		}
 
-		if !hasStdin(args) && len(targets) == 0 {
+		if !hasStdin(args) && len(rrs) == 0 {
 			_ = cmd.Help()
 			return nil
 		}
 
 		fromStdin := hasStdin(args)
 
-		err = run(cmd.Context(), targets, !fromStdin, *shell)
+		err = run(cmd.Context(), rrs, !fromStdin)
 		if err != nil {
 			return err
 		}
@@ -288,20 +290,20 @@ var watchCmd = &cobra.Command{
 			return err
 		}
 
-		targetInvs, err := parseTargetsAndArgs(args)
+		rrs, err := parseTargetsAndArgs(args)
 		if err != nil {
 			return err
 		}
 
-		if !hasStdin(args) && len(targetInvs) == 0 {
+		if !hasStdin(args) && len(rrs) == 0 {
 			_ = cmd.Help()
 			return nil
 		}
 
 		fromStdin := hasStdin(args)
 
-		targets := engine.NewTargets(len(targetInvs))
-		for _, inv := range targetInvs {
+		targets := engine.NewTargets(len(rrs))
+		for _, inv := range rrs {
 			targets.Add(inv.Target)
 		}
 
@@ -390,7 +392,7 @@ var watchCmd = &cobra.Command{
 				fmt.Fprintln(os.Stderr)
 				log.Infof("Got change...")
 
-				localTargetInvs := targetInvs
+				localRRs := rrs
 				if r.files != nil {
 					allTargets, err := Engine.DAG().GetOrderedAncestors(targets.Slice(), true)
 					if err != nil {
@@ -407,7 +409,7 @@ var watchCmd = &cobra.Command{
 						return err
 					}
 
-					localTargetInvs = make([]TargetInvocation, 0)
+					localRRs = make([]engine.TargetRunRequest, 0)
 					for _, target := range descendants {
 						Engine.ResetCacheHashInput(target)
 
@@ -416,7 +418,7 @@ var watchCmd = &cobra.Command{
 							Engine.DisableNamedCache = false
 						} else {
 							if targets.Find(target.FQN) != nil {
-								localTargetInvs = append(localTargetInvs, TargetInvocation{Target: target})
+								localRRs = append(localRRs, engine.TargetRunRequest{Target: target})
 							}
 						}
 					}
@@ -441,7 +443,7 @@ var watchCmd = &cobra.Command{
 					}
 				}
 
-				err = run(r.ctx, localTargetInvs, !fromStdin, false)
+				err = run(r.ctx, localRRs, !fromStdin)
 				if err != nil {
 					if !printTargetError(err) {
 						log.Error(err)
