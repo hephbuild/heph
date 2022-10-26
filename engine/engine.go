@@ -79,6 +79,46 @@ type RunStatus struct {
 	Description string
 }
 
+type TargetRunRequest struct {
+	Target  *Target
+	Args    []string
+	NoCache bool
+	Shell   bool
+}
+
+type TargetRunRequests []TargetRunRequest
+
+func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
+	for _, rr := range rrs {
+		if rr.Target.FQN == t.FQN {
+			return rr
+		}
+	}
+
+	return TargetRunRequest{Target: t}
+}
+
+func (rrs TargetRunRequests) Targets() []*Target {
+	ts := make([]*Target, 0)
+
+	for _, rr := range rrs {
+		ts = append(ts, rr.Target)
+	}
+
+	return ts
+}
+
+func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
+	c := 0
+	for _, rr := range rrs {
+		if f(rr) {
+			c++
+		}
+	}
+
+	return c
+}
+
 func New(rootPath string) *Engine {
 	root := fs2.NewPath(rootPath, "")
 
@@ -461,6 +501,17 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 }
 
 func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target, skip *Target) (*WaitGroupMap, error) {
+	rrs := make([]TargetRunRequest, 0, len(targets))
+	for _, target := range targets {
+		rrs = append(rrs, TargetRunRequest{Target: target})
+	}
+
+	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
+}
+
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
+	targets := rrs.Targets()
+
 	ancestors, err := e.DAG().GetOrderedAncestors(targets, false)
 	if err != nil {
 		return nil, err
@@ -514,7 +565,8 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 					}
 				}
 
-				if !hasParentCacheMiss && target.Cache.Enabled {
+				rr := rrs.Get(target)
+				if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
 					w.Status(fmt.Sprintf("Pulling meta %v...", target.FQN))
 
 					e := TargetRunEngine{
@@ -589,7 +641,7 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 				}
 
 				if needRun.Find(target.FQN) != nil {
-					j, err := e.ScheduleTarget(ctx, target, wdeps)
+					j, err := e.ScheduleTarget(ctx, rrs.Get(target), wdeps)
 					if err != nil {
 						return err
 					}
@@ -653,9 +705,9 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, de
 	return j, nil
 }
 
-func (e *Engine) ScheduleTarget(ctx context.Context, target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
+func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   target.FQN,
+		ID:   rr.Target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
@@ -664,10 +716,10 @@ func (e *Engine) ScheduleTarget(ctx context.Context, target *Target, deps *worke
 				Context: ctx,
 			}
 
-			err := e.Run(target, sandbox.IOConfig{})
+			err := e.Run(rr, sandbox.IOConfig{})
 			if err != nil {
 				return TargetFailedError{
-					Target: target,
+					Target: rr.Target,
 					Err:    err,
 				}
 			}
