@@ -29,7 +29,7 @@ target(
 | `sandbox`        | `bool`                                         | `True`                                            | Enables sandbox (see [`sandbox`](#sandbox))                                                  |
 | `out_in_sandbox` | `bool`                                         | `False`                                           | Will collect output from the sandbox when sandboxing is disabled, use with `sandbox=False`   |
 | `gen`            | `bool`                                         | `False`                                           | Marks target as a generating target                                                          |
-| `codegen`        | `bool`                                         | `False`                                           | Enables linking output back into tree                                                        |
+| `codegen`        | `'link'`, `'copy'`                             | `None`                                            | Enables linking output back into tree, through symlink or hard copy                          |
 | `deps`           | `string`, `[]string`, `dict`                   | `[]`                                              | Dependencies required by this target (target and files)                                      |
 | `hash_deps`      | `string`, `[]string`, `dict`                   | `deps`                                            | Dependencies used to compute the target hash                                                 |
 | `tools`          | `string`, `[]string`, `dict`                   | `[]`                                              | Tools to be exposed to this target (available in `PATH`)                                     |
@@ -75,7 +75,7 @@ By default the value will be the path relative to the package
 ### `transitive`
 
 You can optionally specify `deps`, `tools`, `env` and `pass_env` that will be transitively applied when the current target is required as `tools` or `deps`:
-This si especially useful if a tool requires at runtime another tool to function.
+This is especially useful if a tool requires at runtime another tool to function.
 
 Example:
 
@@ -99,7 +99,7 @@ target(
     tools=[':tool_2'],
 )
 
-# This is equivalent to declaring example as:
+# This is equivalent to declaring `example` as:
 
 target(
     name="example",

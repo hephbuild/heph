@@ -156,6 +156,22 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		return targetspec.TargetSpec{}, fmt.Errorf("executor must be one of %v, got %v", printOneOf(targetspec.ExecutorValues), t.Executor)
 	}
 
+	if t.Codegen != "" {
+		if !validate(t.Codegen, targetspec.CodegenValues) {
+			return targetspec.TargetSpec{}, fmt.Errorf("codegen must be one of %v, got %v", printOneOf(targetspec.CodegenValues), t.Codegen)
+		}
+
+		if !t.Sandbox {
+			return targetspec.TargetSpec{}, fmt.Errorf("codegen is only suported in sandboxed targets")
+		}
+
+		for _, file := range t.Out {
+			if strings.Contains(file.Path, "*") {
+				return targetspec.TargetSpec{}, fmt.Errorf("codegen targets must not have glob outputs")
+			}
+		}
+	}
+
 	return t, nil
 }
 

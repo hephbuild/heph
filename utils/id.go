@@ -2,13 +2,10 @@ package utils
 
 import (
 	"encoding/hex"
-	"fmt"
 	"math/rand"
 	"os"
 	"time"
 )
-
-var ID string
 
 func Seed() {
 	i := int64(time.Now().Nanosecond())
@@ -25,8 +22,4 @@ func RandStr(l int) string {
 	rand.Read(randBytes)
 
 	return hex.EncodeToString(randBytes)
-}
-
-func init() {
-	ID = fmt.Sprintf("%v", RandStr(10))
 }

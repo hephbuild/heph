@@ -23,9 +23,9 @@ heph query //path/to/service/... | heph query --include test - | heph watch -
 
 This will output the targets in the `path/to/service` directory that have the `test` label, and will pipe the result into `heph watch` which will watch for file changes and run the targets. 
 
-> Tip: you can speed up the typing by using the aliases: 
+> **Tip**: you can speed up the typing by using the aliases: 
 > ```shell
 > heph q //path/to/service/... | heph q -i test - | heph w - # heph watch
-> heph q -i test - | heph r -                                # heph run
+> heph q -i test | heph r -                                  # heph run
 > ```
 > And leverage completion: see `heph completion <zsh|fish|bash> --help` for details

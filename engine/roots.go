@@ -98,7 +98,7 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) 
 func (e *Engine) fetchFsRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
 	p := filepath.Join(e.Root.Abs(), uri.Path)
 
-	err := utils.Cp(p, srcRoot.Abs())
+	err := fs2.Cp(p, srcRoot.Abs())
 	if err != nil {
 		return fs2.Path{}, err
 	}

@@ -698,6 +698,11 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, de
 				return fmt.Errorf("%v expected cache pull to succeed", target.FQN)
 			}
 
+			err = e.codegenLink(target)
+			if err != nil {
+				return err
+			}
+
 			return nil
 		},
 	})

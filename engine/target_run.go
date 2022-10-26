@@ -559,37 +559,53 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 }
 
 func (e *TargetRunEngine) codegenLink(target *Target) error {
-	if !target.CodegenLink {
+	if target.Codegen == "" {
 		return nil
 	}
 
 	e.Status(fmt.Sprintf("Linking %v output", target.FQN))
 
 	for _, file := range target.OutFilesInOutRoot() {
-		target := e.Root.Join(file.RelRoot()).Abs()
+		to := e.Root.Join(file.RelRoot()).Abs()
 
-		info, err := os.Lstat(target)
+		info, err := os.Lstat(to)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+		exists := err == nil
 
-		if err == nil {
-			isLink := info.Mode().Type() == os.ModeSymlink
-
-			if !isLink {
-				log.Warnf("linking codegen: %v already exists", target)
-				continue
+		switch target.Codegen {
+		case targetspec.CodegenCopy:
+			if exists {
+				err = os.RemoveAll(to)
+				if err != nil {
+					return err
+				}
 			}
 
-			err = os.Remove(target)
+			err := fs.Cp(file.Abs(), to)
 			if err != nil {
 				return err
 			}
-		}
+		case targetspec.CodegenLink:
+			if exists {
+				isLink := info.Mode().Type() == os.ModeSymlink
 
-		err = os.Symlink(file.Abs(), target)
-		if err != nil {
-			return err
+				if !isLink {
+					log.Warnf("linking codegen: %v already exists", to)
+					continue
+				}
+
+				err = os.Remove(to)
+				if err != nil {
+					return err
+				}
+			}
+
+			err = os.Symlink(file.Abs(), to)
+			if err != nil {
+				return err
+			}
 		}
 	}
 

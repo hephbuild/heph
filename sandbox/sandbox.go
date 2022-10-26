@@ -5,6 +5,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
+	"heph/utils/fs"
 	"io"
 	"os"
 	"os/exec"
@@ -92,7 +93,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 			return err
 		}
 
-		err := utils.Cp(file.From, filepath.Join(cfg.Dir, file.To))
+		err := fs.Cp(file.From, filepath.Join(cfg.Dir, file.To))
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}
