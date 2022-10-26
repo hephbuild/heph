@@ -29,3 +29,11 @@ This will output the targets in the `path/to/service` directory that have the `t
 > heph q -i test | heph r -                                  # heph run
 > ```
 > And leverage completion: see `heph completion <zsh|fish|bash> --help` for details
+
+When the number of targets becomes too important, it can be pretty hard to remember them all, to make it easy to find them, you can run
+
+    heph query fzf sometest
+
+An interactive mode is also available:
+
+    heph query fzf
