@@ -249,8 +249,6 @@ type Target struct {
 	RequireTransitive     TargetTransitive
 	DeepRequireTransitive TargetTransitive
 
-	CodegenLink bool
-
 	WorkdirRoot       fs.Path
 	SandboxRoot       fs.Path
 	OutRoot           *fs.Path
@@ -701,21 +699,7 @@ func (e *Engine) processTarget(t *Target) error {
 	t.cacheLock = e.lockFactory(t, "cache")
 
 	if t.Codegen != "" {
-		if t.Codegen != "link" {
-			return fmt.Errorf("codegen must be omitted or be equal to `link`")
-		}
-
-		if !t.Sandbox {
-			return fmt.Errorf("codegen is only suported in sandbox mode")
-		}
-
-		t.CodegenLink = true
-
 		for _, file := range t.TargetSpec.Out {
-			if strings.Contains(file.Path, "*") {
-				return fmt.Errorf("codegen must not have glob outputs")
-			}
-
 			p := file.Package.Root.Join(file.Path).RelRoot()
 
 			if ct, ok := e.codegenPaths[p]; ok && ct != t {

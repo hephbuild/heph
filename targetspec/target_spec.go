@@ -29,6 +29,13 @@ var (
 	ExecutorValues = []string{ExecutorBash, ExecutorExec}
 )
 
+var (
+	CodegenLink = "link"
+	CodegenCopy = "copy"
+
+	CodegenValues = []string{CodegenLink, CodegenCopy}
+)
+
 type TargetSpec struct {
 	Name    string
 	FQN     string

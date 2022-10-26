@@ -23,3 +23,19 @@ target(
     run='echo $(hash_input)',
     cache=False,
 )
+
+target(
+    name="codegen-link",
+    run='touch $OUT',
+    out='codegen_link',
+    codegen='link',
+    cache=False,
+)
+
+target(
+    name="codegen-copy",
+    run='touch $OUT',
+    out='codegen_copy',
+    codegen='copy',
+    cache=False,
+)

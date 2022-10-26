@@ -1,5 +1,6 @@
 def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_output_contains=None, expect_output_doesnt_contain=None, expected_exit_code=None):
     cmd = cmd.replace("heph ", "heph --porcelain ")
+    cmd = '('+cmd+')'
 
     if expected_failure:
         test_cmd = '%s | tee output && RC=$? || RC=$?; if [ $RC -eq 0 ]; then exit 1; fi; ' % cmd

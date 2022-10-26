@@ -37,6 +37,7 @@ func init() {
 	queryCmd.AddCommand(depsOnCmd)
 	queryCmd.AddCommand(depsCmd)
 	queryCmd.AddCommand(outCmd)
+	queryCmd.AddCommand(outRootCmd)
 
 	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
@@ -638,6 +639,22 @@ var outCmd = &cobra.Command{
 		for _, path := range paths {
 			fmt.Println(path.Abs())
 		}
+
+		return nil
+	},
+}
+
+var outRootCmd = &cobra.Command{
+	Use:   "root",
+	Short: "Prints repo root",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := engineInit()
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(Engine.Root.Abs())
 
 		return nil
 	},

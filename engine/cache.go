@@ -63,7 +63,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 				return err
 			}
 
-			err := utils.Cp(file.Abs(), outFilesDir.Join(file.RelRoot()).Abs())
+			err := fs.Cp(file.Abs(), outFilesDir.Join(file.RelRoot()).Abs())
 			if err != nil {
 				return err
 			}
