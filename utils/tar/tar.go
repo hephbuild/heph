@@ -1,4 +1,4 @@
-package utils
+package tar
 
 import (
 	"archive/tar"
@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	fs2 "heph/utils/fs"
 	"io"
 	"io/fs"
 	"os"
@@ -225,11 +226,9 @@ func doUntar(r io.Reader, to string) error {
 
 		dest := filepath.Join(to, hdr.Name)
 
-		if dir := filepath.Dir(dest); dir != "." {
-			err := os.MkdirAll(dir, os.ModePerm)
-			if err != nil {
-				return err
-			}
+		err = fs2.CreateParentDir(dest)
+		if err != nil {
+			return err
 		}
 
 		switch hdr.Typeflag {

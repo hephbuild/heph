@@ -58,7 +58,7 @@ build_flags=""
 if release:
     version = target(
         name="version",
-        run="mkdir utils && echo ${GITHUB_SHA::7} > $OUT",
+        run="echo ${GITHUB_SHA::7} > $OUT",
         out="utils/version",
         pass_env=["GITHUB_SHA"],
     )

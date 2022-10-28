@@ -38,6 +38,17 @@ func PathExists(filename string) bool {
 	return err == nil
 }
 
+func CreateParentDir(path string) error {
+	if dir := filepath.Dir(path); dir != "." {
+		err := os.MkdirAll(dir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func WriteFileSync(name string, data []byte, perm os.FileMode) error {
 	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {

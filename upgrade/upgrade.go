@@ -7,6 +7,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/config"
 	"heph/utils"
+	"heph/utils/flock"
 	"heph/utils/fs"
 	"io"
 	"net/http"
@@ -26,7 +27,7 @@ func CheckAndUpdate(cfg config.Config) error {
 		return err
 	}
 
-	lock := utils.NewFlock(filepath.Join(homeDir, "update.lock"))
+	lock := flock.NewFlock(filepath.Join(homeDir, "update.lock"))
 	err = lock.Lock()
 	if err != nil {
 		return fmt.Errorf("Failed to lock %v", err)

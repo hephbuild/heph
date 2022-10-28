@@ -1,13 +1,13 @@
 package engine
 
 import (
-	"heph/utils"
+	"heph/utils/tar"
 	"sync"
 )
 
 type SrcRecorder struct {
 	srcTar    []string
-	src       []utils.TarFile
+	src       []tar.TarFile
 	namedSrc  map[string][]string
 	srcOrigin map[string]string
 
@@ -40,7 +40,7 @@ func (s *SrcRecorder) AddTar(tar string) {
 func (s *SrcRecorder) Add(name, from, to, origin string) {
 	s.init()
 
-	s.src = append(s.src, utils.TarFile{
+	s.src = append(s.src, tar.TarFile{
 		From: from,
 		To:   to,
 	})
@@ -51,7 +51,7 @@ func (s *SrcRecorder) Origin() map[string]string {
 	return s.srcOrigin
 }
 
-func (s *SrcRecorder) Src() []utils.TarFile {
+func (s *SrcRecorder) Src() []tar.TarFile {
 	return s.src
 }
 

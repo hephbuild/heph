@@ -10,6 +10,7 @@ import (
 	"heph/targetspec"
 	"heph/upgrade"
 	"heph/utils"
+	"heph/utils/flock"
 	"heph/utils/fs"
 	"os"
 	"path/filepath"
@@ -266,8 +267,8 @@ type Target struct {
 	linkingDeps *Targets
 	m           sync.Mutex
 
-	runLock   utils.Locker
-	cacheLock utils.Locker
+	runLock   flock.Locker
+	cacheLock flock.Locker
 }
 
 type TargetTransitive struct {
@@ -678,10 +679,10 @@ func (e *Engine) createDag() error {
 	return nil
 }
 
-func (e *Engine) lockFactory(t *Target, resource string) utils.Locker {
+func (e *Engine) lockFactory(t *Target, resource string) flock.Locker {
 	p := e.lockPath(t, resource)
 
-	return utils.NewFlock(p)
+	return flock.NewFlock(p)
 }
 
 func (e *Engine) processTarget(t *Target) error {

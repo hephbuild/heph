@@ -1,10 +1,10 @@
-package utils
+package flock
 
 import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"heph/utils/fs"
 	"os"
-	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -30,11 +30,9 @@ func (l *Flock) Lock() error {
 	l.m.Lock()
 	defer l.m.Unlock()
 
-	if dir := filepath.Dir(l.path); dir != "." {
-		err := os.MkdirAll(dir, os.ModePerm)
-		if err != nil {
-			return err
-		}
+	err := fs.CreateParentDir(l.path)
+	if err != nil {
+		return err
 	}
 
 	f, err := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0644)

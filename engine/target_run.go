@@ -351,8 +351,9 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					continue
 				}
 
-				if base := filepath.Dir(path.Abs()); base != "." {
-					err := os.MkdirAll(base, os.ModePerm)
+				if target.Sandbox {
+					// Create the output folder, as a convenience
+					err := fs.CreateParentDir(path.Abs())
 					if err != nil {
 						return err
 					}
@@ -435,12 +436,12 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	if target.IsGroup() {
 		// Ignore
 	} else if target.IsTextFile() {
-		err := os.MkdirAll(dir, os.ModePerm)
+		to := target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs()
+
+		err := fs.CreateParentDir(to)
 		if err != nil {
 			return err
 		}
-
-		to := target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs()
 
 		imode, err := strconv.ParseInt(target.Run[1], 8, 32)
 		if err != nil {
@@ -448,6 +449,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		}
 		mode := os.FileMode(imode)
 
+		// This will respect the umask
 		err = os.WriteFile(to, target.FileContent, mode)
 		if err != nil {
 			return err
@@ -599,7 +601,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 				}
 			}
 
-			err := os.MkdirAll(filepath.Dir(to), os.ModePerm)
+			err := fs.CreateParentDir(to)
 			if err != nil {
 				return err
 			}
@@ -623,7 +625,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 				}
 			}
 
-			err := os.MkdirAll(filepath.Dir(to), os.ModePerm)
+			err := fs.CreateParentDir(to)
 			if err != nil {
 				return err
 			}
