@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -350,6 +351,13 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					continue
 				}
 
+				if base := filepath.Dir(path.Abs()); base != "." {
+					err := os.MkdirAll(base, os.ModePerm)
+					if err != nil {
+						return err
+					}
+				}
+
 				var pathv string
 				switch target.OutEnv {
 				case targetspec.FileEnvAbs:
@@ -432,7 +440,15 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 			return err
 		}
 
-		err = os.WriteFile(target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs(), target.FileContent, os.ModePerm)
+		to := target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs()
+
+		imode, err := strconv.ParseInt(target.Run[1], 8, 32)
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(imode)
+
+		err = os.WriteFile(to, target.FileContent, mode)
 		if err != nil {
 			return err
 		}
@@ -583,7 +599,12 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 				}
 			}
 
-			err := fs.Cp(file.Abs(), to)
+			err := os.MkdirAll(filepath.Dir(to), os.ModePerm)
+			if err != nil {
+				return err
+			}
+
+			err = fs.Cp(file.Abs(), to)
 			if err != nil {
 				return err
 			}
@@ -600,6 +621,11 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 				if err != nil {
 					return err
 				}
+			}
+
+			err := os.MkdirAll(filepath.Dir(to), os.ModePerm)
+			if err != nil {
+				return err
 			}
 
 			err = os.Symlink(file.Abs(), to)
