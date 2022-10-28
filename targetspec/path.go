@@ -110,7 +110,7 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 		}, nil
 	}
 
-	return TargetPath{}, fmt.Errorf("invalid target")
+	return TargetPath{}, fmt.Errorf("invalid target: %v", s)
 }
 
 type TargetOutputPath struct {

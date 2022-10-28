@@ -23,13 +23,13 @@ def group(*args, **kwargs):
         *args, **kwargs
     )
 
-def text_file(name, text, out=None, *args, **kwargs):
+def text_file(name, text, out=None, mode=777, *args, **kwargs):
     _fail_if_present(kwargs, "run")
 
     return target(
         name=name,
         out=out or name,
-        run='text_file',
+        run=['text_file', str(mode)],
         _file_content=text,
         *args, **kwargs
     )

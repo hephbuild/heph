@@ -81,7 +81,7 @@ func (t TargetSpec) IsGroup() bool {
 }
 
 func (t TargetSpec) IsTextFile() bool {
-	return len(t.Run) == 1 && t.Run[0] == "text_file"
+	return len(t.Run) == 2 && t.Run[0] == "text_file"
 }
 
 func (t TargetSpec) Json() []byte {

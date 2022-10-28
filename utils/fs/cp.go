@@ -35,7 +35,7 @@ func Cp(from, to string) error {
 		}
 	}
 
-	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode())
 	if err != nil {
 		return logerr("cp4", err)
 	}
