@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	log "github.com/sirupsen/logrus"
-	"heph/utils"
+	"heph/utils/tar"
 	"os"
 	"path/filepath"
 	"time"
@@ -130,7 +130,7 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 
 		dir := e.cacheDir(target, inputHash)
 
-		err = utils.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
+		err = tar.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
 		if err != nil {
 			return false, err
 		}

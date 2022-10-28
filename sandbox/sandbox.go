@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"heph/utils"
 	"heph/utils/fs"
+	"heph/utils/tar"
 	"io"
 	"os"
 	"os/exec"
@@ -17,7 +17,7 @@ type MakeConfig struct {
 	Dir    string
 	BinDir string
 	Bin    map[string]string
-	Src    []utils.TarFile
+	Src    []tar.TarFile
 	SrcTar []string
 }
 
@@ -100,7 +100,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 	}
 
 	for _, tarFile := range cfg.SrcTar {
-		err := utils.Untar(ctx, tarFile, cfg.Dir)
+		err := tar.Untar(ctx, tarFile, cfg.Dir)
 		if err != nil {
 			return fmt.Errorf("make: untar: %w", err)
 		}

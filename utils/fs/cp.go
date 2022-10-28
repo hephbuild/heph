@@ -28,11 +28,9 @@ func Cp(from, to string) error {
 		return cpDir(from, to)
 	}
 
-	if dir := filepath.Dir(to); dir != "." {
-		err = os.MkdirAll(dir, os.ModePerm)
-		if err != nil {
-			return logerr("cp2", err)
-		}
+	err = CreateParentDir(to)
+	if err != nil {
+		return logerr("cp2", err)
 	}
 
 	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode())

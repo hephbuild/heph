@@ -244,7 +244,7 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 
 	cachePath := e.HomeDir.Join("tmp", "__BUILD", utils.HashString(path), h.Sum()).Abs()
 
-	err = os.MkdirAll(filepath.Dir(cachePath), os.ModePerm)
+	err = fs2.CreateParentDir(cachePath)
 	if err != nil {
 		return nil, err
 	}

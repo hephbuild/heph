@@ -21,7 +21,7 @@ for (mode, expected) in modes:
     t=target(
         name="_text_file_mode_"+smode,
         deps=txt,
-        run='stat -f "%Sp" $SRC',
+        run="ls -l $SRC | awk '{print $1;}'",
         cache=False,
         labels='txt_file_mode'
     )

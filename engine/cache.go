@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"heph/utils"
 	"heph/utils/fs"
+	"heph/utils/tar"
 	"heph/vfssimple"
 	"os"
 )
@@ -57,7 +57,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 	if cache := target.ActualCachedFiles(); len(cache) > 0 {
 		log.Tracef("Copying to cache %v", target.FQN)
 
-		files := make([]utils.TarFile, 0)
+		files := make([]tar.TarFile, 0)
 		for _, file := range cache {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -68,7 +68,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 				return err
 			}
 
-			files = append(files, utils.TarFile{
+			files = append(files, tar.TarFile{
 				From: file.Abs(),
 				To:   file.RelRoot(),
 			})
@@ -76,7 +76,7 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 
 		log.Tracef("Creating archive %v", target.FQN)
 
-		err = utils.Tar(ctx, files, e.targetOutputTarFile(target, inputHash))
+		err = tar.Tar(ctx, files, e.targetOutputTarFile(target, inputHash))
 		if err != nil {
 			return err
 		}
