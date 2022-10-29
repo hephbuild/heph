@@ -41,13 +41,7 @@ func (m bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	m.ti, cmd = m.ti.Update(msg)
-
-	v := m.ti.Value()
-	if v == "" {
-		m.suggestions = nil
-	} else {
-		m.suggestions = autocompleteTargetName(m.targets, v)
-	}
+	m.suggestions = fuzzyFindTargetName(m.targets, m.ti.Value(), 10)
 
 	return m, cmd
 }

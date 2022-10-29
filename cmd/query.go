@@ -50,17 +50,8 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 
-	autocompleteTargetOrLabel := func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, labels, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteLabelOrTarget(targets, labels, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
-	}
-
-	queryCmd.RegisterFlagCompletionFunc("include", autocompleteTargetOrLabel)
-	queryCmd.RegisterFlagCompletionFunc("exclude", autocompleteTargetOrLabel)
+	queryCmd.RegisterFlagCompletionFunc("include", ValidArgsFunctionLabelsOrTargets)
+	queryCmd.RegisterFlagCompletionFunc("exclude", ValidArgsFunctionLabelsOrTargets)
 }
 
 var queryCmd = &cobra.Command{
@@ -164,7 +155,7 @@ var fzfCmd = &cobra.Command{
 			return nil
 		}
 
-		suggestions := autocompleteTargetName(targets, args[0])
+		suggestions := fuzzyFindTargetName(targets, args[0], 0)
 		if len(suggestions) > 10 {
 			l := len(suggestions)
 			suggestions = suggestions[:10]
@@ -229,14 +220,7 @@ var graphCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(cmd.Context(), false)
 	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
@@ -266,14 +250,7 @@ var graphDotCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(cmd.Context(), false)
 	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf(`
 digraph G  {
@@ -349,14 +326,7 @@ var changesCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(cmd.Context(), false)
 	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(_ *cobra.Command, args []string) error {
 		since := args[0]
 
@@ -395,17 +365,10 @@ var changesCmd = &cobra.Command{
 }
 
 var targetCmd = &cobra.Command{
-	Use:   "target <target>",
-	Short: "Prints target details",
-	Args:  cobra.ExactValidArgs(1),
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	Use:               "target <target>",
+	Short:             "Prints target details",
+	Args:              cobra.ExactValidArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
@@ -613,14 +576,7 @@ var outCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return preRunWithGen(cmd.Context(), false)
 	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
-	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {

@@ -25,7 +25,7 @@ func TestAutocomplete(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			suggestions := autocompleteLabelOrTarget(test.targets, test.labels, test.complete)
+			_, suggestions := autocompleteLabelOrTarget(test.targets, test.labels, test.complete)
 
 			assert.EqualValues(t, test.expected, suggestions)
 		})

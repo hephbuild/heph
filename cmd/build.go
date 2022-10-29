@@ -44,13 +44,21 @@ func autocompletePrefix(suggestions, ss []string, comp string) []string {
 	return suggestions
 }
 
-func autocompleteTargetName(targets []string, s string) []string {
+func autocompleteTargetName(targets []string, s string) (bool, []string) {
 	if s == "" {
-		return targets
+		return false, targets
 	}
 
-	if strings.HasPrefix(s, "//") {
-		return autocompletePrefix(nil, targets, s)
+	if strings.HasPrefix(s, "/") {
+		return false, autocompletePrefix(nil, targets, s)
+	}
+
+	return true, fuzzyFindTargetName(targets, s, 10)
+}
+
+func fuzzyFindTargetName(targets []string, s string, max int) []string {
+	if s == "" {
+		return nil
 	}
 
 	matches := fuzzy.RankFindNormalizedFold(s, targets)
@@ -61,8 +69,8 @@ func autocompleteTargetName(targets []string, s string) []string {
 		suggestions = append(suggestions, s.Target)
 	}
 
-	if len(suggestions) > 10 {
-		suggestions = suggestions[:10]
+	if max > 0 && len(suggestions) > max {
+		suggestions = suggestions[:max]
 	}
 
 	return suggestions
@@ -94,17 +102,31 @@ func autocompleteLabel(labels []string, s string) []string {
 	return suggestions
 }
 
-func autocompleteLabelOrTarget(targets, labels []string, s string) []string {
-	tch := make(chan []string)
-	lch := make(chan []string)
+func autocompleteLabelOrTarget(targets, labels []string, s string) (bool, []string) {
+	type res struct {
+		f bool     // isFuzzy
+		s []string // suggestions
+	}
+	tch := make(chan res)
+	lch := make(chan res)
 	go func() {
-		lch <- autocompleteLabel(labels, s)
+		lch <- res{s: autocompleteLabel(labels, s)}
 	}()
 	go func() {
-		tch <- autocompleteTargetName(targets, s)
+		f, suggs := autocompleteTargetName(targets, s)
+		tch <- res{f, suggs}
 	}()
-	suggestions := <-lch
-	suggestions = append(suggestions, <-tch...)
 
-	return suggestions
+	var suggestions []string
+	var isFuzzy bool
+	for _, ch := range []chan res{lch, tch} {
+		r := <-ch
+
+		suggestions = append(suggestions, r.s...)
+		if r.f {
+			isFuzzy = true
+		}
+	}
+
+	return isFuzzy, suggestions
 }
