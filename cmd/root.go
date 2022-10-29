@@ -195,20 +195,13 @@ var rootCmd = &cobra.Command{
 }
 
 var runCmd = &cobra.Command{
-	Use:           "run",
-	Aliases:       []string{"r"},
-	Short:         "Run target",
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	Args:          cobra.MinimumNArgs(1),
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp | cobra.ShellCompDirectiveNoMatching
-	},
+	Use:               "run",
+	Aliases:           []string{"r"},
+	Short:             "Run target",
+	SilenceUsage:      true,
+	SilenceErrors:     true,
+	Args:              cobra.MinimumNArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if hasStdin(args) {
 			tps, err := parseTargetPathsFromStdin()
@@ -253,20 +246,13 @@ type watchRun struct {
 }
 
 var watchCmd = &cobra.Command{
-	Use:           "watch",
-	Aliases:       []string{"w"},
-	Short:         "Watch targets",
-	SilenceUsage:  true,
-	SilenceErrors: true,
-	Args:          cobra.ArbitraryArgs,
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	Use:               "watch",
+	Aliases:           []string{"w"},
+	Short:             "Watch targets",
+	SilenceUsage:      true,
+	SilenceErrors:     true,
+	Args:              cobra.ArbitraryArgs,
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
@@ -589,14 +575,7 @@ var cleanCmd = &cobra.Command{
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		return engineInit()
 	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		targets, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		return autocompleteTargetName(targets, toComplete), cobra.ShellCompDirectiveNoFileComp
-	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return Engine.Clean(true)

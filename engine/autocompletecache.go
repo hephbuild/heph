@@ -22,6 +22,14 @@ func (e *Engine) computeAutocompleteHash() (string, error) {
 	h := utils.NewHash()
 	h.String(utils.Version)
 
+	for _, file := range e.SourceFiles {
+		h.String(file.Path)
+		err := e.hashFilePath(h, file.Path)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	for _, target := range e.linkedTargets().Slice() {
 		if !target.Gen {
 			continue
