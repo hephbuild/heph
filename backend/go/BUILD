@@ -97,7 +97,7 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg+":_go_mod_gen")
 
-def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
+def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
     gomodsum = group(
         name="_mod",
         deps=glob("go.mod")+glob("go.sum"),
@@ -122,6 +122,7 @@ def go_mod(mod_pkgs=[], cfg={}, sandbox=True):
 
     godeps_cfg = json_file(name="godeps_cfg", data={
         'pkg': cfg,
+        'replace': replace,
         'go': go,
         'godeps': godeps,
         'generate_testmain': generate_testmain,
@@ -348,8 +349,7 @@ def go_library(
         env["SRC_RES"] = ' '.join(resources)
     else:
         deps = {'src': src_files, 'libs': libs, 'res': resources}
-
-    deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
+        deps['src'].append('$(collect "{}/." include="go_src")'.format(heph.pkg.addr()))
 
     if len(resources) > 0 or gen_embed:
         embed_deps = deps | {} # copy deps
