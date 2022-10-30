@@ -132,6 +132,14 @@ func testLibFactory(name string, importLibs []string, importPath string, enabled
 	return lib
 }
 
+func applyReplace(t string) string {
+	if rt, ok := Config.Replace[t]; ok {
+		return rt
+	}
+
+	return t
+}
+
 func srcDepForLib(lib *Lib, embedPatterns []string) []string {
 	allFiles := make([]string, 0)
 	allFiles = append(allFiles, lib.GoFiles...)
@@ -141,7 +149,7 @@ func srcDepForLib(lib *Lib, embedPatterns []string) []string {
 	for _, p := range allFiles {
 		relRoot := filepath.Join(lib.Target.Package, p)
 		if o, ok := FilesOrigin[relRoot]; ok {
-			srcDep = append(srcDep, o)
+			srcDep = append(srcDep, applyReplace(o))
 		} else {
 			srcDep = append(srcDep, p)
 		}
@@ -160,7 +168,7 @@ func srcDepForLib(lib *Lib, embedPatterns []string) []string {
 			relPkg, _ := filepath.Rel(root, file)
 
 			if o, ok := FilesOrigin[relRoot]; ok {
-				srcDep = append(srcDep, o)
+				srcDep = append(srcDep, applyReplace(o))
 			} else {
 				srcDep = append(srcDep, relPkg)
 			}

@@ -8,10 +8,24 @@ func Hello() string {
 }
 """
 
-text_file(
+hello=text_file(
     name="hello_gen_go",
     out="hello.go",
     text=hello_src,
+)
+
+mock_hello_src="""
+package main
+
+func Hello() string {
+	panic("mock should have been replaced")
+}
+"""
+
+mock_hello=text_file(
+    name="mock_hello_gen_go",
+    out="hello.go",
+    text=mock_hello_src,
     labels=['go_src']
 )
 
@@ -24,4 +38,6 @@ text_file(
     labels=['go_src']
 )
 
-go_mod()
+go_mod(replace={
+    mock_hello: hello,
+})
