@@ -133,7 +133,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		Gen:        false,
 		Source:     []string{"some_source" + time.Now().String()},
 		RuntimeEnv: nil,
-		SrcEnv:     "",
+		SrcEnv:     TargetSpecSrcEnv{},
 		OutEnv:     "",
 		HashFile:   "",
 	}

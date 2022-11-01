@@ -210,6 +210,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 	e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
+	srcRecNameToDepName := map[string]string{}
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
 			dept := dep.Target
@@ -237,6 +238,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 							rec = envSrcRec
 						}
 
+						srcRecNameToDepName[srcName] = name
 						rec.Add(srcName, file.Abs(), file.RelRoot(), dep.Full())
 					}
 				}
@@ -244,6 +246,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		}
 
 		for _, file := range deps.Files {
+			srcRecNameToDepName[name] = name
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
 	}
@@ -323,15 +326,13 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
-	if target.SrcEnv != targetspec.FileEnvIgnore {
+	if !(target.SrcEnv.All == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
-			k := "SRC_" + strings.ToUpper(name)
-			if name == "" {
-				k = "SRC"
-			}
 			spaths := make([]string, 0)
 			for _, path := range paths {
-				switch target.SrcEnv {
+				switch v := target.SrcEnv.Get(srcRecNameToDepName[name]); v {
+				case targetspec.FileEnvIgnore:
+					continue
 				case targetspec.FileEnvAbs:
 					spaths = append(spaths, target.SandboxRoot.Join(path).Abs())
 				case targetspec.FileEnvRelRoot:
@@ -346,8 +347,13 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					rel = strings.TrimPrefix(rel, "/")
 					spaths = append(spaths, rel)
 				default:
-					panic("unhandled src_env: " + target.SrcEnv)
+					panic("unhandled src_env: " + v)
 				}
+			}
+
+			k := "SRC_" + strings.ToUpper(name)
+			if name == "" {
+				k = "SRC"
 			}
 			env[normalizeEnv(k)] = strings.Join(spaths, " ")
 		}

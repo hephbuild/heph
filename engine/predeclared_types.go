@@ -28,7 +28,7 @@ type TargetArgs struct {
 	Env            ArrayMap
 	PassEnv        ArrayMap
 	RuntimeEnv     ArrayMap
-	SrcEnv         string
+	SrcEnv         SrcEnv
 	OutEnv         string
 	HashFile       string
 	Transitive     TargetArgsTransitive
@@ -361,4 +361,61 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 	}
 
 	return fmt.Errorf("must be dict, list or string, got %v", v.Type())
+}
+
+type SrcEnv struct {
+	All   string
+	Named map[string]string
+}
+
+func (d *SrcEnv) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
+	vs, ok := v.(starlark.String)
+	if ok {
+		*d = SrcEnv{
+			All: string(vs),
+		}
+		return nil
+	}
+
+	vd, ok := v.(*starlark.Dict)
+	if ok {
+		all := ""
+		named := map[string]string{}
+
+		for _, e := range vd.Items() {
+			keyv := e.Index(0)
+			skey, ok := keyv.(starlark.String)
+			if !ok {
+				return fmt.Errorf("key must be string, got %v", keyv.Type())
+			}
+
+			key := string(skey)
+
+			valuev := e.Index(1)
+			svalue, ok := valuev.(starlark.String)
+			if !ok {
+				return fmt.Errorf("value must be string, got %v", valuev.Type())
+			}
+
+			value := string(svalue)
+
+			if key == "_default" {
+				all = value
+			} else {
+				named[key] = value
+			}
+		}
+
+		*d = SrcEnv{
+			All:   all,
+			Named: named,
+		}
+		return nil
+	}
+
+	return fmt.Errorf("must be string or dict, got %v", v.Type())
 }

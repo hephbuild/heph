@@ -37,9 +37,12 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		RunInCwd:     args.RunInCwd,
 		Gen:          args.Gen,
 		RuntimeEnv:   args.RuntimeEnv.StrMap,
-		SrcEnv:       args.SrcEnv,
-		OutEnv:       args.OutEnv,
-		HashFile:     args.HashFile,
+		SrcEnv: targetspec.TargetSpecSrcEnv{
+			All:   args.SrcEnv.All,
+			Named: args.SrcEnv.Named,
+		},
+		OutEnv:   args.OutEnv,
+		HashFile: args.HashFile,
 	}
 
 	var err error
@@ -120,15 +123,22 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		},
 	))
 
-	if t.SrcEnv == "" {
+	if t.SrcEnv.All == "" {
 		if t.OutInSandbox {
-			t.SrcEnv = targetspec.FileEnvAbs
+			t.SrcEnv.All = targetspec.FileEnvAbs
 		} else {
-			t.SrcEnv = targetspec.FileEnvRelPkg
+			t.SrcEnv.All = targetspec.FileEnvRelPkg
 		}
 	}
-	if !validate(t.SrcEnv, targetspec.FileEnvValues) {
-		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv)
+
+	for k, v := range t.SrcEnv.Named {
+		if !validate(v, targetspec.FileEnvValues) {
+			return targetspec.TargetSpec{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, printOneOf(targetspec.FileEnvValues), v)
+		}
+	}
+
+	if !validate(t.SrcEnv.All, targetspec.FileEnvValues) {
+		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv.All)
 	}
 
 	if t.OutEnv == "" {
