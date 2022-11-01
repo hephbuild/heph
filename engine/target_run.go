@@ -201,7 +201,10 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 	log.Tracef("Bin %#v", bin)
 
-	srcRec := &SrcRecorder{}
+	// Records all src as files (even tar) to be used for creating SRC vars later
+	envSrcRec := &SrcRecorder{}
+	// Records src that should be copied, tar & files
+	srcRec := &SrcRecorder{Parent: envSrcRec}
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
@@ -209,19 +212,33 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
-			tarFile := e.targetOutputTarFile(dep.Target, e.hashInput(dep.Target))
-			if fs.PathExists(tarFile) && dep.Output == "" {
+			dept := dep.Target
+
+			tarFile := e.targetOutputTarFile(dept, e.hashInput(dept))
+			fromTar := dep.Output == "" && fs.PathExists(tarFile)
+
+			if fromTar {
 				srcRec.AddTar(tarFile)
-				for _, file := range dep.Target.ActualFilesOut() {
-					srcRec.AddNamed(name, file.RelRoot(), dep.Full())
-				}
-			} else {
-				files := dep.Target.ActualFilesOut()
-				if dep.Output != "" {
-					files = dep.Target.NamedActualFilesOut().Name(dep.Output)
-				}
-				for _, file := range files {
-					srcRec.Add(name, file.Abs(), file.RelRoot(), dep.Full())
+			}
+
+			for outName, files := range dept.NamedActualFilesOut().Named() {
+				if dep.Output == "" || dep.Output == outName {
+					srcName := name
+					if dep.Output == "" && outName != "" {
+						if srcName != "" {
+							srcName += "_"
+						}
+						srcName += outName
+					}
+
+					for _, file := range files {
+						rec := srcRec
+						if fromTar {
+							rec = envSrcRec
+						}
+
+						rec.Add(srcName, file.Abs(), file.RelRoot(), dep.Full())
+					}
 				}
 			}
 		}
@@ -229,6 +246,14 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		for _, file := range deps.Files {
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
+	}
+
+	err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
+		return json.NewEncoder(f).Encode(envSrcRec.Origin())
+	})
+	defer cleanOrigin()
+	if err != nil {
+		return err
 	}
 
 	err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
@@ -251,14 +276,6 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		return json.NewEncoder(f).Encode(m)
 	})
 	defer cleanDeps()
-	if err != nil {
-		return err
-	}
-
-	err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
-		return json.NewEncoder(f).Encode(srcRec.Origin())
-	})
-	defer cleanOrigin()
 	if err != nil {
 		return err
 	}
@@ -307,7 +324,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if target.SrcEnv != targetspec.FileEnvIgnore {
-		for name, paths := range srcRec.Named() {
+		for name, paths := range envSrcRec.Named() {
 			k := "SRC_" + strings.ToUpper(name)
 			if name == "" {
 				k = "SRC"
@@ -502,7 +519,16 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 		err = cmd.Run()
 		if err != nil {
-			return fmt.Errorf("exec: %w", err)
+			err := fmt.Errorf("exec: %w", err)
+
+			if target.LogFile != "" {
+				return ErrorWithLogFile{
+					LogFile: target.LogFile,
+					Err:     err,
+				}
+			}
+
+			return err
 		}
 	}
 

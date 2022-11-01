@@ -462,6 +462,25 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	return sh
 }
 
+type ErrorWithLogFile struct {
+	LogFile string
+	Err     error
+}
+
+func (t ErrorWithLogFile) Error() string {
+	return t.Err.Error()
+}
+
+func (t ErrorWithLogFile) Unwrap() error {
+	return t.Err
+}
+
+func (t ErrorWithLogFile) Is(target error) bool {
+	_, ok := target.(TargetFailedError)
+
+	return ok
+}
+
 type TargetFailedError struct {
 	Target *Target
 	Err    error
@@ -469,6 +488,10 @@ type TargetFailedError struct {
 
 func (t TargetFailedError) Error() string {
 	return t.Err.Error()
+}
+
+func (t TargetFailedError) Unwrap() error {
+	return t.Err
 }
 
 func (t TargetFailedError) Is(target error) bool {
@@ -739,25 +762,37 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
-	for _, filePath := range target.actualcachedFiles {
-		for name, opaths := range outNamedPaths.Named() {
-			for _, opath := range opaths {
-				path := opath.RelRoot()
-				if strings.HasPrefix(opath.RelRoot(), "/") {
-					path = strings.TrimPrefix(path, "/")
-				}
-				pattern := path
+	for name, opaths := range outNamedPaths.Named() {
+		for _, opath := range opaths {
+			found := false
+			isGlob := strings.Contains(opath.RelRoot(), "*")
 
-				relRoot := filePath.RelRoot()
+			for _, cachePath := range target.actualcachedFiles {
+				pattern := opath.RelRoot()
 
-				match, err := doublestar.PathMatch(pattern, relRoot)
-				if err != nil {
-					return nil, err
+				var match bool
+				if !isGlob && strings.HasPrefix(cachePath.RelRoot(), opath.RelRoot()+"/") {
+					match = true
+				} else {
+					var err error
+					match, err = doublestar.PathMatch(pattern, cachePath.RelRoot())
+					if err != nil {
+						return nil, err
+					}
 				}
 
 				if match {
-					tp.Add(name, filePath)
+					tp.Add(name, cachePath)
+					found = true
+
+					if !isGlob {
+						break
+					}
 				}
+			}
+
+			if !isGlob && !found {
+				return nil, fmt.Errorf("%v did not output %v", target.FQN, opath.RelRoot())
 			}
 		}
 	}
@@ -797,6 +832,10 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, erro
 
 	for _, file := range files {
 		pattern := file.RelRoot()
+
+		if !strings.Contains(pattern, "*") && !fs2.PathExists(filepath.Join(root, pattern)) {
+			return nil, fmt.Errorf("%v did not output %v", target.FQN, file.RelRoot())
+		}
 
 		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
 			out = append(out, fs2.NewPath(root, path))

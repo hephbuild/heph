@@ -669,9 +669,12 @@ func printTargetError(err error) bool {
 	var terr engine.TargetFailedError
 	if errors.As(err, &terr) {
 		log.Errorf("%v failed", terr.Target.FQN)
-		log.Error(terr.Error())
-		logFile := terr.Target.LogFile
-		if logFile != "" {
+
+		var lerr engine.ErrorWithLogFile
+		if errors.As(err, &lerr) {
+			log.Error(lerr.Error())
+
+			logFile := lerr.LogFile
 			info, _ := os.Stat(logFile)
 			if info.Size() > 0 {
 				log.Error("Log:")
@@ -682,6 +685,8 @@ func printTargetError(err error) bool {
 				fmt.Fprintln(os.Stderr)
 				fmt.Fprintf(os.Stderr, "The log file can be found at %v:\n", logFile)
 			}
+		} else {
+			log.Error(terr.Error())
 		}
 		return true
 	}
