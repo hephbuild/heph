@@ -12,6 +12,8 @@ type SrcRecorder struct {
 	srcOrigin map[string]string
 
 	o sync.Once
+
+	Parent *SrcRecorder
 }
 
 func (s *SrcRecorder) init() {
@@ -21,7 +23,7 @@ func (s *SrcRecorder) init() {
 	})
 }
 
-func (s *SrcRecorder) AddNamed(name, path, origin string) {
+func (s *SrcRecorder) addNamed(name, path, origin string) {
 	a := s.namedSrc[name]
 	a = append(a, path)
 	s.namedSrc[name] = a
@@ -44,7 +46,11 @@ func (s *SrcRecorder) Add(name, from, to, origin string) {
 		From: from,
 		To:   to,
 	})
-	s.AddNamed(name, to, origin)
+	s.addNamed(name, to, origin)
+
+	if s.Parent != nil {
+		s.Parent.Add(name, from, to, origin)
+	}
 }
 
 func (s *SrcRecorder) Origin() map[string]string {

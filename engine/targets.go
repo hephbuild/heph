@@ -95,6 +95,10 @@ func (tp *NamedPaths[TS, T]) Name(name string) TS {
 	return tp.named[name]
 }
 
+func (tp *NamedPaths[TS, T]) Names() []string {
+	return tp.names
+}
+
 func (tp *NamedPaths[TS, T]) Add(name string, p T) {
 	if tp.named == nil {
 		tp.named = map[string]TS{}
@@ -1274,10 +1278,10 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 		}
 	}
 
-	for _, target := range deps.Targets {
-		dt := e.Targets.Find(target.Target)
+	for _, spec := range deps.Targets {
+		dt := e.Targets.Find(spec.Target)
 		if dt == nil {
-			return TargetDeps{}, TargetNotFoundError(target.Target)
+			return TargetDeps{}, TargetNotFoundError(spec.Target)
 		}
 
 		err := e.linkTarget(dt, breadcrumb)
@@ -1285,9 +1289,13 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 			return TargetDeps{}, err
 		}
 
+		if spec.Output != "" && !dt.Out.HasName(spec.Output) {
+			return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
+		}
+
 		td.Targets = append(td.Targets, TargetWithOutput{
 			Target: dt,
-			Output: target.Output,
+			Output: spec.Output,
 		})
 	}
 
