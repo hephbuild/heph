@@ -155,7 +155,11 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.SrcEnv != spec.SrcEnv {
+	if t.SrcEnv.All != spec.SrcEnv.All {
+		return false
+	}
+
+	if !mapEqual(t.SrcEnv.Named, t.SrcEnv.Named) {
 		return false
 	}
 

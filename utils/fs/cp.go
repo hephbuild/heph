@@ -13,35 +13,58 @@ func Cp(from, to string) error {
 		return fmt.Errorf("%v %v to %v: %w", id, from, to, err)
 	}
 
-	fromf, err := os.Open(from)
+	info, err := os.Lstat(from)
 	if err != nil {
 		return logerr("cp1", err)
-	}
-	defer fromf.Close()
-
-	info, err := fromf.Stat()
-	if err != nil {
-		return logerr("cp3", err)
 	}
 
 	if info.IsDir() {
 		return cpDir(from, to)
 	}
 
+	if !info.Mode().IsRegular() {
+		link, err := os.Readlink(from)
+		if err != nil {
+			return logerr("cp11", err)
+		}
+
+		if filepath.IsAbs(link) {
+			return fmt.Errorf("absolute link not allowed")
+		}
+
+		err = CreateParentDir(to)
+		if err != nil {
+			return logerr("cp12", err)
+		}
+
+		err = os.Symlink(link, to)
+		if err != nil {
+			return logerr("cp13", err)
+		}
+
+		return nil
+	}
+
+	fromf, err := os.Open(from)
+	if err != nil {
+		return logerr("cp4", err)
+	}
+	defer fromf.Close()
+
 	err = CreateParentDir(to)
 	if err != nil {
-		return logerr("cp2", err)
+		return logerr("cp5", err)
 	}
 
 	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode())
 	if err != nil {
-		return logerr("cp4", err)
+		return logerr("cp6", err)
 	}
 	defer tof.Close()
 
 	_, err = io.Copy(tof, fromf)
 	if err != nil {
-		return logerr("cp5", err)
+		return logerr("cp7", err)
 	}
 
 	err = tof.Close()
@@ -51,7 +74,7 @@ func Cp(from, to string) error {
 
 	err = os.Chtimes(to, info.ModTime(), info.ModTime())
 	if err != nil {
-		return logerr("cp6", err)
+		return logerr("cp8", err)
 	}
 
 	return nil

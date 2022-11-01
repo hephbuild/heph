@@ -205,7 +205,13 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	}
 
 	if info.Mode().Type() == os.ModeSymlink {
-		return fmt.Errorf("symlink cannot be hashed")
+		link, err := os.Readlink(path)
+		if err != nil {
+			return err
+		}
+
+		h.String(link)
+		return nil
 	}
 
 	h.UI32(uint32(info.Mode().Perm()))
@@ -391,7 +397,10 @@ func (e *Engine) hashInput(target *Target) string {
 	h.Bool(target.Gen)
 
 	h.String("=")
-	h.String(target.SrcEnv)
+	h.String(target.SrcEnv.All)
+	for k, v := range target.SrcEnv.Named {
+		h.String(k + v)
+	}
 	h.String(target.OutEnv)
 
 	sh := h.Sum()
@@ -770,9 +779,10 @@ func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *O
 			for _, cachePath := range target.actualcachedFiles {
 				pattern := opath.RelRoot()
 
-				var match bool
+				var match, isDir bool
 				if !isGlob && strings.HasPrefix(cachePath.RelRoot(), opath.RelRoot()+"/") {
 					match = true
+					isDir = true
 				} else {
 					var err error
 					match, err = doublestar.PathMatch(pattern, cachePath.RelRoot())
@@ -785,7 +795,7 @@ func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *O
 					tp.Add(name, cachePath)
 					found = true
 
-					if !isGlob {
+					if !isGlob && !isDir {
 						break
 					}
 				}

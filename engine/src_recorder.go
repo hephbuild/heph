@@ -36,6 +36,12 @@ func (s *SrcRecorder) addNamed(name, path, origin string) {
 func (s *SrcRecorder) AddTar(tar string) {
 	s.init()
 
+	for _, itar := range s.srcTar {
+		if itar == tar {
+			return
+		}
+	}
+
 	s.srcTar = append(s.srcTar, tar)
 }
 

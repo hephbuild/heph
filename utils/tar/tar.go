@@ -122,7 +122,7 @@ func doTar(w io.Writer, files []TarFile) error {
 	tw := tar.NewWriter(w)
 
 	for _, file := range files {
-		info, err := os.Stat(file.From)
+		info, err := os.Lstat(file.From)
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
@@ -245,6 +245,10 @@ func doUntar(r io.Reader, to string) error {
 		case tar.TypeSymlink:
 			if hdr.Linkname == "" {
 				return fmt.Errorf("untar: symlink empty for %v", hdr.Name)
+			}
+
+			if fs2.PathExists(dest) {
+				continue
 			}
 
 			err := os.Symlink(hdr.Linkname, dest)

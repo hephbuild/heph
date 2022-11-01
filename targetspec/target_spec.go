@@ -36,6 +36,19 @@ var (
 	CodegenValues = []string{CodegenLink, CodegenCopy}
 )
 
+type TargetSpecSrcEnv struct {
+	All   string
+	Named map[string]string
+}
+
+func (e TargetSpecSrcEnv) Get(name string) string {
+	if v, ok := e.Named[name]; ok {
+		return v
+	}
+
+	return e.All
+}
+
 type TargetSpec struct {
 	Name    string
 	FQN     string
@@ -63,7 +76,7 @@ type TargetSpec struct {
 	Gen               bool
 	Source            []string
 	RuntimeEnv        map[string]string
-	SrcEnv            string
+	SrcEnv            TargetSpecSrcEnv
 	OutEnv            string
 	HashFile          string
 	Transitive        TargetSpecTransitive

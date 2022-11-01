@@ -52,7 +52,10 @@ target(
     "Gen": false,
     "Source": null,
     "RuntimeEnv": null,
-    "SrcEnv": "rel_pkg",
+    "SrcEnv": {
+        "All": "rel_pkg",
+        "Named": null
+    },
     "OutEnv": "rel_pkg",
     "HashFile": "content",
     "Transitive": {
