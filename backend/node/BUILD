@@ -42,6 +42,9 @@ target(
     runtime_env={
         "OUTDIR": "$(outdir)",
     },
+    transitive=heph.target_spec(
+        tools=':node',
+    )
 )
 
 def node_install(name):
