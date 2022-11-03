@@ -148,8 +148,14 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
 
     target(
         name="_go_mod_gen",
-        run="godeps mod $SRC_CFG",
-        out="/**/BUILD",
+        run=[
+            "godeps rename-meta",
+            "touch hello.go_meta",
+            "touch hello2.go_meta",
+            "godeps mod $SRC_CFG",
+        ],
+        out={'build': '/**/BUILD', 'go_meta': '/**/*.go_meta'},
+        restore_cache=['go_meta'],
         deps={'deps': godeps_deps, 'cfg': godeps_cfg},
         hash_deps=[imports, gomodsum, godeps_cfg],
         tools=godeps,

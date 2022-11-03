@@ -15,6 +15,10 @@ func (e *Engine) cacheDir(target *Target, inputHash string) fs.Path {
 	return e.HomeDir.Join("cache", target.Package.FullName, "__target_"+target.Name, inputHash)
 }
 
+func (e *Engine) cacheOutputDir(target *Target, inputHash string) fs.Path {
+	return e.cacheDir(target, inputHash).Join(outputDir)
+}
+
 func (e *Engine) targetOutputTarFile(target *Target, inputHash string) string {
 	return e.cacheDir(target, inputHash).Join(outputTarFile).Abs()
 }

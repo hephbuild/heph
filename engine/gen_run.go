@@ -185,6 +185,10 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 	files := target.ActualFilesOut()
 
 	for _, file := range files {
+		if filepath.Base(file.RelRoot()) != "BUILD" {
+			continue
+		}
+
 		file := file
 		j := e.Pool.Schedule(ctx, &worker.Job{
 			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),

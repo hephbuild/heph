@@ -77,6 +77,7 @@ type TargetSpec struct {
 	Source            []string
 	RuntimeEnv        map[string]string
 	SrcEnv            TargetSpecSrcEnv
+	RestoreCache      []string
 	OutEnv            string
 	HashFile          string
 	Transitive        TargetSpecTransitive

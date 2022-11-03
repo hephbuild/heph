@@ -247,6 +247,11 @@ func goListm(pkg []string, variant PkgCfgVariant) []*Package {
 		panic(err)
 	}
 
+	err = os.WriteFile(filepath.Join(Env.Root, VID(variant)), b, os.ModePerm)
+	if err != nil {
+		panic(err)
+	}
+
 	pkgs := make([]*Package, 0)
 
 	if log.Enabled() {

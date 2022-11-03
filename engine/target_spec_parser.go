@@ -123,6 +123,14 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		},
 	))
 
+	if args.RestoreCache.Bool {
+		if args.RestoreCache.Array == nil {
+			t.RestoreCache = []string{"*"}
+		} else {
+			t.RestoreCache = args.RestoreCache.Array
+		}
+	}
+
 	if t.SrcEnv.All == "" {
 		if t.OutInSandbox {
 			t.SrcEnv.All = targetspec.FileEnvAbs
@@ -176,7 +184,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 
 		for _, file := range t.Out {
-			if strings.Contains(file.Path, "*") {
+			if utils.IsGlob(file.Path) {
 				return targetspec.TargetSpec{}, fmt.Errorf("codegen targets must not have glob outputs")
 			}
 		}

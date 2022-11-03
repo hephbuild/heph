@@ -13,7 +13,7 @@ type SrcRecorder struct {
 
 	o sync.Once
 
-	Parent *SrcRecorder
+	EnvRecorder *SrcRecorder
 }
 
 func (s *SrcRecorder) init() {
@@ -54,8 +54,8 @@ func (s *SrcRecorder) Add(name, from, to, origin string) {
 	})
 	s.addNamed(name, to, origin)
 
-	if s.Parent != nil {
-		s.Parent.Add(name, from, to, origin)
+	if s.EnvRecorder != nil {
+		s.EnvRecorder.Add(name, from, to, origin)
 	}
 }
 

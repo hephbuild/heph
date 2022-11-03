@@ -29,6 +29,7 @@ type TargetArgs struct {
 	PassEnv        ArrayMap
 	RuntimeEnv     ArrayMap
 	SrcEnv         SrcEnv
+	RestoreCache   BoolArray
 	OutEnv         string
 	HashFile       string
 	Transitive     TargetArgsTransitive

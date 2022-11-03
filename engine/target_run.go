@@ -9,6 +9,7 @@ import (
 	"heph/exprs"
 	"heph/sandbox"
 	"heph/targetspec"
+	"heph/utils"
 	"heph/utils/fs"
 	"heph/worker"
 	"io"
@@ -73,7 +74,7 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 				}
 
 				target.OutRoot = dir
-				err := e.populateActualFiles(target)
+				err := e.populateActualFiles(target, dir.Abs())
 				if err != nil {
 					return false, err
 				}
@@ -204,7 +205,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	// Records all src as files (even tar) to be used for creating SRC vars later
 	envSrcRec := &SrcRecorder{}
 	// Records src that should be copied, tar & files
-	srcRec := &SrcRecorder{Parent: envSrcRec}
+	srcRec := &SrcRecorder{EnvRecorder: envSrcRec}
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
@@ -281,6 +282,32 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	defer cleanDeps()
 	if err != nil {
 		return err
+	}
+
+	if len(target.RestoreCache) > 0 {
+		// Prevent cache restore to appear in SRC env
+		srcRec.EnvRecorder = nil
+
+		latestDir := e.cacheOutputDir(target, "latest").Abs()
+
+		if fs.PathExists(latestDir) {
+			_, outFiles, err := e.collectActualFiles(target, latestDir)
+			if err != nil {
+				log.Errorf("restore cache: out %v: %v", target.FQN, err)
+			}
+
+			if outFiles != nil {
+				restoreAll := utils.Contains(target.RestoreCache, "*")
+
+				for name, paths := range outFiles.Named() {
+					if restoreAll || utils.Contains(target.RestoreCache, name) {
+						for _, path := range paths {
+							srcRec.Add("_SHOULD_NOT_SHOW_", path.Abs(), path.RelRoot(), "")
+						}
+					}
+				}
+			}
+		}
 	}
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
@@ -364,7 +391,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		namedOut := map[string][]string{}
 		for name, paths := range out {
 			for _, path := range paths {
-				if strings.Contains(path.RelRoot(), "*") {
+				if utils.IsGlob(path.RelRoot()) {
 					// Skip glob
 					continue
 				}
@@ -549,7 +576,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		target.OutRoot = &target.SandboxRoot
 	}
 
-	err = e.populateActualFiles(target)
+	err = e.populateActualFiles(target, target.OutRoot.Abs())
 	if err != nil {
 		return fmt.Errorf("popfilesout: %w", err)
 	}

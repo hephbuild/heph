@@ -176,6 +176,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"gen?", &sargs.Gen,
 		"runtime_env?", &sargs.RuntimeEnv,
 		"src_env?", &sargs.SrcEnv,
+		"restore_cache?", &sargs.RestoreCache,
 		"out_env?", &sargs.OutEnv,
 		"hash_file?", &sargs.HashFile,
 		"transitive?", &sargs.Transitive,

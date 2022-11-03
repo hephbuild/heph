@@ -768,15 +768,15 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 	return j, nil
 }
 
-func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *OutNamedPaths, paths fs2.Paths) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name, opaths := range outNamedPaths.Named() {
 		for _, opath := range opaths {
 			found := false
-			isGlob := strings.Contains(opath.RelRoot(), "*")
+			isGlob := utils.IsGlob(opath.RelRoot())
 
-			for _, cachePath := range target.actualcachedFiles {
+			for _, cachePath := range paths {
 				pattern := opath.RelRoot()
 
 				var match, isDir bool
@@ -812,11 +812,11 @@ func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *O
 	return tp, nil
 }
 
-func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths, outRoot string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
-		files, err := e.collectOut(target, paths)
+		files, err := e.collectOut(target, paths, outRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -829,7 +829,7 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*Ac
 	return tp, nil
 }
 
-func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, error) {
+func (e *Engine) collectOut(target *Target, files fs2.RelPaths, outRoot string) (fs2.Paths, error) {
 	out := make(fs2.Paths, 0)
 
 	defer func() {
@@ -838,17 +838,15 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, erro
 		})
 	}()
 
-	root := target.OutRoot.Abs()
-
 	for _, file := range files {
 		pattern := file.RelRoot()
 
-		if !strings.Contains(pattern, "*") && !fs2.PathExists(filepath.Join(root, pattern)) {
+		if !utils.IsGlob(pattern) && !fs2.PathExists(filepath.Join(outRoot, pattern)) {
 			return nil, fmt.Errorf("%v did not output %v", target.FQN, file.RelRoot())
 		}
 
-		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			out = append(out, fs2.NewPath(root, path))
+		err := utils.StarWalk(outRoot, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+			out = append(out, fs2.NewPath(outRoot, path))
 
 			return nil
 		})
@@ -860,35 +858,43 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, erro
 	return out, nil
 }
 
-func (e *Engine) populateActualFiles(target *Target) (err error) {
-	empty, err := fs2.IsDirEmpty(target.OutRoot.Abs())
-	if err != nil {
-		return fmt.Errorf("collect output: isempty: %w", err)
-	}
+func (e *Engine) populateActualFiles(target *Target, outRoot string) error {
+	var err error
+	target.actualcachedFiles, target.actualFilesOut, err = e.collectActualFiles(target, outRoot)
 
-	target.actualFilesOut = &ActualOutNamedPaths{}
-	target.actualcachedFiles = make(fs2.Paths, 0)
+	return err
+}
+
+func (e *Engine) collectActualFiles(target *Target, outRoot string) (fs2.Paths, *ActualOutNamedPaths, error) {
+	empty, err := fs2.IsDirEmpty(outRoot)
+	if err != nil {
+		return nil, nil, fmt.Errorf("collect output: isempty: %w", err)
+	}
 
 	if empty {
-		return nil
+		return make(fs2.Paths, 0), &ActualOutNamedPaths{}, nil
 	}
 
-	target.actualcachedFiles, err = e.collectOut(target, target.CacheFiles)
+	cachedFiles, err := e.collectOut(target, target.CacheFiles, outRoot)
 	if err != nil {
-		return fmt.Errorf("cached: %w", err)
+		return nil, nil, fmt.Errorf("cached: %w", err)
 	}
 
-	collector := e.collectNamedOutFromActualFiles
 	if !target.Cache.Enabled {
-		collector = e.collectNamedOut
-	}
+		outFiles, err := e.collectNamedOut(target, target.Out, outRoot)
+		if err != nil {
+			return nil, nil, fmt.Errorf("out: %w", err)
+		}
 
-	target.actualFilesOut, err = collector(target, target.Out)
-	if err != nil {
-		return fmt.Errorf("out: %w", err)
-	}
+		return cachedFiles, outFiles, nil
+	} else {
+		outFiles, err := e.collectNamedOutFromActualFiles(target, target.Out, cachedFiles)
+		if err != nil {
+			return nil, nil, fmt.Errorf("out: %w", err)
+		}
 
-	return nil
+		return cachedFiles, outFiles, nil
+	}
 }
 
 func (e *Engine) sandboxRoot(target *Target) fs2.Path {

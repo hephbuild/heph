@@ -57,6 +57,10 @@ func indexMeta(s string) int {
 	return -1
 }
 
+func IsGlob(path string) bool {
+	return indexMeta(path) != -1
+}
+
 func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 	i := indexMeta(pattern)
 

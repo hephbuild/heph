@@ -8,6 +8,8 @@ func main() {
 	switch os.Args[1] {
 	case "mod":
 		genBuild()
+	case "rename-meta":
+		renameMeta()
 	case "imports":
 		listImports()
 	case "embed":
