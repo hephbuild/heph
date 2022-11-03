@@ -456,6 +456,10 @@ func switchToPorcelain() {
 }
 
 func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
+	return preRunAutocompleteInteractive(ctx, false, true)
+}
+
+func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent bool) ([]string, []string, error) {
 	err := engineInit()
 	if err != nil {
 		return nil, nil, err
@@ -464,10 +468,14 @@ func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
 	cache, _ := Engine.LoadAutocompleteCache()
 
 	if cache != nil {
-		return cache.Targets, cache.Labels, nil
+		if includePrivate {
+			return cache.AllTargets, cache.Labels, nil
+		}
+
+		return cache.PublicTargets, cache.Labels, nil
 	}
 
-	err = preRunWithGen(ctx, true)
+	err = preRunWithGen(ctx, silent)
 	if err != nil {
 		return nil, nil, err
 	}

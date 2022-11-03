@@ -9,12 +9,6 @@ type TargetMatcher func(*Target) bool
 
 type TargetMatchers []TargetMatcher
 
-// AnyMatch
-// Deprecated, use OrMatcher instead
-func (ms TargetMatchers) AnyMatch(target *Target) bool {
-	return OrMatcher(ms...)(target)
-}
-
 func NotMatcher(m TargetMatcher) TargetMatcher {
 	return func(target *Target) bool {
 		return !m(target)
@@ -50,6 +44,12 @@ func OrMatcher(ms ...TargetMatcher) TargetMatcher {
 		}
 
 		return false
+	}
+}
+
+func YesMatcher() TargetMatcher {
+	return func(target *Target) bool {
+		return true
 	}
 }
 

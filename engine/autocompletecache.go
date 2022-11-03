@@ -9,9 +9,10 @@ import (
 )
 
 type AutocompleteCache struct {
-	Hash    string
-	Targets []string
-	Labels  []string
+	Hash          string
+	AllTargets    []string
+	Labels        []string
+	PublicTargets []string
 }
 
 func (e *Engine) autocompleteCachePath() string {
@@ -20,6 +21,7 @@ func (e *Engine) autocompleteCachePath() string {
 
 func (e *Engine) computeAutocompleteHash() (string, error) {
 	h := utils.NewHash()
+	h.I64(1)
 	h.String(utils.Version)
 
 	for _, file := range e.SourceFiles {
@@ -46,22 +48,35 @@ func (e *Engine) computeAutocompleteHash() (string, error) {
 	return h.Sum(), nil
 }
 
+func FilterPublicTargets(targets []*Target) []*Target {
+	pubTargets := make([]*Target, 0)
+	for _, target := range targets {
+		if !target.IsPrivate() {
+			pubTargets = append(pubTargets, target)
+		}
+	}
+	return pubTargets
+}
+
 func (e *Engine) StoreAutocompleteCache() error {
-	targets := make([]string, 0, len(e.Targets.FQNs()))
+	allTargets := make([]string, 0, e.Targets.Len())
+	pubTargets := make([]string, 0, e.Targets.Len())
+
 	for _, fqn := range e.Targets.FQNs() {
 		tp, _ := targetspec.TargetParse("", fqn)
 
-		if tp.IsPrivate() {
-			continue
-		}
+		allTargets = append(allTargets, fqn)
 
-		targets = append(targets, fqn)
+		if !tp.IsPrivate() {
+			pubTargets = append(pubTargets, fqn)
+		}
 	}
 
 	cache := &AutocompleteCache{
-		Hash:    e.autocompleteHash,
-		Targets: targets,
-		Labels:  e.Labels,
+		Hash:          e.autocompleteHash,
+		AllTargets:    allTargets,
+		PublicTargets: pubTargets,
+		Labels:        e.Labels,
 	}
 
 	b, err := json.Marshal(cache)
