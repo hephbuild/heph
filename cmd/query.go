@@ -24,12 +24,12 @@ var exclude []string
 var spec bool
 var transitive bool
 var output string
+var all bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
 	queryCmd.AddCommand(codegenCmd)
 	queryCmd.AddCommand(fzfCmd)
-	queryCmd.AddCommand(alltargetsCmd)
 	queryCmd.AddCommand(graphCmd)
 	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
@@ -49,6 +49,8 @@ func init() {
 
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
+	queryCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
+	fzfCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
 
 	queryCmd.RegisterFlagCompletionFunc("include", ValidArgsFunctionLabelsOrTargets)
 	queryCmd.RegisterFlagCompletionFunc("exclude", ValidArgsFunctionLabelsOrTargets)
@@ -92,6 +94,10 @@ var queryCmd = &cobra.Command{
 			if err != nil {
 				return err
 			}
+		} else {
+			if !all {
+				targets = engine.FilterPublicTargets(targets)
+			}
 		}
 
 		includeMatchers := make(engine.TargetMatchers, 0)
@@ -103,11 +109,18 @@ var queryCmd = &cobra.Command{
 			excludeMatchers = append(excludeMatchers, engine.ParseTargetSelector("", s))
 		}
 
+		matcher := engine.YesMatcher()
+		if len(includeMatchers) > 0 {
+			matcher = engine.OrMatcher(includeMatchers...)
+		}
+		if len(excludeMatchers) > 0 {
+			matcher = engine.AndMatcher(matcher, engine.NotMatcher(engine.OrMatcher(excludeMatchers...)))
+		}
+
 		selected := make([]*engine.Target, 0)
 
 		for _, target := range targets {
-			if (len(include) == 0 || includeMatchers.AnyMatch(target)) &&
-				!excludeMatchers.AnyMatch(target) {
+			if matcher(target) {
 				selected = append(selected, target)
 			}
 		}
@@ -121,28 +134,12 @@ var queryCmd = &cobra.Command{
 	},
 }
 
-var alltargetsCmd = &cobra.Command{
-	Use:   "alltargets",
-	Short: "Prints all targets",
-	Args:  cobra.NoArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		for _, target := range sortedTargets(Engine.Targets.Slice(), false) {
-			fmt.Println(target.FQN)
-		}
-
-		return nil
-	},
-}
-
 var fzfCmd = &cobra.Command{
 	Use:   "fzf",
 	Short: "Fuzzy search targets",
 	Args:  cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		targets, _, err := preRunAutocomplete(cmd.Context())
+		targets, _, err := preRunAutocompleteInteractive(cmd.Context(), all, false)
 		if err != nil {
 			return err
 		}
