@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -70,6 +71,10 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *packag
 		e.SourceFiles = append(e.SourceFiles, file)
 		pkg.SourceFiles = append(pkg.SourceFiles, file)
 	}
+
+	sort.SliceStable(e.SourceFiles, func(i, j int) bool {
+		return strings.Compare(e.SourceFiles[i].Path, e.SourceFiles[j].Path) < 0
+	})
 
 	for _, pkg := range pkgs {
 		err := e.runBuildFilesForPackage(pkg)
