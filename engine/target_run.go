@@ -506,8 +506,9 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		}
 
 		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
-			Args: run,
-			Env:  env,
+			Args:    run,
+			CmdArgs: rr.Args,
+			Env:     env,
 		})
 		if err != nil {
 			return err
@@ -520,7 +521,6 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 			Env:      env,
 			IOConfig: iocfg,
 			ExecArgs: execArgs,
-			CmdArgs:  rr.Args,
 		}, target.Sandbox && !hasPathInEnv)
 
 		err = cmd.Run()

@@ -122,12 +122,10 @@ type ExecConfig struct {
 	Dir      string
 	Env      map[string]string
 	ExecArgs []string
-	CmdArgs  []string
 }
 
 func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 	args := cfg.ExecArgs
-	args = append(args, cfg.CmdArgs...)
 
 	log.Tracef("Exec in %v: %v", cfg.Dir, args)
 

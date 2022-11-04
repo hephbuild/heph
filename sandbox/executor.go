@@ -8,8 +8,9 @@ import (
 var bashArgs = []string{"bash", "--noprofile", "--norc", "-u", "-o", "pipefail"}
 
 type ExecutorContext struct {
-	Args []string
-	Env  map[string]string
+	Args    []string
+	CmdArgs []string // args coming from the terminal
+	Env     map[string]string
 }
 
 var BashShellExecutor = Executor{
@@ -28,7 +29,14 @@ var BashExecutor = Executor{
 		args = append(args, "-e")
 		args = append(args, "-c", strings.Join(ctx.Args, "\n"))
 
-		return args, nil
+		if len(ctx.CmdArgs) == 0 {
+			return args, nil
+		} else {
+			// https://unix.stackexchange.com/a/144519
+			args = append(args, "bash")
+			args = append(args, ctx.CmdArgs...)
+			return args, nil
+		}
 	},
 	ShellPrint: func(args []string) string {
 		return strings.Join(args, "\n")
@@ -54,7 +62,7 @@ var ExecExecutor = Executor{
 		}
 		ctx.Args[0] = p
 
-		return ctx.Args, nil
+		return append(ctx.Args, ctx.CmdArgs...), nil
 	},
 	ShellPrint: func(args []string) string {
 		return strings.Join(args, " ")
