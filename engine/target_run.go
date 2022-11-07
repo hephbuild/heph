@@ -208,24 +208,24 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		for _, dep := range deps.Targets {
 			dept := dep.Target
 
+			if len(dept.ActualOutFiles().All()) == 0 {
+				continue
+			}
+
 			tarFile := e.targetOutputTarFile(dept, dep.Output)
 			srcRec.AddTar(tarFile)
 
-			for outName, files := range dept.ActualOutFiles().Named() {
-				if dep.Output == "" || dep.Output == outName {
-					srcName := name
-					if dep.Output == "" && outName != "" {
-						if srcName != "" {
-							srcName += "_"
-						}
-						srcName += outName
-					}
-
-					for _, file := range files {
-						srcRecNameToDepName[srcName] = name
-						envSrcRec.Add(srcName, "", file.RelRoot(), dep.Full())
-					}
+			srcName := name
+			if dep.SpecOutput == "" && dep.Output != "" {
+				if srcName != "" {
+					srcName += "_"
 				}
+				srcName += dep.Output
+			}
+
+			for _, file := range dept.ActualOutFiles().Name(dep.Output) {
+				srcRecNameToDepName[srcName] = name
+				envSrcRec.Add(srcName, "", file.RelRoot(), dep.Full())
 			}
 		}
 

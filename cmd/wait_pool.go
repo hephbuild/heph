@@ -44,7 +44,7 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 		start := time.Now()
 		printProgress := func() {
 			all, success := deps.TransitiveCount()
-			log.Infof("Progress %v: %v/%v %v", name, success, all, utils.RoundTime(time.Since(start), 1).String())
+			log.Infof("Progress %v: %v/%v %v", name, success, all, utils.RoundDuration(time.Since(start), 1).String())
 		}
 
 		printWorkersStatus := func() {
@@ -66,7 +66,7 @@ func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
 					status = "Waiting..."
 				}
 
-				runtime := fmt.Sprintf("%v", utils.RoundTime(duration, 1).String())
+				runtime := fmt.Sprintf("%v", utils.RoundDuration(duration, 1).String())
 
 				fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
 			}
@@ -248,7 +248,7 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (r *renderer) View() string {
-	start := utils.RoundTime(time.Since(r.start), 1).String()
+	start := utils.RoundDuration(time.Since(r.start), 1).String()
 
 	if r.summary {
 		count := fmt.Sprint(r.success)
@@ -266,7 +266,7 @@ func (r *renderer) View() string {
 		state := "I"
 		if j := w.CurrentJob; j != nil {
 			state = "R"
-			runtime = fmt.Sprintf(" %v", utils.RoundTime(time.Since(j.TimeStart), 1).String())
+			runtime = fmt.Sprintf(" %v", utils.RoundDuration(time.Since(j.TimeStart), 1).String())
 		}
 
 		status := w.GetStatus()

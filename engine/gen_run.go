@@ -6,6 +6,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/targetspec"
 	"heph/worker"
+	"math/rand"
 	"path/filepath"
 	"time"
 )
@@ -19,6 +20,32 @@ type runGenEngine struct {
 func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error) {
 	if e.RanGenPass {
 		return &worker.WaitGroup{}, nil
+	}
+
+	if !e.Config.DisableGC && rand.Float32() > 0.2 {
+		e.RegisterExitHandler(func() {
+			if !e.RanGenPass {
+				return
+			}
+
+			log.Tracef("Running GC...")
+
+			doneCh := make(chan struct{})
+			go func() {
+				err := e.GC(e.Config.CacheHistory, log.Tracef, false)
+				if err != nil {
+					log.Errorf("gc: %v", err)
+				}
+				close(doneCh)
+			}()
+
+			select {
+			case <-doneCh:
+			case <-time.After(2 * time.Second):
+				log.Info("Running GC...")
+				<-doneCh
+			}
+		})
 	}
 
 	genTargets := e.GeneratedTargets()

@@ -3,9 +3,11 @@ package config
 type Extras map[string]interface{}
 
 type FileConfig struct {
-	BaseConfig `yaml:",inline"`
-	Cache      map[string]FileCache `yaml:",omitempty"`
-	BuildFiles struct {
+	BaseConfig   `yaml:",inline"`
+	Cache        map[string]FileCache `yaml:",omitempty"`
+	CacheHistory int                  `yaml:"cache_history"`
+	DisableGC    *bool                `yaml:"disable_gc"`
+	BuildFiles   struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
 	} `yaml:"build_files"`
@@ -29,6 +31,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		c.KeepSandbox = *fc.KeepSandbox
 	}
 
+	if fc.DisableGC != nil {
+		c.DisableGC = *fc.DisableGC
+	}
+
 	if len(fc.Cache) == 0 && fc.Cache != nil {
 		c.Cache = nil
 	} else {
@@ -39,6 +45,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		for k, newCache := range fc.Cache {
 			c.Cache[k] = newCache.ApplyTo(c.Cache[k])
 		}
+	}
+
+	if fc.CacheHistory != 0 {
+		c.CacheHistory = fc.CacheHistory
 	}
 
 	if c.BuildFiles.Roots == nil {

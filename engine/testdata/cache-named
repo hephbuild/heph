@@ -42,8 +42,9 @@ target(
     "Cache": {
         "Enabled": true,
         "Named": ["a"],
-        "Files": null
+        "History": 0
     },
+    "SupportFiles": null,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",

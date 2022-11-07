@@ -40,8 +40,9 @@ target(
     "Cache": {
         "Enabled": false,
         "Named": null,
-        "Files": null
+        "History": 0
     },
+    "SupportFiles": null,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",

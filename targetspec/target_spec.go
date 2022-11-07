@@ -186,6 +186,7 @@ type TargetSpecOutFile struct {
 type TargetSpecCache struct {
 	Enabled bool
 	Named   []string
+	History int
 }
 
 func (c TargetSpecCache) NamedEnabled(name string) bool {

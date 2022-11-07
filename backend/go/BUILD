@@ -31,14 +31,6 @@ def go_toolchain(name, architectures=[]):
         goos, _, goarch = arch.partition("_")
         run.append('(export GOOS={} && export GOARCH={} && export GO_OUTDIR=$(pwd) && ./$OUT_GO install --trimpath std)'.format(goos, goarch))
 
-    # run = [
-    #     'touch $OUT_GO',
-    #     'touch $OUT_GOFMT',
-    #     'mkdir -p go',
-    #     'touch go/test1',
-    #     'touch go/test2',
-    # ]
-
     return target(
         name="go",
         run=run,
@@ -54,6 +46,7 @@ def go_toolchain(name, architectures=[]):
             "go": "go.sh",
             "gofmt": "go/bin/gofmt",
         },
+        cache=heph.cache(history=1),
         support_files="go",
         runtime_env={
             "OUTDIR": "$(outdir)",
