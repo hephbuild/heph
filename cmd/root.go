@@ -63,6 +63,7 @@ func init() {
 	rootCmd.AddCommand(watchCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
+	rootCmd.AddCommand(gcCmd)
 
 	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
 	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
@@ -140,7 +141,7 @@ var rootCmd = &cobra.Command{
 			return nil
 		}
 
-		defer Engine.Cleanup()
+		defer Engine.RunExitHandlers()
 
 		if !Engine.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
@@ -628,6 +629,23 @@ var cleanCmd = &cobra.Command{
 		}
 
 		return nil
+	},
+}
+
+var gcCmd = &cobra.Command{
+	Use:   "gc",
+	Short: "GC",
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return engineInit()
+	},
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
+		return Engine.GC(Engine.Config.CacheHistory, log.Infof, false)
 	},
 }
 

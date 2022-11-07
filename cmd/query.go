@@ -118,7 +118,6 @@ var queryCmd = &cobra.Command{
 		}
 
 		selected := make([]*engine.Target, 0)
-
 		for _, target := range targets {
 			if matcher(target) {
 				selected = append(selected, target)

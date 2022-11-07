@@ -1,6 +1,6 @@
 target(
     name="a",
-    cache=['a'],
+    cache=heph.cache(history=1),
 )
 ===
 {
@@ -40,8 +40,9 @@ target(
     "Cache": {
         "Enabled": true,
         "Named": null,
-        "Files": ["a"]
+        "History": 1
     },
+    "SupportFiles": null,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",

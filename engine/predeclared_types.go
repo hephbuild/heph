@@ -89,6 +89,7 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 type TargetArgsCache struct {
 	Enabled bool
 	Named   Array
+	History int
 }
 
 func (c *TargetArgsCache) Unpack(v starlark.Value) error {
@@ -110,6 +111,15 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 				if err != nil {
 					return err
 				}
+			case "history":
+				vsi, err := starlark.NumberToInt(v)
+				if err != nil {
+					return err
+				}
+
+				vi, _ := vsi.Int64()
+
+				cs.History = int(vi)
 			default:
 				return fmt.Errorf("invalid arg %v, call heph.cache()", n)
 			}

@@ -183,6 +183,10 @@ func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
 		return false
 	}
 
+	if this.History != that.History {
+		return false
+	}
+
 	if !arrEqual(this.Named, that.Named) {
 		return false
 	}

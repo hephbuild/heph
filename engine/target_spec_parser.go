@@ -26,6 +26,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named,
+			History: args.Cache.History,
 		},
 		SupportFiles: args.SupportFiles,
 		Sandbox:      args.SandboxEnabled,

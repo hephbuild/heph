@@ -274,6 +274,7 @@ type Target struct {
 
 	runLock   flock.Locker
 	cacheLock flock.Locker
+	tarLock   flock.Locker
 }
 
 type TargetTransitive struct {
@@ -418,8 +419,9 @@ func (t *Target) HasAnyLabel(labels []string) bool {
 }
 
 type TargetWithOutput struct {
-	Target *Target
-	Output string
+	Target     *Target
+	Output     string
+	SpecOutput string
 }
 
 func (t TargetWithOutput) Full() string {
@@ -686,6 +688,7 @@ func (e *Engine) processTarget(t *Target) error {
 
 	t.runLock = e.lockFactory(t, "run")
 	t.cacheLock = e.lockFactory(t, "cache")
+	t.tarLock = e.lockFactory(t, "tar")
 
 	if t.Codegen != "" {
 		for _, file := range t.TargetSpec.Out {
@@ -1008,6 +1011,8 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
+		refs = append(refs, tt)
+
 		if tool.Output == "" {
 			for _, name := range tt.Out.Names() {
 				targetTools = append(targetTools, targetTool{
@@ -1023,7 +1028,6 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 				Name:   tool.Name,
 			})
 		}
-		refs = append(refs, tt)
 	}
 
 	for _, tool := range toolsSpecs.Exprs {
@@ -1306,8 +1310,9 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 			}
 
 			td.Targets = append(td.Targets, TargetWithOutput{
-				Target: dt,
-				Output: spec.Output,
+				Target:     dt,
+				Output:     spec.Output,
+				SpecOutput: spec.Output,
 			})
 		}
 	}

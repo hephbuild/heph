@@ -27,7 +27,7 @@ func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	p := e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
 
 	if !target.Cache.Enabled {
-		e.registerRemove(p.Abs())
+		e.RegisterRemove(p.Abs())
 	}
 
 	return p
@@ -229,6 +229,12 @@ func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, error) {
 
 	for _, name := range target.Out.Names() {
 		if !fs.PathExists(e.targetOutputTarFile(target, name)) {
+			return false, nil
+		}
+	}
+
+	if len(target.SupportFiles) > 0 {
+		if !fs.PathExists(e.targetSupportTarFile(target)) {
 			return false, nil
 		}
 	}

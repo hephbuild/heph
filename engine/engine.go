@@ -15,6 +15,7 @@ import (
 	"heph/sandbox"
 	"heph/targetspec"
 	"heph/utils"
+	"heph/utils/flock"
 	fs2 "heph/utils/fs"
 	"heph/utils/tar"
 	"heph/vfssimple"
@@ -65,8 +66,11 @@ type Engine struct {
 	fetchRootCache             map[string]fs2.Path
 	Pool                       *worker.Pool
 
-	removeAllm sync.Mutex
-	removeAll  []string
+	exitHandlersm       sync.Mutex
+	exitHandlers        []func()
+	exitHandlersRunning bool
+
+	gcLock *flock.Flock
 }
 
 type Config struct {
@@ -154,6 +158,7 @@ func New(rootPath string) *Engine {
 		cacheHashOutput: map[string]string{},
 		codegenPaths:    map[string]*Target{},
 		fetchRootCache:  map[string]fs2.Path{},
+		gcLock:          flock.NewFlock(homeDir.Join("tmp", "gc.lock").Abs()),
 	}
 }
 
@@ -172,8 +177,11 @@ func (e *Engine) hashFile(h utils.Hash, file fs2.Path) error {
 func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 	for _, dep := range targets {
 		h.String(dep.Target.FQN)
-		dh := e.hashOutput(dep.Target, dep.Output)
+		if dep.Output == "" && dep.SpecOutput == "" {
+			continue
+		}
 
+		dh := e.hashOutput(dep.Target, dep.Output)
 		h.String(dh)
 	}
 }
@@ -329,10 +337,8 @@ func (e *Engine) hashInput(target *Target) string {
 	for _, dep := range target.Tools.Targets {
 		h.String(dep.Name)
 
-		if len(dep.Target.Out.All()) > 0 {
-			dh := e.hashOutput(dep.Target, dep.Output)
-			h.String(dh)
-		}
+		dh := e.hashOutput(dep.Target, dep.Output)
+		h.String(dh)
 	}
 
 	h.String("=")
@@ -428,7 +434,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	}()
 
 	if !target.Out.HasName(output) {
-		panic(fmt.Sprintf("%v does not output %v", target, output))
+		panic(fmt.Sprintf("%v does not output `%v`", target, output))
 	}
 
 	file := e.targetOutputHashFile(target, output)
@@ -816,6 +822,18 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 }
 
 func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, error) {
+	err := target.tarLock.Lock()
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		err := target.tarLock.Unlock()
+		if err != nil {
+			log.Error(err)
+		}
+	}()
+
 	listPath := tarPath + ".list"
 
 	if fs2.PathExists(listPath) {
@@ -842,7 +860,7 @@ func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, e
 
 	ps := make(fs2.Paths, 0)
 	pss := make([]string, 0)
-	err := tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
+	err = tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
 		ps = append(ps, fs2.NewRelPath(hdr.Name).WithRoot(target.OutExpansionRoot.Abs()))
 		pss = append(pss, hdr.Name)
 
@@ -1018,6 +1036,7 @@ func (e *Engine) parseConfigs() error {
 
 	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
+	cfg.CacheHistory = 3
 
 	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {
@@ -1143,23 +1162,38 @@ func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Targe
 	return descendants.Slice(), nil
 }
 
-func (e *Engine) registerRemove(path string) {
-	e.removeAllm.Lock()
-	defer e.removeAllm.Unlock()
-
-	e.removeAll = append(e.removeAll, path)
-}
-
-func (e *Engine) Cleanup() {
-	e.removeAllm.Lock()
-	defer e.removeAllm.Unlock()
-
-	for _, path := range e.removeAll {
+func (e *Engine) RegisterRemove(path string) {
+	e.RegisterExitHandler(func() {
 		err := os.RemoveAll(path)
 		if err != nil {
 			log.Error(err)
 		}
+	})
+}
+
+func (e *Engine) RegisterExitHandler(f func()) {
+	if e.exitHandlersRunning {
+		return
 	}
 
-	e.removeAll = nil
+	e.exitHandlersm.Lock()
+	defer e.exitHandlersm.Unlock()
+
+	e.exitHandlers = append(e.exitHandlers, f)
+}
+
+func (e *Engine) RunExitHandlers() {
+	e.exitHandlersm.Lock()
+	defer e.exitHandlersm.Unlock()
+
+	e.exitHandlersRunning = true
+	defer func() {
+		e.exitHandlersRunning = false
+	}()
+
+	for _, h := range e.exitHandlers {
+		h()
+	}
+
+	e.exitHandlers = nil
 }

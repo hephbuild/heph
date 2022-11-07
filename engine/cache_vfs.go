@@ -90,6 +90,13 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		}
 	}
 
+	if len(target.SupportFiles) > 0 {
+		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheSupportTarName())
+		if err != nil {
+			return err
+		}
+	}
+
 	err = e.vfsCopyFile(localRoot, remoteRoot, inputHashFile)
 	if err != nil {
 		return err
@@ -122,7 +129,11 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 		}
 
 		if !onlyMeta {
-			e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
+			what := target.FQN
+			if name != "" {
+				what += "|" + name
+			}
+			e.Status(fmt.Sprintf("Pulling %v from %v cache...", what, cacheName))
 
 			err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheOutTarName(name))
 			if err != nil {
@@ -131,8 +142,23 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 		}
 	}
 
+	if len(target.SupportFiles) > 0 {
+		err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheSupportTarName())
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+
+			return false, err
+		}
+	}
+
 	err = e.vfsCopyFile(remoteRoot, localRoot, inputHashFile)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+
 		return false, err
 	}
 
