@@ -226,7 +226,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 
 				_, err := re.runBuildFile(file.Abs())
 				if err != nil {
-					return fmt.Errorf("%v: %w", file.Abs(), err)
+					return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
 				}
 
 				return nil

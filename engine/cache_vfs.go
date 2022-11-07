@@ -46,7 +46,7 @@ func (e *Engine) vfsCopyFile(from, to vfs.Location, path string) error {
 	log.Tracef("%v exists: %v", sf.URI(), ok)
 
 	if !ok {
-		return fmt.Errorf("%v: %w", sf.URI(), os.ErrNotExist)
+		return fmt.Errorf("vfs %v: %w", sf.URI(), os.ErrNotExist)
 	}
 
 	df, err := sf.CopyToLocation(to)
