@@ -170,10 +170,10 @@ func Untar(ctx context.Context, in, to string) error {
 	return doUntar(gr, to)
 }
 
-func TarList(ctx context.Context, in string) ([]string, error) {
-	tarf, err := os.Open(in)
+func Walk(ctx context.Context, path string, f func(*tar.Header, *tar.Reader) error) error {
+	tarf, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("untar: %w", err)
+		return fmt.Errorf("untar: %w", err)
 	}
 	defer tarf.Close()
 
@@ -184,13 +184,11 @@ func TarList(ctx context.Context, in string) ([]string, error) {
 
 	gr, err := gzip.NewReader(tarf)
 	if err != nil {
-		return nil, fmt.Errorf("untar: %w", err)
+		return fmt.Errorf("untar: %w", err)
 	}
 	defer gr.Close()
 
 	tr := tar.NewReader(gr)
-
-	paths := make([]string, 0)
 
 	for {
 		hdr, err := tr.Next()
@@ -199,16 +197,16 @@ func TarList(ctx context.Context, in string) ([]string, error) {
 				break // End of archive
 			}
 
-			return nil, fmt.Errorf("untar: %w", err)
+			return fmt.Errorf("untar: %w", err)
 		}
 
-		switch hdr.Typeflag {
-		case tar.TypeReg:
-			paths = append(paths, hdr.Name)
+		err = f(hdr, tr)
+		if err != nil {
+			return err
 		}
 	}
 
-	return paths, nil
+	return nil
 }
 
 func doUntar(r io.Reader, to string) error {

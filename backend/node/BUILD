@@ -25,7 +25,7 @@ target(
         "OS": get_os(),
         "ARCH": get_arch(),
     },
-    cache=["./node", "./npm.sh", "./npx.sh"],
+    support_files=["./node"],
     runtime_env={
         "OUTDIR": "$(outdir)",
     },
@@ -38,7 +38,7 @@ target(
     out={
         "yarn": "./yarn.sh",
     },
-    cache=["./yarn", "./yarn.sh"],
+    support_files=["./yarn"],
     runtime_env={
         "OUTDIR": "$(outdir)",
     },

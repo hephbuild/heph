@@ -41,12 +41,13 @@ func (t TargetTools) Empty() bool {
 
 type TargetTool struct {
 	Target *Target
+	Output string
 	Name   string
 	File   fs.RelPath
 }
 
 func (tt TargetTool) AbsPath() string {
-	return tt.File.WithRoot(tt.Target.OutRoot.Abs()).Abs()
+	return tt.File.WithRoot(tt.Target.OutExpansionRoot.Abs()).Abs()
 }
 
 type TargetDeps struct {
@@ -247,19 +248,19 @@ type Target struct {
 	Deps           TargetNamedDeps
 	HashDeps       TargetDeps
 	Out            *OutNamedPaths
-	actualFilesOut *ActualOutNamedPaths
+	actualOutFiles *ActualOutNamedPaths
 	Env            map[string]string
 	Transitive     TargetTransitive
 
 	RequireTransitive     TargetTransitive
 	DeepRequireTransitive TargetTransitive
 
-	WorkdirRoot       fs.Path
-	SandboxRoot       fs.Path
-	OutRoot           *fs.Path
-	CacheFiles        fs.RelPaths
-	actualcachedFiles fs.Paths
-	LogFile           string
+	WorkdirRoot        fs.Path
+	SandboxRoot        fs.Path
+	SupportFiles       fs.RelPaths
+	actualSupportFiles fs.Paths
+	LogFile            string
+	OutExpansionRoot   *fs.Path
 
 	processed  bool
 	linked     bool
@@ -370,20 +371,12 @@ func (t *Target) ID() string {
 	return t.FQN
 }
 
-func (t *Target) ActualFilesOut() fs.Paths {
-	if t.actualFilesOut == nil {
+func (t *Target) ActualOutFiles() *ActualOutNamedPaths {
+	if t.actualOutFiles == nil {
 		panic("actualFilesOut is nil for " + t.FQN)
 	}
 
-	return t.actualFilesOut.all
-}
-
-func (t *Target) NamedActualFilesOut() *NamedPaths[fs.Paths, fs.Path] {
-	if t.actualFilesOut == nil {
-		panic("actualFilesOut is nil for " + t.FQN)
-	}
-
-	return t.actualFilesOut
+	return t.actualOutFiles
 }
 
 func (t *Target) String() string {
@@ -400,21 +393,12 @@ func Contains(ts []*Target, fqn string) bool {
 	return false
 }
 
-func (t *Target) OutFilesInOutRoot() fs.Paths {
-	out := make(fs.Paths, 0)
-	for _, file := range t.Out.All() {
-		out = append(out, file.WithRoot(t.OutRoot.Abs()))
+func (t *Target) ActualSupportFiles() fs.Paths {
+	if t.actualSupportFiles == nil {
+		panic("actualSupportFiles is nil for " + t.FQN)
 	}
 
-	return out
-}
-
-func (t *Target) ActualCachedFiles() fs.Paths {
-	if t.actualcachedFiles == nil {
-		panic("actualcachedFiles is nil for " + t.FQN)
-	}
-
-	return t.actualcachedFiles
+	return t.actualSupportFiles
 }
 
 func (t *Target) IsPrivate() bool {
@@ -899,27 +883,19 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	for _, file := range t.TargetSpec.Out {
 		t.Out.Add(file.Name, relPathFactory(file.Path))
 	}
-
 	t.Out.Sort()
 
 	if t.TargetSpec.Cache.Enabled {
 		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
-
-		if t.TargetSpec.Cache.Files == nil {
-			t.CacheFiles = t.Out.All()
-		} else {
-			t.CacheFiles = fs.RelPaths{}
-			for _, p := range t.TargetSpec.Cache.Files {
-				t.CacheFiles = append(t.CacheFiles, relPathFactory(p))
-			}
-
-			sort.SliceStable(t.CacheFiles, func(i, j int) bool {
-				return t.CacheFiles[i].RelRoot() < t.CacheFiles[j].RelRoot()
-			})
-		}
 	}
+
+	t.SupportFiles = fs.RelPaths{}
+	for _, p := range t.TargetSpec.SupportFiles {
+		t.SupportFiles = append(t.SupportFiles, relPathFactory(p))
+	}
+	t.SupportFiles.Sort()
 
 	t.Env = map[string]string{}
 	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
@@ -1032,11 +1008,21 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
-		targetTools = append(targetTools, targetTool{
-			Target: tt,
-			Output: tool.Output,
-			Name:   tool.Name,
-		})
+		if tool.Output == "" {
+			for _, name := range tt.Out.Names() {
+				targetTools = append(targetTools, targetTool{
+					Target: tt,
+					Output: name,
+					Name:   tool.Name,
+				})
+			}
+		} else {
+			targetTools = append(targetTools, targetTool{
+				Target: tt,
+				Output: tool.Output,
+				Name:   tool.Name,
+			})
+		}
 		refs = append(refs, tt)
 	}
 
@@ -1113,6 +1099,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 
 			tools = append(tools, TargetTool{
 				Target: tt,
+				Output: tool.Output,
 				Name:   name,
 				File:   path,
 			})
@@ -1274,7 +1261,18 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 		}
 
 		for _, target := range targets {
-			td.Targets = append(td.Targets, TargetWithOutput{Target: target})
+			if len(target.Out.Names()) == 0 {
+				td.Targets = append(td.Targets, TargetWithOutput{
+					Target: target,
+				})
+			} else {
+				for _, name := range target.Out.Names() {
+					td.Targets = append(td.Targets, TargetWithOutput{
+						Target: target,
+						Output: name,
+					})
+				}
+			}
 		}
 	}
 
@@ -1289,14 +1287,29 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 			return TargetDeps{}, err
 		}
 
-		if spec.Output != "" && !dt.Out.HasName(spec.Output) {
-			return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
-		}
+		if spec.Output == "" {
+			if len(dt.Out.Names()) == 0 {
+				td.Targets = append(td.Targets, TargetWithOutput{
+					Target: dt,
+				})
+			} else {
+				for _, name := range dt.Out.Names() {
+					td.Targets = append(td.Targets, TargetWithOutput{
+						Target: dt,
+						Output: name,
+					})
+				}
+			}
+		} else {
+			if !dt.Out.HasName(spec.Output) {
+				return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
+			}
 
-		td.Targets = append(td.Targets, TargetWithOutput{
-			Target: dt,
-			Output: spec.Output,
-		})
+			td.Targets = append(td.Targets, TargetWithOutput{
+				Target: dt,
+				Output: spec.Output,
+			})
+		}
 	}
 
 	for _, file := range deps.Files {

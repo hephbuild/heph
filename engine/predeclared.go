@@ -172,6 +172,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"tools?", &sargs.Tools,
 		"labels?", &sargs.Labels,
 		"out?", &sargs.Out,
+		"support_files?", &sargs.SupportFiles,
 		"env?", &sargs.Env,
 		"gen?", &sargs.Gen,
 		"runtime_env?", &sargs.RuntimeEnv,

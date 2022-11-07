@@ -3,7 +3,6 @@ package engine
 import (
 	"fmt"
 	"heph/exprs"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -55,7 +54,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
 			}
 
-			return filepath.Join(t.OutRoot.Abs(), t.Package.FullName), nil
+			return t.OutExpansionRoot.Join(t.Package.FullName).Abs(), nil
 		},
 		"hash_input": func(expr exprs.Expr) (string, error) {
 			t, err := getTarget(expr)

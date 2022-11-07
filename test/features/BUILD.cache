@@ -1,0 +1,21 @@
+load("//test", "e2e_test")
+
+target(
+    name="uncached_dep",
+    run='echo hello > $OUT',
+    out="some_file",
+    cache=False,
+)
+
+target(
+    name="using_uncached_dep",
+    run='cat $SRC',
+    deps=':uncached_dep',
+    cache=False,
+)
+
+e2e_test(
+    name="sanity_uncached_dep",
+    cmd="heph run //test/features:using_uncached_dep",
+    expected_output="hello",
+)

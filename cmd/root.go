@@ -140,6 +140,8 @@ var rootCmd = &cobra.Command{
 			return nil
 		}
 
+		defer Engine.Cleanup()
+
 		if !Engine.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
 			<-Engine.Pool.Done()

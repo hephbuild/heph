@@ -3,10 +3,16 @@ package fs
 import (
 	"encoding/json"
 	"path/filepath"
+	"sort"
 )
 
 type Paths []Path
-type RelPaths []RelPath
+
+func (ps Paths) Sort() {
+	sort.SliceStable(ps, func(i, j int) bool {
+		return ps[i].RelRoot() < ps[j].RelRoot()
+	})
+}
 
 func (ps Paths) WithRoot(root string) Paths {
 	nps := make(Paths, 0, len(ps))
@@ -16,6 +22,14 @@ func (ps Paths) WithRoot(root string) Paths {
 	}
 
 	return nps
+}
+
+type RelPaths []RelPath
+
+func (ps RelPaths) Sort() {
+	sort.SliceStable(ps, func(i, j int) bool {
+		return ps[i].RelRoot() < ps[j].RelRoot()
+	})
 }
 
 type Path struct {

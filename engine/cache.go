@@ -9,28 +9,63 @@ import (
 	"heph/utils/tar"
 	"heph/vfssimple"
 	"os"
+	"time"
 )
 
-func (e *Engine) cacheDir(target *Target, inputHash string) fs.Path {
-	return e.HomeDir.Join("cache", target.Package.FullName, "__target_"+target.Name, inputHash)
+func (e *Engine) cacheDir(target *Target) fs.Path {
+	return e.cacheDirForHash(target, e.hashInput(target))
 }
 
-func (e *Engine) targetOutputTarFile(target *Target, inputHash string) string {
-	return e.cacheDir(target, inputHash).Join(outputTarFile).Abs()
+var SOMEID = fmt.Sprint(time.Now().Nanosecond())
+
+func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
+	folder := "__target_" + target.Name
+	if !target.Cache.Enabled {
+		folder = "__target_tmp_" + SOMEID + "_" + target.Name
+	}
+
+	p := e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
+
+	if !target.Cache.Enabled {
+		e.registerRemove(p.Abs())
+	}
+
+	return p
+}
+
+func (e *Engine) cacheOutTarName(name string) string {
+	return "out_" + name + ".tar.gz"
+}
+
+func (e *Engine) cacheOutHashName(name string) string {
+	return "hash_out_" + name
+}
+
+func (e *Engine) cacheSupportTarName() string {
+	return "support_out.tar.gz"
+}
+
+func (e *Engine) targetOutputTarFile(target *Target, name string) string {
+	return e.cacheDir(target).Join(e.cacheOutTarName(name)).Abs()
+}
+
+func (e *Engine) targetOutputHashFile(target *Target, name string) string {
+	return e.cacheDir(target).Join(e.cacheOutHashName(name)).Abs()
+}
+
+func (e *Engine) targetSupportTarFile(target *Target) string {
+	return e.cacheDir(target).Join(e.cacheSupportTarName()).Abs()
 }
 
 const versionFile = "version"
 const inputHashFile = "hash_input"
-const outputHashFile = "hash_output"
-const outputTarFile = "output.tar.gz"
-const outputDir = "_output"
 
-func (e *Engine) storeCache(ctx context.Context, target *Target) error {
+func (e *Engine) storeCache(ctx context.Context, target *Target, outRoot string) error {
 	inputHash := e.hashInput(target)
 
 	log.Tracef("Store Cache %v %v", target.FQN, inputHash)
 
-	dir := e.cacheDir(target, inputHash)
+	dir := e.cacheDir(target)
 
 	err := os.RemoveAll(dir.Abs())
 	if err != nil {
@@ -47,26 +82,18 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 		return err
 	}
 
-	outFilesDir := dir.Join(outputDir)
+	log.Tracef("Taring to cache %v", target.FQN)
 
-	err = os.MkdirAll(outFilesDir.Abs(), os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	if cache := target.ActualCachedFiles(); len(cache) > 0 {
-		log.Tracef("Copying to cache %v", target.FQN)
+	for name, paths := range target.ActualOutFiles().Named() {
+		log.Tracef("Creating archive %v %v", target.FQN, name)
 
 		files := make([]tar.TarFile, 0)
-		for _, file := range cache {
+		for _, file := range paths {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
 
-			err := fs.Cp(file.Abs(), outFilesDir.Join(file.RelRoot()).Abs())
-			if err != nil {
-				return err
-			}
+			file := file.WithRoot(outRoot)
 
 			files = append(files, tar.TarFile{
 				From: file.Abs(),
@@ -74,26 +101,40 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 			})
 		}
 
-		log.Tracef("Creating archive %v", target.FQN)
-
-		err = tar.Tar(ctx, files, e.targetOutputTarFile(target, inputHash))
+		err = tar.Tar(ctx, files, e.targetOutputTarFile(target, name))
 		if err != nil {
 			return err
 		}
-	} else {
-		log.Tracef("%v output no files, skipping archive", target.FQN)
+
+		outputHash := e.hashOutput(target, name)
+
+		err = fs.WriteFileSync(e.targetOutputHashFile(target, name), []byte(outputHash), os.ModePerm)
+		if err != nil {
+			return err
+		}
 	}
 
-	target.OutRoot = &outFilesDir
+	if len(target.ActualSupportFiles()) > 0 {
+		log.Tracef("Creating support archive %v", target.FQN)
 
-	target.actualFilesOut = target.actualFilesOut.WithRoot(target.OutRoot.Abs())
-	target.actualcachedFiles = target.actualcachedFiles.WithRoot(target.OutRoot.Abs())
+		files := make([]tar.TarFile, 0)
+		for _, file := range target.ActualSupportFiles() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 
-	outputHash := e.hashOutput(target, "")
+			file := file.WithRoot(outRoot)
 
-	err = fs.WriteFileSync(dir.Join(outputHashFile).Abs(), []byte(outputHash), os.ModePerm)
-	if err != nil {
-		return err
+			files = append(files, tar.TarFile{
+				From: file.Abs(),
+				To:   file.RelRoot(),
+			})
+		}
+
+		err = tar.Tar(ctx, files, e.targetSupportTarFile(target))
+		if err != nil {
+			return err
+		}
 	}
 
 	err = fs.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
@@ -109,19 +150,19 @@ func (e *Engine) storeCache(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *fs.Path, error) {
-	ok, p, err := e.getLocalCache(target, onlyMeta)
+func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) {
+	ok, err := e.getLocalCache(target, onlyMeta)
 	if err != nil {
-		return false, nil, err
+		return false, err
 	}
 
 	if ok {
 		e.Status(fmt.Sprintf("Using local %v cache...", target.FQN))
-		return true, p, nil
+		return true, nil
 	}
 
 	if e.DisableNamedCache {
-		return false, nil, nil
+		return false, nil
 	}
 
 	for _, cache := range e.Config.Cache {
@@ -135,7 +176,7 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *fs.Pat
 
 		loc, err := vfssimple.NewLocation(cache.URI)
 		if err != nil {
-			return false, nil, err
+			return false, err
 		}
 
 		ok, err := e.getVfsCache(loc, cache.Name, target, onlyMeta)
@@ -152,54 +193,56 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, *fs.Pat
 		}
 	}
 
-	return false, nil, nil
+	return false, nil
 }
 
-func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, *fs.Path, error) {
+func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, error) {
 	hash := e.hashInput(target)
 
-	dir := e.cacheDir(target, hash)
+	dir := e.cacheDir(target)
 
 	cacheHashb, err := os.ReadFile(dir.Join(inputHashFile).Abs())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil, nil
+			return false, nil
 		}
 
-		return false, nil, err
+		return false, err
 	}
 	cacheHash := string(cacheHashb)
 
 	log.Tracef("Cache %v: %v %v", target.FQN, hash, cacheHash)
 
 	if cacheHash != hash {
-		return false, nil, nil
+		return false, nil
 	}
 
-	if !fs.PathExists(dir.Join(outputHashFile).Abs()) {
-		return false, nil, nil
+	for _, name := range target.Out.Names() {
+		if !fs.PathExists(e.targetOutputHashFile(target, name)) {
+			return false, nil
+		}
 	}
 
 	if onlyMeta {
-		return true, nil, nil
+		return true, nil
 	}
 
-	outDir := dir.Join(outputDir)
-
-	if !fs.PathExists(outDir.Abs()) {
-		return false, nil, nil
+	for _, name := range target.Out.Names() {
+		if !fs.PathExists(e.targetOutputTarFile(target, name)) {
+			return false, nil
+		}
 	}
 
 	err = e.linkLatestCache(target, dir.Abs())
 	if err != nil {
-		return false, nil, err
+		return false, err
 	}
 
-	return true, &outDir, nil
+	return true, nil
 }
 
 func (e *Engine) linkLatestCache(target *Target, from string) error {
-	latestDir := e.cacheDir(target, "latest")
+	latestDir := e.cacheDirForHash(target, "latest")
 
 	err := os.RemoveAll(latestDir.Abs())
 	if err != nil {

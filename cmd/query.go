@@ -590,12 +590,12 @@ var outCmd = &cobra.Command{
 			return err
 		}
 
-		paths := target.ActualFilesOut()
+		paths := target.ActualOutFiles().All()
 		if output != "" {
-			if !target.NamedActualFilesOut().HasName(output) {
+			if !target.ActualOutFiles().HasName(output) {
 				return fmt.Errorf("output %v does not exist", output)
 			}
-			paths = target.NamedActualFilesOut().Name(output)
+			paths = target.ActualOutFiles().Name(output)
 		}
 
 		for _, path := range paths {
