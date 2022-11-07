@@ -594,6 +594,7 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 	outDir := e.cacheDir(target).Join("_output")
 
 	if !fs.PathExists(outDir.Abs()) {
+		e.Status(fmt.Sprintf("Expanding %v cache...", target.FQN))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
 		err := os.RemoveAll(tmpOutDir)
@@ -628,6 +629,8 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 
 	target.OutExpansionRoot = &outDir
 
+	e.Status(fmt.Sprintf("Hydrating %v output...", target.FQN))
+
 	err := e.populateActualFilesFromTar(target)
 	if err != nil {
 		return err
@@ -648,7 +651,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 
 	e.Status(fmt.Sprintf("Linking %v output", target.FQN))
 
-	for name, paths := range target.ActualOutFiles().Named() {
+	for name, paths := range target.Out.Named() {
 		switch target.Codegen {
 		case targetspec.CodegenCopy:
 			tarPath := e.targetOutputTarFile(target, name)
