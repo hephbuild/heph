@@ -123,6 +123,10 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
+	if !arrEqual(t.SupportFiles, spec.SupportFiles) {
+		return false
+	}
+
 	if t.Sandbox != spec.Sandbox {
 		return false
 	}
@@ -176,10 +180,6 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 
 func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
 	if this.Enabled != that.Enabled {
-		return false
-	}
-
-	if !arrEqual(this.Files, that.Files) {
 		return false
 	}
 

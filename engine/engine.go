@@ -1,6 +1,7 @@
 package engine
 
 import (
+	tar2 "archive/tar"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"heph/targetspec"
 	"heph/utils"
 	fs2 "heph/utils/fs"
+	"heph/utils/tar"
 	"heph/vfssimple"
 	"heph/worker"
 	"io"
@@ -61,6 +63,9 @@ type Engine struct {
 	codegenPaths               map[string]*Target
 	fetchRootCache             map[string]fs2.Path
 	Pool                       *worker.Pool
+
+	removeAllm sync.Mutex
+	removeAll  []string
 }
 
 type Config struct {
@@ -171,6 +176,7 @@ func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 		h.String(dh)
 	}
 }
+
 func (e *Engine) hashFiles(h utils.Hash, hashMethod string, files fs2.Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
@@ -320,10 +326,12 @@ func (e *Engine) hashInput(target *Target) string {
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
-		dh := e.hashOutput(dep.Target, "")
-
 		h.String(dep.Name)
-		h.String(dh)
+
+		if len(dep.Target.Out.All()) > 0 {
+			dh := e.hashOutput(dep.Target, dep.Output)
+			h.String(dh)
+		}
 	}
 
 	h.String("=")
@@ -361,37 +369,23 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	outEntries := make([]string, 0)
-	for _, file := range target.TargetSpec.Out {
-		outEntries = append(outEntries, file.Name+file.Path)
-	}
-
-	sort.Strings(outEntries)
-
-	for _, entry := range outEntries {
-		h.String(entry)
-	}
+	utils.HashArray(h, target.TargetSpec.Out, func(file targetspec.TargetSpecOutFile) string {
+		return file.Name + file.Path
+	})
 
 	if target.OutInSandbox {
 		h.Bool(target.OutInSandbox)
 	}
 
 	h.String("=")
-	for _, file := range target.CacheFiles {
+	for _, file := range target.SupportFiles {
 		h.String(file.RelRoot())
 	}
 
 	h.String("=")
-	envEntries := make([]string, 0)
-	for k, v := range target.Env {
-		envEntries = append(envEntries, k+v)
-	}
-
-	sort.Strings(envEntries)
-
-	for _, e := range envEntries {
-		h.String(e)
-	}
+	utils.HashMap(h, target.Env, func(k, v string) string {
+		return k + v
+	})
 
 	h.String("=")
 	h.Bool(target.Gen)
@@ -432,7 +426,11 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		log.Debugf("hashoutput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	file := e.cacheDir(target, hashInput).Join(outputHashFile).Abs()
+	if !target.Out.HasName(output) {
+		panic(fmt.Sprintf("%v does not output %v", target, output))
+	}
+
+	file := e.targetOutputHashFile(target, output)
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -450,16 +448,38 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	h.String(output)
 
-	actualOut := target.NamedActualFilesOut().All()
-	if output != "" {
-		actualOut = target.NamedActualFilesOut().Name(output)
-	}
+	// Sanity check, will bomb if not called in the right order
+	_ = target.ActualOutFiles()
 
-	for _, file := range actualOut {
-		err := e.hashFile(h, file)
-		if err != nil {
-			panic(fmt.Errorf("actualOut: %v: hashFile %v %w", target.FQN, file.Abs(), err))
+	tarPath := e.targetOutputTarFile(target, output)
+
+	err = tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
+		h.String(hdr.Name)
+
+		switch hdr.Typeflag {
+		case tar2.TypeReg:
+			//h.I64(hdr.Mode)
+			if _, err := io.CopyN(h, r, hdr.Size); err != nil {
+				return err
+			}
+
+			return nil
+		case tar2.TypeDir:
+			return nil
+		case tar2.TypeSymlink:
+			if hdr.Linkname == "" {
+				return fmt.Errorf("untar: symlink empty for %v", hdr.Name)
+			}
+
+			h.String(hdr.Linkname)
+		default:
+			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
 		}
+
+		return nil
+	})
+	if err != nil {
+		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, tarPath, err))
 	}
 
 	sh := h.Sum()
@@ -544,16 +564,13 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
 	targets := rrs.Targets()
 
-	ancestors, err := e.DAG().GetOrderedAncestors(targets, false)
+	toAssess, err := e.DAG().GetOrderedAncestors(targets, true)
 	if err != nil {
 		return nil, err
 	}
 
 	needRun := NewTargets(0)
 	needCacheWarm := NewTargets(0)
-
-	toAssess := ancestors
-	toAssess = append(toAssess, targets...)
 
 	for _, target := range targets {
 		if skip != nil && skip.FQN == target.FQN {
@@ -730,11 +747,6 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, de
 				return fmt.Errorf("%v expected cache pull to succeed", target.FQN)
 			}
 
-			err = e.codegenLink(target)
-			if err != nil {
-				return err
-			}
-
 			return nil
 		},
 	})
@@ -768,55 +780,11 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 	return j, nil
 }
 
-func (e *Engine) collectNamedOutFromActualFiles(target *Target, outNamedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
-	tp := &ActualOutNamedPaths{}
-
-	for name, opaths := range outNamedPaths.Named() {
-		for _, opath := range opaths {
-			found := false
-			isGlob := strings.Contains(opath.RelRoot(), "*")
-
-			for _, cachePath := range target.actualcachedFiles {
-				pattern := opath.RelRoot()
-
-				var match, isDir bool
-				if !isGlob && strings.HasPrefix(cachePath.RelRoot(), opath.RelRoot()+"/") {
-					match = true
-					isDir = true
-				} else {
-					var err error
-					match, err = doublestar.PathMatch(pattern, cachePath.RelRoot())
-					if err != nil {
-						return nil, err
-					}
-				}
-
-				if match {
-					tp.Add(name, cachePath)
-					found = true
-
-					if !isGlob && !isDir {
-						break
-					}
-				}
-			}
-
-			if !isGlob && !found {
-				return nil, fmt.Errorf("%v did not output %v", target.FQN, opath.RelRoot())
-			}
-		}
-	}
-
-	tp.Sort()
-
-	return tp, nil
-}
-
-func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths, root string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
-		files, err := e.collectOut(target, paths)
+		files, err := e.collectOut(target, paths, root)
 		if err != nil {
 			return nil, err
 		}
@@ -829,21 +797,45 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths) (*Ac
 	return tp, nil
 }
 
-func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, error) {
+func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPaths) (*ActualOutNamedPaths, error) {
+	tp := &ActualOutNamedPaths{}
+
+	for name := range namedPaths.Named() {
+		files, err := e.collectOutFromTar(target, e.targetOutputTarFile(target, name))
+		if err != nil {
+			return nil, err
+		}
+
+		for _, file := range files {
+			tp.Add(name, file.WithRoot(target.OutExpansionRoot.Abs()))
+		}
+	}
+
+	return tp, nil
+}
+
+func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, error) {
+	ps := make(fs2.Paths, 0)
+	err := tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
+		ps = append(ps, fs2.NewRelPath(hdr.Name).WithRoot(target.OutExpansionRoot.Abs()))
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return ps, nil
+}
+
+func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs2.Paths, error) {
 	out := make(fs2.Paths, 0)
-
-	defer func() {
-		sort.SliceStable(out, func(i, j int) bool {
-			return out[i].RelRoot() < out[j].RelRoot()
-		})
-	}()
-
-	root := target.OutRoot.Abs()
+	defer out.Sort()
 
 	for _, file := range files {
 		pattern := file.RelRoot()
 
-		if !strings.Contains(pattern, "*") && !fs2.PathExists(filepath.Join(root, pattern)) {
+		if !utils.IsGlob(pattern) && !fs2.PathExists(filepath.Join(root, pattern)) {
 			return nil, fmt.Errorf("%v did not output %v", target.FQN, file.RelRoot())
 		}
 
@@ -860,30 +852,45 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths) (fs2.Paths, erro
 	return out, nil
 }
 
-func (e *Engine) populateActualFiles(target *Target) (err error) {
-	empty, err := fs2.IsDirEmpty(target.OutRoot.Abs())
+func (e *Engine) populateActualFiles(target *Target, outRoot string) error {
+	empty, err := fs2.IsDirEmpty(outRoot)
 	if err != nil {
 		return fmt.Errorf("collect output: isempty: %w", err)
 	}
 
-	target.actualFilesOut = &ActualOutNamedPaths{}
-	target.actualcachedFiles = make(fs2.Paths, 0)
+	target.actualOutFiles = &ActualOutNamedPaths{}
+	target.actualSupportFiles = make(fs2.Paths, 0)
 
 	if empty {
 		return nil
 	}
 
-	target.actualcachedFiles, err = e.collectOut(target, target.CacheFiles)
+	target.actualSupportFiles, err = e.collectOut(target, target.SupportFiles, outRoot)
 	if err != nil {
 		return fmt.Errorf("cached: %w", err)
 	}
 
-	collector := e.collectNamedOutFromActualFiles
-	if !target.Cache.Enabled {
-		collector = e.collectNamedOut
+	target.actualOutFiles, err = e.collectNamedOut(target, target.Out, outRoot)
+	if err != nil {
+		return fmt.Errorf("out: %w", err)
 	}
 
-	target.actualFilesOut, err = collector(target, target.Out)
+	return nil
+}
+
+func (e *Engine) populateActualFilesFromTar(target *Target) error {
+	target.actualOutFiles = &ActualOutNamedPaths{}
+	target.actualSupportFiles = make(fs2.Paths, 0)
+
+	var err error
+	if len(target.SupportFiles) > 0 {
+		target.actualSupportFiles, err = e.collectOutFromTar(target, e.targetSupportTarFile(target))
+		if err != nil {
+			return fmt.Errorf("cached: %w", err)
+		}
+	}
+
+	target.actualOutFiles, err = e.collectNamedOutFromTar(target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}
@@ -906,7 +913,7 @@ func (e *Engine) CleanTarget(target *Target, async bool) error {
 		return err
 	}
 
-	cacheDir := e.cacheDir(target, "")
+	cacheDir := e.cacheDirForHash(target, "")
 	err = deleteDir(cacheDir.Abs(), async)
 	if err != nil {
 		return err
@@ -1096,4 +1103,25 @@ func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Targe
 	descendants.Sort()
 
 	return descendants.Slice(), nil
+}
+
+func (e *Engine) registerRemove(path string) {
+	e.removeAllm.Lock()
+	defer e.removeAllm.Unlock()
+
+	e.removeAll = append(e.removeAll, path)
+}
+
+func (e *Engine) Cleanup() {
+	e.removeAllm.Lock()
+	defer e.removeAllm.Unlock()
+
+	for _, path := range e.removeAll {
+		err := os.RemoveAll(path)
+		if err != nil {
+			log.Error(err)
+		}
+	}
+
+	e.removeAll = nil
 }

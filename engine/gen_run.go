@@ -154,7 +154,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	return nil
 }
 
-func (e *runGenEngine) linkAndDagGenTargets() error {
+func (e *Engine) linkAndDagGenTargets() error {
 	linkStartTime := time.Now()
 	err := e.linkTargets(false, e.GeneratedTargets())
 	if err != nil {
@@ -182,10 +182,11 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 }
 
 func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *Targets) error {
-	files := target.ActualFilesOut()
+	files := target.ActualOutFiles().All()
 
 	for _, file := range files {
 		file := file
+
 		j := e.Pool.Schedule(ctx, &worker.Job{
 			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
 			Do: func(w *worker.Worker, ctx context.Context) error {

@@ -1,12 +1,10 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	log "github.com/sirupsen/logrus"
-	"heph/utils/tar"
 	"os"
 	"path/filepath"
 	"time"
@@ -17,7 +15,7 @@ func (e *Engine) vfsCachePath(target *Target, inputHash string) string {
 }
 
 func (e *Engine) localCacheLocation(target *Target, inputHash string) (vfs.Location, error) {
-	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target, inputHash).Abs())
+	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDirForHash(target, inputHash).Abs())
 	if err != nil {
 		return nil, err
 	}
@@ -80,17 +78,19 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		return err
 	}
 
-	err = e.vfsCopyFile(localRoot, remoteRoot, outputTarFile)
-	if err != nil {
-		return err
+	for _, name := range target.Out.Names() {
+		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheOutTarName(name))
+		if err != nil {
+			return err
+		}
+
+		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheOutHashName(name))
+		if err != nil {
+			return err
+		}
 	}
 
 	err = e.vfsCopyFile(localRoot, remoteRoot, inputHashFile)
-	if err != nil {
-		return err
-	}
-
-	err = e.vfsCopyFile(localRoot, remoteRoot, outputHashFile)
 	if err != nil {
 		return err
 	}
@@ -111,28 +111,23 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 		return false, err
 	}
 
-	err = e.vfsCopyFile(remoteRoot, localRoot, outputHashFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-
-		return false, err
-	}
-
-	if !onlyMeta {
-		e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
-
-		err = e.vfsCopyFile(remoteRoot, localRoot, outputTarFile)
+	for _, name := range target.Out.Names() {
+		err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheOutHashName(name))
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+
 			return false, err
 		}
 
-		dir := e.cacheDir(target, inputHash)
+		if !onlyMeta {
+			e.Status(fmt.Sprintf("Pulling %v from %v cache...", target.FQN, cacheName))
 
-		err = tar.Untar(context.Background(), e.targetOutputTarFile(target, inputHash), dir.Join(outputDir).Abs())
-		if err != nil {
-			return false, err
+			err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheOutTarName(name))
+			if err != nil {
+				return false, err
+			}
 		}
 	}
 

@@ -66,6 +66,7 @@ type TargetSpec struct {
 	Tools             TargetSpecTools
 	Out               []TargetSpecOutFile
 	Cache             TargetSpecCache
+	SupportFiles      []string
 	Sandbox           bool
 	OutInSandbox      bool
 	Codegen           string
@@ -185,7 +186,6 @@ type TargetSpecOutFile struct {
 type TargetSpecCache struct {
 	Enabled bool
 	Named   []string
-	Files   []string
 }
 
 func (c TargetSpecCache) NamedEnabled(name string) bool {

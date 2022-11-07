@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"github.com/zeebo/xxh3"
 	"io"
+	"sort"
 	"sync"
 )
 
@@ -17,6 +18,32 @@ type Hash interface {
 	Sum() string
 
 	io.Writer
+}
+
+func HashArray[T any](h Hash, a []T, f func(T) string) {
+	entries := make([]string, 0, len(a))
+	for _, e := range a {
+		entries = append(entries, f(e))
+	}
+
+	sort.Strings(entries)
+
+	for _, entry := range entries {
+		h.String(entry)
+	}
+}
+
+func HashMap[K comparable, V any](h Hash, a map[K]V, f func(K, V) string) {
+	entries := make([]string, 0, len(a))
+	for k, v := range a {
+		entries = append(entries, f(k, v))
+	}
+
+	sort.Strings(entries)
+
+	for _, entry := range entries {
+		h.String(entry)
+	}
 }
 
 func NewHash() Hash {

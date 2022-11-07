@@ -16,6 +16,7 @@ type TargetArgs struct {
 	Quiet          bool
 	PassArgs       bool
 	Cache          TargetArgsCache
+	SupportFiles   Array
 	SandboxEnabled bool
 	OutInSandbox   bool
 	Gen            bool
@@ -88,7 +89,6 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 type TargetArgsCache struct {
 	Enabled bool
 	Named   Array
-	Files   Array
 }
 
 func (c *TargetArgsCache) Unpack(v starlark.Value) error {
@@ -110,11 +110,6 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 				if err != nil {
 					return err
 				}
-			case "files":
-				err := cs.Files.Unpack(v)
-				if err != nil {
-					return err
-				}
 			default:
 				return fmt.Errorf("invalid arg %v, call heph.cache()", n)
 			}
@@ -124,17 +119,15 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	var ba BoolArray
-	err := ba.Unpack(v)
-	if err == nil {
+	b, ok := v.(starlark.Bool)
+	if ok {
 		*c = TargetArgsCache{
-			Enabled: ba.Bool,
-			Files:   ba.Array,
+			Enabled: bool(b),
 		}
 		return nil
 	}
 
-	return fmt.Errorf("cache must be bool, array, or call heph.cache()")
+	return fmt.Errorf("cache must be bool or call heph.cache(), got %v", v.Type())
 }
 
 type BoolArray struct {

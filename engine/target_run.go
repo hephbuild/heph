@@ -9,7 +9,9 @@ import (
 	"heph/exprs"
 	"heph/sandbox"
 	"heph/targetspec"
+	"heph/utils"
 	"heph/utils/fs"
+	"heph/utils/tar"
 	"heph/worker"
 	"io"
 	"os"
@@ -58,32 +60,29 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 		}
 	}()
 
-	if target.Cache.Enabled {
-		ok, dir, err := e.getCache(target, onlyMeta)
+	if !target.Cache.Enabled {
+		return false, nil
+	}
+
+	ok, err := e.getCache(target, onlyMeta)
+	if err != nil {
+		return false, err
+	}
+
+	if !ok {
+		return false, nil
+	}
+
+	log.Debugf("Using cache %v", target.FQN)
+
+	if !onlyMeta {
+		err = e.postRunOrWarm(target)
 		if err != nil {
 			return false, err
 		}
-
-		if ok {
-			log.Debugf("Using cache %v", target.FQN)
-
-			if !onlyMeta {
-				if dir == nil {
-					panic("dir is nil")
-				}
-
-				target.OutRoot = dir
-				err := e.populateActualFiles(target)
-				if err != nil {
-					return false, err
-				}
-			}
-
-			return true, nil
-		}
 	}
 
-	return false, nil
+	return true, nil
 }
 
 func (e *Engine) tmpRoot(target *Target) string {
@@ -147,14 +146,13 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	}()
 
 	target.LogFile = ""
-	target.OutRoot = nil
 	ctx := e.Context
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	if !rr.Shell && !rr.NoCache {
+	if target.Cache.Enabled && !rr.Shell && !rr.NoCache {
 		start := time.Now()
 		defer func() {
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
@@ -166,24 +164,19 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		}
 
 		if cached {
-			err = e.codegenLink(target)
-			if err != nil {
-				return err
-			}
-
 			return nil
 		}
 	}
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
-		if tool.Target.actualFilesOut == nil {
+		if tool.Target.actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		if dep.Target.actualFilesOut == nil {
+		if dep.Target.actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
@@ -215,14 +208,10 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		for _, dep := range deps.Targets {
 			dept := dep.Target
 
-			tarFile := e.targetOutputTarFile(dept, e.hashInput(dept))
-			fromTar := dep.Output == "" && fs.PathExists(tarFile)
+			tarFile := e.targetOutputTarFile(dept, dep.Output)
+			srcRec.AddTar(tarFile)
 
-			if fromTar {
-				srcRec.AddTar(tarFile)
-			}
-
-			for outName, files := range dept.NamedActualFilesOut().Named() {
+			for outName, files := range dept.ActualOutFiles().Named() {
 				if dep.Output == "" || dep.Output == outName {
 					srcName := name
 					if dep.Output == "" && outName != "" {
@@ -233,13 +222,8 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					}
 
 					for _, file := range files {
-						rec := srcRec
-						if fromTar {
-							rec = envSrcRec
-						}
-
 						srcRecNameToDepName[srcName] = name
-						rec.Add(srcName, file.Abs(), file.RelRoot(), dep.Full())
+						envSrcRec.Add(srcName, "", file.RelRoot(), dep.Full())
 					}
 				}
 			}
@@ -364,7 +348,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		namedOut := map[string][]string{}
 		for name, paths := range out {
 			for _, path := range paths {
-				if strings.Contains(path.RelRoot(), "*") {
+				if utils.IsGlob(path.RelRoot()) {
 					// Skip glob
 					continue
 				}
@@ -544,60 +528,109 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 	e.Status(fmt.Sprintf("Collecting %v output...", target.FQN))
 
-	target.OutRoot = &target.WorkdirRoot
+	outRoot := &target.WorkdirRoot
 	if target.OutInSandbox {
-		target.OutRoot = &target.SandboxRoot
+		outRoot = &target.SandboxRoot
 	}
 
-	err = e.populateActualFiles(target)
+	err = e.populateActualFiles(target, outRoot.Abs())
 	if err != nil {
 		return fmt.Errorf("popfilesout: %w", err)
 	}
 
-	if target.Cache.Enabled {
-		e.Status(fmt.Sprintf("Caching %v output...", target.FQN))
+	e.Status(fmt.Sprintf("Storing %v output...", target.FQN))
 
-		err := e.storeCache(ctx, target)
-		if err != nil {
-			return fmt.Errorf("cache: store: %w", err)
-		}
+	err = e.storeCache(ctx, target, outRoot.Abs())
+	if err != nil {
+		return fmt.Errorf("cache: store: %w", err)
+	}
 
-		if !e.DisableNamedCache {
-			for _, cache := range e.Config.Cache {
-				cache := cache
+	if target.Cache.Enabled && !e.DisableNamedCache {
+		for _, cache := range e.Config.Cache {
+			cache := cache
 
-				if !cache.Write {
-					continue
-				}
-
-				if !target.Cache.NamedEnabled(cache.Name) {
-					continue
-				}
-
-				e.Pool.Schedule(ctx, &worker.Job{
-					ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
-					Do: func(w *worker.Worker, ctx context.Context) error {
-						w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
-
-						err = e.storeVfsCache(cache, target)
-						if err != nil {
-							log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
-							return nil
-						}
-
-						return nil
-					},
-				})
+			if !cache.Write {
+				continue
 			}
+
+			if !target.Cache.NamedEnabled(cache.Name) {
+				continue
+			}
+
+			e.Pool.Schedule(ctx, &worker.Job{
+				ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
+				Do: func(w *worker.Worker, ctx context.Context) error {
+					w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
+
+					err = e.storeVfsCache(cache, target)
+					if err != nil {
+						log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
+						return nil
+					}
+
+					return nil
+				},
+			})
+		}
+	}
+
+	if !e.Config.KeepSandbox {
+		e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
+		err = deleteDir(target.SandboxRoot.Abs(), false)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = e.postRunOrWarm(target)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
+	outDir := e.cacheDir(target).Join("_output")
+
+	if !fs.PathExists(outDir.Abs()) {
+		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
+
+		err := os.RemoveAll(tmpOutDir)
+		if err != nil {
+			return err
 		}
 
-		if !e.Config.KeepSandbox {
-			e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
-			err = deleteDir(target.SandboxRoot.Abs(), false)
+		err = os.MkdirAll(tmpOutDir, os.ModePerm)
+		if err != nil {
+			return err
+		}
+
+		if len(target.SupportFiles) > 0 {
+			err := tar.Untar(context.Background(), e.targetSupportTarFile(target), tmpOutDir)
 			if err != nil {
 				return err
 			}
 		}
+
+		for _, name := range target.Out.Names() {
+			err := tar.Untar(context.Background(), e.targetOutputTarFile(target, name), tmpOutDir)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = os.Rename(tmpOutDir, outDir.Abs())
+		if err != nil {
+			return err
+		}
+	}
+
+	target.OutExpansionRoot = &outDir
+
+	err := e.populateActualFilesFromTar(target)
+	if err != nil {
+		return err
 	}
 
 	err = e.codegenLink(target)
@@ -615,56 +648,48 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 
 	e.Status(fmt.Sprintf("Linking %v output", target.FQN))
 
-	for _, file := range target.OutFilesInOutRoot() {
-		to := e.Root.Join(file.RelRoot()).Abs()
-
-		info, err := os.Lstat(to)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		exists := err == nil
-
+	for name, paths := range target.ActualOutFiles().Named() {
 		switch target.Codegen {
 		case targetspec.CodegenCopy:
-			if exists {
-				err = os.RemoveAll(to)
-				if err != nil {
-					return err
-				}
-			}
-
-			err := fs.CreateParentDir(to)
-			if err != nil {
-				return err
-			}
-
-			err = fs.Cp(file.Abs(), to)
+			tarPath := e.targetOutputTarFile(target, name)
+			err := tar.Untar(context.Background(), tarPath, e.Root.Abs())
 			if err != nil {
 				return err
 			}
 		case targetspec.CodegenLink:
-			if exists {
-				isLink := info.Mode().Type() == os.ModeSymlink
+			for _, path := range paths {
+				from := path.WithRoot(target.OutExpansionRoot.Abs()).Abs()
+				to := path.WithRoot(e.Root.Abs()).Abs()
 
-				if !isLink {
-					log.Warnf("linking codegen: %v already exists", to)
-					continue
+				info, err := os.Lstat(to)
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				exists := err == nil
+
+				if exists {
+					isLink := info.Mode().Type() == os.ModeSymlink
+
+					if !isLink {
+						log.Warnf("linking codegen: %v already exists", to)
+						continue
+					}
+
+					err := os.Remove(to)
+					if err != nil {
+						return err
+					}
 				}
 
-				err = os.Remove(to)
+				err = fs.CreateParentDir(to)
 				if err != nil {
 					return err
 				}
-			}
 
-			err := fs.CreateParentDir(to)
-			if err != nil {
-				return err
-			}
-
-			err = os.Symlink(file.Abs(), to)
-			if err != nil {
-				return err
+				err = os.Symlink(from, to)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	}
