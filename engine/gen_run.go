@@ -22,7 +22,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		return &worker.WaitGroup{}, nil
 	}
 
-	if !e.Config.DisableGC && rand.Float32() > 0.2 {
+	if false && !e.Config.DisableGC && rand.Float32() > 0.2 {
 		e.RegisterExitHandler(func() {
 			if !e.RanGenPass {
 				return
@@ -41,7 +41,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 
 			select {
 			case <-doneCh:
-			case <-time.After(2 * time.Second):
+			case <-time.After(1 * time.Second):
 				log.Info("Running GC...")
 				<-doneCh
 			}
