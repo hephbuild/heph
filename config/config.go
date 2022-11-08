@@ -18,7 +18,7 @@ type BaseConfig struct {
 type Config struct {
 	BaseConfig   `yaml:",inline"`
 	Cache        map[string]Cache
-	CacheHistory int
+	CacheHistory int  `yaml:"cache_history"`
 	DisableGC    bool `yaml:"disable_gc"`
 	BuildFiles   struct {
 		Ignore []string        `yaml:"ignore"`
