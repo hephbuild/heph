@@ -100,7 +100,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 	}
 
 	for _, tarFile := range cfg.SrcTar {
-		err := tar.Untar(ctx, tarFile, cfg.Dir)
+		err := tar.Untar(ctx, tarFile, cfg.Dir, false)
 		if err != nil {
 			return fmt.Errorf("make: untar: %w", err)
 		}

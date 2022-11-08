@@ -3,7 +3,6 @@ package engine
 import (
 	tar2 "archive/tar"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/bmatcuk/doublestar/v4"
@@ -834,51 +833,14 @@ func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, e
 		}
 	}()
 
-	listPath := tarPath + ".list"
-
-	if fs2.PathExists(listPath) {
-		f, err := os.Open(listPath)
-		if err != nil {
-			return nil, fmt.Errorf("colltar read: %w", err)
-		}
-		defer f.Close()
-
-		var ps []string
-		err = json.NewDecoder(f).Decode(&ps)
-		if err == nil {
-			return utils.Map(ps, func(s string) fs2.Path {
-				return fs2.NewRelPath(s).WithRoot(target.OutExpansionRoot.Abs())
-			}), nil
-		}
-
-		f.Close()
-
-		if !errors.Is(err, io.EOF) {
-			log.Errorf("cooltar dec %v: %v", listPath, err)
-		}
-	}
-
-	ps := make(fs2.Paths, 0)
-	pss := make([]string, 0)
-	err = tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
-		ps = append(ps, fs2.NewRelPath(hdr.Name).WithRoot(target.OutExpansionRoot.Abs()))
-		pss = append(pss, hdr.Name)
-
-		return nil
-	})
+	files, err := tar.UntarList(context.Background(), tarPath)
 	if err != nil {
 		return nil, err
 	}
 
-	f, err := os.Create(listPath)
-	if err != nil {
-		return nil, fmt.Errorf("colltar write: %w", err)
-	}
-	defer f.Close()
-
-	err = json.NewEncoder(f).Encode(pss)
-	if err != nil {
-		log.Errorf("cooltar enc %v: %v", listPath, err)
+	ps := make(fs2.Paths, len(files))
+	for i, file := range files {
+		ps[i] = fs2.NewRelPath(file).WithRoot(target.OutExpansionRoot.Abs())
 	}
 
 	return ps, nil

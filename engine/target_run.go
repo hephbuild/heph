@@ -608,14 +608,14 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 		}
 
 		if len(target.SupportFiles) > 0 {
-			err := tar.Untar(context.Background(), e.targetSupportTarFile(target), tmpOutDir)
+			err := tar.Untar(context.Background(), e.targetSupportTarFile(target), tmpOutDir, true)
 			if err != nil {
 				return err
 			}
 		}
 
 		for _, name := range target.Out.Names() {
-			err := tar.Untar(context.Background(), e.targetOutputTarFile(target, name), tmpOutDir)
+			err := tar.Untar(context.Background(), e.targetOutputTarFile(target, name), tmpOutDir, true)
 			if err != nil {
 				return err
 			}
@@ -655,7 +655,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 		switch target.Codegen {
 		case targetspec.CodegenCopy:
 			tarPath := e.targetOutputTarFile(target, name)
-			err := tar.Untar(context.Background(), tarPath, e.Root.Abs())
+			err := tar.Untar(context.Background(), tarPath, e.Root.Abs(), false)
 			if err != nil {
 				return err
 			}
