@@ -588,10 +588,6 @@ var cleanCmd = &cobra.Command{
 	},
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			return Engine.Clean(true)
-		}
-
 		err := preRunWithGen(cmd.Context(), false)
 		if err != nil {
 			return err

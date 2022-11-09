@@ -60,6 +60,10 @@ func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun b
 
 	targetHashDirs := map[string]*Target{}
 	for _, target := range e.Targets.Slice() {
+		if !target.Cache.Enabled {
+			continue
+		}
+
 		targetHashDirs[e.cacheDirForHash(target, "").Abs()] = target
 	}
 
@@ -69,7 +73,7 @@ func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun b
 		flog("%v:", reldir)
 		target, ok := targetHashDirs[dir]
 		if !ok {
-			flog("Not part of schema, delete")
+			flog("Not part of schema or not cached, delete")
 			if !dryrun {
 				err := os.RemoveAll(dir)
 				if err != nil {

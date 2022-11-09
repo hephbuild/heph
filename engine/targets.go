@@ -450,6 +450,10 @@ func (ts *Targets) Add(t *Target) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
+	if t == nil {
+		panic("target must not be nil")
+	}
+
 	ts.add(t)
 }
 

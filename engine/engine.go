@@ -9,6 +9,7 @@ import (
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
+	"go.starlark.net/starlark"
 	"heph/config"
 	"heph/packages"
 	"heph/sandbox"
@@ -63,6 +64,8 @@ type Engine struct {
 	RanGenPass                 bool
 	codegenPaths               map[string]*Target
 	fetchRootCache             map[string]fs2.Path
+	cacheRunBuildFilem         sync.RWMutex
+	cacheRunBuildFile          map[string]starlark.StringDict
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -148,16 +151,17 @@ func New(rootPath string) *Engine {
 	}
 
 	return &Engine{
-		Root:            root,
-		HomeDir:         homeDir,
-		LocalCache:      loc.(*vfsos.Location),
-		Targets:         NewTargets(0),
-		Packages:        map[string]*packages.Package{},
-		cacheHashInput:  map[string]string{},
-		cacheHashOutput: map[string]string{},
-		codegenPaths:    map[string]*Target{},
-		fetchRootCache:  map[string]fs2.Path{},
-		gcLock:          flock.NewFlock(homeDir.Join("tmp", "gc.lock").Abs()),
+		Root:              root,
+		HomeDir:           homeDir,
+		LocalCache:        loc.(*vfsos.Location),
+		Targets:           NewTargets(0),
+		Packages:          map[string]*packages.Package{},
+		cacheHashInput:    map[string]string{},
+		cacheHashOutput:   map[string]string{},
+		codegenPaths:      map[string]*Target{},
+		fetchRootCache:    map[string]fs2.Path{},
+		cacheRunBuildFile: map[string]starlark.StringDict{},
+		gcLock:            flock.NewFlock(homeDir.Join("tmp", "gc.lock").Abs()),
 	}
 }
 

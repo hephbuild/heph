@@ -223,30 +223,12 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 					Engine: e.Engine,
 					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
 					registerTarget: func(spec targetspec.TargetSpec) error {
-						e.TargetsLock.Lock()
-
-						if t := e.Targets.Find(spec.FQN); t != nil {
-							e.TargetsLock.Unlock()
-
-							if t.Gen {
-								return fmt.Errorf("cannot replace gen target")
-							}
-
-							if !t.TargetSpec.Equal(spec) {
-								return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
-							}
-
-							return nil
+						err := e.defaultRegisterTarget(spec)
+						if err != nil {
+							return err
 						}
 
-						t := &Target{
-							TargetSpec: spec,
-						}
-
-						e.Targets.Add(t)
-						e.TargetsLock.Unlock()
-
-						targets.Add(t)
+						targets.Add(e.Targets.Find(spec.FQN))
 						return nil
 					},
 				}

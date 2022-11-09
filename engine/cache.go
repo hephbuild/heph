@@ -16,7 +16,7 @@ func (e *Engine) cacheDir(target *Target) fs.Path {
 	return e.cacheDirForHash(target, e.hashInput(target))
 }
 
-var SOMEID = fmt.Sprint(time.Now().Nanosecond())
+var SOMEID = fmt.Sprintf("%v%v", os.Getpid(), time.Now().Nanosecond())
 
 func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	folder := "__target_" + target.Name

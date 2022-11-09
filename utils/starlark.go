@@ -16,6 +16,11 @@ func FromStarlark(v starlark.Value) interface{} {
 		return string(v)
 	case starlark.Bool:
 		return bool(v)
+	case starlark.Int:
+		vi, _ := v.Int64()
+		return vi
+	case starlark.Float:
+		return float64(v)
 	case *starlark.Dict:
 		data := map[interface{}]interface{}{}
 

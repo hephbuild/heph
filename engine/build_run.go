@@ -12,6 +12,7 @@ import (
 	fs2 "heph/utils/fs"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -92,18 +93,9 @@ func (e *Engine) runBuildFilesForPackage(pkg *packages.Package) error {
 	}
 
 	re := runBuildEngine{
-		Engine: e,
-		pkg:    pkg,
-		registerTarget: func(t targetspec.TargetSpec) error {
-			e.TargetsLock.Lock()
-			defer e.TargetsLock.Unlock()
-
-			e.Targets.Add(&Target{
-				TargetSpec: t,
-			})
-
-			return nil
-		},
+		Engine:         e,
+		pkg:            pkg,
+		registerTarget: e.defaultRegisterTarget,
 	}
 
 	err := re.runBuildFiles()
@@ -114,10 +106,42 @@ func (e *Engine) runBuildFilesForPackage(pkg *packages.Package) error {
 	return nil
 }
 
+func (e *Engine) runBuildFileForPackage(pkg *packages.Package, file string) (starlark.StringDict, error) {
+	re := runBuildEngine{
+		Engine:         e,
+		pkg:            pkg,
+		registerTarget: e.defaultRegisterTarget,
+	}
+
+	return re.runBuildFile(file)
+}
+
+func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
+	e.TargetsLock.Lock()
+
+	if t := e.Targets.Find(spec.FQN); t != nil {
+		e.TargetsLock.Unlock()
+
+		if !t.TargetSpec.Equal(spec) {
+			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
+		}
+
+		return nil
+	}
+
+	e.Targets.Add(&Target{
+		TargetSpec: spec,
+	})
+	e.TargetsLock.Unlock()
+
+	return nil
+}
+
 type runBuildEngine struct {
 	*Engine
 	pkg            *packages.Package
 	registerTarget func(targetspec.TargetSpec) error
+	breadcrumb     []string
 }
 
 func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *packages.Package) *packages.Package {
@@ -158,17 +182,6 @@ func (e *Engine) createPkg(path string) *packages.Package {
 			Root:     fs2.NewPath(e.Root.Abs(), path),
 		}
 	})
-}
-
-func (e *Engine) populatePkg(file *packages.SourceFile) *packages.Package {
-	root := filepath.Dir(file.Path)
-
-	relRoot, err := filepath.Rel(e.Root.Abs(), root)
-	if err != nil {
-		panic(err)
-	}
-
-	return e.createPkg(relRoot)
 }
 
 func (e *runBuildEngine) runBuildFiles() error {
@@ -218,13 +231,27 @@ func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.
 		return nil, err
 	}
 
-	pkg, err := e.loadFromRoots(p.Package)
-	if err != nil {
-		return nil, err
+	dirPkg, file := path.Split(p.Package)
+	dirPkg = strings.TrimSuffix(dirPkg, "/")
+	if file != "" {
+		pkg, err := e.loadFromRootsOrCreatePackage(dirPkg)
+		if err != nil {
+			return nil, err
+		}
+
+		p := pkg.Root.Join(file).Abs()
+
+		if fs2.PathExists(p) {
+			info, _ := os.Lstat(p)
+			if info.Mode().IsRegular() {
+				return e.runBuildFileForPackage(pkg, p)
+			}
+		}
 	}
 
-	if pkg == nil {
-		pkg = e.createPkg(p.Package)
+	pkg, err := e.loadFromRootsOrCreatePackage(p.Package)
+	if err != nil {
+		return nil, err
 	}
 
 	err = e.runBuildFilesForPackage(pkg)
@@ -233,6 +260,19 @@ func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.
 	}
 
 	return pkg.Globals, nil
+}
+
+func (e *runBuildEngine) loadFromRootsOrCreatePackage(pkgName string) (*packages.Package, error) {
+	pkg, err := e.loadFromRoots(pkgName)
+	if err != nil {
+		return nil, err
+	}
+
+	if pkg == nil {
+		pkg = e.createPkg(pkgName)
+	}
+
+	return pkg, nil
 }
 
 func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDict) (*starlark.Program, error) {
@@ -291,6 +331,13 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 }
 
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
+	e.cacheRunBuildFilem.RLock()
+	if globals, ok := e.cacheRunBuildFile[path]; ok {
+		e.cacheRunBuildFilem.RUnlock()
+		return globals, nil
+	}
+	e.cacheRunBuildFilem.RUnlock()
+
 	log.Tracef("BUILD: running %v", path)
 
 	thread := &starlark.Thread{
@@ -321,6 +368,10 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 		}
 		return nil, err
 	}
+
+	e.cacheRunBuildFilem.Lock()
+	e.cacheRunBuildFile[path] = res
+	e.cacheRunBuildFilem.Unlock()
 
 	return res, nil
 }
