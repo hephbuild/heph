@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/muesli/reflow/wrap"
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
 	"heph/worker"
@@ -158,14 +159,18 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				return
 			}
 
-			p.Printf("%s", bytes.TrimSpace(b))
+			b = bytes.TrimSpace(b)
+			if r.termWidth > 0 && len(b) > r.termWidth {
+				b = wrap.Bytes(b, r.termWidth)
+			}
+			p.Printf("%s", b)
 		},
 	})
 
 	prevOut := log.StandardLogger().Out
 	log.SetOutput(io.Discard)
 
-	err := p.Start()
+	_, err := p.Run()
 	r.running = false
 	log.SetOutput(prevOut)
 	if err != nil {
@@ -187,12 +192,13 @@ type UpdateMessage struct {
 }
 
 type renderer struct {
-	name    string
-	running bool
-	start   time.Time
-	cancel  func()
-	sb      strings.Builder
-	pool    *worker.Pool
+	name      string
+	running   bool
+	start     time.Time
+	cancel    func()
+	sb        strings.Builder
+	pool      *worker.Pool
+	termWidth int
 	UpdateMessage
 }
 
@@ -242,6 +248,8 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return r, tea.Batch(tea.Println(strings.Join(strs, "\n")))
 			}
 		}
+	case tea.WindowSizeMsg:
+		r.termWidth = msg.Width
 	}
 
 	return r, nil
