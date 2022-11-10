@@ -170,7 +170,7 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	prevOut := log.StandardLogger().Out
 	log.SetOutput(io.Discard)
 
-	_, err := p.Run()
+	err := p.Start()
 	r.running = false
 	log.SetOutput(prevOut)
 	if err != nil {
