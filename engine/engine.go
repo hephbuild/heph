@@ -797,6 +797,8 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths, root
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
+		tp.ProvisonName(name)
+
 		files, err := e.collectOut(target, paths, root)
 		if err != nil {
 			return nil, err
@@ -814,6 +816,8 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 	tp := &ActualOutNamedPaths{}
 
 	for name := range namedPaths.Named() {
+		tp.ProvisonName(name)
+
 		files, err := e.collectOutFromTar(target, e.targetOutputTarFile(target, name))
 		if err != nil {
 			return nil, err

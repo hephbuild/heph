@@ -100,7 +100,7 @@ func (tp *NamedPaths[TS, T]) Names() []string {
 	return tp.names
 }
 
-func (tp *NamedPaths[TS, T]) Add(name string, p T) {
+func (tp *NamedPaths[TS, T]) ProvisonName(name string) {
 	if tp.named == nil {
 		tp.named = map[string]TS{}
 	}
@@ -109,6 +109,10 @@ func (tp *NamedPaths[TS, T]) Add(name string, p T) {
 		tp.names = append(tp.names, name)
 		tp.named[name] = make(TS, 0)
 	}
+}
+
+func (tp *NamedPaths[TS, T]) Add(name string, p T) {
+	tp.ProvisonName(name)
 	tp.named[name] = append(tp.named[name], p)
 
 	if tp.allm == nil {
