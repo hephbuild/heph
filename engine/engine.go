@@ -232,18 +232,22 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 		return nil
 	}
 
-	h.UI32(uint32(info.Mode().Perm()))
-
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 	defer f.Close()
 
+	return e.hashFileReader(h, info, f)
+}
+
+func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) error {
+	h.UI32(uint32(info.Mode().Perm()))
+
 	buf := copyBufPool.Get().([]byte)
 	defer copyBufPool.Put(buf)
 
-	_, err = io.CopyBuffer(h, f, buf)
+	_, err := io.CopyBuffer(h, f, buf)
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -335,6 +339,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}()
 
 	h := utils.NewHash()
+	h.I64(1) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
@@ -417,12 +422,12 @@ func (e *Engine) hashInput(target *Target) string {
 }
 
 func (e *Engine) hashOutput(target *Target, output string) string {
-	mu := e.cacheHashOutputTargetMutex.Get(target.FQN)
+	mu := e.cacheHashOutputTargetMutex.Get(target.FQN + "|" + output)
 	mu.Lock()
 	defer mu.Unlock()
 
 	hashInput := e.hashInput(target)
-	cacheId := target.FQN + "_" + hashInput
+	cacheId := target.FQN + "|" + output + "_" + hashInput
 
 	e.cacheHashOutputMutex.RLock()
 	if h, ok := e.cacheHashOutput[cacheId]; ok {
@@ -468,8 +473,10 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 		switch hdr.Typeflag {
 		case tar2.TypeReg:
-			//h.I64(hdr.Mode)
-			if _, err := io.CopyN(h, r, hdr.Size); err != nil {
+			h.I64(hdr.Mode)
+
+			err := e.hashFileReader(h, hdr.FileInfo(), io.LimitReader(r, hdr.Size))
+			if err != nil {
 				return err
 			}
 
@@ -477,10 +484,6 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		case tar2.TypeDir:
 			return nil
 		case tar2.TypeSymlink:
-			if hdr.Linkname == "" {
-				return fmt.Errorf("untar: symlink empty for %v", hdr.Name)
-			}
-
 			h.String(hdr.Linkname)
 		default:
 			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
