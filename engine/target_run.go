@@ -312,11 +312,14 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if !(target.SrcEnv.All == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
+			fileEnv := target.SrcEnv.Get(srcRecNameToDepName[name])
+			if fileEnv == targetspec.FileEnvIgnore {
+				continue
+			}
+
 			spaths := make([]string, 0)
 			for _, path := range paths {
-				switch v := target.SrcEnv.Get(srcRecNameToDepName[name]); v {
-				case targetspec.FileEnvIgnore:
-					continue
+				switch fileEnv {
 				case targetspec.FileEnvAbs:
 					spaths = append(spaths, target.SandboxRoot.Join(path).Abs())
 				case targetspec.FileEnvRelRoot:
@@ -331,7 +334,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					rel = strings.TrimPrefix(rel, "/")
 					spaths = append(spaths, rel)
 				default:
-					panic("unhandled src_env: " + v)
+					panic("unhandled src_env: " + fileEnv)
 				}
 			}
 
