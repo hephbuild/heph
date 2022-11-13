@@ -186,7 +186,7 @@ var rootCmd = &cobra.Command{
 			return fmt.Errorf("alias %v not defined\n", alias)
 		}
 
-		err = run(cmd.Context(), []engine.TargetRunRequest{{Target: target, Args: args[1:]}}, true)
+		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, Args: args[1:]}}, true)
 		if err != nil {
 			return err
 		}
@@ -220,7 +220,7 @@ var runCmd = &cobra.Command{
 			return err
 		}
 
-		rrs, err := parseTargetsAndArgs(args)
+		rrs, err := parseTargetsAndArgs(Engine, args)
 		if err != nil {
 			return err
 		}
@@ -232,7 +232,7 @@ var runCmd = &cobra.Command{
 
 		fromStdin := hasStdin(args)
 
-		err = run(cmd.Context(), rrs, !fromStdin)
+		err = run(cmd.Context(), Engine, rrs, !fromStdin)
 		if err != nil {
 			return err
 		}
@@ -282,6 +282,10 @@ func findRoot() (string, error) {
 		return "", err
 	}
 
+	if cwd := os.Getenv("HEPH_CWD"); cwd != "" {
+		root = cwd
+	}
+
 	parts := strings.Split(root, string(filepath.Separator))
 	for len(parts) > 0 {
 		p := "/" + filepath.Join(parts...)
@@ -296,35 +300,43 @@ func findRoot() (string, error) {
 	return "", fmt.Errorf("root not found")
 }
 
+func engineFactory() (*engine.Engine, error) {
+	root, err := findRoot()
+	if err != nil {
+		return nil, err
+	}
+
+	log.Tracef("Root: %v", root)
+
+	e := engine.New(root)
+
+	return e, nil
+}
+
 func engineInit() error {
 	if Engine != nil {
 		return nil
 	}
 
-	if cwd := os.Getenv("HEPH_CWD"); cwd != "" {
-		err := os.Chdir(cwd)
-		if err != nil {
-			return err
-		}
-	}
-
-	root, err := findRoot()
+	var err error
+	Engine, err = engineFactory()
 	if err != nil {
 		return err
 	}
 
-	log.Tracef("Root: %v", root)
+	return engineInitWithEngine(Engine)
+}
 
-	Engine = engine.New(root)
-	Engine.Config.Profiles = *profiles
+func engineInitWithEngine(e *engine.Engine) error {
+	e.Config.Profiles = *profiles
 
-	err = Engine.Init()
+	err := e.Init()
 	if err != nil {
 		return err
 	}
 
 	paramsm := map[string]string{}
-	for k, v := range Engine.Config.Params {
+	for k, v := range e.Config.Params {
 		paramsm[k] = v
 	}
 	for _, s := range *params {
@@ -335,10 +347,13 @@ func engineInit() error {
 
 		paramsm[parts[0]] = parts[1]
 	}
-	Engine.Params = paramsm
-	Engine.Pool = worker.NewPool(*workers)
+	e.Params = paramsm
+	e.Pool = worker.NewPool(*workers)
+	e.RegisterExitHandler(func() {
+		e.Pool.Stop(nil)
+	})
 
-	err = Engine.Parse()
+	err = e.Parse()
 	if err != nil {
 		return err
 	}
@@ -347,7 +362,19 @@ func engineInit() error {
 }
 
 func preRunWithGen(ctx context.Context, silent bool) error {
-	err := engineInit()
+	if Engine == nil {
+		var err error
+		Engine, err = engineFactory()
+		if err != nil {
+			return err
+		}
+	}
+
+	return preRunWithGenWithEngine(ctx, Engine, silent)
+}
+
+func preRunWithGenWithEngine(ctx context.Context, e *engine.Engine, silent bool) error {
+	err := engineInitWithEngine(e)
 	if err != nil {
 		return err
 	}
@@ -357,12 +384,12 @@ func preRunWithGen(ctx context.Context, silent bool) error {
 		return nil
 	}
 
-	deps, err := Engine.ScheduleGenPass(ctx)
+	deps, err := e.ScheduleGenPass(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = WaitPool("PreRun gen", deps, silent)
+	err = WaitPool("PreRun gen", e.Pool, deps, silent)
 	if err != nil {
 		return err
 	}
@@ -386,7 +413,7 @@ var cleanCmd = &cobra.Command{
 		var targets []*engine.Target
 		if hasStdin(args) {
 			var err error
-			targets, err = parseTargetsFromStdin()
+			targets, err = parseTargetsFromStdin(Engine)
 			if err != nil {
 				return err
 			}

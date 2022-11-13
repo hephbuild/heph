@@ -1092,9 +1092,21 @@ func (e *Engine) GetTargetShortcuts() []targetspec.TargetSpec {
 }
 
 func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
+	return e.getFileDeps(targets, func(target *Target) TargetDeps {
+		return target.Deps.All()
+	})
+}
+
+func (e *Engine) GetFileHashDeps(targets ...*Target) []fs2.Path {
+	return e.getFileDeps(targets, func(target *Target) TargetDeps {
+		return target.HashDeps
+	})
+}
+
+func (e *Engine) getFileDeps(targets []*Target, f func(*Target) TargetDeps) []fs2.Path {
 	filesm := map[string]fs2.Path{}
 	for _, target := range targets {
-		for _, file := range target.HashDeps.Files {
+		for _, file := range f(target).Files {
 			filesm[file.Abs()] = file
 		}
 	}
@@ -1109,6 +1121,34 @@ func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
 	})
 
 	return files
+}
+
+func (e *Engine) GetWatcherList(files []fs2.Path) []string {
+	pm := map[string]struct{}{}
+
+	for _, file := range files {
+		filep := file.Abs()
+		for {
+			filep = filepath.Dir(filep)
+			if filep == "." || filep == "/" {
+				break
+			}
+
+			if !strings.HasPrefix(filep, e.Root.Abs()) {
+				break
+			}
+
+			pm[filep] = struct{}{}
+		}
+	}
+
+	paths := make([]string, 0)
+	for p := range pm {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+
+	return paths
 }
 
 func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {

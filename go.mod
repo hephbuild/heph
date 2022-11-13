@@ -13,7 +13,7 @@ require (
 	github.com/charmbracelet/bubbles v0.14.0
 	github.com/charmbracelet/bubbletea v0.22.1
 	github.com/coreos/go-semver v0.3.0
-	github.com/fsnotify/fsnotify v1.5.5-0.20220908164714-85acde25252d
+	github.com/fsnotify/fsnotify v1.6.0
 	github.com/heimdalr/dag v1.2.1
 	github.com/json-iterator/go v1.1.12
 	github.com/lithammer/fuzzysearch v1.1.5

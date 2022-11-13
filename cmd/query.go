@@ -81,7 +81,7 @@ var queryCmd = &cobra.Command{
 				return err
 			}
 
-			err = WaitPool("Query Gen", deps, false)
+			err = WaitPool("Query Gen", Engine.Pool, deps, false)
 			if err != nil {
 				return err
 			}
@@ -90,7 +90,7 @@ var queryCmd = &cobra.Command{
 		targets := Engine.Targets.Slice()
 		if hasStdin(args) {
 			var err error
-			targets, err = parseTargetsFromStdin()
+			targets, err = parseTargetsFromStdin(Engine)
 			if err != nil {
 				return err
 			}
@@ -584,7 +584,7 @@ var outCmd = &cobra.Command{
 			return engine.TargetNotFoundError(tp.Full())
 		}
 
-		err = run(cmd.Context(), []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
