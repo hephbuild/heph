@@ -132,7 +132,7 @@ func (wg *WaitGroup) Err() error {
 	return wg.err
 }
 
-func (wg *WaitGroup) walkerTransitiveCount(mj map[string]struct{}, mwg map[*WaitGroup]struct{}, fs ...func(j *Job)) {
+func (wg *WaitGroup) walkerTransitiveCount(mj map[uint64]struct{}, mwg map[*WaitGroup]struct{}, fs ...func(j *Job)) {
 	if _, ok := mwg[wg]; ok {
 		return
 	}
@@ -159,7 +159,7 @@ func (wg *WaitGroup) walkerTransitiveCount(mj map[string]struct{}, mwg map[*Wait
 func (wg *WaitGroup) TransitiveCount() (uint64, uint64) {
 	var all, success uint64
 
-	mj := map[string]struct{}{}
+	mj := map[uint64]struct{}{}
 	mwg := map[*WaitGroup]struct{}{}
 	wg.walkerTransitiveCount(mj, mwg,
 		func(j *Job) {
@@ -202,7 +202,7 @@ func (wg *WaitGroup) keepWaiting() error {
 		job := job
 
 		if !job.done {
-			return fmt.Errorf("%v is %w", job.ID, ErrPending)
+			return fmt.Errorf("%v is %w", job.Name, ErrPending)
 		}
 
 		if job.State == StateSuccess {
@@ -214,15 +214,15 @@ func (wg *WaitGroup) keepWaiting() error {
 		}
 
 		if job.State == StatePending {
-			return fmt.Errorf("%v is %w", job.ID, ErrPending)
+			return fmt.Errorf("%v is %w", job.Name, ErrPending)
 		}
 
 		jerr := job.err
 		if jerr != nil {
-			return fmt.Errorf("%v is %v: %w", job.ID, job.State.String(), jerr)
+			return fmt.Errorf("%v is %v: %w", job.Name, job.State.String(), jerr)
 		}
 
-		return fmt.Errorf("%v is %v", job.ID, job.State.String())
+		return fmt.Errorf("%v is %v", job.Name, job.State.String())
 	}
 
 	return nil

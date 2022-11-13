@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,7 +42,8 @@ func (s JobState) String() string {
 }
 
 type Job struct {
-	ID    string
+	Name  string
+	ID    uint64
 	Deps  *WaitGroup
 	Do    func(w *Worker, ctx context.Context) error
 	State JobState
@@ -57,12 +59,12 @@ type Job struct {
 }
 
 func (j *Job) Done() {
-	log.Tracef("job %v done", j.ID)
+	log.Tracef("job %v done", j.Name)
 	j.doneWithState(StateSuccess)
 }
 
 func (j *Job) DoneWithErr(err error, state JobState) {
-	log.Tracef("job %v done with err %v", j.ID, err)
+	log.Tracef("job %v done with err %v", j.Name, err)
 	j.err = err
 	j.doneWithState(state)
 }
@@ -115,12 +117,13 @@ type Pool struct {
 	stopErr error
 	jobs    *WaitGroup
 	m       sync.Mutex
+	idc     uint64
 }
 
 func safelyJobDo(j *Job, w *Worker) (err error) {
 	defer func() {
 		if rerr := recover(); rerr != nil {
-			err = fmt.Errorf("panic in %v: %v => %v", j.ID, rerr, string(debug.Stack()))
+			err = fmt.Errorf("panic in %v: %v => %v", j.Name, rerr, string(debug.Stack()))
 		}
 	}()
 
@@ -173,7 +176,7 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	p.m.Lock()
 	defer p.m.Unlock()
 
-	log.Tracef("Scheduling %v", job.ID)
+	log.Tracef("Scheduling %v %v", job.Name, job.ID)
 
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -181,6 +184,7 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 		cancel()
 	}()
 
+	job.ID = atomic.AddUint64(&p.idc, 1)
 	job.State = StatePending
 	job.ctx = ctx
 	job.cancel = cancel
@@ -215,14 +219,14 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 
 	if err == nil {
 		job.Done()
-		log.Debugf("finalize job: %v %v", job.ID, job.State.String())
+		log.Debugf("finalize job: %v %v", job.Name, job.State.String())
 	} else {
 		if skippedOnErr {
 			job.DoneWithErr(err, StateSkipped)
 		} else {
 			job.DoneWithErr(err, StateFailure)
 		}
-		log.Debugf("finalize job err: %v %v: %v", job.ID, job.State.String(), err)
+		log.Debugf("finalize job err: %v %v: %v", job.Name, job.State.String(), err)
 	}
 
 	p.wg.Done()

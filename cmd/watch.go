@@ -118,16 +118,17 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) error {
 }
 
 func (w *watchCtx) triggerRun(currentEvents []watchEvent) {
-	if w.runCancel != nil {
-		w.runCancel()
-	}
-
 	// Should be nil if currentEvents is nil
 	var filteredEvents []watchEvent
 	if currentEvents != nil {
+		codegenPaths := w.e.CodegenPaths()
 		m := map[string]watchEvent{}
 
 		for _, e := range currentEvents {
+			if _, ok := codegenPaths[e.RelPath]; ok {
+				continue
+			}
+
 			if me, ok := m[e.Name]; ok {
 				me.Op |= e.Op
 				m[e.Name] = me
@@ -144,11 +145,19 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) {
 
 			filteredEvents = append(filteredEvents, e)
 		}
+
+		if len(filteredEvents) == 0 {
+			return
+		}
 	}
 
 	//for _, event := range filteredEvents {
 	//	log.Warn(event)
 	//}
+
+	if w.runCancel != nil {
+		w.runCancel()
+	}
 
 	for _, e := range filteredEvents {
 		if e.Op.Has(fsnotify.Create) || e.Op.Has(fsnotify.Remove) || e.Op.Has(fsnotify.Rename) {

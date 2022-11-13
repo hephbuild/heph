@@ -214,7 +214,7 @@ func printJobsWaitStack(jobs []*worker.Job, d int) []string {
 			continue
 		}
 
-		strs = append(strs, fmt.Sprintf("%v- %v (%v)", prefix, j.ID, j.State.String()))
+		strs = append(strs, fmt.Sprintf("%v- %v (%v)", prefix, j.Name, j.State.String()))
 
 		deps := j.Deps.Jobs()
 		if len(deps) > 0 {
