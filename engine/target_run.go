@@ -561,7 +561,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 			}
 
 			e.Pool.Schedule(ctx, &worker.Job{
-				ID: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
+				Name: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
 				Do: func(w *worker.Worker, ctx context.Context) error {
 					w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
 

@@ -599,8 +599,6 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 		}
 	}
 
-	schedId := fmt.Sprintf("_%v", time.Now().Nanosecond())
-
 	deps := &WaitGroupMap{}
 	pullMetaDeps := &WaitGroupMap{}
 	pullAllMetaDeps := &worker.WaitGroup{}
@@ -609,7 +607,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 		target := target
 
 		pj := e.Pool.Schedule(ctx, &worker.Job{
-			ID:   "pull_meta_" + target.FQN + schedId,
+			Name: "pull_meta " + target.FQN,
 			Deps: pullMetaDeps.Get(target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
@@ -679,7 +677,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 		sdeps.AddChild(scheduleDeps.Get(target.FQN))
 
 		sj := e.Pool.Schedule(ctx, &worker.Job{
-			ID:   "schedule_" + target.FQN + schedId,
+			Name: "schedule " + target.FQN,
 			Deps: sdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Scheduling %v...", target.FQN))
@@ -740,7 +738,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 
 func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   "warm_" + target.FQN,
+		Name: "warm " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
@@ -769,7 +767,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, de
 
 func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   rr.Target.FQN,
+		Name: rr.Target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{

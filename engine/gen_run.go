@@ -87,7 +87,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 	}
 
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   "finalize gen",
+		Name: "finalize gen",
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			w.Status("Finalizing gen...")
@@ -142,7 +142,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	}
 
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   fmt.Sprintf("ScheduleGeneratedPipeline_%v", e.Name),
+		Name: "ScheduleGeneratedPipeline_%v" + e.Name,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			w.Status(fmt.Sprintf("Finalizing generated %v...", e.Name))
@@ -199,7 +199,7 @@ func (e *Engine) linkAndDagGenTargets() error {
 
 func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *Targets) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		ID:   "rungen_" + target.FQN,
+		Name: "rungen_" + target.FQN,
 		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			return e.scheduleRunGeneratedFiles(ctx, target, deps, targets)
@@ -215,7 +215,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 		file := file
 
 		j := e.Pool.Schedule(ctx, &worker.Job{
-			ID: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
+			Name: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(fmt.Sprintf("Running %v", file.RelRoot()))
 
