@@ -19,7 +19,7 @@ func hasStdin(args []string) bool {
 	return len(args) == 1 && args[0] == "-"
 }
 
-func parseTargetsFromStdin() ([]*engine.Target, error) {
+func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 	tps, err := parseTargetPathsFromStdin()
 	if err != nil {
 		return nil, err
@@ -28,7 +28,7 @@ func parseTargetsFromStdin() ([]*engine.Target, error) {
 	targets := make([]*engine.Target, 0)
 
 	for _, tp := range tps {
-		target := Engine.Targets.Find(tp.Full())
+		target := e.Targets.Find(tp.Full())
 		if target == nil {
 			return nil, engine.TargetNotFoundError(tp.Full())
 		}
@@ -66,9 +66,9 @@ func parseTargetPathsFromStdin() ([]targetspec.TargetPath, error) {
 	return targetsFromStdin, nil
 }
 
-func parseTargetsAndArgs(args []string) ([]engine.TargetRunRequest, error) {
+func parseTargetsAndArgs(e *engine.Engine, args []string) ([]engine.TargetRunRequest, error) {
 	if hasStdin(args) {
-		targets, err := parseTargetsFromStdin()
+		targets, err := parseTargetsFromStdin(e)
 		if err != nil {
 			return nil, err
 		}
@@ -95,7 +95,7 @@ func parseTargetsAndArgs(args []string) ([]engine.TargetRunRequest, error) {
 		return nil, err
 	}
 
-	target := Engine.Targets.Find(tp.Full())
+	target := e.Targets.Find(tp.Full())
 	if target == nil {
 		return nil, engine.TargetNotFoundError(tp.Full())
 	}
@@ -127,7 +127,7 @@ func (e ErrorWithExitCode) Unwrap() error {
 	return e.Err
 }
 
-func run(ctx context.Context, rrs engine.TargetRunRequests, inlineSingle bool) error {
+func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, inlineSingle bool) error {
 	shellCount := rrs.Count(func(rr engine.TargetRunRequest) bool {
 		return rr.Shell
 	})
@@ -151,7 +151,7 @@ func run(ctx context.Context, rrs engine.TargetRunRequests, inlineSingle bool) e
 
 	targets := rrs.Targets()
 
-	tdeps, err := Engine.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
+	tdeps, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
 	if err != nil {
 		return err
 	}
@@ -161,7 +161,7 @@ func run(ctx context.Context, rrs engine.TargetRunRequests, inlineSingle bool) e
 		deps.AddChild(tdeps.Get(target.FQN))
 	}
 
-	err = WaitPool("Run", deps, false)
+	err = WaitPool("Run", e.Pool, deps, false)
 	if err != nil {
 		return err
 	}
@@ -170,15 +170,15 @@ func run(ctx context.Context, rrs engine.TargetRunRequests, inlineSingle bool) e
 		return nil
 	}
 
-	e := engine.TargetRunEngine{
-		Engine:  Engine,
+	re := engine.TargetRunEngine{
+		Engine:  e,
 		Context: ctx,
 		Print: func(s string) {
 			log.Debug(s)
 		},
 	}
 
-	err = e.Run(*inlineInvocationTarget, sandbox.IOConfig{
+	err = re.Run(*inlineInvocationTarget, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,

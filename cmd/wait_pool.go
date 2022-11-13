@@ -28,13 +28,11 @@ func (h hookFunc) Fire(entry *log.Entry) error {
 	return nil
 }
 
-func WaitPool(name string, deps *worker.WaitGroup, forceSilent bool) error {
+func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilent bool) error {
 	log.Tracef("WaitPool %v", name)
 	defer func() {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
-
-	pool := Engine.Pool
 
 	if !forceSilent && isTerm && !*plain {
 		err := PoolUI(name, deps, pool)
