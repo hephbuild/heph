@@ -20,7 +20,7 @@ e2e_test(
 
 e2e_test(
     name="basic_query_sanity",
-    cmd="heph query alltargets | grep '//test/sanity'",
+    cmd="heph query -a | grep '//test/sanity'",
     expected_output="""
 //test/sanity:basic_query_sanity
 //test/sanity:codegen-copy
