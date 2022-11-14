@@ -315,20 +315,23 @@ func engineFactory() (*engine.Engine, error) {
 }
 
 func engineInit() error {
-	if Engine != nil {
-		return nil
-	}
-
-	var err error
-	Engine, err = engineFactory()
-	if err != nil {
-		return err
+	if Engine == nil {
+		var err error
+		Engine, err = engineFactory()
+		if err != nil {
+			return err
+		}
 	}
 
 	return engineInitWithEngine(Engine)
 }
 
 func engineInitWithEngine(e *engine.Engine) error {
+	if e.RanInit {
+		return nil
+	}
+	e.RanInit = true
+
 	e.Config.Profiles = *profiles
 
 	err := e.Init()
@@ -363,15 +366,17 @@ func engineInitWithEngine(e *engine.Engine) error {
 }
 
 func preRunWithGen(ctx context.Context, silent bool) error {
-	if Engine == nil {
-		var err error
-		Engine, err = engineFactory()
-		if err != nil {
-			return err
-		}
+	err := engineInit()
+	if err != nil {
+		return err
 	}
 
-	return preRunWithGenWithEngine(ctx, Engine, silent)
+	err = preRunWithGenWithEngine(ctx, Engine, silent)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func preRunWithGenWithEngine(ctx context.Context, e *engine.Engine, silent bool) error {
