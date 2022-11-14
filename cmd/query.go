@@ -174,10 +174,12 @@ var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Prints config",
 	Args:  cobra.NoArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return engineInit()
-	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := engineInit()
+		if err != nil {
+			return err
+		}
+
 		b, err := yaml.Marshal(Engine.Config)
 		if err != nil {
 			return err
@@ -193,10 +195,12 @@ var codegenCmd = &cobra.Command{
 	Use:   "codegen",
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return engineInit()
-	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		paths := make([]string, 0)
 
 		for p, t := range Engine.CodegenPaths() {
@@ -214,14 +218,16 @@ var codegenCmd = &cobra.Command{
 }
 
 var graphCmd = &cobra.Command{
-	Use:   "graph <target>",
-	Short: "Prints deps target graph",
-	Args:  cobra.ExactValidArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
+	Use:               "graph <target>",
+	Short:             "Prints deps target graph",
+	Args:              cobra.ExactValidArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
@@ -244,14 +250,16 @@ var graphCmd = &cobra.Command{
 }
 
 var graphDotCmd = &cobra.Command{
-	Use:   "graphdot [ancestors|descendants <target>]",
-	Short: "Outputs graph do",
-	Args:  cobra.ArbitraryArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
+	Use:               "graphdot [ancestors|descendants <target>]",
+	Short:             "Outputs graph do",
+	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		fmt.Printf(`
 digraph G  {
 	fontname="Helvetica,Arial,sans-serif"
@@ -320,14 +328,16 @@ digraph G  {
 }
 
 var changesCmd = &cobra.Command{
-	Use:   "changes <since>",
-	Short: "Prints deps target changes",
-	Args:  cobra.ExactValidArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
+	Use:               "changes <since>",
+	Short:             "Prints deps target changes",
+	Args:              cobra.ExactValidArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
-	RunE: func(_ *cobra.Command, args []string) error {
+	RunE: func(c *cobra.Command, args []string) error {
+		err := preRunWithGen(c.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		since := args[0]
 
 		cmd := exec.Command("git", "--no-pager", "diff", "--name-only", since+"...HEAD")
@@ -447,14 +457,19 @@ var pkgsCmd = &cobra.Command{
 	Use:   "pkgs",
 	Short: "Prints pkgs details",
 	Args:  cobra.NoArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		if spec {
-			return engineInit()
+			err := engineInit()
+			if err != nil {
+				return err
+			}
 		} else {
-			return preRunWithGen(cmd.Context(), false)
+			err := preRunWithGen(cmd.Context(), false)
+			if err != nil {
+				return err
+			}
 		}
-	},
-	RunE: func(_ *cobra.Command, args []string) error {
+
 		pkgs := make([]*packages.Package, 0)
 		for _, p := range Engine.Packages {
 			pkgs = append(pkgs, p)
@@ -481,11 +496,12 @@ var depsCmd = &cobra.Command{
 	Use:   "deps <target>",
 	Short: "Prints target dependencies",
 	Args:  cobra.ExactArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
 
-	RunE: func(_ *cobra.Command, args []string) error {
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
@@ -527,10 +543,12 @@ var depsOnCmd = &cobra.Command{
 	Use:   "depson <target>",
 	Short: "Prints targets dependent on",
 	Args:  cobra.ExactArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
-	RunE: func(_ *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
@@ -570,14 +588,16 @@ var depsOnCmd = &cobra.Command{
 }
 
 var outCmd = &cobra.Command{
-	Use:   "out <target>",
-	Short: "Prints targets output path",
-	Args:  cobra.ExactArgs(1),
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return preRunWithGen(cmd.Context(), false)
-	},
+	Use:               "out <target>",
+	Short:             "Prints targets output path",
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
