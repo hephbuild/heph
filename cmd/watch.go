@@ -15,9 +15,7 @@ import (
 )
 
 type watchRun struct {
-	ctx               context.Context
-	events            []watchEvent
-	needRunBuildFiles bool
+	rrs engine.TargetRunRequests
 }
 
 type watchEvent struct {
@@ -29,93 +27,82 @@ type watchCtx struct {
 	ctx       context.Context
 	watcher   *fsnotify.Watcher
 	e         *engine.Engine
-	runCancel context.CancelFunc
 	sigsCh    chan watchRun
-	rrs       []engine.TargetRunRequest
+	runCancel context.CancelFunc
+	runCh     chan struct{}
+	rrs       engine.TargetRunRequests
 	targets   *engine.Targets
 
 	m           sync.Mutex
 	graphSigsCh chan struct{}
 }
 
-func (w *watchCtx) run(r watchRun, fromStdin bool) error {
+func (w *watchCtx) cancelRunAndWait() {
+	if w.runCancel != nil {
+		w.runCancel()
+	}
+
+	// Wait for previous run to end
+	if w.runCh != nil {
+		select {
+		case <-w.runCh:
+		case <-time.After(time.Second):
+			log.Infof("Waiting for previous run to finish...")
+			<-w.runCh
+		}
+	}
+}
+
+func (w *watchCtx) run(r watchRun, fromStdin bool) {
+	ctx, cancel := context.WithCancel(w.ctx)
+	defer cancel()
+
+	w.cancelRunAndWait()
+
 	w.m.Lock()
 	defer w.m.Unlock()
+
+	w.runCancel = cancel
 
 	fmt.Fprintln(os.Stderr)
 	log.Infof("Got change...")
 
-	localRRs := w.rrs
-	if r.events != nil {
-		allTargets, err := w.e.DAG().GetOrderedAncestors(w.targets.Slice(), true)
+	runCh := make(chan struct{})
+	w.runCh = runCh
+	defer close(runCh)
+
+	if !w.e.RanGenPass {
+		wg, err := w.e.ScheduleGenPass(ctx)
 		if err != nil {
-			return err
+			log.Error(err)
+			return
 		}
 
-		files := make([]string, 0)
-		for _, event := range r.events {
-			files = append(files, event.RelPath)
-		}
-
-		fileDescendantsTargets, err := w.e.GetFileDescendants(files, allTargets)
-		if err != nil {
-			return err
-		}
-
-		descendants, err := w.e.DAG().GetOrderedDescendants(fileDescendantsTargets, true)
-		if err != nil {
-			return err
-		}
-
-		localRRs = make([]engine.TargetRunRequest, 0)
-		for _, target := range descendants {
-			w.e.ResetCacheHashInput(target)
-
-			if target.Gen {
-				w.e.RanGenPass = false
-				w.e.DisableNamedCache = false
-			} else {
-				if w.targets.Find(target.FQN) != nil {
-					localRRs = append(localRRs, engine.TargetRunRequest{Target: target})
-				}
-			}
-		}
-
-		if !w.e.RanGenPass {
-			wg, err := w.e.ScheduleGenPass(r.ctx)
-			if err != nil {
+		select {
+		case <-ctx.Done():
+			log.Error(ctx.Err())
+			return
+		case <-wg.Done():
+			if err := wg.Err(); err != nil {
 				log.Error(err)
-				return nil
-			}
-
-			select {
-			case <-r.ctx.Done():
-				log.Error(r.ctx.Err())
-				return nil
-			case <-wg.Done():
-				if err := wg.Err(); err != nil {
-					log.Error(err)
-					return nil
-				}
+				return
 			}
 		}
 	}
 
-	err := run(r.ctx, w.e, localRRs, !fromStdin)
+	err := run(ctx, w.e, r.rrs, !fromStdin)
 	if err != nil {
 		humanPrintError(err)
-		return nil
+		return
 	}
 
 	log.Info("Completed successfully")
 
 	// Allow first run to use named cache, subsequent ones will skip them
 	w.e.DisableNamedCache = true
-
-	return nil
 }
 
-func (w *watchCtx) triggerRun(currentEvents []watchEvent) {
+func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 	// Should be nil if currentEvents is nil
 	var filteredEvents []watchEvent
 	if currentEvents != nil {
@@ -145,7 +132,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) {
 		}
 
 		if len(filteredEvents) == 0 {
-			return
+			return nil
 		}
 	}
 
@@ -153,28 +140,73 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) {
 	//	log.Warn(event)
 	//}
 
-	if w.runCancel != nil {
-		w.runCancel()
-	}
-
 	for _, e := range filteredEvents {
 		if e.Op.Has(fsnotify.Create) || e.Op.Has(fsnotify.Remove) || e.Op.Has(fsnotify.Rename) {
 			// Reload graph
 			w.graphSigsCh <- struct{}{}
 
-			return
+			return nil
 		}
 	}
 
-	rctx, cancel := context.WithCancel(w.ctx)
-	w.sigsCh <- watchRun{
-		ctx:    rctx,
-		events: filteredEvents,
+	localRRs := w.rrs
+	if filteredEvents != nil {
+		allTargets, err := w.e.DAG().GetOrderedAncestors(w.targets.Slice(), true)
+		if err != nil {
+			return err
+		}
+
+		files := make([]string, 0)
+		for _, event := range filteredEvents {
+			files = append(files, event.RelPath)
+		}
+
+		fileDescendantsTargets, err := w.e.GetFileDescendants(files, allTargets)
+		if err != nil {
+			return err
+		}
+
+		descendants, err := w.e.DAG().GetOrderedDescendants(fileDescendantsTargets, true)
+		if err != nil {
+			return err
+		}
+
+		localRRs = make([]engine.TargetRunRequest, 0)
+
+		for _, target := range descendants {
+			w.e.ResetCacheHashInput(target)
+
+			if target.Gen {
+				w.e.RanGenPass = false
+				w.e.DisableNamedCache = false
+			}
+		}
+
+		if w.e.RanGenPass {
+			for _, target := range descendants {
+				if w.targets.Find(target.FQN) != nil {
+					localRRs = append(localRRs, engine.TargetRunRequest{Target: target})
+				}
+			}
+		} else {
+			localRRs = w.rrs
+		}
+
+		if len(localRRs) == 0 && w.e.RanGenPass {
+			return nil
+		}
 	}
-	w.runCancel = cancel
+
+	w.sigsCh <- watchRun{
+		rrs: localRRs,
+	}
+
+	return nil
 }
 
 func (w *watchCtx) runGraph(args []string) error {
+	w.cancelRunAndWait()
+
 	w.m.Lock()
 	defer w.m.Unlock()
 
@@ -221,9 +253,7 @@ func (w *watchCtx) runGraph(args []string) error {
 		}
 	}
 
-	w.triggerRun(nil)
-
-	return nil
+	return w.triggerRun(nil)
 }
 
 func (w *watchCtx) watchGraph(args []string) error {
@@ -240,10 +270,6 @@ func (w *watchCtx) watchGraph(args []string) error {
 
 			for _, p := range w.watcher.WatchList() {
 				_ = w.watcher.Remove(p)
-			}
-
-			if w.runCancel != nil {
-				w.runCancel()
 			}
 
 			err := w.runGraph(args)
@@ -284,7 +310,10 @@ func (w *watchCtx) watchFiles() error {
 			currentEvents := eventsAccumulator
 
 			debounced(func() {
-				w.triggerRun(currentEvents)
+				err = w.triggerRun(currentEvents)
+				if err != nil {
+					log.Error(err)
+				}
 				eventsAccumulator = nil
 			})
 		case err, ok := <-w.watcher.Errors:
@@ -357,10 +386,7 @@ var watchCmd = &cobra.Command{
 		for {
 			select {
 			case r := <-wctx.sigsCh:
-				err := wctx.run(r, fromStdin)
-				if err != nil {
-					return err
-				}
+				go wctx.run(r, fromStdin)
 			case err := <-errCh:
 				return err
 			}
