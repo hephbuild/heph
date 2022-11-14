@@ -453,7 +453,7 @@ var gcCmd = &cobra.Command{
 			return err
 		}
 
-		return Engine.GC(Engine.Config.CacheHistory, log.Infof, false)
+		return Engine.GC(log.Infof, false)
 	},
 }
 

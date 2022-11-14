@@ -10,13 +10,13 @@ import (
 	"time"
 )
 
-func (e *Engine) GCTargets(targets []*Target, defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
+func (e *Engine) GCTargets(targets []*Target, flog func(string, ...interface{}), dryrun bool) error {
 	targetDirs := make([]string, 0)
 	for _, target := range targets {
 		targetDirs = append(targetDirs, e.cacheDirForHash(target, "").Abs())
 	}
 
-	return e.runGc(targetDirs, defaultKeep, flog, dryrun)
+	return e.runGc(targetDirs, flog, dryrun)
 }
 
 func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
@@ -41,7 +41,7 @@ func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
 	return targetDirs, err
 }
 
-func (e *Engine) runGc(targetDirs []string, defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
+func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), dryrun bool) error {
 	if flog == nil {
 		flog = func(string, ...interface{}) {}
 	}
@@ -129,10 +129,7 @@ func (e *Engine) runGc(targetDirs []string, defaultKeep int, flog func(string, .
 			return entries[i].Time.Unix() > entries[j].Time.Unix()
 		})
 
-		targetKeep := defaultKeep
-		if target != nil && target.Cache.History != 0 {
-			targetKeep = target.Cache.History
-		}
+		targetKeep := target.Cache.History
 		flog("keep %v", targetKeep)
 
 		elog := func(entry gcEntry, keep bool) {
@@ -171,11 +168,7 @@ func (e *Engine) runGc(targetDirs []string, defaultKeep int, flog func(string, .
 	return nil
 }
 
-func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
-	if defaultKeep < 1 {
-		panic("must keep at least 1")
-	}
-
+func (e *Engine) GC(flog func(string, ...interface{}), dryrun bool) error {
 	err := e.gcLock.Lock()
 	if err != nil {
 		return err
@@ -193,5 +186,5 @@ func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun b
 		return err
 	}
 
-	return e.runGc(targetDirs, defaultKeep, flog, dryrun)
+	return e.runGc(targetDirs, flog, dryrun)
 }

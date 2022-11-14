@@ -698,6 +698,10 @@ func (e *Engine) processTarget(t *Target) error {
 	t.cacheLock = e.lockFactory(t, "cache")
 	t.tarLock = e.lockFactory(t, "tar")
 
+	if t.Cache.History == 0 {
+		t.Cache.History = e.Config.CacheHistory
+	}
+
 	if t.Codegen != "" {
 		for _, file := range t.TargetSpec.Out {
 			p := file.Package.Root.Join(file.Path).RelRoot()
