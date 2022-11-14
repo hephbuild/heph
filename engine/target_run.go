@@ -644,6 +644,13 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 		return err
 	}
 
+	if target.Cache.Enabled && !e.Config.DisableGC {
+		err = e.GCTargets([]*Target{target}, nil, false)
+		if err != nil {
+			log.Error(err)
+		}
+	}
+
 	return nil
 }
 
