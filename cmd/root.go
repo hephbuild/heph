@@ -7,6 +7,7 @@ import (
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.uber.org/multierr"
 	"heph/config"
 	"heph/engine"
 	"heph/targetspec"
@@ -506,42 +507,51 @@ func execute() error {
 	return nil
 }
 
-func printTargetError(err error) bool {
-	var terr engine.TargetFailedError
-	if errors.As(err, &terr) {
-		log.Errorf("%v failed", terr.Target.FQN)
+func humanPrintError(err error) {
+	errs := multierr.Errors(err)
 
-		var lerr engine.ErrorWithLogFile
-		if errors.As(err, &lerr) {
-			log.Error(lerr.Error())
+	for i, err := range errs {
+		if i != 0 {
+			fmt.Fprintln(os.Stderr)
+		}
 
-			logFile := lerr.LogFile
-			info, _ := os.Stat(logFile)
-			if info.Size() > 0 {
-				log.Error("Log:")
-				fmt.Fprintln(os.Stderr)
-				c := exec.Command("cat", logFile)
-				c.Stdout = os.Stderr
-				_ = c.Run()
-				fmt.Fprintln(os.Stderr)
-				fmt.Fprintf(os.Stderr, "The log file can be found at %v:\n", logFile)
+		var terr engine.TargetFailedError
+		if errors.As(err, &terr) {
+			log.Errorf("%v failed", terr.Target.FQN)
+
+			var lerr engine.ErrorWithLogFile
+			if errors.As(err, &lerr) {
+				log.Error(lerr.Error())
+
+				logFile := lerr.LogFile
+				info, _ := os.Stat(logFile)
+				if info.Size() > 0 {
+					fmt.Fprintln(os.Stderr)
+					c := exec.Command("cat", logFile)
+					c.Stdout = os.Stderr
+					_ = c.Run()
+					fmt.Fprintln(os.Stderr)
+					fmt.Fprintf(os.Stderr, "The log file can be found at %v\n", logFile)
+				}
+			} else {
+				log.Error(terr.Error())
 			}
 		} else {
-			log.Error(terr.Error())
+			log.Error(err)
 		}
-		return true
 	}
 
-	return false
+	if len(errs) > 1 {
+		fmt.Fprintln(os.Stderr)
+		log.Errorf("%v jobs failed", len(errs))
+	}
 }
 
 func Execute() {
 	utils.Seed()
 
 	if err := execute(); err != nil {
-		if !printTargetError(err) {
-			log.Error(err)
-		}
+		humanPrintError(err)
 
 		var eerr ErrorWithExitCode
 		if errors.As(err, &eerr) {

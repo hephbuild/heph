@@ -103,10 +103,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) error {
 
 	err := run(r.ctx, w.e, localRRs, !fromStdin)
 	if err != nil {
-		if !printTargetError(err) {
-			log.Error(err)
-			return nil
-		}
+		humanPrintError(err)
+		return nil
 	}
 
 	log.Info("Completed successfully")
