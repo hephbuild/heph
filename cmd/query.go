@@ -60,7 +60,7 @@ var queryCmd = &cobra.Command{
 	Use:     "query",
 	Aliases: []string{"q"},
 	Short:   "Query the graph",
-	Args:    cobra.ArbitraryArgs,
+	Args:    cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := engineInit()
 		if err != nil {
@@ -97,6 +97,10 @@ var queryCmd = &cobra.Command{
 		} else {
 			if !all {
 				targets = engine.FilterPublicTargets(targets)
+			}
+
+			if len(include) == 0 && len(exclude) == 0 && !all {
+				return fmt.Errorf("specify at least one of --include or --exclude")
 			}
 		}
 
