@@ -147,6 +147,11 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 	target.LogFile = ""
 	ctx := e.Context
+	if target.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
+		defer cancel()
+	}
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -512,6 +517,10 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 
 		err = cmd.Run()
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				err = fmt.Errorf("%w: %v", cerr, err)
+			}
+
 			err := fmt.Errorf("exec: %w", err)
 
 			if target.LogFile != "" {

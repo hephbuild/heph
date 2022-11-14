@@ -25,7 +25,8 @@ target(
 | `executor`       | `'bash'`, `'exec'`                             | `'bash'`                                          | See [`executor`](#executor)                                                                  |
 | `run_in_cwd`     | `bool`                                         | `False`                                           | Will run the target in the current working directory, use with `sandbox=False`               |
 | `pass_args`      | `bool`                                         | `False`                                           | Forward extra args passed to heph to the command (ex: `heph run //some/target -- arg1 arg2`) |
-| `cache`          | `bool`,`[]string`,`heph.cache()`               | `True`                                            | See [`cache`](#cache)                                                                        |
+| `cache`          | `bool`, `heph.cache()`                         | `True`                                            | See [`cache`](#cache)                                                                        |
+| `support_files`  | `string`, `[]string`                           | `[]`                                              | See [`support_files`](#support_files)                                                        |
 | `sandbox`        | `bool`                                         | `True`                                            | Enables sandbox (see [`sandbox`](#sandbox))                                                  |
 | `out_in_sandbox` | `bool`                                         | `False`                                           | Will collect output from the sandbox when sandboxing is disabled, use with `sandbox=False`   |
 | `gen`            | `bool`                                         | `False`                                           | Marks target as a generating target                                                          |
@@ -41,6 +42,7 @@ target(
 | `out_env`        | `'ignore'`, `'rel_root'`, `'rel_pkg'`, `'abs'` | `'rel_pkg'`                                       | See [`src_env/out_env`](#src_env-out_env)                                                    |
 | `hash_file`      | `'content'`, `'mod_time'`,                     | `'content'`                                       | Method to hash dependencies                                                                  |
 | `transitive`     | `heph.target_spec()`                           | `None`                                            | See [`transitive`](#transitive)                                                              |
+| `timeout`        | `string`                                       | `None`                                            | Timeout to run target                                                                        |
 
 ### `executor`
 
@@ -49,15 +51,17 @@ target(
 
 ### `cache`
 
-- `bool`: enabled or disables cache, will default to caching the paths defined in `out`
-- `[]string`: Enables cache and sets the paths to cache
-- `heph.cache()`: 
+- `bool`: enabled or disables cache, will cache the paths defined in `out`
+- `heph.cache()`:
 ```python
 heph.cache(
-    files: [string], # set paths to cache
     named: [string], # set named cache to enable
 )
 ```
+
+### `support_files`
+
+Files to be cached, but not be part of `out`, this is useful for support files to be used by a tool during runtime
 
 ### `sandbox`
 

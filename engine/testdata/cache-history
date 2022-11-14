@@ -43,6 +43,7 @@ target(
         "History": 1
     },
     "SupportFiles": null,
+    "Timeout": 0,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",
