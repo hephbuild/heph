@@ -62,6 +62,7 @@ type Engine struct {
 	cacheHashOutputMutex       sync.RWMutex
 	cacheHashOutput            map[string]string // TODO: LRU
 	RanGenPass                 bool
+	RanInit                    bool
 	codegenPaths               map[string]*Target
 	fetchRootCache             map[string]fs2.Path
 	cacheRunBuildFilem         sync.RWMutex
