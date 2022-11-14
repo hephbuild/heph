@@ -298,7 +298,7 @@ func findRoot() (string, error) {
 		parts = parts[:len(parts)-1]
 	}
 
-	return "", fmt.Errorf("root not found")
+	return "", fmt.Errorf("root not found, are you running this command in the repo directory?")
 }
 
 func engineFactory() (*engine.Engine, error) {
