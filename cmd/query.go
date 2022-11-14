@@ -60,7 +60,7 @@ var queryCmd = &cobra.Command{
 	Use:     "query",
 	Aliases: []string{"q"},
 	Short:   "Query the graph",
-	Args:    cobra.NoArgs,
+	Args:    cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := engineInit()
 		if err != nil {
