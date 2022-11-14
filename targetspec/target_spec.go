@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"heph/exprs"
 	"heph/packages"
+	"time"
 )
 
 var (
@@ -81,6 +82,7 @@ type TargetSpec struct {
 	OutEnv            string
 	HashFile          string
 	Transitive        TargetSpecTransitive
+	Timeout           time.Duration
 }
 
 type TargetSpecTransitive struct {

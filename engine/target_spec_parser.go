@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec, error) {
@@ -179,6 +181,22 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		for _, file := range t.Out {
 			if utils.IsGlob(file.Path) {
 				return targetspec.TargetSpec{}, fmt.Errorf("codegen targets must not have glob outputs")
+			}
+		}
+	}
+
+	if len(args.Timeout) > 0 {
+		t.Timeout, err = time.ParseDuration(args.Timeout)
+		if err != nil {
+			if strings.Contains(err.Error(), "missing unit in duration") {
+				v, err := strconv.ParseInt(args.Timeout, 10, 64)
+				if err != nil {
+					return targetspec.TargetSpec{}, err
+				}
+
+				t.Timeout = time.Duration(v) * time.Second
+			} else {
+				return targetspec.TargetSpec{}, fmt.Errorf("timeout: %w", err)
 			}
 		}
 	}

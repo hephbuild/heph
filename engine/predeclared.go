@@ -180,6 +180,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"out_env?", &sargs.OutEnv,
 		"hash_file?", &sargs.HashFile,
 		"transitive?", &sargs.Transitive,
+		"timeout?", &sargs.Timeout,
 	); err != nil {
 		if sargs.Name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.Name), err)

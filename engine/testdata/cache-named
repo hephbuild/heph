@@ -45,6 +45,7 @@ target(
         "History": 0
     },
     "SupportFiles": null,
+    "Timeout": 0,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",

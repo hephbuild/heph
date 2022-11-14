@@ -413,6 +413,11 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 	h.String(target.OutEnv)
 
+	if target.Timeout > 0 {
+		h.String("=")
+		h.I64(target.Timeout.Nanoseconds())
+	}
+
 	sh := h.Sum()
 
 	e.cacheHashInputMutex.Lock()

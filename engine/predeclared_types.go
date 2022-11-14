@@ -33,6 +33,7 @@ type TargetArgs struct {
 	OutEnv         string
 	HashFile       string
 	Transitive     TargetArgsTransitive
+	Timeout        string
 }
 
 type TargetArgsTransitive struct {
