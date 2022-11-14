@@ -42,8 +42,8 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 	} else {
 		start := time.Now()
 		printProgress := func() {
-			all, success := deps.TransitiveCount()
-			log.Infof("Progress %v: %v/%v %v", name, success, all, utils.RoundDuration(time.Since(start), 1).String())
+			s := deps.TransitiveCount()
+			log.Infof("Progress %v: %v/%v %v", name, s.Done, s.All, utils.RoundDuration(time.Since(start), 1).String())
 		}
 
 		printWorkersStatus := func() {
@@ -102,11 +102,10 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 
 func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
-		all, success := deps.TransitiveCount()
+		s := deps.TransitiveCount()
 
 		return UpdateMessage{
-			jobs:    all,
-			success: success,
+			stats:   s,
 			workers: pool.Workers,
 		}
 	}
@@ -184,8 +183,7 @@ func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 
 type UpdateMessage struct {
 	workers []*worker.Worker
-	jobs    uint64
-	success uint64
+	stats   worker.WaitGroupStats
 	summary bool
 }
 
@@ -257,15 +255,22 @@ func (r *renderer) View() string {
 	start := utils.RoundDuration(time.Since(r.start), 1).String()
 
 	if r.summary {
-		count := fmt.Sprint(r.success)
-		if r.success != r.jobs {
-			count = fmt.Sprintf("%v/%v", r.success, r.jobs)
+		count := fmt.Sprint(r.stats.Done)
+		if r.stats.Success != r.stats.All {
+			count = fmt.Sprintf("%v/%v", r.stats.Success, r.stats.All)
 		}
-		return fmt.Sprintf("%v: Ran %v jobs in %v\n", r.name, count, start)
+		extra := ""
+		if r.stats.Failed > 0 || r.stats.Skipped > 0 {
+			extra = fmt.Sprintf(" (%v failed, %v skipped)", r.stats.Failed, r.stats.Skipped)
+		}
+		return fmt.Sprintf("%v: Ran %v jobs in %v%v\n", r.name, count, start, extra)
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.success, r.jobs, start))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.stats.Success, r.stats.All, start))
+	if r.stats.Failed > 0 || r.stats.Skipped > 0 {
+		s.WriteString(fmt.Sprintf("%v failed, %v skipped\n", r.stats.Failed, r.stats.Skipped))
+	}
 
 	for _, w := range r.workers {
 		var runtime string

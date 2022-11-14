@@ -18,7 +18,7 @@ const (
 	StatePending
 	StateRunning
 	StateSuccess
-	StateFailure
+	StateFailed
 	StateSkipped
 )
 
@@ -30,8 +30,8 @@ func (s JobState) String() string {
 		return "running"
 	case StateSuccess:
 		return "success"
-	case StateFailure:
-		return "failure"
+	case StateFailed:
+		return "failed"
 	case StateSkipped:
 		return "skipped"
 	case StateUnknown:
@@ -50,7 +50,6 @@ type Job struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	done   bool
 	doneCh chan struct{}
 	err    error
 
@@ -71,12 +70,15 @@ func (j *Job) DoneWithErr(err error, state JobState) {
 
 func (j *Job) doneWithState(state JobState) {
 	j.State = state
-	j.done = true
 	close(j.doneCh)
 }
 
 func (j *Job) IsDone() bool {
-	return j.done
+	return StateIsDone(j.State)
+}
+
+func StateIsDone(s JobState) bool {
+	return s != StateUnknown && s != StateRunning && s != StatePending
 }
 
 type Worker struct {
@@ -224,7 +226,7 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 		if skippedOnErr {
 			job.DoneWithErr(err, StateSkipped)
 		} else {
-			job.DoneWithErr(err, StateFailure)
+			job.DoneWithErr(err, StateFailed)
 		}
 		log.Debugf("finalize job err: %v %v: %v", job.Name, job.State.String(), err)
 	}

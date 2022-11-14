@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"go.uber.org/multierr"
 	"sync"
 	"sync/atomic"
 )
@@ -18,6 +19,8 @@ type WaitGroup struct {
 	oSetup sync.Once
 	oDone  sync.Once
 	sem    int64
+
+	failfast bool
 }
 
 func (wg *WaitGroup) Add(job *Job) {
@@ -30,7 +33,7 @@ func (wg *WaitGroup) Add(job *Job) {
 
 	go func() {
 		<-job.doneCh
-		wg.handleDone(job.err)
+		wg.handleUnitDone()
 	}()
 
 	wg.jobs = append(wg.jobs, job)
@@ -46,16 +49,13 @@ func (wg *WaitGroup) AddChild(child *WaitGroup) {
 
 	go func() {
 		<-child.Done()
-		wg.handleDone(child.Err())
+		wg.handleUnitDone()
 	}()
 
 	wg.wgs = append(wg.wgs, child)
 }
 
-func (wg *WaitGroup) handleDone(err error) {
-	if err != nil {
-		wg.err = err
-	}
+func (wg *WaitGroup) handleUnitDone() {
 	wg.broadcast()
 }
 
@@ -92,9 +92,12 @@ func (wg *WaitGroup) broadcast() {
 
 func (wg *WaitGroup) wait() {
 	wg.cond.L.Lock()
+
+	waitm := map[*WaitGroup]error{}
+
 	var err error
 	for {
-		err = wg.keepWaiting()
+		err = wg.keepWaiting(wg.failfast, waitm)
 		if !errors.Is(err, ErrPending) {
 			break
 		}
@@ -132,98 +135,125 @@ func (wg *WaitGroup) Err() error {
 	return wg.err
 }
 
-func (wg *WaitGroup) walkerTransitiveCount(mj map[uint64]struct{}, mwg map[*WaitGroup]struct{}, fs ...func(j *Job)) {
+func (wg *WaitGroup) walkerTransitiveDo(mj map[uint64]struct{}, mwg map[*WaitGroup]struct{}, f func(j *Job)) {
 	if _, ok := mwg[wg]; ok {
 		return
 	}
 	mwg[wg] = struct{}{}
 
-	for _, job := range wg.jobs[:] {
+	for _, job := range wg.jobs {
 		if _, ok := mj[job.ID]; ok {
 			continue
 		}
 		mj[job.ID] = struct{}{}
 
-		for _, f := range fs {
-			f(job)
-		}
+		f(job)
 
-		job.Deps.walkerTransitiveCount(mj, mwg, fs...)
+		job.Deps.walkerTransitiveDo(mj, mwg, f)
 	}
 
 	for _, wg := range wg.wgs {
-		wg.walkerTransitiveCount(mj, mwg, fs...)
+		wg.walkerTransitiveDo(mj, mwg, f)
 	}
 }
 
-func (wg *WaitGroup) TransitiveCount() (uint64, uint64) {
-	var all, success uint64
-
+func (wg *WaitGroup) TransitiveDo(f func(j *Job)) {
 	mj := map[uint64]struct{}{}
 	mwg := map[*WaitGroup]struct{}{}
-	wg.walkerTransitiveCount(mj, mwg,
-		func(j *Job) {
-			atomic.AddUint64(&all, 1)
-		},
-		func(j *Job) {
-			if j.State == StateSuccess {
-				atomic.AddUint64(&success, 1)
-			}
-		},
-	)
+	wg.walkerTransitiveDo(mj, mwg, f)
+}
 
-	return all, success
+type WaitGroupStats struct {
+	All     uint64
+	Done    uint64
+	Success uint64
+	Failed  uint64
+	Skipped uint64
+}
+
+func (wg *WaitGroup) TransitiveCount() WaitGroupStats {
+	s := WaitGroupStats{}
+
+	wg.TransitiveDo(func(j *Job) {
+		atomic.AddUint64(&s.All, 1)
+
+		if j.IsDone() {
+			atomic.AddUint64(&s.Done, 1)
+		}
+
+		if j.State == StateSuccess {
+			atomic.AddUint64(&s.Success, 1)
+		}
+
+		if j.State == StateFailed {
+			atomic.AddUint64(&s.Failed, 1)
+		}
+
+		if j.State == StateSkipped {
+			atomic.AddUint64(&s.Skipped, 1)
+		}
+	})
+
+	return s
 }
 
 var ErrPending = errors.New("pending")
 
 // keepWaiting returns ErrPending if it should keep waiting, nil represents no jobs error
-func (wg *WaitGroup) keepWaiting() error {
-	if wg.done {
-		return nil
+func (wg *WaitGroup) keepWaiting(failFast bool, m map[*WaitGroup]error) (rerr error) {
+	if err, ok := m[wg]; ok {
+		return err
 	}
-
-	if wg.err != nil {
-		return wg.err
-	}
+	defer func() {
+		if !errors.Is(rerr, ErrPending) {
+			m[wg] = rerr
+		}
+	}()
 
 	if atomic.LoadInt64(&wg.sem) > 0 {
 		return fmt.Errorf("sem is > 0: %w", ErrPending)
 	}
 
+	var errs []error
+
 	for _, wg := range wg.wgs[:] {
-		err := wg.keepWaiting()
+		err := wg.keepWaiting(failFast, m)
 		if err != nil {
-			return err
+			if failFast {
+				return err
+			} else {
+				errs = append(errs, err)
+			}
 		}
 	}
+
+	allDone := true
 
 	for _, job := range wg.jobs[:] {
-		job := job
+		state := job.State
 
-		if !job.done {
-			return fmt.Errorf("%v is %w", job.Name, ErrPending)
+		if StateIsDone(state) {
+			if state == StateSuccess {
+				continue
+			}
+
+			jerr := fmt.Errorf("2 %v is %v: %w", job.Name, state.String(), job.err)
+
+			if failFast {
+				return jerr
+			} else {
+				errs = append(errs, jerr)
+			}
+		} else {
+			allDone = false
+
+			return fmt.Errorf("1 %v is %w", job.Name, ErrPending)
 		}
-
-		if job.State == StateSuccess {
-			continue
-		}
-
-		if job.State == StateRunning {
-			continue
-		}
-
-		if job.State == StatePending {
-			return fmt.Errorf("%v is %w", job.Name, ErrPending)
-		}
-
-		jerr := job.err
-		if jerr != nil {
-			return fmt.Errorf("%v is %v: %w", job.Name, job.State.String(), jerr)
-		}
-
-		return fmt.Errorf("%v is %v", job.Name, job.State.String())
 	}
 
-	return nil
+	if !allDone {
+		return nil
+	}
+
+	return multierr.Combine(errs...)
 }

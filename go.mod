@@ -26,6 +26,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	github.com/zeebo/xxh3 v1.0.2
 	go.starlark.net v0.0.0-20220817180228-f738f5508c12
+	go.uber.org/multierr v1.8.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -68,6 +69,7 @@ require (
 	github.com/stretchr/objx v0.4.0 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opencensus.io v0.23.0 // indirect
+	go.uber.org/atomic v1.7.0 // indirect
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
 	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e // indirect
 	golang.org/x/oauth2 v0.0.0-20220622183110-fd043fe589d2 // indirect
