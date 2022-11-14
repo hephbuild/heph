@@ -10,30 +10,19 @@ import (
 	"time"
 )
 
-func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
-	if defaultKeep < 1 {
-		panic("must keep at least 1")
+func (e *Engine) GCTargets(targets []*Target, defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
+	targetDirs := make([]string, 0)
+	for _, target := range targets {
+		targetDirs = append(targetDirs, e.cacheDirForHash(target, "").Abs())
 	}
 
-	if flog == nil {
-		flog = func(string, ...interface{}) {}
-	}
+	return e.runGc(targetDirs, defaultKeep, flog, dryrun)
+}
 
-	err := e.gcLock.Lock()
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		err := e.gcLock.Unlock()
-		if err != nil {
-			log.Errorf("gc: %v", err)
-		}
-	}()
-
+func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
 	targetDirs := make([]string, 0)
 
-	err = filepath.WalkDir(e.HomeDir.Join("cache").Abs(), func(path string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -48,8 +37,13 @@ func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun b
 
 		return nil
 	})
-	if err != nil {
-		return err
+
+	return targetDirs, err
+}
+
+func (e *Engine) runGc(targetDirs []string, defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
+	if flog == nil {
+		flog = func(string, ...interface{}) {}
 	}
 
 	type gcEntry struct {
@@ -175,4 +169,29 @@ func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun b
 	}
 
 	return nil
+}
+
+func (e *Engine) GC(defaultKeep int, flog func(string, ...interface{}), dryrun bool) error {
+	if defaultKeep < 1 {
+		panic("must keep at least 1")
+	}
+
+	err := e.gcLock.Lock()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		err := e.gcLock.Unlock()
+		if err != nil {
+			log.Errorf("gc: %v", err)
+		}
+	}()
+
+	targetDirs, err := e.gcCollectTargetDirs(e.HomeDir.Join("cache").Abs())
+	if err != nil {
+		return err
+	}
+
+	return e.runGc(targetDirs, defaultKeep, flog, dryrun)
 }

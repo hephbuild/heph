@@ -399,11 +399,8 @@ func preRunWithGenWithEngine(ctx context.Context, e *engine.Engine, silent bool)
 }
 
 var cleanCmd = &cobra.Command{
-	Use:   "clean",
-	Short: "Clean",
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return engineInit()
-	},
+	Use:               "clean",
+	Short:             "Clean",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := preRunWithGen(cmd.Context(), false)
@@ -447,11 +444,8 @@ var cleanCmd = &cobra.Command{
 }
 
 var gcCmd = &cobra.Command{
-	Use:   "gc",
-	Short: "GC",
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return engineInit()
-	},
+	Use:               "gc",
+	Short:             "GC",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := preRunWithGen(cmd.Context(), false)
@@ -467,10 +461,12 @@ var cleanLockCmd = &cobra.Command{
 	Use:   "lock",
 	Short: "Clean locks",
 	Args:  cobra.NoArgs,
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		return engineInit()
-	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
 		for _, target := range Engine.Targets.Slice() {
 			err := Engine.CleanTargetLock(target)
 			if err != nil {

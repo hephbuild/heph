@@ -147,6 +147,13 @@ func (e *Engine) storeCache(ctx context.Context, target *Target, outRoot string)
 		return err
 	}
 
+	if !e.Config.DisableGC {
+		err = e.GCTargets([]*Target{target}, e.Config.CacheHistory, nil, false)
+		if err != nil {
+			log.Error(err)
+		}
+	}
+
 	return nil
 }
 
