@@ -56,7 +56,7 @@ func Cp(from, to string) error {
 		return logerr("cp5", err)
 	}
 
-	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, info.Mode())
+	tof, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		return logerr("cp6", err)
 	}
@@ -68,6 +68,11 @@ func Cp(from, to string) error {
 	}
 
 	err = tof.Close()
+	if err != nil {
+		return err
+	}
+
+	err = os.Chmod(to, info.Mode())
 	if err != nil {
 		return err
 	}

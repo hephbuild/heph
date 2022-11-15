@@ -38,6 +38,8 @@ func init() {
 	queryCmd.AddCommand(depsOnCmd)
 	queryCmd.AddCommand(depsCmd)
 	queryCmd.AddCommand(outCmd)
+	queryCmd.AddCommand(hashoutCmd)
+	queryCmd.AddCommand(hashinCmd)
 	queryCmd.AddCommand(outRootCmd)
 
 	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
@@ -624,6 +626,77 @@ var outCmd = &cobra.Command{
 		for _, path := range paths {
 			fmt.Println(path.Abs())
 		}
+
+		return nil
+	},
+}
+
+var hashoutCmd = &cobra.Command{
+	Use:               "hashout <target>",
+	Short:             "Prints targets output hash",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
+		tp, err := targetspec.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		if err != nil {
+			return err
+		}
+
+		for _, name := range target.ActualOutFiles().Names() {
+			fmt.Println(name+":", Engine.HashOutput(target, name))
+		}
+
+		return nil
+	},
+}
+
+var hashinCmd = &cobra.Command{
+	Use:               "hashin <target>",
+	Short:             "Prints targets input hash",
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
+		tp, err := targetspec.TargetParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		target := Engine.Targets.Find(tp.Full())
+		if target == nil {
+			return engine.TargetNotFoundError(tp.Full())
+		}
+
+		tdeps, err := Engine.ScheduleTargetsWithDeps(cmd.Context(), []*engine.Target{target}, target)
+		if err != nil {
+			return err
+		}
+
+		err = WaitPool("Run", Engine.Pool, tdeps.All(), false)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(Engine.HashInput(target))
 
 		return nil
 	},

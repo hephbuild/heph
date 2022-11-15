@@ -39,6 +39,20 @@ func (t TargetTools) Empty() bool {
 	return len(t.Targets) == 0 && len(t.Hosts) == 0
 }
 
+func (t TargetTools) Sort() {
+	sort.SliceStable(t.Hosts, func(i, j int) bool {
+		return t.Hosts[i].Name < t.Hosts[j].Name
+	})
+
+	sort.SliceStable(t.Targets, func(i, j int) bool {
+		return t.Targets[i].Name < t.Targets[j].Name
+	})
+
+	sort.SliceStable(t.TargetReferences, func(i, j int) bool {
+		return t.TargetReferences[i].Name < t.TargetReferences[j].Name
+	})
+}
+
 type TargetTool struct {
 	Target *Target
 	Output string
@@ -61,6 +75,19 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd.Files = append(d.Files, deps.Files...)
 
 	return nd
+}
+
+func (d TargetDeps) Sort() {
+	sort.SliceStable(d.Targets, func(i, j int) bool {
+		if d.Targets[i].Target.FQN == d.Targets[j].Target.FQN {
+			return d.Targets[i].Output < d.Targets[j].Output
+		}
+
+		return d.Targets[i].Target.FQN < d.Targets[j].Target.FQN
+	})
+	sort.SliceStable(d.Files, func(i, j int) bool {
+		return d.Files[i].RelRoot() < d.Files[j].RelRoot()
+	})
 }
 
 type NamedPaths[TS ~[]T, T fs.RelablePath] struct {
@@ -214,6 +241,10 @@ func (tp *TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {
 func (tp *TargetNamedDeps) Sort() {
 	tp.Map(func(deps TargetDeps) TargetDeps {
 		sort.SliceStable(deps.Targets, func(i, j int) bool {
+			if deps.Targets[i].Target.FQN == deps.Targets[j].Target.FQN {
+				return deps.Targets[i].Output < deps.Targets[j].Output
+			}
+
 			return deps.Targets[i].Target.FQN < deps.Targets[j].Target.FQN
 		})
 
@@ -929,13 +960,16 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	if !t.Transitive.Tools.Empty() {
 		t.Tools = t.Tools.Merge(t.Transitive.Tools)
+		t.Tools.Sort()
 	}
 
 	if !t.Transitive.Deps.Empty() {
 		t.Deps = t.Deps.Merge(t.Transitive.Deps)
+		t.Deps.Sort()
 
 		if t.DifferentHashDeps {
 			t.HashDeps = t.HashDeps.Merge(t.Transitive.Deps.All())
+			t.HashDeps.Sort()
 		} else {
 			t.HashDeps = t.Deps.All()
 		}
@@ -1122,20 +1156,15 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 		}
 	}
 
-	sort.SliceStable(toolsSpecs.Hosts, func(i, j int) bool {
-		ts := toolsSpecs.Hosts
-		return ts[i].Name < ts[j].Name
-	})
-
-	sort.SliceStable(tools, func(i, j int) bool {
-		return tools[i].Name < tools[j].Name
-	})
-
-	return TargetTools{
+	tt := TargetTools{
 		TargetReferences: refs,
 		Targets:          tools,
 		Hosts:            toolsSpecs.Hosts,
-	}, nil
+	}
+
+	tt.Sort()
+
+	return tt, nil
 }
 
 var allEnv = map[string]string{}
@@ -1365,12 +1394,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 		return t.RelRoot()
 	})
 
-	sort.SliceStable(td.Targets, func(i, j int) bool {
-		return td.Targets[i].Target.FQN < td.Targets[j].Target.FQN
-	})
-	sort.SliceStable(td.Files, func(i, j int) bool {
-		return td.Files[i].RelRoot() < td.Files[j].RelRoot()
-	})
+	td.Sort()
 
 	return td, nil
 }
