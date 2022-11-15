@@ -60,7 +60,15 @@ func (e *Engine) targetSupportTarFile(target *Target) string {
 const versionFile = "version"
 const inputHashFile = "hash_input"
 
-func (e *Engine) storeCache(ctx context.Context, target *Target, outRoot string) error {
+func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string) (rerr error) {
+	e.Status(fmt.Sprintf("Storing %v output...", target.FQN))
+
+	span := e.SpanCacheStore(ctx, target)
+	defer func() {
+		span.RecordError(rerr)
+		span.End()
+	}()
+
 	inputHash := e.hashInput(target)
 
 	log.Tracef("Store Cache %v %v", target.FQN, inputHash)

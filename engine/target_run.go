@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"heph/engine/htrace"
 	"heph/exprs"
 	"heph/sandbox"
 	"heph/targetspec"
@@ -32,18 +34,22 @@ func (e *TargetRunEngine) Status(s string) {
 	e.Print(s)
 }
 
-func (e *TargetRunEngine) PullTargetMeta(target *Target) (bool, error) {
-	return e.warmTargetCache(target, true)
+func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target) (bool, error) {
+	return e.warmTargetCache(ctx, target, true)
 }
 
-func (e *TargetRunEngine) WarmTargetCache(target *Target) (bool, error) {
-	return e.warmTargetCache(target, false)
+func (e *TargetRunEngine) WarmTargetCache(ctx context.Context, target *Target) (bool, error) {
+	return e.warmTargetCache(ctx, target, false)
 }
 
-func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, error) {
+func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, onlyMeta bool) (_ bool, rerr error) {
 	err := e.linkTarget(target, NewTargets(0))
 	if err != nil {
 		return false, err
+	}
+
+	if !target.Cache.Enabled {
+		return false, nil
 	}
 
 	log.Tracef("locking cache %v", target.FQN)
@@ -60,9 +66,11 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 		}
 	}()
 
-	if !target.Cache.Enabled {
-		return false, nil
-	}
+	span := e.SpanCachePull(ctx, target, onlyMeta)
+	defer func() {
+		span.RecordError(rerr)
+		span.End()
+	}()
 
 	ok, err := e.getCache(target, onlyMeta)
 	if err != nil {
@@ -82,6 +90,7 @@ func (e *TargetRunEngine) warmTargetCache(target *Target, onlyMeta bool) (bool, 
 		}
 	}
 
+	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
 	return true, nil
 }
 
@@ -120,58 +129,17 @@ func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *Src
 	return nil, cleanup
 }
 
-func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error {
-	target := rr.Target
-	e.Status(target.FQN)
+type runPrepare struct {
+	Env    map[string]string
+	BinDir string
+}
 
-	err := e.linkTarget(target, NewTargets(0))
-	if err != nil {
-		return err
-	}
-
-	log.Tracef("%v locking run", target.FQN)
-	err = target.runLock.Lock()
-	if err != nil {
-		return err
-	}
-
+func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *runPrepare, rerr error) {
+	span := e.SpanRunPrepare(ctx, target)
 	defer func() {
-		log.Tracef("%v unlocking run", target.FQN)
-		err := target.runLock.Unlock()
-		if err != nil {
-			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
-		}
-
-		log.Tracef("Target DONE %v", target.FQN)
+		span.RecordError(rerr)
+		span.End()
 	}()
-
-	target.LogFile = ""
-	ctx := e.Context
-	if target.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
-		defer cancel()
-	}
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	if target.Cache.Enabled && !rr.Shell && !rr.NoCache {
-		start := time.Now()
-		defer func() {
-			log.Debugf("%v done in %v", target.FQN, time.Since(start))
-		}()
-
-		cached, err := e.WarmTargetCache(target)
-		if err != nil {
-			return err
-		}
-
-		if cached {
-			return nil
-		}
-	}
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
@@ -245,7 +213,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	})
 	defer cleanOrigin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
@@ -269,7 +237,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 	})
 	defer cleanDeps()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
@@ -280,34 +248,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		SrcTar: srcRec.SrcTar(),
 	})
 	if err != nil {
-		return err
-	}
-
-	if iocfg.Stdout == nil || iocfg.Stderr == nil {
-		target.LogFile = sandboxRoot.Join("log.txt").Abs()
-
-		f, err := os.Create(target.LogFile)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		if iocfg.Stdout == nil {
-			iocfg.Stdout = f
-		}
-
-		if iocfg.Stderr == nil {
-			iocfg.Stderr = f
-		}
-	}
-
-	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.FullName)
-	if target.RunInCwd {
-		if target.Cache.Enabled {
-			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
-		}
-
-		dir = e.Cwd
+		return nil, err
 	}
 
 	env := make(map[string]string)
@@ -333,7 +274,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					p := "/root"
 					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path))
 					if err != nil {
-						return err
+						return nil, err
 					}
 					rel = strings.TrimPrefix(rel, p)
 					rel = strings.TrimPrefix(rel, "/")
@@ -370,7 +311,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					// Create the output folder, as a convenience
 					err := fs.CreateParentDir(path.Abs())
 					if err != nil {
-						return err
+						return nil, err
 					}
 				}
 
@@ -384,7 +325,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 					fakeRoot := "/root"
 					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.FullName), filepath.Join(fakeRoot, path.RelRoot()))
 					if err != nil {
-						return err
+						return nil, err
 					}
 					rel = strings.TrimPrefix(rel, fakeRoot)
 					rel = strings.TrimPrefix(rel, "/")
@@ -423,7 +364,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		for rk, expr := range tool.Target.RuntimeEnv {
 			val, err := exprs.Exec(expr, e.queryFunctions(tool.Target))
 			if err != nil {
-				return fmt.Errorf("runtime env `%v`: %w", expr, err)
+				return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 			}
 
 			env[normalizeEnv(strings.ToUpper(tool.Target.Name+"_"+rk))] = val
@@ -438,11 +379,111 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		env[k] = v
 	}
 
-	_, hasPathInEnv := env["PATH"]
+	return &runPrepare{
+		Env:    env,
+		BinDir: binDir,
+	}, nil
+}
+
+func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
+	target := rr.Target
+
+	ctx, rspan := e.SpanRun(e.Context, target)
+	defer func() {
+		rspan.RecordError(rerr)
+		rspan.End()
+	}()
+
+	e.Status(target.FQN)
+
+	err := e.linkTarget(target, NewTargets(0))
+	if err != nil {
+		return err
+	}
+
+	log.Tracef("%v locking run", target.FQN)
+	err = target.runLock.Lock()
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		log.Tracef("%v unlocking run", target.FQN)
+		err := target.runLock.Unlock()
+		if err != nil {
+			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
+		}
+
+		log.Tracef("Target DONE %v", target.FQN)
+	}()
+
+	target.LogFile = ""
+	if target.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
+		defer cancel()
+	}
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if target.Cache.Enabled && !rr.Shell && !rr.NoCache {
+		start := time.Now()
+		defer func() {
+			log.Debugf("%v done in %v", target.FQN, time.Since(start))
+		}()
+
+		cached, err := e.WarmTargetCache(ctx, target)
+		if err != nil {
+			return err
+		}
+
+		if cached {
+			return nil
+		}
+	}
 
 	if len(rr.Args) > 0 {
 		if target.Cache.Enabled {
 			return fmt.Errorf("args are not supported with cache")
+		}
+	}
+
+	rp, err := e.runPrepare(ctx, target)
+	if rerr != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+
+	env := rp.Env
+	binDir := rp.BinDir
+
+	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.FullName)
+	if target.RunInCwd {
+		if target.Cache.Enabled {
+			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
+		}
+
+		dir = e.Cwd
+	}
+
+	_, hasPathInEnv := env["PATH"]
+
+	if iocfg.Stdout == nil || iocfg.Stderr == nil {
+		target.LogFile = e.sandboxRoot(target).Join("log.txt").Abs()
+
+		f, err := os.Create(target.LogFile)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		if iocfg.Stdout == nil {
+			iocfg.Stdout = f
+		}
+
+		if iocfg.Stderr == nil {
+			iocfg.Stderr = f
 		}
 	}
 
@@ -515,7 +556,10 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 			ExecArgs: execArgs,
 		}, target.Sandbox && !hasPathInEnv)
 
+		espan := e.SpanRunExec(ctx, target)
 		err = cmd.Run()
+		espan.RecordError(err)
+		espan.End()
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				err = fmt.Errorf("%w: %v", cerr, err)
@@ -538,19 +582,15 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) error
 		return nil
 	}
 
-	e.Status(fmt.Sprintf("Collecting %v output...", target.FQN))
-
 	outRoot := &target.WorkdirRoot
 	if target.OutInSandbox {
 		outRoot = &target.SandboxRoot
 	}
 
-	err = e.populateActualFiles(target, outRoot.Abs())
+	err = e.populateActualFiles(ctx, target, outRoot.Abs())
 	if err != nil {
 		return fmt.Errorf("popfilesout: %w", err)
 	}
-
-	e.Status(fmt.Sprintf("Storing %v output...", target.FQN))
 
 	err = e.storeCache(ctx, target, outRoot.Abs())
 	if err != nil {
