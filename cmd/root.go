@@ -7,6 +7,10 @@ import (
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"go.uber.org/multierr"
 	"heph/config"
 	"heph/engine"
@@ -37,6 +41,8 @@ var memprofile *string
 var shell *bool
 var nocache *bool
 var params *[]string
+var summary *bool
+var jaegerEndpoint *string
 
 func init() {
 	// Output to stdout instead of the default stderr
@@ -70,6 +76,8 @@ func init() {
 	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
+	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
+	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
@@ -140,8 +148,6 @@ var rootCmd = &cobra.Command{
 			return nil
 		}
 
-		defer Engine.RunExitHandlers()
-
 		if !Engine.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
 			<-Engine.Pool.Done()
@@ -150,7 +156,18 @@ var rootCmd = &cobra.Command{
 
 		Engine.Pool.Stop(nil)
 
-		return Engine.Pool.Err()
+		err := Engine.Pool.Err()
+		if err != nil {
+			log.Error(err)
+		}
+
+		Engine.RunExitHandlers()
+
+		if *summary {
+			PrintSummary(Engine.TraceRecorder)
+		}
+
+		return nil
 	},
 	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		_, _, err := preRunAutocomplete(cmd.Context())
@@ -331,6 +348,39 @@ func engineInitWithEngine(e *engine.Engine) error {
 		return nil
 	}
 	e.RanInit = true
+
+	if *summary || *jaegerEndpoint != "" {
+
+		opts := []tracesdk.TracerProviderOption{
+			tracesdk.WithResource(resource.NewWithAttributes(
+				semconv.SchemaURL,
+				semconv.ServiceNameKey.String("heph"),
+			)),
+		}
+
+		if *jaegerEndpoint != "" {
+			jexp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(*jaegerEndpoint)))
+			if err != nil {
+				return err
+			}
+
+			opts = append(opts, tracesdk.WithBatcher(jexp))
+		}
+
+		if *summary {
+			opts = append(opts, tracesdk.WithSpanProcessor(e.TraceRecorder))
+		}
+
+		pr := tracesdk.NewTracerProvider(opts...)
+		e.Tracer = pr.Tracer("heph")
+
+		e.StartRootSpan()
+		e.RegisterExitHandler(func() {
+			e.RootSpan.End()
+			_ = pr.ForceFlush(context.Background())
+			_ = pr.Shutdown(context.Background())
+		})
+	}
 
 	e.Config.Profiles = *profiles
 

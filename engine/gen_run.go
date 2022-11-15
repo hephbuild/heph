@@ -16,7 +16,7 @@ type runGenEngine struct {
 	*Engine
 }
 
-func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error) {
+func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr error) {
 	if e.RanGenPass {
 		return &worker.WaitGroup{}, nil
 	}
@@ -41,6 +41,14 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		return &worker.WaitGroup{}, nil
 	}
 
+	ctx, span := e.SpanGenPass(ctx)
+	defer func() {
+		if rerr != nil {
+			span.RecordError(rerr)
+			span.End()
+		}
+	}()
+
 	log.Debugf("Run gen pass")
 
 	ge := runGenEngine{
@@ -63,6 +71,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (*worker.WaitGroup, error)
 		Name: "finalize gen",
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
+			span.End()
 			w.Status("Finalizing gen...")
 
 			// free references to starlark

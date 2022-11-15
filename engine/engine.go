@@ -9,8 +9,10 @@ import (
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
 	"heph/config"
+	"heph/engine/htrace"
 	"heph/packages"
 	"heph/sandbox"
 	"heph/targetspec"
@@ -33,11 +35,14 @@ import (
 )
 
 type Engine struct {
-	Cwd        string
-	Root       fs2.Path
-	HomeDir    fs2.Path
-	Config     Config
-	LocalCache *vfsos.Location
+	Cwd           string
+	Root          fs2.Path
+	HomeDir       fs2.Path
+	Config        Config
+	LocalCache    *vfsos.Location
+	TraceRecorder *htrace.Stats
+	Tracer        trace.Tracer
+	RootSpan      trace.Span
 
 	DisableNamedCache bool
 
@@ -156,6 +161,8 @@ func New(rootPath string) *Engine {
 		HomeDir:           homeDir,
 		LocalCache:        loc.(*vfsos.Location),
 		Targets:           NewTargets(0),
+		TraceRecorder:     &htrace.Stats{},
+		Tracer:            trace.NewNoopTracerProvider().Tracer(""),
 		Packages:          map[string]*packages.Package{},
 		cacheHashInput:    map[string]string{},
 		cacheHashOutput:   map[string]string{},
@@ -553,6 +560,16 @@ type WaitGroupMap struct {
 	m  map[string]*worker.WaitGroup
 }
 
+func (wgm *WaitGroupMap) All() *worker.WaitGroup {
+	wg := &worker.WaitGroup{}
+
+	for _, e := range wgm.m {
+		wg.AddChild(e)
+	}
+
+	return wg
+}
+
 func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	wgm.mu.Lock()
 	defer wgm.mu.Unlock()
@@ -580,8 +597,16 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (_ *WaitGroupMap, rerr error) {
 	targets := rrs.Targets()
+
+	sctx, span := e.SpanScheduleTargetWithDeps(octx, targets)
+	defer func() {
+		if rerr != nil {
+			span.RecordError(rerr)
+			span.End()
+		}
+	}()
 
 	toAssess, err := e.DAG().GetOrderedAncestors(targets, true)
 	if err != nil {
@@ -612,7 +637,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 	for _, target := range toAssess {
 		target := target
 
-		pj := e.Pool.Schedule(ctx, &worker.Job{
+		pj := e.Pool.Schedule(sctx, &worker.Job{
 			Name: "pull_meta " + target.FQN,
 			Deps: pullMetaDeps.Get(target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
@@ -641,7 +666,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 						Context: ctx,
 					}
 
-					cached, err := e.PullTargetMeta(target)
+					cached, err := e.PullTargetMeta(ctx, target)
 					if err != nil {
 						return err
 					}
@@ -682,7 +707,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 		sdeps.AddChild(pullAllMetaDeps)
 		sdeps.AddChild(scheduleDeps.Get(target.FQN))
 
-		sj := e.Pool.Schedule(ctx, &worker.Job{
+		sj := e.Pool.Schedule(octx, &worker.Job{
 			Name: "schedule " + target.FQN,
 			Deps: sdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
@@ -739,6 +764,11 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 		targetDeps.DoneSem()
 	}
 
+	go func() {
+		<-deps.All().Done()
+		span.End()
+	}()
+
 	return deps, nil
 }
 
@@ -755,7 +785,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, de
 
 			w.Status(fmt.Sprintf("Fetching cache %v...", target.FQN))
 
-			cached, err := e.WarmTargetCache(target)
+			cached, err := e.WarmTargetCache(ctx, target)
 			if err != nil {
 				return err
 			}
@@ -885,7 +915,13 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 	return out, nil
 }
 
-func (e *Engine) populateActualFiles(target *Target, outRoot string) error {
+func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
+	span := e.SpanCollectOutput(ctx, target)
+	defer func() {
+		span.RecordError(rerr)
+		span.End()
+	}()
+
 	empty, err := fs2.IsDirEmpty(outRoot)
 	if err != nil {
 		return fmt.Errorf("collect output: isempty: %w", err)
@@ -1208,7 +1244,8 @@ func (e *Engine) RunExitHandlers() {
 		e.exitHandlersRunning = false
 	}()
 
-	for _, h := range e.exitHandlers {
+	for i := len(e.exitHandlers) - 1; i >= 0; i-- {
+		h := e.exitHandlers[i]
 		h()
 	}
 
