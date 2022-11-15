@@ -305,7 +305,7 @@ func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader)
 }
 
 func untarFile(hdr *tar.Header, tr *tar.Reader, to string) error {
-	f, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(hdr.Mode))
+	f, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -316,6 +316,11 @@ func untarFile(hdr *tar.Header, tr *tar.Reader, to string) error {
 	}
 
 	err = f.Close()
+	if err != nil {
+		return err
+	}
+
+	err = os.Chmod(to, os.FileMode(hdr.Mode))
 	if err != nil {
 		return err
 	}

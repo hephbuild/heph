@@ -250,7 +250,9 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 }
 
 func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) error {
-	h.UI32(uint32(info.Mode().Perm()))
+	// We only really care if the file is executable
+	// https://stackoverflow.com/a/60128480/3212099
+	h.UI32(uint32(info.Mode().Perm() & 0111))
 
 	buf := copyBufPool.Get().([]byte)
 	defer copyBufPool.Put(buf)
@@ -327,6 +329,10 @@ func hashCacheId(target *Target) string {
 	return target.FQN + idh.Sum()
 }
 
+func (e *Engine) HashInput(target *Target) string {
+	return e.hashInput(target)
+}
+
 func (e *Engine) hashInput(target *Target) string {
 	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
 	mu.Lock()
@@ -347,7 +353,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}()
 
 	h := utils.NewHash()
-	h.I64(1) // Force break all caches
+	h.I64(4) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
@@ -432,6 +438,9 @@ func (e *Engine) hashInput(target *Target) string {
 	e.cacheHashInputMutex.Unlock()
 
 	return sh
+}
+func (e *Engine) HashOutput(target *Target, output string) string {
+	return e.hashOutput(target, output)
 }
 
 func (e *Engine) hashOutput(target *Target, output string) string {
@@ -862,6 +871,8 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 		}
 	}
 
+	tp.Sort()
+
 	return tp, nil
 }
 
@@ -888,12 +899,13 @@ func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, e
 		ps[i] = fs2.NewRelPath(file).WithRoot(target.OutExpansionRoot.Abs())
 	}
 
+	ps.Sort()
+
 	return ps, nil
 }
 
 func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs2.Paths, error) {
 	out := make(fs2.Paths, 0)
-	defer out.Sort()
 
 	for _, file := range files {
 		pattern := file.RelRoot()
@@ -911,6 +923,8 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 			return nil, fmt.Errorf("collect output %v: %w", file.RelRoot(), err)
 		}
 	}
+
+	out.Sort()
 
 	return out, nil
 }
