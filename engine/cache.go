@@ -65,8 +65,7 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 
 	span := e.SpanCacheStore(ctx, target)
 	defer func() {
-		span.RecordError(rerr)
-		span.End()
+		span.EndError(rerr)
 	}()
 
 	inputHash := e.hashInput(target)

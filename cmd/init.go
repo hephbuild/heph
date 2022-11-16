@@ -62,7 +62,7 @@ func engineInitWithEngine(e *engine.Engine) error {
 		}
 
 		if *summary {
-			opts = append(opts, tracesdk.WithSpanProcessor(e.TraceRecorder))
+			opts = append(opts, tracesdk.WithSpanProcessor(e.Stats))
 		}
 
 		pr := tracesdk.NewTracerProvider(opts...)

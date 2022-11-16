@@ -8,6 +8,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"heph/engine"
+	"heph/utils/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -83,6 +84,11 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 			log.Error(ctx.Err())
 			return
 		case <-wg.Done():
+			if *summary {
+				PrintSummary(w.e.Stats)
+				w.e.Stats.Reset()
+			}
+
 			if err := wg.Err(); err != nil {
 				log.Error(err)
 				return
@@ -91,6 +97,12 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 	}
 
 	err := run(ctx, w.e, r.rrs, !fromStdin)
+
+	if *summary {
+		PrintSummary(w.e.Stats)
+		w.e.Stats.Reset()
+	}
+
 	if err != nil {
 		humanPrintError(err)
 		return
@@ -128,6 +140,10 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 				continue
 			}
 
+			if e.Op.Has(fsnotify.Create) && !fs.PathExists(e.Name) {
+				continue
+			}
+
 			filteredEvents = append(filteredEvents, e)
 		}
 
@@ -161,17 +177,15 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 			files = append(files, event.RelPath)
 		}
 
-		fileDescendantsTargets, err := w.e.GetFileDescendants(files, allTargets)
+		directDescendants, err := w.e.GetFileDescendants(files, allTargets)
 		if err != nil {
 			return err
 		}
 
-		descendants, err := w.e.DAG().GetOrderedDescendants(fileDescendantsTargets, true)
+		descendants, err := w.e.DAG().GetOrderedDescendants(directDescendants, true)
 		if err != nil {
 			return err
 		}
-
-		localRRs = make([]engine.TargetRunRequest, 0)
 
 		for _, target := range descendants {
 			w.e.ResetCacheHashInput(target)
@@ -182,14 +196,16 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 			}
 		}
 
-		if w.e.RanGenPass {
+		localRRs = make([]engine.TargetRunRequest, 0)
+		if !w.e.RanGenPass {
+			// Run all if gen has not run yet
+			localRRs = w.rrs
+		} else {
 			for _, target := range descendants {
 				if w.targets.Find(target.FQN) != nil {
 					localRRs = append(localRRs, engine.TargetRunRequest{Target: target})
 				}
 			}
-		} else {
-			localRRs = w.rrs
 		}
 
 		if len(localRRs) == 0 && w.e.RanGenPass {

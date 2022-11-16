@@ -3,6 +3,7 @@ package htrace
 import (
 	"context"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"heph/utils"
 	"sync"
@@ -140,7 +141,9 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 		if cacheHit {
 			stat.CacheHit = true
 		}
-
+		if s.Status().Code == codes.Error {
+			stat.Error = true
+		}
 		st.Spans[fqn] = stat
 	}
 }
@@ -151,6 +154,14 @@ func (st *Stats) Shutdown(ctx context.Context) error {
 
 func (st *Stats) ForceFlush(ctx context.Context) error {
 	return nil
+}
+
+func (st *Stats) Reset() {
+	st.spansm.Lock()
+	defer st.spansm.Unlock()
+
+	st.Spans = map[string]TargetStatsSpan{}
+	st.targetPhases = map[string]map[string]TargetStatsSpanPhase{}
 }
 
 type TargetStatsSpanPhase struct {
@@ -165,6 +176,7 @@ type TargetStatsSpan struct {
 	End      time.Time
 	Phases   []TargetStatsSpanPhase
 	CacheHit bool
+	Error    bool
 }
 
 func (s TargetStatsSpan) Duration() time.Duration {

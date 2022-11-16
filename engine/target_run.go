@@ -68,8 +68,7 @@ func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, o
 
 	span := e.SpanCachePull(ctx, target, onlyMeta)
 	defer func() {
-		span.RecordError(rerr)
-		span.End()
+		span.EndError(rerr)
 	}()
 
 	ok, err := e.getCache(target, onlyMeta)
@@ -137,8 +136,7 @@ type runPrepare struct {
 func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *runPrepare, rerr error) {
 	span := e.SpanRunPrepare(ctx, target)
 	defer func() {
-		span.RecordError(rerr)
-		span.End()
+		span.EndError(rerr)
 	}()
 
 	// Sanity checks
@@ -390,8 +388,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 
 	ctx, rspan := e.SpanRun(e.Context, target)
 	defer func() {
-		rspan.RecordError(rerr)
-		rspan.End()
+		rspan.EndError(rerr)
 	}()
 
 	e.Status(target.FQN)
@@ -558,8 +555,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 
 		espan := e.SpanRunExec(ctx, target)
 		err = cmd.Run()
-		espan.RecordError(err)
-		espan.End()
+		espan.EndError(err)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				err = fmt.Errorf("%w: %v", cerr, err)
