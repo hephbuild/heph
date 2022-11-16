@@ -64,11 +64,6 @@ var queryCmd = &cobra.Command{
 	Short:   "Query the graph",
 	Args:    cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := engineInit()
-		if err != nil {
-			return err
-		}
-
 		if hasStdin(args) {
 			// Block and read stdin here to prevent multiple bubbletea running at the same time
 			_, err := parseTargetPathsFromStdin()
@@ -77,16 +72,17 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		if !*noGen {
-			deps, err := Engine.ScheduleGenPass(cmd.Context())
-			if err != nil {
-				return err
-			}
+		err := engineInit()
+		if err != nil {
+			return err
+		}
 
-			err = WaitPool("Query Gen", Engine.Pool, deps, false)
-			if err != nil {
-				return err
-			}
+		err = preRunWithGenWithOpts(cmd.Context(), PreRunOpts{
+			Engine:       Engine,
+			PoolWaitName: "Query gen",
+		})
+		if err != nil {
+			return err
 		}
 
 		targets := Engine.Targets.Slice()
