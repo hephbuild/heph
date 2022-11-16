@@ -28,6 +28,61 @@ func (h hookFunc) Fire(entry *log.Entry) error {
 	return nil
 }
 
+func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+	start := time.Now()
+	printProgress := func() {
+		s := deps.TransitiveCount()
+		log.Infof("Progress %v: %v/%v %v", name, s.Done, s.All, utils.RoundDuration(time.Since(start), 1).String())
+	}
+
+	printWorkersStatus := func() {
+		for _, w := range pool.Workers {
+			j := w.CurrentJob
+			if j == nil {
+				continue
+			}
+
+			duration := time.Since(j.TimeStart)
+
+			if duration < 5*time.Second {
+				// Skip printing short jobs
+				continue
+			}
+
+			status := w.GetStatus()
+			if status == "" {
+				status = "Waiting..."
+			}
+
+			runtime := fmt.Sprintf("%v", utils.RoundDuration(duration, 1).String())
+
+			fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
+		}
+	}
+
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+
+	c := 1
+	for {
+		select {
+		case <-t.C:
+			printProgress()
+			if c >= 5 {
+				c = 1
+				printWorkersStatus()
+			}
+			c++
+			continue
+		case <-deps.Done():
+			// will break
+		}
+
+		printProgress()
+		return nil
+	}
+}
+
 func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilent bool) error {
 	log.Tracef("WaitPool %v", name)
 	defer func() {
@@ -35,61 +90,14 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 	}()
 
 	if !forceSilent && isTerm && !*plain {
-		err := PoolUI(name, deps, pool)
+		err := poolUI(name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)
 		}
 	} else {
-		start := time.Now()
-		printProgress := func() {
-			s := deps.TransitiveCount()
-			log.Infof("Progress %v: %v/%v %v", name, s.Done, s.All, utils.RoundDuration(time.Since(start), 1).String())
-		}
-
-		printWorkersStatus := func() {
-			for _, w := range pool.Workers {
-				j := w.CurrentJob
-				if j == nil {
-					continue
-				}
-
-				duration := time.Since(j.TimeStart)
-
-				if duration < 5*time.Second {
-					// Skip printing short jobs
-					continue
-				}
-
-				status := w.GetStatus()
-				if status == "" {
-					status = "Waiting..."
-				}
-
-				runtime := fmt.Sprintf("%v", utils.RoundDuration(duration, 1).String())
-
-				fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
-			}
-		}
-
-		t := time.NewTicker(time.Second)
-		c := 1
-		for {
-			select {
-			case <-t.C:
-				printProgress()
-				if c >= 5 {
-					c = 1
-					printWorkersStatus()
-				}
-				c++
-				continue
-			case <-deps.Done():
-				// will break
-			}
-
-			t.Stop()
-			printProgress()
-			break
+		err := logPoolUI(name, deps, pool)
+		if err != nil {
+			return fmt.Errorf("logpoolui: %w", err)
 		}
 	}
 
@@ -100,7 +108,7 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 	return deps.Err()
 }
 
-func PoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
 
@@ -257,7 +265,7 @@ func (r *renderer) View() string {
 	if r.summary {
 		count := fmt.Sprint(r.stats.Done)
 		if r.stats.Success != r.stats.All {
-			count = fmt.Sprintf("%v/%v", r.stats.Success, r.stats.All)
+			count = fmt.Sprintf("%v/%v", r.stats.Done, r.stats.All)
 		}
 		extra := ""
 		if r.stats.Failed > 0 || r.stats.Skipped > 0 {
@@ -267,14 +275,14 @@ func (r *renderer) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.stats.Success, r.stats.All, start))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", r.name, r.stats.Done, r.stats.All, start))
 	if r.stats.Failed > 0 || r.stats.Skipped > 0 {
 		s.WriteString(fmt.Sprintf("%v failed, %v skipped\n", r.stats.Failed, r.stats.Skipped))
 	}
 
 	for _, w := range r.workers {
-		var runtime string
 		state := "I"
+		runtime := ""
 		if j := w.CurrentJob; j != nil {
 			state = "R"
 			runtime = fmt.Sprintf(" %v", utils.RoundDuration(time.Since(j.TimeStart), 1).String())

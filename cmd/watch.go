@@ -221,12 +221,7 @@ func (w *watchCtx) runGraph(args []string) error {
 	}
 	e := w.e
 
-	err = preRunWithGenWithEngine(w.ctx, e, false)
-	if err != nil {
-		return err
-	}
-
-	w.rrs, err = parseTargetsAndArgs(e, args)
+	w.rrs, err = parseTargetsAndArgsWithEngine(w.ctx, e, args)
 	if err != nil {
 		return err
 	}

@@ -1,31 +1,18 @@
 package cmd
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"github.com/mattn/go-isatty"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"go.opentelemetry.io/otel/exporters/jaeger"
-	"go.opentelemetry.io/otel/sdk/resource"
-	tracesdk "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
-	"go.uber.org/multierr"
 	"heph/config"
 	"heph/engine"
-	"heph/targetspec"
 	"heph/utils"
-	"heph/worker"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
-	"syscall"
-	"time"
 )
 
 var isTerm bool
@@ -92,6 +79,51 @@ var cpuProfileFile *os.File
 
 var Engine *engine.Engine
 
+func postRun() {
+	defer func() {
+		if cpuProfileFile != nil {
+			pprof.StopCPUProfile()
+			defer cpuProfileFile.Close()
+		}
+
+		if *memprofile != "" {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				log.Errorf("could not create memory profile: %v", err)
+				return
+			}
+			defer f.Close()
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				log.Errorf("could not write memory profile: %v", err)
+			}
+		}
+	}()
+
+	if Engine == nil {
+		return
+	}
+
+	if !Engine.Pool.IsDone() {
+		log.Tracef("Waiting for all pool items to finish")
+		<-Engine.Pool.Done()
+		log.Tracef("All pool items finished")
+	}
+
+	Engine.Pool.Stop(nil)
+
+	err := Engine.Pool.Err()
+	if err != nil {
+		log.Error(err)
+	}
+
+	Engine.RunExitHandlers()
+
+	if *summary {
+		PrintSummary(Engine.TraceRecorder)
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:           "heph",
 	Short:         "Efficient build system",
@@ -121,51 +153,7 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		return nil
-	},
-	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-		defer func() {
-			if cpuProfileFile != nil {
-				pprof.StopCPUProfile()
-				defer cpuProfileFile.Close()
-			}
-
-			if *memprofile != "" {
-				f, err := os.Create(*memprofile)
-				if err != nil {
-					log.Errorf("could not create memory profile: %v", err)
-					return
-				}
-				defer f.Close()
-				runtime.GC() // get up-to-date statistics
-				if err := pprof.WriteHeapProfile(f); err != nil {
-					log.Errorf("could not write memory profile: %v", err)
-				}
-			}
-		}()
-
-		if Engine == nil {
-			return nil
-		}
-
-		if !Engine.Pool.IsDone() {
-			log.Tracef("Waiting for all pool items to finish")
-			<-Engine.Pool.Done()
-			log.Tracef("All pool items finished")
-		}
-
-		Engine.Pool.Stop(nil)
-
-		err := Engine.Pool.Err()
-		if err != nil {
-			log.Error(err)
-		}
-
-		Engine.RunExitHandlers()
-
-		if *summary {
-			PrintSummary(Engine.TraceRecorder)
-		}
+		cobra.OnFinalize(postRun)
 
 		return nil
 	},
@@ -222,33 +210,19 @@ var runCmd = &cobra.Command{
 	Args:              cobra.MinimumNArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if hasStdin(args) {
-			tps, err := parseTargetPathsFromStdin()
-			if err != nil {
-				return err
-			}
-
-			if len(tps) == 0 {
-				return nil
-			}
-		}
-
-		err := preRunWithGen(cmd.Context(), false)
+		rrs, err := parseTargetsAndArgs(cmd.Context(), args)
 		if err != nil {
 			return err
-		}
-
-		rrs, err := parseTargetsAndArgs(Engine, args)
-		if err != nil {
-			return err
-		}
-
-		if !hasStdin(args) && len(rrs) == 0 {
-			_ = cmd.Help()
-			return nil
 		}
 
 		fromStdin := hasStdin(args)
+
+		if len(rrs) == 0 {
+			if fromStdin {
+				_ = cmd.Help()
+			}
+			return nil
+		}
 
 		err = run(cmd.Context(), Engine, rrs, !fromStdin)
 		if err != nil {
@@ -264,34 +238,6 @@ func switchToPorcelain() {
 	*porcelain = true
 	*plain = true
 	log.SetLevel(log.ErrorLevel)
-}
-
-func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
-	return preRunAutocompleteInteractive(ctx, false, true)
-}
-
-func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent bool) ([]string, []string, error) {
-	err := engineInit()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cache, _ := Engine.LoadAutocompleteCache()
-
-	if cache != nil {
-		if includePrivate {
-			return cache.AllTargets, cache.Labels, nil
-		}
-
-		return cache.PublicTargets, cache.Labels, nil
-	}
-
-	err = preRunWithGen(ctx, silent)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return Engine.Targets.FQNs(), Engine.Labels, nil
 }
 
 func findRoot() (string, error) {
@@ -318,173 +264,17 @@ func findRoot() (string, error) {
 	return "", fmt.Errorf("root not found, are you running this command in the repo directory?")
 }
 
-func engineFactory() (*engine.Engine, error) {
-	root, err := findRoot()
-	if err != nil {
-		return nil, err
-	}
-
-	log.Tracef("Root: %v", root)
-
-	e := engine.New(root)
-
-	return e, nil
-}
-
-func engineInit() error {
-	if Engine == nil {
-		var err error
-		Engine, err = engineFactory()
-		if err != nil {
-			return err
-		}
-	}
-
-	return engineInitWithEngine(Engine)
-}
-
-func engineInitWithEngine(e *engine.Engine) error {
-	if e.RanInit {
-		return nil
-	}
-	e.RanInit = true
-
-	if *summary || *jaegerEndpoint != "" {
-
-		opts := []tracesdk.TracerProviderOption{
-			tracesdk.WithResource(resource.NewWithAttributes(
-				semconv.SchemaURL,
-				semconv.ServiceNameKey.String("heph"),
-			)),
-		}
-
-		if *jaegerEndpoint != "" {
-			jexp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(*jaegerEndpoint)))
-			if err != nil {
-				return err
-			}
-
-			opts = append(opts, tracesdk.WithBatcher(jexp))
-		}
-
-		if *summary {
-			opts = append(opts, tracesdk.WithSpanProcessor(e.TraceRecorder))
-		}
-
-		pr := tracesdk.NewTracerProvider(opts...)
-		e.Tracer = pr.Tracer("heph")
-
-		e.StartRootSpan()
-		e.RegisterExitHandler(func() {
-			e.RootSpan.End()
-			_ = pr.ForceFlush(context.Background())
-			_ = pr.Shutdown(context.Background())
-		})
-	}
-
-	e.Config.Profiles = *profiles
-
-	err := e.Init()
-	if err != nil {
-		return err
-	}
-
-	paramsm := map[string]string{}
-	for k, v := range e.Config.Params {
-		paramsm[k] = v
-	}
-	for _, s := range *params {
-		parts := strings.SplitN(s, "=", 2)
-		if len(parts) != 2 {
-			return fmt.Errorf("parameter must be name=value, got `%v`", s)
-		}
-
-		paramsm[parts[0]] = parts[1]
-	}
-	e.Params = paramsm
-	e.Pool = worker.NewPool(*workers)
-	e.RegisterExitHandler(func() {
-		e.Pool.Stop(nil)
-	})
-
-	err = e.Parse()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func preRunWithGen(ctx context.Context, silent bool) error {
-	err := engineInit()
-	if err != nil {
-		return err
-	}
-
-	err = preRunWithGenWithEngine(ctx, Engine, silent)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func preRunWithGenWithEngine(ctx context.Context, e *engine.Engine, silent bool) error {
-	err := engineInitWithEngine(e)
-	if err != nil {
-		return err
-	}
-
-	if *noGen {
-		log.Info("Generated targets disabled")
-		return nil
-	}
-
-	deps, err := e.ScheduleGenPass(ctx)
-	if err != nil {
-		return err
-	}
-
-	err = WaitPool("PreRun gen", e.Pool, deps, silent)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 var cleanCmd = &cobra.Command{
 	Use:               "clean",
 	Short:             "Clean",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		rrs, err := parseTargetsAndArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
 
-		var targets []*engine.Target
-		if hasStdin(args) {
-			var err error
-			targets, err = parseTargetsFromStdin(Engine)
-			if err != nil {
-				return err
-			}
-		} else {
-			for _, arg := range args {
-				tp, err := targetspec.TargetParse("", arg)
-				if err != nil {
-					return err
-				}
-
-				target := Engine.Targets.Find(tp.Full())
-				if target == nil {
-					return engine.TargetNotFoundError(tp.Full())
-				}
-
-				targets = append(targets, target)
-			}
-		}
+		targets := rrs.Targets()
 
 		for _, target := range targets {
 			log.Tracef("Cleaning %v...", target.FQN)
@@ -531,83 +321,4 @@ var cleanLockCmd = &cobra.Command{
 
 		return nil
 	},
-}
-
-func execute() error {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-sig
-		go func() {
-			<-time.After(time.Second)
-			log.Warnf("Attempting to soft cancel... ctrl+c one more time to force")
-		}()
-		cancel()
-
-		<-sig
-		os.Exit(1)
-	}()
-
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func humanPrintError(err error) {
-	errs := multierr.Errors(err)
-
-	for i, err := range errs {
-		if i != 0 {
-			fmt.Fprintln(os.Stderr)
-		}
-
-		var terr engine.TargetFailedError
-		if errors.As(err, &terr) {
-			log.Errorf("%v failed", terr.Target.FQN)
-
-			var lerr engine.ErrorWithLogFile
-			if errors.As(err, &lerr) {
-				log.Error(lerr.Error())
-
-				logFile := lerr.LogFile
-				info, _ := os.Stat(logFile)
-				if info.Size() > 0 {
-					fmt.Fprintln(os.Stderr)
-					c := exec.Command("cat", logFile)
-					c.Stdout = os.Stderr
-					_ = c.Run()
-					fmt.Fprintln(os.Stderr)
-					fmt.Fprintf(os.Stderr, "The log file can be found at %v\n", logFile)
-				}
-			} else {
-				log.Error(terr.Error())
-			}
-		} else {
-			log.Error(err)
-		}
-	}
-
-	if len(errs) > 1 {
-		fmt.Fprintln(os.Stderr)
-		log.Errorf("%v jobs failed", len(errs))
-	}
-}
-
-func Execute() {
-	utils.Seed()
-
-	if err := execute(); err != nil {
-		humanPrintError(err)
-
-		var eerr ErrorWithExitCode
-		if errors.As(err, &eerr) {
-			os.Exit(eerr.ExitCode)
-		}
-		os.Exit(1)
-	}
 }

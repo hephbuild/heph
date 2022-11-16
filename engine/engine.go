@@ -117,7 +117,7 @@ func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
 }
 
 func (rrs TargetRunRequests) Targets() []*Target {
-	ts := make([]*Target, 0)
+	ts := make([]*Target, 0, len(rrs))
 
 	for _, rr := range rrs {
 		ts = append(ts, rr.Target)
