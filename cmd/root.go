@@ -120,7 +120,7 @@ func postRun() {
 	Engine.RunExitHandlers()
 
 	if *summary {
-		PrintSummary(Engine.TraceRecorder)
+		PrintSummary(Engine.Stats)
 	}
 }
 

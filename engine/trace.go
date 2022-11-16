@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"heph/engine/htrace"
 	"os"
@@ -20,12 +21,24 @@ func targetSpanAttr(t *Target) trace.SpanStartOption {
 	return trace.WithAttributes(attrs...)
 }
 
-func (e *Engine) newTargetSpanPure(ctx context.Context, spanName, phase string, opts ...trace.SpanStartOption) trace.Span {
+type Span struct {
+	trace.Span
+}
+
+func (s Span) EndError(err error) {
+	if err != nil {
+		s.Span.RecordError(err)
+		s.Span.SetStatus(codes.Error, "")
+	}
+	s.Span.End()
+}
+
+func (e *Engine) newTargetSpanPure(ctx context.Context, spanName, phase string, opts ...trace.SpanStartOption) Span {
 	_, span := e.newTargetSpan(ctx, spanName, phase, opts...)
 	return span
 }
 
-func (e *Engine) newTargetSpan(ctx context.Context, spanName, phase string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+func (e *Engine) newTargetSpan(ctx context.Context, spanName, phase string, opts ...trace.SpanStartOption) (context.Context, Span) {
 	if spanName == "" {
 		spanName = phase
 	}
@@ -47,7 +60,9 @@ func (e *Engine) newTargetSpan(ctx context.Context, spanName, phase string, opts
 
 	opts = append(opts, trace.WithAttributes(attrs...))
 
-	return e.Tracer.Start(ctx, spanName, opts...)
+	ctx, span := e.Tracer.Start(ctx, spanName, opts...)
+
+	return ctx, Span{span}
 }
 
 func (e *Engine) StartRootSpan() {
@@ -66,15 +81,15 @@ func (e *Engine) StartRootSpan() {
 	_, e.RootSpan = e.Tracer.Start(context.Background(), strings.Join(args, " "), trace.WithAttributes(attrs...))
 }
 
-func (e *Engine) SpanRun(ctx context.Context, t *Target) (context.Context, trace.Span) {
+func (e *Engine) SpanRun(ctx context.Context, t *Target) (context.Context, Span) {
 	return e.newTargetSpan(ctx, "run "+t.FQN, htrace.PhaseTargetRun, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanGenPass(ctx context.Context) (context.Context, trace.Span) {
+func (e *Engine) SpanGenPass(ctx context.Context) (context.Context, Span) {
 	return e.newTargetSpan(ctx, "", htrace.PhaseGenPass)
 }
 
-func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Target) (context.Context, trace.Span) {
+func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Target) (context.Context, Span) {
 	fqns := make([]string, 0)
 	for _, target := range targets {
 		fqns = append(fqns, target.FQN)
@@ -89,7 +104,7 @@ func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Targ
 	return e.newTargetSpan(ctx, "", htrace.PhaseScheduleTargetWithDeps, trace.WithAttributes(attrs...))
 }
 
-func (e *Engine) SpanCachePull(ctx context.Context, t *Target, onlyMeta bool) trace.Span {
+func (e *Engine) SpanCachePull(ctx context.Context, t *Target, onlyMeta bool) Span {
 	phase := htrace.PhaseCachePull
 	if onlyMeta {
 		phase = htrace.PhaseCachePullMeta
@@ -97,18 +112,18 @@ func (e *Engine) SpanCachePull(ctx context.Context, t *Target, onlyMeta bool) tr
 	return e.newTargetSpanPure(ctx, phase, phase, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanRunPrepare(ctx context.Context, t *Target) trace.Span {
+func (e *Engine) SpanRunPrepare(ctx context.Context, t *Target) Span {
 	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunPrepare, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanRunExec(ctx context.Context, t *Target) trace.Span {
+func (e *Engine) SpanRunExec(ctx context.Context, t *Target) Span {
 	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunExec, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanCollectOutput(ctx context.Context, t *Target) trace.Span {
+func (e *Engine) SpanCollectOutput(ctx context.Context, t *Target) Span {
 	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunCollectOutput, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanCacheStore(ctx context.Context, t *Target) trace.Span {
+func (e *Engine) SpanCacheStore(ctx context.Context, t *Target) Span {
 	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunCacheStore, targetSpanAttr(t))
 }

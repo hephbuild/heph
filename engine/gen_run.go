@@ -44,8 +44,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 	ctx, span := e.SpanGenPass(ctx)
 	defer func() {
 		if rerr != nil {
-			span.RecordError(rerr)
-			span.End()
+			span.EndError(rerr)
 		}
 	}()
 

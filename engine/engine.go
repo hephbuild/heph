@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/bmatcuk/doublestar/v4"
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	log "github.com/sirupsen/logrus"
@@ -35,14 +34,14 @@ import (
 )
 
 type Engine struct {
-	Cwd           string
-	Root          fs2.Path
-	HomeDir       fs2.Path
-	Config        Config
-	LocalCache    *vfsos.Location
-	TraceRecorder *htrace.Stats
-	Tracer        trace.Tracer
-	RootSpan      trace.Span
+	Cwd        string
+	Root       fs2.Path
+	HomeDir    fs2.Path
+	Config     Config
+	LocalCache *vfsos.Location
+	Stats      *htrace.Stats
+	Tracer     trace.Tracer
+	RootSpan   trace.Span
 
 	DisableNamedCache bool
 
@@ -161,7 +160,7 @@ func New(rootPath string) *Engine {
 		HomeDir:           homeDir,
 		LocalCache:        loc.(*vfsos.Location),
 		Targets:           NewTargets(0),
-		TraceRecorder:     &htrace.Stats{},
+		Stats:             &htrace.Stats{},
 		Tracer:            trace.NewNoopTracerProvider().Tracer(""),
 		Packages:          map[string]*packages.Package{},
 		cacheHashInput:    map[string]string{},
@@ -612,8 +611,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(octx context.Context, rrs TargetRunRe
 	sctx, span := e.SpanScheduleTargetWithDeps(octx, targets)
 	defer func() {
 		if rerr != nil {
-			span.RecordError(rerr)
-			span.End()
+			span.EndError(rerr)
 		}
 	}()
 
@@ -932,8 +930,7 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
 	span := e.SpanCollectOutput(ctx, target)
 	defer func() {
-		span.RecordError(rerr)
-		span.End()
+		span.EndError(rerr)
 	}()
 
 	empty, err := fs2.IsDirEmpty(outRoot)
@@ -1211,12 +1208,7 @@ func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Targe
 	for _, path := range paths {
 		for _, target := range targets {
 			for _, file := range target.HashDeps.Files {
-				match, err := doublestar.PathMatch(file.RelRoot(), path)
-				if err != nil {
-					return nil, err
-				}
-
-				if match {
+				if file.RelRoot() == path {
 					descendants.Add(target)
 					break
 				}

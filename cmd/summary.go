@@ -53,7 +53,14 @@ func PrintSummary(stats *htrace.Stats) {
 	data := make([][]string, 0)
 	for _, span := range spans {
 		row := []string{
-			span.FQN,
+			func() string {
+				s := span.FQN
+				if span.Error {
+					s += " (error)"
+				}
+
+				return s
+			}(),
 			summaryPhaseStringOpt(
 				summaryOpt{
 					phase: span.PhaseCachePull(),
@@ -88,6 +95,7 @@ func PrintSummary(stats *htrace.Stats) {
 
 	table := tablewriter.NewWriter(os.Stderr)
 	table.SetAutoFormatHeaders(false)
+	table.SetAutoWrapText(false)
 	table.SetHeader([]string{"Target", "Cache Pull", "Prepare", "Exec", "Collect Output", "Cache Store", "Total"})
 	table.SetBorder(true)
 	table.AppendBulk(data)
