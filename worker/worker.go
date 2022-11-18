@@ -22,6 +22,10 @@ const (
 	StateSkipped
 )
 
+func (s JobState) IsDone() bool {
+	return s != StateUnknown && s != StateRunning && s != StatePending
+}
+
 func (s JobState) String() string {
 	switch s {
 	case StatePending:
@@ -63,8 +67,16 @@ func (j *Job) Done() {
 }
 
 func (j *Job) DoneWithErr(err error, state JobState) {
-	log.Tracef("job %v done with err %v", j.Name, err)
-	j.err = err
+	if state == StateFailed {
+		log.Errorf("%v finished with err: %v", j.Name, err)
+	}
+	jerr := JobError{
+		ID:    j.ID,
+		Name:  j.Name,
+		State: state,
+		Err:   err,
+	}
+	j.err = jerr
 	j.doneWithState(state)
 }
 
@@ -74,11 +86,7 @@ func (j *Job) doneWithState(state JobState) {
 }
 
 func (j *Job) IsDone() bool {
-	return StateIsDone(j.State)
-}
-
-func StateIsDone(s JobState) bool {
-	return s != StateUnknown && s != StateRunning && s != StatePending
+	return j.State.IsDone()
 }
 
 type Worker struct {
@@ -204,8 +212,7 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 			return
 		case <-job.Deps.Done():
 			if err := job.Deps.Err(); err != nil {
-				// TODO: find out root cause from err
-				p.finalize(job, fmt.Errorf("deps failed"), true)
+				p.finalize(job, CollectRootErrors(err), true)
 				return
 			}
 		}
@@ -222,14 +229,14 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 
 	if err == nil {
 		job.Done()
-		log.Debugf("finalize job: %v %v", job.Name, job.State.String())
+		//log.Debugf("finalize job: %v %v", job.Name, job.State.String())
 	} else {
 		if skippedOnErr {
 			job.DoneWithErr(err, StateSkipped)
 		} else {
 			job.DoneWithErr(err, StateFailed)
 		}
-		log.Debugf("finalize job err: %v %v: %v", job.Name, job.State.String(), err)
+		//log.Debugf("finalize job err: %v %v: %v", job.Name, job.State.String(), err)
 	}
 
 	p.wg.Done()

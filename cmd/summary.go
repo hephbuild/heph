@@ -52,20 +52,15 @@ func PrintSummary(stats *htrace.Stats) {
 
 	data := make([][]string, 0)
 	for _, span := range spans {
-		row := []string{
-			func() string {
-				s := span.FQN
-				if span.Error {
-					s += " (error)"
-				}
+		inlineCachePull := len(span.CachePulls) == 1 && span.CachePulls[0].Name == ""
 
-				return s
-			}(),
-			summaryPhaseStringOpt(
+		cachePullCell := ""
+		if inlineCachePull {
+			cachePullCell = summaryPhaseStringOpt(
 				summaryOpt{
 					phase: span.PhaseCachePull(),
 					decorator: func(s string) string {
-						if span.CacheHit {
+						if span.CacheHit() {
 							return s + " (hit)"
 						}
 
@@ -75,14 +70,26 @@ func PrintSummary(stats *htrace.Stats) {
 				summaryOpt{
 					phase: span.PhaseCachePullMeta(),
 					decorator: func(s string) string {
-						if span.CacheHit {
+						if span.CacheHit() {
 							s = s + " (hit)"
 						}
 
 						return s + " (meta)"
 					},
 				},
-			),
+			)
+		}
+
+		row := []string{
+			func() string {
+				s := span.FQN
+				if span.Error {
+					s += " (error)"
+				}
+
+				return s
+			}(),
+			cachePullCell,
 			summaryPhaseString(span.PhaseCachePrepare()),
 			summaryPhaseString(span.PhaseRunExec()),
 			summaryPhaseString(span.PhaseRunCollectOutput()),
@@ -91,12 +98,43 @@ func PrintSummary(stats *htrace.Stats) {
 		}
 
 		data = append(data, row)
+
+		if !inlineCachePull {
+			sort.SliceStable(span.CachePulls, func(i, j int) bool {
+				return span.CachePulls[i].Name < span.CachePulls[j].Name
+			})
+
+			for _, pull := range span.CachePulls {
+				name := pull.Name
+				if name == "" {
+					name = "<unnamed>"
+				}
+				data = append(data, []string{
+					"  |" + name,
+					func() string {
+						s := utils.RoundDuration(pull.Duration(), 1).String()
+						if span.CacheHit() {
+							s = s + " (hit)"
+						}
+						return s
+					}(),
+					"",
+					"",
+					"",
+					"",
+					"",
+				})
+			}
+		}
 	}
 
 	table := tablewriter.NewWriter(os.Stderr)
 	table.SetAutoFormatHeaders(false)
 	table.SetAutoWrapText(false)
 	table.SetHeader([]string{"Target", "Cache Pull", "Prepare", "Exec", "Collect Output", "Cache Store", "Total"})
+	if stats.RootSpan != nil {
+		table.SetFooter([]string{"Total", "", "", "", "", "", utils.RoundDuration(stats.RootSpan.EndTime().Sub(stats.RootSpan.StartTime()), 1).String()})
+	}
 	table.SetBorder(true)
 	table.AppendBulk(data)
 	table.Render()

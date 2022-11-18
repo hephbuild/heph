@@ -76,11 +76,6 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		})
 	}
 
-	var supportFiles []string
-	for i := 0; i < factor; i++ {
-		supportFiles = append(supportFiles, "aaa")
-	}
-
 	var cacheNames []string
 	for i := 0; i < factor; i++ {
 		cacheNames = append(cacheNames, "aaa")
@@ -123,19 +118,18 @@ func genTargetSpec(name string, factor int) TargetSpec {
 			Enabled: true,
 			Named:   cacheNames,
 		},
-		SupportFiles: supportFiles,
-		Sandbox:      false,
-		Codegen:      "",
-		Labels:       labels,
-		Env:          env,
-		PassEnv:      passEnv,
-		RunInCwd:     false,
-		Gen:          false,
-		Source:       []string{"some_source" + time.Now().String()},
-		RuntimeEnv:   nil,
-		SrcEnv:       TargetSpecSrcEnv{},
-		OutEnv:       "",
-		HashFile:     "",
+		Sandbox:    false,
+		Codegen:    "",
+		Labels:     labels,
+		Env:        env,
+		PassEnv:    passEnv,
+		RunInCwd:   false,
+		Gen:        false,
+		Source:     []string{"some_source" + time.Now().String()},
+		RuntimeEnv: nil,
+		SrcEnv:     TargetSpecSrcEnv{},
+		OutEnv:     "",
+		HashFile:   "",
 	}
 }
 

@@ -30,7 +30,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			Named:   args.Cache.Named,
 			History: args.Cache.History,
 		},
-		SupportFiles: args.SupportFiles,
 		Sandbox:      args.SandboxEnabled,
 		OutInSandbox: args.OutInSandbox,
 		Codegen:      args.Codegen,
@@ -111,6 +110,18 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	} else {
 		for _, file := range args.Out.Array {
 			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+				Package: pkg,
+				Path:    file,
+			})
+		}
+	}
+
+	if len(args.SupportFiles) > 0 {
+		t.HasSupportFiles = true
+
+		for _, file := range args.SupportFiles {
+			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+				Name:    targetspec.SupportFilesOutput,
 				Package: pkg,
 				Path:    file,
 			})

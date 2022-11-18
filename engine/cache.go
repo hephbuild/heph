@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"heph/targetspec"
 	"heph/utils/fs"
 	"heph/utils/tar"
 	"heph/vfssimple"
@@ -41,20 +42,12 @@ func (e *Engine) cacheOutHashName(name string) string {
 	return "hash_out_" + name
 }
 
-func (e *Engine) cacheSupportTarName() string {
-	return "support_out.tar.gz"
-}
-
 func (e *Engine) targetOutputTarFile(target *Target, name string) string {
 	return e.cacheDir(target).Join(e.cacheOutTarName(name)).Abs()
 }
 
 func (e *Engine) targetOutputHashFile(target *Target, name string) string {
 	return e.cacheDir(target).Join(e.cacheOutHashName(name)).Abs()
-}
-
-func (e *Engine) targetSupportTarFile(target *Target) string {
-	return e.cacheDir(target).Join(e.cacheSupportTarName()).Abs()
 }
 
 const versionFile = "version"
@@ -91,7 +84,13 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 
 	log.Tracef("Taring to cache %v", target.FQN)
 
-	for name, paths := range target.ActualOutFiles().Named() {
+	for _, name := range target.OutWithSupport.Names() {
+		var paths fs.Paths
+		if name == targetspec.SupportFilesOutput {
+			paths = target.ActualSupportFiles()
+		} else {
+			paths = target.ActualOutFiles().Name(name)
+		}
 		log.Tracef("Creating archive %v %v", target.FQN, name)
 
 		files := make([]tar.TarFile, 0)
@@ -121,29 +120,6 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 		}
 	}
 
-	if len(target.ActualSupportFiles()) > 0 {
-		log.Tracef("Creating support archive %v", target.FQN)
-
-		files := make([]tar.TarFile, 0)
-		for _, file := range target.ActualSupportFiles() {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			file := file.WithRoot(outRoot)
-
-			files = append(files, tar.TarFile{
-				From: file.Abs(),
-				To:   file.RelRoot(),
-			})
-		}
-
-		err = tar.Tar(ctx, files, e.targetSupportTarFile(target))
-		if err != nil {
-			return err
-		}
-	}
-
 	err = fs.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
 	if err != nil {
 		return err
@@ -157,8 +133,22 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	return nil
 }
 
-func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) {
-	ok, err := e.getLocalCache(target, onlyMeta)
+func (e *TargetRunEngine) getCache(target *Target, output string, onlyMeta bool) (bool, error) {
+	log.Tracef("locking cache %v|%v", target.FQN, output)
+	err := target.cacheLocks[output].Lock()
+	if err != nil {
+		return false, err
+	}
+
+	defer func() {
+		log.Tracef("unlocking cache %v|%v", target.FQN, output)
+		err := target.cacheLocks[output].Unlock()
+		if err != nil {
+			log.Errorf("unlocking cache %v %v", target.FQN, err)
+		}
+	}()
+
+	ok, err := e.getLocalCache(target, output, onlyMeta)
 	if err != nil {
 		return false, err
 	}
@@ -166,10 +156,6 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) 
 	if ok {
 		e.Status(fmt.Sprintf("Using local %v cache...", target.FQN))
 		return true, nil
-	}
-
-	if e.DisableNamedCache {
-		return false, nil
 	}
 
 	for _, cache := range e.Config.Cache {
@@ -186,7 +172,7 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) 
 			return false, err
 		}
 
-		ok, err := e.getVfsCache(loc, cache.Name, target, onlyMeta)
+		ok, err := e.getVfsCache(loc, cache.Name, target, output, onlyMeta)
 		if err != nil {
 			log.Errorf("cache %v: %v", cache.Name, err)
 			continue
@@ -194,7 +180,7 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) 
 
 		if ok {
 			log.Debugf("%v %v cache hit", target.FQN, cache.Name)
-			return e.getLocalCache(target, onlyMeta)
+			return e.getLocalCache(target, output, onlyMeta)
 		} else {
 			log.Debugf("%v %v cache miss", target.FQN, cache.Name)
 		}
@@ -203,7 +189,7 @@ func (e *TargetRunEngine) getCache(target *Target, onlyMeta bool) (bool, error) 
 	return false, nil
 }
 
-func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, error) {
+func (e *Engine) getLocalCache(target *Target, output string, onlyMeta bool) (bool, error) {
 	hash := e.hashInput(target)
 
 	dir := e.cacheDir(target)
@@ -224,26 +210,16 @@ func (e *Engine) getLocalCache(target *Target, onlyMeta bool) (bool, error) {
 		return false, nil
 	}
 
-	for _, name := range target.Out.Names() {
-		if !fs.PathExists(e.targetOutputHashFile(target, name)) {
-			return false, nil
-		}
+	if !fs.PathExists(e.targetOutputHashFile(target, output)) {
+		return false, nil
 	}
 
 	if onlyMeta {
 		return true, nil
 	}
 
-	for _, name := range target.Out.Names() {
-		if !fs.PathExists(e.targetOutputTarFile(target, name)) {
-			return false, nil
-		}
-	}
-
-	if len(target.SupportFiles) > 0 {
-		if !fs.PathExists(e.targetSupportTarFile(target)) {
-			return false, nil
-		}
+	if !fs.PathExists(e.targetOutputTarFile(target, output)) {
+		return false, nil
 	}
 
 	err = e.linkLatestCache(target, dir.Abs())

@@ -9,7 +9,7 @@ e2e_test(
 e2e_test(
     name="sanity_echo-hash-input",
     cmd="heph run //test/sanity:echo-hash-input",
-    expected_output="16f8a6ecb2c13bb2282608cd06e7fa08",
+    expected_output="6fc38766979372f2337f4006685fc752",
 )
 
 e2e_test(

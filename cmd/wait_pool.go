@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/muesli/reflow/wrap"
 	log "github.com/sirupsen/logrus"
+	"go.uber.org/multierr"
 	"heph/utils"
 	"heph/worker"
 	"io"
@@ -101,11 +102,19 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 		}
 	}
 
-	if err := pool.Err(); err != nil {
-		return fmt.Errorf("pool: %w", err)
+	perr := pool.Err()
+	derr := deps.Err()
+
+	if perr != nil && derr != nil {
+		if perr.Error() == derr.Error() {
+			return perr
+		}
+
+		perr = fmt.Errorf("pool: %w", perr)
+		derr = fmt.Errorf("deps: %w", derr)
 	}
 
-	return deps.Err()
+	return multierr.Combine(perr, derr)
 }
 
 func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
@@ -264,7 +273,7 @@ func (r *renderer) View() string {
 
 	if r.summary {
 		count := fmt.Sprint(r.stats.Done)
-		if r.stats.Success != r.stats.All {
+		if r.stats.Done != r.stats.All {
 			count = fmt.Sprintf("%v/%v", r.stats.Done, r.stats.All)
 		}
 		extra := ""

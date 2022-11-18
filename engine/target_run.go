@@ -16,9 +16,11 @@ import (
 	"heph/utils/tar"
 	"heph/worker"
 	"io"
+	fs2 "io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,23 +28,60 @@ import (
 
 type TargetRunEngine struct {
 	*Engine
-	Print   func(s string)
-	Context context.Context
+	Print func(s string)
 }
 
 func (e *TargetRunEngine) Status(s string) {
 	e.Print(s)
 }
 
-func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target) (bool, error) {
-	return e.warmTargetCache(ctx, target, true)
+func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target, outputs []string) (bool, error) {
+	return e.warmTargetCaches(ctx, target, outputs, true)
 }
 
-func (e *TargetRunEngine) WarmTargetCache(ctx context.Context, target *Target) (bool, error) {
-	return e.warmTargetCache(ctx, target, false)
+func (e *TargetRunEngine) WarmTargetCache(ctx context.Context, target *Target, output string) (bool, error) {
+	return e.warmTargetCache(ctx, target, output, false)
 }
 
-func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, onlyMeta bool) (_ bool, rerr error) {
+func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target) (bool, error) {
+	return e.warmTargetCaches(ctx, target, target.OutWithSupport.Names(), false)
+}
+
+func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, _outputs []string, onlyMeta bool) (bool, error) {
+	var outputs []string
+	for _, output := range _outputs {
+		outputs = append(outputs, output)
+	}
+	sort.SliceStable(outputs, func(i, j int) bool {
+		if outputs[i] == targetspec.SupportFilesOutput {
+			return true
+		}
+
+		return outputs[i] < outputs[j]
+	})
+
+	for _, output := range outputs {
+		cached, err := e.warmTargetCache(ctx, target, output, onlyMeta)
+		if err != nil {
+			return false, err
+		}
+
+		if !cached {
+			return false, nil
+		}
+	}
+
+	if !onlyMeta {
+		err := e.postRunOrWarm(ctx, target, outputs)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	return true, nil
+}
+
+func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
 	err := e.linkTarget(target, NewTargets(0))
 	if err != nil {
 		return false, err
@@ -52,26 +91,16 @@ func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, o
 		return false, nil
 	}
 
-	log.Tracef("locking cache %v", target.FQN)
-	err = target.cacheLock.Lock()
-	if err != nil {
-		return false, err
+	if !target.OutWithSupport.HasName(output) {
+		return false, fmt.Errorf("%v does not output %v", target.FQN, output)
 	}
 
-	defer func() {
-		log.Tracef("unlocking cache %v", target.FQN)
-		err := target.cacheLock.Unlock()
-		if err != nil {
-			log.Errorf("unlocking cache %v %v", target.FQN, err)
-		}
-	}()
-
-	span := e.SpanCachePull(ctx, target, onlyMeta)
+	span := e.SpanCachePull(ctx, target, output, onlyMeta)
 	defer func() {
 		span.EndError(rerr)
 	}()
 
-	ok, err := e.getCache(target, onlyMeta)
+	ok, err := e.getCache(target, output, onlyMeta)
 	if err != nil {
 		return false, err
 	}
@@ -82,11 +111,8 @@ func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, o
 
 	log.Debugf("Using cache %v", target.FQN)
 
-	if !onlyMeta {
-		err = e.postRunOrWarm(target)
-		if err != nil {
-			return false, err
-		}
+	if onlyMeta {
+		return true, nil
 	}
 
 	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
@@ -383,10 +409,10 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	}, nil
 }
 
-func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
+func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
 	target := rr.Target
 
-	ctx, rspan := e.SpanRun(e.Context, target)
+	ctx, rspan := e.SpanRun(ctx, target)
 	defer func() {
 		rspan.EndError(rerr)
 	}()
@@ -431,7 +457,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
 		}()
 
-		cached, err := e.WarmTargetCache(ctx, target)
+		cached, err := e.WarmAllTargetCache(ctx, target)
 		if err != nil {
 			return err
 		}
@@ -448,7 +474,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 	}
 
 	rp, err := e.runPrepare(ctx, target)
-	if rerr != nil {
+	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
 
@@ -502,8 +528,12 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 		}
 		mode := os.FileMode(imode)
 
-		// This will respect the umask
-		err = os.WriteFile(to, target.FileContent, mode)
+		err = os.WriteFile(to, target.FileContent, os.ModePerm)
+		if err != nil {
+			return err
+		}
+
+		err = os.Chmod(to, mode)
 		if err != nil {
 			return err
 		}
@@ -585,7 +615,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 
 	err = e.populateActualFiles(ctx, target, outRoot.Abs())
 	if err != nil {
-		return fmt.Errorf("popfilesout: %w", err)
+		return fmt.Errorf("pop: %w", err)
 	}
 
 	err = e.storeCache(ctx, target, outRoot.Abs())
@@ -593,7 +623,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 		return fmt.Errorf("cache: store: %w", err)
 	}
 
-	if target.Cache.Enabled && !e.DisableNamedCache {
+	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
 		for _, cache := range e.Config.Cache {
 			cache := cache
 
@@ -630,7 +660,7 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 		}
 	}
 
-	err = e.postRunOrWarm(target)
+	err = e.postRunOrWarm(ctx, target, target.OutWithSupport.Names())
 	if err != nil {
 		return err
 	}
@@ -638,10 +668,50 @@ func (e *TargetRunEngine) Run(rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr
 	return nil
 }
 
-func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
-	outDir := e.cacheDir(target).Join("_output")
+func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string) error {
+	err := target.postRunWarmLock.Lock()
+	if err != nil {
+		return err
+	}
 
+	defer func() {
+		err := target.postRunWarmLock.Unlock()
+		if err != nil {
+			log.Errorf("Failed to unlock %v", err)
+		}
+	}()
+
+	outDir := e.cacheDir(target).Join("_output")
+	outDirHashPath := e.cacheDir(target).Join("_output_hash").Abs()
+
+	// sanity check
+	for _, name := range outputs {
+		p := e.targetOutputTarFile(target, name)
+		if !fs.PathExists(p) {
+			return fmt.Errorf("%v does not exist", p)
+		}
+	}
+	outDirHash := strings.Join(outputs, ",")
+
+	shouldExpand := false
 	if !fs.PathExists(outDir.Abs()) {
+		shouldExpand = true
+	} else {
+		b, err := os.ReadFile(outDirHashPath)
+		if err != nil && !errors.Is(err, fs2.ErrNotExist) {
+			return err
+		}
+
+		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
+			shouldExpand = true
+		}
+	}
+
+	if len(outputs) == 0 {
+		shouldExpand = false
+	}
+
+	if shouldExpand {
 		e.Status(fmt.Sprintf("Expanding %v cache...", target.FQN))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
@@ -655,21 +725,24 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 			return err
 		}
 
-		if len(target.SupportFiles) > 0 {
-			err := tar.Untar(context.Background(), e.targetSupportTarFile(target), tmpOutDir, true)
+		for _, name := range outputs {
+			err := tar.Untar(ctx, e.targetOutputTarFile(target, name), tmpOutDir, true)
 			if err != nil {
 				return err
 			}
 		}
 
-		for _, name := range target.Out.Names() {
-			err := tar.Untar(context.Background(), e.targetOutputTarFile(target, name), tmpOutDir, true)
-			if err != nil {
-				return err
-			}
+		err = os.RemoveAll(outDir.Abs())
+		if err != nil {
+			return err
 		}
 
 		err = os.Rename(tmpOutDir, outDir.Abs())
+		if err != nil {
+			return err
+		}
+
+		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
 		if err != nil {
 			return err
 		}
@@ -679,9 +752,9 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 
 	e.Status(fmt.Sprintf("Hydrating %v output...", target.FQN))
 
-	err := e.populateActualFilesFromTar(target)
+	err = e.populateActualFilesFromTar(target)
 	if err != nil {
-		return err
+		return fmt.Errorf("poptar: %w", err)
 	}
 
 	err = e.codegenLink(target)
@@ -692,7 +765,7 @@ func (e *TargetRunEngine) postRunOrWarm(target *Target) error {
 	if target.Cache.Enabled && !e.Config.DisableGC {
 		err = e.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
-			log.Error(err)
+			log.Errorf("gc: %v", err)
 		}
 	}
 

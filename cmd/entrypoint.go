@@ -40,7 +40,7 @@ func Execute() {
 	utils.Seed()
 
 	if err := execute(); err != nil {
-		humanPrintError(err)
+		printHumanError(err)
 
 		var eerr ErrorWithExitCode
 		if errors.As(err, &eerr) {

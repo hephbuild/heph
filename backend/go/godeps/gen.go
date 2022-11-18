@@ -187,26 +187,25 @@ func generate() []RenderUnit {
 	modRoot := filepath.Dir(Env.Package)
 
 	for _, pkg := range pkgs.Array() {
+		if StdPackages.Get(pkg.Variant).Includes(pkg.ImportPath) {
+			continue
+		}
+
+		fmt.Println("PKG", pkg.ImportPath, VID(pkg.Variant))
+
 		if len(pkg.DepsErrors) > 0 {
 			errs := make([]string, 0)
 			for _, err := range pkg.DepsErrors {
 				errs = append(errs, err.String())
 			}
 
-			fmt.Println(fmt.Errorf("deps errors:\n%v", strings.Join(errs, "\n")))
-			continue
+			panic(fmt.Sprintf("deps errors:\n%v", strings.Join(errs, "\n")))
 		}
 
 		if pkg.Error != nil {
 			fmt.Println(fmt.Errorf("err: %v", pkg.Error.String()))
 			continue
 		}
-
-		if StdPackages.Get(pkg.Variant).Includes(pkg.ImportPath) {
-			continue
-		}
-
-		fmt.Println("PKG", pkg.ImportPath, VID(pkg.Variant))
 
 		_, imports := splitOutPkgs(pkg.Variant, pkg.Imports)
 

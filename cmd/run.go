@@ -69,14 +69,13 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 	}
 
 	re := engine.TargetRunEngine{
-		Engine:  e,
-		Context: ctx,
+		Engine: e,
 		Print: func(s string) {
 			log.Debug(s)
 		},
 	}
 
-	err = re.Run(*inlineInvocationTarget, sandbox.IOConfig{
+	err = re.Run(ctx, *inlineInvocationTarget, sandbox.IOConfig{
 		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,

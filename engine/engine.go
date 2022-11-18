@@ -43,7 +43,7 @@ type Engine struct {
 	Tracer     trace.Tracer
 	RootSpan   trace.Span
 
-	DisableNamedCache bool
+	DisableNamedCacheWrite bool
 
 	SourceFiles   packages.SourceFiles
 	packagesMutex sync.Mutex
@@ -104,6 +104,16 @@ type TargetRunRequest struct {
 }
 
 type TargetRunRequests []TargetRunRequest
+
+func (rrs TargetRunRequests) Has(t *Target) bool {
+	for _, rr := range rrs {
+		if rr.Target.FQN == t.FQN {
+			return true
+		}
+	}
+
+	return false
+}
 
 func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
 	for _, rr := range rrs {
@@ -186,7 +196,7 @@ func (e *Engine) hashFile(h utils.Hash, file fs2.Path) error {
 
 func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 	for _, dep := range targets {
-		if len(dep.Target.Out.All()) == 0 {
+		if len(dep.Target.Out.Names()) == 0 {
 			continue
 		}
 
@@ -264,6 +274,32 @@ func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) err
 	return nil
 }
 
+func (e *Engine) hashTar(h utils.Hash, tarPath string) error {
+	return tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
+		h.String(hdr.Name)
+
+		switch hdr.Typeflag {
+		case tar2.TypeReg:
+			h.I64(hdr.Mode)
+
+			err := e.hashFileReader(h, hdr.FileInfo(), io.LimitReader(r, hdr.Size))
+			if err != nil {
+				return err
+			}
+
+			return nil
+		case tar2.TypeDir:
+			return nil
+		case tar2.TypeSymlink:
+			h.String(hdr.Linkname)
+		default:
+			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
+		}
+
+		return nil
+	})
+}
+
 func (e *Engine) hashFileModTime(h utils.Hash, file fs2.Path) error {
 	return e.hashFileModTimePath(h, file.Abs())
 }
@@ -278,21 +314,27 @@ func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
 		return fmt.Errorf("symlink cannot be hashed")
 	}
 
-	h.UI32(uint32(info.Mode().Perm()))
+	h.UI32(uint32(info.Mode().Perm() & 0111))
 	h.I64(info.ModTime().UnixNano())
 
 	return nil
-}
-
-func (e *Engine) GetHashInputCache() map[string]string {
-	return e.cacheHashInput
 }
 
 func (e *Engine) ResetCacheHashInput(target *Target) {
 	e.cacheHashInputMutex.Lock()
 	defer e.cacheHashInputMutex.Unlock()
 
-	delete(e.cacheHashInput, hashCacheId(target))
+	ks := make([]string, 0)
+
+	for k := range e.cacheHashInput {
+		if strings.HasPrefix(k, target.FQN) {
+			ks = append(ks, k)
+		}
+	}
+
+	for _, k := range ks {
+		delete(e.cacheHashInput, k)
+	}
 }
 
 func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
@@ -352,7 +394,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}()
 
 	h := utils.NewHash()
-	h.I64(4) // Force break all caches
+	h.I64(5) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
@@ -406,11 +448,6 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, file := range target.SupportFiles {
-		h.String(file.RelRoot())
-	}
-
-	h.String("=")
 	utils.HashMap(h, target.Env, func(k, v string) string {
 		return k + v
 	})
@@ -459,10 +496,10 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	start := time.Now()
 	defer func() {
-		log.Debugf("hashoutput %v took %v", target.FQN, time.Since(start))
+		log.Debugf("hashoutput %v|%v took %v", target.FQN, output, time.Since(start))
 	}()
 
-	if !target.Out.HasName(output) {
+	if !target.OutWithSupport.HasName(output) {
 		panic(fmt.Sprintf("%v does not output `%v`", target, output))
 	}
 
@@ -480,40 +517,22 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		return sh
 	}
 
+	// Sanity check, will bomb if not called in the right order
+	_ = target.ActualOutFiles()
+
 	h := utils.NewHash()
 
 	h.String(output)
 
-	// Sanity check, will bomb if not called in the right order
-	_ = target.ActualOutFiles()
-
 	tarPath := e.targetOutputTarFile(target, output)
-
-	err = tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
-		h.String(hdr.Name)
-
-		switch hdr.Typeflag {
-		case tar2.TypeReg:
-			h.I64(hdr.Mode)
-
-			err := e.hashFileReader(h, hdr.FileInfo(), io.LimitReader(r, hdr.Size))
-			if err != nil {
-				return err
-			}
-
-			return nil
-		case tar2.TypeDir:
-			return nil
-		case tar2.TypeSymlink:
-			h.String(hdr.Linkname)
-		default:
-			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
-		}
-
-		return nil
-	})
+	err = e.hashTar(h, tarPath)
 	if err != nil {
 		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, tarPath, err))
+	}
+
+	if target.HasSupportFiles && output != targetspec.SupportFilesOutput {
+		sh := e.hashOutput(target, targetspec.SupportFilesOutput)
+		h.String(sh)
 	}
 
 	sh := h.Sum()
@@ -605,203 +624,55 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (_ *WaitGroupMap, rerr error) {
-	targets := rrs.Targets()
-
-	sctx, span := e.SpanScheduleTargetWithDeps(octx, targets)
-	defer func() {
-		if rerr != nil {
-			span.EndError(rerr)
-		}
-	}()
-
-	toAssess, err := e.DAG().GetOrderedAncestors(targets, true)
-	if err != nil {
-		return nil, err
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
+	if e.Config.TargetScheduler == "v2" {
+		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 	}
 
-	needRun := NewTargets(0)
-	needCacheWarm := NewTargets(0)
+	return e.ScheduleV1TargetRRsWithDeps(ctx, rrs, skip)
+}
 
-	for _, target := range targets {
-		if skip != nil && skip.FQN == target.FQN {
-			parents, err := e.DAG().GetParents(target)
-			if err != nil {
-				return nil, err
-			}
+func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, outputs []string, wdeps *worker.WaitGroup) (*worker.Job, error) {
+	postDeps := &worker.WaitGroup{}
+	for _, output := range outputs {
+		output := output
 
-			needCacheWarm.AddAll(parents)
-			needRun.Add(target)
-		} else {
-			needCacheWarm.Add(target)
-		}
-	}
-
-	deps := &WaitGroupMap{}
-	pullMetaDeps := &WaitGroupMap{}
-	pullAllMetaDeps := &worker.WaitGroup{}
-
-	for _, target := range toAssess {
-		target := target
-
-		pj := e.Pool.Schedule(sctx, &worker.Job{
-			Name: "pull_meta " + target.FQN,
-			Deps: pullMetaDeps.Get(target.FQN),
+		j := e.Pool.Schedule(ctx, &worker.Job{
+			Name: "warm " + target.FQN + "|" + output,
+			Deps: wdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
+				e := TargetRunEngine{
+					Engine: e,
+					Print:  w.Status,
+				}
 
-				parents, err := e.DAG().GetParents(target)
+				w.Status(fmt.Sprintf("Priming cache %v|%v...", target.FQN, output))
+
+				cached, err := e.WarmTargetCache(ctx, target, output)
 				if err != nil {
 					return err
 				}
 
-				hasParentCacheMiss := false
-				for _, parent := range parents {
-					if needRun.Find(parent.FQN) != nil {
-						hasParentCacheMiss = true
-						break
-					}
-				}
-
-				rr := rrs.Get(target)
-				if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
-					w.Status(fmt.Sprintf("Pulling meta %v...", target.FQN))
-
-					e := TargetRunEngine{
-						Engine:  e,
-						Print:   w.Status,
-						Context: ctx,
-					}
-
-					cached, err := e.PullTargetMeta(ctx, target)
-					if err != nil {
-						return err
-					}
-
-					if cached {
-						return nil
-					}
-				}
-
-				needCacheWarm.AddAll(parents)
-				needRun.Add(target)
-
-				return nil
-			},
-		})
-		pullAllMetaDeps.Add(pj)
-
-		children, err := e.DAG().GetChildren(target)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, child := range children {
-			pullMetaDeps.Get(child.FQN).Add(pj)
-		}
-	}
-
-	scheduleDeps := &WaitGroupMap{}
-
-	for _, target := range toAssess {
-		target := target
-
-		targetDeps := deps.Get(target.FQN)
-		targetDeps.AddSem()
-
-		sdeps := &worker.WaitGroup{}
-		// TODO: Replace with waiting for all dependants pull meta of target.FQN in the list of all ancestors
-		sdeps.AddChild(pullAllMetaDeps)
-		sdeps.AddChild(scheduleDeps.Get(target.FQN))
-
-		sj := e.Pool.Schedule(octx, &worker.Job{
-			Name: "schedule " + target.FQN,
-			Deps: sdeps,
-			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(fmt.Sprintf("Scheduling %v...", target.FQN))
-
-				parents, err := e.DAG().GetParents(target)
-				if err != nil {
-					return err
-				}
-
-				wdeps := &worker.WaitGroup{}
-				for _, parent := range parents {
-					pdeps := deps.Get(parent.FQN)
-					wdeps.AddChild(pdeps)
-				}
-
-				if skip != nil && target.FQN == skip.FQN {
-					log.Debugf("%v skip", target.FQN)
-					targetDeps.AddChild(wdeps)
-
+				if cached {
 					return nil
 				}
 
-				if needRun.Find(target.FQN) != nil {
-					j, err := e.ScheduleTarget(ctx, rrs.Get(target), wdeps)
-					if err != nil {
-						return err
-					}
-					targetDeps.Add(j)
-				} else if needCacheWarm.Find(target.FQN) != nil {
-					j, err := e.ScheduleTargetCacheWarm(ctx, target, wdeps)
-					if err != nil {
-						return err
-					}
-					targetDeps.Add(j)
-				}
-
-				log.Debugf("%v nothing to do", target.FQN)
-
 				return nil
 			},
 		})
-
-		children, err := e.DAG().GetChildren(target)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, child := range children {
-			scheduleDeps.Get(child.FQN).Add(sj)
-		}
-
-		targetDeps.Add(sj)
-		targetDeps.DoneSem()
+		postDeps.Add(j)
 	}
 
-	go func() {
-		<-deps.All().Done()
-		span.End()
-	}()
-
-	return deps, nil
-}
-
-func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		Name: "warm " + target.FQN,
-		Deps: deps,
+		Name: "postrunwarm " + target.FQN,
+		Deps: postDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
-				Engine:  e,
-				Print:   w.Status,
-				Context: ctx,
+				Engine: e,
+				Print:  w.Status,
 			}
 
-			w.Status(fmt.Sprintf("Fetching cache %v...", target.FQN))
-
-			cached, err := e.WarmTargetCache(ctx, target)
-			if err != nil {
-				return err
-			}
-
-			if !cached {
-				return fmt.Errorf("%v expected cache pull to succeed", target.FQN)
-			}
-
-			return nil
+			return e.postRunOrWarm(ctx, target, outputs)
 		},
 	})
 
@@ -814,12 +685,11 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
-				Engine:  e,
-				Print:   w.Status,
-				Context: ctx,
+				Engine: e,
+				Print:  w.Status,
 			}
 
-			err := e.Run(rr, sandbox.IOConfig{})
+			err := e.Run(ctx, rr, sandbox.IOConfig{})
 			if err != nil {
 				return TargetFailedError{
 					Target: rr.Target,
@@ -857,9 +727,14 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 	tp := &ActualOutNamedPaths{}
 
 	for name := range namedPaths.Named() {
+		p := e.targetOutputTarFile(target, name)
+		if !fs2.PathExists(p) {
+			continue
+		}
+
 		tp.ProvisonName(name)
 
-		files, err := e.collectOutFromTar(target, e.targetOutputTarFile(target, name))
+		files, err := e.collectOutFromTar(target, p)
 		if err != nil {
 			return nil, err
 		}
@@ -875,18 +750,6 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 }
 
 func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, error) {
-	err := target.tarLock.Lock()
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		err := target.tarLock.Unlock()
-		if err != nil {
-			log.Error(err)
-		}
-	}()
-
 	files, err := tar.UntarList(context.Background(), tarPath)
 	if err != nil {
 		return nil, err
@@ -933,46 +796,44 @@ func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Targe
 		span.EndError(rerr)
 	}()
 
-	empty, err := fs2.IsDirEmpty(outRoot)
-	if err != nil {
-		return fmt.Errorf("collect output: isempty: %w", err)
-	}
-
 	target.actualOutFiles = &ActualOutNamedPaths{}
 	target.actualSupportFiles = make(fs2.Paths, 0)
 
-	if empty {
-		return nil
-	}
-
-	target.actualSupportFiles, err = e.collectOut(target, target.SupportFiles, outRoot)
-	if err != nil {
-		return fmt.Errorf("cached: %w", err)
-	}
+	var err error
 
 	target.actualOutFiles, err = e.collectNamedOut(target, target.Out, outRoot)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}
 
+	if target.HasSupportFiles {
+		target.actualSupportFiles, err = e.collectOut(target, target.OutWithSupport.Name(targetspec.SupportFilesOutput), outRoot)
+		if err != nil {
+			return fmt.Errorf("support: %w", err)
+		}
+	}
+
 	return nil
 }
 
 func (e *Engine) populateActualFilesFromTar(target *Target) error {
+	log.Tracef("populateActualFilesFromTar %v", target.FQN)
+
 	target.actualOutFiles = &ActualOutNamedPaths{}
 	target.actualSupportFiles = make(fs2.Paths, 0)
 
 	var err error
-	if len(target.SupportFiles) > 0 {
-		target.actualSupportFiles, err = e.collectOutFromTar(target, e.targetSupportTarFile(target))
-		if err != nil {
-			return fmt.Errorf("cached: %w", err)
-		}
-	}
 
 	target.actualOutFiles, err = e.collectNamedOutFromTar(target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
+	}
+
+	if target.HasSupportFiles {
+		target.actualSupportFiles, err = e.collectOutFromTar(target, e.targetOutputTarFile(target, targetspec.SupportFilesOutput))
+		if err != nil {
+			return fmt.Errorf("support: %w", err)
+		}
 	}
 
 	return nil
@@ -1008,9 +869,11 @@ func (e *Engine) CleanTargetLock(target *Target) error {
 		return err
 	}
 
-	err = target.cacheLock.Clean()
-	if err != nil {
-		return err
+	for _, l := range target.cacheLocks {
+		err = l.Clean()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1061,6 +924,7 @@ func (e *Engine) parseConfigs() error {
 	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
 	cfg.CacheHistory = 3
+	cfg.TargetScheduler = "v1"
 
 	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {

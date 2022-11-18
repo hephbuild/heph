@@ -64,10 +64,12 @@ func (wg *WaitGroup) AddSem() {
 }
 
 func (wg *WaitGroup) DoneSem() {
-	if atomic.AddInt64(&wg.sem, -1) < 0 {
+	v := atomic.AddInt64(&wg.sem, -1)
+	if v < 0 {
 		panic("too many calls to DoneSem")
+	} else if v == 0 {
+		wg.handleUnitDone()
 	}
-	wg.broadcast()
 }
 
 func (wg *WaitGroup) Jobs() []*Job {
@@ -93,11 +95,9 @@ func (wg *WaitGroup) broadcast() {
 func (wg *WaitGroup) wait() {
 	wg.cond.L.Lock()
 
-	waitm := map[*WaitGroup]error{}
-
 	var err error
 	for {
-		err = wg.keepWaiting(wg.failfast, waitm)
+		err = wg.keepWaiting(wg.failfast)
 		if !errors.Is(err, ErrPending) {
 			break
 		}
@@ -181,15 +181,12 @@ func (wg *WaitGroup) TransitiveCount() WaitGroupStats {
 			atomic.AddUint64(&s.Done, 1)
 		}
 
-		if j.State == StateSuccess {
+		switch j.State {
+		case StateSuccess:
 			atomic.AddUint64(&s.Success, 1)
-		}
-
-		if j.State == StateFailed {
+		case StateFailed:
 			atomic.AddUint64(&s.Failed, 1)
-		}
-
-		if j.State == StateSkipped {
+		case StateSkipped:
 			atomic.AddUint64(&s.Skipped, 1)
 		}
 	})
@@ -199,60 +196,64 @@ func (wg *WaitGroup) TransitiveCount() WaitGroupStats {
 
 var ErrPending = errors.New("pending")
 
-// keepWaiting returns ErrPending if it should keep waiting, nil represents no jobs error
-func (wg *WaitGroup) keepWaiting(failFast bool, m map[*WaitGroup]error) (rerr error) {
-	if err, ok := m[wg]; ok {
-		return err
-	}
-	defer func() {
-		if !errors.Is(rerr, ErrPending) {
-			m[wg] = rerr
-		}
-	}()
+var ErrSemPending = fmt.Errorf("sem is > 0: %w", ErrPending)
 
+// keepWaiting returns ErrPending if it should keep waiting, nil represents no jobs error
+func (wg *WaitGroup) keepWaiting(failFast bool) error {
 	if atomic.LoadInt64(&wg.sem) > 0 {
-		return fmt.Errorf("sem is > 0: %w", ErrPending)
+		return ErrSemPending
 	}
 
 	var errs []error
-
-	for _, wg := range wg.wgs[:] {
-		err := wg.keepWaiting(failFast, m)
-		if err != nil {
-			if failFast {
-				return err
-			} else {
-				errs = append(errs, err)
-			}
+	jerrs := map[uint64]JobError{}
+	addErr := func(err error) {
+		var jerr JobError
+		if errors.As(err, &jerr) {
+			jerrs[jerr.ID] = jerr
+		} else {
+			errs = append(errs, err)
 		}
 	}
 
-	allDone := true
+	for _, wg := range wg.wgs {
+		select {
+		case <-wg.Done():
+			err := wg.Err()
+			if err != nil {
+				if failFast {
+					return err
+				} else {
+					for _, err := range multierr.Errors(err) {
+						addErr(err)
+					}
+				}
+			}
 
-	for _, job := range wg.jobs[:] {
+		default:
+			return ErrPending
+		}
+	}
+
+	for _, job := range wg.jobs {
 		state := job.State
 
-		if StateIsDone(state) {
+		if state.IsDone() {
 			if state == StateSuccess {
 				continue
 			}
 
-			jerr := fmt.Errorf("2 %v is %v: %w", job.Name, state.String(), job.err)
-
 			if failFast {
-				return jerr
+				return job.err
 			} else {
-				errs = append(errs, jerr)
+				addErr(job.err)
 			}
 		} else {
-			allDone = false
-
-			return fmt.Errorf("1 %v is %w", job.Name, ErrPending)
+			return ErrPending
 		}
 	}
 
-	if !allDone {
-		return nil
+	for _, err := range jerrs {
+		errs = append(errs, err)
 	}
 
 	return multierr.Combine(errs...)

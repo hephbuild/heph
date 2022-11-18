@@ -24,6 +24,8 @@ const (
 
 const (
 	AttrPhase      = "heph.phase"
+	AttrRoot       = "heph.root"
+	AttrOutput     = "heph.output"
 	AttrTargetAddr = "heph.target_addr"
 	AttrCacheHit   = "heph.cache_hit"
 )
@@ -49,6 +51,7 @@ var TargetRunPhases = []string{
 
 type Stats struct {
 	Spans        map[string]TargetStatsSpan
+	RootSpan     tracesdk.ReadOnlySpan
 	targetPhases map[string]map[string]TargetStatsSpanPhase
 	spansm       sync.Mutex
 }
@@ -70,6 +73,11 @@ func findAttr(key string, attributes []attribute.KeyValue) attribute.Value {
 func (st *Stats) OnStart(parent context.Context, s tracesdk.ReadWriteSpan) {}
 
 func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
+	if findAttr(AttrRoot, s.Attributes()).AsBool() {
+		st.RootSpan = s
+		return
+	}
+
 	phase := findAttr(AttrPhase, s.Attributes()).AsString()
 
 	if !utils.Contains(AllPhases, phase) {
@@ -116,11 +124,6 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 			phases = append(phases, phase)
 		}
 
-		cacheHit := false
-		if v := findAttr(AttrCacheHit, s.Attributes()); v != AttributeNotFound {
-			cacheHit = v.AsBool()
-		}
-
 		delete(st.targetPhases, fqn)
 
 		if st.Spans == nil {
@@ -138,11 +141,21 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 
 		stat.End = s.EndTime()
 		stat.Phases = append(stat.Phases, phases...)
-		if cacheHit {
-			stat.CacheHit = true
-		}
 		if s.Status().Code == codes.Error {
 			stat.Error = true
+		}
+		if output := findAttr(AttrOutput, s.Attributes()); output != AttributeNotFound {
+			cacheHit := false
+			if v := findAttr(AttrCacheHit, s.Attributes()); v != AttributeNotFound {
+				cacheHit = v.AsBool()
+			}
+
+			stat.CachePulls = append(stat.CachePulls, TargetStatsSpanCachePull{
+				Name:     output.AsString(),
+				Start:    s.StartTime(),
+				End:      s.EndTime(),
+				CacheHit: cacheHit,
+			})
 		}
 		st.Spans[fqn] = stat
 	}
@@ -170,13 +183,24 @@ type TargetStatsSpanPhase struct {
 	End   time.Time
 }
 
-type TargetStatsSpan struct {
-	FQN      string
+type TargetStatsSpanCachePull struct {
+	Name     string
 	Start    time.Time
 	End      time.Time
-	Phases   []TargetStatsSpanPhase
 	CacheHit bool
-	Error    bool
+}
+
+func (p TargetStatsSpanCachePull) Duration() time.Duration {
+	return p.End.Sub(p.Start)
+}
+
+type TargetStatsSpan struct {
+	FQN        string
+	Start      time.Time
+	End        time.Time
+	Phases     []TargetStatsSpanPhase
+	CachePulls []TargetStatsSpanCachePull
+	Error      bool
 }
 
 func (s TargetStatsSpan) Duration() time.Duration {
@@ -215,4 +239,14 @@ func (s TargetStatsSpan) PhaseRunCollectOutput() TargetStatsSpanPhase {
 
 func (s TargetStatsSpan) PhaseCacheStore() TargetStatsSpanPhase {
 	return s.getPhase(PhaseRunCacheStore)
+}
+
+func (s TargetStatsSpan) CacheHit() bool {
+	for _, pull := range s.CachePulls {
+		if !pull.CacheHit {
+			return false
+		}
+	}
+
+	return true
 }
