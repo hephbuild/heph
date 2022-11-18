@@ -104,14 +104,14 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 	}
 
 	if err != nil {
-		humanPrintError(err)
+		printHumanError(err)
 		return
 	}
 
 	log.Info("Completed successfully")
 
 	// Allow first run to use named cache, subsequent ones will skip them
-	w.e.DisableNamedCache = true
+	w.e.DisableNamedCacheWrite = true
 }
 
 func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
@@ -192,7 +192,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 
 			if target.Gen {
 				w.e.RanGenPass = false
-				w.e.DisableNamedCache = false
+				w.e.DisableNamedCacheWrite = false
 			}
 		}
 

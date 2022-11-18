@@ -2,6 +2,8 @@ package engine
 
 import (
 	"github.com/heimdalr/dag"
+	"heph/utils/maps"
+	"heph/utils/sets"
 	"sort"
 )
 
@@ -9,7 +11,8 @@ type DAG struct {
 	*dag.DAG
 }
 
-func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancs *[]*Target, ancsm map[string]struct{}, minDepth, depth int) error {
+// returns parents first
+func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -21,14 +24,14 @@ func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error)
 	}
 
 	for _, parent := range parents {
-		err := e.orderedWalker(parent, rel, ancs, ancsm, minDepth, depth+1)
+		err := e.orderedWalker(parent, rel, ancsm, minDepth, depth+1, f)
 		if err != nil {
 			return err
 		}
 	}
 
 	if depth >= minDepth {
-		*ancs = append(*ancs, target)
+		f(target)
 	}
 
 	return nil
@@ -36,6 +39,61 @@ func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error)
 
 func (e *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Target, error) {
 	ancs := make([]*Target, 0)
+
+	err := e.getOrderedAncestors(targets, includeRoot, func(target *Target) {
+		ancs = append(ancs, target)
+	})
+
+	return ancs, err
+}
+
+func (e *DAG) GetOrderedAncestorsWithOutput(targets []*Target, includeRoot bool) ([]*Target, *maps.Map[string, *sets.Set[string]], error) {
+	ancs := make([]*Target, 0)
+	ancsout := &maps.Map[string, *sets.Set[string]]{
+		Default: func() *sets.Set[string] {
+			return sets.NewSet(func(s string) string {
+				return s
+			}, 0)
+		},
+	}
+
+	addOut := func(t *Target, output string) {
+		if output == "" && !t.OutWithSupport.HasName(output) {
+			return
+		}
+
+		ancsout.Get(t.FQN).Add(output)
+	}
+
+	addAllOut := func(t *Target) {
+		ancsout.Get(t.FQN).AddAll(t.OutWithSupport.Names())
+	}
+
+	maybeAddAllOuts := func(t *Target, output string) {
+		if t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets, t.FQN) {
+			addAllOut(t)
+		} else {
+			addOut(t, output)
+		}
+	}
+
+	err := e.getOrderedAncestors(targets, includeRoot, func(target *Target) {
+		deps := target.Deps.All().Merge(target.HashDeps)
+		for _, dep := range deps.Targets {
+			maybeAddAllOuts(dep.Target, dep.Output)
+		}
+
+		for _, tool := range target.Tools.Targets {
+			maybeAddAllOuts(tool.Target, tool.Output)
+		}
+
+		ancs = append(ancs, target)
+	})
+
+	return ancs, ancsout, err
+}
+
+func (e *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*Target)) error {
 	ancsm := map[string]struct{}{}
 
 	minDepth := 1
@@ -44,13 +102,13 @@ func (e *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Targe
 	}
 
 	for _, target := range targets {
-		err := e.orderedWalker(target, e.GetParents, &ancs, ancsm, minDepth, 0)
+		err := e.orderedWalker(target, e.GetParents, ancsm, minDepth, 0, f)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
-	return ancs, nil
+	return nil
 }
 
 func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Target, error) {
@@ -63,7 +121,9 @@ func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 	}
 
 	for _, target := range targets {
-		err := e.orderedWalker(target, e.GetChildren, &ancs, ancsm, minDepth, 0)
+		err := e.orderedWalker(target, e.GetChildren, ancsm, minDepth, 0, func(target *Target) {
+			ancs = append(ancs, target)
+		})
 		if err != nil {
 			return nil, err
 		}

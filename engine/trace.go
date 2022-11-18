@@ -76,6 +76,10 @@ func (e *Engine) StartRootSpan() {
 			Key:   "heph.args",
 			Value: attribute.StringSliceValue(args),
 		},
+		{
+			Key:   htrace.AttrRoot,
+			Value: attribute.BoolValue(true),
+		},
 	}
 
 	_, e.RootSpan = e.Tracer.Start(context.Background(), strings.Join(args, " "), trace.WithAttributes(attrs...))
@@ -104,12 +108,12 @@ func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Targ
 	return e.newTargetSpan(ctx, "", htrace.PhaseScheduleTargetWithDeps, trace.WithAttributes(attrs...))
 }
 
-func (e *Engine) SpanCachePull(ctx context.Context, t *Target, onlyMeta bool) Span {
+func (e *Engine) SpanCachePull(ctx context.Context, t *Target, output string, onlyMeta bool) Span {
 	phase := htrace.PhaseCachePull
 	if onlyMeta {
 		phase = htrace.PhaseCachePullMeta
 	}
-	return e.newTargetSpanPure(ctx, phase, phase, targetSpanAttr(t))
+	return e.newTargetSpanPure(ctx, phase, phase, targetSpanAttr(t), trace.WithAttributes(attribute.String(htrace.AttrOutput, output)))
 }
 
 func (e *Engine) SpanRunPrepare(ctx context.Context, t *Target) Span {

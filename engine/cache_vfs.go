@@ -27,6 +27,34 @@ func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target, inputHash
 	return loc.NewLocation(e.vfsCachePath(target, inputHash))
 }
 
+func (e *Engine) vfsExistsFile(from vfs.Location, path string) (bool, error) {
+	sf, err := from.NewFile(path)
+	if err != nil {
+		return false, fmt.Errorf("NewFile: %w", err)
+	}
+	defer sf.Close()
+
+	return sf.Exists()
+}
+
+func (e *Engine) vfsCopyFileIfNotExists(from, to vfs.Location, path string) error {
+	tof, err := to.NewFile(path)
+	if err != nil {
+		return err
+	}
+
+	exists, err := tof.Exists()
+	if err != nil {
+		return err
+	}
+
+	if exists {
+		log.Tracef("vfs copy %v to %v: exists", from.URI(), to.URI())
+		return nil
+	}
+
+	return e.vfsCopyFile(from, to, path)
+}
 func (e *Engine) vfsCopyFile(from, to vfs.Location, path string) error {
 	log.Tracef("vfs copy %v to %v", from.URI(), to.URI())
 
@@ -53,6 +81,7 @@ func (e *Engine) vfsCopyFile(from, to vfs.Location, path string) error {
 	if err != nil {
 		return fmt.Errorf("CopyToLocation: %w", err)
 	}
+
 	defer df.Close()
 
 	log.Debugf("vfs copy to %v took %v", to.URI(), time.Since(start).String())
@@ -78,20 +107,13 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		return err
 	}
 
-	for _, name := range target.Out.Names() {
+	for _, name := range target.OutWithSupport.Names() {
 		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheOutTarName(name))
 		if err != nil {
 			return err
 		}
 
 		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheOutHashName(name))
-		if err != nil {
-			return err
-		}
-	}
-
-	if len(target.SupportFiles) > 0 {
-		err = e.vfsCopyFile(localRoot, remoteRoot, e.cacheSupportTarName())
 		if err != nil {
 			return err
 		}
@@ -105,7 +127,13 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string, target *Target, onlyMeta bool) (bool, error) {
+func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string, target *Target, output string, onlyMeta bool) (bool, error) {
+	what := target.FQN
+	if output != "" {
+		what += "|" + output
+	}
+	e.Status(fmt.Sprintf("Downloading meta %v from %v cache...", what, cacheName))
+
 	inputHash := e.hashInput(target)
 
 	localRoot, err := e.localCacheLocation(target, inputHash)
@@ -118,42 +146,50 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 		return false, err
 	}
 
-	for _, name := range target.Out.Names() {
-		err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheOutHashName(name))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return false, nil
-			}
+	err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, e.cacheOutHashName(output))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
 
+		return false, err
+	}
+
+	if onlyMeta {
+		e.Status(fmt.Sprintf("Checking %v exists in %v cache...", what, cacheName))
+
+		ok, err := e.vfsExistsFile(remoteRoot, e.cacheOutTarName(output))
+		if err != nil {
 			return false, err
 		}
 
-		if !onlyMeta {
-			what := target.FQN
-			if name != "" {
-				what += "|" + name
-			}
-			e.Status(fmt.Sprintf("Pulling %v from %v cache...", what, cacheName))
-
-			err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheOutTarName(name))
-			if err != nil {
-				return false, err
-			}
+		if !ok {
+			return false, nil
 		}
-	}
+	} else {
+		e.Status(fmt.Sprintf("Downloading %v from %v cache...", what, cacheName))
 
-	if len(target.SupportFiles) > 0 {
-		err = e.vfsCopyFile(remoteRoot, localRoot, e.cacheSupportTarName())
+		err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, e.cacheOutTarName(output))
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return false, nil
-			}
-
 			return false, err
 		}
 	}
 
-	err = e.vfsCopyFile(remoteRoot, localRoot, inputHashFile)
+	e.Status(fmt.Sprintf("Downloading meta %v from %v cache...", what, cacheName))
+
+	err = target.cacheGlobalLock.Lock()
+	if err != nil {
+		return false, err
+	}
+
+	defer func() {
+		err := target.cacheGlobalLock.Unlock()
+		if err != nil {
+			log.Errorf("%v: cache:unlock %v", target.FQN, err)
+		}
+	}()
+
+	err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, inputHashFile)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return false, nil

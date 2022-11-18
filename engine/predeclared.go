@@ -215,6 +215,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 
 func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
+	e := getEngine(thread)
 
 	var (
 		pattern string
@@ -231,6 +232,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 
 	allExclude := exclude.Array
 	allExclude = append(allExclude, ".heph")
+	allExclude = append(allExclude, e.Config.Glob.Exclude...)
 
 	elems := make([]starlark.Value, 0)
 	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	log "github.com/sirupsen/logrus"
 	"io/fs"
 	"os"
@@ -80,6 +81,10 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 
 		dirEntries, err := os.ReadDir(dir)
 		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+
 			return err
 		}
 

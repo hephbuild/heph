@@ -12,6 +12,7 @@ import (
 	"heph/utils"
 	"heph/utils/flock"
 	"heph/utils/fs"
+	"heph/utils/sets"
 	"os"
 	"path/filepath"
 	"sort"
@@ -135,6 +136,13 @@ func (tp *NamedPaths[TS, T]) ProvisonName(name string) {
 	if _, ok := tp.named[name]; !ok {
 		tp.names = append(tp.names, name)
 		tp.named[name] = make(TS, 0)
+	}
+}
+
+func (tp *NamedPaths[TS, T]) AddAll(name string, ps []T) {
+	tp.ProvisonName(name)
+	for _, p := range ps {
+		tp.Add(name, p)
 	}
 }
 
@@ -282,6 +290,7 @@ type Target struct {
 	Tools          TargetTools
 	Deps           TargetNamedDeps
 	HashDeps       TargetDeps
+	OutWithSupport *OutNamedPaths
 	Out            *OutNamedPaths
 	actualOutFiles *ActualOutNamedPaths
 	Env            map[string]string
@@ -292,7 +301,6 @@ type Target struct {
 
 	WorkdirRoot        fs.Path
 	SandboxRoot        fs.Path
-	SupportFiles       fs.RelPaths
 	actualSupportFiles fs.Paths
 	LogFile            string
 	OutExpansionRoot   *fs.Path
@@ -307,9 +315,10 @@ type Target struct {
 	linkingDeps *Targets
 	m           sync.Mutex
 
-	runLock   flock.Locker
-	cacheLock flock.Locker
-	tarLock   flock.Locker
+	runLock         flock.Locker
+	postRunWarmLock flock.Locker
+	cacheLocks      map[string]flock.Locker
+	cacheGlobalLock flock.Locker
 }
 
 type TargetTransitive struct {
@@ -409,7 +418,7 @@ func (t *Target) ID() string {
 
 func (t *Target) ActualOutFiles() *ActualOutNamedPaths {
 	if t.actualOutFiles == nil {
-		panic("actualFilesOut is nil for " + t.FQN)
+		panic("actualOutFiles is nil for " + t.FQN)
 	}
 
 	return t.actualOutFiles
@@ -468,57 +477,21 @@ func (t TargetWithOutput) Full() string {
 }
 
 type Targets struct {
-	mu sync.RWMutex
-	m  map[string]*Target
-	a  []*Target
+	*sets.Set[*Target]
 }
 
 func NewTargets(cap int) *Targets {
-	t := &Targets{}
-	t.m = make(map[string]*Target, cap)
-	t.a = make([]*Target, 0, cap)
+	s := sets.NewSet(func(t *Target) string {
+		if t == nil {
+			panic("target must not be nil")
+		}
 
-	return t
-}
+		return t.FQN
+	}, cap)
 
-func (ts *Targets) Add(t *Target) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	if t == nil {
-		panic("target must not be nil")
+	return &Targets{
+		Set: s,
 	}
-
-	ts.add(t)
-}
-
-func (ts *Targets) add(t *Target) {
-	if _, ok := ts.m[t.FQN]; ok {
-		return
-	}
-
-	ts.m[t.FQN] = t
-	ts.a = append(ts.a, t)
-}
-
-func (ts *Targets) AddAll(ats []*Target) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	for _, t := range ats {
-		ts.add(t)
-	}
-}
-
-func (ts *Targets) Find(fqn string) *Target {
-	if ts == nil {
-		return nil
-	}
-
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-
-	return ts.m[fqn]
 }
 
 func (ts *Targets) FQNs() []string {
@@ -527,7 +500,7 @@ func (ts *Targets) FQNs() []string {
 	}
 
 	fqns := make([]string, 0)
-	for _, target := range ts.a {
+	for _, target := range ts.Slice() {
 		fqns = append(fqns, target.FQN)
 	}
 
@@ -539,32 +512,39 @@ func (ts *Targets) Sort() {
 		return
 	}
 
-	sort.SliceStable(ts.a, func(i, j int) bool {
-		return ts.a[i].FQN < ts.a[j].FQN
+	a := ts.Slice()
+
+	sort.SliceStable(a, func(i, j int) bool {
+		return a[i].FQN < a[j].FQN
 	})
 }
 
-func (ts *Targets) Slice() []*Target {
+func (ts *Targets) Copy() *Targets {
+	if ts == nil {
+		return NewTargets(0)
+	}
+
+	return &Targets{
+		Set: ts.Set.Copy(),
+	}
+}
+
+func (ts *Targets) Find(fqn string) *Target {
 	if ts == nil {
 		return nil
 	}
 
-	return ts.a[:]
-}
-
-func (ts *Targets) Len() int {
-	if ts == nil {
-		return 0
+	if !ts.HasKey(fqn) {
+		return nil
 	}
 
-	return len(ts.a)
-}
+	for _, target := range ts.Slice() {
+		if target.FQN == fqn {
+			return target
+		}
+	}
 
-func (ts *Targets) Copy() *Targets {
-	t := NewTargets(ts.Len())
-	t.AddAll(ts.Slice())
-
-	return t
+	panic("should not happen")
 }
 
 func (e *Engine) Init() error {
@@ -726,8 +706,12 @@ func (e *Engine) processTarget(t *Target) error {
 	}
 
 	t.runLock = e.lockFactory(t, "run")
-	t.cacheLock = e.lockFactory(t, "cache")
-	t.tarLock = e.lockFactory(t, "tar")
+	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
+	t.cacheGlobalLock = e.lockFactory(t, "cache")
+	t.cacheLocks = map[string]flock.Locker{}
+	for _, o := range t.TargetSpec.Out {
+		t.cacheLocks[o.Name] = e.lockFactory(t, "cache_"+o.Name)
+	}
 
 	if t.Cache.History == 0 {
 		t.Cache.History = e.Config.CacheHistory
@@ -773,8 +757,8 @@ func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error 
 		targets = e.Targets.Slice()
 	}
 
-	for i, target := range targets {
-		log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
+	for _, target := range targets {
+		//log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
 		err := e.linkTarget(target, nil)
 		if err != nil {
 			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, targetNotFoundError{})) {
@@ -812,7 +796,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	breadcrumb = breadcrumb.Copy()
 	breadcrumb.Add(t)
 
-	logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
+	//logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
 	t.m.Lock()
 	if t.linkingDeps == nil {
@@ -861,10 +845,10 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	var err error
 
-	log.Tracef(logPrefix+"Linking %v", t.FQN)
-	defer func() {
-		log.Tracef(logPrefix+"Linking %v done", t.FQN)
-	}()
+	//log.Tracef(logPrefix+"Linking %v", t.FQN)
+	//defer func() {
+	//	log.Tracef(logPrefix+"Linking %v done", t.FQN)
+	//}()
 
 	t.SandboxRoot = e.sandboxRoot(t).Join("_dir")
 
@@ -874,14 +858,14 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		t.WorkdirRoot = t.SandboxRoot
 	}
 
-	log.Tracef(logPrefix + "Linking tools")
+	//log.Tracef(logPrefix + "Linking tools")
 
 	t.Tools, err = e.linkTargetTools(t, t.TargetSpec.Tools, breadcrumb)
 	if err != nil {
 		return err
 	}
 
-	log.Tracef(logPrefix + "Linking deps")
+	//log.Tracef(logPrefix + "Linking deps")
 	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, breadcrumb)
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
@@ -889,7 +873,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	// Resolve hash deps specs
 	if t.TargetSpec.DifferentHashDeps {
-		log.Tracef(logPrefix + "Linking hashdeps")
+		//log.Tracef(logPrefix + "Linking hashdeps")
 		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
 		if err != nil {
 			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
@@ -926,22 +910,21 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	t.Out = &OutNamedPaths{}
+	t.OutWithSupport = &OutNamedPaths{}
 	for _, file := range t.TargetSpec.Out {
-		t.Out.Add(file.Name, relPathFactory(file.Path))
+		if file.Name != targetspec.SupportFilesOutput {
+			t.Out.Add(file.Name, relPathFactory(file.Path))
+		}
+		t.OutWithSupport.Add(file.Name, relPathFactory(file.Path))
 	}
 	t.Out.Sort()
+	t.OutWithSupport.Sort()
 
 	if t.TargetSpec.Cache.Enabled {
 		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 	}
-
-	t.SupportFiles = fs.RelPaths{}
-	for _, p := range t.TargetSpec.SupportFiles {
-		t.SupportFiles = append(t.SupportFiles, relPathFactory(p))
-	}
-	t.SupportFiles.Sort()
 
 	t.Env = map[string]string{}
 	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
@@ -952,7 +935,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	// Apply transitive deps
-	log.Tracef(logPrefix + "Linking transitive")
+	//log.Tracef(logPrefix + "Linking transitive")
 	t.Transitive, err = e.collectDepsTransitive(t, breadcrumb)
 	if err != nil {
 		return err

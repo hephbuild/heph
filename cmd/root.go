@@ -109,13 +109,13 @@ func postRun() {
 			log.Tracef("Waiting for all pool items to finish")
 			<-Engine.Pool.Done()
 			log.Tracef("All pool items finished")
-		}
 
-		Engine.Pool.Stop(nil)
+			Engine.Pool.Stop(nil)
 
-		err := Engine.Pool.Err()
-		if err != nil {
-			log.Error(err)
+			err := Engine.Pool.Err()
+			if err != nil {
+				log.Error(err)
+			}
 		}
 	}
 
@@ -220,7 +220,7 @@ var runCmd = &cobra.Command{
 		fromStdin := hasStdin(args)
 
 		if len(rrs) == 0 {
-			if fromStdin {
+			if !fromStdin {
 				_ = cmd.Help()
 			}
 			return nil

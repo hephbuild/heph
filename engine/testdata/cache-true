@@ -42,7 +42,7 @@ target(
         "Named": null,
         "History": 0
     },
-    "SupportFiles": null,
+    "HasSupportFiles": false,
     "Timeout": 0,
     "Sandbox": true,
     "OutInSandbox": false,
@@ -73,5 +73,6 @@ target(
         },
         "Env": null,
         "PassEnv": null
-    }
+    },
+    "Timeout": 0
 }

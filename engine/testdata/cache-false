@@ -42,8 +42,7 @@ target(
         "Named": null,
         "History": 0
     },
-    "SupportFiles": null,
-    "Timeout": 0,
+    "HasSupportFiles": false,
     "Sandbox": true,
     "OutInSandbox": false,
     "Codegen": "",
@@ -73,5 +72,6 @@ target(
         },
         "Env": null,
         "PassEnv": null
-    }
+    },
+    "Timeout": 0
 }

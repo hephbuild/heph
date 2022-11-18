@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
 	"heph/engine"
+	"heph/worker"
 	"os"
 	"os/exec"
 )
@@ -41,13 +42,21 @@ func ValidArgsFunctionLabelsOrTargets(cmd *cobra.Command, args []string, toCompl
 	return suggestions, directive
 }
 
-func humanPrintError(err error) {
-	errs := multierr.Errors(err)
+func printHumanError(err error) {
+	errs := multierr.Errors(worker.CollectRootErrors(err))
+	skippedCount := 0
+	skipSpacing := true
 
-	for i, err := range errs {
-		if i != 0 {
+	separate := func() {
+		if skipSpacing {
+			skipSpacing = false
+		} else {
 			fmt.Fprintln(os.Stderr)
 		}
+	}
+
+	for _, err := range errs {
+		separate()
 
 		var terr engine.TargetFailedError
 		if errors.As(err, &terr) {
@@ -68,15 +77,33 @@ func humanPrintError(err error) {
 					fmt.Fprintf(os.Stderr, "The log file can be found at %v\n", logFile)
 				}
 			} else {
-				log.Error(terr.Error())
+				for _, err := range multierr.Errors(terr) {
+					skipSpacing = true
+					separate()
+					log.Error(err.Error())
+				}
 			}
 		} else {
+			var jerr worker.JobError
+			if errors.As(err, &jerr) {
+				if jerr.Skipped() {
+					skippedCount++
+					skipSpacing = true
+					log.Debugf("skipped: %v", jerr)
+					continue
+				}
+			}
+
 			log.Error(err)
 		}
 	}
 
-	if len(errs) > 1 {
+	if len(errs) > 1 || skippedCount > 0 {
 		fmt.Fprintln(os.Stderr)
-		log.Errorf("%v jobs failed", len(errs))
+		skippedStr := ""
+		if skippedCount > 0 {
+			skippedStr = fmt.Sprintf(" %v skipped", skippedCount)
+		}
+		log.Errorf("%v jobs failed%v", len(errs), skippedStr)
 	}
 }

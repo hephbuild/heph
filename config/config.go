@@ -24,9 +24,13 @@ type Config struct {
 		Ignore []string        `yaml:"ignore"`
 		Roots  map[string]Root `yaml:"roots"`
 	} `yaml:"build_files"`
-	KeepSandbox bool              `yaml:"keep_sandbox"`
-	Params      map[string]string `yaml:"params"`
-	Extras      `yaml:",inline"`
+	Glob struct {
+		Exclude []string `yaml:"exclude"`
+	} `yaml:"glob"`
+	KeepSandbox     bool              `yaml:"keep_sandbox"`
+	TargetScheduler string            `yaml:"target_scheduler"`
+	Params          map[string]string `yaml:"params"`
+	Extras          `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`
 }

@@ -50,6 +50,8 @@ func (e TargetSpecSrcEnv) Get(name string) string {
 	return e.All
 }
 
+const SupportFilesOutput = "@support_files"
+
 type TargetSpec struct {
 	Name    string
 	FQN     string
@@ -67,7 +69,7 @@ type TargetSpec struct {
 	Tools             TargetSpecTools
 	Out               []TargetSpecOutFile
 	Cache             TargetSpecCache
-	SupportFiles      []string
+	HasSupportFiles   bool
 	Sandbox           bool
 	OutInSandbox      bool
 	Codegen           string

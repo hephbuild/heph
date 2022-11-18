@@ -266,7 +266,7 @@ func UntarList(ctx context.Context, in string) ([]string, error) {
 func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader) error) error {
 	tarf, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("untar: %w", err)
+		return fmt.Errorf("tarwalk: %w", err)
 	}
 	defer tarf.Close()
 
