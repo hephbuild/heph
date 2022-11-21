@@ -307,7 +307,7 @@ func generate() []RenderUnit {
 					TestLib:    testlib,
 					XTestLib:   xtestlib,
 					ImportPath: pkg.ImportPath,
-					PreRun:     pkgCfg.Test.PreRun,
+					RunExtra:   pkgCfg.Test.Run,
 					TestFiles:  pkg.TestGoFiles,
 					XTestFiles: pkg.XTestGoFiles,
 					DepsLibs:   depsLibs,

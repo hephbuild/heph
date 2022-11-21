@@ -14,10 +14,10 @@ type LibTest struct {
 	DepsLibs []string
 
 	ImportPath string
-	PreRun     string
 
 	TestFiles  []string
 	XTestFiles []string
+	RunExtra   map[string]interface{}
 }
 
 func (t LibTest) Data() interface{} {
@@ -42,7 +42,6 @@ func (t LibTest) Data() interface{} {
 		"ImportPath": t.ImportPath,
 		"DepsLibs":   genStringArray(t.DepsLibs, 2),
 
-		"PreRun":               t.PreRun,
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
 
 		"TestLib":  RenderLibCall(t.TestLib),
@@ -53,6 +52,7 @@ func (t LibTest) Data() interface{} {
 		"Variant":    genVariant(variant, false),
 		"VariantBin": genVariant(variant, true),
 		"IfTest":     fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
+		"RunArgs":    genArgValue(t.RunExtra, "\n"),
 	}
 }
 
@@ -102,19 +102,32 @@ test_build = go_build_bin(
 )
 
 if {{.IfTest}}:
-	target(
-		name="go_test@{{.VID}}",
-		deps={
+	rargs = {{.RunArgs}}
+
+	args = {
+		'name': "go_test@{{.VID}}",
+		'deps': {
 			'bin': test_build,
 			'data': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
 		},
-		run=[
-			{{- if .PreRun}}'{{.PreRun}}',{{end}}
-			'./$SRC_BIN -test.v 2>&1 | tee test_out',
-		],
-		out=['test_out'],
-		labels=["test"],
-	)
+		'run': ['./$SRC_BIN -test.v 2>&1 | tee test_out'],
+		'out': ['test_out'],
+		'labels': ["test"],
+	}
+
+	for (k, v) in rargs.items():
+		if k == 'pre_run':
+			pre_run = v
+			if type(pre_run) != "list":
+				pre_run = [pre_run]	
+			
+			args['run'] = pre_run+args['run']
+		elif k == 'deps': 
+			args[k] |= v
+		else:
+			args[k] = v
+
+	target(**args)
 
 # end test
 `

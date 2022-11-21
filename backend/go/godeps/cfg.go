@@ -82,10 +82,12 @@ type PkgCfgVariant struct {
 	Tags []string `json:"tags"`
 }
 
+type Extra map[string]interface{}
+
 type PkgCfg struct {
 	Test struct {
-		Skip   bool   `json:"skip"`
-		PreRun string `json:"pre_run"`
+		Skip bool  `json:"skip"`
+		Run  Extra `json:"run"`
 	} `json:"test"`
 	Variants []PkgCfgVariant `json:"variants"`
 }

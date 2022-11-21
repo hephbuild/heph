@@ -15,5 +15,5 @@ e2e_test(
 e2e_test(
     name="sanity_count_tests",
     cmd="heph query -i //test/go/... | heph query -i test - | wc -l | xargs",
-    expected_output="20",
+    expected_output="21",
 )

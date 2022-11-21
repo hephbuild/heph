@@ -224,6 +224,7 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 		log.Debugf("finalize job: %v %v", job.Name, job.State.String())
 	} else {
 		if skippedOnErr {
+			// TODO: find out root cause from err
 			job.DoneWithErr(err, StateSkipped)
 		} else {
 			job.DoneWithErr(err, StateFailed)
