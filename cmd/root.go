@@ -104,17 +104,19 @@ func postRun() {
 		return
 	}
 
-	if !Engine.Pool.IsDone() {
-		log.Tracef("Waiting for all pool items to finish")
-		<-Engine.Pool.Done()
-		log.Tracef("All pool items finished")
-	}
+	if Engine.Pool != nil {
+		if !Engine.Pool.IsDone() {
+			log.Tracef("Waiting for all pool items to finish")
+			<-Engine.Pool.Done()
+			log.Tracef("All pool items finished")
+		}
 
-	Engine.Pool.Stop(nil)
+		Engine.Pool.Stop(nil)
 
-	err := Engine.Pool.Err()
-	if err != nil {
-		log.Error(err)
+		err := Engine.Pool.Err()
+		if err != nil {
+			log.Error(err)
+		}
 	}
 
 	Engine.RunExitHandlers()
