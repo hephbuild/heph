@@ -204,7 +204,8 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 			return
 		case <-job.Deps.Done():
 			if err := job.Deps.Err(); err != nil {
-				p.finalize(job, err, true)
+				// TODO: find out root cause from err
+				p.finalize(job, fmt.Errorf("deps failed"), true)
 				return
 			}
 		}
@@ -224,7 +225,6 @@ func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
 		log.Debugf("finalize job: %v %v", job.Name, job.State.String())
 	} else {
 		if skippedOnErr {
-			// TODO: find out root cause from err
 			job.DoneWithErr(err, StateSkipped)
 		} else {
 			job.DoneWithErr(err, StateFailed)
