@@ -318,7 +318,6 @@ type Target struct {
 	runLock         flock.Locker
 	postRunWarmLock flock.Locker
 	cacheLocks      map[string]flock.Locker
-	cacheGlobalLock flock.Locker
 }
 
 type TargetTransitive struct {
@@ -477,7 +476,7 @@ func (t TargetWithOutput) Full() string {
 }
 
 type Targets struct {
-	*sets.Set[*Target]
+	*sets.Set[string, *Target]
 }
 
 func NewTargets(cap int) *Targets {
@@ -707,11 +706,11 @@ func (e *Engine) processTarget(t *Target) error {
 
 	t.runLock = e.lockFactory(t, "run")
 	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
-	t.cacheGlobalLock = e.lockFactory(t, "cache")
 	t.cacheLocks = map[string]flock.Locker{}
 	for _, o := range t.TargetSpec.Out {
 		t.cacheLocks[o.Name] = e.lockFactory(t, "cache_"+o.Name)
 	}
+	t.cacheLocks[inputHashName] = e.lockFactory(t, "cache_"+inputHashName)
 
 	if t.Cache.History == 0 {
 		t.Cache.History = e.Config.CacheHistory

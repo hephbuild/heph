@@ -31,6 +31,15 @@ func (m *Map[K, V]) Set(k K, v V) {
 	m.m[k] = v
 }
 
+func (m *Map[K, V]) Delete(k K) {
+	m.init()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.m, k)
+}
+
 func (m *Map[K, V]) GetOk(k K) (V, bool) {
 	m.init()
 
@@ -47,10 +56,10 @@ func (m *Map[K, V]) Get(k K) V {
 
 	if m.Default == nil {
 		m.mu.RLock()
-		m.mu.RUnlock()
+		defer m.mu.RUnlock()
 	} else {
 		m.mu.Lock()
-		m.mu.Unlock()
+		defer m.mu.Unlock()
 	}
 
 	v, ok := m.m[k]

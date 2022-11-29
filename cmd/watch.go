@@ -203,7 +203,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 		} else {
 			for _, target := range descendants {
 				if w.targets.Find(target.FQN) != nil {
-					localRRs = append(localRRs, engine.TargetRunRequest{Target: target})
+					localRRs = append(localRRs, w.rrs.Get(target))
 				}
 			}
 		}

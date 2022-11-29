@@ -17,7 +17,6 @@ type WaitGroup struct {
 	err    error
 	cond   *sync.Cond
 	oSetup sync.Once
-	oDone  sync.Once
 	sem    int64
 
 	failfast bool
@@ -117,9 +116,6 @@ func (wg *WaitGroup) wait() {
 func (wg *WaitGroup) Done() <-chan struct{} {
 	wg.oSetup.Do(func() {
 		wg.cond = sync.NewCond(&wg.m)
-	})
-
-	wg.oDone.Do(func() {
 		wg.doneCh = make(chan struct{})
 		go wg.wait()
 	})

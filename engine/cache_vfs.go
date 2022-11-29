@@ -10,6 +10,8 @@ import (
 	"time"
 )
 
+const inputHashName = "@input"
+
 func (e *Engine) vfsCachePath(target *Target, inputHash string) string {
 	return filepath.Join(target.Package.FullName, target.Name, inputHash) + "/"
 }
@@ -119,11 +121,6 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		}
 	}
 
-	err = e.vfsCopyFile(localRoot, remoteRoot, inputHashFile)
-	if err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -144,6 +141,19 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 	remoteRoot, err = e.remoteCacheLocation(remoteRoot, target, inputHash)
 	if err != nil {
 		return false, err
+	}
+
+	if output == inputHashName {
+		err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, inputHashFile)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return false, nil
+			}
+
+			return false, err
+		}
+
+		return true, nil
 	}
 
 	err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, e.cacheOutHashName(output))
@@ -176,27 +186,6 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 	}
 
 	e.Status(fmt.Sprintf("Downloading meta %v from %v cache...", what, cacheName))
-
-	err = target.cacheGlobalLock.Lock()
-	if err != nil {
-		return false, err
-	}
-
-	defer func() {
-		err := target.cacheGlobalLock.Unlock()
-		if err != nil {
-			log.Errorf("%v: cache:unlock %v", target.FQN, err)
-		}
-	}()
-
-	err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, inputHashFile)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-
-		return false, err
-	}
 
 	return true, nil
 }

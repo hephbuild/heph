@@ -59,14 +59,22 @@ type Job struct {
 
 	TimeStart time.Time
 	TimeEnd   time.Time
+
+	m sync.Mutex
 }
 
 func (j *Job) Done() {
+	j.m.Lock()
+	defer j.m.Unlock()
+
 	log.Tracef("job %v done", j.Name)
 	j.doneWithState(StateSuccess)
 }
 
 func (j *Job) DoneWithErr(err error, state JobState) {
+	j.m.Lock()
+	defer j.m.Unlock()
+
 	if state == StateFailed {
 		log.Errorf("%v finished with err: %v", j.Name, err)
 	}
@@ -183,9 +191,6 @@ func NewPool(n int) *Pool {
 func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	p.wg.Add(1)
 
-	p.m.Lock()
-	defer p.m.Unlock()
-
 	log.Tracef("Scheduling %v %v", job.Name, job.ID)
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -224,9 +229,6 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 }
 
 func (p *Pool) finalize(job *Job, err error, skippedOnErr bool) {
-	p.m.Lock()
-	defer p.m.Unlock()
-
 	if err == nil {
 		job.Done()
 		//log.Debugf("finalize job: %v %v", job.Name, job.State.String())
@@ -251,9 +253,6 @@ func (p *Pool) IsDone() bool {
 }
 
 func (p *Pool) Done() <-chan struct{} {
-	p.m.Lock()
-	defer p.m.Unlock()
-
 	p.o.Do(func() {
 		p.doneCh = make(chan struct{})
 

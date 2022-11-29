@@ -38,6 +38,15 @@ func PathExists(filename string) bool {
 	return err == nil
 }
 
+func Touch(filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
+}
+
 func CreateParentDir(path string) error {
 	if dir := filepath.Dir(path); dir != "." {
 		err := os.MkdirAll(dir, os.ModePerm)

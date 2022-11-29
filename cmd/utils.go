@@ -64,8 +64,6 @@ func printHumanError(err error) {
 
 			var lerr engine.ErrorWithLogFile
 			if errors.As(err, &lerr) {
-				log.Error(lerr.Error())
-
 				logFile := lerr.LogFile
 				info, _ := os.Stat(logFile)
 				if info.Size() > 0 {
@@ -76,6 +74,8 @@ func printHumanError(err error) {
 					fmt.Fprintln(os.Stderr)
 					fmt.Fprintf(os.Stderr, "The log file can be found at %v\n", logFile)
 				}
+
+				log.Error(lerr.Error())
 			} else {
 				for _, err := range multierr.Errors(terr) {
 					skipSpacing = true

@@ -9,12 +9,6 @@ func WaitGroupOr(wgs ...*WaitGroup) *WaitGroup {
 	}
 
 	doneCh := make(chan struct{})
-	owg := &WaitGroup{}
-	owg.AddSem()
-	go func() {
-		<-doneCh
-		owg.DoneSem()
-	}()
 
 	for _, wg := range wgs {
 		wg := wg
@@ -28,5 +22,23 @@ func WaitGroupOr(wgs ...*WaitGroup) *WaitGroup {
 		}()
 	}
 
-	return owg
+	return WaitGroupChan(doneCh)
+}
+
+func WaitGroupJob(j *Job) *WaitGroup {
+	wg := &WaitGroup{}
+	wg.Add(j)
+
+	return wg
+}
+
+func WaitGroupChan[T any](ch <-chan T) *WaitGroup {
+	wg := &WaitGroup{}
+	wg.AddSem()
+	go func() {
+		<-ch
+		wg.DoneSem()
+	}()
+
+	return wg
 }

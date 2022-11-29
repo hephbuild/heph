@@ -127,14 +127,19 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 
 	targs := args[1:]
 
-	if len(targs) > 0 && !target.PassArgs {
-		return nil, fmt.Errorf("%v does not allow args", target.FQN)
+	tnocache := *nocache
+	if len(targs) > 0 {
+		if !target.PassArgs {
+			return nil, fmt.Errorf("%v does not allow args", target.FQN)
+		}
+
+		tnocache = true
 	}
 
 	return []engine.TargetRunRequest{{
 		Target:  target,
 		Args:    targs,
-		NoCache: *nocache,
+		NoCache: tnocache,
 		Shell:   *shell,
 	}}, nil
 }

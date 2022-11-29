@@ -40,18 +40,16 @@ func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target, ou
 }
 
 func (e *TargetRunEngine) WarmTargetCache(ctx context.Context, target *Target, output string) (bool, error) {
-	return e.warmTargetCache(ctx, target, output, false)
+	return e.warmTargetOutput(ctx, target, output, false)
 }
 
 func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target) (bool, error) {
 	return e.warmTargetCaches(ctx, target, target.OutWithSupport.Names(), false)
 }
 
-func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, _outputs []string, onlyMeta bool) (bool, error) {
-	var outputs []string
-	for _, output := range _outputs {
-		outputs = append(outputs, output)
-	}
+func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
+	outputs = utils.CopyArray(outputs)
+
 	sort.SliceStable(outputs, func(i, j int) bool {
 		if outputs[i] == targetspec.SupportFilesOutput {
 			return true
@@ -60,8 +58,17 @@ func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, 
 		return outputs[i] < outputs[j]
 	})
 
+	cached, err := e.warmTargetInput(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
+	if !cached {
+		return false, nil
+	}
+
 	for _, output := range outputs {
-		cached, err := e.warmTargetCache(ctx, target, output, onlyMeta)
+		cached, err := e.warmTargetOutput(ctx, target, output, onlyMeta)
 		if err != nil {
 			return false, err
 		}
@@ -81,7 +88,7 @@ func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, 
 	return true, nil
 }
 
-func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
+func (e *TargetRunEngine) warmTargetInput(ctx context.Context, target *Target) (_ bool, rerr error) {
 	err := e.linkTarget(target, NewTargets(0))
 	if err != nil {
 		return false, err
@@ -91,7 +98,25 @@ func (e *TargetRunEngine) warmTargetCache(ctx context.Context, target *Target, o
 		return false, nil
 	}
 
-	if !target.OutWithSupport.HasName(output) {
+	span := e.SpanCachePull(ctx, target, inputHashName, true)
+	defer func() {
+		span.EndError(rerr)
+	}()
+
+	return e.getCache(target, inputHashName, true)
+}
+
+func (e *TargetRunEngine) warmTargetOutput(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
+	err := e.linkTarget(target, NewTargets(0))
+	if err != nil {
+		return false, err
+	}
+
+	if !target.Cache.Enabled {
+		return false, nil
+	}
+
+	if output != inputHashName && !target.OutWithSupport.HasName(output) {
 		return false, fmt.Errorf("%v does not output %v", target.FQN, output)
 	}
 
@@ -452,6 +477,10 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	if target.Cache.Enabled && !rr.Shell && !rr.NoCache {
+		if len(rr.Args) > 0 {
+			return fmt.Errorf("args are not supported with cache")
+		}
+
 		start := time.Now()
 		defer func() {
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
@@ -464,12 +493,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 
 		if cached {
 			return nil
-		}
-	}
-
-	if len(rr.Args) > 0 {
-		if target.Cache.Enabled {
-			return fmt.Errorf("args are not supported with cache")
 		}
 	}
 
@@ -669,9 +692,14 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 }
 
 func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string) error {
+	_, err := e.postRunOrWarmCached(ctx, target, outputs)
+	return err
+}
+
+func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Target, outputs []string) (bool, error) {
 	err := target.postRunWarmLock.Lock()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	defer func() {
@@ -681,6 +709,11 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		}
 	}()
 
+	doneMarker := e.cacheDir(target).Join(inputHashFile).Abs()
+	if !fs.PathExists(doneMarker) {
+		return false, err
+	}
+
 	outDir := e.cacheDir(target).Join("_output")
 	outDirHashPath := e.cacheDir(target).Join("_output_hash").Abs()
 
@@ -688,7 +721,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	for _, name := range outputs {
 		p := e.targetOutputTarFile(target, name)
 		if !fs.PathExists(p) {
-			return fmt.Errorf("%v does not exist", p)
+			return false, fmt.Errorf("%v does not exist", p)
 		}
 	}
 	outDirHash := strings.Join(outputs, ",")
@@ -699,7 +732,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	} else {
 		b, err := os.ReadFile(outDirHashPath)
 		if err != nil && !errors.Is(err, fs2.ErrNotExist) {
-			return err
+			return false, err
 		}
 
 		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
@@ -717,34 +750,34 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 		err := os.RemoveAll(tmpOutDir)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		err = os.MkdirAll(tmpOutDir, os.ModePerm)
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		for _, name := range outputs {
 			err := tar.Untar(ctx, e.targetOutputTarFile(target, name), tmpOutDir, true)
 			if err != nil {
-				return err
+				return false, err
 			}
 		}
 
 		err = os.RemoveAll(outDir.Abs())
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		err = os.Rename(tmpOutDir, outDir.Abs())
 		if err != nil {
-			return err
+			return false, err
 		}
 
 		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -754,12 +787,12 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 	err = e.populateActualFilesFromTar(target)
 	if err != nil {
-		return fmt.Errorf("poptar: %w", err)
+		return false, fmt.Errorf("poptar: %w", err)
 	}
 
 	err = e.codegenLink(target)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if target.Cache.Enabled && !e.Config.DisableGC {
@@ -769,7 +802,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		}
 	}
 
-	return nil
+	return true, nil
 }
 
 func (e *TargetRunEngine) codegenLink(target *Target) error {

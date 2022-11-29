@@ -19,3 +19,20 @@ func Contains[T comparable](a []T, e T) bool {
 
 	return false
 }
+
+func Filter[T any](a []T, f func(T) bool) []T {
+	o := make([]T, 0)
+
+	for _, e := range a {
+		if f(e) {
+			o = append(o, e)
+		}
+	}
+
+	return o
+}
+
+func CopyArray[T any](a []T) []T {
+	var empty []T
+	return append(empty, a...)
+}

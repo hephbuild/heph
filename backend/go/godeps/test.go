@@ -110,9 +110,10 @@ if {{.IfTest}}:
 			'bin': test_build,
 			'data': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
 		},
-		'run': ['./$SRC_BIN -test.v 2>&1 | tee test_out'],
+		'run': ['./$SRC_BIN -test.v "$@" 2>&1 | tee test_out'],
 		'out': ['test_out'],
-		'labels': ["test"],
+		'labels': ['test'],
+		'pass_args': True,
 	}
 
 	for (k, v) in rargs.items():

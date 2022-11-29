@@ -25,13 +25,13 @@ func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 		folder = "__target_tmp_" + SOMEID + "_" + target.Name
 	}
 
-	p := e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
+	p := e.HomeDir.Join("cache", target.Package.FullName, folder)
 
 	if !target.Cache.Enabled {
 		e.RegisterRemove(p.Abs())
 	}
 
-	return p
+	return p.Join(inputHash)
 }
 
 func (e *Engine) cacheOutTarName(name string) string {
@@ -208,6 +208,10 @@ func (e *Engine) getLocalCache(target *Target, output string, onlyMeta bool) (bo
 
 	if cacheHash != hash {
 		return false, nil
+	}
+
+	if output == inputHashName {
+		return true, nil
 	}
 
 	if !fs.PathExists(e.targetOutputHashFile(target, output)) {

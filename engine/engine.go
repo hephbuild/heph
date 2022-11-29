@@ -18,6 +18,7 @@ import (
 	"heph/utils"
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
+	"heph/utils/maps"
 	"heph/utils/tar"
 	"heph/vfssimple"
 	"heph/worker"
@@ -59,12 +60,10 @@ type Engine struct {
 
 	autocompleteHash string
 
-	cacheHashInputTargetMutex  utils.KMutex
-	cacheHashInputMutex        sync.RWMutex
-	cacheHashInput             map[string]string
-	cacheHashOutputTargetMutex utils.KMutex
-	cacheHashOutputMutex       sync.RWMutex
-	cacheHashOutput            map[string]string // TODO: LRU
+	cacheHashInputTargetMutex  maps.KMutex
+	cacheHashInput             *maps.Map[string, string]
+	cacheHashOutputTargetMutex maps.KMutex
+	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
 	RanGenPass                 bool
 	RanInit                    bool
 	codegenPaths               map[string]*Target
@@ -173,8 +172,8 @@ func New(rootPath string) *Engine {
 		Stats:             &htrace.Stats{},
 		Tracer:            trace.NewNoopTracerProvider().Tracer(""),
 		Packages:          map[string]*packages.Package{},
-		cacheHashInput:    map[string]string{},
-		cacheHashOutput:   map[string]string{},
+		cacheHashInput:    &maps.Map[string, string]{},
+		cacheHashOutput:   &maps.Map[string, string]{},
 		codegenPaths:      map[string]*Target{},
 		fetchRootCache:    map[string]fs2.Path{},
 		cacheRunBuildFile: map[string]starlark.StringDict{},
@@ -321,19 +320,16 @@ func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
 }
 
 func (e *Engine) ResetCacheHashInput(target *Target) {
-	e.cacheHashInputMutex.Lock()
-	defer e.cacheHashInputMutex.Unlock()
-
 	ks := make([]string, 0)
 
-	for k := range e.cacheHashInput {
+	for _, k := range e.cacheHashInput.Keys() {
 		if strings.HasPrefix(k, target.FQN) {
 			ks = append(ks, k)
 		}
 	}
 
 	for _, k := range ks {
-		delete(e.cacheHashInput, k)
+		e.cacheHashInput.Delete(k)
 	}
 }
 
@@ -381,12 +377,9 @@ func (e *Engine) hashInput(target *Target) string {
 
 	cacheId := hashCacheId(target)
 
-	e.cacheHashInputMutex.RLock()
-	if h, ok := e.cacheHashInput[cacheId]; ok {
-		e.cacheHashInputMutex.RUnlock()
+	if h, ok := e.cacheHashInput.GetOk(cacheId); ok {
 		return h
 	}
-	e.cacheHashInputMutex.RUnlock()
 
 	start := time.Now()
 	defer func() {
@@ -469,9 +462,7 @@ func (e *Engine) hashInput(target *Target) string {
 
 	sh := h.Sum()
 
-	e.cacheHashInputMutex.Lock()
-	e.cacheHashInput[cacheId] = sh
-	e.cacheHashInputMutex.Unlock()
+	e.cacheHashInput.Set(cacheId, sh)
 
 	return sh
 }
@@ -487,12 +478,9 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	hashInput := e.hashInput(target)
 	cacheId := target.FQN + "|" + output + "_" + hashInput
 
-	e.cacheHashOutputMutex.RLock()
-	if h, ok := e.cacheHashOutput[cacheId]; ok {
-		e.cacheHashOutputMutex.RUnlock()
+	if h, ok := e.cacheHashOutput.GetOk(cacheId); ok {
 		return h
 	}
-	e.cacheHashOutputMutex.RUnlock()
 
 	start := time.Now()
 	defer func() {
@@ -510,9 +498,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	}
 
 	if sh := strings.TrimSpace(string(b)); len(sh) > 0 {
-		e.cacheHashOutputMutex.Lock()
-		e.cacheHashOutput[cacheId] = sh
-		e.cacheHashOutputMutex.Unlock()
+		e.cacheHashOutput.Set(cacheId, sh)
 
 		return sh
 	}
@@ -537,9 +523,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	sh := h.Sum()
 
-	e.cacheHashOutputMutex.Lock()
-	e.cacheHashOutput[cacheId] = sh
-	e.cacheHashOutputMutex.Unlock()
+	e.cacheHashOutput.Set(cacheId, sh)
 
 	return sh
 }
@@ -624,8 +608,13 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
+var schedulerV2Once sync.Once
+
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
 	if e.Config.TargetScheduler == "v2" {
+		schedulerV2Once.Do(func() {
+			log.Info("Scheduler v2")
+		})
 		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 	}
 
@@ -634,7 +623,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 
 func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, outputs []string, wdeps *worker.WaitGroup) (*worker.Job, error) {
 	postDeps := &worker.WaitGroup{}
-	for _, output := range outputs {
+	for _, output := range append(outputs, inputHashName) {
 		output := output
 
 		j := e.Pool.Schedule(ctx, &worker.Job{
@@ -663,9 +652,13 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 		postDeps.Add(j)
 	}
 
-	j := e.Pool.Schedule(ctx, &worker.Job{
+	return e.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
+}
+
+func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target, deps *worker.WaitGroup, outputs []string) *worker.Job {
+	return e.Pool.Schedule(ctx, &worker.Job{
 		Name: "postrunwarm " + target.FQN,
-		Deps: postDeps,
+		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine: e,
@@ -675,8 +668,6 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 			return e.postRunOrWarm(ctx, target, outputs)
 		},
 	})
-
-	return j, nil
 }
 
 func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
