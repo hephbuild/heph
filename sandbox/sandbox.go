@@ -124,7 +124,31 @@ type ExecConfig struct {
 	ExecArgs []string
 }
 
-func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
+func AddPathEnv(env map[string]string, binDir string, isolatePath bool) {
+	pathStr := func(path string) string {
+		if isolatePath {
+			return binDir + ":/usr/sbin:/usr/bin:/sbin:/bin"
+		} else {
+			return binDir + ":" + path
+		}
+	}
+
+	if v, ok := env["PATH"]; ok {
+		env["PATH"] = pathStr(v)
+	} else {
+		env["PATH"] = pathStr(os.Getenv("PATH"))
+	}
+}
+
+func envMapToArray(m map[string]string) []string {
+	env := make([]string, 0, len(m))
+	for k, v := range m {
+		env = append(env, fmt.Sprintf("%v=%v", k, v))
+	}
+	return env
+}
+
+func Exec(cfg ExecConfig) *exec.Cmd {
 	args := cfg.ExecArgs
 
 	log.Tracef("Exec in %v: %v", cfg.Dir, args)
@@ -137,33 +161,10 @@ func Exec(cfg ExecConfig, isolatePath bool) *exec.Cmd {
 	cmd := exec.CommandContext(cfg.Context, args[0], args[1:]...)
 	cmd.Dir = cfg.Dir
 
+	cmd.Env = envMapToArray(cfg.Env)
 	cmd.Stdin = cfg.Stdin
 	cmd.Stdout = cfg.Stdout
 	cmd.Stderr = cfg.Stderr
-
-	pathStr := func(path string) string {
-		if isolatePath {
-			return "PATH=" + cfg.BinDir + ":/usr/sbin:/usr/bin:/sbin:/bin"
-		} else {
-			return "PATH=" + cfg.BinDir + ":" + path
-		}
-	}
-
-	cmd.Env = make([]string, 0)
-	pathReplaced := false
-	for k, v := range cfg.Env {
-		if k == "PATH" {
-			pathReplaced = true
-			cmd.Env = append(cmd.Env, pathStr(v))
-			continue
-		}
-
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%v=%v", k, v))
-	}
-
-	if !pathReplaced {
-		cmd.Env = append(cmd.Env, pathStr(os.Getenv("PATH")))
-	}
 
 	cmd.SysProcAttr = sysProcAttr()
 

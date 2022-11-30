@@ -1,4 +1,4 @@
-def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_output_contains=None, expect_output_doesnt_contain=None, expected_exit_code=None):
+def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_output_contains=None, expect_output_doesnt_contain=None, expected_exit_code=None, deps=None):
     cmd = cmd.replace("heph ", "heph --porcelain ")
     cmd = '('+cmd+')'
 
@@ -25,4 +25,5 @@ def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_out
         tools=['heph', 'diff'],
         cache=False,
         pass_env=["PATH"],
+        deps=deps,
     )

@@ -513,8 +513,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		dir = e.Cwd
 	}
 
-	_, hasPathInEnv := env["PATH"]
-
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
 		target.LogFile = e.sandboxRoot(target).Join("log.txt").Abs()
 
@@ -588,6 +586,9 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			executor = sandbox.BashShellExecutor
 		}
 
+		_, hasPathInEnv := env["PATH"]
+		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
+
 		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
 			Args:    run,
 			CmdArgs: rr.Args,
@@ -604,7 +605,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			Env:      env,
 			IOConfig: iocfg,
 			ExecArgs: execArgs,
-		}, target.Sandbox && !hasPathInEnv)
+		})
 
 		espan := e.SpanRunExec(ctx, target)
 		err = cmd.Run()

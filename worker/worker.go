@@ -253,6 +253,9 @@ func (p *Pool) IsDone() bool {
 }
 
 func (p *Pool) Done() <-chan struct{} {
+	p.m.Lock()
+	defer p.m.Unlock()
+
 	p.o.Do(func() {
 		p.doneCh = make(chan struct{})
 

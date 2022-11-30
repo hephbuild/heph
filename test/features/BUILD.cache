@@ -27,8 +27,15 @@ target(
     ],
 )
 
-e2e_test(
-    name="sanity_cached_no_output",
+no_out1=e2e_test(
+    name="sanity_cached_no_output1",
     cmd="rm -rf $(heph query root)/.heph/cache/test/features/__target_cached_no_output || true; heph run //test/features:cached_no_output",
     expected_output="1",
+)
+
+no_out1=e2e_test(
+    name="sanity_cached_no_output2",
+    cmd="heph run //test/features:cached_no_output",
+    expected_output="",
+    deps=no_out1,
 )

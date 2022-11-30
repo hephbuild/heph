@@ -1,5 +1,7 @@
 package utils
 
+import "sort"
+
 func Map[T, O any](a []T, f func(T) O) []O {
 	out := make([]O, len(a))
 
@@ -35,4 +37,15 @@ func Filter[T any](a []T, f func(T) bool) []T {
 func CopyArray[T any](a []T) []T {
 	var empty []T
 	return append(empty, a...)
+}
+
+func Keys[K string, V any](m map[K]V) []K {
+	ks := make([]K, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.SliceStable(ks, func(i, j int) bool {
+		return ks[i] < ks[j]
+	})
+	return ks
 }

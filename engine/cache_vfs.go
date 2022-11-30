@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const inputHashName = "@input"
+const inputHashName = "@input_hash"
 
 func (e *Engine) vfsCachePath(target *Target, inputHash string) string {
 	return filepath.Join(target.Package.FullName, target.Name, inputHash) + "/"
@@ -119,6 +119,11 @@ func (e *Engine) storeVfsCache(remote CacheConfig, target *Target) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	err = e.vfsCopyFile(localRoot, remoteRoot, inputHashFile)
+	if err != nil {
+		return err
 	}
 
 	return nil
