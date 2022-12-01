@@ -18,6 +18,14 @@ func NewSet[K comparable, T any](f func(T) K, cap int) *Set[K, T] {
 	return t
 }
 
+type StringSet = Set[string, string]
+
+func NewStringSet(cap int) *StringSet {
+	return NewSet(func(s string) string {
+		return s
+	}, cap)
+}
+
 func (ts *Set[K, T]) Add(t T) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()

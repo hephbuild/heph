@@ -187,5 +187,5 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 		return nil, nil, err
 	}
 
-	return Engine.Targets.FQNs(), Engine.Labels, nil
+	return Engine.Targets.FQNs(), Engine.Labels.Slice(), nil
 }

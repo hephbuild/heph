@@ -76,7 +76,7 @@ func (e *Engine) StoreAutocompleteCache() error {
 		Hash:          e.autocompleteHash,
 		AllTargets:    allTargets,
 		PublicTargets: pubTargets,
-		Labels:        e.Labels,
+		Labels:        e.Labels.Slice(),
 	}
 
 	b, err := json.Marshal(cache)

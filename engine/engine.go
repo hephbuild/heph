@@ -19,6 +19,7 @@ import (
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
 	"heph/utils/maps"
+	"heph/utils/sets"
 	"heph/utils/tar"
 	"heph/vfssimple"
 	"heph/worker"
@@ -52,7 +53,7 @@ type Engine struct {
 
 	TargetsLock sync.Mutex
 	Targets     *Targets
-	Labels      []string
+	Labels      *sets.StringSet
 
 	Params map[string]string
 
@@ -177,6 +178,7 @@ func New(rootPath string) *Engine {
 		codegenPaths:      map[string]*Target{},
 		fetchRootCache:    map[string]fs2.Path{},
 		cacheRunBuildFile: map[string]starlark.StringDict{},
+		Labels:            sets.NewStringSet(0),
 		gcLock:            flock.NewFlock(homeDir.Join("tmp", "gc.lock").Abs()),
 	}
 }
@@ -953,13 +955,7 @@ func (e *Engine) parseConfigs() error {
 }
 
 func (e *Engine) HasLabel(label string) bool {
-	for _, l := range e.Labels {
-		if l == label {
-			return true
-		}
-	}
-
-	return false
+	return e.Labels.Has(label)
 }
 
 func (e *Engine) GeneratedTargets() []*Target {
@@ -979,9 +975,7 @@ func (e *Engine) GeneratedTargets() []*Target {
 
 func (e *Engine) registerLabels(labels []string) {
 	for _, label := range labels {
-		if !e.HasLabel(label) {
-			e.Labels = append(e.Labels, label)
-		}
+		e.Labels.Add(label)
 	}
 }
 
