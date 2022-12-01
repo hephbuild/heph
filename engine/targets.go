@@ -294,6 +294,7 @@ type Target struct {
 	Out            *OutNamedPaths
 	actualOutFiles *ActualOutNamedPaths
 	Env            map[string]string
+	RuntimeEnv     map[string]TargetRuntimeEnv
 	Transitive     TargetTransitive
 
 	RequireTransitive     TargetTransitive
@@ -320,16 +321,23 @@ type Target struct {
 	cacheLocks      map[string]flock.Locker
 }
 
+type TargetRuntimeEnv struct {
+	Value  string
+	Target *Target
+}
+
 type TargetTransitive struct {
-	Tools   TargetTools
-	Deps    TargetNamedDeps
-	Env     map[string]string
-	PassEnv []string
+	Tools      TargetTools
+	Deps       TargetNamedDeps
+	Env        map[string]string
+	RuntimeEnv map[string]TargetRuntimeEnv
+	PassEnv    []string
 }
 
 func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 	ntr := TargetTransitive{
-		Env: map[string]string{},
+		Env:        map[string]string{},
+		RuntimeEnv: map[string]TargetRuntimeEnv{},
 	}
 
 	if otr.Tools.Empty() {
@@ -350,13 +358,21 @@ func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 	for k, v := range otr.Env {
 		ntr.Env[k] = v
 	}
+
+	for k, v := range tr.RuntimeEnv {
+		ntr.RuntimeEnv[k] = v
+	}
+	for k, v := range otr.RuntimeEnv {
+		ntr.RuntimeEnv[k] = v
+	}
+
 	ntr.PassEnv = append(tr.PassEnv, otr.PassEnv...)
 
 	return ntr
 }
 
 func (tr TargetTransitive) Empty() bool {
-	return tr.Tools.Empty() && tr.Deps.Empty() && len(tr.Env) == 0 && len(tr.PassEnv) == 0
+	return tr.Tools.Empty() && tr.Deps.Empty() && len(tr.Env) == 0 && len(tr.RuntimeEnv) == 0 && len(tr.PassEnv) == 0
 }
 
 var ErrStopWalk = errors.New("stop walk")
@@ -893,6 +909,13 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		return err
 	}
 	t.RequireTransitive.Env = t.TargetSpec.Transitive.Env
+	t.RequireTransitive.RuntimeEnv = map[string]TargetRuntimeEnv{}
+	for k, v := range t.TargetSpec.Transitive.RuntimeEnv {
+		t.RequireTransitive.RuntimeEnv[k] = TargetRuntimeEnv{
+			Value:  v,
+			Target: t,
+		}
+	}
 	t.RequireTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
 
 	relPathFactory := func(p string) fs.RelPath {
@@ -958,6 +981,12 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	e.applyEnv(t, t.Transitive.PassEnv, t.Transitive.Env)
+	if t.RuntimeEnv == nil {
+		t.RuntimeEnv = map[string]TargetRuntimeEnv{}
+	}
+	for k, v := range t.Transitive.RuntimeEnv {
+		t.RuntimeEnv[k] = v
+	}
 
 	e.registerLabels(t.Labels)
 

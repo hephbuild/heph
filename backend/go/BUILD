@@ -48,9 +48,11 @@ def go_toolchain(name, architectures=[]):
         },
         cache=heph.cache(history=1),
         support_files="go",
-        runtime_env={
-            "OUTDIR": "$(outdir)",
-        },
+        transitive=heph.target_spec(
+            runtime_env={
+                "GO_OUTDIR": "$(outdir)",
+            },
+        ),
     )
 
 godeps = target(

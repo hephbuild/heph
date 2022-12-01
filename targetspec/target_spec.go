@@ -69,6 +69,7 @@ type TargetSpec struct {
 	Tools             TargetSpecTools
 	Out               []TargetSpecOutFile
 	Cache             TargetSpecCache
+	RestoreCache      bool
 	HasSupportFiles   bool
 	Sandbox           bool
 	OutInSandbox      bool
@@ -88,10 +89,11 @@ type TargetSpec struct {
 }
 
 type TargetSpecTransitive struct {
-	Deps    TargetSpecDeps
-	Tools   TargetSpecTools
-	Env     map[string]string
-	PassEnv []string
+	Deps       TargetSpecDeps
+	Tools      TargetSpecTools
+	Env        map[string]string
+	PassEnv    []string
+	RuntimeEnv map[string]string
 }
 
 func (t TargetSpec) IsGroup() bool {

@@ -70,7 +70,7 @@ func (e *DAG) GetOrderedAncestorsWithOutput(targets []*Target, includeRoot bool)
 	}
 
 	maybeAddAllOuts := func(t *Target, output string) {
-		if t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets, t.FQN) {
+		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets, t.FQN) {
 			addAllOut(t)
 		} else {
 			addOut(t, output)

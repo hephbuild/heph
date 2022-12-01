@@ -225,6 +225,22 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 
 	e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
 
+	restoreSrcRec := &SrcRecorder{}
+	if target.RestoreCache {
+		latestDir := e.cacheDirForHash(target, "latest").Abs()
+
+		if fs.PathExists(latestDir) {
+			for _, name := range target.OutWithSupport.Names() {
+				p := e.targetOutputTarFileForHash(target, "latest", name)
+				if !fs.PathExists(p) {
+					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, name)
+					continue
+				}
+				restoreSrcRec.AddTar(p)
+			}
+		}
+	}
+
 	srcRecNameToDepName := map[string]string{}
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
@@ -293,8 +309,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		Dir:    target.SandboxRoot.Abs(),
 		BinDir: binDir,
 		Bin:    bin,
-		Src:    srcRec.Src(),
-		SrcTar: srcRec.SrcTar(),
+		Src:    append(srcRec.Src(), restoreSrcRec.Src()...),
+		SrcTar: append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
 	})
 	if err != nil {
 		return nil, err
@@ -409,19 +425,19 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		if tool.Target == nil {
 			continue
 		}
-
-		for rk, expr := range tool.Target.RuntimeEnv {
-			val, err := exprs.Exec(expr, e.queryFunctions(tool.Target))
-			if err != nil {
-				return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
-			}
-
-			env[normalizeEnv(strings.ToUpper(tool.Target.Name+"_"+rk))] = val
-		}
 	}
 	for _, tool := range target.Tools.Hosts {
 		k := "TOOL_" + strings.ToUpper(tool.Name)
 		env[normalizeEnv(k)] = tool.Path
+	}
+
+	for k, expr := range target.RuntimeEnv {
+		val, err := exprs.Exec(expr.Value, e.queryFunctions(expr.Target))
+		if err != nil {
+			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
+		}
+
+		env[normalizeEnv(strings.ToUpper(k))] = val
 	}
 
 	for k, v := range target.Env {
@@ -611,6 +627,14 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		err = cmd.Run()
 		espan.EndError(err)
 		if err != nil {
+			if strings.Contains(err.Error(), "argument list too long") {
+				for k, v := range env {
+					if len(v) > 500 {
+						log.Warnf("long environment variable: %v", k)
+					}
+				}
+			}
+
 			if cerr := ctx.Err(); cerr != nil {
 				err = fmt.Errorf("%w: %v", cerr, err)
 			}

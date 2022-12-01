@@ -30,6 +30,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			Named:   args.Cache.Named,
 			History: args.Cache.History,
 		},
+		RestoreCache: args.RestoreCache,
 		Sandbox:      args.SandboxEnabled,
 		OutInSandbox: args.OutInSandbox,
 		Codegen:      args.Codegen,
@@ -79,6 +80,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	}
 
 	t.Transitive.Env = args.Transitive.Env.StrMap
+	t.Transitive.RuntimeEnv = args.Transitive.RuntimeEnv.StrMap
 	t.Transitive.PassEnv = args.Transitive.PassEnv.Array
 
 	if len(args.Out.ArrMap) > 0 {

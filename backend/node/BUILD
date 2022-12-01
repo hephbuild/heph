@@ -26,9 +26,11 @@ target(
         "ARCH": get_arch(),
     },
     support_files=["./node"],
-    runtime_env={
-        "OUTDIR": "$(outdir)",
-    },
+    transitive=heph.target_spec(
+        runtime_env={
+            "NODE_OUTDIR": "$(outdir)",
+        },
+    ),
 )
 
 target(
@@ -39,11 +41,11 @@ target(
         "yarn": "./yarn.sh",
     },
     support_files=["./yarn"],
-    runtime_env={
-        "OUTDIR": "$(outdir)",
-    },
     transitive=heph.target_spec(
         tools=':node',
+        runtime_env={
+            "YARN_OUTDIR": "$(outdir)",
+        },
     )
 )
 

@@ -16,6 +16,7 @@ type TargetArgs struct {
 	Quiet          bool
 	PassArgs       bool
 	Cache          TargetArgsCache
+	RestoreCache   bool
 	SupportFiles   Array
 	SandboxEnabled bool
 	OutInSandbox   bool
@@ -37,13 +38,18 @@ type TargetArgs struct {
 }
 
 type TargetArgsTransitive struct {
-	Deps    ArrayMap
-	Tools   ArrayMap
-	Env     ArrayMap
-	PassEnv ArrayMap
+	Deps       ArrayMap
+	Tools      ArrayMap
+	Env        ArrayMap
+	PassEnv    ArrayMap
+	RuntimeEnv ArrayMap
 }
 
 func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
 	d, ok := v.(*starlarkstruct.Struct)
 	if ok {
 		cs := TargetArgsTransitive{}
@@ -67,6 +73,11 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 				}
 			case "env":
 				err := cs.Env.Unpack(v)
+				if err != nil {
+					return err
+				}
+			case "runtime_env":
+				err := cs.RuntimeEnv.Unpack(v)
 				if err != nil {
 					return err
 				}

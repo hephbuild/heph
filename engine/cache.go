@@ -46,6 +46,10 @@ func (e *Engine) targetOutputTarFile(target *Target, name string) string {
 	return e.cacheDir(target).Join(e.cacheOutTarName(name)).Abs()
 }
 
+func (e *Engine) targetOutputTarFileForHash(target *Target, hash, name string) string {
+	return e.cacheDirForHash(target, hash).Join(e.cacheOutTarName(name)).Abs()
+}
+
 func (e *Engine) targetOutputHashFile(target *Target, name string) string {
 	return e.cacheDir(target).Join(e.cacheOutHashName(name)).Abs()
 }

@@ -54,6 +54,10 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
 			}
 
+			if t.OutExpansionRoot == nil {
+				return "", fmt.Errorf("%v has not been cached yet", t.FQN)
+			}
+
 			return t.OutExpansionRoot.Join(t.Package.FullName).Abs(), nil
 		},
 		"hash_input": func(expr exprs.Expr) (string, error) {
