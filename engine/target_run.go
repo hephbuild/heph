@@ -614,6 +614,11 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			return err
 		}
 
+		err = sandbox.FilterLongEnv(env, execArgs)
+		if rerr != nil {
+			return err
+		}
+
 		cmd := sandbox.Exec(sandbox.ExecConfig{
 			Context:  ctx,
 			BinDir:   binDir,
@@ -627,14 +632,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		err = cmd.Run()
 		espan.EndError(err)
 		if err != nil {
-			if strings.Contains(err.Error(), "argument list too long") {
-				for k, v := range env {
-					if len(v) > 500 {
-						log.Warnf("long environment variable: %v", k)
-					}
-				}
-			}
-
 			if cerr := ctx.Err(); cerr != nil {
 				err = fmt.Errorf("%w: %v", cerr, err)
 			}

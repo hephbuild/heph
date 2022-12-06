@@ -47,7 +47,7 @@ func (e *Engine) newTargetSpan(ctx context.Context, spanName, phase string, opts
 		ctx = context.Background()
 	}
 
-	if !trace.SpanFromContext(ctx).SpanContext().HasSpanID() {
+	if !trace.SpanFromContext(ctx).SpanContext().IsValid() {
 		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	}
 
