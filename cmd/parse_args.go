@@ -53,6 +53,9 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 	for _, tp := range tps {
 		target := e.Targets.Find(tp.Full())
 		if target == nil {
+			if *ignoreUnknownTarget {
+				continue
+			}
 			return nil, engine.TargetNotFoundError(tp.Full())
 		}
 

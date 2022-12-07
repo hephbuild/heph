@@ -30,6 +30,7 @@ var nocache *bool
 var params *[]string
 var summary *bool
 var jaegerEndpoint *string
+var ignoreUnknownTarget *bool
 
 func init() {
 	// Output to stdout instead of the default stderr
@@ -65,6 +66,7 @@ func init() {
 	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
 	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
 	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
+	ignoreUnknownTarget = rootCmd.PersistentFlags().Bool("ignore-unknown", false, "Ignore unknown targets")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
