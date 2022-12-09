@@ -28,7 +28,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 
 		target := e.Targets.Find(fqn)
 		if target == nil {
-			return nil, TargetNotFoundError(fqn)
+			return nil, NewTargetNotFoundError(fqn)
 		}
 
 		return target, nil
@@ -86,7 +86,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 
 			t := e.Targets.Find(fqn)
 			if t == nil {
-				return "", TargetNotFoundError(fqn)
+				return "", NewTargetNotFoundError(fqn)
 			}
 
 			universe, err := e.DAG().GetParents(t)

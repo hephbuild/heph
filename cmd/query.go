@@ -397,7 +397,7 @@ var targetCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		if spec {
@@ -507,7 +507,7 @@ var depsCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		fn := Engine.DAG().GetParents
@@ -554,7 +554,7 @@ var depsOnCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		fn := Engine.DAG().GetChildren
@@ -603,7 +603,7 @@ var outCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
@@ -645,7 +645,7 @@ var hashoutCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
@@ -679,7 +679,7 @@ var hashinCmd = &cobra.Command{
 
 		target := Engine.Targets.Find(tp.Full())
 		if target == nil {
-			return engine.TargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		tdeps, err := Engine.ScheduleTargetsWithDeps(cmd.Context(), []*engine.Target{target}, target)

@@ -80,21 +80,24 @@ func printHumanError(err error) {
 				for _, err := range multierr.Errors(terr) {
 					skipSpacing = true
 					separate()
-					log.Error(err.Error())
+					if printTargetNotFoundErrorSuggestions(err) {
+						continue
+					} else {
+						log.Error(err.Error())
+					}
 				}
 			}
 		} else {
 			var jerr worker.JobError
-			if errors.As(err, &jerr) {
-				if jerr.Skipped() {
-					skippedCount++
-					skipSpacing = true
-					log.Debugf("skipped: %v", jerr)
-					continue
-				}
+			if errors.As(err, &jerr) && jerr.Skipped() {
+				skippedCount++
+				skipSpacing = true
+				log.Debugf("skipped: %v", jerr)
+			} else if printTargetNotFoundErrorSuggestions(err) {
+				// printed in function
+			} else {
+				log.Error(err)
 			}
-
-			log.Error(err)
 		}
 	}
 
@@ -106,4 +109,22 @@ func printHumanError(err error) {
 		}
 		log.Errorf("%v jobs failed%v", len(errs), skippedStr)
 	}
+}
+
+func printTargetNotFoundErrorSuggestions(err error) bool {
+	e := Engine
+	if e == nil {
+		return false
+	}
+
+	var terr engine.TargetNotFoundErr
+	if errors.As(err, &terr) {
+		suggestions := fuzzyFindTargetName(e.Targets.FQNs(), terr.String, 1)
+		if len(suggestions) > 0 {
+			log.Errorf("%v not found, did you mean %v ?", terr.String, suggestions[0])
+			return true
+		}
+	}
+
+	return false
 }

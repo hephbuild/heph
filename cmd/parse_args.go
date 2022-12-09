@@ -56,7 +56,7 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 			if *ignoreUnknownTarget {
 				continue
 			}
-			return nil, engine.TargetNotFoundError(tp.Full())
+			return nil, engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		targets = append(targets, target)
@@ -125,7 +125,7 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 
 	target := e.Targets.Find(tp.Full())
 	if target == nil {
-		return nil, engine.TargetNotFoundError(tp.Full())
+		return nil, engine.NewTargetNotFoundError(tp.Full())
 	}
 
 	targs := args[1:]

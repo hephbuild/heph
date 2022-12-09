@@ -633,22 +633,22 @@ func (e *Engine) Parse() error {
 	return nil
 }
 
-type targetNotFoundError struct {
-	target string
+type TargetNotFoundErr struct {
+	String string
 }
 
-func (e targetNotFoundError) Error() string {
-	return fmt.Sprintf("target %v not found", e.target)
+func (e TargetNotFoundErr) Error() string {
+	return fmt.Sprintf("target %v not found", e.String)
 }
 
-func (e targetNotFoundError) Is(err error) bool {
-	_, ok := err.(targetNotFoundError)
+func (e TargetNotFoundErr) Is(err error) bool {
+	_, ok := err.(TargetNotFoundErr)
 	return ok
 }
 
-func TargetNotFoundError(target string) error {
-	return targetNotFoundError{
-		target: target,
+func NewTargetNotFoundError(target string) error {
+	return TargetNotFoundErr{
+		String: target,
 	}
 }
 
@@ -776,7 +776,7 @@ func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error 
 		//log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
 		err := e.linkTarget(target, nil)
 		if err != nil {
-			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, targetNotFoundError{})) {
+			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, TargetNotFoundErr{})) {
 				return fmt.Errorf("%v: %w", target.FQN, err)
 			}
 		}
@@ -1060,7 +1060,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 	for _, tool := range toolsSpecs.Targets {
 		tt := e.Targets.Find(tool.Target)
 		if tt == nil {
-			return TargetTools{}, TargetNotFoundError(tool.Target)
+			return TargetTools{}, NewTargetNotFoundError(tool.Target)
 		}
 
 		err := e.linkTarget(tt, breadcrumb)
@@ -1335,7 +1335,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 	for _, spec := range deps.Targets {
 		dt := e.Targets.Find(spec.Target)
 		if dt == nil {
-			return TargetDeps{}, TargetNotFoundError(spec.Target)
+			return TargetDeps{}, NewTargetNotFoundError(spec.Target)
 		}
 
 		err := e.linkTarget(dt, breadcrumb)
