@@ -720,7 +720,11 @@ func (e *Engine) processTarget(t *Target) error {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
 
-	t.runLock = e.lockFactory(t, "run")
+	if t.Cache.Enabled {
+		t.runLock = e.lockFactory(t, "run")
+	} else {
+		t.runLock = flock.NewMutex(t.FQN)
+	}
 	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
 	t.cacheLocks = map[string]flock.Locker{}
 	for _, o := range t.TargetSpec.Out {

@@ -77,7 +77,7 @@ type Engine struct {
 	exitHandlers        []func()
 	exitHandlersRunning bool
 
-	gcLock *flock.Flock
+	gcLock flock.Locker
 }
 
 type Config struct {

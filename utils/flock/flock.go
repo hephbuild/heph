@@ -10,13 +10,7 @@ import (
 	"syscall"
 )
 
-type Locker interface {
-	Lock() error
-	Unlock() error
-	Clean() error
-}
-
-func NewFlock(p string) *Flock {
+func NewFlock(p string) Locker {
 	return &Flock{path: p}
 }
 

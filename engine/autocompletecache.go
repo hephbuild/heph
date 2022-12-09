@@ -60,7 +60,7 @@ func FilterPublicTargets(targets []*Target) []*Target {
 
 func (e *Engine) StoreAutocompleteCache() error {
 	allTargets := make([]string, 0, e.Targets.Len())
-	pubTargets := make([]string, 0, e.Targets.Len())
+	pubTargets := make([]string, 0, e.Targets.Len()/2)
 
 	for _, fqn := range e.Targets.FQNs() {
 		tp, _ := targetspec.TargetParse("", fqn)
