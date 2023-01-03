@@ -2,6 +2,8 @@ package engine
 
 import (
 	"encoding/json"
+	"flag"
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.starlark.net/starlark"
@@ -16,6 +18,8 @@ import (
 	"strings"
 	"testing"
 )
+
+var testWriteExpected = flag.Bool("write-expected", false, "Write expected output files")
 
 func TestTargetSpec(t *testing.T) {
 	files := make([]string, 0)
@@ -43,8 +47,10 @@ func TestTargetSpec(t *testing.T) {
 			b, err := io.ReadAll(f)
 			require.NoError(t, err)
 
+			f.Close()
+
 			parts := strings.SplitN(string(b), "===\n", 2)
-			build := parts[0]
+			build := strings.TrimSpace(parts[0])
 			expected := strings.TrimSpace(parts[1])
 
 			lspath, err := exec.LookPath("ls")
@@ -82,6 +88,18 @@ func TestTargetSpec(t *testing.T) {
 
 			actual, err := json.MarshalIndent(spec, "", "    ")
 			require.NoError(t, err)
+
+			if *testWriteExpected {
+				f, err := os.Create(file)
+				require.NoError(t, err)
+
+				defer f.Close()
+
+				actual := strings.ReplaceAll(string(actual), lspath, "REPLACE_LS_BIN")
+
+				_, err = fmt.Fprintf(f, "%v\n===\n%v", build, actual)
+				require.NoError(t, err)
+			}
 
 			t.Log(string(actual))
 
