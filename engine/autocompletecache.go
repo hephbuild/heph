@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"heph/targetspec"
 	"heph/utils"
+	"heph/utils/hash"
 	"os"
 	"path/filepath"
 )
@@ -20,7 +21,7 @@ func (e *Engine) autocompleteCachePath() string {
 }
 
 func (e *Engine) computeAutocompleteHash() (string, error) {
-	h := utils.NewHash()
+	h := hash.NewHash()
 	h.I64(1)
 	h.String(utils.Version)
 

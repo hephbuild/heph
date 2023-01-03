@@ -1,4 +1,4 @@
-package utils
+package hash
 
 import (
 	"encoding/binary"
@@ -93,9 +93,9 @@ var bytesFalse = []byte{0}
 
 func (h *hasher) Bool(val bool) {
 	if val {
-		h.h.Write(bytesTrue)
+		h.Write(bytesTrue)
 	} else {
-		h.h.Write(bytesFalse)
+		h.Write(bytesFalse)
 	}
 }
 

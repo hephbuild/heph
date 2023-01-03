@@ -10,6 +10,7 @@ import (
 	"heph/packages"
 	"heph/targetspec"
 	"heph/utils"
+	"heph/utils/hash"
 	"io/fs"
 	"path/filepath"
 	"runtime"
@@ -46,7 +47,7 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 		panic(err)
 	}
 	predeclaredGlobals = globals
-	predeclaredHash = utils.HashBytes(predeclaredSrc)
+	predeclaredHash = hash.HashBytes(predeclaredSrc)
 }
 
 func predeclared(globals ...starlark.StringDict) starlark.StringDict {

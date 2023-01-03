@@ -18,6 +18,7 @@ import (
 	"heph/utils"
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
+	"heph/utils/hash"
 	"heph/utils/maps"
 	"heph/utils/sets"
 	"heph/utils/tar"
@@ -191,11 +192,11 @@ func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
 }
 
-func (e *Engine) hashFile(h utils.Hash, file fs2.Path) error {
+func (e *Engine) hashFile(h hash.Hash, file fs2.Path) error {
 	return e.hashFilePath(h, file.Abs())
 }
 
-func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
+func (e *Engine) hashDepsTargets(h hash.Hash, targets []TargetWithOutput) {
 	for _, dep := range targets {
 		if len(dep.Target.Out.Names()) == 0 {
 			continue
@@ -207,7 +208,7 @@ func (e *Engine) hashDepsTargets(h utils.Hash, targets []TargetWithOutput) {
 	}
 }
 
-func (e *Engine) hashFiles(h utils.Hash, hashMethod string, files fs2.Paths) {
+func (e *Engine) hashFiles(h hash.Hash, hashMethod string, files fs2.Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
 
@@ -234,7 +235,7 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-func (e *Engine) hashFilePath(h utils.Hash, path string) error {
+func (e *Engine) hashFilePath(h hash.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
@@ -259,11 +260,11 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	return e.hashFileReader(h, info, f)
 }
 
-func (e *Engine) hashFilePerm(h utils.Hash, m os.FileMode) {
+func (e *Engine) hashFilePerm(h hash.Hash, m os.FileMode) {
 	h.UI32(uint32(m.Perm()))
 }
 
-func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) error {
+func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
 	e.hashFilePerm(h, info.Mode())
 
 	buf := copyBufPool.Get().([]byte)
@@ -277,7 +278,7 @@ func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) err
 	return nil
 }
 
-func (e *Engine) hashTar(h utils.Hash, tarPath string) error {
+func (e *Engine) hashTar(h hash.Hash, tarPath string) error {
 	return tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
 		h.String(hdr.Name)
 
@@ -303,11 +304,11 @@ func (e *Engine) hashTar(h utils.Hash, tarPath string) error {
 	})
 }
 
-func (e *Engine) hashFileModTime(h utils.Hash, file fs2.Path) error {
+func (e *Engine) hashFileModTime(h hash.Hash, file fs2.Path) error {
 	return e.hashFileModTimePath(h, file.Abs())
 }
 
-func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
+func (e *Engine) hashFileModTimePath(h hash.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
@@ -337,7 +338,7 @@ func (e *Engine) ResetCacheHashInput(target *Target) {
 	}
 }
 
-func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
+func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 	e.hashFiles(h, targetspec.HashFileModTime, target.Deps.All().Files)
 
 	for _, dep := range target.Deps.All().Targets {
@@ -362,7 +363,7 @@ func (e *Engine) hashInputFiles(h utils.Hash, target *Target) error {
 }
 
 func hashCacheId(target *Target) string {
-	idh := utils.NewHash()
+	idh := hash.NewHash()
 	for _, fqn := range target.linkingDeps.FQNs() {
 		idh.String(fqn)
 	}
@@ -390,7 +391,7 @@ func (e *Engine) hashInput(target *Target) string {
 		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	h := utils.NewHash()
+	h := hash.NewDebuggableHash(target.FQN + "_hash_input")
 	h.I64(6) // Force break all caches
 
 	h.String("=")
@@ -436,7 +437,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	utils.HashArray(h, target.TargetSpec.Out, func(file targetspec.TargetSpecOutFile) string {
+	hash.HashArray(h, target.TargetSpec.Out, func(file targetspec.TargetSpecOutFile) string {
 		return file.Name + file.Path
 	})
 
@@ -445,7 +446,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	utils.HashMap(h, target.Env, func(k, v string) string {
+	hash.HashMap(h, target.Env, func(k, v string) string {
 		return k + v
 	})
 
@@ -454,7 +455,7 @@ func (e *Engine) hashInput(target *Target) string {
 
 	h.String("=")
 	h.String(target.SrcEnv.All)
-	utils.HashMap(h, target.SrcEnv.Named, func(k, v string) string {
+	hash.HashMap(h, target.SrcEnv.Named, func(k, v string) string {
 		return k + v
 	})
 	h.String(target.OutEnv)
@@ -510,7 +511,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	// Sanity check, will bomb if not called in the right order
 	_ = target.ActualOutFiles()
 
-	h := utils.NewHash()
+	h := hash.NewDebuggableHash(target.FQN + "_hash_out_" + output)
 
 	h.String(output)
 

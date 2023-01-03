@@ -2,10 +2,8 @@ package utils
 
 import (
 	"fmt"
-	"github.com/vmihailenco/msgpack/v5"
 	"go.starlark.net/starlark"
 	"reflect"
-	"sort"
 )
 
 func FromStarlark(v starlark.Value) interface{} {
@@ -87,52 +85,4 @@ func FromGo(v interface{}) starlark.Value {
 	}
 
 	return starlark.None
-}
-
-func HashStarlark(h Hash, value starlark.Value) {
-	if value == nil {
-		h.Write([]byte{0})
-		return
-	}
-
-	switch value := value.(type) {
-	case *starlark.Dict:
-		rkeys := value.Keys()
-		keym := make(map[string]starlark.Value, len(rkeys))
-		keys := make([]string, 0, len(rkeys))
-
-		for _, k := range rkeys {
-			s := k.String()
-			keym[s] = k
-		}
-
-		sort.Strings(keys)
-
-		for _, ks := range keys {
-			k := keym[ks]
-			HashStarlark(h, k)
-			v, _, _ := value.Get(k)
-			HashStarlark(h, v)
-		}
-		return
-	case *starlark.List:
-		it := value.Iterate()
-		var v starlark.Value
-		for it.Next(&v) {
-			HashStarlark(h, v)
-		}
-		return
-	}
-
-	u, err := value.Hash()
-	if err == nil {
-		h.UI32(u)
-		return
-	}
-
-	enc := msgpack.NewEncoder(h)
-	err = enc.Encode(FromStarlark(value))
-	if err != nil {
-		panic(err)
-	}
 }
