@@ -54,8 +54,20 @@ func (r *hasherRecorder) Sum() string {
 }
 
 func (r *hasherRecorder) Write(p []byte) (n int, err error) {
-	r.record(p)
-	return r.h.Write(p)
+	// Make sure to store a copy of the bytes
+	c := make([]byte, len(p))
+	copy(c, p)
+
+	r.record(c)
+	return r.h.Write(c)
+}
+
+var root string
+
+func init() {
+	_, file, _, _ := runtime.Caller(0)
+	i := strings.Index(file, "utils/hash")
+	root = file[:i]
 }
 
 func (r *hasherRecorder) trace(skip int) []string {
@@ -66,6 +78,7 @@ func (r *hasherRecorder) trace(skip int) []string {
 		if !ok {
 			break
 		}
+		file = strings.ReplaceAll(file, root, "")
 		trace = append(trace, fmt.Sprintf("%v:%v", file, no))
 	}
 

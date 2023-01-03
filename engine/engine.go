@@ -261,7 +261,8 @@ func (e *Engine) hashFilePath(h hash.Hash, path string) error {
 }
 
 func (e *Engine) hashFilePerm(h hash.Hash, m os.FileMode) {
-	h.UI32(uint32(m.Perm()))
+	// TODO: figure out a way to properly hash file permission, taking into account different umask
+	//h.UI32(uint32(m.Perm()))
 }
 
 func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
@@ -284,18 +285,17 @@ func (e *Engine) hashTar(h hash.Hash, tarPath string) error {
 
 		switch hdr.Typeflag {
 		case tar2.TypeReg:
-			h.I64(hdr.Mode)
-
 			err := e.hashFileReader(h, hdr.FileInfo(), io.LimitReader(r, hdr.Size))
 			if err != nil {
 				return err
 			}
 
 			return nil
+		case tar2.TypeSymlink:
+			e.hashFilePerm(h, hdr.FileInfo().Mode())
+			h.String(hdr.Linkname)
 		case tar2.TypeDir:
 			return nil
-		case tar2.TypeSymlink:
-			h.String(hdr.Linkname)
 		default:
 			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
 		}
@@ -392,7 +392,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}()
 
 	h := hash.NewDebuggableHash(target.FQN + "_hash_input")
-	h.I64(6) // Force break all caches
+	h.I64(8) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
@@ -704,7 +704,7 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *OutNamedPaths, root
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
-		tp.ProvisonName(name)
+		tp.ProvisionName(name)
 
 		files, err := e.collectOut(target, paths, root)
 		if err != nil {
@@ -728,7 +728,7 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *OutNamedPath
 			continue
 		}
 
-		tp.ProvisonName(name)
+		tp.ProvisionName(name)
 
 		files, err := e.collectOutFromTar(target, p)
 		if err != nil {
@@ -762,7 +762,9 @@ func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, e
 }
 
 func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs2.Paths, error) {
-	out := make(fs2.Paths, 0)
+	outSet := sets.NewSet(func(p fs2.Path) string {
+		return p.RelRoot()
+	}, len(files))
 
 	for _, file := range files {
 		pattern := file.RelRoot()
@@ -772,7 +774,7 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 		}
 
 		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			out = append(out, fs2.NewPath(root, path))
+			outSet.Add(fs2.NewPath(root, path))
 
 			return nil
 		})
@@ -781,6 +783,7 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 		}
 	}
 
+	out := fs2.Paths(outSet.Slice())
 	out.Sort()
 
 	return out, nil
