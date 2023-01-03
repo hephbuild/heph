@@ -83,7 +83,7 @@ func printHumanError(err error) {
 					if printTargetNotFoundErrorSuggestions(err) {
 						continue
 					} else {
-						log.Error(err.Error())
+						log.Error(err)
 					}
 				}
 			}

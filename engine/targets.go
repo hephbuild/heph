@@ -45,9 +45,14 @@ func (t TargetTools) Sort() {
 		return t.Hosts[i].Name < t.Hosts[j].Name
 	})
 
-	sort.SliceStable(t.Targets, func(i, j int) bool {
-		return t.Targets[i].Name < t.Targets[j].Name
-	})
+	sort.SliceStable(t.Targets, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(t.Targets[i].Target.FQN, t.Targets[j].Target.FQN)
+		},
+		func(i, j int) int {
+			return strings.Compare(t.Targets[i].Name, t.Targets[j].Name)
+		},
+	))
 
 	sort.SliceStable(t.TargetReferences, func(i, j int) bool {
 		return t.TargetReferences[i].Name < t.TargetReferences[j].Name
@@ -79,13 +84,15 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 }
 
 func (d TargetDeps) Sort() {
-	sort.SliceStable(d.Targets, func(i, j int) bool {
-		if d.Targets[i].Target.FQN == d.Targets[j].Target.FQN {
-			return d.Targets[i].Output < d.Targets[j].Output
-		}
+	sort.SliceStable(d.Targets, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(d.Targets[i].Target.FQN, d.Targets[j].Target.FQN)
+		},
+		func(i, j int) int {
+			return strings.Compare(d.Targets[i].Output, d.Targets[j].Output)
+		},
+	))
 
-		return d.Targets[i].Target.FQN < d.Targets[j].Target.FQN
-	})
 	sort.SliceStable(d.Files, func(i, j int) bool {
 		return d.Files[i].RelRoot() < d.Files[j].RelRoot()
 	})
@@ -167,10 +174,8 @@ func (tp *NamedPaths[TS, T]) Sort() {
 	})
 
 	for name := range tp.named {
-		named := tp.named[name]
-
 		sort.SliceStable(tp.named[name], func(i, j int) bool {
-			return named[i].RelRoot() < named[j].RelRoot()
+			return tp.named[name][i].RelRoot() < tp.named[name][j].RelRoot()
 		})
 	}
 }
@@ -720,11 +725,12 @@ func (e *Engine) processTarget(t *Target) error {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
 
-	if t.Cache.Enabled {
-		t.runLock = e.lockFactory(t, "run")
-	} else {
-		t.runLock = flock.NewMutex(t.FQN)
-	}
+	t.runLock = e.lockFactory(t, "run")
+	//if t.Cache.Enabled {
+	//	t.runLock = e.lockFactory(t, "run")
+	//} else {
+	//	t.runLock = flock.NewMutex(t.FQN)
+	//}
 	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
 	t.cacheLocks = map[string]flock.Locker{}
 	for _, o := range t.TargetSpec.Out {

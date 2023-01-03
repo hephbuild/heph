@@ -4,8 +4,8 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	jsoniter "github.com/json-iterator/go"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkjson"
 	"go.starlark.net/starlarkstruct"
 	"heph/packages"
 	"heph/targetspec"
@@ -279,20 +279,14 @@ func get_arch(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple
 }
 
 func to_json(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	value := args[0]
-
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
-	b, err := json.Marshal(utils.FromStarlark(value))
-	if err != nil {
-		return nil, err
-	}
-
-	return starlark.String(b), nil
+	return starlarkjson.Module.Members["encode"].(*starlark.Builtin).CallInternal(thread, args, kwargs)
 }
 
 func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	value := args[0]
+	var value starlark.Value
+	if err := starlark.UnpackPositionalArgs(fn.Name(), args, kwargs, 1, &value); err != nil {
+		return nil, err
+	}
 
 	trace := stackTrace(thread)
 	for i, s := range trace {

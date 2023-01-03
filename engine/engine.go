@@ -259,10 +259,12 @@ func (e *Engine) hashFilePath(h utils.Hash, path string) error {
 	return e.hashFileReader(h, info, f)
 }
 
+func (e *Engine) hashFilePerm(h utils.Hash, m os.FileMode) {
+	h.UI32(uint32(m.Perm()))
+}
+
 func (e *Engine) hashFileReader(h utils.Hash, info os.FileInfo, f io.Reader) error {
-	// We only really care if the file is executable
-	// https://stackoverflow.com/a/60128480/3212099
-	h.UI32(uint32(info.Mode().Perm() & 0111))
+	e.hashFilePerm(h, info.Mode())
 
 	buf := copyBufPool.Get().([]byte)
 	defer copyBufPool.Put(buf)
@@ -315,7 +317,7 @@ func (e *Engine) hashFileModTimePath(h utils.Hash, path string) error {
 		return fmt.Errorf("symlink cannot be hashed")
 	}
 
-	h.UI32(uint32(info.Mode().Perm() & 0111))
+	e.hashFilePerm(h, info.Mode())
 	h.I64(info.ModTime().UnixNano())
 
 	return nil
@@ -389,7 +391,7 @@ func (e *Engine) hashInput(target *Target) string {
 	}()
 
 	h := utils.NewHash()
-	h.I64(5) // Force break all caches
+	h.I64(6) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
@@ -452,9 +454,9 @@ func (e *Engine) hashInput(target *Target) string {
 
 	h.String("=")
 	h.String(target.SrcEnv.All)
-	for k, v := range target.SrcEnv.Named {
-		h.String(k + v)
-	}
+	utils.HashMap(h, target.SrcEnv.Named, func(k, v string) string {
+		return k + v
+	})
 	h.String(target.OutEnv)
 
 	if target.Timeout > 0 {
