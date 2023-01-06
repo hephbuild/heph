@@ -574,7 +574,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		if err != nil {
 			return err
 		}
-	} else if len(target.Run) > 0 {
+	} else if len(target.Run) > 0 || rr.Shell {
 		var executor sandbox.Executor
 		switch target.Executor {
 		case targetspec.ExecutorBash:

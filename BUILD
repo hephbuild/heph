@@ -1,11 +1,25 @@
 load("//backend/go", "go_toolchain")
+load("//backend/node", "node_toolchain")
+load("//backend/node", "yarn_toolchain")
 
 go_toolchain(
     name="go",
+    version="1.18.4",
     architectures=[
         "darwin_amd64", "darwin_arm64",
         "linux_amd64", "linux_arm64",
     ],
+)
+
+node = node_toolchain(
+    name="node",
+    version="v16.15.1",
+)
+
+yarn_toolchain(
+    name="yarn",
+    version="v1.22.19",
+    node=node,
 )
 
 target(

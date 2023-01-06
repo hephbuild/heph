@@ -8,10 +8,6 @@ gofmt = cfg["gofmt"]
 if not gofmt:
     fail("set go_backend.gofmt")
 
-go_version = cfg["version"]
-if not go_version:
-    fail("set go_backend.go_version")
-
 go_toolchain_installsh = group(
     name="_go_toolchain_installsh",
     deps=["go_install.sh"],
@@ -21,9 +17,9 @@ go_toolchain_gosh = group(
     deps=["go.sh"],
 )
 
-def go_toolchain(name, architectures=[]):
+def go_toolchain(name, version, architectures=[]):
     run = [
-        "./$SRC_INSTALL '{}'".format(go_version),
+        "./$SRC_INSTALL '{}'".format(version),
         "mv $SRC_GO $OUT_GO"
     ]
 

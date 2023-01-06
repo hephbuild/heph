@@ -6,6 +6,6 @@ target(
         'echo npm: $(npm -v)',
         'echo yarn: $(yarn -v)',
     ],
-    tools=["//backend/node:node", "//backend/node:yarn"],
+    tools=["//:node", "//:yarn"],
     cache=False,
 )

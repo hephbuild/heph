@@ -11,6 +11,5 @@ go_backend:
   gofmt: //:go|gofmt
 
 node_backend:
-  version: v16.15.1
-  node: //backend/node:node
-  yarn: //backend/node:yarn
+  node: //:node
+  yarn: //:yarn
