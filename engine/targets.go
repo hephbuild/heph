@@ -823,8 +823,8 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	if breadcrumb.Find(t.FQN) != nil {
-		breadcrumb.Add(t)
-		return fmt.Errorf("linking cycle: %v", breadcrumb.FQNs())
+		fqns := append(breadcrumb.FQNs(), t.FQN)
+		return fmt.Errorf("linking cycle: %v", fqns)
 	}
 	breadcrumb = breadcrumb.Copy()
 	breadcrumb.Add(t)

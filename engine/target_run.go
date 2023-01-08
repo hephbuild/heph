@@ -230,6 +230,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		latestDir := e.cacheDirForHash(target, "latest").Abs()
 
 		if fs.PathExists(latestDir) {
+			done := utils.TraceTiming("Restoring cache")
+
 			for _, name := range target.OutWithSupport.Names() {
 				p := e.targetOutputTarFileForHash(target, "latest", name)
 				if !fs.PathExists(p) {
@@ -238,13 +240,32 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 				}
 				restoreSrcRec.AddTar(p)
 			}
+
+			done()
 		}
 	}
 
-	srcRecNameToDepName := map[string]string{}
+	var length int
+	for _, deps := range target.Deps.Named() {
+		var deplength int
+		for _, dep := range deps.Targets {
+			deplength += len(dep.Target.ActualOutFiles().Name(dep.Output))
+		}
+		deplength += len(deps.Files)
+
+		length += deplength
+	}
+
+	traceFilesList := utils.TraceTiming("Building sandbox files list")
+
+	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
+		log.Tracef("%v: targets: %v files: %v", name, len(deps.Targets), deps.Files)
+
 		for _, dep := range deps.Targets {
 			dept := dep.Target
+
+			log.Tracef("target: %v", dept.FQN)
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -272,6 +293,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
 	}
+
+	traceFilesList()
 
 	err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
 		return json.NewEncoder(f).Encode(envSrcRec.Origin())
@@ -316,6 +339,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		return nil, err
 	}
 
+	traceSrcEnv := utils.TraceTiming("Building src env")
+
 	env := make(map[string]string)
 	env["TARGET"] = target.FQN
 	env["PACKAGE"] = target.Package.FullName
@@ -356,6 +381,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 			env[normalizeEnv(k)] = strings.Join(spaths, " ")
 		}
 	}
+
+	traceSrcEnv()
 
 	if target.OutEnv != targetspec.FileEnvIgnore {
 		out := target.Out.WithRoot(target.SandboxRoot.Abs()).Named()
