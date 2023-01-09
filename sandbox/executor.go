@@ -5,7 +5,14 @@ import (
 	"strings"
 )
 
-var bashArgs = []string{"bash", "--noprofile", "--norc", "-u", "-o", "pipefail"}
+func bashArgs(so, lo []string) []string {
+	// Bash also interprets a number of multi-character options. These options must appear on the command line
+	// before the single-character options to be recognized.
+	return append(
+		append([]string{"bash", "--noprofile"}, lo...),
+		append([]string{"-o", "pipefail"}, so...)...,
+	)
+}
 
 type ExecutorContext struct {
 	Args    []string
@@ -13,21 +20,26 @@ type ExecutorContext struct {
 	Env     map[string]string
 }
 
-var BashShellExecutor = Executor{
-	ExecArgs: func(ctx ExecutorContext) ([]string, error) {
-		return bashArgs, nil
-	},
-	ShellPrint: func(args []string) string {
-		panic("not implemented")
-	},
+func BashShellExecutor(rcfile string) (Executor, error) {
+	return Executor{
+		ExecArgs: func(ctx ExecutorContext) ([]string, error) {
+			return bashArgs(
+				nil,
+				[]string{"--rcfile", rcfile},
+			), nil
+		},
+		ShellPrint: func(args []string) string {
+			panic("not implemented")
+		},
+	}, nil
 }
 
 var BashExecutor = Executor{
 	ExecArgs: func(ctx ExecutorContext) ([]string, error) {
-		args := bashArgs
-		//args = append(args, "-x")
-		args = append(args, "-e")
-		args = append(args, "-c", strings.Join(ctx.Args, "\n"))
+		args := bashArgs(
+			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(ctx.Args, "\n")},
+			[]string{"--norc"},
+		)
 
 		if len(ctx.CmdArgs) == 0 {
 			return args, nil

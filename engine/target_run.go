@@ -13,6 +13,7 @@ import (
 	"heph/targetspec"
 	"heph/utils"
 	"heph/utils/fs"
+	"heph/utils/sets"
 	"heph/utils/tar"
 	"heph/worker"
 	"io"
@@ -260,12 +261,16 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
-		log.Tracef("%v: targets: %v files: %v", name, len(deps.Targets), deps.Files)
+		// TODO: dedup deps.Targets ahead of time, particularly when transitive are being applied
+		dedup := sets.NewStringSet(len(deps.Targets) + len(deps.Files))
 
 		for _, dep := range deps.Targets {
 			dept := dep.Target
 
-			log.Tracef("target: %v", dept.FQN)
+			if dedup.Has(dep.Full()) {
+				continue
+			}
+			dedup.Add(dep.Full())
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -289,6 +294,11 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		}
 
 		for _, file := range deps.Files {
+			if dedup.Has(file.RelRoot()) {
+				continue
+			}
+			dedup.Add(file.RelRoot())
+
 			srcRecNameToDepName[name] = name
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
@@ -623,10 +633,32 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 
 		if rr.Shell {
-			fmt.Println("Shell mode enabled, exit the shell to terminate")
-			fmt.Printf("Command:\n%v\n", executor.ShellPrint(run))
+			shellCmds := executor.ShellPrint(run)
 
-			executor = sandbox.BashShellExecutor
+			fmt.Println("Shell mode enabled, exit the shell to terminate")
+			fmt.Println("The run alias is available to execute the below commands:")
+			fmt.Printf("%v\n", shellCmds)
+
+			f, err := os.CreateTemp(e.tmpRoot(target), "")
+			if err != nil {
+				return err
+			}
+			defer os.Remove(f.Name())
+
+			_, err = io.WriteString(f, fmt.Sprintf("function run {\n%v\n}", shellCmds))
+			if err != nil {
+				return err
+			}
+
+			executor, err = sandbox.BashShellExecutor(f.Name())
+			if err != nil {
+				return err
+			}
+
+			err = f.Close()
+			if err != nil {
+				return err
+			}
 		}
 
 		_, hasPathInEnv := env["PATH"]
@@ -640,6 +672,8 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		if err != nil {
 			return err
 		}
+
+		log.Debugf("exec: %v", execArgs)
 
 		err = sandbox.FilterLongEnv(env, execArgs)
 		if rerr != nil {
