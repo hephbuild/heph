@@ -91,7 +91,7 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 
 	names := target.OutWithSupport.Names()
 	names = utils.CopyArray(names)
-	targetspec.SortOutputsForHashing(names)
+	names = targetspec.SortOutputsForHashing(names)
 
 	for _, name := range names {
 		var paths fs.Paths

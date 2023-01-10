@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"heph/exprs"
 	"heph/packages"
-	"sort"
 	"time"
 )
 
@@ -53,14 +52,28 @@ func (e TargetSpecSrcEnv) Get(name string) string {
 
 const SupportFilesOutput = "@support_files"
 
-func SortOutputsForHashing(names []string) {
-	sort.SliceStable(names, func(i, j int) bool {
-		if names[i] == SupportFilesOutput {
-			return true
+func SortOutputsForHashing(names []string) []string {
+	index := -1
+	for i, name := range names {
+		if name == SupportFilesOutput {
+			index = i
+			break
 		}
+	}
 
-		return names[i] < names[j]
-	})
+	if index > 0 {
+		n := make([]string, 0, len(names))
+		n = append(n, SupportFilesOutput)
+		for _, name := range names {
+			if name == SupportFilesOutput {
+				continue
+			}
+			n = append(n, name)
+		}
+		return n
+	}
+
+	return names
 }
 
 type TargetSpec struct {

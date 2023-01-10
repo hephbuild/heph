@@ -5,6 +5,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"heph/exprs"
 	"heph/packages"
+	"heph/utils"
+	"strings"
 	"testing"
 	"time"
 )
@@ -178,3 +180,24 @@ func BenchmarkTargetSpec_EqualStruct1(b *testing.B)    { benchmarkTargetSpecEqua
 func BenchmarkTargetSpec_EqualStruct10(b *testing.B)   { benchmarkTargetSpecEqualStruct(b, 10) }
 func BenchmarkTargetSpec_EqualStruct100(b *testing.B)  { benchmarkTargetSpecEqualStruct(b, 100) }
 func BenchmarkTargetSpec_EqualStruct1000(b *testing.B) { benchmarkTargetSpecEqualStruct(b, 1000) }
+
+func TestSortOutputsForHashing(t *testing.T) {
+	tests := []struct {
+		outputs  []string
+		expected []string
+	}{
+		{[]string{"a", "b", "c"}, []string{"a", "b", "c"}},
+		{[]string{SupportFilesOutput, "b"}, []string{SupportFilesOutput, "b"}},
+		{[]string{"a", "b", SupportFilesOutput}, []string{SupportFilesOutput, "a", "b"}},
+		{[]string{"a", "b", SupportFilesOutput, "c"}, []string{SupportFilesOutput, "a", "b", "c"}},
+	}
+
+	for _, test := range tests {
+		t.Run(strings.Join(test.outputs, ","), func(t *testing.T) {
+			outputs := utils.CopyArray(test.outputs)
+			actual := SortOutputsForHashing(outputs)
+
+			assert.EqualValues(t, test.expected, actual)
+		})
+	}
+}
