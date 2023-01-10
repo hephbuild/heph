@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -50,14 +49,7 @@ func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target
 
 func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
 	outputs = utils.CopyArray(outputs)
-
-	sort.SliceStable(outputs, func(i, j int) bool {
-		if outputs[i] == targetspec.SupportFilesOutput {
-			return true
-		}
-
-		return outputs[i] < outputs[j]
-	})
+	targetspec.SortOutputsForHashing(outputs)
 
 	cached, err := e.warmTargetInput(ctx, target)
 	if err != nil {

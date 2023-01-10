@@ -6,6 +6,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/targetspec"
+	"heph/utils"
 	"heph/utils/fs"
 	"heph/utils/tar"
 	"heph/vfssimple"
@@ -88,7 +89,11 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 
 	log.Tracef("Taring to cache %v", target.FQN)
 
-	for _, name := range target.OutWithSupport.Names() {
+	names := target.OutWithSupport.Names()
+	names = utils.CopyArray(names)
+	targetspec.SortOutputsForHashing(names)
+
+	for _, name := range names {
 		var paths fs.Paths
 		if name == targetspec.SupportFilesOutput {
 			paths = target.ActualSupportFiles()
