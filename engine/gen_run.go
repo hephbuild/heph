@@ -78,16 +78,21 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 				p.Globals = nil
 			}
 
+			w.Status("Linking targets...")
+
 			err := e.linkTargets(false, nil)
 			if err != nil {
 				return err
 			}
+
+			w.Status("Creating DAG...")
 
 			err = e.createDag()
 			if err != nil {
 				return err
 			}
 
+			w.Status("Storing cache...")
 			_ = e.StoreAutocompleteCache()
 
 			return nil

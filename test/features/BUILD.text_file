@@ -15,7 +15,6 @@ for (mode, expected) in modes:
         name="text_file_"+smode,
         text=smode,
         mode=mode,
-        cache=False,
     )
 
     t=target(

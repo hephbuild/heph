@@ -233,7 +233,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 	}
 
 	allExclude := exclude.Array
-	allExclude = append(allExclude, ".heph")
+	allExclude = append(allExclude, "**/.heph")
 	allExclude = append(allExclude, e.Config.Glob.Exclude...)
 
 	elems := make([]starlark.Value, 0)

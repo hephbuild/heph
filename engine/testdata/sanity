@@ -26,7 +26,8 @@ target(
             {
                 "Name": "",
                 "Output": "",
-                "Target": "//some/test:some_target"
+                "Target": "//some/test:some_target",
+                "Mode": "rw"
             }
         ],
         "Files": [
@@ -42,7 +43,8 @@ target(
             {
                 "Name": "",
                 "Output": "",
-                "Target": "//some/test:some_target"
+                "Target": "//some/test:some_target",
+                "Mode": "rw"
             }
         ],
         "Files": [

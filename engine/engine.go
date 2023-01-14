@@ -205,6 +205,10 @@ func (e *Engine) hashDepsTargets(h hash.Hash, targets []TargetWithOutput) {
 		h.String(dep.Target.FQN)
 		dh := e.hashOutput(dep.Target, dep.Output)
 		h.String(dh)
+
+		if dep.Mode != targetspec.TargetSpecDepModeRW {
+			h.String(string(dep.Mode))
+		}
 	}
 }
 
@@ -459,11 +463,6 @@ func (e *Engine) hashInput(target *Target) string {
 		return k + v
 	})
 	h.String(target.OutEnv)
-
-	if target.Timeout > 0 {
-		h.String("=")
-		h.I64(target.Timeout.Nanoseconds())
-	}
 
 	sh := h.Sum()
 
@@ -921,7 +920,7 @@ func (e *Engine) parseConfigs() error {
 	log.Tracef("Profiles: %v", e.Config.Profiles)
 
 	cfg := config.Config{}
-	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "/.heph")
+	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
 	cfg.TargetScheduler = "v1"
 

@@ -494,6 +494,7 @@ type TargetWithOutput struct {
 	Target     *Target
 	Output     string
 	SpecOutput string
+	Mode       targetspec.TargetSpecDepMode
 }
 
 func (t TargetWithOutput) Full() string {
@@ -533,6 +534,18 @@ func (ts *Targets) FQNs() []string {
 	}
 
 	return fqns
+}
+
+func (ts *Targets) Public() *Targets {
+	pts := NewTargets(ts.Len() / 2)
+
+	for _, target := range ts.Slice() {
+		if !target.IsPrivate() {
+			pts.Add(target)
+		}
+	}
+
+	return pts
 }
 
 func (ts *Targets) Sort() {
@@ -1365,12 +1378,14 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 			if len(dt.Out.Names()) == 0 {
 				td.Targets = append(td.Targets, TargetWithOutput{
 					Target: dt,
+					Mode:   spec.Mode,
 				})
 			} else {
 				for _, name := range dt.Out.Names() {
 					td.Targets = append(td.Targets, TargetWithOutput{
 						Target: dt,
 						Output: name,
+						Mode:   spec.Mode,
 					})
 				}
 			}
@@ -1383,6 +1398,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 				Target:     dt,
 				Output:     spec.Output,
 				SpecOutput: spec.Output,
+				Mode:       spec.Mode,
 			})
 		}
 	}

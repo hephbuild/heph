@@ -112,7 +112,7 @@ if {{.IfTest}}:
 		},
 		'run': ['./$SRC_BIN -test.v "$@" 2>&1 | tee test_out'],
 		'out': ['test_out'],
-		'labels': ['test'],
+		'labels': ['test', 'go-test'],
 		'pass_args': True,
 	}
 

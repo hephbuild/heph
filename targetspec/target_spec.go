@@ -190,10 +190,20 @@ type TargetSpecTools struct {
 	Exprs   []TargetSpecExprTool
 }
 
+type TargetSpecDepMode string
+
+const (
+	TargetSpecDepModeRO TargetSpecDepMode = "ro"
+	TargetSpecDepModeRW TargetSpecDepMode = "rw"
+)
+
+var TargetSpecDepModes = []TargetSpecDepMode{TargetSpecDepModeRO, TargetSpecDepModeRW}
+
 type TargetSpecDepTarget struct {
 	Name   string
 	Output string
 	Target string
+	Mode   TargetSpecDepMode
 }
 
 type TargetSpecDepExpr struct {

@@ -217,7 +217,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	return t, nil
 }
 
-func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) targetspec.TargetSpecDeps {
+func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (targetspec.TargetSpecDeps, error) {
 	td := targetspec.TargetSpecDeps{}
 
 	for _, dep := range arr {
@@ -230,12 +230,27 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) targets
 			continue
 		}
 
-		if dtp, err := targetspec.TargetOutputParse(t.Package.FullName, dep); err == nil {
-			td.Targets = append(td.Targets, targetspec.TargetSpecDepTarget{
+		if dtp, options, err := targetspec.TargetOutputOptionsParse(t.Package.FullName, dep); err == nil {
+			tspec := targetspec.TargetSpecDepTarget{
 				Name:   name,
 				Target: dtp.TargetPath.Full(),
 				Output: dtp.Output,
-			})
+				Mode:   targetspec.TargetSpecDepModeRW,
+			}
+
+			for k, v := range options {
+				switch k {
+				case "mode":
+					mode := targetspec.TargetSpecDepMode(v)
+					if !utils.Contains(targetspec.TargetSpecDepModes, mode) {
+						return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid mode: %v", v)
+					}
+					tspec.Mode = mode
+				default:
+					return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid option %v", k)
+				}
+			}
+			td.Targets = append(td.Targets, tspec)
 			continue
 		}
 
@@ -246,7 +261,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) targets
 		})
 	}
 
-	return td
+	return td, nil
 }
 
 func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools, name, tool string) error {
@@ -322,13 +337,19 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.Target
 
 	if len(deps.ArrMap) > 0 {
 		for name, arr := range deps.ArrMap {
-			d := depsSpecFromArr(t, arr, name)
+			d, err := depsSpecFromArr(t, arr, name)
+			if err != nil {
+				return d, err
+			}
 			td.Targets = append(td.Targets, d.Targets...)
 			td.Exprs = append(td.Exprs, d.Exprs...)
 			td.Files = append(td.Files, d.Files...)
 		}
 	} else {
-		d := depsSpecFromArr(t, deps.Array, "")
+		d, err := depsSpecFromArr(t, deps.Array, "")
+		if err != nil {
+			return d, err
+		}
 		td.Targets = append(td.Targets, d.Targets...)
 		td.Exprs = append(td.Exprs, d.Exprs...)
 		td.Files = append(td.Files, d.Files...)

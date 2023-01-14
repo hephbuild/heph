@@ -290,12 +290,20 @@ func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader)
 				break // End of archive
 			}
 
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
 			return fmt.Errorf("untar: %w", err)
 		}
 
 		for _, f := range fs {
 			err = f(hdr, tr)
 			if err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+
 				return err
 			}
 		}

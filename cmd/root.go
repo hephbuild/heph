@@ -22,7 +22,7 @@ var profiles *[]string
 var plain *bool
 var noGen *bool
 var porcelain *bool
-var workers *int
+var workers int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
@@ -69,7 +69,7 @@ func init() {
 	ignoreUnknownTarget = rootCmd.PersistentFlags().Bool("ignore-unknown", false, "Ignore unknown targets")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
-	workers = rootCmd.PersistentFlags().Int("workers", runtime.NumCPU(), "Number of workers")
+	rootCmd.PersistentFlags().Var(newWorkersValue(&workers), "workers", "Workers to spawn as a number or percentage")
 	noGen = rootCmd.PersistentFlags().Bool("no-gen", false, "Disable generated targets")
 	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Set parameter name=value")
 

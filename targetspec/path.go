@@ -153,6 +153,38 @@ func TargetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 	return tp, err
 }
 
+func TargetOutputOptionsParse(pkg string, s string) (TargetOutputPath, map[string]string, error) {
+	var options map[string]string
+	if strings.HasPrefix(s, "${") {
+		i := strings.Index(s, "}")
+		if i < 0 {
+			return TargetOutputPath{}, nil, fmt.Errorf("invalid target options, expected }")
+		}
+
+		ostr := s[2:i]
+		if len(ostr) > 0 {
+			options = map[string]string{}
+			for _, part := range strings.Split(ostr, ",") {
+				parts := strings.Split(part, "=")
+				if len(parts) != 2 {
+					return TargetOutputPath{}, nil, fmt.Errorf("invalid target option, %v", parts)
+				}
+
+				options[parts[0]] = parts[1]
+			}
+		}
+
+		s = s[i+1:]
+	}
+
+	tp, err := TargetOutputParse(pkg, s)
+	if err != nil {
+		return TargetOutputPath{}, nil, err
+	}
+
+	return tp, options, nil
+}
+
 func targetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 	parts := strings.SplitN(s, "|", 2)
 

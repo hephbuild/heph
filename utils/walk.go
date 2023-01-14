@@ -9,28 +9,25 @@ import (
 	"strings"
 )
 
-func isIgnored(path string, ignored []string) bool {
-	if len(ignored) == 0 {
-		return false
-	}
-
-	parts := strings.Split(path, string(filepath.Separator))
-
-	for _, i := range ignored {
-		if strings.HasPrefix(i, string(filepath.Separator)) {
-			if strings.HasPrefix(path, strings.TrimLeft(i, "/")) {
-				return true
+func pathMatch(path string, matchers []string) (bool, error) {
+	for _, matcher := range matchers {
+		i := indexMeta(matcher)
+		if i == -1 {
+			if strings.HasPrefix(path, matcher) {
+				return true, nil
 			}
 		} else {
-			for _, p := range parts {
-				if i == p {
-					return true
-				}
+			match, err := doublestar.PathMatch(matcher, path)
+			if err != nil {
+				return false, err
+			}
+			if match {
+				return true, nil
 			}
 		}
 	}
 
-	return false
+	return false, nil
 }
 
 // From doublestar package
@@ -90,8 +87,11 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		alwaysMatch = true
 		walkRoot = filepath.Join(root, pattern)
 	} else if i > 0 {
-		p := unescapeMeta(pattern[:i])
-		walkRoot = filepath.Join(root, p)
+		i := strings.LastIndex(pattern[:i], string(filepath.Separator))
+		if i > 0 {
+			p := unescapeMeta(pattern[:i])
+			walkRoot = filepath.Join(root, p)
+		}
 	}
 
 	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
@@ -104,7 +104,12 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			return err
 		}
 
-		if isIgnored(rel, ignore) {
+		skipMatch, err := pathMatch(rel, ignore)
+		if err != nil {
+			return err
+		}
+
+		if skipMatch {
 			if d.IsDir() {
 				return filepath.SkipDir
 			} else {

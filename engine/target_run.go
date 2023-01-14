@@ -213,6 +213,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	envSrcRec := &SrcRecorder{}
 	// Records src that should be copied, tar & files
 	srcRec := &SrcRecorder{Parent: envSrcRec}
+	// Records symlinks that should be created
+	linkSrcRec := &SrcRecorder{}
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
@@ -268,8 +270,14 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 				continue
 			}
 
-			tarFile := e.targetOutputTarFile(dept, dep.Output)
-			srcRec.AddTar(tarFile)
+			if dep.Mode == targetspec.TargetSpecDepModeRO {
+				for _, file := range dept.ActualOutFiles().Name(dep.Output) {
+					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
+				}
+			} else {
+				tarFile := e.targetOutputTarFile(dept, dep.Output)
+				srcRec.AddTar(tarFile)
+			}
 
 			srcName := name
 			if dep.SpecOutput == "" && dep.Output != "" {
@@ -331,11 +339,12 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	}
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
-		Dir:    target.SandboxRoot.Abs(),
-		BinDir: binDir,
-		Bin:    bin,
-		Src:    append(srcRec.Src(), restoreSrcRec.Src()...),
-		SrcTar: append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
+		Dir:       target.SandboxRoot.Abs(),
+		BinDir:    binDir,
+		Bin:       bin,
+		Files:     append(srcRec.Src(), restoreSrcRec.Src()...),
+		LinkFiles: linkSrcRec.Src(),
+		FilesTar:  append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
 	})
 	if err != nil {
 		return nil, err
@@ -578,7 +587,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 
 	e.Status(fmt.Sprintf("Running %v...", target.FQN))
 
-	if target.IsGroup() {
+	if target.IsGroup() && !rr.Shell {
 		// Ignore
 	} else if target.IsTextFile() {
 		to := target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs()
@@ -603,7 +612,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		if err != nil {
 			return err
 		}
-	} else if len(target.Run) > 0 || rr.Shell {
+	} else {
 		var executor sandbox.Executor
 		switch target.Executor {
 		case targetspec.ExecutorBash:
@@ -799,7 +808,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 			return false, fmt.Errorf("%v does not exist", p)
 		}
 	}
-	outDirHash := strings.Join(outputs, ",")
+	outDirHash := "2|" + strings.Join(outputs, ",")
 
 	shouldExpand := false
 	if !fs.PathExists(outDir.Abs()) {
@@ -838,6 +847,25 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 			if err != nil {
 				return false, err
 			}
+		}
+
+		err = filepath.Walk(tmpOutDir, func(path string, info fs2.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if info.IsDir() {
+				return nil
+			}
+
+			if info.Mode().Type() == os.ModeSymlink {
+				return nil
+			}
+
+			return os.Chmod(path, info.Mode()&^0222)
+		})
+		if err != nil {
+			return false, err
 		}
 
 		err = os.RemoveAll(outDir.Abs())

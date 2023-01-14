@@ -96,7 +96,7 @@ func engineInitWithEngine(e *engine.Engine) error {
 		paramsm[parts[0]] = parts[1]
 	}
 	e.Params = paramsm
-	e.Pool = worker.NewPool(*workers)
+	e.Pool = worker.NewPool(workers)
 	e.RegisterExitHandler(func() {
 		e.Pool.Stop(nil)
 	})
@@ -187,5 +187,10 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 		return nil, nil, err
 	}
 
-	return Engine.Targets.FQNs(), Engine.Labels.Slice(), nil
+	targets := Engine.Targets
+	if !all {
+		targets = targets.Public()
+	}
+
+	return targets.FQNs(), Engine.Labels.Slice(), nil
 }

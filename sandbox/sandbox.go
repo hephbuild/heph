@@ -15,11 +15,12 @@ import (
 )
 
 type MakeConfig struct {
-	Dir    string
-	BinDir string
-	Bin    map[string]string
-	Src    []tar.TarFile
-	SrcTar []string
+	Dir       string
+	BinDir    string
+	Bin       map[string]string
+	Files     []tar.TarFile
+	FilesTar  []string
+	LinkFiles []tar.TarFile
 }
 
 type MakeBinConfig struct {
@@ -89,7 +90,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		return err
 	}
 
-	for _, file := range cfg.Src {
+	for _, file := range cfg.Files {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -100,13 +101,31 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 	}
 
-	for _, tarFile := range cfg.SrcTar {
+	for _, tarFile := range cfg.FilesTar {
 		done := utils.TraceTimingDone("untar " + tarFile)
 		err := tar.Untar(ctx, tarFile, cfg.Dir, false)
 		if err != nil {
 			return fmt.Errorf("make: untar: %w", err)
 		}
 		done()
+	}
+
+	for _, file := range cfg.LinkFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		to := filepath.Join(cfg.Dir, file.To)
+
+		err := fs.CreateParentDir(to)
+		if err != nil {
+			return err
+		}
+
+		err = os.Link(file.From, to)
+		if err != nil {
+			return fmt.Errorf("make: link %v to %v: %w", file.From, to, err)
+		}
 	}
 
 	return nil
