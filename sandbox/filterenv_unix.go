@@ -24,7 +24,7 @@ func envSrcKeys(env map[string]string) []string {
 		keys = append(keys, k)
 	}
 
-	sort.SliceStable(keys, func(i, j int) bool {
+	sort.Slice(keys, func(i, j int) bool {
 		return len(keys[i]) < len(keys[j])
 	})
 

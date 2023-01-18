@@ -44,7 +44,7 @@ func Keys[K string, V any](m map[K]V) []K {
 	for k := range m {
 		ks = append(ks, k)
 	}
-	sort.SliceStable(ks, func(i, j int) bool {
+	sort.Slice(ks, func(i, j int) bool {
 		return ks[i] < ks[j]
 	})
 	return ks

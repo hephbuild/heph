@@ -45,14 +45,20 @@ func (t TargetTools) Dedup() {
 	t.Hosts = utils.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
 		return tool.Name + "|" + tool.Path
 	})
+	t.Targets = utils.Dedup(t.Targets, func(tool TargetTool) string {
+		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
+	})
+	t.TargetReferences = utils.Dedup(t.TargetReferences, func(target *Target) string {
+		return target.FQN
+	})
 }
 
 func (t TargetTools) Sort() {
-	sort.SliceStable(t.Hosts, func(i, j int) bool {
+	sort.Slice(t.Hosts, func(i, j int) bool {
 		return t.Hosts[i].Name < t.Hosts[j].Name
 	})
 
-	sort.SliceStable(t.Targets, utils.MultiLess(
+	sort.Slice(t.Targets, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(t.Targets[i].Target.FQN, t.Targets[j].Target.FQN)
 		},
@@ -61,7 +67,7 @@ func (t TargetTools) Sort() {
 		},
 	))
 
-	sort.SliceStable(t.TargetReferences, func(i, j int) bool {
+	sort.Slice(t.TargetReferences, func(i, j int) bool {
 		return t.TargetReferences[i].Name < t.TargetReferences[j].Name
 	})
 }
@@ -100,7 +106,7 @@ func (d *TargetDeps) Dedup() {
 }
 
 func (d TargetDeps) Sort() {
-	sort.SliceStable(d.Targets, utils.MultiLess(
+	sort.Slice(d.Targets, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(d.Targets[i].Target.FQN, d.Targets[j].Target.FQN)
 		},
@@ -109,7 +115,7 @@ func (d TargetDeps) Sort() {
 		},
 	))
 
-	sort.SliceStable(d.Files, func(i, j int) bool {
+	sort.Slice(d.Files, func(i, j int) bool {
 		return d.Files[i].RelRoot() < d.Files[j].RelRoot()
 	})
 }
@@ -193,12 +199,12 @@ func (tp *NamedPaths[TS, T]) Add(name string, p T) {
 }
 
 func (tp *NamedPaths[TS, T]) Sort() {
-	sort.SliceStable(tp.all, func(i, j int) bool {
+	sort.Slice(tp.all, func(i, j int) bool {
 		return tp.all[i].RelRoot() < tp.all[j].RelRoot()
 	})
 
 	for name := range tp.named {
-		sort.SliceStable(tp.named[name], func(i, j int) bool {
+		sort.Slice(tp.named[name], func(i, j int) bool {
 			return tp.named[name][i].RelRoot() < tp.named[name][j].RelRoot()
 		})
 	}
@@ -284,7 +290,7 @@ func (tp *TargetNamedDeps) Dedup() {
 
 func (tp *TargetNamedDeps) Sort() {
 	tp.Map(func(deps TargetDeps) TargetDeps {
-		sort.SliceStable(deps.Targets, func(i, j int) bool {
+		sort.Slice(deps.Targets, func(i, j int) bool {
 			if deps.Targets[i].Target.FQN == deps.Targets[j].Target.FQN {
 				return deps.Targets[i].Output < deps.Targets[j].Output
 			}
@@ -292,7 +298,7 @@ func (tp *TargetNamedDeps) Sort() {
 			return deps.Targets[i].Target.FQN < deps.Targets[j].Target.FQN
 		})
 
-		sort.SliceStable(deps.Files, func(i, j int) bool {
+		sort.Slice(deps.Files, func(i, j int) bool {
 			return deps.Files[i].RelRoot() < deps.Files[j].RelRoot()
 		})
 
@@ -578,7 +584,7 @@ func (ts *Targets) Sort() {
 
 	a := ts.Slice()
 
-	sort.SliceStable(a, func(i, j int) bool {
+	sort.Slice(a, func(i, j int) bool {
 		return a[i].FQN < a[j].FQN
 	})
 }
@@ -1031,19 +1037,19 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	if !t.Transitive.Tools.Empty() {
 		t.Tools = t.Tools.Merge(t.Transitive.Tools)
-		t.Tools.Sort()
 		t.Tools.Dedup()
+		t.Tools.Sort()
 	}
 
 	if !t.Transitive.Deps.Empty() {
 		t.Deps = t.Deps.Merge(t.Transitive.Deps)
-		t.Deps.Sort()
 		t.Deps.Dedup()
+		t.Deps.Sort()
 
 		if t.DifferentHashDeps {
 			t.HashDeps = t.HashDeps.Merge(t.Transitive.Deps.All())
-			t.HashDeps.Sort()
 			t.HashDeps.Dedup()
+			t.HashDeps.Sort()
 		} else {
 			t.HashDeps = t.Deps.All()
 		}

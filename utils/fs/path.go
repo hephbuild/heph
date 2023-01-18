@@ -9,7 +9,7 @@ import (
 type Paths []Path
 
 func (ps Paths) Sort() {
-	sort.SliceStable(ps, func(i, j int) bool {
+	sort.Slice(ps, func(i, j int) bool {
 		return ps[i].RelRoot() < ps[j].RelRoot()
 	})
 }
@@ -27,7 +27,7 @@ func (ps Paths) WithRoot(root string) Paths {
 type RelPaths []RelPath
 
 func (ps RelPaths) Sort() {
-	sort.SliceStable(ps, func(i, j int) bool {
+	sort.Slice(ps, func(i, j int) bool {
 		return ps[i].RelRoot() < ps[j].RelRoot()
 	})
 }

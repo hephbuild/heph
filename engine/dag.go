@@ -195,7 +195,7 @@ func (e *DAG) mapToArray(m map[string]interface{}) []*Target {
 		a = append(a, anc)
 	}
 
-	sort.SliceStable(a, func(i, j int) bool {
+	sort.Slice(a, func(i, j int) bool {
 		return a[i].FQN < a[j].FQN
 	})
 

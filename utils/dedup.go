@@ -1,11 +1,28 @@
 package utils
 
-import "heph/utils/sets"
-
 func Dedup[T any](as []T, id func(T) string) []T {
-	s := sets.NewSetFrom[string, T](id, as)
+	value := make(map[string]struct{}, len(as))
 
-	return s.Slice()
+	nas := as
+	copied := false
+	for i, a := range as {
+		id := id(a)
+
+		if _, ok := value[id]; ok {
+			if !copied {
+				nas = make([]T, i, len(as))
+				copy(nas, as[:i])
+				copied = true
+			}
+			continue
+		}
+		value[id] = struct{}{}
+		if copied {
+			nas = append(nas, a)
+		}
+	}
+
+	return nas
 }
 
 func DedupKeepLast[T any](as []T, id func(T) string) []T {

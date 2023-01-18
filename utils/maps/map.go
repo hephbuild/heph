@@ -94,7 +94,7 @@ func (m *Map[K, V]) Keys() []K {
 		ks = append(ks, k)
 	}
 
-	sort.SliceStable(ks, func(i, j int) bool {
+	sort.Slice(ks, func(i, j int) bool {
 		return ks[i] < ks[j]
 	})
 
