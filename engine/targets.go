@@ -40,6 +40,12 @@ func (t TargetTools) Empty() bool {
 	return len(t.Targets) == 0 && len(t.Hosts) == 0
 }
 
+func (t TargetTools) Dedup() {
+	t.Hosts = utils.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+		return tool.Name + "|" + tool.Path
+	})
+}
+
 func (t TargetTools) Sort() {
 	sort.SliceStable(t.Hosts, func(i, j int) bool {
 		return t.Hosts[i].Name < t.Hosts[j].Name
@@ -81,6 +87,15 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd.Files = append(d.Files, deps.Files...)
 
 	return nd
+}
+
+func (d *TargetDeps) Dedup() {
+	d.Targets = utils.Dedup(d.Targets, func(t TargetWithOutput) string {
+		return t.Target.FQN + t.Output
+	})
+	d.Files = utils.Dedup(d.Files, func(t fs.Path) string {
+		return t.RelRoot()
+	})
 }
 
 func (d TargetDeps) Sort() {
@@ -257,6 +272,13 @@ func (tp *TargetNamedDeps) Map(fn func(deps TargetDeps) TargetDeps) {
 	}
 
 	tp.all = fn(tp.all)
+}
+
+func (tp *TargetNamedDeps) Dedup() {
+	tp.Map(func(d TargetDeps) TargetDeps {
+		d.Dedup()
+		return d
+	})
 }
 
 func (tp *TargetNamedDeps) Sort() {
@@ -997,15 +1019,18 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	if !t.Transitive.Tools.Empty() {
 		t.Tools = t.Tools.Merge(t.Transitive.Tools)
 		t.Tools.Sort()
+		t.Tools.Dedup()
 	}
 
 	if !t.Transitive.Deps.Empty() {
 		t.Deps = t.Deps.Merge(t.Transitive.Deps)
 		t.Deps.Sort()
+		t.Deps.Dedup()
 
 		if t.DifferentHashDeps {
 			t.HashDeps = t.HashDeps.Merge(t.Transitive.Deps.All())
 			t.HashDeps.Sort()
+			t.HashDeps.Dedup()
 		} else {
 			t.HashDeps = t.Deps.All()
 		}
@@ -1074,6 +1099,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, 
 		return e.filterOutCodegenFromDeps(t, deps)
 	})
 
+	td.Dedup()
 	td.Sort()
 
 	return td, nil
@@ -1432,13 +1458,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 		td.Targets = targets
 	}
 
-	td.Targets = utils.DedupKeepLast(td.Targets, func(t TargetWithOutput) string {
-		return t.Target.FQN + t.Output
-	})
-	td.Files = utils.DedupKeepLast(td.Files, func(t fs.Path) string {
-		return t.RelRoot()
-	})
-
+	td.Dedup()
 	td.Sort()
 
 	return td, nil

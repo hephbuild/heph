@@ -255,16 +255,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
-		// TODO: dedup deps.Targets ahead of time, particularly when transitive are being applied
-		dedup := sets.NewStringSet(len(deps.Targets) + len(deps.Files))
-
 		for _, dep := range deps.Targets {
 			dept := dep.Target
-
-			if dedup.Has(dep.Full()) {
-				continue
-			}
-			dedup.Add(dep.Full())
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -294,11 +286,6 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		}
 
 		for _, file := range deps.Files {
-			if dedup.Has(file.RelRoot()) {
-				continue
-			}
-			dedup.Add(file.RelRoot())
-
 			srcRecNameToDepName[name] = name
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
@@ -842,30 +829,18 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 			return false, err
 		}
 
+		untarDedup := sets.NewStringSet(0)
+
 		for _, name := range outputs {
-			err := tar.Untar(ctx, e.targetOutputTarFile(target, name), tmpOutDir, true)
+			tarf := e.targetOutputTarFile(target, name)
+			err := tar.UntarWith(ctx, tarf, tmpOutDir, tar.UntarOptions{
+				List:  true,
+				RO:    true,
+				Dedup: untarDedup,
+			})
 			if err != nil {
 				return false, err
 			}
-		}
-
-		err = filepath.Walk(tmpOutDir, func(path string, info fs2.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if info.IsDir() {
-				return nil
-			}
-
-			if info.Mode().Type() == os.ModeSymlink {
-				return nil
-			}
-
-			return os.Chmod(path, info.Mode()&^0222)
-		})
-		if err != nil {
-			return false, err
 		}
 
 		err = os.RemoveAll(outDir.Abs())

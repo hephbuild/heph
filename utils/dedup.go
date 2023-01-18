@@ -1,5 +1,13 @@
 package utils
 
+import "heph/utils/sets"
+
+func Dedup[T any](as []T, id func(T) string) []T {
+	s := sets.NewSetFrom[string, T](id, as)
+
+	return s.Slice()
+}
+
 func DedupKeepLast[T any](as []T, id func(T) string) []T {
 	value := make(map[string]T, len(as))
 	pos := make(map[string]int, len(as))

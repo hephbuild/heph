@@ -6,6 +6,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"heph/utils"
 	"heph/utils/fs"
+	"heph/utils/sets"
 	"heph/utils/tar"
 	"io"
 	"os"
@@ -90,12 +91,22 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		return err
 	}
 
+	// TODO: figure out if different origins would override each other
+	untarDedup := sets.NewStringSet(0)
+
 	for _, file := range cfg.Files {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		err := fs.Cp(file.From, filepath.Join(cfg.Dir, file.To))
+		to := filepath.Join(cfg.Dir, file.To)
+
+		if untarDedup.Has(to) {
+			continue
+		}
+		untarDedup.Add(to)
+
+		err := fs.Cp(file.From, to)
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}
@@ -103,7 +114,10 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 
 	for _, tarFile := range cfg.FilesTar {
 		done := utils.TraceTimingDone("untar " + tarFile)
-		err := tar.Untar(ctx, tarFile, cfg.Dir, false)
+		err := tar.UntarWith(ctx, tarFile, cfg.Dir, tar.UntarOptions{
+			List:  false,
+			Dedup: untarDedup,
+		})
 		if err != nil {
 			return fmt.Errorf("make: untar: %w", err)
 		}
@@ -116,6 +130,11 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 
 		to := filepath.Join(cfg.Dir, file.To)
+
+		if untarDedup.Has(to) {
+			continue
+		}
+		untarDedup.Add(to)
 
 		err := fs.CreateParentDir(to)
 		if err != nil {

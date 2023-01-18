@@ -247,7 +247,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 					}
 					tspec.Mode = mode
 				default:
-					return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid option %v", k)
+					return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid option %v=%v", k, v)
 				}
 			}
 			td.Targets = append(td.Targets, tspec)

@@ -18,6 +18,13 @@ func NewSet[K comparable, T any](f func(T) K, cap int) *Set[K, T] {
 	return t
 }
 
+func NewSetFrom[K comparable, T any](f func(T) K, vs []T) *Set[K, T] {
+	s := NewSet[K, T](f, len(vs))
+	s.AddAll(vs)
+
+	return s
+}
+
 type StringSet = Set[string, string]
 
 func NewStringSet(cap int) *StringSet {

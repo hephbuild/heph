@@ -8,6 +8,7 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	fs2 "heph/utils/fs"
+	"heph/utils/sets"
 	"io"
 	"io/fs"
 	"os"
@@ -169,11 +170,23 @@ func tarListFactory(tar string) (func(string), func() ([]string, error)) {
 	}
 }
 
+type UntarOptions struct {
+	List  bool
+	RO    bool
+	Dedup *sets.StringSet
+}
+
 func Untar(ctx context.Context, in, to string, list bool) (err error) {
-	log.Tracef("untar: %v to %v", in, to)
+	return UntarWith(ctx, in, to, UntarOptions{
+		List: list,
+	})
+}
+
+func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
+	log.Tracef("untar: %v to %v %#v", in, to, o)
 
 	recordFile := func(string) {}
-	if list {
+	if o.List {
 		var complete func() ([]string, error)
 		recordFile, complete = tarListFactory(in)
 
@@ -189,6 +202,13 @@ func Untar(ctx context.Context, in, to string, list bool) (err error) {
 	return Walk(ctx, in, func(hdr *tar.Header, tr *tar.Reader) error {
 		dest := filepath.Join(to, hdr.Name)
 
+		if o.Dedup != nil {
+			if o.Dedup.Has(dest) {
+				return nil
+			}
+			o.Dedup.Add(dest)
+		}
+
 		err := fs2.CreateParentDir(dest)
 		if err != nil {
 			return err
@@ -196,7 +216,7 @@ func Untar(ctx context.Context, in, to string, list bool) (err error) {
 
 		switch hdr.Typeflag {
 		case tar.TypeReg:
-			err = untarFile(hdr, tr, dest)
+			err = untarFile(hdr, tr, dest, o.RO)
 			if err != nil {
 				return fmt.Errorf("untar: %w", err)
 			}
@@ -312,7 +332,7 @@ func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader)
 	return nil
 }
 
-func untarFile(hdr *tar.Header, tr *tar.Reader, to string) error {
+func untarFile(hdr *tar.Header, tr *tar.Reader, to string, ro bool) error {
 	f, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		return err
@@ -328,7 +348,11 @@ func untarFile(hdr *tar.Header, tr *tar.Reader, to string) error {
 		return err
 	}
 
-	err = os.Chmod(to, os.FileMode(hdr.Mode))
+	mode := os.FileMode(hdr.Mode)
+	if ro {
+		mode = mode &^ 0222
+	}
+	err = os.Chmod(to, mode)
 	if err != nil {
 		return err
 	}
