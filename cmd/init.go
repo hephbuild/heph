@@ -26,7 +26,7 @@ func engineFactory() (*engine.Engine, error) {
 	return e, nil
 }
 
-func engineInit() error {
+func engineInit(ctx context.Context) error {
 	if Engine == nil {
 		var err error
 		Engine, err = engineFactory()
@@ -35,10 +35,10 @@ func engineInit() error {
 		}
 	}
 
-	return engineInitWithEngine(Engine)
+	return engineInitWithEngine(ctx, Engine)
 }
 
-func engineInitWithEngine(e *engine.Engine) error {
+func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 	if e.RanInit {
 		return nil
 	}
@@ -101,7 +101,7 @@ func engineInitWithEngine(e *engine.Engine) error {
 		e.Pool.Stop(nil)
 	})
 
-	err = e.Parse()
+	err = e.Parse(ctx)
 	if err != nil {
 		return err
 	}
@@ -110,7 +110,7 @@ func engineInitWithEngine(e *engine.Engine) error {
 }
 
 func preRunWithGen(ctx context.Context, silent bool) error {
-	err := engineInit()
+	err := engineInit(ctx)
 	if err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ type PreRunOpts struct {
 func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	e := opts.Engine
 
-	err := engineInitWithEngine(e)
+	err := engineInitWithEngine(ctx, e)
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
 }
 
 func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent bool) ([]string, []string, error) {
-	err := engineInit()
+	err := engineInit(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -155,13 +155,13 @@ func TargetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 
 func TargetOutputOptionsParse(pkg string, s string) (TargetOutputPath, map[string]string, error) {
 	var options map[string]string
-	if strings.HasPrefix(s, "${") {
+	if strings.HasPrefix(s, "{") {
 		i := strings.Index(s, "}")
 		if i < 0 {
 			return TargetOutputPath{}, nil, fmt.Errorf("invalid target options, expected }")
 		}
 
-		ostr := s[2:i]
+		ostr := s[1:i]
 		if len(ostr) > 0 {
 			options = map[string]string{}
 			for _, part := range strings.Split(ostr, ",") {

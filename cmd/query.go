@@ -64,6 +64,8 @@ var queryCmd = &cobra.Command{
 	Short:   "Query the graph",
 	Args:    cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
 		if hasStdin(args) {
 			// Block and read stdin here to prevent multiple bubbletea running at the same time
 			_, err := parseTargetPathsFromStdin()
@@ -72,12 +74,12 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		err := engineInit()
+		err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		err = preRunWithGenWithOpts(cmd.Context(), PreRunOpts{
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
 			Engine:       Engine,
 			PoolWaitName: "Query gen",
 		})
@@ -173,7 +175,9 @@ var configCmd = &cobra.Command{
 	Short: "Prints config",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := engineInit()
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
@@ -378,18 +382,20 @@ var targetCmd = &cobra.Command{
 	Args:              cobra.ExactValidArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
 			return err
 		}
 
 		if *noGen {
-			err := engineInit()
+			err := engineInit(ctx)
 			if err != nil {
 				return err
 			}
 		} else {
-			err := preRunWithGen(cmd.Context(), false)
+			err := preRunWithGen(ctx, false)
 			if err != nil {
 				return err
 			}
@@ -456,13 +462,15 @@ var pkgsCmd = &cobra.Command{
 	Short: "Prints pkgs details",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
 		if spec {
-			err := engineInit()
+			err := engineInit(ctx)
 			if err != nil {
 				return err
 			}
 		} else {
-			err := preRunWithGen(cmd.Context(), false)
+			err := preRunWithGen(ctx, false)
 			if err != nil {
 				return err
 			}
@@ -703,7 +711,9 @@ var outRootCmd = &cobra.Command{
 	Short: "Prints repo root",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := engineInit()
+		ctx := cmd.Context()
+		
+		err := engineInit(ctx)
 		if err != nil {
 			return err
 		}

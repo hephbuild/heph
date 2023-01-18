@@ -27,11 +27,13 @@ func (c rootCmdData) HasTargetShortcuts() bool {
 func setupRootUsage() {
 	defUsage := rootCmd.UsageFunc()
 	rootCmd.SetUsageFunc(func(cmd *cobra.Command) error {
+		ctx := cmd.Context()
+
 		if cmd != rootCmd {
 			return defUsage(cmd)
 		}
 
-		err := engineInit()
+		err := engineInit(ctx)
 		if err != nil {
 			return err
 		}

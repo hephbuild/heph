@@ -66,7 +66,7 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 }
 
 func parseTargetsAndArgs(ctx context.Context, args []string) (engine.TargetRunRequests, error) {
-	err := engineInit()
+	err := engineInit(ctx)
 	if err != nil {
 		return nil, err
 	}

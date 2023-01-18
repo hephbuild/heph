@@ -206,7 +206,7 @@ func (e *Engine) hashDepsTargets(h hash.Hash, targets []TargetWithOutput) {
 		dh := e.hashOutput(dep.Target, dep.Output)
 		h.String(dh)
 
-		if dep.Mode != targetspec.TargetSpecDepModeRW {
+		if dep.Mode != targetspec.TargetSpecDepModeCopy {
 			h.String(string(dep.Mode))
 		}
 	}

@@ -235,7 +235,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 				Name:   name,
 				Target: dtp.TargetPath.Full(),
 				Output: dtp.Output,
-				Mode:   targetspec.TargetSpecDepModeRW,
+				Mode:   targetspec.TargetSpecDepModeCopy,
 			}
 
 			for k, v := range options {

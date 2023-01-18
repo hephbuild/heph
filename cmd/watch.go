@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/bep/debounce"
+	"github.com/bmatcuk/doublestar/v4"
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -144,6 +145,22 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 				continue
 			}
 
+			ignored := false
+			for _, p := range *ignore {
+				match, err := doublestar.PathMatch(p, e.Name)
+				if err != nil {
+					return err
+				}
+				ignored = match
+
+				if match {
+					break
+				}
+			}
+			if ignored {
+				continue
+			}
+
 			filteredEvents = append(filteredEvents, e)
 		}
 
@@ -158,6 +175,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 
 	for _, e := range filteredEvents {
 		if e.Op.Has(fsnotify.Create) || e.Op.Has(fsnotify.Remove) || e.Op.Has(fsnotify.Rename) {
+			log.Warnf("event %v", e.String())
 			// Reload graph
 			w.graphSigsCh <- struct{}{}
 

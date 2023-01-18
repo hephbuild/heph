@@ -262,7 +262,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 				continue
 			}
 
-			if dep.Mode == targetspec.TargetSpecDepModeRO {
+			if dep.Mode == targetspec.TargetSpecDepModeLink {
 				for _, file := range dept.ActualOutFiles().Name(dep.Output) {
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
@@ -835,7 +835,6 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 			tarf := e.targetOutputTarFile(target, name)
 			err := tar.UntarWith(ctx, tarf, tmpOutDir, tar.UntarOptions{
 				List:  true,
-				RO:    true,
 				Dedup: untarDedup,
 			})
 			if err != nil {

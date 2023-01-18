@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/heimdalr/dag"
@@ -633,7 +634,7 @@ func (e *Engine) Init() error {
 	return nil
 }
 
-func (e *Engine) Parse() error {
+func (e *Engine) Parse(ctx context.Context) error {
 	for name, cfg := range e.Config.BuildFiles.Roots {
 		err := e.runRootBuildFiles(name, cfg)
 		if err != nil {
@@ -662,7 +663,7 @@ func (e *Engine) Parse() error {
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
 	linkStartTime := time.Now()
-	err = e.linkTargets(true, nil)
+	err = e.linkTargets(ctx, true, nil)
 	if err != nil {
 		return err
 	}
@@ -816,7 +817,7 @@ func (e *Engine) linkedTargets() *Targets {
 	return targets
 }
 
-func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error {
+func (e *Engine) linkTargets(ctx context.Context, ignoreNotFoundError bool, targets []*Target) error {
 	for _, target := range e.Targets.Slice() {
 		target.resetLinking()
 	}
@@ -826,6 +827,10 @@ func (e *Engine) linkTargets(ignoreNotFoundError bool, targets []*Target) error 
 	}
 
 	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		//log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
 		err := e.linkTarget(target, nil)
 		if err != nil {
@@ -1003,6 +1008,14 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	t.Env = map[string]string{}
 	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
+
+	t.RuntimeEnv = map[string]TargetRuntimeEnv{}
+	for k, v := range t.TargetSpec.RuntimeEnv {
+		t.RuntimeEnv[k] = TargetRuntimeEnv{
+			Value:  v,
+			Target: t,
+		}
+	}
 
 	t.DeepRequireTransitive, err = e.computeDeepTransitive(t, breadcrumb)
 	if err != nil {

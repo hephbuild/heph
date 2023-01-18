@@ -79,14 +79,14 @@ func TestTargetOutputOptionsParse(t *testing.T) {
 		options map[string]string
 	}{
 		{
-			"${mode=rw}//some/path:target",
+			"{mode=rw}//some/path:target",
 			"some/path",
 			"target",
 			"",
 			map[string]string{"mode": "rw"},
 		},
 		{
-			"${}//some/path:target|output",
+			"{}//some/path:target|output",
 			"some/path",
 			"target",
 			"output",

@@ -26,6 +26,7 @@ var workers int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
+var ignore *[]string
 var nocache *bool
 var params *[]string
 var summary *bool
@@ -51,6 +52,7 @@ func init() {
 	cleanCmd.AddCommand(cleanLockCmd)
 
 	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
+	ignore = watchCmd.Flags().StringArray("ignore", nil, "Ignore files, supports glob")
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(watchCmd)

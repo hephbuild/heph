@@ -193,11 +193,14 @@ type TargetSpecTools struct {
 type TargetSpecDepMode string
 
 const (
-	TargetSpecDepModeRO TargetSpecDepMode = "ro"
-	TargetSpecDepModeRW TargetSpecDepMode = "rw"
+	TargetSpecDepModeCopy TargetSpecDepMode = "copy"
+	TargetSpecDepModeLink TargetSpecDepMode = "link"
 )
 
-var TargetSpecDepModes = []TargetSpecDepMode{TargetSpecDepModeRO, TargetSpecDepModeRW}
+var TargetSpecDepModes = []TargetSpecDepMode{
+	TargetSpecDepModeCopy,
+	TargetSpecDepModeLink,
+}
 
 type TargetSpecDepTarget struct {
 	Name   string

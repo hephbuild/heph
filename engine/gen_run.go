@@ -27,7 +27,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 		log.Debugf("No gen targets, skip gen pass")
 
 		linkStartTime := time.Now()
-		err := e.linkTargets(true, nil)
+		err := e.linkTargets(ctx, true, nil)
 		if err != nil {
 			return nil, fmt.Errorf("linking %w", err)
 		}
@@ -56,7 +56,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 		deps:   &worker.WaitGroup{},
 	}
 
-	err := ge.linkAndDagGenTargets()
+	err := ge.linkAndDagGenTargets(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +80,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 
 			w.Status("Linking targets...")
 
-			err := e.linkTargets(false, nil)
+			err := e.linkTargets(ctx, false, nil)
 			if err != nil {
 				return err
 			}
@@ -148,7 +148,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 			}
 
 			if len(genTargets) > 0 {
-				err := e.linkAndDagGenTargets()
+				err := e.linkAndDagGenTargets(ctx)
 				if err != nil {
 					return err
 				}
@@ -167,9 +167,9 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	return nil
 }
 
-func (e *Engine) linkAndDagGenTargets() error {
+func (e *Engine) linkAndDagGenTargets(ctx context.Context) error {
 	linkStartTime := time.Now()
-	err := e.linkTargets(false, e.GeneratedTargets())
+	err := e.linkTargets(ctx, false, e.GeneratedTargets())
 	if err != nil {
 		return fmt.Errorf("linking %w", err)
 	}
