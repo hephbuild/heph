@@ -41,6 +41,7 @@ func init() {
 	queryCmd.AddCommand(hashoutCmd)
 	queryCmd.AddCommand(hashinCmd)
 	queryCmd.AddCommand(outRootCmd)
+	queryCmd.AddCommand(labelsCmd)
 
 	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
@@ -706,13 +707,35 @@ var hashinCmd = &cobra.Command{
 	},
 }
 
+var labelsCmd = &cobra.Command{
+	Use:               "labels",
+	Short:             "Prints labels",
+	Args:              cobra.NoArgs,
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := preRunWithGen(cmd.Context(), false)
+		if err != nil {
+			return err
+		}
+
+		labels := Engine.Labels.Slice()
+		sort.Strings(labels)
+
+		for _, label := range labels {
+			fmt.Println(label)
+		}
+
+		return nil
+	},
+}
+
 var outRootCmd = &cobra.Command{
 	Use:   "root",
 	Short: "Prints repo root",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
-		
+
 		err := engineInit(ctx)
 		if err != nil {
 			return err

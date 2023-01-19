@@ -290,18 +290,7 @@ func (tp *TargetNamedDeps) Dedup() {
 
 func (tp *TargetNamedDeps) Sort() {
 	tp.Map(func(deps TargetDeps) TargetDeps {
-		sort.Slice(deps.Targets, func(i, j int) bool {
-			if deps.Targets[i].Target.FQN == deps.Targets[j].Target.FQN {
-				return deps.Targets[i].Output < deps.Targets[j].Output
-			}
-
-			return deps.Targets[i].Target.FQN < deps.Targets[j].Target.FQN
-		})
-
-		sort.Slice(deps.Files, func(i, j int) bool {
-			return deps.Files[i].RelRoot() < deps.Files[j].RelRoot()
-		})
-
+		deps.Sort()
 		return deps
 	})
 }

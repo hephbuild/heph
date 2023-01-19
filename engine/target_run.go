@@ -624,28 +624,30 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			shellCmds := executor.ShellPrint(run)
 
 			fmt.Println("Shell mode enabled, exit the shell to terminate")
-			fmt.Println("The run alias is available to execute the below commands:")
-			fmt.Printf("%v\n", shellCmds)
+			if len(shellCmds) > 0 {
+				fmt.Println("The run alias is available to execute the below commands:")
+				fmt.Printf("%v\n", shellCmds)
 
-			f, err := os.CreateTemp(e.tmpRoot(target), "")
-			if err != nil {
-				return err
-			}
-			defer os.Remove(f.Name())
+				f, err := os.CreateTemp(e.tmpRoot(target), "")
+				if err != nil {
+					return err
+				}
+				defer os.Remove(f.Name())
 
-			_, err = io.WriteString(f, fmt.Sprintf("function run {\n%v\n}", shellCmds))
-			if err != nil {
-				return err
-			}
+				_, err = io.WriteString(f, fmt.Sprintf("function run {\n%v\n}\nfunction show {\ndeclare -f run\n}", shellCmds))
+				if err != nil {
+					return err
+				}
 
-			executor, err = sandbox.BashShellExecutor(f.Name())
-			if err != nil {
-				return err
-			}
+				executor, err = sandbox.BashShellExecutor(f.Name())
+				if err != nil {
+					return err
+				}
 
-			err = f.Close()
-			if err != nil {
-				return err
+				err = f.Close()
+				if err != nil {
+					return err
+				}
 			}
 		}
 
