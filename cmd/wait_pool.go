@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/reflow/wrap"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/multierr"
@@ -287,6 +288,18 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return r, nil
 }
 
+var styleWorkerStart lipgloss.Style
+var styleFaint lipgloss.Style
+
+func setupStyles() {
+	if !isTerm {
+		return
+	}
+
+	styleWorkerStart = lipgloss.NewStyle().Bold(true)
+	styleFaint = lipgloss.NewStyle().Faint(true)
+}
+
 func (r *renderer) View() string {
 	start := utils.RoundDuration(time.Since(r.start), 1).String()
 
@@ -309,19 +322,17 @@ func (r *renderer) View() string {
 	}
 
 	for _, w := range r.workers {
-		state := "I"
 		runtime := ""
 		if j := w.CurrentJob; j != nil {
-			state = "R"
-			runtime = fmt.Sprintf(" %v", utils.RoundDuration(time.Since(j.TimeStart), 1).String())
+			runtime = fmt.Sprintf("[%5s]", utils.FormatDuration(time.Since(j.TimeStart)))
 		}
 
 		status := w.GetStatus()
 		if status == "" {
-			status = "Waiting..."
+			status = styleFaint.Render("=|")
 		}
 
-		s.WriteString(fmt.Sprintf("  %v%v %v\n", state, runtime, status))
+		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render("=> "+runtime), status))
 	}
 
 	return s.String()

@@ -214,7 +214,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
-	e.Status(fmt.Sprintf("Creating %v sandbox...", target.FQN))
+	e.Status(TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
@@ -568,7 +568,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 	}
 
-	e.Status(fmt.Sprintf("Running %v...", target.FQN))
+	e.Status(TargetStatus(target, "Running..."))
 
 	if target.IsGroup() && !rr.Shell {
 		// Ignore
@@ -730,7 +730,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			e.Pool.Schedule(ctx, &worker.Job{
 				Name: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
 				Do: func(w *worker.Worker, ctx context.Context) error {
-					w.Status(fmt.Sprintf("Pushing %v to %v cache...", target.FQN, cache.Name))
+					w.Status(TargetStatus(target, fmt.Sprintf("Pushing to %v cache...", cache.Name)))
 
 					err = e.storeVfsCache(cache, target)
 					if err != nil {
@@ -745,7 +745,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	if !e.Config.KeepSandbox {
-		e.Status(fmt.Sprintf("Clearing %v sandbox...", target.FQN))
+		e.Status(TargetStatus(target, "Clearing sandbox..."))
 		err = deleteDir(target.SandboxRoot.Abs(), false)
 		if err != nil {
 			return err
@@ -814,7 +814,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 	}
 
 	if shouldExpand {
-		e.Status(fmt.Sprintf("Expanding %v cache...", target.FQN))
+		e.Status(TargetStatus(target, "Expanding cache..."))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
 		err := os.RemoveAll(tmpOutDir)
@@ -858,7 +858,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 	target.OutExpansionRoot = &outDir
 
-	e.Status(fmt.Sprintf("Hydrating %v output...", target.FQN))
+	e.Status(TargetStatus(target, "Hydrating output..."))
 
 	err = e.populateActualFilesFromTar(target)
 	if err != nil {
@@ -885,7 +885,7 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 		return nil
 	}
 
-	e.Status(fmt.Sprintf("Linking %v output", target.FQN))
+	e.Status(TargetStatus(target, "Linking output..."))
 
 	for name, paths := range target.Out.Named() {
 		switch target.Codegen {

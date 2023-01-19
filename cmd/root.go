@@ -42,6 +42,8 @@ func init() {
 		isTerm = isatty.IsTerminal(os.Stderr.Fd())
 	}
 
+	setupStyles()
+
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: isTerm,
 		ForceColors:      isTerm,

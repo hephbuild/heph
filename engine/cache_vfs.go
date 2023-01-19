@@ -134,7 +134,7 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 	if output != "" {
 		what += "|" + output
 	}
-	e.Status(fmt.Sprintf("Downloading meta %v from %v cache...", what, cacheName))
+	e.Status(TargetOutputStatus(target, output, fmt.Sprintf("Downloading meta from %v cache...", cacheName)))
 
 	inputHash := e.hashInput(target)
 
@@ -171,7 +171,7 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 	}
 
 	if onlyMeta {
-		e.Status(fmt.Sprintf("Checking %v exists in %v cache...", what, cacheName))
+		e.Status(TargetOutputStatus(target, output, fmt.Sprintf("Downloading meta from %v cache...", cacheName)))
 
 		ok, err := e.vfsExistsFile(remoteRoot, e.cacheOutTarName(output))
 		if err != nil {
@@ -182,15 +182,13 @@ func (e *TargetRunEngine) getVfsCache(remoteRoot vfs.Location, cacheName string,
 			return false, nil
 		}
 	} else {
-		e.Status(fmt.Sprintf("Downloading %v from %v cache...", what, cacheName))
+		e.Status(TargetOutputStatus(target, output, fmt.Sprintf("Downloading from %v cache...", cacheName)))
 
 		err = e.vfsCopyFileIfNotExists(remoteRoot, localRoot, e.cacheOutTarName(output))
 		if err != nil {
 			return false, err
 		}
 	}
-
-	e.Status(fmt.Sprintf("Downloading meta %v from %v cache...", what, cacheName))
 
 	return true, nil
 }

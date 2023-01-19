@@ -639,7 +639,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 					Status: w.Status,
 				}
 
-				w.Status(fmt.Sprintf("Priming cache %v|%v...", target.FQN, output))
+				w.Status(TargetOutputStatus(target, output, "Priming cache..."))
 
 				cached, err := e.WarmTargetCache(ctx, target, output)
 				if err != nil {
@@ -657,6 +657,18 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 	}
 
 	return e.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
+}
+
+func TargetStatus(t *Target, status string) string {
+	return TargetOutputStatus(t, "", status)
+}
+
+func TargetOutputStatus(t *Target, output string, status string) string {
+	ts := t.FQN
+	if output != "" {
+		ts += "|" + output
+	}
+	return fmt.Sprintf("%v %v", ts, status)
 }
 
 func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target, deps *worker.WaitGroup, outputs []string) *worker.Job {

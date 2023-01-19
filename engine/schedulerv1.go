@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	log "github.com/sirupsen/logrus"
 	"heph/worker"
 )
@@ -50,7 +49,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 			Name: "pull_meta " + target.FQN,
 			Deps: pullMetaDeps.Get(target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(fmt.Sprintf("Scheduling analysis %v...", target.FQN))
+				w.Status(TargetStatus(target, "Scheduling Analysis..."))
 
 				parents, err := e.DAG().GetParents(target)
 				if err != nil {
@@ -67,7 +66,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 
 				rr := rrs.Get(target)
 				if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
-					w.Status(fmt.Sprintf("Pulling meta %v...", target.FQN))
+					w.Status(TargetStatus(target, "Pulling meta..."))
 
 					e := TargetRunEngine{
 						Engine: e,
@@ -119,7 +118,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 			Name: "schedule " + target.FQN,
 			Deps: sdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(fmt.Sprintf("Scheduling %v...", target.FQN))
+				w.Status(TargetStatus(target, "Scheduling..."))
 
 				parents, err := e.DAG().GetParents(target)
 				if err != nil {

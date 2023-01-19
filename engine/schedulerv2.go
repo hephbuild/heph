@@ -126,7 +126,7 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 					Status: w.Status,
 				}
 
-				w.Status(fmt.Sprintf("Priming cache %v|%v...", target.FQN, output))
+				w.Status(TargetOutputStatus(target, output, "Priming cache..."))
 
 				cached, err := re.WarmTargetCache(ctx, target, output)
 				if err != nil {
@@ -243,7 +243,7 @@ func (e *schedEngine) schedulePullMeta(ctx context.Context, target *Target) (*wo
 
 			rr := e.rrs.Get(target)
 			if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
-				w.Status(fmt.Sprintf("Fetching meta %v...", target.FQN))
+				w.Status(TargetStatus(target, "Fetching meta..."))
 
 				re := TargetRunEngine{
 					Engine: e.Engine,
