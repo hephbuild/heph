@@ -70,7 +70,7 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 
 	re := engine.TargetRunEngine{
 		Engine: e,
-		Print: func(s string) {
+		Status: func(s string) {
 			log.Debug(s)
 		},
 	}

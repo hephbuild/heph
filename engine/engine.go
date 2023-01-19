@@ -636,7 +636,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				e := TargetRunEngine{
 					Engine: e,
-					Print:  w.Status,
+					Status: w.Status,
 				}
 
 				w.Status(fmt.Sprintf("Priming cache %v|%v...", target.FQN, output))
@@ -666,7 +666,7 @@ func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine: e,
-				Print:  w.Status,
+				Status: w.Status,
 			}
 
 			return e.postRunOrWarm(ctx, target, outputs)
@@ -681,7 +681,7 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := TargetRunEngine{
 				Engine: e,
-				Print:  w.Status,
+				Status: w.Status,
 			}
 
 			err := e.Run(ctx, rr, sandbox.IOConfig{})

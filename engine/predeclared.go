@@ -36,7 +36,7 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 		panic(err)
 	}
 
-	thread := &starlark.Thread{}
+	thread := newStarlarkThread()
 
 	globals, err := mod.Init(thread, predeclared(config))
 	if err != nil {

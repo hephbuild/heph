@@ -71,7 +71,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 
 					e := TargetRunEngine{
 						Engine: e,
-						Print:  w.Status,
+						Status: w.Status,
 					}
 
 					cached, err := e.PullTargetMeta(ctx, target, target.OutWithSupport.Names())

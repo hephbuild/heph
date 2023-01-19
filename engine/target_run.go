@@ -28,11 +28,7 @@ import (
 
 type TargetRunEngine struct {
 	*Engine
-	Print func(s string)
-}
-
-func (e *TargetRunEngine) Status(s string) {
-	e.Print(s)
+	Status func(s string)
 }
 
 func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target, outputs []string) (bool, error) {

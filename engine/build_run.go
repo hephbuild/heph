@@ -331,6 +331,14 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 	return mod, err
 }
 
+func newStarlarkThread() *starlark.Thread {
+	return &starlark.Thread{
+		Print: func(thread *starlark.Thread, msg string) {
+			log.Info(msg)
+		},
+	}
+}
+
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
 	e.cacheRunBuildFilem.RLock()
 	if globals, ok := e.cacheRunBuildFile[path]; ok {
@@ -341,9 +349,8 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 
 	log.Tracef("BUILD: running %v", path)
 
-	thread := &starlark.Thread{
-		Load: e.load,
-	}
+	thread := newStarlarkThread()
+	thread.Load = e.load
 	thread.SetLocal("engine", e)
 
 	config := e.config()

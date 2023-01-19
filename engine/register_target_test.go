@@ -76,7 +76,7 @@ func TestTargetSpec(t *testing.T) {
 				},
 			}
 
-			thread := &starlark.Thread{}
+			thread := newStarlarkThread()
 			thread.SetLocal("engine", e)
 
 			predeclaredGlobalsOnce(nil)

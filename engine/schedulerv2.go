@@ -122,7 +122,8 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				re := TargetRunEngine{
 					Engine: e.Engine,
-					Print:  w.Status,
+
+					Status: w.Status,
 				}
 
 				w.Status(fmt.Sprintf("Priming cache %v|%v...", target.FQN, output))
@@ -246,7 +247,7 @@ func (e *schedEngine) schedulePullMeta(ctx context.Context, target *Target) (*wo
 
 				re := TargetRunEngine{
 					Engine: e.Engine,
-					Print:  w.Status,
+					Status: w.Status,
 				}
 
 				outputs := e.requiredOutputs.Get(target.FQN).Slice()

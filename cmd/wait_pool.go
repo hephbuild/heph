@@ -117,6 +117,42 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 	return multierr.Combine(perr, derr)
 }
 
+var printf func(string, ...interface{})
+var termWidth int
+
+func init() {
+	log.AddHook(hookFunc{
+		f: func(entry *log.Entry) {
+			printf := printf
+
+			if printf == nil {
+				return
+			}
+
+			if !entry.Logger.IsLevelEnabled(entry.Level) {
+				return
+			}
+
+			b, err := entry.Logger.Formatter.Format(entry)
+			if err != nil {
+				printf(fmt.Sprintf("logger fmt error: %v", err))
+				return
+			}
+
+			b = bytes.TrimSpace(b)
+
+			// Local copy
+			termWidth := termWidth
+
+			if termWidth > 0 && len(b) > termWidth {
+				b = wrap.Bytes(b, termWidth)
+			}
+
+			go printf("%s", b)
+		},
+	})
+}
+
 func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
@@ -135,57 +171,41 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 			pool.Stop(fmt.Errorf("user canceled"))
 		},
 		UpdateMessage: msg(),
+		onTermWidth: func(w int) {
+			termWidth = w
+		},
 	}
 
 	p := tea.NewProgram(r, tea.WithOutput(os.Stderr))
 
-	go func() {
-		t := time.NewTicker(50 * time.Millisecond)
-		defer t.Stop()
+	r.onInit = func() {
+		log.SetOutput(io.Discard)
+		printf = p.Printf
 
-		for {
-			select {
-			case <-deps.Done():
-				m := msg()
-				m.summary = true
-				p.Send(m)
-				p.Quit()
-				return
-			case <-t.C:
-				p.Send(msg())
-			}
-		}
-	}()
+		go func() {
+			t := time.NewTicker(50 * time.Millisecond)
+			defer t.Stop()
 
-	log.AddHook(hookFunc{
-		f: func(entry *log.Entry) {
-			if !r.running {
-				return
+			for {
+				select {
+				case <-deps.Done():
+					m := msg()
+					m.summary = true
+					p.Send(m)
+					p.Quit()
+					return
+				case <-t.C:
+					p.Send(msg())
+				}
 			}
-
-			if !entry.Logger.IsLevelEnabled(entry.Level) {
-				return
-			}
-
-			b, err := entry.Logger.Formatter.Format(entry)
-			if err != nil {
-				p.Printf(fmt.Sprintf("logger fmt error: %v", err))
-				return
-			}
-
-			b = bytes.TrimSpace(b)
-			if r.termWidth > 0 && len(b) > r.termWidth {
-				b = wrap.Bytes(b, r.termWidth)
-			}
-			p.Printf("%s", b)
-		},
-	})
+		}()
+	}
 
 	prevOut := log.StandardLogger().Out
-	log.SetOutput(io.Discard)
 
 	err := p.Start()
-	r.running = false
+
+	printf = nil
 	log.SetOutput(prevOut)
 	if err != nil {
 		return err
@@ -205,18 +225,17 @@ type UpdateMessage struct {
 }
 
 type renderer struct {
-	name      string
-	running   bool
-	start     time.Time
-	cancel    func()
-	sb        strings.Builder
-	pool      *worker.Pool
-	termWidth int
+	name        string
+	start       time.Time
+	cancel      func()
+	pool        *worker.Pool
+	onTermWidth func(w int)
+	onInit      func()
 	UpdateMessage
 }
 
 func (r *renderer) Init() tea.Cmd {
-	r.running = true
+	r.onInit()
 	return nil
 }
 
@@ -262,7 +281,7 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case tea.WindowSizeMsg:
-		r.termWidth = msg.Width
+		r.onTermWidth(msg.Width)
 	}
 
 	return r, nil
