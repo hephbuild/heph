@@ -91,9 +91,8 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 
 			for _, v := range vs {
 				t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-					Name:    k,
-					Package: pkg,
-					Path:    v,
+					Name: k,
+					Path: v,
 				})
 			}
 		}
@@ -104,16 +103,14 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			}
 
 			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-				Name:    k,
-				Package: pkg,
-				Path:    v,
+				Name: k,
+				Path: v,
 			})
 		}
 	} else {
 		for _, file := range args.Out.Array {
 			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-				Package: pkg,
-				Path:    file,
+				Path: file,
 			})
 		}
 	}
@@ -123,14 +120,13 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 
 		for _, file := range args.SupportFiles {
 			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-				Name:    targetspec.SupportFilesOutput,
-				Package: pkg,
-				Path:    file,
+				Name: targetspec.SupportFilesOutput,
+				Path: file,
 			})
 		}
 	}
 
-	sort.SliceStable(t.Out, utils.MultiLess(
+	sort.Slice(t.Out, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(t.Out[i].Path, t.Out[j].Path)
 		},
@@ -223,9 +219,8 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 	for _, dep := range arr {
 		if expr, err := exprs.Parse(dep); err == nil {
 			td.Exprs = append(td.Exprs, targetspec.TargetSpecDepExpr{
-				Name:    name,
-				Package: t.Package,
-				Expr:    expr,
+				Name: name,
+				Expr: expr,
 			})
 			continue
 		}
@@ -355,7 +350,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.Target
 		td.Files = append(td.Files, d.Files...)
 	}
 
-	sort.SliceStable(td.Exprs, utils.MultiLess(
+	sort.Slice(td.Exprs, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(td.Exprs[i].Expr.String, td.Exprs[j].Expr.String)
 		},
@@ -364,7 +359,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.Target
 		},
 	))
 
-	sort.SliceStable(td.Targets, utils.MultiLess(
+	sort.Slice(td.Targets, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(td.Targets[i].Target, td.Targets[j].Target)
 		},
@@ -373,7 +368,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.Target
 		},
 	))
 
-	sort.SliceStable(td.Files, utils.MultiLess(
+	sort.Slice(td.Files, utils.MultiLess(
 		func(i, j int) int {
 			return strings.Compare(td.Files[i].Path, td.Files[j].Path)
 		},

@@ -141,7 +141,7 @@ func getEngine(thread *starlark.Thread) *runBuildEngine {
 func stackTrace(thread *starlark.Thread) []string {
 	var source []string
 	for _, c := range thread.CallStack() {
-		source = append(source, fmt.Sprintf("%v %v", c.Name, c.Pos.String()))
+		source = append(source, c.Name+" "+c.Pos.String())
 	}
 
 	return source

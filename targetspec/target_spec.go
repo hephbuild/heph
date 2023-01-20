@@ -82,7 +82,7 @@ type TargetSpec struct {
 	Package *packages.Package
 
 	Run               []string
-	FileContent       []byte `json:"-"` // Used by special target `text_file`
+	FileContent       []byte // Used by special target `text_file`
 	Executor          string
 	Quiet             bool
 	Dir               string
@@ -210,9 +210,8 @@ type TargetSpecDepTarget struct {
 }
 
 type TargetSpecDepExpr struct {
-	Name    string
-	Package *packages.Package
-	Expr    exprs.Expr
+	Name string
+	Expr exprs.Expr
 }
 
 type TargetSpecDepFile struct {
@@ -221,9 +220,8 @@ type TargetSpecDepFile struct {
 }
 
 type TargetSpecOutFile struct {
-	Name    string
-	Package *packages.Package
-	Path    string
+	Name string
+	Path string
 }
 
 type TargetSpecCache struct {

@@ -35,6 +35,34 @@ func TestTargetParse(t *testing.T) {
 	}
 }
 
+func TestTargetParseError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		fqn   string
+		error string
+	}{
+		{
+			"//some/path::",
+			"invalid target, got multiple `:`",
+		},
+		{
+			"//some/path: test",
+			"target name must match:",
+		},
+		{
+			"//some/path:test:",
+			"invalid target, got multiple `:`",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.fqn, func(t *testing.T) {
+			_, err := TargetParse("", test.fqn)
+			assert.ErrorContains(t, err, test.error)
+		})
+	}
+}
+
 func TestTargetOutputParse(t *testing.T) {
 	t.Parallel()
 
@@ -64,6 +92,30 @@ func TestTargetOutputParse(t *testing.T) {
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)
 			assert.Equal(t, test.output, tp.Output)
+		})
+	}
+}
+
+func TestTargetOutputParseError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		fqn   string
+		error string
+	}{
+		{
+			"//some/path:test||",
+			"package name must match",
+		},
+		{
+			"//some/path:test|test|",
+			"package name must match",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.fqn, func(t *testing.T) {
+			_, _, err := TargetOutputOptionsParse("", test.fqn)
+			assert.ErrorContains(t, err, test.error)
 		})
 	}
 }

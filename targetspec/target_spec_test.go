@@ -29,8 +29,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 			Path: "aaa",
 		})
 		deps.Exprs = append(deps.Exprs, TargetSpecDepExpr{
-			Name:    "aaa",
-			Package: pkg,
+			Name: "aaa",
 			Expr: exprs.Expr{
 				String:    "$(aaa)",
 				Function:  "aaa",
@@ -72,9 +71,8 @@ func genTargetSpec(name string, factor int) TargetSpec {
 	var out []TargetSpecOutFile
 	for i := 0; i < factor; i++ {
 		out = append(out, TargetSpecOutFile{
-			Name:    "",
-			Package: nil,
-			Path:    "",
+			Name: "",
+			Path: "",
 		})
 	}
 

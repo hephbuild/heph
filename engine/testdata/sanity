@@ -12,11 +12,13 @@ target(
         "FullName": "some/test",
         "Root": {
             "Root": "/tmp/some/test",
-            "RelRoot": "some/test"
+            "RelRoot": "some/test",
+            "Abs": ""
         },
         "SourceFiles": null
     },
     "Run": null,
+    "FileContent": "",
     "Executor": "bash",
     "Quiet": false,
     "Dir": "",

@@ -77,14 +77,14 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 	if strings.HasPrefix(s, "//") {
 		s := s[2:]
 		if strings.Contains(s, ":") {
-			parts := strings.Split(s, ":")
-			if len(parts) != 2 {
+			i := strings.Index(s, ":")
+			if strings.Index(s[i+1:], ":") != -1 {
 				return TargetPath{}, fmt.Errorf("invalid target, got multiple `:`")
 			}
 
 			return TargetPath{
-				Package: parts[0],
-				Name:    parts[1],
+				Package: s[:i],
+				Name:    s[i+1:],
 			}, nil
 		} else {
 			pkg := s
@@ -186,16 +186,18 @@ func TargetOutputOptionsParse(pkg string, s string) (TargetOutputPath, map[strin
 }
 
 func targetOutputParse(pkg string, s string) (TargetOutputPath, error) {
-	parts := strings.SplitN(s, "|", 2)
-
-	tp, err := TargetParse(pkg, parts[0])
-	if err != nil {
-		return TargetOutputPath{}, err
-	}
+	i := strings.Index(s, "|")
 
 	output := ""
-	if len(parts) > 1 {
-		output = parts[1]
+	parseStr := s
+	if i != -1 {
+		parseStr = s[:i]
+		output = s[i+1:]
+	}
+
+	tp, err := TargetParse(pkg, parseStr)
+	if err != nil {
+		return TargetOutputPath{}, err
 	}
 
 	return TargetOutputPath{

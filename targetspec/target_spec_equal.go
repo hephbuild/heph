@@ -243,10 +243,6 @@ func (this TargetSpecDepExpr) Equal(that TargetSpecDepExpr) bool {
 		return false
 	}
 
-	if this.Package.FullName != that.Package.FullName {
-		return false
-	}
-
 	return true
 }
 

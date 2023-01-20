@@ -57,12 +57,32 @@ func (p *Path) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
 		Root    string
 		RelRoot string
-		Abs     string `json:",omitempty"`
+		Abs     string
 	}{
 		Root:    p.root,
 		RelRoot: p.relRoot,
 		Abs:     p.abs,
 	})
+}
+
+func (p *Path) UnmarshalJSON(b []byte) error {
+	var data struct {
+		Root    string
+		RelRoot string
+		Abs     string
+	}
+	err := json.Unmarshal(b, &data)
+	if err != nil {
+		return err
+	}
+
+	*p = Path{
+		root:    data.Root,
+		relRoot: data.RelRoot,
+		abs:     data.Abs,
+	}
+
+	return nil
 }
 
 func (p Path) WithRoot(root string) Path {

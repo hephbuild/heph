@@ -796,7 +796,7 @@ func (e *Engine) processTarget(t *Target) error {
 
 	if t.Codegen != "" {
 		for _, file := range t.TargetSpec.Out {
-			p := file.Package.Root.Join(file.Path).RelRoot()
+			p := t.Package.Root.Join(file.Path).RelRoot()
 
 			if ct, ok := e.codegenPaths[p]; ok && ct != t {
 				return fmt.Errorf("%v: target %v codegen already outputs %v", t.FQN, ct.FQN, p)
@@ -1055,10 +1055,6 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		} else {
 			t.HashDeps = t.Deps.All()
 		}
-	}
-
-	if t.FQN == "//test/features:tr_deps" {
-		fmt.Print()
 	}
 
 	e.applyEnv(t, t.TransitiveDeps.PassEnv, t.TransitiveDeps.Env)
