@@ -12,9 +12,9 @@ var LevelColors = map[Level]lipgloss.TerminalColor{
 	DebugLevel: lipgloss.Color("#29C6E8"),
 	InfoLevel:  lipgloss.Color("#2C75FE"),
 	WarnLevel:  lipgloss.Color("#E7C229"),
-	ErrorLevel: lipgloss.Color("#ED302B"),
-	PanicLevel: lipgloss.Color("#ED302B"),
-	FatalLevel: lipgloss.Color("#ED302B"),
+	ErrorLevel: lipgloss.Color("#FF2A25"),
+	PanicLevel: lipgloss.Color("#FF2A25"),
+	FatalLevel: lipgloss.Color("#FF2A25"),
 }
 
 var LevelStyles map[Level]lipgloss.Style
