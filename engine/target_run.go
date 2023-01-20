@@ -28,7 +28,7 @@ import (
 
 type TargetRunEngine struct {
 	*Engine
-	Status func(s string)
+	Status func(s worker.Status)
 }
 
 func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target, outputs []string) (bool, error) {
@@ -479,7 +479,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		rspan.EndError(rerr)
 	}()
 
-	e.Status(target.FQN)
+	e.Status(worker.StringStatus(target.FQN))
 
 	err := e.linkTarget(target, NewTargets(0))
 	if err != nil {

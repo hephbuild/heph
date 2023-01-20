@@ -5,7 +5,6 @@ import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -97,25 +96,37 @@ func (j *Job) IsDone() bool {
 	return j.State.IsDone()
 }
 
+type Status interface {
+	String(term bool) string
+}
+
+func StringStatus(status string) Status {
+	return stringStatus(status)
+}
+
+type stringStatus string
+
+func (s stringStatus) String(bool) string {
+	return string(s)
+}
+
 type Worker struct {
-	status     string
+	status     Status
 	statusm    sync.Mutex
 	CurrentJob *Job
 }
 
-func (w *Worker) GetStatus() string {
-	w.statusm.Lock()
-	defer w.statusm.Unlock()
+func (w *Worker) GetStatus() Status {
+	if w.status == nil {
+		return StringStatus("")
+	}
 
-	return strings.Clone(w.status)
+	return w.status
 }
 
-func (w *Worker) Status(status string) {
-	w.statusm.Lock()
-	defer w.statusm.Unlock()
-
+func (w *Worker) Status(status Status) {
 	w.status = status
-	if status != "" {
+	if status := status.String(false); status != "" {
 		log.Debug(status)
 	}
 }
@@ -178,7 +189,7 @@ func NewPool(n int) *Pool {
 
 				j.TimeEnd = time.Now()
 				w.CurrentJob = nil
-				w.Status("")
+				w.Status(StringStatus(""))
 
 				p.finalize(j, err, false)
 			}

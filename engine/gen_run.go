@@ -71,28 +71,28 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			span.End()
-			w.Status("Finalizing gen...")
+			w.Status(worker.StringStatus("Finalizing gen..."))
 
 			// free references to starlark
 			for _, p := range e.Packages {
 				p.Globals = nil
 			}
 
-			w.Status("Linking targets...")
+			w.Status(worker.StringStatus("Linking targets..."))
 
 			err := e.linkTargets(ctx, false, nil)
 			if err != nil {
 				return err
 			}
 
-			w.Status("Creating DAG...")
+			w.Status(worker.StringStatus("Creating DAG..."))
 
 			err = e.createDag()
 			if err != nil {
 				return err
 			}
 
-			w.Status("Storing cache...")
+			w.Status(worker.StringStatus("Storing cache..."))
 			_ = e.StoreAutocompleteCache()
 
 			return nil
@@ -131,7 +131,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 		Name: "ScheduleGeneratedPipeline " + e.Name,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			w.Status(fmt.Sprintf("Finalizing generated %v...", e.Name))
+			w.Status(worker.StringStatus(fmt.Sprintf("Finalizing generated %v...", e.Name)))
 
 			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
@@ -204,7 +204,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 		j := e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(fmt.Sprintf("Running %v", file.RelRoot()))
+				w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
 
 				re := &runBuildEngine{
 					Engine: e.Engine,

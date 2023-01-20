@@ -42,7 +42,7 @@ func init() {
 		isTerm = isatty.IsTerminal(os.Stderr.Fd())
 	}
 
-	setupStyles()
+	setupPoolStyles()
 
 	log.SetFormatter(&log.TextFormatter{
 		DisableTimestamp: isTerm,

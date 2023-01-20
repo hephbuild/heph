@@ -51,7 +51,7 @@ func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				continue
 			}
 
-			status := w.GetStatus()
+			status := w.GetStatus().String(isTerm)
 			if status == "" {
 				status = "Waiting..."
 			}
@@ -291,7 +291,7 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 var styleWorkerStart lipgloss.Style
 var styleFaint lipgloss.Style
 
-func setupStyles() {
+func setupPoolStyles() {
 	if !isTerm {
 		return
 	}
@@ -324,15 +324,15 @@ func (r *renderer) View() string {
 	for _, w := range r.workers {
 		runtime := ""
 		if j := w.CurrentJob; j != nil {
-			runtime = fmt.Sprintf("[%5s]", utils.FormatDuration(time.Since(j.TimeStart)))
+			runtime = fmt.Sprintf("=> [%5s]", utils.FormatDuration(time.Since(j.TimeStart)))
 		}
 
-		status := w.GetStatus()
+		status := w.GetStatus().String(isTerm)
 		if status == "" {
 			status = styleFaint.Render("=|")
 		}
 
-		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render("=> "+runtime), status))
+		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), status))
 	}
 
 	return s.String()

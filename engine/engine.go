@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
+	"github.com/charmbracelet/lipgloss"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
@@ -659,16 +660,37 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 	return e.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
 }
 
-func TargetStatus(t *Target, status string) string {
+func TargetStatus(t *Target, status string) worker.Status {
 	return TargetOutputStatus(t, "", status)
 }
 
-func TargetOutputStatus(t *Target, output string, status string) string {
-	ts := t.FQN
-	if output != "" {
-		ts += "|" + output
+type targetStatus struct {
+	fqn, output, status string
+}
+
+var targetStyle = struct {
+	target, output lipgloss.Style
+}{
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#FFCA33")),
+	lipgloss.NewStyle().Foreground(lipgloss.Color("#FFCA33")).Bold(true),
+}
+
+func (t targetStatus) String(term bool) string {
+	var target, output lipgloss.Style
+	if term {
+		target, output = targetStyle.target, targetStyle.output
 	}
-	return fmt.Sprintf("%v %v", ts, status)
+
+	outputStr := ""
+	if t.output != "" {
+		outputStr = output.Render("|" + t.output)
+	}
+
+	return target.Render(t.fqn) + outputStr + " " + t.status
+}
+
+func TargetOutputStatus(t *Target, output string, status string) worker.Status {
+	return targetStatus{t.FQN, output, status}
 }
 
 func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target, deps *worker.WaitGroup, outputs []string) *worker.Job {
