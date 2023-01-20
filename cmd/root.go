@@ -3,10 +3,10 @@ package cmd
 import (
 	"fmt"
 	"github.com/mattn/go-isatty"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"heph/config"
 	"heph/engine"
+	log "heph/hlog"
 	"heph/utils"
 	"os"
 	"path/filepath"
@@ -34,20 +34,13 @@ var jaegerEndpoint *string
 var ignoreUnknownTarget *bool
 
 func init() {
-	// Output to stdout instead of the default stderr
-	// Can be any io.Writer, see below for File example
-	log.SetOutput(os.Stderr)
-
 	if os.Stderr != nil {
 		isTerm = isatty.IsTerminal(os.Stderr.Fd())
 	}
 
-	setupPoolStyles()
+	log.Setup()
 
-	log.SetFormatter(&log.TextFormatter{
-		DisableTimestamp: isTerm,
-		ForceColors:      isTerm,
-	})
+	setupPoolStyles(os.Stderr)
 
 	log.SetLevel(log.InfoLevel)
 
@@ -130,6 +123,8 @@ func postRun() {
 	if *summary {
 		PrintSummary(Engine.Stats)
 	}
+
+	log.Cleanup()
 }
 
 var rootCmd = &cobra.Command{

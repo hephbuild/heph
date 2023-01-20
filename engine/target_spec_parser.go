@@ -2,8 +2,8 @@ package engine
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"heph/exprs"
+	log "heph/hlog"
 	"heph/packages"
 	"heph/targetspec"
 	"heph/utils"

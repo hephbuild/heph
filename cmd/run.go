@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"heph/engine"
+	log "heph/hlog"
 	"heph/sandbox"
 	"heph/worker"
 	"os"
@@ -71,7 +71,7 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 	re := engine.TargetRunEngine{
 		Engine: e,
 		Status: func(s worker.Status) {
-			log.Debug(s.String(isTerm))
+			log.Info(s.String(isTerm))
 		},
 	}
 

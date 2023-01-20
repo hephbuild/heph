@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"heph/targetspec"
 	"heph/utils"
 	"heph/utils/fs"

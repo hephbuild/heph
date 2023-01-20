@@ -2,7 +2,7 @@ package flock
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"heph/utils/fs"
 	"os"
 	"strconv"
@@ -10,11 +10,12 @@ import (
 	"syscall"
 )
 
-func NewFlock(p string) Locker {
-	return &Flock{path: p}
+func NewFlock(name, p string) Locker {
+	return &Flock{path: p, name: name}
 }
 
 type Flock struct {
+	name string
 	m    sync.Mutex
 	path string
 	f    *os.File
@@ -40,10 +41,14 @@ func (l *Flock) Lock() error {
 		l.m.Unlock()
 
 		pid, err := os.ReadFile(f.Name())
+		name := l.name
+		if name == "" || log.IsLevelEnabled(log.DebugLevel) {
+			name = f.Name()
+		}
 		if err == nil && len(pid) > 0 {
-			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), f.Name())
+			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), name)
 		} else {
-			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", f.Name())
+			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", name)
 		}
 
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {

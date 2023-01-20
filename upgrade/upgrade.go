@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"github.com/coreos/go-semver/semver"
 	"github.com/mitchellh/go-homedir"
-	log "github.com/sirupsen/logrus"
 	"heph/config"
+	log "heph/hlog"
 	"heph/utils"
 	"heph/utils/flock"
 	"heph/utils/fs"
@@ -27,7 +27,7 @@ func CheckAndUpdate(cfg config.Config) error {
 		return err
 	}
 
-	lock := flock.NewFlock(filepath.Join(homeDir, "update.lock"))
+	lock := flock.NewFlock("heph update", filepath.Join(homeDir, "update.lock"))
 	err = lock.Lock()
 	if err != nil {
 		return fmt.Errorf("Failed to lock %v", err)

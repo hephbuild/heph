@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"os"
 	"path/filepath"
 	"time"

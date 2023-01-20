@@ -12,6 +12,17 @@ func Map[T, O any](a []T, f func(T) O) []O {
 	return out
 }
 
+func MapMap[K, KO comparable, V, VO any](m map[K]V, f func(K, V) (KO, VO)) map[KO]VO {
+	out := make(map[KO]VO, len(m))
+
+	for k, v := range m {
+		ko, vo := f(k, v)
+		out[ko] = vo
+	}
+
+	return out
+}
+
 func Contains[T comparable](a []T, e T) bool {
 	for _, ae := range a {
 		if ae == e {

@@ -1,7 +1,7 @@
 package flock
 
 import (
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"sync"
 )
 

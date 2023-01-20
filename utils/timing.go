@@ -1,7 +1,7 @@
 package utils
 
 import (
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"time"
 )
 

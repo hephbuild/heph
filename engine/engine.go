@@ -8,11 +8,11 @@ import (
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	"github.com/charmbracelet/lipgloss"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
 	"heph/config"
 	"heph/engine/htrace"
+	log "heph/hlog"
 	"heph/packages"
 	"heph/sandbox"
 	"heph/targetspec"
@@ -181,7 +181,7 @@ func New(rootPath string) *Engine {
 		fetchRootCache:    map[string]fs2.Path{},
 		cacheRunBuildFile: map[string]starlark.StringDict{},
 		Labels:            sets.NewStringSet(0),
-		gcLock:            flock.NewFlock(homeDir.Join("tmp", "gc.lock").Abs()),
+		gcLock:            flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 	}
 }
 

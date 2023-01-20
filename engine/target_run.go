@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/htrace"
 	"heph/exprs"
+	log "heph/hlog"
 	"heph/sandbox"
 	"heph/targetspec"
 	"heph/utils"
@@ -478,8 +478,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	defer func() {
 		rspan.EndError(rerr)
 	}()
-
-	e.Status(worker.StringStatus(target.FQN))
 
 	err := e.linkTarget(target, NewTargets(0))
 	if err != nil {

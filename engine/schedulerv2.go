@@ -122,7 +122,6 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				re := TargetRunEngine{
 					Engine: e.Engine,
-
 					Status: w.Status,
 				}
 

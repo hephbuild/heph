@@ -1,7 +1,7 @@
 package config
 
 import (
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"io"
 	"os"
 	"path/filepath"

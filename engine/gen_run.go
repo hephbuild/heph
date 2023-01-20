@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"heph/targetspec"
 	"heph/worker"
 	"path/filepath"

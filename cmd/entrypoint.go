@@ -3,7 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"heph/utils"
 	"os"
 	"os/signal"

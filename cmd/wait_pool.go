@@ -1,34 +1,18 @@
 package cmd
 
 import (
-	"bytes"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/reflow/wrap"
-	log "github.com/sirupsen/logrus"
+	"github.com/muesli/termenv"
 	"go.uber.org/multierr"
+	log "heph/hlog"
 	"heph/utils"
 	"heph/worker"
-	"io"
 	"os"
 	"strings"
 	"time"
 )
-
-type hookFunc struct {
-	f func(*log.Entry)
-}
-
-func (h hookFunc) Levels() []log.Level {
-	return log.AllLevels
-}
-
-func (h hookFunc) Fire(entry *log.Entry) error {
-	h.f(entry)
-
-	return nil
-}
 
 func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	start := time.Now()
@@ -118,42 +102,6 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilen
 	return multierr.Combine(perr, derr)
 }
 
-var printf func(string, ...interface{})
-var termWidth int
-
-func init() {
-	log.AddHook(hookFunc{
-		f: func(entry *log.Entry) {
-			printf := printf
-
-			if printf == nil {
-				return
-			}
-
-			if !entry.Logger.IsLevelEnabled(entry.Level) {
-				return
-			}
-
-			b, err := entry.Logger.Formatter.Format(entry)
-			if err != nil {
-				printf(fmt.Sprintf("logger fmt error: %v", err))
-				return
-			}
-
-			b = bytes.TrimSpace(b)
-
-			// Local copy
-			termWidth := termWidth
-
-			if termWidth > 0 && len(b) > termWidth {
-				b = wrap.Bytes(b, termWidth)
-			}
-
-			go printf("%s", b)
-		},
-	})
-}
-
 func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
@@ -172,16 +120,17 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 			pool.Stop(fmt.Errorf("user canceled"))
 		},
 		UpdateMessage: msg(),
-		onTermWidth: func(w int) {
-			termWidth = w
-		},
 	}
 
 	p := tea.NewProgram(r, tea.WithOutput(os.Stderr))
 
+	r.onTermWidth = func(w int) {
+		log.SetPrint(w, func(s string) {
+			p.Println(s)
+		})
+	}
 	r.onInit = func() {
-		log.SetOutput(io.Discard)
-		printf = p.Printf
+		r.onTermWidth(0)
 
 		go func() {
 			t := time.NewTicker(50 * time.Millisecond)
@@ -202,12 +151,9 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 		}()
 	}
 
-	prevOut := log.StandardLogger().Out
-
 	err := p.Start()
+	log.SetPrint(0, nil)
 
-	printf = nil
-	log.SetOutput(prevOut)
 	if err != nil {
 		return err
 	}
@@ -288,16 +234,11 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return r, nil
 }
 
-var styleWorkerStart lipgloss.Style
-var styleFaint lipgloss.Style
+var styleWorkerStart = lipgloss.NewStyle().Bold(true)
+var styleFaint = lipgloss.NewStyle().Faint(true)
 
-func setupPoolStyles() {
-	if !isTerm {
-		return
-	}
-
-	styleWorkerStart = lipgloss.NewStyle().Bold(true)
-	styleFaint = lipgloss.NewStyle().Faint(true)
+func setupPoolStyles(w *os.File) {
+	lipgloss.SetColorProfile(termenv.NewOutput(w).ColorProfile())
 }
 
 func (r *renderer) View() string {

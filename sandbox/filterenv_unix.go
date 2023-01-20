@@ -2,7 +2,7 @@ package sandbox
 
 import (
 	"bytes"
-	log "github.com/sirupsen/logrus"
+	log "heph/hlog"
 	"heph/utils"
 	"os/exec"
 	"sort"

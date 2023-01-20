@@ -3,10 +3,10 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
 	"heph/engine"
+	log "heph/hlog"
 	"heph/worker"
 	"os"
 	"os/exec"

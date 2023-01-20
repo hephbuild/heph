@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	log "github.com/sirupsen/logrus"
 	"heph/config"
+	log "heph/hlog"
 	"heph/packages"
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
@@ -159,7 +159,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 		return p, nil
 	}
 
-	lock := flock.NewFlock(filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
+	lock := flock.NewFlock("Roots", filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
 	err := lock.Lock()
 	if err != nil {
 		return fs2.Path{}, fmt.Errorf("Failed to lock %v", err)

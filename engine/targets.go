@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/heimdalr/dag"
-	log "github.com/sirupsen/logrus"
 	"heph/exprs"
+	log "heph/hlog"
 	"heph/packages"
 	"heph/targetspec"
 	"heph/upgrade"
@@ -763,7 +763,7 @@ func (e *Engine) createDag() error {
 func (e *Engine) lockFactory(t *Target, resource string) flock.Locker {
 	p := e.lockPath(t, resource)
 
-	return flock.NewFlock(p)
+	return flock.NewFlock(t.FQN+" ("+resource+")", p)
 }
 
 func (e *Engine) processTarget(t *Target) error {
