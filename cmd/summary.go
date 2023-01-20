@@ -40,9 +40,13 @@ func summaryPhaseStringOpt(phases ...summaryOpt) string {
 	return ""
 }
 
-func PrintSummary(stats *htrace.Stats) {
+func PrintSummary(stats *htrace.Stats, withGen bool) {
 	spans := make([]htrace.TargetStatsSpan, 0)
 	for _, span := range stats.Spans {
+		if !withGen && span.Gen {
+			continue
+		}
+
 		spans = append(spans, span)
 	}
 

@@ -85,8 +85,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 			log.Error(ctx.Err())
 			return
 		case <-wg.Done():
-			if *summary {
-				PrintSummary(w.e.Stats)
+			if *summary || *summaryGen {
+				PrintSummary(w.e.Stats, *summaryGen)
 				w.e.Stats.Reset()
 			}
 
@@ -99,8 +99,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 
 	err := run(ctx, w.e, r.rrs, !fromStdin)
 
-	if *summary {
-		PrintSummary(w.e.Stats)
+	if *summary || *summaryGen {
+		PrintSummary(w.e.Stats, *summaryGen)
 		w.e.Stats.Reset()
 	}
 

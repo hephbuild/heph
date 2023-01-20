@@ -30,6 +30,7 @@ var ignore *[]string
 var nocache *bool
 var params *[]string
 var summary *bool
+var summaryGen *bool
 var jaegerEndpoint *string
 var ignoreUnknownTarget *bool
 
@@ -62,6 +63,7 @@ func init() {
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
 	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
+	summaryGen = rootCmd.PersistentFlags().Bool("summary-gen", false, "Prints execution stats, including during gen")
 	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
 	ignoreUnknownTarget = rootCmd.PersistentFlags().Bool("ignore-unknown", false, "Ignore unknown targets")
 
@@ -120,8 +122,8 @@ func postRun() {
 
 	Engine.RunExitHandlers()
 
-	if *summary {
-		PrintSummary(Engine.Stats)
+	if *summary || *summaryGen {
+		PrintSummary(Engine.Stats, *summaryGen)
 	}
 
 	log.Cleanup()

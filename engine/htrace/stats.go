@@ -24,6 +24,7 @@ const (
 
 const (
 	AttrPhase      = "heph.phase"
+	AttrDuringGen  = "heph.during_gen"
 	AttrRoot       = "heph.root"
 	AttrOutput     = "heph.output"
 	AttrTargetAddr = "heph.target_addr"
@@ -70,7 +71,12 @@ func findAttr(key string, attributes []attribute.KeyValue) attribute.Value {
 	return AttributeNotFound
 }
 
-func (st *Stats) OnStart(parent context.Context, s tracesdk.ReadWriteSpan) {}
+func (st *Stats) OnStart(parent context.Context, s tracesdk.ReadWriteSpan) {
+	duringGen, _ := parent.Value(AttrDuringGen).(bool)
+	if duringGen {
+		s.SetAttributes(attribute.Bool(AttrDuringGen, true))
+	}
+}
 
 func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 	if findAttr(AttrRoot, s.Attributes()).AsBool() {
@@ -144,6 +150,9 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 		if s.Status().Code == codes.Error {
 			stat.Error = true
 		}
+		if v := findAttr(AttrDuringGen, s.Attributes()); v != AttributeNotFound {
+			stat.Gen = v.AsBool()
+		}
 		if output := findAttr(AttrOutput, s.Attributes()); output != AttributeNotFound {
 			cacheHit := false
 			if v := findAttr(AttrCacheHit, s.Attributes()); v != AttributeNotFound {
@@ -201,6 +210,7 @@ type TargetStatsSpan struct {
 	Phases     []TargetStatsSpanPhase
 	CachePulls []TargetStatsSpanCachePull
 	Error      bool
+	Gen        bool
 }
 
 func (s TargetStatsSpan) Duration() time.Duration {

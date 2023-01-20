@@ -90,7 +90,9 @@ func (e *Engine) SpanRun(ctx context.Context, t *Target) (context.Context, Span)
 }
 
 func (e *Engine) SpanGenPass(ctx context.Context) (context.Context, Span) {
-	return e.newTargetSpan(ctx, "", htrace.PhaseGenPass)
+	ctx, span := e.newTargetSpan(ctx, "", htrace.PhaseGenPass)
+
+	return context.WithValue(ctx, htrace.AttrDuringGen, true), span
 }
 
 func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Target) (context.Context, Span) {

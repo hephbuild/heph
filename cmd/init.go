@@ -44,7 +44,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 	}
 	e.RanInit = true
 
-	if *summary || *jaegerEndpoint != "" {
+	if *summary || *summaryGen || *jaegerEndpoint != "" {
 		opts := []tracesdk.TracerProviderOption{
 			tracesdk.WithResource(resource.NewWithAttributes(
 				semconv.SchemaURL,
@@ -61,7 +61,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 			opts = append(opts, tracesdk.WithBatcher(jexp))
 		}
 
-		if *summary {
+		if *summary || *summaryGen {
 			opts = append(opts, tracesdk.WithSpanProcessor(e.Stats))
 		}
 
