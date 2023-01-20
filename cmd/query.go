@@ -420,17 +420,21 @@ var targetCmd = &cobra.Command{
 
 		fmt.Println(target.FQN)
 
-		fmt.Println("Require Transitive:")
-		printTools("    ", target.RequireTransitive.Tools)
-		printDeps("    ", target.RequireTransitive.Deps)
+		fmt.Println("Transitive:")
+		printTools("    ", target.OwnTransitive.Tools)
+		printDeps("    ", target.OwnTransitive.Deps)
+
+		fmt.Println("Deep Transitive:")
+		printTools("    ", target.DeepOwnTransitive.Tools)
+		printDeps("    ", target.DeepOwnTransitive.Deps)
 
 		fmt.Println("Deps:")
 		printTools("    ", target.Tools)
 		printDeps("    ", target.Deps)
 
-		fmt.Println("Transitive Deps:")
-		printTools("    ", target.Transitive.Tools)
-		printDeps("    ", target.Transitive.Deps)
+		fmt.Println("Deps from transitive:")
+		printTools("    ", target.TransitiveDeps.Tools)
+		printDeps("    ", target.TransitiveDeps.Deps)
 
 		return nil
 	},

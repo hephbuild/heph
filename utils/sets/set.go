@@ -56,6 +56,13 @@ func (ts *Set[K, T]) HasKey(k K) bool {
 	return ok
 }
 
+func (ts *Set[K, T]) GetKey(k K) T {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	return ts.m[k]
+}
+
 func (ts *Set[K, T]) has(t T) bool {
 	k := ts.f(t)
 	_, ok := ts.m[k]

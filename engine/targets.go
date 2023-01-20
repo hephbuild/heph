@@ -30,15 +30,22 @@ type TargetTools struct {
 }
 
 func (t TargetTools) Merge(tools TargetTools) TargetTools {
-	return TargetTools{
-		TargetReferences: append(t.TargetReferences, tools.TargetReferences...),
-		Targets:          append(t.Targets, tools.Targets...),
-		Hosts:            append(t.Hosts, tools.Hosts...),
-	}
+	tt := TargetTools{}
+	tt.TargetReferences = utils.DedupAppend(t.TargetReferences, func(t *Target) string {
+		return t.FQN
+	}, tools.TargetReferences...)
+	tt.Targets = utils.DedupAppend(t.Targets, func(tool TargetTool) string {
+		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
+	}, tools.Targets...)
+	tt.Hosts = utils.DedupAppend(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+		return tool.Name + "|" + tool.Path
+	}, tools.Hosts...)
+
+	return tt
 }
 
 func (t TargetTools) Empty() bool {
-	return len(t.Targets) == 0 && len(t.Hosts) == 0
+	return len(t.Targets) == 0 && len(t.Hosts) == 0 && len(t.TargetReferences) == 0
 }
 
 func (t TargetTools) Dedup() {
@@ -90,18 +97,22 @@ type TargetDeps struct {
 
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
-	nd.Targets = append(d.Targets, deps.Targets...)
-	nd.Files = append(d.Files, deps.Files...)
+	nd.Targets = utils.DedupAppend(d.Targets, func(t TargetWithOutput) string {
+		return t.Full()
+	}, deps.Targets...)
+	nd.Files = utils.DedupAppend(d.Files, func(path fs.Path) string {
+		return path.RelRoot()
+	}, deps.Files...)
 
 	return nd
 }
 
 func (d *TargetDeps) Dedup() {
 	d.Targets = utils.Dedup(d.Targets, func(t TargetWithOutput) string {
-		return t.Target.FQN + t.Output
+		return t.Full()
 	})
-	d.Files = utils.Dedup(d.Files, func(t fs.Path) string {
-		return t.RelRoot()
+	d.Files = utils.Dedup(d.Files, func(path fs.Path) string {
+		return path.RelRoot()
 	})
 }
 
@@ -244,8 +255,7 @@ func (tp *TargetNamedDeps) Set(name string, p TargetDeps) {
 	}
 
 	tp.named[name] = p
-	tp.all.Targets = append(tp.all.Targets, p.Targets...)
-	tp.all.Files = append(tp.all.Files, p.Files...)
+	tp.all = tp.all.Merge(p)
 }
 
 func (tp *TargetNamedDeps) Named() map[string]TargetDeps {
@@ -326,10 +336,14 @@ type Target struct {
 	actualOutFiles *ActualOutNamedPaths
 	Env            map[string]string
 	RuntimeEnv     map[string]TargetRuntimeEnv
-	Transitive     TargetTransitive
 
-	RequireTransitive     TargetTransitive
-	DeepRequireTransitive TargetTransitive
+	// Collected transitive deps from deps/tools
+	TransitiveDeps TargetTransitive
+
+	// Own transitive config
+	OwnTransitive TargetTransitive
+	// Own transitive config plus their own transitive
+	DeepOwnTransitive TargetTransitive
 
 	WorkdirRoot        fs.Path
 	SandboxRoot        fs.Path
@@ -597,10 +611,9 @@ func (ts *Targets) Find(fqn string) *Target {
 		return nil
 	}
 
-	for _, target := range ts.Slice() {
-		if target.FQN == fqn {
-			return target
-		}
+	target := ts.GetKey(fqn)
+	if target != nil {
+		return target
 	}
 
 	panic("should not happen")
@@ -952,24 +965,29 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	}
 
 	// Resolve transitive specs
-	t.RequireTransitive = TargetTransitive{}
-	t.RequireTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
+	t.OwnTransitive = TargetTransitive{}
+	t.OwnTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
 	if err != nil {
 		return err
 	}
-	t.RequireTransitive.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Transitive.Deps, breadcrumb)
+	t.OwnTransitive.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Transitive.Deps, breadcrumb)
 	if err != nil {
 		return err
 	}
-	t.RequireTransitive.Env = t.TargetSpec.Transitive.Env
-	t.RequireTransitive.RuntimeEnv = map[string]TargetRuntimeEnv{}
+	t.OwnTransitive.Env = t.TargetSpec.Transitive.Env
+	t.OwnTransitive.RuntimeEnv = map[string]TargetRuntimeEnv{}
 	for k, v := range t.TargetSpec.Transitive.RuntimeEnv {
-		t.RequireTransitive.RuntimeEnv[k] = TargetRuntimeEnv{
+		t.OwnTransitive.RuntimeEnv[k] = TargetRuntimeEnv{
 			Value:  v,
 			Target: t,
 		}
 	}
-	t.RequireTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
+	t.OwnTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
+
+	t.DeepOwnTransitive, err = e.collectDeepTransitive(t.OwnTransitive, breadcrumb)
+	if err != nil {
+		return err
+	}
 
 	relPathFactory := func(p string) fs.RelPath {
 		abs := strings.HasPrefix(p, "/")
@@ -1012,31 +1030,26 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		}
 	}
 
-	t.DeepRequireTransitive, err = e.computeDeepTransitive(t, breadcrumb)
-	if err != nil {
-		return err
-	}
-
 	// Apply transitive deps
 	//log.Tracef(logPrefix + "Linking transitive")
-	t.Transitive, err = e.collectDepsTransitive(t, breadcrumb)
+	t.TransitiveDeps, err = e.collectTransitiveFromDeps(t, breadcrumb)
 	if err != nil {
 		return err
 	}
 
-	if !t.Transitive.Tools.Empty() {
-		t.Tools = t.Tools.Merge(t.Transitive.Tools)
+	if !t.TransitiveDeps.Tools.Empty() {
+		t.Tools = t.Tools.Merge(t.TransitiveDeps.Tools)
 		t.Tools.Dedup()
 		t.Tools.Sort()
 	}
 
-	if !t.Transitive.Deps.Empty() {
-		t.Deps = t.Deps.Merge(t.Transitive.Deps)
+	if !t.TransitiveDeps.Deps.Empty() {
+		t.Deps = t.Deps.Merge(t.TransitiveDeps.Deps)
 		t.Deps.Dedup()
 		t.Deps.Sort()
 
 		if t.DifferentHashDeps {
-			t.HashDeps = t.HashDeps.Merge(t.Transitive.Deps.All())
+			t.HashDeps = t.HashDeps.Merge(t.TransitiveDeps.Deps.All())
 			t.HashDeps.Dedup()
 			t.HashDeps.Sort()
 		} else {
@@ -1044,11 +1057,15 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		}
 	}
 
-	e.applyEnv(t, t.Transitive.PassEnv, t.Transitive.Env)
+	if t.FQN == "//test/features:tr_deps" {
+		fmt.Print()
+	}
+
+	e.applyEnv(t, t.TransitiveDeps.PassEnv, t.TransitiveDeps.Env)
 	if t.RuntimeEnv == nil {
 		t.RuntimeEnv = map[string]TargetRuntimeEnv{}
 	}
-	for k, v := range t.Transitive.RuntimeEnv {
+	for k, v := range t.TransitiveDeps.RuntimeEnv {
 		t.RuntimeEnv[k] = v
 	}
 
@@ -1195,7 +1212,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 		} else {
 			paths = tt.Out.Named()
 
-			if len(paths) == 0 && tool.Target.DeepRequireTransitive.Empty() {
+			if len(paths) == 0 && tool.Target.DeepOwnTransitive.Empty() {
 				return TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
 			}
 
@@ -1276,17 +1293,18 @@ func (e *Engine) applyEnv(t *Target, passEnv []string, env map[string]string) {
 	}
 }
 
-func (e *Engine) computeDeepTransitive(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
-	tr := t.RequireTransitive
-	targets := make([]*Target, 0, len(tr.Deps.All().Targets)+len(tr.Tools.Targets))
+func (e *Engine) collectDeepTransitive(tr TargetTransitive, breadcrumb *Targets) (TargetTransitive, error) {
+	targets := sets.NewSet(func(t *Target) string {
+		return t.FQN
+	}, 0)
 	for _, dep := range tr.Deps.All().Targets {
-		targets = append(targets, dep.Target)
+		targets.Add(dep.Target)
 	}
 	for _, dep := range tr.Tools.Targets {
-		targets = append(targets, dep.Target)
+		targets.Add(dep.Target)
 	}
 
-	dtr, err := e.collectTransitive(targets, breadcrumb)
+	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)
 	if err != nil {
 		return TargetTransitive{}, err
 	}
@@ -1295,23 +1313,23 @@ func (e *Engine) computeDeepTransitive(t *Target, breadcrumb *Targets) (TargetTr
 	return dtr, nil
 }
 
-func (e *Engine) collectDepsTransitive(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
-	targets := make([]*Target, 0, len(t.Deps.All().Targets)+len(t.Tools.TargetReferences))
+func (e *Engine) collectTransitiveFromDeps(t *Target, breadcrumb *Targets) (TargetTransitive, error) {
+	targets := sets.NewSet(func(t *Target) string {
+		return t.FQN
+	}, 0)
 	for _, dep := range t.Deps.All().Targets {
-		targets = append(targets, dep.Target)
+		targets.Add(dep.Target)
 	}
-	for _, t := range t.Tools.TargetReferences {
-		targets = append(targets, t)
-	}
+	targets.AddAll(t.Tools.TargetReferences)
 
-	return e.collectTransitive(targets, breadcrumb)
+	return e.collectTransitive(targets.Slice(), breadcrumb)
 }
 
 func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (TargetTransitive, error) {
 	tt := TargetTransitive{}
 
 	for _, dep := range deps {
-		tt = tt.Merge(dep.DeepRequireTransitive)
+		tt = tt.Merge(dep.DeepOwnTransitive)
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
