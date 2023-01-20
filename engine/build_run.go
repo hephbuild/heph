@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
 	log "heph/hlog"
@@ -143,6 +144,8 @@ type runBuildEngine struct {
 	pkg            *packages.Package
 	registerTarget func(targetspec.TargetSpec) error
 	breadcrumb     []string
+	targets        []targetspec.TargetSpec
+	globs          []buildFileGlob
 }
 
 func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *packages.Package) *packages.Package {
@@ -340,12 +343,19 @@ func newStarlarkThread() *starlark.Thread {
 }
 
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
-	e.cacheRunBuildFilem.RLock()
-	if globals, ok := e.cacheRunBuildFile[path]; ok {
-		e.cacheRunBuildFilem.RUnlock()
+	e.mutexRunBuildFile.Get(path).Lock()
+	defer e.mutexRunBuildFile.Get(path).Unlock()
+
+	if globals, ok := e.cacheRunBuildFile.GetOk(path); ok {
 		return globals, nil
 	}
-	e.cacheRunBuildFilem.RUnlock()
+
+	globals, err := e.buildFileRunLoad(path)
+	if err == nil {
+		e.cacheRunBuildFile.Set(path, globals)
+		return globals, nil
+	}
+	log.Tracef("cache %v: %v", path, err)
 
 	log.Tracef("BUILD: running %v", path)
 
@@ -368,7 +378,7 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 		return nil, err
 	}
 
-	res, err := prog.Init(thread, universe)
+	globals, err = prog.Init(thread, universe)
 	if err != nil {
 		var eerr *starlark.EvalError
 		if errors.As(err, &eerr) {
@@ -377,9 +387,172 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 		return nil, err
 	}
 
-	e.cacheRunBuildFilem.Lock()
-	e.cacheRunBuildFile[path] = res
-	e.cacheRunBuildFilem.Unlock()
+	exported := make(starlark.StringDict, len(globals))
+	for k, v := range globals {
+		if strings.HasPrefix(k, "_") {
+			continue
+		}
+		exported[k] = v
+	}
 
-	return res, nil
+	e.cacheRunBuildFile.Set(path, exported)
+
+	err = e.buildFileRunStore(path, exported)
+	if err != nil {
+		log.Errorf("caching %v: %v", path, err)
+	}
+
+	return exported, nil
+}
+
+func (e *runBuildEngine) buildFileRunCachePath(path string) string {
+	return filepath.Join(e.HomeDir.Abs(), "tmp", "__build_cache", hash.HashString(path))
+}
+
+type buildFileCache struct {
+	Hash  string
+	Globs []buildFileGlob
+
+	Targets []targetspec.TargetSpec
+	Globals starlark.StringDict
+}
+
+func (e *runBuildEngine) buildFileRunHash(path string, globs []buildFileGlob) (string, error) {
+	h := hash.NewHash()
+	h.I64(2)
+	h.String(e.Config.Version.String)
+	err := e.hashFileModTimePath(h, path)
+	if err != nil {
+		return "", err
+	}
+
+	hash.HashMap(h, e.Config.Params, func(k string, v string) string {
+		return k + v
+	})
+
+	for _, glob := range globs {
+		h.String("=")
+		for _, i := range glob.Include {
+			h.String(i)
+		}
+		h.String("=")
+		for _, i := range glob.Exclude {
+			h.String(i)
+		}
+		h.String("=")
+		for _, i := range glob.Result {
+			h.String(i)
+		}
+	}
+
+	return h.Sum(), nil
+}
+
+func (e *runBuildEngine) glob(pattern string, exclude []string) ([]string, error) {
+	pkg := e.pkg
+
+	allExclude := exclude
+	allExclude = append(allExclude, "**/.heph")
+	allExclude = append(allExclude, e.Config.Glob.Exclude...)
+
+	paths := make([]string, 0)
+	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
+		if d.IsDir() {
+			return nil
+		}
+
+		paths = append(paths, path)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return paths, nil
+}
+
+func (e *runBuildEngine) buildFileRunLoad(path string) (starlark.StringDict, error) {
+	return nil, fmt.Errorf("a")
+
+	f, err := os.Open(e.buildFileRunCachePath(path))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var cache buildFileCache
+	err = json.NewDecoder(f).Decode(&cache)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := e.buildFileRunHash(path, cache.Globs)
+	if err != nil {
+		return nil, err
+	}
+
+	if h != cache.Hash {
+		return nil, fmt.Errorf("cache mismatch current: %v cache: %v", h, cache.Hash)
+	}
+
+	log.Warnf("Cache loading %v: %v", path, len(cache.Targets))
+
+	for _, target := range cache.Targets {
+		target.Package = e.getOrCreatePkg(target.Package.FullName, func(fullname, name string) *packages.Package {
+			return target.Package
+		})
+
+		err = e.registerTarget(target)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return cache.Globals, nil
+}
+
+func (e *runBuildEngine) buildFileRunStore(path string, globals starlark.StringDict) error {
+	return nil
+	for k, value := range globals {
+		switch value.(type) {
+		case *starlark.Function:
+			log.Warnf("Cannot cache %v, %v is %v", path, k, value.Type())
+			return nil
+		}
+	}
+
+	h, err := e.buildFileRunHash(path, e.globs)
+	if err != nil {
+		return err
+	}
+
+	cache := buildFileCache{
+		Hash:    h,
+		Targets: e.targets,
+		Globs:   e.globs,
+		Globals: globals,
+	}
+
+	cachePath := e.buildFileRunCachePath(path)
+
+	err = fs2.CreateParentDir(cachePath)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(cachePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	//enc.SetIndent("", "    ")
+	err = enc.Encode(cache)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -15,6 +15,7 @@ require (
 	github.com/charmbracelet/lipgloss v0.5.0
 	github.com/coreos/go-semver v0.3.0
 	github.com/fsnotify/fsnotify v1.6.0
+	github.com/goccy/go-json v0.10.0
 	github.com/heimdalr/dag v1.2.1
 	github.com/lithammer/fuzzysearch v1.1.5
 	github.com/mattn/go-isatty v0.0.16

@@ -11,7 +11,6 @@ import (
 	"heph/targetspec"
 	"heph/utils"
 	"heph/utils/hash"
-	"io/fs"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -207,6 +206,8 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 
 	t.Source = stackTrace(thread)
 
+	e.targets = append(e.targets, t)
+
 	err = e.registerTarget(t)
 	if err != nil {
 		return nil, err
@@ -216,7 +217,6 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 }
 
 func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	pkg := getPackage(thread)
 	e := getEngine(thread)
 
 	var (
@@ -232,23 +232,20 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	allExclude := exclude.Array
-	allExclude = append(allExclude, "**/.heph")
-	allExclude = append(allExclude, e.Config.Glob.Exclude...)
-
-	elems := make([]starlark.Value, 0)
-	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
-
-		elems = append(elems, starlark.String(path))
-
-		return nil
-	})
+	paths, err := e.glob(pattern, exclude.Array)
 	if err != nil {
 		return nil, err
 	}
+
+	elems := utils.Map(paths, func(path string) starlark.Value {
+		return starlark.String(path)
+	})
+
+	e.globs = append(e.globs, buildFileGlob{
+		Include: []string{pattern},
+		Exclude: exclude.Array,
+		Result:  paths,
+	})
 
 	return starlark.NewList(elems), nil
 }

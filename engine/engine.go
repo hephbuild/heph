@@ -71,8 +71,8 @@ type Engine struct {
 	RanInit                    bool
 	codegenPaths               map[string]*Target
 	fetchRootCache             map[string]fs2.Path
-	cacheRunBuildFilem         sync.RWMutex
-	cacheRunBuildFile          map[string]starlark.StringDict
+	mutexRunBuildFile          maps.KMutex
+	cacheRunBuildFile          *maps.Map[string, starlark.StringDict]
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -80,6 +80,12 @@ type Engine struct {
 	exitHandlersRunning bool
 
 	gcLock flock.Locker
+}
+
+type buildFileGlob struct {
+	Include []string
+	Exclude []string
+	Result  []string
 }
 
 type Config struct {
@@ -179,7 +185,7 @@ func New(rootPath string) *Engine {
 		cacheHashOutput:   &maps.Map[string, string]{},
 		codegenPaths:      map[string]*Target{},
 		fetchRootCache:    map[string]fs2.Path{},
-		cacheRunBuildFile: map[string]starlark.StringDict{},
+		cacheRunBuildFile: &maps.Map[string, starlark.StringDict]{},
 		Labels:            sets.NewStringSet(0),
 		gcLock:            flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 	}
