@@ -14,6 +14,9 @@ type FileConfig struct {
 	Glob struct {
 		Exclude []string `yaml:"exclude,omitempty"`
 	} `yaml:"glob"`
+	Watch struct {
+		Ignore []string `yaml:",omitempty"`
+	} `yaml:"watch"`
 	KeepSandbox     *bool             `yaml:"keep_sandbox"`
 	TargetScheduler string            `yaml:"target_scheduler"`
 	Params          map[string]string `yaml:"params"`
@@ -68,6 +71,7 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)
 	c.Glob.Exclude = append(c.Glob.Exclude, fc.Glob.Exclude...)
+	c.Watch.Ignore = append(c.Watch.Ignore, fc.Watch.Ignore...)
 
 	if c.Extras == nil {
 		c.Extras = map[string]interface{}{}

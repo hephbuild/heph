@@ -116,6 +116,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 }
 
 func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
+	allIgnore := append(*ignore, w.e.Config.Watch.Ignore...)
+
 	// Should be nil if currentEvents is nil
 	var filteredEvents []watchEvent
 	if currentEvents != nil {
@@ -145,8 +147,17 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 				continue
 			}
 
+			rel, err := filepath.Rel(w.e.Root.Abs(), e.Name)
+			if err != nil {
+				continue
+			}
+
+			if _, ok := w.e.GetCodegenOrigin(rel); ok {
+				continue
+			}
+
 			ignored := false
-			for _, p := range *ignore {
+			for _, p := range allIgnore {
 				match, err := doublestar.PathMatch(p, e.Name)
 				if err != nil {
 					return err

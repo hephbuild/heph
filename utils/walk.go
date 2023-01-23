@@ -9,7 +9,16 @@ import (
 	"strings"
 )
 
-func pathMatch(path string, matchers []string) (bool, error) {
+func PathMatch(path string, matchers ...string) (bool, error) {
+	for _, matcher := range matchers[:] {
+		if strings.HasSuffix(matcher, "/**/*") {
+			matcher = strings.TrimSuffix(matcher, "/**/*")
+			if matcher == path {
+				matchers = append(matchers, matcher)
+			}
+		}
+	}
+
 	for _, matcher := range matchers {
 		i := indexMeta(matcher)
 		if i == -1 {
@@ -104,7 +113,7 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			return err
 		}
 
-		skipMatch, err := pathMatch(rel, ignore)
+		skipMatch, err := PathMatch(rel, ignore...)
 		if err != nil {
 			return err
 		}

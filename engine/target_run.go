@@ -78,7 +78,7 @@ func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, 
 }
 
 func (e *TargetRunEngine) warmTargetInput(ctx context.Context, target *Target) (_ bool, rerr error) {
-	err := e.linkTarget(target, NewTargets(0))
+	err := e.LinkTarget(target, NewTargets(0))
 	if err != nil {
 		return false, err
 	}
@@ -96,7 +96,7 @@ func (e *TargetRunEngine) warmTargetInput(ctx context.Context, target *Target) (
 }
 
 func (e *TargetRunEngine) warmTargetOutput(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
-	err := e.linkTarget(target, NewTargets(0))
+	err := e.LinkTarget(target, NewTargets(0))
 	if err != nil {
 		return false, err
 	}
@@ -479,7 +479,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		rspan.EndError(rerr)
 	}()
 
-	err := e.linkTarget(target, NewTargets(0))
+	err := e.LinkTarget(target, NewTargets(0))
 	if err != nil {
 		return err
 	}
@@ -605,13 +605,18 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 
 		run := make([]string, 0)
-		for _, s := range target.Run {
-			out, err := exprs.Exec(s, e.queryFunctions(target))
-			if err != nil {
-				return fmt.Errorf("run `%v`: %w", s, err)
-			}
+		if target.IsTool() {
+			log.Tracef("%v is tool, replacing run", target.FQN)
+			run = []string{target.ToolTarget().AbsPath()}
+		} else {
+			for _, s := range target.Run {
+				out, err := exprs.Exec(s, e.queryFunctions(target))
+				if err != nil {
+					return fmt.Errorf("run `%v`: %w", s, err)
+				}
 
-			run = append(run, out)
+				run = append(run, out)
+			}
 		}
 
 		if rr.Shell {
@@ -856,7 +861,9 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 	target.OutExpansionRoot = &outDir
 
-	e.Status(TargetStatus(target, "Hydrating output..."))
+	if len(target.OutWithSupport.All()) > 0 {
+		e.Status(TargetStatus(target, "Hydrating output..."))
+	}
 
 	err = e.populateActualFilesFromTar(target)
 	if err != nil {
@@ -869,6 +876,8 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 	}
 
 	if target.Cache.Enabled && !e.Config.DisableGC {
+		e.Status(TargetStatus(target, "GC..."))
+
 		err = e.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
 			log.Errorf("gc: %v", err)

@@ -124,6 +124,10 @@ func (t TargetSpec) IsGroup() bool {
 	return len(t.Run) == 1 && t.Run[0] == "group"
 }
 
+func (t TargetSpec) IsTool() bool {
+	return len(t.Run) == 1 && t.Run[0] == "tool"
+}
+
 func (t TargetSpec) IsTextFile() bool {
 	return len(t.Run) == 2 && t.Run[0] == "text_file"
 }

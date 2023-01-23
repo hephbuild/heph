@@ -118,10 +118,11 @@ func (e *Engine) runBuildFileForPackage(pkg *packages.Package, file string) (sta
 }
 
 func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
-	e.TargetsLock.Lock()
+	l := e.TargetsLock.Get(spec.FQN)
+	l.Lock()
 
 	if t := e.Targets.Find(spec.FQN); t != nil {
-		e.TargetsLock.Unlock()
+		l.Unlock()
 
 		if !t.TargetSpec.Equal(spec) {
 			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
@@ -133,7 +134,7 @@ func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 	e.Targets.Add(&Target{
 		TargetSpec: spec,
 	})
-	e.TargetsLock.Unlock()
+	l.Unlock()
 
 	return nil
 }

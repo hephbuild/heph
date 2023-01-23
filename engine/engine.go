@@ -53,7 +53,7 @@ type Engine struct {
 	packagesMutex sync.Mutex
 	Packages      map[string]*packages.Package
 
-	TargetsLock sync.Mutex
+	TargetsLock maps.KMutex
 	Targets     *Targets
 	Labels      *sets.StringSet
 
@@ -70,6 +70,7 @@ type Engine struct {
 	RanGenPass                 bool
 	RanInit                    bool
 	codegenPaths               map[string]*Target
+	tools                      *Targets
 	fetchRootCache             map[string]fs2.Path
 	cacheRunBuildFilem         sync.RWMutex
 	cacheRunBuildFile          map[string]starlark.StringDict
@@ -79,7 +80,8 @@ type Engine struct {
 	exitHandlers        []func()
 	exitHandlersRunning bool
 
-	gcLock flock.Locker
+	gcLock    flock.Locker
+	toolsLock flock.Locker
 }
 
 type Config struct {
@@ -178,10 +180,12 @@ func New(rootPath string) *Engine {
 		cacheHashInput:    &maps.Map[string, string]{},
 		cacheHashOutput:   &maps.Map[string, string]{},
 		codegenPaths:      map[string]*Target{},
+		tools:             NewTargets(0),
 		fetchRootCache:    map[string]fs2.Path{},
 		cacheRunBuildFile: map[string]starlark.StringDict{},
 		Labels:            sets.NewStringSet(0),
 		gcLock:            flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
+		toolsLock:         flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
 	}
 }
 

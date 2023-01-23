@@ -112,13 +112,16 @@ func TestPathMatch(t *testing.T) {
 		{"some/path/to/file", []string{"**/to/**/*"}, true},
 		{"some/path/to/file", []string{"**/file"}, true},
 		{"some/path/to/file", []string{"some/path"}, true},
+		{"some/path/to/file", []string{"some/path/to"}, true},
+		{"some/path/to/file", []string{"some/path/to/file"}, true},
 		{"some/path/to/file", []string{"path/to"}, false},
 		{"some/path/to/file", []string{"some/path/*"}, false},
 		{"some/path/to/file", []string{"some/path/**/*"}, true},
+		{"some/path/to/file", []string{"some/path/to/file/**/*"}, true},
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.path, test.matchers), func(t *testing.T) {
-			actual, err := pathMatch(test.path, test.matchers)
+			actual, err := PathMatch(test.path, test.matchers...)
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, actual)

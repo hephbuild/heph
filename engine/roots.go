@@ -159,7 +159,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 		return p, nil
 	}
 
-	lock := flock.NewFlock("Roots", filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
+	lock := flock.NewFlock("root "+name, filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
 	err := lock.Lock()
 	if err != nil {
 		return fs2.Path{}, fmt.Errorf("Failed to lock %v", err)

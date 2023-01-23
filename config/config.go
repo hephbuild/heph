@@ -27,6 +27,9 @@ type Config struct {
 	Glob struct {
 		Exclude []string `yaml:"exclude"`
 	} `yaml:"glob"`
+	Watch struct {
+		Ignore []string `yaml:"ignore"`
+	} `yaml:"watch"`
 	KeepSandbox     bool              `yaml:"keep_sandbox"`
 	TargetScheduler string            `yaml:"target_scheduler"`
 	Params          map[string]string `yaml:"params"`

@@ -33,7 +33,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 		}
 		log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
 
-		err = e.createDag()
+		err = e.CreateDag()
 		if err != nil {
 			return nil, err
 		}
@@ -87,7 +87,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 
 			w.Status(worker.StringStatus("Creating DAG..."))
 
-			err = e.createDag()
+			err = e.CreateDag()
 			if err != nil {
 				return err
 			}
@@ -175,7 +175,7 @@ func (e *Engine) linkAndDagGenTargets(ctx context.Context) error {
 	}
 	log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
 
-	err = e.createDag()
+	err = e.CreateDag()
 	if err != nil {
 		return err
 	}

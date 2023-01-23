@@ -59,7 +59,15 @@ const versionFile = "version"
 const inputHashFile = "hash_input"
 
 func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string) (rerr error) {
-	e.Status(TargetStatus(target, "Caching..."))
+	names := target.OutWithSupport.Names()
+	names = utils.CopyArray(names)
+	names = targetspec.SortOutputsForHashing(names)
+
+	if target.Cache.Enabled {
+		e.Status(TargetStatus(target, "Caching..."))
+	} else if len(names) > 0 {
+		e.Status(TargetStatus(target, "Storing output..."))
+	}
 
 	span := e.SpanCacheStore(ctx, target)
 	defer func() {
@@ -88,10 +96,6 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	log.Tracef("Taring to cache %v", target.FQN)
-
-	names := target.OutWithSupport.Names()
-	names = utils.CopyArray(names)
-	names = targetspec.SortOutputsForHashing(names)
 
 	for _, name := range names {
 		e.Status(TargetOutputStatus(target, name, "Caching..."))

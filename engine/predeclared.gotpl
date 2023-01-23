@@ -42,13 +42,15 @@ def json_file(data, *args, **kwargs):
 
 def tool_target(*args, **kwargs):
     _fail_if_present(kwargs, "executor")
+    _fail_if_present(kwargs, "run")
     _fail_if_present(kwargs, "run_in_cwd")
     _fail_if_present(kwargs, "sandbox")
     _fail_if_present(kwargs, "cache")
     _fail_if_present(kwargs, "pass_args")
 
     return target(
-        executor="exec",
+        executor='exec',
+        run='tool',
         run_in_cwd=True,
         sandbox=False,
         cache=False,

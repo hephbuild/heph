@@ -366,6 +366,22 @@ type Target struct {
 	cacheLocks      map[string]flock.Locker
 }
 
+func (t *Target) ToolTarget() TargetTool {
+	if !t.IsTool() {
+		panic("not a tool target")
+	}
+
+	ts := t.TargetSpec.Tools.Targets[0]
+
+	for _, tool := range t.Tools.Targets {
+		if tool.Target.FQN == ts.Target {
+			return tool
+		}
+	}
+
+	panic("unable to find tool target bin")
+}
+
 type TargetRuntimeEnv struct {
 	Value  string
 	Target *Target
@@ -677,7 +693,12 @@ func (e *Engine) Parse(ctx context.Context) error {
 	}
 	log.Debugf("ProcessTargets took %v", time.Since(linkStartTime))
 
-	err = e.createDag()
+	err = e.CreateDag()
+	if err != nil {
+		return err
+	}
+
+	err = e.InstallTools()
 	if err != nil {
 		return err
 	}
@@ -709,7 +730,7 @@ func NewTargetNotFoundError(target string) error {
 	}
 }
 
-func (e *Engine) createDag() error {
+func (e *Engine) CreateDag() error {
 	targets := e.linkedTargets()
 
 	e.dag = &DAG{dag.NewDAG()}
@@ -806,6 +827,10 @@ func (e *Engine) processTarget(t *Target) error {
 		}
 	}
 
+	if t.IsTool() {
+		e.tools.Add(t)
+	}
+
 	t.processed = true
 
 	return nil
@@ -840,7 +865,7 @@ func (e *Engine) linkTargets(ctx context.Context, ignoreNotFoundError bool, targ
 		}
 
 		//log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
-		err := e.linkTarget(target, nil)
+		err := e.LinkTarget(target, nil)
 		if err != nil {
 			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, TargetNotFoundErr{})) {
 				return fmt.Errorf("%v: %w", target.FQN, err)
@@ -851,10 +876,24 @@ func (e *Engine) linkTargets(ctx context.Context, ignoreNotFoundError bool, targ
 	return nil
 }
 
+func (e *Engine) GetCodegenOrigin(path string) (*Target, bool) {
+	if dep, ok := e.codegenPaths[path]; ok {
+		return dep, ok
+	}
+
+	for cpath, dep := range e.codegenPaths {
+		if ok, _ := utils.PathMatch(path, cpath); ok {
+			return dep, true
+		}
+	}
+
+	return nil, false
+}
+
 func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	files := make(fs.Paths, 0, len(td.Files))
 	for _, file := range td.Files {
-		if dep, ok := e.codegenPaths[file.RelRoot()]; ok {
+		if dep, ok := e.GetCodegenOrigin(file.RelRoot()); ok {
 			log.Tracef("%v: %v removed from deps, and %v outputs it", t.FQN, file.RelRoot(), dep.FQN)
 		} else {
 			files = append(files, file)
@@ -865,7 +904,7 @@ func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	return td
 }
 
-func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
+func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
 	}
@@ -891,7 +930,7 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		t.m.Unlock()
 
 		for _, dep := range t.linkingDeps.Slice() {
-			err := e.linkTarget(dep, breadcrumb)
+			err := e.LinkTarget(dep, breadcrumb)
 			if err != nil {
 				t.linkingErr = err
 				t.linked = false
@@ -962,6 +1001,13 @@ func (e *Engine) linkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
 	} else {
 		t.HashDeps = t.Deps.All()
+	}
+
+	if t.IsTool() {
+		ts := t.TargetSpec.Tools
+		if len(ts.Targets) != 1 || len(ts.Hosts) > 0 {
+			return fmt.Errorf("is a tool, mut have a single `tool` with a single output")
+		}
 	}
 
 	// Resolve transitive specs
@@ -1141,7 +1187,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 			return TargetTools{}, NewTargetNotFoundError(tool.Target)
 		}
 
-		err := e.linkTarget(tt, breadcrumb)
+		err := e.LinkTarget(tt, breadcrumb)
 		if err != nil {
 			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
 		}
@@ -1329,14 +1375,14 @@ func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (TargetT
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
-		err := e.linkTarget(dep.Target, breadcrumb)
+		err := e.LinkTarget(dep.Target, breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
 	}
 
 	for _, t := range tt.Tools.TargetReferences {
-		err := e.linkTarget(t, breadcrumb)
+		err := e.LinkTarget(t, breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
@@ -1354,7 +1400,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]
 		}
 
 		for _, target := range targets {
-			err := e.linkTarget(target, breadcrumb)
+			err := e.LinkTarget(target, breadcrumb)
 			if err != nil {
 				return nil, fmt.Errorf("collect: %w", err)
 			}
@@ -1368,7 +1414,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]
 		}
 
 		if target != nil {
-			err = e.linkTarget(target, breadcrumb)
+			err = e.LinkTarget(target, breadcrumb)
 			if err != nil {
 				return nil, fmt.Errorf("find_parent: %w", err)
 			}
@@ -1417,7 +1463,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 			return TargetDeps{}, NewTargetNotFoundError(spec.Target)
 		}
 
-		err := e.linkTarget(dt, breadcrumb)
+		err := e.LinkTarget(dt, breadcrumb)
 		if err != nil {
 			return TargetDeps{}, err
 		}
