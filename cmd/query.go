@@ -35,7 +35,7 @@ func init() {
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(targetCmd)
 	queryCmd.AddCommand(pkgsCmd)
-	queryCmd.AddCommand(depsOnCmd)
+	queryCmd.AddCommand(revdepsCmd)
 	queryCmd.AddCommand(depsCmd)
 	queryCmd.AddCommand(outCmd)
 	queryCmd.AddCommand(hashoutCmd)
@@ -43,7 +43,7 @@ func init() {
 	queryCmd.AddCommand(outRootCmd)
 	queryCmd.AddCommand(labelsCmd)
 
-	depsOnCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
+	revdepsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 
 	outCmd.Flags().StringVar(&output, "output", "", "Output name")
@@ -67,15 +67,12 @@ var queryCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		if hasStdin(args) {
-			// Block and read stdin here to prevent multiple bubbletea running at the same time
-			_, err := parseTargetPathsFromStdin()
-			if err != nil {
-				return err
-			}
+		err := blockReadStdin(args)
+		if err != nil {
+			return err
 		}
 
-		err := engineInit(ctx)
+		err = engineInit(ctx)
 		if err != nil {
 			return err
 		}
@@ -223,22 +220,12 @@ var codegenCmd = &cobra.Command{
 var graphCmd = &cobra.Command{
 	Use:               "graph <target>",
 	Short:             "Prints deps target graph",
-	Args:              cobra.ExactValidArgs(1),
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
-		}
-
-		tp, err := targetspec.TargetParse("", args[0])
-		if err != nil {
-			return err
-		}
-
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return fmt.Errorf("target %v not found", args[0])
 		}
 
 		ances, _, err := Engine.DAG().GetAncestorsGraph(target.FQN)
@@ -496,7 +483,7 @@ var pkgsCmd = &cobra.Command{
 			}
 
 			fmt.Printf("%v\n", fullname)
-			fmt.Printf("  %v\n", p.Root.RelRoot())
+			fmt.Printf("  name: %v\n", p.Root.RelRoot())
 			fmt.Println()
 		}
 		return nil
@@ -508,19 +495,9 @@ var depsCmd = &cobra.Command{
 	Short: "Prints target dependencies",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
-		}
-
-		tp, err := targetspec.TargetParse("", args[0])
-		if err != nil {
-			return err
-		}
-
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		fn := Engine.DAG().GetParents
@@ -550,12 +527,22 @@ var depsCmd = &cobra.Command{
 	},
 }
 
-var depsOnCmd = &cobra.Command{
-	Use:   "depson <target>",
-	Short: "Prints targets dependent on",
+var revdepsCmd = &cobra.Command{
+	Use:   "revdeps <target>",
+	Short: "Prints targets dependent on the input",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
+			Engine:  Engine,
+			LinkAll: true,
+		})
 		if err != nil {
 			return err
 		}
@@ -604,19 +591,9 @@ var outCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
-		}
-
-		tp, err := targetspec.TargetParse("", args[0])
-		if err != nil {
-			return err
-		}
-
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
@@ -680,19 +657,9 @@ var hashinCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
-		}
-
-		tp, err := targetspec.TargetParse("", args[0])
-		if err != nil {
-			return err
-		}
-
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		tdeps, err := Engine.ScheduleTargetsWithDeps(cmd.Context(), []*engine.Target{target}, target)

@@ -14,6 +14,17 @@ import (
 // cache reading stdin
 var targetsFromStdin []targetspec.TargetPath
 
+func blockReadStdin(args []string) error {
+	if hasStdin(args) {
+		_, err := parseTargetPathsFromStdin()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func parseTargetPathsFromStdin() ([]targetspec.TargetPath, error) {
 	if targetsFromStdin != nil {
 		return targetsFromStdin, nil
@@ -66,13 +77,41 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 	return targets, nil
 }
 
+func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("expected one arg")
+	}
+
+	err := engineInit(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rrs, err := parseTargetsAndArgsWithEngine(ctx, Engine, args, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(rrs) != 1 {
+		log.Debugf("no rrs: %v", args)
+
+		s := ""
+		if len(args) > 0 {
+			s = args[0]
+		}
+		return nil, engine.NewTargetNotFoundError(s)
+	}
+
+	return rrs[0].Target, nil
+}
+
 func parseTargetsAndArgs(ctx context.Context, args []string) (engine.TargetRunRequests, error) {
 	err := engineInit(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return parseTargetsAndArgsWithEngine(ctx, Engine, args)
+	return parseTargetsAndArgsWithEngine(ctx, Engine, args, true)
 }
 
 func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool) (engine.TargetRunRequests, error) {
@@ -88,6 +127,10 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 
 	rrs := make(engine.TargetRunRequests, 0)
 	for _, target := range targets.Slice() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		if bailOutOnExpr {
 			if len(target.TargetSpec.Deps.Exprs) > 0 {
 				return nil, fmt.Errorf("%v has expr, bailing out", target.FQN)
@@ -107,18 +150,13 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		})
 	}
 
-	err := e.CreateDag()
-	if err != nil {
-		return nil, err
-	}
-
 	return rrs, nil
 }
 
-func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string) (engine.TargetRunRequests, error) {
+func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string, stdin bool) (engine.TargetRunRequests, error) {
 	var tps []targetspec.TargetPath
 	var targs []string
-	if hasStdin(args) {
+	if stdin && hasStdin(args) {
 		// Block and read stdin here to prevent multiple bubbletea running at the same time
 		var err error
 		tps, err = parseTargetPathsFromStdin()

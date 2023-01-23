@@ -16,7 +16,7 @@ type runGenEngine struct {
 	*Engine
 }
 
-func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr error) {
+func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.WaitGroup, rerr error) {
 	if e.RanGenPass {
 		return &worker.WaitGroup{}, nil
 	}
@@ -26,16 +26,11 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 	if len(genTargets) == 0 {
 		log.Debugf("No gen targets, skip gen pass")
 
-		linkStartTime := time.Now()
-		err := e.linkTargets(ctx, true, nil)
-		if err != nil {
-			return nil, fmt.Errorf("linking %w", err)
-		}
-		log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
-
-		err = e.CreateDag()
-		if err != nil {
-			return nil, err
+		if linkAll {
+			err := e.LinkTargets(ctx, false, nil)
+			if err != nil {
+				return nil, fmt.Errorf("linking %w", err)
+			}
 		}
 
 		return &worker.WaitGroup{}, nil
@@ -56,7 +51,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 		deps:   &worker.WaitGroup{},
 	}
 
-	err := ge.linkAndDagGenTargets(ctx)
+	err := ge.linkGenTargets(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -78,18 +73,13 @@ func (e *Engine) ScheduleGenPass(ctx context.Context) (_ *worker.WaitGroup, rerr
 				p.Globals = nil
 			}
 
-			w.Status(worker.StringStatus("Linking targets..."))
+			if linkAll {
+				w.Status(worker.StringStatus("Linking targets..."))
 
-			err := e.linkTargets(ctx, false, nil)
-			if err != nil {
-				return err
-			}
-
-			w.Status(worker.StringStatus("Creating DAG..."))
-
-			err = e.CreateDag()
-			if err != nil {
-				return err
+				err := e.LinkTargets(ctx, false, nil)
+				if err != nil {
+					return err
+				}
 			}
 
 			w.Status(worker.StringStatus("Storing cache..."))
@@ -148,7 +138,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 			}
 
 			if len(genTargets) > 0 {
-				err := e.linkAndDagGenTargets(ctx)
+				err := e.linkGenTargets(ctx)
 				if err != nil {
 					return err
 				}
@@ -167,18 +157,13 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	return nil
 }
 
-func (e *Engine) linkAndDagGenTargets(ctx context.Context) error {
+func (e *Engine) linkGenTargets(ctx context.Context) error {
 	linkStartTime := time.Now()
-	err := e.linkTargets(ctx, false, e.GeneratedTargets())
+	err := e.LinkTargets(ctx, false, e.GeneratedTargets())
 	if err != nil {
 		return fmt.Errorf("linking %w", err)
 	}
 	log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
-
-	err = e.CreateDag()
-	if err != nil {
-		return err
-	}
 
 	return nil
 }

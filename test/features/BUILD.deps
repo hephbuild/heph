@@ -1,0 +1,43 @@
+load("//test", "e2e_test")
+
+e2e_test(
+    name="sanity_gen_deps",
+    cmd="heph q deps '//test/go/mod-transitive-gen:go_bin#build@os=darwin,arch=arm64'",
+    expected_output="""
+//:_std_pkgs_darwin_arm64
+//:go
+//test/go/mod-transitive-gen:_go_lib_e3b0c44298fc1c@os=darwin,arch=arm64
+""".strip(),
+)
+
+e2e_test(
+    name="sanity_gen_revdeps",
+    cmd="heph q revdeps '//test/go/mod-transitive-gen:go_bin#build@os=darwin,arch=arm64'",
+    expected_output="""//test/go/mod-transitive-gen:test""".strip(),
+)
+
+target(
+    name='deps1',
+)
+
+target(
+    name='deps2',
+    deps=':deps1',
+)
+
+target(
+    name='deps3',
+    deps=':deps2',
+)
+
+e2e_test(
+    name="sanity_deps",
+    cmd="heph q deps '//test/features:deps2'",
+    expected_output="""//test/features:deps1""".strip(),
+)
+
+e2e_test(
+    name="sanity_revdeps",
+    cmd="heph q revdeps '//test/features:deps2'",
+    expected_output="""//test/features:deps3""".strip(),
+)

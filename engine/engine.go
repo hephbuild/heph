@@ -8,6 +8,7 @@ import (
 	"github.com/c2fo/vfs/v6"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/heimdalr/dag"
 	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
 	"heph/config"
@@ -186,6 +187,7 @@ func New(rootPath string) *Engine {
 		Labels:            sets.NewStringSet(0),
 		gcLock:            flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 		toolsLock:         flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
+		dag:               &DAG{dag.NewDAG()},
 	}
 }
 
@@ -1020,18 +1022,6 @@ func (e *Engine) registerLabels(labels []string) {
 	for _, label := range labels {
 		e.Labels.Add(label)
 	}
-}
-
-func (e *Engine) GetTargetShortcuts() []targetspec.TargetSpec {
-	aliases := make([]targetspec.TargetSpec, 0)
-	for _, target := range e.Targets.Slice() {
-		spec := target.TargetSpec
-
-		if spec.Package.FullName == "" {
-			aliases = append(aliases, spec)
-		}
-	}
-	return aliases
 }
 
 func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {

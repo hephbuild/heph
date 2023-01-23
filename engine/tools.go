@@ -29,6 +29,7 @@ func (e *Engine) InstallTools() error {
 	sort.Strings(fqns)
 
 	h := hash.NewHash()
+	h.String(e.Config.Version.String)
 	for _, fqn := range fqns {
 		h.String(fqn)
 	}

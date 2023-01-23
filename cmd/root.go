@@ -73,7 +73,6 @@ func init() {
 	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Set parameter name=value")
 
 	rootCmd.Flags().SetInterspersed(false)
-	setupRootUsage()
 }
 
 var cpuProfileFile *os.File
@@ -159,48 +158,6 @@ var rootCmd = &cobra.Command{
 		}
 
 		cobra.OnFinalize(postRun)
-
-		return nil
-	},
-	ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-		_, _, err := preRunAutocomplete(cmd.Context())
-		if err != nil {
-			return nil, cobra.ShellCompDirectiveError
-		}
-
-		aliases := Engine.GetTargetShortcuts()
-
-		names := make([]string, 0)
-		for _, target := range aliases {
-			names = append(names, target.Name)
-		}
-
-		return names, cobra.ShellCompDirectiveNoFileComp
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			_ = cmd.Help()
-			return nil
-		}
-
-		switchToPorcelain()
-
-		err := preRunWithGen(cmd.Context(), false)
-		if err != nil {
-			return err
-		}
-
-		alias := args[0]
-
-		target := Engine.Targets.Find("//:" + alias)
-		if target == nil {
-			return fmt.Errorf("alias %v not defined\n", alias)
-		}
-
-		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, Args: args[1:]}}, true)
-		if err != nil {
-			return err
-		}
 
 		return nil
 	},

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/heimdalr/dag"
 	"heph/exprs"
 	log "heph/hlog"
 	"heph/packages"
@@ -686,18 +685,6 @@ func (e *Engine) Parse(ctx context.Context) error {
 	}
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
-	linkStartTime := time.Now()
-	err = e.linkTargets(ctx, true, nil)
-	if err != nil {
-		return err
-	}
-	log.Debugf("ProcessTargets took %v", time.Since(linkStartTime))
-
-	err = e.CreateDag()
-	if err != nil {
-		return err
-	}
-
 	err = e.InstallTools()
 	if err != nil {
 		return err
@@ -716,6 +703,9 @@ type TargetNotFoundErr struct {
 }
 
 func (e TargetNotFoundErr) Error() string {
+	if e.String == "" {
+		return "target not found"
+	}
 	return fmt.Sprintf("target %v not found", e.String)
 }
 
@@ -728,57 +718,6 @@ func NewTargetNotFoundError(target string) error {
 	return TargetNotFoundErr{
 		String: target,
 	}
-}
-
-func (e *Engine) CreateDag() error {
-	targets := e.linkedTargets()
-
-	e.dag = &DAG{dag.NewDAG()}
-
-	dagStartTime := time.Now()
-	for _, target := range targets.Slice() {
-		_, err := e.dag.AddVertex(target)
-		if err != nil {
-			return err
-		}
-	}
-
-	addEdge := func(src, dst *Target) error {
-		ok, err := e.dag.IsEdge(src.FQN, dst.FQN)
-		if ok || err != nil {
-			return err
-		}
-
-		return e.dag.AddEdge(src.FQN, dst.FQN)
-	}
-
-	for _, target := range targets.Slice() {
-		for _, dep := range target.Deps.All().Targets {
-			err := addEdge(dep.Target, target)
-			if err != nil {
-				return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
-			}
-		}
-
-		if target.DifferentHashDeps {
-			for _, dep := range target.HashDeps.Targets {
-				err := addEdge(dep.Target, target)
-				if err != nil {
-					return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.FQN, target.FQN, err)
-				}
-			}
-		}
-
-		for _, tool := range target.Tools.Targets {
-			err := addEdge(tool.Target, target)
-			if err != nil {
-				return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, target.FQN, err)
-			}
-		}
-	}
-	log.Debugf("DAG took %v", time.Since(dagStartTime))
-
-	return nil
 }
 
 func (e *Engine) lockFactory(t *Target, resource string) flock.Locker {
@@ -850,7 +789,24 @@ func (e *Engine) linkedTargets() *Targets {
 	return targets
 }
 
-func (e *Engine) linkTargets(ctx context.Context, ignoreNotFoundError bool, targets []*Target) error {
+func (e *Engine) toolTargets() *Targets {
+	targets := NewTargets(e.Targets.Len())
+
+	for _, target := range e.Targets.Slice() {
+		if !target.IsTool() {
+			continue
+		}
+
+		targets.Add(target)
+	}
+
+	return targets
+}
+
+func (e *Engine) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targets []*Target) error {
+	linkDone := utils.TraceTiming("link targets")
+	defer linkDone()
+
 	for _, target := range e.Targets.Slice() {
 		target.resetLinking()
 	}
@@ -1113,21 +1069,58 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 	e.registerLabels(t.Labels)
 
+	err = e.registerDag(t)
+	if rerr != nil {
+		return rerr
+	}
+
+	parents, err := e.DAG().GetParents(t)
+	if err != nil {
+		return err
+	}
+	t.linkingDeps.AddAll(parents)
+	t.linkingDeps.Sort()
+
+	return nil
+}
+
+func (e *Engine) registerDag(t *Target) error {
+	_, err := e.dag.AddVertex(t)
+	if err != nil {
+		return err
+	}
+
+	addEdge := func(src, dst *Target) error {
+		ok, err := e.dag.IsEdge(src.FQN, dst.FQN)
+		if ok || err != nil {
+			return err
+		}
+
+		return e.dag.AddEdge(src.FQN, dst.FQN)
+	}
+
 	for _, dep := range t.Deps.All().Targets {
-		t.linkingDeps.Add(dep.Target)
+		err := addEdge(dep.Target, t)
+		if err != nil {
+			return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, t.FQN, err)
+		}
 	}
 
 	if t.DifferentHashDeps {
 		for _, dep := range t.HashDeps.Targets {
-			t.linkingDeps.Add(dep.Target)
+			err := addEdge(dep.Target, t)
+			if err != nil {
+				return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.FQN, t.FQN, err)
+			}
 		}
 	}
 
-	for _, dep := range t.Tools.Targets {
-		t.linkingDeps.Add(dep.Target)
+	for _, tool := range t.Tools.Targets {
+		err := addEdge(tool.Target, t)
+		if err != nil {
+			return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, t.FQN, err)
+		}
 	}
-
-	t.linkingDeps.Sort()
 
 	return nil
 }

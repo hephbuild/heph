@@ -74,7 +74,7 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 	defer close(runCh)
 
 	if !w.e.RanGenPass {
-		wg, err := w.e.ScheduleGenPass(ctx)
+		wg, err := w.e.ScheduleGenPass(ctx, true)
 		if err != nil {
 			log.Error(err)
 			return
@@ -266,7 +266,7 @@ func (w *watchCtx) runGraph(args []string) error {
 	}
 	e := w.e
 
-	w.rrs, err = parseTargetsAndArgsWithEngine(w.ctx, e, args)
+	w.rrs, err = parseTargetsAndArgsWithEngine(w.ctx, e, args, true)
 	if err != nil {
 		return err
 	}
@@ -379,19 +379,9 @@ var watchCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		if hasStdin(args) {
-			tps, err := parseTargetPathsFromStdin()
-			if err != nil {
-				return err
-			}
-
-			if len(tps) == 0 {
-				return nil
-			}
-		} else {
-			if len(args) == 0 {
-				return nil
-			}
+		err := blockReadStdin(args)
+		if err != nil {
+			return err
 		}
 
 		fromStdin := hasStdin(args)

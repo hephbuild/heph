@@ -130,6 +130,7 @@ type PreRunOpts struct {
 	Engine       *engine.Engine
 	Silent       bool
 	PoolWaitName string
+	LinkAll      bool
 }
 
 func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
@@ -142,10 +143,17 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 
 	if *noGen {
 		log.Info("Generated targets disabled")
+		if opts.LinkAll {
+			err := e.LinkTargets(ctx, true, nil)
+			if err != nil {
+				return fmt.Errorf("linking %w", err)
+			}
+		}
+
 		return nil
 	}
 
-	deps, err := e.ScheduleGenPass(ctx)
+	deps, err := e.ScheduleGenPass(ctx, opts.LinkAll)
 	if err != nil {
 		return err
 	}
