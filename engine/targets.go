@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/heimdalr/dag"
 	"heph/exprs"
 	log "heph/hlog"
 	"heph/packages"
@@ -37,7 +38,7 @@ func (t TargetTools) Merge(tools TargetTools) TargetTools {
 		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
 	}, tools.Targets...)
 	tt.Hosts = utils.DedupAppend(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
-		return tool.Name + "|" + tool.Path
+		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	}, tools.Hosts...)
 
 	return tt
@@ -49,7 +50,7 @@ func (t TargetTools) Empty() bool {
 
 func (t TargetTools) Dedup() {
 	t.Hosts = utils.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
-		return tool.Name + "|" + tool.Path
+		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	})
 	t.Targets = utils.Dedup(t.Targets, func(tool TargetTool) string {
 		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
@@ -1070,8 +1071,8 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	e.registerLabels(t.Labels)
 
 	err = e.registerDag(t)
-	if rerr != nil {
-		return rerr
+	if err != nil {
+		return err
 	}
 
 	parents, err := e.DAG().GetParents(t)
@@ -1086,7 +1087,7 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 
 func (e *Engine) registerDag(t *Target) error {
 	_, err := e.dag.AddVertex(t)
-	if err != nil {
+	if err != nil && !errors.As(err, &dag.VertexDuplicateError{}) {
 		return err
 	}
 

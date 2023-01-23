@@ -200,7 +200,11 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	}
 
 	for _, t := range target.Tools.Hosts {
-		bin[t.Name] = t.Path
+		var err error
+		bin[t.Name], err = t.ResolvedPath()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	log.Tracef("Bin %#v", bin)
@@ -449,7 +453,10 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	}
 	for _, tool := range target.Tools.Hosts {
 		k := "TOOL_" + strings.ToUpper(tool.Name)
-		env[normalizeEnv(k)] = tool.Path
+		env[normalizeEnv(k)], err = tool.ResolvedPath()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for k, expr := range target.RuntimeEnv {

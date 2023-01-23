@@ -3,12 +3,9 @@ package engine
 import (
 	"fmt"
 	"heph/exprs"
-	log "heph/hlog"
 	"heph/packages"
 	"heph/targetspec"
 	"heph/utils"
-	"os"
-	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
@@ -279,27 +276,13 @@ func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools
 		return nil
 	}
 
-	lookPath := exec.LookPath
-	if tool == "heph" {
-		lookPath = func(file string) (string, error) {
-			return os.Executable()
-		}
-	}
-
-	binPath, err := lookPath(tool)
-	if err != nil {
-		return fmt.Errorf("%v is not a target, and cannot be found in PATH", tool)
-	}
-
-	log.Tracef("%v Using tool %v from %v", t.FQN, tool, binPath)
-
 	if name == "" {
 		name = tool
 	}
 
 	ts.Hosts = append(ts.Hosts, targetspec.TargetSpecHostTool{
-		Name: name,
-		Path: binPath,
+		Name:    name,
+		BinName: tool,
 	})
 
 	return nil

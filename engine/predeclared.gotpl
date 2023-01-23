@@ -55,5 +55,6 @@ def tool_target(*args, **kwargs):
         sandbox=False,
         cache=False,
         pass_args=True,
+        pass_env='*',
         *args, **kwargs
     )

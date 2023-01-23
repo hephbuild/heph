@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"heph/exprs"
 	"heph/packages"
+	"heph/utils"
+	"heph/utils/maps"
+	"os"
+	"os/exec"
 	"time"
 )
 
@@ -178,8 +182,27 @@ type TargetSpecExprTool struct {
 }
 
 type TargetSpecHostTool struct {
-	Name string
-	Path string
+	Name    string
+	BinName string
+	Path    string
+}
+
+var binCache = maps.Map[string, utils.Once[string]]{}
+
+func (t TargetSpecHostTool) ResolvedPath() (string, error) {
+	if t.Path != "" {
+		return t.Path, nil
+	}
+
+	if t.BinName == "heph" {
+		return os.Executable()
+	}
+
+	once := binCache.Get(t.BinName)
+
+	return once.Do(func() (string, error) {
+		return exec.LookPath(t.BinName)
+	})
 }
 
 type TargetSpecDeps struct {

@@ -1,18 +1,21 @@
 load("//test", "e2e_test")
+load("//backend/go", "go_bin_build_addr")
+
+bin = go_bin_build_addr('//test/go/mod-transitive-gen')
 
 e2e_test(
     name="sanity_gen_deps",
-    cmd="heph q deps '//test/go/mod-transitive-gen:go_bin#build@os=darwin,arch=arm64'",
-    expected_output="""
-//:_std_pkgs_darwin_arm64
+    cmd="heph q deps '{}'".format(bin),
+    expect_output_contains="""
+//:_std_pkgs_OS_ARCH
 //:go
-//test/go/mod-transitive-gen:_go_lib_e3b0c44298fc1c@os=darwin,arch=arm64
-""".strip(),
+//test/go/mod-transitive-gen:_go_lib_
+""".replace("OS", get_os()).replace("ARCH", get_arch()).strip(),
 )
 
 e2e_test(
     name="sanity_gen_revdeps",
-    cmd="heph q revdeps '//test/go/mod-transitive-gen:go_bin#build@os=darwin,arch=arm64'",
+    cmd="heph q revdeps '{}'".format(bin),
     expected_output="""//test/go/mod-transitive-gen:test""".strip(),
 )
 

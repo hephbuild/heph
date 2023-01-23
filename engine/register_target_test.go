@@ -13,7 +13,6 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -53,11 +52,6 @@ func TestTargetSpec(t *testing.T) {
 			build := strings.TrimSpace(parts[0])
 			expected := strings.TrimSpace(parts[1])
 
-			lspath, err := exec.LookPath("ls")
-			require.NoError(t, err)
-
-			expected = strings.ReplaceAll(expected, "REPLACE_LS_BIN", lspath)
-
 			var spec targetspec.TargetSpec
 
 			e := &runBuildEngine{
@@ -86,8 +80,10 @@ func TestTargetSpec(t *testing.T) {
 
 			spec.Source = nil
 
-			actual, err := json.MarshalIndent(spec, "", "    ")
+			actualb, err := json.MarshalIndent(spec, "", "    ")
 			require.NoError(t, err)
+
+			actual := string(actualb)
 
 			if *testWriteExpected {
 				f, err := os.Create(file)
@@ -95,15 +91,13 @@ func TestTargetSpec(t *testing.T) {
 
 				defer f.Close()
 
-				actual := strings.ReplaceAll(string(actual), lspath, "REPLACE_LS_BIN")
-
 				_, err = fmt.Fprintf(f, "%v\n===\n%v", build, actual)
 				require.NoError(t, err)
 			}
 
-			t.Log(string(actual))
+			t.Log(actual)
 
-			assert.JSONEq(t, expected, string(actual))
+			assert.JSONEq(t, expected, actual)
 		})
 	}
 }

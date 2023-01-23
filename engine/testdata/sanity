@@ -69,7 +69,8 @@ target(
         "Hosts": [
             {
                 "Name": "ls",
-                "Path": "REPLACE_LS_BIN"
+                "BinName": "ls",
+                "Path": ""
             }
         ],
         "Exprs": null
