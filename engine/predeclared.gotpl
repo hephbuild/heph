@@ -47,6 +47,7 @@ def tool_target(*args, **kwargs):
     _fail_if_present(kwargs, "sandbox")
     _fail_if_present(kwargs, "cache")
     _fail_if_present(kwargs, "pass_args")
+    _fail_if_present(kwargs, "concurrent_execution")
 
     return target(
         executor='exec',
@@ -56,5 +57,6 @@ def tool_target(*args, **kwargs):
         cache=False,
         pass_args=True,
         pass_env='*',
+        concurrent_execution=True,
         *args, **kwargs
     )

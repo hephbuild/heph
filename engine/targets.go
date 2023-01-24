@@ -750,12 +750,11 @@ func (e *Engine) processTarget(t *Target) error {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
 
-	t.runLock = e.lockFactory(t, "run")
-	//if t.Cache.Enabled {
-	//	t.runLock = e.lockFactory(t, "run")
-	//} else {
-	//	t.runLock = flock.NewMutex(t.FQN)
-	//}
+	if t.ConcurrentExecution {
+		t.runLock = flock.NewMutex(t.FQN)
+	} else {
+		t.runLock = e.lockFactory(t, "run")
+	}
 	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
 	t.cacheLocks = map[string]flock.Locker{}
 	for _, o := range t.TargetSpec.Out {
@@ -873,6 +872,16 @@ func (e *Engine) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	return td
 }
 
+func (e *Engine) preventDepOnTool(t *Target, td TargetDeps) error {
+	for _, target := range td.Targets {
+		if target.Target.IsTool() {
+			return fmt.Errorf("cannot depend on %v because it is a tool", target.Target.FQN)
+		}
+	}
+
+	return nil
+}
+
 func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
@@ -968,6 +977,10 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
 		}
 		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
+		err = e.preventDepOnTool(t, t.HashDeps)
+		if err != nil {
+			return err
+		}
 	} else {
 		t.HashDeps = t.Deps.All()
 	}
@@ -1161,6 +1174,11 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, 
 	td := TargetNamedDeps{}
 	for name, deps := range m {
 		ldeps, err := e.linkTargetDeps(t, deps, breadcrumb)
+		if err != nil {
+			return TargetNamedDeps{}, err
+		}
+
+		err = e.preventDepOnTool(t, ldeps)
 		if err != nil {
 			return TargetNamedDeps{}, err
 		}

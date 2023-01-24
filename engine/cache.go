@@ -63,6 +63,11 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	names = utils.CopyArray(names)
 	names = targetspec.SortOutputsForHashing(names)
 
+	if len(names) == 0 {
+		log.Debugf("%v does not have any output, skipping storeCache", target.FQN)
+		return nil
+	}
+
 	if target.Cache.Enabled {
 		e.Status(TargetStatus(target, "Caching..."))
 	} else if len(names) > 0 {

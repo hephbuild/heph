@@ -47,16 +47,27 @@ var fmtBufPool = sync.Pool{New: func() any {
 	return new(bytes.Buffer)
 }}
 
-func (f *Formatter) Format(entry Entry) []byte {
+type Buffer struct {
+	buf *bytes.Buffer
+}
+
+func (b Buffer) Bytes() []byte {
+	return b.buf.Bytes()
+}
+
+func (b Buffer) Free() {
+	fmtBufPool.Put(b.buf)
+}
+
+func (f *Formatter) Format(entry Entry) Buffer {
 	buf := fmtBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
-	defer fmtBufPool.Put(buf)
 
 	buf.WriteString(LevelStyle(entry.Level).Render(entry.Level.String() + "|"))
 	buf.WriteRune(' ')
 	buf.WriteString(entry.Message)
 
-	return buf.Bytes()
+	return Buffer{buf}
 }
 
 func NewConsole(w io.Writer) Collector {
@@ -69,7 +80,10 @@ type console struct {
 }
 
 func (c console) Write(entry Entry) error {
-	c.w.Write(c.fmt.Format(entry))
+	buf := c.fmt.Format(entry)
+	defer buf.Free()
+
+	c.w.Write(buf.Bytes())
 	c.w.Write([]byte{'\n'})
 	return nil
 }

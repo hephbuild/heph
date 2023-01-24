@@ -29,7 +29,10 @@ func (t interceptCore) Log(entry log.Entry) error {
 	if printf != nil {
 		termWidth := t.width
 
-		b := t.fmt.Format(entry)
+		buf := t.fmt.Format(entry)
+		defer buf.Free()
+
+		b := buf.Bytes()
 
 		if termWidth > 0 && len(b) > termWidth {
 			b = wrap.Bytes(b, termWidth)

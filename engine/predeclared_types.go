@@ -7,34 +7,35 @@ import (
 )
 
 type TargetArgs struct {
-	Name           string
-	Pkg            string
-	Run            ArrayMap
-	FileContent    string
-	Executor       string
-	RunInCwd       bool
-	Quiet          bool
-	PassArgs       bool
-	Cache          TargetArgsCache
-	RestoreCache   bool
-	SupportFiles   Array
-	SandboxEnabled bool
-	OutInSandbox   bool
-	Gen            bool
-	Codegen        string
-	Deps           ArrayMap
-	HashDeps       ArrayMap
-	Tools          ArrayMap
-	Labels         ArrayMap
-	Out            ArrayMap
-	Env            ArrayMap
-	PassEnv        ArrayMap
-	RuntimeEnv     ArrayMap
-	SrcEnv         SrcEnv
-	OutEnv         string
-	HashFile       string
-	Transitive     TargetArgsTransitive
-	Timeout        string
+	Name                string
+	Pkg                 string
+	Run                 ArrayMap
+	ConcurrentExecution bool
+	FileContent         string
+	Executor            string
+	RunInCwd            bool
+	Quiet               bool
+	PassArgs            bool
+	Cache               TargetArgsCache
+	RestoreCache        bool
+	SupportFiles        Array
+	SandboxEnabled      bool
+	OutInSandbox        bool
+	Gen                 bool
+	Codegen             string
+	Deps                ArrayMap
+	HashDeps            ArrayMap
+	Tools               ArrayMap
+	Labels              ArrayMap
+	Out                 ArrayMap
+	Env                 ArrayMap
+	PassEnv             ArrayMap
+	RuntimeEnv          ArrayMap
+	SrcEnv              SrcEnv
+	OutEnv              string
+	HashFile            string
+	Transitive          TargetArgsTransitive
+	Timeout             string
 }
 
 type TargetArgsTransitive struct {

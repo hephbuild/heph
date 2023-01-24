@@ -878,7 +878,18 @@ func (e *Engine) populateActualFilesFromTar(target *Target) error {
 }
 
 func (e *Engine) sandboxRoot(target *Target) fs2.Path {
-	return e.HomeDir.Join("sandbox", target.Package.FullName, "__target_"+target.Name)
+	folder := "__target_" + target.Name
+	if target.ConcurrentExecution {
+		folder = "__target_tmp_" + SOMEID + "_" + target.Name
+	}
+
+	p := e.HomeDir.Join("sandbox", target.Package.FullName, folder)
+
+	if target.ConcurrentExecution {
+		e.RegisterRemove(p.Abs())
+	}
+
+	return p
 }
 
 func (e *Engine) Clean(async bool) error {

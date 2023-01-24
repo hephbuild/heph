@@ -20,7 +20,7 @@ func (l *Logger) logf(lvl Level, f string, args ...interface{}) {
 		return
 	}
 
-	l.log(lvl, fmt.Sprintf(f, args...))
+	l.logs(lvl, fmt.Sprintf(f, args...))
 }
 
 func (l *Logger) log(lvl Level, args ...any) {
@@ -38,10 +38,17 @@ func (l *Logger) log(lvl Level, args ...any) {
 		}
 	}
 
+	l.logs(lvl, strings.Join(argsstr, " "))
+}
+func (l *Logger) logs(lvl Level, s string) {
+	if !l.core.Enabled(lvl) {
+		return
+	}
+
 	err := l.core.Log(Entry{
 		Timestamp: time.Now(),
 		Level:     lvl,
-		Message:   strings.Join(argsstr, " "),
+		Message:   s,
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "error logging: %v", err)

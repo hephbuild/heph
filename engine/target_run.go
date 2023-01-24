@@ -148,7 +148,14 @@ func normalizeEnv(k string) string {
 }
 
 func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
-	f, err := os.Create(filepath.Join(e.tmpRoot(target), name))
+	tmppath := filepath.Join(e.tmpRoot(target), name)
+
+	err := fs.CreateParentDir(tmppath)
+	if err != nil {
+		return err, func() {}
+	}
+
+	f, err := os.Create(tmppath)
 	if err != nil {
 		return err, func() {}
 	}

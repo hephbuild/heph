@@ -14,14 +14,15 @@ import (
 
 func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec, error) {
 	t := targetspec.TargetSpec{
-		FQN:         pkg.TargetPath(args.Name),
-		Name:        args.Name,
-		Run:         args.Run.Array,
-		FileContent: []byte(args.FileContent),
-		Executor:    args.Executor,
-		Package:     pkg,
-		PassArgs:    args.PassArgs,
-		Quiet:       args.Quiet,
+		FQN:                 pkg.TargetPath(args.Name),
+		Name:                args.Name,
+		Run:                 args.Run.Array,
+		FileContent:         []byte(args.FileContent),
+		ConcurrentExecution: args.ConcurrentExecution,
+		Executor:            args.Executor,
+		Package:             pkg,
+		PassArgs:            args.PassArgs,
+		Quiet:               args.Quiet,
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named,
@@ -205,6 +206,10 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 				return targetspec.TargetSpec{}, fmt.Errorf("timeout: %w", err)
 			}
 		}
+	}
+
+	if args.Cache.Enabled && args.ConcurrentExecution {
+		return targetspec.TargetSpec{}, fmt.Errorf("concurrent_execution and cache are incompatible")
 	}
 
 	return t, nil

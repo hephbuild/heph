@@ -85,35 +85,36 @@ type TargetSpec struct {
 	FQN     string
 	Package *packages.Package
 
-	Run               []string
-	FileContent       []byte // Used by special target `text_file`
-	Executor          string
-	Quiet             bool
-	Dir               string
-	PassArgs          bool
-	Deps              TargetSpecDeps
-	HashDeps          TargetSpecDeps
-	DifferentHashDeps bool
-	Tools             TargetSpecTools
-	Out               []TargetSpecOutFile
-	Cache             TargetSpecCache
-	RestoreCache      bool
-	HasSupportFiles   bool
-	Sandbox           bool
-	OutInSandbox      bool
-	Codegen           string
-	Labels            []string
-	Env               map[string]string
-	PassEnv           []string
-	RunInCwd          bool
-	Gen               bool
-	Source            []string
-	RuntimeEnv        map[string]string
-	SrcEnv            TargetSpecSrcEnv
-	OutEnv            string
-	HashFile          string
-	Transitive        TargetSpecTransitive
-	Timeout           time.Duration
+	Run                 []string
+	FileContent         []byte // Used by special target `text_file`
+	Executor            string
+	ConcurrentExecution bool
+	Quiet               bool
+	Dir                 string
+	PassArgs            bool
+	Deps                TargetSpecDeps
+	HashDeps            TargetSpecDeps
+	DifferentHashDeps   bool
+	Tools               TargetSpecTools
+	Out                 []TargetSpecOutFile
+	Cache               TargetSpecCache
+	RestoreCache        bool
+	HasSupportFiles     bool
+	Sandbox             bool
+	OutInSandbox        bool
+	Codegen             string
+	Labels              []string
+	Env                 map[string]string
+	PassEnv             []string
+	RunInCwd            bool
+	Gen                 bool
+	Source              []string
+	RuntimeEnv          map[string]string
+	SrcEnv              TargetSpecSrcEnv
+	OutEnv              string
+	HashFile            string
+	Transitive          TargetSpecTransitive
+	Timeout             time.Duration
 }
 
 type TargetSpecTransitive struct {

@@ -19,6 +19,7 @@ target(
     "Run": null,
     "FileContent": "",
     "Executor": "bash",
+    "ConcurrentExecution": false,
     "Quiet": false,
     "Dir": "",
     "PassArgs": false,
