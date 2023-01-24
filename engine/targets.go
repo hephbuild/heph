@@ -61,9 +61,14 @@ func (t TargetTools) Dedup() {
 }
 
 func (t TargetTools) Sort() {
-	sort.Slice(t.Hosts, func(i, j int) bool {
-		return t.Hosts[i].Name < t.Hosts[j].Name
-	})
+	sort.Slice(t.Hosts, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(t.Hosts[i].BinName, t.Hosts[j].BinName)
+		},
+		func(i, j int) int {
+			return strings.Compare(t.Hosts[i].Name, t.Hosts[j].Name)
+		},
+	))
 
 	sort.Slice(t.Targets, utils.MultiLess(
 		func(i, j int) int {
@@ -74,9 +79,14 @@ func (t TargetTools) Sort() {
 		},
 	))
 
-	sort.Slice(t.TargetReferences, func(i, j int) bool {
-		return t.TargetReferences[i].Name < t.TargetReferences[j].Name
-	})
+	sort.Slice(t.TargetReferences, utils.MultiLess(
+		func(i, j int) int {
+			return strings.Compare(t.TargetReferences[i].FQN, t.TargetReferences[j].FQN)
+		},
+		func(i, j int) int {
+			return strings.Compare(t.TargetReferences[i].Name, t.TargetReferences[j].Name)
+		},
+	))
 }
 
 type TargetTool struct {

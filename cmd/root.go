@@ -55,6 +55,7 @@ func init() {
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
 	rootCmd.AddCommand(gcCmd)
+	rootCmd.AddCommand(validateCmd)
 
 	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
 	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
@@ -280,6 +281,32 @@ var cleanLockCmd = &cobra.Command{
 				return err
 			}
 		}
+
+		return nil
+	},
+}
+
+var validateCmd = &cobra.Command{
+	Use:   "validate",
+	Short: "Validate the complete graph",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
+			Engine:  Engine,
+			LinkAll: true,
+		})
+		if err != nil {
+			return err
+		}
+
+		log.Info("Build graph is valid")
 
 		return nil
 	},

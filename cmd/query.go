@@ -679,10 +679,9 @@ var hashinCmd = &cobra.Command{
 }
 
 var labelsCmd = &cobra.Command{
-	Use:               "labels",
-	Short:             "Prints labels",
-	Args:              cobra.NoArgs,
-	ValidArgsFunction: ValidArgsFunctionTargets,
+	Use:   "labels",
+	Short: "Prints labels",
+	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		err := preRunWithGen(cmd.Context(), false)
 		if err != nil {
