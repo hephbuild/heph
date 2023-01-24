@@ -7,6 +7,7 @@ type FileConfig struct {
 	Cache        map[string]FileCache `yaml:",omitempty"`
 	CacheHistory int                  `yaml:"cache_history"`
 	DisableGC    *bool                `yaml:"disable_gc"`
+	InstallTools *bool                `yaml:"install_tools"`
 	BuildFiles   struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
@@ -40,6 +41,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.DisableGC != nil {
 		c.DisableGC = *fc.DisableGC
+	}
+
+	if fc.InstallTools != nil {
+		c.InstallTools = *fc.InstallTools
 	}
 
 	if len(fc.Cache) == 0 && fc.Cache != nil {

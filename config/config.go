@@ -20,6 +20,7 @@ type Config struct {
 	Cache        map[string]Cache
 	CacheHistory int  `yaml:"cache_history"`
 	DisableGC    bool `yaml:"disable_gc"`
+	InstallTools bool `yaml:"install_tools"`
 	BuildFiles   struct {
 		Ignore []string        `yaml:"ignore"`
 		Roots  map[string]Root `yaml:"roots"`

@@ -56,6 +56,7 @@ func init() {
 	rootCmd.AddCommand(queryCmd)
 	rootCmd.AddCommand(gcCmd)
 	rootCmd.AddCommand(validateCmd)
+	rootCmd.AddCommand(setupCmd)
 
 	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
 	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
@@ -307,6 +308,22 @@ var validateCmd = &cobra.Command{
 		}
 
 		log.Info("Build graph is valid")
+
+		return nil
+	},
+}
+
+var setupCmd = &cobra.Command{
+	Use:   "setup",
+	Short: "Installs tools in path",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
 
 		return nil
 	},

@@ -696,9 +696,11 @@ func (e *Engine) Parse(ctx context.Context) error {
 	}
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
-	err = e.InstallTools()
-	if err != nil {
-		return err
+	if e.Config.InstallTools {
+		err = e.InstallTools()
+		if err != nil {
+			return err
+		}
 	}
 
 	e.autocompleteHash, err = e.computeAutocompleteHash()

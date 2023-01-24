@@ -4,6 +4,7 @@ import (
 	"errors"
 	log "heph/hlog"
 	"heph/targetspec"
+	"heph/utils/fs"
 	"heph/utils/hash"
 	"os"
 	"sort"
@@ -12,7 +13,7 @@ import (
 
 var toolTemplate = strings.TrimSpace(`
 #!/bin/sh
-heph run TARGET -- "$@" 
+exec heph run TARGET -- "$@" 
 `)
 
 func (e *Engine) InstallTools() error {
@@ -73,10 +74,17 @@ func (e *Engine) InstallTools() error {
 		}
 	}
 
+	err = fs.CreateParentDir(hashPath)
+	if err != nil {
+		return err
+	}
+
 	err = os.WriteFile(hashPath, []byte(toolsHash), os.ModePerm)
 	if err != nil {
 		return err
 	}
+
+	log.Infof("Tools installed at %v", dir.Abs())
 
 	return nil
 }
