@@ -147,7 +147,6 @@ Creates a target which will proxy invocation to a binary, this is useful to allo
 ```python
 tool_target(
     name="go",
-    run="go",
     tools=['//thirparty/go:go']
 )
 ```

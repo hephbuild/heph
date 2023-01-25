@@ -12,9 +12,20 @@ build_files:
       uri: git://github.com/hephbuild/heph.git@master:/backend/go
 
 go_backend:
-  version: 1.18.4
-  go: //go_backend:go|go
-  gofmt: //go_backend:go|gofmt
+  go: //some/path:go|go
+  gofmt: //some/path:go|gofmt
+```
+
+And the following somewhere in your repo:
+
+```yaml title="some/path/BUILD"
+go_toolchain(
+    name="go",
+    version="1.18.4",
+    architectures=[
+        "linux_amd64", "linux_arm64",
+    ],
+)
 ```
 
 This will import the go backend and configure it. 

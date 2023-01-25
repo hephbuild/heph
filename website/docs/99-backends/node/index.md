@@ -14,7 +14,22 @@ build_files:
       uri: git://github.com/hephbuild/heph.git@master:/backend/node
 
 node_backend:
-  version: v16.15.1
-  node: //node_backend:node
-  yarn: //node_backend:yarn
+  node: //some/path:node
+  yarn: //some/path:yarn
 ```
+
+And the following in your repo:
+
+```yaml title="some/path/BUILD"
+node = node_toolchain(
+    name="node",
+    version="v16.15.1",
+)
+yarn_toolchain(
+    name="yarn",
+    version="v1.22.19",
+    node=node,
+)
+```
+
+This will import the go backend and configure it. 

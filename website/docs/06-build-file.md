@@ -7,7 +7,7 @@ Just like Python, you can use control statements to generate targets and functio
 
 ### `target`, `text_file`, `json_file`, `tool_target`, `group`
 
-Declares a target, see [Target](target).
+Declares a target, see [Target](./04-target.md).
 
 ### `glob`
 
@@ -31,6 +31,12 @@ Will stop the execution and exit with an error message
 
 ```python
 fail("Bad value")
+```
+
+### `print`
+
+```python
+print("Hello")
 ```
 
 ### `heph.canonicalize`
