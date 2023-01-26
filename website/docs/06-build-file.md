@@ -1,6 +1,6 @@
 # BUILD
 
-Targets are defined in `BUILD` (`BUILD.*`) files. `BUILD` files are writted in [Starlark](https://github.com/bazelbuild/starlark) which is a language similar to Python.
+Targets are defined in `BUILD` (`BUILD.*`) files. `BUILD` files are writted in [Starlark](https://github.com/google/starlark-go/blob/master/doc/spec.md) which is a language similar to Python.
 Just like Python, you can use control statements to generate targets and functions to abstract things away.
 
 ## Functions

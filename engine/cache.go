@@ -59,14 +59,14 @@ const versionFile = "version"
 const inputHashFile = "hash_input"
 
 func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string) (rerr error) {
+	if target.ConcurrentExecution {
+		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
+		return nil
+	}
+
 	names := target.OutWithSupport.Names()
 	names = utils.CopyArray(names)
 	names = targetspec.SortOutputsForHashing(names)
-
-	if len(names) == 0 {
-		log.Debugf("%v does not have any output, skipping storeCache", target.FQN)
-		return nil
-	}
 
 	if target.Cache.Enabled {
 		e.Status(TargetStatus(target, "Caching..."))

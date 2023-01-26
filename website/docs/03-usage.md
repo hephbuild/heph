@@ -1,5 +1,9 @@
 # Usage
 
+## BUILD files
+
+Targets are declared in BUILD files, see [BUILD](./06-build-file.md) more details 
+
 ## Query & Run
 
 The usual way to use heph is to run a single target
