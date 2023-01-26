@@ -32,6 +32,16 @@ An interactive mode is also available:
 heph query fzf
 ```
 
+## Artifacts
+
+When running, output artifacts for each target will be placed somewhere in the `.heph/cache` folder, to get the path of a built artifact, you can request heph to print it out:
+
+```shell
+heph query out //path/to:target
+```
+
+This will run the target and print the output path to stdout.
+
 ## Watch
 
 A very useful tool is `heph watch`. It works similarly to `heph run` but will continuously watch all input files and will rerun targets that have been affected by file changes. When doing TDD for example it can be used to have a very quick save-test loop:
