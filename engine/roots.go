@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -55,7 +56,7 @@ func parseGitURI(uri *url.URL) (GitURI, error) {
 	}, nil
 }
 
-func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
+func (e *Engine) fetchGitRoot(ctx context.Context, uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
 	err := os.MkdirAll(srcRoot.Abs(), os.ModePerm)
 	if err != nil {
 		return fs2.Path{}, err
@@ -86,7 +87,7 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) 
 		return fs2.Path{}, err
 	}
 
-	cmd := exec.Command("bash", "-eux", "-c", b.String())
+	cmd := exec.CommandContext(ctx, "bash", "-eux", "-c", b.String())
 	ob, err := cmd.CombinedOutput()
 	if err != nil {
 		return fs2.Path{}, fmt.Errorf("%v: %s", err, ob)
@@ -99,8 +100,8 @@ func (e *Engine) fetchFsRoot(uri *url.URL) fs2.Path {
 	return e.Root.Join(strings.TrimPrefix(uri.Path, "/"))
 }
 
-func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
-	p, err := e.fetchRoot(rootName, cfg)
+func (e *Engine) runRootBuildFiles(ctx context.Context, rootName string, cfg config.Root) error {
+	p, err := e.fetchRoot(ctx, rootName, cfg)
 	if err != nil {
 		return err
 	}
@@ -127,7 +128,7 @@ func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
 }
 
 func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*packages.Package, error) {
-	p, err := e.fetchRoot(rootName, cfg)
+	p, err := e.fetchRoot(context.TODO(), rootName, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -147,13 +148,13 @@ func (e *Engine) loadFromRoot(pkgName, rootName string, cfg config.Root) (*packa
 	return pkg, nil
 }
 
-func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
+func (e *Engine) fetchRoot(ctx context.Context, name string, cfg config.Root) (fs2.Path, error) {
 	if p, ok := e.fetchRootCache[name]; ok {
 		return p, nil
 	}
 
 	lock := flock.NewFlock("root "+name, filepath.Join(e.HomeDir.Abs(), "root_"+name+".lock"))
-	err := lock.Lock()
+	err := lock.Lock(ctx)
 	if err != nil {
 		return fs2.Path{}, fmt.Errorf("Failed to lock %v", err)
 	}
@@ -210,7 +211,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 	var backendRoot fs2.Path
 	switch u.Scheme {
 	case "git":
-		backendRoot, err = e.fetchGitRoot(u, srcRoot)
+		backendRoot, err = e.fetchGitRoot(ctx, u, srcRoot)
 		if err != nil {
 			return fs2.Path{}, err
 		}

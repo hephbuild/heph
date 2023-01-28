@@ -1,7 +1,9 @@
 package flock
 
+import "context"
+
 type Locker interface {
-	Lock() error
+	Lock(ctx context.Context) error
 	Unlock() error
 	Clean() error
 }

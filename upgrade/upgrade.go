@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"context"
 	"fmt"
 	"github.com/coreos/go-semver/semver"
 	"github.com/mitchellh/go-homedir"
@@ -21,14 +22,14 @@ import (
 
 const baseUrl = "https://storage.googleapis.com/heph-build"
 
-func CheckAndUpdate(cfg config.Config) error {
+func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 	homeDir, err := homeDir(cfg)
 	if err != nil {
 		return err
 	}
 
 	lock := flock.NewFlock("heph update", filepath.Join(homeDir, "update.lock"))
-	err = lock.Lock()
+	err = lock.Lock(ctx)
 	if err != nil {
 		return fmt.Errorf("Failed to lock %v", err)
 	}

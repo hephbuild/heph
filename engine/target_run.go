@@ -92,7 +92,7 @@ func (e *TargetRunEngine) warmTargetInput(ctx context.Context, target *Target) (
 		span.EndError(rerr)
 	}()
 
-	return e.getCache(target, inputHashName, true)
+	return e.getCache(ctx, target, inputHashName, true)
 }
 
 func (e *TargetRunEngine) warmTargetOutput(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
@@ -114,7 +114,7 @@ func (e *TargetRunEngine) warmTargetOutput(ctx context.Context, target *Target, 
 		span.EndError(rerr)
 	}()
 
-	ok, err := e.getCache(target, output, onlyMeta)
+	ok, err := e.getCache(ctx, target, output, onlyMeta)
 	if err != nil {
 		return false, err
 	}
@@ -499,7 +499,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	log.Tracef("%v locking run", target.FQN)
-	err = target.runLock.Lock()
+	err = target.runLock.Lock(ctx)
 	if err != nil {
 		return err
 	}
@@ -783,7 +783,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 }
 
 func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Target, outputs []string) (bool, error) {
-	err := target.postRunWarmLock.Lock()
+	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
 		return false, err
 	}

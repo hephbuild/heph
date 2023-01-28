@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	log "heph/hlog"
 	"io/fs"
@@ -174,7 +175,7 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 }
 
 func (e *Engine) GC(flog func(string, ...interface{}), dryrun bool) error {
-	err := e.gcLock.Lock()
+	err := e.gcLock.Lock(context.TODO())
 	if err != nil {
 		return err
 	}

@@ -78,7 +78,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 
 	e.Config.Profiles = *profiles
 
-	err := e.Init()
+	err := e.Init(ctx)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package flock
 
 import (
+	"context"
 	"fmt"
 	log "heph/hlog"
 	"heph/utils/fs"
@@ -21,7 +22,7 @@ type Flock struct {
 	f    *os.File
 }
 
-func (l *Flock) Lock() error {
+func (l *Flock) Lock(ctx context.Context) error {
 	l.m.Lock()
 	defer l.m.Unlock()
 
@@ -51,11 +52,24 @@ func (l *Flock) Lock() error {
 			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", name)
 		}
 
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-			l.m.Lock()
-			return fmt.Errorf("acquire lock for %s: %w", l.path, err)
+		lockCh := make(chan error, 1)
+
+		go func() {
+			// This will block forever if the ctx completes before
+			lockCh <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+		}()
+
+		var lockErr error
+		select {
+		case err := <-lockCh:
+			lockErr = err
+		case <-ctx.Done():
+			lockErr = ctx.Err()
 		}
 		l.m.Lock()
+		if lockErr != nil {
+			return fmt.Errorf("acquire lock for %s: %w", name, lockErr)
+		}
 	}
 	log.Debugf("Acquired lock for %s", f.Name())
 

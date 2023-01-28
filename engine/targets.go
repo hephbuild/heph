@@ -645,7 +645,7 @@ func (ts *Targets) Find(fqn string) *Target {
 	panic("should not happen")
 }
 
-func (e *Engine) Init() error {
+func (e *Engine) Init(ctx context.Context) error {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return err
@@ -660,7 +660,7 @@ func (e *Engine) Init() error {
 	}
 	log.Debugf("ParseConfigs took %v", time.Since(configStartTime))
 
-	err = upgrade.CheckAndUpdate(e.Config.Config)
+	err = upgrade.CheckAndUpdate(ctx, e.Config.Config)
 	if err != nil {
 		return fmt.Errorf("upgrade: %w", err)
 	}
@@ -670,7 +670,7 @@ func (e *Engine) Init() error {
 
 func (e *Engine) Parse(ctx context.Context) error {
 	for name, cfg := range e.Config.BuildFiles.Roots {
-		err := e.runRootBuildFiles(name, cfg)
+		err := e.runRootBuildFiles(ctx, name, cfg)
 		if err != nil {
 			return fmt.Errorf("root %v: %w", name, err)
 		}
@@ -697,7 +697,7 @@ func (e *Engine) Parse(ctx context.Context) error {
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
 	if e.Config.InstallTools {
-		err = e.InstallTools()
+		err = e.InstallTools(ctx)
 		if err != nil {
 			return err
 		}

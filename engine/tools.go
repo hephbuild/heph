@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	log "heph/hlog"
 	"heph/targetspec"
@@ -16,8 +17,8 @@ var toolTemplate = strings.TrimSpace(`
 exec heph run TARGET -- "$@" 
 `)
 
-func (e *Engine) InstallTools() error {
-	err := e.toolsLock.Lock()
+func (e *Engine) InstallTools(ctx context.Context) error {
+	err := e.toolsLock.Lock(ctx)
 	if err != nil {
 		return err
 	}

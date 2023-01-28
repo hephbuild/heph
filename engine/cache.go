@@ -153,9 +153,9 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	return nil
 }
 
-func (e *TargetRunEngine) getCache(target *Target, output string, onlyMeta bool) (bool, error) {
+func (e *TargetRunEngine) getCache(ctx context.Context, target *Target, output string, onlyMeta bool) (bool, error) {
 	log.Tracef("locking cache %v|%v", target.FQN, output)
-	err := target.cacheLocks[output].Lock()
+	err := target.cacheLocks[output].Lock(ctx)
 	if err != nil {
 		return false, err
 	}
