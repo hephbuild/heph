@@ -1,17 +1,24 @@
-for file in glob('roots/**/e2e_main.go'):
+main_files=glob('roots/**/e2e_main*.go')
+
+for file in main_files:
     if file.startswith('e2e/lib'):
         continue
 
     dir=heph.path.dir(file)
+    filename=heph.path.base(file)
 
     name='e2e_'+dir.replace('roots/', '').replace('/', '_')
+    if filename != "e2e_main.go":
+        name+='_'+filename.replace('e2e_main', '').replace('.go', '').strip('.')
+
     build=target(
         name='_'+name+'_build',
         deps={
             'f': file,
             'files': [
+                file,
                 'go.mod',
-            ]+glob(dir+'/**/*')+glob('lib/**/*'),
+            ]+glob(dir+'/**/*', exclude=main_files+["**/BUILD"])+glob('lib/**/*'),
         },
         tools='//:go|go',
         run=[

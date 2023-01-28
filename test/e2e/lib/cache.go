@@ -19,15 +19,30 @@ func RmCache() error {
 }
 
 func TargetCacheRoot(tgt string, elems ...string) (string, error) {
-	cmd := exec.Command("heph", "query", "cacheroot", tgt)
+	args := []string{"query", "cacheroot", tgt}
+	args = append(args, defaultOpts.Args()...)
+
+	cmd := exec.Command("heph", args...)
 
 	b, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("%v: %v", err, string(b))
+	}
 
-	return filepath.Join(pathAppend(strings.TrimSpace(string(b)), elems...)...), err
+	return filepath.Join(pathAppend(strings.TrimSpace(string(b)), elems...)...), nil
 }
 
 func TargetCacheInputHash(tgt string) (string, error) {
 	p, err := TargetCacheRoot(tgt, "hash_input")
+	if err != nil {
+		return "", err
+	}
+
+	return FileContent(p)
+}
+
+func TargetCacheOutputHash(tgt, output string) (string, error) {
+	p, err := TargetCacheRoot(tgt, "hash_out_"+output)
 	if err != nil {
 		return "", err
 	}

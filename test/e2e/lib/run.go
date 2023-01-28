@@ -13,8 +13,29 @@ type RunOpts struct {
 	Params map[string]string
 }
 
+func (o RunOpts) Args() []string {
+	var args []string
+	for k, v := range o.Params {
+		args = append(args, "-p", k+"="+v)
+	}
+	return args
+}
+
+var defaultOpts RunOpts
+
+func SetDefaultRunOpts(o RunOpts) {
+	defaultOpts = o
+}
+
 func Run(tgt string) error {
-	cmd := exec.Command("heph", "run", tgt)
+	return RunO(tgt, defaultOpts)
+}
+
+func RunO(tgt string, o RunOpts) error {
+	args := []string{"run", tgt}
+	args = append(args, o.Args()...)
+
+	cmd := exec.Command("heph", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

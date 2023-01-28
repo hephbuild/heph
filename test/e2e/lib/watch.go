@@ -20,11 +20,14 @@ func (w *Watcher) Kill() error {
 	return nil
 }
 
-func Watch(tgt string, o RunOpts) (*Watcher, error) {
+func Watch(tgt string) (*Watcher, error) {
+	return WatchO(tgt, defaultOpts)
+}
+
+func WatchO(tgt string, o RunOpts) (*Watcher, error) {
 	args := []string{"watch", tgt, "--plain"}
-	for k, v := range o.Params {
-		args = append(args, "-p", k+"="+v)
-	}
+	args = append(args, o.Args()...)
+
 	cmd := exec.Command("heph", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

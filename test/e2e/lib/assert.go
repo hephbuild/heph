@@ -2,20 +2,9 @@ package lib
 
 import (
 	"fmt"
-	"os"
-	"strings"
 )
 
-func FileContent(p string) (string, error) {
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimSpace(string(b)), nil
-}
-
-func FileContentEqual(p, expected string) error {
+func AssertFileContentEqual(p, expected string) error {
 	actual, err := FileContent(p)
 	if err != nil {
 		return err
@@ -31,7 +20,15 @@ func FileContentEqual(p, expected string) error {
 
 func AssertEqual(actual, expected string) error {
 	if actual != expected {
-		return fmt.Errorf("content is not equal, got:\n%v\nexected:\n%v", actual, expected)
+		return fmt.Errorf("> is not equal, got:\n%v\n> expected:\n%v", actual, expected)
+	}
+
+	return nil
+}
+
+func AssertNotEqual(actual, expected string) error {
+	if actual == expected {
+		return fmt.Errorf("> is equal, got:\n%v", actual)
 	}
 
 	return nil
