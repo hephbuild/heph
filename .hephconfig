@@ -1,12 +1,13 @@
 version: latest
 build_files:
+  ignore:
+    - '**/test/e2e/roots'
   roots:
     go_backend:
 #      uri: git://github.com/hephbuild/heph.git@master:/backend/go
       uri: file:///backend/go
 
 go_backend:
-  version: 1.18.4
   go: //:go|go
   gofmt: //:go|gofmt
 

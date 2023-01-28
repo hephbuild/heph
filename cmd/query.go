@@ -11,8 +11,10 @@ import (
 	"heph/packages"
 	"heph/targetspec"
 	"heph/utils"
+	"heph/utils/sets"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -40,6 +42,7 @@ func init() {
 	queryCmd.AddCommand(outCmd)
 	queryCmd.AddCommand(hashoutCmd)
 	queryCmd.AddCommand(hashinCmd)
+	queryCmd.AddCommand(cacheRootCmd)
 	queryCmd.AddCommand(outRootCmd)
 	queryCmd.AddCommand(labelsCmd)
 
@@ -245,22 +248,17 @@ var graphDotCmd = &cobra.Command{
 	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		err := engineInit(cmd.Context())
 		if err != nil {
 			return err
 		}
 
-		fmt.Printf(`
-digraph G  {
-	fontname="Helvetica,Arial,sans-serif"
-	node [fontname="Helvetica,Arial,sans-serif"]
-	edge [fontname="Helvetica,Arial,sans-serif"]
-	rankdir="LR"
-	node [fontsize=10, shape=box, height=0.25]
-	edge [fontsize=10]
-`)
-		id := func(target *engine.Target) string {
-			return strconv.Quote(target.FQN)
+		err = preRunWithGenWithOpts(cmd.Context(), PreRunOpts{
+			Engine:  Engine,
+			LinkAll: true,
+		})
+		if err != nil {
+			return err
 		}
 
 		dag := Engine.DAG()
@@ -287,6 +285,19 @@ digraph G  {
 			}
 		}
 
+		fmt.Printf(`
+digraph G  {
+	fontname="Helvetica,Arial,sans-serif"
+	node [fontname="Helvetica,Arial,sans-serif"]
+	edge [fontname="Helvetica,Arial,sans-serif"]
+	rankdir="LR"
+	node [fontsize=10, shape=box, height=0.25]
+	edge [fontsize=10]
+`)
+		id := func(target *engine.Target) string {
+			return strconv.Quote(target.FQN)
+		}
+
 		for _, target := range dag.GetVertices() {
 			extra := ""
 			if target.IsGroup() {
@@ -305,7 +316,16 @@ digraph G  {
 
 			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.FQN, extra)
 
+			skip := sets.NewStringSet(0)
+			//for _, tool := range target.Tools.Targets {
+			//	skip.Add(tool.Target.FQN)
+			//}
+
 			for _, ancestor := range parents {
+				if skip.Has(ancestor.FQN) {
+					continue
+				}
+
 				fmt.Printf("    %v -> %v;\n", id(ancestor), id(target))
 			}
 			fmt.Println()
@@ -483,7 +503,7 @@ var pkgsCmd = &cobra.Command{
 			}
 
 			fmt.Printf("%v\n", fullname)
-			fmt.Printf("  name: %v\n", p.Root.RelRoot())
+			fmt.Printf("  path: %v\n", p.Root.RelRoot())
 			fmt.Println()
 		}
 		return nil
@@ -612,6 +632,29 @@ var outCmd = &cobra.Command{
 		for _, path := range paths {
 			fmt.Println(path.Abs())
 		}
+
+		return nil
+	},
+}
+
+var cacheRootCmd = &cobra.Command{
+	Use:               "cacheroot <target>",
+	Short:             "Prints targets cache root",
+	Hidden:            true,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		target, err := parseTargetFromArgs(cmd.Context(), args)
+		if err != nil {
+			return err
+		}
+
+		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
 
 		return nil
 	},

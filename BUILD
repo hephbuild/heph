@@ -32,6 +32,15 @@ target(
 )
 
 target(
+    name="e2e_isolated_test",
+    run="heph query --include e2e_isolated | heph run -",
+    tools=['heph'],
+    pass_env=["PATH"],
+    sandbox=False,
+    cache=False,
+)
+
+target(
     name="intg_test",
     run="heph query --include //test/... | heph query --include test - | heph run -",
     tools=['heph'],

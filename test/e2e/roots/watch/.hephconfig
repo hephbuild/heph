@@ -1,0 +1,4 @@
+version: latest
+watch:
+  ignore:
+    - '**/.heph'

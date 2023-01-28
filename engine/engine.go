@@ -156,7 +156,7 @@ func New(rootPath string) *Engine {
 
 	homeDir := root.Join(".heph")
 
-	log.Tracef("home dir %v", homeDir)
+	log.Tracef("home dir %v", homeDir.Abs())
 
 	err := os.MkdirAll(homeDir.Abs(), os.ModePerm)
 	if err != nil {

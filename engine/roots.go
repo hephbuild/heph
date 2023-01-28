@@ -95,15 +95,8 @@ func (e *Engine) fetchGitRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) 
 	return srcRoot, nil
 }
 
-func (e *Engine) fetchFsRoot(uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
-	p := filepath.Join(e.Root.Abs(), uri.Path)
-
-	err := fs2.Cp(p, srcRoot.Abs())
-	if err != nil {
-		return fs2.Path{}, err
-	}
-
-	return srcRoot, err
+func (e *Engine) fetchFsRoot(uri *url.URL) fs2.Path {
+	return e.Root.Join(strings.TrimPrefix(uri.Path, "/"))
 }
 
 func (e *Engine) runRootBuildFiles(rootName string, cfg config.Root) error {
@@ -168,6 +161,18 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 
 	log.Tracef("fetchRoot %v", name)
 
+	u, err := url.Parse(cfg.URI)
+	if err != nil {
+		return fs2.Path{}, err
+	}
+
+	if u.Scheme == "file" {
+		root := e.fetchFsRoot(u)
+
+		e.fetchRootCache[name] = root
+		return root, nil
+	}
+
 	root := e.rootRoot(name)
 	srcRoot := root.Join("src")
 	metaPath := root.Join("meta").Abs()
@@ -202,11 +207,6 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 		return fs2.Path{}, err
 	}
 
-	u, err := url.Parse(cfg.URI)
-	if err != nil {
-		return fs2.Path{}, err
-	}
-
 	var backendRoot fs2.Path
 	switch u.Scheme {
 	case "git":
@@ -215,10 +215,7 @@ func (e *Engine) fetchRoot(name string, cfg config.Root) (fs2.Path, error) {
 			return fs2.Path{}, err
 		}
 	case "file":
-		backendRoot, err = e.fetchFsRoot(u, srcRoot)
-		if err != nil {
-			return fs2.Path{}, err
-		}
+		backendRoot = e.fetchFsRoot(u)
 	default:
 		return fs2.Path{}, fmt.Errorf("unsupported scheme %v", u.Scheme)
 	}
