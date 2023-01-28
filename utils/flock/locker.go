@@ -12,6 +12,9 @@ import (
 )
 
 func NewFlock(name, p string) Locker {
+	if name == "" || log.IsLevelEnabled(log.DebugLevel) {
+		name = p
+	}
 	return &Flock{path: p, name: name}
 }
 
@@ -22,34 +25,56 @@ type Flock struct {
 	f    *os.File
 }
 
-func (l *Flock) Lock(ctx context.Context) error {
+func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
 	l.m.Lock()
 	defer l.m.Unlock()
 
 	err := fs.CreateParentDir(l.path)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	f, err := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
-		return fmt.Errorf("open %s to acquire lock: %w", l.path, err)
+		return false, err
 	}
 
 	log.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
+		ok, err := onErr(f)
+		if !ok || err != nil {
+			if err != nil {
+				err = fmt.Errorf("acquire lock for %s: %w", l.name, err)
+			}
+			return false, err
+		}
+	}
+	log.Debugf("Acquired lock for %s", f.Name())
+
+	l.f = f
+
+	if err := f.Truncate(0); err == nil {
+		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+	}
+	return true, nil
+}
+
+func (l *Flock) TryLock() (bool, error) {
+	return l.tryLock(func(f *os.File) (bool, error) {
+		return false, nil
+	})
+}
+
+func (l *Flock) Lock(ctx context.Context) error {
+	_, err := l.tryLock(func(f *os.File) (bool, error) {
 		l.m.Unlock()
 
 		pid, err := os.ReadFile(f.Name())
-		name := l.name
-		if name == "" || log.IsLevelEnabled(log.DebugLevel) {
-			name = f.Name()
-		}
 		if err == nil && len(pid) > 0 {
-			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), name)
+			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), l.name)
 		} else {
-			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", name)
+			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
 		}
 
 		lockCh := make(chan error, 1)
@@ -57,6 +82,9 @@ func (l *Flock) Lock(ctx context.Context) error {
 		go func() {
 			// This will block forever if the ctx completes before
 			lockCh <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+			if ctx.Err() != nil {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			}
 		}()
 
 		var lockErr error
@@ -68,18 +96,12 @@ func (l *Flock) Lock(ctx context.Context) error {
 		}
 		l.m.Lock()
 		if lockErr != nil {
-			return fmt.Errorf("acquire lock for %s: %w", name, lockErr)
+			return false, lockErr
 		}
-	}
-	log.Debugf("Acquired lock for %s", f.Name())
 
-	l.f = f
-
-	if err := f.Truncate(0); err == nil {
-		f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
-	}
-
-	return nil
+		return true, nil
+	})
+	return err
 }
 
 func (l *Flock) Unlock() error {

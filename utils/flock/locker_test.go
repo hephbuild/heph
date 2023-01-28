@@ -33,6 +33,17 @@ func TestFlockContext(t *testing.T) {
 	})
 }
 
+func TestFlockTry(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	testLockerTry(t, func() Locker {
+		return NewFlock("lock", filepath.Join(dir, "lock.lock"))
+	})
+}
+
 func TestFlockSingleInstance(t *testing.T) {
 	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
@@ -59,6 +70,19 @@ func TestFlockSingleInstanceContext(t *testing.T) {
 	})
 }
 
+func TestFlockSingleInstanceTry(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	l := NewFlock("lock", filepath.Join(dir, "lock.lock"))
+
+	testLockerTry(t, func() Locker {
+		return l
+	})
+}
+
 func TestMutex(t *testing.T) {
 	t.Parallel()
 	l := NewMutex("lock")
@@ -71,6 +95,14 @@ func TestMutexContext(t *testing.T) {
 	t.Parallel()
 	l := NewMutex("lock")
 	testLockerContext(t, func() Locker {
+		return l
+	})
+}
+
+func TestMutexTry(t *testing.T) {
+	t.Parallel()
+	l := NewMutex("lock")
+	testLockerTry(t, func() Locker {
 		return l
 	})
 }
@@ -148,4 +180,27 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 
 	err = l.Lock(ctx)
 	assert.ErrorContains(t, err, "acquire lock for lock: context deadline exceeded")
+}
+
+func testLockerTry(t *testing.T, factory func() Locker) {
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	l1 := factory()
+	l2 := factory()
+
+	err = l1.Lock(context.Background())
+	require.NoError(t, err)
+
+	ok, err := l2.TryLock()
+	require.NoError(t, err)
+	assert.False(t, ok)
+
+	err = l1.Unlock()
+	require.NoError(t, err)
+
+	ok, err = l2.TryLock()
+	require.NoError(t, err)
+	assert.True(t, ok)
 }

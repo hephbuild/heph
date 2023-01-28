@@ -24,12 +24,22 @@ func (m *mutex) Unlock() error {
 	}
 }
 
-func (m *mutex) Lock(ctx context.Context) error {
+func (m *mutex) TryLock() (bool, error) {
 	select {
 	case m.ch <- struct{}{}:
-		return nil
+		return true, nil
 	default:
-		// continue
+		return false, nil
+	}
+}
+
+func (m *mutex) Lock(ctx context.Context) error {
+	ok, err := m.TryLock()
+	if err != nil {
+		return err
+	}
+	if ok {
+		return nil
 	}
 
 	log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", m.name)

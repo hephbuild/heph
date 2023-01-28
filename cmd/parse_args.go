@@ -82,7 +82,12 @@ func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, er
 		return nil, fmt.Errorf("expected one arg")
 	}
 
-	err := engineInit(ctx)
+	err := blockReadStdin(args)
+	if err != nil {
+		return nil, err
+	}
+
+	err = engineInit(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +111,12 @@ func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, er
 }
 
 func parseTargetsAndArgs(ctx context.Context, args []string) (engine.TargetRunRequests, error) {
-	err := engineInit(ctx)
+	err := blockReadStdin(args)
+	if err != nil {
+		return nil, err
+	}
+
+	err = engineInit(ctx)
 	if err != nil {
 		return nil, err
 	}

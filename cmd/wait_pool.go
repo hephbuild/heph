@@ -75,7 +75,9 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
 
-	if isTerm && !*plain {
+	tui := isTerm && !*plain
+
+	if tui {
 		err := poolUI(name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)

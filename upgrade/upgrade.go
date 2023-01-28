@@ -28,6 +28,10 @@ func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
+	if !shouldUpdate(cfg) {
+		return nil
+	}
+
 	lock := flock.NewFlock("heph update", filepath.Join(homeDir, "update.lock"))
 	err = lock.Lock(ctx)
 	if err != nil {
