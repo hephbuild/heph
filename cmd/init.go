@@ -109,7 +109,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 	return nil
 }
 
-func preRunWithGen(ctx context.Context, silent bool) error {
+func preRunWithGen(ctx context.Context) error {
 	err := engineInit(ctx)
 	if err != nil {
 		return err
@@ -117,7 +117,6 @@ func preRunWithGen(ctx context.Context, silent bool) error {
 
 	err = preRunWithGenWithOpts(ctx, PreRunOpts{
 		Engine: Engine,
-		Silent: silent,
 	})
 	if err != nil {
 		return err
@@ -128,17 +127,23 @@ func preRunWithGen(ctx context.Context, silent bool) error {
 
 type PreRunOpts struct {
 	Engine       *engine.Engine
-	Silent       bool
 	PoolWaitName string
 	LinkAll      bool
 }
 
 func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	e := opts.Engine
-
-	err := engineInitWithEngine(ctx, e)
-	if err != nil {
-		return err
+	if e == nil {
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+		e = Engine
+	} else {
+		err := engineInitWithEngine(ctx, e)
+		if err != nil {
+			return err
+		}
 	}
 
 	if *noGen {
@@ -162,7 +167,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 		opts.PoolWaitName = "PreRun gen"
 	}
 
-	err = WaitPool(opts.PoolWaitName, e.Pool, deps, opts.Silent)
+	err = WaitPool(opts.PoolWaitName, e.Pool, deps)
 	if err != nil {
 		return err
 	}
@@ -190,7 +195,7 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 		return cache.PublicTargets, cache.Labels, nil
 	}
 
-	err = preRunWithGen(ctx, silent)
+	err = preRunWithGen(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

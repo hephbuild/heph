@@ -199,7 +199,7 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -340,10 +340,10 @@ digraph G  {
 var changesCmd = &cobra.Command{
 	Use:               "changes <since>",
 	Short:             "Prints deps target changes",
-	Args:              cobra.ExactValidArgs(1),
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(c *cobra.Command, args []string) error {
-		err := preRunWithGen(c.Context(), false)
+		err := preRunWithGen(c.Context())
 		if err != nil {
 			return err
 		}
@@ -387,7 +387,7 @@ var changesCmd = &cobra.Command{
 var targetCmd = &cobra.Command{
 	Use:               "target <target>",
 	Short:             "Prints target details",
-	Args:              cobra.ExactValidArgs(1),
+	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
@@ -397,16 +397,9 @@ var targetCmd = &cobra.Command{
 			return err
 		}
 
-		if *noGen {
-			err := engineInit(ctx)
-			if err != nil {
-				return err
-			}
-		} else {
-			err := preRunWithGen(ctx, false)
-			if err != nil {
-				return err
-			}
+		err = preRunWithGen(ctx)
+		if err != nil {
+			return err
 		}
 
 		target := Engine.Targets.Find(tp.Full())
@@ -423,6 +416,11 @@ var targetCmd = &cobra.Command{
 			}
 
 			return nil
+		}
+
+		err = Engine.LinkTarget(target, nil)
+		if err != nil {
+			return err
 		}
 
 		fmt.Println(target.FQN)
@@ -476,16 +474,9 @@ var pkgsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		if spec {
-			err := engineInit(ctx)
-			if err != nil {
-				return err
-			}
-		} else {
-			err := preRunWithGen(ctx, false)
-			if err != nil {
-				return err
-			}
+		err := preRunWithGen(ctx)
+		if err != nil {
+			return err
 		}
 
 		pkgs := make([]*packages.Package, 0)
@@ -554,13 +545,7 @@ var revdepsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
-		if err != nil {
-			return err
-		}
-
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:  Engine,
+		err := preRunWithGenWithOpts(ctx, PreRunOpts{
 			LinkAll: true,
 		})
 		if err != nil {
@@ -611,12 +596,14 @@ var outCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target, err := parseTargetFromArgs(cmd.Context(), args)
+		ctx := cmd.Context()
+
+		target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
@@ -644,12 +631,13 @@ var cacheRootCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target, err := parseTargetFromArgs(cmd.Context(), args)
+		ctx := cmd.Context()
+		target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
@@ -666,27 +654,19 @@ var hashoutCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		ctx := cmd.Context()
+		target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		tp, err := targetspec.TargetParse("", args[0])
+		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
 
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
-		}
-
-		err = run(cmd.Context(), Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
-		if err != nil {
-			return err
-		}
-
-		for _, name := range target.ActualOutFiles().Names() {
+		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
+		for _, name := range names {
 			fmt.Println(name+":", Engine.HashOutput(target, name))
 		}
 
@@ -700,17 +680,19 @@ var hashinCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target, err := parseTargetFromArgs(cmd.Context(), args)
+		ctx := cmd.Context()
+
+		target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		tdeps, err := Engine.ScheduleTargetsWithDeps(cmd.Context(), []*engine.Target{target}, target)
+		tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, []*engine.Target{target}, target)
 		if err != nil {
 			return err
 		}
 
-		err = WaitPool("Run", Engine.Pool, tdeps.All(), false)
+		err = WaitPool("Run", Engine.Pool, tdeps.All())
 		if err != nil {
 			return err
 		}
@@ -726,7 +708,7 @@ var labelsCmd = &cobra.Command{
 	Short: "Prints labels",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}

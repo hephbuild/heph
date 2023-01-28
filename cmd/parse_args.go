@@ -125,19 +125,28 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		targets.Add(target)
 	}
 
+	check := func(target *engine.Target) error {
+		if bailOutOnExpr {
+			if len(target.TargetSpec.Deps.Exprs) > 0 {
+				return fmt.Errorf("%v has expr, bailing out", target.FQN)
+			}
+		}
+
+		return nil
+	}
+
 	rrs := make(engine.TargetRunRequests, 0)
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		if bailOutOnExpr {
-			if len(target.TargetSpec.Deps.Exprs) > 0 {
-				return nil, fmt.Errorf("%v has expr, bailing out", target.FQN)
-			}
+		err := check(target)
+		if err != nil {
+			return nil, err
 		}
 
-		err := e.LinkTarget(target, nil)
+		err = e.LinkTarget(target, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -148,6 +157,18 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 			NoCache: *nocache,
 			Shell:   *shell,
 		})
+	}
+
+	ancs, err := e.DAG().GetOrderedAncestors(targets.Slice(), true)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, anc := range ancs {
+		err := check(anc)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return rrs, nil
@@ -195,7 +216,6 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 
 	err = preRunWithGenWithOpts(ctx, PreRunOpts{
 		Engine: e,
-		Silent: false,
 	})
 	if err != nil {
 		return nil, err

@@ -11,7 +11,7 @@ func main() {
 	// Test zero cache run
 	Must(Run("//:run"))
 	Must(ValidateCache("//:run", []string{""}))
-	hashInput1 := MustV(TargetCacheInput("//:run"))
+	hashInput1 := MustV(TargetCacheInputHash("//:run"))
 
 	Must(RmCache())
 
@@ -23,7 +23,7 @@ hello
 #!/bin/sh
 echo hello`)
 	Must(FileContentEqual(outputs[0], expected))
-	hashInput2 := MustV(TargetCacheInput("//:run"))
+	hashInput2 := MustV(TargetCacheInputHash("//:run"))
 
 	Must(AssertEqual(hashInput2, hashInput1))
 

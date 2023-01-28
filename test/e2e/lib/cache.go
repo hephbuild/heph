@@ -26,7 +26,7 @@ func TargetCacheRoot(tgt string, elems ...string) (string, error) {
 	return filepath.Join(pathAppend(strings.TrimSpace(string(b)), elems...)...), err
 }
 
-func TargetCacheInput(tgt string) (string, error) {
+func TargetCacheInputHash(tgt string) (string, error) {
 	p, err := TargetCacheRoot(tgt, "hash_input")
 	if err != nil {
 		return "", err

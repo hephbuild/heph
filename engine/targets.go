@@ -782,6 +782,8 @@ func (e *Engine) processTarget(t *Target) error {
 		e.tools.Add(t)
 	}
 
+	e.registerLabels(t.Labels)
+
 	t.processed = true
 
 	return nil
@@ -1092,8 +1094,6 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	for k, v := range t.TransitiveDeps.RuntimeEnv {
 		t.RuntimeEnv[k] = v
 	}
-
-	e.registerLabels(t.Labels)
 
 	err = e.registerDag(t)
 	if err != nil {

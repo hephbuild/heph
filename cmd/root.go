@@ -257,7 +257,7 @@ var gcCmd = &cobra.Command{
 	Short:             "GC",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -271,7 +271,7 @@ var cleanLockCmd = &cobra.Command{
 	Short: "Clean locks",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context(), false)
+		err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}

@@ -59,7 +59,7 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 		deps.AddChild(tdeps.Get(target.FQN))
 	}
 
-	err = WaitPool("Run", e.Pool, deps, false)
+	err = WaitPool("Run", e.Pool, deps)
 	if err != nil {
 		return err
 	}

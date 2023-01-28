@@ -69,13 +69,13 @@ func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	}
 }
 
-func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup, forceSilent bool) error {
+func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
 	log.Tracef("WaitPool %v", name)
 	defer func() {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
 
-	if !forceSilent && isTerm && !*plain {
+	if isTerm && !*plain {
 		err := poolUI(name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)
