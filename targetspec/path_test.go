@@ -20,6 +20,11 @@ func TestTargetParse(t *testing.T) {
 			"target",
 		},
 		{
+			":target",
+			"some/path",
+			"target",
+		},
+		{
 			"//thirdparty/go/github.com/Azure/azure-sdk-for-go:_go_mod_download_v32.0.0_incompatible",
 			"thirdparty/go/github.com/Azure/azure-sdk-for-go",
 			"_go_mod_download_v32.0.0_incompatible",
@@ -27,7 +32,7 @@ func TestTargetParse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.fqn, func(t *testing.T) {
-			tp, err := TargetParse("", test.fqn)
+			tp, err := TargetParse(test.pkg, test.fqn)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)
@@ -79,6 +84,12 @@ func TestTargetOutputParse(t *testing.T) {
 			"",
 		},
 		{
+			":target",
+			"some/path",
+			"target",
+			"",
+		},
+		{
 			"//some/path:target|output",
 			"some/path",
 			"target",
@@ -87,7 +98,7 @@ func TestTargetOutputParse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.fqn, func(t *testing.T) {
-			tp, err := TargetOutputParse("", test.fqn)
+			tp, err := TargetOutputParse(test.pkg, test.fqn)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)

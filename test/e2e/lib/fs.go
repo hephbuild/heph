@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"time"
@@ -35,4 +36,15 @@ func ReWriteFile(p, content string) error {
 	}
 
 	return os.WriteFile(p, []byte(content), os.ModePerm)
+}
+
+func ReplaceFile(p, old, new string) error {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return err
+	}
+
+	nb := bytes.ReplaceAll(b, []byte(old), []byte(new))
+
+	return os.WriteFile(p, nb, os.ModePerm)
 }

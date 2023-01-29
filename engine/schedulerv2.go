@@ -17,9 +17,9 @@ type schedEngine struct {
 	allTargets []*Target
 	skip       *Target
 
-	targetDeps         *WaitGroupMap
-	targetAnalysisDeps *WaitGroupMap
-	pullMetaDeps       *WaitGroupMap
+	targetDeps     *WaitGroupMap
+	targetAnalysis *WaitGroupMap
+	pullMetaDeps   *WaitGroupMap
 
 	allScheduled *worker.WaitGroup
 
@@ -47,17 +47,17 @@ func newSchedEngine(e *Engine, rrs TargetRunRequests, skip *Target) (*schedEngin
 	}
 
 	return &schedEngine{
-		Engine:             e,
-		rrs:                rrs,
-		targets:            targets,
-		allTargets:         allTargets,
-		skip:               skip,
-		targetDeps:         &WaitGroupMap{},
-		targetAnalysisDeps: &WaitGroupMap{},
-		pullMetaDeps:       &WaitGroupMap{},
-		allScheduled:       &worker.WaitGroup{},
-		requiredOutputs:    requiredOutputs,
-		needRun:            NewTargets(0),
+		Engine:          e,
+		rrs:             rrs,
+		targets:         targets,
+		allTargets:      allTargets,
+		skip:            skip,
+		targetDeps:      &WaitGroupMap{},
+		targetAnalysis:  &WaitGroupMap{},
+		pullMetaDeps:    &WaitGroupMap{},
+		allScheduled:    &worker.WaitGroup{},
+		requiredOutputs: requiredOutputs,
+		needRun:         NewTargets(0),
 		needCacheWarm: sets.NewSet[string, TargetWithOutput](func(t TargetWithOutput) string {
 			return t.Full()
 		}, 0),
@@ -77,7 +77,7 @@ func (e *schedEngine) scheduleRun(ctx context.Context, target *Target) error {
 	rdeps := &worker.WaitGroup{}
 	rdeps.AddChild(e.allScheduled)
 	for _, parent := range parents {
-		rdeps.AddChild(e.targetAnalysisDeps.Get(parent.FQN))
+		rdeps.AddChild(e.targetAnalysis.Get(parent.FQN))
 		rdeps.AddChild(e.targetDeps.Get(parent.FQN))
 	}
 
@@ -91,7 +91,7 @@ func (e *schedEngine) scheduleRun(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, outputs []string) error {
+func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, outputs []string) (*worker.WaitGroup, error) {
 	outputs = append(outputs, inputHashName)
 
 	deps := &worker.WaitGroup{}
@@ -108,7 +108,7 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 
 		parents, err := e.DAG().GetParents(target)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		wdeps := &worker.WaitGroup{}
@@ -120,10 +120,7 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 			Name: "warm " + target.FQN + "|" + output,
 			Deps: wdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				re := TargetRunEngine{
-					Engine: e.Engine,
-					Status: w.Status,
-				}
+				re := NewTargetRunEngine(e.Engine, w.Status)
 
 				w.Status(TargetOutputStatus(target, output, "Priming cache..."))
 
@@ -143,7 +140,7 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 		deps.Add(j)
 	}
 
-	return nil
+	return deps, nil
 }
 
 func (e *schedEngine) scheduleAnalysis(ctx context.Context, target *Target) error {
@@ -154,8 +151,7 @@ func (e *schedEngine) scheduleAnalysis(ctx context.Context, target *Target) erro
 
 	deps := &worker.WaitGroup{}
 	for _, child := range children {
-		wg := e.targetAnalysisDeps.Get(child.FQN)
-		deps.AddChild(wg)
+		deps.AddChild(e.targetAnalysis.Get(child.FQN))
 	}
 
 	pmj, err := e.schedulePullMeta(ctx, target)
@@ -168,9 +164,9 @@ func (e *schedEngine) scheduleAnalysis(ctx context.Context, target *Target) erro
 		Name: "analysis " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			defer e.targetAnalysisDeps.Get(target.FQN).DoneSem()
-
 			if e.needRun.Has(target) {
+				defer e.targetAnalysis.Get(target.FQN).DoneSem()
+
 				if e.isSkip(target) {
 					// Will get manually ran
 					return nil
@@ -190,26 +186,31 @@ func (e *schedEngine) scheduleAnalysis(ctx context.Context, target *Target) erro
 				return false
 			})
 			if len(cacheToWarm) > 0 {
-				outputs := sets.NewSet(func(s string) string {
-					return s
-				}, 0)
+				outputs := sets.NewStringSet(0)
 				for _, c := range cacheToWarm {
 					outputs.Add(c.Output)
 				}
 
-				j, err := e.ScheduleTargetCacheWarm(ctx, target, outputs.Slice(), nil)
+				warmDeps, err := e.scheduleCacheWarm(ctx, target, outputs.Slice())
 				if err != nil {
 					return err
 				}
-				e.targetDeps.Get(target.FQN).Add(j)
+				e.targetDeps.Get(target.FQN).AddChild(warmDeps)
+
+				go func() {
+					<-warmDeps.Done()
+					e.targetAnalysis.Get(target.FQN).DoneSem()
+				}()
 				return nil
 			}
+
+			e.targetAnalysis.Get(target.FQN).DoneSem()
 
 			return nil
 		},
 	})
 
-	taDeps := e.targetAnalysisDeps.Get(target.FQN)
+	taDeps := e.targetAnalysis.Get(target.FQN)
 	taDeps.Add(j)
 
 	e.targetDeps.Get(target.FQN).AddChild(taDeps)
@@ -244,10 +245,7 @@ func (e *schedEngine) schedulePullMeta(ctx context.Context, target *Target) (*wo
 			if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
 				w.Status(TargetStatus(target, "Fetching meta..."))
 
-				re := TargetRunEngine{
-					Engine: e.Engine,
-					Status: w.Status,
-				}
+				re := NewTargetRunEngine(e.Engine, w.Status)
 
 				outputs := e.requiredOutputs.Get(target.FQN).Slice()
 				cached, err := re.PullTargetMeta(ctx, target, outputs)
@@ -299,8 +297,8 @@ func (e *schedEngine) scheduleTargetRRsWithDeps(octx context.Context) (_ *WaitGr
 	defer e.allScheduled.DoneSem()
 
 	for _, target := range e.allTargets {
-		// Will need to be cleared by a schedulerun or a successful cache pull of all the outputs
-		e.targetAnalysisDeps.Get(target.FQN).AddSem()
+		// Will need to be cleared by a schedulerun or a successful cache pull of all the required outputs
+		e.targetAnalysis.Get(target.FQN).AddSem()
 	}
 
 	for _, target := range e.allTargets {

@@ -61,7 +61,7 @@ func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 }
 
 func shouldUpdate(cfg config.Config) bool {
-	if utils.Version == utils.DevVersion {
+	if utils.IsDevVersion() {
 		// We are in dev, never update
 		return false
 	}

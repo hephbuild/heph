@@ -26,6 +26,10 @@ func (e ErrorWithExitCode) Unwrap() error {
 }
 
 func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, inlineSingle bool) error {
+	return runMode(ctx, e, rrs, inlineSingle, "")
+}
+
+func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, inlineSingle bool, mode string) error {
 	shellCount := rrs.Count(func(rr engine.TargetRunRequest) bool {
 		return rr.Shell
 	})
@@ -44,6 +48,7 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 	var inlineTarget *engine.Target
 	if len(rrs) == 1 && inlineSingle {
 		inlineInvocationTarget = &rrs[0]
+		inlineInvocationTarget.Mode = mode
 		inlineTarget = inlineInvocationTarget.Target
 	}
 
@@ -68,12 +73,9 @@ func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, in
 		return nil
 	}
 
-	re := engine.TargetRunEngine{
-		Engine: e,
-		Status: func(s worker.Status) {
-			log.Info(s.String(isTerm))
-		},
-	}
+	re := engine.NewTargetRunEngine(e, func(s worker.Status) {
+		log.Info(s.String(isTerm))
+	})
 
 	err = re.Run(ctx, *inlineInvocationTarget, sandbox.IOConfig{
 		Stdin:  os.Stdin,

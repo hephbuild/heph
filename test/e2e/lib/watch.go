@@ -25,10 +25,7 @@ func Watch(tgt string) (*Watcher, error) {
 }
 
 func WatchO(tgt string, o RunOpts) (*Watcher, error) {
-	args := []string{"watch", tgt, "--plain"}
-	args = append(args, o.Args()...)
-
-	cmd := exec.Command("heph", args...)
+	cmd := commandO(o, "watch", tgt, "--plain")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -43,10 +40,10 @@ func WatchO(tgt string, o RunOpts) (*Watcher, error) {
 
 	go func() {
 		err := cmd.Wait()
-		if err != nil {
-			panic(err)
-		}
 		if !w.expectedKill {
+			if err != nil {
+				panic(err)
+			}
 			panic("watch finished unexpectedly")
 		}
 	}()

@@ -1,3 +1,7 @@
+tmp=heph.param('tmp')
+if not tmp:
+    fail('tmp is empty')
+
 hello=target(
     name='hello',
     deps='hello.txt',
@@ -11,6 +15,6 @@ target(
     name='run',
     deps=[hello],
     run=[
-        'cp $SRC '+heph.param('tmp')+'/hello.txt',
+        'cp $SRC {}/hello.txt'.format(tmp),
     ],
 )

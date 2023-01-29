@@ -29,6 +29,16 @@ type TargetTools struct {
 	Hosts            []targetspec.TargetSpecHostTool
 }
 
+func (t TargetTools) HasHeph() bool {
+	for _, tool := range t.Hosts {
+		if tool.BinName == "heph" {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt := TargetTools{}
 	tt.TargetReferences = utils.DedupAppend(t.TargetReferences, func(t *Target) string {

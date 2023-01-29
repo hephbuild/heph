@@ -3,7 +3,6 @@ package lib
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -19,10 +18,7 @@ func RmCache() error {
 }
 
 func TargetCacheRoot(tgt string, elems ...string) (string, error) {
-	args := []string{"query", "cacheroot", tgt}
-	args = append(args, defaultOpts.Args()...)
-
-	cmd := exec.Command("heph", args...)
+	cmd := command("query", "cacheroot", tgt)
 
 	b, err := cmd.Output()
 	if err != nil {
@@ -50,46 +46,86 @@ func TargetCacheOutputHash(tgt, output string) (string, error) {
 	return FileContent(p)
 }
 
-func ValidateCache(tgt string, outputs []string) error {
+func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
+	expected := []string{
+		"hash_input",
+	}
+	if !fromRemote {
+		expected = append(expected, "version")
+	}
+	if len(outputs) > 0 {
+		expected = append(expected, "_output")
+		expected = append(expected, "_output_hash")
+	}
+	for _, output := range outputs {
+		expected = append(expected, "hash_out_"+output)
+		expected = append(expected, fmt.Sprintf("out_%v.tar.gz", output))
+		expected = append(expected, fmt.Sprintf("out_%v.tar.gz.list", output))
+	}
+
 	root, err := TargetCacheRoot(tgt)
 	if err != nil {
 		return err
 	}
 
+	fmt.Println("cache folder:", root)
+
+	return validateFolderContent(root, expected)
+}
+
+func ValidateRemoteCache(root, tgt string, outputs []string) error {
+	expected := []string{
+		"hash_input",
+		"version",
+	}
+	for _, output := range outputs {
+		expected = append(expected, "hash_out_"+output)
+		expected = append(expected, "out_.tar.gz"+output)
+	}
+
+	tp, err := ParseTargetPath(tgt)
+	if err != nil {
+		return err
+	}
+
+	hash, err := TargetCacheInputHash(tgt)
+	if err != nil {
+		return err
+	}
+
+	tgtroot := filepath.Join(root, tp.Package, tp.Name, hash)
+
+	fmt.Println("remote cache folder:", root)
+
+	return validateFolderContent(tgtroot, expected)
+}
+
+func validateFolderContent(root string, expected []string) error {
 	if !PathExists(root) {
 		return fmt.Errorf("%v doesnt exist", root)
 	}
 
-	expectedFilesMap := map[string]struct{}{}
-
-	expectedFiles := []string{
-		filepath.Join(root, "_output"),
-		filepath.Join(root, "_output_hash"),
-		filepath.Join(root, "hash_input"),
-		filepath.Join(root, "version"),
-	}
-	for _, output := range outputs {
-		expectedFiles = append(expectedFiles, filepath.Join(root, "hash_out_"+output))
-		expectedFiles = append(expectedFiles, filepath.Join(root, "out_.tar.gz"+output))
-		expectedFiles = append(expectedFiles, filepath.Join(root, "out_.tar.gz.list"+output))
+	for i, p := range expected {
+		expected[i] = filepath.Join(root, p)
 	}
 
-	for _, p := range expectedFiles {
-		expectedFilesMap[p] = struct{}{}
+	expectedMap := map[string]struct{}{}
+	for _, p := range expected {
+		expectedMap[p] = struct{}{}
 
 		if !PathExists(p) {
 			return fmt.Errorf("%v doesnt exist", p)
 		}
 	}
 
-	actualFiles, err := os.ReadDir(root)
+	actual, err := os.ReadDir(root)
 	if err != nil {
 		return err
 	}
-	for _, file := range actualFiles {
+	for _, file := range actual {
 		p := filepath.Join(root, file.Name())
-		if _, ok := expectedFilesMap[p]; !ok {
-			return fmt.Errorf("%v exists, but shouldn't, expected: %v", p, expectedFiles)
+		if _, ok := expectedMap[p]; !ok {
+			return fmt.Errorf("%v exists, but shouldn't, expected: %v", p, expected)
 		}
 	}
 

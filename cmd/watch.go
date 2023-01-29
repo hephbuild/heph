@@ -97,7 +97,7 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 		}
 	}
 
-	err := run(ctx, w.e, r.rrs, !fromStdin)
+	err := runMode(ctx, w.e, r.rrs, !fromStdin, "watch")
 
 	if *summary || *summaryGen {
 		PrintSummary(w.e.Stats, *summaryGen)

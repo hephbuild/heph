@@ -2,9 +2,9 @@ package lib
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -21,7 +21,7 @@ func cachedRootPath() (string, error) {
 	}
 
 	var buf bytes.Buffer
-	cmd := exec.Command("heph", "query", "root")
+	cmd := command("query", "root")
 	cmd.Stderr = &buf
 
 	b, err := cmd.Output()
@@ -31,6 +31,31 @@ func cachedRootPath() (string, error) {
 	rootCache = strings.TrimSpace(string(b))
 
 	return rootCache, err
+}
+
+type TargetPath struct {
+	Package string
+	Name    string
+	Output  string
+}
+
+func ParseTargetPath(s string) (TargetPath, error) {
+	var buf bytes.Buffer
+	cmd := command("query", "parsetarget", s)
+	cmd.Stderr = &buf
+
+	b, err := cmd.Output()
+	if err != nil {
+		return TargetPath{}, fmt.Errorf("%v: %s", err, buf.String())
+	}
+
+	var tp TargetPath
+	err = json.Unmarshal(b, &tp)
+	if err != nil {
+		return TargetPath{}, err
+	}
+
+	return tp, nil
 }
 
 func RootPath(elems ...string) (string, error) {

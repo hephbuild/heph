@@ -19,12 +19,20 @@ import (
 	"io"
 	fs2 "io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
+
+func NewTargetRunEngine(e *Engine, status func(s worker.Status)) TargetRunEngine {
+	return TargetRunEngine{
+		Engine: e,
+		Status: status,
+	}
+}
 
 type TargetRunEngine struct {
 	*Engine
@@ -180,7 +188,7 @@ type runPrepare struct {
 	BinDir string
 }
 
-func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *runPrepare, rerr error) {
+func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
 	span := e.SpanRunPrepare(ctx, target)
 	defer func() {
 		span.EndError(rerr)
@@ -211,6 +219,17 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 		bin[t.Name], err = t.ResolvedPath()
 		if err != nil {
 			return nil, err
+		}
+	}
+
+	// Allow building from within a sandbox, especially useful for isolated e2e
+	if utils.HephFromPath && utils.IsDevVersion() {
+		if target.Tools.HasHeph() {
+			var err error
+			bin["go"], err = exec.LookPath("go")
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -351,6 +370,29 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target) (_ *ru
 	env["PACKAGE"] = target.Package.FullName
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
+	if !target.Cache.Enabled {
+		env["REPO_ROOT"] = e.Root.Abs()
+		mode := mode
+		if mode == "" {
+			mode = "run"
+		}
+		env["HEPH_MODE"] = mode
+	}
+	if target.Tools.HasHeph() {
+		// Forward heph variables inside the sandbox
+		forward := []string{
+			"HEPH_PROFILES",
+			"HEPH_FROM_PATH",
+		}
+		for _, k := range forward {
+			value, ok := os.LookupEnv(k)
+			if !ok {
+				continue
+			}
+			env[k] = value
+		}
+	}
+
 	if !(target.SrcEnv.All == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
 			fileEnv := target.SrcEnv.Get(srcRecNameToDepName[name])
@@ -545,7 +587,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 	}
 
-	rp, err := e.runPrepare(ctx, target)
+	rp, err := e.runPrepare(ctx, target, rr.Mode)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
@@ -661,6 +703,10 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 				if err != nil {
 					return err
 				}
+			}
+
+			if _, ok := env["TERM"]; !ok {
+				env["TERM"] = os.Getenv("TERM")
 			}
 		}
 

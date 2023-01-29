@@ -67,9 +67,12 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.FQN)
 
-		tp, _ := targetspec.TargetParse("", target.FQN)
+		tp, err := targetspec.TargetParse("", target.FQN)
+		if err != nil {
+			return err
+		}
 
-		err := os.WriteFile(dir.Join(tp.Name).Abs(), []byte(wrapper), os.ModePerm)
+		err = os.WriteFile(dir.Join(tp.Name).Abs(), []byte(wrapper), os.ModePerm)
 		if err != nil {
 			return err
 		}

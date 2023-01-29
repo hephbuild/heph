@@ -72,7 +72,7 @@ target(
 extra_src = [
     "engine/predeclared.gotpl",
 ]
-deps = ["go.mod", "go.sum"] + glob("**/*.go", exclude=["website", "backend"]) + extra_src
+deps = ["go.mod", "go.sum"] + glob("**/*.go", exclude=["website", "backend", "test"]) + extra_src
 
 release = "release" in CONFIG["profiles"]
 

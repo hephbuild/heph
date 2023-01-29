@@ -6,7 +6,6 @@ import (
 	"heph/packages"
 	"heph/utils"
 	"heph/utils/maps"
-	"os"
 	"os/exec"
 	"time"
 )
@@ -196,7 +195,7 @@ func (t TargetSpecHostTool) ResolvedPath() (string, error) {
 	}
 
 	if t.BinName == "heph" {
-		return os.Executable()
+		return utils.Executable(), nil
 	}
 
 	once := binCache.Get(t.BinName)

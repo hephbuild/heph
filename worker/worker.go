@@ -202,8 +202,6 @@ func NewPool(n int) *Pool {
 func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	p.wg.Add(1)
 
-	log.Tracef("Scheduling %v %v", job.Name, job.ID)
-
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		<-p.ctx.Done()
@@ -218,6 +216,8 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	if job.Deps == nil {
 		job.Deps = &WaitGroup{}
 	}
+
+	log.Tracef("Scheduling %v %v", job.Name, job.ID)
 
 	p.jobs.Add(job)
 

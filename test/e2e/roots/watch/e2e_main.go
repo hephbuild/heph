@@ -9,12 +9,12 @@ import (
 
 // This is a sanity test that watching a target works
 func main() {
-	Must(CleanSetup())
-
 	tmp := MustV(TempDir())
 	defer os.RemoveAll(tmp)
 
 	SetDefaultRunOpts(RunOpts{Params: map[string]string{"tmp": tmp}})
+
+	Must(CleanSetup())
 
 	// Test zero cache run
 	w := MustV(Watch("//:run"))

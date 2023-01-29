@@ -1,3 +1,5 @@
+# Will generate one sandbox per e2e_main*.go file
+
 main_files=glob('roots/**/e2e_main*.go')
 
 for file in main_files:
@@ -18,23 +20,29 @@ for file in main_files:
             'files': [
                 file,
                 'go.mod',
-            ]+glob(dir+'/**/*', exclude=main_files+["**/BUILD"])+glob('lib/**/*'),
+            ]+glob('go.sum')+glob(dir+'/**/*', exclude=main_files+["**/BUILD"])+glob('lib/**/*'),
         },
         tools='//:go|go',
         run=[
-            'go build -o $OUT $SRC_F'
+            'go build -o $OUT $(dirname $SRC_F)'
         ],
         out='test',
+        src_env={'f': 'abs'}
     )
 
     target(
         name=name,
-        deps=glob(dir+'/**/*'),
+        deps={
+            'cfg': 'e2e.hephconfig',
+            'f': glob(dir+'/**/*', exclude=main_files),
+        },
         run=[
             'cd '+dir,
+            'cp $SRC_CFG .hephconfig',
             '$TOOL_TEST',
         ],
         cache=False,
         tools=[build, 'heph'],
         labels=['e2e_isolated'],
+        src_env='abs',
     )

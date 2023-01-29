@@ -106,6 +106,7 @@ type TargetRunRequest struct {
 	Args    []string
 	NoCache bool
 	Shell   bool
+	Mode    string // run or watch
 }
 
 type TargetRunRequests []TargetRunRequest
@@ -641,10 +642,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 			Name: "warm " + target.FQN + "|" + output,
 			Deps: wdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				e := TargetRunEngine{
-					Engine: e,
-					Status: w.Status,
-				}
+				e := NewTargetRunEngine(e, w.Status)
 
 				w.Status(TargetOutputStatus(target, output, "Priming cache..."))
 
@@ -704,10 +702,7 @@ func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target
 		Name: "postrunwarm " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := TargetRunEngine{
-				Engine: e,
-				Status: w.Status,
-			}
+			e := NewTargetRunEngine(e, w.Status)
 
 			return e.postRunOrWarm(ctx, target, outputs)
 		},
@@ -719,10 +714,7 @@ func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *
 		Name: rr.Target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := TargetRunEngine{
-				Engine: e,
-				Status: w.Status,
-			}
+			e := NewTargetRunEngine(e, w.Status)
 
 			err := e.Run(ctx, rr, sandbox.IOConfig{})
 			if err != nil {

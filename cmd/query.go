@@ -42,9 +42,12 @@ func init() {
 	queryCmd.AddCommand(outCmd)
 	queryCmd.AddCommand(hashoutCmd)
 	queryCmd.AddCommand(hashinCmd)
-	queryCmd.AddCommand(cacheRootCmd)
 	queryCmd.AddCommand(outRootCmd)
 	queryCmd.AddCommand(labelsCmd)
+
+	// Private, for internal testing
+	queryCmd.AddCommand(cacheRootCmd)
+	queryCmd.AddCommand(parseTargetCmd)
 
 	revdepsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
@@ -643,6 +646,29 @@ var cacheRootCmd = &cobra.Command{
 		}
 
 		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
+
+		return nil
+	},
+}
+
+var parseTargetCmd = &cobra.Command{
+	Use:               "parsetarget <target>",
+	Short:             "Prints parsed target",
+	Hidden:            true,
+	Args:              cobra.ExactArgs(1),
+	ValidArgsFunction: ValidArgsFunctionTargets,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		tp, err := targetspec.TargetOutputParse("", args[0])
+		if err != nil {
+			return err
+		}
+
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "    ")
+		err = enc.Encode(tp)
+		if err != nil {
+			return err
+		}
 
 		return nil
 	},

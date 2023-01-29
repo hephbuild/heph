@@ -68,10 +68,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 				if !hasParentCacheMiss && target.Cache.Enabled && !rr.NoCache {
 					w.Status(TargetStatus(target, "Pulling meta..."))
 
-					e := TargetRunEngine{
-						Engine: e,
-						Status: w.Status,
-					}
+					e := NewTargetRunEngine(e, w.Status)
 
 					cached, err := e.PullTargetMeta(ctx, target, target.OutWithSupport.Names())
 					if err != nil {

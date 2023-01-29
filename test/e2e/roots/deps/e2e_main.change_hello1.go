@@ -9,12 +9,12 @@ import (
 // This tests that changing when running a dependency A, changing a dependency C of a
 // dependency B does trigger a rerun when the output of B is not the same
 func main() {
-	Must(CleanSetup())
-
 	tmp := MustV(TempDir())
 	defer os.RemoveAll(tmp)
 
 	SetDefaultRunOpts(RunOpts{Params: map[string]string{"tmp": tmp}})
+
+	Must(CleanSetup())
 
 	touchhello := filepath.Join(tmp, "hello")
 	touchrun := filepath.Join(tmp, "run")

@@ -1,3 +1,7 @@
+tmp=heph.param('tmp')
+if not tmp:
+    fail('tmp is empty')
+
 hello=target(
     name='hello',
     deps={
@@ -5,7 +9,7 @@ hello=target(
         'h2': 'hello2.txt',
     },
     run=[
-        'TMP='+heph.param('tmp'),
+        'TMP='+tmp,
         'touch $TMP/hello',
         'cat $SRC_H1 > $OUT',
     ],
@@ -23,7 +27,7 @@ target(
     name='run',
     deps=hellocp,
     run=[
-        'TMP='+heph.param('tmp'),
+        'TMP='+tmp,
         'touch $TMP/run',
         'cp $SRC $TMP/hello.txt',
     ],
