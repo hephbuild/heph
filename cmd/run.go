@@ -70,6 +70,15 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	}
 
 	if inlineInvocationTarget == nil {
+		if printOutput.bool {
+			for _, target := range rrs.Targets() {
+				err = printTargetOutput(target, printOutput.str)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -77,11 +86,17 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		log.Info(s.String(isTerm))
 	})
 
-	err = re.Run(ctx, *inlineInvocationTarget, sandbox.IOConfig{
-		Stdin:  os.Stdin,
+	cfg := sandbox.IOConfig{
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
-	})
+		Stdin:  os.Stdin,
+	}
+	if printOutput.bool {
+		log.Debugf("Redirecting stdout to stderr")
+		cfg.Stdout = os.Stderr
+	}
+
+	err = re.Run(ctx, *inlineInvocationTarget, cfg)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {
@@ -92,6 +107,13 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		}
 
 		return fmt.Errorf("%v: %w", inlineTarget.FQN, err)
+	}
+
+	if printOutput.bool {
+		err = printTargetOutput(inlineTarget, printOutput.str)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

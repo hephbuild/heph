@@ -22,7 +22,7 @@ func RunO(tgt string, o RunOpts) error {
 
 func RunOutput(tgt string) ([]string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := command("q", "out", tgt)
+	cmd := command("run", tgt, "--print-out")
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	cmd.Stdout = &stdout
 

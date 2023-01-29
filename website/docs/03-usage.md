@@ -41,7 +41,7 @@ heph query fzf
 When running, output artifacts for each target will be placed somewhere in the `.heph/cache` folder, to get the path of a built artifact, you can request heph to print it out:
 
 ```shell
-heph query out //path/to:target
+heph run //path/to:target --print-out
 ```
 
 This will run the target and print the output path to stdout.

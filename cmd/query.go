@@ -593,12 +593,32 @@ var revdepsCmd = &cobra.Command{
 	},
 }
 
+func printTargetOutput(target *engine.Target, output string) error {
+	paths := target.ActualOutFiles().All()
+	if output != "" {
+		if !target.ActualOutFiles().HasName(output) {
+			return fmt.Errorf("%v: output `%v` does not exist", target.FQN, output)
+		}
+		paths = target.ActualOutFiles().Name(output)
+	} else if len(paths) == 0 {
+		return fmt.Errorf("%v: does not output anything", target.FQN)
+	}
+
+	for _, path := range paths {
+		fmt.Println(path.Abs())
+	}
+	return nil
+}
+
 var outCmd = &cobra.Command{
 	Use:               "out <target>",
 	Short:             "Prints targets output path",
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
+	Hidden:            true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		log.Warnf("Deprecated, use heph run xxx --print-out")
+
 		ctx := cmd.Context()
 
 		target, err := parseTargetFromArgs(ctx, args)
@@ -611,16 +631,9 @@ var outCmd = &cobra.Command{
 			return err
 		}
 
-		paths := target.ActualOutFiles().All()
-		if output != "" {
-			if !target.ActualOutFiles().HasName(output) {
-				return fmt.Errorf("output %v does not exist", output)
-			}
-			paths = target.ActualOutFiles().Name(output)
-		}
-
-		for _, path := range paths {
-			fmt.Println(path.Abs())
+		err = printTargetOutput(target, output)
+		if err != nil {
+			return err
 		}
 
 		return nil
