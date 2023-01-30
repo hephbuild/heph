@@ -1,19 +1,47 @@
 package engine
 
 import (
-	"encoding/json"
+	"github.com/vmihailenco/msgpack/v5"
 	"heph/targetspec"
 	"heph/utils"
 	"heph/utils/hash"
+	"heph/utils/sets"
 	"os"
 	"path/filepath"
 )
 
 type AutocompleteCache struct {
-	Hash          string
-	AllTargets    []string
-	Labels        []string
-	PublicTargets []string
+	Hash    string
+	Targets []targetspec.TargetSpec
+
+	publicTargets utils.Once[[]targetspec.TargetSpec]
+	labels        utils.Once[[]string]
+}
+
+func (a *AutocompleteCache) PublicTargets() []targetspec.TargetSpec {
+	return a.publicTargets.MustDo(func() ([]targetspec.TargetSpec, error) {
+		pub := make([]targetspec.TargetSpec, 0)
+		for _, target := range a.Targets {
+			if target.IsPrivate() {
+				continue
+			}
+
+			pub = append(pub, target)
+		}
+
+		return pub, nil
+	})
+}
+
+func (a *AutocompleteCache) Labels() []string {
+	return a.labels.MustDo(func() ([]string, error) {
+		labels := sets.NewStringSet(0)
+		for _, target := range a.Targets {
+			labels.AddAll(target.Labels)
+		}
+
+		return labels.Slice(), nil
+	})
 }
 
 func (e *Engine) autocompleteCachePath() string {
@@ -22,7 +50,7 @@ func (e *Engine) autocompleteCachePath() string {
 
 func (e *Engine) computeAutocompleteHash() (string, error) {
 	h := hash.NewHash()
-	h.I64(1)
+	h.I64(2)
 	h.String(utils.Version)
 
 	for _, file := range e.SourceFiles {
@@ -60,27 +88,17 @@ func FilterPublicTargets(targets []*Target) []*Target {
 }
 
 func (e *Engine) StoreAutocompleteCache() error {
-	allTargets := make([]string, 0, e.Targets.Len())
-	pubTargets := make([]string, 0, e.Targets.Len()/2)
-
-	for _, fqn := range e.Targets.FQNs() {
-		tp, _ := targetspec.TargetParse("", fqn)
-
-		allTargets = append(allTargets, fqn)
-
-		if !tp.IsPrivate() {
-			pubTargets = append(pubTargets, fqn)
-		}
+	allTargets := make([]targetspec.TargetSpec, 0, e.Targets.Len())
+	for _, target := range e.Targets.Slice() {
+		allTargets = append(allTargets, target.TargetSpec)
 	}
 
 	cache := &AutocompleteCache{
-		Hash:          e.autocompleteHash,
-		AllTargets:    allTargets,
-		PublicTargets: pubTargets,
-		Labels:        e.Labels.Slice(),
+		Hash:    e.autocompleteHash,
+		Targets: allTargets,
 	}
 
-	b, err := json.Marshal(cache)
+	b, err := msgpack.Marshal(cache)
 	if err != nil {
 		return err
 	}
@@ -104,7 +122,7 @@ func (e *Engine) LoadAutocompleteCache() (*AutocompleteCache, error) {
 	}
 
 	var cache AutocompleteCache
-	err = json.Unmarshal(b, &cache)
+	err = msgpack.Unmarshal(b, &cache)
 	if err != nil {
 		return nil, err
 	}

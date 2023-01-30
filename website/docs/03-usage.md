@@ -25,7 +25,7 @@ See `heph query -h` for available query commands.
 When the number of targets becomes too important, it can be pretty hard to remember them all, to make it easy to find them, you can run
 
 ```shell
-$ heph query fzf pathtarget
+$ heph search pathtarget
 //path/to:target
 //path/to/some/other:target
 ```
@@ -33,7 +33,7 @@ $ heph query fzf pathtarget
 An interactive mode is also available:
 
 ```shell
-heph query fzf
+heph search
 ```
 
 ## Artifacts

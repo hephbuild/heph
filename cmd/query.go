@@ -3,9 +3,9 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+	"heph/cmd/search"
 	"heph/engine"
 	log "heph/hlog"
 	"heph/packages"
@@ -146,31 +146,37 @@ var fzfCmd = &cobra.Command{
 	Short: "Fuzzy search targets",
 	Args:  cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		log.Warnf("Deprecated, use heph search")
+
 		targets, _, err := preRunAutocompleteInteractive(cmd.Context(), all, false)
 		if err != nil {
 			return err
 		}
 
 		if len(args) == 0 {
-			p := tea.NewProgram(newBbtFzf(targets))
-			if err := p.Start(); err != nil {
-				return err
-			}
-			return nil
+			return search.TUI(targets)
 		}
 
-		suggestions := fuzzyFindTargetName(targets, args[0], 0)
-		if len(suggestions) > 10 {
-			l := len(suggestions)
-			suggestions = suggestions[:10]
-			suggestions = append(suggestions, fmt.Sprintf("%v more", l-10))
+		return search.Search(targets, args[0])
+	},
+}
+
+var searchCmd = &cobra.Command{
+	Use:     "search [target]",
+	Aliases: []string{"s"},
+	Short:   "Search targets",
+	Args:    cobra.ArbitraryArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		targets, _, err := preRunAutocompleteInteractive(cmd.Context(), all, false)
+		if err != nil {
+			return err
 		}
 
-		for _, target := range suggestions {
-			fmt.Println(target)
+		if len(args) == 0 {
+			return search.TUI(targets)
 		}
 
-		return nil
+		return search.Search(targets, strings.Join(args, " "))
 	},
 }
 

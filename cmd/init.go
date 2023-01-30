@@ -9,6 +9,7 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"heph/engine"
 	log "heph/hlog"
+	"heph/targetspec"
 	"heph/worker"
 	"strings"
 )
@@ -175,11 +176,11 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	return nil
 }
 
-func preRunAutocomplete(ctx context.Context) ([]string, []string, error) {
+func preRunAutocomplete(ctx context.Context) (targetspec.TargetSpecs, []string, error) {
 	return preRunAutocompleteInteractive(ctx, false, true)
 }
 
-func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent bool) ([]string, []string, error) {
+func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent bool) (targetspec.TargetSpecs, []string, error) {
 	err := engineInit(ctx)
 	if err != nil {
 		return nil, nil, err
@@ -188,11 +189,12 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 	cache, _ := Engine.LoadAutocompleteCache()
 
 	if cache != nil {
-		if includePrivate {
-			return cache.AllTargets, cache.Labels, nil
+		targets := cache.Targets
+		if !includePrivate {
+			targets = cache.PublicTargets()
 		}
 
-		return cache.PublicTargets, cache.Labels, nil
+		return targets, cache.Labels(), nil
 	}
 
 	err = preRunWithGen(ctx)
@@ -201,9 +203,9 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 	}
 
 	targets := Engine.Targets
-	if !all {
+	if !includePrivate {
 		targets = targets.Public()
 	}
 
-	return targets.FQNs(), Engine.Labels.Slice(), nil
+	return targets.Specs(), Engine.Labels.Slice(), nil
 }

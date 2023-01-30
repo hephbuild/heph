@@ -17,6 +17,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		FQN:                 pkg.TargetPath(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run.Array,
+		Doc:                 args.Doc,
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
 		Executor:            args.Executor,

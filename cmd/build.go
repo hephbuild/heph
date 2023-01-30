@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/lithammer/fuzzysearch/fuzzy"
+	"heph/cmd/search"
 	"heph/engine"
 	"heph/targetspec"
 	"sort"
@@ -44,36 +45,21 @@ func autocompletePrefix(suggestions, ss []string, comp string) []string {
 	return suggestions
 }
 
-func autocompleteTargetName(targets []string, s string) (bool, []string) {
+func autocompleteTargetName(targets targetspec.TargetSpecs, s string) (bool, []string) {
 	if s == "" {
-		return false, targets
+		return false, targets.FQNs()
 	}
 
 	if strings.HasPrefix(s, "/") {
-		return false, autocompletePrefix(nil, targets, s)
+		return false, autocompletePrefix(nil, targets.FQNs(), s)
 	}
 
 	return true, fuzzyFindTargetName(targets, s, 10)
 }
 
-func fuzzyFindTargetName(targets []string, s string, max int) []string {
-	if s == "" {
-		return nil
-	}
-
-	matches := fuzzy.RankFindNormalizedFold(s, targets)
-	sort.Sort(matches)
-
-	suggestions := autocompletePrefix(nil, targets, s)
-	for _, s := range matches {
-		suggestions = append(suggestions, s.Target)
-	}
-
-	if max > 0 && len(suggestions) > max {
-		suggestions = suggestions[:max]
-	}
-
-	return suggestions
+func fuzzyFindTargetName(targets targetspec.TargetSpecs, s string, max int) []string {
+	suggestions := search.FuzzyFindTarget(targets, s, max)
+	return suggestions.FQNs()
 }
 
 var labelChars = []byte(targetspec.Alphanum + `_`)
@@ -102,7 +88,7 @@ func autocompleteLabel(labels []string, s string) []string {
 	return suggestions
 }
 
-func autocompleteLabelOrTarget(targets, labels []string, s string) (bool, []string) {
+func autocompleteLabelOrTarget(targets targetspec.TargetSpecs, labels []string, s string) (bool, []string) {
 	type res struct {
 		f bool     // isFuzzy
 		s []string // suggestions

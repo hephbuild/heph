@@ -156,6 +156,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	if err := starlark.UnpackArgs(
 		"target", args, kwargs,
 		"name?", &sargs.Name,
+		"doc?", &sargs.Doc,
 		"pkg?", &sargs.Pkg,
 		"run?", &sargs.Run,
 		"_file_content?", &sargs.FileContent,

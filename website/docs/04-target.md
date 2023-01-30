@@ -21,6 +21,7 @@ target(
 | Name             | Type                                           | Default                                           | Description                                                                                  |
 |------------------|------------------------------------------------|---------------------------------------------------|----------------------------------------------------------------------------------------------|
 | `name`           | `string`                                       | <span class="badge badge--danger">required</span> | Target name                                                                                  |
+| `doc`            | `string`                                       | `None`                                            | Documentation                                                                                |
 | `run`            | `string`, `[]string`                           | `[]`                                              | Command(s) to run (see `executor`)                                                           |
 | `executor`       | `'bash'`, `'exec'`                             | `'bash'`                                          | See [`executor`](#executor)                                                                  |
 | `run_in_cwd`     | `bool`                                         | `False`                                           | Will run the target in the current working directory, use with `sandbox=False`               |

@@ -7,6 +7,7 @@ import (
 	"heph/utils"
 	"heph/utils/maps"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -79,10 +80,32 @@ func SortOutputsForHashing(names []string) []string {
 	return names
 }
 
+type TargetSpecs []TargetSpec
+
+func (ts TargetSpecs) FQNs() []string {
+	fqns := make([]string, 0, len(ts))
+	for _, t := range ts {
+		fqns = append(fqns, t.FQN)
+	}
+
+	return fqns
+}
+
+func (ts TargetSpecs) Get(fqn string) (TargetSpec, bool) {
+	for _, t := range ts {
+		if t.FQN == fqn {
+			return t, true
+		}
+	}
+
+	return TargetSpec{}, false
+}
+
 type TargetSpec struct {
 	Name    string
 	FQN     string
 	Package *packages.Package
+	Doc     string
 
 	Run                 []string
 	FileContent         []byte // Used by special target `text_file`
@@ -122,6 +145,10 @@ type TargetSpecTransitive struct {
 	Env        map[string]string
 	PassEnv    []string
 	RuntimeEnv map[string]string
+}
+
+func (t TargetSpec) IsPrivate() bool {
+	return strings.HasPrefix(t.Name, "_")
 }
 
 func (t TargetSpec) IsGroup() bool {

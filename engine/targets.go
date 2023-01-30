@@ -542,10 +542,6 @@ func (t *Target) ActualSupportFiles() fs.Paths {
 	return t.actualSupportFiles
 }
 
-func (t *Target) IsPrivate() bool {
-	return strings.HasPrefix(t.Name, "_")
-}
-
 func (t *Target) HasAnyLabel(labels []string) bool {
 	for _, clabel := range labels {
 		for _, tlabel := range t.Labels {
@@ -602,6 +598,19 @@ func (ts *Targets) FQNs() []string {
 	}
 
 	return fqns
+}
+
+func (ts *Targets) Specs() []targetspec.TargetSpec {
+	if ts == nil {
+		return nil
+	}
+
+	specs := make([]targetspec.TargetSpec, 0)
+	for _, target := range ts.Slice() {
+		specs = append(specs, target.TargetSpec)
+	}
+
+	return specs
 }
 
 func (ts *Targets) Public() *Targets {

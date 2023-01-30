@@ -94,10 +94,10 @@ testmain_lib = go_library(
 )
 
 test_build = go_build_bin(
-    name="go_test#build@{{.VID}}",
+    name="_go_test#build@{{.VID}}",
 	main=testmain_lib,
     libs={{.DepsLibs}},
-	out="pkg.test",
+	out=heph.pkg.name(),
 	{{.VariantBin}}
 )
 

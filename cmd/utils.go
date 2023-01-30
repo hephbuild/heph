@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
+	"heph/cmd/search"
 	"heph/engine"
 	log "heph/hlog"
 	"heph/worker"
@@ -119,7 +120,7 @@ func printTargetNotFoundErrorSuggestions(err error) bool {
 
 	var terr engine.TargetNotFoundErr
 	if errors.As(err, &terr) {
-		suggestions := fuzzyFindTargetName(e.Targets.FQNs(), terr.String, 1)
+		suggestions := search.FuzzyFindTarget(e.Targets.Specs(), terr.String, 1).FQNs()
 		if len(suggestions) > 0 {
 			log.Errorf("%v not found, did you mean %v ?", terr.String, suggestions[0])
 			return true

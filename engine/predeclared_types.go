@@ -9,6 +9,7 @@ import (
 type TargetArgs struct {
 	Name                string
 	Pkg                 string
+	Doc                 string
 	Run                 ArrayMap
 	ConcurrentExecution bool
 	FileContent         string

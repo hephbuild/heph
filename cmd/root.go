@@ -60,6 +60,7 @@ func init() {
 	rootCmd.AddCommand(gcCmd)
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(setupCmd)
+	rootCmd.AddCommand(searchCmd)
 
 	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
 	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
