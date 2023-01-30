@@ -68,17 +68,15 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 
 	for _, target := range targets {
 		err = idx.Index(target.FQN, struct {
-			Name    string   `json:"name"`
-			Package string   `json:"pkg"`
-			FQN     string   `json:"fqn"`
-			Doc     string   `json:"doc"`
-			Labels  []string `json:"labels"`
+			Name    string `json:"name"`
+			Package string `json:"pkg"`
+			FQN     string `json:"fqn"`
+			Doc     string `json:"doc"`
 		}{
 			Name:    target.Name,
 			Package: target.Package.FullName,
 			FQN:     target.FQN,
 			Doc:     target.Doc,
-			Labels:  nil,
 		})
 		if err != nil {
 			return nil, err
@@ -90,16 +88,12 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 			return Result{}, nil
 		}
 
-		fzfq := newFzfQuery(querys)
-
-		bfzfq := bleve.NewBooleanQuery()
-		bfzfq.AddShould(fzfq)
-		bfzfq.SetBoost(2)
+		fzfq := newFzfQuery(querys, 2)
 
 		qsq := bleve.NewQueryStringQuery(querys)
 
 		q := bleve.NewDisjunctionQuery(
-			bfzfq,
+			fzfq,
 			qsq,
 		)
 
@@ -113,7 +107,7 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 
 		targets := sets.NewSet(func(t targetspec.TargetSpec) string {
 			return t.FQN
-		}, searchResults.Size())
+		}, searchResults.Hits.Len())
 		for _, hit := range searchResults.Hits {
 			targets.Add(ts.GetKey(hit.ID))
 		}

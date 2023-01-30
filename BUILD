@@ -97,7 +97,7 @@ for os in ["linux", "darwin"]:
             run=[
                 "go version",
                 "pwd",
-                "go build {} -ldflags='-s -w' -o $OUT .".format(build_flags)
+                "go build -trimpath {} -ldflags='-s -w' -o $OUT .".format(build_flags)
             ],
             out=out,
             deps=deps,

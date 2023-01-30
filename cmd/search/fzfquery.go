@@ -8,10 +8,12 @@ import (
 	"github.com/blevesearch/bleve/v2/search/searcher"
 	index "github.com/blevesearch/bleve_index_api"
 	"github.com/lithammer/fuzzysearch/fuzzy"
+	"math"
 )
 
 type fzfQuery struct {
-	s string
+	s     string
+	boost float64
 }
 
 func (q fzfQuery) Searcher(ctx context.Context, i index.IndexReader, m mapping.IndexMapping, options search.SearcherOptions) (search.Searcher, error) {
@@ -38,17 +40,18 @@ func (q fzfQuery) Searcher(ctx context.Context, i index.IndexReader, m mapping.I
 			return false
 		}
 
-		score := fuzzy.RankMatchNormalizedFold(q.s, fqn)
-		if score < 0 {
+		ld := fuzzy.RankMatchNormalizedFold(q.s, fqn)
+		if ld < 0 {
 			return false
 		}
 
-		d.Score = float64(score)
+		score := math.Min(1, math.Pow(2, -float64(ld)/float64(len(fqn))))
+		d.Score = (d.Score + score*q.boost) / (q.boost + 1)
 
 		return true
 	}), nil
 }
 
-func newFzfQuery(s string) query.Query {
-	return fzfQuery{s: s}
+func newFzfQuery(s string, boost float64) query.Query {
+	return fzfQuery{s: s, boost: boost}
 }
