@@ -40,9 +40,8 @@ def json_file(data, *args, **kwargs):
         *args, **kwargs
     )
 
-def tool_target(*args, **kwargs):
+def tool_target(run=[], *args, **kwargs):
     _fail_if_present(kwargs, "executor")
-    _fail_if_present(kwargs, "run")
     _fail_if_present(kwargs, "run_in_cwd")
     _fail_if_present(kwargs, "sandbox")
     _fail_if_present(kwargs, "cache")
@@ -51,12 +50,13 @@ def tool_target(*args, **kwargs):
 
     return target(
         executor='exec',
-        run='tool',
+        run=['heph_tool']+([run] or []),
         run_in_cwd=True,
         sandbox=False,
         cache=False,
         pass_args=True,
         pass_env='*',
         concurrent_execution=True,
+        src_env='abs',
         *args, **kwargs
     )

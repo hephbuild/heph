@@ -663,7 +663,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		run := make([]string, 0)
 		if target.IsTool() {
 			log.Tracef("%v is tool, replacing run", target.FQN)
-			run = []string{target.ToolTarget().AbsPath()}
+			run = append(target.Run[1:], target.ToolTarget().AbsPath())
 		} else {
 			for _, s := range target.Run {
 				out, err := exprs.Exec(s, e.queryFunctions(target))

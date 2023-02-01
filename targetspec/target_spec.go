@@ -156,7 +156,7 @@ func (t TargetSpec) IsGroup() bool {
 }
 
 func (t TargetSpec) IsTool() bool {
-	return len(t.Run) == 1 && t.Run[0] == "tool"
+	return len(t.Run) > 0 && t.Run[0] == "heph_tool"
 }
 
 func (t TargetSpec) IsTextFile() bool {

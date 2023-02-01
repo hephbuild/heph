@@ -46,6 +46,10 @@ func Filter[T any](a []T, f func(T) bool) []T {
 }
 
 func CopyArray[T any](a []T) []T {
+	if a == nil {
+		return nil
+	}
+
 	var empty []T
 	return append(empty, a...)
 }
