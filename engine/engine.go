@@ -665,7 +665,7 @@ func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, ou
 }
 
 func TargetStatus(t *Target, status string) worker.Status {
-	return TargetOutputStatus(t, "", status)
+	return targetStatus{t.FQN, "", status}
 }
 
 type targetStatus struct {
@@ -694,6 +694,9 @@ func (t targetStatus) String(term bool) string {
 }
 
 func TargetOutputStatus(t *Target, output string, status string) worker.Status {
+	if output == "" {
+		output = "-"
+	}
 	return targetStatus{t.FQN, output, status}
 }
 

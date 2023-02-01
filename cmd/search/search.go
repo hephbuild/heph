@@ -53,18 +53,19 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 	specMapping := bleve.NewDocumentMapping()
 	mapping.AddDocumentMapping("spec", specMapping)
 
-	for _, name := range []string{"fqn", "pkg", "name", "doc"} {
+	for _, name := range []string{"fqn", "pkg", "name"} {
 		simpleMapping := bleve.NewTextFieldMapping()
-		simpleMapping.Store = false
 		simpleMapping.Analyzer = simple.Name
+		simpleMapping.Store = false
+		simpleMapping.IncludeTermVectors = true
 		specMapping.AddFieldMappingsAt(name, simpleMapping)
-
-		langMapping := bleve.NewTextFieldMapping()
-		langMapping.Analyzer = lang_en.AnalyzerName
-		langMapping.IncludeTermVectors = true
-		langMapping.Store = false
-		specMapping.AddFieldMappingsAt(name, langMapping)
 	}
+
+	langMapping := bleve.NewTextFieldMapping()
+	langMapping.Analyzer = lang_en.AnalyzerName
+	langMapping.Store = false
+	langMapping.IncludeTermVectors = true
+	specMapping.AddFieldMappingsAt("doc", langMapping)
 
 	for _, target := range targets {
 		err = idx.Index(target.FQN, struct {
