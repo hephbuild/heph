@@ -96,9 +96,27 @@ const config = {
         theme: lightCodeTheme,
         darkTheme: darkCodeTheme,
       },
+      algolia: {
+        // The application ID provided by Algolia
+        appId: 'STE8BMOSCB',
+
+        // Public API key: it is safe to commit it
+        apiKey: '84ed2e7e95755632c38773d0374dafcb',
+
+        indexName: 'heph',
+
+        // Optional: see doc section below
+        contextualSearch: true,
+
+        // Optional: Algolia search parameters
+        searchParameters: {},
+
+        // Optional: path for search page that enabled by default (`false` to disable it)
+        searchPagePath: 'search',
+      },
     }),
   plugins: [
-      require.resolve("@cmfcmf/docusaurus-search-local"),
+      // require.resolve("@cmfcmf/docusaurus-search-local"),
       'docusaurus-plugin-sass',
   ],
 };
