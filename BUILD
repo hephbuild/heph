@@ -104,13 +104,43 @@ for os in ["linux", "darwin"]:
             env={
                 "GOOS": os,
                 "GOARCH": arch,
-                "CGO_ENABLED": "0",
+                "CGO_ENABLED": "1",
             },
             tools=["go"],
             labels=["build"],
             pass_env=go_env_vars,
         )
         builds.append(t)
+
+        target(
+            name="docker_build_{}_{}".format(os, arch),
+            deps=deps,
+            run=[
+                'docker run --platform=$GOOS/$GOARCH --privileged --cap-add=ALL --rm -it --volume=$(pwd):/ws --volume=/tmp/gocache:/gocache --volume=/tmp/gopath:/gopath --workdir=/ws -e GOCACHE=/gocache -e GOPATH=/gopath -e GOOS=$GOOS -e GOARCH=$GOARCH -e CGO_ENABLED=$CGO_ENABLED golang:1.19 bash -c "go build -trimpath {} -ldflags="-s -w" -o $OUT ."'.format(build_flags),
+                'mv heph $OUT',
+            ],
+            env={
+                "GOOS": os,
+                "GOARCH": arch,
+                "CGO_ENABLED": "1",
+            },
+            out=out,
+            tools='docker',
+        )
+
+target(
+    name="linux",
+    deps=[
+        '//:build_linux_amd64',
+    ],
+    run=[
+        'docker run --privileged --cap-add=ALL --rm -it --volume=$(dirname $SRC):/ws --volume=/Users/XXX/Downloads/py3:/tmp/py3 --workdir=/ws ubuntu ./$(basename $SRC) "$@"',
+    ],
+    tools='docker',
+    src_env='abs',
+    pass_args=True,
+    cache=False,
+)
 
 target(
     name="cp_builds",
