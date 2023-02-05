@@ -40,14 +40,14 @@ jobs:
       - name: Go Tests
         run: "./heph run //:go_test"
 
+      - name: Light E2E Test
+        run: "./heph run //:light_e2e_test"
+
+      - name: Light E2E ReTest
+        run: "./heph run //:light_e2e_test"
+
       - name: E2E Test
         run: "./heph run //:e2e_test"
-
-      - name: E2E ReTest
-        run: "./heph run //:e2e_test"
-
-      - name: E2E Isolated Test
-        run: "./heph run //:e2e_isolated_test"
 
       - name: intg Test
         run: "./heph run //:intg_test"

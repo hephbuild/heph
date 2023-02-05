@@ -13,4 +13,4 @@ if [ -f "$HEPH_SOURCE" ]; then
 fi
 
 export HEPH_CWD="$CWD"
-exec go run . "$@"
+exec go run heph/cmd/heph "$@"

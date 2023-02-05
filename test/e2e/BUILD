@@ -42,7 +42,8 @@ for file in main_files:
             '$TOOL_TEST',
         ],
         cache=False,
-        tools=[build, 'heph'],
-        labels=['e2e_isolated'],
+        tools=[build, 'heph', 'lwe'],
+        labels=['e2e'],
         src_env='abs',
+        pass_env=['TERM', 'PATH'],
     )

@@ -23,8 +23,8 @@ yarn_toolchain(
 )
 
 target(
-    name="e2e_test",
-    run="heph query --include e2e_test | heph run -",
+    name="light_e2e_test",
+    run="heph query --include light_e2e_test | heph run -",
     tools=['heph'],
     pass_env=["PATH"],
     sandbox=False,
@@ -32,8 +32,8 @@ target(
 )
 
 target(
-    name="e2e_isolated_test",
-    run="heph query --include e2e_isolated | heph run -",
+    name="e2e_test",
+    run="heph query --include e2e | heph run -",
     tools=['heph'],
     pass_env=["PATH"],
     sandbox=False,
@@ -76,6 +76,9 @@ deps = ["go.mod", "go.sum"] + glob("**/*.go", exclude=["website", "backend", "te
 
 release = "release" in CONFIG["profiles"]
 
+def _gobuild(pkg, args):
+    return "go build -trimpath {} -ldflags='-s -w' -o $OUT {}".format(build_flags, pkg)
+
 build_flags=""
 if release:
     version = target(
@@ -91,15 +94,13 @@ if release:
 builds = []
 for os in ["linux", "darwin"]:
     for arch in ["amd64", "arm64"]:
-        out = "heph_{}_{}".format(os, arch)
         t = target(
             name="build_{}_{}".format(os, arch),
             run=[
                 "go version",
-                "pwd",
-                "go build -trimpath {} -ldflags='-s -w' -o $OUT .".format(build_flags)
+                _gobuild('heph/cmd/heph', build_flags),
             ],
-            out=out,
+            out="heph_{}_{}".format(os, arch),
             deps=deps,
             env={
                 "GOOS": os,
@@ -111,6 +112,53 @@ for os in ["linux", "darwin"]:
             pass_env=go_env_vars,
         )
         builds.append(t)
+
+        target(
+            name="build_lwe_{}_{}".format(os, arch),
+            run=[
+                _gobuild('heph/cmd/heph', build_flags),
+            ],
+            out="lwe_{}_{}".format(os, arch),
+            deps=deps,
+            env={
+                "GOOS": os,
+                "GOARCH": arch,
+                "CGO_ENABLED": "0",
+            },
+            tools=["go"],
+            labels=["build"],
+            pass_env=go_env_vars,
+        )
+
+def docker_run(args="", volumes=[], env=[]):
+    volumes+=['$(pwd)']
+    env+=['PATH=$(pwd):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin']
+    env=[e if ('=' in e) else e+'=$'+e for e in env]
+
+    volumes_flags = ['--volume={}:{}'.format(p, p) for p in volumes]
+    env_flags = ['-e '+e for e in env]
+
+    flags=' '.join(volumes_flags+env_flags)
+    flags+=' --workdir=$(pwd)'
+
+    return 'docker run --privileged --cap-add=ALL --rm -t {} {}'.format(flags, args)
+
+target(
+    name="docker",
+    deps={
+        'heph': '//:build_linux_amd64',
+        'lwe': '//:build_lwe_linux_amd64',
+    },
+    run=[
+        'mv $SRC_HEPH heph',
+        'mv $SRC_LWE lwe',
+        docker_run('"$@"'),
+    ],
+    tools='docker',
+    src_env='abs',
+    pass_args=True,
+    cache=False,
+)
 
 target(
     name="cp_builds",

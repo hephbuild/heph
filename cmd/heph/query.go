@@ -1,11 +1,11 @@
-package cmd
+package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
-	"heph/cmd/search"
+	"heph/cmd/heph/search"
 	"heph/engine"
 	log "heph/hlog"
 	"heph/packages"
