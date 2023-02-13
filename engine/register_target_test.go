@@ -14,11 +14,22 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 var testWriteExpected = flag.Bool("write-expected", false, "Write expected output files")
+
+type repl struct {
+	Spec   string
+	Actual string
+}
+
+var replacements = []repl{
+	{Spec: "<OS>", Actual: runtime.GOOS},
+	{Spec: "<ARCH>", Actual: runtime.GOARCH},
+}
 
 func TestTargetSpec(t *testing.T) {
 	files := make([]string, 0)
@@ -51,6 +62,9 @@ func TestTargetSpec(t *testing.T) {
 			parts := strings.SplitN(string(b), "===\n", 2)
 			build := strings.TrimSpace(parts[0])
 			expected := strings.TrimSpace(parts[1])
+			for _, r := range replacements {
+				expected = strings.ReplaceAll(expected, r.Spec, r.Actual)
+			}
 
 			var spec targetspec.TargetSpec
 
@@ -90,6 +104,11 @@ func TestTargetSpec(t *testing.T) {
 				require.NoError(t, err)
 
 				defer f.Close()
+
+				actual := actual
+				for _, r := range replacements {
+					actual = strings.ReplaceAll(actual, r.Actual, r.Spec)
+				}
 
 				_, err = fmt.Fprintf(f, "%v\n===\n%v", build, actual)
 				require.NoError(t, err)

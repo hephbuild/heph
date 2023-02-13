@@ -192,8 +192,6 @@ func envMapToArray(m map[string]string) []string {
 func Exec(cfg ExecConfig) *exec.Cmd {
 	args := cfg.ExecArgs
 
-	log.Tracef("Exec in %v: %v", cfg.Dir, args)
-
 	err := os.MkdirAll(cfg.Dir, os.ModePerm)
 	if err != nil {
 		panic(err)

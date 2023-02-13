@@ -1,8 +1,8 @@
-package cmd
+package main
 
 import (
 	"github.com/lithammer/fuzzysearch/fuzzy"
-	"heph/cmd/search"
+	"heph/cmd/heph/search"
 	"heph/engine"
 	"heph/targetspec"
 	"sort"

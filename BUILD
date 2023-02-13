@@ -23,28 +23,28 @@ yarn_toolchain(
 )
 
 target(
-    name="e2e_test",
-    run="heph query --include e2e_test | heph run -",
+    name="test_light_e2e",
+    run="heph query --include light_e2e | heph run -",
     tools=['heph'],
-    pass_env=["PATH"],
+    pass_env=["PATH", "TERM"],
     sandbox=False,
     cache=False,
 )
 
 target(
-    name="e2e_isolated_test",
-    run="heph query --include e2e_isolated | heph run -",
+    name="test_e2e",
+    run="heph query --include e2e | heph run -",
     tools=['heph'],
-    pass_env=["PATH"],
+    pass_env=["PATH", "TERM"],
     sandbox=False,
     cache=False,
 )
 
 target(
-    name="intg_test",
+    name="test_intg",
     run="heph query --include //test/... | heph query --include test - | heph run -",
     tools=['heph'],
-    pass_env=["PATH"],
+    pass_env=["PATH", "TERM"],
     sandbox=False,
     cache=False,
 )
@@ -52,7 +52,7 @@ target(
 go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
-    name="go_test",
+    name="test_go",
     run="go test -v ./...",
     tools=["go"],
     cache=False,
@@ -70,11 +70,15 @@ target(
 )
 
 extra_src = [
-    "engine/predeclared.gotpl",
+    'engine/predeclared.gotpl',
+    'platform/initfile.sh',
 ]
 deps = ["go.mod", "go.sum"] + glob("**/*.go", exclude=["website", "backend", "test"]) + extra_src
 
 release = "release" in CONFIG["profiles"]
+
+def _gobuild(pkg, args):
+    return "go build -trimpath {} -ldflags='-s -w' -o $OUT {}".format(args, pkg)
 
 build_flags=""
 if release:
@@ -91,15 +95,13 @@ if release:
 builds = []
 for os in ["linux", "darwin"]:
     for arch in ["amd64", "arm64"]:
-        out = "heph_{}_{}".format(os, arch)
         t = target(
             name="build_{}_{}".format(os, arch),
             run=[
                 "go version",
-                "pwd",
-                "go build -trimpath {} -ldflags='-s -w' -o $OUT .".format(build_flags)
+                _gobuild('heph/cmd/heph', build_flags),
             ],
-            out=out,
+            out="heph_{}_{}".format(os, arch),
             deps=deps,
             env={
                 "GOOS": os,

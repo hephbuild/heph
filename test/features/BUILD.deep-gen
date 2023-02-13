@@ -31,7 +31,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_echo",
+    name="e2e_echo",
     cmd="heph run //test/features:hello-deep-gen",
     expected_output="Hello deep gen",
 )

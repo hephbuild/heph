@@ -16,6 +16,9 @@ func RunO(tgt string, o RunOpts) error {
 	cmd := commandO(o, "run", tgt)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	if o.Shell {
+		cmd.Stdin = os.Stdin
+	}
 
 	return cmd.Run()
 }

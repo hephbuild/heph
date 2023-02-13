@@ -17,7 +17,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_load_file_source",
+    name="e2e_load_file_source",
     cmd="heph run //test/features:cat_load_file_source",
     expected_output="[1,2,3]",
 )

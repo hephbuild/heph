@@ -13,7 +13,8 @@ type TargetArgs struct {
 	Run                 ArrayMap
 	ConcurrentExecution bool
 	FileContent         string
-	Executor            string
+	Entrypoint          string
+	Platforms           TargetArgsPlatforms
 	RunInCwd            bool
 	Quiet               bool
 	PassArgs            bool
@@ -37,6 +38,34 @@ type TargetArgs struct {
 	HashFile            string
 	Transitive          TargetArgsTransitive
 	Timeout             string
+}
+
+type TargetArgsPlatforms []*starlark.Dict
+
+func (c *TargetArgsPlatforms) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
+	if v, ok := v.(*starlark.Dict); ok {
+		*c = []*starlark.Dict{v}
+		return nil
+	}
+
+	if v, ok := v.(*starlark.List); ok {
+		platforms := make([]*starlark.Dict, 0, v.Len())
+		it := v.Iterate()
+		var e starlark.Value
+		for it.Next(&e) {
+			e := e
+			platforms = append(platforms, e.(*starlark.Dict))
+		}
+
+		*c = platforms
+		return nil
+	}
+
+	return fmt.Errorf("platforms must be list")
 }
 
 type TargetArgsTransitive struct {

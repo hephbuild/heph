@@ -12,53 +12,6 @@ env:
   NOCACHE: "Cache-Control: no-cache, no-store"
 
 jobs:
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v3
-
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: 1.19
-          cache: true
-
-      - name: Build
-        run: go build -v -o heph .
-
-      - name: Cache .heph
-        uses: actions/cache@v3
-        with:
-          path: .heph/cache
-          key: dot-heph-test-${{ github.run_id }}
-          restore-keys: |
-            dot-heph-build-
-
-      - name: Go Tests
-        run: "./heph run //:go_test"
-
-      - name: E2E Test
-        run: "./heph run //:e2e_test"
-
-      - name: E2E ReTest
-        run: "./heph run //:e2e_test"
-
-      - name: E2E Isolated Test
-        run: "./heph run //:e2e_isolated_test"
-
-      - name: intg Test
-        run: "./heph run //:intg_test"
-
-      - name: intg ReTest
-        run: "./heph run //:intg_test"
-
-      - name: Cleanup .heph
-        run: |
-          rm -rf .heph/cache/test
-
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -66,15 +19,15 @@ jobs:
       CGO_ENABLED: "0"
       HEPH_PROFILES: "release"
     outputs:
-      version: ${{ steps.upload.outputs.version }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v3
 
       - name: Set up Go
-        uses: actions/setup-go@v3
+        uses: magnetikonline/action-golang-cache@v3
         with:
           go-version: 1.19
-          cache: true
+          cache-key-suffix: -build
 
       - name: Cache .heph
         uses: actions/cache@v3
@@ -84,10 +37,10 @@ jobs:
           restore-keys: |
             dot-heph-build-
 
-      - name: Pre-Build
-        run: go build -v -o heph .
+      - name: Bootstrap Build
+        run: go build -v -o heph heph/cmd/heph
 
-      - name: Self Build
+      - name: Build all OS/ARCH
         run: |
           mkdir -p dist
           ./heph r //:cp_builds $(pwd)/dist
@@ -99,39 +52,57 @@ jobs:
           name: heph
           path: dist/*
 
+      - name: Set version
+        id: version
+        run: |
+          VERSION=$(cat $(./heph run --print-out //:version))    
+          echo $VERSION
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+  upload_gcs:
+    name: Upload binaries
+    needs: [ build ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: heph
+          path: dist
+
       - name: 'Authenticate to Google Cloud'
         uses: 'google-github-actions/auth@v0'
         with:
           credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
 
       - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v0'
+        uses: 'google-github-actions/setup-gcloud@v1'
 
       - name: Copy to bucket
         id: upload
         run: |
-          VERSION=$(cat $(./heph query out //:version))          
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          VERSION=${{needs.build.outputs.version}}
 
           echo $VERSION
+          
+          [ -z "$VERSION" ] && echo "Empty version" && exit 1
 
           gsutil -h "${NOCACHE}" rsync -r './dist' gs://heph-build/${VERSION}
-          gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
-          gsutil -h "${NOCACHE}" cp './hephw' gs://heph-build/hephw
 
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [ build, test ]
+    needs: [ build, upload_gcs, test ]
     if: github.ref == 'refs/heads/master'
     steps:
+      - uses: actions/checkout@v3
+
       - name: 'Authenticate to Google Cloud'
         uses: 'google-github-actions/auth@v0'
         with:
           credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
 
       - name: 'Set up Cloud SDK'
-        uses: 'google-github-actions/setup-gcloud@v0'
+        uses: 'google-github-actions/setup-gcloud@v1'
 
       - name: Copy to bucket
         run: |
@@ -140,3 +111,61 @@ jobs:
           echo $VERSION > ./latest_version
           
           gsutil -h "${NOCACHE}" cp './latest_version' gs://heph-build/latest_version
+          gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
+          gsutil -h "${NOCACHE}" cp './hephw' gs://heph-build/hephw
+  test:
+    name: Test
+    needs: [ build ]
+    runs-on: ubuntu-latest
+    env:
+      HEPH_PROFILES: "test"
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Go
+        uses: magnetikonline/action-golang-cache@v3
+        with:
+          go-version: 1.19
+          cache-key-suffix: -test
+
+      - uses: actions/download-artifact@v3
+        with:
+          name: heph
+          path: dist
+
+      - name: Setup heph bin
+        run: |
+          chmod +x dist/*
+          mkdir -p /home/runner/.local/bin
+          cp dist/heph_linux_amd64 /home/runner/.local/bin/heph
+          echo "HEPH_DIST_ROOT=$(pwd)/dist" >> $GITHUB_ENV
+
+      - name: Cache
+        uses: actions/cache@v3
+        with:
+          path: /tmp/heph-cache
+          key: heph-cache-test-${{ github.run_id }}
+          restore-keys: |
+            heph-cache-test-
+
+      - name: Go Tests
+        run: "heph run //:test_go"
+
+      - name: Light E2E Test
+        run: "heph run //:test_light_e2e"
+
+      - name: Light E2E ReTest
+        run: "heph run //:test_light_e2e"
+
+      - name: E2E Test
+        run: "heph run //:test_e2e"
+
+      - name: intg Test
+        run: "heph run //:test_intg"
+
+      - name: intg ReTest
+        run: "heph run //:test_intg"
+
+      - name: Cleanup .heph
+        run: |
+          rm -rf .heph/cache/test

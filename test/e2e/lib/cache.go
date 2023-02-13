@@ -68,7 +68,7 @@ func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
 		return err
 	}
 
-	fmt.Println("cache folder:", root)
+	fmt.Println(tgt+" cache folder:", root)
 
 	return validateFolderContent(root, expected)
 }

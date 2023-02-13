@@ -22,7 +22,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_simple_src_out",
+    name="e2e_simple_src_out",
     cmd="heph run //test/features:simple_src_out",
     expected_output="""
 OUT=out
@@ -41,7 +41,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_named_src_out",
+    name="e2e_named_src_out",
     cmd="heph run //test/features:named_src_out",
     expected_output="""
 OUT_OUT1=out1file
@@ -59,7 +59,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_named_src_named_out",
+    name="e2e_named_src_named_out",
     cmd="heph run //test/features:named_src_named_out",
     expected_output="""
 SRC_D1=f1

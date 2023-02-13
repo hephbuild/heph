@@ -31,13 +31,13 @@ target(
 )
 
 e2e_test(
-    name="sanity_exec_echo",
+    name="e2e_exec_echo",
     cmd="heph run //test/features:exec_echo -- 1 2 3",
     expected_output="[1 2 3]",
 )
 
 e2e_test(
-    name="sanity_bash_echo",
+    name="e2e_bash_echo",
     cmd="heph run //test/features:bash_echo -- 1 2 3",
     expected_output="[1 2 3]",
 )

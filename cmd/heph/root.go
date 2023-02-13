@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"fmt"
@@ -140,7 +140,6 @@ var rootCmd = &cobra.Command{
 	Version:       utils.Version,
 	SilenceUsage:  true,
 	SilenceErrors: true,
-	Args:          cobra.ArbitraryArgs,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		lvl, err := log.ParseLevel(*logLevel)
 		if err != nil {
@@ -166,6 +165,16 @@ var rootCmd = &cobra.Command{
 		cobra.OnFinalize(postRun)
 
 		return nil
+	},
+	RunE: func(cmd *cobra.Command, args []string) error {
+		err := cmd.Help()
+		if err != nil {
+			return err
+		}
+
+		return ErrorWithExitCode{
+			ExitCode: 1,
+		}
 	},
 }
 

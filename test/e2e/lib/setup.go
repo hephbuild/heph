@@ -3,15 +3,16 @@ package lib
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
-func RmHome() error {
+func RmSandbox() error {
 	cache, err := HomePath()
 	if err != nil {
 		return err
 	}
 
-	return os.RemoveAll(cache)
+	return os.RemoveAll(filepath.Join(cache, "sandbox"))
 }
 
 func PrintConfig() error {
@@ -26,7 +27,12 @@ func CleanSetup() error {
 	d, _ := os.Getwd()
 	fmt.Println("Root: ", d)
 
-	err := RmHome()
+	err := RmCache()
+	if err != nil {
+		return err
+	}
+
+	err = RmSandbox()
 	if err != nil {
 		return err
 	}

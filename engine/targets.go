@@ -8,6 +8,7 @@ import (
 	"heph/exprs"
 	log "heph/hlog"
 	"heph/packages"
+	"heph/platform"
 	"heph/targetspec"
 	"heph/upgrade"
 	"heph/utils"
@@ -725,6 +726,20 @@ func (e *Engine) Parse(ctx context.Context) error {
 	e.autocompleteHash, err = e.computeAutocompleteHash()
 	if err != nil {
 		return err
+	}
+
+	e.PlatformProviders = []PlatformProvider{}
+	for _, p := range e.Config.OrderedPlatforms() {
+		provider, err := platform.GetProvider(p.Provider, p.Name, p.Options)
+		if err != nil {
+			log.Warnf("provider: %v: %v", p.Name, err)
+			continue
+		}
+
+		e.PlatformProviders = append(e.PlatformProviders, PlatformProvider{
+			Platform: p,
+			Provider: provider,
+		})
 	}
 
 	return nil

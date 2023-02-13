@@ -1,11 +1,11 @@
-package cmd
+package main
 
 import (
 	"errors"
 	"fmt"
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
-	"heph/cmd/search"
+	"heph/cmd/heph/search"
 	"heph/engine"
 	log "heph/hlog"
 	"heph/worker"

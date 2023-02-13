@@ -8,6 +8,7 @@ import (
 type RunOpts struct {
 	Params   map[string]string
 	LogLevel string
+	Shell    bool
 }
 
 func (o RunOpts) Args() []string {
@@ -17,6 +18,9 @@ func (o RunOpts) Args() []string {
 	}
 	if o.LogLevel != "" {
 		args = append(args, "--log_level="+o.LogLevel)
+	}
+	if o.Shell {
+		args = append(args, "--shell")
 	}
 	return args
 }
@@ -44,7 +48,7 @@ func command(args ...string) *exec.Cmd {
 
 func commandO(o RunOpts, args ...string) *exec.Cmd {
 	// TODO handle cli args
-	args = append(args, o.Args()...)
+	args = append(o.Args(), args...)
 
 	return exec.Command("heph", args...)
 }

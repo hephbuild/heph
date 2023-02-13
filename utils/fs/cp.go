@@ -8,6 +8,41 @@ import (
 	"path/filepath"
 )
 
+func CpHardlink(from, to string) error {
+	info, err := os.Lstat(from)
+	if err != nil {
+		return err
+	}
+
+	if !info.IsDir() {
+		err := CreateParentDir(to)
+		if err != nil {
+			return err
+		}
+
+		err = os.RemoveAll(to)
+		if err != nil {
+			return err
+		}
+
+		return os.Link(from, to)
+	}
+
+	entries, err := os.ReadDir(from)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		err := CpHardlink(filepath.Join(from, entry.Name()), filepath.Join(to, entry.Name()))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 func Cp(from, to string) error {
 	logerr := func(id string, err error) error {
 		return fmt.Errorf("%v %v to %v: %w", id, from, to, err)

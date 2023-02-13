@@ -5,7 +5,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"heph/exprs"
 	"heph/packages"
-	"heph/utils"
 	"strings"
 	"testing"
 	"time"
@@ -101,7 +100,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		FQN:               "//:" + name,
 		Package:           pkg,
 		Run:               []string{"some", "command"},
-		Executor:          "exec",
+		Entrypoint:        "exec",
 		Quiet:             false,
 		Dir:               "",
 		PassArgs:          false,
@@ -184,7 +183,7 @@ func TestSortOutputsForHashing(t *testing.T) {
 		outputs  []string
 		expected []string
 	}{
-		{[]string{"a", "b", "c"}, []string{"a", "b", "c"}},
+		{[]string{"a", "c", "b"}, []string{"a", "b", "c"}},
 		{[]string{SupportFilesOutput, "b"}, []string{SupportFilesOutput, "b"}},
 		{[]string{"a", "b", SupportFilesOutput}, []string{SupportFilesOutput, "a", "b"}},
 		{[]string{"a", "b", SupportFilesOutput, "c"}, []string{SupportFilesOutput, "a", "b", "c"}},
@@ -192,8 +191,7 @@ func TestSortOutputsForHashing(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(strings.Join(test.outputs, ","), func(t *testing.T) {
-			outputs := utils.CopyArray(test.outputs)
-			actual := SortOutputsForHashing(outputs)
+			actual := SortOutputsForHashing(test.outputs)
 
 			assert.EqualValues(t, test.expected, actual)
 		})

@@ -20,7 +20,17 @@ target(
     "Doc": "",
     "Run": null,
     "FileContent": "",
-    "Executor": "bash",
+    "Entrypoint": "bash",
+    "Platforms": [
+        {
+            "Labels": {
+                "arch": "<ARCH>",
+                "name": "local",
+                "os": "<OS>"
+            },
+            "Options": null
+        }
+    ],
     "ConcurrentExecution": false,
     "Quiet": false,
     "Dir": "",

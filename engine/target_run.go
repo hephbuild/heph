@@ -8,7 +8,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/htrace"
 	"heph/exprs"
+	"heph/hephprovider"
 	log "heph/hlog"
+	"heph/platform"
 	"heph/sandbox"
 	"heph/targetspec"
 	"heph/utils"
@@ -52,7 +54,6 @@ func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target
 }
 
 func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
-	outputs = utils.CopyArray(outputs)
 	outputs = targetspec.SortOutputsForHashing(outputs)
 
 	cached, err := e.warmTargetInput(ctx, target)
@@ -184,11 +185,14 @@ func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *Src
 }
 
 type runPrepare struct {
-	Env    map[string]string
-	BinDir string
+	Env      map[string]string
+	BinDir   string
+	Executor platform.Executor
 }
 
 func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
+	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
+
 	span := e.SpanRunPrepare(ctx, target)
 	defer func() {
 		span.EndError(rerr)
@@ -207,16 +211,30 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		}
 	}
 
-	log.Debugf("Running %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
+	plat := target.Platforms[0]
+	executor, err := e.chooseExecutor(plat.Labels, plat.Options, e.PlatformProviders)
+	if err != nil {
+		return nil, err
+	}
 
 	bin := map[string]string{}
 	for _, t := range target.Tools.Targets {
 		bin[t.Name] = t.AbsPath()
 	}
 
+	var hephDistRoot string
 	for _, t := range target.Tools.Hosts {
 		var err error
-		bin[t.Name], err = t.ResolvedPath()
+		if t.BinName == "heph" {
+			bin[t.Name], hephDistRoot, err = hephprovider.GetHephPath(
+				e.HomeDir.Join("tmp", "__heph_build").Abs(),
+				executor.Os(), executor.Arch(),
+				true, /*!platform.HasHostFsAccess(executor)*/
+			)
+		} else {
+			bin[t.Name], err = t.ResolvedPath()
+		}
+
 		if err != nil {
 			return nil, err
 		}
@@ -383,14 +401,17 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		forward := []string{
 			"HEPH_PROFILES",
 			"HEPH_FROM_PATH",
+			hephprovider.EnvSrcRoot,
+			hephprovider.EnvDistRoot,
 		}
 		for _, k := range forward {
-			value, ok := os.LookupEnv(k)
-			if !ok {
-				continue
+			if value, ok := os.LookupEnv(k); ok {
+				env[k] = value
 			}
-			env[k] = value
 		}
+	}
+	if hephDistRoot != "" {
+		env[hephprovider.EnvDistRoot] = hephDistRoot
 	}
 
 	if !(target.SrcEnv.All == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
@@ -502,10 +523,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}
 	for _, tool := range target.Tools.Hosts {
 		k := "TOOL_" + strings.ToUpper(tool.Name)
-		env[normalizeEnv(k)], err = tool.ResolvedPath()
-		if err != nil {
-			return nil, err
-		}
+		env[normalizeEnv(k)] = bin[tool.Name]
 	}
 
 	for k, expr := range target.RuntimeEnv {
@@ -522,8 +540,9 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}
 
 	return &runPrepare{
-		Env:    env,
-		BinDir: binDir,
+		Env:      env,
+		BinDir:   binDir,
+		Executor: executor,
 	}, nil
 }
 
@@ -650,14 +669,16 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			return err
 		}
 	} else {
-		var executor sandbox.Executor
-		switch target.Executor {
-		case targetspec.ExecutorBash:
-			executor = sandbox.BashExecutor
-		case targetspec.ExecutorExec:
-			executor = sandbox.ExecExecutor
+		var entrypoint platform.Entrypoint
+		switch target.Entrypoint {
+		case targetspec.EntrypointBash:
+			entrypoint = platform.BashEntrypoint
+		case targetspec.EntrypointSh:
+			entrypoint = platform.ShEntrypoint
+		case targetspec.EntrypointExec:
+			entrypoint = platform.ExecEntrypoint
 		default:
-			panic("unhandled executor: " + target.Executor)
+			panic("unhandled entrypoint: " + target.Entrypoint)
 		}
 
 		run := make([]string, 0)
@@ -676,35 +697,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 
 		if rr.Shell {
-			shellCmds := executor.ShellPrint(run)
-
-			fmt.Println("Shell mode enabled, exit the shell to terminate")
-			if len(shellCmds) > 0 {
-				fmt.Println("The run alias is available to execute the below commands:")
-				fmt.Printf("%v\n", shellCmds)
-
-				f, err := os.CreateTemp(e.tmpRoot(target), "")
-				if err != nil {
-					return err
-				}
-				defer os.Remove(f.Name())
-
-				_, err = io.WriteString(f, fmt.Sprintf("function run {\n%v\n}\nfunction show {\ndeclare -f run\n}", shellCmds))
-				if err != nil {
-					return err
-				}
-
-				executor, err = sandbox.BashShellExecutor(f.Name())
-				if err != nil {
-					return err
-				}
-
-				err = f.Close()
-				if err != nil {
-					return err
-				}
-			}
-
 			if _, ok := env["TERM"]; !ok {
 				env["TERM"] = os.Getenv("TERM")
 			}
@@ -713,35 +705,31 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		_, hasPathInEnv := env["PATH"]
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
-		execArgs, err := executor.ExecArgs(sandbox.ExecutorContext{
-			Args:    run,
-			CmdArgs: rr.Args,
-			Env:     env,
-		})
-		if err != nil {
-			return err
-		}
-
-		log.Debugf("exec: %v", execArgs)
-
-		err = sandbox.FilterLongEnv(env, execArgs)
-		if rerr != nil {
-			return err
-		}
-
-		cmd := sandbox.Exec(sandbox.ExecConfig{
-			Context:  ctx,
-			BinDir:   binDir,
-			Dir:      dir,
-			Env:      env,
-			IOConfig: iocfg,
-			ExecArgs: execArgs,
-		})
-
 		espan := e.SpanRunExec(ctx, target)
-		err = cmd.Run()
+		err = platform.Exec(
+			ctx,
+			rp.Executor,
+			entrypoint,
+			e.tmpRoot(target),
+			platform.ExecOptions{
+				WorkDir:  dir,
+				BinDir:   binDir,
+				HomeDir:  e.HomeDir.Abs(),
+				Target:   target.TargetSpec,
+				Env:      env,
+				Run:      run,
+				TermArgs: rr.Args,
+				IOCfg:    iocfg,
+			},
+			rr.Shell,
+		)
 		espan.EndError(err)
 		if err != nil {
+			if rr.Shell {
+				log.Debugf("exec: %v", err)
+				return nil
+			}
+
 			if cerr := ctx.Err(); cerr != nil {
 				err = fmt.Errorf("%w: %v", cerr, err)
 			}
@@ -811,7 +799,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		e.Status(TargetStatus(target, "Clearing sandbox..."))
 		err = deleteDir(target.SandboxRoot.Abs(), false)
 		if err != nil {
-			return err
+			return fmt.Errorf("clear sandbox: %w", err)
 		}
 	}
 
@@ -821,6 +809,24 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	return nil
+}
+
+func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[string]interface{}, providers []PlatformProvider) (platform.Executor, error) {
+	for _, p := range providers {
+		executor, err := p.NewExecutor(labels, options)
+		if err != nil {
+			log.Errorf("%v: %v", p.Name, err)
+			return nil, err
+		}
+
+		if executor == nil {
+			continue
+		}
+
+		return executor, nil
+	}
+
+	return nil, fmt.Errorf("no platform available for %v", labels)
 }
 
 func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string) error {

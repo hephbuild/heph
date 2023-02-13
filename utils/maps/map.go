@@ -100,3 +100,7 @@ func (m *Map[K, V]) Keys() []K {
 
 	return ks
 }
+
+func (m *Map[K, V]) Map() map[K]V {
+	return m.m
+}
