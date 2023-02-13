@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"context"
@@ -227,7 +227,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 
 		localRRs = make([]engine.TargetRunRequest, 0)
 		if !w.e.RanGenPass {
-			// Run all if gen has not run yet
+			// Exec all if gen has not run yet
 			localRRs = w.rrs
 		} else {
 			for _, target := range descendants {

@@ -40,13 +40,13 @@ for (name, tgt, expected_in, expected_out) in expected:
     )
 
     e2e_test(
-        name='sanity_hashin_'+name,
+        name='e2e_hashin_'+name,
         cmd='heph run '+hashin,
         expected_output=expected_in,
     )
 
     e2e_test(
-        name='sanity_hashout_'+name,
+        name='e2e_hashout_'+name,
         cmd='heph run '+hashout,
         expected_output=expected_out,
     )

@@ -2,6 +2,7 @@
 
 export GOPATH=${GOPATH:-$GO_OUTDIR/gopath}
 export GOCACHE=${GOCACHE:-$GO_OUTDIR/gocache}
+export GOROOT=$GO_OUTDIR/go
 export GOFLAGS=-modcacherw
 export CGO_ENABLED=${CGO_ENABLED:-0}
 

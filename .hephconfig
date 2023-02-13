@@ -4,8 +4,11 @@ build_files:
     - '**/test/e2e/roots'
   roots:
     go_backend:
-#      uri: git://github.com/hephbuild/heph.git@master:/backend/go
       uri: file:///backend/go
+
+platforms:
+  docker:
+    provider: docker
 
 go_backend:
   go: //:go|go

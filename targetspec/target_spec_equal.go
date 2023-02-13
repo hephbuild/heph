@@ -79,7 +79,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.Executor != spec.Executor {
+	if t.Entrypoint != spec.Entrypoint {
 		return false
 	}
 

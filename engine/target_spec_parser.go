@@ -2,10 +2,12 @@ package engine
 
 import (
 	"fmt"
+	"go.starlark.net/starlark"
 	"heph/exprs"
 	"heph/packages"
 	"heph/targetspec"
 	"heph/utils"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,10 +22,33 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		Doc:                 args.Doc,
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
-		Executor:            args.Executor,
-		Package:             pkg,
-		PassArgs:            args.PassArgs,
-		Quiet:               args.Quiet,
+		Entrypoint:          args.Entrypoint,
+		Platforms: utils.Map(args.Platforms, func(d *starlark.Dict) targetspec.TargetPlatform {
+			labels := map[string]string{}
+			options := map[string]interface{}{}
+			for _, k := range d.Keys() {
+				ks := k.(starlark.String).GoString()
+				if ks == "options" {
+					v, _, _ := d.Get(k)
+
+					for _, t := range v.(*starlark.Dict).Items() {
+						options[t[0].(starlark.String).GoString()] = utils.FromStarlark(t[1])
+					}
+
+					continue
+				}
+				v, _, _ := d.Get(k)
+				labels[ks] = v.(starlark.String).GoString()
+			}
+
+			return targetspec.TargetPlatform{
+				Labels:  labels,
+				Options: options,
+			}
+		}),
+		Package:  pkg,
+		PassArgs: args.PassArgs,
+		Quiet:    args.Quiet,
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named,
@@ -170,11 +195,23 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		return targetspec.TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(targetspec.HashFileValues), t.HashFile)
 	}
 
-	if t.Executor == "" {
-		t.Executor = targetspec.ExecutorBash
+	if t.Entrypoint == "" {
+		t.Entrypoint = targetspec.EntrypointBash
 	}
-	if !validate(t.Executor, targetspec.ExecutorValues) {
-		return targetspec.TargetSpec{}, fmt.Errorf("executor must be one of %v, got %v", printOneOf(targetspec.ExecutorValues), t.Executor)
+	if !validate(t.Entrypoint, targetspec.EntrypointValues) {
+		return targetspec.TargetSpec{}, fmt.Errorf("executor must be one of %v, got %v", printOneOf(targetspec.EntrypointValues), t.Entrypoint)
+	}
+
+	if len(t.Platforms) == 0 {
+		t.Platforms = []targetspec.TargetPlatform{{
+			Labels: map[string]string{
+				"name": "local",
+				"os":   runtime.GOOS,
+				"arch": runtime.GOARCH,
+			},
+		}}
+	} else if len(t.Platforms) != 1 {
+		return targetspec.TargetSpec{}, fmt.Errorf("only a single platform is supported, for now")
 	}
 
 	if t.Codegen != "" {

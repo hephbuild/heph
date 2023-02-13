@@ -4,10 +4,11 @@ type Extras map[string]interface{}
 
 type FileConfig struct {
 	BaseConfig   `yaml:",inline"`
-	Cache        map[string]FileCache `yaml:",omitempty"`
-	CacheHistory int                  `yaml:"cache_history"`
-	DisableGC    *bool                `yaml:"disable_gc"`
-	InstallTools *bool                `yaml:"install_tools"`
+	Cache        map[string]FileCache    `yaml:",omitempty"`
+	CacheHistory int                     `yaml:"cache_history"`
+	DisableGC    *bool                   `yaml:"disable_gc"`
+	InstallTools *bool                   `yaml:"install_tools"`
+	Platforms    map[string]FilePlatform `yaml:"platforms"`
 	BuildFiles   struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
@@ -61,6 +62,16 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.CacheHistory != 0 {
 		c.CacheHistory = fc.CacheHistory
+	}
+
+	if c.Platforms == nil {
+		c.Platforms = map[string]Platform{}
+	}
+	for k, newPlatform := range fc.Platforms {
+		pf := c.Platforms[k]
+		pf = newPlatform.ApplyTo(pf)
+		pf.Name = k
+		c.Platforms[k] = pf
 	}
 
 	if c.BuildFiles.Roots == nil {
@@ -124,6 +135,26 @@ type FileRoot struct {
 func (fc FileRoot) ApplyTo(c Root) Root {
 	if fc.URI != "" {
 		c.URI = fc.URI
+	}
+
+	return c
+}
+
+type FilePlatform struct {
+	Provider string                 `yaml:"provider"`
+	Priority *int                   `yaml:"priority"`
+	Options  map[string]interface{} `yaml:"options,omitempty"`
+}
+
+func (fc FilePlatform) ApplyTo(c Platform) Platform {
+	if fc.Provider != "" {
+		c.Provider = fc.Provider
+	}
+	if fc.Priority != nil {
+		c.Priority = *fc.Priority
+	}
+	if fc.Options != nil {
+		c.Options = fc.Options
 	}
 
 	return c

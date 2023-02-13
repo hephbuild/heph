@@ -160,7 +160,9 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"pkg?", &sargs.Pkg,
 		"run?", &sargs.Run,
 		"_file_content?", &sargs.FileContent,
-		"executor?", &sargs.Executor,
+		// TODO: change to entrypoint
+		"executor?", &sargs.Entrypoint,
+		"platforms?", &sargs.Platforms,
 		"concurrent_execution?", &sargs.ConcurrentExecution,
 		"run_in_cwd?", &sargs.RunInCwd,
 		"quiet?", &sargs.Quiet,

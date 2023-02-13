@@ -6,10 +6,10 @@ import (
 	"github.com/coreos/go-semver/semver"
 	"github.com/mitchellh/go-homedir"
 	"heph/config"
+	"heph/hephprovider"
 	log "heph/hlog"
 	"heph/utils"
 	"heph/utils/flock"
-	"heph/utils/fs"
 	"io"
 	"net/http"
 	"os"
@@ -19,8 +19,6 @@ import (
 	"strings"
 	"syscall"
 )
-
-const baseUrl = "https://storage.googleapis.com/heph-build"
 
 func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 	homeDir, err := homeDir(cfg)
@@ -86,7 +84,7 @@ func shouldUpdate(cfg config.Config) bool {
 }
 
 func findLatestVersion() (string, error) {
-	res, err := http.Get(fmt.Sprintf("%v/latest_version", baseUrl))
+	res, err := http.Get(fmt.Sprintf("%v/latest_version", hephprovider.BaseUrl))
 	if err != nil {
 		return "", err
 	}
@@ -125,45 +123,8 @@ func downloadAndLink(cfg config.Config) (string, error) {
 
 	dir := filepath.Join(homeDir, cfg.Version.String)
 
-	err = os.MkdirAll(dir, os.ModePerm)
+	dstPath, err := hephprovider.Download(dir, "heph", cfg.Version.String, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
-		return "", err
-	}
-
-	dstPath := filepath.Join(dir, "heph")
-
-	if fs.PathExists(dstPath) {
-		log.Debugf("%v already exists", dstPath)
-
-		err = linkNew(dir, cfg)
-		if err != nil {
-			return "", err
-		}
-
-		return dstPath, nil
-	}
-
-	url := fmt.Sprintf("%v/%v/heph_%v_%v", baseUrl, cfg.Version.String, runtime.GOOS, runtime.GOARCH)
-
-	res, err := http.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%v: status: %v", url, res.StatusCode)
-	}
-
-	dst, err := os.OpenFile(dstPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0744)
-	if err != nil {
-		return "", err
-	}
-	defer dst.Close()
-
-	_, err = io.Copy(dst, res.Body)
-	if err != nil {
-		_ = os.RemoveAll(dir)
 		return "", err
 	}
 

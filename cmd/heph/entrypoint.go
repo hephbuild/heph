@@ -1,4 +1,4 @@
-package cmd
+package main
 
 import (
 	"context"
@@ -40,12 +40,15 @@ func Execute() {
 	utils.Seed()
 
 	if err := execute(); err != nil {
-		printHumanError(err)
-
+		exitCode := 1
 		var eerr ErrorWithExitCode
 		if errors.As(err, &eerr) {
-			os.Exit(eerr.ExitCode)
+			exitCode = eerr.ExitCode
+			// This is required in case ErrorWithExitCode does not have an Err set, just an ExitCode
+			err = eerr.Err
 		}
-		os.Exit(1)
+		printHumanError(err)
+
+		os.Exit(exitCode)
 	}
 }

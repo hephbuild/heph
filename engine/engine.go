@@ -15,6 +15,7 @@ import (
 	"heph/engine/htrace"
 	log "heph/hlog"
 	"heph/packages"
+	"heph/platform"
 	"heph/sandbox"
 	"heph/targetspec"
 	"heph/utils"
@@ -39,14 +40,15 @@ import (
 )
 
 type Engine struct {
-	Cwd        string
-	Root       fs2.Path
-	HomeDir    fs2.Path
-	Config     Config
-	LocalCache *vfsos.Location
-	Stats      *htrace.Stats
-	Tracer     trace.Tracer
-	RootSpan   trace.Span
+	Cwd               string
+	Root              fs2.Path
+	HomeDir           fs2.Path
+	Config            Config
+	LocalCache        *vfsos.Location
+	Stats             *htrace.Stats
+	Tracer            trace.Tracer
+	RootSpan          trace.Span
+	PlatformProviders []PlatformProvider
 
 	DisableNamedCacheWrite bool
 
@@ -83,6 +85,11 @@ type Engine struct {
 
 	gcLock    flock.Locker
 	toolsLock flock.Locker
+}
+
+type PlatformProvider struct {
+	config.Platform
+	platform.Provider
 }
 
 type Config struct {
@@ -441,7 +448,7 @@ func (e *Engine) hashInput(target *Target) string {
 	for _, cmd := range target.Run {
 		h.String(cmd)
 	}
-	h.String(target.Executor)
+	h.String(target.Entrypoint)
 
 	if target.IsTextFile() {
 		h.String("=")
@@ -969,6 +976,13 @@ func (e *Engine) parseConfigs() error {
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
 	cfg.TargetScheduler = "v1"
+	cfg.Platforms = map[string]config.Platform{
+		"local": {
+			Name:     "local",
+			Provider: "local",
+			Priority: 100,
+		},
+	}
 
 	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {

@@ -26,7 +26,7 @@ for (mode, expected) in modes:
     )
 
     e2e_test(
-        name="sanity_text_file_mode_"+smode,
+        name="e2e_text_file_mode_"+smode,
         cmd="umask 022 && heph run "+t,
         expected_output=expected,
     )

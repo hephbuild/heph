@@ -8,16 +8,16 @@ import (
 	"time"
 )
 
-// heph may have a startup time that is quite
+// heph may have a startup time that is quite long, dur to compilation
 var startupOffset time.Duration
 var onceStartupOffset sync.Once
 
 func computeStartupOffset() {
 	start := time.Now()
-	cmd := command()
-	err := cmd.Run()
+	cmd := command("--version")
+	b, err := cmd.CombinedOutput()
 	if err != nil {
-		panic(err)
+		panic(fmt.Errorf("%v: %w: %s", cmd.Args, err, b))
 	}
 	startupOffset = time.Since(start)
 }

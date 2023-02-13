@@ -7,6 +7,7 @@ import (
 	"heph/utils"
 	"heph/utils/maps"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
 )
@@ -28,10 +29,11 @@ var (
 )
 
 var (
-	ExecutorBash = "bash"
-	ExecutorExec = "exec"
+	EntrypointExec = "exec"
+	EntrypointBash = "bash"
+	EntrypointSh   = "sh"
 
-	ExecutorValues = []string{ExecutorBash, ExecutorExec}
+	EntrypointValues = []string{EntrypointExec, EntrypointSh, EntrypointBash}
 )
 
 var (
@@ -57,26 +59,13 @@ func (e TargetSpecSrcEnv) Get(name string) string {
 const SupportFilesOutput = "@support_files"
 
 func SortOutputsForHashing(names []string) []string {
-	index := -1
-	for i, name := range names {
-		if name == SupportFilesOutput {
-			index = i
-			break
+	names = utils.CopyArray(names)
+	sort.Slice(names, func(i, j int) bool {
+		if names[i] == SupportFilesOutput {
+			return true
 		}
-	}
-
-	if index > 0 {
-		n := make([]string, 0, len(names))
-		n = append(n, SupportFilesOutput)
-		for _, name := range names {
-			if name == SupportFilesOutput {
-				continue
-			}
-			n = append(n, name)
-		}
-		return n
-	}
-
+		return strings.Compare(names[i], names[j]) < 0
+	})
 	return names
 }
 
@@ -109,7 +98,8 @@ type TargetSpec struct {
 
 	Run                 []string
 	FileContent         []byte // Used by special target `text_file`
-	Executor            string
+	Entrypoint          string
+	Platforms           []TargetPlatform
 	ConcurrentExecution bool
 	Quiet               bool
 	Dir                 string
@@ -137,6 +127,11 @@ type TargetSpec struct {
 	HashFile            string
 	Transitive          TargetSpecTransitive
 	Timeout             time.Duration
+}
+
+type TargetPlatform struct {
+	Labels  map[string]string
+	Options map[string]interface{}
 }
 
 type TargetSpecTransitive struct {
@@ -222,7 +217,7 @@ func (t TargetSpecHostTool) ResolvedPath() (string, error) {
 	}
 
 	if t.BinName == "heph" {
-		return utils.Executable(), nil
+		panic("heph should be handled separately")
 	}
 
 	once := binCache.Get(t.BinName)

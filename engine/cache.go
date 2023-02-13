@@ -6,7 +6,6 @@ import (
 	"fmt"
 	log "heph/hlog"
 	"heph/targetspec"
-	"heph/utils"
 	"heph/utils/fs"
 	"heph/utils/tar"
 	"heph/vfssimple"
@@ -65,7 +64,6 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	names := target.OutWithSupport.Names()
-	names = utils.CopyArray(names)
 	names = targetspec.SortOutputsForHashing(names)
 
 	if target.Cache.Enabled {

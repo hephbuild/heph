@@ -8,7 +8,7 @@ target(
 )
 
 e2e_test(
-    name="sanity_timeout",
+    name="e2e_timeout",
     cmd="heph run //test/features:timeout",
     expected_failure=True,
 )

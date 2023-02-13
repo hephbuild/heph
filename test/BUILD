@@ -21,9 +21,9 @@ def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_out
     return target(
         name=name,
         run=test_cmd,
-        labels=["e2e_test"],
+        labels=['light_e2e'],
         tools=['heph', 'diff'],
         cache=False,
-        pass_env=["PATH"],
+        pass_env=["PATH", "TERM"],
         deps=deps,
     )

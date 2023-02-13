@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 )
 import (
 	"gopkg.in/yaml.v3"
@@ -18,9 +19,10 @@ type BaseConfig struct {
 type Config struct {
 	BaseConfig   `yaml:",inline"`
 	Cache        map[string]Cache
-	CacheHistory int  `yaml:"cache_history"`
-	DisableGC    bool `yaml:"disable_gc"`
-	InstallTools bool `yaml:"install_tools"`
+	CacheHistory int                 `yaml:"cache_history"`
+	DisableGC    bool                `yaml:"disable_gc"`
+	InstallTools bool                `yaml:"install_tools"`
+	Platforms    map[string]Platform `yaml:"platforms"`
 	BuildFiles   struct {
 		Ignore []string        `yaml:"ignore"`
 		Roots  map[string]Root `yaml:"roots"`
@@ -39,6 +41,19 @@ type Config struct {
 	Sources []FileConfig `yaml:"-"`
 }
 
+func (c Config) OrderedPlatforms() []Platform {
+	platforms := make([]Platform, 0, len(c.Platforms))
+	for _, p := range c.Platforms {
+		platforms = append(platforms, p)
+	}
+	sort.Slice(platforms, func(i, j int) bool {
+		// Order priority DESC
+		return platforms[i].Priority > platforms[j].Priority
+	})
+
+	return platforms
+}
+
 type Cache struct {
 	URI   string
 	Read  bool
@@ -47,6 +62,13 @@ type Cache struct {
 
 type Root struct {
 	URI string
+}
+
+type Platform struct {
+	Name     string                 `yaml:"name"`
+	Provider string                 `yaml:"provider"`
+	Priority int                    `yaml:"priority"`
+	Options  map[string]interface{} `yaml:"options"`
 }
 
 func Parse(name string) (FileConfig, error) {
