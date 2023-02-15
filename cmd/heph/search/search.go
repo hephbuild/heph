@@ -3,8 +3,9 @@ package search
 import (
 	"fmt"
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/analysis/analyzer/simple"
-	lang_en "github.com/blevesearch/bleve/v2/analysis/lang/en"
+	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
+	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
+	"github.com/blevesearch/bleve/v2/analysis/tokenizer/regexp"
 	"heph/targetspec"
 	"heph/utils/sets"
 )
@@ -45,6 +46,27 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 
 	mapping := bleve.NewIndexMapping()
 
+	err := mapping.AddCustomTokenizer("techy", map[string]interface{}{
+		"type":   regexp.Name,
+		"regexp": `[0-9A-Za-z]+`,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// A custom analyzer for techy stuff
+	err = mapping.AddCustomAnalyzer("techy", map[string]interface{}{
+		"type":      custom.Name,
+		"tokenizer": "techy",
+		"token_filters": []string{
+			lowercase.Name,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	mapping.DefaultAnalyzer = "techy"
+
 	idx, err := bleve.NewMemOnly(mapping)
 	if err != nil {
 		return nil, err
@@ -53,19 +75,12 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 	specMapping := bleve.NewDocumentMapping()
 	mapping.AddDocumentMapping("spec", specMapping)
 
-	for _, name := range []string{"fqn", "pkg", "name"} {
+	for _, name := range []string{"fqn", "pkg", "name", "doc"} {
 		simpleMapping := bleve.NewTextFieldMapping()
-		simpleMapping.Analyzer = simple.Name
+		simpleMapping.Analyzer = "techy"
 		simpleMapping.Store = false
-		simpleMapping.IncludeTermVectors = true
 		specMapping.AddFieldMappingsAt(name, simpleMapping)
 	}
-
-	langMapping := bleve.NewTextFieldMapping()
-	langMapping.Analyzer = lang_en.AnalyzerName
-	langMapping.Store = false
-	langMapping.IncludeTermVectors = true
-	specMapping.AddFieldMappingsAt("doc", langMapping)
 
 	for _, target := range targets {
 		err = idx.Index(target.FQN, struct {
