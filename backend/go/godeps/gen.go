@@ -224,6 +224,9 @@ func generate() []RenderUnit {
 					GenEmbed:   len(pkg.EmbedPatterns) > 0,
 					Variant:    pkg.Variant,
 				}
+				if pkg.Name == "main" {
+					lib.ImportPath = pkg.Name
+				}
 				lib.SrcDep = srcDepForLib(lib, pkg.EmbedPatterns)
 
 				for _, p := range imports {
@@ -356,6 +359,9 @@ func generate() []RenderUnit {
 				SrcDep:     []string{moddl.Target.Full()},
 				GenEmbed:   len(pkg.EmbedPatterns) > 0,
 				Variant:    pkg.Variant,
+			}
+			if pkg.Name == "main" {
+				lib.ImportPath = pkg.Name
 			}
 
 			for _, p := range imports {

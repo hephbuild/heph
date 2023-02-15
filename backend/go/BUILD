@@ -20,12 +20,14 @@ go_toolchain_gosh = group(
 def go_toolchain(name, version, architectures=[]):
     run = [
         "./$SRC_INSTALL '{}'".format(version),
-        "mv $SRC_GO $OUT_GO"
+        "mv $SRC_GO $OUT_GO",
+        "export GO_OUTDIR=$(pwd)",
+        "export GODEBUG='installgoroot=all'",
     ]
 
     for arch in architectures:
         goos, _, goarch = arch.partition("_")
-        run.append('(export GOOS={} && export GOARCH={} && export GO_OUTDIR=$(pwd) && ./$OUT_GO install --trimpath std)'.format(goos, goarch))
+        run.append('(export GOOS={} && export GOARCH={} && ./$OUT_GO install --trimpath std)'.format(goos, goarch))
 
     return target(
         name="go",
@@ -216,6 +218,8 @@ def _go_compile_cmd(name, import_path, abi, complete, embed_cfg):
 
     if complete:
         extra += ' -complete'
+
+    extra += ' -p '+import_path
 
     return [
         'echo "Compiling..."',

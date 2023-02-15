@@ -1,5 +1,7 @@
-/*
- * Parts adapted from Pants, Go SDK and Bazel rules_go, under BSD-compatible licenses.
+/* Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
+ * Licensed under the Apache License, Version 2.0 (see LICENSE).
+ *
+ * Parts adapted from Go SDK and Bazel rules_go, both under BSD-compatible licenses.
  */
 
 package main
@@ -78,6 +80,10 @@ type Analysis struct {
 
 	// True if Go 1.18 is in use. This is not set by analyze but rather by generate based on release tags.
 	IsGo1_18 bool
+
+	// True if coverage is enabled. This is not set by `analyze` but rather by `generate` based on an
+	// environment variable set by the invoker.
+	Cover bool
 }
 
 // isTestFunc tells whether fn has the type of a testing function. arg
@@ -289,21 +295,25 @@ import (
 	{{if .NeedXTest}}_xtest{{else}}_{{end}} {{.ImportPath | printf "%s_test" | printf "%q"}}
 {{- end}}
 )
+
 var tests = []testing.InternalTest{
 {{- range .Tests}}
 	{"{{.Name}}", {{.Package}}.{{.Name}}},
 {{- end}}
 }
+
 var benchmarks = []testing.InternalBenchmark{
 {{- range .Benchmarks}}
 	{"{{.Name}}", {{.Package}}.{{.Name}}},
 {{- end}}
 }
+
 var examples = []testing.InternalExample{
 {{- range .Examples}}
 	{"{{.Name}}", {{.Package}}.{{.Name}}, {{.Output | printf "%q"}}, {{.Unordered}}},
 {{- end }}
 }
+
 {{ if .IsGo1_18 -}}
 var fuzzTargets = []testing.InternalFuzzTarget{
 {{- range .FuzzTargets }}
@@ -311,10 +321,16 @@ var fuzzTargets = []testing.InternalFuzzTarget{
 {{- end }}
 }
 {{- end }}
+
 func init() {
 	testdeps.ImportPath = "{{.ImportPath}}"
 }
+
 func main() {
+{{if .Cover}}
+	registerCover()
+{{end}}
+
 {{- if .IsGo1_18 }}
 	m := testing.MainStart(testdeps.TestDeps{}, tests, benchmarks, fuzzTargets, examples)
 {{- else }}
@@ -329,7 +345,7 @@ func main() {
 }
 `
 
-func generate(analysis *Analysis) ([]byte, error) {
+func generate(analysis *Analysis, genCover bool) ([]byte, error) {
 	tmpl, err := template.New("testmain").Parse(testMainTemplate)
 	if err != nil {
 		return nil, err
@@ -343,6 +359,9 @@ func generate(analysis *Analysis) ([]byte, error) {
 		}
 	}
 
+	// Pass through the config to generate the call to the coverage stubs.
+	analysis.Cover = genCover
+
 	var buffer bytes.Buffer
 
 	err = tmpl.Execute(&buffer, analysis)
@@ -354,21 +373,28 @@ func generate(analysis *Analysis) ([]byte, error) {
 }
 
 func main() {
-	analysis, err := analyze(os.Args[1], os.Args[2:])
+	if len(os.Args) < 3 {
+		fmt.Fprintf(os.Stderr, "usage: generator TESTMAIN_PATH IMPORT_PATH [FILES...]\n")
+		os.Exit(1)
+	}
+
+	analysis, err := analyze(os.Args[2], os.Args[3:])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(1)
 	}
 
-	testmain, err := generate(analysis)
+	genCover := os.Getenv("GENERATE_COVER") != ""
+
+	testmain, err := generate(analysis, genCover)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to generate _testmain.go: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to generate %s: %s\n", os.Args[1], err)
 		os.Exit(1)
 	}
 
-	err = os.WriteFile("_testmain.go", testmain, 0600)
+	err = os.WriteFile(os.Args[1], testmain, 0600)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to write _testmain.go: %s\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to write %s: %s\n", os.Args[1], err)
 		os.Exit(1)
 	}
 
@@ -388,6 +414,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println()
 	os.Exit(0)
 }

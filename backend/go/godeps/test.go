@@ -71,10 +71,7 @@ xtest_lib = {{.XTestLib}}
 gen_testmain = target(
     name="_go_gen_testmain@{{.VID}}",
     deps={{.GoFiles}},
-    run=[
-		'generate_testmain {{.ImportPath}} {{.TestFilesForAnalysis}}',
-		'mkdir -p testmain && mv _testmain.go $OUT',
-	],
+    run='generate_testmain $OUT {{.ImportPath}} {{.TestFilesForAnalysis}}',
     out=['testmain/_testmain.go'],
     tools=[go, generate_testmain],
     env={
@@ -88,8 +85,9 @@ testmain_lib = go_library(
 	src_dep=gen_testmain,
 	libs=[test_lib, xtest_lib],
 	go_files=['_testmain.go'],
-	import_path="{{.ImportPath}}/testmain",
+	import_path="main",
 	dir="testmain",
+	complete=False,
 	{{.Variant}}
 )
 
