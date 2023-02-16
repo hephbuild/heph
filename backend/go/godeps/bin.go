@@ -22,7 +22,7 @@ func (l Bin) Data() map[string]interface{} {
 		"Name":       l.TargetName,
 		"Libs":       genStringArray(l.Libs, 2),
 		"MainLib":    l.MainLib,
-		"Variant":    genVariant(l.Variant, true),
+		"Variant":    genVariant(l.Variant, true, true),
 	}
 }
 

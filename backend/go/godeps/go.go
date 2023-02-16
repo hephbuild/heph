@@ -124,6 +124,10 @@ func (p *Packages) key(importPath, vstr string) string {
 }
 
 func VID(variant PkgCfgVariant) string {
+	if variant.Name != "" {
+		return variant.Name
+	}
+
 	s := fmt.Sprintf("os=%v,arch=%v", variant.OS, variant.ARCH)
 
 	if len(variant.Tags) > 0 {
@@ -313,8 +317,10 @@ func goListWithTransitiveTestDeps() *Packages {
 		variants := cfg.Variants
 		if len(variants) == 0 {
 			variants = append(variants, PkgCfgVariant{
-				OS:   Env.GOOS,
-				ARCH: Env.GOARCH,
+				PkgCfgCompileVariant: PkgCfgCompileVariant{
+					OS:   Env.GOOS,
+					ARCH: Env.GOARCH,
+				},
 			})
 		}
 

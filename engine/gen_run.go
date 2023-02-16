@@ -83,7 +83,10 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 			}
 
 			w.Status(worker.StringStatus("Storing cache..."))
-			_ = e.StoreAutocompleteCache()
+			err = e.StoreAutocompleteCache()
+			if err != nil {
+				log.Warnf("autocomplete cache: %v", err)
+			}
 
 			return nil
 		},

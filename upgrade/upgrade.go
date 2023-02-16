@@ -41,7 +41,7 @@ func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 		return nil
 	}
 
-	log.Infof("Updating to %v", cfg.Version.String)
+	log.Infof("Updating %v to %v", utils.Version, cfg.Version.String)
 
 	newHeph, err := downloadAndLink(cfg)
 	if err != nil {

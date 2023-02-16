@@ -60,6 +60,7 @@ func buildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
 }
 
 func doBuildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
+	log.Info("Building heph all matrix...")
 	log.Debugf("building heph: src:%v out:%v matrix: %v", srcDir, outDir, matrix)
 
 	err := os.MkdirAll(outDir, os.ModePerm)

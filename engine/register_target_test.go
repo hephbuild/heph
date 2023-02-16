@@ -34,6 +34,10 @@ var replacements = []repl{
 func TestTargetSpec(t *testing.T) {
 	files := make([]string, 0)
 	err := filepath.WalkDir("testdata", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
 		if d.IsDir() {
 			return nil
 		}

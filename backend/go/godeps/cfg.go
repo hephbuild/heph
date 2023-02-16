@@ -77,6 +77,12 @@ func init() {
 }
 
 type PkgCfgVariant struct {
+	Name string `json:"name"`
+	PkgCfgCompileVariant
+	LDFlags string `json:"ldflags"`
+}
+
+type PkgCfgCompileVariant struct {
 	OS   string   `json:"os"`
 	ARCH string   `json:"arch"`
 	Tags []string `json:"tags"`

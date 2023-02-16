@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"compress/gzip"
+	"errors"
 	"github.com/vmihailenco/msgpack/v5"
 	"heph/targetspec"
 	"heph/utils"
@@ -98,12 +100,17 @@ func (e *Engine) StoreAutocompleteCache() error {
 		Targets: allTargets,
 	}
 
-	b, err := msgpack.Marshal(cache)
+	f, err := os.Create(e.autocompleteCachePath())
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	err = os.WriteFile(e.autocompleteCachePath(), b, os.ModePerm)
+	gw := gzip.NewWriter(f)
+	defer gw.Close()
+
+	enc := msgpack.NewEncoder(gw)
+	err = enc.Encode(cache)
 	if err != nil {
 		return err
 	}
@@ -116,13 +123,24 @@ func (e *Engine) LoadAutocompleteCache() (*AutocompleteCache, error) {
 		return nil, nil
 	}
 
-	b, err := os.ReadFile(e.autocompleteCachePath())
+	f, err := os.Open(e.autocompleteCachePath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
 	if err != nil {
 		return nil, err
 	}
+	defer gr.Close()
 
 	var cache AutocompleteCache
-	err = msgpack.Unmarshal(b, &cache)
+	dec := msgpack.NewDecoder(gr)
+	err = dec.Decode(&cache)
 	if err != nil {
 		return nil, err
 	}

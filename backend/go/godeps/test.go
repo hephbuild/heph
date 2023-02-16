@@ -49,8 +49,8 @@ func (t LibTest) Data() interface{} {
 		"GoFiles":  genStringArray(append(t.TestFiles, t.XTestFiles...), 2),
 
 		"VID":        VID(variant),
-		"Variant":    genVariant(variant, false),
-		"VariantBin": genVariant(variant, true),
+		"Variant":    genVariant(variant, true, false),
+		"VariantBin": genVariant(variant, true, false),
 		"IfTest":     fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
 		"RunArgs":    genArgValue(t.RunExtra, "\n"),
 	}

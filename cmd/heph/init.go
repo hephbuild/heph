@@ -186,7 +186,10 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 		return nil, nil, err
 	}
 
-	cache, _ := Engine.LoadAutocompleteCache()
+	cache, err := Engine.LoadAutocompleteCache()
+	if err != nil {
+		log.Warnf("autocomplete cache: %v", err)
+	}
 
 	if cache != nil {
 		targets := cache.Targets

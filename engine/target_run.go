@@ -766,6 +766,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return fmt.Errorf("cache: store: %w", err)
 	}
 
+	clearDeps := &worker.WaitGroup{}
 	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
 		for _, cache := range e.Config.Cache {
 			cache := cache
@@ -778,7 +779,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 				continue
 			}
 
-			e.Pool.Schedule(ctx, &worker.Job{
+			j := e.Pool.Schedule(ctx, &worker.Job{
 				Name: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
 				Do: func(w *worker.Worker, ctx context.Context) error {
 					w.Status(TargetStatus(target, fmt.Sprintf("Pushing to %v cache...", cache.Name)))
@@ -792,15 +793,28 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 					return nil
 				},
 			})
+			clearDeps.Add(j)
 		}
 	}
 
 	if !e.Config.KeepSandbox {
-		e.Status(TargetStatus(target, "Clearing sandbox..."))
-		err = deleteDir(target.SandboxRoot.Abs(), false)
-		if err != nil {
-			return fmt.Errorf("clear sandbox: %w", err)
-		}
+		e.Pool.Schedule(ctx, &worker.Job{
+			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
+			Deps: clearDeps,
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				w.Status(TargetStatus(target, "Clearing sandbox..."))
+				err = deleteDir(target.SandboxRoot.Abs(), false)
+				if err != nil {
+					return fmt.Errorf("clear sandbox: %w", err)
+				}
+
+				return nil
+			},
+		})
+	}
+
+	if !target.Cache.Enabled && !rr.PreserveCache {
+		e.RegisterRemove(e.cacheDir(target).Abs())
 	}
 
 	err = e.postRunOrWarm(ctx, target, target.OutWithSupport.Names())

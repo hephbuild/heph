@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
-      HEPH_PROFILES: "release"
+      HEPH_PROFILES: "release,ci"
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -29,13 +29,13 @@ jobs:
           go-version: 1.19
           cache-key-suffix: -build
 
-      - name: Cache .heph
+      - name: Cache
         uses: actions/cache@v3
         with:
-          path: .heph/cache
-          key: dot-heph-build-${{ github.run_id }}
+          path: /tmp/heph-cache
+          key: heph-cache-build-${{ github.run_id }}
           restore-keys: |
-            dot-heph-build-
+            heph-cache-build-
 
       - name: Bootstrap Build
         run: go build -v -o heph heph/cmd/heph
@@ -118,7 +118,7 @@ jobs:
     needs: [ build ]
     runs-on: ubuntu-latest
     env:
-      HEPH_PROFILES: "test"
+      HEPH_PROFILES: "ci"
     steps:
       - uses: actions/checkout@v3
 

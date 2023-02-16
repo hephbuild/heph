@@ -24,14 +24,7 @@ func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	if !target.Cache.Enabled {
 		folder = "__target_tmp_" + SOMEID + "_" + target.Name
 	}
-
-	p := e.HomeDir.Join("cache", target.Package.FullName, folder)
-
-	if !target.Cache.Enabled {
-		e.RegisterRemove(p.Abs())
-	}
-
-	return p.Join(inputHash)
+	return e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
 }
 
 func (e *Engine) cacheOutTarName(name string) string {

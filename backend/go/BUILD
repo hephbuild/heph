@@ -130,7 +130,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         'backend_pkg': backend_pkg,
     })
 
-    godeps_deps = [src]+mod_pkg_srcs+mod_pkg_modsums
+    godeps_deps = glob("**/*.{mod,sum}")+[src]+mod_pkg_srcs+mod_pkg_modsums
 
     imports = target(
         name="_go_mod_gen_imports",
@@ -405,7 +405,7 @@ def _std_pkgs(os, arch):
         }
     )
 
-def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch()):
+def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), tags=[], ldflags=''):
     if not out:
         out = heph.pkg.name()
 
@@ -415,13 +415,13 @@ def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch()):
 
     return target(
         name=name,
-        doc="Build {} {}/{}".format(heph.pkg.addr(), os, arch),
+        doc="Build {} {}/{} {}".format(heph.pkg.addr(), os, arch, ' '.join(tags)).strip(),
         deps={
             'libs': libs,
             'main': main,
             'std': _std_pkgs(os, arch),
         },
-        run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT $SRC_MAIN'],
+        run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {} $SRC_MAIN'.format(ldflags)],
         out_env='rel_root',
         tools=[go],
         labels=['go_build_bin'],
@@ -432,25 +432,27 @@ def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch()):
         },
     )
 
-def go_bin_build_addr_name(os=get_os(), arch=get_arch(), tags=[]):
-    name = "go_bin#build@os={},arch={}".format(os, arch)
-    if len(tags) > 0:
-        name += ",tags={{}}".format(','.join(tags))
-    return name
+def go_bin_build_addr_name(name=None, os=get_os(), arch=get_arch(), tags=[]):
+    if not name:
+        name = "os={},arch={}".format(os, arch)
+        if len(tags) > 0:
+            name += ",tags={"+','.join(tags)+"}"
 
-def go_bin_build_addr(pkg=None, os=get_os(), arch=get_arch(), tags=[]):
+    return "go_bin#build@"+name
+
+def go_bin_build_addr(pkg=None, name=None, os=get_os(), arch=get_arch(), tags=[]):
     if not pkg:
         pkg = heph.pkg.addr()
 
-    return heph.canonicalize(pkg+":"+go_bin_build_addr_name(os=os, arch=arch, tags=tags))
+    return heph.canonicalize(pkg+":"+go_bin_build_addr_name(name=name, os=os, arch=arch, tags=tags))
 
-def go_bin(name, pkg=None, os=get_os(), arch=get_arch(), tags=[], *args, **kwargs):
+def go_bin(name, pkg=None, variant_name=None, os=get_os(), arch=get_arch(), tags=[], *args, **kwargs):
     if not pkg:
         pkg = heph.pkg.addr()
 
     kwargs = {
         "name": name,
-        "tools": {'bin': go_bin_build_addr(pkg)},
+        "tools": {'bin': go_bin_build_addr(pkg=pkg, name=variant_name, os=os, arch=arch, tags=tags)},
         "sandbox": False,
         "cache": False,
         "pass_args": True,

@@ -64,15 +64,19 @@ func joinedArrays(es []string) string {
 	return strings.Join(es, "+")
 }
 
-func genVariant(v PkgCfgVariant, onlyOsArch bool) string {
+func genVariant(v PkgCfgVariant, tags, ldflags bool) string {
 	if v.OS == "" || v.ARCH == "" {
 		panic("empty os/arch")
 	}
 
 	s := fmt.Sprintf("os=%v, arch=%v", strconv.Quote(v.OS), strconv.Quote(v.ARCH))
 
-	if !onlyOsArch && len(v.Tags) > 0 {
-		s += fmt.Sprintf(", tags=%v", genStringArrayInline(v.Tags, 0))
+	if tags && len(v.Tags) > 0 {
+		s += ", tags=" + genStringArrayInline(v.Tags, 0)
+	}
+
+	if ldflags && v.LDFlags != "" {
+		s += ", ldflags=" + strconv.Quote(v.LDFlags)
 	}
 
 	return s

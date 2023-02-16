@@ -18,6 +18,8 @@ def e2e_test(name, cmd, expected_failure=False, expected_output=None, expect_out
     else:
         test_cmd += 'true'
 
+    test_cmd = '({}) && echo E2E PASSED'.format(test_cmd)
+
     return target(
         name=name,
         run=test_cmd,

@@ -162,10 +162,11 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		}
 
 		rrs = append(rrs, engine.TargetRunRequest{
-			Target:  target,
-			Args:    args,
-			NoCache: *nocache,
-			Shell:   *shell,
+			Target:        target,
+			Args:          args,
+			NoCache:       *nocache,
+			Shell:         *shell,
+			PreserveCache: printOutput.bool,
 		})
 	}
 

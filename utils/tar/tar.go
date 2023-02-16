@@ -122,6 +122,7 @@ func Tar(ctx context.Context, files []TarFile, out string) error {
 
 func doTar(w io.Writer, files []TarFile) error {
 	tw := tar.NewWriter(w)
+	defer tw.Close()
 
 	for _, file := range files {
 		info, err := os.Lstat(file.From)

@@ -17,3 +17,15 @@ e2e_test(
     cmd="heph query -i //test/go/... | heph query -i test - | wc -l | xargs",
     expected_output="21",
 )
+
+e2e_test(
+    name="sanity_ldflags_default",
+    cmd="heph run //test/go/mod-ldflags:run-default",
+    expected_output="default",
+)
+
+e2e_test(
+    name="sanity_ldflags_withflags",
+    cmd="heph run //test/go/mod-ldflags:run-withflags",
+    expected_output="overriden",
+)

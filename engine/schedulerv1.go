@@ -25,17 +25,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	needCacheWarm := NewTargets(0)
 
 	for _, target := range targets {
-		if skip != nil && skip.FQN == target.FQN {
-			parents, err := e.DAG().GetParents(target)
-			if err != nil {
-				return nil, err
-			}
-
-			needCacheWarm.AddAll(parents)
-			needRun.Add(target)
-		} else {
-			needCacheWarm.Add(target)
-		}
+		needCacheWarm.Add(target)
 	}
 
 	deps := &WaitGroupMap{}

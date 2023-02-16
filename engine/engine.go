@@ -114,6 +114,8 @@ type TargetRunRequest struct {
 	NoCache bool
 	Shell   bool
 	Mode    string // run or watch
+	// Force preserving cache for uncached targets when --print-out is enabled
+	PreserveCache bool
 }
 
 type TargetRunRequests []TargetRunRequest

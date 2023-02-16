@@ -50,8 +50,6 @@ func GetHephPath(outDir, goos, goarch string, shouldBuildAll bool) (string, stri
 				return p, "", nil
 			}
 
-			log.Info("Building heph all matrix...")
-
 			m, err := buildAll(srcDir, outDir)
 			if err != nil {
 				return "", "", err
