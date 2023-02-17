@@ -48,9 +48,10 @@ func (e *Engine) targetOutputHashFile(target *Target, name string) string {
 }
 
 const versionFile = "version"
+const logFile = "log.txt"
 const inputHashFile = "hash_input"
 
-func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string) (rerr error) {
+func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot, logFilePath string) (rerr error) {
 	if target.ConcurrentExecution {
 		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
 		return nil

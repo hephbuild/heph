@@ -3,14 +3,14 @@ package main
 import (
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"heph/cmd/heph/search"
-	"heph/engine"
 	"heph/targetspec"
+	"heph/tgt"
 	"sort"
 	"strings"
 )
 
-func sortedTargets(targets []*engine.Target, skipPrivate bool) []*engine.Target {
-	stargets := make([]*engine.Target, 0)
+func sortedTargets(targets []*tgt.Target, skipPrivate bool) []*tgt.Target {
+	stargets := make([]*tgt.Target, 0)
 	for _, target := range targets {
 		if skipPrivate && target.IsPrivate() {
 			continue
@@ -26,7 +26,7 @@ func sortedTargets(targets []*engine.Target, skipPrivate bool) []*engine.Target 
 	return stargets
 }
 
-func sortedTargetNames(targets []*engine.Target, skipPrivate bool) []string {
+func sortedTargetNames(targets []*tgt.Target, skipPrivate bool) []string {
 	names := make([]string, 0)
 	for _, t := range sortedTargets(targets, skipPrivate) {
 		names = append(names, t.FQN)

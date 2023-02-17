@@ -7,6 +7,7 @@ import (
 	"heph/engine"
 	log "heph/hlog"
 	"heph/targetspec"
+	"heph/tgt"
 	"os"
 	"strings"
 )
@@ -54,13 +55,13 @@ func hasStdin(args []string) bool {
 	return len(args) == 1 && args[0] == "-"
 }
 
-func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
+func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
 	tps, err := parseTargetPathsFromStdin()
 	if err != nil {
 		return nil, err
 	}
 
-	targets := make([]*engine.Target, 0)
+	targets := make([]*tgt.Target, 0)
 
 	for _, tp := range tps {
 		target := e.Targets.Find(tp.Full())
@@ -71,7 +72,7 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*engine.Target, error) {
 			return nil, engine.NewTargetNotFoundError(tp.Full())
 		}
 
-		targets = append(targets, target)
+		targets = append(targets, target.Target)
 	}
 
 	return targets, nil
@@ -135,7 +136,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		targets.Add(target)
 	}
 
-	check := func(target *engine.Target) error {
+	check := func(target *tgt.Target) error {
 		if bailOutOnExpr {
 			if len(target.TargetSpec.Deps.Exprs) > 0 {
 				return fmt.Errorf("%v has expr, bailing out", target.FQN)
@@ -151,7 +152,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 			return nil, err
 		}
 
-		err := check(target)
+		err := check(target.Target)
 		if err != nil {
 			return nil, err
 		}
@@ -176,7 +177,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 	}
 
 	for _, anc := range ancs {
-		err := check(anc)
+		err := check(anc.Target)
 		if err != nil {
 			return nil, err
 		}

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"heph/tgt"
 	"heph/utils"
 	"heph/utils/maps"
 	"heph/utils/sets"
@@ -26,7 +27,7 @@ type schedEngine struct {
 	requiredOutputs *maps.Map[string, *sets.Set[string, string]]
 
 	needRun       *Targets
-	needCacheWarm *sets.Set[string, TargetWithOutput]
+	needCacheWarm *sets.Set[string, tgt.TargetWithOutput]
 }
 
 func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
@@ -41,7 +42,7 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 func newSchedEngine(e *Engine, rrs TargetRunRequests, skip *Target) (*schedEngine, error) {
 	targets := rrs.Targets()
 
-	allTargets, requiredOutputs, err := e.DAG().GetOrderedAncestorsWithOutput(targets, true)
+	allTargets, requiredOutputs, err := e.DAG().GetOrderedAncestorsWithOutput(e, targets, true)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func newSchedEngine(e *Engine, rrs TargetRunRequests, skip *Target) (*schedEngin
 		allScheduled:    &worker.WaitGroup{},
 		requiredOutputs: requiredOutputs,
 		needRun:         NewTargets(0),
-		needCacheWarm: sets.NewSet[string, TargetWithOutput](func(t TargetWithOutput) string {
+		needCacheWarm: sets.NewSet(func(t tgt.TargetWithOutput) string {
 			return t.Full()
 		}, 0),
 	}, nil
@@ -98,8 +99,8 @@ func (e *schedEngine) scheduleCacheWarm(ctx context.Context, target *Target, out
 	for _, output := range outputs {
 		output := output
 
-		added := e.needCacheWarm.Add(TargetWithOutput{
-			Target: target,
+		added := e.needCacheWarm.Add(tgt.TargetWithOutput{
+			Target: target.Target,
 			Output: output,
 		})
 		if !added {
@@ -179,7 +180,7 @@ func (e *schedEngine) scheduleAnalysis(ctx context.Context, target *Target) erro
 				return nil
 			}
 
-			cacheToWarm := utils.Filter(e.needCacheWarm.Slice(), func(t TargetWithOutput) bool {
+			cacheToWarm := utils.Filter(e.needCacheWarm.Slice(), func(t tgt.TargetWithOutput) bool {
 				if t.Target.FQN == target.FQN {
 					return true
 				}
@@ -256,8 +257,8 @@ func (e *schedEngine) schedulePullMeta(ctx context.Context, target *Target) (*wo
 				if cached {
 					if Contains(e.targets, target.FQN) {
 						for _, output := range target.OutWithSupport.Names() {
-							e.needCacheWarm.Add(TargetWithOutput{
-								Target: target,
+							e.needCacheWarm.Add(tgt.TargetWithOutput{
+								Target: target.Target,
 								Output: output,
 							})
 						}
@@ -269,8 +270,8 @@ func (e *schedEngine) schedulePullMeta(ctx context.Context, target *Target) (*wo
 			for _, parent := range parents {
 				// TODO: only required outputs
 				for _, output := range parent.OutWithSupport.Names() {
-					e.needCacheWarm.Add(TargetWithOutput{
-						Target: parent,
+					e.needCacheWarm.Add(tgt.TargetWithOutput{
+						Target: parent.Target,
 						Output: output,
 					})
 				}

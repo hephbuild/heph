@@ -10,6 +10,7 @@ import (
 	log "heph/hlog"
 	"heph/packages"
 	"heph/targetspec"
+	"heph/tgt"
 	"heph/utils"
 	"heph/utils/sets"
 	"os"
@@ -93,10 +94,14 @@ var queryCmd = &cobra.Command{
 
 		targets := Engine.Targets.Slice()
 		if hasStdin(args) {
-			var err error
-			targets, err = parseTargetsFromStdin(Engine)
+			stargets, err := parseTargetsFromStdin(Engine)
 			if err != nil {
 				return err
+			}
+
+			targets := engine.NewTargets(len(stargets))
+			for _, target := range stargets {
+				targets.Add(Engine.Targets.Find(target.FQN))
 			}
 		} else {
 			if !all {
@@ -125,10 +130,10 @@ var queryCmd = &cobra.Command{
 			matcher = engine.AndMatcher(matcher, engine.NotMatcher(engine.OrMatcher(excludeMatchers...)))
 		}
 
-		selected := make([]*engine.Target, 0)
+		selected := make([]*tgt.Target, 0)
 		for _, target := range targets {
 			if matcher(target) {
-				selected = append(selected, target)
+				selected = append(selected, target.Target)
 			}
 		}
 
@@ -366,7 +371,7 @@ var changesCmd = &cobra.Command{
 			return err
 		}
 
-		affectedTargets := make([]*engine.Target, 0)
+		affectedTargets := make([]*tgt.Target, 0)
 		affectedFiles := strings.Split(string(out), "\n")
 
 		allTargets := Engine.Targets.Slice()
@@ -377,7 +382,7 @@ var changesCmd = &cobra.Command{
 				for _, file := range t.HashDeps.Files {
 					if strings.HasPrefix(affectedFile, file.RelRoot()) {
 						log.Tracef("%v affects %v", affectedFile, t.FQN)
-						affectedTargets = append(affectedTargets, t)
+						affectedTargets = append(affectedTargets, t.Target)
 						allTargets = append(allTargets[:ti], allTargets[ti+1:]...)
 						continue targets
 					}
@@ -454,7 +459,7 @@ var targetCmd = &cobra.Command{
 	},
 }
 
-func printDeps(indent string, deps engine.TargetNamedDeps) {
+func printDeps(indent string, deps tgt.TargetNamedDeps) {
 	fmt.Println(indent + "Targets:")
 	for _, t := range deps.All().Targets {
 		fmt.Printf(indent+"  %v\n", t.Target.FQN)
@@ -465,7 +470,7 @@ func printDeps(indent string, deps engine.TargetNamedDeps) {
 	}
 }
 
-func printTools(indent string, tools engine.TargetTools) {
+func printTools(indent string, tools tgt.TargetTools) {
 	fmt.Println(indent + "Tools:")
 	for _, t := range tools.Targets {
 		fmt.Printf(indent+"  %v\n", t.Target.FQN)

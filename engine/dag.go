@@ -12,7 +12,7 @@ type DAG struct {
 }
 
 // returns parents first
-func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
+func (d *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -24,7 +24,7 @@ func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error)
 	}
 
 	for _, parent := range parents {
-		err := e.orderedWalker(parent, rel, ancsm, minDepth, depth+1, f)
+		err := d.orderedWalker(parent, rel, ancsm, minDepth, depth+1, f)
 		if err != nil {
 			return err
 		}
@@ -37,17 +37,17 @@ func (e *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error)
 	return nil
 }
 
-func (e *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Target, error) {
+func (d *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Target, error) {
 	ancs := make([]*Target, 0)
 
-	err := e.getOrderedAncestors(targets, includeRoot, func(target *Target) {
+	err := d.getOrderedAncestors(targets, includeRoot, func(target *Target) {
 		ancs = append(ancs, target)
 	})
 
 	return ancs, err
 }
 
-func (e *DAG) GetOrderedAncestorsWithOutput(targets []*Target, includeRoot bool) ([]*Target, *maps.Map[string, *sets.Set[string, string]], error) {
+func (d *DAG) GetOrderedAncestorsWithOutput(e *Engine, targets []*Target, includeRoot bool) ([]*Target, *maps.Map[string, *sets.Set[string, string]], error) {
 	ancs := make([]*Target, 0)
 	ancsout := &maps.Map[string, *sets.Set[string, string]]{
 		Default: func() *sets.Set[string, string] {
@@ -77,14 +77,14 @@ func (e *DAG) GetOrderedAncestorsWithOutput(targets []*Target, includeRoot bool)
 		}
 	}
 
-	err := e.getOrderedAncestors(targets, includeRoot, func(target *Target) {
+	err := d.getOrderedAncestors(targets, includeRoot, func(target *Target) {
 		deps := target.Deps.All().Merge(target.HashDeps)
 		for _, dep := range deps.Targets {
-			maybeAddAllOuts(dep.Target, dep.Output)
+			maybeAddAllOuts(e.Targets.Find(dep.Target.FQN), dep.Output)
 		}
 
 		for _, tool := range target.Tools.Targets {
-			maybeAddAllOuts(tool.Target, tool.Output)
+			maybeAddAllOuts(e.Targets.Find(tool.Target.FQN), tool.Output)
 		}
 
 		ancs = append(ancs, target)
@@ -93,7 +93,7 @@ func (e *DAG) GetOrderedAncestorsWithOutput(targets []*Target, includeRoot bool)
 	return ancs, ancsout, err
 }
 
-func (e *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*Target)) error {
+func (d *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*Target)) error {
 	ancsm := map[string]struct{}{}
 
 	minDepth := 1
@@ -102,7 +102,7 @@ func (e *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*T
 	}
 
 	for _, target := range targets {
-		err := e.orderedWalker(target, e.GetParents, ancsm, minDepth, 0, f)
+		err := d.orderedWalker(target, d.GetParents, ancsm, minDepth, 0, f)
 		if err != nil {
 			return err
 		}
@@ -111,7 +111,7 @@ func (e *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*T
 	return nil
 }
 
-func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Target, error) {
+func (d *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Target, error) {
 	ancs := make([]*Target, 0)
 	ancsm := map[string]struct{}{}
 
@@ -121,7 +121,7 @@ func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 	}
 
 	for _, target := range targets {
-		err := e.orderedWalker(target, e.GetChildren, ancsm, minDepth, 0, func(target *Target) {
+		err := d.orderedWalker(target, d.GetChildren, ancsm, minDepth, 0, func(target *Target) {
 			ancs = append(ancs, target)
 		})
 		if err != nil {
@@ -132,63 +132,63 @@ func (e *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 	return ancs, nil
 }
 
-func (e *DAG) GetAncestors(target *Target) ([]*Target, error) {
-	return e.GetAncestorsOfFQN(target.FQN)
+func (d *DAG) GetAncestors(target *Target) ([]*Target, error) {
+	return d.GetAncestorsOfFQN(target.FQN)
 }
 
-func (e *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
-	ancestors, err := e.DAG.GetAncestors(fqn)
+func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
+	ancestors, err := d.DAG.GetAncestors(fqn)
 	if err != nil {
 		return nil, err
 	}
 
-	return e.mapToArray(ancestors), nil
+	return d.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetDescendants(target *Target) ([]*Target, error) {
-	return e.GetDescendantsOfFQN(target.FQN)
+func (d *DAG) GetDescendants(target *Target) ([]*Target, error) {
+	return d.GetDescendantsOfFQN(target.FQN)
 }
 
-func (e *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
-	ancestors, err := e.DAG.GetDescendants(fqn)
+func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
+	ancestors, err := d.DAG.GetDescendants(fqn)
 	if err != nil {
 		return nil, err
 	}
 
-	return e.mapToArray(ancestors), nil
+	return d.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetParents(target *Target) ([]*Target, error) {
-	ancestors, err := e.DAG.GetParents(target.FQN)
+func (d *DAG) GetParents(target *Target) ([]*Target, error) {
+	ancestors, err := d.DAG.GetParents(target.FQN)
 	if err != nil {
 		return nil, err
 	}
 
-	return e.mapToArray(ancestors), nil
+	return d.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetVertices() []*Target {
-	vertices := e.DAG.GetVertices()
+func (d *DAG) GetVertices() []*Target {
+	vertices := d.DAG.GetVertices()
 
-	return e.mapToArray(vertices)
+	return d.mapToArray(vertices)
 }
 
-func (e *DAG) GetChildren(target *Target) ([]*Target, error) {
-	ancestors, err := e.DAG.GetChildren(target.FQN)
+func (d *DAG) GetChildren(target *Target) ([]*Target, error) {
+	ancestors, err := d.DAG.GetChildren(target.FQN)
 	if err != nil {
 		return nil, err
 	}
 
-	return e.mapToArray(ancestors), nil
+	return d.mapToArray(ancestors), nil
 }
 
-func (e *DAG) GetLeaves() []*Target {
-	leaves := e.DAG.GetLeaves()
+func (d *DAG) GetLeaves() []*Target {
+	leaves := d.DAG.GetLeaves()
 
-	return e.mapToArray(leaves)
+	return d.mapToArray(leaves)
 }
 
-func (e *DAG) mapToArray(m map[string]interface{}) []*Target {
+func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
 	a := make([]*Target, 0)
 	for _, anci := range m {
 		anc := anci.(*Target)

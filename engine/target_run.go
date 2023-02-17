@@ -13,6 +13,7 @@ import (
 	"heph/platform"
 	"heph/sandbox"
 	"heph/targetspec"
+	"heph/tgt"
 	"heph/utils"
 	"heph/utils/fs"
 	"heph/utils/sets"
@@ -54,6 +55,7 @@ func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target
 }
 
 func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
+	outputs = utils.CopyArray(outputs)
 	outputs = targetspec.SortOutputsForHashing(outputs)
 
 	cached, err := e.warmTargetInput(ctx, target)
@@ -190,6 +192,10 @@ type runPrepare struct {
 	Executor platform.Executor
 }
 
+func (e *TargetRunEngine) toolAbsPath(tt tgt.TargetTool) string {
+	return tt.File.WithRoot(e.Targets.Find(tt.Target.FQN).OutExpansionRoot.Abs()).Abs()
+}
+
 func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
 	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
 
@@ -200,13 +206,13 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
-		if tool.Target.actualOutFiles == nil {
+		if e.Targets.Find(tool.Target.FQN).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		if dep.Target.actualOutFiles == nil {
+		if e.Targets.Find(dep.Target.FQN).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
@@ -219,7 +225,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	bin := map[string]string{}
 	for _, t := range target.Tools.Targets {
-		bin[t.Name] = t.AbsPath()
+		bin[t.Name] = e.toolAbsPath(t)
 	}
 
 	var hephDistRoot string
@@ -288,7 +294,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	for _, deps := range target.Deps.Named() {
 		var deplength int
 		for _, dep := range deps.Targets {
-			deplength += len(dep.Target.ActualOutFiles().Name(dep.Output))
+			deplength += len(e.Targets.Find(dep.Target.FQN).ActualOutFiles().Name(dep.Output))
 		}
 		deplength += len(deps.Files)
 
@@ -300,7 +306,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
-			dept := dep.Target
+			dept := e.Targets.Find(dep.Target.FQN)
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -515,7 +521,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		if tool.Name == "" {
 			k = "TOOL"
 		}
-		env[normalizeEnv(k)] = tool.AbsPath()
+		env[normalizeEnv(k)] = e.toolAbsPath(tool)
 
 		if tool.Target == nil {
 			continue
@@ -527,7 +533,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}
 
 	for k, expr := range target.RuntimeEnv {
-		val, err := exprs.Exec(expr.Value, e.queryFunctions(expr.Target))
+		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target.FQN)))
 		if err != nil {
 			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 		}
@@ -575,7 +581,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
-	target.LogFile = ""
+	logFilePath := ""
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
@@ -624,9 +630,9 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
-		target.LogFile = e.sandboxRoot(target).Join("log.txt").Abs()
+		logFilePath = e.sandboxRoot(target).Join(logFile).Abs()
 
-		f, err := os.Create(target.LogFile)
+		f, err := os.Create(logFilePath)
 		if err != nil {
 			return err
 		}
@@ -684,7 +690,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		run := make([]string, 0)
 		if target.IsTool() {
 			log.Tracef("%v is tool, replacing run", target.FQN)
-			run = append(target.Run[1:], target.ToolTarget().AbsPath())
+			run = append(target.Run[1:], e.toolAbsPath(target.ToolTarget()))
 		} else {
 			for _, s := range target.Run {
 				out, err := exprs.Exec(s, e.queryFunctions(target))
@@ -736,9 +742,9 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 
 			err := fmt.Errorf("exec: %w", err)
 
-			if target.LogFile != "" {
+			if logFilePath != "" {
 				return ErrorWithLogFile{
-					LogFile: target.LogFile,
+					LogFile: logFilePath,
 					Err:     err,
 				}
 			}
@@ -761,7 +767,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return fmt.Errorf("pop: %w", err)
 	}
 
-	err = e.storeCache(ctx, target, outRoot.Abs())
+	err = e.storeCache(ctx, target, outRoot.Abs(), logFilePath)
 	if err != nil {
 		return fmt.Errorf("cache: store: %w", err)
 	}

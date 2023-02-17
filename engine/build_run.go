@@ -8,6 +8,7 @@ import (
 	log "heph/hlog"
 	"heph/packages"
 	"heph/targetspec"
+	"heph/tgt"
 	"heph/utils"
 	fs2 "heph/utils/fs"
 	"heph/utils/hash"
@@ -132,7 +133,9 @@ func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 	}
 
 	e.Targets.Add(&Target{
-		TargetSpec: spec,
+		Target: &tgt.Target{
+			TargetSpec: spec,
+		},
 	})
 	l.Unlock()
 

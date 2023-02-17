@@ -83,6 +83,10 @@ func (ts *Set[K, T]) add(t T) bool {
 }
 
 func (ts *Set[K, T]) AddAll(ats []T) {
+	if len(ats) == 0 {
+		return
+	}
+
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
