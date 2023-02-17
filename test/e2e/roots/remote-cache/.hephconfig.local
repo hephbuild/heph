@@ -3,3 +3,6 @@ cache:
     uri: <URI>
     read: true
     write: true
+
+params:
+  tmp: <TMP>

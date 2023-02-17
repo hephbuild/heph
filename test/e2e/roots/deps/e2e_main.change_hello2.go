@@ -12,7 +12,7 @@ func main() {
 	tmp := MustV(TempDir())
 	defer os.RemoveAll(tmp)
 
-	SetDefaultRunOpts(RunOpts{Params: map[string]string{"tmp": tmp}})
+	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))
 
 	Must(CleanSetup())
 

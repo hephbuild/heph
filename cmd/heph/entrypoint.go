@@ -5,6 +5,7 @@ import (
 	"errors"
 	log "heph/hlog"
 	"heph/utils"
+	"heph/vfssimple"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +14,9 @@ import (
 
 func execute() error {
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	vfssimple.WithContext(ctx)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)

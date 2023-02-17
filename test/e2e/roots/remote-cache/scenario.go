@@ -10,13 +10,11 @@ import (
 func Scenario(tgt string, outputs []string) {
 	cache := MustV(TempDir())
 	defer os.RemoveAll(cache)
-
-	Must(ReplaceFile(".hephconfig.local", "uri: <URI>", "uri: file://"+cache+"/"))
-
 	tmp := MustV(TempDir())
 	defer os.RemoveAll(tmp)
 
-	SetDefaultRunOpts(RunOpts{Params: map[string]string{"tmp": tmp}})
+	Must(ReplaceFile(".hephconfig.local", "<URI>", "file://"+cache+"/"))
+	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))
 
 	Must(CleanSetup())
 

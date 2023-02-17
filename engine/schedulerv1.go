@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	log "heph/hlog"
 	"heph/worker"
 )
@@ -60,7 +61,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 
 					e := NewTargetRunEngine(e, w.Status)
 
-					cached, err := e.PullTargetMeta(ctx, target, target.OutWithSupport.Names())
+					cached, err := e.pullOrGetCache(ctx, target, target.OutWithSupport.Names(), true)
 					if err != nil {
 						return err
 					}
@@ -126,13 +127,13 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 				}
 
 				if needRun.Find(target.FQN) != nil {
-					j, err := e.ScheduleTarget(ctx, rrs.Get(target), wdeps)
+					j, err := e.ScheduleTargetRun(ctx, rrs.Get(target), wdeps)
 					if err != nil {
 						return err
 					}
 					targetDeps.Add(j)
 				} else if needCacheWarm.Find(target.FQN) != nil {
-					j, err := e.ScheduleTargetCacheWarm(ctx, target, target.OutWithSupport.Names(), wdeps)
+					j, err := e.ScheduleTargetCacheGet(ctx, target, target.OutWithSupport.Names(), wdeps)
 					if err != nil {
 						return err
 					}
@@ -164,4 +165,29 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	}()
 
 	return deps, nil
+}
+
+func (e *Engine) ScheduleTargetCacheGet(ctx context.Context, target *Target, outputs []string, wdeps *worker.WaitGroup) (*worker.Job, error) {
+	postDeps := &worker.WaitGroup{}
+	j := e.Pool.Schedule(ctx, &worker.Job{
+		Name: "cache get " + target.FQN,
+		Deps: wdeps,
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			e := NewTargetRunEngine(e, w.Status)
+
+			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs)
+			if err != nil {
+				return err
+			}
+
+			if !cached {
+				return fmt.Errorf("%v was supposed to pull cache", target.FQN)
+			}
+
+			return nil
+		},
+	})
+	postDeps.Add(j)
+
+	return e.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
 }

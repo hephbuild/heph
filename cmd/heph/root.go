@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"strings"
+	"time"
 )
 
 var isTerm bool
@@ -113,7 +114,12 @@ func postRun() {
 	if Engine.Pool != nil {
 		if !Engine.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
-			<-Engine.Pool.Done()
+			select {
+			case <-Engine.Pool.Done():
+			case <-time.After(time.Second):
+				log.Infof("Waiting for background jobs to finish...")
+				<-Engine.Pool.Done()
+			}
 			log.Tracef("All pool items finished")
 
 			Engine.Pool.Stop(nil)
