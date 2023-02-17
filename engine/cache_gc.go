@@ -63,8 +63,10 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 		targetHashDirs[e.cacheDirForHash(target, "").Abs()] = target
 	}
 
+	homeDir := e.HomeDir.Abs()
+
 	for _, dir := range targetDirs {
-		reldir, _ := filepath.Rel(e.HomeDir.Abs(), dir)
+		reldir, _ := filepath.Rel(homeDir, dir)
 
 		flog("%v:", reldir)
 		target, ok := targetHashDirs[dir]
