@@ -52,11 +52,9 @@ func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Locati
 
 func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string) error {
 	log.Tracef("vfs copy %v to %v", from.URI(), to.URI())
-	doneCh := make(chan struct{})
-	defer close(doneCh)
 
-	done := utils.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
-	defer done()
+	doneTrace := utils.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
+	defer doneTrace()
 
 	sf, err := from.NewFile(path)
 	if err != nil {
@@ -64,14 +62,8 @@ func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path st
 	}
 	defer sf.Close()
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			sf.Close()
-		case <-doneCh:
-			// discard goroutine
-		}
-	}()
+	doneCloser := utils.CloserContext(sf, ctx)
+	defer doneCloser()
 
 	ok, err := sf.Exists()
 	if err != nil {

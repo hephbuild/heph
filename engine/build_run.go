@@ -56,9 +56,11 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *packag
 		return err
 	}
 
+	repoRoot := e.Root.Abs()
+
 	pkgs := make([]*packages.Package, 0)
 	for _, file := range files {
-		relRoot, err := filepath.Rel(e.Root.Abs(), filepath.Dir(file.Path))
+		relRoot, err := filepath.Rel(repoRoot, filepath.Dir(file.Path))
 		if err != nil {
 			panic(err)
 		}
@@ -75,7 +77,7 @@ func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *packag
 		pkg.SourceFiles = append(pkg.SourceFiles, file)
 	}
 
-	sort.SliceStable(e.SourceFiles, func(i, j int) bool {
+	sort.Slice(e.SourceFiles, func(i, j int) bool {
 		return strings.Compare(e.SourceFiles[i].Path, e.SourceFiles[j].Path) < 0
 	})
 

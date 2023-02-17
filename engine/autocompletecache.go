@@ -2,6 +2,7 @@ package engine
 
 import (
 	"compress/gzip"
+	"context"
 	"errors"
 	"github.com/vmihailenco/msgpack/v5"
 	"heph/targetspec"
@@ -10,6 +11,7 @@ import (
 	"heph/utils/sets"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 type AutocompleteCache struct {
@@ -50,9 +52,13 @@ func (e *Engine) autocompleteCachePath() string {
 	return filepath.Join(e.HomeDir.Abs(), "tmp", "autocomplete")
 }
 
+func (e *Engine) autocompleteCacheHashPath() string {
+	return filepath.Join(e.HomeDir.Abs(), "tmp", "autocomplete_hash")
+}
+
 func (e *Engine) computeAutocompleteHash() (string, error) {
 	h := hash.NewHash()
-	h.I64(2)
+	h.I64(3)
 	h.String(utils.Version)
 
 	for _, file := range e.SourceFiles {
@@ -61,6 +67,12 @@ func (e *Engine) computeAutocompleteHash() (string, error) {
 		if err != nil {
 			return "", err
 		}
+	}
+
+	fqns := e.Targets.FQNs()
+	sort.Strings(fqns)
+	for _, fqn := range fqns {
+		h.String(fqn)
 	}
 
 	for _, target := range e.linkedTargets().Slice() {
@@ -89,7 +101,13 @@ func FilterPublicTargets(targets []*Target) []*Target {
 	return pubTargets
 }
 
-func (e *Engine) StoreAutocompleteCache() error {
+func (e *Engine) StoreAutocompleteCache(ctx context.Context) error {
+	prevHash, _ := e.LoadAutocompleteCacheHash()
+
+	if prevHash == e.autocompleteHash {
+		return nil
+	}
+
 	allTargets := make([]targetspec.TargetSpec, 0, e.Targets.Len())
 	for _, target := range e.Targets.Slice() {
 		allTargets = append(allTargets, target.TargetSpec)
@@ -106,6 +124,9 @@ func (e *Engine) StoreAutocompleteCache() error {
 	}
 	defer f.Close()
 
+	doneCloser := utils.CloserContext(f, ctx)
+	defer doneCloser()
+
 	gw := gzip.NewWriter(f)
 	defer gw.Close()
 
@@ -115,7 +136,21 @@ func (e *Engine) StoreAutocompleteCache() error {
 		return err
 	}
 
+	err = os.WriteFile(e.autocompleteCacheHashPath(), []byte(e.autocompleteHash), os.ModePerm)
+	if err != nil {
+		return err
+	}
+
 	return nil
+}
+
+func (e *Engine) LoadAutocompleteCacheHash() (string, error) {
+	b, err := os.ReadFile(e.autocompleteCacheHashPath())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	return string(b), nil
 }
 
 func (e *Engine) LoadAutocompleteCache() (*AutocompleteCache, error) {

@@ -49,7 +49,7 @@ func (o *ArtifactOrchestrator) AllStore() []artifacts.Artifact {
 		all := make([]artifacts.Artifact, 0, len(o.Out)+2)
 		all = append(all, o.Log)
 		names := utils.Keys(o.Out)
-		targetspec.SortOutputsForHashing(names)
+		names = targetspec.SortOutputsForHashing(names)
 		for _, name := range names {
 			a := o.Out[name]
 			all = append(all, a.Tar(), a.Hash())
