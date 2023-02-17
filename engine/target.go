@@ -28,6 +28,8 @@ type Target struct {
 	linkingDeps *Targets
 	m           sync.Mutex
 
+	artifacts *ArtifactOrchestrator
+
 	runLock         flock.Locker
 	postRunWarmLock flock.Locker
 	cacheLocks      map[string]flock.Locker

@@ -313,7 +313,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		panic(fmt.Sprintf("%v does not output `%v`", target, output))
 	}
 
-	file := e.targetOutputHashFile(target, output)
+	file := e.cacheDir(target).Join(target.artifacts.OutHash(output).Name()).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -332,7 +332,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	h.String(output)
 
-	tarPath := e.targetOutputTarFile(target, output)
+	tarPath := e.cacheDir(target).Join(target.artifacts.OutTar(output).Name()).Abs()
 	err = e.hashTar(h, tarPath)
 	if err != nil {
 		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, tarPath, err))

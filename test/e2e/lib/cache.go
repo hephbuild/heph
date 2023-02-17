@@ -50,9 +50,6 @@ func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
 	expected := []string{
 		"hash_input",
 	}
-	if !fromRemote {
-		expected = append(expected, "version")
-	}
 	if len(outputs) > 0 {
 		expected = append(expected, "_output")
 		expected = append(expected, "_output_hash")
@@ -74,9 +71,10 @@ func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
 }
 
 func ValidateRemoteCache(root, tgt string, outputs []string) error {
+	fmt.Println("remote cache folder:", root)
+
 	expected := []string{
 		"hash_input",
-		"version",
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)
@@ -94,8 +92,6 @@ func ValidateRemoteCache(root, tgt string, outputs []string) error {
 	}
 
 	tgtroot := filepath.Join(root, tp.Package, tp.Name, hash)
-
-	fmt.Println("remote cache folder:", root)
 
 	return validateFolderContent(tgtroot, expected)
 }

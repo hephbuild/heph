@@ -41,11 +41,6 @@ func (e *Engine) processTarget(t *Target) error {
 		t.runLock = e.lockFactory(t, "run")
 	}
 	t.postRunWarmLock = e.lockFactory(t, "postrunwarm")
-	t.cacheLocks = map[string]flock.Locker{}
-	for _, o := range t.TargetSpec.Out {
-		t.cacheLocks[o.Name] = e.lockFactory(t, "cache_"+o.Name)
-	}
-	t.cacheLocks[inputHashName] = e.lockFactory(t, "cache_"+inputHashName)
 
 	if t.Cache.History == 0 {
 		t.Cache.History = e.Config.CacheHistory
@@ -341,6 +336,12 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	err = e.registerDag(t)
 	if err != nil {
 		return err
+	}
+
+	t.artifacts = e.newArtifactOrchestrator(t)
+	t.cacheLocks = map[string]flock.Locker{}
+	for _, artifact := range t.artifacts.All() {
+		t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 	}
 
 	parents, err := e.DAG().GetParents(t)

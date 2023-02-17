@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go.opentelemetry.io/otel/attribute"
-	"heph/engine/htrace"
 	"heph/exprs"
 	"heph/hephprovider"
 	log "heph/hlog"
@@ -40,108 +38,6 @@ func NewTargetRunEngine(e *Engine, status func(s worker.Status)) TargetRunEngine
 type TargetRunEngine struct {
 	*Engine
 	Status func(s worker.Status)
-}
-
-func (e *TargetRunEngine) PullTargetMeta(ctx context.Context, target *Target, outputs []string) (bool, error) {
-	return e.warmTargetCaches(ctx, target, outputs, true)
-}
-
-func (e *TargetRunEngine) WarmTargetCache(ctx context.Context, target *Target, output string) (bool, error) {
-	return e.warmTargetOutput(ctx, target, output, false)
-}
-
-func (e *TargetRunEngine) WarmAllTargetCache(ctx context.Context, target *Target) (bool, error) {
-	return e.warmTargetCaches(ctx, target, target.OutWithSupport.Names(), false)
-}
-
-func (e *TargetRunEngine) warmTargetCaches(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
-	outputs = utils.CopyArray(outputs)
-	outputs = targetspec.SortOutputsForHashing(outputs)
-
-	cached, err := e.warmTargetInput(ctx, target)
-	if err != nil {
-		return false, err
-	}
-
-	if !cached {
-		return false, nil
-	}
-
-	for _, output := range outputs {
-		cached, err := e.warmTargetOutput(ctx, target, output, onlyMeta)
-		if err != nil {
-			return false, err
-		}
-
-		if !cached {
-			return false, nil
-		}
-	}
-
-	if !onlyMeta {
-		err := e.postRunOrWarm(ctx, target, outputs)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	return true, nil
-}
-
-func (e *TargetRunEngine) warmTargetInput(ctx context.Context, target *Target) (_ bool, rerr error) {
-	err := e.LinkTarget(target, NewTargets(0))
-	if err != nil {
-		return false, err
-	}
-
-	if !target.Cache.Enabled {
-		return false, nil
-	}
-
-	span := e.SpanCachePull(ctx, target, inputHashName, true)
-	defer func() {
-		span.EndError(rerr)
-	}()
-
-	return e.getCache(ctx, target, inputHashName, true)
-}
-
-func (e *TargetRunEngine) warmTargetOutput(ctx context.Context, target *Target, output string, onlyMeta bool) (_ bool, rerr error) {
-	err := e.LinkTarget(target, NewTargets(0))
-	if err != nil {
-		return false, err
-	}
-
-	if !target.Cache.Enabled {
-		return false, nil
-	}
-
-	if output != inputHashName && !target.OutWithSupport.HasName(output) {
-		return false, fmt.Errorf("%v does not output %v", target.FQN, output)
-	}
-
-	span := e.SpanCachePull(ctx, target, output, onlyMeta)
-	defer func() {
-		span.EndError(rerr)
-	}()
-
-	ok, err := e.getCache(ctx, target, output, onlyMeta)
-	if err != nil {
-		return false, err
-	}
-
-	if !ok {
-		return false, nil
-	}
-
-	log.Debugf("Using cache %v", target.FQN)
-
-	if onlyMeta {
-		return true, nil
-	}
-
-	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
-	return true, nil
 }
 
 func (e *Engine) tmpRoot(target *Target) string {
@@ -272,13 +168,13 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
-		latestDir := e.cacheDirForHash(target, "latest").Abs()
+		latestDir := e.cacheDirForHash(target, "latest")
 
-		if fs.PathExists(latestDir) {
+		if fs.PathExists(latestDir.Abs()) {
 			done := utils.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
-				p := e.targetOutputTarFileForHash(target, "latest", name)
+				p := latestDir.Join(target.artifacts.OutTar(name).Name()).Abs()
 				if !fs.PathExists(p) {
 					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, name)
 					continue
@@ -317,7 +213,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				tarFile := e.targetOutputTarFile(dept, dep.Output)
+				tarFile := e.cacheDir(dept).Join(dept.artifacts.OutTar(dep.Output).Name()).Abs()
 				srcRec.AddTar(tarFile)
 			}
 
@@ -602,7 +498,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
 		}()
 
-		cached, err := e.WarmAllTargetCache(ctx, target)
+		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.OutWithSupport.Names())
 		if err != nil {
 			return err
 		}
@@ -630,7 +526,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	if iocfg.Stdout == nil || iocfg.Stderr == nil {
-		logFilePath = e.sandboxRoot(target).Join(logFile).Abs()
+		logFilePath = e.sandboxRoot(target).Join(target.artifacts.Log.Name()).Abs()
 
 		f, err := os.Create(logFilePath)
 		if err != nil {
@@ -772,7 +668,10 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return fmt.Errorf("cache: store: %w", err)
 	}
 
-	clearDeps := &worker.WaitGroup{}
+	if !target.Cache.Enabled && !rr.PreserveCache {
+		e.RegisterRemove(e.cacheDir(target).Abs())
+	}
+
 	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
 		for _, cache := range e.Config.Cache {
 			cache := cache
@@ -785,28 +684,13 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 				continue
 			}
 
-			j := e.Pool.Schedule(ctx, &worker.Job{
-				Name: fmt.Sprintf("cache %v %v", target.FQN, cache.Name),
-				Do: func(w *worker.Worker, ctx context.Context) error {
-					w.Status(TargetStatus(target, fmt.Sprintf("Pushing to %v cache...", cache.Name)))
-
-					err = e.storeVfsCache(cache, target)
-					if err != nil {
-						log.Errorf("store vfs cache %v: %v %v", cache.Name, target.FQN, err)
-						return nil
-					}
-
-					return nil
-				},
-			})
-			clearDeps.Add(j)
+			_ = e.scheduleStoreExternalCache(ctx, target, cache)
 		}
 	}
 
 	if !e.Config.KeepSandbox {
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
-			Deps: clearDeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				w.Status(TargetStatus(target, "Clearing sandbox..."))
 				err = deleteDir(target.SandboxRoot.Abs(), false)
@@ -817,10 +701,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 				return nil
 			},
 		})
-	}
-
-	if !target.Cache.Enabled && !rr.PreserveCache {
-		e.RegisterRemove(e.cacheDir(target).Abs())
 	}
 
 	err = e.postRunOrWarm(ctx, target, target.OutWithSupport.Names())
@@ -867,7 +747,9 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 		}
 	}()
 
-	doneMarker := e.cacheDir(target).Join(inputHashFile).Abs()
+	cacheDir := e.cacheDir(target)
+
+	doneMarker := cacheDir.Join(target.artifacts.InputHash.Name()).Abs()
 	if !fs.PathExists(doneMarker) {
 		return false, err
 	}
@@ -877,9 +759,9 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 	// sanity check
 	for _, name := range outputs {
-		p := e.targetOutputTarFile(target, name)
+		p := cacheDir.Join(target.artifacts.OutTar(name).Name()).Abs()
 		if !fs.PathExists(p) {
-			return false, fmt.Errorf("%v does not exist", p)
+			panic(fmt.Errorf("%v does not exist", p))
 		}
 	}
 	outDirHash := "2|" + strings.Join(outputs, ",")
@@ -919,7 +801,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 		untarDedup := sets.NewStringSet(0)
 
 		for _, name := range outputs {
-			tarf := e.targetOutputTarFile(target, name)
+			tarf := cacheDir.Join(target.artifacts.OutTar(name).Name()).Abs()
 			err := tar.UntarWith(ctx, tarf, tmpOutDir, tar.UntarOptions{
 				List:  true,
 				Dedup: untarDedup,
@@ -956,7 +838,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 		return false, fmt.Errorf("poptar: %w", err)
 	}
 
-	err = e.codegenLink(target)
+	err = e.codegenLink(ctx, target)
 	if err != nil {
 		return false, err
 	}
@@ -973,7 +855,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 	return true, nil
 }
 
-func (e *TargetRunEngine) codegenLink(target *Target) error {
+func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error {
 	if target.Codegen == "" {
 		return nil
 	}
@@ -981,10 +863,14 @@ func (e *TargetRunEngine) codegenLink(target *Target) error {
 	e.Status(TargetStatus(target, "Linking output..."))
 
 	for name, paths := range target.Out.Named() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		switch target.Codegen {
 		case targetspec.CodegenCopy:
-			tarPath := e.targetOutputTarFile(target, name)
-			err := tar.Untar(context.Background(), tarPath, e.Root.Abs(), false)
+			tarf := e.cacheDir(target).Join(target.artifacts.OutTar(name).Name()).Abs()
+			err := tar.Untar(ctx, tarf, e.Root.Abs(), false)
 			if err != nil {
 				return err
 			}

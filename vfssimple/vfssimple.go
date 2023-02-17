@@ -1,8 +1,10 @@
 package vfssimple
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/c2fo/vfs/v6/backend/gs"
 	"github.com/c2fo/vfs/v6/backend/mem"
 	"github.com/c2fo/vfs/v6/backend/os"
 	"net/url"
@@ -21,6 +23,12 @@ import (
 	_ "github.com/c2fo/vfs/v6/backend/s3"   // register s3 backend
 	_ "github.com/c2fo/vfs/v6/backend/sftp" // register sftp backend
 )
+
+func WithContext(ctx context.Context) {
+	gsfs := backend.Backend(gs.Scheme).(*gs.FileSystem)
+	gsfs.WithContext(ctx)
+	backend.Register(gs.Scheme, gsfs)
+}
 
 var (
 	ErrMissingAuthority = errors.New("unable to determine uri authority ([user@]host[:port]) for network-based scheme")

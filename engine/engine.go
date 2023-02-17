@@ -296,48 +296,17 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
-var schedulerV2Once sync.Once
+//var schedulerV2Once sync.Once
 
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
-	if e.Config.TargetScheduler == "v2" {
-		schedulerV2Once.Do(func() {
-			log.Info("Scheduler v2")
-		})
-		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-	}
+	//if e.Config.TargetScheduler == "v2" {
+	//	schedulerV2Once.Do(func() {
+	//		log.Info("Scheduler v2")
+	//	})
+	//	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
+	//}
 
 	return e.ScheduleV1TargetRRsWithDeps(ctx, rrs, skip)
-}
-
-func (e *Engine) ScheduleTargetCacheWarm(ctx context.Context, target *Target, outputs []string, wdeps *worker.WaitGroup) (*worker.Job, error) {
-	postDeps := &worker.WaitGroup{}
-	for _, output := range append(outputs, inputHashName) {
-		output := output
-
-		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: "warm " + target.FQN + "|" + output,
-			Deps: wdeps,
-			Do: func(w *worker.Worker, ctx context.Context) error {
-				e := NewTargetRunEngine(e, w.Status)
-
-				w.Status(TargetOutputStatus(target, output, "Priming cache..."))
-
-				cached, err := e.WarmTargetCache(ctx, target, output)
-				if err != nil {
-					return err
-				}
-
-				if cached {
-					return nil
-				}
-
-				return nil
-			},
-		})
-		postDeps.Add(j)
-	}
-
-	return e.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
 }
 
 func TargetStatus(t *Target, status string) worker.Status {
@@ -388,7 +357,7 @@ func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target
 	})
 }
 
-func (e *Engine) ScheduleTarget(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
+func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.FQN,
 		Deps: deps,
@@ -433,7 +402,7 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *tgt.OutNamed
 	tp := &ActualOutNamedPaths{}
 
 	for name := range namedPaths.Named() {
-		p := e.targetOutputTarFile(target, name)
+		p := e.cacheDir(target).Join(target.artifacts.OutTar(name).Name()).Abs()
 		if !fs2.PathExists(p) {
 			continue
 		}
@@ -539,7 +508,9 @@ func (e *Engine) populateActualFilesFromTar(target *Target) error {
 	}
 
 	if target.HasSupportFiles {
-		target.actualSupportFiles, err = e.collectOutFromTar(target, e.targetOutputTarFile(target, targetspec.SupportFilesOutput))
+		p := e.cacheDir(target).Join(target.artifacts.OutTar(targetspec.SupportFilesOutput).Name()).Abs()
+
+		target.actualSupportFiles, err = e.collectOutFromTar(target, p)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
@@ -551,7 +522,7 @@ func (e *Engine) populateActualFilesFromTar(target *Target) error {
 func (e *Engine) sandboxRoot(target *Target) fs2.Path {
 	folder := "__target_" + target.Name
 	if target.ConcurrentExecution {
-		folder = "__target_tmp_" + SOMEID + "_" + target.Name
+		folder = "__target_tmp_" + InstanceUID + "_" + target.Name
 	}
 
 	p := e.HomeDir.Join("sandbox", target.Package.FullName, folder)
@@ -794,6 +765,25 @@ func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Targe
 func (e *Engine) RegisterRemove(path string) {
 	e.RegisterExitHandler(func() {
 		err := os.RemoveAll(path)
+		if err != nil {
+			log.Error(err)
+		}
+	})
+}
+
+func (e *Engine) RegisterRemoveWithLocker(l flock.Locker, path string) {
+	e.RegisterExitHandler(func() {
+		ok, err := l.TryLock()
+		if err != nil {
+			log.Errorf("lock rm %v: %v", path, err)
+			return
+		}
+		if !ok {
+			return
+		}
+		defer l.Unlock()
+
+		err = os.RemoveAll(path)
 		if err != nil {
 			log.Error(err)
 		}

@@ -4,11 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"heph/engine/artifacts"
 	log "heph/hlog"
-	"heph/targetspec"
 	"heph/utils/fs"
-	"heph/utils/tar"
-	"heph/vfssimple"
 	"os"
 	"time"
 )
@@ -17,12 +15,18 @@ func (e *Engine) cacheDir(target *Target) fs.Path {
 	return e.cacheDirForHash(target, e.hashInput(target))
 }
 
-var SOMEID = fmt.Sprintf("%v%v", os.Getpid(), time.Now().Nanosecond())
+func genInstanceUid() string {
+	host, _ := os.Hostname()
+	return fmt.Sprintf("%v%v%v", os.Getpid(), host, time.Now().Nanosecond())
+}
+
+var InstanceUID = genInstanceUid()
 
 func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
+	// TODO: cache
 	folder := "__target_" + target.Name
 	if !target.Cache.Enabled {
-		folder = "__target_tmp_" + SOMEID + "_" + target.Name
+		folder = "__target_tmp_" + InstanceUID + "_" + target.Name
 	}
 	return e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
 }
@@ -33,217 +37,6 @@ func (e *Engine) cacheOutTarName(name string) string {
 
 func (e *Engine) cacheOutHashName(name string) string {
 	return "hash_out_" + name
-}
-
-func (e *Engine) targetOutputTarFile(target *Target, name string) string {
-	return e.cacheDir(target).Join(e.cacheOutTarName(name)).Abs()
-}
-
-func (e *Engine) targetOutputTarFileForHash(target *Target, hash, name string) string {
-	return e.cacheDirForHash(target, hash).Join(e.cacheOutTarName(name)).Abs()
-}
-
-func (e *Engine) targetOutputHashFile(target *Target, name string) string {
-	return e.cacheDir(target).Join(e.cacheOutHashName(name)).Abs()
-}
-
-const versionFile = "version"
-const logFile = "log.txt"
-const inputHashFile = "hash_input"
-
-func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot, logFilePath string) (rerr error) {
-	if target.ConcurrentExecution {
-		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
-		return nil
-	}
-
-	names := target.OutWithSupport.Names()
-	names = targetspec.SortOutputsForHashing(names)
-
-	if target.Cache.Enabled {
-		e.Status(TargetStatus(target, "Caching..."))
-	} else if len(names) > 0 {
-		e.Status(TargetStatus(target, "Storing output..."))
-	}
-
-	span := e.SpanCacheStore(ctx, target)
-	defer func() {
-		span.EndError(rerr)
-	}()
-
-	inputHash := e.hashInput(target)
-
-	log.Tracef("Store Cache %v %v", target.FQN, inputHash)
-
-	dir := e.cacheDir(target)
-
-	err := os.RemoveAll(dir.Abs())
-	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(dir.Abs(), os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	err = fs.WriteFileSync(dir.Join(versionFile).Abs(), []byte("1"), os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	log.Tracef("Taring to cache %v", target.FQN)
-
-	for _, name := range names {
-		e.Status(TargetOutputStatus(target, name, "Caching..."))
-
-		var paths fs.Paths
-		if name == targetspec.SupportFilesOutput {
-			paths = target.ActualSupportFiles()
-		} else {
-			paths = target.ActualOutFiles().Name(name)
-		}
-		log.Tracef("Creating archive %v %v", target.FQN, name)
-
-		files := make([]tar.TarFile, 0)
-		for _, file := range paths {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			file := file.WithRoot(outRoot)
-
-			files = append(files, tar.TarFile{
-				From: file.Abs(),
-				To:   file.RelRoot(),
-			})
-		}
-
-		err = tar.Tar(ctx, files, e.targetOutputTarFile(target, name))
-		if err != nil {
-			return err
-		}
-
-		outputHash := e.hashOutput(target, name)
-
-		err = fs.WriteFileSync(e.targetOutputHashFile(target, name), []byte(outputHash), os.ModePerm)
-		if err != nil {
-			return err
-		}
-	}
-
-	err = fs.WriteFileSync(dir.Join(inputHashFile).Abs(), []byte(inputHash), os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	err = e.linkLatestCache(target, dir.Abs())
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (e *TargetRunEngine) getCache(ctx context.Context, target *Target, output string, onlyMeta bool) (bool, error) {
-	log.Tracef("locking cache %v|%v", target.FQN, output)
-	err := target.cacheLocks[output].Lock(ctx)
-	if err != nil {
-		return false, err
-	}
-
-	defer func() {
-		log.Tracef("unlocking cache %v|%v", target.FQN, output)
-		err := target.cacheLocks[output].Unlock()
-		if err != nil {
-			log.Errorf("unlocking cache %v %v", target.FQN, err)
-		}
-	}()
-
-	ok, err := e.getLocalCache(target, output, onlyMeta)
-	if err != nil {
-		return false, err
-	}
-
-	if ok {
-		e.Status(TargetOutputStatus(target, output, "Using local cache..."))
-		return true, nil
-	}
-
-	for _, cache := range e.Config.Cache {
-		if !cache.Read {
-			continue
-		}
-
-		if !target.Cache.NamedEnabled(cache.Name) {
-			continue
-		}
-
-		loc, err := vfssimple.NewLocation(cache.URI)
-		if err != nil {
-			return false, err
-		}
-
-		ok, err := e.getVfsCache(loc, cache.Name, target, output, onlyMeta)
-		if err != nil {
-			log.Errorf("cache %v: %v", cache.Name, err)
-			continue
-		}
-
-		if ok {
-			log.Debugf("%v %v cache hit", target.FQN, cache.Name)
-			return e.getLocalCache(target, output, onlyMeta)
-		} else {
-			log.Debugf("%v %v cache miss", target.FQN, cache.Name)
-		}
-	}
-
-	return false, nil
-}
-
-func (e *Engine) getLocalCache(target *Target, output string, onlyMeta bool) (bool, error) {
-	hash := e.hashInput(target)
-
-	dir := e.cacheDir(target)
-
-	cacheHashb, err := os.ReadFile(dir.Join(inputHashFile).Abs())
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-
-		return false, err
-	}
-	cacheHash := string(cacheHashb)
-
-	log.Tracef("Cache %v: %v %v", target.FQN, hash, cacheHash)
-
-	if cacheHash != hash {
-		return false, nil
-	}
-
-	if output == inputHashName {
-		return true, nil
-	}
-
-	if !fs.PathExists(e.targetOutputHashFile(target, output)) {
-		return false, nil
-	}
-
-	if onlyMeta {
-		return true, nil
-	}
-
-	if !fs.PathExists(e.targetOutputTarFile(target, output)) {
-		return false, nil
-	}
-
-	err = e.linkLatestCache(target, dir.Abs())
-	if err != nil {
-		return false, err
-	}
-
-	return true, nil
 }
 
 func (e *Engine) linkLatestCache(target *Target, from string) error {
@@ -260,4 +53,128 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 	}
 
 	return nil
+}
+
+func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string) (bool, error) {
+	cached, err := e.pullOrGetCache(ctx, target, outputs, false)
+	if err != nil {
+		return false, err
+	}
+
+	if !cached {
+		return false, nil
+	}
+
+	return true, e.postRunOrWarm(ctx, target, outputs)
+}
+
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
+	e.Status(TargetStatus(target, "Checking local cache..."))
+
+	cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta)
+	if err != nil {
+		return false, err
+	}
+
+	if cached {
+		return true, nil
+	}
+
+	for _, cache := range e.Config.Cache {
+		if !cache.Read {
+			continue
+		}
+
+		if !target.Cache.NamedEnabled(cache.Name) {
+			continue
+		}
+
+		externalCached, err := e.pullExternalCache(ctx, target, outputs, onlyMeta, cache)
+		if err != nil {
+			log.Errorf("%v: %v", cache.Name, err)
+			continue
+		}
+
+		if externalCached {
+			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta)
+			if err != nil {
+				log.Errorf("local: %v", err)
+				continue
+			}
+
+			if cached {
+				return true, err
+			}
+
+			log.Warnf("%v: local cache is supposed to be pulled locally, but failed getLocalCache, this is not supposed to happen", cache.Name)
+		}
+	}
+
+	return false, nil
+}
+
+func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache CacheConfig) (bool, error) {
+	err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	for _, output := range outputs {
+		if !onlyMeta {
+			err := e.downloadExternalCache(ctx, target, cache, target.artifacts.OutTar(output))
+			if err != nil {
+				return false, err
+			}
+		}
+
+		err = e.downloadExternalCache(ctx, target, cache, target.artifacts.OutHash(output))
+		if err != nil {
+			return false, err
+		}
+	}
+
+	return true, nil
+}
+
+func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) bool {
+	cacheDir := e.cacheDir(target)
+
+	p := cacheDir.Join(artifact.Name()).Abs()
+	if !fs.PathExists(p) {
+		return false
+	}
+
+	return true
+}
+
+func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
+	cacheDir := e.cacheDir(target)
+
+	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash) {
+		return false, nil
+	}
+
+	for _, output := range outputs {
+		if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutHash(output)) {
+			return false, nil
+		}
+
+		if !onlyMeta {
+			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output)) {
+				return false, nil
+			}
+		}
+	}
+
+	if !onlyMeta {
+		err := e.linkLatestCache(target, cacheDir.Abs())
+		if err != nil {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }

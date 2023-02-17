@@ -19,7 +19,7 @@ def group(*args, **kwargs):
         run='group',
         out='/**/*',
         sandbox=True,
-        cache=True,
+        cache=heph.cache(named=False),
         *args, **kwargs
     )
 
@@ -31,6 +31,7 @@ def text_file(name, text, out=None, mode=777, *args, **kwargs):
         out=out or name,
         run=['text_file', str(mode)],
         _file_content=text,
+        cache=heph.cache(named=False),
         *args, **kwargs
     )
 
