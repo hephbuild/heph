@@ -133,8 +133,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		var err error
 		if t.BinName == "heph" {
 			bin[t.Name], hephDistRoot, err = hephprovider.GetHephPath(
-				e.HomeDir.Join("tmp", "__heph_build").Abs(),
-				executor.Os(), executor.Arch(),
+				e.HomeDir.Join("tmp", "__heph", utils.Version).Abs(),
+				executor.Os(), executor.Arch(), utils.Version,
 				true, /*!platform.HasHostFsAccess(executor)*/
 			)
 		} else {
@@ -309,6 +309,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 			"HEPH_FROM_PATH",
 			hephprovider.EnvSrcRoot,
 			hephprovider.EnvDistRoot,
+			hephprovider.EnvDistNoVersion,
 		}
 		for _, k := range forward {
 			if value, ok := os.LookupEnv(k); ok {
