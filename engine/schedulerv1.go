@@ -138,9 +138,9 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 						return err
 					}
 					targetDeps.Add(j)
+				} else {
+					log.Debugf("%v nothing to do", target.FQN)
 				}
-
-				log.Debugf("%v nothing to do", target.FQN)
 
 				return nil
 			},
