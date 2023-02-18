@@ -730,14 +730,9 @@ func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[s
 }
 
 func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string) error {
-	_, err := e.postRunOrWarmCached(ctx, target, outputs)
-	return err
-}
-
-func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Target, outputs []string) (bool, error) {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	defer func() {
@@ -751,7 +746,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 	doneMarker := cacheDir.Join(target.artifacts.InputHash.Name()).Abs()
 	if !fs.PathExists(doneMarker) {
-		return false, err
+		return err
 	}
 
 	outDir := e.cacheDir(target).Join("_output")
@@ -772,7 +767,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 	} else {
 		b, err := os.ReadFile(outDirHashPath)
 		if err != nil && !errors.Is(err, fs2.ErrNotExist) {
-			return false, err
+			return err
 		}
 
 		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
@@ -790,12 +785,12 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 		err := os.RemoveAll(tmpOutDir)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		err = os.MkdirAll(tmpOutDir, os.ModePerm)
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		untarDedup := sets.NewStringSet(0)
@@ -807,23 +802,23 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 				Dedup: untarDedup,
 			})
 			if err != nil {
-				return false, err
+				return err
 			}
 		}
 
 		err = os.RemoveAll(outDir.Abs())
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		err = os.Rename(tmpOutDir, outDir.Abs())
 		if err != nil {
-			return false, err
+			return err
 		}
 
 		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
 		if err != nil {
-			return false, err
+			return err
 		}
 	}
 
@@ -835,12 +830,17 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 
 	err = e.populateActualFilesFromTar(target)
 	if err != nil {
-		return false, fmt.Errorf("poptar: %w", err)
+		return fmt.Errorf("poptar: %w", err)
 	}
 
 	err = e.codegenLink(ctx, target)
 	if err != nil {
-		return false, err
+		return err
+	}
+
+	err = e.linkLatestCache(target, cacheDir.Abs())
+	if err != nil {
+		return nil
 	}
 
 	if target.Cache.Enabled && !e.Config.DisableGC {
@@ -852,7 +852,7 @@ func (e *TargetRunEngine) postRunOrWarmCached(ctx context.Context, target *Targe
 		}
 	}
 
-	return true, nil
+	return nil
 }
 
 func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error {

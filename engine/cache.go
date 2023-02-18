@@ -71,7 +71,8 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
-	cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta)
+	// Always check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
+	cached, err := e.getLocalCache(ctx, target, outputs, false)
 	if err != nil {
 		return false, err
 	}
@@ -106,7 +107,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 				return true, err
 			}
 
-			log.Warnf("%v: local cache is supposed to be pulled locally, but failed getLocalCache, this is not supposed to happen", cache.Name)
+			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
 		}
 	}
 
@@ -123,8 +124,18 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 	}
 
 	for _, output := range outputs {
-		if !onlyMeta {
-			err := e.downloadExternalCache(ctx, target, cache, target.artifacts.OutTar(output))
+		tarArtifact := target.artifacts.OutTar(output)
+		if onlyMeta {
+			exists, err := e.existsExternalCache(ctx, target, cache, tarArtifact)
+			if err != nil {
+				return false, err
+			}
+
+			if !exists {
+				return false, nil
+			}
+		} else {
+			err := e.downloadExternalCache(ctx, target, cache, tarArtifact)
 			if err != nil {
 				return false, err
 			}
@@ -151,8 +162,6 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 }
 
 func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
-	cacheDir := e.cacheDir(target)
-
 	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash) {
 		return false, nil
 	}
@@ -166,13 +175,6 @@ func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []st
 			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output)) {
 				return false, nil
 			}
-		}
-	}
-
-	if !onlyMeta {
-		err := e.linkLatestCache(target, cacheDir.Abs())
-		if err != nil {
-			return false, nil
 		}
 	}
 

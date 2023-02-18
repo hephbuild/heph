@@ -148,6 +148,17 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) error {
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
+	err := target.cacheLocks[artifact.Name()].Lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		err := target.cacheLocks[artifact.Name()].Unlock()
+		if err != nil {
+			log.Errorf("unlock %v %v: %v", target.FQN, artifact.Name(), err)
+		}
+	}()
+
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
 		return err
@@ -159,4 +170,21 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 	}
 
 	return e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
+}
+
+func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
+	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+
+	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
+	if err != nil {
+		return false, err
+	}
+
+	f, err := remoteRoot.NewFile(artifact.Name())
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	return f.Exists()
 }

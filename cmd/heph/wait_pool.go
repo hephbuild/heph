@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -93,7 +94,7 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
 	derr := deps.Err()
 
 	if perr != nil && derr != nil {
-		if perr.Error() == derr.Error() {
+		if errors.Is(perr, derr) || errors.Is(derr, perr) {
 			return perr
 		}
 
