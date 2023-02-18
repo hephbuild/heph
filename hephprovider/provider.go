@@ -2,20 +2,21 @@ package hephprovider
 
 import (
 	"fmt"
-	log "heph/hlog"
 	"heph/utils"
 	fs2 "heph/utils/fs"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 const (
-	EnvDistRoot = "HEPH_DIST_ROOT"
-	EnvSrcRoot  = "HEPH_SRC_ROOT"
+	EnvDistRoot      = "HEPH_DIST_ROOT"
+	EnvDistNoVersion = "HEPH_DIST_NOVERSION"
+	EnvSrcRoot       = "HEPH_SRC_ROOT"
 )
 
-func GetHephPath(outDir, goos, goarch string, shouldBuildAll bool) (string, string, error) {
+func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (string, string, error) {
 	if root := os.Getenv(EnvDistRoot); root != "" {
 		if outDir != root {
 			// In the case of e2e test, a sandbox is created inside the sandbox
@@ -39,7 +40,6 @@ func GetHephPath(outDir, goos, goarch string, shouldBuildAll bool) (string, stri
 	if utils.IsDevVersion() {
 		if srcDir := os.Getenv(EnvSrcRoot); srcDir != "" {
 			if !shouldBuildAll {
-				log.Infof("Building heph %v/%v...", goos, goarch)
 				p := filepath.Join(outDir, hephBinName(goos, goarch))
 
 				err := build(srcDir, goos, goarch, p)
@@ -70,7 +70,17 @@ func GetHephPath(outDir, goos, goarch string, shouldBuildAll bool) (string, stri
 		return "", "", fmt.Errorf("hephbuild: must provide %v or %v", EnvSrcRoot, EnvDistRoot)
 	}
 
-	p, err := Download(outDir, "", utils.Version, goos, goarch)
+	if goos == runtime.GOOS && goarch == runtime.GOARCH && version == utils.Version {
+		exe, _ := os.Executable()
+		if exe != "" {
+			p := filepath.Join(outDir, hephBinName(goos, goarch))
+
+			err := fs2.CpHardlink(exe, p)
+			return p, outDir, err
+		}
+	}
+
+	p, err := Download(outDir, "", version, goos, goarch)
 	if err != nil {
 		return "", "", err
 	}

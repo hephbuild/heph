@@ -29,6 +29,8 @@ func Download(dir, binName, version, goos, goarch string) (string, error) {
 		return dstPath, nil
 	}
 
+	log.Infof("Downloading heph %v %v/%v", version, goos, goarch)
+
 	url := fmt.Sprintf("%v/%v/heph_%v_%v", BaseUrl, version, goos, goarch)
 
 	res, err := http.Get(url)

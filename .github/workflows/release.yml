@@ -139,6 +139,7 @@ jobs:
           mkdir -p /home/runner/.local/bin
           cp dist/heph_linux_amd64 /home/runner/.local/bin/heph
           echo "HEPH_DIST_ROOT=$(pwd)/dist" >> $GITHUB_ENV
+          echo "HEPH_DIST_NOVERSION=1" >> $GITHUB_ENV
 
       - name: Cache
         uses: actions/cache@v3

@@ -25,7 +25,11 @@ func CpHardlink(from, to string) error {
 			return err
 		}
 
-		return os.Link(from, to)
+		err = os.Link(from, to)
+		if err != nil {
+			return Cp(from, to)
+		}
+		return nil
 	}
 
 	entries, err := os.ReadDir(from)
