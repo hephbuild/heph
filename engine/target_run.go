@@ -40,12 +40,16 @@ type TargetRunEngine struct {
 	Status func(s worker.Status)
 }
 
-func (e *Engine) tmpRoot(target *Target) string {
-	return filepath.Join(e.HomeDir.Abs(), "tmp", target.Package.FullName, "__target_"+target.Name)
+func (e *Engine) tmpRoot(elem ...string) fs.Path {
+	return e.HomeDir.Join("tmp").Join(elem...)
+}
+
+func (e *Engine) tmpTargetRoot(target *Target) fs.Path {
+	return e.HomeDir.Join("tmp", target.Package.FullName, "__target_"+target.Name)
 }
 
 func (e *Engine) lockPath(target *Target, resource string) string {
-	return filepath.Join(e.tmpRoot(target), resource+".lock")
+	return e.tmpTargetRoot(target).Join(resource + ".lock").Abs()
 }
 
 var envRegex = regexp.MustCompile(`[^A-Za-z0-9_]+`)
@@ -55,7 +59,7 @@ func normalizeEnv(k string) string {
 }
 
 func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
-	tmppath := filepath.Join(e.tmpRoot(target), name)
+	tmppath := e.tmpTargetRoot(target).Join(name).Abs()
 
 	err := fs.CreateParentDir(tmppath)
 	if err != nil {
@@ -612,7 +616,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			ctx,
 			rp.Executor,
 			entrypoint,
-			e.tmpRoot(target),
+			e.tmpTargetRoot(target).Abs(),
 			platform.ExecOptions{
 				WorkDir:  dir,
 				BinDir:   binDir,
