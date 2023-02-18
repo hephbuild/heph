@@ -31,14 +31,6 @@ func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	return e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
 }
 
-func (e *Engine) cacheOutTarName(name string) string {
-	return "out_" + name + ".tar.gz"
-}
-
-func (e *Engine) cacheOutHashName(name string) string {
-	return "hash_out_" + name
-}
-
 func (e *Engine) linkLatestCache(target *Target, from string) error {
 	latestDir := e.cacheDirForHash(target, "latest")
 

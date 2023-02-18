@@ -51,19 +51,28 @@ func (m *Map[K, V]) GetOk(k K) (V, bool) {
 	return v, ok
 }
 
+func (m *Map[K, V]) getFast(k K) (V, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	v, ok := m.m[k]
+
+	return v, ok
+}
+
 func (m *Map[K, V]) Get(k K) V {
 	m.init()
 
-	if m.Default == nil {
-		m.mu.RLock()
-		defer m.mu.RUnlock()
-	} else {
-		m.mu.Lock()
-		defer m.mu.Unlock()
+	v, ok := m.getFast(k)
+	if m.Default == nil || ok {
+		return v
 	}
 
-	v, ok := m.m[k]
-	if !ok && m.Default != nil {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	v, ok = m.m[k]
+	if !ok {
 		v = m.Default()
 		m.m[k] = v
 	}

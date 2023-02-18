@@ -173,7 +173,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 }
 
 func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
