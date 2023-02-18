@@ -2,55 +2,62 @@ package flock
 
 import (
 	"context"
+	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 func TestFlock(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
+	name := t.Name()
+	p := filepath.Join(dir, name+".lock")
+
 	testLocker(t, func() Locker {
-		return NewFlock("lock", filepath.Join(dir, "lock.lock"))
+		return NewFlock(name, p)
 	})
 }
 
 func TestFlockContext(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
+	name := t.Name()
+	p := filepath.Join(dir, name+".lock")
+
 	testLockerContext(t, func() Locker {
-		return NewFlock("lock", filepath.Join(dir, "lock.lock"))
+		return NewFlock(name, p)
 	})
 }
 
 func TestFlockTry(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
+	name := t.Name()
+	p := filepath.Join(dir, name+".lock")
+
 	testLockerTry(t, func() Locker {
-		return NewFlock("lock", filepath.Join(dir, "lock.lock"))
+		return NewFlock(name, p)
 	})
 }
 
 func TestFlockSingleInstance(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	l := NewFlock("lock", filepath.Join(dir, "lock.lock"))
+	l := NewFlock("lock", filepath.Join(dir, t.Name()+".lock"))
 
 	testLocker(t, func() Locker {
 		return l
@@ -58,12 +65,11 @@ func TestFlockSingleInstance(t *testing.T) {
 }
 
 func TestFlockSingleInstanceContext(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	l := NewFlock("lock", filepath.Join(dir, "lock.lock"))
+	l := NewFlock("lock", filepath.Join(dir, t.Name()+".lock"))
 
 	testLockerContext(t, func() Locker {
 		return l
@@ -71,12 +77,11 @@ func TestFlockSingleInstanceContext(t *testing.T) {
 }
 
 func TestFlockSingleInstanceTry(t *testing.T) {
-	t.Parallel()
 	dir, err := os.MkdirTemp("", "flock")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	l := NewFlock("lock", filepath.Join(dir, "lock.lock"))
+	l := NewFlock("lock", filepath.Join(dir, t.Name()+".lock"))
 
 	testLockerTry(t, func() Locker {
 		return l
@@ -84,7 +89,6 @@ func TestFlockSingleInstanceTry(t *testing.T) {
 }
 
 func TestMutex(t *testing.T) {
-	t.Parallel()
 	l := NewMutex("lock")
 	testLocker(t, func() Locker {
 		return l
@@ -92,7 +96,6 @@ func TestMutex(t *testing.T) {
 }
 
 func TestMutexContext(t *testing.T) {
-	t.Parallel()
 	l := NewMutex("lock")
 	testLockerContext(t, func() Locker {
 		return l
@@ -100,7 +103,6 @@ func TestMutexContext(t *testing.T) {
 }
 
 func TestMutexTry(t *testing.T) {
-	t.Parallel()
 	l := NewMutex("lock")
 	testLockerTry(t, func() Locker {
 		return l
@@ -108,9 +110,8 @@ func TestMutexTry(t *testing.T) {
 }
 
 func testLocker(t *testing.T, factory func() Locker) {
-	ch := make(chan struct{}, 1)
-
 	var wg sync.WaitGroup
+	var n int32
 
 	do := func() {
 		defer wg.Done()
@@ -122,13 +123,14 @@ func testLocker(t *testing.T, factory func() Locker) {
 			panic(err)
 		}
 
-		select {
-		case ch <- struct{}{}:
-			// ok
-			time.Sleep(100 * time.Millisecond)
-			<-ch
-		default:
-			panic("lock didnt work, got concurrent access to chan")
+		if v := atomic.AddInt32(&n, 1); v != 1 {
+			panic(fmt.Sprintf("lock didnt work, got concurrent access 1: %v", v))
+		}
+
+		time.Sleep(time.Millisecond)
+
+		if v := atomic.AddInt32(&n, -1); v != 0 {
+			panic(fmt.Sprintf("lock didnt work, got concurrent access 2: %v", v))
 		}
 
 		err = l.Unlock()
@@ -137,7 +139,7 @@ func testLocker(t *testing.T, factory func() Locker) {
 		}
 	}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 1000; i++ {
 		wg.Add(1)
 		go do()
 	}
@@ -146,9 +148,8 @@ func testLocker(t *testing.T, factory func() Locker) {
 }
 
 func testLockerContext(t *testing.T, factory func() Locker) {
-	dir, err := os.MkdirTemp("", "flock")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	doneCh := make(chan struct{})
+	defer close(doneCh)
 
 	ch := make(chan struct{})
 
@@ -171,26 +172,26 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 
 	go func() {
 		<-ctx.Done()
-		t.Log(ctx.Err())
-		time.Sleep(3 * time.Second)
-		panic("should have already exited")
+		t.Log("CTX DONE:", ctx.Err())
+		select {
+		case <-time.After(5 * time.Second):
+			panic("should have already finished")
+		case <-doneCh:
+			// all good
+		}
 	}()
 
 	l := factory()
 
-	err = l.Lock(ctx)
-	assert.ErrorContains(t, err, "acquire lock for lock: context deadline exceeded")
+	err := l.Lock(ctx)
+	assert.ErrorContains(t, err, "context deadline exceeded")
 }
 
 func testLockerTry(t *testing.T, factory func() Locker) {
-	dir, err := os.MkdirTemp("", "flock")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
 	l1 := factory()
 	l2 := factory()
 
-	err = l1.Lock(context.Background())
+	err := l1.Lock(context.Background())
 	require.NoError(t, err)
 
 	ok, err := l2.TryLock()

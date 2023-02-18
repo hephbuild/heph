@@ -3,6 +3,7 @@ package flock
 import (
 	"context"
 	"fmt"
+	"golang.org/x/sys/unix"
 	log "heph/hlog"
 	"heph/utils/fs"
 	"os"
@@ -42,11 +43,15 @@ func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
 	log.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
-		ok, err := onErr(f)
-		if !ok || err != nil {
-			if err != nil {
-				err = fmt.Errorf("acquire lock for %s: %w", l.name, err)
+		if errno, _ := err.(unix.Errno); errno == unix.EWOULDBLOCK {
+			ok, err := onErr(f)
+			if !ok || err != nil {
+				if err != nil {
+					err = fmt.Errorf("acquire lock for %s: %w", l.name, err)
+				}
+				return false, err
 			}
+		} else {
 			return false, err
 		}
 	}
@@ -69,6 +74,7 @@ func (l *Flock) TryLock() (bool, error) {
 func (l *Flock) Lock(ctx context.Context) error {
 	_, err := l.tryLock(func(f *os.File) (bool, error) {
 		l.m.Unlock()
+		defer l.m.Lock()
 
 		pid, err := os.ReadFile(f.Name())
 		if err == nil && len(pid) > 0 {
@@ -82,21 +88,15 @@ func (l *Flock) Lock(ctx context.Context) error {
 		go func() {
 			// This will block forever if the ctx completes before
 			lockCh <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
-			if ctx.Err() != nil {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-			}
 		}()
 
-		var lockErr error
 		select {
 		case err := <-lockCh:
-			lockErr = err
+			if err != nil {
+				return false, err
+			}
 		case <-ctx.Done():
-			lockErr = ctx.Err()
-		}
-		l.m.Lock()
-		if lockErr != nil {
-			return false, lockErr
+			return false, ctx.Err()
 		}
 
 		return true, nil
@@ -118,7 +118,7 @@ func (l *Flock) Unlock() error {
 
 	f = nil
 
-	return l.Clean()
+	return nil
 }
 
 func (l *Flock) Clean() error {
