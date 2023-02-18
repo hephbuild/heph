@@ -175,7 +175,7 @@ func (e *Engine) ScheduleTargetCacheGet(ctx context.Context, target *Target, out
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(e, w.Status)
 
-			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs)
+			cached, err := e.pullOrGetCache(ctx, target, outputs, false)
 			if err != nil {
 				return err
 			}

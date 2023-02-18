@@ -111,9 +111,19 @@ func (p Path) RelRoot() string {
 }
 
 func (p Path) Join(elem ...string) Path {
+	var relRoot string
+	if len(elem) > 0 {
+		joins := make([]string, 0, len(elem)+1)
+		joins = append(joins, p.relRoot)
+		joins = append(joins, elem...)
+
+		relRoot = filepath.Join(joins...)
+	} else {
+		relRoot = p.relRoot
+	}
 	return Path{
 		root:    p.root,
-		relRoot: filepath.Join(append([]string{p.relRoot}, elem...)...),
+		relRoot: relRoot,
 	}
 }
 
