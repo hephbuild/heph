@@ -102,6 +102,12 @@ func FilterPublicTargets(targets []*Target) []*Target {
 }
 
 func (e *Engine) StoreAutocompleteCache(ctx context.Context) error {
+	err := e.autocompleteCacheLock.Lock(ctx)
+	if err != nil {
+		return err
+	}
+	defer e.autocompleteCacheLock.Unlock()
+
 	prevHash, _ := e.LoadAutocompleteCacheHash()
 
 	if prevHash == e.autocompleteHash {
@@ -155,6 +161,12 @@ func (e *Engine) LoadAutocompleteCacheHash() (string, error) {
 
 func (e *Engine) LoadAutocompleteCache() (*AutocompleteCache, error) {
 	if e.autocompleteHash == "" {
+		return nil, nil
+	}
+
+	hashFromFile, _ := e.LoadAutocompleteCacheHash()
+
+	if e.autocompleteHash != hashFromFile {
 		return nil, nil
 	}
 

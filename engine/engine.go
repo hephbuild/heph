@@ -81,8 +81,9 @@ type Engine struct {
 	exitHandlers        []func()
 	exitHandlersRunning bool
 
-	gcLock    flock.Locker
-	toolsLock flock.Locker
+	gcLock                flock.Locker
+	toolsLock             flock.Locker
+	autocompleteCacheLock flock.Locker
 }
 
 type PlatformProvider struct {
@@ -179,23 +180,24 @@ func New(rootPath string) *Engine {
 	}
 
 	return &Engine{
-		Root:              root,
-		HomeDir:           homeDir,
-		LocalCache:        loc.(*vfsos.Location),
-		Targets:           NewTargets(0),
-		Stats:             &htrace.Stats{},
-		Tracer:            trace.NewNoopTracerProvider().Tracer(""),
-		Packages:          map[string]*packages.Package{},
-		cacheHashInput:    &maps.Map[string, string]{},
-		cacheHashOutput:   &maps.Map[string, string]{},
-		codegenPaths:      map[string]*Target{},
-		tools:             NewTargets(0),
-		fetchRootCache:    map[string]fs2.Path{},
-		cacheRunBuildFile: map[string]starlark.StringDict{},
-		Labels:            sets.NewStringSet(0),
-		gcLock:            flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
-		toolsLock:         flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
-		dag:               &DAG{dag.NewDAG()},
+		Root:                  root,
+		HomeDir:               homeDir,
+		LocalCache:            loc.(*vfsos.Location),
+		Targets:               NewTargets(0),
+		Stats:                 &htrace.Stats{},
+		Tracer:                trace.NewNoopTracerProvider().Tracer(""),
+		Packages:              map[string]*packages.Package{},
+		cacheHashInput:        &maps.Map[string, string]{},
+		cacheHashOutput:       &maps.Map[string, string]{},
+		codegenPaths:          map[string]*Target{},
+		tools:                 NewTargets(0),
+		fetchRootCache:        map[string]fs2.Path{},
+		cacheRunBuildFile:     map[string]starlark.StringDict{},
+		Labels:                sets.NewStringSet(0),
+		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
+		toolsLock:             flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
+		autocompleteCacheLock: flock.NewFlock("Autocomplete cache", homeDir.Join("tmp", "ac_cache.lock").Abs()),
+		dag:                   &DAG{dag.NewDAG()},
 	}
 }
 
