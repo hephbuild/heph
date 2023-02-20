@@ -176,7 +176,6 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 		Name: "rungen_" + target.FQN,
 		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			_ = runDeps
 			return e.scheduleRunGeneratedFiles(ctx, target, deps, targets)
 		},
 	})

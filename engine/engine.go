@@ -298,15 +298,10 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
-//var schedulerV2Once sync.Once
-
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
-	//if e.Config.TargetScheduler == "v2" {
-	//	schedulerV2Once.Do(func() {
-	//		log.Info("Scheduler v2")
-	//	})
-	//	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-	//}
+	if e.Config.TargetScheduler == "v2" {
+		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
+	}
 
 	return e.ScheduleV1TargetRRsWithDeps(ctx, rrs, skip)
 }
@@ -617,7 +612,7 @@ func (e *Engine) parseConfigs() error {
 	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
-	cfg.TargetScheduler = "v1"
+	cfg.TargetScheduler = "v2"
 	cfg.Platforms = map[string]config.Platform{
 		"local": {
 			Name:     "local",

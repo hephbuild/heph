@@ -97,7 +97,7 @@ func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 
 	for _, name := range names {
 		o.Out[name] = ArtifactsOut{
-			artifacts.New("hash_out_"+name, strings.TrimSpace("#out "+name), true, true, hashOutputArtifact{
+			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, true, hashOutputArtifact{
 				Engine: e,
 				Target: target,
 				Output: name,

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func NewFlock(name, p string) Locker {
@@ -76,12 +77,30 @@ func (l *Flock) Lock(ctx context.Context) error {
 		l.m.Unlock()
 		defer l.m.Lock()
 
-		pid, err := os.ReadFile(f.Name())
-		if err == nil && len(pid) > 0 {
-			log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), l.name)
-		} else {
-			log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
-		}
+		doneCh := make(chan struct{})
+		defer close(doneCh)
+
+		pid, _ := os.ReadFile(f.Name())
+		go func() {
+			if fmt.Sprint(os.Getpid()) == string(pid) {
+				log.Debugf("Looks another routine has already acquired the lock for %s. Waiting for it to finish...", l.name)
+				return
+			}
+
+			select {
+			case <-doneCh:
+				// don't log
+				return
+			case <-time.After(500 * time.Millisecond):
+				// log
+			}
+
+			if len(pid) > 0 {
+				log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), l.name)
+			} else {
+				log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
+			}
+		}()
 
 		lockCh := make(chan error, 1)
 

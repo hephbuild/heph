@@ -61,7 +61,7 @@ func (e *Engine) ScheduleV1TargetRRsWithDeps(octx context.Context, rrs TargetRun
 
 					e := NewTargetRunEngine(e, w.Status)
 
-					cached, err := e.pullOrGetCache(ctx, target, target.OutWithSupport.Names(), true)
+					cached, err := e.pullOrGetCache(ctx, target, target.OutWithSupport.Names(), true, false)
 					if err != nil {
 						return err
 					}
@@ -175,7 +175,7 @@ func (e *Engine) ScheduleTargetCacheGet(ctx context.Context, target *Target, out
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(e, w.Status)
 
-			cached, err := e.pullOrGetCache(ctx, target, outputs, false)
+			cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
 			if err != nil {
 				return err
 			}
