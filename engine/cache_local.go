@@ -40,7 +40,7 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 		}
 	}()
 
-	span := e.SpanCacheStore(ctx, target)
+	ctx, span := e.SpanLocalCacheStore(ctx, target)
 	defer func() {
 		span.EndError(rerr)
 	}()

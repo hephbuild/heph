@@ -13,7 +13,9 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 
 	sctx, span := e.SpanScheduleTargetWithDeps(octx, targets)
 	defer func() {
-		span.EndError(rerr)
+		if rerr != nil {
+			span.EndError(rerr)
+		}
 	}()
 
 	targetsSet := NewTargets(len(targets))
@@ -58,6 +60,11 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	if err != nil {
 		return nil, err
 	}
+
+	go func() {
+		<-sched.deps.All().Done()
+		span.EndError(sched.deps.All().Err())
+	}()
 
 	return sched.deps, nil
 }

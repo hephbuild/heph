@@ -5,56 +5,55 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	log "heph/hlog"
 	"heph/utils"
 	"sync"
 	"time"
 )
 
 const (
-	PhaseTargetRun              = "target_run"
-	PhaseGenPass                = "gen_pass"
-	PhaseRunPrepare             = "run_prepare"
-	PhaseRunExec                = "run_exec"
-	PhaseRunCollectOutput       = "run_collect_output"
-	PhaseRunCacheStore          = "run_cache_store"
-	PhaseCachePull              = "cache_pull"
-	PhaseCachePullMeta          = "cache_pull_meta"
-	PhaseScheduleTargetWithDeps = "schedule_target_with_deps"
+	TypeTargetRun              = "target_run"
+	TypeGenPass                = "gen_pass"
+	TypeRunPrepare             = "run_prepare"
+	TypeRunExec                = "run_exec"
+	TypeCollectOutput          = "collect_output"
+	TypeLocalCacheStore        = "cache_store"
+	TypeLocalCacheGet          = "cache_local_get"
+	TypeExternalCacheGet       = "cache_external_get"
+	TypeCacheDownload          = "cache_download"
+	TypeCacheUpload            = "cache_upload"
+	TypeScheduleTargetWithDeps = "schedule_target_with_deps"
 )
 
 const (
-	AttrPhase      = "heph.phase"
-	AttrDuringGen  = "heph.during_gen"
-	AttrRoot       = "heph.root"
-	AttrOutput     = "heph.output"
-	AttrTargetAddr = "heph.target_addr"
-	AttrCacheHit   = "heph.cache_hit"
+	AttrType                = "heph.type"
+	AttrDuringGen           = "heph.during_gen"
+	AttrRoot                = "heph.root"
+	AttrArtifactName        = "heph.artifact_name"
+	AttrArtifactDisplayName = "heph.artifact_display_name"
+	AttrTargetAddr          = "heph.target_addr"
+	AttrCacheHit            = "heph.cache_hit"
+	AttrAfterPulling        = "heph.after_pulling"
 )
 
-var AllPhases = []string{
-	PhaseTargetRun,
-	PhaseRunPrepare,
-	PhaseRunExec,
-	PhaseRunCacheStore,
-	PhaseRunCollectOutput,
-	PhaseCachePull,
-	PhaseCachePullMeta,
-}
-
-var TargetRunPhases = []string{
-	PhaseCachePullMeta,
-	PhaseCachePull,
-	PhaseRunPrepare,
-	PhaseRunExec,
-	PhaseRunCollectOutput,
-	PhaseRunCacheStore,
+var AllTypes = []string{
+	TypeGenPass,
+	TypeTargetRun,
+	TypeRunPrepare,
+	TypeRunExec,
+	TypeCollectOutput,
+	TypeLocalCacheStore,
+	TypeLocalCacheGet,
+	TypeExternalCacheGet,
+	TypeCacheDownload,
+	TypeCacheUpload,
+	TypeScheduleTargetWithDeps,
 }
 
 type Stats struct {
-	Spans        map[string]TargetStatsSpan
-	RootSpan     tracesdk.ReadOnlySpan
-	targetPhases map[string]map[string]TargetStatsSpanPhase
-	spansm       sync.Mutex
+	Spans    map[string]*TargetStats
+	RootSpan tracesdk.ReadOnlySpan
+	spansm   sync.Mutex
 }
 
 var _ tracesdk.SpanProcessor = (*Stats)(nil)
@@ -84,89 +83,96 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 		return
 	}
 
-	phase := findAttr(AttrPhase, s.Attributes()).AsString()
+	typ := findAttr(AttrType, s.Attributes()).AsString()
 
-	if !utils.Contains(AllPhases, phase) {
+	if !utils.Contains(AllTypes, typ) {
 		return
 	}
 
 	fqn := findAttr(AttrTargetAddr, s.Attributes()).AsString()
 
-	if fqn == "" || phase == "" {
+	if fqn == "" || typ == "" {
 		return
 	}
 
 	st.spansm.Lock()
 	defer st.spansm.Unlock()
 
-	if utils.Contains(TargetRunPhases, phase) {
-		if st.targetPhases == nil {
-			st.targetPhases = map[string]map[string]TargetStatsSpanPhase{}
-		}
+	if st.Spans == nil {
+		st.Spans = map[string]*TargetStats{}
+	}
 
-		if st.targetPhases[fqn] == nil {
-			st.targetPhases[fqn] = map[string]TargetStatsSpanPhase{}
-		}
-
-		st.targetPhases[fqn][phase] = TargetStatsSpanPhase{
-			Name:  phase,
+	stat, ok := st.Spans[fqn]
+	if !ok {
+		stat = &TargetStats{
+			FQN:   fqn,
 			Start: s.StartTime(),
 			End:   s.EndTime(),
 		}
+		st.Spans[fqn] = stat
 	}
 
-	if phase == PhaseTargetRun || phase == PhaseCachePull {
-		if _, ok := st.targetPhases[fqn]; !ok {
-			return
-		}
-
-		phases := make([]TargetStatsSpanPhase, 0)
-		for _, phaseName := range TargetRunPhases {
-			phase, ok := st.targetPhases[fqn][phaseName]
-			if !ok {
-				continue
-			}
-
-			phases = append(phases, phase)
-		}
-
-		delete(st.targetPhases, fqn)
-
-		if st.Spans == nil {
-			st.Spans = map[string]TargetStatsSpan{}
-		}
-
-		stat, ok := st.Spans[fqn]
-		if !ok {
-			stat = TargetStatsSpan{
-				FQN:   fqn,
-				Start: s.StartTime(),
-				End:   s.EndTime(),
-			}
-		}
-
+	if s.EndTime().Unix() > stat.End.Unix() {
 		stat.End = s.EndTime()
-		stat.Phases = append(stat.Phases, phases...)
-		if s.Status().Code == codes.Error {
-			stat.Error = true
-		}
-		if v := findAttr(AttrDuringGen, s.Attributes()); v != AttributeNotFound {
-			stat.Gen = v.AsBool()
-		}
-		if output := findAttr(AttrOutput, s.Attributes()); output != AttributeNotFound {
-			cacheHit := false
-			if v := findAttr(AttrCacheHit, s.Attributes()); v != AttributeNotFound {
-				cacheHit = v.AsBool()
-			}
+	}
 
-			stat.CachePulls = append(stat.CachePulls, TargetStatsSpanCachePull{
-				Name:     output.AsString(),
-				Start:    s.StartTime(),
-				End:      s.EndTime(),
-				CacheHit: cacheHit,
-			})
+	tstat := TargetStatsSpan{}
+	tstat.Start = s.StartTime()
+	tstat.End = s.EndTime()
+	if s.Status().Code == codes.Error {
+		tstat.Error = true
+	}
+	if v := findAttr(AttrDuringGen, s.Attributes()); v != AttributeNotFound {
+		stat.Gen = v.AsBool()
+	}
+
+	switch typ {
+	case TypeRunPrepare:
+		stat.Prepare = &tstat
+	case TypeRunExec:
+		stat.Exec = &tstat
+	case TypeCollectOutput:
+		stat.CollectOutput = &tstat
+	case TypeLocalCacheStore:
+		stat.CacheStore = &tstat
+	case TypeCacheDownload, TypeCacheUpload, TypeLocalCacheGet:
+		name := findAttr(AttrArtifactName, s.Attributes())
+		displayName := findAttr(AttrArtifactDisplayName, s.Attributes())
+
+		if name == AttributeNotFound || displayName == AttributeNotFound {
+			log.Error("%v %v span is missing attribute %#v", fqn, typ, s.Attributes())
 		}
-		st.Spans[fqn] = stat
+
+		if typ == TypeLocalCacheGet {
+			if v := findAttr(AttrAfterPulling, s.Attributes()); v != AttributeNotFound {
+				return
+			}
+		}
+
+		cacheHit := false
+		if v := findAttr(AttrCacheHit, s.Attributes()); v != AttributeNotFound {
+			cacheHit = v.AsBool()
+		}
+
+		astats := TargetStatsArtifact{
+			Name:        name.AsString(),
+			DisplayName: displayName.AsString(),
+			Start:       tstat.Start,
+			End:         tstat.End,
+			CacheHit:    cacheHit,
+		}
+		if s.Status().Code == codes.Error {
+			astats.Error = true
+		}
+
+		switch typ {
+		case TypeCacheDownload:
+			stat.ArtifactsDownload = append(stat.ArtifactsDownload, astats)
+		case TypeCacheUpload:
+			stat.ArtifactsUpload = append(stat.ArtifactsUpload, astats)
+		case TypeLocalCacheGet:
+			stat.ArtifactsLocalGet = append(stat.ArtifactsLocalGet, astats)
+		}
 	}
 }
 
@@ -182,81 +188,76 @@ func (st *Stats) Reset() {
 	st.spansm.Lock()
 	defer st.spansm.Unlock()
 
-	st.Spans = map[string]TargetStatsSpan{}
-	st.targetPhases = map[string]map[string]TargetStatsSpanPhase{}
-}
-
-type TargetStatsSpanPhase struct {
-	Name  string
-	Start time.Time
-	End   time.Time
-}
-
-type TargetStatsSpanCachePull struct {
-	Name     string
-	Start    time.Time
-	End      time.Time
-	CacheHit bool
-}
-
-func (p TargetStatsSpanCachePull) Duration() time.Duration {
-	return p.End.Sub(p.Start)
+	st.Spans = map[string]*TargetStats{}
 }
 
 type TargetStatsSpan struct {
-	FQN        string
-	Start      time.Time
-	End        time.Time
-	Phases     []TargetStatsSpanPhase
-	CachePulls []TargetStatsSpanCachePull
-	Error      bool
-	Gen        bool
+	Start time.Time
+	End   time.Time
+	Error bool
 }
 
-func (s TargetStatsSpan) Duration() time.Duration {
+type TargetStatsArtifact struct {
+	Name        string
+	DisplayName string
+	Start       time.Time
+	End         time.Time
+	CacheHit    bool
+	Error       bool
+}
+
+func (p TargetStatsArtifact) Duration() time.Duration {
+	return p.End.Sub(p.Start)
+}
+
+type TargetStatsArtifacts []TargetStatsArtifact
+
+func (as TargetStatsArtifacts) Find(name string) TargetStatsArtifact {
+	for _, artifact := range as {
+		if artifact.Name == name {
+			return artifact
+		}
+	}
+
+	return TargetStatsArtifact{}
+}
+
+type TargetStats struct {
+	FQN               string
+	Start             time.Time
+	End               time.Time
+	Prepare           *TargetStatsSpan
+	Exec              *TargetStatsSpan
+	CollectOutput     *TargetStatsSpan
+	CacheStore        *TargetStatsSpan
+	ArtifactsLocalGet TargetStatsArtifacts
+	ArtifactsDownload TargetStatsArtifacts
+	ArtifactsUpload   TargetStatsArtifacts
+	Gen               bool
+}
+
+func (s TargetStats) Duration() time.Duration {
 	return s.End.Sub(s.Start)
 }
 
-func (s TargetStatsSpan) getPhase(name string) TargetStatsSpanPhase {
-	for _, phase := range s.Phases {
-		if phase.Name == name {
-			return phase
+func (s TargetStats) HasError() bool {
+	for _, span := range []*TargetStatsSpan{s.Prepare, s.Exec, s.CollectOutput, s.CacheStore} {
+		if span == nil {
+			continue
+		}
+
+		if span.Error {
+			return true
 		}
 	}
 
-	return TargetStatsSpanPhase{}
-}
-
-func (s TargetStatsSpan) PhaseCachePull() TargetStatsSpanPhase {
-	return s.getPhase(PhaseCachePull)
-}
-
-func (s TargetStatsSpan) PhaseCachePullMeta() TargetStatsSpanPhase {
-	return s.getPhase(PhaseCachePullMeta)
-}
-
-func (s TargetStatsSpan) PhaseCachePrepare() TargetStatsSpanPhase {
-	return s.getPhase(PhaseRunPrepare)
-}
-
-func (s TargetStatsSpan) PhaseRunExec() TargetStatsSpanPhase {
-	return s.getPhase(PhaseRunExec)
-}
-
-func (s TargetStatsSpan) PhaseRunCollectOutput() TargetStatsSpanPhase {
-	return s.getPhase(PhaseRunCollectOutput)
-}
-
-func (s TargetStatsSpan) PhaseCacheStore() TargetStatsSpanPhase {
-	return s.getPhase(PhaseRunCacheStore)
-}
-
-func (s TargetStatsSpan) CacheHit() bool {
-	for _, pull := range s.CachePulls {
-		if !pull.CacheHit {
-			return false
+	for _, as := range []TargetStatsArtifacts{s.ArtifactsLocalGet, s.ArtifactsDownload, s.ArtifactsUpload} {
+		for _, a := range as {
+			if a.Error {
+				return true
+			}
 		}
 	}
 
-	return true
+	return false
 }

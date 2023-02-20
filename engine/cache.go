@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/artifacts"
+	"heph/engine/htrace"
 	log "heph/hlog"
 	"heph/utils/fs"
 	"os"
@@ -64,7 +66,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
-	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal)
+	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false)
 	if err != nil {
 		return false, err
 	}
@@ -89,7 +91,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		}
 
 		if externalCached {
-			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta)
+			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta, true)
 			if err != nil {
 				log.Errorf("local: %v", err)
 				continue
@@ -106,7 +108,10 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 	return false, nil
 }
 
-func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache CacheConfig) (bool, error) {
+func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache CacheConfig) (_ bool, rerr error) {
+	ctx, span := e.SpanExternalCacheGet(ctx, target, cache.Name, outputs, onlyMeta)
+	defer span.EndError(rerr)
+
 	err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -139,10 +144,17 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 		}
 	}
 
+	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
 	return true, nil
 }
 
-func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) bool {
+func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, isAfterPulling bool) bool {
+	ctx, span := e.SpanLocalCacheGet(ctx, target, artifact)
+	defer span.End()
+	if isAfterPulling {
+		span.SetAttributes(attribute.Bool(htrace.AttrAfterPulling, true))
+	}
+
 	cacheDir := e.cacheDir(target)
 
 	p := cacheDir.Join(artifact.Name()).Abs()
@@ -150,21 +162,22 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 		return false
 	}
 
+	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
 	return true
 }
 
-func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
-	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash) {
+func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, isAfterPulling bool) (bool, error) {
+	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash, isAfterPulling) {
 		return false, nil
 	}
 
 	for _, output := range outputs {
-		if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutHash(output)) {
+		if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutHash(output), isAfterPulling) {
 			return false, nil
 		}
 
 		if !onlyMeta {
-			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output)) {
+			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output), isAfterPulling) {
 				return false, nil
 			}
 		}
