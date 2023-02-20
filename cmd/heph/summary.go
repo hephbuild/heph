@@ -4,31 +4,32 @@ import (
 	"github.com/olekukonko/tablewriter"
 	"heph/engine/htrace"
 	"heph/utils"
+	"heph/utils/sets"
 	"os"
 	"sort"
 )
 
-func summaryPhaseString(phases ...htrace.TargetStatsSpanPhase) string {
+func summarySpanString(phases ...*htrace.TargetStatsSpan) string {
 	opts := make([]summaryOpt, 0)
 	for _, phase := range phases {
-		opts = append(opts, summaryOpt{phase: phase})
+		opts = append(opts, summaryOpt{span: phase})
 	}
-	return summaryPhaseStringOpt(opts...)
+	return summarySpanStringOpt(opts...)
 }
 
 type summaryOpt struct {
-	phase     htrace.TargetStatsSpanPhase
+	span      *htrace.TargetStatsSpan
 	decorator func(s string) string
 }
 
-func summaryPhaseStringOpt(phases ...summaryOpt) string {
+func summarySpanStringOpt(phases ...summaryOpt) string {
 	for _, opt := range phases {
-		phase := opt.phase
-		if phase.Name == "" {
+		span := opt.span
+		if span == nil {
 			continue
 		}
 
-		s := utils.RoundDuration(phase.End.Sub(phase.Start), 1).String()
+		s := utils.RoundDuration(span.End.Sub(span.Start), 1).String()
 
 		if opt.decorator != nil {
 			return opt.decorator(s)
@@ -40,95 +41,100 @@ func summaryPhaseStringOpt(phases ...summaryOpt) string {
 	return ""
 }
 
+func artifactString(a htrace.TargetStatsArtifact, hitText string) string {
+	if a.Name == "" {
+		return ""
+	}
+	s := utils.RoundDuration(a.Duration(), 1).String()
+	if hitText != "" && a.CacheHit {
+		s = s + " (" + hitText + ")"
+	}
+	return s
+}
+
 func PrintSummary(stats *htrace.Stats, withGen bool) {
-	spans := make([]htrace.TargetStatsSpan, 0)
+	targets := make([]*htrace.TargetStats, 0)
 	for _, span := range stats.Spans {
 		if !withGen && span.Gen {
 			continue
 		}
 
-		spans = append(spans, span)
+		targets = append(targets, span)
 	}
 
-	sort.SliceStable(spans, func(i, j int) bool {
-		return spans[i].Duration() > spans[j].Duration()
+	sort.Slice(targets, func(i, j int) bool {
+		return targets[i].Duration() > targets[j].Duration()
 	})
 
 	data := make([][]string, 0)
-	for _, span := range spans {
-		inlineCachePull := len(span.CachePulls) == 1 && span.CachePulls[0].Name == ""
-
-		cachePullCell := ""
-		if inlineCachePull {
-			cachePullCell = summaryPhaseStringOpt(
-				summaryOpt{
-					phase: span.PhaseCachePull(),
-					decorator: func(s string) string {
-						if span.CacheHit() {
-							return s + " (hit)"
-						}
-
-						return s
-					},
-				},
-				summaryOpt{
-					phase: span.PhaseCachePullMeta(),
-					decorator: func(s string) string {
-						if span.CacheHit() {
-							s = s + " (hit)"
-						}
-
-						return s + " (meta)"
-					},
-				},
-			)
-		}
-
+	for _, target := range targets {
 		row := []string{
 			func() string {
-				s := span.FQN
-				if span.Error {
+				s := target.FQN
+				if target.HasError() {
 					s += " (error)"
 				}
 
 				return s
 			}(),
-			cachePullCell,
-			summaryPhaseString(span.PhaseCachePrepare()),
-			summaryPhaseString(span.PhaseRunExec()),
-			summaryPhaseString(span.PhaseRunCollectOutput()),
-			summaryPhaseString(span.PhaseCacheStore()),
-			utils.RoundDuration(span.Duration(), 1).String(),
+			"",
+			summarySpanString(target.Prepare),
+			summarySpanString(target.Exec),
+			summarySpanString(target.CollectOutput),
+			summarySpanString(target.CacheStore),
+			utils.RoundDuration(target.Duration(), 1).String(),
 		}
 
 		data = append(data, row)
 
-		if !inlineCachePull {
-			sort.SliceStable(span.CachePulls, func(i, j int) bool {
-				return span.CachePulls[i].Name < span.CachePulls[j].Name
-			})
+		artifactsSet := sets.NewStringSet(0)
+		for _, artifact := range target.ArtifactsUpload {
+			artifactsSet.Add(artifact.Name)
+		}
+		for _, artifact := range target.ArtifactsDownload {
+			artifactsSet.Add(artifact.Name)
+		}
+		for _, artifact := range target.ArtifactsLocalGet {
+			artifactsSet.Add(artifact.Name)
+		}
+		artifacts := artifactsSet.Slice()
+		sort.Strings(artifacts)
 
-			for _, pull := range span.CachePulls {
-				name := pull.Name
-				if name == "" {
-					name = "<unnamed>"
-				}
-				data = append(data, []string{
-					"  |" + name,
-					func() string {
-						s := utils.RoundDuration(pull.Duration(), 1).String()
-						if span.CacheHit() {
-							s = s + " (hit)"
-						}
-						return s
-					}(),
-					"",
-					"",
-					"",
-					"",
-					"",
-				})
+		for _, name := range artifacts {
+			artifactPull := target.ArtifactsDownload.Find(name)
+			artifactPush := target.ArtifactsUpload.Find(name)
+			artifactLocalGet := target.ArtifactsLocalGet.Find(name)
+
+			displayName := artifactPull.DisplayName
+			if displayName == "" {
+				displayName = artifactPush.DisplayName
 			}
+			if displayName == "" {
+				displayName = artifactLocalGet.DisplayName
+			}
+			if displayName == "" {
+				displayName = name
+			}
+
+			data = append(data, []string{
+				"  |" + displayName,
+				func() string {
+					if artifactLocalGet.Name == "" {
+						if artifactPull.Name == "" {
+							return ""
+						}
+
+						return artifactString(artifactPull, "hit remote")
+					}
+
+					return artifactString(artifactLocalGet, "hit")
+				}(),
+				"",
+				"",
+				"",
+				artifactString(artifactPush, ""),
+				"",
+			})
 		}
 	}
 

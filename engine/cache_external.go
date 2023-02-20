@@ -120,7 +120,12 @@ func (e *TargetRunEngine) scheduleStoreExternalCacheArtifact(ctx context.Context
 	})
 }
 
-func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) error {
+func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
+	span := e.SpanCacheUpload(ctx, target, artifact)
+	defer func() {
+		span.EndError(rerr)
+	}()
+
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	localRoot, err := e.localCacheLocation(target)
@@ -145,7 +150,12 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 	return nil
 }
 
-func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) error {
+func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
+	span := e.SpanCacheDownload(ctx, target, artifact)
+	defer func() {
+		span.EndError(rerr)
+	}()
+
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	err := target.cacheLocks[artifact.Name()].Lock(ctx)

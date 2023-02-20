@@ -5,6 +5,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"heph/engine/artifacts"
 	"heph/engine/htrace"
 	"os"
 	"strings"
@@ -19,6 +20,13 @@ func targetSpanAttr(t *Target) trace.SpanStartOption {
 	}
 
 	return trace.WithAttributes(attrs...)
+}
+
+func artifactSpanAttr(a artifacts.Artifact) trace.SpanStartOption {
+	return trace.WithAttributes(
+		attribute.String(htrace.AttrArtifactName, a.Name()),
+		attribute.String(htrace.AttrArtifactDisplayName, a.DisplayName()),
+	)
 }
 
 type Span struct {
@@ -53,7 +61,7 @@ func (e *Engine) newTargetSpan(ctx context.Context, spanName, phase string, opts
 
 	attrs := []attribute.KeyValue{
 		{
-			Key:   htrace.AttrPhase,
+			Key:   htrace.AttrType,
 			Value: attribute.StringValue(phase),
 		},
 	}
@@ -86,11 +94,11 @@ func (e *Engine) StartRootSpan() {
 }
 
 func (e *Engine) SpanRun(ctx context.Context, t *Target) (context.Context, Span) {
-	return e.newTargetSpan(ctx, "run "+t.FQN, htrace.PhaseTargetRun, targetSpanAttr(t))
+	return e.newTargetSpan(ctx, "run "+t.FQN, htrace.TypeTargetRun, targetSpanAttr(t))
 }
 
 func (e *Engine) SpanGenPass(ctx context.Context) (context.Context, Span) {
-	ctx, span := e.newTargetSpan(ctx, "", htrace.PhaseGenPass)
+	ctx, span := e.newTargetSpan(ctx, "", htrace.TypeGenPass)
 
 	return context.WithValue(ctx, htrace.AttrDuringGen, true), span
 }
@@ -107,29 +115,37 @@ func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Targ
 		},
 	}
 
-	return e.newTargetSpan(ctx, "", htrace.PhaseScheduleTargetWithDeps, trace.WithAttributes(attrs...))
+	return e.newTargetSpan(ctx, "", htrace.TypeScheduleTargetWithDeps, trace.WithAttributes(attrs...))
 }
 
-func (e *Engine) SpanCachePull(ctx context.Context, t *Target, output string, onlyMeta bool) Span {
-	phase := htrace.PhaseCachePull
-	if onlyMeta {
-		phase = htrace.PhaseCachePullMeta
-	}
-	return e.newTargetSpanPure(ctx, phase, phase, targetSpanAttr(t), trace.WithAttributes(attribute.String(htrace.AttrOutput, output)))
+func (e *Engine) SpanCacheDownload(ctx context.Context, t *Target, artifact artifacts.Artifact) Span {
+	return e.newTargetSpanPure(ctx, "", htrace.TypeCacheDownload, targetSpanAttr(t), artifactSpanAttr(artifact))
+}
+
+func (e *Engine) SpanCacheUpload(ctx context.Context, t *Target, artifact artifacts.Artifact) Span {
+	return e.newTargetSpanPure(ctx, "", htrace.TypeCacheUpload, targetSpanAttr(t), artifactSpanAttr(artifact))
 }
 
 func (e *Engine) SpanRunPrepare(ctx context.Context, t *Target) Span {
-	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunPrepare, targetSpanAttr(t))
+	return e.newTargetSpanPure(ctx, "", htrace.TypeRunPrepare, targetSpanAttr(t))
 }
 
 func (e *Engine) SpanRunExec(ctx context.Context, t *Target) Span {
-	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunExec, targetSpanAttr(t))
+	return e.newTargetSpanPure(ctx, "", htrace.TypeRunExec, targetSpanAttr(t))
 }
 
 func (e *Engine) SpanCollectOutput(ctx context.Context, t *Target) Span {
-	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunCollectOutput, targetSpanAttr(t))
+	return e.newTargetSpanPure(ctx, "", htrace.TypeCollectOutput, targetSpanAttr(t))
 }
 
-func (e *Engine) SpanCacheStore(ctx context.Context, t *Target) Span {
-	return e.newTargetSpanPure(ctx, "", htrace.PhaseRunCacheStore, targetSpanAttr(t))
+func (e *Engine) SpanLocalCacheStore(ctx context.Context, t *Target) (context.Context, Span) {
+	return e.newTargetSpan(ctx, "", htrace.TypeLocalCacheStore, targetSpanAttr(t))
+}
+
+func (e *Engine) SpanLocalCacheGet(ctx context.Context, t *Target, artifact artifacts.Artifact) (context.Context, Span) {
+	return e.newTargetSpan(ctx, "", htrace.TypeLocalCacheGet, targetSpanAttr(t), artifactSpanAttr(artifact))
+}
+
+func (e *Engine) SpanExternalCacheGet(ctx context.Context, t *Target, cache string, outputs []string, onlyMeta bool) (context.Context, Span) {
+	return e.newTargetSpan(ctx, "", htrace.TypeExternalCacheGet, targetSpanAttr(t))
 }

@@ -415,7 +415,7 @@ def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), ta
 
     return target(
         name=name,
-        doc="Build {} {}/{} {}".format(heph.pkg.addr(), os, arch, ' '.join(tags)).strip(),
+        doc="Build {} {}/{} {}".format(heph.pkg.dir(), os, arch, ' '.join(tags)).strip(),
         deps={
             'libs': libs,
             'main': main,
