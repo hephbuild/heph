@@ -30,7 +30,7 @@ func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
 		}
 
 		if !d.IsDir() {
-			return err
+			return nil
 		}
 
 		if strings.HasPrefix(d.Name(), "__target_") {
@@ -129,7 +129,7 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 		}
 
 		// Sort fresher first
-		sort.SliceStable(entries, func(i, j int) bool {
+		sort.Slice(entries, func(i, j int) bool {
 			if entries[i].Latest {
 				return true
 			}

@@ -48,7 +48,7 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 }
 
 func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string) (bool, error) {
-	cached, err := e.pullOrGetCache(ctx, target, outputs, false)
+	cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
 	if err != nil {
 		return false, err
 	}
@@ -60,11 +60,11 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 	return true, e.postRunOrWarm(ctx, target, outputs)
 }
 
-func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool) (bool, error) {
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal bool) (bool, error) {
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
-	// Always check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
-	cached, err := e.getLocalCache(ctx, target, outputs, false)
+	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
+	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal)
 	if err != nil {
 		return false, err
 	}
