@@ -10,9 +10,10 @@ func ValidateRemoteCache(root, tgt string, outputs []string, expectLogs bool) er
 
 	expected := []string{
 		"hash_input",
+		"manifest.json",
 	}
 	if expectLogs {
-		expected = append(expected, "log.txt")
+		expected = append(expected, "log.tar.gz")
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)

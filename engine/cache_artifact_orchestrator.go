@@ -1,11 +1,9 @@
 package engine
 
 import (
-	"context"
 	"heph/engine/artifacts"
 	"heph/targetspec"
 	"heph/utils"
-	"heph/utils/fs"
 	"strings"
 )
 
@@ -22,8 +20,8 @@ func (a ArtifactsOut) Tar() artifacts.Artifact {
 type ArtifactOrchestrator struct {
 	InputHash artifacts.Artifact
 	Log       artifacts.Artifact
-	// TODO: Manifest artifacts.Artifact
-	Out map[string]ArtifactsOut
+	Manifest  artifacts.Artifact
+	Out       map[string]ArtifactsOut
 
 	allOnce        utils.Once[[]artifacts.Artifact]
 	allReverseOnce utils.Once[[]artifacts.Artifact]
@@ -33,6 +31,7 @@ func (o *ArtifactOrchestrator) All() []artifacts.Artifact {
 	return o.allOnce.MustDo(func() ([]artifacts.Artifact, error) {
 		all := make([]artifacts.Artifact, 0, len(o.Out)+2)
 		all = append(all, o.InputHash)
+		all = append(all, o.Manifest)
 		all = append(all, o.Log)
 		for _, a := range o.Out {
 			all = append(all, a.Tar(), a.Hash())
@@ -54,6 +53,7 @@ func (o *ArtifactOrchestrator) AllStore() []artifacts.Artifact {
 			a := o.Out[name]
 			all = append(all, a.Tar(), a.Hash())
 		}
+		all = append(all, o.Manifest)
 		all = append(all, o.InputHash)
 		return all, nil
 	})
@@ -73,24 +73,13 @@ func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 			Engine: e,
 			Target: target,
 		}),
-		Log: artifacts.New("log.txt", "log", false, artifacts.Func{
-			Func: func(ctx context.Context, gctx artifacts.GenContext) error {
-				if gctx.LogFilePath == "" {
-					return artifacts.Skip
-				}
-
-				return fs.Cp(gctx.LogFilePath, gctx.ArtifactPath)
-			},
+		Manifest: artifacts.New("manifest.json", "manifest", true, manifestArtifact{
+			Engine: e,
+			Target: target,
 		}),
+		Log: artifacts.New("log.tar.gz", "log", false, logArtifact{}),
 		Out: map[string]ArtifactsOut{},
 	}
-
-	// TODO: manifest
-	// - git commit
-	// - git branch
-	// - input hash
-	// - deps input hashes
-	// - output hash
 
 	names := target.OutWithSupport.Names()
 	names = targetspec.SortOutputsForHashing(names)

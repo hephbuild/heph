@@ -50,8 +50,11 @@ func ValidateCache(tgt string, outputs []string, fromRemote bool, expectLogs boo
 	expected := []string{
 		"hash_input",
 	}
+	if !fromRemote {
+		expected = append(expected, "manifest.json")
+	}
 	if expectLogs {
-		expected = append(expected, "log.txt")
+		expected = append(expected, "log.tar.gz")
 	}
 	if len(outputs) > 0 {
 		expected = append(expected, "_output")

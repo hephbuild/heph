@@ -57,7 +57,6 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 		return err
 	}
 
-	// TODO: look into schedule on pool
 	for _, artifact := range allArtifacts {
 		_, err := artifacts.GenArtifact(ctx, dir, artifact, artifacts.GenContext{
 			OutRoot:     outRoot,
