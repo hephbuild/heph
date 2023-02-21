@@ -4,6 +4,7 @@ type Extras map[string]interface{}
 
 type FileConfig struct {
 	BaseConfig   `yaml:",inline"`
+	CacheOrder   string                  `yaml:"cache_order"`
 	Cache        map[string]FileCache    `yaml:",omitempty"`
 	CacheHistory int                     `yaml:"cache_history"`
 	DisableGC    *bool                   `yaml:"disable_gc"`
@@ -46,6 +47,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.InstallTools != nil {
 		c.InstallTools = *fc.InstallTools
+	}
+
+	if fc.CacheOrder != "" {
+		c.CacheOrder = fc.CacheOrder
 	}
 
 	if len(fc.Cache) == 0 && fc.Cache != nil {

@@ -44,6 +44,7 @@ func init() {
 	queryCmd.AddCommand(hashoutCmd)
 	queryCmd.AddCommand(hashinCmd)
 	queryCmd.AddCommand(outRootCmd)
+	queryCmd.AddCommand(orderedCachesCmd)
 	queryCmd.AddCommand(labelsCmd)
 
 	// Private, for internal testing
@@ -787,6 +788,31 @@ var outRootCmd = &cobra.Command{
 		}
 
 		fmt.Println(Engine.Root.Abs())
+
+		return nil
+	},
+}
+
+var orderedCachesCmd = &cobra.Command{
+	Use:   "ordered-caches",
+	Short: "Prints ordered caches",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		orderedCaches, err := Engine.OrderedCaches(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, cache := range orderedCaches {
+			fmt.Println(cache.Name, cache.URI)
+		}
 
 		return nil
 	},

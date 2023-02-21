@@ -75,7 +75,12 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		return true, nil
 	}
 
-	for _, cache := range e.Config.Cache {
+	orderedCaches, err := e.OrderedCaches(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	for _, cache := range orderedCaches {
 		if !cache.Read {
 			continue
 		}

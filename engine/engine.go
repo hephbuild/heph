@@ -84,6 +84,9 @@ type Engine struct {
 	gcLock                flock.Locker
 	toolsLock             flock.Locker
 	autocompleteCacheLock flock.Locker
+
+	orderedCachesLock flock.Locker
+	orderedCaches     []CacheConfig
 }
 
 type PlatformProvider struct {
@@ -197,6 +200,7 @@ func New(rootPath string) *Engine {
 		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 		toolsLock:             flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
 		autocompleteCacheLock: flock.NewFlock("Autocomplete cache", homeDir.Join("tmp", "ac_cache.lock").Abs()),
+		orderedCachesLock:     flock.NewFlock("Order cache", homeDir.Join("tmp", "order_cache.lock").Abs()),
 		dag:                   &DAG{dag.NewDAG()},
 	}
 }
@@ -628,6 +632,7 @@ func (e *Engine) parseConfigs() error {
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
 	cfg.TargetScheduler = "v2"
+	cfg.CacheOrder = "latency"
 	cfg.Platforms = map[string]config.Platform{
 		"local": {
 			Name:     "local",

@@ -683,7 +683,12 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	}
 
 	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
-		for _, cache := range e.Config.Cache {
+		orderedCaches, err := e.OrderedCaches(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, cache := range orderedCaches {
 			if !cache.Write {
 				continue
 			}
