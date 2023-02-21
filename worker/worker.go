@@ -66,7 +66,6 @@ func (j *Job) Done() {
 	j.m.Lock()
 	defer j.m.Unlock()
 
-	log.Tracef("job %v done", j.Name)
 	j.doneWithState(StateSuccess)
 }
 
@@ -76,7 +75,10 @@ func (j *Job) DoneWithErr(err error, state JobState) {
 
 	if state == StateFailed {
 		log.Errorf("%v finished with err: %v", j.Name, err)
+	} else {
+		log.Tracef("%v finished with %v err: %v", j.Name, state, err)
 	}
+
 	jerr := JobError{
 		ID:    j.ID,
 		Name:  j.Name,

@@ -69,8 +69,8 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	err = fs.CreateParentDir(dir)
-	if rerr != nil {
-		return rerr
+	if err != nil {
+		return err
 	}
 
 	return e.linkLatestCache(target, dir)

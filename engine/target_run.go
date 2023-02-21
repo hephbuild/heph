@@ -482,12 +482,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
-	if target.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
-		defer cancel()
-	}
-
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -613,9 +607,16 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			}
 		}
 
+		execCtx := ctx
+		if target.Timeout > 0 {
+			var cancel context.CancelFunc
+			execCtx, cancel = context.WithTimeout(ctx, target.Timeout)
+			defer cancel()
+		}
+
 		espan := e.SpanRunExec(ctx, target)
 		err = platform.Exec(
-			ctx,
+			execCtx,
 			rp.Executor,
 			entrypoint,
 			e.tmpTargetRoot(target).Abs(),
@@ -683,8 +684,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 
 	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
 		for _, cache := range e.Config.Cache {
-			cache := cache
-
 			if !cache.Write {
 				continue
 			}
@@ -693,7 +692,11 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 				continue
 			}
 
-			_ = e.scheduleStoreExternalCache(ctx, target, cache)
+			j := e.scheduleStoreExternalCache(ctx, target, cache)
+
+			if poolDeps := ForegroundWaitGroup(ctx); poolDeps != nil {
+				poolDeps.Add(j)
+			}
 		}
 	}
 

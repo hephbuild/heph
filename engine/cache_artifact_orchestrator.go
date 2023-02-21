@@ -69,11 +69,11 @@ func (o *ArtifactOrchestrator) OutTar(name string) artifacts.Artifact {
 
 func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 	o := &ArtifactOrchestrator{
-		InputHash: artifacts.New("hash_input", "#input", true, true, hashInputArtifact{
+		InputHash: artifacts.New("hash_input", "#input", true, hashInputArtifact{
 			Engine: e,
 			Target: target,
 		}),
-		Log: artifacts.New("log.txt", "log", false, false, artifacts.Func{
+		Log: artifacts.New("log.txt", "log", false, artifacts.Func{
 			Func: func(ctx context.Context, gctx artifacts.GenContext) error {
 				if gctx.LogFilePath == "" {
 					return artifacts.Skip
@@ -97,12 +97,12 @@ func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 
 	for _, name := range names {
 		o.Out[name] = ArtifactsOut{
-			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, true, hashOutputArtifact{
+			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, hashOutputArtifact{
 				Engine: e,
 				Target: target,
 				Output: name,
 			}),
-			artifacts.New("out_"+name+".tar.gz", strings.TrimSpace(name+" tar.gz"), true, true, outTarArtifact{
+			artifacts.New("out_"+name+".tar.gz", strings.TrimSpace(name+" tar.gz"), true, outTarArtifact{
 				Target: target,
 				Output: name,
 			}),

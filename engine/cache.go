@@ -112,12 +112,12 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 	ctx, span := e.SpanExternalCacheGet(ctx, target, cache.Name, outputs, onlyMeta)
 	defer span.EndError(rerr)
 
-	err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash)
+	cached, err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash, false)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
 		return false, err
+	}
+	if !cached {
+		return false, nil
 	}
 
 	for _, output := range outputs {
@@ -132,13 +132,13 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 				return false, nil
 			}
 		} else {
-			err := e.downloadExternalCache(ctx, target, cache, tarArtifact)
+			_, err := e.downloadExternalCache(ctx, target, cache, tarArtifact, true)
 			if err != nil {
 				return false, err
 			}
 		}
 
-		err = e.downloadExternalCache(ctx, target, cache, target.artifacts.OutHash(output))
+		_, err = e.downloadExternalCache(ctx, target, cache, target.artifacts.OutHash(output), true)
 		if err != nil {
 			return false, err
 		}

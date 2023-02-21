@@ -141,6 +141,7 @@ func (st *Stats) OnEnd(s tracesdk.ReadOnlySpan) {
 
 		if name == AttributeNotFound || displayName == AttributeNotFound {
 			log.Error("%v %v span is missing attribute %#v", fqn, typ, s.Attributes())
+			return
 		}
 
 		if typ == TypeLocalCacheGet {

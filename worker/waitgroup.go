@@ -13,7 +13,6 @@ type WaitGroup struct {
 	wgs    []*WaitGroup
 	jobs   []*Job
 	doneCh chan struct{}
-	done   bool
 	err    error
 	cond   *sync.Cond
 	oSetup sync.Once
@@ -107,7 +106,6 @@ func (wg *WaitGroup) wait() {
 	if wg.err == nil {
 		wg.err = err
 	}
-	wg.done = true
 	close(wg.doneCh)
 
 	wg.cond.L.Unlock()
@@ -124,7 +122,16 @@ func (wg *WaitGroup) Done() <-chan struct{} {
 }
 
 func (wg *WaitGroup) IsDone() bool {
-	return wg.done
+	if wg.doneCh == nil {
+		return false
+	}
+
+	select {
+	case <-wg.doneCh:
+		return true
+	default:
+		return false
+	}
 }
 
 func (wg *WaitGroup) Err() error {

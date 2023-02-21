@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
+	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/artifacts"
+	"heph/engine/htrace"
 	log "heph/hlog"
 	"heph/utils"
 	"heph/worker"
@@ -121,38 +123,48 @@ func (e *TargetRunEngine) scheduleStoreExternalCacheArtifact(ctx context.Context
 }
 
 func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	span := e.SpanCacheUpload(ctx, target, artifact)
-	defer func() {
-		span.EndError(rerr)
-	}()
-
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
-
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
 		return err
 	}
+
+	exists, err := e.existsLocalCache(ctx, target, artifact)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		if artifact.GenRequired() {
+			return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.FQN, artifact.Name())
+		}
+
+		return nil
+	}
+
+	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
 		return err
 	}
 
+	span := e.SpanCacheUpload(ctx, target, artifact)
+	defer func() {
+		span.EndError(rerr)
+	}()
+
 	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifact.Name())
 	if err != nil {
-		if !artifact.GenRequired() && errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-
 		return err
 	}
 
 	return nil
 }
 
-func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
+func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact, errNotExist bool) (rcached bool, rerr error) {
 	span := e.SpanCacheDownload(ctx, target, artifact)
 	defer func() {
+		span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, rcached))
 		span.EndError(rerr)
 	}()
 
@@ -160,7 +172,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 
 	err := target.cacheLocks[artifact.Name()].Lock(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() {
 		err := target.cacheLocks[artifact.Name()].Unlock()
@@ -171,26 +183,49 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
-		return err
+		return false, err
 	}
-
-	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
-	if err != nil {
-		return err
-	}
-
-	return e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
-}
-
-func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
 		return false, err
 	}
 
-	f, err := remoteRoot.NewFile(artifact.Name())
+	err = e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
+	if err != nil {
+		if !errNotExist && errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return true, nil
+}
+
+func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
+	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
+
+	root, err := e.remoteCacheLocation(cache.Location, target)
+	if err != nil {
+		return false, err
+	}
+
+	f, err := root.NewFile(artifact.Name())
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	return f.Exists()
+}
+
+func (e *TargetRunEngine) existsLocalCache(ctx context.Context, target *Target, artifact artifacts.Artifact) (bool, error) {
+	root, err := e.localCacheLocation(target)
+	if err != nil {
+		return false, err
+	}
+
+	f, err := root.NewFile(artifact.Name())
 	if err != nil {
 		return false, err
 	}

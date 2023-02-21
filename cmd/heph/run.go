@@ -52,19 +52,27 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		inlineTarget = inlineInvocationTarget.Target
 	}
 
-	targets := rrs.Targets()
+	// fgDeps will include deps created inside the scheduled jobs to be waitfed for in the foreground
+	// The Done() must be called after all the tdeps have finished
+	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
+	fgDeps.AddSem()
 
-	tdeps, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
+	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
 	if err != nil {
 		return err
 	}
 
-	deps := &worker.WaitGroup{}
-	for _, target := range targets {
-		deps.AddChild(tdeps.Get(target.FQN))
-	}
+	tdeps := tdepsMap.All()
+	go func() {
+		<-tdeps.Done()
+		fgDeps.DoneSem()
+	}()
 
-	err = WaitPool("Run", e.Pool, deps)
+	runDeps := &worker.WaitGroup{}
+	runDeps.AddChild(tdeps)
+	runDeps.AddChild(fgDeps)
+
+	err = WaitPool("Run", e.Pool, runDeps)
 	if err != nil {
 		return err
 	}

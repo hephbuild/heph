@@ -47,7 +47,10 @@ func artifactString(a htrace.TargetStatsArtifact, hitText string) string {
 	}
 	s := utils.RoundDuration(a.Duration(), 1).String()
 	if hitText != "" && a.CacheHit {
-		s = s + " (" + hitText + ")"
+		s += " (" + hitText + ")"
+	}
+	if a.Error {
+		s += " (error)"
 	}
 	return s
 }
@@ -119,15 +122,15 @@ func PrintSummary(stats *htrace.Stats, withGen bool) {
 			data = append(data, []string{
 				"  |" + displayName,
 				func() string {
-					if artifactLocalGet.Name == "" {
-						if artifactPull.Name == "" {
-							return ""
-						}
-
-						return artifactString(artifactPull, "hit remote")
+					if artifactPull.Name != "" {
+						return artifactString(artifactPull, "RH")
 					}
 
-					return artifactString(artifactGet, "hit")
+					if artifactLocalGet.Name != "" {
+						return artifactString(artifactLocalGet, "H")
+					}
+
+					return ""
 				}(),
 				"",
 				"",

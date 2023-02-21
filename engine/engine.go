@@ -298,6 +298,21 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target,
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
+func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *worker.WaitGroup) {
+	deps := &worker.WaitGroup{}
+	ctx = context.WithValue(ctx, "heph_pool_deps", deps)
+
+	return ctx, deps
+}
+
+func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
+	if deps, ok := ctx.Value("heph_pool_deps").(*worker.WaitGroup); ok {
+		return deps
+	}
+
+	return nil
+}
+
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
 	if e.Config.TargetScheduler == "v2" {
 		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)

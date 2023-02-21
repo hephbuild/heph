@@ -12,10 +12,9 @@ var Skip = errors.New("skip artifact")
 
 type container struct {
 	Producer
-	name         string
-	displayName  string
-	loadRequired bool
-	genRequired  bool
+	name        string
+	displayName string
+	genRequired bool
 }
 
 func (a container) Name() string {
@@ -26,21 +25,16 @@ func (a container) DisplayName() string {
 	return a.displayName
 }
 
-func (a container) LoadRequired() bool {
-	return a.loadRequired
-}
-
 func (a container) GenRequired() bool {
 	return a.genRequired
 }
 
-func New(name, displayName string, loadRequired, genRequired bool, artifact Producer) Artifact {
+func New(name, displayName string, genRequired bool, artifact Producer) Artifact {
 	return container{
-		Producer:     artifact,
-		name:         name,
-		displayName:  displayName,
-		loadRequired: loadRequired,
-		genRequired:  genRequired,
+		Producer:    artifact,
+		name:        name,
+		displayName: displayName,
+		genRequired: genRequired,
 	}
 }
 
@@ -59,7 +53,6 @@ type Artifact interface {
 	Producer
 	Name() string
 	DisplayName() string
-	LoadRequired() bool
 	GenRequired() bool
 }
 
