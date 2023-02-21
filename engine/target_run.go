@@ -482,7 +482,6 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		log.Tracef("Target DONE %v", target.FQN)
 	}()
 
-	logFilePath := ""
 	if target.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, target.Timeout)
@@ -530,25 +529,9 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		dir = e.Cwd
 	}
 
-	if iocfg.Stdout == nil || iocfg.Stderr == nil {
-		logFilePath = e.sandboxRoot(target).Join(target.artifacts.Log.Name()).Abs()
-
-		f, err := os.Create(logFilePath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		if iocfg.Stdout == nil {
-			iocfg.Stdout = f
-		}
-
-		if iocfg.Stderr == nil {
-			iocfg.Stderr = f
-		}
-	}
-
 	e.Status(TargetStatus(target, "Running..."))
+
+	logFilePath := ""
 
 	if target.IsGroup() && !rr.Shell {
 		// Ignore
@@ -612,6 +595,24 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		_, hasPathInEnv := env["PATH"]
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
+		var logFile *os.File
+		if iocfg.Stdout == nil || iocfg.Stderr == nil {
+			logFilePath = e.sandboxRoot(target).Join(target.artifacts.Log.Name()).Abs()
+
+			logFile, err = os.Create(logFilePath)
+			if err != nil {
+				return err
+			}
+
+			if iocfg.Stdout == nil {
+				iocfg.Stdout = logFile
+			}
+
+			if iocfg.Stderr == nil {
+				iocfg.Stderr = logFile
+			}
+		}
+
 		espan := e.SpanRunExec(ctx, target)
 		err = platform.Exec(
 			ctx,
@@ -630,6 +631,9 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			},
 			rr.Shell,
 		)
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		espan.EndError(err)
 		if err != nil {
 			if rr.Shell {

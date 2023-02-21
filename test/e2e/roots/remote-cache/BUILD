@@ -16,6 +16,7 @@ target(
     name='without-out',
     run=[
         'TMP='+tmp,
+        'echo some log',
         'touch $TMP/run',
     ],
 )

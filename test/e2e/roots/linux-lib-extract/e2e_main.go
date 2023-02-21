@@ -9,6 +9,6 @@ func main() {
 
 	// Test zero cache run
 	outputs := MustV(RunOutput("//:run_py"))
-	Must(ValidateCache("//:run_py", []string{""}, false))
+	Must(ValidateCache("//:run_py", []string{""}, false, false))
 	Must(AssertFileContentEqual(outputs[0], "Hello, world"))
 }

@@ -9,9 +9,10 @@ type RunOpts struct {
 	Params   map[string]string
 	LogLevel string
 	Shell    bool
+	NoInline bool
 }
 
-func (o RunOpts) Args() []string {
+func (o RunOpts) Args(runArgs ...string) []string {
 	var args []string
 	for k, v := range o.Params {
 		args = append(args, "-p", k+"="+v)
@@ -21,6 +22,10 @@ func (o RunOpts) Args() []string {
 	}
 	if o.Shell {
 		args = append(args, "--shell")
+	}
+	args = append(args, runArgs...)
+	if o.NoInline {
+		args = append(args, "--no-inline")
 	}
 	return args
 }
@@ -48,7 +53,7 @@ func command(args ...string) *exec.Cmd {
 
 func commandO(o RunOpts, args ...string) *exec.Cmd {
 	// TODO handle cli args
-	args = append(o.Args(), args...)
+	args = o.Args(args...)
 
 	return exec.Command("heph", args...)
 }

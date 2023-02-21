@@ -46,7 +46,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 
 	var inlineInvocationTarget *engine.TargetRunRequest
 	var inlineTarget *engine.Target
-	if len(rrs) == 1 && inlineSingle {
+	if len(rrs) == 1 && inlineSingle && !*noInline {
 		inlineInvocationTarget = &rrs[0]
 		inlineInvocationTarget.Mode = mode
 		inlineTarget = inlineInvocationTarget.Target

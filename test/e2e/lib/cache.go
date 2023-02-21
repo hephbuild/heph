@@ -46,9 +46,12 @@ func TargetCacheOutputHash(tgt, output string) (string, error) {
 	return FileContent(p)
 }
 
-func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
+func ValidateCache(tgt string, outputs []string, fromRemote bool, expectLogs bool) error {
 	expected := []string{
 		"hash_input",
+	}
+	if expectLogs {
+		expected = append(expected, "log.txt")
 	}
 	if len(outputs) > 0 {
 		expected = append(expected, "_output")

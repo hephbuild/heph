@@ -64,7 +64,7 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 			LogFilePath: logFilePath,
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
 		}
 	}
 

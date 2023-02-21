@@ -27,6 +27,7 @@ var workers int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
+var noInline *bool
 var printOutput boolStr
 var ignore *[]string
 var nocache *bool
@@ -50,6 +51,7 @@ func init() {
 	cleanCmd.AddCommand(cleanLockCmd)
 
 	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
+	noInline = runCmd.Flags().Bool("no-inline", false, "Force running in workers")
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output, --print-out=<name> to filter output"))
 
 	ignore = watchCmd.Flags().StringArray("ignore", nil, "Ignore files, supports glob")

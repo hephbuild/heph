@@ -101,19 +101,19 @@ func PrintSummary(stats *htrace.Stats, withGen bool) {
 		sort.Strings(artifacts)
 
 		for _, name := range artifacts {
+			artifactLocalGet := target.ArtifactsLocalGet.Find(name)
 			artifactPull := target.ArtifactsDownload.Find(name)
 			artifactPush := target.ArtifactsUpload.Find(name)
-			artifactLocalGet := target.ArtifactsLocalGet.Find(name)
 
-			displayName := artifactPull.DisplayName
+			artifactGet := artifactPull
+			if artifactGet.DisplayName == "" {
+				artifactGet = artifactLocalGet
+			}
+
+			displayName := artifactGet.DisplayName
+
 			if displayName == "" {
 				displayName = artifactPush.DisplayName
-			}
-			if displayName == "" {
-				displayName = artifactLocalGet.DisplayName
-			}
-			if displayName == "" {
-				displayName = name
 			}
 
 			data = append(data, []string{
@@ -127,7 +127,7 @@ func PrintSummary(stats *htrace.Stats, withGen bool) {
 						return artifactString(artifactPull, "hit remote")
 					}
 
-					return artifactString(artifactLocalGet, "hit")
+					return artifactString(artifactGet, "hit")
 				}(),
 				"",
 				"",
