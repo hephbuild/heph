@@ -52,8 +52,8 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		inlineTarget = inlineInvocationTarget.Target
 	}
 
-	// fgDeps will include deps created inside the scheduled jobs to be waitfed for in the foreground
-	// The Done() must be called after all the tdeps have finished
+	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
+	// The DoneSem() must be called after all the tdeps have finished
 	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 

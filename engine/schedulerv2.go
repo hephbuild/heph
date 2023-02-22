@@ -109,8 +109,6 @@ func (s *schedulerv2) schedule() (rerr error) {
 			Name: "pull_meta " + target.FQN,
 			Deps: pmdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				defer targetDeps.DoneSem()
-
 				w.Status(TargetStatus(target, "Scheduling analysis..."))
 
 				isSkip := s.skip != nil && s.skip.FQN == target.FQN
@@ -134,6 +132,10 @@ func (s *schedulerv2) schedule() (rerr error) {
 				return nil
 			},
 		})
+		go func() {
+			<-pj.Wait()
+			targetDeps.DoneSem()
+		}()
 		targetDeps.Add(pj)
 
 		children, err := s.DAG().GetChildren(target)

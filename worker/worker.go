@@ -62,6 +62,10 @@ type Job struct {
 	m sync.Mutex
 }
 
+func (j *Job) Wait() <-chan struct{} {
+	return j.doneCh
+}
+
 func (j *Job) Done() {
 	j.m.Lock()
 	defer j.m.Unlock()
