@@ -58,7 +58,7 @@ target(
         'echo $LD',
         './pyhome/$LD ./python3 $SRC_SCRIPT | tee $OUT',
     ],
-    executor='sh',
+    entrypoint='sh',
     platforms={
         'os': 'linux',
         'name': 'docker',

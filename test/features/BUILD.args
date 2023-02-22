@@ -16,7 +16,7 @@ target(
     name="exec_echo",
     run=['$TOOL_GOECHO'],
     tools=echo,
-    executor='exec',
+    entrypoint='exec',
     pass_args=True,
     cache=False,
 )
@@ -25,7 +25,7 @@ target(
     name="bash_echo",
     run=['$TOOL_GOECHO "$@"'],
     tools=echo,
-    executor='bash',
+    entrypoint='bash',
     pass_args=True,
     cache=False,
 )

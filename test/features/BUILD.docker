@@ -26,7 +26,7 @@ bash=target(
 
 exec=target(
     name="platform_docker_exec",
-    executor='exec',
+    entrypoint='exec',
     platforms={
         "name": "docker",
         'options': {

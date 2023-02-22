@@ -458,10 +458,10 @@ def go_bin(name, pkg=None, variant_name=None, os=get_os(), arch=get_arch(), tags
         "pass_args": True,
     } | kwargs
 
-    if "run" not in kwargs and "executor" not in kwargs:
+    if "run" not in kwargs and "entrypoint" not in kwargs:
         kwargs = {
             "run": "$TOOL_BIN",
-            "executor": "exec",
+            "entrypoint": "exec",
         } | kwargs
 
     return target(

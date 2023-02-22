@@ -199,7 +199,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		t.Entrypoint = targetspec.EntrypointBash
 	}
 	if !validate(t.Entrypoint, targetspec.EntrypointValues) {
-		return targetspec.TargetSpec{}, fmt.Errorf("executor must be one of %v, got %v", printOneOf(targetspec.EntrypointValues), t.Entrypoint)
+		return targetspec.TargetSpec{}, fmt.Errorf("entrypoint must be one of %v, got %v", printOneOf(targetspec.EntrypointValues), t.Entrypoint)
 	}
 
 	if len(t.Platforms) == 0 {

@@ -23,7 +23,7 @@ target(
 | `name`           | `string`                                       | <span class="badge badge--danger">required</span> | Target name                                                                                  |
 | `doc`            | `string`                                       | `None`                                            | Documentation                                                                                |
 | `run`            | `string`, `[]string`                           | `[]`                                              | Command(s) to run (see `executor`)                                                           |
-| `executor`       | `'bash'`, `'exec'`                             | `'bash'`                                          | See [`executor`](#executor)                                                                  |
+| `entrypoint`     | `'bash'`, `'sh'`, `'exec'`                     | `'bash'`                                          | See [`entrypoint`](#entrypoint)                                                              |
 | `run_in_cwd`     | `bool`                                         | `False`                                           | Will run the target in the current working directory, use with `sandbox=False`               |
 | `pass_args`      | `bool`                                         | `False`                                           | Forward extra args passed to heph to the command (ex: `heph run //some/target -- arg1 arg2`) |
 | `cache`          | `bool`, `heph.cache()`                         | `True`                                            | See [`cache`](#cache)                                                                        |
@@ -45,9 +45,9 @@ target(
 | `transitive`     | `heph.target_spec()`                           | `None`                                            | See [`transitive`](#transitive)                                                              |
 | `timeout`        | `string`                                       | `None`                                            | Timeout to run target                                                                        |
 
-### `executor`
+### `entrypoint`
 
-- `bash`: runs the commands defined in `run` with `bash -c` (each item of the array on a new line)
+- `bash`, `sh`: runs the commands defined in `run` with `bash -c` or `sh -c` (each item of the array on a new line)
 - `exec` uses the value of `run` as an array of arguments passed to `exec`
 
 ### `cache`
