@@ -101,6 +101,9 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			output := expr.PosArg(1, "")
 			return e.hashOutput(t, output), nil
 		},
+		"repo_root": func(expr exprs.Expr) (string, error) {
+			return e.Root.Abs(), nil
+		},
 	}
 
 	for k, v := range utilFunctions {

@@ -112,9 +112,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 }
 
 type FileCache struct {
-	URI   string `yaml:"uri"`
-	Read  *bool  `yaml:",omitempty"`
-	Write *bool  `yaml:",omitempty"`
+	URI       string `yaml:"uri"`
+	Read      *bool  `yaml:",omitempty"`
+	Write     *bool  `yaml:",omitempty"`
+	Secondary *bool  `yaml:",omitempty"`
 }
 
 func (fc FileCache) ApplyTo(c Cache) Cache {
@@ -128,6 +129,10 @@ func (fc FileCache) ApplyTo(c Cache) Cache {
 
 	if fc.Write != nil {
 		c.Write = *fc.Write
+	}
+
+	if fc.Secondary != nil {
+		c.Secondary = *fc.Secondary
 	}
 
 	return c

@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/c2fo/vfs/v6/backend/gs"
 	"github.com/c2fo/vfs/v6/backend/os"
+	"heph/config"
 	log "heph/hlog"
 	"heph/utils"
 	"heph/utils/hash"
@@ -89,7 +90,7 @@ func orderCaches(ctx context.Context, caches []CacheConfig) []CacheConfig {
 }
 
 func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
-	if e.Config.CacheOrder != "latency" {
+	if len(e.Config.Cache) <= 1 || e.Config.CacheOrder != config.CacheOrderLatency {
 		return e.Config.Cache, nil
 	}
 
@@ -131,9 +132,17 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 		cacheMap[c.Name] = c
 	}
 
+	hasSecondary := false
 	ordered := make([]CacheConfig, 0, len(names))
 	for _, name := range names {
-		ordered = append(ordered, cacheMap[name])
+		c := cacheMap[name]
+		if c.Secondary {
+			if hasSecondary {
+				continue
+			}
+			hasSecondary = true
+		}
+		ordered = append(ordered, c)
 	}
 
 	e.orderedCaches = ordered

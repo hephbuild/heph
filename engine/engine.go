@@ -632,7 +632,7 @@ func (e *Engine) parseConfigs() error {
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
 	cfg.TargetScheduler = "v2"
-	cfg.CacheOrder = "latency"
+	cfg.CacheOrder = config.CacheOrderLatency
 	cfg.Platforms = map[string]config.Platform{
 		"local": {
 			Name:     "local",

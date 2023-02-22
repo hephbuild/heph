@@ -295,7 +295,6 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if !target.Cache.Enabled {
-		env["REPO_ROOT"] = e.Root.Abs()
 		mode := mode
 		if mode == "" {
 			mode = "run"

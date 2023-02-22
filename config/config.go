@@ -16,6 +16,11 @@ type BaseConfig struct {
 	Location string
 }
 
+const (
+	CacheOrderLatency = "latency"
+	CacheOrderNone    = "none"
+)
+
 type Config struct {
 	BaseConfig   `yaml:",inline"`
 	CacheOrder   string `yaml:"cache_order"`
@@ -56,9 +61,10 @@ func (c Config) OrderedPlatforms() []Platform {
 }
 
 type Cache struct {
-	URI   string
-	Read  bool
-	Write bool
+	URI       string
+	Read      bool
+	Write     bool
+	Secondary bool
 }
 
 type Root struct {
