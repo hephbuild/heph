@@ -167,6 +167,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"quiet?", &sargs.Quiet,
 		"pass_args?", &sargs.PassArgs,
 		"pass_env?", &sargs.PassEnv,
+		"runtime_pass_env?", &sargs.RuntimePassEnv,
 		"deps?", &sargs.Deps,
 		"hash_deps?", &sargs.HashDeps,
 		"cache?", &sargs.Cache,

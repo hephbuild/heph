@@ -118,6 +118,7 @@ type TargetSpec struct {
 	Labels              []string
 	Env                 map[string]string
 	PassEnv             []string
+	RuntimePassEnv      []string
 	RunInCwd            bool
 	Gen                 bool
 	Source              []string
@@ -135,11 +136,12 @@ type TargetPlatform struct {
 }
 
 type TargetSpecTransitive struct {
-	Deps       TargetSpecDeps
-	Tools      TargetSpecTools
-	Env        map[string]string
-	PassEnv    []string
-	RuntimeEnv map[string]string
+	Deps           TargetSpecDeps
+	Tools          TargetSpecTools
+	Env            map[string]string
+	PassEnv        []string
+	RuntimePassEnv []string
+	RuntimeEnv     map[string]string
 }
 
 func (t TargetSpec) IsPrivate() bool {

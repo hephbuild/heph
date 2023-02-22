@@ -32,6 +32,7 @@ type TargetArgs struct {
 	Out                 ArrayMap
 	Env                 ArrayMap
 	PassEnv             ArrayMap
+	RuntimePassEnv      ArrayMap
 	RuntimeEnv          ArrayMap
 	SrcEnv              SrcEnv
 	OutEnv              string
@@ -69,11 +70,12 @@ func (c *TargetArgsPlatforms) Unpack(v starlark.Value) error {
 }
 
 type TargetArgsTransitive struct {
-	Deps       ArrayMap
-	Tools      ArrayMap
-	Env        ArrayMap
-	PassEnv    ArrayMap
-	RuntimeEnv ArrayMap
+	Deps           ArrayMap
+	Tools          ArrayMap
+	Env            ArrayMap
+	PassEnv        ArrayMap
+	RuntimeEnv     ArrayMap
+	RuntimePassEnv ArrayMap
 }
 
 func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
@@ -114,6 +116,11 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 				}
 			case "pass_env":
 				err := cs.PassEnv.Unpack(v)
+				if err != nil {
+					return err
+				}
+			case "runtime_pass_env":
+				err := cs.RuntimePassEnv.Unpack(v)
 				if err != nil {
 					return err
 				}

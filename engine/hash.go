@@ -224,9 +224,9 @@ func (e *Engine) hashInput(target *Target) string {
 	}
 
 	h.String("=")
-	for _, tool := range target.Tools.Hosts {
-		h.String(tool.Name)
-	}
+	hash.HashArray(h, target.Tools.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+		return tool.Name
+	})
 
 	h.String("=")
 	if target.DifferentHashDeps {

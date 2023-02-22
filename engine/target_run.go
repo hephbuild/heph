@@ -432,13 +432,22 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		env[normalizeEnv(k)] = bin[tool.Name]
 	}
 
+	for _, k := range target.RuntimePassEnv {
+		v, ok := os.LookupEnv(k)
+		if !ok {
+			continue
+		}
+
+		env[k] = v
+	}
+
 	for k, expr := range target.RuntimeEnv {
 		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target.FQN)))
 		if err != nil {
 			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 		}
 
-		env[normalizeEnv(strings.ToUpper(k))] = val
+		env[k] = val
 	}
 
 	for k, v := range target.Env {

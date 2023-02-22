@@ -14,8 +14,10 @@ func Run(tgt string) error {
 
 func RunO(tgt string, o RunOpts) error {
 	cmd := commandO(o, "run", tgt)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	if !o.Silent {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
 	if o.Shell {
 		cmd.Stdin = os.Stdin
 	}
@@ -24,10 +26,20 @@ func RunO(tgt string, o RunOpts) error {
 }
 
 func RunOutput(tgt string) ([]string, error) {
+	return RunOutputO(tgt, defaultOpts)
+}
+
+func RunOutputO(tgt string, o RunOpts) ([]string, error) {
 	var stdout, stderr bytes.Buffer
-	cmd := command("run", tgt, "--print-out")
+	cmd := commandO(o, "run", tgt, "--print-out")
 	cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	cmd.Stdout = &stdout
+	if len(o.Env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range o.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
 
 	err := cmd.Run()
 	if err != nil {

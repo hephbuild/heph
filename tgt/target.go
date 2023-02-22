@@ -18,6 +18,7 @@ type Target struct {
 	Out            *OutNamedPaths
 	Env            map[string]string
 	RuntimeEnv     map[string]TargetRuntimeEnv
+	RuntimePassEnv []string
 
 	// Collected transitive deps from deps/tools
 	TransitiveDeps TargetTransitive

@@ -3,7 +3,9 @@ package lib
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 )
 
 func RmSandbox() error {
@@ -24,6 +26,14 @@ func PrintConfig() error {
 }
 
 func CleanSetup() error {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sig
+		os.Exit(1)
+	}()
+
 	d, _ := os.Getwd()
 	fmt.Println("Root: ", d)
 

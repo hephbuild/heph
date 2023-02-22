@@ -143,6 +143,10 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
+	if !arrEqual(t.RuntimePassEnv, spec.RuntimePassEnv) {
+		return false
+	}
+
 	if t.RunInCwd != spec.RunInCwd {
 		return false
 	}

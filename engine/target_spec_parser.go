@@ -54,16 +54,17 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			Named:   args.Cache.Named,
 			History: args.Cache.History,
 		},
-		RestoreCache: args.RestoreCache,
-		Sandbox:      args.SandboxEnabled,
-		OutInSandbox: args.OutInSandbox,
-		Codegen:      args.Codegen,
-		Labels:       args.Labels.Array,
-		Env:          args.Env.StrMap,
-		PassEnv:      args.PassEnv.Array,
-		RunInCwd:     args.RunInCwd,
-		Gen:          args.Gen,
-		RuntimeEnv:   args.RuntimeEnv.StrMap,
+		RestoreCache:   args.RestoreCache,
+		Sandbox:        args.SandboxEnabled,
+		OutInSandbox:   args.OutInSandbox,
+		Codegen:        args.Codegen,
+		Labels:         args.Labels.Array,
+		Env:            args.Env.StrMap,
+		PassEnv:        args.PassEnv.Array,
+		RuntimePassEnv: args.RuntimePassEnv.Array,
+		RunInCwd:       args.RunInCwd,
+		Gen:            args.Gen,
+		RuntimeEnv:     args.RuntimeEnv.StrMap,
 		SrcEnv: targetspec.TargetSpecSrcEnv{
 			All:   args.SrcEnv.All,
 			Named: args.SrcEnv.Named,
@@ -106,6 +107,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	t.Transitive.Env = args.Transitive.Env.StrMap
 	t.Transitive.RuntimeEnv = args.Transitive.RuntimeEnv.StrMap
 	t.Transitive.PassEnv = args.Transitive.PassEnv.Array
+	t.Transitive.RuntimePassEnv = args.Transitive.RuntimePassEnv.Array
 
 	if len(args.Out.ArrMap) > 0 {
 		for k, vs := range args.Out.ArrMap {

@@ -232,7 +232,7 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		}
 	}
 
-	// Resolve transitive specs
+	// Resolve transitive spec
 	t.OwnTransitive = tgt.TargetTransitive{}
 	t.OwnTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
 	if err != nil {
@@ -251,6 +251,7 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		}
 	}
 	t.OwnTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
+	t.OwnTransitive.RuntimePassEnv = t.TargetSpec.Transitive.RuntimePassEnv
 
 	t.DeepOwnTransitive, err = e.collectDeepTransitive(t.OwnTransitive, breadcrumb)
 	if err != nil {
@@ -286,6 +287,9 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
 		}
 	}
+
+	t.RuntimePassEnv = []string{}
+	t.RuntimePassEnv = append(t.RuntimePassEnv, t.TargetSpec.RuntimePassEnv...)
 
 	t.Env = map[string]string{}
 	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
@@ -325,13 +329,11 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 		}
 	}
 
-	e.applyEnv(t, t.TransitiveDeps.PassEnv, t.TransitiveDeps.Env)
-	if t.RuntimeEnv == nil {
-		t.RuntimeEnv = map[string]tgt.TargetRuntimeEnv{}
-	}
 	for k, v := range t.TransitiveDeps.RuntimeEnv {
 		t.RuntimeEnv[k] = v
 	}
+	t.RuntimePassEnv = append(t.RuntimePassEnv, t.TransitiveDeps.RuntimePassEnv...)
+	e.applyEnv(t, t.TransitiveDeps.PassEnv, t.TransitiveDeps.Env)
 
 	err = e.registerDag(t)
 	if err != nil {
@@ -612,6 +614,9 @@ func (e *Engine) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *Targ
 	}
 	for _, dep := range tr.Tools.Targets {
 		targets.Add(e.Targets.Find(dep.Target.FQN))
+	}
+	for _, t := range tr.Tools.TargetReferences {
+		targets.Add(e.Targets.Find(t.FQN))
 	}
 
 	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)

@@ -10,6 +10,8 @@ type RunOpts struct {
 	LogLevel string
 	Shell    bool
 	NoInline bool
+	Silent   bool
+	Env      map[string]string
 }
 
 func (o RunOpts) Args(runArgs ...string) []string {

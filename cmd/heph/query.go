@@ -443,10 +443,14 @@ var targetCmd = &cobra.Command{
 		fmt.Println("Transitive:")
 		printTools("    ", target.OwnTransitive.Tools)
 		printDeps("    ", target.OwnTransitive.Deps)
+		fmt.Println("    pass_env:", target.OwnTransitive.PassEnv)
+		fmt.Println("    runtime_pass_env:", target.OwnTransitive.RuntimePassEnv)
 
 		fmt.Println("Deep Transitive:")
 		printTools("    ", target.DeepOwnTransitive.Tools)
 		printDeps("    ", target.DeepOwnTransitive.Deps)
+		fmt.Println("    pass_env:", target.DeepOwnTransitive.PassEnv)
+		fmt.Println("    runtime_pass_env:", target.DeepOwnTransitive.RuntimePassEnv)
 
 		fmt.Println("Deps:")
 		printTools("    ", target.Tools)
@@ -455,6 +459,8 @@ var targetCmd = &cobra.Command{
 		fmt.Println("Deps from transitive:")
 		printTools("    ", target.TransitiveDeps.Tools)
 		printDeps("    ", target.TransitiveDeps.Deps)
+		fmt.Println("    pass_env:", target.TransitiveDeps.PassEnv)
+		fmt.Println("    runtime_pass_env:", target.TransitiveDeps.RuntimePassEnv)
 
 		return nil
 	},

@@ -1,11 +1,12 @@
 package tgt
 
 type TargetTransitive struct {
-	Tools      TargetTools
-	Deps       TargetNamedDeps
-	Env        map[string]string
-	RuntimeEnv map[string]TargetRuntimeEnv
-	PassEnv    []string
+	Tools          TargetTools
+	Deps           TargetNamedDeps
+	Env            map[string]string
+	RuntimeEnv     map[string]TargetRuntimeEnv
+	PassEnv        []string
+	RuntimePassEnv []string
 }
 
 func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
@@ -41,10 +42,16 @@ func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 	}
 
 	ntr.PassEnv = append(tr.PassEnv, otr.PassEnv...)
+	ntr.RuntimePassEnv = append(tr.RuntimePassEnv, otr.RuntimePassEnv...)
 
 	return ntr
 }
 
 func (tr TargetTransitive) Empty() bool {
-	return tr.Tools.Empty() && tr.Deps.Empty() && len(tr.Env) == 0 && len(tr.RuntimeEnv) == 0 && len(tr.PassEnv) == 0
+	return tr.Tools.Empty() &&
+		tr.Deps.Empty() &&
+		len(tr.Env) == 0 &&
+		len(tr.RuntimeEnv) == 0 &&
+		len(tr.PassEnv) == 0 &&
+		len(tr.RuntimePassEnv) == 0
 }
