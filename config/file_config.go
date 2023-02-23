@@ -3,14 +3,15 @@ package config
 type Extras map[string]interface{}
 
 type FileConfig struct {
-	BaseConfig   `yaml:",inline"`
-	CacheOrder   string                  `yaml:"cache_order"`
-	Cache        map[string]FileCache    `yaml:",omitempty"`
-	CacheHistory int                     `yaml:"cache_history"`
-	DisableGC    *bool                   `yaml:"disable_gc"`
-	InstallTools *bool                   `yaml:"install_tools"`
-	Platforms    map[string]FilePlatform `yaml:"platforms"`
-	BuildFiles   struct {
+	BaseConfig        `yaml:",inline"`
+	CacheOrder        string                  `yaml:"cache_order"`
+	Cache             map[string]FileCache    `yaml:",omitempty"`
+	CacheHistory      int                     `yaml:"cache_history"`
+	DisableGC         *bool                   `yaml:"disable_gc"`
+	DisableCacheHints *bool                   `yaml:"disable_cache_hints"`
+	InstallTools      *bool                   `yaml:"install_tools"`
+	Platforms         map[string]FilePlatform `yaml:"platforms"`
+	BuildFiles        struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
 	} `yaml:"build_files"`
@@ -43,6 +44,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.DisableGC != nil {
 		c.DisableGC = *fc.DisableGC
+	}
+
+	if fc.DisableCacheHints != nil {
+		c.DisableCacheHints = *fc.DisableCacheHints
 	}
 
 	if fc.InstallTools != nil {

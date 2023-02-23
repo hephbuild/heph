@@ -733,6 +733,11 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return err
 	}
 
+	err = e.gc(ctx, target)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -868,10 +873,14 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		return nil
 	}
 
+	return nil
+}
+
+func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
 	if target.Cache.Enabled && !e.Config.DisableGC {
 		e.Status(TargetStatus(target, "GC..."))
 
-		err = e.GCTargets([]*Target{target}, nil, false)
+		err := e.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
 			log.Errorf("gc: %v", err)
 		}

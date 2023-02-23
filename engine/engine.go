@@ -15,6 +15,7 @@ import (
 	log "heph/hlog"
 	"heph/packages"
 	"heph/platform"
+	"heph/rcache"
 	"heph/sandbox"
 	"heph/targetspec"
 	"heph/tgt"
@@ -47,6 +48,7 @@ type Engine struct {
 	Tracer            trace.Tracer
 	RootSpan          trace.Span
 	PlatformProviders []PlatformProvider
+	RemoteCacheHints  *rcache.HintStore
 
 	DisableNamedCacheWrite bool
 
@@ -190,6 +192,7 @@ func New(rootPath string) *Engine {
 		Stats:                 &htrace.Stats{},
 		Tracer:                trace.NewNoopTracerProvider().Tracer(""),
 		Packages:              map[string]*packages.Package{},
+		RemoteCacheHints:      &rcache.HintStore{},
 		cacheHashInput:        &maps.Map[string, string]{},
 		cacheHashOutput:       &maps.Map[string, string]{},
 		codegenPaths:          map[string]*Target{},

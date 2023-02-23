@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"heph/rcache"
 	"heph/utils/maps"
 	"heph/utils/sets"
 	"heph/worker"
@@ -86,7 +87,7 @@ type schedulerv2 struct {
 	targetSchedJobs *maps.Map[string, *worker.Job]
 }
 
-func (s *schedulerv2) schedule() (rerr error) {
+func (s *schedulerv2) schedule() error {
 	for _, target := range s.toAssess {
 		target := target
 
@@ -273,6 +274,17 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 						group.Add(j)
 					}
 					return nil
+				}
+
+				if !s.Engine.Config.DisableCacheHints {
+					children, err := s.Engine.DAG().GetDescendants(target)
+					if err != nil {
+						return err
+					}
+
+					for _, child := range children {
+						s.Engine.RemoteCacheHints.Set(child.FQN, rcache.HintSkip{})
+					}
 				}
 			}
 

@@ -75,6 +75,10 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		return true, nil
 	}
 
+	if e.RemoteCacheHints.Get(target.FQN).Skip() {
+		return false, nil
+	}
+
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
 		return false, err
@@ -150,6 +154,12 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 	}
 
 	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
+
+	err = e.gc(ctx, target)
+	if err != nil {
+		return false, err
+	}
+
 	return true, nil
 }
 
