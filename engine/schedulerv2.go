@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"heph/rcache"
 	"heph/utils/maps"
 	"heph/utils/sets"
 	"heph/worker"
@@ -181,7 +180,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(s.Engine, w.Status)
 
-			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs)
+			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs, false)
 			if err != nil {
 				return err
 			}
@@ -256,7 +255,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 
 				e := NewTargetRunEngine(s.Engine, w.Status)
 
-				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, true)
+				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, true, true)
 				if err != nil {
 					return err
 				}
@@ -270,17 +269,6 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 						group.Add(j)
 					}
 					return nil
-				}
-
-				if !s.Engine.Config.DisableCacheHints {
-					children, err := s.Engine.DAG().GetDescendants(target)
-					if err != nil {
-						return err
-					}
-
-					for _, child := range children {
-						s.Engine.RemoteCacheHints.Set(child.FQN, rcache.HintSkip{})
-					}
 				}
 			}
 

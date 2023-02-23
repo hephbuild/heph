@@ -22,14 +22,14 @@ type HintStore struct {
 	m maps.Map[string, Hint]
 }
 
-func (s *HintStore) Set(fqn string, hint Hint) {
-	s.m.Set(fqn, hint)
+func (s *HintStore) Set(fqn, cache string, hint Hint) {
+	s.m.Set(fqn+" "+cache, hint)
 }
 
 var defaultHint = HintNone{}
 
-func (s *HintStore) Get(fqn string) Hint {
-	if hint, ok := s.m.GetOk(fqn); ok {
+func (s *HintStore) Get(fqn, cache string) Hint {
+	if hint, ok := s.m.GetOk(fqn + " " + cache); ok {
 		return hint
 	}
 

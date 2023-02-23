@@ -8,6 +8,7 @@ import (
 	"heph/engine/artifacts"
 	"heph/engine/htrace"
 	log "heph/hlog"
+	"heph/rcache"
 	"heph/utils/fs"
 	"os"
 	"time"
@@ -49,8 +50,8 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 	return nil
 }
 
-func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string) (bool, error) {
-	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
+func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint bool) (bool, error) {
+	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint)
 	if err != nil {
 		return false, err
 	}
@@ -62,7 +63,7 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 	return true, e.postRunOrWarm(ctx, target, outputs, pulled)
 }
 
-func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal bool) (bool, bool, error) {
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled bool, rcached bool, rerr error) {
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
@@ -73,10 +74,6 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 
 	if cached {
 		return false, true, nil
-	}
-
-	if e.RemoteCacheHints.Get(target.FQN).Skip() {
-		return false, false, nil
 	}
 
 	e.Status(TargetStatus(target, "Checking remote caches..."))
@@ -92,6 +89,10 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		}
 
 		if !target.Cache.NamedEnabled(cache.Name) {
+			continue
+		}
+
+		if followHint && e.RemoteCacheHints.Get(target.FQN, cache.Name).Skip() {
 			continue
 		}
 
@@ -113,6 +114,17 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 			}
 
 			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
+		} else {
+			if !e.Config.DisableCacheHints {
+				children, err := e.DAG().GetDescendants(target)
+				if err != nil {
+					log.Error(err)
+				}
+
+				for _, child := range children {
+					e.RemoteCacheHints.Set(child.FQN, cache.Name, rcache.HintSkip{})
+				}
+			}
 		}
 	}
 

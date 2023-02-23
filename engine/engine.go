@@ -269,6 +269,9 @@ type WaitGroupMap struct {
 }
 
 func (wgm *WaitGroupMap) All() *worker.WaitGroup {
+	wgm.mu.Lock()
+	defer wgm.mu.Unlock()
+
 	wg := &worker.WaitGroup{}
 
 	for _, e := range wgm.m {
