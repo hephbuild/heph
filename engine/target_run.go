@@ -728,12 +728,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		})
 	}
 
-	err = e.postRunOrWarm(ctx, target, target.OutWithSupport.Names())
-	if err != nil {
-		return err
-	}
-
-	err = e.gc(ctx, target)
+	err = e.postRunOrWarm(ctx, target, target.OutWithSupport.Names(), true)
 	if err != nil {
 		return err
 	}
@@ -759,7 +754,7 @@ func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[s
 	return nil, fmt.Errorf("no platform available for %v", labels)
 }
 
-func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string) error {
+func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
 		return err
@@ -871,6 +866,13 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	err = e.linkLatestCache(target, cacheDir.Abs())
 	if err != nil {
 		return nil
+	}
+
+	if runGc {
+		err = e.gc(ctx, target)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

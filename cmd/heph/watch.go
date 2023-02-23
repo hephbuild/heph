@@ -56,6 +56,8 @@ func (w *watchCtx) cancelRunAndWait() {
 }
 
 func (w *watchCtx) run(r watchRun, fromStdin bool) {
+	w.e.RemoteCacheHints.Reset()
+
 	ctx, cancel := context.WithCancel(w.ctx)
 	defer cancel()
 

@@ -21,10 +21,9 @@ type FileConfig struct {
 	Watch struct {
 		Ignore []string `yaml:",omitempty"`
 	} `yaml:"watch"`
-	KeepSandbox     *bool             `yaml:"keep_sandbox"`
-	TargetScheduler string            `yaml:"target_scheduler"`
-	Params          map[string]string `yaml:"params"`
-	Extras          `yaml:",inline"`
+	KeepSandbox *bool             `yaml:"keep_sandbox"`
+	Params      map[string]string `yaml:"params"`
+	Extras      `yaml:",inline"`
 }
 
 func (fc FileConfig) ApplyTo(c Config) Config {
@@ -89,10 +88,6 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	}
 	for k, newRoot := range fc.BuildFiles.Roots {
 		c.BuildFiles.Roots[k] = newRoot.ApplyTo(c.BuildFiles.Roots[k])
-	}
-
-	if fc.TargetScheduler != "" {
-		c.TargetScheduler = fc.TargetScheduler
 	}
 
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)

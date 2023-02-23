@@ -35,3 +35,7 @@ func (s *HintStore) Get(fqn string) Hint {
 
 	return defaultHint
 }
+
+func (s *HintStore) Reset() {
+	s.m = maps.Map[string, Hint]{}
+}

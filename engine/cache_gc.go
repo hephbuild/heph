@@ -176,8 +176,8 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 	return nil
 }
 
-func (e *Engine) GC(flog func(string, ...interface{}), dryrun bool) error {
-	err := e.gcLock.Lock(context.TODO())
+func (e *Engine) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
+	err := e.gcLock.Lock(ctx)
 	if err != nil {
 		return err
 	}

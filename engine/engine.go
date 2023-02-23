@@ -321,11 +321,7 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 }
 
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
-	if e.Config.TargetScheduler == "v2" {
-		return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-	}
-
-	return e.ScheduleV1TargetRRsWithDeps(ctx, rrs, skip)
+	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
 func TargetStatus(t *Target, status string) worker.Status {
@@ -362,18 +358,6 @@ func TargetOutputStatus(t *Target, output string, status string) worker.Status {
 		output = "-"
 	}
 	return targetStatus{t.FQN, output, status}
-}
-
-func (e *Engine) ScheduleTargetPostRunOrWarm(ctx context.Context, target *Target, deps *worker.WaitGroup, outputs []string) *worker.Job {
-	return e.Pool.Schedule(ctx, &worker.Job{
-		Name: "postrunwarm " + target.FQN,
-		Deps: deps,
-		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(e, w.Status)
-
-			return e.postRunOrWarm(ctx, target, outputs)
-		},
-	})
 }
 
 func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
@@ -634,7 +618,6 @@ func (e *Engine) parseConfigs() error {
 	cfg := config.Config{}
 	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
 	cfg.CacheHistory = 3
-	cfg.TargetScheduler = "v2"
 	cfg.CacheOrder = config.CacheOrderLatency
 	cfg.Platforms = map[string]config.Platform{
 		"local": {

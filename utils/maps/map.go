@@ -7,7 +7,7 @@ import (
 )
 
 type Map[K constraints.Ordered, V any] struct {
-	Default func() V
+	Default func(k K) V
 
 	mu sync.RWMutex
 	m  map[K]V
@@ -73,7 +73,7 @@ func (m *Map[K, V]) Get(k K) V {
 
 	v, ok = m.m[k]
 	if !ok {
-		v = m.Default()
+		v = m.Default(k)
 		m.m[k] = v
 	}
 

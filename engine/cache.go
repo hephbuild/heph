@@ -50,7 +50,7 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 }
 
 func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string) (bool, error) {
-	cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
+	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
 	if err != nil {
 		return false, err
 	}
@@ -59,29 +59,31 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 		return false, nil
 	}
 
-	return true, e.postRunOrWarm(ctx, target, outputs)
+	return true, e.postRunOrWarm(ctx, target, outputs, pulled)
 }
 
-func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal bool) (bool, error) {
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal bool) (bool, bool, error) {
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	if cached {
-		return true, nil
+		return false, true, nil
 	}
 
 	if e.RemoteCacheHints.Get(target.FQN).Skip() {
-		return false, nil
+		return false, false, nil
 	}
+
+	e.Status(TargetStatus(target, "Checking remote caches..."))
 
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 
 	for _, cache := range orderedCaches {
@@ -107,14 +109,14 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 			}
 
 			if cached {
-				return true, err
+				return true, true, err
 			}
 
 			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
 		}
 	}
 
-	return false, nil
+	return false, false, nil
 }
 
 func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache CacheConfig) (_ bool, rerr error) {
@@ -154,11 +156,6 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 	}
 
 	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
-
-	err = e.gc(ctx, target)
-	if err != nil {
-		return false, err
-	}
 
 	return true, nil
 }

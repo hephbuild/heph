@@ -40,10 +40,9 @@ type Config struct {
 	Watch struct {
 		Ignore []string `yaml:"ignore"`
 	} `yaml:"watch"`
-	KeepSandbox     bool              `yaml:"keep_sandbox"`
-	TargetScheduler string            `yaml:"target_scheduler"`
-	Params          map[string]string `yaml:"params"`
-	Extras          `yaml:",inline"`
+	KeepSandbox bool              `yaml:"keep_sandbox"`
+	Params      map[string]string `yaml:"params"`
+	Extras      `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`
 }

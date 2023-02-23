@@ -175,14 +175,13 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		return nil, err
 	}
 
-	postDeps := &worker.WaitGroup{}
-	j := s.Pool.Schedule(ctx, &worker.Job{
+	return s.Pool.Schedule(ctx, &worker.Job{
 		Name: "cache get " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(s.Engine, w.Status)
 
-			cached, err := e.pullOrGetCache(ctx, target, outputs, false, false)
+			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs)
 			if err != nil {
 				return err
 			}
@@ -193,10 +192,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 
 			return nil
 		},
-	})
-	postDeps.Add(j)
-
-	return s.ScheduleTargetPostRunOrWarm(ctx, target, postDeps, outputs), nil
+	}), nil
 }
 
 func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Target, outputs []string) (*worker.Job, error) {
@@ -260,7 +256,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 
 				e := NewTargetRunEngine(s.Engine, w.Status)
 
-				cached, err := e.pullOrGetCache(ctx, target, outputs, true, true)
+				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, true)
 				if err != nil {
 					return err
 				}

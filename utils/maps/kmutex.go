@@ -9,7 +9,7 @@ type KMutex struct {
 
 func (m *KMutex) Get(key string) *sync.Mutex {
 	m.o.Do(func() {
-		m.m = &Map[string, *sync.Mutex]{Default: func() *sync.Mutex {
+		m.m = &Map[string, *sync.Mutex]{Default: func(string) *sync.Mutex {
 			return &sync.Mutex{}
 		}}
 	})

@@ -50,7 +50,7 @@ func (d *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Targe
 func (d *DAG) GetOrderedAncestorsWithOutput(e *Engine, targets []*Target, includeRoot bool) ([]*Target, *maps.Map[string, *sets.Set[string, string]], error) {
 	ancs := make([]*Target, 0)
 	ancsout := &maps.Map[string, *sets.Set[string, string]]{
-		Default: func() *sets.Set[string, string] {
+		Default: func(k string) *sets.Set[string, string] {
 			return sets.NewSet(func(s string) string {
 				return s
 			}, 0)
