@@ -162,13 +162,19 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 			return nil, err
 		}
 
-		rrs = append(rrs, engine.TargetRunRequest{
+		rr := engine.TargetRunRequest{
 			Target:        target,
 			Args:          args,
 			NoCache:       *nocache,
 			Shell:         *shell,
 			PreserveCache: printOutput.bool,
-		})
+		}
+		if len(rr.Args) > 0 && target.Cache.Enabled {
+			log.Warnf("%v: args are being passed, disabling cache", target.FQN)
+			rr.NoCache = true
+		}
+
+		rrs = append(rrs, rr)
 	}
 
 	ancs, err := e.DAG().GetOrderedAncestors(targets.Slice(), true)

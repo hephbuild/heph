@@ -48,11 +48,12 @@ func (t LibTest) Data() interface{} {
 		"XTestLib": RenderLibCall(t.XTestLib),
 		"GoFiles":  genStringArray(append(t.TestFiles, t.XTestFiles...), 2),
 
-		"VID":        VID(variant),
-		"Variant":    genVariant(variant, true, false),
-		"VariantBin": genVariant(variant, true, false),
-		"IfTest":     fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
-		"RunArgs":    genArgValue(t.RunExtra, "\n"),
+		"Variant":        variant,
+		"VID":            VID(variant),
+		"VariantArgs":    genVariant(variant, true, false),
+		"VariantBinArgs": genVariant(variant, true, false),
+		"IfTest":         fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
+		"RunArgs":        genArgValue(t.RunExtra, "\n"),
 	}
 }
 
@@ -88,7 +89,7 @@ testmain_lib = go_library(
 	import_path="main",
 	dir="testmain",
 	complete=False,
-	{{.Variant}}
+	{{.VariantArgs}}
 )
 
 test_build = go_build_bin(
@@ -96,7 +97,7 @@ test_build = go_build_bin(
 	main=testmain_lib,
     libs={{.DepsLibs}},
 	out=heph.pkg.name(),
-	{{.VariantBin}}
+	{{.VariantBinArgs}}
 )
 
 if {{.IfTest}}:
@@ -104,11 +105,12 @@ if {{.IfTest}}:
 
 	args = {
 		'name': "go_test@{{.VID}}",
+		'doc': 'Run go test {{.ImportPath}} {{.Variant.OS}}/{{.Variant.ARCH}} {{StringsJoin .Variant.Tags ","}}'.strip(), 
 		'deps': {
 			'bin': test_build,
 			'data': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
 		},
-		'run': ['./$SRC_BIN -test.v "$@" 2>&1 | tee test_out'],
+		'run': ['./$SRC_BIN -test.v "$@" 2>&1 | tee $OUT'],
 		'out': ['test_out'],
 		'labels': ['test', 'go-test'],
 		'pass_args': True,
@@ -135,7 +137,9 @@ var testTpl *template.Template
 
 func init() {
 	var err error
-	testTpl, err = template.New("test").Parse(testTplStr)
+	testTpl, err = template.New("test").
+		Funcs(template.FuncMap{"StringsJoin": strings.Join}).
+		Parse(testTplStr)
 	if err != nil {
 		panic(err)
 	}
