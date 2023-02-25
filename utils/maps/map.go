@@ -32,8 +32,6 @@ func (m *Map[K, V]) Set(k K, v V) {
 }
 
 func (m *Map[K, V]) Delete(k K) {
-	m.init()
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -41,14 +39,7 @@ func (m *Map[K, V]) Delete(k K) {
 }
 
 func (m *Map[K, V]) GetOk(k K) (V, bool) {
-	m.init()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	v, ok := m.m[k]
-
-	return v, ok
+	return m.getFast(k)
 }
 
 func (m *Map[K, V]) getFast(k K) (V, bool) {
@@ -56,17 +47,16 @@ func (m *Map[K, V]) getFast(k K) (V, bool) {
 	defer m.mu.RUnlock()
 
 	v, ok := m.m[k]
-
 	return v, ok
 }
 
 func (m *Map[K, V]) Get(k K) V {
-	m.init()
-
 	v, ok := m.getFast(k)
 	if m.Default == nil || ok {
 		return v
 	}
+
+	m.init()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -81,12 +71,7 @@ func (m *Map[K, V]) Get(k K) V {
 }
 
 func (m *Map[K, V]) Has(k K) bool {
-	m.init()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	_, ok := m.m[k]
+	_, ok := m.getFast(k)
 
 	return ok
 }

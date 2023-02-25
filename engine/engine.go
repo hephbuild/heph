@@ -75,8 +75,8 @@ type Engine struct {
 	codegenPaths               map[string]*Target
 	tools                      *Targets
 	fetchRootCache             map[string]fs2.Path
-	cacheRunBuildFilem         sync.RWMutex
-	cacheRunBuildFile          map[string]starlark.StringDict
+	cacheRunBuildFileCache     *maps.Map[string, starlark.StringDict]
+	cacheRunBuildFileLocks     *maps.Map[string, flock.Locker]
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -185,20 +185,23 @@ func New(rootPath string) *Engine {
 	}
 
 	return &Engine{
-		Root:                  root,
-		HomeDir:               homeDir,
-		LocalCache:            loc.(*vfsos.Location),
-		Targets:               NewTargets(0),
-		Stats:                 &htrace.Stats{},
-		Tracer:                trace.NewNoopTracerProvider().Tracer(""),
-		Packages:              map[string]*packages.Package{},
-		RemoteCacheHints:      &rcache.HintStore{},
-		cacheHashInput:        &maps.Map[string, string]{},
-		cacheHashOutput:       &maps.Map[string, string]{},
-		codegenPaths:          map[string]*Target{},
-		tools:                 NewTargets(0),
-		fetchRootCache:        map[string]fs2.Path{},
-		cacheRunBuildFile:     map[string]starlark.StringDict{},
+		Root:                   root,
+		HomeDir:                homeDir,
+		LocalCache:             loc.(*vfsos.Location),
+		Targets:                NewTargets(0),
+		Stats:                  &htrace.Stats{},
+		Tracer:                 trace.NewNoopTracerProvider().Tracer(""),
+		Packages:               map[string]*packages.Package{},
+		RemoteCacheHints:       &rcache.HintStore{},
+		cacheHashInput:         &maps.Map[string, string]{},
+		cacheHashOutput:        &maps.Map[string, string]{},
+		codegenPaths:           map[string]*Target{},
+		tools:                  NewTargets(0),
+		fetchRootCache:         map[string]fs2.Path{},
+		cacheRunBuildFileCache: &maps.Map[string, starlark.StringDict]{},
+		cacheRunBuildFileLocks: &maps.Map[string, flock.Locker]{Default: func(k string) flock.Locker {
+			return flock.NewMutex(k)
+		}},
 		Labels:                sets.NewStringSet(0),
 		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 		toolsLock:             flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),

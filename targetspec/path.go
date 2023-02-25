@@ -69,6 +69,14 @@ func TargetParse(pkg string, s string) (TargetPath, error) {
 	return tp, err
 }
 
+type invalidTargetError struct {
+	s string
+}
+
+func (e invalidTargetError) Error() string {
+	return fmt.Sprintf("invalid target: %v", e.s)
+}
+
 func targetParse(pkg string, s string) (TargetPath, error) {
 	if strings.Contains(s, "|") {
 		return TargetPath{}, fmt.Errorf("cannot reference a named output: %v", s)
@@ -110,7 +118,7 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 		}, nil
 	}
 
-	return TargetPath{}, fmt.Errorf("invalid target: %v", s)
+	return TargetPath{}, invalidTargetError{s: s}
 }
 
 type TargetOutputPath struct {

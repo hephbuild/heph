@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"go.starlark.net/resolve"
@@ -331,10 +332,10 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 
 	err = mod.Write(f)
 	if err != nil {
-		log.Error(err)
+		return nil, err
 	}
 
-	return mod, err
+	return mod, nil
 }
 
 func newStarlarkThread() *starlark.Thread {
@@ -346,12 +347,16 @@ func newStarlarkThread() *starlark.Thread {
 }
 
 func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
-	e.cacheRunBuildFilem.RLock()
-	if globals, ok := e.cacheRunBuildFile[path]; ok {
-		e.cacheRunBuildFilem.RUnlock()
+	if globals, ok := e.cacheRunBuildFileCache.GetOk(path); ok {
 		return globals, nil
 	}
-	e.cacheRunBuildFilem.RUnlock()
+
+	lock := e.cacheRunBuildFileLocks.Get(path)
+	err := lock.Lock(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+	defer lock.Unlock()
 
 	log.Tracef("BUILD: running %v", path)
 
@@ -369,7 +374,7 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	if err != nil {
 		var eerr *starlark.EvalError
 		if errors.As(err, &eerr) {
-			return nil, fmt.Errorf("%v: %v", eerr.Msg, eerr.Backtrace())
+			return nil, fmt.Errorf("%v:\n%v", eerr.Msg, eerr.Backtrace())
 		}
 		return nil, err
 	}
@@ -378,14 +383,12 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	if err != nil {
 		var eerr *starlark.EvalError
 		if errors.As(err, &eerr) {
-			return nil, fmt.Errorf("%v: %v", eerr.Msg, eerr.Backtrace())
+			return nil, fmt.Errorf("%v:\n%v", eerr.Msg, eerr.Backtrace())
 		}
 		return nil, err
 	}
 
-	e.cacheRunBuildFilem.Lock()
-	e.cacheRunBuildFile[path] = res
-	e.cacheRunBuildFilem.Unlock()
+	e.cacheRunBuildFileCache.Set(path, res)
 
 	return res, nil
 }

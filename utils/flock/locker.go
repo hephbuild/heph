@@ -80,9 +80,10 @@ func (l *Flock) Lock(ctx context.Context) error {
 		doneCh := make(chan struct{})
 		defer close(doneCh)
 
-		pid, _ := os.ReadFile(f.Name())
+		pidb, _ := os.ReadFile(f.Name())
+		pid := string(pidb)
 		go func() {
-			if fmt.Sprint(os.Getpid()) == string(pid) {
+			if strconv.Itoa(os.Getpid()) == pid {
 				log.Debugf("Looks another routine has already acquired the lock for %s. Waiting for it to finish...", l.name)
 				return
 			}
@@ -96,7 +97,7 @@ func (l *Flock) Lock(ctx context.Context) error {
 			}
 
 			if len(pid) > 0 {
-				log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", string(pid), l.name)
+				log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", pid, l.name)
 			} else {
 				log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
 			}
