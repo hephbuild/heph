@@ -13,6 +13,7 @@ import (
 	"heph/utils"
 	fs2 "heph/utils/fs"
 	"heph/utils/hash"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -283,6 +284,18 @@ func (e *runBuildEngine) loadFromRootsOrCreatePackage(pkgName string) (*packages
 	return pkg, nil
 }
 
+func safelyCompileProgram(in io.Reader) (_ *starlark.Program, err error) {
+	// Sometimes starlark.CompiledProgram bombs when concurrent read/write on the file is happening...
+
+	defer func() {
+		if rerr := recover(); rerr != nil {
+			err = fmt.Errorf("buildProgram paniced: %v", rerr)
+		}
+	}()
+
+	return starlark.CompiledProgram(in)
+}
+
 func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDict) (*starlark.Program, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -308,7 +321,7 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 	}
 
 	if f != nil {
-		mod, err := starlark.CompiledProgram(f)
+		mod, err := safelyCompileProgram(f)
 		_ = f.Close()
 		if err == nil {
 			return mod, nil

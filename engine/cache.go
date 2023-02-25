@@ -53,14 +53,19 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint bool) (bool, error) {
 	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("pullorget: %w", err)
 	}
 
 	if !cached {
 		return false, nil
 	}
 
-	return true, e.postRunOrWarm(ctx, target, outputs, pulled)
+	err = e.postRunOrWarm(ctx, target, outputs, pulled)
+	if err != nil {
+		return false, fmt.Errorf("postrunwarm: %w", err)
+	}
+
+	return true, nil
 }
 
 func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled bool, rcached bool, rerr error) {
@@ -69,7 +74,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false)
 	if err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("getlocal: %w", err)
 	}
 
 	if cached {
@@ -80,7 +85,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
-		return false, false, err
+		return false, false, fmt.Errorf("orderedcaches: %w", err)
 	}
 
 	for _, cache := range orderedCaches {
@@ -110,7 +115,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 			}
 
 			if cached {
-				return true, true, err
+				return true, true, nil
 			}
 
 			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
@@ -118,7 +123,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 			if !e.Config.DisableCacheHints {
 				children, err := e.DAG().GetDescendants(target)
 				if err != nil {
-					log.Error(err)
+					log.Error(fmt.Errorf("descendants: %w", err))
 				}
 
 				for _, child := range children {

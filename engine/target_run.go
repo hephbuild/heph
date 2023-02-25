@@ -757,7 +757,7 @@ func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[s
 func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("lock postrunwarm: %w", err)
 	}
 
 	defer func() {
@@ -771,11 +771,14 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 	doneMarker := cacheDir.Join(target.artifacts.InputHash.Name()).Abs()
 	if !fs.PathExists(doneMarker) {
-		return err
+		return nil
 	}
 
 	outDir := e.cacheDir(target).Join("_output")
 	outDirHashPath := e.cacheDir(target).Join("_output_hash").Abs()
+
+	// TODO: This can be a problem, where 2 targets depends on the same target, but with different outputs,
+	// leading to the expand overriding each other
 
 	// sanity check
 	for _, name := range outputs {
@@ -792,7 +795,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	} else {
 		b, err := os.ReadFile(outDirHashPath)
 		if err != nil && !errors.Is(err, fs2.ErrNotExist) {
-			return err
+			return fmt.Errorf("outdirhash: %w", err)
 		}
 
 		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
@@ -827,7 +830,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 				Dedup: untarDedup,
 			})
 			if err != nil {
-				return err
+				return fmt.Errorf("untar: %w", err)
 			}
 		}
 
@@ -843,7 +846,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
 		if err != nil {
-			return err
+			return fmt.Errorf("outdirhash: %w", err)
 		}
 	}
 
@@ -860,18 +863,18 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 	err = e.codegenLink(ctx, target)
 	if err != nil {
-		return err
+		return fmt.Errorf("codegenlink: %w", err)
 	}
 
 	err = e.linkLatestCache(target, cacheDir.Abs())
 	if err != nil {
-		return nil
+		return fmt.Errorf("linklatest: %w", err)
 	}
 
 	if runGc {
 		err = e.gc(ctx, target)
 		if err != nil {
-			return err
+			log.Errorf("gc %v: %v", target.FQN, err)
 		}
 	}
 
@@ -884,7 +887,7 @@ func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
 
 		err := e.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
-			log.Errorf("gc: %v", err)
+			return err
 		}
 	}
 
