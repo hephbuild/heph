@@ -77,7 +77,7 @@ type Engine struct {
 	tools                      *Targets
 	fetchRootCache             map[string]fs2.Path
 	cacheRunBuildFileCache     *maps.Map[string, starlark.StringDict]
-	cacheRunBuildFileLocks     *maps.Map[string, flock.Locker]
+	cacheRunBuildFileLocks     *maps.Map[string, *sync.Mutex]
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -200,8 +200,8 @@ func New(rootPath string) *Engine {
 		tools:                  NewTargets(0),
 		fetchRootCache:         map[string]fs2.Path{},
 		cacheRunBuildFileCache: &maps.Map[string, starlark.StringDict]{},
-		cacheRunBuildFileLocks: &maps.Map[string, flock.Locker]{Default: func(k string) flock.Locker {
-			return flock.NewMutex(k)
+		cacheRunBuildFileLocks: &maps.Map[string, *sync.Mutex]{Default: func(k string) *sync.Mutex {
+			return &sync.Mutex{}
 		}},
 		Labels:                sets.NewStringSet(0),
 		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),

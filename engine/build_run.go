@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"go.starlark.net/resolve"
@@ -365,10 +364,7 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	}
 
 	lock := e.cacheRunBuildFileLocks.Get(path)
-	err := lock.Lock(context.TODO())
-	if err != nil {
-		return nil, err
-	}
+	lock.Lock()
 	defer lock.Unlock()
 
 	log.Tracef("BUILD: running %v", path)

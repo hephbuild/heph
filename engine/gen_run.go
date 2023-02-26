@@ -5,6 +5,7 @@ import (
 	"fmt"
 	log "heph/hlog"
 	"heph/targetspec"
+	"heph/utils"
 	"heph/worker"
 	"path/filepath"
 	"time"
@@ -185,31 +186,35 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *Targets) error {
 	files := target.ActualOutFiles().All()
 
-	for _, file := range files {
-		file := file
+	chunks := utils.ChunkSlice(files, len(e.Pool.Workers))
+
+	for i, files := range chunks {
+		files := files
 
 		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
+			Name: fmt.Sprintf("rungen %v chunk %v", target.FQN, i),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
+				for _, file := range files {
+					w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
 
-				re := &runBuildEngine{
-					Engine: e.Engine,
-					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-					registerTarget: func(spec targetspec.TargetSpec) error {
-						err := e.defaultRegisterTarget(spec)
-						if err != nil {
-							return err
-						}
+					re := &runBuildEngine{
+						Engine: e.Engine,
+						pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
+						registerTarget: func(spec targetspec.TargetSpec) error {
+							err := e.defaultRegisterTarget(spec)
+							if err != nil {
+								return err
+							}
 
-						targets.Add(e.Targets.Find(spec.FQN))
-						return nil
-					},
-				}
+							targets.Add(e.Targets.Find(spec.FQN))
+							return nil
+						},
+					}
 
-				_, err := re.runBuildFile(file.Abs())
-				if err != nil {
-					return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
+					_, err := re.runBuildFile(file.Abs())
+					if err != nil {
+						return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
+					}
 				}
 
 				return nil
