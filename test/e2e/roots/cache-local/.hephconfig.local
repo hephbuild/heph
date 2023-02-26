@@ -1,4 +1,4 @@
-cache:
+caches:
   master:
     uri: <URI>
     read: true

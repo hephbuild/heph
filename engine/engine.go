@@ -100,7 +100,7 @@ type PlatformProvider struct {
 type Config struct {
 	config.Config
 	Profiles []string
-	Cache    []CacheConfig
+	Caches   []CacheConfig
 }
 
 type CacheConfig struct {
@@ -637,7 +637,12 @@ func (e *Engine) parseConfigs() error {
 	}
 	cfg.Watch.Ignore = append(cfg.Watch.Ignore, e.HomeDir.Join(".heph/**/*").Abs())
 
-	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
+	err := config.ParseAndApply("/etc/.hephconfig", &cfg)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	err = config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {
 		return err
 	}
@@ -656,13 +661,17 @@ func (e *Engine) parseConfigs() error {
 
 	e.Config.Config = cfg
 
-	for name, cache := range cfg.Cache {
-		loc, err := vfssimple.NewLocation(cache.URI)
+	for name, cache := range cfg.Caches {
+		uri := cache.URI
+		if !strings.HasSuffix(uri, "/") {
+			uri += "/"
+		}
+		loc, err := vfssimple.NewLocation(uri)
 		if err != nil {
 			return fmt.Errorf("cache %v :%w", name, err)
 		}
 
-		e.Config.Cache = append(e.Config.Cache, CacheConfig{
+		e.Config.Caches = append(e.Config.Caches, CacheConfig{
 			Name:     name,
 			Cache:    cache,
 			Location: loc,

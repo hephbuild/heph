@@ -90,8 +90,8 @@ func orderCaches(ctx context.Context, caches []CacheConfig) []CacheConfig {
 }
 
 func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
-	if len(e.Config.Cache) <= 1 || e.Config.CacheOrder != config.CacheOrderLatency {
-		return e.Config.Cache, nil
+	if len(e.Config.Caches) <= 1 || e.Config.CacheOrder != config.CacheOrderLatency {
+		return e.Config.Caches, nil
 	}
 
 	if e.orderedCaches != nil {
@@ -111,7 +111,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 	h := hash.NewHash()
 	h.I64(1)
 	h.String(e.Config.Version.String)
-	hash.HashArray(h, e.Config.Cache, func(c CacheConfig) string {
+	hash.HashArray(h, e.Config.Caches, func(c CacheConfig) string {
 		return c.Name + "|" + c.URI
 	})
 
@@ -120,7 +120,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 
 	names, err := utils.HashCache(cachePath, cacheHash, func() ([]string, error) {
 		log.Infof("Measuring caches latency...")
-		ordered := orderCaches(ctx, e.Config.Cache)
+		ordered := orderCaches(ctx, e.Config.Caches)
 
 		return utils.Map(ordered, func(c CacheConfig) string {
 			return c.Name
@@ -128,7 +128,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 	})
 
 	cacheMap := map[string]CacheConfig{}
-	for _, c := range e.Config.Cache {
+	for _, c := range e.Config.Caches {
 		cacheMap[c.Name] = c
 	}
 

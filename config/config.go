@@ -22,7 +22,7 @@ const (
 
 type Config struct {
 	BaseConfig   `yaml:",inline"`
-	Cache        map[string]Cache
+	Caches       map[string]Cache
 	CacheOrder   string `yaml:"cache_order"`
 	CacheHistory int    `yaml:"cache_history"`
 	Engine       struct {

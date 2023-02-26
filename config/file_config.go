@@ -4,7 +4,7 @@ type Extras map[string]interface{}
 
 type FileConfig struct {
 	BaseConfig   `yaml:",inline"`
-	Cache        map[string]FileCache `yaml:",omitempty"`
+	Caches       map[string]FileCache `yaml:"caches,omitempty"`
 	CacheOrder   string               `yaml:"cache_order"`
 	CacheHistory int                  `yaml:"cache_history"`
 	Engine       struct {
@@ -15,14 +15,14 @@ type FileConfig struct {
 	} `yaml:"engine"`
 	Platforms  map[string]FilePlatform `yaml:"platforms"`
 	BuildFiles struct {
-		Ignore []string            `yaml:",omitempty"`
-		Roots  map[string]FileRoot `yaml:",omitempty"`
+		Ignore []string            `yaml:"ignore,omitempty"`
+		Roots  map[string]FileRoot `yaml:"roots,omitempty"`
 		Glob   struct {
-			Exclude []string `yaml:"exclude,omitempty"`
+			Exclude []string `yaml:"exclude"`
 		} `yaml:"glob"`
 	} `yaml:"build_files"`
 	Watch struct {
-		Ignore []string `yaml:",omitempty"`
+		Ignore []string `yaml:"ignore,omitempty"`
 	} `yaml:"watch"`
 	Params map[string]string `yaml:"params"`
 	Extras `yaml:",inline"`
@@ -59,15 +59,15 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		c.CacheOrder = fc.CacheOrder
 	}
 
-	if len(fc.Cache) == 0 && fc.Cache != nil {
-		c.Cache = nil
+	if len(fc.Caches) == 0 && fc.Caches != nil {
+		c.Caches = nil
 	} else {
-		if c.Cache == nil {
-			c.Cache = map[string]Cache{}
+		if c.Caches == nil {
+			c.Caches = map[string]Cache{}
 		}
 
-		for k, newCache := range fc.Cache {
-			c.Cache[k] = newCache.ApplyTo(c.Cache[k])
+		for k, newCache := range fc.Caches {
+			c.Caches[k] = newCache.ApplyTo(c.Caches[k])
 		}
 	}
 

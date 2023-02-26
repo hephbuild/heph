@@ -1,4 +1,4 @@
-cache:
+caches:
   gha:
     uri: file:///tmp/heph-cache/
     read: true
