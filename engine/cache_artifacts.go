@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 type outTarArtifact struct {
@@ -99,6 +100,7 @@ type ManifestData struct {
 	InputHash  string                       `json:"input_hash,omitempty"`
 	DepsHashes map[string]map[string]string `json:"deps_hashes,omitempty"`
 	OutHashes  map[string]string            `json:"out_hashes,omitempty"`
+	Timestamp  time.Time                    `json:"timestamp"`
 }
 
 func (a manifestArtifact) git(args ...string) string {
@@ -122,6 +124,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) er
 		InputHash:  a.Engine.hashInput(a.Target),
 		DepsHashes: map[string]map[string]string{},
 		OutHashes:  map[string]string{},
+		Timestamp:  time.Now(),
 	}
 
 	e := a.Engine
