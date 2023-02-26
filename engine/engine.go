@@ -633,6 +633,7 @@ func (e *Engine) parseConfigs() error {
 			Priority: 100,
 		},
 	}
+	cfg.Watch.Ignore = append(cfg.Watch.Ignore, e.HomeDir.Join(".heph/**/*").Abs())
 
 	err := config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
 	if err != nil {

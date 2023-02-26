@@ -355,6 +355,7 @@ func (w *watchCtx) watchFiles() error {
 				err = w.triggerRun(currentEvents)
 				if err != nil {
 					log.Error(err)
+					return
 				}
 				eventsAccumulator = nil
 			})

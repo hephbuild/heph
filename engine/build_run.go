@@ -337,13 +337,21 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 		return nil, err
 	}
 
-	f, err = os.Create(cachePath)
+	cachePathTmp := cachePath + "_tmp_" + InstanceUID
+
+	f, err = os.Create(cachePathTmp)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	defer os.Remove(cachePathTmp)
 
 	err = mod.Write(f)
+	if err != nil {
+		return nil, err
+	}
+
+	err = os.Rename(cachePathTmp, cachePath)
 	if err != nil {
 		return nil, err
 	}

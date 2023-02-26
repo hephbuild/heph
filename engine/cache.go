@@ -103,7 +103,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 
 		externalCached, err := e.pullExternalCache(ctx, target, outputs, onlyMeta, cache)
 		if err != nil {
-			log.Errorf("%v: %v", cache.Name, err)
+			log.Warnf("%v: %v", cache.Name, err)
 			continue
 		}
 
