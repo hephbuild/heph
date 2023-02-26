@@ -2,7 +2,6 @@ package config
 
 import (
 	log "heph/hlog"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -22,27 +21,29 @@ const (
 )
 
 type Config struct {
-	BaseConfig        `yaml:",inline"`
-	CacheOrder        string `yaml:"cache_order"`
-	Cache             map[string]Cache
-	CacheHistory      int                 `yaml:"cache_history"`
-	DisableGC         bool                `yaml:"disable_gc"`
-	DisableCacheHints bool                `yaml:"disable_cache_hints"`
-	InstallTools      bool                `yaml:"install_tools"`
-	Platforms         map[string]Platform `yaml:"platforms"`
-	BuildFiles        struct {
+	BaseConfig   `yaml:",inline"`
+	Cache        map[string]Cache
+	CacheOrder   string `yaml:"cache_order"`
+	CacheHistory int    `yaml:"cache_history"`
+	Engine       struct {
+		GC           bool `yaml:"gc"`
+		CacheHints   bool `yaml:"cache_hints"`
+		InstallTools bool `yaml:"install_tools"`
+		KeepSandbox  bool `yaml:"keep_sandbox"`
+	} `yaml:"engine"`
+	Platforms  map[string]Platform `yaml:"platforms"`
+	BuildFiles struct {
 		Ignore []string        `yaml:"ignore"`
 		Roots  map[string]Root `yaml:"roots"`
+		Glob   struct {
+			Exclude []string `yaml:"exclude"`
+		} `yaml:"glob"`
 	} `yaml:"build_files"`
-	Glob struct {
-		Exclude []string `yaml:"exclude"`
-	} `yaml:"glob"`
 	Watch struct {
 		Ignore []string `yaml:"ignore"`
 	} `yaml:"watch"`
-	KeepSandbox bool              `yaml:"keep_sandbox"`
-	Params      map[string]string `yaml:"params"`
-	Extras      `yaml:",inline"`
+	Params map[string]string `yaml:"params"`
+	Extras `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`
 }
@@ -85,13 +86,10 @@ func Parse(name string) (FileConfig, error) {
 	}
 	defer f.Close()
 
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return FileConfig{}, err
-	}
-
 	var cfg FileConfig
-	err = yaml.Unmarshal(b, &cfg)
+	dec := yaml.NewDecoder(f)
+	// dec.KnownFields(true)
+	err = dec.Decode(&cfg)
 	if err != nil {
 		return FileConfig{}, err
 	}

@@ -62,7 +62,7 @@ func (e *Engine) Parse(ctx context.Context) error {
 	}
 	log.Debugf("ProcessTargets took %v", time.Since(processStartTime))
 
-	if e.Config.InstallTools {
+	if e.Config.Engine.InstallTools {
 		err = e.InstallTools(ctx)
 		if err != nil {
 			return err

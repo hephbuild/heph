@@ -3,27 +3,29 @@ package config
 type Extras map[string]interface{}
 
 type FileConfig struct {
-	BaseConfig        `yaml:",inline"`
-	CacheOrder        string                  `yaml:"cache_order"`
-	Cache             map[string]FileCache    `yaml:",omitempty"`
-	CacheHistory      int                     `yaml:"cache_history"`
-	DisableGC         *bool                   `yaml:"disable_gc"`
-	DisableCacheHints *bool                   `yaml:"disable_cache_hints"`
-	InstallTools      *bool                   `yaml:"install_tools"`
-	Platforms         map[string]FilePlatform `yaml:"platforms"`
-	BuildFiles        struct {
+	BaseConfig   `yaml:",inline"`
+	Cache        map[string]FileCache `yaml:",omitempty"`
+	CacheOrder   string               `yaml:"cache_order"`
+	CacheHistory int                  `yaml:"cache_history"`
+	Engine       struct {
+		GC           *bool `yaml:"gc"`
+		CacheHints   *bool `yaml:"cache_hints"`
+		InstallTools *bool `yaml:"install_tools"`
+		KeepSandbox  *bool `yaml:"keep_sandbox"`
+	} `yaml:"engine"`
+	Platforms  map[string]FilePlatform `yaml:"platforms"`
+	BuildFiles struct {
 		Ignore []string            `yaml:",omitempty"`
 		Roots  map[string]FileRoot `yaml:",omitempty"`
+		Glob   struct {
+			Exclude []string `yaml:"exclude,omitempty"`
+		} `yaml:"glob"`
 	} `yaml:"build_files"`
-	Glob struct {
-		Exclude []string `yaml:"exclude,omitempty"`
-	} `yaml:"glob"`
 	Watch struct {
 		Ignore []string `yaml:",omitempty"`
 	} `yaml:"watch"`
-	KeepSandbox *bool             `yaml:"keep_sandbox"`
-	Params      map[string]string `yaml:"params"`
-	Extras      `yaml:",inline"`
+	Params map[string]string `yaml:"params"`
+	Extras `yaml:",inline"`
 }
 
 func (fc FileConfig) ApplyTo(c Config) Config {
@@ -37,20 +39,20 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		c.Location = fc.Location
 	}
 
-	if fc.KeepSandbox != nil {
-		c.KeepSandbox = *fc.KeepSandbox
+	if fc.Engine.KeepSandbox != nil {
+		c.Engine.KeepSandbox = *fc.Engine.KeepSandbox
 	}
 
-	if fc.DisableGC != nil {
-		c.DisableGC = *fc.DisableGC
+	if fc.Engine.GC != nil {
+		c.Engine.GC = *fc.Engine.GC
 	}
 
-	if fc.DisableCacheHints != nil {
-		c.DisableCacheHints = *fc.DisableCacheHints
+	if fc.Engine.CacheHints != nil {
+		c.Engine.CacheHints = *fc.Engine.CacheHints
 	}
 
-	if fc.InstallTools != nil {
-		c.InstallTools = *fc.InstallTools
+	if fc.Engine.InstallTools != nil {
+		c.Engine.InstallTools = *fc.Engine.InstallTools
 	}
 
 	if fc.CacheOrder != "" {
@@ -91,7 +93,7 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	}
 
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)
-	c.Glob.Exclude = append(c.Glob.Exclude, fc.Glob.Exclude...)
+	c.BuildFiles.Glob.Exclude = append(c.BuildFiles.Glob.Exclude, fc.BuildFiles.Glob.Exclude...)
 	c.Watch.Ignore = append(c.Watch.Ignore, fc.Watch.Ignore...)
 
 	if c.Extras == nil {

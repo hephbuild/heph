@@ -701,7 +701,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		}
 	}
 
-	if !e.Config.KeepSandbox {
+	if !e.Config.Engine.KeepSandbox {
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
@@ -870,7 +870,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 }
 
 func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
-	if target.Cache.Enabled && !e.Config.DisableGC {
+	if target.Cache.Enabled && e.Config.Engine.GC {
 		e.Status(TargetStatus(target, "GC..."))
 
 		err := e.GCTargets([]*Target{target}, nil, false)

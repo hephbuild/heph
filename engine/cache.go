@@ -113,7 +113,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 
 			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
 		} else {
-			if !e.Config.DisableCacheHints {
+			if e.Config.Engine.CacheHints {
 				children, err := e.DAG().GetDescendants(target)
 				if err != nil {
 					log.Error(fmt.Errorf("descendants: %w", err))

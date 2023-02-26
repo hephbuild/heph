@@ -238,7 +238,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 
 	allExclude := exclude.Array
 	allExclude = append(allExclude, "**/.heph")
-	allExclude = append(allExclude, e.Config.Glob.Exclude...)
+	allExclude = append(allExclude, e.Config.BuildFiles.Glob.Exclude...)
 
 	elems := make([]starlark.Value, 0)
 	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
