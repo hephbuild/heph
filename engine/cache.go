@@ -10,26 +10,19 @@ import (
 	log "heph/hlog"
 	"heph/rcache"
 	"heph/utils/fs"
+	"heph/utils/instance"
 	"os"
-	"time"
 )
 
 func (e *Engine) cacheDir(target *Target) fs.Path {
 	return e.cacheDirForHash(target, e.hashInput(target))
 }
 
-func genInstanceUid() string {
-	host, _ := os.Hostname()
-	return fmt.Sprintf("%v%v%v", os.Getpid(), host, time.Now().Nanosecond())
-}
-
-var InstanceUID = genInstanceUid()
-
 func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	// TODO: cache
 	folder := "__target_" + target.Name
 	if !target.Cache.Enabled {
-		folder = "__target_tmp_" + InstanceUID + "_" + target.Name
+		folder = "__target_tmp_" + instance.UID + "_" + target.Name
 	}
 	return e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
 }

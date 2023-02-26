@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"heph/utils/fs"
+	"os"
 	"path/filepath"
 )
 
@@ -66,7 +67,10 @@ func (a Func) Gen(ctx context.Context, gctx GenContext) error {
 
 func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext) (string, error) {
 	p := filepath.Join(dir, a.Name())
-	gctx.ArtifactPath = p
+	tmpp := fs.ProcessUniquePath(p)
+	defer os.Remove(tmpp)
+
+	gctx.ArtifactPath = tmpp
 
 	err := a.Gen(ctx, gctx)
 	if err != nil {
@@ -79,8 +83,13 @@ func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext) (
 		return "", fmt.Errorf("%v: %w", a.Name(), err)
 	}
 
-	if !fs.PathExists(p) {
+	if !fs.PathExists(tmpp) {
 		return "", fmt.Errorf("%v did not produce output", a.Name())
+	}
+
+	err = os.Rename(tmpp, p)
+	if err != nil {
+		return "", err
 	}
 
 	return p, nil

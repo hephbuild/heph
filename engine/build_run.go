@@ -315,14 +315,14 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 		return nil, err
 	}
 
-	f, err := os.Open(cachePath)
+	cf, err := os.Open(cachePath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return nil, err
 	}
 
-	if f != nil {
-		mod, err := safelyCompileProgram(f)
-		_ = f.Close()
+	if cf != nil {
+		mod, err := safelyCompileProgram(cf)
+		_ = cf.Close()
 		if err == nil {
 			return mod, nil
 		}
@@ -337,21 +337,13 @@ func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDi
 		return nil, err
 	}
 
-	cachePathTmp := cachePath + "_tmp_" + InstanceUID
-
-	f, err = os.Create(cachePathTmp)
+	f, err := fs2.AtomicCreate(cachePath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	defer os.Remove(cachePathTmp)
 
 	err = mod.Write(f)
-	if err != nil {
-		return nil, err
-	}
-
-	err = os.Rename(cachePathTmp, cachePath)
 	if err != nil {
 		return nil, err
 	}

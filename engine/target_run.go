@@ -20,7 +20,6 @@ import (
 	"io"
 	fs2 "io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -143,17 +142,6 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 		if err != nil {
 			return nil, err
-		}
-	}
-
-	// Allow building from within a sandbox, especially useful for isolated e2e
-	if utils.HephFromPath && utils.IsDevVersion() {
-		if target.Tools.HasHeph() {
-			var err error
-			bin["go"], err = exec.LookPath("go")
-			if err != nil {
-				return nil, err
-			}
 		}
 	}
 

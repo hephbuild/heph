@@ -23,6 +23,7 @@ import (
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
 	"heph/utils/hash"
+	"heph/utils/instance"
 	"heph/utils/maps"
 	"heph/utils/sets"
 	"heph/utils/tar"
@@ -531,7 +532,7 @@ func (e *Engine) populateActualFilesFromTar(target *Target) error {
 func (e *Engine) sandboxRoot(target *Target) fs2.Path {
 	folder := "__target_" + target.Name
 	if target.ConcurrentExecution {
-		folder = "__target_tmp_" + InstanceUID + "_" + target.Name
+		folder = "__target_tmp_" + instance.UID + "_" + target.Name
 	}
 
 	p := e.HomeDir.Join("sandbox", target.Package.FullName, folder)
