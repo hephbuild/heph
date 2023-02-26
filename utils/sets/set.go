@@ -41,24 +41,15 @@ func (ts *Set[K, T]) Add(t T) bool {
 }
 
 func (ts *Set[K, T]) Has(t T) bool {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return ts.has(t)
 }
 
-func (ts *Set[K, T]) HasKey(k K) bool {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-
-	_, ok := ts.m[k]
-
-	return ok
-}
-
 func (ts *Set[K, T]) GetKey(k K) T {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return ts.m[k]
 }

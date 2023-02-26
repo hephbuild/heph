@@ -457,7 +457,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		rspan.EndError(rerr)
 	}()
 
-	err := e.LinkTarget(target, NewTargets(0))
+	err := e.LinkTarget(target, nil)
 	if err != nil {
 		return err
 	}

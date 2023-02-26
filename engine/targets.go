@@ -99,14 +99,5 @@ func (ts *Targets) Find(fqn string) *Target {
 		return nil
 	}
 
-	if !ts.HasKey(fqn) {
-		return nil
-	}
-
-	target := ts.GetKey(fqn)
-	if target != nil {
-		return target
-	}
-
-	panic("target not found, this should not happen")
+	return ts.GetKey(fqn)
 }
