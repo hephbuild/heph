@@ -33,7 +33,7 @@ require (
 	go.opentelemetry.io/otel/exporters/jaeger v1.11.1
 	go.opentelemetry.io/otel/sdk v1.11.1
 	go.opentelemetry.io/otel/trace v1.11.1
-	go.starlark.net v0.0.0-20230128213706-3f75dec8e403
+	go.starlark.net v0.0.0-20230224151120-c52844e64a10
 	go.uber.org/multierr v1.8.0
 	golang.org/x/exp v0.0.0-20221114191408-850992195362
 	golang.org/x/sys v0.1.0
