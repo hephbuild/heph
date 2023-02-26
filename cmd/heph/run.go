@@ -7,6 +7,7 @@ import (
 	"heph/engine"
 	log "heph/hlog"
 	"heph/sandbox"
+	"heph/tgt"
 	"heph/worker"
 	"os"
 	"os/exec"
@@ -45,7 +46,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	}
 
 	var inlineInvocationTarget *engine.TargetRunRequest
-	var inlineTarget *engine.Target
+	var inlineTarget *tgt.Target
 	if len(rrs) == 1 && inlineSingle && !*noInline {
 		inlineInvocationTarget = &rrs[0]
 		inlineInvocationTarget.Mode = mode
@@ -80,7 +81,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	if inlineInvocationTarget == nil {
 		if printOutput.bool {
 			for _, target := range rrs.Targets() {
-				err = printTargetOutput(target, printOutput.str)
+				err = printTargetOutput(e.Targets.Find(target), printOutput.str)
 				if err != nil {
 					return err
 				}
@@ -118,7 +119,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	}
 
 	if printOutput.bool {
-		err = printTargetOutput(inlineTarget, printOutput.str)
+		err = printTargetOutput(e.Targets.Find(inlineTarget), printOutput.str)
 		if err != nil {
 			return err
 		}

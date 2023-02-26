@@ -71,8 +71,8 @@ func (wg *WaitGroup) DoneSem() {
 }
 
 func (wg *WaitGroup) Jobs() []*Job {
-	jobs := wg.jobs[:]
-	for _, wg := range wg.wgs[:] {
+	jobs := wg.jobs
+	for _, wg := range wg.wgs {
 		jobs = append(jobs, wg.Jobs()...)
 	}
 

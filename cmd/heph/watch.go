@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"heph/engine"
 	log "heph/hlog"
+	"heph/tgt"
 	"heph/utils/fs"
 	"os"
 	"path/filepath"
@@ -33,7 +34,7 @@ type watchCtx struct {
 	runCancel context.CancelFunc
 	runCh     chan struct{}
 	rrs       engine.TargetRunRequests
-	targets   *engine.Targets
+	targets   *tgt.TargetsSet
 
 	m           sync.Mutex
 	graphSigsCh chan struct{}
@@ -219,7 +220,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 		}
 
 		for _, target := range descendants {
-			w.e.ResetCacheHashInput(target)
+			w.e.ResetCacheHashInput(w.e.Targets.Find(target))
 
 			if target.Gen {
 				w.e.RanGenPass = false
@@ -233,7 +234,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 			localRRs = w.rrs
 		} else {
 			for _, target := range descendants {
-				if w.targets.Find(target.FQN) != nil {
+				if w.targets.Find(target) != nil {
 					localRRs = append(localRRs, w.rrs.Get(target))
 				}
 			}
@@ -277,7 +278,7 @@ func (w *watchCtx) runGraph(args []string) error {
 		return nil
 	}
 
-	w.targets = engine.NewTargets(len(w.rrs))
+	w.targets = tgt.NewTargetsSet(len(w.rrs))
 	for _, inv := range w.rrs {
 		w.targets.Add(inv.Target)
 	}

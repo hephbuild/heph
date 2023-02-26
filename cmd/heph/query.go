@@ -12,6 +12,7 @@ import (
 	"heph/targetspec"
 	"heph/tgt"
 	"heph/utils"
+	"heph/utils/fs"
 	"heph/utils/sets"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ var include []string
 var exclude []string
 var spec bool
 var transitive bool
+var files bool
 var output string
 var all bool
 
@@ -53,6 +55,9 @@ func init() {
 
 	revdepsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
+
+	revdepsCmd.Flags().BoolVar(&files, "files", false, "Query files")
+	depsCmd.Flags().BoolVar(&files, "files", false, "Query files")
 
 	outCmd.Flags().StringVar(&output, "output", "", "Output name")
 
@@ -100,9 +105,9 @@ var queryCmd = &cobra.Command{
 				return err
 			}
 
-			targets := engine.NewTargets(len(stargets))
+			targets = make([]*engine.Target, 0, len(stargets))
 			for _, target := range stargets {
-				targets.Add(Engine.Targets.Find(target.FQN))
+				targets = append(targets, Engine.Targets.Find(target))
 			}
 		} else {
 			if !all {
@@ -309,8 +314,8 @@ digraph G  {
 	node [fontsize=10, shape=box, height=0.25]
 	edge [fontsize=10]
 `)
-		id := func(target *engine.Target) string {
-			return strconv.Quote(target.FQN)
+		id := func(target targetspec.TargetBase) string {
+			return strconv.Quote(target.GetFQN())
 		}
 
 		for _, target := range dag.GetVertices() {
@@ -417,7 +422,7 @@ var targetCmd = &cobra.Command{
 			return err
 		}
 
-		target := Engine.Targets.Find(tp.Full())
+		target := Engine.Targets.Find(tp)
 		if target == nil {
 			return engine.NewTargetNotFoundError(tp.Full())
 		}
@@ -532,6 +537,40 @@ var depsCmd = &cobra.Command{
 			return err
 		}
 
+		if files {
+			fn := func(target *tgt.Target) ([]fs.Path, error) {
+				return target.Deps.All().Files, nil
+			}
+			if transitive {
+				fn = func(target *tgt.Target) ([]fs.Path, error) {
+					ancs, err := Engine.DAG().GetAncestors(target)
+					if err != nil {
+						return nil, err
+					}
+
+					files := sets.NewSet(func(t fs.Path) string {
+						return t.Abs()
+					}, 0)
+					for _, anc := range ancs {
+						files.AddAll(anc.Deps.All().Files)
+					}
+
+					return files.Slice(), nil
+				}
+			}
+
+			files, err := fn(target)
+			if err != nil {
+				return err
+			}
+
+			for _, file := range files {
+				fmt.Println(file)
+			}
+
+			return nil
+		}
+
 		fn := Engine.DAG().GetParents
 		if transitive {
 			fn = Engine.DAG().GetAncestors
@@ -578,7 +617,7 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		target := Engine.Targets.Find(tp.Full())
+		target := Engine.Targets.Find(tp)
 		if target == nil {
 			return engine.NewTargetNotFoundError(tp.Full())
 		}
@@ -649,7 +688,9 @@ var outCmd = &cobra.Command{
 			return err
 		}
 
-		err = printTargetOutput(target, output)
+		etarget := Engine.Targets.Find(target)
+
+		err = printTargetOutput(etarget, output)
 		if err != nil {
 			return err
 		}
@@ -676,7 +717,9 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
+		etarget := Engine.Targets.Find(target)
+
+		fmt.Println(filepath.Dir(etarget.OutExpansionRoot.Abs()))
 
 		return nil
 	},
@@ -722,9 +765,11 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
+		etarget := Engine.Targets.Find(target)
+
+		names := targetspec.SortOutputsForHashing(etarget.ActualOutFiles().Names())
 		for _, name := range names {
-			fmt.Println(name+":", Engine.HashOutput(target, name))
+			fmt.Println(name+":", Engine.HashOutput(etarget, name))
 		}
 
 		return nil
@@ -744,7 +789,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, []*engine.Target{target}, target)
+		tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, []*tgt.Target{target}, target)
 		if err != nil {
 			return err
 		}
@@ -754,7 +799,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(Engine.HashInput(target))
+		fmt.Println(Engine.HashInput(Engine.Targets.Find(target)))
 
 		return nil
 	},

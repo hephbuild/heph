@@ -92,7 +92,7 @@ type runPrepare struct {
 }
 
 func (e *TargetRunEngine) toolAbsPath(tt tgt.TargetTool) string {
-	return tt.File.WithRoot(e.Targets.Find(tt.Target.FQN).OutExpansionRoot.Abs()).Abs()
+	return tt.File.WithRoot(e.Targets.Find(tt.Target).OutExpansionRoot.Abs()).Abs()
 }
 
 func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
@@ -105,13 +105,13 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
-		if e.Targets.Find(tool.Target.FQN).actualOutFiles == nil {
+		if e.Targets.Find(tool.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		if e.Targets.Find(dep.Target.FQN).actualOutFiles == nil {
+		if e.Targets.Find(dep.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
@@ -182,7 +182,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	for _, deps := range target.Deps.Named() {
 		var deplength int
 		for _, dep := range deps.Targets {
-			deplength += len(e.Targets.Find(dep.Target.FQN).ActualOutFiles().Name(dep.Output))
+			deplength += len(e.Targets.Find(dep.Target).ActualOutFiles().Name(dep.Output))
 		}
 		deplength += len(deps.Files)
 
@@ -194,7 +194,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
-			dept := e.Targets.Find(dep.Target.FQN)
+			dept := e.Targets.Find(dep.Target)
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -430,7 +430,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}
 
 	for k, expr := range target.RuntimeEnv {
-		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target.FQN)))
+		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target)))
 		if err != nil {
 			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 		}
@@ -450,14 +450,14 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 }
 
 func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
-	target := rr.Target
+	target := e.Targets.Find(rr.Target)
 
 	ctx, rspan := e.SpanRun(ctx, target)
 	defer func() {
 		rspan.EndError(rerr)
 	}()
 
-	err := e.LinkTarget(target, NewTargets(0))
+	err := e.LinkTarget(target, nil)
 	if err != nil {
 		return err
 	}

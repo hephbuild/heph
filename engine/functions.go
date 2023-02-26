@@ -26,7 +26,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 	getTarget := func(expr exprs.Expr) (*Target, error) {
 		fqn := expr.PosArg(0, t.FQN)
 
-		target := e.Targets.Find(fqn)
+		target := e.Targets.FindBy(fqn)
 		if target == nil {
 			return nil, NewTargetNotFoundError(fqn)
 		}
@@ -48,7 +48,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t)
+			universe = append(universe, t.Target)
 
 			if !Contains(universe, t.FQN) {
 				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
@@ -70,13 +70,13 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t)
+			universe = append(universe, t.Target)
 
 			if !Contains(universe, t.FQN) {
 				return "", fmt.Errorf("cannot get input of %v", t.FQN)
 			}
 
-			return e.hashInput(t), nil
+			return e.hashInput(e.Targets.Find(t)), nil
 		},
 		"hash_output": func(expr exprs.Expr) (string, error) {
 			fqn, err := expr.MustPosArg(0)
@@ -84,7 +84,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			t := e.Targets.Find(fqn)
+			t := e.Targets.FindBy(fqn)
 			if t == nil {
 				return "", NewTargetNotFoundError(fqn)
 			}
@@ -183,7 +183,7 @@ func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
 
 	parts := strings.Split(t.Package.FullName, "/")
 	for len(parts) > 0 {
-		t := e.Targets.Find("//" + strings.Join(parts, "/") + selector)
+		t := e.Targets.FindBy("//" + strings.Join(parts, "/") + selector)
 		if t != nil {
 			return t, nil
 		}

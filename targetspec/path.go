@@ -16,6 +16,10 @@ func (p TargetPath) Full() string {
 	return "//" + p.Package + ":" + p.Name
 }
 
+func (p TargetPath) GetFQN() string {
+	return p.Full()
+}
+
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
 const numbers = `0123456789`
 

@@ -69,7 +69,7 @@ type Analysis struct {
 	// Fuzz targets (supported on Go 1.18+).
 	FuzzTargets []*TestFunc
 
-	// Set with location of any `TestMain` function. `nil` if no `TestMain` supplied.
+	// Store with location of any `TestMain` function. `nil` if no `TestMain` supplied.
 	TestMain *TestFunc
 
 	ImportPath  string

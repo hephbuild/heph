@@ -22,7 +22,6 @@ import (
 	"heph/utils"
 	"heph/utils/flock"
 	fs2 "heph/utils/fs"
-	"heph/utils/hash"
 	"heph/utils/instance"
 	"heph/utils/maps"
 	"heph/utils/sets"
@@ -77,7 +76,7 @@ type Engine struct {
 	tools                      *Targets
 	fetchRootCache             map[string]fs2.Path
 	cacheRunBuildFileCache     *maps.Map[string, starlark.StringDict]
-	cacheRunBuildFileLocks     *maps.Map[string, flock.Locker]
+	cacheRunBuildFileLocks     *maps.Map[string, *sync.Mutex]
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -114,7 +113,7 @@ type RunStatus struct {
 }
 
 type TargetRunRequest struct {
-	Target  *Target
+	Target  *tgt.Target
 	Args    []string
 	NoCache bool
 	Shell   bool
@@ -135,7 +134,7 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 	return false
 }
 
-func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
+func (rrs TargetRunRequests) Get(t *tgt.Target) TargetRunRequest {
 	for _, rr := range rrs {
 		if rr.Target.FQN == t.FQN {
 			return rr
@@ -145,8 +144,8 @@ func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
 	return TargetRunRequest{Target: t}
 }
 
-func (rrs TargetRunRequests) Targets() []*Target {
-	ts := make([]*Target, 0, len(rrs))
+func (rrs TargetRunRequests) Targets() []*tgt.Target {
+	ts := make([]*tgt.Target, 0, len(rrs))
 
 	for _, rr := range rrs {
 		ts = append(ts, rr.Target)
@@ -200,8 +199,8 @@ func New(rootPath string) *Engine {
 		tools:                  NewTargets(0),
 		fetchRootCache:         map[string]fs2.Path{},
 		cacheRunBuildFileCache: &maps.Map[string, starlark.StringDict]{},
-		cacheRunBuildFileLocks: &maps.Map[string, flock.Locker]{Default: func(k string) flock.Locker {
-			return flock.NewMutex(k)
+		cacheRunBuildFileLocks: &maps.Map[string, *sync.Mutex]{Default: func(k string) *sync.Mutex {
+			return &sync.Mutex{}
 		}},
 		Labels:                sets.NewStringSet(0),
 		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
@@ -218,15 +217,6 @@ func (e *Engine) DAG() *DAG {
 
 func (e *Engine) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
-}
-
-func hashCacheId(target *Target) string {
-	idh := hash.NewHash()
-	for _, fqn := range target.linkingDeps.FQNs() {
-		idh.String(fqn)
-	}
-
-	return target.FQN + idh.Sum()
 }
 
 type ErrorWithLogFile struct {
@@ -249,7 +239,7 @@ func (t ErrorWithLogFile) Is(target error) bool {
 }
 
 type TargetFailedError struct {
-	Target *Target
+	Target *tgt.Target
 	Err    error
 }
 
@@ -303,7 +293,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target, skip *Target) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*tgt.Target, skip *tgt.Target) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -327,12 +317,12 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *tgt.Target) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func TargetStatus(t *Target, status string) worker.Status {
-	return targetStatus{t.FQN, "", status}
+func TargetStatus(t targetspec.TargetBase, status string) worker.Status {
+	return targetStatus{t.GetFQN(), "", status}
 }
 
 type targetStatus struct {
@@ -705,19 +695,19 @@ func (e *Engine) registerLabels(labels []string) {
 	}
 }
 
-func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
-	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
+func (e *Engine) GetFileDeps(targets ...*tgt.Target) []fs2.Path {
+	return e.getFileDeps(targets, func(target *tgt.Target) tgt.TargetDeps {
 		return target.Deps.All()
 	})
 }
 
-func (e *Engine) GetFileHashDeps(targets ...*Target) []fs2.Path {
-	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
+func (e *Engine) GetFileHashDeps(targets ...*tgt.Target) []fs2.Path {
+	return e.getFileDeps(targets, func(target *tgt.Target) tgt.TargetDeps {
 		return target.HashDeps
 	})
 }
 
-func (e *Engine) getFileDeps(targets []*Target, f func(*Target) tgt.TargetDeps) []fs2.Path {
+func (e *Engine) getFileDeps(targets []*tgt.Target, f func(*tgt.Target) tgt.TargetDeps) []fs2.Path {
 	filesm := map[string]fs2.Path{}
 	for _, target := range targets {
 		for _, file := range f(target).Files {
@@ -765,8 +755,8 @@ func (e *Engine) GetWatcherList(files []fs2.Path) []string {
 	return paths
 }
 
-func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {
-	descendants := NewTargets(0)
+func (e *Engine) GetFileDescendants(paths []string, targets []*tgt.Target) ([]*tgt.Target, error) {
+	descendants := tgt.NewTargetsSet(0)
 
 	for _, path := range paths {
 		for _, target := range targets {
@@ -779,9 +769,7 @@ func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Targe
 		}
 	}
 
-	descendants.Sort()
-
-	return descendants.Slice(), nil
+	return descendants.Sorted(), nil
 }
 
 func (e *Engine) RegisterRemove(path string) {

@@ -29,7 +29,7 @@ func (e *Engine) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) {
 		}
 
 		h.String(dep.Target.FQN)
-		dh := e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		dh := e.hashOutput(e.Targets.Find(dep.Target), dep.Output)
 		h.String(dh)
 
 		if dep.Mode != targetspec.TargetSpecDepModeCopy {
@@ -172,7 +172,7 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 	e.hashFiles(h, targetspec.HashFileModTime, target.Deps.All().Files)
 
 	for _, dep := range target.Deps.All().Targets {
-		err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
+		err := e.hashInputFiles(h, e.Targets.Find(dep.Target))
 		if tgt.ErrStopWalk != nil {
 			return err
 		}
@@ -182,7 +182,7 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 		e.hashFiles(h, targetspec.HashFileModTime, target.HashDeps.Files)
 
 		for _, dep := range target.HashDeps.Targets {
-			err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
+			err := e.hashInputFiles(h, e.Targets.Find(dep.Target))
 			if tgt.ErrStopWalk != nil {
 				return err
 			}
@@ -194,6 +194,15 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 
 func (e *Engine) HashInput(target *Target) string {
 	return e.hashInput(target)
+}
+
+func hashCacheId(target *Target) string {
+	idh := hash.NewHash()
+	for _, fqn := range target.linkingDeps.FQNs() {
+		idh.String(fqn)
+	}
+
+	return target.FQN + idh.Sum()
 }
 
 func (e *Engine) hashInput(target *Target) string {
@@ -219,7 +228,7 @@ func (e *Engine) hashInput(target *Target) string {
 	for _, dep := range target.Tools.Targets {
 		h.String(dep.Name)
 
-		dh := e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		dh := e.hashOutput(e.Targets.Find(dep.Target), dep.Output)
 		h.String(dh)
 	}
 

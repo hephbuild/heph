@@ -90,6 +90,19 @@ func (ts TargetSpecs) Get(fqn string) (TargetSpec, bool) {
 	return TargetSpec{}, false
 }
 
+type TargetFQN interface {
+	GetFQN() string
+}
+
+type TargetBase interface {
+	TargetFQN
+	GetSpec() TargetSpec
+	IsPrivate() bool
+	IsGroup() bool
+	IsTool() bool
+	IsTextFile() bool
+}
+
 type TargetSpec struct {
 	Name    string
 	FQN     string
@@ -142,6 +155,14 @@ type TargetSpecTransitive struct {
 	PassEnv        []string
 	RuntimePassEnv []string
 	RuntimeEnv     map[string]string
+}
+
+func (t TargetSpec) GetFQN() string {
+	return t.FQN
+}
+
+func (t TargetSpec) GetSpec() TargetSpec {
+	return t
 }
 
 func (t TargetSpec) IsPrivate() bool {

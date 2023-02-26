@@ -7,15 +7,17 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"heph/engine/artifacts"
 	"heph/engine/htrace"
+	"heph/targetspec"
+	"heph/tgt"
 	"os"
 	"strings"
 )
 
-func targetSpanAttr(t *Target) trace.SpanStartOption {
+func targetSpanAttr(t targetspec.TargetBase) trace.SpanStartOption {
 	attrs := []attribute.KeyValue{
 		{
 			Key:   htrace.AttrTargetAddr,
-			Value: attribute.StringValue(t.FQN),
+			Value: attribute.StringValue(t.GetFQN()),
 		},
 	}
 
@@ -103,10 +105,10 @@ func (e *Engine) SpanGenPass(ctx context.Context) (context.Context, Span) {
 	return context.WithValue(ctx, htrace.AttrDuringGen, true), span
 }
 
-func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*Target) (context.Context, Span) {
+func (e *Engine) SpanScheduleTargetWithDeps(ctx context.Context, targets []*tgt.Target) (context.Context, Span) {
 	fqns := make([]string, 0)
 	for _, target := range targets {
-		fqns = append(fqns, target.FQN)
+		fqns = append(fqns, target.GetFQN())
 	}
 	attrs := []attribute.KeyValue{
 		{

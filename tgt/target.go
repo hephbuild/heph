@@ -11,6 +11,8 @@ type OutNamedPaths = NamedPaths[fs.RelPaths, fs.RelPath]
 type Target struct {
 	targetspec.TargetSpec
 
+	StoreUID uint64
+
 	Tools          TargetTools
 	Deps           TargetNamedDeps
 	HashDeps       TargetDeps
@@ -32,6 +34,14 @@ type Target struct {
 type TargetRuntimeEnv struct {
 	Value  string
 	Target *Target
+}
+
+func (t *Target) GetUID() uint64 {
+	if t.StoreUID == 0 {
+		panic("SetId should not be 0")
+	}
+
+	return t.StoreUID
 }
 
 func (t *Target) ToolTarget() TargetTool {

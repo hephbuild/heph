@@ -137,7 +137,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) er
 		if d.DepsHashes[dep.Target.FQN] == nil {
 			d.DepsHashes[dep.Target.FQN] = map[string]string{}
 		}
-		d.DepsHashes[dep.Target.FQN][dep.Output] = e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		d.DepsHashes[dep.Target.FQN][dep.Output] = e.hashOutput(e.Targets.Find(dep.Target), dep.Output)
 	}
 
 	for _, name := range a.Target.OutWithSupport.Names() {

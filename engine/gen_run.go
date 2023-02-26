@@ -109,7 +109,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 
 	start := time.Now()
 
-	sdeps, err := e.ScheduleTargetsWithDeps(ctx, targets, nil)
+	sdeps, err := e.ScheduleTargetsWithDeps(ctx, Downcast(targets), nil)
 	if err != nil {
 		return err
 	}
@@ -182,34 +182,58 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 	deps.Add(j)
 }
 
+func chunkSlice[T any](slice []T, chunkSize int) [][]T {
+	var chunks [][]T
+	for {
+		if len(slice) == 0 {
+			break
+		}
+
+		// necessary check to avoid slicing beyond
+		// slice capacity
+		if len(slice) < chunkSize {
+			chunkSize = len(slice)
+		}
+
+		chunks = append(chunks, slice[0:chunkSize])
+		slice = slice[chunkSize:]
+	}
+
+	return chunks
+}
+
 func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *Targets) error {
 	files := target.ActualOutFiles().All()
 
-	for _, file := range files {
-		file := file
+	chunks := chunkSlice(files, len(e.Pool.Workers)*2)
+
+	for i, files := range chunks {
+		files := files
 
 		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("rungen_%v_%v", target.FQN, file.Abs()),
+			Name: fmt.Sprintf("rungen %v chunk %v", target.FQN, i),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
+				for _, file := range files {
+					w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
 
-				re := &runBuildEngine{
-					Engine: e.Engine,
-					pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-					registerTarget: func(spec targetspec.TargetSpec) error {
-						err := e.defaultRegisterTarget(spec)
-						if err != nil {
-							return err
-						}
+					re := &runBuildEngine{
+						Engine: e.Engine,
+						pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
+						registerTarget: func(spec targetspec.TargetSpec) error {
+							err := e.defaultRegisterTarget(spec)
+							if err != nil {
+								return err
+							}
 
-						targets.Add(e.Targets.Find(spec.FQN))
-						return nil
-					},
-				}
+							targets.Add(e.Targets.Find(spec))
+							return nil
+						},
+					}
 
-				_, err := re.runBuildFile(file.Abs())
-				if err != nil {
-					return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
+					_, err := re.runBuildFile(file.Abs())
+					if err != nil {
+						return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
+					}
 				}
 
 				return nil

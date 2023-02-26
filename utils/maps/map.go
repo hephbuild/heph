@@ -1,6 +1,7 @@
 package maps
 
 import (
+	"github.com/puzpuzpuz/xsync/v2"
 	"golang.org/x/exp/constraints"
 	"sort"
 	"sync"
@@ -9,7 +10,7 @@ import (
 type Map[K constraints.Ordered, V any] struct {
 	Default func(k K) V
 
-	mu sync.RWMutex
+	mu *xsync.RBMutex
 	m  map[K]V
 	o  sync.Once
 }
@@ -18,6 +19,9 @@ func (m *Map[K, V]) init() {
 	m.o.Do(func() {
 		if m.m == nil {
 			m.m = map[K]V{}
+		}
+		if m.mu == nil {
+			m.mu = xsync.NewRBMutex()
 		}
 	})
 }
@@ -32,6 +36,8 @@ func (m *Map[K, V]) Set(k K, v V) {
 }
 
 func (m *Map[K, V]) Delete(k K) {
+	m.init()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -43,8 +49,10 @@ func (m *Map[K, V]) GetOk(k K) (V, bool) {
 }
 
 func (m *Map[K, V]) getFast(k K) (V, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.init()
+
+	tok := m.mu.RLock()
+	defer m.mu.RUnlock(tok)
 
 	v, ok := m.m[k]
 	return v, ok
@@ -79,8 +87,8 @@ func (m *Map[K, V]) Has(k K) bool {
 func (m *Map[K, V]) Keys() []K {
 	m.init()
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	tok := m.mu.RLock()
+	defer m.mu.RUnlock(tok)
 
 	ks := make([]K, len(m.m))
 

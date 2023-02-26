@@ -51,8 +51,6 @@ func (e *Engine) Parse(ctx context.Context) error {
 	}
 	log.Debugf("RunBuildFiles took %v", time.Since(runStartTime))
 
-	e.Targets.Sort()
-
 	processStartTime := time.Now()
 	for _, target := range e.Targets.Slice() {
 		err := e.processTarget(target)

@@ -128,7 +128,7 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 			continue
 		}
 
-		// Sort fresher first
+		// Sorted fresher first
 		sort.Slice(entries, func(i, j int) bool {
 			if entries[i].Latest {
 				return true

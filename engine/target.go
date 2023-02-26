@@ -85,10 +85,6 @@ func (t *Target) resetLinking() {
 	}
 }
 
-func (t *Target) ID() string {
-	return t.FQN
-}
-
 func (t *Target) ActualOutFiles() *ActualOutNamedPaths {
 	if t.actualOutFiles == nil {
 		panic("actualOutFiles is nil for " + t.FQN)

@@ -1,12 +1,11 @@
 package engine
 
 import (
-	"heph/targetspec"
-	"heph/utils/sets"
-	"sort"
+	"heph/tgt"
+	"heph/utils"
 )
 
-func Contains(ts []*Target, fqn string) bool {
+func Contains(ts []*tgt.Target, fqn string) bool {
 	for _, t := range ts {
 		if t.FQN == fqn {
 			return true
@@ -16,97 +15,26 @@ func Contains(ts []*Target, fqn string) bool {
 	return false
 }
 
-type Targets struct {
-	*sets.Set[string, *Target]
-}
-
-func NewTargets(cap int) *Targets {
-	s := sets.NewSet(func(t *Target) string {
-		if t == nil {
-			panic("target must not be nil")
-		}
-
-		return t.FQN
-	}, cap)
-
-	return &Targets{
-		Set: s,
-	}
-}
-
-func (ts *Targets) FQNs() []string {
-	if ts == nil {
-		return nil
-	}
-
-	fqns := make([]string, 0)
-	for _, target := range ts.Slice() {
-		fqns = append(fqns, target.FQN)
-	}
-
-	return fqns
-}
-
-func (ts *Targets) Specs() []targetspec.TargetSpec {
-	if ts == nil {
-		return nil
-	}
-
-	specs := make([]targetspec.TargetSpec, 0)
-	for _, target := range ts.Slice() {
-		specs = append(specs, target.TargetSpec)
-	}
-
-	return specs
-}
-
-func (ts *Targets) Public() *Targets {
-	pts := NewTargets(ts.Len() / 2)
-
-	for _, target := range ts.Slice() {
-		if !target.IsPrivate() {
-			pts.Add(target)
-		}
-	}
-
-	return pts
-}
-
-func (ts *Targets) Sort() {
-	if ts == nil {
-		return
-	}
-
-	a := ts.Slice()
-
-	sort.Slice(a, func(i, j int) bool {
-		return a[i].FQN < a[j].FQN
+func Downcast(ts []*Target) []*tgt.Target {
+	return utils.Map(ts, func(t *Target) *tgt.Target {
+		return t.Target
 	})
 }
 
-func (ts *Targets) Copy() *Targets {
-	if ts == nil {
-		return NewTargets(0)
-	}
-
-	return &Targets{
-		Set: ts.Set.Copy(),
-	}
+type Targets struct {
+	*tgt.Store[*Target]
 }
 
-func (ts *Targets) Find(fqn string) *Target {
-	if ts == nil {
-		return nil
+func (ts *Targets) BaseTargets() *tgt.TargetsSet {
+	s := tgt.NewTargetsSet(ts.Len())
+	for _, target := range ts.Slice() {
+		s.Add(target.Target)
 	}
+	return s
+}
 
-	if !ts.HasKey(fqn) {
-		return nil
+func NewTargets(cap int) *Targets {
+	return &Targets{
+		Store: tgt.NewSet[*Target](cap),
 	}
-
-	target := ts.GetKey(fqn)
-	if target != nil {
-		return target
-	}
-
-	panic("target not found, this should not happen")
 }

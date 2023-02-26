@@ -122,17 +122,21 @@ func (e *Engine) preventDepOnTool(t *Target, td tgt.TargetDeps) error {
 	return nil
 }
 
-func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
+func (e *Engine) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	if !t.processed {
 		panic(fmt.Sprintf("%v has not been processed", t.FQN))
 	}
 
-	if breadcrumb.Find(t.FQN) != nil {
-		fqns := append(breadcrumb.FQNs(), t.FQN)
-		return fmt.Errorf("linking cycle: %v", fqns)
+	if breadcrumb != nil {
+		if breadcrumb.Has(t.FQN) {
+			fqns := append(breadcrumb.Slice(), t.FQN)
+			return fmt.Errorf("linking cycle: %v", fqns)
+		}
+		breadcrumb = breadcrumb.Copy()
+	} else {
+		breadcrumb = sets.NewStringSet(1)
 	}
-	breadcrumb = breadcrumb.Copy()
-	breadcrumb.Add(t)
+	breadcrumb.Add(t.GetFQN())
 
 	//logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
@@ -350,14 +354,16 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *Targets) (rerr error) {
 	if err != nil {
 		return err
 	}
-	t.linkingDeps.AddAll(parents)
-	t.linkingDeps.Sort()
+	for _, parent := range parents {
+		t.linkingDeps.Add(e.Targets.Find(parent))
+	}
+	t.linkingDeps.Sorted()
 
 	return nil
 }
 
 func (e *Engine) registerDag(t *Target) error {
-	_, err := e.dag.AddVertex(t)
+	err := e.dag.AddVertex(t.Target)
 	if err != nil && !errors.As(err, &dag.VertexDuplicateError{}) {
 		return err
 	}
@@ -397,7 +403,7 @@ func (e *Engine) registerDag(t *Target) error {
 	return nil
 }
 
-func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *Targets) (tgt.TargetNamedDeps, error) {
+func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *sets.StringSet) (tgt.TargetNamedDeps, error) {
 	m := map[string]targetspec.TargetSpecDeps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
@@ -442,7 +448,7 @@ func (e *Engine) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, 
 	return td, nil
 }
 
-func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTools, breadcrumb *Targets) (tgt.TargetTools, error) {
+func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTools, breadcrumb *sets.StringSet) (tgt.TargetTools, error) {
 	type targetTool struct {
 		Target *Target
 		Output string
@@ -452,7 +458,7 @@ func (e *Engine) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTool
 	refs := make([]*tgt.Target, 0, len(toolsSpecs.Targets))
 	targetTools := make([]targetTool, 0)
 	for _, tool := range toolsSpecs.Targets {
-		tt := e.Targets.Find(tool.Target)
+		tt := e.Targets.FindBy(tool.Target)
 		if tt == nil {
 			return tgt.TargetTools{}, NewTargetNotFoundError(tool.Target)
 		}
@@ -605,18 +611,18 @@ func (e *Engine) applyEnv(t *Target, passEnv []string, env map[string]string) {
 	}
 }
 
-func (e *Engine) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *Targets) (tgt.TargetTransitive, error) {
+func (e *Engine) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
 	for _, dep := range tr.Deps.All().Targets {
-		targets.Add(e.Targets.Find(dep.Target.FQN))
+		targets.Add(e.Targets.Find(dep.Target))
 	}
 	for _, dep := range tr.Tools.Targets {
-		targets.Add(e.Targets.Find(dep.Target.FQN))
+		targets.Add(e.Targets.Find(dep.Target))
 	}
 	for _, t := range tr.Tools.TargetReferences {
-		targets.Add(e.Targets.Find(t.FQN))
+		targets.Add(e.Targets.Find(t))
 	}
 
 	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)
@@ -628,21 +634,21 @@ func (e *Engine) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *Targ
 	return dtr, nil
 }
 
-func (e *Engine) collectTransitiveFromDeps(t *Target, breadcrumb *Targets) (tgt.TargetTransitive, error) {
+func (e *Engine) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
 	for _, dep := range t.Deps.All().Targets {
-		targets.Add(e.Targets.Find(dep.Target.FQN))
+		targets.Add(e.Targets.Find(dep.Target))
 	}
 	for _, ref := range t.Tools.TargetReferences {
-		targets.Add(e.Targets.Find(ref.FQN))
+		targets.Add(e.Targets.Find(ref))
 	}
 
 	return e.collectTransitive(targets.Slice(), breadcrumb)
 }
 
-func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (tgt.TargetTransitive, error) {
+func (e *Engine) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
 	tt := tgt.TargetTransitive{}
 
 	for _, dep := range deps {
@@ -650,14 +656,14 @@ func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (tgt.Tar
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
-		err := e.LinkTarget(e.Targets.Find(dep.Target.FQN), breadcrumb)
+		err := e.LinkTarget(e.Targets.Find(dep.Target), breadcrumb)
 		if err != nil {
 			return tgt.TargetTransitive{}, err
 		}
 	}
 
 	for _, t := range tt.Tools.TargetReferences {
-		err := e.LinkTarget(e.Targets.Find(t.FQN), breadcrumb)
+		err := e.LinkTarget(e.Targets.Find(t), breadcrumb)
 		if err != nil {
 			return tgt.TargetTransitive{}, err
 		}
@@ -666,7 +672,7 @@ func (e *Engine) collectTransitive(deps []*Target, breadcrumb *Targets) (tgt.Tar
 	return tt, nil
 }
 
-func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]*Target, error) {
+func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSet) ([]*Target, error) {
 	switch expr.Function {
 	case "collect":
 		targets, err := e.collect(t, expr)
@@ -705,7 +711,7 @@ func (e *Engine) targetExpr(t *Target, expr exprs.Expr, breadcrumb *Targets) ([]
 
 const InlineGroups = true
 
-func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *Targets) (tgt.TargetDeps, error) {
+func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *sets.StringSet) (tgt.TargetDeps, error) {
 	td := tgt.TargetDeps{}
 
 	for _, expr := range deps.Exprs {
@@ -733,7 +739,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 	}
 
 	for _, spec := range deps.Targets {
-		dt := e.Targets.Find(spec.Target)
+		dt := e.Targets.FindBy(spec.Target)
 		if dt == nil {
 			return tgt.TargetDeps{}, NewTargetNotFoundError(spec.Target)
 		}

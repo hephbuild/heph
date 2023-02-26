@@ -79,7 +79,7 @@ func init() {
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	rootCmd.PersistentFlags().Var(newWorkersValue(&workers), "workers", "Workers to spawn as a number or percentage")
 	noGen = rootCmd.PersistentFlags().Bool("no-gen", false, "Disable generated targets")
-	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Set parameter name=value")
+	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Store parameter name=value")
 
 	rootCmd.Flags().SetInterspersed(false)
 }
@@ -263,7 +263,7 @@ var cleanCmd = &cobra.Command{
 
 		for _, target := range targets {
 			log.Tracef("Cleaning %v...", target.FQN)
-			err := Engine.CleanTarget(target, true)
+			err := Engine.CleanTarget(Engine.Targets.Find(target), true)
 			if err != nil {
 				return err
 			}

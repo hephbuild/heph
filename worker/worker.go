@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	log "heph/hlog"
 	"runtime/debug"
@@ -58,8 +59,6 @@ type Job struct {
 
 	TimeStart time.Time
 	TimeEnd   time.Time
-
-	m sync.Mutex
 }
 
 func (j *Job) Wait() <-chan struct{} {
@@ -67,16 +66,10 @@ func (j *Job) Wait() <-chan struct{} {
 }
 
 func (j *Job) Done() {
-	j.m.Lock()
-	defer j.m.Unlock()
-
 	j.doneWithState(StateSuccess)
 }
 
 func (j *Job) DoneWithErr(err error, state JobState) {
-	j.m.Lock()
-	defer j.m.Unlock()
-
 	if state == StateFailed {
 		log.Errorf("%v finished with err: %v", j.Name, err)
 	} else {
@@ -165,6 +158,8 @@ func safelyJobDo(j *Job, w *Worker) (err error) {
 	return j.Do(w, j.ctx)
 }
 
+var poolStoppedErr = errors.New("pool stopped")
+
 func NewPool(n int) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -184,7 +179,7 @@ func NewPool(n int) *Pool {
 			for j := range p.jobsCh {
 				if p.stopped {
 					// Drain chan
-					p.finalize(j, fmt.Errorf("pool stopped"), true)
+					p.finalize(j, poolStoppedErr, true)
 					continue
 				}
 

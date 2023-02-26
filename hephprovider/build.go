@@ -35,6 +35,8 @@ func build(srcDir, goos, goarch, out string) error {
 		return fmt.Errorf("%v/%v: %v:\n%s", goos, goarch, err, b)
 	}
 
+	log.Infof("Building heph %v/%v: done", goos, goarch)
+
 	return nil
 }
 

@@ -64,7 +64,7 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
 	targets := make([]*tgt.Target, 0)
 
 	for _, tp := range tps {
-		target := e.Targets.Find(tp.Full())
+		target := e.Targets.Find(tp)
 		if target == nil {
 			if *ignoreUnknownTarget {
 				continue
@@ -78,7 +78,7 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
 	return targets, nil
 }
 
-func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, error) {
+func parseTargetFromArgs(ctx context.Context, args []string) (*tgt.Target, error) {
 	if len(args) != 1 {
 		return nil, fmt.Errorf("expected one arg")
 	}
@@ -128,7 +128,7 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (engine.TargetRunRe
 func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool) (engine.TargetRunRequests, error) {
 	targets := engine.NewTargets(len(tps))
 	for _, tp := range tps {
-		target := e.Targets.Find(tp.Full())
+		target := e.Targets.Find(tp)
 		if target == nil {
 			return nil, engine.NewTargetNotFoundError(tp.Full())
 		}
@@ -163,7 +163,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		}
 
 		rr := engine.TargetRunRequest{
-			Target:        target,
+			Target:        target.Target,
 			Args:          args,
 			NoCache:       *nocache,
 			Shell:         *shell,
@@ -177,13 +177,13 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := e.DAG().GetOrderedAncestors(targets.Slice(), true)
+	ancs, err := e.DAG().GetOrderedAncestors(engine.Downcast(targets.Slice()), true)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, anc := range ancs {
-		err := check(anc.Target)
+		err := check(anc)
 		if err != nil {
 			return nil, err
 		}

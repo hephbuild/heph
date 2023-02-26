@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"go.starlark.net/resolve"
@@ -20,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -122,11 +122,13 @@ func (e *Engine) runBuildFileForPackage(pkg *packages.Package, file string) (sta
 	return re.runBuildFile(file)
 }
 
+var targetsc uint64
+
 func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 	l := e.TargetsLock.Get(spec.FQN)
 	l.Lock()
 
-	if t := e.Targets.Find(spec.FQN); t != nil {
+	if t := e.Targets.Find(spec); t != nil {
 		l.Unlock()
 
 		if !t.TargetSpec.Equal(spec) {
@@ -139,6 +141,7 @@ func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 	e.Targets.Add(&Target{
 		Target: &tgt.Target{
 			TargetSpec: spec,
+			StoreUID:   atomic.AddUint64(&targetsc, 1),
 		},
 	})
 	l.Unlock()
@@ -365,10 +368,7 @@ func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) 
 	}
 
 	lock := e.cacheRunBuildFileLocks.Get(path)
-	err := lock.Lock(context.TODO())
-	if err != nil {
-		return nil, err
-	}
+	lock.Lock()
 	defer lock.Unlock()
 
 	log.Tracef("BUILD: running %v", path)

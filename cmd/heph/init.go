@@ -205,7 +205,7 @@ func preRunAutocompleteInteractive(ctx context.Context, includePrivate, silent b
 		return nil, nil, err
 	}
 
-	targets := Engine.Targets
+	targets := Engine.Targets.Store
 	if !includePrivate {
 		targets = targets.Public()
 	}
