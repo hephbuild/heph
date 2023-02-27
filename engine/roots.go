@@ -240,13 +240,16 @@ func (e *Engine) fetchRoot(ctx context.Context, name string, cfg config.Root) (f
 	return backendRoot, nil
 }
 
-func (e *Engine) splitRootNameFromPkgName(pkgName string) (root string, rest string) {
-	parts := strings.SplitN(pkgName, "/", 2)
-	if len(parts) == 0 {
+func (e *Engine) splitRootNameFromPkgName(pkgName string) (string, string) {
+	i := strings.Index(pkgName, "/")
+	if i <= 0 {
 		return "", ""
 	}
 
-	return parts[0], strings.Join(parts[1:], "/")
+	root := pkgName[:i]
+	rest := pkgName[i+1:]
+
+	return root, rest
 }
 
 func (e *Engine) loadFromRoots(pkgName string) (*packages.Package, error) {
