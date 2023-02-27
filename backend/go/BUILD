@@ -30,7 +30,7 @@ def go_toolchain(name, version, architectures=[]):
         run.append('(export GOOS={} && export GOARCH={} && ./$OUT_GO install --trimpath std)'.format(goos, goarch))
 
     return target(
-        name="go",
+        name=name,
         run=run,
         deps={
             'install': go_toolchain_installsh,
