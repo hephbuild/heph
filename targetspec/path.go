@@ -84,8 +84,8 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 
 	if strings.HasPrefix(s, "//") {
 		s := s[2:]
-		if strings.Contains(s, ":") {
-			i := strings.Index(s, ":")
+		i := strings.Index(s, ":")
+		if i >= 0 {
 			if strings.Index(s[i+1:], ":") != -1 {
 				return TargetPath{}, fmt.Errorf("invalid target, got multiple `:`")
 			}
