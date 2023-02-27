@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -131,13 +132,13 @@ func dockerInspect(exe string) ([]dockerInspectData, error) {
 	cmd := exec.Command(exe, "inspect", strings.TrimSpace(string(hostnameb)))
 	b, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", err, b)
+		return nil, fmt.Errorf("%w: %s", err, bytes.TrimSpace(b))
 	}
 
 	var data []dockerInspectData
 	err = json.Unmarshal(b, &data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s", err, bytes.TrimSpace(b))
 	}
 
 	return data, nil
@@ -153,13 +154,13 @@ func dockerVersion(exe string) (*dockerVersionData, error) {
 	cmd := exec.Command(exe, "version", "--format", "{{json .Server}}")
 	b, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", err, b)
+		return nil, fmt.Errorf("%w: %s", err, bytes.TrimSpace(b))
 	}
 
 	var data dockerVersionData
 	err = json.Unmarshal(b, &data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %s", err, bytes.TrimSpace(b))
 	}
 
 	return &data, nil

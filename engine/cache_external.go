@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	"go.opentelemetry.io/otel/attribute"
@@ -32,24 +31,29 @@ func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Loca
 	return loc.NewLocation(filepath.Join(target.Package.FullName, target.Name, inputHash) + "/")
 }
 
-func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string) error {
+func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string) (bool, error) {
 	tof, err := to.NewFile(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	exists, err := tof.Exists()
 	_ = tof.Close()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	if exists {
 		log.Tracef("vfs copy %v to %v: exists", from.URI(), to.URI())
-		return nil
+		return false, nil
 	}
 
-	return e.vfsCopyFile(ctx, from, to, path)
+	err = e.vfsCopyFile(ctx, from, to, path)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string) error {
@@ -161,10 +165,10 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 	return nil
 }
 
-func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact, errNotExist bool) (rcached bool, rerr error) {
+func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	span := e.SpanCacheDownload(ctx, target, artifact)
 	defer func() {
-		span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, rcached))
+		span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, rerr == nil))
 		span.EndError(rerr)
 	}()
 
@@ -172,7 +176,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 
 	err := target.cacheLocks[artifact.Name()].Lock(ctx)
 	if err != nil {
-		return false, err
+		return err
 	}
 	defer func() {
 		err := target.cacheLocks[artifact.Name()].Unlock()
@@ -183,23 +187,32 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	err = e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
+	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
 	if err != nil {
-		if !errNotExist && errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return false, err
+		return err
 	}
 
-	return true, nil
+	// A file may exist locally, but not remotely (coming from another source), make sure that it actually exists there
+	if !copied {
+		remoteExist, err := e.existsExternalCache(ctx, target, cache, artifact)
+		if err != nil {
+			return err
+		}
+
+		if !remoteExist {
+			return fmt.Errorf("%v: %w", filepath.Join(remoteRoot.URI(), artifact.Name()), os.ErrNotExist)
+		}
+	}
+
+	return nil
 }
 
 func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
