@@ -113,17 +113,16 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			return err
 		}
 
-		skipMatch, err := PathMatch(rel, ignore...)
-		if err != nil {
-			return err
-		}
-
-		if skipMatch {
-			if d.IsDir() {
-				return filepath.SkipDir
-			} else {
-				return nil
+		if d.IsDir() {
+			skip, err := PathMatch(rel, ignore...)
+			if err != nil {
+				return err
 			}
+
+			if skip {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 
 		if d.IsDir() {
@@ -142,7 +141,16 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		}
 
 		if match {
-			err := fn(rel, d, err)
+			skip, err := PathMatch(rel, ignore...)
+			if err != nil {
+				return err
+			}
+
+			if skip {
+				return nil
+			}
+
+			err = fn(rel, d, err)
 			if err != nil {
 				return err
 			}
