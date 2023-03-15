@@ -8,10 +8,10 @@ import (
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/heimdalr/dag"
-	"go.opentelemetry.io/otel/trace"
 	"go.starlark.net/starlark"
 	"heph/config"
-	"heph/engine/htrace"
+	"heph/engine/observability"
+	obsummary "heph/engine/observability/summary"
 	log "heph/hlog"
 	"heph/packages"
 	"heph/platform"
@@ -45,9 +45,8 @@ type Engine struct {
 	HomeDir           fs2.Path
 	Config            Config
 	LocalCache        *vfsos.Location
-	Stats             *htrace.Stats
-	Tracer            trace.Tracer
-	RootSpan          trace.Span
+	Observability     *observability.Observability
+	Summary           *obsummary.Summary
 	PlatformProviders []PlatformProvider
 	RemoteCacheHints  *rcache.HintStore
 
@@ -190,8 +189,7 @@ func New(rootPath string) *Engine {
 		HomeDir:                homeDir,
 		LocalCache:             loc.(*vfsos.Location),
 		Targets:                NewTargets(0),
-		Stats:                  &htrace.Stats{},
-		Tracer:                 trace.NewNoopTracerProvider().Tracer(""),
+		Observability:          observability.NewTelemetry(),
 		Packages:               map[string]*packages.Package{},
 		RemoteCacheHints:       &rcache.HintStore{},
 		cacheHashInput:         &maps.Map[string, string]{},
@@ -479,10 +477,8 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 }
 
 func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
-	span := e.SpanCollectOutput(ctx, target)
-	defer func() {
-		span.EndError(rerr)
-	}()
+	ctx, span := e.Observability.SpanCollectOutput(ctx, target.Target)
+	defer span.EndError(rerr)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
 	target.actualSupportFiles = make(fs2.Paths, 0)

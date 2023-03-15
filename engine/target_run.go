@@ -98,10 +98,8 @@ func (e *TargetRunEngine) toolAbsPath(tt tgt.TargetTool) string {
 func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
 	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
 
-	span := e.SpanRunPrepare(ctx, target)
-	defer func() {
-		span.EndError(rerr)
-	}()
+	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target)
+	defer span.EndError(rerr)
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
@@ -452,10 +450,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
 	target := rr.Target
 
-	ctx, rspan := e.SpanRun(ctx, target)
-	defer func() {
-		rspan.EndError(rerr)
-	}()
+	ctx, rspan := e.Observability.SpanRun(ctx, target.Target)
+	defer rspan.EndError(rerr)
 
 	err := e.LinkTarget(target, nil)
 	if err != nil {
@@ -610,7 +606,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			defer cancel()
 		}
 
-		espan := e.SpanRunExec(ctx, target)
+		execCtx, espan := e.Observability.SpanRunExec(execCtx, target.Target)
 		err = platform.Exec(
 			execCtx,
 			rp.Executor,

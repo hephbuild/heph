@@ -60,3 +60,15 @@ def tool_target(run=[], *args, **kwargs):
         src_env='abs',
         *args, **kwargs
     )
+
+def switch_target(switch, cases={}, *args, **kwargs):
+    _fail_if_present(kwargs, "name")
+    _fail_if_present(kwargs, "out")
+
+    return target(
+        run=['switch_target'],
+        deps=switch,
+        _switch_cases=cases,
+        cache=False,
+        *args, **kwargs,
+    )

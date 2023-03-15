@@ -136,7 +136,7 @@ func postRun() {
 	Engine.RunExitHandlers()
 
 	if *summary || *summaryGen {
-		PrintSummary(Engine.Stats, *summaryGen)
+		PrintSummary(Engine.Summary, *summaryGen)
 	}
 
 	log.Cleanup()

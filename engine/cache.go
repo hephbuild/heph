@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/artifacts"
-	"heph/engine/htrace"
+	"heph/engine/observability"
 	log "heph/hlog"
 	"heph/rcache"
 	"heph/utils/fs"
@@ -130,7 +129,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 }
 
 func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache CacheConfig) (_ bool, rerr error) {
-	ctx, span := e.SpanExternalCacheGet(ctx, target, cache.Name, outputs, onlyMeta)
+	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.Target, cache.Name, outputs, onlyMeta)
 	defer span.EndError(rerr)
 
 	err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash)
@@ -165,16 +164,18 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 		}
 	}
 
-	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
-
 	return true, nil
 }
 
 func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, isAfterPulling bool) bool {
-	ctx, span := e.SpanLocalCacheGet(ctx, target, artifact)
-	defer span.End()
-	if isAfterPulling {
-		span.SetAttributes(attribute.Bool(htrace.AttrAfterPulling, true))
+	setCacheHit := func() {}
+	if !isAfterPulling {
+		var span *observability.TargetArtifactCacheSpan
+		ctx, span = e.Observability.SpanLocalCacheCheck(ctx, target.Target, artifact)
+		defer span.End()
+		setCacheHit = func() {
+			span.SetCacheHit(true)
+		}
 	}
 
 	cacheDir := e.cacheDir(target)
@@ -184,7 +185,7 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 		return false
 	}
 
-	span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, true))
+	setCacheHit()
 	return true
 }
 

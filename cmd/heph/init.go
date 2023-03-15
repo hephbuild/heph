@@ -8,6 +8,8 @@ import (
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
 	"heph/engine"
+	obotlp "heph/engine/observability/otlp"
+	obsummary "heph/engine/observability/summary"
 	log "heph/hlog"
 	"heph/targetspec"
 	"heph/worker"
@@ -45,7 +47,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 	}
 	e.RanInit = true
 
-	if *summary || *summaryGen || *jaegerEndpoint != "" {
+	if *jaegerEndpoint != "" {
 		opts := []tracesdk.TracerProviderOption{
 			tracesdk.WithResource(resource.NewWithAttributes(
 				semconv.SchemaURL,
@@ -53,29 +55,36 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 			)),
 		}
 
-		if *jaegerEndpoint != "" {
-			jexp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(*jaegerEndpoint)))
-			if err != nil {
-				return err
-			}
-
-			opts = append(opts, tracesdk.WithBatcher(jexp))
+		jexp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(*jaegerEndpoint)))
+		if err != nil {
+			return err
 		}
 
-		if *summary || *summaryGen {
-			opts = append(opts, tracesdk.WithSpanProcessor(e.Stats))
-		}
+		opts = append(opts, tracesdk.WithBatcher(jexp))
 
 		pr := tracesdk.NewTracerProvider(opts...)
-		e.Tracer = pr.Tracer("heph")
 
-		e.StartRootSpan()
+		hook := &obotlp.Hook{
+			Tracer: pr.Tracer("heph"),
+		}
+
+		e.Observability.RegisterHook(hook)
+
 		e.RegisterExitHandler(func() {
-			e.RootSpan.End()
 			_ = pr.ForceFlush(context.Background())
 			_ = pr.Shutdown(context.Background())
 		})
 	}
+
+	if *summary || *summaryGen {
+		e.Summary = &obsummary.Summary{}
+		e.Observability.RegisterHook(e.Summary)
+	}
+
+	ctx, rootSpan := e.Observability.SpanRoot(ctx)
+	e.RegisterExitHandler(func() {
+		rootSpan.End()
+	})
 
 	e.Config.Profiles = *profiles
 

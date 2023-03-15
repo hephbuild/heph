@@ -40,10 +40,8 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 		}
 	}()
 
-	ctx, span := e.SpanLocalCacheStore(ctx, target)
-	defer func() {
-		span.EndError(rerr)
-	}()
+	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target.Target)
+	defer span.EndError(rerr)
 
 	dir := e.cacheDir(target).Abs()
 
