@@ -2,14 +2,14 @@ package main
 
 import (
 	"github.com/olekukonko/tablewriter"
-	"heph/engine/htrace"
+	obsummary "heph/engine/observability/summary"
 	"heph/utils"
 	"heph/utils/sets"
 	"os"
 	"sort"
 )
 
-func summarySpanString(phases ...*htrace.TargetStatsSpan) string {
+func summarySpanString(phases ...*obsummary.TargetStatsSpan) string {
 	opts := make([]summaryOpt, 0)
 	for _, phase := range phases {
 		opts = append(opts, summaryOpt{span: phase})
@@ -18,7 +18,7 @@ func summarySpanString(phases ...*htrace.TargetStatsSpan) string {
 }
 
 type summaryOpt struct {
-	span      *htrace.TargetStatsSpan
+	span      *obsummary.TargetStatsSpan
 	decorator func(s string) string
 }
 
@@ -41,7 +41,7 @@ func summarySpanStringOpt(phases ...summaryOpt) string {
 	return ""
 }
 
-func artifactString(a htrace.TargetStatsArtifact, hitText string) string {
+func artifactString(a obsummary.TargetStatsArtifact, hitText string) string {
 	if a.Name == "" {
 		return ""
 	}
@@ -55,8 +55,8 @@ func artifactString(a htrace.TargetStatsArtifact, hitText string) string {
 	return s
 }
 
-func PrintSummary(stats *htrace.Stats, withGen bool) {
-	targets := make([]*htrace.TargetStats, 0)
+func PrintSummary(stats *obsummary.Summary, withGen bool) {
+	targets := make([]*obsummary.TargetStats, 0)
 	for _, span := range stats.Spans {
 		if !withGen && span.Gen {
 			continue

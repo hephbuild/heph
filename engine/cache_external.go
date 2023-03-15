@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
-	"go.opentelemetry.io/otel/attribute"
 	"heph/engine/artifacts"
-	"heph/engine/htrace"
 	log "heph/hlog"
 	"heph/utils"
 	"heph/worker"
@@ -147,15 +145,13 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
+	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, artifact)
+	defer span.EndError(rerr)
+
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
 		return err
 	}
-
-	span := e.SpanCacheUpload(ctx, target, artifact)
-	defer func() {
-		span.EndError(rerr)
-	}()
 
 	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifact.Name())
 	if err != nil {
@@ -166,11 +162,8 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 }
 
 func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	span := e.SpanCacheDownload(ctx, target, artifact)
-	defer func() {
-		span.SetAttributes(attribute.Bool(htrace.AttrCacheHit, rerr == nil))
-		span.EndError(rerr)
-	}()
+	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target, artifact)
+	defer span.EndError(rerr)
 
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
@@ -211,6 +204,8 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 			return fmt.Errorf("%v: %w", filepath.Join(remoteRoot.URI(), artifact.Name()), os.ErrNotExist)
 		}
 	}
+
+	span.SetCacheHit(true)
 
 	return nil
 }

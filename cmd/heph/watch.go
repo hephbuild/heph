@@ -88,8 +88,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 			return
 		case <-wg.Done():
 			if *summary || *summaryGen {
-				PrintSummary(w.e.Stats, *summaryGen)
-				w.e.Stats.Reset()
+				PrintSummary(w.e.Summary, *summaryGen)
+				w.e.Summary.Reset()
 			}
 
 			if err := wg.Err(); err != nil {
@@ -102,8 +102,8 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 	err := runMode(ctx, w.e, r.rrs, !fromStdin, "watch")
 
 	if *summary || *summaryGen {
-		PrintSummary(w.e.Stats, *summaryGen)
-		w.e.Stats.Reset()
+		PrintSummary(w.e.Summary, *summaryGen)
+		w.e.Summary.Reset()
 	}
 
 	if err != nil {

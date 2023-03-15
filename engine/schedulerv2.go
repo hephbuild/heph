@@ -11,13 +11,6 @@ import (
 func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (_ *WaitGroupMap, rerr error) {
 	targets := rrs.Targets()
 
-	sctx, span := e.SpanScheduleTargetWithDeps(octx, targets)
-	defer func() {
-		if rerr != nil {
-			span.EndError(rerr)
-		}
-	}()
-
 	targetsSet := NewTargets(len(targets))
 	targetsSet.AddAll(targets)
 
@@ -41,7 +34,7 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	sched := &schedulerv2{
 		Engine:     e,
 		octx:       octx,
-		sctx:       sctx,
+		sctx:       octx,
 		rrs:        rrs,
 		skip:       skip,
 		targets:    targets,
@@ -60,11 +53,6 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	if err != nil {
 		return nil, err
 	}
-
-	go func() {
-		<-sched.deps.All().Done()
-		span.EndError(sched.deps.All().Err())
-	}()
 
 	return sched.deps, nil
 }

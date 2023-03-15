@@ -37,7 +37,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 		return &worker.WaitGroup{}, nil
 	}
 
-	ctx, span := e.SpanGenPass(ctx)
+	ctx, span := e.Observability.SpanGenPass(ctx)
 	defer func() {
 		if rerr != nil {
 			span.EndError(rerr)
@@ -95,8 +95,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 
 	e.RanGenPass = true
 
-	deps := &worker.WaitGroup{}
-	deps.Add(j)
+	deps := worker.WaitGroupJob(j)
 
 	return deps, nil
 }
