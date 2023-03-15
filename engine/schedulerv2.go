@@ -255,7 +255,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 
 				e := NewTargetRunEngine(s.Engine, w.Status)
 
-				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, true, true)
+				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true)
 				if err != nil {
 					return err
 				}
