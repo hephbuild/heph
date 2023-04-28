@@ -2,11 +2,11 @@ package hephprovider
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/maps"
 	"go.uber.org/multierr"
-	log "heph/hlog"
-	"heph/utils"
-	"heph/utils/fs"
-	"heph/utils/maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +21,7 @@ func build(srcDir, goos, goarch, out string) error {
 		return err
 	}
 
-	cmd := exec.Command("go", "build", "-o", out, "heph/cmd/heph")
+	cmd := exec.Command("go", "build", "-o", out, "github.com/hephbuild/heph/cmd/heph")
 	cmd.Dir = srcDir
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, []string{

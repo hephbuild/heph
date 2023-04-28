@@ -4,8 +4,8 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"heph/cmd/heph/bbt"
-	"heph/targetspec"
+	"github.com/hephbuild/heph/cmd/heph/bbt"
+	"github.com/hephbuild/heph/targetspec"
 	"time"
 )
 

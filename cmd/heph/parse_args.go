@@ -4,10 +4,10 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"heph/engine"
-	log "heph/hlog"
-	"heph/targetspec"
-	"heph/tgt"
+	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
 	"os"
 	"strings"
 )
@@ -168,6 +168,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 			NoCache:       *nocache,
 			Shell:         *shell,
 			PreserveCache: printOutput.bool,
+			NoPTY:         *nopty,
 		}
 		if len(rr.Args) > 0 && target.Cache.Enabled {
 			log.Warnf("%v: args are being passed, disabling cache", target.FQN)

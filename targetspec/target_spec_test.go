@@ -2,9 +2,9 @@ package targetspec
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/packages"
 	"github.com/stretchr/testify/assert"
-	"heph/exprs"
-	"heph/packages"
 	"strings"
 	"testing"
 	"time"

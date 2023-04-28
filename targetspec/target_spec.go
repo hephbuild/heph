@@ -2,10 +2,10 @@ package targetspec
 
 import (
 	"encoding/json"
-	"heph/exprs"
-	"heph/packages"
-	"heph/utils"
-	"heph/utils/maps"
+	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/maps"
 	"os/exec"
 	"sort"
 	"strings"
@@ -37,10 +37,11 @@ var (
 )
 
 var (
-	CodegenLink = "link"
-	CodegenCopy = "copy"
+	CodegenLink          = "link"
+	CodegenCopy          = "copy"
+	CodegenCopyNoExclude = "copy_noexclude"
 
-	CodegenValues = []string{CodegenLink, CodegenCopy}
+	CodegenValues = []string{CodegenLink, CodegenCopy, CodegenCopyNoExclude}
 )
 
 type TargetSpecSrcEnv struct {

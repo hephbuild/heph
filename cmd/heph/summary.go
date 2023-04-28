@@ -1,10 +1,10 @@
 package main
 
 import (
+	obsummary "github.com/hephbuild/heph/engine/observability/summary"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/olekukonko/tablewriter"
-	obsummary "heph/engine/observability/summary"
-	"heph/utils"
-	"heph/utils/sets"
 	"os"
 	"sort"
 )

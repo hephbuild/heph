@@ -1,30 +1,30 @@
-package hlog
+package log
 
 import (
+	"github.com/hephbuild/heph/log/liblog"
 	"github.com/muesli/reflow/wrap"
-	"heph/hlog/log"
 	"io"
 )
 
-func newInterceptCore(w io.Writer, core log.Core) *interceptCore {
+func newInterceptCore(w io.Writer, core liblog.Core) *interceptCore {
 	return &interceptCore{
-		fmt:  log.NewConsoleFormatter(w),
+		fmt:  liblog.NewConsoleFormatter(w),
 		core: core,
 	}
 }
 
 type interceptCore struct {
-	fmt   *log.Formatter
-	core  log.Core
+	fmt   *liblog.ConsoleFormatter
+	core  liblog.Core
 	width int
 	print func(string)
 }
 
-func (t interceptCore) Enabled(l log.Level) bool {
+func (t interceptCore) Enabled(l liblog.Level) bool {
 	return t.core.Enabled(l)
 }
 
-func (t interceptCore) Log(entry log.Entry) error {
+func (t interceptCore) Log(entry liblog.Entry) error {
 	printf := t.print
 	if printf != nil {
 		termWidth := t.width
@@ -45,4 +45,4 @@ func (t interceptCore) Log(entry log.Entry) error {
 	return t.core.Log(entry)
 }
 
-var _ log.Core = (*interceptCore)(nil)
+var _ liblog.Core = (*interceptCore)(nil)

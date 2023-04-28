@@ -22,7 +22,7 @@ func PathMatch(path string, matchers ...string) (bool, error) {
 	for _, matcher := range matchers {
 		i := indexMeta(matcher)
 		if i == -1 {
-			if strings.HasPrefix(path, matcher) {
+			if path == matcher || strings.HasPrefix(path, matcher+"/") {
 				return true, nil
 			}
 		} else {

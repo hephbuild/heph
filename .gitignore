@@ -81,3 +81,4 @@ dist/
 .heph
 utils/version
 /.hephconfig.local
+node_modules

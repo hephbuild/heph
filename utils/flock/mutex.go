@@ -3,7 +3,7 @@ package flock
 import (
 	"context"
 	"fmt"
-	log "heph/hlog"
+	"github.com/hephbuild/heph/log/log"
 )
 
 func NewMutex(name string) Locker {
@@ -24,7 +24,7 @@ func (m *mutex) Unlock() error {
 	}
 }
 
-func (m *mutex) TryLock() (bool, error) {
+func (m *mutex) TryLock(context.Context) (bool, error) {
 	select {
 	case m.ch <- struct{}{}:
 		return true, nil
@@ -34,7 +34,7 @@ func (m *mutex) TryLock() (bool, error) {
 }
 
 func (m *mutex) Lock(ctx context.Context) error {
-	ok, err := m.TryLock()
+	ok, err := m.TryLock(ctx)
 	if err != nil {
 		return err
 	}

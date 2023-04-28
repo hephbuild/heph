@@ -5,6 +5,8 @@ build_files:
   roots:
     go_backend:
       uri: file:///backend/go
+    node_backend:
+      uri: file:///backend/node
 
 platforms:
   docker:

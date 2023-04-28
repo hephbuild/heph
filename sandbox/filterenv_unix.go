@@ -2,8 +2,8 @@ package sandbox
 
 import (
 	"bytes"
-	log "heph/hlog"
-	"heph/utils"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
 	"os/exec"
 	"sort"
 	"strconv"

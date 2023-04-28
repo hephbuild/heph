@@ -3,9 +3,9 @@ package engine
 import (
 	"context"
 	"fmt"
-	"heph/engine/artifacts"
-	log "heph/hlog"
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/fs"
 	"os"
 )
 

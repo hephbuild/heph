@@ -2,8 +2,8 @@ package platform
 
 import (
 	"context"
-	"heph/sandbox"
-	"heph/targetspec"
+	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/targetspec"
 )
 
 type Provider interface {

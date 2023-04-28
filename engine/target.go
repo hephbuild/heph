@@ -2,9 +2,9 @@ package engine
 
 import (
 	"errors"
-	"heph/tgt"
-	"heph/utils/flock"
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/flock"
+	"github.com/hephbuild/heph/utils/fs"
 	"sync"
 )
 

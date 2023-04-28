@@ -5,11 +5,12 @@ import (
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/xlipgloss"
+	"github.com/hephbuild/heph/worker"
 	"github.com/muesli/termenv"
 	"go.uber.org/multierr"
-	log "heph/hlog"
-	"heph/utils"
-	"heph/worker"
 	"os"
 	"strings"
 	"time"
@@ -240,8 +241,9 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 var styleWorkerStart = lipgloss.NewStyle().Bold(true)
 var styleFaint = lipgloss.NewStyle().Faint(true)
 
+// Deprecated: use lipgloss.Renderer() and propagate wherever its needed
 func setupPoolStyles(w *os.File) {
-	lipgloss.SetColorProfile(termenv.NewOutput(w).ColorProfile())
+	lipgloss.SetColorProfile(termenv.NewOutput(w, xlipgloss.EnvForceTTY()).ColorProfile())
 }
 
 func (r *renderer) View() string {

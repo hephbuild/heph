@@ -3,12 +3,12 @@ package main
 import (
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/cmd/heph/search"
+	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/worker"
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
-	"heph/cmd/heph/search"
-	"heph/engine"
-	log "heph/hlog"
-	"heph/worker"
 	"os"
 	"os/exec"
 )

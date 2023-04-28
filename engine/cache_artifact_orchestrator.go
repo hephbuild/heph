@@ -1,9 +1,9 @@
 package engine
 
 import (
-	"heph/engine/artifacts"
-	"heph/targetspec"
-	"heph/utils"
+	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
 	"strings"
 )
 

@@ -24,8 +24,8 @@ func Scenario(tgt string, outputs []string) {
 
 	// Test zero cache run
 	Must(Run(tgt))
-	Must(ValidateCache(tgt, outputs, false, false))
-	Must(ValidateRemoteCache(cache, tgt, outputs, false))
+	Must(ValidateCache(tgt, outputs, false))
+	Must(ValidateRemoteCache(cache, tgt, outputs))
 	hashInput1 := MustV(TargetCacheInputHash(tgt))
 	runAt1 := MustV(FileModTime(touchrun))
 
@@ -34,11 +34,11 @@ func Scenario(tgt string, outputs []string) {
 	// Test remote cache run
 	if len(outputs) > 0 {
 		outputPaths := MustV(RunOutput(tgt))
-		Must(ValidateCache(tgt, outputs, true, false))
+		Must(ValidateCache(tgt, outputs, true))
 		Must(AssertFileContentEqual(outputPaths[0], "hello"))
 	} else {
 		Must(Run(tgt))
-		Must(ValidateCache(tgt, outputs, true, false))
+		Must(ValidateCache(tgt, outputs, true))
 	}
 	hashInput2 := MustV(TargetCacheInputHash(tgt))
 	runAt2 := MustV(FileModTime(touchrun))

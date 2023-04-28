@@ -3,16 +3,19 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/cloudclient"
+	"github.com/hephbuild/heph/engine"
+	obhephcloud "github.com/hephbuild/heph/engine/observability/hephcloud"
+	obotlp "github.com/hephbuild/heph/engine/observability/otlp"
+	obsummary "github.com/hephbuild/heph/engine/observability/summary"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/worker"
 	"go.opentelemetry.io/otel/exporters/jaeger"
 	"go.opentelemetry.io/otel/sdk/resource"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.12.0"
-	"heph/engine"
-	obotlp "heph/engine/observability/otlp"
-	obsummary "heph/engine/observability/summary"
-	log "heph/hlog"
-	"heph/targetspec"
-	"heph/worker"
+	"os"
 	"strings"
 )
 
@@ -47,6 +50,13 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 	}
 	e.RanInit = true
 
+	e.Config.Profiles = *profiles
+
+	err := e.Init(ctx)
+	if err != nil {
+		return err
+	}
+
 	if *jaegerEndpoint != "" {
 		opts := []tracesdk.TracerProviderOption{
 			tracesdk.WithResource(resource.NewWithAttributes(
@@ -76,22 +86,59 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 		})
 	}
 
+	if e.Config.Cloud.URL != "" && e.Config.Cloud.Project != "" {
+		cloudClient := cloudclient.New(strings.TrimRight(e.Config.Cloud.URL, "/") + "/api/graphql")
+		e.CloudClient = &cloudClient
+
+		token := strings.TrimSpace(os.Getenv("HEPH_CLOUD_TOKEN"))
+		if token == "" {
+			data, err := e.GetCloudAuthData()
+			if err != nil {
+				return fmt.Errorf("cloud auth: %w", err)
+			}
+
+			if data != nil {
+				token = data.Token
+			}
+		}
+
+		if token == "" {
+			log.Errorf("You must login to use cloud features")
+		} else {
+			client := cloudClient.WithAuthToken(token)
+			e.CloudClientAuth = &client
+
+			if !*noCloudTelemetry {
+				_, err := cloudclient.AuthActor(ctx, client)
+				if err != nil {
+					log.Errorf("You must login to use cloud features: auth error: %v", err)
+				} else {
+					hook := obhephcloud.NewHook(&obhephcloud.Hook{
+						Client:    client,
+						ProjectID: e.Config.Cloud.Project,
+						Config:    e.Config,
+					})
+					e.Observability.RegisterHook(hook)
+					e.GetFlowID = hook.GetFlowID
+
+					flush := hook.Start(ctx)
+					e.RegisterExitHandler(func() {
+						flush()
+					})
+				}
+			}
+		}
+	}
+
 	if *summary || *summaryGen {
 		e.Summary = &obsummary.Summary{}
 		e.Observability.RegisterHook(e.Summary)
 	}
 
 	ctx, rootSpan := e.Observability.SpanRoot(ctx)
-	e.RegisterExitHandler(func() {
-		rootSpan.End()
+	e.RegisterExitHandlerWithErr(func(err error) {
+		rootSpan.EndError(err)
 	})
-
-	e.Config.Profiles = *profiles
-
-	err := e.Init(ctx)
-	if err != nil {
-		return err
-	}
 
 	paramsm := map[string]string{}
 	for k, v := range e.Config.Params {

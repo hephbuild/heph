@@ -3,7 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
-	log "heph/hlog"
+	"github.com/hephbuild/heph/log/log"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -13,8 +13,9 @@ import (
 type JobState int8
 
 const (
-	StateUnknown JobState = iota - 1
-	StatePending
+	StateUnknown JobState = iota
+	StateScheduled
+	StateQueued
 	StateRunning
 	StateSuccess
 	StateFailed
@@ -22,13 +23,15 @@ const (
 )
 
 func (s JobState) IsDone() bool {
-	return s != StateUnknown && s != StateRunning && s != StatePending
+	return s == StateSuccess || s == StateFailed || s == StateSkipped
 }
 
 func (s JobState) String() string {
 	switch s {
-	case StatePending:
-		return "pending"
+	case StateScheduled:
+		return "scheduled"
+	case StateQueued:
+		return "queued"
 	case StateRunning:
 		return "running"
 	case StateSuccess:
@@ -44,22 +47,79 @@ func (s JobState) String() string {
 	}
 }
 
+type Hook interface {
+	Run(*Job) context.Context
+}
+
+type StageHook struct {
+	OnScheduled func(*Job) context.Context
+	OnQueued    func(*Job) context.Context
+	OnStart     func(*Job) context.Context
+	OnEnd       func(*Job) context.Context
+}
+
+func (h StageHook) Run(j *Job) context.Context {
+	switch j.State {
+	case StateScheduled:
+		if h.OnScheduled != nil {
+			return h.OnScheduled(j)
+		}
+	case StateQueued:
+		if h.OnQueued != nil {
+			return h.OnQueued(j)
+		}
+	case StateRunning:
+		if h.OnStart != nil {
+			return h.OnStart(j)
+		}
+	default:
+		if j.IsDone() {
+			if h.OnEnd != nil {
+				return h.OnEnd(j)
+			}
+		}
+	}
+	return nil
+}
+
 type Job struct {
 	Name  string
 	ID    uint64
 	Deps  *WaitGroup
 	Do    func(w *Worker, ctx context.Context) error
 	State JobState
+	Hook  Hook
 
 	ctx    context.Context
 	cancel context.CancelFunc
 	doneCh chan struct{}
 	err    error
 
-	TimeStart time.Time
-	TimeEnd   time.Time
+	TimeScheduled time.Time
+	TimeQueued    time.Time
+	TimeStart     time.Time
+	TimeEnd       time.Time
 
 	m sync.Mutex
+}
+
+func (j *Job) RunHook() {
+	ctx := j.ctx
+	if h := j.Hook; h != nil {
+		jctx := h.Run(j)
+		if jctx != nil {
+			ctx = jctx
+		}
+	}
+	j.ctx = ctx
+}
+
+func (j *Job) Ctx() context.Context {
+	return j.ctx
+}
+
+func (j *Job) Err() error {
+	return j.err
 }
 
 func (j *Job) Wait() <-chan struct{} {
@@ -96,6 +156,7 @@ func (j *Job) DoneWithErr(err error, state JobState) {
 func (j *Job) doneWithState(state JobState) {
 	j.State = state
 	close(j.doneCh)
+	j.RunHook()
 }
 
 func (j *Job) IsDone() bool {
@@ -189,8 +250,10 @@ func NewPool(n int) *Pool {
 				}
 
 				j.TimeStart = time.Now()
+				j.State = StateRunning
 				w.CurrentJob = j
 
+				j.RunHook()
 				err := safelyJobDo(j, w)
 
 				j.TimeEnd = time.Now()
@@ -215,7 +278,8 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	}()
 
 	job.ID = atomic.AddUint64(&p.idc, 1)
-	job.State = StatePending
+	job.State = StateScheduled
+	job.TimeScheduled = time.Now()
 	job.ctx = ctx
 	job.cancel = cancel
 	job.doneCh = make(chan struct{})
@@ -226,6 +290,7 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	log.Tracef("Scheduling %v %v", job.Name, job.ID)
 
 	p.jobs.Add(job)
+	job.RunHook()
 
 	go func() {
 		select {
@@ -238,6 +303,10 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 				return
 			}
 		}
+
+		job.State = StateQueued
+		job.TimeQueued = time.Now()
+		job.RunHook()
 
 		p.jobsCh <- job
 	}()

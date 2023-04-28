@@ -1,4 +1,4 @@
-package log
+package liblog
 
 type Core interface {
 	Enabled(Level) bool
