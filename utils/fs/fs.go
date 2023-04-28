@@ -2,7 +2,7 @@ package fs
 
 import (
 	"errors"
-	"heph/utils"
+	"github.com/hephbuild/heph/utils"
 	"io"
 	"os"
 	"path/filepath"

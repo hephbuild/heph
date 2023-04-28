@@ -5,14 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/heimdalr/dag"
-	"heph/exprs"
-	log "heph/hlog"
-	"heph/targetspec"
-	"heph/tgt"
-	"heph/utils"
-	"heph/utils/flock"
-	"heph/utils/fs"
-	"heph/utils/sets"
+	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/flock"
+	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/sets"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,7 +46,8 @@ func (e *Engine) processTarget(t *Target) error {
 		t.Cache.History = e.Config.CacheHistory
 	}
 
-	if t.Codegen != "" {
+	switch t.Codegen {
+	case targetspec.CodegenCopy, targetspec.CodegenLink:
 		for _, file := range t.TargetSpec.Out {
 			p := t.Package.Root.Join(file.Path).RelRoot()
 

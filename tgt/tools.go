@@ -1,9 +1,9 @@
 package tgt
 
 import (
-	"heph/targetspec"
-	"heph/utils"
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/fs"
 	"sort"
 	"strings"
 )

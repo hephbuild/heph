@@ -14,4 +14,4 @@ if [ -f "$HEPH_SOURCE" ]; then
     set +a
 fi
 
-exec go run heph/cmd/heph "$@"
+exec go run github.com/hephbuild/heph/cmd/heph "$@"

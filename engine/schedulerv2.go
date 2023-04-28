@@ -3,9 +3,9 @@ package engine
 import (
 	"context"
 	"fmt"
-	"heph/utils/maps"
-	"heph/utils/sets"
-	"heph/worker"
+	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/worker"
 )
 
 func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (_ *WaitGroupMap, rerr error) {
@@ -162,6 +162,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		return nil, err
 	}
 
+	// TODO: add an observability span: OnPullOrGetCache
 	return s.Pool.Schedule(ctx, &worker.Job{
 		Name: "cache get " + target.FQN,
 		Deps: deps,

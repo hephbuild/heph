@@ -1,8 +1,8 @@
 package packages
 
 import (
+	"github.com/hephbuild/heph/utils/fs"
 	"go.starlark.net/starlark"
-	"heph/utils/fs"
 )
 
 type Package struct {

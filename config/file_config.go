@@ -7,7 +7,11 @@ type FileConfig struct {
 	Caches       map[string]FileCache `yaml:"caches,omitempty"`
 	CacheOrder   string               `yaml:"cache_order"`
 	CacheHistory int                  `yaml:"cache_history"`
-	Engine       struct {
+	Cloud        struct {
+		URL     string `yaml:"url"`
+		Project string `yaml:"project"`
+	} `yaml:"cloud"`
+	Engine struct {
 		GC           *bool `yaml:"gc"`
 		CacheHints   *bool `yaml:"cache_hints"`
 		InstallTools *bool `yaml:"install_tools"`
@@ -37,6 +41,14 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Location != "" {
 		c.Location = fc.Location
+	}
+
+	if fc.Cloud.URL != "" {
+		c.Cloud.URL = fc.Cloud.URL
+	}
+
+	if fc.Cloud.Project != "" {
+		c.Cloud.Project = fc.Cloud.Project
 	}
 
 	if fc.Engine.KeepSandbox != nil {

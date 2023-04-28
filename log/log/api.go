@@ -1,20 +1,20 @@
-package hlog
+package log
 
-import "heph/hlog/log"
+import "github.com/hephbuild/heph/log/liblog"
 
-type Level = log.Level
+type Level = liblog.Level
 
-var ParseLevel = log.ParseLevel
+var ParseLevel = liblog.ParseLevel
 
 const (
-	InvalidLevel = log.InvalidLevel
-	TraceLevel   = log.TraceLevel
-	DebugLevel   = log.DebugLevel
-	InfoLevel    = log.InfoLevel
-	WarnLevel    = log.WarnLevel
-	ErrorLevel   = log.ErrorLevel
-	PanicLevel   = log.PanicLevel
-	FatalLevel   = log.FatalLevel
+	InvalidLevel = liblog.InvalidLevel
+	TraceLevel   = liblog.TraceLevel
+	DebugLevel   = liblog.DebugLevel
+	InfoLevel    = liblog.InfoLevel
+	WarnLevel    = liblog.WarnLevel
+	ErrorLevel   = liblog.ErrorLevel
+	PanicLevel   = liblog.PanicLevel
+	FatalLevel   = liblog.FatalLevel
 )
 
 func Trace(args ...any) {

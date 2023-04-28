@@ -4,17 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	fs2 "heph/utils/fs"
-	"heph/utils/sets"
+	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/sets"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 )
-
-type PackLibrary struct {
-	Path string
-}
 
 var lddLib = regexp.MustCompile(`\s*(\S+) => (\S+).*`)
 var lddNoArrowLib = regexp.MustCompile(`\s*(\S+).*`)
@@ -54,7 +51,7 @@ func Analyze(binPath string) ([]string, error) {
 	cmd := exec.Command("ldd", binPath)
 	lddb, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", err, lddb)
+		return nil, fmt.Errorf("%v: %w: %s", binPath, err, bytes.TrimSpace(lddb))
 	}
 
 	libPaths, err := parseLdd(lddb)
@@ -95,7 +92,7 @@ func expandPaths(paths []string) ([]string, error) {
 	return expPaths, nil
 }
 
-func ExtractLibs(binPath string, extras []string, to string) error {
+func ExtractLibs(binPath string, extras []string, libPath, ldPath string) error {
 	binLibs, err := Analyze(binPath)
 	if err != nil {
 		return err
@@ -117,11 +114,17 @@ func ExtractLibs(binPath string, extras []string, to string) error {
 		allLibs.AddAll(libPaths)
 	}
 
-	err = os.MkdirAll(to, os.ModePerm)
+	err = os.MkdirAll(libPath, os.ModePerm)
 	if err != nil {
 		return err
 	}
 
+	err = fs2.CreateParentDir(ldPath)
+	if err != nil {
+		return err
+	}
+
+	foundld := false
 	for _, path := range allLibs.Slice() {
 		name := filepath.Base(path)
 		path, err = filepath.EvalSymlinks(path)
@@ -129,10 +132,22 @@ func ExtractLibs(binPath string, extras []string, to string) error {
 			return err
 		}
 
-		err := fs2.Cp(path, filepath.Join(to, name))
-		if err != nil {
-			return err
+		if strings.Contains(name, "ld-linux") {
+			foundld = true
+			err := fs2.Cp(path, ldPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			err := fs2.Cp(path, filepath.Join(libPath, name))
+			if err != nil {
+				return err
+			}
 		}
+	}
+
+	if !foundld {
+		return fmt.Errorf("did not find ld")
 	}
 
 	return nil

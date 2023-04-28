@@ -3,9 +3,9 @@ package flock
 import (
 	"context"
 	"fmt"
+	log "github.com/hephbuild/heph/log/liblog"
+	"github.com/hephbuild/heph/utils/fs"
 	"golang.org/x/sys/unix"
-	log "heph/hlog"
-	"heph/utils/fs"
 	"os"
 	"strconv"
 	"sync"
@@ -14,7 +14,7 @@ import (
 )
 
 func NewFlock(name, p string) Locker {
-	if name == "" || log.IsLevelEnabled(log.DebugLevel) {
+	if name == "" || log.Default().IsLevelEnabled(log.DebugLevel) {
 		name = p
 	}
 	return &Flock{path: p, name: name}
@@ -27,7 +27,9 @@ type Flock struct {
 	f    *os.File
 }
 
-func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
+func (l *Flock) tryLock(ctx context.Context, onErr func(f *os.File) (bool, error)) (bool, error) {
+	logger := log.FromContext(ctx)
+
 	l.m.Lock()
 	defer l.m.Unlock()
 
@@ -41,7 +43,7 @@ func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
 		return false, err
 	}
 
-	log.Debugf("Attempting to acquire lock for %s...", f.Name())
+	logger.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		if errno, _ := err.(unix.Errno); errno == unix.EWOULDBLOCK {
@@ -56,7 +58,7 @@ func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
 			return false, err
 		}
 	}
-	log.Debugf("Acquired lock for %s", f.Name())
+	logger.Debugf("Acquired lock for %s", f.Name())
 
 	l.f = f
 
@@ -66,14 +68,16 @@ func (l *Flock) tryLock(onErr func(f *os.File) (bool, error)) (bool, error) {
 	return true, nil
 }
 
-func (l *Flock) TryLock() (bool, error) {
-	return l.tryLock(func(f *os.File) (bool, error) {
+func (l *Flock) TryLock(ctx context.Context) (bool, error) {
+	return l.tryLock(ctx, func(f *os.File) (bool, error) {
 		return false, nil
 	})
 }
 
 func (l *Flock) Lock(ctx context.Context) error {
-	_, err := l.tryLock(func(f *os.File) (bool, error) {
+	logger := log.FromContext(ctx)
+
+	_, err := l.tryLock(ctx, func(f *os.File) (bool, error) {
 		l.m.Unlock()
 		defer l.m.Lock()
 
@@ -84,7 +88,7 @@ func (l *Flock) Lock(ctx context.Context) error {
 		pid := string(pidb)
 		go func() {
 			if strconv.Itoa(os.Getpid()) == pid {
-				log.Debugf("Looks another routine has already acquired the lock for %s. Waiting for it to finish...", l.name)
+				logger.Debugf("Looks another routine has already acquired the lock for %s. Waiting for it to finish...", l.name)
 				return
 			}
 
@@ -97,9 +101,9 @@ func (l *Flock) Lock(ctx context.Context) error {
 			}
 
 			if len(pid) > 0 {
-				log.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", pid, l.name)
+				logger.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", pid, l.name)
 			} else {
-				log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
+				logger.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
 			}
 		}()
 

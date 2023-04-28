@@ -1,6 +1,6 @@
 package rcache
 
-import "heph/utils/maps"
+import "github.com/hephbuild/heph/utils/maps"
 
 type Hint interface {
 	Skip() bool

@@ -1,0 +1,67 @@
+mutation RegisterFlow($projectId: ID!, $flow: FlowInput!) {
+    registerFlow(projectId: $projectId, flow: $flow) {
+        id
+    }
+}
+
+mutation RegisterFlowInvocation($projectId: ID!, $flow: FlowInput!, $invocation: InvocationInput!) {
+    registerFlowInvocation(projectId: $projectId, flow: $flow, invocation: $invocation) {
+        id
+        invocations {
+            edges {
+                node {
+                    id
+                }
+            }
+        }
+    }
+}
+
+mutation RegisterInvocation($flowId: ID!, $invocation: InvocationInput!) {
+    registerInvocation(flowId: $flowId, invocation: $invocation) {
+        id
+    }
+}
+
+mutation SendEndInvocation($idata: InvocationEndInput!) {
+    endInvocation(data: $idata) {
+        id
+    }
+}
+
+mutation SendInvocationHeartbeat($invocationId: ID!) {
+    heartbeatInvocation(invocationId: $invocationId) {
+        id
+    }
+}
+
+
+mutation SendEvents($invocationId: ID!, $spans: [JSON!]!) {
+    ingestSpans(invocationId: $invocationId, spans: $spans) {
+        id
+        spanId
+    }
+}
+
+mutation SendLogs($spanId: ID!, $bdata: Bytes!) {
+    ingestSpanLogs(spanId: $spanId, data: $bdata)
+}
+
+mutation Login($email: String!, $pass: String!) {
+    login(email: $email, password: $pass) {
+        token
+        user {
+            id
+            email
+        }
+    }
+}
+
+query AuthActor {
+    auth {
+        actor {
+            actor_type
+            actor_id
+        }
+    }
+}

@@ -1,7 +1,7 @@
 package config
 
 import (
-	log "heph/hlog"
+	"github.com/hephbuild/heph/log/log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -25,7 +25,11 @@ type Config struct {
 	Caches       map[string]Cache
 	CacheOrder   string `yaml:"cache_order"`
 	CacheHistory int    `yaml:"cache_history"`
-	Engine       struct {
+	Cloud        struct {
+		URL     string `yaml:"url"`
+		Project string `yaml:"project"`
+	} `yaml:"cloud"`
+	Engine struct {
 		GC           bool `yaml:"gc"`
 		CacheHints   bool `yaml:"cache_hints"`
 		InstallTools bool `yaml:"install_tools"`
@@ -43,6 +47,7 @@ type Config struct {
 		Ignore []string `yaml:"ignore"`
 	} `yaml:"watch"`
 	Params map[string]string `yaml:"params"`
+
 	Extras `yaml:",inline"`
 
 	Sources []FileConfig `yaml:"-"`

@@ -1,8 +1,8 @@
 package search
 
 import (
+	"github.com/hephbuild/heph/targetspec"
 	"github.com/lithammer/fuzzysearch/fuzzy"
-	"heph/targetspec"
 	"sort"
 )
 

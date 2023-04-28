@@ -6,10 +6,10 @@ import (
 	"github.com/bep/debounce"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/fsnotify/fsnotify"
+	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/fs"
 	"github.com/spf13/cobra"
-	"heph/engine"
-	log "heph/hlog"
-	"heph/utils/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -258,7 +258,7 @@ func (w *watchCtx) runGraph(args []string) error {
 	defer w.m.Unlock()
 
 	if w.e != nil {
-		w.e.RunExitHandlers()
+		w.e.RunExitHandlers(nil)
 	}
 
 	var err error
@@ -301,7 +301,7 @@ func (w *watchCtx) runGraph(args []string) error {
 func (w *watchCtx) watchGraph(args []string) error {
 	defer func() {
 		if w.e != nil {
-			w.e.RunExitHandlers()
+			w.e.RunExitHandlers(nil)
 		}
 	}()
 

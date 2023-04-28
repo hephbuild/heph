@@ -6,8 +6,8 @@ import (
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
 	"github.com/blevesearch/bleve/v2/analysis/tokenizer/regexp"
-	"heph/targetspec"
-	"heph/utils/sets"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils/sets"
 )
 
 type Result struct {

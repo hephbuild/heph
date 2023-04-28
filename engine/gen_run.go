@@ -3,10 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
-	log "heph/hlog"
-	"heph/targetspec"
-	"heph/utils"
-	"heph/worker"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/worker"
 	"path/filepath"
 	"time"
 )

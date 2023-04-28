@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"heph/targetspec"
+	"github.com/hephbuild/heph/targetspec"
 	"strings"
 )
 

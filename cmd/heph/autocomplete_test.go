@@ -1,9 +1,9 @@
 package main
 
 import (
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
 	"github.com/stretchr/testify/assert"
-	"heph/targetspec"
-	"heph/utils"
 	"testing"
 )
 

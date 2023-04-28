@@ -2,7 +2,7 @@ package platform
 
 import (
 	"fmt"
-	log "heph/hlog"
+	"github.com/hephbuild/heph/log/log"
 	"io"
 	"os"
 	"strings"

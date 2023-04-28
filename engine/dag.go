@@ -2,8 +2,8 @@ package engine
 
 import (
 	"github.com/heimdalr/dag"
-	"heph/utils/maps"
-	"heph/utils/sets"
+	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/sets"
 	"sort"
 )
 

@@ -82,3 +82,7 @@ func ChunkSlice[T any](slice []T, chunkSize int) [][]T {
 
 	return chunks
 }
+
+func RemoveSlice[T any](slice []T, s int) []T {
+	return append(slice[:s], slice[s+1:]...)
+}

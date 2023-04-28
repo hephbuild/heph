@@ -5,15 +5,13 @@ import (
 	"path/filepath"
 )
 
-func ValidateRemoteCache(root, tgt string, outputs []string, expectLogs bool) error {
+func ValidateRemoteCache(root, tgt string, outputs []string) error {
 	fmt.Println("remote cache folder:", root)
 
 	expected := []string{
 		"hash_input",
 		"manifest.json",
-	}
-	if expectLogs {
-		expected = append(expected, "log.tar.gz")
+		"log.tar.gz",
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)

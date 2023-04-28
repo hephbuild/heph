@@ -8,27 +8,28 @@ import (
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/heimdalr/dag"
+	"github.com/hephbuild/heph/cloudclient"
+	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine/observability"
+	obsummary "github.com/hephbuild/heph/engine/observability/summary"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/platform"
+	"github.com/hephbuild/heph/rcache"
+	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/flock"
+	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/hash"
+	"github.com/hephbuild/heph/utils/instance"
+	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/vfssimple"
+	"github.com/hephbuild/heph/worker"
 	"go.starlark.net/starlark"
-	"heph/config"
-	"heph/engine/observability"
-	obsummary "heph/engine/observability/summary"
-	log "heph/hlog"
-	"heph/packages"
-	"heph/platform"
-	"heph/rcache"
-	"heph/sandbox"
-	"heph/targetspec"
-	"heph/tgt"
-	"heph/utils"
-	"heph/utils/flock"
-	fs2 "heph/utils/fs"
-	"heph/utils/hash"
-	"heph/utils/instance"
-	"heph/utils/maps"
-	"heph/utils/sets"
-	"heph/utils/tar"
-	"heph/vfssimple"
-	"heph/worker"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -46,6 +47,7 @@ type Engine struct {
 	Config            Config
 	LocalCache        *vfsos.Location
 	Observability     *observability.Observability
+	GetFlowID         func() string
 	Summary           *obsummary.Summary
 	PlatformProviders []PlatformProvider
 	RemoteCacheHints  *rcache.HintStore
@@ -80,7 +82,7 @@ type Engine struct {
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
-	exitHandlers        []func()
+	exitHandlers        []func(error)
 	exitHandlersRunning bool
 
 	gcLock                flock.Locker
@@ -89,6 +91,8 @@ type Engine struct {
 
 	orderedCachesLock flock.Locker
 	orderedCaches     []CacheConfig
+	CloudClient       *cloudclient.HephClient
+	CloudClientAuth   *cloudclient.HephClient
 }
 
 type PlatformProvider struct {
@@ -120,6 +124,7 @@ type TargetRunRequest struct {
 	Mode    string // run or watch
 	// Force preserving cache for uncached targets when --print-out is enabled
 	PreserveCache bool
+	NoPTY         bool
 }
 
 type TargetRunRequests []TargetRunRequest
@@ -369,6 +374,9 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.FQN,
 		Deps: deps,
+		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
+			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
+		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(e, w.Status)
 
@@ -791,7 +799,8 @@ func (e *Engine) RegisterRemove(path string) {
 
 func (e *Engine) RegisterRemoveWithLocker(l flock.Locker, path string) {
 	e.RegisterExitHandler(func() {
-		ok, err := l.TryLock()
+		ctx := context.Background()
+		ok, err := l.TryLock(ctx)
 		if err != nil {
 			log.Errorf("lock rm %v: %v", path, err)
 			return
@@ -808,7 +817,7 @@ func (e *Engine) RegisterRemoveWithLocker(l flock.Locker, path string) {
 	})
 }
 
-func (e *Engine) RegisterExitHandler(f func()) {
+func (e *Engine) RegisterExitHandlerWithErr(f func(error)) {
 	if e.exitHandlersRunning {
 		return
 	}
@@ -819,7 +828,13 @@ func (e *Engine) RegisterExitHandler(f func()) {
 	e.exitHandlers = append(e.exitHandlers, f)
 }
 
-func (e *Engine) RunExitHandlers() {
+func (e *Engine) RegisterExitHandler(f func()) {
+	e.RegisterExitHandlerWithErr(func(error) {
+		f()
+	})
+}
+
+func (e *Engine) RunExitHandlers(err error) {
 	e.exitHandlersm.Lock()
 	defer e.exitHandlersm.Unlock()
 
@@ -830,7 +845,7 @@ func (e *Engine) RunExitHandlers() {
 
 	for i := len(e.exitHandlers) - 1; i >= 0; i-- {
 		h := e.exitHandlers[i]
-		h()
+		h(err)
 	}
 
 	e.exitHandlers = nil

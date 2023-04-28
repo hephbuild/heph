@@ -3,8 +3,8 @@
 package main
 
 import (
+	lwl "github.com/hephbuild/heph/linux-lib"
 	"github.com/spf13/cobra"
-	lwl "heph/linux-lib"
 )
 
 var lleExtra []string
@@ -18,12 +18,13 @@ func init() {
 var lleCmd = &cobra.Command{
 	Use:   "lle",
 	Short: "Linux Lib Extract",
-	Args:  cobra.ExactArgs(2),
+	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		binPath := args[0]
-		toPath := args[1]
+		libPath := args[1]
+		ldPath := args[2]
 
-		err := lwl.ExtractLibs(binPath, lleExtra, toPath)
+		err := lwl.ExtractLibs(binPath, lleExtra, libPath, ldPath)
 		if err != nil {
 			return err
 		}

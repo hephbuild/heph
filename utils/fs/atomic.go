@@ -1,7 +1,7 @@
 package fs
 
 import (
-	"heph/utils/instance"
+	"github.com/hephbuild/heph/utils/instance"
 	"os"
 )
 

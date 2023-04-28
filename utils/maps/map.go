@@ -51,8 +51,12 @@ func (m *Map[K, V]) getFast(k K) (V, bool) {
 }
 
 func (m *Map[K, V]) Get(k K) V {
+	return m.GetDefault(k, m.Default)
+}
+
+func (m *Map[K, V]) GetDefault(k K, def func(K) V) V {
 	v, ok := m.getFast(k)
-	if m.Default == nil || ok {
+	if def == nil || ok {
 		return v
 	}
 
@@ -63,7 +67,7 @@ func (m *Map[K, V]) Get(k K) V {
 
 	v, ok = m.m[k]
 	if !ok {
-		v = m.Default(k)
+		v = def(k)
 		m.m[k] = v
 	}
 

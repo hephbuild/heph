@@ -2,8 +2,8 @@ package summary
 
 import (
 	"context"
-	"heph/engine/observability"
-	log "heph/hlog"
+	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/log/log"
 	"sync"
 )
 
@@ -79,12 +79,14 @@ func prepareArtifactCache[S interface {
 }](s *Summary, ctx context.Context, span S) (*TargetStats, TargetStatsArtifact) {
 	ts, astats := prepareArtifact(s, ctx, span)
 
-	astats.CacheHit = span.IsCacheHit()
+	if v := span.IsCacheHit(); v != nil && *v {
+		astats.CacheHit = true
+	}
 
 	return ts, astats
 }
 
-func (s *Summary) OnRoot(ctx context.Context, span *observability.BaseSpan) (context.Context, observability.Finalizer) {
+func (s *Summary) OnRoot(ctx context.Context, span *observability.BaseSpan) (context.Context, observability.SpanHook) {
 	if s.RootSpan != nil {
 		log.Warnf("rootspan is already defined")
 	}
@@ -93,67 +95,67 @@ func (s *Summary) OnRoot(ctx context.Context, span *observability.BaseSpan) (con
 	return ctx, nil
 }
 
-func (s *Summary) OnRun(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnRun(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		// This should be called so that the TargetSpan has start & end time set properly
 		_, _ = prepare(s, ctx, span)
-	}
+	})
 }
 
-func (s *Summary) OnCacheDownload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnCacheDownload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tas := prepareArtifactCache(s, ctx, span)
 		if ts == nil {
 			return
 		}
 		ts.ArtifactsDownload = append(ts.ArtifactsDownload, tas)
-	}
+	})
 }
 
-func (s *Summary) OnCacheUpload(ctx context.Context, span *observability.TargetArtifactSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnCacheUpload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tas := prepareArtifact(s, ctx, span)
 		if ts == nil {
 			return
 		}
 		ts.ArtifactsUpload = append(ts.ArtifactsUpload, tas)
-	}
+	})
 }
 
-func (s *Summary) OnRunPrepare(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnRunPrepare(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tss := prepare(s, ctx, span)
 		ts.Prepare = tss
-	}
+	})
 }
 
-func (s *Summary) OnRunExec(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnRunExec(ctx context.Context, span *observability.TargetExecSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tss := prepare(s, ctx, span)
 		ts.Exec = tss
-	}
+	})
 }
 
-func (s *Summary) OnCollectOutput(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnCollectOutput(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tss := prepare(s, ctx, span)
 		ts.CollectOutput = tss
-	}
+	})
 }
 
-func (s *Summary) OnLocalCacheStore(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnLocalCacheStore(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tss := prepare(s, ctx, span)
 		ts.CacheStore = tss
-	}
+	})
 }
 
-func (s *Summary) OnLocalCacheCheck(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.Finalizer) {
-	return ctx, func() {
+func (s *Summary) OnLocalCacheCheck(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
+	return ctx, observability.FinalizerSpanHook(func() {
 		ts, tas := prepareArtifactCache(s, ctx, span)
 		if ts == nil {
 			return
 		}
 		ts.ArtifactsLocalGet = append(ts.ArtifactsLocalGet, tas)
-	}
+	})
 }

@@ -1,0 +1,17 @@
+# Default genqlient config; for full documentation see:
+# https://github.com/Khan/genqlient/blob/main/docs/genqlient.yaml
+schema:
+  - ../hephcloud/graph/schemas/*.graphqls
+
+operations:
+  - cloudclient/*.graphql
+
+generated: cloudclient/generated.go
+
+bindings:
+  JSON:
+    type: 'encoding/json.RawMessage'
+  Time:
+    type: 'time.Time'
+  Bytes:
+    type: 'string'

@@ -5,18 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"heph/exprs"
-	"heph/hephprovider"
-	log "heph/hlog"
-	"heph/platform"
-	"heph/sandbox"
-	"heph/targetspec"
-	"heph/tgt"
-	"heph/utils"
-	"heph/utils/fs"
-	"heph/utils/sets"
-	"heph/utils/tar"
-	"heph/worker"
+	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/hephprovider"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/platform"
+	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/worker"
+	ptylib "github.com/kr/pty"
 	"io"
 	fs2 "io/fs"
 	"os"
@@ -292,6 +293,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		forward := []string{
 			"HEPH_PROFILES",
 			"HEPH_FROM_PATH",
+			"HEPH_CLOUD_TOKEN",
 			hephprovider.EnvSrcRoot,
 			hephprovider.EnvDistRoot,
 			hephprovider.EnvDistNoVersion,
@@ -301,6 +303,10 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 				env[k] = value
 			}
 		}
+	}
+
+	if e.GetFlowID != nil {
+		env["HEPH_FLOW_ID"] = e.GetFlowID()
 	}
 	if hephDistRoot != "" {
 		env[hephprovider.EnvDistRoot] = hephDistRoot
@@ -517,8 +523,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 
 	e.Status(TargetStatus(target, "Running..."))
 
-	logFilePath := ""
-
+	var logFilePath string
 	if target.IsGroup() && !rr.Shell {
 		// Ignore
 	} else if target.IsTextFile() {
@@ -581,22 +586,11 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		_, hasPathInEnv := env["PATH"]
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
-		var logFile *os.File
-		if iocfg.Stdout == nil || iocfg.Stderr == nil {
-			logFilePath = e.sandboxRoot(target).Join(target.artifacts.Log.Name()).Abs()
+		logFilePath = e.sandboxRoot(target).Join("log.txt").Abs()
 
-			logFile, err = os.Create(logFilePath)
-			if err != nil {
-				return err
-			}
-
-			if iocfg.Stdout == nil {
-				iocfg.Stdout = logFile
-			}
-
-			if iocfg.Stderr == nil {
-				iocfg.Stderr = logFile
-			}
+		logFile, err := os.Create(logFilePath)
+		if err != nil {
+			return err
 		}
 
 		execCtx := ctx
@@ -606,7 +600,48 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			defer cancel()
 		}
 
-		execCtx, espan := e.Observability.SpanRunExec(execCtx, target.Target)
+		execCtx, execSpan := e.Observability.SpanRunExec(execCtx, target.Target)
+
+		obw := e.Observability.LogsWriter(execCtx)
+
+		obw = multiWriterNil(obw, logFile)
+
+		if obw != nil {
+			var szch chan *ptylib.Winsize
+			if iocfg.Stdin != nil {
+				ch, cleanwinsize := stdinWinSizeCh()
+				szch = ch
+				defer cleanwinsize()
+			}
+
+			outw := multiWriterNil(iocfg.Stdout, obw)
+			errw := multiWriterNil(iocfg.Stderr, obw)
+
+			if !rr.NoPTY && isWriterTerminal(iocfg.Stdout) {
+				pty, err, clean := createPty(outw, szch)
+				if err != nil {
+					return err
+				}
+				defer clean()
+
+				iocfg.Stdout = pty
+			} else {
+				iocfg.Stdout = outw
+			}
+
+			if !rr.NoPTY && isWriterTerminal(iocfg.Stderr) {
+				pty, err, clean := createPty(errw, szch)
+				if err != nil {
+					return err
+				}
+				defer clean()
+
+				iocfg.Stderr = pty
+			} else {
+				iocfg.Stderr = errw
+			}
+		}
+
 		err = platform.Exec(
 			execCtx,
 			rp.Executor,
@@ -627,7 +662,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		if logFile != nil {
 			_ = logFile.Close()
 		}
-		espan.EndError(err)
+		execSpan.EndError(err)
 		if err != nil {
 			if rr.Shell {
 				log.Debugf("exec: %v", err)
@@ -891,7 +926,7 @@ func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error
 		}
 
 		switch target.Codegen {
-		case targetspec.CodegenCopy:
+		case targetspec.CodegenCopy, targetspec.CodegenCopyNoExclude:
 			tarf := e.cacheDir(target).Join(target.artifacts.OutTar(name).Name()).Abs()
 			err := tar.Untar(ctx, tarf, e.Root.Abs(), false)
 			if err != nil {

@@ -1,7 +1,7 @@
 package tgt
 
 import (
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/utils/fs"
 	"sort"
 )
 

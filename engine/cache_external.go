@@ -2,12 +2,13 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
-	"heph/engine/artifacts"
-	log "heph/hlog"
-	"heph/utils"
-	"heph/worker"
+	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/worker"
 	"os"
 	"path/filepath"
 )
@@ -145,7 +146,7 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
-	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, artifact)
+	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, cache.Name, artifact)
 	defer span.EndError(rerr)
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
@@ -162,8 +163,13 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 }
 
 func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target, artifact)
-	defer span.EndError(rerr)
+	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target, cache.Name, artifact)
+	defer func() {
+		if rerr != nil && errors.Is(rerr, os.ErrNotExist) {
+			span.SetCacheHit(false)
+		}
+		span.EndError(rerr)
+	}()
 
 	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 

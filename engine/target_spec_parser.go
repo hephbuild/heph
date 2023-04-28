@@ -2,11 +2,11 @@ package engine
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
 	"go.starlark.net/starlark"
-	"heph/exprs"
-	"heph/packages"
-	"heph/targetspec"
-	"heph/utils"
 	"runtime"
 	"sort"
 	"strconv"

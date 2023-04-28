@@ -2,8 +2,8 @@ package tgt
 
 import (
 	"errors"
-	"heph/targetspec"
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils/fs"
 )
 
 type OutNamedPaths = NamedPaths[fs.RelPaths, fs.RelPath]

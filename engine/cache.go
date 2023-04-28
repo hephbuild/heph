@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"heph/engine/artifacts"
-	"heph/engine/observability"
-	log "heph/hlog"
-	"heph/rcache"
-	"heph/utils/fs"
-	"heph/utils/instance"
+	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/rcache"
+	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/instance"
 	"os"
 )
 
@@ -60,7 +60,7 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 	return true, nil
 }
 
-func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled bool, rcached bool, rerr error) {
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled, rcached bool, rerr error) {
 	e.Status(TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
@@ -135,6 +135,7 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 	err := e.downloadExternalCache(ctx, target, cache, target.artifacts.InputHash)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			span.SetCacheHit(false)
 			return false, nil
 		}
 		return false, err
@@ -149,6 +150,7 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 			}
 
 			if !exists {
+				span.SetCacheHit(false)
 				return false, nil
 			}
 		} else {
@@ -164,17 +166,19 @@ func (e *TargetRunEngine) pullExternalCache(ctx context.Context, target *Target,
 		}
 	}
 
+	span.SetCacheHit(true)
+
 	return true, nil
 }
 
-func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, isAfterPulling bool) bool {
-	setCacheHit := func() {}
-	if !isAfterPulling {
+func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, skipSpan bool) bool {
+	setCacheHit := func(bool) {}
+	if !skipSpan {
 		var span *observability.TargetArtifactCacheSpan
 		ctx, span = e.Observability.SpanLocalCacheCheck(ctx, target.Target, artifact)
 		defer span.End()
-		setCacheHit = func() {
-			span.SetCacheHit(true)
+		setCacheHit = func(v bool) {
+			span.SetCacheHit(v)
 		}
 	}
 
@@ -182,25 +186,26 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 
 	p := cacheDir.Join(artifact.Name()).Abs()
 	if !fs.PathExists(p) {
+		setCacheHit(false)
 		return false
 	}
 
-	setCacheHit()
+	setCacheHit(true)
 	return true
 }
 
-func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, isAfterPulling bool) (bool, error) {
-	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash, isAfterPulling) {
+func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan bool) (bool, error) {
+	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash, skipSpan) {
 		return false, nil
 	}
 
 	for _, output := range outputs {
-		if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutHash(output), isAfterPulling) {
+		if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutHash(output), skipSpan) {
 			return false, nil
 		}
 
 		if !onlyMeta {
-			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output), isAfterPulling) {
+			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output), skipSpan) {
 				return false, nil
 			}
 		}

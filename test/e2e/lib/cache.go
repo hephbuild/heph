@@ -46,14 +46,12 @@ func TargetCacheOutputHash(tgt, output string) (string, error) {
 	return FileContent(p)
 }
 
-func ValidateCache(tgt string, outputs []string, fromRemote bool, expectLogs bool) error {
+func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
 	expected := []string{
 		"hash_input",
 	}
 	if !fromRemote {
 		expected = append(expected, "manifest.json")
-	}
-	if expectLogs {
 		expected = append(expected, "log.tar.gz")
 	}
 	if len(outputs) > 0 {

@@ -1,8 +1,8 @@
 package engine
 
 import (
-	"heph/targetspec"
-	"heph/utils/sets"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils/sets"
 	"sort"
 )
 

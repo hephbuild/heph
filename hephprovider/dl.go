@@ -2,8 +2,8 @@ package hephprovider
 
 import (
 	"fmt"
-	log "heph/hlog"
-	"heph/utils/fs"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/fs"
 	"io"
 	"net/http"
 	"os"

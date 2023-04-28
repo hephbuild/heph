@@ -3,8 +3,8 @@ package platform
 import (
 	"context"
 	"fmt"
-	log "heph/hlog"
-	"heph/sandbox"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/sandbox"
 	"runtime"
 )
 

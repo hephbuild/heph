@@ -3,7 +3,7 @@ package utils
 import (
 	"encoding/json"
 	"errors"
-	log "heph/hlog"
+	"github.com/hephbuild/heph/log/log"
 	"os"
 )
 

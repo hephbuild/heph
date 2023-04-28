@@ -3,8 +3,8 @@ package hash
 import (
 	"encoding/json"
 	"fmt"
-	log "heph/hlog"
-	fs2 "heph/utils/fs"
+	"github.com/hephbuild/heph/log/log"
+	fs2 "github.com/hephbuild/heph/utils/fs"
 	"os"
 	"path/filepath"
 	"runtime"

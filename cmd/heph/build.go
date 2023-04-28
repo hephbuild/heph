@@ -1,10 +1,10 @@
 package main
 
 import (
+	"github.com/hephbuild/heph/cmd/heph/search"
+	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/lithammer/fuzzysearch/fuzzy"
-	"heph/cmd/heph/search"
-	"heph/targetspec"
-	"heph/tgt"
 	"sort"
 	"strings"
 )

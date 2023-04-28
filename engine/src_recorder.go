@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"heph/utils/tar"
+	"github.com/hephbuild/heph/utils/tar"
 	"sync"
 )
 

@@ -1,7 +1,7 @@
 package utils
 
 import (
-	log "heph/hlog"
+	log "github.com/hephbuild/heph/log/liblog"
 	"time"
 )
 
@@ -16,16 +16,16 @@ func TraceTimingDone(name string) func() {
 }
 
 func traceTiming(name string, before bool) func() {
-	if !log.IsLevelEnabled(log.TraceLevel) {
+	if !log.Default().IsLevelEnabled(log.TraceLevel) {
 		return noop
 	}
 
 	start := time.Now()
 	if before {
-		log.Trace(name)
+		log.Default().Trace(name)
 	}
 
 	return func() {
-		log.Tracef("%v took %v", name, time.Since(start))
+		log.Default().Tracef("%v took %v", name, time.Since(start))
 	}
 }

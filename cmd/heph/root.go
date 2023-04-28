@@ -2,12 +2,12 @@ package main
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
-	"heph/config"
-	"heph/engine"
-	log "heph/hlog"
-	"heph/utils"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,10 +27,12 @@ var workers int
 var cpuprofile *string
 var memprofile *string
 var shell *bool
+var noCloudTelemetry *bool
 var noInline *bool
 var printOutput boolStr
 var ignore *[]string
 var nocache *bool
+var nopty *bool
 var params *[]string
 var summary *bool
 var summaryGen *bool
@@ -60,6 +62,7 @@ func init() {
 	rootCmd.AddCommand(watchCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
+	rootCmd.AddCommand(cloudCmd)
 	rootCmd.AddCommand(gcCmd)
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(setupCmd)
@@ -71,10 +74,12 @@ func init() {
 	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
 	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
+	nopty = rootCmd.PersistentFlags().Bool("no-pty", false, "Disables PTY")
 	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
 	summaryGen = rootCmd.PersistentFlags().Bool("summary-gen", false, "Prints execution stats, including during gen")
 	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
 	ignoreUnknownTarget = rootCmd.PersistentFlags().Bool("ignore-unknown", false, "Ignore unknown targets")
+	noCloudTelemetry = rootCmd.PersistentFlags().Bool("no-cloud-telemetry", false, "Disable cloud reporting")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	rootCmd.PersistentFlags().Var(newWorkersValue(&workers), "workers", "Workers to spawn as a number or percentage")
@@ -88,7 +93,7 @@ var cpuProfileFile *os.File
 
 var Engine *engine.Engine
 
-func postRun() {
+func postRun(err error) {
 	defer func() {
 		if cpuProfileFile != nil {
 			pprof.StopCPUProfile()
@@ -133,7 +138,7 @@ func postRun() {
 		}
 	}
 
-	Engine.RunExitHandlers()
+	Engine.RunExitHandlers(err)
 
 	if *summary || *summaryGen {
 		PrintSummary(Engine.Summary, *summaryGen)
@@ -169,8 +174,6 @@ var rootCmd = &cobra.Command{
 				return fmt.Errorf("could not start CPU profile: %w", err)
 			}
 		}
-
-		cobra.OnFinalize(postRun)
 
 		return nil
 	},

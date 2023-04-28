@@ -3,6 +3,8 @@ package flock
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/log/liblog"
+	"github.com/hephbuild/heph/log/testlog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"os"
@@ -113,12 +115,15 @@ func testLocker(t *testing.T, factory func() Locker) {
 	var wg sync.WaitGroup
 	var n int32
 
+	logger := testlog.NewLogger(t)
+	ctx := liblog.ContextWith(context.Background(), logger)
+
 	do := func() {
 		defer wg.Done()
 
 		l := factory()
 
-		err := l.Lock(context.Background())
+		err := l.Lock(ctx)
 		if err != nil {
 			panic(err)
 		}
@@ -153,10 +158,13 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 
 	ch := make(chan struct{})
 
+	logger := testlog.NewLogger(t)
+	ctx := liblog.ContextWith(context.Background(), logger)
+
 	go func() {
 		l := factory()
 
-		err := l.Lock(context.Background())
+		err := l.Lock(ctx)
 		if err != nil {
 			panic(err)
 		}
@@ -167,7 +175,7 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 	<-ch
 	t.Log("other routine got lock, locking here")
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
 
 	go func() {
@@ -191,17 +199,20 @@ func testLockerTry(t *testing.T, factory func() Locker) {
 	l1 := factory()
 	l2 := factory()
 
-	err := l1.Lock(context.Background())
+	logger := testlog.NewLogger(t)
+	ctx := liblog.ContextWith(context.Background(), logger)
+
+	err := l1.Lock(ctx)
 	require.NoError(t, err)
 
-	ok, err := l2.TryLock()
+	ok, err := l2.TryLock(ctx)
 	require.NoError(t, err)
 	assert.False(t, ok)
 
 	err = l1.Unlock()
 	require.NoError(t, err)
 
-	ok, err = l2.TryLock()
+	ok, err = l2.TryLock(ctx)
 	require.NoError(t, err)
 	assert.True(t, ok)
 }

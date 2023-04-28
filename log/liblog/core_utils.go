@@ -1,4 +1,4 @@
-package log
+package liblog
 
 import (
 	"go.uber.org/multierr"

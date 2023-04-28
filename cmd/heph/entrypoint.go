@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 	"errors"
-	log "heph/hlog"
-	"heph/utils"
-	"heph/vfssimple"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/vfssimple"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,7 +33,9 @@ func execute() error {
 		os.Exit(1)
 	}()
 
-	if err := rootCmd.ExecuteContext(ctx); err != nil {
+	err := rootCmd.ExecuteContext(ctx)
+	postRun(err)
+	if err != nil {
 		return err
 	}
 

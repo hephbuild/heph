@@ -2,8 +2,8 @@ package hephprovider
 
 import (
 	"fmt"
-	"heph/utils"
-	fs2 "heph/utils/fs"
+	"github.com/hephbuild/heph/utils"
+	fs2 "github.com/hephbuild/heph/utils/fs"
 	"io/fs"
 	"os"
 	"path/filepath"

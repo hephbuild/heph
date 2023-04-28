@@ -53,18 +53,18 @@ go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
     name="test_go",
-    run="go test -v ./...",
+    run="CGO_ENABLED=0 go test -v ./...",
     tools=["go"],
     cache=False,
     sandbox=False,
-    pass_env=go_env_vars,
+    pass_env="*",
 )
 
 target(
     name="build_all",
     run="heph query --include build | heph run -",
     tools=['heph'],
-    pass_env=go_env_vars,
+    pass_env="*",
     sandbox=False,
     cache=False,
 )
@@ -73,7 +73,9 @@ extra_src = [
     'engine/predeclared.gotpl',
     'platform/initfile.sh',
 ]
-deps = ["go.mod", "go.sum"] + glob("**/*.go", exclude=["website", "backend", "test"]) + extra_src
+deps = ["go.mod", "go.sum"] +\
+       glob("**/*.go", exclude=["website", "backend", "test"]) +\
+       extra_src
 
 release = "release" in CONFIG["profiles"]
 
@@ -99,7 +101,7 @@ for os in ["linux", "darwin"]:
             name="build_{}_{}".format(os, arch),
             run=[
                 "go version",
-                _gobuild('heph/cmd/heph', build_flags),
+                _gobuild('github.com/hephbuild/heph/cmd/heph', build_flags),
             ],
             out="heph_{}_{}".format(os, arch),
             deps=deps,
@@ -138,4 +140,59 @@ target(
       """,
     cache=False,
     pass_env="*",
+)
+
+target(
+    name="noop",
+    run="echo ran",
+    cache=False,
+)
+
+target(
+    name="long-running",
+    run="""
+for j in {1..100}; do
+    echo $j
+    sleep 0.1
+done
+      """,
+    cache=False,
+)
+
+target(
+    name="infinite-running",
+    run="""
+for j in {1..99999}; do
+    echo $j
+    sleep 1
+done
+      """,
+    cache=False,
+)
+
+waitfail=target(
+    name="wait-fail",
+    run="""
+    sleep 5
+    exit 1
+    """,
+    cache=False,
+)
+
+target(
+    name="dep-wait-fail",
+    deps=waitfail,
+    run='echo hello',
+    cache=False,
+)
+
+target(
+    name="long-log",
+    run=[
+        'cat /private/var/log/install.log',
+        'cat /private/var/log/install.log',
+        'cat /private/var/log/install.log',
+        'cat /private/var/log/install.log',
+    ],
+    cache=False,
 )
