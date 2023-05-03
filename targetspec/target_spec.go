@@ -5,6 +5,7 @@ import (
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"os/exec"
 	"sort"
@@ -60,7 +61,7 @@ func (e TargetSpecSrcEnv) Get(name string) string {
 const SupportFilesOutput = "@support_files"
 
 func SortOutputsForHashing(names []string) []string {
-	names = utils.CopyArray(names)
+	names = ads.Copy(names)
 	sort.Slice(names, func(i, j int) bool {
 		if names[i] == SupportFilesOutput {
 			return true

@@ -1,6 +1,4 @@
-package utils
-
-import "sort"
+package ads
 
 func Map[T, O any](a []T, f func(T) O) []O {
 	out := make([]O, len(a))
@@ -12,12 +10,14 @@ func Map[T, O any](a []T, f func(T) O) []O {
 	return out
 }
 
-func MapMap[K, KO comparable, V, VO any](m map[K]V, f func(K, V) (KO, VO)) map[KO]VO {
-	out := make(map[KO]VO, len(m))
+func MapFilter[T, O any](a []T, f func(T) (O, bool)) []O {
+	out := make([]O, 0, len(a))
 
-	for k, v := range m {
-		ko, vo := f(k, v)
-		out[ko] = vo
+	for _, e := range a {
+		v, ok := f(e)
+		if ok {
+			out = append(out, v)
+		}
 	}
 
 	return out
@@ -45,7 +45,28 @@ func Filter[T any](a []T, f func(T) bool) []T {
 	return o
 }
 
-func CopyArray[T any](a []T) []T {
+func Find[T any](a []T, f func(T) bool) (T, bool) {
+	for _, e := range a {
+		if f(e) {
+			return e, true
+		}
+	}
+
+	var empty T
+	return empty, false
+}
+
+func FindIndex[T any](a []T, f func(T) bool) int {
+	for i, e := range a {
+		if f(e) {
+			return i
+		}
+	}
+
+	return -1
+}
+
+func Copy[T any](a []T) []T {
 	if a == nil {
 		return nil
 	}
@@ -54,18 +75,7 @@ func CopyArray[T any](a []T) []T {
 	return append(empty, a...)
 }
 
-func Keys[K string, V any](m map[K]V) []K {
-	ks := make([]K, 0, len(m))
-	for k := range m {
-		ks = append(ks, k)
-	}
-	sort.Slice(ks, func(i, j int) bool {
-		return ks[i] < ks[j]
-	})
-	return ks
-}
-
-func ChunkSlice[T any](slice []T, chunkSize int) [][]T {
+func Chunk[T any](slice []T, chunkSize int) [][]T {
 	var chunks [][]T
 	for {
 		if len(slice) == 0 {
@@ -83,6 +93,17 @@ func ChunkSlice[T any](slice []T, chunkSize int) [][]T {
 	return chunks
 }
 
-func RemoveSlice[T any](slice []T, s int) []T {
+func Remove[T comparable](slice []T, e T) []T {
+	i := FindIndex(slice, func(t T) bool {
+		return e == t
+	})
+	if i < 0 {
+		return slice
+	}
+
+	return RemoveIndex(slice, i)
+}
+
+func RemoveIndex[T any](slice []T, s int) []T {
 	return append(slice[:s], slice[s+1:]...)
 }

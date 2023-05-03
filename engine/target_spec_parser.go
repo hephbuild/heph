@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/starlark"
 	"runtime"
 	"sort"
@@ -23,7 +24,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
 		Entrypoint:          args.Entrypoint,
-		Platforms: utils.Map(args.Platforms, func(d *starlark.Dict) targetspec.TargetPlatform {
+		Platforms: ads.Map(args.Platforms, func(d *starlark.Dict) targetspec.TargetPlatform {
 			labels := map[string]string{}
 			options := map[string]interface{}{}
 			for _, k := range d.Keys() {
@@ -279,7 +280,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 				switch k {
 				case "mode":
 					mode := targetspec.TargetSpecDepMode(v)
-					if !utils.Contains(targetspec.TargetSpecDepModes, mode) {
+					if !ads.Contains(targetspec.TargetSpecDepModes, mode) {
 						return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid mode: %v", v)
 					}
 					tspec.Mode = mode

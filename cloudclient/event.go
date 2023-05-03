@@ -41,4 +41,5 @@ type Event struct {
 	TargetFQN     null.Val[string]                   `json:"target_fqn,omitempty"`
 	ArtifactName  null.Val[string]                   `json:"artifact_name,omitempty"`
 	CacheHit      null.Val[bool]                     `json:"cache_hit,omitempty"`
+	ParentID      null.Val[string]                   `json:"parent_id,omitempty"`
 }

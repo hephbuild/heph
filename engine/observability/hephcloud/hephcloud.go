@@ -170,7 +170,25 @@ func (h *Hook) sendSpans(ctx context.Context) error {
 	})
 }
 
-func (h *Hook) addEvent(event cloudclient.Event) {
+func (h *Hook) on(ctx context.Context, typ cloudclient.TargetExecSpanEvent, span span) (context.Context, observability.SpanHook) {
+	cctx := h.newEvent(ctx, eventFactory(ctx, typ, span))
+
+	return cctx, observability.AllSpanHook(func() {
+		h.enqueueEvent(eventFactory(ctx, typ, span))
+	})
+}
+
+type parentEventKey struct{}
+
+func (h *Hook) newEvent(ctx context.Context, event cloudclient.Event) context.Context {
+	h.enqueueEvent(event)
+
+	ctx = context.WithValue(ctx, parentEventKey{}, event)
+
+	return ctx
+}
+
+func (h *Hook) enqueueEvent(event cloudclient.Event) {
 	if h.invocationID == "" {
 		return
 	}
@@ -192,6 +210,11 @@ func nullFromTime(t time.Time) null.Val[time.Time] {
 }
 
 func eventFactory(ctx context.Context, eventType cloudclient.TargetExecSpanEvent, span span) cloudclient.Event {
+	parentId := ""
+	if parent, ok := ctx.Value(parentEventKey{}).(cloudclient.Event); ok {
+		parentId = parent.SpanID
+	}
+
 	espan := cloudclient.Event{
 		Event:         eventType,
 		SpanID:        strconv.FormatUint(span.ID(), 10),
@@ -200,6 +223,7 @@ func eventFactory(ctx context.Context, eventType cloudclient.TargetExecSpanEvent
 		StartTime:     nullFromTime(span.StartTime()),
 		EndTime:       nullFromTime(span.EndTime()),
 		TargetFQN:     null.From(span.Target().FQN),
+		ParentID:      null.From(parentId),
 	}
 
 	if !span.EndTime().IsZero() {
@@ -308,37 +332,25 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (contex
 }
 
 func (h *Hook) OnRun(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventRUN, span)
 }
 
 func (h *Hook) OnCacheDownload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_DOWNLOAD, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_DOWNLOAD, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_DOWNLOAD, span)
 }
 
 func (h *Hook) OnCacheUpload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_UPLOAD, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_UPLOAD, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventARTIFACT_REMOTE_UPLOAD, span)
 }
 
 func (h *Hook) OnRunPrepare(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_PREPARE, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_PREPARE, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventRUN_PREPARE, span)
 }
 
 type execLogsKey struct{}
 
 func (h *Hook) OnRunExec(ctx context.Context, span *observability.TargetExecSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_EXEC, span))
+	cctx := h.newEvent(ctx, eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_EXEC, span))
 
 	h.logsm.Lock()
 	w := &spanLogBuffer{localSpanId: fmt.Sprint(span.ID())}
@@ -346,39 +358,27 @@ func (h *Hook) OnRunExec(ctx context.Context, span *observability.TargetExecSpan
 	h.logs = append(h.logs, w)
 	h.logsm.Unlock()
 
-	ctx = context.WithValue(ctx, execLogsKey{}, w)
+	cctx = context.WithValue(cctx, execLogsKey{}, w)
 
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_EXEC, span))
+	return cctx, observability.AllSpanHook(func() {
+		h.enqueueEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_EXEC, span))
 	})
 }
 
 func (h *Hook) OnCollectOutput(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_COLLECT_OUTPUT, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_COLLECT_OUTPUT, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventCACHE_COLLECT_OUTPUT, span)
 }
 
 func (h *Hook) OnLocalCacheStore(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_STORE, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_STORE, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_STORE, span)
 }
 
 func (h *Hook) OnLocalCacheCheck(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_CHECK, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_CHECK, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventCACHE_LOCAL_CHECK, span)
 }
 
 func (h *Hook) OnExternalCacheGet(ctx context.Context, span *observability.ExternalCacheGetSpan) (context.Context, observability.SpanHook) {
-	h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_REMOTE_GET, span))
-	return ctx, observability.AllSpanHook(func() {
-		h.addEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventCACHE_REMOTE_GET, span))
-	})
+	return h.on(ctx, cloudclient.TargetExecSpanEventCACHE_REMOTE_GET, span)
 }
 
 func (h *Hook) OnLogs(ctx context.Context) io.Writer {
