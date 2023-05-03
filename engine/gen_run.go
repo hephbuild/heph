@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/worker"
 	"path/filepath"
 	"time"
@@ -185,7 +185,7 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *Targets) error {
 	files := target.ActualOutFiles().All()
 
-	chunks := utils.ChunkSlice(files, len(e.Pool.Workers))
+	chunks := ads.Chunk(files, len(e.Pool.Workers))
 
 	for i, files := range chunks {
 		files := files

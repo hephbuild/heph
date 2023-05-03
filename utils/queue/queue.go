@@ -6,9 +6,9 @@ import (
 )
 
 type Queue[T any] struct {
+	Max int
 	vs  []T
 	m   sync.Mutex
-	Max int
 }
 
 func (q *Queue[T]) Enqueue(vs ...T) {
@@ -26,18 +26,11 @@ func (q *Queue[T]) Enqueue(vs ...T) {
 
 func (q *Queue[T]) DequeueChunk(chunkSize int, f func(vs []T) error) error {
 	for {
-		q.m.Lock()
-		vs := q.vs
-		if len(vs) > chunkSize {
-			vs = vs[:chunkSize]
-		}
-		q.vs = q.vs[len(vs):]
-		q.m.Unlock()
+		vs := q.Dequeue(chunkSize)
 
 		if len(vs) == 0 {
 			return nil
 		}
-
 		err := f(vs)
 		if err != nil {
 			// Requeue...
@@ -47,4 +40,16 @@ func (q *Queue[T]) DequeueChunk(chunkSize int, f func(vs []T) error) error {
 			return err
 		}
 	}
+}
+
+func (q *Queue[T]) Dequeue(chunkSize int) []T {
+	q.m.Lock()
+	vs := q.vs
+	if len(vs) > chunkSize {
+		vs = vs[:chunkSize]
+	}
+	q.vs = q.vs[len(vs):]
+	q.m.Unlock()
+
+	return vs
 }

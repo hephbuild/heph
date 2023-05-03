@@ -4,6 +4,7 @@ import (
 	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/mds"
 	"strings"
 )
 
@@ -47,7 +48,7 @@ func (o *ArtifactOrchestrator) AllStore() []artifacts.Artifact {
 	return o.allReverseOnce.MustDo(func() ([]artifacts.Artifact, error) {
 		all := make([]artifacts.Artifact, 0, len(o.Out)+2)
 		all = append(all, o.Log)
-		names := utils.Keys(o.Out)
+		names := mds.Keys(o.Out)
 		names = targetspec.SortOutputsForHashing(names)
 		for _, name := range names {
 			a := o.Out[name]

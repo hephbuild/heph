@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"io"
 	"io/ioutil"
@@ -84,7 +85,7 @@ func orderCaches(ctx context.Context, caches []CacheConfig) []CacheConfig {
 		return orderedCaches[i].latency < orderedCaches[j].latency
 	})
 
-	return utils.Map(orderedCaches, func(c orderCacheContainer) CacheConfig {
+	return ads.Map(orderedCaches, func(c orderCacheContainer) CacheConfig {
 		return c.cache
 	})
 }
@@ -122,7 +123,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 		log.Infof("Measuring caches latency...")
 		ordered := orderCaches(ctx, e.Config.Caches)
 
-		return utils.Map(ordered, func(c CacheConfig) string {
+		return ads.Map(ordered, func(c CacheConfig) string {
 			return c.Name
 		}), nil
 	})

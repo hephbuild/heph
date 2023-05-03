@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/sets"
 	"go.starlark.net/starlark"
@@ -268,7 +269,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	return starlark.NewList(utils.Map(elems.Slice(), func(p string) starlark.Value {
+	return starlark.NewList(ads.Map(elems.Slice(), func(p string) starlark.Value {
 		return starlark.String(p)
 	})), nil
 }
