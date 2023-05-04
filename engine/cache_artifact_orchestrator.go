@@ -70,15 +70,15 @@ func (o *ArtifactOrchestrator) OutTar(name string) artifacts.Artifact {
 
 func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 	o := &ArtifactOrchestrator{
-		InputHash: artifacts.New("hash_input", "#input", true, hashInputArtifact{
+		InputHash: artifacts.New("hash_input", "#input", true, false, hashInputArtifact{
 			Engine: e,
 			Target: target,
 		}),
-		Manifest: artifacts.New("manifest.json", "manifest", true, manifestArtifact{
+		Manifest: artifacts.New("manifest.json", "manifest", true, false, manifestArtifact{
 			Engine: e,
 			Target: target,
 		}),
-		Log: artifacts.New("log.tar.gz", "log", false, logArtifact{}),
+		Log: artifacts.New("log.txt", "log", false, false, logArtifact{}),
 		Out: map[string]ArtifactsOut{},
 	}
 
@@ -87,12 +87,12 @@ func (e *Engine) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 
 	for _, name := range names {
 		o.Out[name] = ArtifactsOut{
-			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, hashOutputArtifact{
+			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, false, hashOutputArtifact{
 				Engine: e,
 				Target: target,
 				Output: name,
 			}),
-			artifacts.New("out_"+name+".tar.gz", strings.TrimSpace(name+" tar.gz"), true, outTarArtifact{
+			artifacts.New("out_"+name+".tar", strings.TrimSpace(name+" tar"), true, true, outTarArtifact{
 				Target: target,
 				Output: name,
 			}),

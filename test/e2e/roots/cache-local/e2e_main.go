@@ -17,12 +17,12 @@ func main() {
 
 	// Test zero cache run
 	Must(Run("//:hello"))
-	Must(ValidateCache("//:hello", []string{""}, false))
+	Must(ValidateCache("//:hello", []string{""}, false, true, false))
 
 	cacheRoot := MustV(TargetCacheRoot("//:hello"))
 	Must(os.Remove(filepath.Join(cacheRoot, "out_.tar.gz")))
 
 	// Test zero cache run
 	Must(Run("//:hello"))
-	Must(ValidateCache("//:hello", []string{""}, false))
+	Must(ValidateCache("//:hello", []string{""}, false, true, false))
 }

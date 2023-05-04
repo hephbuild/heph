@@ -46,13 +46,13 @@ func TargetCacheOutputHash(tgt, output string) (string, error) {
 	return FileContent(p)
 }
 
-func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
+func ValidateCache(tgt string, outputs []string, fromRemote, compressed, uncompressed bool) error {
 	expected := []string{
 		"hash_input",
 	}
 	if !fromRemote {
 		expected = append(expected, "manifest.json")
-		expected = append(expected, "log.tar.gz")
+		expected = append(expected, "log.txt")
 	}
 	if len(outputs) > 0 {
 		expected = append(expected, "_output")
@@ -60,8 +60,13 @@ func ValidateCache(tgt string, outputs []string, fromRemote bool) error {
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)
-		expected = append(expected, fmt.Sprintf("out_%v.tar.gz", output))
-		expected = append(expected, fmt.Sprintf("out_%v.tar.gz.list", output))
+		if compressed {
+			expected = append(expected, fmt.Sprintf("out_%v.tar.gz", output))
+		}
+		if uncompressed {
+			expected = append(expected, fmt.Sprintf("out_%v.tar", output))
+		}
+		expected = append(expected, fmt.Sprintf("out_%v.tar.list", output))
 	}
 
 	root, err := TargetCacheRoot(tgt)

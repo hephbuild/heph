@@ -2,11 +2,9 @@ package tar
 
 import (
 	"archive/tar"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
 	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
 	"io"
@@ -90,37 +88,7 @@ func tarWriteDir(file TarFile, tw *tar.Writer) error {
 	})
 }
 
-func Tar(ctx context.Context, files []TarFile, out string) error {
-	outTmp := out + ".tmp"
-
-	tarf, err := os.Create(outTmp)
-	if err != nil {
-		return fmt.Errorf("tar: %w", err)
-	}
-	defer tarf.Close()
-
-	go func() {
-		<-ctx.Done()
-		tarf.Close()
-	}()
-
-	gw := gzip.NewWriter(tarf)
-	defer gw.Close()
-
-	err = doTar(gw, files)
-	if err != nil {
-		return err
-	}
-
-	err = os.Rename(outTmp, out)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func doTar(w io.Writer, files []TarFile) error {
+func Tar(w io.Writer, files []TarFile) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
@@ -150,14 +118,14 @@ func doTar(w io.Writer, files []TarFile) error {
 	return nil
 }
 
-func tarListFactory(tar string) (func(string), func() ([]string, error)) {
+func tarListFactory(path string) (func(string), func() ([]string, error)) {
 	files := make([]string, 0)
 	recordFile := func(path string) {
 		files = append(files, path)
 	}
 
 	return recordFile, func() ([]string, error) {
-		listf, err := os.Create(tar + ".list")
+		listf, err := os.Create(path)
 		if err != nil {
 			return nil, err
 		}
@@ -172,24 +140,30 @@ func tarListFactory(tar string) (func(string), func() ([]string, error)) {
 }
 
 type UntarOptions struct {
-	List  bool
-	RO    bool
-	Dedup *sets.StringSet
+	ListPath string
+	RO       bool
+	Dedup    *sets.StringSet
 }
 
-func Untar(ctx context.Context, in, to string, list bool) (err error) {
-	return UntarWith(ctx, in, to, UntarOptions{
-		List: list,
-	})
+func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
+	tarf, err := os.Open(in)
+	if err != nil {
+		return fmt.Errorf("tarwalk: %w", err)
+	}
+	defer tarf.Close()
+
+	return UntarContext(ctx, tarf, to, o)
 }
 
-func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
-	log.Tracef("untar: %v to %v %#v", in, to, o)
+func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
+	return Untar(ContextReader(ctx, in), to, o)
+}
 
+func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 	recordFile := func(string) {}
-	if o.List {
+	if o.ListPath != "" {
 		var complete func() ([]string, error)
-		recordFile, complete = tarListFactory(in)
+		recordFile, complete = tarListFactory(o.ListPath)
 
 		defer func() {
 			if err != nil {
@@ -200,7 +174,7 @@ func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
 		}()
 	}
 
-	return Walk(ctx, in, func(hdr *tar.Header, tr *tar.Reader) error {
+	return Walk(in, func(hdr *tar.Header, tr *tar.Reader) error {
 		dest := filepath.Join(to, hdr.Name)
 
 		if o.Dedup != nil {
@@ -219,14 +193,14 @@ func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
 		case tar.TypeReg:
 			err = untarFile(hdr, tr, dest, o.RO)
 			if err != nil {
-				return fmt.Errorf("untar: %w", err)
+				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
 
 			recordFile(hdr.Name)
 		case tar.TypeDir:
 			err := os.MkdirAll(dest, os.FileMode(hdr.Mode))
 			if err != nil {
-				return fmt.Errorf("untar: %w", err)
+				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
 		case tar.TypeSymlink:
 			if hdr.Linkname == "" {
@@ -241,7 +215,7 @@ func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
 
 			err := os.Symlink(hdr.Linkname, dest)
 			if err != nil {
-				return fmt.Errorf("untar: %w", err)
+				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
 		default:
 			return fmt.Errorf("untar: unsupported type %v", hdr.Typeflag)
@@ -251,8 +225,7 @@ func UntarWith(ctx context.Context, in, to string, o UntarOptions) (err error) {
 	})
 }
 
-func UntarList(ctx context.Context, in string) ([]string, error) {
-	listPath := in + ".list"
+func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string, error) {
 	if fs2.PathExists(listPath) {
 		f, err := os.Open(listPath)
 		if err != nil {
@@ -267,9 +240,9 @@ func UntarList(ctx context.Context, in string) ([]string, error) {
 		}
 	}
 
-	recordFile, complete := tarListFactory(in)
+	recordFile, complete := tarListFactory(listPath)
 
-	err := Walk(ctx, in, func(hdr *tar.Header, tr *tar.Reader) error {
+	err := Walk(ContextReader(ctx, in), func(hdr *tar.Header, tr *tar.Reader) error {
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeSymlink:
 			recordFile(hdr.Name)
@@ -284,25 +257,27 @@ func UntarList(ctx context.Context, in string) ([]string, error) {
 	return complete()
 }
 
-func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader) error) error {
+func ContextReader[R io.Closer](ctx context.Context, r R) R {
+	go func() {
+		<-ctx.Done()
+		_ = r.Close()
+	}()
+
+	return r
+}
+
+func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader) error) error {
 	tarf, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("tarwalk: %w", err)
 	}
 	defer tarf.Close()
 
-	go func() {
-		<-ctx.Done()
-		tarf.Close()
-	}()
+	return Walk(ContextReader(ctx, tarf), fs...)
+}
 
-	gr, err := gzip.NewReader(tarf)
-	if err != nil {
-		return err
-	}
-	defer gr.Close()
-
-	tr := tar.NewReader(gr)
+func Walk(tarf io.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
+	tr := tar.NewReader(tarf)
 
 	for {
 		hdr, err := tr.Next()
@@ -311,20 +286,12 @@ func Walk(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader)
 				break // End of archive
 			}
 
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			return fmt.Errorf("untar: %w", err)
+			return fmt.Errorf("walk: %w", err)
 		}
 
 		for _, f := range fs {
 			err = f(hdr, tr)
 			if err != nil {
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-
 				return err
 			}
 		}

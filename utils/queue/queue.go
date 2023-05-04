@@ -6,9 +6,10 @@ import (
 )
 
 type Queue[T any] struct {
-	Max int
-	vs  []T
-	m   sync.Mutex
+	Max                 int
+	vs                  []T
+	m                   sync.Mutex
+	DisableRescheduling bool
 }
 
 func (q *Queue[T]) Enqueue(vs ...T) {
@@ -35,7 +36,9 @@ func (q *Queue[T]) DequeueChunk(chunkSize int, f func(vs []T) error) error {
 		if err != nil {
 			// Requeue...
 			q.m.Lock()
-			q.vs = append(vs, q.vs...)
+			if !q.DisableRescheduling {
+				q.vs = append(vs, q.vs...)
+			}
 			q.m.Unlock()
 			return err
 		}

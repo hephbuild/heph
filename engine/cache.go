@@ -184,14 +184,16 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 
 	cacheDir := e.cacheDir(target)
 
-	p := cacheDir.Join(artifact.Name()).Abs()
-	if !fs.PathExists(p) {
-		setCacheHit(false)
-		return false
+	for _, name := range []string{artifact.FileName(), artifact.GzFileName()} {
+		p := cacheDir.Join(name).Abs()
+		if fs.PathExists(p) {
+			setCacheHit(true)
+			return true
+		}
 	}
 
-	setCacheHit(true)
-	return true
+	setCacheHit(false)
+	return false
 }
 
 func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan bool) (bool, error) {

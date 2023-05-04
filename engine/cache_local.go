@@ -9,7 +9,7 @@ import (
 	"os"
 )
 
-func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string, logFilePath string) (rerr error) {
+func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoot string, logFilePath string, compress bool) (rerr error) {
 	if target.ConcurrentExecution {
 		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
 		return nil
@@ -59,7 +59,7 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 		_, err := artifacts.GenArtifact(ctx, dir, artifact, artifacts.GenContext{
 			OutRoot:     outRoot,
 			LogFilePath: logFilePath,
-		})
+		}, compress)
 		if err != nil {
 			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
 		}

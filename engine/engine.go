@@ -10,6 +10,7 @@ import (
 	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/cloudclient"
 	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/engine/observability"
 	obsummary "github.com/hephbuild/heph/engine/observability/summary"
 	"github.com/hephbuild/heph/log/log"
@@ -93,6 +94,7 @@ type Engine struct {
 	orderedCaches     []CacheConfig
 	CloudClient       *cloudclient.HephClient
 	CloudClientAuth   *cloudclient.HephClient
+	CloudToken        string
 }
 
 type PlatformProvider struct {
@@ -342,12 +344,15 @@ type targetStatus struct {
 	fqn, output, status string
 }
 
-var targetStyle = struct {
-	target, output lipgloss.Style
-}{
-	lipgloss.NewStyle().Foreground(lipgloss.Color("#FFCA33")),
-	lipgloss.NewStyle().Foreground(lipgloss.Color("#FFCA33")).Bold(true),
-}
+var (
+	targetColor = lipgloss.AdaptiveColor{Light: "#FFBB00", Dark: "#FFCA33"}
+	targetStyle = struct {
+		target, output lipgloss.Style
+	}{
+		lipgloss.NewStyle().Foreground(targetColor),
+		lipgloss.NewStyle().Foreground(targetColor).Bold(true),
+	}
+)
 
 func (t targetStatus) String(term bool) string {
 	var target, output lipgloss.Style
@@ -414,18 +419,15 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *tgt.OutNamedPaths, 
 	return tp, nil
 }
 
-func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *tgt.OutNamedPaths) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, namedPaths *tgt.OutNamedPaths) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name := range namedPaths.Named() {
-		p := e.cacheDir(target).Join(target.artifacts.OutTar(name).Name()).Abs()
-		if !fs2.PathExists(p) {
-			continue
-		}
-
 		tp.ProvisionName(name)
 
-		files, err := e.collectOutFromTar(target, p)
+		artifact := target.artifacts.OutTar(name)
+
+		files, err := e.collectOutFromArtifact(ctx, target, artifact)
 		if err != nil {
 			return nil, err
 		}
@@ -440,8 +442,14 @@ func (e *Engine) collectNamedOutFromTar(target *Target, namedPaths *tgt.OutNamed
 	return tp, nil
 }
 
-func (e *Engine) collectOutFromTar(target *Target, tarPath string) (fs2.Paths, error) {
-	files, err := tar.UntarList(context.Background(), tarPath)
+func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (fs2.Paths, error) {
+	r, err := artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target))
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +516,7 @@ func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Targe
 	return nil
 }
 
-func (e *Engine) populateActualFilesFromTar(target *Target) error {
+func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target) error {
 	log.Tracef("populateActualFilesFromTar %v", target.FQN)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
@@ -516,15 +524,15 @@ func (e *Engine) populateActualFilesFromTar(target *Target) error {
 
 	var err error
 
-	target.actualOutFiles, err = e.collectNamedOutFromTar(target, target.Out)
+	target.actualOutFiles, err = e.collectNamedOutFromTar(ctx, target, target.Out)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}
 
 	if target.HasSupportFiles {
-		p := e.cacheDir(target).Join(target.artifacts.OutTar(targetspec.SupportFilesOutput).Name()).Abs()
+		art := target.artifacts.OutTar(targetspec.SupportFilesOutput)
 
-		target.actualSupportFiles, err = e.collectOutFromTar(target, p)
+		target.actualSupportFiles, err = e.collectOutFromArtifact(ctx, target, art)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
