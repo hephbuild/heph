@@ -107,6 +107,7 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 		} else {
 			client := cloudClient.WithAuthToken(token)
 			e.CloudClientAuth = &client
+			e.CloudToken = token
 
 			if !*noCloudTelemetry {
 				_, err := cloudclient.AuthActor(ctx, client)

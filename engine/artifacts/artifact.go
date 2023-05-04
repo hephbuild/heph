@@ -1,10 +1,14 @@
 package artifacts
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -13,13 +17,26 @@ var Skip = errors.New("skip artifact")
 
 type container struct {
 	Producer
-	name        string
-	displayName string
-	genRequired bool
+	name         string
+	displayName  string
+	genRequired  bool
+	compressible bool
+}
+
+func (a container) Compressible() bool {
+	return a.compressible
 }
 
 func (a container) Name() string {
 	return a.name
+}
+
+func (a container) FileName() string {
+	return a.name
+}
+
+func (a container) GzFileName() string {
+	return a.name + ".gz"
 }
 
 func (a container) DisplayName() string {
@@ -30,49 +47,83 @@ func (a container) GenRequired() bool {
 	return a.genRequired
 }
 
-func New(name, displayName string, genRequired bool, artifact Producer) Artifact {
+func New(name, displayName string, genRequired, compressible bool, artifact Producer) Artifact {
 	return container{
-		Producer:    artifact,
-		name:        name,
-		displayName: displayName,
-		genRequired: genRequired,
+		Producer:     artifact,
+		name:         name,
+		displayName:  displayName,
+		genRequired:  genRequired,
+		compressible: compressible,
 	}
 }
 
 type GenContext struct {
-	ArtifactPath string
-
 	OutRoot     string
 	LogFilePath string
+
+	w              io.WriteCloser
+	accessedWriter bool
+}
+
+func (g *GenContext) Writer() io.Writer {
+	g.accessedWriter = true
+	return g.w
 }
 
 type Producer interface {
-	Gen(ctx context.Context, gctx GenContext) error
+	Gen(ctx context.Context, gctx *GenContext) error
 }
 
 type Artifact interface {
 	Producer
 	Name() string
+	FileName() string
+	GzFileName() string
 	DisplayName() string
 	GenRequired() bool
+	Compressible() bool
 }
 
 type Func struct {
-	Func func(ctx context.Context, gctx GenContext) error
+	Func func(ctx context.Context, gctx *GenContext) error
 }
 
-func (a Func) Gen(ctx context.Context, gctx GenContext) error {
+func (a Func) Gen(ctx context.Context, gctx *GenContext) error {
 	return a.Func(ctx, gctx)
 }
 
-func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext) (string, error) {
-	p := filepath.Join(dir, a.Name())
+func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext, compress bool) (string, error) {
+	shouldCompress := a.Compressible() && compress
+
+	p := filepath.Join(dir, a.FileName())
+	if shouldCompress {
+		p = filepath.Join(dir, a.GzFileName())
+	}
+
 	tmpp := fs.ProcessUniquePath(p)
 	defer os.Remove(tmpp)
 
-	gctx.ArtifactPath = tmpp
+	f, err := os.Create(tmpp)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
 
-	err := a.Gen(ctx, gctx)
+	go func() {
+		<-ctx.Done()
+		_ = f.Close()
+	}()
+
+	gctx.w = f
+
+	if shouldCompress {
+		gw := gzip.NewWriter(f)
+		defer gw.Close()
+
+		gctx.w = gw
+	}
+
+	err = a.Gen(ctx, &gctx)
 	if err != nil {
 		if errors.Is(err, Skip) {
 			if a.GenRequired() {
@@ -83,9 +134,12 @@ func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext) (
 		return "", fmt.Errorf("%v: %w", a.Name(), err)
 	}
 
-	if !fs.PathExists(tmpp) {
+	if !gctx.accessedWriter {
 		return "", fmt.Errorf("%v did not produce output", a.Name())
 	}
+
+	_ = gctx.w.Close()
+	_ = f.Close()
 
 	err = os.Rename(tmpp, p)
 	if err != nil {
@@ -93,4 +147,107 @@ func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext) (
 	}
 
 	return p, nil
+}
+
+func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error) {
+	uncompressedPath := filepath.Join(dir, artifact.FileName())
+	if fs.PathExists(uncompressedPath) {
+		return uncompressedPath, nil
+	}
+
+	if artifact.Compressible() {
+		gzPath := filepath.Join(dir, artifact.GzFileName())
+		if fs.PathExists(gzPath) {
+			l := flock.NewFlock("", gzPath+".lock")
+			err := l.Lock(context.Background())
+			if err != nil {
+				return "", err
+			}
+
+			defer func() {
+				err := l.Unlock()
+				if err != nil {
+					log.Errorf("unlock: %v: %v", gzPath, err)
+				}
+			}()
+
+			if fs.PathExists(uncompressedPath) {
+				return uncompressedPath, nil
+			}
+
+			log.Debugf("ungz %v to %v", gzPath, uncompressedPath)
+
+			tmpp := fs.ProcessUniquePath(uncompressedPath)
+
+			gf, err := os.Open(gzPath)
+			if err != nil {
+				return "", err
+			}
+			defer gf.Close()
+
+			tf, err := os.Create(tmpp)
+			if err != nil {
+				return "", err
+			}
+			defer tf.Close()
+
+			gr, err := gzip.NewReader(gf)
+			if err != nil {
+				return "", fmt.Errorf("ungz: reader: %w", err)
+			}
+
+			_, err = io.Copy(tf, gr)
+			if err != nil {
+				return "", fmt.Errorf("ungz: cp: %w", err)
+			}
+
+			_ = tf.Close()
+			_ = gf.Close()
+
+			err = os.Rename(tmpp, uncompressedPath)
+			if err != nil {
+				return "", err
+			}
+
+			err = os.Remove(gzPath)
+			if err != nil {
+				return "", err
+			}
+
+			return uncompressedPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("%v: %w", artifact.Name(), os.ErrNotExist)
+}
+
+func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadCloser, error) {
+	uncompressedPath := filepath.Join(dir, artifact.FileName())
+	if fs.PathExists(uncompressedPath) {
+		f, err := os.Open(uncompressedPath)
+		if err != nil {
+			return nil, err
+		}
+
+		return f, nil
+	}
+
+	if artifact.Compressible() {
+		gzPath := filepath.Join(dir, artifact.GzFileName())
+		if fs.PathExists(gzPath) {
+			f, err := os.Open(gzPath)
+			if err != nil {
+				return nil, err
+			}
+
+			gr, err := gzip.NewReader(f)
+			if err != nil {
+				return nil, err
+			}
+
+			return gr, nil
+		}
+	}
+
+	return nil, fmt.Errorf("%v: %w", artifact.Name(), os.ErrNotExist)
 }

@@ -99,6 +99,12 @@ func (h *Hook) Start(ctx context.Context) func() {
 
 	return func() {
 		close(stopCh)
+		h.events.DisableRescheduling = true
+		h.logsm.Lock()
+		for _, buf := range h.logs {
+			buf.q.DisableRescheduling = true
+		}
+		h.logsm.Unlock()
 		<-spansDoneCh
 		<-logsDoneCh
 
@@ -150,7 +156,7 @@ func (h *Hook) sendSpans(ctx context.Context) error {
 			gqlEvents = append(gqlEvents, b)
 		}
 
-		log.Debug("Sending %v events", len(gqlEvents))
+		log.Debugf("Sending %v events", len(gqlEvents))
 
 		res, err := cloudclient.SendEvents(ctx, h.Client, h.invocationID, gqlEvents)
 		if err != nil {

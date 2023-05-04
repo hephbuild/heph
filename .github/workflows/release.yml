@@ -40,6 +40,9 @@ jobs:
       - name: Bootstrap Build
         run: go build -v -o heph github.com/hephbuild/heph/cmd/heph
 
+#      - name: Setup tmate session
+#        uses: mxschmitt/action-tmate@v3
+
       - name: Build all OS/ARCH
         run: |
           mkdir -p dist

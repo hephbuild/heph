@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/tar"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -20,7 +21,7 @@ type outTarArtifact struct {
 	Output string
 }
 
-func (a outTarArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) error {
+func (a outTarArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
 	target := a.Target
 
 	var paths fs.Paths
@@ -45,7 +46,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) erro
 		})
 	}
 
-	err := tar.Tar(ctx, files, gctx.ArtifactPath)
+	err := tar.Tar(gctx.Writer(), files)
 	if err != nil {
 		return err
 	}
@@ -59,10 +60,11 @@ type hashOutputArtifact struct {
 	Output string
 }
 
-func (a hashOutputArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) error {
+func (a hashOutputArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
 	outputHash := a.Engine.hashOutput(a.Target, a.Output)
 
-	return fs.WriteFileSync(gctx.ArtifactPath, []byte(outputHash), os.ModePerm)
+	_, err := io.WriteString(gctx.Writer(), outputHash)
+	return err
 }
 
 type hashInputArtifact struct {
@@ -70,23 +72,28 @@ type hashInputArtifact struct {
 	Target *Target
 }
 
-func (a hashInputArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) error {
+func (a hashInputArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
 	inputHash := a.Engine.hashInput(a.Target)
 
-	return fs.WriteFileSync(gctx.ArtifactPath, []byte(inputHash), os.ModePerm)
+	_, err := io.WriteString(gctx.Writer(), inputHash)
+	return err
 }
 
 type logArtifact struct{}
 
-func (a logArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) error {
+func (a logArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
 	if gctx.LogFilePath == "" {
 		return artifacts.Skip
 	}
 
-	return tar.Tar(ctx, []tar.TarFile{{
-		From: gctx.LogFilePath,
-		To:   "log.txt",
-	}}, gctx.ArtifactPath)
+	f, err := os.Open(gctx.LogFilePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = io.Copy(gctx.Writer(), f)
+	return err
 }
 
 type manifestArtifact struct {
@@ -113,7 +120,7 @@ func (a manifestArtifact) git(args ...string) string {
 var gitCommitOnce utils.Once[string]
 var gitRefOnce utils.Once[string]
 
-func (a manifestArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) error {
+func (a manifestArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
 	d := ManifestData{
 		GitCommit: gitCommitOnce.MustDo(func() (string, error) {
 			return a.git("rev-parse", "HEAD"), nil
@@ -144,10 +151,6 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx artifacts.GenContext) er
 		d.OutHashes[name] = e.hashOutput(a.Target, name)
 	}
 
-	b, err := json.Marshal(d)
-	if err != nil {
-		return err
-	}
-
-	return fs.WriteFileSync(gctx.ArtifactPath, b, os.ModePerm)
+	enc := json.NewEncoder(gctx.Writer())
+	return enc.Encode(d)
 }

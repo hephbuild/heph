@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/hephprovider"
 	"github.com/hephbuild/heph/log/log"
@@ -165,8 +166,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 			done := utils.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
-				p := latestDir.Join(target.artifacts.OutTar(name).Name()).Abs()
-				if !fs.PathExists(p) {
+				p, err := artifacts.UncompressedPathFromArtifact(target.artifacts.OutTar(name), latestDir.Abs())
+				if err != nil {
 					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, name)
 					continue
 				}
@@ -204,8 +205,11 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				tarFile := e.cacheDir(dept).Join(dept.artifacts.OutTar(dep.Output).Name()).Abs()
-				srcRec.AddTar(tarFile)
+				p, err := artifacts.UncompressedPathFromArtifact(dept.artifacts.OutTar(dep.Output), e.cacheDir(dept).Abs())
+				if err != nil {
+					return nil, err
+				}
+				srcRec.AddTar(p)
 			}
 
 			srcName := name
@@ -451,6 +455,51 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		BinDir:   binDir,
 		Executor: executor,
 	}, nil
+}
+
+func (e *TargetRunEngine) WriteableCaches(ctx context.Context, target *Target) ([]CacheConfig, error) {
+	if !target.Cache.Enabled || e.DisableNamedCacheWrite {
+		return nil, nil
+	}
+
+	wcs := make([]CacheConfig, 0)
+	for _, cache := range e.Config.Caches {
+		if !cache.Write {
+			continue
+		}
+
+		if !target.Cache.NamedEnabled(cache.Name) {
+			continue
+		}
+
+		wcs = append(wcs, cache)
+	}
+
+	if len(wcs) == 0 {
+		return nil, nil
+	}
+
+	orderedCaches, err := e.OrderedCaches(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reset and re-add in order
+	wcs = nil
+
+	for _, cache := range orderedCaches {
+		if !cache.Write {
+			continue
+		}
+
+		if !target.Cache.NamedEnabled(cache.Name) {
+			continue
+		}
+
+		wcs = append(wcs, cache)
+	}
+
+	return wcs, nil
 }
 
 func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
@@ -700,7 +749,12 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return fmt.Errorf("pop: %w", err)
 	}
 
-	err = e.storeCache(ctx, target, outRoot.Abs(), logFilePath)
+	writeableCaches, err := e.WriteableCaches(ctx, target)
+	if err != nil {
+		return fmt.Errorf("wcs: %w", err)
+	}
+
+	err = e.storeCache(ctx, target, outRoot.Abs(), logFilePath, len(writeableCaches) > 0)
 	if err != nil {
 		return fmt.Errorf("cache: store: %w", err)
 	}
@@ -709,21 +763,8 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		e.RegisterRemove(e.cacheDir(target).Abs())
 	}
 
-	if target.Cache.Enabled && !e.DisableNamedCacheWrite {
-		orderedCaches, err := e.OrderedCaches(ctx)
-		if err != nil {
-			return err
-		}
-
-		for _, cache := range orderedCaches {
-			if !cache.Write {
-				continue
-			}
-
-			if !target.Cache.NamedEnabled(cache.Name) {
-				continue
-			}
-
+	if len(writeableCaches) > 0 {
+		for _, cache := range writeableCaches {
 			j := e.scheduleStoreExternalCache(ctx, target, cache)
 
 			if poolDeps := ForegroundWaitGroup(ctx); poolDeps != nil {
@@ -773,6 +814,10 @@ func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[s
 	return nil, fmt.Errorf("no platform available for %v", labels)
 }
 
+func (e *Engine) tarListPath(artifact artifacts.Artifact, target *Target) string {
+	return e.cacheDir(target).Join(artifact.Name() + ".list").Abs()
+}
+
 func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
@@ -799,13 +844,6 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	// TODO: This can be a problem, where 2 targets depends on the same target, but with different outputs,
 	// leading to the expand overriding each other
 
-	// sanity check
-	for _, name := range outputs {
-		p := cacheDir.Join(target.artifacts.OutTar(name).Name()).Abs()
-		if !fs.PathExists(p) {
-			panic(fmt.Errorf("%v does not exist", p))
-		}
-	}
 	outDirHash := "2|" + strings.Join(outputs, ",")
 
 	shouldExpand := false
@@ -843,13 +881,18 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		untarDedup := sets.NewStringSet(0)
 
 		for _, name := range outputs {
-			tarf := cacheDir.Join(target.artifacts.OutTar(name).Name()).Abs()
-			err := tar.UntarWith(ctx, tarf, tmpOutDir, tar.UntarOptions{
-				List:  true,
-				Dedup: untarDedup,
-			})
+			r, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(name), cacheDir.Abs())
 			if err != nil {
-				return fmt.Errorf("untar: %w", err)
+				return err
+			}
+
+			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
+				ListPath: e.tarListPath(target.artifacts.OutTar(name), target),
+				Dedup:    untarDedup,
+			})
+			_ = r.Close()
+			if err != nil {
+				return fmt.Errorf("%v: untar: %w", name, err)
 			}
 		}
 
@@ -875,7 +918,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		e.Status(TargetStatus(target, "Hydrating output..."))
 	}
 
-	err = e.populateActualFilesFromTar(target)
+	err = e.populateActualFilesFromTar(ctx, target)
 	if err != nil {
 		return fmt.Errorf("poptar: %w", err)
 	}
@@ -927,8 +970,13 @@ func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error
 
 		switch target.Codegen {
 		case targetspec.CodegenCopy, targetspec.CodegenCopyNoExclude:
-			tarf := e.cacheDir(target).Join(target.artifacts.OutTar(name).Name()).Abs()
-			err := tar.Untar(ctx, tarf, e.Root.Abs(), false)
+			tarf, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(name), e.cacheDir(target).Abs())
+			if err != nil {
+				return err
+			}
+
+			err = tar.UntarContext(ctx, tarf, e.Root.Abs(), tar.UntarOptions{})
+			_ = tarf.Close()
 			if err != nil {
 				return err
 			}

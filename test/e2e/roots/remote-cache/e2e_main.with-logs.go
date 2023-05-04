@@ -22,6 +22,6 @@ func main() {
 
 	// Test zero cache run
 	Must(RunO("//:without-out", RunOpts{NoInline: true}))
-	Must(ValidateCache("//:without-out", nil, false))
+	Must(ValidateCache("//:without-out", nil, false, true, false))
 	Must(ValidateRemoteCache(cache, "//:without-out", nil))
 }

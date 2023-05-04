@@ -2,9 +2,9 @@ package engine
 
 import (
 	tar2 "archive/tar"
-	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -109,8 +109,8 @@ func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) erro
 	return nil
 }
 
-func (e *Engine) hashTar(h hash.Hash, tarPath string) error {
-	return tar.Walk(context.Background(), tarPath, func(hdr *tar2.Header, r *tar2.Reader) error {
+func (e *Engine) hashTar(h hash.Hash, r io.ReadCloser) error {
+	return tar.Walk(r, func(hdr *tar2.Header, r *tar2.Reader) error {
 		h.String(hdr.Name)
 
 		switch hdr.Typeflag {
@@ -313,7 +313,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		panic(fmt.Sprintf("%v does not output `%v`", target, output))
 	}
 
-	file := e.cacheDir(target).Join(target.artifacts.OutHash(output).Name()).Abs()
+	file := e.cacheDir(target).Join(target.artifacts.OutHash(output).FileName()).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -332,10 +332,15 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	h.String(output)
 
-	tarPath := e.cacheDir(target).Join(target.artifacts.OutTar(output).Name()).Abs()
-	err = e.hashTar(h, tarPath)
+	r, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(output), e.cacheDir(target).Abs())
 	if err != nil {
-		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, tarPath, err))
+		panic(fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.FQN, output, err))
+	}
+	defer r.Close()
+
+	err = e.hashTar(h, r)
+	if err != nil {
+		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, output, err))
 	}
 
 	if target.HasSupportFiles && output != targetspec.SupportFilesOutput {

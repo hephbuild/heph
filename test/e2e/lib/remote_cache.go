@@ -11,7 +11,7 @@ func ValidateRemoteCache(root, tgt string, outputs []string) error {
 	expected := []string{
 		"hash_input",
 		"manifest.json",
-		"log.tar.gz",
+		"log.txt",
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)

@@ -114,12 +114,11 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 
 	for _, tarFile := range cfg.FilesTar {
 		done := utils.TraceTimingDone("untar " + tarFile)
-		err := tar.UntarWith(ctx, tarFile, cfg.Dir, tar.UntarOptions{
-			List:  false,
+		err := tar.UntarPath(ctx, tarFile, cfg.Dir, tar.UntarOptions{
 			Dedup: untarDedup,
 		})
 		if err != nil {
-			return fmt.Errorf("make: untar: %w", err)
+			return fmt.Errorf("make: %w", err)
 		}
 		done()
 	}

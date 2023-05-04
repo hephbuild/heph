@@ -13,6 +13,14 @@ import (
 	"path/filepath"
 )
 
+func ArtifactExternalFileName(a artifacts.Artifact) string {
+	if a.Compressible() {
+		return a.GzFileName()
+	}
+
+	return a.FileName()
+}
+
 func (e *Engine) localCacheLocation(target *Target) (vfs.Location, error) {
 	// TODO: cache
 	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target).Abs())
@@ -154,7 +162,7 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 		return err
 	}
 
-	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifact.Name())
+	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, ArtifactExternalFileName(artifact))
 	if err != nil {
 		return err
 	}
@@ -194,7 +202,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 		return err
 	}
 
-	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.Name())
+	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, ArtifactExternalFileName(artifact))
 	if err != nil {
 		return err
 	}
@@ -224,7 +232,7 @@ func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Targe
 		return false, err
 	}
 
-	f, err := root.NewFile(artifact.Name())
+	f, err := root.NewFile(ArtifactExternalFileName(artifact))
 	if err != nil {
 		return false, err
 	}
@@ -239,11 +247,22 @@ func (e *TargetRunEngine) existsLocalCache(ctx context.Context, target *Target, 
 		return false, err
 	}
 
-	f, err := root.NewFile(artifact.Name())
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
+	for _, name := range []string{artifact.GzFileName(), artifact.FileName()} {
+		f, err := root.NewFile(name)
+		if err != nil {
+			return false, err
+		}
 
-	return f.Exists()
+		exists, err := f.Exists()
+		_ = f.Close()
+		if err != nil {
+			return false, err
+		}
+
+		if exists {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

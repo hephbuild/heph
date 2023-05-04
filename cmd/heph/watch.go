@@ -58,10 +58,10 @@ func (w *watchCtx) cancelRunAndWait() {
 func (w *watchCtx) run(r watchRun, fromStdin bool) {
 	w.e.RemoteCacheHints.Reset()
 
+	w.cancelRunAndWait()
+
 	ctx, cancel := context.WithCancel(w.ctx)
 	defer cancel()
-
-	w.cancelRunAndWait()
 
 	w.m.Lock()
 	defer w.m.Unlock()
@@ -77,6 +77,12 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 
 	if !w.e.RanGenPass {
 		wg, err := w.e.ScheduleGenPass(ctx, true)
+		if err != nil {
+			log.Error(err)
+			return
+		}
+
+		err = WaitPool("Gen Run", w.e.Pool, wg)
 		if err != nil {
 			log.Error(err)
 			return
