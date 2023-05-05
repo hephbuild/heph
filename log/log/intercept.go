@@ -1,14 +1,14 @@
 package log
 
 import (
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/liblog"
 	"github.com/muesli/reflow/wrap"
-	"io"
 )
 
-func newInterceptCore(w io.Writer, core liblog.Core) *interceptCore {
+func newInterceptCore(r *lipgloss.Renderer, core liblog.Core) *interceptCore {
 	return &interceptCore{
-		fmt:  liblog.NewConsoleFormatter(w),
+		fmt:  liblog.NewConsoleFormatter(r),
 		core: core,
 	}
 }

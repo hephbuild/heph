@@ -37,7 +37,7 @@ func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				continue
 			}
 
-			status := w.GetStatus().String(isTerm)
+			status := w.GetStatus().String(log.Renderer())
 			if status == "" {
 				status = "Waiting..."
 			}
@@ -109,7 +109,6 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
 func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
-
 		return UpdateMessage{
 			stats:   s,
 			workers: pool.Workers,
@@ -273,7 +272,7 @@ func (r *renderer) View() string {
 			runtime = fmt.Sprintf("=> [%5s]", utils.FormatDuration(time.Since(j.TimeStart)))
 		}
 
-		status := w.GetStatus().String(isTerm)
+		status := w.GetStatus().String(log.Renderer())
 		if status == "" {
 			status = styleFaint.Render("=|")
 		}

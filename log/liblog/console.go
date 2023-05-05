@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/utils/xlipgloss"
+	"github.com/muesli/termenv"
 	"io"
 	"sync"
 )
@@ -18,9 +19,11 @@ var LevelColors = map[Level]lipgloss.TerminalColor{
 	FatalLevel: lipgloss.Color("#FF2A25"),
 }
 
-func NewConsoleFormatter(w io.Writer) *ConsoleFormatter {
-	r := lipgloss.NewRenderer(w, xlipgloss.EnvForceTTY())
+func NewConsoleRenderer(w io.Writer) *lipgloss.Renderer {
+	return lipgloss.NewRenderer(w, xlipgloss.EnvForceTTY(), termenv.WithColorCache(true))
+}
 
+func NewConsoleFormatter(r *lipgloss.Renderer) *ConsoleFormatter {
 	lvlStyles := map[Level]lipgloss.Style{}
 	for lvl, color := range LevelColors {
 		lvlStyles[lvl] = r.NewStyle().Bold(true).Foreground(color)
@@ -115,7 +118,11 @@ func (f *ConsoleFormatter) Format(entry Entry) Buffer {
 }
 
 func NewConsole(w io.Writer) Collector {
-	return console{w: w, fmt: NewConsoleFormatter(w)}
+	return NewConsoleWith(w, NewConsoleRenderer(w))
+}
+
+func NewConsoleWith(w io.Writer, r *lipgloss.Renderer) Collector {
+	return console{w: w, fmt: NewConsoleFormatter(r)}
 }
 
 func NewConsoleJSON(w io.Writer) Collector {

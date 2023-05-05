@@ -12,7 +12,7 @@ func SetDefaultLogger(f func() Logger) {
 	defaultLoggerFunc = f
 }
 
-// Logger provider by default so that it doesnt bomb in tests for example
+// Logger provider by default so that it doesn't bomb in tests for example
 var defaultLogger = NewLogger(NewLock(NewCore(NewConsole(os.Stderr))))
 
 func Default() Logger {

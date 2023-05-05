@@ -7,7 +7,7 @@ import (
 )
 
 func NewCollector(t testing.TB) liblog.Collector {
-	return console{t: t, fmt: liblog.NewConsoleFormatter(os.Stderr)}
+	return console{t: t, fmt: liblog.NewConsoleFormatter(liblog.NewConsoleRenderer(os.Stderr))}
 }
 
 func NewLogger(t testing.TB) liblog.Logger {

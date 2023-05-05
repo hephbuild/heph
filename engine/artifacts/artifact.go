@@ -209,11 +209,6 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 				return "", err
 			}
 
-			err = os.Remove(gzPath)
-			if err != nil {
-				return "", err
-			}
-
 			return uncompressedPath, nil
 		}
 	}
