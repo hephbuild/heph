@@ -125,7 +125,6 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         'pkg': cfg,
         'replace': replace,
         'go': go,
-        'godeps': godeps,
         'generate_testmain': generate_testmain,
         'backend_pkg': backend_pkg,
     })
@@ -138,6 +137,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         out="imports",
         deps=godeps_deps,
         tools=godeps,
+        gen_deps_meta=True,
     )
 
     mod_gen_kwargs={}
@@ -160,6 +160,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
             # "DEBUG": "1",
         },
         gen=True,
+        gen_deps_meta=True,
         **mod_gen_kwargs,
     )
 
@@ -365,6 +366,7 @@ def go_library(
             out=p+pkg_name+'.embedcfg',
             tools=[go, godeps],
             env=env,
+            gen_deps_meta=True,
         )
     else:
         embed_cfg = None

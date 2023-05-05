@@ -234,36 +234,38 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	traceFilesList()
 
-	err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
-		return json.NewEncoder(f).Encode(envSrcRec.Origin())
-	})
-	defer cleanOrigin()
-	if err != nil {
-		return nil, err
-	}
-
-	err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
-		m := map[string]interface{}{}
-
-		for name, deps := range target.Deps.Named() {
-			a := make([]string, 0)
-
-			for _, dep := range deps.Targets {
-				a = append(a, dep.Full())
-			}
-
-			for _, file := range deps.Files {
-				a = append(a, file.RelRoot())
-			}
-
-			m[name] = a
+	if target.GenDepsMeta {
+		err, cleanOrigin := e.createFile(target, "heph_files_origin", ".heph/files_origin.json", srcRec, func(f io.Writer) error {
+			return json.NewEncoder(f).Encode(envSrcRec.Origin())
+		})
+		defer cleanOrigin()
+		if err != nil {
+			return nil, err
 		}
 
-		return json.NewEncoder(f).Encode(m)
-	})
-	defer cleanDeps()
-	if err != nil {
-		return nil, err
+		err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
+			m := map[string]interface{}{}
+
+			for name, deps := range target.Deps.Named() {
+				a := make([]string, 0)
+
+				for _, dep := range deps.Targets {
+					a = append(a, dep.Full())
+				}
+
+				for _, file := range deps.Files {
+					a = append(a, file.RelRoot())
+				}
+
+				m[name] = a
+			}
+
+			return json.NewEncoder(f).Encode(m)
+		})
+		defer cleanDeps()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	err = sandbox.Make(ctx, sandbox.MakeConfig{

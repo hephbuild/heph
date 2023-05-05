@@ -39,6 +39,7 @@ type TargetArgs struct {
 	HashFile            string
 	Transitive          TargetArgsTransitive
 	Timeout             string
+	GenDepsMeta         bool
 }
 
 type TargetArgsPlatforms []*starlark.Dict

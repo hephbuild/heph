@@ -70,8 +70,9 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			All:   args.SrcEnv.All,
 			Named: args.SrcEnv.Named,
 		},
-		OutEnv:   args.OutEnv,
-		HashFile: args.HashFile,
+		OutEnv:      args.OutEnv,
+		HashFile:    args.HashFile,
+		GenDepsMeta: args.GenDepsMeta,
 	}
 
 	var err error
