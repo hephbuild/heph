@@ -3,7 +3,10 @@ package worker
 import (
 	"context"
 	"fmt"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/muesli/termenv"
+	"io"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -164,7 +167,7 @@ func (j *Job) IsDone() bool {
 }
 
 type Status interface {
-	String(term bool) string
+	String(r *lipgloss.Renderer) string
 }
 
 func StringStatus(status string) Status {
@@ -173,7 +176,7 @@ func StringStatus(status string) Status {
 
 type stringStatus string
 
-func (s stringStatus) String(bool) string {
+func (s stringStatus) String(*lipgloss.Renderer) string {
 	return string(s)
 }
 
@@ -191,9 +194,11 @@ func (w *Worker) GetStatus() Status {
 	return w.status
 }
 
+var stringRenderer = lipgloss.NewRenderer(io.Discard, termenv.WithColorCache(true))
+
 func (w *Worker) Status(status Status) {
 	w.status = status
-	if status := status.String(false); status != "" {
+	if status := status.String(stringRenderer); status != "" {
 		log.Debug(status)
 	}
 }

@@ -354,11 +354,8 @@ var (
 	}
 )
 
-func (t targetStatus) String(term bool) string {
-	var target, output lipgloss.Style
-	if term {
-		target, output = targetStyle.target, targetStyle.output
-	}
+func (t targetStatus) String(r *lipgloss.Renderer) string {
+	target, output := targetStyle.target.Renderer(r), targetStyle.output.Renderer(r)
 
 	outputStr := ""
 	if t.output != "" {
