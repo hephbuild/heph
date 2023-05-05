@@ -30,6 +30,7 @@ var shell *bool
 var noCloudTelemetry *bool
 var noInline *bool
 var printOutput boolStr
+var catOutput boolStr
 var ignore *[]string
 var nocache *bool
 var nopty *bool
@@ -54,7 +55,8 @@ func init() {
 
 	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
 	noInline = runCmd.Flags().Bool("no-inline", false, "Force running in workers")
-	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output, --print-out=<name> to filter output"))
+	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output paths, --print-out=<name> to filter output"))
+	runCmd.Flags().AddFlag(NewBoolStrFlag(&catOutput, "cat-out", "", "Print target output content, --cat-out=<name> to filter output"))
 
 	ignore = watchCmd.Flags().StringArray("ignore", nil, "Ignore files, supports glob")
 

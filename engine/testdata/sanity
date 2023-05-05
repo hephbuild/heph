@@ -128,5 +128,6 @@ target(
         "RuntimePassEnv": null,
         "RuntimeEnv": null
     },
-    "Timeout": 0
+    "Timeout": 0,
+    "GenDepsMeta": false
 }

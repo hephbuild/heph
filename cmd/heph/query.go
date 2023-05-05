@@ -10,9 +10,11 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -611,7 +613,27 @@ var revdepsCmd = &cobra.Command{
 	},
 }
 
-func printTargetOutput(target *engine.Target, output string) error {
+func printTargetOutputContent(target *engine.Target, output string) error {
+	return targetOutputsFunc(target, output, func(path fs.Path) error {
+		f, err := os.Open(path.Abs())
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		_, err = io.Copy(os.Stdout, f)
+		return err
+	})
+}
+
+func printTargetOutputPaths(target *engine.Target, output string) error {
+	return targetOutputsFunc(target, output, func(path fs.Path) error {
+		fmt.Println(path.Abs())
+		return nil
+	})
+}
+
+func targetOutputsFunc(target *engine.Target, output string, f func(path fs.Path) error) error {
 	paths := target.ActualOutFiles().All()
 	if output != "" {
 		if !target.ActualOutFiles().HasName(output) {
@@ -623,8 +645,9 @@ func printTargetOutput(target *engine.Target, output string) error {
 	}
 
 	for _, path := range paths {
-		fmt.Println(path.Abs())
+		f(path)
 	}
+
 	return nil
 }
 
@@ -649,7 +672,7 @@ var outCmd = &cobra.Command{
 			return err
 		}
 
-		err = printTargetOutput(target, output)
+		err = printTargetOutputPaths(target, output)
 		if err != nil {
 			return err
 		}

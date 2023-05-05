@@ -6,8 +6,6 @@ f3 = text_file(name="f3", text="a")
 
 grep_env = [
     "env > e",
-    "cat e | grep -v SRC_HEPH_DEPS > et && mv et e",
-    "cat e | grep -v SRC_HEPH_FILES_ORIGIN > et && mv et e",
     "cat e | grep -E 'SRC|OUT' | sort || true",
 ]
 

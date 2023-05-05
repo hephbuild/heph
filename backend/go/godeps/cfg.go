@@ -102,7 +102,6 @@ type Cfg struct {
 	Pkg               map[string]PkgCfg `json:"pkg"`
 	Replace           map[string]string `json:"replace"`
 	Go                string            `json:"go"`
-	GoDeps            string            `json:"godeps"`
 	GenerateTestMain  string            `json:"generate_testmain"`
 	ThirdpartyPackage string            `json:"thirdparty_package"`
 	BackendPkg        string            `json:"backend_pkg"`

@@ -130,6 +130,7 @@ type TargetSpec struct {
 	HashFile            string
 	Transitive          TargetSpecTransitive
 	Timeout             time.Duration
+	GenDepsMeta         bool
 }
 
 type TargetPlatform struct {
