@@ -21,6 +21,7 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/flock"
 	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/hash"
@@ -416,10 +417,14 @@ func (e *Engine) collectNamedOut(target *Target, namedPaths *tgt.OutNamedPaths, 
 	return tp, nil
 }
 
-func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, namedPaths *tgt.OutNamedPaths) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, outputs []string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
-	for name := range namedPaths.Named() {
+	for name := range target.Out.Named() {
+		if !ads.Contains(outputs, name) {
+			continue
+		}
+
 		tp.ProvisionName(name)
 
 		artifact := target.artifacts.OutTar(name)
@@ -513,7 +518,7 @@ func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Targe
 	return nil
 }
 
-func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target) error {
+func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target, outputs []string) error {
 	log.Tracef("populateActualFilesFromTar %v", target.FQN)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
@@ -521,7 +526,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target)
 
 	var err error
 
-	target.actualOutFiles, err = e.collectNamedOutFromTar(ctx, target, target.Out)
+	target.actualOutFiles, err = e.collectNamedOutFromTar(ctx, target, outputs)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}

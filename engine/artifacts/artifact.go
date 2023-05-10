@@ -196,12 +196,14 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 			if err != nil {
 				return "", fmt.Errorf("ungz: reader: %w", err)
 			}
+			defer gr.Close()
 
 			_, err = io.Copy(tf, gr)
 			if err != nil {
 				return "", fmt.Errorf("ungz: cp: %w", err)
 			}
 
+			_ = gr.Close()
 			_ = tf.Close()
 			_ = gf.Close()
 
@@ -214,7 +216,7 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 		}
 	}
 
-	return "", fmt.Errorf("%v: %w", artifact.Name(), os.ErrNotExist)
+	return "", fmt.Errorf("%v: artifact not found", artifact.Name())
 }
 
 type readerMultiCloser struct {
@@ -266,5 +268,5 @@ func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadClose
 		}
 	}
 
-	return nil, fmt.Errorf("artifact %v: %w", artifact.Name(), os.ErrNotExist)
+	return nil, fmt.Errorf("%v: artifact not found", artifact.Name())
 }

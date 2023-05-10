@@ -920,7 +920,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		e.Status(TargetStatus(target, "Hydrating output..."))
 	}
 
-	err = e.populateActualFilesFromTar(ctx, target)
+	err = e.populateActualFilesFromTar(ctx, target, outputs)
 	if err != nil {
 		return fmt.Errorf("poptar: %w", err)
 	}
