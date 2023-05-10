@@ -18,6 +18,8 @@ func init() {
 	cloudCmd.AddCommand(cloudLogoutCmd)
 	cloudCmd.AddCommand(cloudAuthActorCmd)
 	cloudCmd.AddCommand(cloudStartFlowCmd)
+	cloudCmd.AddCommand(cloudStopFlowCmd)
+	cloudCmd.AddCommand(cloudFlowGetCmd)
 
 	metas = cloudStartFlowCmd.PersistentFlags().StringArrayP("metas", "m", nil, "Flow meta key=value")
 }
@@ -135,12 +137,59 @@ var cloudStartFlowCmd = &cobra.Command{
 			metasm[parts[0]] = parts[1]
 		}
 
-		id, err := Engine.StartFlow(ctx, args[0], metasm)
+		err = Engine.StartFlow(ctx, args[0], metasm)
 		if err != nil {
 			return err
 		}
 
-		fmt.Println(id)
+		return nil
+	},
+}
+
+var cloudStopFlowCmd = &cobra.Command{
+	Use:  "stop-flow",
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = Engine.StopCurrentFlow(ctx)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	},
+}
+
+var cloudFlowGetCmd = &cobra.Command{
+	Use:  "get",
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		flow, err := Engine.GetCurrentFlowDetails(ctx)
+		if err != nil {
+			return err
+		}
+
+		switch args[0] {
+		case "id":
+			fmt.Println(flow.ID)
+		case "url":
+			fmt.Println(flow.URL)
+		default:
+			return fmt.Errorf("invalid flow attribute %v", args[0])
+		}
 
 		return nil
 	},

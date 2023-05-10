@@ -1,5 +1,9 @@
 package ads
 
+import (
+	"sort"
+)
+
 func Map[T, O any](a []T, f func(T) O) []O {
 	out := make([]O, len(a))
 
@@ -106,4 +110,40 @@ func Remove[T comparable](slice []T, e T) []T {
 
 func RemoveIndex[T any](slice []T, s int) []T {
 	return append(slice[:s], slice[s+1:]...)
+}
+
+type Group[T any, K comparable] struct {
+	Key   K
+	Items []T
+}
+
+func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j T) bool) []Group[T, K] {
+	m := make(map[K]int)
+	ga := make([]Group[T, K], 0)
+
+	for _, o := range a {
+		o := o
+		k := keyer(o)
+		if i, ok := m[k]; ok {
+			ga[i].Items = append(ga[i].Items, o)
+		} else {
+			ga = append(ga, Group[T, K]{
+				Key:   k,
+				Items: []T{o},
+			})
+			m[k] = len(ga) - 1
+		}
+	}
+
+	for _, g := range ga {
+		sort.Slice(g.Items, func(i, j int) bool {
+			return less(g.Items[i], g.Items[j])
+		})
+	}
+
+	sort.Slice(ga, func(i, j int) bool {
+		return less(ga[i].Items[0], ga[j].Items[0])
+	})
+
+	return ga
 }
