@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
+	"go.uber.org/multierr"
 	"io"
 	"os"
 	"path/filepath"
@@ -216,6 +217,24 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 	return "", fmt.Errorf("%v: %w", artifact.Name(), os.ErrNotExist)
 }
 
+type readerMultiCloser struct {
+	io.Reader
+	cs []io.Closer
+}
+
+func (r readerMultiCloser) Close() error {
+	var err error
+
+	for _, c := range r.cs {
+		cerr := c.Close()
+		if cerr != nil {
+			err = multierr.Append(err, cerr)
+		}
+	}
+
+	return err
+}
+
 func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadCloser, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	if fs.PathExists(uncompressedPath) {
@@ -240,9 +259,12 @@ func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadClose
 				return nil, err
 			}
 
-			return gr, nil
+			return readerMultiCloser{
+				Reader: gr,
+				cs:     []io.Closer{gr, f},
+			}, nil
 		}
 	}
 
-	return nil, fmt.Errorf("%v: %w", artifact.Name(), os.ErrNotExist)
+	return nil, fmt.Errorf("artifact %v: %w", artifact.Name(), os.ErrNotExist)
 }
