@@ -65,9 +65,16 @@ func (e *Engine) DeleteCloudAuthData() error {
 	return os.RemoveAll(path)
 }
 
-func (e *Engine) StartFlow(ctx context.Context, name string, metas map[string]string) (string, error) {
+const flowFileName = "current_flow"
+
+type FlowDetails struct {
+	ID  string
+	URL string
+}
+
+func (e *Engine) StartFlow(ctx context.Context, name string, metas map[string]string) error {
 	if e.CloudClientAuth == nil {
-		return "", fmt.Errorf("cloud not configured")
+		return fmt.Errorf("cloud not configured")
 	}
 
 	input := cloudclient.FlowInput{
@@ -83,8 +90,40 @@ func (e *Engine) StartFlow(ctx context.Context, name string, metas map[string]st
 
 	res, err := cloudclient.RegisterFlow(ctx, e.CloudClientAuth, e.Config.Cloud.Project, input)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	return res.RegisterFlow.Id, nil
+	b, err := json.Marshal(FlowDetails{
+		ID:  res.RegisterFlow.Id,
+		URL: res.RegisterFlow.Url,
+	})
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(e.tmpRoot(flowFileName).Abs(), b, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (e *Engine) StopCurrentFlow(ctx context.Context) error {
+	return os.RemoveAll(e.tmpRoot(flowFileName).Abs())
+}
+
+func (e *Engine) GetCurrentFlowDetails(ctx context.Context) (FlowDetails, error) {
+	b, err := os.ReadFile(e.tmpRoot(flowFileName).Abs())
+	if err != nil {
+		return FlowDetails{}, err
+	}
+
+	var deets FlowDetails
+	err = json.Unmarshal(b, &deets)
+	if err != nil {
+		return FlowDetails{}, err
+	}
+
+	return deets, nil
 }

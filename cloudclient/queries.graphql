@@ -1,6 +1,7 @@
 mutation RegisterFlow($projectId: ID!, $flow: FlowInput!) {
     registerFlow(projectId: $projectId, flow: $flow) {
         id
+        url
     }
 }
 

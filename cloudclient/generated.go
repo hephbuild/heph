@@ -85,9 +85,9 @@ func (v *AuthActorAuth) __premarshalJSON() (*__premarshalAuthActorAuth, error) {
 // AuthActorAuthActor includes the requested fields of the GraphQL interface Actor.
 //
 // AuthActorAuthActor is implemented by the following types:
+// AuthActorAuthActorAnonymousActor
 // AuthActorAuthActorOrganizationToken
 // AuthActorAuthActorUser
-// AuthActorAuthActorAnonymousActor
 type AuthActorAuthActor interface {
 	implementsGraphQLInterfaceAuthActorAuthActor()
 	// GetTypename returns the receiver's concrete GraphQL type-name (see interface doc for possible values).
@@ -98,9 +98,9 @@ type AuthActorAuthActor interface {
 	GetActor_id() string
 }
 
+func (v *AuthActorAuthActorAnonymousActor) implementsGraphQLInterfaceAuthActorAuthActor()    {}
 func (v *AuthActorAuthActorOrganizationToken) implementsGraphQLInterfaceAuthActorAuthActor() {}
 func (v *AuthActorAuthActorUser) implementsGraphQLInterfaceAuthActorAuthActor()              {}
-func (v *AuthActorAuthActorAnonymousActor) implementsGraphQLInterfaceAuthActorAuthActor()    {}
 
 func __unmarshalAuthActorAuthActor(b []byte, v *AuthActorAuthActor) error {
 	if string(b) == "null" {
@@ -116,14 +116,14 @@ func __unmarshalAuthActorAuthActor(b []byte, v *AuthActorAuthActor) error {
 	}
 
 	switch tn.TypeName {
+	case "AnonymousActor":
+		*v = new(AuthActorAuthActorAnonymousActor)
+		return json.Unmarshal(b, *v)
 	case "OrganizationToken":
 		*v = new(AuthActorAuthActorOrganizationToken)
 		return json.Unmarshal(b, *v)
 	case "User":
 		*v = new(AuthActorAuthActorUser)
-		return json.Unmarshal(b, *v)
-	case "AnonymousActor":
-		*v = new(AuthActorAuthActorAnonymousActor)
 		return json.Unmarshal(b, *v)
 	case "":
 		return fmt.Errorf(
@@ -138,6 +138,14 @@ func __marshalAuthActorAuthActor(v *AuthActorAuthActor) ([]byte, error) {
 
 	var typename string
 	switch v := (*v).(type) {
+	case *AuthActorAuthActorAnonymousActor:
+		typename = "AnonymousActor"
+
+		result := struct {
+			TypeName string `json:"__typename"`
+			*AuthActorAuthActorAnonymousActor
+		}{typename, v}
+		return json.Marshal(result)
 	case *AuthActorAuthActorOrganizationToken:
 		typename = "OrganizationToken"
 
@@ -152,14 +160,6 @@ func __marshalAuthActorAuthActor(v *AuthActorAuthActor) ([]byte, error) {
 		result := struct {
 			TypeName string `json:"__typename"`
 			*AuthActorAuthActorUser
-		}{typename, v}
-		return json.Marshal(result)
-	case *AuthActorAuthActorAnonymousActor:
-		typename = "AnonymousActor"
-
-		result := struct {
-			TypeName string `json:"__typename"`
-			*AuthActorAuthActorAnonymousActor
 		}{typename, v}
 		return json.Marshal(result)
 	case nil:
@@ -362,11 +362,15 @@ func (v *RegisterFlowInvocationResponse) GetRegisterFlowInvocation() RegisterFlo
 
 // RegisterFlowRegisterFlow includes the requested fields of the GraphQL type Flow.
 type RegisterFlowRegisterFlow struct {
-	Id string `json:"id"`
+	Id  string `json:"id"`
+	Url string `json:"url"`
 }
 
 // GetId returns RegisterFlowRegisterFlow.Id, and is useful for accessing the field via an interface.
 func (v *RegisterFlowRegisterFlow) GetId() string { return v.Id }
+
+// GetUrl returns RegisterFlowRegisterFlow.Url, and is useful for accessing the field via an interface.
+func (v *RegisterFlowRegisterFlow) GetUrl() string { return v.Url }
 
 // RegisterFlowResponse is returned by RegisterFlow on success.
 type RegisterFlowResponse struct {
@@ -632,6 +636,7 @@ func RegisterFlow(
 mutation RegisterFlow ($projectId: ID!, $flow: FlowInput!) {
 	registerFlow(projectId: $projectId, flow: $flow) {
 		id
+		url
 	}
 }
 `,
