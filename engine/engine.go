@@ -337,7 +337,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func TargetStatus(t *Target, status string) worker.Status {
+func TargetStatus(t *Target, status string) observability.StatusFactory {
 	return targetStatus{t.FQN, "", status}
 }
 
@@ -366,7 +366,7 @@ func (t targetStatus) String(r *lipgloss.Renderer) string {
 	return target.Render(t.fqn) + outputStr + " " + t.status
 }
 
-func TargetOutputStatus(t *Target, output string, status string) worker.Status {
+func TargetOutputStatus(t *Target, output string, status string) observability.StatusFactory {
 	if output == "" {
 		output = "-"
 	}
@@ -381,7 +381,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(e, w.Status)
+			e := NewTargetRunEngine(e)
 
 			err := e.Run(ctx, rr, sandbox.IOConfig{})
 			if err != nil {

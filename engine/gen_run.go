@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/ads"
@@ -62,12 +63,16 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 		return nil, err
 	}
 
+	go func() {
+		<-ge.deps.Done()
+		span.End()
+	}()
+
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: "finalize gen",
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			span.End()
-			w.Status(worker.StringStatus("Finalizing gen..."))
+			observability.Status(ctx, observability.StringStatus("Finalizing gen..."))
 
 			// free references to starlark
 			for _, p := range e.Packages {
@@ -75,7 +80,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 			}
 
 			if linkAll {
-				w.Status(worker.StringStatus("Linking targets..."))
+				observability.Status(ctx, observability.StringStatus("Linking targets..."))
 
 				err := e.LinkTargets(ctx, false, nil)
 				if err != nil {
@@ -83,7 +88,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 				}
 			}
 
-			w.Status(worker.StringStatus("Storing cache..."))
+			observability.Status(ctx, observability.StringStatus("Storing cache..."))
 			err = e.StoreAutocompleteCache(ctx)
 			if err != nil {
 				log.Warnf("autocomplete cache: %v", err)
@@ -124,7 +129,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 		Name: "ScheduleGeneratedPipeline " + e.Name,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			w.Status(worker.StringStatus(fmt.Sprintf("Finalizing generated %v...", e.Name)))
+			observability.Status(ctx, observability.StringStatus(fmt.Sprintf("Finalizing generated %v...", e.Name)))
 
 			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
@@ -194,7 +199,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 			Name: fmt.Sprintf("rungen %v chunk %v", target.FQN, i),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				for _, file := range files {
-					w.Status(worker.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
+					observability.Status(ctx, observability.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
 
 					re := &runBuildEngine{
 						Engine: e.Engine,

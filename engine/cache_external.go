@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/worker"
@@ -121,7 +122,7 @@ func (e *TargetRunEngine) scheduleStoreExternalCacheArtifact(ctx context.Context
 		Name: fmt.Sprintf("cache %v %v %v", target.FQN, cache.Name, artifact.Name()),
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(e.Engine, w.Status)
+			e := NewTargetRunEngine(e.Engine)
 
 			err := e.storeExternalCache(ctx, target, cache, artifact)
 			if err != nil {
@@ -152,7 +153,7 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 		return nil
 	}
 
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
+	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, cache.Name, artifact)
 	defer span.EndError(rerr)
@@ -179,7 +180,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 		span.EndError(rerr)
 	}()
 
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	err := target.cacheLocks[artifact.Name()].Lock(ctx)
 	if err != nil {
@@ -225,7 +226,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 }
 
 func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
-	e.Status(TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
+	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	root, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {

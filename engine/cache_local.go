@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/fs"
 	"os"
@@ -16,9 +17,9 @@ func (e *TargetRunEngine) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	if target.Cache.Enabled {
-		e.Status(TargetStatus(target, "Caching..."))
+		observability.Status(ctx, TargetStatus(target, "Caching..."))
 	} else if len(target.artifacts.Out) > 0 {
-		e.Status(TargetStatus(target, "Storing output..."))
+		observability.Status(ctx, TargetStatus(target, "Storing output..."))
 	}
 
 	// Calling AllStore here since the InputHash must be the last one stored,

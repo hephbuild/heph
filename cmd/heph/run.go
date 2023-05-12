@@ -99,9 +99,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return nil
 	}
 
-	re := engine.NewTargetRunEngine(e, func(s worker.Status) {
-		log.Info(s.String(log.Renderer()))
-	})
+	re := engine.NewTargetRunEngine(e)
 
 	cfg := sandbox.IOConfig{
 		Stdout: os.Stdout,

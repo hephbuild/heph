@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker"
@@ -97,7 +98,7 @@ func (s *schedulerv2) schedule() error {
 			Name: "pull_meta " + target.FQN,
 			Deps: pmdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(TargetStatus(target, "Scheduling analysis..."))
+				observability.Status(ctx, TargetStatus(target, "Scheduling analysis..."))
 
 				isSkip := s.skip != nil && s.skip.FQN == target.FQN
 
@@ -167,7 +168,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		Name: "cache get " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(s.Engine, w.Status)
+			e := NewTargetRunEngine(s.Engine)
 
 			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs, false)
 			if err != nil {
@@ -242,7 +243,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 			if target.Cache.Enabled && useCached {
 				outputs := s.outputs.Get(target.FQN).Slice()
 
-				e := NewTargetRunEngine(s.Engine, w.Status)
+				e := NewTargetRunEngine(s.Engine)
 
 				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true)
 				if err != nil {

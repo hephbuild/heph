@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/hephprovider"
 	"github.com/hephbuild/heph/log/log"
@@ -29,16 +30,14 @@ import (
 	"time"
 )
 
-func NewTargetRunEngine(e *Engine, status func(s worker.Status)) TargetRunEngine {
+func NewTargetRunEngine(e *Engine) TargetRunEngine {
 	return TargetRunEngine{
 		Engine: e,
-		Status: status,
 	}
 }
 
 type TargetRunEngine struct {
 	*Engine
-	Status func(s worker.Status)
 }
 
 func (e *Engine) tmpRoot(elem ...string) fs.Path {
@@ -156,7 +155,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
-	e.Status(TargetStatus(target, "Creating sandbox..."))
+	observability.Status(ctx, TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
@@ -166,9 +165,10 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 			done := utils.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
-				p, err := artifacts.UncompressedPathFromArtifact(ctx, target.artifacts.OutTar(name), latestDir.Abs())
+				art := target.artifacts.OutTar(name)
+				p, err := UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
 				if err != nil {
-					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, name)
+					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, art.Name())
 					continue
 				}
 				restoreSrcRec.AddTar(p)
@@ -205,7 +205,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				p, err := artifacts.UncompressedPathFromArtifact(ctx, dept.artifacts.OutTar(dep.Output), e.cacheDir(dept).Abs())
+				art := dept.artifacts.OutTar(dep.Output)
+				p, err := UncompressedPathFromArtifact(ctx, dept, art, e.cacheDir(dept).Abs())
 				if err != nil {
 					return nil, err
 				}
@@ -572,7 +573,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		dir = e.Cwd
 	}
 
-	e.Status(TargetStatus(target, "Running..."))
+	observability.Status(ctx, TargetStatus(target, "Running..."))
 
 	var logFilePath string
 	if target.IsGroup() && !rr.Shell {
@@ -779,7 +780,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				w.Status(TargetStatus(target, "Clearing sandbox..."))
+				observability.Status(ctx, TargetStatus(target, "Clearing sandbox..."))
 				err = deleteDir(target.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
@@ -867,7 +868,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	}
 
 	if shouldExpand {
-		e.Status(TargetStatus(target, "Expanding cache..."))
+		observability.Status(ctx, TargetStatus(target, "Expanding cache..."))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
 		err := os.RemoveAll(tmpOutDir)
@@ -917,7 +918,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	target.OutExpansionRoot = &outDir
 
 	if len(target.OutWithSupport.All()) > 0 {
-		e.Status(TargetStatus(target, "Hydrating output..."))
+		observability.Status(ctx, TargetStatus(target, "Hydrating output..."))
 	}
 
 	err = e.populateActualFilesFromTar(ctx, target, outputs)
@@ -947,7 +948,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
 	if target.Cache.Enabled && e.Config.Engine.GC {
-		e.Status(TargetStatus(target, "GC..."))
+		observability.Status(ctx, TargetStatus(target, "GC..."))
 
 		err := e.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
@@ -963,7 +964,7 @@ func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error
 		return nil
 	}
 
-	e.Status(TargetStatus(target, "Linking output..."))
+	observability.Status(ctx, TargetStatus(target, "Linking output..."))
 
 	for name, paths := range target.Out.Named() {
 		if err := ctx.Err(); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/muesli/termenv"
 	"io"
@@ -166,29 +167,15 @@ func (j *Job) IsDone() bool {
 	return j.State.IsDone()
 }
 
-type Status interface {
-	String(r *lipgloss.Renderer) string
-}
-
-func StringStatus(status string) Status {
-	return stringStatus(status)
-}
-
-type stringStatus string
-
-func (s stringStatus) String(*lipgloss.Renderer) string {
-	return string(s)
-}
-
 type Worker struct {
-	status     Status
+	status     observability.StatusFactory
 	statusm    sync.Mutex
 	CurrentJob *Job
 }
 
-func (w *Worker) GetStatus() Status {
+func (w *Worker) GetStatus() observability.StatusFactory {
 	if w.status == nil {
-		return StringStatus("")
+		return observability.StringStatus("")
 	}
 
 	return w.status
@@ -196,7 +183,7 @@ func (w *Worker) GetStatus() Status {
 
 var stringRenderer = lipgloss.NewRenderer(io.Discard, termenv.WithColorCache(true))
 
-func (w *Worker) Status(status Status) {
+func (w *Worker) Status(status observability.StatusFactory) {
 	w.status = status
 	if status := status.String(stringRenderer); status != "" {
 		log.Debug(status)
@@ -254,6 +241,8 @@ func NewPool(n int) *Pool {
 					continue
 				}
 
+				j.ctx = observability.ContextWithStatus(j.ctx, w)
+
 				j.TimeStart = time.Now()
 				j.State = StateRunning
 				w.CurrentJob = j
@@ -263,7 +252,7 @@ func NewPool(n int) *Pool {
 
 				j.TimeEnd = time.Now()
 				w.CurrentJob = nil
-				w.Status(StringStatus(""))
+				w.Status(observability.StringStatus(""))
 
 				p.finalize(j, err, false)
 			}

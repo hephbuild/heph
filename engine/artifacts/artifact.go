@@ -5,10 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
-	"github.com/hephbuild/heph/utils/hio"
 	"go.uber.org/multierr"
 	"io"
 	"os"
@@ -149,78 +146,6 @@ func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext, c
 	}
 
 	return p, nil
-}
-
-func UncompressedPathFromArtifact(ctx context.Context, artifact Artifact, dir string) (string, error) {
-	uncompressedPath := filepath.Join(dir, artifact.FileName())
-	if fs.PathExists(uncompressedPath) {
-		return uncompressedPath, nil
-	}
-
-	if artifact.Compressible() {
-		gzPath := filepath.Join(dir, artifact.GzFileName())
-		if fs.PathExists(gzPath) {
-			l := flock.NewFlock("", gzPath+".lock")
-			err := l.Lock(ctx)
-			if err != nil {
-				return "", err
-			}
-
-			defer func() {
-				err := l.Unlock()
-				if err != nil {
-					log.Errorf("unlock: %v: %v", gzPath, err)
-				}
-			}()
-
-			if fs.PathExists(uncompressedPath) {
-				return uncompressedPath, nil
-			}
-
-			log.Debugf("ungz %v to %v", gzPath, uncompressedPath)
-
-			tmpp := fs.ProcessUniquePath(uncompressedPath)
-
-			gf, err := os.Open(gzPath)
-			if err != nil {
-				return "", err
-			}
-			defer gf.Close()
-
-			gfc, cancel := hio.ContextReader(ctx, gf)
-			defer cancel()
-
-			tf, err := os.Create(tmpp)
-			if err != nil {
-				return "", err
-			}
-			defer tf.Close()
-
-			gr, err := gzip.NewReader(gfc)
-			if err != nil {
-				return "", fmt.Errorf("ungz: reader: %w", err)
-			}
-			defer gr.Close()
-
-			_, err = io.Copy(tf, gr)
-			if err != nil {
-				return "", fmt.Errorf("ungz: cp: %w", err)
-			}
-
-			_ = gr.Close()
-			_ = tf.Close()
-			_ = gf.Close()
-
-			err = os.Rename(tmpp, uncompressedPath)
-			if err != nil {
-				return "", err
-			}
-
-			return uncompressedPath, nil
-		}
-	}
-
-	return "", fmt.Errorf("%v: artifact not found", artifact.Name())
 }
 
 type readerMultiCloser struct {

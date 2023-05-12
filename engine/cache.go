@@ -61,7 +61,7 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 }
 
 func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled, rcached bool, rerr error) {
-	e.Status(TargetStatus(target, "Checking local cache..."))
+	observability.Status(ctx, TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false)
@@ -73,7 +73,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		return false, true, nil
 	}
 
-	e.Status(TargetStatus(target, "Checking remote caches..."))
+	observability.Status(ctx, TargetStatus(target, "Checking remote caches..."))
 
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
