@@ -42,8 +42,8 @@ func (e *Engine) linkLatestCache(target *Target, from string) error {
 	return nil
 }
 
-func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint bool) (bool, error) {
-	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint)
+func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint, uncompress bool) (bool, error) {
+	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint, uncompress)
 	if err != nil {
 		return false, fmt.Errorf("pullorget: %w", err)
 	}
@@ -60,11 +60,11 @@ func (e *TargetRunEngine) pullOrGetCacheAndPost(ctx context.Context, target *Tar
 	return true, nil
 }
 
-func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint bool) (rpulled, rcached bool, rerr error) {
+func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
 	observability.Status(ctx, TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
-	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false)
+	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false, uncompress)
 	if err != nil {
 		return false, false, fmt.Errorf("getlocal: %w", err)
 	}
@@ -100,7 +100,7 @@ func (e *TargetRunEngine) pullOrGetCache(ctx context.Context, target *Target, ou
 		}
 
 		if externalCached {
-			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta, true)
+			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta, true, uncompress)
 			if err != nil {
 				log.Errorf("local: %v", err)
 				continue
@@ -196,7 +196,7 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 	return false
 }
 
-func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan bool) (bool, error) {
+func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	if !e.getLocalCacheArtifact(ctx, target, target.artifacts.InputHash, skipSpan) {
 		return false, nil
 	}
@@ -207,8 +207,17 @@ func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []st
 		}
 
 		if !onlyMeta {
-			if !e.getLocalCacheArtifact(ctx, target, target.artifacts.OutTar(output), skipSpan) {
+			art := target.artifacts.OutTar(output)
+
+			if !e.getLocalCacheArtifact(ctx, target, art, skipSpan) {
 				return false, nil
+			}
+
+			if uncompress {
+				_, err := UncompressedPathFromArtifact(ctx, target, art, e.cacheDir(target).Abs())
+				if err != nil {
+					return false, err
+				}
 			}
 		}
 	}

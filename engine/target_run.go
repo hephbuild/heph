@@ -546,7 +546,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			log.Debugf("%v done in %v", target.FQN, time.Since(start))
 		}()
 
-		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.OutWithSupport.Names(), true)
+		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.OutWithSupport.Names(), true, false)
 		if err != nil {
 			return err
 		}

@@ -94,13 +94,14 @@ func (s *schedulerv2) schedule() error {
 			pmdeps.AddChild(s.pullMetaDeps.Get(parent.FQN))
 		}
 
+		isSkip := s.skip != nil && s.skip.FQN == target.FQN
+		isInRRs := s.targetsSet.Has(target)
+
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{
 			Name: "pull_meta " + target.FQN,
 			Deps: pmdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				observability.Status(ctx, TargetStatus(target, "Scheduling analysis..."))
-
-				isSkip := s.skip != nil && s.skip.FQN == target.FQN
 
 				if isSkip {
 					d, err := s.ScheduleTargetDepsOnce(ctx, target)
@@ -112,7 +113,7 @@ func (s *schedulerv2) schedule() error {
 				}
 
 				rr := s.rrs.Get(target)
-				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, s.targetsSet.Has(target))
+				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs, false)
 				if err != nil {
 					return err
 				}
@@ -157,7 +158,7 @@ func (s *schedulerv2) parentTargetDeps(target *Target) (*worker.WaitGroup, error
 	return deps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target, outputs []string) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target, outputs []string, uncompress bool) (*worker.Job, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -170,7 +171,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			e := NewTargetRunEngine(s.Engine)
 
-			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs, false)
+			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs, false, uncompress)
 			if err != nil {
 				return err
 			}
@@ -184,7 +185,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 	}), nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Target, outputs []string) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Target, outputs []string, uncompress bool) (*worker.Job, error) {
 	lock := s.targetSchedLock.Get(target.FQN)
 	lock.Lock()
 	defer lock.Unlock()
@@ -193,7 +194,7 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Ta
 		return j, nil
 	}
 
-	j, err := s.ScheduleTargetCacheGet(ctx, target, outputs)
+	j, err := s.ScheduleTargetCacheGet(ctx, target, outputs, uncompress)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +220,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target *Target
 
 	runDeps := &worker.WaitGroup{}
 	for _, parent := range parents {
-		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true)
+		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +230,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target *Target
 	return runDeps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *Target, useCached, pullIfCached bool) (*worker.WaitGroup, error) {
+func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *Target, useCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -245,14 +246,14 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 
 				e := NewTargetRunEngine(s.Engine)
 
-				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true)
+				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
 				if err != nil {
 					return err
 				}
 
 				if cached {
 					if pullIfCached {
-						j, err := s.ScheduleTargetCacheGetOnce(ctx, target, outputs)
+						j, err := s.ScheduleTargetCacheGetOnce(ctx, target, outputs, uncompress)
 						if err != nil {
 							return err
 						}
