@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/hio"
 	"github.com/hephbuild/heph/utils/sets"
 	"io"
 	"io/fs"
@@ -156,7 +157,10 @@ func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
 }
 
 func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
-	return Untar(ContextReader(ctx, in), to, o)
+	inc, cancel := hio.ContextReader(ctx, in)
+	defer cancel()
+
+	return Untar(inc, to, o)
 }
 
 func Untar(in io.Reader, to string, o UntarOptions) (err error) {
@@ -242,7 +246,10 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string
 
 	recordFile, complete := tarListFactory(listPath)
 
-	err := Walk(ContextReader(ctx, in), func(hdr *tar.Header, tr *tar.Reader) error {
+	inc, cancel := hio.ContextReader(ctx, in)
+	defer cancel()
+
+	err := Walk(inc, func(hdr *tar.Header, tr *tar.Reader) error {
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeSymlink:
 			recordFile(hdr.Name)
@@ -257,15 +264,6 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string
 	return complete()
 }
 
-func ContextReader[R io.Closer](ctx context.Context, r R) R {
-	go func() {
-		<-ctx.Done()
-		_ = r.Close()
-	}()
-
-	return r
-}
-
 func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Reader) error) error {
 	tarf, err := os.Open(path)
 	if err != nil {
@@ -273,7 +271,10 @@ func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Rea
 	}
 	defer tarf.Close()
 
-	return Walk(ContextReader(ctx, tarf), fs...)
+	tarfc, cancel := hio.ContextReader(ctx, tarf)
+	defer cancel()
+
+	return Walk(tarfc, fs...)
 }
 
 func Walk(tarf io.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {

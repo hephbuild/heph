@@ -166,7 +166,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 			done := utils.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
-				p, err := artifacts.UncompressedPathFromArtifact(target.artifacts.OutTar(name), latestDir.Abs())
+				p, err := artifacts.UncompressedPathFromArtifact(ctx, target.artifacts.OutTar(name), latestDir.Abs())
 				if err != nil {
 					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, name)
 					continue
@@ -205,7 +205,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				p, err := artifacts.UncompressedPathFromArtifact(dept.artifacts.OutTar(dep.Output), e.cacheDir(dept).Abs())
+				p, err := artifacts.UncompressedPathFromArtifact(ctx, dept.artifacts.OutTar(dep.Output), e.cacheDir(dept).Abs())
 				if err != nil {
 					return nil, err
 				}

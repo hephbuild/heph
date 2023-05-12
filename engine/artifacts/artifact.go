@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/hio"
 	"go.uber.org/multierr"
 	"io"
 	"os"
@@ -150,7 +151,7 @@ func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext, c
 	return p, nil
 }
 
-func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error) {
+func UncompressedPathFromArtifact(ctx context.Context, artifact Artifact, dir string) (string, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	if fs.PathExists(uncompressedPath) {
 		return uncompressedPath, nil
@@ -160,7 +161,7 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 		gzPath := filepath.Join(dir, artifact.GzFileName())
 		if fs.PathExists(gzPath) {
 			l := flock.NewFlock("", gzPath+".lock")
-			err := l.Lock(context.Background())
+			err := l.Lock(ctx)
 			if err != nil {
 				return "", err
 			}
@@ -186,13 +187,16 @@ func UncompressedPathFromArtifact(artifact Artifact, dir string) (string, error)
 			}
 			defer gf.Close()
 
+			gfc, cancel := hio.ContextReader(ctx, gf)
+			defer cancel()
+
 			tf, err := os.Create(tmpp)
 			if err != nil {
 				return "", err
 			}
 			defer tf.Close()
 
-			gr, err := gzip.NewReader(gf)
+			gr, err := gzip.NewReader(gfc)
 			if err != nil {
 				return "", fmt.Errorf("ungz: reader: %w", err)
 			}
