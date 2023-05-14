@@ -1,8 +1,8 @@
 package engine
 
 import (
+	ptylib "github.com/creack/pty"
 	"github.com/hephbuild/heph/log/log"
-	ptylib "github.com/kr/pty"
 	"github.com/mattn/go-isatty"
 	"golang.org/x/term"
 	"io"

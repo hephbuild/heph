@@ -5,24 +5,24 @@ go 1.19
 replace github.com/spf13/cobra v1.6.1 => github.com/raphaelvigee/cobra v0.0.0-20221020122344-217ca52feee0
 
 require (
-	github.com/Khan/genqlient v0.5.0
+	github.com/Khan/genqlient v0.6.0
 	github.com/aarondl/json v0.0.0-20221020222930-8b0db17ef1bf
 	github.com/aarondl/opt v0.0.0-20230114172057-b91f370c41f0
 	github.com/bep/debounce v1.2.1
 	github.com/blevesearch/bleve/v2 v2.3.6
 	github.com/blevesearch/bleve_index_api v1.0.5
-	github.com/bmatcuk/doublestar/v4 v4.2.0
+	github.com/bmatcuk/doublestar/v4 v4.6.0
 	github.com/c2fo/vfs/v6 v6.6.0
 	github.com/charmbracelet/bubbles v0.15.0
-	github.com/charmbracelet/bubbletea v0.23.1
+	github.com/charmbracelet/bubbletea v0.24.0
 	github.com/charmbracelet/lipgloss v0.7.1
 	github.com/coreos/go-semver v0.3.0
+	github.com/creack/pty v1.1.9
 	github.com/fsnotify/fsnotify v1.6.0
 	github.com/google/uuid v1.3.0
 	github.com/heimdalr/dag v1.2.1
-	github.com/kr/pty v1.1.1
-	github.com/lithammer/fuzzysearch v1.1.5
-	github.com/mattn/go-isatty v0.0.17
+	github.com/lithammer/fuzzysearch v1.1.7
+	github.com/mattn/go-isatty v0.0.18
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/muesli/reflow v0.3.0
 	github.com/muesli/termenv v0.15.1
@@ -36,11 +36,11 @@ require (
 	go.opentelemetry.io/otel/exporters/jaeger v1.11.1
 	go.opentelemetry.io/otel/sdk v1.11.1
 	go.opentelemetry.io/otel/trace v1.11.1
-	go.starlark.net v0.0.0-20230224151120-c52844e64a10
+	go.starlark.net v0.0.0-20230302034142-4b1e35fe2254
 	go.uber.org/multierr v1.9.0
 	golang.org/x/exp v0.0.0-20230131160201-f062dba9d201
-	golang.org/x/sys v0.6.0
-	golang.org/x/term v0.6.0
+	golang.org/x/sys v0.8.0
+	golang.org/x/term v0.7.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -71,7 +71,7 @@ require (
 	github.com/blevesearch/zapx/v13 v13.3.7 // indirect
 	github.com/blevesearch/zapx/v14 v14.3.7 // indirect
 	github.com/blevesearch/zapx/v15 v15.3.8 // indirect
-	github.com/containerd/console v1.0.3 // indirect
+	github.com/containerd/console v1.0.4-0.20230313162750-1ae8d489ac81 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/go-logr/logr v1.2.3 // indirect
@@ -108,11 +108,12 @@ require (
 	go.opencensus.io v0.24.0 // indirect
 	go.uber.org/atomic v1.10.0 // indirect
 	golang.org/x/crypto v0.6.0 // indirect
-	golang.org/x/mod v0.9.0 // indirect
-	golang.org/x/net v0.8.0 // indirect
+	golang.org/x/mod v0.10.0 // indirect
+	golang.org/x/net v0.9.0 // indirect
 	golang.org/x/oauth2 v0.3.0 // indirect
-	golang.org/x/text v0.8.0 // indirect
-	golang.org/x/tools v0.7.0 // indirect
+	golang.org/x/sync v0.1.0 // indirect
+	golang.org/x/text v0.9.0 // indirect
+	golang.org/x/tools v0.8.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 	google.golang.org/api v0.100.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
