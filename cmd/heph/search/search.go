@@ -90,7 +90,7 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 			Doc     string `json:"doc"`
 		}{
 			Name:    target.Name,
-			Package: target.Package.FullName,
+			Package: target.Package.Path,
 			FQN:     target.FQN,
 			Doc:     target.Doc,
 		})

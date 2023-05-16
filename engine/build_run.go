@@ -1,125 +1,17 @@
 package engine
 
 import (
-	"errors"
+	"context"
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine/buildfiles"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
-	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/hash"
-	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
-	"io"
-	"io/fs"
-	"os"
-	"path"
-	"path/filepath"
-	"sort"
-	"strings"
-	"time"
 )
-
-func init() {
-	resolve.AllowGlobalReassign = true
-	resolve.AllowRecursion = true
-}
-
-const buildFilesPattern = "**/{BUILD,BUILD.*}"
-
-func (e *Engine) collectBuildFiles(root string) (packages.SourceFiles, error) {
-	files := make(packages.SourceFiles, 0)
-
-	walkStartTime := time.Now()
-	err := utils.StarWalk(root, buildFilesPattern, e.Config.BuildFiles.Ignore, func(path string, d fs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
-
-		files = append(files, &packages.SourceFile{
-			Path: filepath.Join(root, path),
-		})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	log.Debugf("RunBuildFiles:walk took %v", time.Now().Sub(walkStartTime))
-
-	return files, err
-}
-
-func (e *Engine) runBuildFiles(root string, pkgProvider func(dir string) *packages.Package) error {
-	files, err := e.collectBuildFiles(root)
-	if err != nil {
-		return err
-	}
-
-	repoRoot := e.Root.Abs()
-
-	pkgs := make([]*packages.Package, 0)
-	for _, file := range files {
-		relRoot, err := filepath.Rel(repoRoot, filepath.Dir(file.Path))
-		if err != nil {
-			panic(err)
-		}
-
-		if relRoot == "." {
-			relRoot = ""
-		}
-
-		pkg := pkgProvider(relRoot)
-
-		pkgs = append(pkgs, pkg)
-
-		e.SourceFiles = append(e.SourceFiles, file)
-		pkg.SourceFiles = append(pkg.SourceFiles, file)
-	}
-
-	sort.Slice(e.SourceFiles, func(i, j int) bool {
-		return strings.Compare(e.SourceFiles[i].Path, e.SourceFiles[j].Path) < 0
-	})
-
-	for _, pkg := range pkgs {
-		err := e.runBuildFilesForPackage(pkg)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (e *Engine) runBuildFilesForPackage(pkg *packages.Package) error {
-	if pkg.Globals != nil {
-		return nil
-	}
-
-	re := runBuildEngine{
-		Engine:         e,
-		pkg:            pkg,
-		registerTarget: e.defaultRegisterTarget,
-	}
-
-	err := re.runBuildFiles()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (e *Engine) runBuildFileForPackage(pkg *packages.Package, file string) (starlark.StringDict, error) {
-	re := runBuildEngine{
-		Engine:         e,
-		pkg:            pkg,
-		registerTarget: e.defaultRegisterTarget,
-	}
-
-	return re.runBuildFile(file)
-}
 
 func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 	l := e.TargetsLock.Get(spec.FQN)
@@ -147,65 +39,8 @@ func (e *Engine) defaultRegisterTarget(spec targetspec.TargetSpec) error {
 
 type runBuildEngine struct {
 	*Engine
-	pkg            *packages.Package
 	registerTarget func(targetspec.TargetSpec) error
-	breadcrumb     []string
-}
-
-func (e *Engine) getOrCreatePkg(path string, fn func(fullname, name string) *packages.Package) *packages.Package {
-	e.packagesMutex.Lock()
-	defer e.packagesMutex.Unlock()
-
-	if strings.HasPrefix(path, "./") || strings.HasSuffix(path, "/") {
-		panic("path must be clean")
-	}
-
-	fullname := path
-
-	if pkg, ok := e.Packages[fullname]; ok {
-		return pkg
-	}
-
-	name := filepath.Base(fullname)
-	if name == "." {
-		name = ""
-	}
-
-	pkg := fn(fullname, name)
-
-	if fullname != pkg.FullName {
-		panic(fmt.Sprintf("pkg fullname don't match, %v %v", fullname, pkg.FullName))
-	}
-
-	e.Packages[fullname] = pkg
-
-	return pkg
-}
-
-func (e *Engine) createPkg(path string) *packages.Package {
-	return e.getOrCreatePkg(path, func(fullname, name string) *packages.Package {
-		return &packages.Package{
-			Name:     name,
-			FullName: fullname,
-			Root:     fs2.NewPath(e.Root.Abs(), path),
-		}
-	})
-}
-
-func (e *runBuildEngine) runBuildFiles() error {
-	e.pkg.Globals = starlark.StringDict{}
-	for _, file := range e.pkg.SourceFiles {
-		globals, err := e.runBuildFile(file.Path)
-		if err != nil {
-			return err
-		}
-
-		for k, v := range globals {
-			e.pkg.Globals[k] = v
-		}
-	}
-
-	return nil
+	onceOptions    utils.Once[buildfiles.RunOptions]
 }
 
 func (e *runBuildEngine) config() starlark.StringDict {
@@ -233,171 +68,55 @@ func (e *runBuildEngine) config() starlark.StringDict {
 	}
 }
 
-func (e *runBuildEngine) load(thread *starlark.Thread, module string) (starlark.StringDict, error) {
-	p, err := targetspec.TargetParse(e.pkg.FullName, module)
-	if err != nil {
-		return nil, err
-	}
+func (e *runBuildEngine) runUtils() buildfiles.RunOptions {
+	return e.onceOptions.MustDo(func() (buildfiles.RunOptions, error) {
+		configUniverse := e.config()
+		predeclaredGlobalsOnce(configUniverse)
+		universe := predeclared(predeclaredGlobals, configUniverse)
 
-	dirPkg, file := path.Split(p.Package)
-	dirPkg = strings.TrimSuffix(dirPkg, "/")
-	if file != "" {
-		pkg, err := e.loadFromRootsOrCreatePackage(dirPkg)
-		if err != nil {
-			return nil, err
-		}
-
-		p := pkg.Root.Join(file).Abs()
-
-		if fs2.PathExists(p) {
-			info, _ := os.Lstat(p)
-			if info.Mode().IsRegular() {
-				return e.runBuildFileForPackage(pkg, p)
-			}
-		}
-	}
-
-	pkg, err := e.loadFromRootsOrCreatePackage(p.Package)
-	if err != nil {
-		return nil, err
-	}
-
-	err = e.runBuildFilesForPackage(pkg)
-	if err != nil {
-		return nil, fmt.Errorf("load: %w", err)
-	}
-
-	return pkg.Globals, nil
+		return buildfiles.RunOptions{
+			ThreadModifier: func(thread *starlark.Thread) {
+				thread.SetLocal("__engine", e)
+			},
+			UniverseFactory: func() starlark.StringDict {
+				return universe
+			},
+			CacheDirPath: e.HomeDir.Join("__BUILD").Abs(),
+			BuildHash: func(h hash.Hash) {
+				h.String(predeclaredHash)
+			},
+			Packages: e.Packages,
+			RootPkg: e.Packages.GetOrCreate(packages.Package{
+				Path: "",
+				Root: e.Root,
+			}),
+		}, nil
+	})
 }
 
-func (e *runBuildEngine) loadFromRootsOrCreatePackage(pkgName string) (*packages.Package, error) {
-	pkg, err := e.loadFromRoots(pkgName)
+func (e *runBuildEngine) runRootBuildFiles(ctx context.Context, rootName string, cfg config.Root) error {
+	p, err := e.Packages.FetchRoot(ctx, rootName, cfg)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("fetch: %w", err)
 	}
 
-	if pkg == nil {
-		pkg = e.createPkg(pkgName)
-	}
+	opts := e.runUtils()
+	opts.RootPkg = e.Packages.GetOrCreate(packages.Package{
+		Path: rootName,
+		Root: p,
+	})
 
-	return pkg, nil
+	return e.BuildFilesState.RunBuildFiles(opts)
 }
 
-func safelyCompileProgram(in io.Reader) (_ *starlark.Program, err error) {
-	// Sometimes starlark.CompiledProgram bombs when concurrent read/write on the file is happening...
+func (e *runBuildEngine) runBuildFiles() error {
+	opts := e.runUtils()
 
-	defer func() {
-		if rerr := recover(); rerr != nil {
-			err = fmt.Errorf("buildProgram paniced: %v", rerr)
-		}
-	}()
-
-	return starlark.CompiledProgram(in)
+	return e.BuildFilesState.RunBuildFiles(opts)
 }
 
-func (e *runBuildEngine) buildProgram(path string, predeclared starlark.StringDict) (*starlark.Program, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
+func (e *runBuildEngine) runBuildFile(pkg *packages.Package, path string) error {
+	opts := e.runUtils()
 
-	h := hash.NewHash()
-	h.I64(info.ModTime().Unix())
-	h.UI32(uint32(info.Mode().Perm()))
-	h.String(utils.Version)
-	h.String(predeclaredHash)
-
-	cachePath := e.HomeDir.Join("tmp", "__BUILD", hash.HashString(path), h.Sum()).Abs()
-
-	err = fs2.CreateParentDir(cachePath)
-	if err != nil {
-		return nil, err
-	}
-
-	cf, err := os.Open(cachePath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return nil, err
-	}
-
-	if cf != nil {
-		mod, err := safelyCompileProgram(cf)
-		_ = cf.Close()
-		if err == nil {
-			return mod, nil
-		}
-
-		log.Debugf("BUILD: compiled: %v %v", path, err)
-	} else {
-		log.Debugf("BUILD: no cache: %v", path)
-	}
-
-	_, mod, err := starlark.SourceProgram(path, nil, predeclared.Has)
-	if err != nil {
-		return nil, err
-	}
-
-	f, err := fs2.AtomicCreate(cachePath)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	err = mod.Write(f)
-	if err != nil {
-		return nil, err
-	}
-
-	return mod, nil
-}
-
-func newStarlarkThread() *starlark.Thread {
-	return &starlark.Thread{
-		Print: func(thread *starlark.Thread, msg string) {
-			log.Info(msg)
-		},
-	}
-}
-
-func (e *runBuildEngine) runBuildFile(path string) (starlark.StringDict, error) {
-	if globals, ok := e.cacheRunBuildFileCache.GetOk(path); ok {
-		return globals, nil
-	}
-
-	lock := e.cacheRunBuildFileLocks.Get(path)
-	lock.Lock()
-	defer lock.Unlock()
-
-	log.Tracef("BUILD: running %v", path)
-
-	thread := newStarlarkThread()
-	thread.Load = e.load
-	thread.SetLocal("engine", e)
-
-	config := e.config()
-
-	predeclaredGlobalsOnce(config)
-
-	universe := predeclared(predeclaredGlobals, config)
-
-	prog, err := e.buildProgram(path, universe)
-	if err != nil {
-		var eerr *starlark.EvalError
-		if errors.As(err, &eerr) {
-			return nil, fmt.Errorf("%v:\n%v", eerr.Msg, eerr.Backtrace())
-		}
-		return nil, err
-	}
-
-	res, err := prog.Init(thread, universe)
-	if err != nil {
-		var eerr *starlark.EvalError
-		if errors.As(err, &eerr) {
-			return nil, fmt.Errorf("%v:\n%v", eerr.Msg, eerr.Backtrace())
-		}
-		return nil, err
-	}
-
-	e.cacheRunBuildFileCache.Set(path, res)
-
-	return res, nil
+	return e.BuildFilesState.RunBuildFile(pkg, path, opts)
 }

@@ -36,7 +36,7 @@ func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Loca
 	// TODO: cache
 	inputHash := e.hashInput(target)
 
-	return loc.NewLocation(filepath.Join(target.Package.FullName, target.Name, inputHash) + "/")
+	return loc.NewLocation(filepath.Join(target.Package.Path, target.Name, inputHash) + "/")
 }
 
 func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string) (bool, error) {

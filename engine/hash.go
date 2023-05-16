@@ -275,7 +275,7 @@ func (e *Engine) hashInput(target *Target) string {
 	h.Bool(target.Gen)
 
 	h.String("=")
-	h.String(target.SrcEnv.All)
+	h.String(target.SrcEnv.Default)
 	hash.HashMap(h, target.SrcEnv.Named, func(k, v string) string {
 		return k + v
 	})

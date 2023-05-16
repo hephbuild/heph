@@ -62,7 +62,7 @@ func fuzzyFindTargetName(targets targetspec.TargetSpecs, s string, max int) []st
 	return suggestions.FQNs()
 }
 
-var labelChars = []byte(targetspec.Alphanum + `_`)
+var labelChars = []rune(targetspec.Alphanum + `_`)
 
 func autocompleteLabel(labels []string, s string) []string {
 	if s == "" {

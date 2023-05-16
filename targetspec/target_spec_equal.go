@@ -67,7 +67,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.Package.FullName != spec.Package.FullName {
+	if t.Package.Path != spec.Package.Path {
 		return false
 	}
 
@@ -159,7 +159,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.SrcEnv.All != spec.SrcEnv.All {
+	if t.SrcEnv.Default != spec.SrcEnv.Default {
 		return false
 	}
 

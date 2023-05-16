@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"sort"
+	"sync"
 )
 
 type Paths []Path
@@ -39,13 +40,14 @@ type Path struct {
 }
 
 func NewPath(root, relRoot string) Path {
-	return Path{
-		root:    root,
-		relRoot: relRoot,
-	}
+	return NewPathAbs(root, relRoot, "")
 }
 
 func NewPathAbs(root, relRoot, abs string) Path {
+	if relRoot == "." {
+		relRoot = ""
+	}
+
 	return Path{
 		root:    root,
 		relRoot: relRoot,
@@ -106,6 +108,11 @@ func (p Path) Root() string {
 	return p.root
 }
 
+var joinsPoolSize = 10
+var joinsPool = sync.Pool{New: func() any {
+	return make([]string, joinsPoolSize)
+}}
+
 func (p Path) RelRoot() string {
 	return p.relRoot
 }
@@ -113,11 +120,20 @@ func (p Path) RelRoot() string {
 func (p Path) Join(elem ...string) Path {
 	var relRoot string
 	if len(elem) > 0 {
-		joins := make([]string, 0, len(elem)+1)
-		joins = append(joins, p.relRoot)
-		joins = append(joins, elem...)
+		endIndex := len(elem) + 1
 
-		relRoot = filepath.Join(joins...)
+		var gjoins []string
+		if endIndex < joinsPoolSize {
+			gjoins = joinsPool.Get().([]string)
+			defer joinsPool.Put(gjoins)
+		} else {
+			gjoins = make([]string, endIndex+1)
+		}
+
+		gjoins[0] = p.relRoot
+		copy(gjoins[1:], elem)
+
+		relRoot = filepath.Join(gjoins[:endIndex]...)
 	} else {
 		relRoot = p.relRoot
 	}

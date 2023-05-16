@@ -46,8 +46,8 @@ var (
 )
 
 type TargetSpecSrcEnv struct {
-	All   string
-	Named map[string]string
+	Default string
+	Named   map[string]string
 }
 
 func (e TargetSpecSrcEnv) Get(name string) string {
@@ -55,7 +55,7 @@ func (e TargetSpecSrcEnv) Get(name string) string {
 		return v
 	}
 
-	return e.All
+	return e.Default
 }
 
 const SupportFilesOutput = "@support_files"

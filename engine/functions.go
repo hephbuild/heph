@@ -58,7 +58,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", fmt.Errorf("%v has not been cached yet", t.FQN)
 			}
 
-			return t.OutExpansionRoot.Join(t.Package.FullName).Abs(), nil
+			return t.OutExpansionRoot.Join(t.Package.Path).Abs(), nil
 		},
 		"hash_input": func(expr exprs.Expr) (string, error) {
 			t, err := getTarget(expr)
@@ -119,7 +119,7 @@ func (e *Engine) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
 		return nil, err
 	}
 
-	pkgMatcher := ParseTargetSelector(t.Package.FullName, s)
+	pkgMatcher := ParseTargetSelector(t.Package.Path, s)
 
 	var includeMatchers TargetMatchers
 	var excludeMatchers TargetMatchers
@@ -130,7 +130,7 @@ func (e *Engine) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
 		case "must":
 			must = true
 		case "include", "exclude":
-			m := ParseTargetSelector(t.Package.FullName, arg.Value)
+			m := ParseTargetSelector(t.Package.Path, arg.Value)
 			if arg.Name == "exclude" {
 				excludeMatchers = append(excludeMatchers, m)
 			} else {
@@ -181,7 +181,7 @@ func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
 		return nil, fmt.Errorf("must be a target selector, got `%v`", selector)
 	}
 
-	parts := strings.Split(t.Package.FullName, "/")
+	parts := strings.Split(t.Package.Path, "/")
 	for len(parts) > 0 {
 		t := e.Targets.Find("//" + strings.Join(parts, "/") + selector)
 		if t != nil {

@@ -11,6 +11,7 @@ import (
 	"github.com/hephbuild/heph/cloudclient"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/buildfiles"
 	"github.com/hephbuild/heph/engine/observability"
 	obsummary "github.com/hephbuild/heph/engine/observability/summary"
 	"github.com/hephbuild/heph/log/log"
@@ -31,7 +32,6 @@ import (
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/vfssimple"
 	"github.com/hephbuild/heph/worker"
-	"go.starlark.net/starlark"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -56,9 +56,10 @@ type Engine struct {
 
 	DisableNamedCacheWrite bool
 
-	SourceFiles   packages.SourceFiles
-	packagesMutex sync.Mutex
-	Packages      map[string]*packages.Package
+	SourceFiles packages.SourceFiles
+	Packages    *packages.Registry
+
+	BuildFilesState *buildfiles.State
 
 	TargetsLock maps.KMutex
 	Targets     *Targets
@@ -78,9 +79,6 @@ type Engine struct {
 	RanInit                    bool
 	codegenPaths               map[string]*Target
 	tools                      *Targets
-	fetchRootCache             map[string]fs2.Path
-	cacheRunBuildFileCache     *maps.Map[string, starlark.StringDict]
-	cacheRunBuildFileLocks     *maps.Map[string, *sync.Mutex]
 	Pool                       *worker.Pool
 
 	exitHandlersm       sync.Mutex
@@ -192,23 +190,27 @@ func New(rootPath string) *Engine {
 		log.Fatal(fmt.Errorf("cache location: %w", err))
 	}
 
+	pkgs := packages.NewRegistry(packages.Registry{
+		RepoRoot:       root,
+		HomeRoot:       homeDir,
+		RootsCachePath: homeDir.Join("roots").Abs(),
+	})
+
 	return &Engine{
-		Root:                   root,
-		HomeDir:                homeDir,
-		LocalCache:             loc.(*vfsos.Location),
-		Targets:                NewTargets(0),
-		Observability:          observability.NewTelemetry(),
-		Packages:               map[string]*packages.Package{},
-		RemoteCacheHints:       &rcache.HintStore{},
-		cacheHashInput:         &maps.Map[string, string]{},
-		cacheHashOutput:        &maps.Map[string, string]{},
-		codegenPaths:           map[string]*Target{},
-		tools:                  NewTargets(0),
-		fetchRootCache:         map[string]fs2.Path{},
-		cacheRunBuildFileCache: &maps.Map[string, starlark.StringDict]{},
-		cacheRunBuildFileLocks: &maps.Map[string, *sync.Mutex]{Default: func(k string) *sync.Mutex {
-			return &sync.Mutex{}
-		}},
+		Root:          root,
+		HomeDir:       homeDir,
+		LocalCache:    loc.(*vfsos.Location),
+		Targets:       NewTargets(0),
+		Observability: observability.NewTelemetry(),
+		Packages:      pkgs,
+		BuildFilesState: buildfiles.NewState(buildfiles.State{
+			Packages: pkgs,
+		}),
+		RemoteCacheHints:      &rcache.HintStore{},
+		cacheHashInput:        &maps.Map[string, string]{},
+		cacheHashOutput:       &maps.Map[string, string]{},
+		codegenPaths:          map[string]*Target{},
+		tools:                 NewTargets(0),
 		Labels:                sets.NewStringSet(0),
 		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
 		toolsLock:             flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
@@ -549,7 +551,7 @@ func (e *Engine) sandboxRoot(target *Target) fs2.Path {
 		folder = "__target_tmp_" + instance.UID + "_" + target.Name
 	}
 
-	p := e.HomeDir.Join("sandbox", target.Package.FullName, folder)
+	p := e.HomeDir.Join("sandbox", target.Package.Path, folder)
 
 	if target.ConcurrentExecution {
 		e.RegisterRemove(p.Abs())

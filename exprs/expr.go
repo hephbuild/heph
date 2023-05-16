@@ -1,6 +1,7 @@
 package exprs
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -56,7 +57,13 @@ func Exec(s string, funcs map[string]Func) (string, error) {
 	return e.exec()
 }
 
+var ErrNotExpr = errors.New("not an expr")
+
 func Parse(s string) (Expr, error) {
+	if !strings.HasPrefix(s, "$(") {
+		return Expr{}, ErrNotExpr
+	}
+
 	e := executor{
 		s: []rune(s),
 	}

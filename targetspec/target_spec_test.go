@@ -12,8 +12,8 @@ import (
 
 func genTargetSpec(name string, factor int) TargetSpec {
 	pkg := &packages.Package{
-		Name:     "aaa",
-		FullName: "aaa",
+		Name: "aaa",
+		Path: "aaa",
 	}
 
 	var deps TargetSpecDeps

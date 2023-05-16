@@ -1,8 +1,8 @@
 package targetspec
 
 import (
-	"bytes"
 	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
 	"path"
 	"strings"
 )
@@ -21,17 +21,17 @@ const numbers = `0123456789`
 
 var Alphanum = letters + numbers
 
-var packageRegex = []byte(Alphanum + `-._/`)
-var targetNameRegex = []byte(Alphanum + `-.+_#@=,{}`)
-var outputNameRegex = []byte(Alphanum + `-_`)
+var packageChars = []rune(Alphanum + `-._/`)
+var targetNameChars = []rune(Alphanum + `-.+_#@=,{}`)
+var outputNameChars = []rune(Alphanum + `-_`)
 
-func ContainsOnly(s string, chars []byte) bool {
+func ContainsOnly(s string, chars []rune) bool {
 	if len(s) == 0 {
 		return true
 	}
 
 	for _, r := range s {
-		if !bytes.ContainsRune(chars, r) {
+		if !ads.Contains(chars, r) {
 			return false
 		}
 	}
@@ -40,12 +40,12 @@ func ContainsOnly(s string, chars []byte) bool {
 }
 
 func (p TargetPath) validate() error {
-	if !ContainsOnly(p.Package, packageRegex) {
-		return fmt.Errorf("package name must match: %s (got %v)", packageRegex, p.Package)
+	if !ContainsOnly(p.Package, packageChars) {
+		return fmt.Errorf("package name must match: %s (got %v)", packageChars, p.Package)
 	}
 
-	if !ContainsOnly(p.Name, targetNameRegex) {
-		return fmt.Errorf("target name must match: %s (got %v)", targetNameRegex, p.Name)
+	if !ContainsOnly(p.Name, targetNameChars) {
+		return fmt.Errorf("target name must match: %s (got %v)", targetNameChars, p.Name)
 	}
 
 	return nil
@@ -140,8 +140,8 @@ func (p TargetOutputPath) validate() error {
 		return err
 	}
 
-	if !ContainsOnly(p.Output, outputNameRegex) {
-		return fmt.Errorf("package name must match: %s (got %v)", outputNameRegex, p.Output)
+	if !ContainsOnly(p.Output, outputNameChars) {
+		return fmt.Errorf("package name must match: %s (got %v)", outputNameChars, p.Output)
 	}
 
 	return nil
