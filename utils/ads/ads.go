@@ -1,6 +1,7 @@
 package ads
 
 import (
+	"fmt"
 	"sort"
 )
 
@@ -153,8 +154,12 @@ func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j 
 }
 
 func Grow[T any](slice []T, newCap int) []T {
-	if cap(slice) > newCap {
+	if cap(slice) >= newCap {
 		return slice
+	}
+
+	if newCap < len(slice) {
+		panic(fmt.Sprintf("Grow: newCap is smaller than existing slice, slice len: %v, newCap: %v", len(slice), newCap))
 	}
 
 	newSlice := make([]T, len(slice), newCap)

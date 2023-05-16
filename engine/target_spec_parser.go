@@ -19,7 +19,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	t := targetspec.TargetSpec{
 		FQN:                 pkg.TargetAddr(args.Name),
 		Name:                args.Name,
-		Run:                 args.Run.Array,
+		Run:                 args.Run,
 		Doc:                 args.Doc,
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
@@ -52,20 +52,20 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		Quiet:    args.Quiet,
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
-			Named:   args.Cache.Named,
+			Named:   args.Cache.Named.Array,
 			History: args.Cache.History,
 		},
 		RestoreCache:   args.RestoreCache,
 		Sandbox:        args.SandboxEnabled,
 		OutInSandbox:   args.OutInSandbox,
 		Codegen:        args.Codegen,
-		Labels:         args.Labels.Array,
-		Env:            args.Env.StrMap,
-		PassEnv:        args.PassEnv.Array,
-		RuntimePassEnv: args.RuntimePassEnv.Array,
+		Labels:         args.Labels,
+		Env:            args.Env.ArrMap,
+		PassEnv:        args.PassEnv,
+		RuntimePassEnv: args.RuntimePassEnv,
 		RunInCwd:       args.RunInCwd,
 		Gen:            args.Gen,
-		RuntimeEnv:     args.RuntimeEnv.StrMap,
+		RuntimeEnv:     args.RuntimeEnv.ArrMap,
 		SrcEnv: targetspec.TargetSpecSrcEnv{
 			Default: args.SrcEnv.Default,
 			Named:   args.SrcEnv.Named,
@@ -106,10 +106,10 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		return targetspec.TargetSpec{}, err
 	}
 
-	t.Transitive.Env = args.Transitive.Env.StrMap
-	t.Transitive.RuntimeEnv = args.Transitive.RuntimeEnv.StrMap
-	t.Transitive.PassEnv = args.Transitive.PassEnv.Array
-	t.Transitive.RuntimePassEnv = args.Transitive.RuntimePassEnv.Array
+	t.Transitive.Env = args.Transitive.Env.ArrMap
+	t.Transitive.RuntimeEnv = args.Transitive.RuntimeEnv.ArrMap
+	t.Transitive.PassEnv = args.Transitive.PassEnv
+	t.Transitive.RuntimePassEnv = args.Transitive.RuntimePassEnv
 
 	if len(args.Out.ArrMap) > 0 {
 		for k, vs := range args.Out.ArrMap {
@@ -124,16 +124,18 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 				})
 			}
 		}
-	} else if len(args.Out.StrMap) > 0 {
-		for k, v := range args.Out.StrMap {
+	} else if len(args.Out.ArrMap) > 0 {
+		for k, v := range args.Out.ArrMap {
 			if k == "" {
 				return t, fmt.Errorf("named output must not be empty")
 			}
 
-			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-				Name: k,
-				Path: v,
-			})
+			for _, v := range v {
+				t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+					Name: k,
+					Path: v,
+				})
+			}
 		}
 	} else {
 		for _, file := range args.Out.Array {
@@ -335,11 +337,11 @@ func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools
 	return nil
 }
 
-func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMap) (targetspec.TargetSpecTools, error) {
+func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMapStr) (targetspec.TargetSpecTools, error) {
 	ts := targetspec.TargetSpecTools{}
 
-	if len(tools.StrMap) > 0 {
-		for name, s := range tools.StrMap {
+	if len(tools.ArrMap) > 0 {
+		for name, s := range tools.ArrMap {
 			err := toolsSpecFromString(t, &ts, name, s)
 			if err != nil {
 				return targetspec.TargetSpecTools{}, err
@@ -357,7 +359,7 @@ func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMap) (targetspec.Targ
 	return ts, nil
 }
 
-func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.TargetSpecDeps, error) {
+func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspec.TargetSpecDeps, error) {
 	var td targetspec.TargetSpecDeps
 	if len(deps.ArrMap) > 0 {
 		for name, arr := range deps.ArrMap {
