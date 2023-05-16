@@ -11,7 +11,7 @@ type TargetArgs struct {
 	Name                string
 	Pkg                 string
 	Doc                 string
-	Run                 ArrayMap
+	Run                 ArrayStr
 	ConcurrentExecution bool
 	FileContent         string
 	Entrypoint          string
@@ -21,20 +21,20 @@ type TargetArgs struct {
 	PassArgs            bool
 	Cache               TargetArgsCache
 	RestoreCache        bool
-	SupportFiles        Array
+	SupportFiles        ArrayStr
 	SandboxEnabled      bool
 	OutInSandbox        bool
 	Gen                 bool
 	Codegen             string
-	Deps                ArrayMap
-	HashDeps            ArrayMap
-	Tools               ArrayMap
-	Labels              ArrayMap
-	Out                 ArrayMap
-	Env                 ArrayMap
-	PassEnv             ArrayMap
-	RuntimePassEnv      ArrayMap
-	RuntimeEnv          ArrayMap
+	Deps                ArrayMapStrArray
+	HashDeps            ArrayMapStrArray
+	Tools               ArrayMapStr
+	Labels              ArrayStr
+	Out                 ArrayMapStrArray
+	Env                 ArrayMapStr
+	PassEnv             ArrayStr
+	RuntimePassEnv      ArrayStr
+	RuntimeEnv          ArrayMapStr
 	SrcEnv              SrcEnv
 	OutEnv              string
 	HashFile            string
@@ -58,6 +58,8 @@ func (c *TargetArgsPlatforms) Unpack(v starlark.Value) error {
 	if v, ok := v.(*starlark.List); ok {
 		platforms := make([]*starlark.Dict, 0, v.Len())
 		it := v.Iterate()
+		defer it.Done()
+
 		var e starlark.Value
 		for it.Next(&e) {
 			e := e
@@ -72,12 +74,12 @@ func (c *TargetArgsPlatforms) Unpack(v starlark.Value) error {
 }
 
 type TargetArgsTransitive struct {
-	Deps           ArrayMap
-	Tools          ArrayMap
-	Env            ArrayMap
-	PassEnv        ArrayMap
-	RuntimeEnv     ArrayMap
-	RuntimePassEnv ArrayMap
+	Deps           ArrayMapStrArray
+	Tools          ArrayMapStr
+	Env            ArrayMapStr
+	PassEnv        ArrayStr
+	RuntimeEnv     ArrayMapStr
+	RuntimePassEnv ArrayStr
 }
 
 func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
@@ -134,12 +136,12 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	return fmt.Errorf("transitive must call heph.target_spec()")
+	return fmt.Errorf("please use heph.target_spec()")
 }
 
 type TargetArgsCache struct {
 	Enabled bool
-	Named   Array
+	Named   BoolArray
 	History int
 }
 
@@ -188,7 +190,7 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	return fmt.Errorf("cache must be bool or call heph.cache(), got %v", v.Type())
+	return fmt.Errorf("cache must be bool or use heph.cache(), got %v", v.Type())
 }
 
 type BoolArray struct {
@@ -220,27 +222,18 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	return fmt.Errorf("must be bool or array, got %v", v.Type())
+	return fmt.Errorf("must be bool or []string, got %v", v.Type())
 }
 
-type Array []string
+type ArrayStr []string
 
-func (d *Array) Unpack(v starlark.Value) error {
+func (d *ArrayStr) Unpack(v starlark.Value) error {
 	if _, ok := v.(starlark.NoneType); ok {
 		return nil
 	}
 
-	if vb, ok := v.(starlark.Bool); ok {
-		if vb {
-			return fmt.Errorf("True is not a valid value")
-		}
-
-		*d = Array{}
-		return nil
-	}
-
 	if vs, ok := v.(starlark.String); ok {
-		*d = Array{string(vs)}
+		*d = ArrayStr{string(vs)}
 		return nil
 	}
 
@@ -290,86 +283,58 @@ func (d *Array) Unpack(v starlark.Value) error {
 	return fmt.Errorf("must be list or string, got %v", v.Type())
 }
 
-type ArrayMap struct {
-	Array []string
-	// TODO Separate StrMap and ArrMap
-	StrMap map[string]string
-	ArrMap map[string][]string
+type ArrayMapStr struct {
+	Array  []string
+	ArrMap map[string]string
 }
 
-func (d *ArrayMap) Unpack(v starlark.Value) error {
+func (d *ArrayMapStr) Unpack(v starlark.Value) error {
 	if _, ok := v.(starlark.NoneType); ok {
 		return nil
 	}
 
-	if vs, ok := v.(starlark.String); ok {
-		*d = ArrayMap{
-			Array: []string{string(vs)},
-		}
-		return nil
+	var sa ArrayMapStrArray
+	err := sa.Unpack(v)
+	if err != nil {
+		return err
 	}
 
-	if vd, ok := v.(*starlark.Dict); ok {
-		arr := make([]string, 0, vd.Len())
-		arrMap := make(map[string][]string, vd.Len())
-		strMap := make(map[string]string, vd.Len())
-
-		for _, e := range vd.Items() {
-			keyv := e.Index(0)
-			skey, ok := keyv.(starlark.String)
-			if !ok {
-				return fmt.Errorf("key must be string, got %v", keyv.Type())
-			}
-
-			key := string(skey)
-
-			valv := e.Index(1)
-			switch val := valv.(type) {
-			case starlark.NoneType:
+	*d = ArrayMapStr{Array: sa.Array}
+	if sa.ArrMap != nil {
+		d.ArrMap = make(map[string]string, len(sa.ArrMap))
+		for k, a := range sa.ArrMap {
+			switch len(a) {
+			case 0:
 				continue
-			case starlark.String:
-				arr = append(arr, string(val))
-				strMap[key] = string(val)
-				arrMap[key] = append(arrMap[key], string(val))
-			case *starlark.List:
-				arrMap[key] = ads.Grow(arrMap[key], val.Len())
-
-				err := listForeach(val, func(i int, value starlark.Value) error {
-					if _, ok := value.(starlark.NoneType); ok {
-						return nil
-					}
-
-					val, ok := value.(starlark.String)
-					if !ok {
-						return fmt.Errorf("value must be string, got %v", value.Type())
-					}
-
-					arr = append(arr, string(val))
-					strMap[key] = string(val)
-					arrMap[key] = append(arrMap[key], string(val))
-
-					return nil
-				})
-				if err != nil {
-					return err
-				}
+			case 1:
+				d.ArrMap[k] = a[0]
 			default:
-				return fmt.Errorf("val must be string or []string, got %v", valv.Type())
+				return fmt.Errorf("%v: value must be a String, got List", k)
 			}
 		}
-
-		*d = ArrayMap{
-			Array:  arr,
-			StrMap: strMap,
-			ArrMap: arrMap,
-		}
-		return nil
 	}
 
-	if vl, ok := v.(*starlark.List); ok {
-		arr := make([]string, 0, vl.Len())
+	return nil
+}
 
-		err := listForeach(vl, func(i int, value starlark.Value) error {
+type ArrayMapStrArray struct {
+	Array  []string
+	ArrMap map[string][]string
+}
+
+func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
+	switch v := v.(type) {
+	case starlark.NoneType:
+		return nil
+	case starlark.String:
+		*d = ArrayMapStrArray{
+			Array: []string{string(v)},
+		}
+		return nil
+	case *starlark.List:
+		arr := make([]string, 0, v.Len())
+
+		err := listForeach(v, func(i int, value starlark.Value) error {
 			switch e := value.(type) {
 			case starlark.NoneType:
 				// ignore
@@ -382,7 +347,7 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 					return nil
 				}
 
-				arr = ads.Grow(arr, e.Len())
+				arr = ads.Grow(arr, len(arr)+e.Len())
 
 				err := listForeach(e, func(i int, value starlark.Value) error {
 					if _, ok := value.(starlark.NoneType); ok {
@@ -400,16 +365,68 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				return err
 			}
 
-			return fmt.Errorf("element at index %v must be string or (string, string), is %v", i, value.Type())
+			return fmt.Errorf("at %v: element must be string []string, got %v", i, value.Type())
 		})
 		if err != nil {
 			return err
 		}
 
-		*d = ArrayMap{
+		*d = ArrayMapStrArray{
 			Array: arr,
 		}
 
+		return nil
+	case *starlark.Dict:
+		arr := make([]string, 0, v.Len())
+		arrMap := make(map[string][]string, v.Len())
+
+		for _, e := range v.Items() {
+			keyv := e.Index(0)
+			skey, ok := keyv.(starlark.String)
+			if !ok {
+				return fmt.Errorf("key must be string, got %v", keyv.Type())
+			}
+
+			key := string(skey)
+
+			valv := e.Index(1)
+			switch val := valv.(type) {
+			case starlark.NoneType:
+				continue
+			case starlark.String:
+				arr = append(arr, string(val))
+				arrMap[key] = append(arrMap[key], string(val))
+			case *starlark.List:
+				arr = ads.Grow(arr, len(arr)+val.Len())
+				arrMap[key] = ads.Grow(arrMap[key], len(arrMap[key])+val.Len())
+
+				err := listForeach(val, func(i int, value starlark.Value) error {
+					if _, ok := value.(starlark.NoneType); ok {
+						return nil
+					}
+
+					val, ok := value.(starlark.String)
+					if !ok {
+						return fmt.Errorf("value must be string, got %v", value.Type())
+					}
+
+					arr = append(arr, string(val))
+					arrMap[key] = append(arrMap[key], string(val))
+
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("val must be string or []string, got %v", v.Type())
+			}
+		}
+
+		*d = ArrayMapStrArray{
+			Array:  arr,
+			ArrMap: arrMap,
+		}
 		return nil
 	}
 

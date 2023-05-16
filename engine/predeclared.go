@@ -248,7 +248,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 
 	var (
 		pattern string
-		exclude ArrayMap
+		exclude ArrayStr
 	)
 
 	if err := starlark.UnpackArgs(
@@ -259,7 +259,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	allExclude := exclude.Array
+	allExclude := exclude
 	allExclude = append(allExclude, "**/.heph")
 	allExclude = append(allExclude, e.Config.BuildFiles.Glob.Exclude...)
 

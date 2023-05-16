@@ -20,7 +20,7 @@ func FromStarlark(v starlark.Value) interface{} {
 	case starlark.Float:
 		return float64(v)
 	case *starlark.Dict:
-		data := map[interface{}]interface{}{}
+		data := make(map[interface{}]interface{}, v.Len())
 
 		for _, e := range v.Items() {
 			data[FromStarlark(e.Index(0))] = FromStarlark(e.Index(1))
@@ -28,10 +28,11 @@ func FromStarlark(v starlark.Value) interface{} {
 
 		return data
 	case *starlark.List:
-		data := []interface{}{}
+		data := make([]interface{}, 0, v.Len())
 
 		it := v.Iterate()
 		defer it.Done()
+
 		var value starlark.Value
 		for it.Next(&value) {
 			data = append(data, FromStarlark(value))
@@ -46,11 +47,29 @@ func FromStarlark(v starlark.Value) interface{} {
 }
 
 func FromGo(v interface{}) starlark.Value {
+	if v == nil {
+		return starlark.None
+	}
+
 	switch v := v.(type) {
 	case string:
 		return starlark.String(v)
 	case bool:
 		return starlark.Bool(v)
+	case int:
+		return starlark.MakeInt(v)
+	case int8:
+		return starlark.MakeInt(int(v))
+	case int16:
+		return starlark.MakeInt(int(v))
+	case int32:
+		return starlark.MakeInt(int(v))
+	case int64:
+		return starlark.MakeInt64(v)
+	case float32:
+		return starlark.Float(v)
+	case float64:
+		return starlark.Float(v)
 	default:
 		rv := reflect.ValueOf(v)
 		switch rv.Kind() {
@@ -83,6 +102,4 @@ func FromGo(v interface{}) starlark.Value {
 
 		panic(fmt.Sprintf("FromGo: unhandled type %T", v))
 	}
-
-	return starlark.None
 }
