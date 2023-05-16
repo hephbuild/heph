@@ -16,6 +16,7 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
@@ -326,7 +327,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 				continue
 			}
 
-			spaths := make([]string, 0)
+			spaths := make([]string, 0, len(paths))
 			for _, path := range paths {
 				switch fileEnv {
 				case targetspec.FileEnvAbs:
@@ -361,6 +362,8 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		out := target.Out.WithRoot(target.SandboxRoot.Abs()).Named()
 		namedOut := map[string][]string{}
 		for name, paths := range out {
+			namedOut[name] = ads.GrowExtra(namedOut[name], len(paths))
+
 			for _, path := range paths {
 				if utils.IsGlob(path.RelRoot()) {
 					// Skip glob

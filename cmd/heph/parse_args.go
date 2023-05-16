@@ -167,7 +167,7 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 			Args:          args,
 			NoCache:       *nocache,
 			Shell:         *shell,
-			PreserveCache: printOutput.bool,
+			PreserveCache: printOutput.bool || catOutput.bool,
 			NoPTY:         *nopty,
 		}
 		if len(rr.Args) > 0 && target.Cache.Enabled {

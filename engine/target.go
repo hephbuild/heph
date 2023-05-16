@@ -3,6 +3,7 @@ package engine
 import (
 	"errors"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
 	"sync"
@@ -110,13 +111,5 @@ func (t *Target) ActualSupportFiles() fs.Paths {
 }
 
 func (t *Target) HasAnyLabel(labels []string) bool {
-	for _, clabel := range labels {
-		for _, tlabel := range t.Labels {
-			if clabel == tlabel {
-				return true
-			}
-		}
-	}
-
-	return false
+	return ads.ContainsAny(t.Labels, labels)
 }

@@ -347,7 +347,7 @@ func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
 					return nil
 				}
 
-				arr = ads.Grow(arr, len(arr)+e.Len())
+				arr = ads.GrowExtra(arr, e.Len())
 
 				err := listForeach(e, func(i int, value starlark.Value) error {
 					if _, ok := value.(starlark.NoneType); ok {
@@ -397,8 +397,8 @@ func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
 				arr = append(arr, string(val))
 				arrMap[key] = append(arrMap[key], string(val))
 			case *starlark.List:
-				arr = ads.Grow(arr, len(arr)+val.Len())
-				arrMap[key] = ads.Grow(arrMap[key], len(arrMap[key])+val.Len())
+				arr = ads.GrowExtra(arr, val.Len())
+				arrMap[key] = ads.GrowExtra(arrMap[key], val.Len())
 
 				err := listForeach(val, func(i int, value starlark.Value) error {
 					if _, ok := value.(starlark.NoneType); ok {
