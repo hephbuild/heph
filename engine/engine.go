@@ -869,7 +869,7 @@ func (e *Engine) GetCodegenOrigin(path string) (*Target, bool) {
 	}
 
 	for cpath, dep := range e.codegenPaths {
-		if ok, _ := utils.PathMatch(path, cpath); ok {
+		if ok, _ := utils.PathMatchAny(path, cpath); ok {
 			return dep, true
 		}
 	}
