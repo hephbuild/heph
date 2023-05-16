@@ -121,7 +121,7 @@ func TestPathMatch(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.path, test.matchers), func(t *testing.T) {
-			actual, err := PathMatch(test.path, test.matchers...)
+			actual, err := PathMatchAny(test.path, test.matchers...)
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, actual)

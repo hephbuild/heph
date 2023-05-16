@@ -1,7 +1,6 @@
 package buildfiles
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
@@ -286,10 +285,8 @@ func (e *runContext) buildProgram(path string, universe starlark.StringDict) (*s
 	}
 
 	if cfr != nil {
-		cfb := bufio.NewReader(cfr)
-
 		var c progCache
-		err := msgpack.NewDecoder(cfb).Decode(&c)
+		err := msgpack.NewDecoder(cfr).Decode(&c)
 		_ = cfr.Close()
 		if err == nil && c.Hash == sum {
 			log.Debugf("BUILD: %v: compiled: %v", path, err)

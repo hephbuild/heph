@@ -9,30 +9,41 @@ import (
 	"strings"
 )
 
-func PathMatch(path string, matchers ...string) (bool, error) {
-	for _, matcher := range matchers[:] {
-		if strings.HasSuffix(matcher, "/**/*") {
-			matcher = strings.TrimSuffix(matcher, "/**/*")
-			if matcher == path {
-				matchers = append(matchers, matcher)
-			}
+// Equivalent to `strings.HasPrefix(path, prefix+"/")`, without the string concat
+func matchPrefix(path, prefix string) bool {
+	return len(path) >= len(prefix) &&
+		strings.HasPrefix(path, prefix) &&
+		path[len(prefix)] == '/'
+}
+
+func fastMatchDir(path, matcher string) bool {
+	i := indexMeta(matcher)
+	if i == -1 {
+		if path == matcher || matchPrefix(path, matcher) {
+			return true
 		}
 	}
 
+	return false
+}
+
+func PathMatchAny(path string, matchers ...string) (bool, error) {
 	for _, matcher := range matchers {
-		i := indexMeta(matcher)
-		if i == -1 {
-			if path == matcher || strings.HasPrefix(path, matcher+"/") {
+		if strings.HasSuffix(matcher, "/**/*") {
+			matcher := strings.TrimSuffix(matcher, "/**/*")
+
+			if fastMatchDir(path, matcher) {
 				return true, nil
 			}
-		} else {
-			match, err := doublestar.PathMatch(matcher, path)
-			if err != nil {
-				return false, err
-			}
-			if match {
-				return true, nil
-			}
+		}
+
+		if fastMatchDir(path, matcher) {
+			return true, nil
+		}
+
+		match, err := doublestar.PathMatch(matcher, path)
+		if match || err != nil {
+			return match, err
 		}
 	}
 
@@ -74,11 +85,11 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 	walkRoot := root
 
 	if i == -1 {
-		// Pattern is actually a path
+		// Pattern is actually a pure path
 
 		rel := unescapeMeta(pattern)
 		abs := filepath.Join(root, rel)
-		info, err := os.Stat(abs)
+		info, err := os.Lstat(abs)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
@@ -94,7 +105,7 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 
 		// All files recursively in the dir would match
 		alwaysMatch = true
-		walkRoot = filepath.Join(root, pattern)
+		walkRoot = abs
 	} else if i > 0 {
 		i := strings.LastIndex(pattern[:i], string(filepath.Separator))
 		if i > 0 {
@@ -114,7 +125,7 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		}
 
 		if d.IsDir() {
-			skip, err := PathMatch(rel, ignore...)
+			skip, err := PathMatchAny(rel, ignore...)
 			if err != nil {
 				return err
 			}
@@ -122,10 +133,6 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 			if skip {
 				return filepath.SkipDir
 			}
-			return nil
-		}
-
-		if d.IsDir() {
 			// Only match files
 			return nil
 		}
@@ -141,7 +148,7 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		}
 
 		if match {
-			skip, err := PathMatch(rel, ignore...)
+			skip, err := PathMatchAny(rel, ignore...)
 			if err != nil {
 				return err
 			}
@@ -150,7 +157,7 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 				return nil
 			}
 
-			err = fn(rel, d, err)
+			err = fn(rel, d, nil)
 			if err != nil {
 				return err
 			}
