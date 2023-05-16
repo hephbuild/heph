@@ -38,6 +38,16 @@ func Contains[T comparable](a []T, e T) bool {
 	return false
 }
 
+func ContainsAny[T comparable](a []T, e []T) bool {
+	for _, ee := range e {
+		if Contains(a, ee) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func Filter[T any](a []T, f func(T) bool) []T {
 	o := make([]T, 0)
 
@@ -153,13 +163,17 @@ func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j 
 	return ga
 }
 
+func GrowExtra[T any](slice []T, extraCap int) []T {
+	return Grow(slice, len(slice)+extraCap)
+}
+
 func Grow[T any](slice []T, newCap int) []T {
 	if cap(slice) >= newCap {
 		return slice
 	}
 
 	if newCap < len(slice) {
-		panic(fmt.Sprintf("Grow: newCap is smaller than existing slice, slice len: %v, newCap: %v", len(slice), newCap))
+		panic(fmt.Sprintf("Grow: newCap is smaller than existing slice len, slice len: %v, newCap: %v", len(slice), newCap))
 	}
 
 	newSlice := make([]T, len(slice), newCap)

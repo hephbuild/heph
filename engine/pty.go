@@ -25,6 +25,10 @@ func multiWriterNil(ws ...io.Writer) io.Writer {
 		return nil
 	}
 
+	if len(mws) == 1 {
+		return mws[0]
+	}
+
 	return io.MultiWriter(mws...)
 }
 
