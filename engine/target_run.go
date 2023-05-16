@@ -45,7 +45,7 @@ func (e *Engine) tmpRoot(elem ...string) fs.Path {
 }
 
 func (e *Engine) tmpTargetRoot(target *Target) fs.Path {
-	return e.HomeDir.Join("tmp", target.Package.FullName, "__target_"+target.Name)
+	return e.HomeDir.Join("tmp", target.Package.Path, "__target_"+target.Name)
 }
 
 func (e *Engine) lockPath(target *Target, resource string) string {
@@ -285,7 +285,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 
 	env := make(map[string]string)
 	env["TARGET"] = target.FQN
-	env["PACKAGE"] = target.Package.FullName
+	env["PACKAGE"] = target.Package.Path
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
 	if !target.Cache.Enabled {
@@ -319,7 +319,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		env[hephprovider.EnvDistRoot] = hephDistRoot
 	}
 
-	if !(target.SrcEnv.All == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
+	if !(target.SrcEnv.Default == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
 			fileEnv := target.SrcEnv.Get(srcRecNameToDepName[name])
 			if fileEnv == targetspec.FileEnvIgnore {
@@ -335,7 +335,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					spaths = append(spaths, path)
 				case targetspec.FileEnvRelPkg:
 					p := "/root"
-					rel, err := filepath.Rel(filepath.Join(p, target.Package.FullName), filepath.Join(p, path))
+					rel, err := filepath.Rel(filepath.Join(p, target.Package.Path), filepath.Join(p, path))
 					if err != nil {
 						return nil, err
 					}
@@ -388,7 +388,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					pathv = path.RelRoot()
 				case targetspec.FileEnvRelPkg:
 					fakeRoot := "/root"
-					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.FullName), filepath.Join(fakeRoot, path.RelRoot()))
+					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.Path), filepath.Join(fakeRoot, path.RelRoot()))
 					if err != nil {
 						return nil, err
 					}
@@ -564,7 +564,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	env := rp.Env
 	binDir := rp.BinDir
 
-	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.FullName)
+	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.Path)
 	if target.RunInCwd {
 		if target.Cache.Enabled {
 			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)

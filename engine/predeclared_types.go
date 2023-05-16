@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
@@ -84,8 +85,7 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	d, ok := v.(*starlarkstruct.Struct)
-	if ok {
+	if d, ok := v.(*starlarkstruct.Struct); ok {
 		cs := TargetArgsTransitive{}
 
 		for _, n := range d.AttrNames() {
@@ -204,7 +204,7 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 		}
 		return nil
 	case *starlark.List:
-		arr := make([]string, 0)
+		arr := make([]string, 0, e.Len())
 		err := listForeach(e, func(i int, value starlark.Value) error {
 			arr = append(arr, value.(starlark.String).GoString())
 			return nil
@@ -230,8 +230,7 @@ func (d *Array) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vb, ok := v.(starlark.Bool)
-	if ok {
+	if vb, ok := v.(starlark.Bool); ok {
 		if vb {
 			return fmt.Errorf("True is not a valid value")
 		}
@@ -240,15 +239,13 @@ func (d *Array) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vs, ok := v.(starlark.String)
-	if ok {
+	if vs, ok := v.(starlark.String); ok {
 		*d = Array{string(vs)}
 		return nil
 	}
 
-	vl, ok := v.(*starlark.List)
-	if ok {
-		arr := make([]string, 0)
+	if vl, ok := v.(*starlark.List); ok {
+		arr := make([]string, 0, vl.Len())
 
 		err := listForeach(vl, func(i int, value starlark.Value) error {
 			switch e := value.(type) {
@@ -305,20 +302,18 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vs, ok := v.(starlark.String)
-	if ok {
+	if vs, ok := v.(starlark.String); ok {
 		*d = ArrayMap{
 			Array: []string{string(vs)},
 		}
 		return nil
 	}
 
-	arr := make([]string, 0)
-	arrMap := map[string][]string{}
-	strMap := map[string]string{}
+	if vd, ok := v.(*starlark.Dict); ok {
+		arr := make([]string, 0, vd.Len())
+		arrMap := make(map[string][]string, vd.Len())
+		strMap := make(map[string]string, vd.Len())
 
-	vd, ok := v.(*starlark.Dict)
-	if ok {
 		for _, e := range vd.Items() {
 			keyv := e.Index(0)
 			skey, ok := keyv.(starlark.String)
@@ -337,6 +332,8 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				strMap[key] = string(val)
 				arrMap[key] = append(arrMap[key], string(val))
 			case *starlark.List:
+				arrMap[key] = ads.Grow(arrMap[key], val.Len())
+
 				err := listForeach(val, func(i int, value starlark.Value) error {
 					if _, ok := value.(starlark.NoneType); ok {
 						return nil
@@ -369,8 +366,9 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vl, ok := v.(*starlark.List)
-	if ok {
+	if vl, ok := v.(*starlark.List); ok {
+		arr := make([]string, 0, vl.Len())
+
 		err := listForeach(vl, func(i int, value starlark.Value) error {
 			switch e := value.(type) {
 			case starlark.NoneType:
@@ -383,6 +381,8 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 				if e.Len() == 0 {
 					return nil
 				}
+
+				arr = ads.Grow(arr, e.Len())
 
 				err := listForeach(e, func(i int, value starlark.Value) error {
 					if _, ok := value.(starlark.NoneType); ok {
@@ -407,8 +407,7 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 		}
 
 		*d = ArrayMap{
-			Array:  arr,
-			StrMap: strMap,
+			Array: arr,
 		}
 
 		return nil
@@ -418,8 +417,8 @@ func (d *ArrayMap) Unpack(v starlark.Value) error {
 }
 
 type SrcEnv struct {
-	All   string
-	Named map[string]string
+	Default string
+	Named   map[string]string
 }
 
 func (d *SrcEnv) Unpack(v starlark.Value) error {
@@ -427,18 +426,16 @@ func (d *SrcEnv) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	vs, ok := v.(starlark.String)
-	if ok {
+	if vs, ok := v.(starlark.String); ok {
 		*d = SrcEnv{
-			All: string(vs),
+			Default: string(vs),
 		}
 		return nil
 	}
 
-	vd, ok := v.(*starlark.Dict)
-	if ok {
-		all := ""
-		named := map[string]string{}
+	if vd, ok := v.(*starlark.Dict); ok {
+		def := ""
+		named := make(map[string]string, vd.Len())
 
 		for _, e := range vd.Items() {
 			keyv := e.Index(0)
@@ -458,15 +455,15 @@ func (d *SrcEnv) Unpack(v starlark.Value) error {
 			value := string(svalue)
 
 			if key == "_default" {
-				all = value
+				def = value
 			} else {
 				named[key] = value
 			}
 		}
 
 		*d = SrcEnv{
-			All:   all,
-			Named: named,
+			Default: def,
+			Named:   named,
 		}
 		return nil
 	}

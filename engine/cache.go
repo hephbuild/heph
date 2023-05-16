@@ -23,7 +23,7 @@ func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
 	if !target.Cache.Enabled {
 		folder = "__target_tmp_" + instance.UID + "_" + target.Name
 	}
-	return e.HomeDir.Join("cache", target.Package.FullName, folder, inputHash)
+	return e.HomeDir.Join("cache", target.Package.Path, folder, inputHash)
 }
 
 func (e *Engine) linkLatestCache(target *Target, from string) error {

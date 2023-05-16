@@ -503,15 +503,15 @@ var pkgsCmd = &cobra.Command{
 		}
 
 		pkgs := make([]*packages.Package, 0)
-		for _, p := range Engine.Packages {
+		for _, p := range Engine.Packages.All() {
 			pkgs = append(pkgs, p)
 		}
 		sort.SliceStable(pkgs, func(i, j int) bool {
-			return pkgs[i].FullName < pkgs[j].FullName
+			return pkgs[i].Path < pkgs[j].Path
 		})
 
 		for _, p := range pkgs {
-			fullname := p.FullName
+			fullname := p.Path
 			if fullname == "" {
 				fullname = "<root>"
 			}

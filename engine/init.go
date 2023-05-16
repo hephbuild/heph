@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/upgrade"
 	"os"
@@ -35,17 +34,20 @@ func (e *Engine) Init(ctx context.Context) error {
 }
 
 func (e *Engine) Parse(ctx context.Context) error {
+	re := &runBuildEngine{
+		Engine:         e,
+		registerTarget: e.defaultRegisterTarget,
+	}
+
 	for name, cfg := range e.Config.BuildFiles.Roots {
-		err := e.runRootBuildFiles(ctx, name, cfg)
+		err := re.runRootBuildFiles(ctx, name, cfg)
 		if err != nil {
 			return fmt.Errorf("root %v: %w", name, err)
 		}
 	}
 
 	runStartTime := time.Now()
-	err := e.runBuildFiles(e.Root.Abs(), func(dir string) *packages.Package {
-		return e.createPkg(dir)
-	})
+	err := re.runBuildFiles()
 	if err != nil {
 		return err
 	}

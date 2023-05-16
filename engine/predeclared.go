@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/engine/buildfiles"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
@@ -38,7 +39,7 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 		panic(err)
 	}
 
-	thread := newStarlarkThread()
+	thread := buildfiles.NewStarlarkThread()
 
 	globals, err := mod.Init(thread, predeclared(config))
 	if err != nil {
@@ -140,26 +141,29 @@ func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
 }
 
 func getPackage(thread *starlark.Thread) *packages.Package {
-	return getEngine(thread).pkg
-}
-
-func getEngine(thread *starlark.Thread) *runBuildEngine {
-	pkg := thread.Local("engine").(*runBuildEngine)
+	pkg := thread.Local("__pkg").(*packages.Package)
 
 	if pkg == nil {
-		panic("engine is nil, not supposed to happen")
+		panic("pkg is nil, not supposed to happen")
 	}
 
 	return pkg
 }
 
-func stackTrace(thread *starlark.Thread) []string {
-	var source []string
-	for _, c := range thread.CallStack() {
-		source = append(source, c.Name+" "+c.Pos.String())
+func getEngine(thread *starlark.Thread) *runBuildEngine {
+	engine := thread.Local("__engine").(*runBuildEngine)
+
+	if engine == nil {
+		panic("engine is nil, not supposed to happen")
 	}
 
-	return source
+	return engine
+}
+
+func stackTrace(thread *starlark.Thread) []string {
+	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) string {
+		return c.Name + " " + c.Pos.String()
+	})
 }
 
 func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -205,7 +209,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		"gen_deps_meta?", &sargs.GenDepsMeta,
 	); err != nil {
 		if sargs.Name != "" {
-			return nil, fmt.Errorf("%v: %w", pkg.TargetPath(sargs.Name), err)
+			return nil, fmt.Errorf("%v: %w", pkg.TargetAddr(sargs.Name), err)
 		}
 
 		return nil, err
@@ -217,7 +221,10 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 			return nil, err
 		}
 
-		pkg = e.createPkg(tp.Package)
+		pkg = e.Packages.GetOrCreate(packages.Package{
+			Path: tp.Package,
+			Root: e.Root.Join(tp.Package),
+		})
 	}
 
 	t, err := specFromArgs(sargs, pkg)
@@ -278,19 +285,19 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 func package_name(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
 
-	return starlark.String(pkg.Name), nil
+	return starlark.String(pkg.Name()), nil
 }
 
 func package_dir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
 
-	return starlark.String(pkg.FullName), nil
+	return starlark.String(pkg.Path), nil
 }
 
 func package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
 
-	return starlark.String("//" + pkg.FullName), nil
+	return starlark.String("//" + pkg.Path), nil
 }
 
 func get_os(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -338,7 +345,7 @@ func canonicalize(thread *starlark.Thread, fn *starlark.Builtin, args starlark.T
 
 	pkg := getPackage(thread)
 
-	tp, err := targetspec.TargetOutputParse(pkg.FullName, value)
+	tp, err := targetspec.TargetOutputParse(pkg.Path, value)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +382,7 @@ func split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 
 	pkg := getPackage(thread)
 
-	tp, err := targetspec.TargetOutputParse(pkg.FullName, value)
+	tp, err := targetspec.TargetOutputParse(pkg.Path, value)
 	if err != nil {
 		return nil, err
 	}

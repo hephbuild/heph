@@ -80,7 +80,11 @@ func Copy[T any](a []T) []T {
 }
 
 func Chunk[T any](slice []T, chunkSize int) [][]T {
-	var chunks [][]T
+	if chunkSize == 1 {
+		return [][]T{slice}
+	}
+
+	chunks := make([][]T, 0, chunkSize)
 	for {
 		if len(slice) == 0 {
 			break
@@ -146,4 +150,15 @@ func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j 
 	})
 
 	return ga
+}
+
+func Grow[T any](slice []T, newCap int) []T {
+	if cap(slice) > newCap {
+		return slice
+	}
+
+	newSlice := make([]T, len(slice), newCap)
+	copy(newSlice, slice)
+
+	return newSlice
 }

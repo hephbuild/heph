@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/worker"
 	"path/filepath"
 	"time"
@@ -75,7 +77,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 			observability.Status(ctx, observability.StringStatus("Finalizing gen..."))
 
 			// free references to starlark
-			for _, p := range e.Packages {
+			for _, p := range e.Packages.All() {
 				p.Globals = nil
 			}
 
@@ -198,24 +200,29 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 		j := e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("rungen %v chunk %v", target.FQN, i),
 			Do: func(w *worker.Worker, ctx context.Context) error {
+				re := runBuildEngine{
+					Engine: e.Engine,
+					registerTarget: func(spec targetspec.TargetSpec) error {
+						err := e.defaultRegisterTarget(spec)
+						if err != nil {
+							return err
+						}
+
+						targets.Add(e.Targets.Find(spec.FQN))
+						return nil
+					},
+				}
+
 				for _, file := range files {
 					observability.Status(ctx, observability.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
 
-					re := &runBuildEngine{
-						Engine: e.Engine,
-						pkg:    e.createPkg(filepath.Dir(file.RelRoot())),
-						registerTarget: func(spec targetspec.TargetSpec) error {
-							err := e.defaultRegisterTarget(spec)
-							if err != nil {
-								return err
-							}
+					ppath := filepath.Dir(file.RelRoot())
+					pkg := re.Packages.GetOrCreate(packages.Package{
+						Path: ppath,
+						Root: fs.NewPath(e.Root.Abs(), ppath),
+					})
 
-							targets.Add(e.Targets.Find(spec.FQN))
-							return nil
-						},
-					}
-
-					_, err := re.runBuildFile(file.Abs())
+					err := re.runBuildFile(pkg, file.Abs())
 					if err != nil {
 						return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
 					}

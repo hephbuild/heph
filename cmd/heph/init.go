@@ -57,6 +57,9 @@ func engineInitWithEngine(ctx context.Context, e *engine.Engine) error {
 		return err
 	}
 
+	e.Packages.Roots = e.Config.BuildFiles.Roots
+	e.BuildFilesState.Ignore = e.Config.BuildFiles.Ignore
+
 	if *jaegerEndpoint != "" {
 		opts := []tracesdk.TracerProviderOption{
 			tracesdk.WithResource(resource.NewWithAttributes(

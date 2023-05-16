@@ -17,7 +17,7 @@ import (
 
 func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec, error) {
 	t := targetspec.TargetSpec{
-		FQN:                 pkg.TargetPath(args.Name),
+		FQN:                 pkg.TargetAddr(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run.Array,
 		Doc:                 args.Doc,
@@ -67,8 +67,8 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		Gen:            args.Gen,
 		RuntimeEnv:     args.RuntimeEnv.StrMap,
 		SrcEnv: targetspec.TargetSpecSrcEnv{
-			All:   args.SrcEnv.All,
-			Named: args.SrcEnv.Named,
+			Default: args.SrcEnv.Default,
+			Named:   args.SrcEnv.Named,
 		},
 		OutEnv:      args.OutEnv,
 		HashFile:    args.HashFile,
@@ -163,11 +163,11 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		},
 	))
 
-	if t.SrcEnv.All == "" {
+	if t.SrcEnv.Default == "" {
 		if t.OutInSandbox {
-			t.SrcEnv.All = targetspec.FileEnvAbs
+			t.SrcEnv.Default = targetspec.FileEnvAbs
 		} else {
-			t.SrcEnv.All = targetspec.FileEnvRelPkg
+			t.SrcEnv.Default = targetspec.FileEnvRelPkg
 		}
 	}
 
@@ -177,8 +177,8 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 	}
 
-	if !validate(t.SrcEnv.All, targetspec.FileEnvValues) {
-		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv.All)
+	if !validate(t.SrcEnv.Default, targetspec.FileEnvValues) {
+		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv.Default)
 	}
 
 	if t.OutEnv == "" {
@@ -269,7 +269,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 			continue
 		}
 
-		if dtp, options, err := targetspec.TargetOutputOptionsParse(t.Package.FullName, dep); err == nil {
+		if dtp, options, err := targetspec.TargetOutputOptionsParse(t.Package.Path, dep); err == nil {
 			tspec := targetspec.TargetSpecDepTarget{
 				Name:   name,
 				Target: dtp.TargetPath.Full(),
@@ -313,7 +313,7 @@ func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools
 		return nil
 	}
 
-	tp, err := targetspec.TargetOutputParse(t.Package.FullName, tool)
+	tp, err := targetspec.TargetOutputParse(t.Package.Path, tool)
 	if err == nil {
 		ts.Targets = append(ts.Targets, targetspec.TargetSpecTargetTool{
 			Name:   name,
@@ -358,8 +358,7 @@ func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMap) (targetspec.Targ
 }
 
 func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.TargetSpecDeps, error) {
-	td := targetspec.TargetSpecDeps{}
-
+	var td targetspec.TargetSpecDeps
 	if len(deps.ArrMap) > 0 {
 		for name, arr := range deps.ArrMap {
 			d, err := depsSpecFromArr(t, arr, name)
@@ -375,9 +374,8 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMap) (targetspec.Target
 		if err != nil {
 			return d, err
 		}
-		td.Targets = append(td.Targets, d.Targets...)
-		td.Exprs = append(td.Exprs, d.Exprs...)
-		td.Files = append(td.Files, d.Files...)
+
+		td = d
 	}
 
 	sort.Slice(td.Exprs, utils.MultiLess(

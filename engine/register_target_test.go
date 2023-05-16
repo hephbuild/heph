@@ -4,9 +4,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/engine/buildfiles"
 	"github.com/hephbuild/heph/targetspec"
-	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.starlark.net/starlark"
@@ -73,14 +72,6 @@ func TestTargetSpec(t *testing.T) {
 			var spec targetspec.TargetSpec
 
 			e := &runBuildEngine{
-				pkg: &packages.Package{
-					Name:     "test",
-					FullName: "some/test",
-					Root: fs2.NewPath(
-						"/tmp/some/test",
-						"some/test",
-					),
-				},
 				registerTarget: func(rspec targetspec.TargetSpec) error {
 					spec = rspec
 
@@ -88,8 +79,8 @@ func TestTargetSpec(t *testing.T) {
 				},
 			}
 
-			thread := newStarlarkThread()
-			thread.SetLocal("engine", e)
+			thread := buildfiles.NewStarlarkThread()
+			thread.SetLocal("__engine", e)
 
 			predeclaredGlobalsOnce(nil)
 

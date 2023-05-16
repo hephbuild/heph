@@ -3,18 +3,43 @@ package packages
 import (
 	"github.com/hephbuild/heph/utils/fs"
 	"go.starlark.net/starlark"
+	"path"
+	"path/filepath"
 )
 
 type Package struct {
-	Name        string
-	FullName    string
+	Path        string
 	Root        fs.Path
 	Globals     starlark.StringDict `json:"-" msgpack:"-"`
 	SourceFiles SourceFiles
 }
 
-func (p Package) TargetPath(name string) string {
-	return "//" + p.FullName + ":" + name
+func (p *Package) Name() string {
+	if p.Path == "" {
+		return ""
+	}
+
+	return path.Base(p.Path)
+}
+
+func (p *Package) Addr() string {
+	return "//" + p.Path
+}
+
+func (p *Package) TargetAddr(name string) string {
+	return "//" + p.Path + ":" + name
+}
+
+func (p *Package) Child(childPath string) Package {
+	if p.Path != "" && childPath != "" {
+		childPath = p.Path + "/" + childPath
+	} else if p.Path != "" {
+		childPath = p.Path
+	}
+	return Package{
+		Path: childPath,
+		Root: p.Root.Join(filepath.FromSlash(childPath)),
+	}
 }
 
 type SourceFile struct {

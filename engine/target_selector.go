@@ -70,12 +70,12 @@ func ParseTargetSelector(pkg, s string) TargetMatcher {
 	if err == nil {
 		if isAllDeep {
 			return func(target *Target) bool {
-				pkg := target.Package.FullName
+				pkg := target.Package.Path
 				return pkg == tp.Package || strings.HasPrefix(pkg, tp.Package+"/")
 			}
 		} else if isAll {
 			return func(target *Target) bool {
-				pkg := target.Package.FullName
+				pkg := target.Package.Path
 				return pkg == tp.Package
 			}
 		}

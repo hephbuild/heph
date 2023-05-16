@@ -270,7 +270,7 @@ func (e *Engine) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) 
 		if abs {
 			relRoot = strings.TrimPrefix(p, "/")
 		} else {
-			relRoot = filepath.Join(t.Package.FullName, p)
+			relRoot = filepath.Join(t.Package.Path, p)
 		}
 
 		return fs.NewRelPath(relRoot)
@@ -787,7 +787,7 @@ func (e *Engine) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, bread
 		} else {
 			td.Files = append(td.Files, fs.NewPathAbs(
 				t.Package.Root.Root(),
-				filepath.Join(t.Package.FullName, file.Path),
+				filepath.Join(t.Package.Path, file.Path),
 				t.Package.Root.Join(file.Path).Abs(),
 			))
 		}
