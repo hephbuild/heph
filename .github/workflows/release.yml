@@ -40,9 +40,6 @@ jobs:
       - name: Bootstrap Build
         run: go build -v -o heph github.com/hephbuild/heph/cmd/heph
 
-#      - name: Setup tmate session
-#        uses: mxschmitt/action-tmate@v3
-
       - name: Build all OS/ARCH
         run: |
           mkdir -p dist
@@ -173,3 +170,9 @@ jobs:
       - name: Cleanup .heph
         run: |
           rm -rf .heph/cache/test
+
+#      - name: Setup tmate session
+#        if: ${{ failure() }}
+#        run: |
+#          curl -L https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz | tar -xJ --strip-components 1
+#          ./tmate -F

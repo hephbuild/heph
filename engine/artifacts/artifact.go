@@ -168,26 +168,27 @@ func (r readerMultiCloser) Close() error {
 
 func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadCloser, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
-	if fs.PathExists(uncompressedPath) {
-		f, err := os.Open(uncompressedPath)
-		if err != nil {
-			return nil, err
-		}
+	f, err := os.Open(uncompressedPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("open: %w", err)
+	}
 
+	if f != nil {
 		return f, nil
 	}
 
 	if artifact.Compressible() {
 		gzPath := filepath.Join(dir, artifact.GzFileName())
-		if fs.PathExists(gzPath) {
-			f, err := os.Open(gzPath)
-			if err != nil {
-				return nil, err
-			}
+		f, err := os.Open(gzPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("open: %w", err)
+		}
 
+		if f != nil {
 			gr, err := gzip.NewReader(f)
 			if err != nil {
-				return nil, err
+				_ = f.Close()
+				return nil, fmt.Errorf("new: %w", err)
 			}
 
 			return readerMultiCloser{

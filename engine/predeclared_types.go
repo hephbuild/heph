@@ -202,7 +202,8 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 	switch e := v.(type) {
 	case starlark.Bool:
 		*d = BoolArray{
-			Bool: bool(e),
+			Bool:  bool(e),
+			Array: []string{},
 		}
 		return nil
 	case *starlark.List:

@@ -54,7 +54,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 
 			gr, err := artifacts.UncompressedReaderFromArtifact(artifact, dir)
 			if err != nil {
-				return "", err
+				return "", fmt.Errorf("ungz: reader: %w", err)
 			}
 			defer gr.Close()
 

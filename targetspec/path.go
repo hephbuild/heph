@@ -53,11 +53,11 @@ func (p TargetPath) validate() error {
 	}
 
 	if !ContainsOnly(p.Package, packageChars) {
-		return fmt.Errorf("package name must match: %s (got %v)", packageChars, p.Package)
+		return fmt.Errorf("package name must match: %v (got %v)", string(packageChars), p.Package)
 	}
 
 	if !ContainsOnly(p.Name, targetNameChars) {
-		return fmt.Errorf("target name must match: %s (got %v)", targetNameChars, p.Name)
+		return fmt.Errorf("target name must match: %v (got %v)", string(targetNameChars), p.Name)
 	}
 
 	targetPathValidateCache.Set(k, struct{}{})
@@ -165,7 +165,7 @@ func (p TargetOutputPath) validate() error {
 	}
 
 	if !ContainsOnly(p.Output, outputNameChars) {
-		return fmt.Errorf("package name must match: %s (got %v)", outputNameChars, p.Output)
+		return fmt.Errorf("package name must match: %v (got %v)", string(outputNameChars), p.Output)
 	}
 
 	targetOutputPathValidateCache.Set(k, struct{}{})

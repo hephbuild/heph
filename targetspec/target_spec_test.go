@@ -12,7 +12,6 @@ import (
 
 func genTargetSpec(name string, factor int) TargetSpec {
 	pkg := &packages.Package{
-		Name: "aaa",
 		Path: "aaa",
 	}
 
@@ -124,7 +123,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		PassEnv:    passEnv,
 		RunInCwd:   false,
 		Gen:        false,
-		Source:     []string{"some_source" + time.Now().String()},
+		Source:     []TargetSource{{Name: "some_source" + time.Now().String()}},
 		RuntimeEnv: nil,
 		SrcEnv:     TargetSpecSrcEnv{},
 		OutEnv:     "",

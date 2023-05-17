@@ -9,8 +9,7 @@ target(
     "Name": "a",
     "FQN": "//some/test:a",
     "Package": {
-        "Name": "test",
-        "FullName": "some/test",
+        "Path": "some/test",
         "Root": {
             "Root": "/tmp/some/test",
             "RelRoot": "some/test",
@@ -74,7 +73,7 @@ target(
     "Source": null,
     "RuntimeEnv": null,
     "SrcEnv": {
-        "All": "rel_pkg",
+        "Default": "rel_pkg",
         "Named": null
     },
     "OutEnv": "rel_pkg",
