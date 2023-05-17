@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/starlark"
 	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -156,14 +155,14 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 	}
 
-	sort.Slice(t.Out, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(t.Out[i].Path, t.Out[j].Path)
+	utils.SortP(t.Out,
+		func(i, j *targetspec.TargetSpecOutFile) int {
+			return strings.Compare(i.Path, j.Path)
 		},
-		func(i, j int) int {
-			return strings.Compare(t.Out[i].Name, t.Out[j].Name)
+		func(i, j *targetspec.TargetSpecOutFile) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
 	if t.SrcEnv.Default == "" {
 		if t.OutInSandbox {
@@ -380,32 +379,32 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspe
 		td = d
 	}
 
-	sort.Slice(td.Exprs, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(td.Exprs[i].Expr.String, td.Exprs[j].Expr.String)
+	utils.SortP(td.Exprs,
+		func(i, j *targetspec.TargetSpecDepExpr) int {
+			return strings.Compare(i.Expr.String, j.Expr.String)
 		},
-		func(i, j int) int {
-			return strings.Compare(td.Exprs[i].Name, td.Exprs[j].Name)
+		func(i, j *targetspec.TargetSpecDepExpr) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
-	sort.Slice(td.Targets, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(td.Targets[i].Target, td.Targets[j].Target)
+	utils.SortP(td.Targets,
+		func(i, j *targetspec.TargetSpecDepTarget) int {
+			return strings.Compare(i.Target, j.Target)
 		},
-		func(i, j int) int {
-			return strings.Compare(td.Targets[i].Name, td.Targets[j].Name)
+		func(i, j *targetspec.TargetSpecDepTarget) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
-	sort.Slice(td.Files, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(td.Files[i].Path, td.Files[j].Path)
+	utils.SortP(td.Files,
+		func(i, j *targetspec.TargetSpecDepFile) int {
+			return strings.Compare(i.Path, j.Path)
 		},
-		func(i, j int) int {
-			return strings.Compare(td.Files[i].Name, td.Files[j].Name)
+		func(i, j *targetspec.TargetSpecDepFile) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
 	return td, nil
 }

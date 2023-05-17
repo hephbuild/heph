@@ -2,8 +2,9 @@ package engine
 
 import (
 	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/sets"
-	"sort"
+	"strings"
 )
 
 func Contains(ts []*Target, fqn string) bool {
@@ -79,8 +80,8 @@ func (ts *Targets) Sort() {
 
 	a := ts.Slice()
 
-	sort.Slice(a, func(i, j int) bool {
-		return a[i].FQN < a[j].FQN
+	utils.Sort(a, func(i, j *Target) int {
+		return strings.Compare(i.FQN, j.FQN)
 	})
 }
 

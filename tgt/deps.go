@@ -4,7 +4,6 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/fs"
-	"sort"
 	"strings"
 )
 
@@ -50,16 +49,16 @@ func (d *TargetDeps) Dedup() {
 }
 
 func (d TargetDeps) Sort() {
-	sort.Slice(d.Targets, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(d.Targets[i].Target.FQN, d.Targets[j].Target.FQN)
+	utils.SortP(d.Targets,
+		func(i, j *TargetWithOutput) int {
+			return strings.Compare(i.Target.FQN, j.Target.FQN)
 		},
-		func(i, j int) int {
-			return strings.Compare(d.Targets[i].Output, d.Targets[j].Output)
+		func(i, j *TargetWithOutput) int {
+			return strings.Compare(i.Output, j.Output)
 		},
-	))
+	)
 
-	sort.Slice(d.Files, func(i, j int) bool {
-		return d.Files[i].RelRoot() < d.Files[j].RelRoot()
+	utils.Sort(d.Files, func(i, j fs.Path) int {
+		return strings.Compare(i.RelRoot(), j.RelRoot())
 	})
 }
