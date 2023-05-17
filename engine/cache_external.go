@@ -44,17 +44,30 @@ func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Locati
 	if err != nil {
 		return false, err
 	}
+	defer tof.Close()
+
+	fromf, err := from.NewFile(path)
+	if err != nil {
+		return false, err
+	}
+	defer fromf.Close()
 
 	exists, err := tof.Exists()
-	_ = tof.Close()
 	if err != nil {
 		return false, err
 	}
 
 	if exists {
-		log.Tracef("vfs copy %v to %v: exists", from.URI(), to.URI())
-		return false, nil
+		tos, _ := tof.Size()
+		froms, _ := fromf.Size()
+		if tos == froms {
+			log.Tracef("vfs copy %v to %v: exists", from.URI(), to.URI())
+			return false, nil
+		}
 	}
+
+	_ = tof.Close()
+	_ = fromf.Close()
 
 	err = e.vfsCopyFile(ctx, from, to, path)
 	if err != nil {

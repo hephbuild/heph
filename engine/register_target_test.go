@@ -5,7 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"github.com/hephbuild/heph/engine/buildfiles"
+	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
+	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.starlark.net/starlark"
@@ -81,6 +83,13 @@ func TestTargetSpec(t *testing.T) {
 
 			thread := buildfiles.NewStarlarkThread()
 			thread.SetLocal("__engine", e)
+			thread.SetLocal("__pkg", &packages.Package{
+				Path: "some/test",
+				Root: fs2.NewPath(
+					"/tmp/some/test",
+					"some/test",
+				),
+			})
 
 			predeclaredGlobalsOnce(nil)
 

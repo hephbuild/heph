@@ -20,7 +20,7 @@ for (mode, expected) in modes:
     t=target(
         name="_text_file_mode_"+smode,
         deps=txt,
-        run="ls -l $SRC | awk '{print $1;}'",
+        run="ls -l $SRC | awk '{print $1;}' | sed 's/@//'",
         cache=False,
         labels='txt_file_mode'
     )
