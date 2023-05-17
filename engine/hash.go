@@ -59,12 +59,6 @@ func (e *Engine) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) {
 	}
 }
 
-var copyBufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 1000)
-	},
-}
-
 func (e *Engine) hashFilePath(h hash.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -95,6 +89,12 @@ func (e *Engine) hashFilePerm(h hash.Hash, m os.FileMode) {
 	//h.UI32(uint32(m.Perm()))
 }
 
+var copyBufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 32*1024)
+	},
+}
+
 func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
 	e.hashFilePerm(h, info.Mode())
 
@@ -109,7 +109,7 @@ func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) erro
 	return nil
 }
 
-func (e *Engine) hashTar(h hash.Hash, r io.ReadCloser) error {
+func (e *Engine) hashTar(h hash.Hash, r io.Reader) error {
 	return tar.Walk(r, func(hdr *tar2.Header, r *tar2.Reader) error {
 		h.String(hdr.Name)
 
@@ -173,7 +173,7 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 
 	for _, dep := range target.Deps.All().Targets {
 		err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
-		if tgt.ErrStopWalk != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -183,7 +183,7 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 
 		for _, dep := range target.HashDeps.Targets {
 			err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
-			if tgt.ErrStopWalk != nil {
+			if err != nil {
 				return err
 			}
 		}

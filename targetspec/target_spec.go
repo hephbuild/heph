@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
+	"go.starlark.net/syntax"
 	"os/exec"
 	"sort"
 	"strings"
@@ -123,7 +124,7 @@ type TargetSpec struct {
 	RuntimePassEnv      []string
 	RunInCwd            bool
 	Gen                 bool
-	Source              []string
+	Source              []TargetSource
 	RuntimeEnv          map[string]string
 	SrcEnv              TargetSpecSrcEnv
 	OutEnv              string
@@ -131,6 +132,15 @@ type TargetSpec struct {
 	Transitive          TargetSpecTransitive
 	Timeout             time.Duration
 	GenDepsMeta         bool
+}
+
+type TargetSource struct {
+	Name string
+	Pos  syntax.Position
+}
+
+func (s TargetSource) String() string {
+	return s.Name + " " + s.Pos.String()
 }
 
 type TargetPlatform struct {

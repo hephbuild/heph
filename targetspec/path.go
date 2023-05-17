@@ -3,6 +3,8 @@ package targetspec
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/maps"
+	"github.com/segmentio/fasthash/fnv1a"
 	"path"
 	"strings"
 )
@@ -39,7 +41,17 @@ func ContainsOnly(s string, chars []rune) bool {
 	return true
 }
 
+var targetPathValidateCache maps.Map[uint32, struct{}]
+
 func (p TargetPath) validate() error {
+	k := fnv1a.Init32
+	k = fnv1a.AddString32(k, p.Package)
+	k = fnv1a.AddString32(k, p.Name)
+
+	if targetPathValidateCache.Has(k) {
+		return nil
+	}
+
 	if !ContainsOnly(p.Package, packageChars) {
 		return fmt.Errorf("package name must match: %s (got %v)", packageChars, p.Package)
 	}
@@ -47,6 +59,8 @@ func (p TargetPath) validate() error {
 	if !ContainsOnly(p.Name, targetNameChars) {
 		return fmt.Errorf("target name must match: %s (got %v)", targetNameChars, p.Name)
 	}
+
+	targetPathValidateCache.Set(k, struct{}{})
 
 	return nil
 }
@@ -134,15 +148,27 @@ func (p TargetOutputPath) Full() string {
 	return p.TargetPath.Full()
 }
 
+var targetOutputPathValidateCache maps.Map[uint32, struct{}]
+
 func (p TargetOutputPath) validate() error {
 	err := p.TargetPath.validate()
 	if err != nil {
 		return err
 	}
 
+	k := fnv1a.Init32
+	k = fnv1a.AddString32(k, p.Package)
+	k = fnv1a.AddString32(k, p.Name)
+
+	if targetOutputPathValidateCache.Has(k) {
+		return nil
+	}
+
 	if !ContainsOnly(p.Output, outputNameChars) {
 		return fmt.Errorf("package name must match: %s (got %v)", outputNameChars, p.Output)
 	}
+
+	targetOutputPathValidateCache.Set(k, struct{}{})
 
 	return nil
 }

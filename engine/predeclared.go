@@ -160,9 +160,12 @@ func getEngine(thread *starlark.Thread) *runBuildEngine {
 	return engine
 }
 
-func stackTrace(thread *starlark.Thread) []string {
-	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) string {
-		return c.Name + " " + c.Pos.String()
+func stackTrace(thread *starlark.Thread) []targetspec.TargetSource {
+	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) targetspec.TargetSource {
+		return targetspec.TargetSource{
+			Name: c.Name,
+			Pos:  c.Pos,
+		}
 	})
 }
 
@@ -318,10 +321,9 @@ func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	trace := stackTrace(thread)
-	for i, s := range trace {
-		trace[i] = "  " + s
-	}
+	trace := ads.Map(stackTrace(thread), func(t targetspec.TargetSource) string {
+		return t.String()
+	})
 	traceStr := strings.Join(trace, "\n")
 
 	if s, ok := value.(starlark.String); ok {
