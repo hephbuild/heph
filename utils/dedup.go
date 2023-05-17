@@ -82,17 +82,3 @@ func DedupKeepLast[T any](as []T, id func(T) string) []T {
 
 	return nas
 }
-
-func MultiLess(compares ...func(i, j int) int) func(i, j int) bool {
-	return func(i, j int) bool {
-		for _, compare := range compares {
-			r := compare(i, j)
-
-			if r != 0 {
-				return r < 0
-			}
-		}
-
-		return false
-	}
-}

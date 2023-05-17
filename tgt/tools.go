@@ -4,7 +4,6 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/fs"
-	"sort"
 	"strings"
 )
 
@@ -64,30 +63,30 @@ func (t TargetTools) Dedup() {
 }
 
 func (t TargetTools) Sort() {
-	sort.Slice(t.Hosts, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(t.Hosts[i].BinName, t.Hosts[j].BinName)
+	utils.SortP(t.Hosts,
+		func(i, j *targetspec.TargetSpecHostTool) int {
+			return strings.Compare(i.BinName, j.BinName)
 		},
-		func(i, j int) int {
-			return strings.Compare(t.Hosts[i].Name, t.Hosts[j].Name)
+		func(i, j *targetspec.TargetSpecHostTool) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
-	sort.Slice(t.Targets, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(t.Targets[i].Target.FQN, t.Targets[j].Target.FQN)
+	utils.SortP(t.Targets,
+		func(i, j *TargetTool) int {
+			return strings.Compare(i.Target.FQN, j.Target.FQN)
 		},
-		func(i, j int) int {
-			return strings.Compare(t.Targets[i].Name, t.Targets[j].Name)
+		func(i, j *TargetTool) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 
-	sort.Slice(t.TargetReferences, utils.MultiLess(
-		func(i, j int) int {
-			return strings.Compare(t.TargetReferences[i].FQN, t.TargetReferences[j].FQN)
+	utils.Sort(t.TargetReferences,
+		func(i, j *Target) int {
+			return strings.Compare(i.FQN, j.FQN)
 		},
-		func(i, j int) int {
-			return strings.Compare(t.TargetReferences[i].Name, t.TargetReferences[j].Name)
+		func(i, j *Target) int {
+			return strings.Compare(i.Name, j.Name)
 		},
-	))
+	)
 }

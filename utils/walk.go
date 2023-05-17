@@ -27,6 +27,16 @@ func fastMatchDir(path, matcher string) bool {
 	return false
 }
 
+func PathMatchExactOrPrefixAny(path string, matchers ...string) (bool, error) {
+	for _, matcher := range matchers {
+		if path == matcher || matchPrefix(path, matcher) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func PathMatchAny(path string, matchers ...string) (bool, error) {
 	for _, matcher := range matchers {
 		if strings.HasSuffix(matcher, "/**/*") {
