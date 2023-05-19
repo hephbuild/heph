@@ -3,24 +3,23 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker"
 )
 
-func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip *Target) (_ *WaitGroupMap, rerr error) {
-	targets := rrs.Targets()
+func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip targetspec.Specer) (_ *WaitGroupMap, rerr error) {
+	targetsSet := rrs.Targets()
 
-	targetsSet := NewTargets(len(targets))
-	targetsSet.AddAll(targets)
-
-	toAssess, outputs, err := e.DAG().GetOrderedAncestorsWithOutput(e, targets, true)
+	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, target := range targets {
+	for _, target := range targetsSet.Slice() {
 		ss := sets.NewStringSet(len(target.OutWithSupport.All()))
 		ss.AddAll(target.OutWithSupport.Names())
 		outputs.Set(target.FQN, ss)
@@ -33,13 +32,13 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	targetSchedJobs := &maps.Map[string, *worker.Job]{}
 
 	sched := &schedulerv2{
-		Engine:     e,
-		octx:       octx,
-		sctx:       octx,
-		rrs:        rrs,
-		skip:       skip,
-		targets:    targets,
-		targetsSet: targetsSet,
+		Engine:         e,
+		octx:           octx,
+		sctx:           octx,
+		rrs:            rrs,
+		skip:           skip,
+		rrTargets:      targetsSet,
+		allTargetMetas: e.Targets,
 
 		toAssess:     toAssess,
 		outputs:      outputs,
@@ -63,11 +62,11 @@ type schedulerv2 struct {
 	octx context.Context
 	sctx context.Context
 	rrs  TargetRunRequests
-	skip *Target
+	skip targetspec.Specer
 
-	targets         []*Target
-	targetsSet      *Targets
-	toAssess        []*Target
+	rrTargets       *graph.Targets
+	allTargetMetas  *TargetMetas
+	toAssess        *graph.Targets
 	outputs         *maps.Map[string, *sets.Set[string, string]]
 	deps            *WaitGroupMap
 	pullMetaDeps    *WaitGroupMap
@@ -76,15 +75,15 @@ type schedulerv2 struct {
 }
 
 func (s *schedulerv2) schedule() error {
-	for _, target := range s.toAssess {
-		target := target
+	for _, target := range s.toAssess.Slice() {
+		target := s.allTargetMetas.FindGraph(target)
 
 		targetDeps := s.deps.Get(target.FQN)
 		targetDeps.AddSem()
 
 		s.pullMetaDeps.Get(target.FQN).AddSem()
 
-		parents, err := s.DAG().GetParents(target)
+		parents, err := s.Graph.DAG().GetParents(target)
 		if err != nil {
 			return err
 		}
@@ -94,8 +93,8 @@ func (s *schedulerv2) schedule() error {
 			pmdeps.AddChild(s.pullMetaDeps.Get(parent.FQN))
 		}
 
-		isSkip := s.skip != nil && s.skip.FQN == target.FQN
-		isInRRs := s.targetsSet.Has(target)
+		isSkip := s.skip != nil && s.skip.Spec().FQN == target.FQN
+		isInRRs := s.rrTargets.Has(target.Target)
 
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{
 			Name: "pull_meta " + target.FQN,
@@ -112,7 +111,7 @@ func (s *schedulerv2) schedule() error {
 					return nil
 				}
 
-				rr := s.rrs.Get(target)
+				rr := s.rrs.Get(target.Target)
 				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs, false)
 				if err != nil {
 					return err
@@ -128,7 +127,7 @@ func (s *schedulerv2) schedule() error {
 		}()
 		targetDeps.Add(pj)
 
-		children, err := s.DAG().GetChildren(target)
+		children, err := s.Graph.DAG().GetChildren(target)
 		if err != nil {
 			return err
 		}
@@ -138,16 +137,16 @@ func (s *schedulerv2) schedule() error {
 		}
 	}
 
-	for _, target := range s.toAssess {
+	for _, target := range s.toAssess.Slice() {
 		s.pullMetaDeps.Get(target.FQN).DoneSem()
 	}
 
 	return nil
 }
 
-func (s *schedulerv2) parentTargetDeps(target *Target) (*worker.WaitGroup, error) {
+func (s *schedulerv2) parentTargetDeps(target targetspec.Specer) (*worker.WaitGroup, error) {
 	deps := &worker.WaitGroup{}
-	parents, err := s.DAG().GetParents(target)
+	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
 	}
@@ -169,9 +168,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 		Name: "cache get " + target.FQN,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(s.Engine)
-
-			cached, err := e.pullOrGetCacheAndPost(ctx, target, outputs, false, uncompress)
+			cached, err := s.pullOrGetCacheAndPost(ctx, target, outputs, false, uncompress)
 			if err != nil {
 				return err
 			}
@@ -199,7 +196,7 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Ta
 		return nil, err
 	}
 
-	children, err := s.DAG().GetChildren(target)
+	children, err := s.Graph.DAG().GetChildren(target.Target)
 	if err != nil {
 		return nil, err
 	}
@@ -212,15 +209,15 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Ta
 	return j, nil
 }
 
-func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target *Target) (*worker.WaitGroup, error) {
-	parents, err := s.DAG().GetParents(target)
+func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target targetspec.Specer) (*worker.WaitGroup, error) {
+	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
 	}
 
 	runDeps := &worker.WaitGroup{}
 	for _, parent := range parents {
-		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
+		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, s.allTargetMetas.FindGraph(parent), true, true, true)
 		if err != nil {
 			return nil, err
 		}
@@ -244,9 +241,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 			if target.Cache.Enabled && useCached {
 				outputs := s.outputs.Get(target.FQN).Slice()
 
-				e := NewTargetRunEngine(s.Engine)
-
-				_, cached, err := e.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
+				_, cached, err := s.Engine.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
 				if err != nil {
 					return err
 				}
@@ -292,7 +287,7 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *Target)
 	}
 
 	deps := &worker.WaitGroup{}
-	parents, err := s.DAG().GetParents(target)
+	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
 	}
@@ -301,12 +296,12 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *Target)
 	}
 	deps.AddChild(runDeps)
 
-	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target), runDeps)
+	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target.Target), runDeps)
 	if err != nil {
 		return nil, err
 	}
 
-	children, err := s.DAG().GetChildren(target)
+	children, err := s.Graph.DAG().GetChildren(target)
 	if err != nil {
 		return nil, err
 	}

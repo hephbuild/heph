@@ -1,3 +1,5 @@
+//go:build ignored
+
 package main
 
 import (
@@ -33,7 +35,7 @@ type watchCtx struct {
 	runCancel context.CancelFunc
 	runCh     chan struct{}
 	rrs       engine.TargetRunRequests
-	targets   *engine.Targets
+	targets   *engine.TargetMetas
 
 	m           sync.Mutex
 	graphSigsCh chan struct{}
@@ -124,7 +126,7 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 }
 
 func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
-	allIgnore := append(*ignore, w.e.Config.Watch.Ignore...)
+	allIgnore := append(*watchIgnore, w.e.Config.Watch.Ignore...)
 
 	// Should be nil if currentEvents is nil
 	var filteredEvents []watchEvent
@@ -239,7 +241,7 @@ func (w *watchCtx) triggerRun(currentEvents []watchEvent) error {
 			localRRs = w.rrs
 		} else {
 			for _, target := range descendants {
-				if w.targets.Find(target.FQN) != nil {
+				if w.targets.FindGraph(target.FQN) != nil {
 					localRRs = append(localRRs, w.rrs.Get(target))
 				}
 			}
@@ -283,7 +285,7 @@ func (w *watchCtx) runGraph(args []string) error {
 		return nil
 	}
 
-	w.targets = engine.NewTargets(len(w.rrs))
+	w.targets = engine.NewTargetMetas(len(w.rrs))
 	for _, inv := range w.rrs {
 		w.targets.Add(inv.Target)
 	}
@@ -375,6 +377,13 @@ func (w *watchCtx) watchFiles() error {
 			return w.ctx.Err()
 		}
 	}
+}
+
+var watchIgnore *[]string
+
+func init() {
+	watchIgnore = watchCmd.Flags().StringArray("ignore", nil, "Ignore files, supports glob")
+	rootCmd.AddCommand(watchCmd)
 }
 
 var watchCmd = &cobra.Command{

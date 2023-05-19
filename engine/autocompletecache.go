@@ -11,7 +11,6 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 	"os"
 	"path/filepath"
-	"sort"
 )
 
 type AutocompleteCache struct {
@@ -49,11 +48,11 @@ func (a *AutocompleteCache) Labels() []string {
 }
 
 func (e *Engine) autocompleteCachePath() string {
-	return filepath.Join(e.HomeDir.Abs(), "tmp", "autocomplete")
+	return filepath.Join(e.Root.Home.Abs(), "tmp", "autocomplete")
 }
 
 func (e *Engine) autocompleteCacheHashPath() string {
-	return filepath.Join(e.HomeDir.Abs(), "tmp", "autocomplete_hash")
+	return filepath.Join(e.Root.Home.Abs(), "tmp", "autocomplete_hash")
 }
 
 func (e *Engine) computeAutocompleteHash() (string, error) {
@@ -61,44 +60,35 @@ func (e *Engine) computeAutocompleteHash() (string, error) {
 	h.I64(3)
 	h.String(utils.Version)
 
-	for _, file := range e.SourceFiles {
-		h.String(file.Path)
-		err := e.hashFilePath(h, file.Path)
-		if err != nil {
-			return "", err
-		}
-	}
-
-	fqns := e.Targets.FQNs()
-	sort.Strings(fqns)
-	for _, fqn := range fqns {
-		h.String(fqn)
-	}
-
-	for _, target := range e.linkedTargets().Slice() {
-		if !target.Gen {
-			continue
-		}
-
-		h.String(target.FQN)
-
-		err := e.hashInputFiles(h, target)
-		if err != nil {
-			return "", err
-		}
-	}
+	// TODO
+	//for _, file := range e.SourceFiles {
+	//	h.String(file.Path)
+	//	err := e.hashFilePath(h, file.Path)
+	//	if err != nil {
+	//		return "", err
+	//	}
+	//}
+	//
+	//fqns := e.Targets.FQNs()
+	//sort.Strings(fqns)
+	//for _, fqn := range fqns {
+	//	h.String(fqn)
+	//}
+	//
+	//for _, target := range e.linkedTargets().Slice() {
+	//	if !target.Gen {
+	//		continue
+	//	}
+	//
+	//	h.String(target.FQN)
+	//
+	//	err := e.hashInputFiles(h, target)
+	//	if err != nil {
+	//		return "", err
+	//	}
+	//}
 
 	return h.Sum(), nil
-}
-
-func FilterPublicTargets(targets []*Target) []*Target {
-	pubTargets := make([]*Target, 0)
-	for _, target := range targets {
-		if !target.IsPrivate() {
-			pubTargets = append(pubTargets, target)
-		}
-	}
-	return pubTargets
 }
 
 func (e *Engine) StoreAutocompleteCache(ctx context.Context) error {
@@ -114,8 +104,8 @@ func (e *Engine) StoreAutocompleteCache(ctx context.Context) error {
 		return nil
 	}
 
-	allTargets := make([]targetspec.TargetSpec, 0, e.Targets.Len())
-	for _, target := range e.Targets.Slice() {
+	allTargets := make([]targetspec.TargetSpec, 0, e.Graph.Targets().Len())
+	for _, target := range e.Graph.Targets().Slice() {
 		allTargets = append(allTargets, target.TargetSpec)
 	}
 
@@ -151,6 +141,9 @@ func (e *Engine) StoreAutocompleteCache(ctx context.Context) error {
 }
 
 func (e *Engine) LoadAutocompleteCacheHash() (string, error) {
+	// TODO
+	return "", nil
+
 	b, err := os.ReadFile(e.autocompleteCacheHashPath())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err

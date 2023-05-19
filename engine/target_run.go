@@ -7,6 +7,7 @@ import (
 	"fmt"
 	ptylib "github.com/creack/pty"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/hephprovider"
@@ -31,25 +32,16 @@ import (
 	"time"
 )
 
-func NewTargetRunEngine(e *Engine) TargetRunEngine {
-	return TargetRunEngine{
-		Engine: e,
-	}
-}
-
-type TargetRunEngine struct {
-	*Engine
-}
-
 func (e *Engine) tmpRoot(elem ...string) fs.Path {
-	return e.HomeDir.Join("tmp").Join(elem...)
+	return e.Root.Home.Join("tmp").Join(elem...)
 }
 
-func (e *Engine) tmpTargetRoot(target *Target) fs.Path {
-	return e.HomeDir.Join("tmp", target.Package.Path, "__target_"+target.Name)
+func (e *Engine) tmpTargetRoot(target targetspec.Specer) fs.Path {
+	spec := target.Spec()
+	return e.Root.Home.Join("tmp", spec.Package.Path, "__target_"+spec.Name)
 }
 
-func (e *Engine) lockPath(target *Target, resource string) string {
+func (e *Engine) lockPath(target targetspec.Specer, resource string) string {
 	return e.tmpTargetRoot(target).Join(resource + ".lock").Abs()
 }
 
@@ -59,7 +51,7 @@ func normalizeEnv(k string) string {
 	return envRegex.ReplaceAllString(k, "_")
 }
 
-func (e *TargetRunEngine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
+func (e *Engine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
 	tmppath := e.tmpTargetRoot(target).Join(name).Abs()
 
 	err := fs.CreateParentDir(tmppath)
@@ -93,25 +85,25 @@ type runPrepare struct {
 	Executor platform.Executor
 }
 
-func (e *TargetRunEngine) toolAbsPath(tt tgt.TargetTool) string {
-	return tt.File.WithRoot(e.Targets.Find(tt.Target.FQN).OutExpansionRoot.Abs()).Abs()
+func (e *Engine) toolAbsPath(tt tgt.TargetTool) string {
+	return tt.File.WithRoot(e.Targets.FindTGT(tt.Target).OutExpansionRoot.Abs()).Abs()
 }
 
-func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
+func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
 	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
 
-	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target)
+	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target.Target)
 	defer span.EndError(rerr)
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
-		if e.Targets.Find(tool.Target.FQN).actualOutFiles == nil {
+		if e.Targets.FindTGT(tool.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		if e.Targets.Find(dep.Target.FQN).actualOutFiles == nil {
+		if e.Targets.FindTGT(dep.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
@@ -132,7 +124,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 		var err error
 		if t.BinName == "heph" {
 			bin[t.Name], hephDistRoot, err = hephprovider.GetHephPath(
-				e.HomeDir.Join("tmp", "__heph", utils.Version).Abs(),
+				e.tmpRoot("__heph", utils.Version).Abs(),
 				executor.Os(), executor.Arch(), utils.Version,
 				true, /*!platform.HasHostFsAccess(executor)*/
 			)
@@ -166,7 +158,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 			done := utils.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
-				art := target.artifacts.OutTar(name)
+				art := target.Artifacts.OutTar(name)
 				p, err := UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
 				if err != nil {
 					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, art.Name())
@@ -183,7 +175,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	for _, deps := range target.Deps.Named() {
 		var deplength int
 		for _, dep := range deps.Targets {
-			deplength += len(e.Targets.Find(dep.Target.FQN).ActualOutFiles().Name(dep.Output))
+			deplength += len(e.Targets.FindTGT(dep.Target).ActualOutFiles().Name(dep.Output))
 		}
 		deplength += len(deps.Files)
 
@@ -195,7 +187,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
-			dept := e.Targets.Find(dep.Target.FQN)
+			dept := e.Targets.FindTGT(dep.Target)
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -206,7 +198,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				art := dept.artifacts.OutTar(dep.Output)
+				art := dept.Artifacts.OutTar(dep.Output)
 				p, err := UncompressedPathFromArtifact(ctx, dept, art, e.cacheDir(dept).Abs())
 				if err != nil {
 					return nil, err
@@ -444,7 +436,7 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}
 
 	for k, expr := range target.RuntimeEnv {
-		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target.FQN)))
+		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.FindTGT(expr.Target)))
 		if err != nil {
 			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 		}
@@ -463,12 +455,12 @@ func (e *TargetRunEngine) runPrepare(ctx context.Context, target *Target, mode s
 	}, nil
 }
 
-func (e *TargetRunEngine) WriteableCaches(ctx context.Context, target *Target) ([]CacheConfig, error) {
+func (e *Engine) WriteableCaches(ctx context.Context, target *Target) ([]graph.CacheConfig, error) {
 	if !target.Cache.Enabled || e.DisableNamedCacheWrite {
 		return nil, nil
 	}
 
-	wcs := make([]CacheConfig, 0)
+	wcs := make([]graph.CacheConfig, 0)
 	for _, cache := range e.Config.Caches {
 		if !cache.Write {
 			continue
@@ -508,13 +500,13 @@ func (e *TargetRunEngine) WriteableCaches(ctx context.Context, target *Target) (
 	return wcs, nil
 }
 
-func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
-	target := rr.Target
+func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
+	target := e.Targets.FindGraph(rr.Target)
 
-	ctx, rspan := e.Observability.SpanRun(ctx, target.Target)
+	ctx, rspan := e.Observability.SpanRun(ctx, target.Target.Target)
 	defer rspan.EndError(rerr)
 
-	err := e.LinkTarget(target, nil)
+	err := e.Graph.LinkTarget(target.Target, nil)
 	if err != nil {
 		return err
 	}
@@ -655,7 +647,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			defer cancel()
 		}
 
-		execCtx, execSpan := e.Observability.SpanRunExec(execCtx, target.Target)
+		execCtx, execSpan := e.Observability.SpanRunExec(execCtx, target.Target.Target)
 
 		obw := e.Observability.LogsWriter(execCtx)
 
@@ -705,7 +697,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 			platform.ExecOptions{
 				WorkDir:  dir,
 				BinDir:   binDir,
-				HomeDir:  e.HomeDir.Abs(),
+				HomeDir:  e.Root.Home.Abs(),
 				Target:   target.TargetSpec,
 				Env:      env,
 				Run:      run,
@@ -760,13 +752,13 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 		return fmt.Errorf("wcs: %w", err)
 	}
 
-	err = e.storeCache(ctx, target, outRoot.Abs(), logFilePath, len(writeableCaches) > 0)
+	err = e.LocalCache.storeCache(ctx, target, outRoot.Abs(), logFilePath, len(writeableCaches) > 0)
 	if err != nil {
 		return fmt.Errorf("cache: store: %w", err)
 	}
 
 	if !target.Cache.Enabled && !rr.PreserveCache {
-		e.RegisterRemove(e.cacheDir(target).Abs())
+		e.Finalizers.RegisterRemove(e.cacheDir(target).Abs())
 	}
 
 	if len(writeableCaches) > 0 {
@@ -802,7 +794,7 @@ func (e *TargetRunEngine) Run(ctx context.Context, rr TargetRunRequest, iocfg sa
 	return nil
 }
 
-func (e *TargetRunEngine) chooseExecutor(labels map[string]string, options map[string]interface{}, providers []PlatformProvider) (platform.Executor, error) {
+func (e *Engine) chooseExecutor(labels map[string]string, options map[string]interface{}, providers []platform.PlatformProvider) (platform.Executor, error) {
 	for _, p := range providers {
 		executor, err := p.NewExecutor(labels, options)
 		if err != nil {
@@ -824,7 +816,7 @@ func (e *Engine) tarListPath(artifact artifacts.Artifact, target *Target) string
 	return e.cacheDir(target).Join(artifact.Name() + ".list").Abs()
 }
 
-func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
+func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
 		return fmt.Errorf("lock postrunwarm: %w", err)
@@ -839,7 +831,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 
 	cacheDir := e.cacheDir(target)
 
-	doneMarker := cacheDir.Join(target.artifacts.InputHash.Name()).Abs()
+	doneMarker := cacheDir.Join(target.Artifacts.InputHash.Name()).Abs()
 	if !fs.PathExists(doneMarker) {
 		return nil
 	}
@@ -887,13 +879,13 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		untarDedup := sets.NewStringSet(0)
 
 		for _, name := range outputs {
-			r, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(name), cacheDir.Abs())
+			r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), cacheDir.Abs())
 			if err != nil {
 				return err
 			}
 
 			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
-				ListPath: e.tarListPath(target.artifacts.OutTar(name), target),
+				ListPath: e.tarListPath(target.Artifacts.OutTar(name), target),
 				Dedup:    untarDedup,
 			})
 			_ = r.Close()
@@ -934,7 +926,7 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 		return fmt.Errorf("codegenlink: %w", err)
 	}
 
-	err = e.linkLatestCache(target, cacheDir.Abs())
+	err = e.LocalCache.linkLatestCache(target, cacheDir.Abs())
 	if err != nil {
 		return fmt.Errorf("linklatest: %w", err)
 	}
@@ -949,11 +941,11 @@ func (e *TargetRunEngine) postRunOrWarm(ctx context.Context, target *Target, out
 	return nil
 }
 
-func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
+func (e *Engine) gc(ctx context.Context, target *Target) error {
 	if target.Cache.Enabled && e.Config.Engine.GC {
 		observability.Status(ctx, TargetStatus(target, "GC..."))
 
-		err := e.GCTargets([]*Target{target}, nil, false)
+		err := e.LocalCache.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
 			return err
 		}
@@ -962,7 +954,7 @@ func (e *TargetRunEngine) gc(ctx context.Context, target *Target) error {
 	return nil
 }
 
-func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error {
+func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 	if target.Codegen == "" {
 		return nil
 	}
@@ -976,12 +968,12 @@ func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error
 
 		switch target.Codegen {
 		case targetspec.CodegenCopy, targetspec.CodegenCopyNoExclude:
-			tarf, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(name), e.cacheDir(target).Abs())
+			tarf, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), e.cacheDir(target).Abs())
 			if err != nil {
 				return err
 			}
 
-			err = tar.UntarContext(ctx, tarf, e.Root.Abs(), tar.UntarOptions{})
+			err = tar.UntarContext(ctx, tarf, e.Root.Root.Abs(), tar.UntarOptions{})
 			_ = tarf.Close()
 			if err != nil {
 				return err
@@ -989,7 +981,7 @@ func (e *TargetRunEngine) codegenLink(ctx context.Context, target *Target) error
 		case targetspec.CodegenLink:
 			for _, path := range paths {
 				from := path.WithRoot(target.OutExpansionRoot.Abs()).Abs()
-				to := path.WithRoot(e.Root.Abs()).Abs()
+				to := path.WithRoot(e.Root.Root.Abs()).Abs()
 
 				info, err := os.Lstat(to)
 				if err != nil && !errors.Is(err, os.ErrNotExist) {

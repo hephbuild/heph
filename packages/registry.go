@@ -3,6 +3,7 @@ package packages
 import (
 	"fmt"
 	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine/hroot"
 	fs2 "github.com/hephbuild/heph/utils/fs"
 	"path"
 	"sort"
@@ -15,8 +16,7 @@ type Registry struct {
 	packagesm     map[string]*Package
 	packages      []*Package
 
-	RepoRoot       fs2.Path
-	HomeRoot       fs2.Path
+	Root           *hroot.State
 	Roots          map[string]config.Root
 	RootsCachePath string
 	fetchRootCache map[string]fs2.Path

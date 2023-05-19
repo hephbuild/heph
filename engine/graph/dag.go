@@ -1,7 +1,8 @@
-package engine
+package graph
 
 import (
 	"github.com/heimdalr/dag"
+	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"sort"
@@ -9,10 +10,11 @@ import (
 
 type DAG struct {
 	*dag.DAG
+	targets *Targets
 }
 
 // returns parents first
-func (d *DAG) orderedWalker(target *Target, rel func(*Target) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
+func (d *DAG) orderedWalker(target *Target, rel func(targetspec.Specer) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -47,8 +49,8 @@ func (d *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Targe
 	return ancs, err
 }
 
-func (d *DAG) GetOrderedAncestorsWithOutput(e *Engine, targets []*Target, includeRoot bool) ([]*Target, *maps.Map[string, *sets.Set[string, string]], error) {
-	ancs := make([]*Target, 0)
+func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) (*Targets, *maps.Map[string, *sets.Set[string, string]], error) {
+	ancs := NewTargets(0)
 	ancsout := &maps.Map[string, *sets.Set[string, string]]{
 		Default: func(k string) *sets.Set[string, string] {
 			return sets.NewSet(func(s string) string {
@@ -70,24 +72,24 @@ func (d *DAG) GetOrderedAncestorsWithOutput(e *Engine, targets []*Target, includ
 	}
 
 	maybeAddAllOuts := func(t *Target, output string) {
-		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets, t.FQN) {
+		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets.Slice(), t.FQN) {
 			addAllOut(t)
 		} else {
 			addOut(t, output)
 		}
 	}
 
-	err := d.getOrderedAncestors(targets, includeRoot, func(target *Target) {
+	err := d.getOrderedAncestors(targets.Slice(), includeRoot, func(target *Target) {
 		deps := target.Deps.All().Merge(target.HashDeps)
 		for _, dep := range deps.Targets {
-			maybeAddAllOuts(e.Targets.Find(dep.Target.FQN), dep.Output)
+			maybeAddAllOuts(d.targets.Find(dep.Target.FQN), dep.Output)
 		}
 
 		for _, tool := range target.Tools.Targets {
-			maybeAddAllOuts(e.Targets.Find(tool.Target.FQN), tool.Output)
+			maybeAddAllOuts(d.targets.Find(tool.Target.FQN), tool.Output)
 		}
 
-		ancs = append(ancs, target)
+		ancs.Add(target)
 	})
 
 	return ancs, ancsout, err
@@ -132,8 +134,8 @@ func (d *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 	return ancs, nil
 }
 
-func (d *DAG) GetAncestors(target *Target) ([]*Target, error) {
-	return d.GetAncestorsOfFQN(target.FQN)
+func (d *DAG) GetAncestors(target targetspec.Specer) ([]*Target, error) {
+	return d.GetAncestorsOfFQN(target.Spec().FQN)
 }
 
 func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
@@ -145,8 +147,8 @@ func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
 	return d.mapToArray(ancestors), nil
 }
 
-func (d *DAG) GetDescendants(target *Target) ([]*Target, error) {
-	return d.GetDescendantsOfFQN(target.FQN)
+func (d *DAG) GetDescendants(target targetspec.Specer) ([]*Target, error) {
+	return d.GetDescendantsOfFQN(target.Spec().FQN)
 }
 
 func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
@@ -158,8 +160,8 @@ func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
 	return d.mapToArray(ancestors), nil
 }
 
-func (d *DAG) GetParents(target *Target) ([]*Target, error) {
-	ancestors, err := d.DAG.GetParents(target.FQN)
+func (d *DAG) GetParents(target targetspec.Specer) ([]*Target, error) {
+	ancestors, err := d.DAG.GetParents(target.Spec().FQN)
 	if err != nil {
 		return nil, err
 	}
@@ -173,8 +175,8 @@ func (d *DAG) GetVertices() []*Target {
 	return d.mapToArray(vertices)
 }
 
-func (d *DAG) GetChildren(target *Target) ([]*Target, error) {
-	ancestors, err := d.DAG.GetChildren(target.FQN)
+func (d *DAG) GetChildren(target targetspec.Specer) ([]*Target, error) {
+	ancestors, err := d.DAG.GetChildren(target.Spec().FQN)
 	if err != nil {
 		return nil, err
 	}
@@ -186,6 +188,25 @@ func (d *DAG) GetLeaves() []*Target {
 	leaves := d.DAG.GetLeaves()
 
 	return d.mapToArray(leaves)
+}
+
+func (d *DAG) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {
+	descendants := NewTargets(0)
+
+	for _, path := range paths {
+		for _, target := range targets {
+			for _, file := range target.HashDeps.Files {
+				if file.RelRoot() == path {
+					descendants.Add(target)
+					break
+				}
+			}
+		}
+	}
+
+	descendants.Sort()
+
+	return descendants.Slice(), nil
 }
 
 func (d *DAG) mapToArray(m map[string]interface{}) []*Target {

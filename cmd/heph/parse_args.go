@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -55,7 +57,7 @@ func hasStdin(args []string) bool {
 	return len(args) == 1 && args[0] == "-"
 }
 
-func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
+func parseTargetsFromStdin(gtargets *graph.Targets) ([]*tgt.Target, error) {
 	tps, err := parseTargetPathsFromStdin()
 	if err != nil {
 		return nil, err
@@ -64,12 +66,12 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
 	targets := make([]*tgt.Target, 0)
 
 	for _, tp := range tps {
-		target := e.Targets.Find(tp.Full())
+		target := gtargets.Find(tp.Full())
 		if target == nil {
 			if *ignoreUnknownTarget {
 				continue
 			}
-			return nil, engine.NewTargetNotFoundError(tp.Full())
+			return nil, engine.NewTargetNotFoundError(tp.Full(), gtargets)
 		}
 
 		targets = append(targets, target.Target)
@@ -78,24 +80,24 @@ func parseTargetsFromStdin(e *engine.Engine) ([]*tgt.Target, error) {
 	return targets, nil
 }
 
-func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, error) {
+func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, *graph.Target, error) {
 	if len(args) != 1 {
-		return nil, fmt.Errorf("expected one arg")
+		return bootstrap.EngineBootstrap{}, nil, fmt.Errorf("expected one arg")
 	}
 
 	err := blockReadStdin(args)
 	if err != nil {
-		return nil, err
+		return bootstrap.EngineBootstrap{}, nil, err
 	}
 
-	err = engineInit(ctx)
+	bs, err := engineInit(ctx)
 	if err != nil {
-		return nil, err
+		return bs, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithEngine(ctx, Engine, args, false)
+	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, false)
 	if err != nil {
-		return nil, err
+		return bs, nil, err
 	}
 
 	if len(rrs) != 1 {
@@ -105,38 +107,43 @@ func parseTargetFromArgs(ctx context.Context, args []string) (*engine.Target, er
 		if len(args) > 0 {
 			s = args[0]
 		}
-		return nil, engine.NewTargetNotFoundError(s)
+		return bs, nil, engine.NewTargetNotFoundError(s, bs.Graph.Targets())
 	}
 
-	return rrs[0].Target, nil
+	return bs, rrs[0].Target, nil
 }
 
-func parseTargetsAndArgs(ctx context.Context, args []string) (engine.TargetRunRequests, error) {
+func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, engine.TargetRunRequests, error) {
 	err := blockReadStdin(args)
 	if err != nil {
-		return nil, err
+		return bootstrap.EngineBootstrap{}, nil, err
 	}
 
-	err = engineInit(ctx)
+	bs, err := engineInit(ctx)
 	if err != nil {
-		return nil, err
+		return bootstrap.EngineBootstrap{}, nil, err
 	}
 
-	return parseTargetsAndArgsWithEngine(ctx, Engine, args, true)
+	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, true)
+	if err != nil {
+		return bootstrap.EngineBootstrap{}, nil, err
+	}
+
+	return bs, rrs, err
 }
 
 func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool) (engine.TargetRunRequests, error) {
-	targets := engine.NewTargets(len(tps))
+	targets := graph.NewTargets(len(tps))
 	for _, tp := range tps {
-		target := e.Targets.Find(tp.Full())
+		target := e.Graph.Targets().Find(tp.Full())
 		if target == nil {
-			return nil, engine.NewTargetNotFoundError(tp.Full())
+			return nil, engine.NewTargetNotFoundError(tp.Full(), e.Graph.Targets())
 		}
 
 		targets.Add(target)
 	}
 
-	check := func(target *tgt.Target) error {
+	check := func(target *graph.Target) error {
 		if bailOutOnExpr {
 			if len(target.TargetSpec.Deps.Exprs) > 0 {
 				return fmt.Errorf("%v has expr, bailing out", target.FQN)
@@ -146,18 +153,18 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		return nil
 	}
 
-	rrs := make(engine.TargetRunRequests, 0)
+	rrs := make(engine.TargetRunRequests, 0, targets.Len())
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		err := check(target.Target)
+		err := check(target)
 		if err != nil {
 			return nil, err
 		}
 
-		err = e.LinkTarget(target, nil)
+		err = e.Graph.LinkTarget(target, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -178,13 +185,13 @@ func generateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetP
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := e.DAG().GetOrderedAncestors(targets.Slice(), true)
+	ancs, err := e.Graph.DAG().GetOrderedAncestors(targets.Slice(), true)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, anc := range ancs {
-		err := check(anc.Target)
+		err := check(anc)
 		if err != nil {
 			return nil, err
 		}
@@ -219,11 +226,6 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 
 	if len(tps) == 0 {
 		return nil, nil
-	}
-
-	err := engineInitWithEngine(ctx, e)
-	if err != nil {
-		return nil, err
 	}
 
 	rrs, err := generateRRs(ctx, e, tps, targs, true)

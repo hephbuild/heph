@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/worker"
 	"os"
 	"os/exec"
@@ -44,12 +46,12 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		}
 	}
 
-	var inlineInvocationTarget *engine.TargetRunRequest
-	var inlineTarget *engine.Target
+	var inlineRR *engine.TargetRunRequest
+	var inlineTarget *graph.Target = nil
 	if len(rrs) == 1 && inlineSingle && !*noInline {
-		inlineInvocationTarget = &rrs[0]
-		inlineInvocationTarget.Mode = mode
-		inlineTarget = inlineInvocationTarget.Target
+		inlineRR = &rrs[0]
+		inlineRR.Mode = mode
+		inlineTarget = inlineRR.Target
 	}
 
 	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
@@ -57,7 +59,12 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 
-	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, inlineTarget)
+	// Passing inlineTarget directly results in a crash...
+	var skip targetspec.Specer
+	if inlineTarget != nil {
+		skip = inlineTarget
+	}
+	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 	if err != nil {
 		return err
 	}
@@ -77,9 +84,10 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return err
 	}
 
-	if inlineInvocationTarget == nil {
+	if inlineRR == nil {
 		if printOutput.bool {
-			for _, target := range rrs.Targets() {
+			for _, target := range rrs.Targets().Slice() {
+				target := e.Targets.FindGraph(target)
 				err = printTargetOutputPaths(target, printOutput.str)
 				if err != nil {
 					return err
@@ -88,7 +96,8 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		}
 
 		if catOutput.bool {
-			for _, target := range rrs.Targets() {
+			for _, target := range rrs.Targets().Slice() {
+				target := e.Targets.FindGraph(target)
 				err = printTargetOutputContent(target, catOutput.str)
 				if err != nil {
 					return err
@@ -98,8 +107,6 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 
 		return nil
 	}
-
-	re := engine.NewTargetRunEngine(e)
 
 	cfg := sandbox.IOConfig{
 		Stdout: os.Stdout,
@@ -111,7 +118,7 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		cfg.Stdout = os.Stderr
 	}
 
-	err = re.Run(ctx, *inlineInvocationTarget, cfg)
+	err = e.Run(ctx, *inlineRR, cfg)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {
@@ -121,18 +128,18 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 			}
 		}
 
-		return fmt.Errorf("%v: %w", inlineTarget.FQN, err)
+		return err
 	}
 
+	inlineTargetEngine := e.Targets.FindGraph(inlineTarget)
+
 	if printOutput.bool {
-		err = printTargetOutputPaths(inlineTarget, printOutput.str)
+		err = printTargetOutputPaths(inlineTargetEngine, printOutput.str)
 		if err != nil {
 			return err
 		}
-	}
-
-	if catOutput.bool {
-		err = printTargetOutputContent(inlineTarget, catOutput.str)
+	} else if catOutput.bool {
+		err = printTargetOutputContent(inlineTargetEngine, catOutput.str)
 		if err != nil {
 			return err
 		}

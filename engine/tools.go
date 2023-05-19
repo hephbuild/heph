@@ -1,3 +1,5 @@
+//go:build ignored
+
 package engine
 
 import (

@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cloudclient"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
-	"strings"
 	"syscall"
 )
 
@@ -33,16 +32,16 @@ var cloudLoginCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := bootstrapInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		if Engine.CloudClientAuth == nil {
+		if bs.Cloud.AuthClient == nil {
 			return fmt.Errorf("cloud not configured")
 		}
 
-		fmt.Println(Engine.Config.Cloud.URL)
+		fmt.Println(bs.Config.Cloud.URL)
 
 		fmt.Print("Email: ")
 		var email string
@@ -59,7 +58,7 @@ var cloudLoginCmd = &cobra.Command{
 		}
 		pass := string(passb)
 
-		res, err := cloudclient.Login(ctx, Engine.CloudClient, email, pass)
+		res, err := cloudclient.Login(ctx, bs.Cloud.Client, email, pass)
 		if err != nil {
 			return err
 		}
@@ -67,7 +66,7 @@ var cloudLoginCmd = &cobra.Command{
 		tok := res.Login.Token
 		user := res.Login.User
 
-		err = Engine.StoreCloudAuthData(engine.CloudAuthData{
+		err = bs.Cloud.StoreCloudAuthData(bootstrap.CloudAuthData{
 			Token:     tok,
 			UserID:    user.Id,
 			UserEmail: user.Email,
@@ -85,7 +84,14 @@ var cloudLoginCmd = &cobra.Command{
 var cloudLogoutCmd = &cobra.Command{
 	Use: "logout",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return Engine.DeleteCloudAuthData()
+		ctx := cmd.Context()
+
+		bs, err := bootstrapInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		return bs.Cloud.DeleteCloudAuthData()
 	},
 }
 
@@ -94,12 +100,12 @@ var cloudAuthActorCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := bootstrapInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		res, err := cloudclient.AuthActor(ctx, Engine.CloudClientAuth)
+		res, err := cloudclient.AuthActor(ctx, bs.Cloud.AuthClient)
 		if err != nil {
 			return err
 		}
@@ -120,27 +126,27 @@ var cloudStartFlowCmd = &cobra.Command{
 	Use:  "start-flow",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-
-		err := engineInit(ctx)
-		if err != nil {
-			return err
-		}
-
-		metasm := map[string]string{}
-		for _, s := range *metas {
-			parts := strings.SplitN(s, "=", 2)
-			if len(parts) != 2 {
-				return fmt.Errorf("malformed meta `%v`", s)
-			}
-
-			metasm[parts[0]] = parts[1]
-		}
-
-		err = Engine.StartFlow(ctx, args[0], metasm)
-		if err != nil {
-			return err
-		}
+		//ctx := cmd.Context()
+		//
+		//bs, err := bootstrapInit(ctx)
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//metasm := map[string]string{}
+		//for _, s := range *metas {
+		//	parts := strings.SplitN(s, "=", 2)
+		//	if len(parts) != 2 {
+		//		return fmt.Errorf("malformed meta `%v`", s)
+		//	}
+		//
+		//	metasm[parts[0]] = parts[1]
+		//}
+		//
+		//err = Engine.StartFlow(ctx, args[0], metasm)
+		//if err != nil {
+		//	return err
+		//}
 
 		return nil
 	},
@@ -150,17 +156,17 @@ var cloudStopFlowCmd = &cobra.Command{
 	Use:  "stop-flow",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-
-		err := engineInit(ctx)
-		if err != nil {
-			return err
-		}
-
-		err = Engine.StopCurrentFlow(ctx)
-		if err != nil {
-			return err
-		}
+		//ctx := cmd.Context()
+		//
+		//bs, err := bootstrapInit(ctx)
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//err = Engine.StopCurrentFlow(ctx)
+		//if err != nil {
+		//	return err
+		//}
 
 		return nil
 	},
@@ -170,26 +176,26 @@ var cloudFlowGetCmd = &cobra.Command{
 	Use:  "get",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-
-		err := engineInit(ctx)
-		if err != nil {
-			return err
-		}
-
-		flow, err := Engine.GetCurrentFlowDetails(ctx)
-		if err != nil {
-			return err
-		}
-
-		switch args[0] {
-		case "id":
-			fmt.Println(flow.ID)
-		case "url":
-			fmt.Println(flow.URL)
-		default:
-			return fmt.Errorf("invalid flow attribute %v", args[0])
-		}
+		//ctx := cmd.Context()
+		//
+		//bs, err := bootstrapInit(ctx)
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//flow, err := Engine.GetCurrentFlowDetails(ctx)
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//switch args[0] {
+		//case "id":
+		//	fmt.Println(flow.ID)
+		//case "url":
+		//	fmt.Println(flow.URL)
+		//default:
+		//	return fmt.Errorf("invalid flow attribute %v", args[0])
+		//}
 
 		return nil
 	},

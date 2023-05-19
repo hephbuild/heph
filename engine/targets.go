@@ -1,10 +1,9 @@
 package engine
 
 import (
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/sets"
-	"strings"
 )
 
 func Contains(ts []*Target, fqn string) bool {
@@ -19,86 +18,37 @@ func Contains(ts []*Target, fqn string) bool {
 
 type Targets struct {
 	*sets.Set[string, *Target]
+	graph *graph.Targets
+}
+
+func NewTargetsFromGraph(tsm *TargetMetas, gts *graph.Targets) *Targets {
+	ts := NewTargets(gts.Len())
+	for _, target := range gts.Slice() {
+		ts.Add(tsm.FindGraph(target))
+	}
+	return ts
 }
 
 func NewTargets(cap int) *Targets {
-	s := sets.NewSet(func(t *Target) string {
-		if t == nil {
-			panic("target must not be nil")
-		}
-
-		return t.FQN
-	}, cap)
-
 	return &Targets{
-		Set: s,
+		Set: sets.NewSet(func(t *Target) string {
+			if t == nil {
+				panic("target must not be nil")
+			}
+
+			return t.FQN
+		}, cap),
+		graph: graph.NewTargets(cap),
 	}
 }
 
-func (ts *Targets) FQNs() []string {
-	if ts == nil {
-		return nil
+func (ts *Targets) Add(t *Target) bool {
+	if ts.Set.Add(t) {
+		return ts.graph.Add(t.Target)
 	}
-
-	fqns := make([]string, 0)
-	for _, target := range ts.Slice() {
-		fqns = append(fqns, target.FQN)
-	}
-
-	return fqns
+	return false
 }
 
-func (ts *Targets) Specs() []targetspec.TargetSpec {
-	if ts == nil {
-		return nil
-	}
-
-	specs := make([]targetspec.TargetSpec, 0)
-	for _, target := range ts.Slice() {
-		specs = append(specs, target.TargetSpec)
-	}
-
-	return specs
-}
-
-func (ts *Targets) Public() *Targets {
-	pts := NewTargets(ts.Len() / 2)
-
-	for _, target := range ts.Slice() {
-		if !target.IsPrivate() {
-			pts.Add(target)
-		}
-	}
-
-	return pts
-}
-
-func (ts *Targets) Sort() {
-	if ts == nil {
-		return
-	}
-
-	a := ts.Slice()
-
-	utils.Sort(a, func(i, j *Target) int {
-		return strings.Compare(i.FQN, j.FQN)
-	})
-}
-
-func (ts *Targets) Copy() *Targets {
-	if ts == nil {
-		return NewTargets(0)
-	}
-
-	return &Targets{
-		Set: ts.Set.Copy(),
-	}
-}
-
-func (ts *Targets) Find(fqn string) *Target {
-	if ts == nil {
-		return nil
-	}
-
-	return ts.GetKey(fqn)
+func (ts *Targets) Specs() targetspec.TargetSpecs {
+	return ts.graph.Specs()
 }

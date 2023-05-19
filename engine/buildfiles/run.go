@@ -24,12 +24,16 @@ import (
 )
 
 type RunOptions struct {
-	ThreadModifier  func(thread *starlark.Thread)
+	ThreadModifier  func(thread *starlark.Thread, pkg *packages.Package)
 	UniverseFactory func() starlark.StringDict
 	CacheDirPath    string
 	BuildHash       func(hash.Hash)
 	Packages        *packages.Registry
 	RootPkg         *packages.Package
+}
+
+func (o RunOptions) Copy() RunOptions {
+	return o
 }
 
 type runContext struct {
@@ -132,9 +136,8 @@ func (e *runContext) RunBuildFile(pkg *packages.Package, path string, bc *breadc
 
 	thread := NewStarlarkThread()
 	thread.Load = e.load
-	thread.SetLocal("__pkg", pkg)
 	thread.SetLocal("__bc", nbc)
-	e.ThreadModifier(thread)
+	e.ThreadModifier(thread, pkg)
 
 	universe := e.UniverseFactory()
 

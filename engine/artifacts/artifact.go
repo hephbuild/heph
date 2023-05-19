@@ -2,20 +2,15 @@ package artifacts
 
 import (
 	"compress/gzip"
-	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/utils/fs"
 	"go.uber.org/multierr"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-var Skip = errors.New("skip artifact")
-
 type container struct {
-	Producer
 	name         string
 	displayName  string
 	genRequired  bool
@@ -46,9 +41,8 @@ func (a container) GenRequired() bool {
 	return a.genRequired
 }
 
-func New(name, displayName string, genRequired, compressible bool, artifact Producer) Artifact {
+func New(name, displayName string, genRequired, compressible bool) Artifact {
 	return container{
-		Producer:     artifact,
 		name:         name,
 		displayName:  displayName,
 		genRequired:  genRequired,
@@ -56,96 +50,13 @@ func New(name, displayName string, genRequired, compressible bool, artifact Prod
 	}
 }
 
-type GenContext struct {
-	OutRoot     string
-	LogFilePath string
-
-	w              io.WriteCloser
-	accessedWriter bool
-}
-
-func (g *GenContext) Writer() io.Writer {
-	g.accessedWriter = true
-	return g.w
-}
-
-type Producer interface {
-	Gen(ctx context.Context, gctx *GenContext) error
-}
-
 type Artifact interface {
-	Producer
 	Name() string
 	FileName() string
 	GzFileName() string
 	DisplayName() string
 	GenRequired() bool
 	Compressible() bool
-}
-
-type Func struct {
-	Func func(ctx context.Context, gctx *GenContext) error
-}
-
-func (a Func) Gen(ctx context.Context, gctx *GenContext) error {
-	return a.Func(ctx, gctx)
-}
-
-func GenArtifact(ctx context.Context, dir string, a Artifact, gctx GenContext, compress bool) (string, error) {
-	shouldCompress := a.Compressible() && compress
-
-	p := filepath.Join(dir, a.FileName())
-	if shouldCompress {
-		p = filepath.Join(dir, a.GzFileName())
-	}
-
-	tmpp := fs.ProcessUniquePath(p)
-	defer os.Remove(tmpp)
-
-	f, err := os.Create(tmpp)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	go func() {
-		<-ctx.Done()
-		_ = f.Close()
-	}()
-
-	gctx.w = f
-
-	if shouldCompress {
-		gw := gzip.NewWriter(f)
-		defer gw.Close()
-
-		gctx.w = gw
-	}
-
-	err = a.Gen(ctx, &gctx)
-	if err != nil {
-		if errors.Is(err, Skip) {
-			if a.GenRequired() {
-				return "", fmt.Errorf("%v is required, but returned: %w", a.Name(), err)
-			}
-			return "", nil
-		}
-		return "", fmt.Errorf("%v: %w", a.Name(), err)
-	}
-
-	if !gctx.accessedWriter {
-		return "", fmt.Errorf("%v did not produce output", a.Name())
-	}
-
-	_ = gctx.w.Close()
-	_ = f.Close()
-
-	err = os.Rename(tmpp, p)
-	if err != nil {
-		return "", err
-	}
-
-	return p, nil
 }
 
 type readerMultiCloser struct {

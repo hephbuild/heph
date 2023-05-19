@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/worker"
@@ -14,7 +13,7 @@ import (
 )
 
 func ValidArgsFunctionTargets(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	targets, _, err := preRunAutocomplete(cmd.Context())
+	targets, _, err := preRunAutocomplete(cmd.Context(), false)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -29,7 +28,7 @@ func ValidArgsFunctionTargets(cmd *cobra.Command, args []string, toComplete stri
 }
 
 func ValidArgsFunctionLabelsOrTargets(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	targets, labels, err := preRunAutocomplete(cmd.Context())
+	targets, labels, err := preRunAutocomplete(cmd.Context(), false)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -81,11 +80,7 @@ func printHumanError(err error) {
 				for _, err := range multierr.Errors(terr) {
 					skipSpacing = true
 					separate()
-					if printTargetNotFoundErrorSuggestions(err) {
-						continue
-					} else {
-						log.Error(err)
-					}
+					log.Error(err)
 				}
 			}
 		} else {
@@ -94,8 +89,6 @@ func printHumanError(err error) {
 				skippedCount++
 				skipSpacing = true
 				log.Debugf("skipped: %v", jerr)
-			} else if printTargetNotFoundErrorSuggestions(err) {
-				// printed in function
 			} else {
 				log.Error(err)
 			}
@@ -110,22 +103,4 @@ func printHumanError(err error) {
 		}
 		log.Errorf("%v jobs failed%v", len(errs), skippedStr)
 	}
-}
-
-func printTargetNotFoundErrorSuggestions(err error) bool {
-	e := Engine
-	if e == nil {
-		return false
-	}
-
-	var terr engine.TargetNotFoundErr
-	if errors.As(err, &terr) {
-		suggestions := search.FuzzyFindTarget(e.Targets.Specs(), terr.String, 1).FQNs()
-		if len(suggestions) > 0 {
-			log.Errorf("%v not found, did you mean %v ?", terr.String, suggestions[0])
-			return true
-		}
-	}
-
-	return false
 }

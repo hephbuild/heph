@@ -125,7 +125,7 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 		UpdateMessage: msg(),
 	}
 
-	p := tea.NewProgram(r, tea.WithOutput(os.Stderr))
+	p := tea.NewProgram(r, tea.WithOutput(os.Stderr), tea.WithoutSignalHandler())
 
 	r.onTermWidth = func(w int) {
 		log.SetPrint(w, func(s string) {

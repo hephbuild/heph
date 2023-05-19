@@ -2,9 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/exprs"
-	"strconv"
-	"strings"
 )
 
 var utilFunctions = map[string]exprs.Func{
@@ -26,9 +25,9 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 	getTarget := func(expr exprs.Expr) (*Target, error) {
 		fqn := expr.PosArg(0, t.FQN)
 
-		target := e.Targets.Find(fqn)
+		target := e.Targets.FindFQN(fqn)
 		if target == nil {
-			return nil, NewTargetNotFoundError(fqn)
+			return nil, NewTargetNotFoundError(fqn, e.Graph.Targets())
 		}
 
 		return target, nil
@@ -44,13 +43,13 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			universe, err := e.DAG().GetParents(t)
+			universe, err := e.Graph.DAG().GetParents(t.Target)
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t)
+			universe = append(universe, t.Target)
 
-			if !Contains(universe, t.FQN) {
+			if !graph.Contains(universe, t.FQN) {
 				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
 			}
 
@@ -66,17 +65,17 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			universe, err := e.DAG().GetParents(t)
+			universe, err := e.Graph.DAG().GetParents(t.Target)
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t)
+			universe = append(universe, t.Target)
 
-			if !Contains(universe, t.FQN) {
+			if !graph.Contains(universe, t.FQN) {
 				return "", fmt.Errorf("cannot get input of %v", t.FQN)
 			}
 
-			return e.hashInput(t), nil
+			return e.LocalCache.hashInput(t), nil
 		},
 		"hash_output": func(expr exprs.Expr) (string, error) {
 			fqn, err := expr.MustPosArg(0)
@@ -84,25 +83,25 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			t := e.Targets.Find(fqn)
+			t := e.Graph.Targets().Find(fqn)
 			if t == nil {
-				return "", NewTargetNotFoundError(fqn)
+				return "", NewTargetNotFoundError(fqn, e.Graph.Targets())
 			}
 
-			universe, err := e.DAG().GetParents(t)
+			universe, err := e.Graph.DAG().GetParents(t)
 			if err != nil {
 				return "", err
 			}
 
-			if !Contains(universe, t.FQN) {
+			if !graph.Contains(universe, t.FQN) {
 				return "", fmt.Errorf("cannot get output of %v", t.FQN)
 			}
 
 			output := expr.PosArg(1, "")
-			return e.hashOutput(t, output), nil
+			return e.LocalCache.hashOutput(e.Targets.FindGraph(t), output), nil
 		},
 		"repo_root": func(expr exprs.Expr) (string, error) {
-			return e.Root.Abs(), nil
+			return e.Root.Root.Abs(), nil
 		},
 	}
 
@@ -111,89 +110,4 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 	}
 
 	return m
-}
-
-func (e *Engine) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
-	s, err := expr.MustPosArg(0)
-	if err != nil {
-		return nil, err
-	}
-
-	pkgMatcher := ParseTargetSelector(t.Package.Path, s)
-
-	var includeMatchers TargetMatchers
-	var excludeMatchers TargetMatchers
-	must := false
-
-	for _, arg := range expr.NamedArgs {
-		switch arg.Name {
-		case "must":
-			must = true
-		case "include", "exclude":
-			m := ParseTargetSelector(t.Package.Path, arg.Value)
-			if arg.Name == "exclude" {
-				excludeMatchers = append(excludeMatchers, m)
-			} else {
-				includeMatchers = append(includeMatchers, m)
-			}
-		default:
-			return nil, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
-		}
-	}
-
-	matchers := TargetMatchers{
-		pkgMatcher,
-	}
-	if len(includeMatchers) > 0 {
-		matchers = append(matchers, OrMatcher(includeMatchers...))
-	}
-	if len(excludeMatchers) > 0 {
-		matchers = append(matchers, NotMatcher(OrMatcher(excludeMatchers...)))
-	}
-
-	matcher := AndMatcher(matchers...)
-
-	targets := make([]*Target, 0)
-	for _, target := range e.Targets.Slice() {
-		if !matcher(target) {
-			continue
-		}
-
-		targets = append(targets, target)
-	}
-
-	if must && len(targets) == 0 {
-		return nil, fmt.Errorf("must match a target, found none")
-	}
-
-	return targets, nil
-}
-
-func (e *Engine) findParent(t *Target, expr exprs.Expr) (*Target, error) {
-	selector, err := expr.MustPosArg(0)
-	if err != nil {
-		return nil, err
-	}
-
-	must, _ := strconv.ParseBool(expr.NamedArg("must"))
-
-	if !strings.HasPrefix(selector, ":") {
-		return nil, fmt.Errorf("must be a target selector, got `%v`", selector)
-	}
-
-	parts := strings.Split(t.Package.Path, "/")
-	for len(parts) > 0 {
-		t := e.Targets.Find("//" + strings.Join(parts, "/") + selector)
-		if t != nil {
-			return t, nil
-		}
-
-		parts = parts[:len(parts)-1]
-	}
-
-	if must {
-		return nil, fmt.Errorf("not target matching %v found in parent of %v", selector, t.FQN)
-	}
-
-	return nil, nil
 }

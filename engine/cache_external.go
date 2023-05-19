@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/c2fo/vfs/v6"
 	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
@@ -24,17 +25,17 @@ func ArtifactExternalFileName(a artifacts.Artifact) string {
 
 func (e *Engine) localCacheLocation(target *Target) (vfs.Location, error) {
 	// TODO: cache
-	rel, err := filepath.Rel(e.LocalCache.Path(), e.cacheDir(target).Abs())
+	rel, err := filepath.Rel(e.LocalCache.Path.Abs(), e.cacheDir(target).Abs())
 	if err != nil {
 		return nil, err
 	}
 
-	return e.LocalCache.NewLocation(rel + "/")
+	return e.LocalCache.Location.NewLocation(rel + "/")
 }
 
 func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Location, error) {
 	// TODO: cache
-	inputHash := e.hashInput(target)
+	inputHash := e.LocalCache.hashInput(target)
 
 	return loc.NewLocation(filepath.Join(target.Package.Path, target.Name, inputHash) + "/")
 }
@@ -112,13 +113,13 @@ func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path st
 	return nil
 }
 
-func (e *TargetRunEngine) scheduleStoreExternalCache(ctx context.Context, target *Target, cache CacheConfig) *worker.Job {
+func (e *Engine) scheduleStoreExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig) *worker.Job {
 	// input hash is used as a marker that everything went well,
 	// wait for everything else to be done before copying the input hash
-	inputHashArtifact := target.artifacts.InputHash
+	inputHashArtifact := target.Artifacts.InputHash
 
 	deps := &worker.WaitGroup{}
-	for _, artifact := range target.artifacts.All() {
+	for _, artifact := range target.Artifacts.All() {
 		if artifact.Name() == inputHashArtifact.Name() {
 			continue
 		}
@@ -130,13 +131,11 @@ func (e *TargetRunEngine) scheduleStoreExternalCache(ctx context.Context, target
 	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps)
 }
 
-func (e *TargetRunEngine) scheduleStoreExternalCacheArtifact(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
+func (e *Engine) scheduleStoreExternalCacheArtifact(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
 	return e.Pool.Schedule(ctx, &worker.Job{
 		Name: fmt.Sprintf("cache %v %v %v", target.FQN, cache.Name, artifact.Name()),
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(e.Engine)
-
 			err := e.storeExternalCache(ctx, target, cache, artifact)
 			if err != nil {
 				return fmt.Errorf("store vfs cache %v: %v %w", cache.Name, target.FQN, err)
@@ -147,7 +146,7 @@ func (e *TargetRunEngine) scheduleStoreExternalCacheArtifact(ctx context.Context
 	})
 }
 
-func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
+func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
 		return err
@@ -168,7 +167,7 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 
 	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
-	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, cache.Name, artifact)
+	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target.Target, cache.Name, artifact)
 	defer span.EndError(rerr)
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)
@@ -184,8 +183,8 @@ func (e *TargetRunEngine) storeExternalCache(ctx context.Context, target *Target
 	return nil
 }
 
-func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target, cache.Name, artifact)
+func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
+	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target.Target, cache.Name, artifact)
 	defer func() {
 		if rerr != nil && errors.Is(rerr, os.ErrNotExist) {
 			span.SetCacheHit(false)
@@ -238,7 +237,7 @@ func (e *TargetRunEngine) downloadExternalCache(ctx context.Context, target *Tar
 	return nil
 }
 
-func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Target, cache CacheConfig, artifact artifacts.Artifact) (bool, error) {
+func (e *Engine) existsExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (bool, error) {
 	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	root, err := e.remoteCacheLocation(cache.Location, target)
@@ -255,7 +254,7 @@ func (e *TargetRunEngine) existsExternalCache(ctx context.Context, target *Targe
 	return f.Exists()
 }
 
-func (e *TargetRunEngine) existsLocalCache(ctx context.Context, target *Target, artifact artifacts.Artifact) (bool, error) {
+func (e *Engine) existsLocalCache(ctx context.Context, target *Target, artifact artifacts.Artifact) (bool, error) {
 	root, err := e.localCacheLocation(target)
 	if err != nil {
 		return false, err

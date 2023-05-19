@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/ads"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -12,16 +14,11 @@ import (
 	"time"
 )
 
-func (e *Engine) GCTargets(targets []*Target, flog func(string, ...interface{}), dryrun bool) error {
-	targetDirs := make([]string, 0)
-	for _, target := range targets {
-		targetDirs = append(targetDirs, e.cacheDirForHash(target, "").Abs())
-	}
-
-	return e.runGc(targetDirs, flog, dryrun)
+func (e *LocalCacheState) GCTargets(targets []*Target, flog func(string, ...interface{}), dryrun bool) error {
+	return e.runGc(targets, nil, flog, dryrun)
 }
 
-func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
+func (e *LocalCacheState) gcCollectTargetDirs(root string) ([]string, error) {
 	targetDirs := make([]string, 0)
 
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -43,7 +40,7 @@ func (e *Engine) gcCollectTargetDirs(root string) ([]string, error) {
 	return targetDirs, err
 }
 
-func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), dryrun bool) error {
+func (e *LocalCacheState) runGc(targets []*Target, targetDirs []string, flog func(string, ...interface{}), dryrun bool) error {
 	if flog == nil {
 		flog = func(string, ...interface{}) {}
 	}
@@ -55,7 +52,7 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 	}
 
 	targetHashDirs := map[string]*Target{}
-	for _, target := range e.Targets.Slice() {
+	for _, target := range targets {
 		if !target.Cache.Enabled {
 			continue
 		}
@@ -63,7 +60,14 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 		targetHashDirs[e.cacheDirForHash(target, "").Abs()] = target
 	}
 
-	homeDir := e.HomeDir.Abs()
+	if targetDirs == nil {
+		targetDirs = make([]string, 0, len(targets))
+		for _, target := range targets {
+			targetDirs = append(targetDirs, e.cacheDirForHash(target, "").Abs())
+		}
+	}
+
+	homeDir := e.Root.Home.Abs()
 
 	for _, dir := range targetDirs {
 		reldir, _ := filepath.Rel(homeDir, dir)
@@ -176,7 +180,7 @@ func (e *Engine) runGc(targetDirs []string, flog func(string, ...interface{}), d
 	return nil
 }
 
-func (e *Engine) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
+func (e *LocalCacheState) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
 	err := e.gcLock.Lock(ctx)
 	if err != nil {
 		return err
@@ -189,10 +193,14 @@ func (e *Engine) GC(ctx context.Context, flog func(string, ...interface{}), dryr
 		}
 	}()
 
-	targetDirs, err := e.gcCollectTargetDirs(e.HomeDir.Join("cache").Abs())
+	targetDirs, err := e.gcCollectTargetDirs(e.Path.Abs())
 	if err != nil {
 		return err
 	}
 
-	return e.runGc(targetDirs, flog, dryrun)
+	targets := ads.Map(e.Graph.Targets().Slice(), func(t *graph.Target) *Target {
+		return e.Targets.FindGraph(t)
+	})
+
+	return e.runGc(targets, targetDirs, flog, dryrun)
 }

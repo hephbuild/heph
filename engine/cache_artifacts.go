@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
@@ -17,11 +16,12 @@ import (
 )
 
 type outTarArtifact struct {
-	Target *Target
-	Output string
+	Target  *Target
+	Output  string
+	OutRoot string
 }
 
-func (a outTarArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
+func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
 	target := a.Target
 
 	var paths fs.Paths
@@ -38,7 +38,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) err
 			return err
 		}
 
-		file := file.WithRoot(gctx.OutRoot)
+		file := file.WithRoot(a.OutRoot)
 
 		files = append(files, tar.TarFile{
 			From: file.Abs(),
@@ -55,38 +55,40 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) err
 }
 
 type hashOutputArtifact struct {
-	Engine *Engine
-	Target *Target
-	Output string
+	LocalState *LocalCacheState
+	Target     *Target
+	Output     string
 }
 
-func (a hashOutputArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
-	outputHash := a.Engine.hashOutput(a.Target, a.Output)
+func (a hashOutputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+	outputHash := a.LocalState.hashOutput(a.Target, a.Output)
 
 	_, err := io.WriteString(gctx.Writer(), outputHash)
 	return err
 }
 
 type hashInputArtifact struct {
-	Engine *Engine
-	Target *Target
+	LocalState *LocalCacheState
+	Target     *Target
 }
 
-func (a hashInputArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
-	inputHash := a.Engine.hashInput(a.Target)
+func (a hashInputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+	inputHash := a.LocalState.hashInput(a.Target)
 
 	_, err := io.WriteString(gctx.Writer(), inputHash)
 	return err
 }
 
-type logArtifact struct{}
+type logArtifact struct {
+	LogFilePath string
+}
 
-func (a logArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
-	if gctx.LogFilePath == "" {
-		return artifacts.Skip
+func (a logArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+	if a.LogFilePath == "" {
+		return ArtifactSkip
 	}
 
-	f, err := os.Open(gctx.LogFilePath)
+	f, err := os.Open(a.LogFilePath)
 	if err != nil {
 		return err
 	}
@@ -97,8 +99,8 @@ func (a logArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error 
 }
 
 type manifestArtifact struct {
-	Engine *Engine
-	Target *Target
+	LocalState *LocalCacheState
+	Target     *Target
 }
 
 type ManifestData struct {
@@ -120,7 +122,7 @@ func (a manifestArtifact) git(args ...string) string {
 var gitCommitOnce utils.Once[string]
 var gitRefOnce utils.Once[string]
 
-func (a manifestArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) error {
+func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
 	d := ManifestData{
 		GitCommit: gitCommitOnce.MustDo(func() (string, error) {
 			return a.git("rev-parse", "HEAD"), nil
@@ -128,13 +130,13 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) e
 		GitRef: gitRefOnce.MustDo(func() (string, error) {
 			return a.git("rev-parse", "--abbrev-ref", "HEAD"), nil
 		}),
-		InputHash:  a.Engine.hashInput(a.Target),
+		InputHash:  a.LocalState.hashInput(a.Target),
 		DepsHashes: map[string]map[string]string{},
 		OutHashes:  map[string]string{},
 		Timestamp:  time.Now(),
 	}
 
-	e := a.Engine
+	e := a.LocalState
 
 	allDeps := a.Target.Deps.Merge(a.Target.Deps)
 	for _, dep := range allDeps.All().Targets {
@@ -144,7 +146,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *artifacts.GenContext) e
 		if d.DepsHashes[dep.Target.FQN] == nil {
 			d.DepsHashes[dep.Target.FQN] = map[string]string{}
 		}
-		d.DepsHashes[dep.Target.FQN][dep.Output] = e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		d.DepsHashes[dep.Target.FQN][dep.Output] = e.hashOutput(e.Targets.FindTGT(dep.Target), dep.Output)
 	}
 
 	for _, name := range a.Target.OutWithSupport.Names() {

@@ -134,6 +134,14 @@ type TargetSpec struct {
 	GenDepsMeta         bool
 }
 
+type Specer interface {
+	Spec() TargetSpec
+}
+
+func (t TargetSpec) Spec() TargetSpec {
+	return t
+}
+
 type TargetSource struct {
 	Name string
 	Pos  syntax.Position

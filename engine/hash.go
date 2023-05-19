@@ -10,6 +10,7 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/hash"
+	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/tar"
 	"io"
 	"os"
@@ -18,18 +19,18 @@ import (
 	"time"
 )
 
-func (e *Engine) hashFile(h hash.Hash, file fs.Path) error {
+func (e *LocalCacheState) hashFile(h hash.Hash, file fs.Path) error {
 	return e.hashFilePath(h, file.Abs())
 }
 
-func (e *Engine) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) {
+func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) {
 	for _, dep := range targets {
 		if len(dep.Target.Out.Names()) == 0 {
 			continue
 		}
 
 		h.String(dep.Target.FQN)
-		dh := e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		dh := e.hashOutput(e.find(dep.Target), dep.Output)
 		h.String(dh)
 
 		if dep.Mode != targetspec.TargetSpecDepModeCopy {
@@ -38,7 +39,7 @@ func (e *Engine) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) {
 	}
 }
 
-func (e *Engine) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) {
+func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) {
 	for _, dep := range files {
 		h.String(dep.RelRoot())
 
@@ -59,7 +60,7 @@ func (e *Engine) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) {
 	}
 }
 
-func (e *Engine) hashFilePath(h hash.Hash, path string) error {
+func (e *LocalCacheState) hashFilePath(h hash.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
@@ -84,7 +85,7 @@ func (e *Engine) hashFilePath(h hash.Hash, path string) error {
 	return e.hashFileReader(h, info, f)
 }
 
-func (e *Engine) hashFilePerm(h hash.Hash, m os.FileMode) {
+func (e *LocalCacheState) hashFilePerm(h hash.Hash, m os.FileMode) {
 	// TODO: figure out a way to properly hash file permission, taking into account different umask
 	//h.UI32(uint32(m.Perm()))
 }
@@ -95,7 +96,7 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
+func (e *LocalCacheState) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
 	e.hashFilePerm(h, info.Mode())
 
 	buf := copyBufPool.Get().([]byte)
@@ -109,7 +110,7 @@ func (e *Engine) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) erro
 	return nil
 }
 
-func (e *Engine) hashTar(h hash.Hash, r io.Reader) error {
+func (e *LocalCacheState) hashTar(h hash.Hash, r io.Reader) error {
 	return tar.Walk(r, func(hdr *tar2.Header, r *tar2.Reader) error {
 		h.String(hdr.Name)
 
@@ -134,11 +135,11 @@ func (e *Engine) hashTar(h hash.Hash, r io.Reader) error {
 	})
 }
 
-func (e *Engine) hashFileModTime(h hash.Hash, file fs.Path) error {
+func (e *LocalCacheState) hashFileModTime(h hash.Hash, file fs.Path) error {
 	return e.hashFileModTimePath(h, file.Abs())
 }
 
-func (e *Engine) hashFileModTimePath(h hash.Hash, path string) error {
+func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("stat: %w", err)
@@ -154,25 +155,11 @@ func (e *Engine) hashFileModTimePath(h hash.Hash, path string) error {
 	return nil
 }
 
-func (e *Engine) ResetCacheHashInput(target *Target) {
-	ks := make([]string, 0)
-
-	for _, k := range e.cacheHashInput.Keys() {
-		if strings.HasPrefix(k, target.FQN) {
-			ks = append(ks, k)
-		}
-	}
-
-	for _, k := range ks {
-		e.cacheHashInput.Delete(k)
-	}
-}
-
-func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
+func (e *LocalCacheState) hashInputFiles(h hash.Hash, target *Target) error {
 	e.hashFiles(h, targetspec.HashFileModTime, target.Deps.All().Files)
 
 	for _, dep := range target.Deps.All().Targets {
-		err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
+		err := e.hashInputFiles(h, e.find(dep.Target))
 		if err != nil {
 			return err
 		}
@@ -182,7 +169,7 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 		e.hashFiles(h, targetspec.HashFileModTime, target.HashDeps.Files)
 
 		for _, dep := range target.HashDeps.Targets {
-			err := e.hashInputFiles(h, e.Targets.Find(dep.Target.FQN))
+			err := e.hashInputFiles(h, e.find(dep.Target))
 			if err != nil {
 				return err
 			}
@@ -192,11 +179,24 @@ func (e *Engine) hashInputFiles(h hash.Hash, target *Target) error {
 	return nil
 }
 
-func (e *Engine) HashInput(target *Target) string {
+func (e *LocalCacheState) find(t *tgt.Target) *Target {
+	return e.Targets.FindFQN(t.FQN)
+}
+
+func (e *LocalCacheState) HashInput(target *Target) string {
 	return e.hashInput(target)
 }
 
-func (e *Engine) hashInput(target *Target) string {
+func hashCacheId(target *Target) string {
+	idh := hash.NewHash()
+	for _, fqn := range target.LinkingDeps.FQNs() {
+		idh.String(fqn)
+	}
+
+	return target.FQN + idh.Sum()
+}
+
+func (e *LocalCacheState) hashInput(target *Target) string {
 	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
 	mu.Lock()
 	defer mu.Unlock()
@@ -219,7 +219,7 @@ func (e *Engine) hashInput(target *Target) string {
 	for _, dep := range target.Tools.Targets {
 		h.String(dep.Name)
 
-		dh := e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		dh := e.hashOutput(e.find(dep.Target), dep.Output)
 		h.String(dh)
 	}
 
@@ -288,11 +288,11 @@ func (e *Engine) hashInput(target *Target) string {
 	return sh
 }
 
-func (e *Engine) HashOutput(target *Target, output string) string {
+func (e *LocalCacheState) HashOutput(target *Target, output string) string {
 	return e.hashOutput(target, output)
 }
 
-func (e *Engine) hashOutput(target *Target, output string) string {
+func (e *LocalCacheState) hashOutput(target *Target, output string) string {
 	mu := e.cacheHashOutputTargetMutex.Get(target.FQN + "|" + output)
 	mu.Lock()
 	defer mu.Unlock()
@@ -313,7 +313,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 		panic(fmt.Sprintf("%v does not output `%v`", target, output))
 	}
 
-	file := e.cacheDir(target).Join(target.artifacts.OutHash(output).FileName()).Abs()
+	file := e.cacheDir(target).Join(target.Artifacts.OutHash(output).FileName()).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -332,7 +332,7 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 
 	h.String(output)
 
-	r, err := artifacts.UncompressedReaderFromArtifact(target.artifacts.OutTar(output), e.cacheDir(target).Abs())
+	r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(output), e.cacheDir(target).Abs())
 	if err != nil {
 		panic(fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.FQN, output, err))
 	}
@@ -353,4 +353,17 @@ func (e *Engine) hashOutput(target *Target, output string) string {
 	e.cacheHashOutput.Set(cacheId, sh)
 
 	return sh
+}
+
+func (e *LocalCacheState) cacheDir(target *Target) fs.Path {
+	return e.cacheDirForHash(target, e.hashInput(target))
+}
+
+func (e *LocalCacheState) cacheDirForHash(target *Target, inputHash string) fs.Path {
+	// TODO: cache
+	folder := "__target_" + target.Name
+	if !target.Cache.Enabled {
+		folder = "__target_tmp_" + instance.UID + "_" + target.Name
+	}
+	return e.Root.Home.Join("cache", target.Package.Path, folder, inputHash)
 }
