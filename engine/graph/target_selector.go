@@ -1,4 +1,4 @@
-package engine
+package graph
 
 import (
 	"github.com/hephbuild/heph/targetspec"

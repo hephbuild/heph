@@ -59,7 +59,7 @@ func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) 
 		return root, nil
 	}
 
-	root := e.HomeRoot.Join("root", name)
+	root := e.Root.Home.Join("root", name)
 	srcRoot := root.Join("src")
 	metaPath := root.Join("meta").Abs()
 
@@ -225,5 +225,5 @@ func (e *Registry) fetchGitRoot(ctx context.Context, uri *url.URL, srcRoot fs2.P
 }
 
 func (e *Registry) fetchFsRoot(uri *url.URL) fs2.Path {
-	return e.RepoRoot.Join(strings.TrimPrefix(uri.Path, "/"))
+	return e.Root.Root.Join(strings.TrimPrefix(uri.Path, "/"))
 }

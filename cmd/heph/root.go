@@ -3,17 +3,14 @@ package main
 import (
 	"fmt"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"os"
-	"path/filepath"
 	"runtime"
 	"runtime/pprof"
-	"strings"
-	"time"
 )
 
 var isTerm bool
@@ -31,7 +28,6 @@ var noCloudTelemetry *bool
 var noInline *bool
 var printOutput boolStr
 var catOutput boolStr
-var ignore *[]string
 var nocache *bool
 var nopty *bool
 var params *[]string
@@ -51,17 +47,12 @@ func init() {
 
 	log.SetLevel(log.InfoLevel)
 
-	cleanCmd.AddCommand(cleanLockCmd)
-
 	shell = runCmd.Flags().Bool("shell", false, "Opens a shell with the environment setup")
 	noInline = runCmd.Flags().Bool("no-inline", false, "Force running in workers")
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output paths, --print-out=<name> to filter output"))
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&catOutput, "cat-out", "", "Print target output content, --cat-out=<name> to filter output"))
 
-	ignore = watchCmd.Flags().StringArray("ignore", nil, "Ignore files, supports glob")
-
 	rootCmd.AddCommand(runCmd)
-	rootCmd.AddCommand(watchCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
 	rootCmd.AddCommand(cloudCmd)
@@ -93,7 +84,7 @@ func init() {
 
 var cpuProfileFile *os.File
 
-var Engine *engine.Engine
+var Finalizers finalizers.Finalizers
 
 func postRun(err error) {
 	defer func() {
@@ -116,35 +107,7 @@ func postRun(err error) {
 		}
 	}()
 
-	if Engine == nil {
-		return
-	}
-
-	if Engine.Pool != nil {
-		if !Engine.Pool.IsDone() {
-			log.Tracef("Waiting for all pool items to finish")
-			select {
-			case <-Engine.Pool.Done():
-			case <-time.After(time.Second):
-				log.Infof("Waiting for background jobs to finish...")
-				<-Engine.Pool.Done()
-			}
-			log.Tracef("All pool items finished")
-
-			Engine.Pool.Stop(nil)
-
-			err := Engine.Pool.Err()
-			if err != nil {
-				log.Error(err)
-			}
-		}
-	}
-
-	Engine.RunExitHandlers(err)
-
-	if *summary || *summaryGen {
-		PrintSummary(Engine.Summary, *summaryGen)
-	}
+	Finalizers.Run(err)
 
 	log.Cleanup()
 }
@@ -200,7 +163,7 @@ var runCmd = &cobra.Command{
 	Args:              cobra.MinimumNArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		rrs, err := parseTargetsAndArgs(cmd.Context(), args)
+		bs, rrs, err := parseTargetsAndArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
@@ -214,7 +177,7 @@ var runCmd = &cobra.Command{
 			return nil
 		}
 
-		err = run(cmd.Context(), Engine, rrs, !fromStdin)
+		err = run(cmd.Context(), bs.Engine, rrs, !fromStdin)
 		if err != nil {
 			return err
 		}
@@ -230,45 +193,21 @@ func switchToPorcelain() {
 	log.SetLevel(log.ErrorLevel)
 }
 
-func findRoot() (string, error) {
-	root, err := filepath.Abs(".")
-	if err != nil {
-		return "", err
-	}
-
-	if cwd := os.Getenv("HEPH_CWD"); cwd != "" {
-		root = cwd
-	}
-
-	parts := strings.Split(root, string(filepath.Separator))
-	for len(parts) > 0 {
-		p := "/" + filepath.Join(parts...)
-
-		if _, err := os.Stat(filepath.Join(p, ".hephconfig")); err == nil {
-			return p, nil
-		}
-
-		parts = parts[:len(parts)-1]
-	}
-
-	return "", fmt.Errorf("root not found, are you running this command in the repo directory?")
-}
-
 var cleanCmd = &cobra.Command{
 	Use:               "clean",
 	Short:             "Clean",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		rrs, err := parseTargetsAndArgs(cmd.Context(), args)
+		bs, rrs, err := parseTargetsAndArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
 
 		targets := rrs.Targets()
 
-		for _, target := range targets {
+		for _, target := range targets.Slice() {
 			log.Tracef("Cleaning %v...", target.FQN)
-			err := Engine.CleanTarget(target, true)
+			err := bs.Engine.CleanTarget(bs.Engine.Targets.FindGraph(target), true)
 			if err != nil {
 				return err
 			}
@@ -283,33 +222,12 @@ var gcCmd = &cobra.Command{
 	Short:             "GC",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context())
+		bs, err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}
 
-		return Engine.GC(cmd.Context(), log.Infof, false)
-	},
-}
-
-var cleanLockCmd = &cobra.Command{
-	Use:   "lock",
-	Short: "Clean locks",
-	Args:  cobra.NoArgs,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context())
-		if err != nil {
-			return err
-		}
-
-		for _, target := range Engine.Targets.Slice() {
-			err := Engine.CleanTargetLock(target)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
+		return bs.Engine.LocalCache.GC(cmd.Context(), log.Infof, false)
 	},
 }
 
@@ -320,13 +238,13 @@ var validateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:  Engine,
+			Engine:  bs.Engine,
 			LinkAll: true,
 		})
 		if err != nil {
@@ -346,10 +264,13 @@ var setupCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := bootstrapInit(ctx)
 		if err != nil {
 			return err
 		}
+
+		// TODO
+		_ = bs
 
 		return nil
 	},

@@ -1,7 +1,8 @@
-package engine
+package graph
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -9,8 +10,8 @@ import (
 	"testing"
 )
 
-func targetFactory(pkg string, fqn string, labels []string) *Target {
-	return &Target{
+func targetFactory(pkg string, fqn string, labels []string) *engine.Target {
+	return &engine.Target{
 		Target: &tgt.Target{
 			TargetSpec: targetspec.TargetSpec{
 				FQN:    "//" + pkg + ":" + fqn,
@@ -29,7 +30,7 @@ func TestParseTargetSelector(t *testing.T) {
 
 	tests := []struct {
 		selector string
-		t        *Target
+		t        *engine.Target
 		expected bool
 	}{
 		{"//some/pkg:t1", t1, true},

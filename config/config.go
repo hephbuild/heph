@@ -50,7 +50,8 @@ type Config struct {
 
 	Extras `yaml:",inline"`
 
-	Sources []FileConfig `yaml:"-"`
+	Sources  []FileConfig `yaml:"-"`
+	Profiles []string     `yaml:"-"`
 }
 
 func (c Config) OrderedPlatforms() []Platform {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
@@ -82,33 +83,33 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		err = engineInit(ctx)
+		bs, err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:       Engine,
+			Engine:       bs.Engine,
 			PoolWaitName: "Query gen",
 		})
 		if err != nil {
 			return err
 		}
 
-		targets := Engine.Targets.Slice()
+		targets := bs.Graph.Targets()
 		if hasStdin(args) {
-			stargets, err := parseTargetsFromStdin(Engine)
+			stargets, err := parseTargetsFromStdin(bs.Graph.Targets())
 			if err != nil {
 				return err
 			}
 
-			targets := engine.NewTargets(len(stargets))
+			targets = graph.NewTargets(len(stargets))
 			for _, target := range stargets {
-				targets.Add(Engine.Targets.Find(target.FQN))
+				targets.Add(bs.Engine.Graph.Targets().Find(target.FQN))
 			}
 		} else {
 			if !all {
-				targets = engine.FilterPublicTargets(targets)
+				targets = targets.Public()
 			}
 
 			if len(include) == 0 && len(exclude) == 0 && !all {
@@ -116,25 +117,25 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		includeMatchers := make(engine.TargetMatchers, 0)
+		includeMatchers := make(graph.TargetMatchers, 0)
 		for _, s := range include {
-			includeMatchers = append(includeMatchers, engine.ParseTargetSelector("", s))
+			includeMatchers = append(includeMatchers, graph.ParseTargetSelector("", s))
 		}
-		excludeMatchers := make(engine.TargetMatchers, 0)
+		excludeMatchers := make(graph.TargetMatchers, 0)
 		for _, s := range exclude {
-			excludeMatchers = append(excludeMatchers, engine.ParseTargetSelector("", s))
+			excludeMatchers = append(excludeMatchers, graph.ParseTargetSelector("", s))
 		}
 
-		matcher := engine.YesMatcher()
+		matcher := graph.YesMatcher()
 		if len(includeMatchers) > 0 {
-			matcher = engine.OrMatcher(includeMatchers...)
+			matcher = graph.OrMatcher(includeMatchers...)
 		}
 		if len(excludeMatchers) > 0 {
-			matcher = engine.AndMatcher(matcher, engine.NotMatcher(engine.OrMatcher(excludeMatchers...)))
+			matcher = graph.AndMatcher(matcher, graph.NotMatcher(graph.OrMatcher(excludeMatchers...)))
 		}
 
 		selected := make([]*tgt.Target, 0)
-		for _, target := range targets {
+		for _, target := range targets.Slice() {
 			if matcher(target) {
 				selected = append(selected, target.Target)
 			}
@@ -156,7 +157,7 @@ var fzfCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		log.Warnf("Deprecated, use heph search")
 
-		targets, _, err := preRunAutocompleteInteractive(cmd.Context(), all, false)
+		targets, _, err := preRunAutocomplete(cmd.Context(), all)
 		if err != nil {
 			return err
 		}
@@ -175,7 +176,7 @@ var searchCmd = &cobra.Command{
 	Short:   "Search targets",
 	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		targets, _, err := preRunAutocompleteInteractive(cmd.Context(), all, false)
+		targets, _, err := preRunAutocomplete(cmd.Context(), all)
 		if err != nil {
 			return err
 		}
@@ -195,12 +196,12 @@ var configCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := bootstrapInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		b, err := yaml.Marshal(Engine.Config)
+		b, err := yaml.Marshal(bs.Config)
 		if err != nil {
 			return err
 		}
@@ -216,14 +217,14 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context())
+		bs, err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}
 
 		paths := make([]string, 0)
 
-		for p, t := range Engine.CodegenPaths() {
+		for p, t := range bs.Graph.CodegenPaths() {
 			paths = append(paths, fmt.Sprintf("%v: %v", p, t.FQN))
 		}
 
@@ -243,12 +244,12 @@ var graphCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target, err := parseTargetFromArgs(cmd.Context(), args)
+		bs, target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
 
-		ances, _, err := Engine.DAG().GetAncestorsGraph(target.FQN)
+		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(target.FQN)
 		if err != nil {
 			return err
 		}
@@ -265,20 +266,20 @@ var graphDotCmd = &cobra.Command{
 	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := engineInit(cmd.Context())
+		bs, err := engineInit(cmd.Context())
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(cmd.Context(), PreRunOpts{
-			Engine:  Engine,
+			Engine:  bs.Engine,
 			LinkAll: true,
 		})
 		if err != nil {
 			return err
 		}
 
-		dag := Engine.DAG()
+		dag := bs.Graph.DAG()
 		if len(args) > 0 {
 			if len(args) < 2 {
 				return fmt.Errorf("requires two args")
@@ -290,13 +291,13 @@ var graphDotCmd = &cobra.Command{
 				if err != nil {
 					return err
 				}
-				dag = &engine.DAG{DAG: gdag}
+				dag = &graph.DAG{DAG: gdag}
 			case "descendants":
 				gdag, _, err := dag.GetDescendantsGraph(args[1])
 				if err != nil {
 					return err
 				}
-				dag = &engine.DAG{DAG: gdag}
+				dag = &graph.DAG{DAG: gdag}
 			default:
 				return fmt.Errorf("must be one of ancestors, descendants")
 			}
@@ -311,7 +312,7 @@ digraph G  {
 	node [fontsize=10, shape=box, height=0.25]
 	edge [fontsize=10]
 `)
-		id := func(target *engine.Target) string {
+		id := func(target *graph.Target) string {
 			return strconv.Quote(target.FQN)
 		}
 
@@ -360,7 +361,7 @@ var changesCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(c *cobra.Command, args []string) error {
-		err := preRunWithGen(c.Context())
+		bs, err := preRunWithGen(c.Context())
 		if err != nil {
 			return err
 		}
@@ -368,7 +369,7 @@ var changesCmd = &cobra.Command{
 		since := args[0]
 
 		cmd := exec.Command("git", "--no-pager", "diff", "--name-only", since+"...HEAD")
-		cmd.Dir = Engine.Root.Abs()
+		cmd.Dir = bs.Root.Root.Abs()
 		out, err := cmd.Output()
 		if err != nil {
 			return err
@@ -377,7 +378,7 @@ var changesCmd = &cobra.Command{
 		affectedTargets := make([]*tgt.Target, 0)
 		affectedFiles := strings.Split(string(out), "\n")
 
-		allTargets := Engine.Targets.Slice()
+		allTargets := bs.Graph.Targets().Slice()
 
 		for _, affectedFile := range affectedFiles {
 		targets:
@@ -409,19 +410,9 @@ var targetCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		tp, err := targetspec.TargetParse("", args[0])
+		bs, target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
-		}
-
-		err = preRunWithGen(ctx)
-		if err != nil {
-			return err
-		}
-
-		target := Engine.Targets.Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
 		}
 
 		if spec {
@@ -435,7 +426,7 @@ var targetCmd = &cobra.Command{
 			return nil
 		}
 
-		err = Engine.LinkTarget(target, nil)
+		err = bs.Graph.LinkTarget(target, nil)
 		if err != nil {
 			return err
 		}
@@ -497,13 +488,13 @@ var pkgsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := preRunWithGen(ctx)
+		bs, err := preRunWithGen(ctx)
 		if err != nil {
 			return err
 		}
 
 		pkgs := make([]*packages.Package, 0)
-		for _, p := range Engine.Packages.All() {
+		for _, p := range bs.Packages.All() {
 			pkgs = append(pkgs, p)
 		}
 		sort.SliceStable(pkgs, func(i, j int) bool {
@@ -529,18 +520,18 @@ var depsCmd = &cobra.Command{
 	Short: "Prints target dependencies",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		target, err := parseTargetFromArgs(cmd.Context(), args)
+		bs, target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
 
-		fn := Engine.DAG().GetParents
+		fn := bs.Graph.DAG().GetParents
 		if transitive {
-			fn = Engine.DAG().GetAncestors
+			fn = bs.Graph.DAG().GetAncestors
 		}
 
 		ancestors := make([]string, 0)
-		ancs, err := fn(target)
+		ancs, err := fn(target.Target)
 		if err != nil {
 			return err
 		}
@@ -568,8 +559,14 @@ var revdepsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := preRunWithGenWithOpts(ctx, PreRunOpts{
+		bs, err := engineInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
 			LinkAll: true,
+			Engine:  bs.Engine,
 		})
 		if err != nil {
 			return err
@@ -580,14 +577,14 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		target := Engine.Targets.Find(tp.Full())
+		target := bs.Graph.Targets().Find(tp.Full())
 		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full())
+			return engine.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
 		}
 
-		fn := Engine.DAG().GetChildren
+		fn := bs.Graph.DAG().GetChildren
 		if transitive {
-			fn = Engine.DAG().GetDescendants
+			fn = bs.Graph.DAG().GetDescendants
 		}
 
 		descendants := make([]string, 0)
@@ -662,17 +659,17 @@ var outCmd = &cobra.Command{
 
 		ctx := cmd.Context()
 
-		target, err := parseTargetFromArgs(ctx, args)
+		bs, target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
 
-		err = printTargetOutputPaths(target, output)
+		err = printTargetOutputPaths(bs.Engine.Targets.FindGraph(target), output)
 		if err != nil {
 			return err
 		}
@@ -689,15 +686,17 @@ var cacheRootCmd = &cobra.Command{
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
-		target, err := parseTargetFromArgs(ctx, args)
+		bs, gtarget, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
+
+		target := bs.Engine.Targets.FindGraph(gtarget)
 
 		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
 
@@ -735,19 +734,21 @@ var hashoutCmd = &cobra.Command{
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
-		target, err := parseTargetFromArgs(ctx, args)
+		bs, gtarget, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = run(ctx, Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
+		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, NoCache: *nocache}}, false)
 		if err != nil {
 			return err
 		}
+
+		target := bs.Engine.Targets.FindGraph(gtarget)
 
 		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {
-			fmt.Println(name+":", Engine.HashOutput(target, name))
+			fmt.Println(name+":", bs.Engine.LocalCache.HashOutput(target, name))
 		}
 
 		return nil
@@ -762,22 +763,24 @@ var hashinCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		target, err := parseTargetFromArgs(ctx, args)
+		bs, gtarget, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		tdeps, err := Engine.ScheduleTargetsWithDeps(ctx, []*engine.Target{target}, target)
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, gtarget)
 		if err != nil {
 			return err
 		}
 
-		err = WaitPool("Run", Engine.Pool, tdeps.All())
+		err = WaitPool("Run", bs.Engine.Pool, tdeps.All())
 		if err != nil {
 			return err
 		}
 
-		fmt.Println(Engine.HashInput(target))
+		target := bs.Engine.Targets.FindGraph(gtarget)
+
+		fmt.Println(bs.Engine.LocalCache.HashInput(target))
 
 		return nil
 	},
@@ -788,12 +791,12 @@ var labelsCmd = &cobra.Command{
 	Short: "Prints labels",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		err := preRunWithGen(cmd.Context())
+		bs, err := preRunWithGen(cmd.Context())
 		if err != nil {
 			return err
 		}
 
-		labels := Engine.Labels.Slice()
+		labels := bs.Graph.Labels().Slice()
 		sort.Strings(labels)
 
 		for _, label := range labels {
@@ -811,12 +814,12 @@ var outRootCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := bootstrapInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		fmt.Println(Engine.Root.Abs())
+		fmt.Println(bs.Root.Root.Abs())
 
 		return nil
 	},
@@ -829,12 +832,12 @@ var orderedCachesCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := engineInit(ctx)
+		bs, err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
 
-		orderedCaches, err := Engine.OrderedCaches(ctx)
+		orderedCaches, err := bs.Engine.OrderedCaches(ctx)
 		if err != nil {
 			return err
 		}

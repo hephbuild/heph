@@ -53,15 +53,17 @@ func key(goos, goarch string) string {
 	return goos + "/" + goarch
 }
 
-var buildOnce = utils.Once[*maps.Map[string, string]]{}
+type buildMatrix = maps.OMap[string, string]
 
-func buildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
-	return buildOnce.Do(func() (*maps.Map[string, string], error) {
+var buildOnce = utils.Once[*buildMatrix]{}
+
+func buildAll(srcDir, outDir string) (*buildMatrix, error) {
+	return buildOnce.Do(func() (*buildMatrix, error) {
 		return doBuildAll(srcDir, outDir)
 	})
 }
 
-func doBuildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
+func doBuildAll(srcDir, outDir string) (*buildMatrix, error) {
 	log.Debugf("building heph: src:%v out:%v matrix: %v", srcDir, outDir, matrix)
 
 	err := os.MkdirAll(outDir, os.ModePerm)
@@ -70,7 +72,7 @@ func doBuildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
 	}
 
 	var wg sync.WaitGroup
-	m := &maps.Map[string, string]{}
+	m := &buildMatrix{}
 	errCh := make(chan error)
 
 	for _, e := range matrix {
@@ -100,7 +102,7 @@ func doBuildAll(srcDir, outDir string) (*maps.Map[string, string], error) {
 		err = multierr.Append(err, berr)
 	}
 
-	log.Tracef("building heph: done: %v", m.Map())
+	log.Tracef("building heph: done: %v", m.Raw())
 
 	return m, err
 }

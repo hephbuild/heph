@@ -70,7 +70,7 @@ target(
 )
 
 extra_src = [
-    'engine/predeclared.gotpl',
+    'hbuiltin/predeclared.gotpl',
     'platform/initfile.sh',
 ]
 deps = ["go.mod", "go.sum"] +\

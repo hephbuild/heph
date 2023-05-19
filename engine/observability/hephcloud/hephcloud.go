@@ -10,7 +10,7 @@ import (
 	ajson "github.com/aarondl/json"
 	"github.com/aarondl/opt/null"
 	"github.com/hephbuild/heph/cloudclient"
-	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/tgt"
@@ -26,7 +26,7 @@ import (
 
 type Hook struct {
 	observability.BaseHook
-	Config    engine.Config
+	Config    *config.Config
 	Client    graphql.Client
 	ProjectID string
 

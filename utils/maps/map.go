@@ -6,7 +6,30 @@ import (
 	"sync"
 )
 
-type Map[K constraints.Ordered, V any] struct {
+type OMap[K constraints.Ordered, V any] struct {
+	Map[K, V]
+}
+
+func (m *OMap[K, V]) Keys() []K {
+	m.init()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ks := make([]K, 0, len(m.m))
+
+	for k := range m.m {
+		ks = append(ks, k)
+	}
+
+	sort.Slice(ks, func(i, j int) bool {
+		return ks[i] < ks[j]
+	})
+
+	return ks
+}
+
+type Map[K comparable, V any] struct {
 	Default func(k K) V
 
 	mu sync.RWMutex
@@ -80,25 +103,6 @@ func (m *Map[K, V]) Has(k K) bool {
 	return ok
 }
 
-func (m *Map[K, V]) Keys() []K {
-	m.init()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	ks := make([]K, len(m.m))
-
-	for k := range m.m {
-		ks = append(ks, k)
-	}
-
-	sort.Slice(ks, func(i, j int) bool {
-		return ks[i] < ks[j]
-	})
-
-	return ks
-}
-
-func (m *Map[K, V]) Map() map[K]V {
+func (m *Map[K, V]) Raw() map[K]V {
 	return m.m
 }

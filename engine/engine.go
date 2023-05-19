@@ -2,18 +2,13 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"github.com/c2fo/vfs/v6"
-	vfsos "github.com/c2fo/vfs/v6/backend/os"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/heimdalr/dag"
-	"github.com/hephbuild/heph/cloudclient"
-	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/engine/buildfiles"
+	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/engine/hroot"
 	"github.com/hephbuild/heph/engine/observability"
-	obsummary "github.com/hephbuild/heph/engine/observability/summary"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
@@ -23,14 +18,12 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/flock"
 	fs2 "github.com/hephbuild/heph/utils/fs"
-	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/instance"
-	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
-	"github.com/hephbuild/heph/vfssimple"
 	"github.com/hephbuild/heph/worker"
 	"io/fs"
 	"os"
@@ -44,81 +37,36 @@ import (
 
 type Engine struct {
 	Cwd               string
-	Root              fs2.Path
-	HomeDir           fs2.Path
-	Config            Config
-	LocalCache        *vfsos.Location
+	Root              *hroot.State
+	Config            *graph.Config
 	Observability     *observability.Observability
 	GetFlowID         func() string
-	Summary           *obsummary.Summary
-	PlatformProviders []PlatformProvider
+	PlatformProviders []platform.PlatformProvider
+	LocalCache        *LocalCacheState
 	RemoteCacheHints  *rcache.HintStore
+	Packages          *packages.Registry
+	BuildFilesState   *buildfiles.State
+	Graph             *graph.State
+	Pool              *worker.Pool
+	Finalizers        *finalizers.Finalizers
 
 	DisableNamedCacheWrite bool
 
-	SourceFiles packages.SourceFiles
-	Packages    *packages.Registry
-
-	BuildFilesState *buildfiles.State
-
-	TargetsLock maps.KMutex
-	Targets     *Targets
-	Labels      *sets.StringSet
-
-	Params map[string]string
-
-	dag *DAG
-
 	autocompleteHash string
 
-	cacheHashInputTargetMutex  maps.KMutex
-	cacheHashInput             *maps.Map[string, string]
-	cacheHashOutputTargetMutex maps.KMutex
-	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
-	RanGenPass                 bool
-	RanInit                    bool
-	codegenPaths               map[string]*Target
-	tools                      *Targets
-	Pool                       *worker.Pool
-
-	exitHandlersm       sync.Mutex
-	exitHandlers        []func(error)
-	exitHandlersRunning bool
-
-	gcLock                flock.Locker
 	toolsLock             flock.Locker
 	autocompleteCacheLock flock.Locker
 
 	orderedCachesLock flock.Locker
-	orderedCaches     []CacheConfig
-	CloudClient       *cloudclient.HephClient
-	CloudClientAuth   *cloudclient.HephClient
-	CloudToken        string
-}
+	orderedCaches     []graph.CacheConfig
 
-type PlatformProvider struct {
-	config.Platform
-	platform.Provider
-}
+	Targets *TargetMetas
 
-type Config struct {
-	config.Config
-	Profiles []string
-	Caches   []CacheConfig
-}
-
-type CacheConfig struct {
-	Name string
-	config.Cache
-	Location vfs.Location `yaml:"-"`
-}
-
-type RunStatus struct {
-	Description string
+	RanGenPass bool
 }
 
 type TargetRunRequest struct {
-	Target  *Target
+	Target  *graph.Target
 	Args    []string
 	NoCache bool
 	Shell   bool
@@ -140,7 +88,7 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 	return false
 }
 
-func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
+func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
 	for _, rr := range rrs {
 		if rr.Target.FQN == t.FQN {
 			return rr
@@ -150,11 +98,11 @@ func (rrs TargetRunRequests) Get(t *Target) TargetRunRequest {
 	return TargetRunRequest{Target: t}
 }
 
-func (rrs TargetRunRequests) Targets() []*Target {
-	ts := make([]*Target, 0, len(rrs))
+func (rrs TargetRunRequests) Targets() *graph.Targets {
+	ts := graph.NewTargets(len(rrs))
 
 	for _, rr := range rrs {
-		ts = append(ts, rr.Target)
+		ts.Add(rr.Target)
 	}
 
 	return ts
@@ -171,70 +119,55 @@ func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
 	return c
 }
 
-func New(rootPath string) *Engine {
-	root := fs2.NewPath(rootPath, "")
+func New(e Engine) *Engine {
+	e.Targets = NewTargetMetas(func(fqn string) *Target {
+		gtarget := e.Graph.Targets().Find(fqn)
 
-	homeDir := root.Join(".heph")
+		t := &Target{
+			Target:           gtarget,
+			WorkdirRoot:      fs2.Path{},
+			SandboxRoot:      fs2.Path{},
+			OutExpansionRoot: nil, // Set during execution
+			runLock:          nil, // Set after
+			postRunWarmLock:  e.lockFactory(gtarget, "postrunwarm"),
+			cacheLocks:       nil, // Set after
+		}
+		if t.ConcurrentExecution {
+			t.runLock = flock.NewMutex(t.FQN)
+		} else {
+			t.runLock = e.lockFactory(t, "run")
+		}
 
-	log.Tracef("home dir %v", homeDir.Abs())
+		t.cacheLocks = map[string]flock.Locker{}
+		for _, artifact := range t.Artifacts.All() {
+			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
+		}
 
-	err := os.MkdirAll(homeDir.Abs(), os.ModePerm)
-	if err != nil {
-		log.Fatal(fmt.Errorf("create homedir %v: %w", homeDir, err))
-	}
+		t.SandboxRoot = e.sandboxRoot(t).Join("_dir")
 
-	cacheDir := homeDir.Join("cache")
+		t.WorkdirRoot = e.Root.Root
+		if t.Sandbox {
+			t.WorkdirRoot = t.SandboxRoot
+		}
 
-	loc, err := vfssimple.NewLocation("file://" + cacheDir.Abs() + "/")
-	if err != nil {
-		log.Fatal(fmt.Errorf("cache location: %w", err))
-	}
+		t.cacheLocks = map[string]flock.Locker{}
+		for _, artifact := range t.Artifacts.All() {
+			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
+		}
 
-	pkgs := packages.NewRegistry(packages.Registry{
-		RepoRoot:       root,
-		HomeRoot:       homeDir,
-		RootsCachePath: homeDir.Join("roots").Abs(),
+		return t
 	})
-
-	return &Engine{
-		Root:          root,
-		HomeDir:       homeDir,
-		LocalCache:    loc.(*vfsos.Location),
-		Targets:       NewTargets(0),
-		Observability: observability.NewTelemetry(),
-		Packages:      pkgs,
-		BuildFilesState: buildfiles.NewState(buildfiles.State{
-			Packages: pkgs,
-		}),
-		RemoteCacheHints:      &rcache.HintStore{},
-		cacheHashInput:        &maps.Map[string, string]{},
-		cacheHashOutput:       &maps.Map[string, string]{},
-		codegenPaths:          map[string]*Target{},
-		tools:                 NewTargets(0),
-		Labels:                sets.NewStringSet(0),
-		gcLock:                flock.NewFlock("Global GC", homeDir.Join("tmp", "gc.lock").Abs()),
-		toolsLock:             flock.NewFlock("Tools", homeDir.Join("tmp", "tools.lock").Abs()),
-		autocompleteCacheLock: flock.NewFlock("Autocomplete cache", homeDir.Join("tmp", "ac_cache.lock").Abs()),
-		orderedCachesLock:     flock.NewFlock("Order cache", homeDir.Join("tmp", "order_cache.lock").Abs()),
-		dag:                   &DAG{dag.NewDAG()},
-	}
+	e.toolsLock = flock.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
+	e.autocompleteCacheLock = flock.NewFlock("Autocomplete cache", e.Root.Home.Join("tmp", "ac_cache.lock").Abs())
+	e.orderedCachesLock = flock.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
+	return &e
 }
 
-func (e *Engine) DAG() *DAG {
-	return e.dag
-}
+func (e *Engine) lockFactory(t targetspec.Specer, resource string) flock.Locker {
+	ts := t.Spec()
+	p := e.lockPath(t, resource)
 
-func (e *Engine) CodegenPaths() map[string]*Target {
-	return e.codegenPaths
-}
-
-func hashCacheId(target *Target) string {
-	idh := hash.NewHash()
-	for _, fqn := range target.linkingDeps.FQNs() {
-		idh.String(fqn)
-	}
-
-	return target.FQN + idh.Sum()
+	return flock.NewFlock(ts.FQN+" ("+resource+")", p)
 }
 
 type ErrorWithLogFile struct {
@@ -257,7 +190,7 @@ func (t ErrorWithLogFile) Is(target error) bool {
 }
 
 type TargetFailedError struct {
-	Target *Target
+	Target *graph.Target
 	Err    error
 }
 
@@ -311,7 +244,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*Target, skip *Target) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip targetspec.Specer) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -335,12 +268,12 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip *Target) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip targetspec.Specer) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func TargetStatus(t *Target, status string) observability.StatusFactory {
-	return targetStatus{t.FQN, "", status}
+func TargetStatus(t targetspec.Specer, status string) observability.StatusFactory {
+	return targetStatus{t.Spec().FQN, "", status}
 }
 
 type targetStatus struct {
@@ -383,8 +316,6 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			e := NewTargetRunEngine(e)
-
 			err := e.Run(ctx, rr, sandbox.IOConfig{})
 			if err != nil {
 				return TargetFailedError{
@@ -429,7 +360,7 @@ func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, out
 
 		tp.ProvisionName(name)
 
-		artifact := target.artifacts.OutTar(name)
+		artifact := target.Artifacts.OutTar(name)
 
 		files, err := e.collectOutFromArtifact(ctx, target, artifact)
 		if err != nil {
@@ -496,8 +427,8 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 	return out, nil
 }
 
-func (e *TargetRunEngine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
-	ctx, span := e.Observability.SpanCollectOutput(ctx, target.Target)
+func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
+	ctx, span := e.Observability.SpanCollectOutput(ctx, target.Target.Target)
 	defer span.EndError(rerr)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
@@ -534,7 +465,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	}
 
 	if target.HasSupportFiles {
-		art := target.artifacts.OutTar(targetspec.SupportFilesOutput)
+		art := target.Artifacts.OutTar(targetspec.SupportFilesOutput)
 
 		target.actualSupportFiles, err = e.collectOutFromArtifact(ctx, target, art)
 		if err != nil {
@@ -545,23 +476,25 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	return nil
 }
 
-func (e *Engine) sandboxRoot(target *Target) fs2.Path {
+func (e *Engine) sandboxRoot(specer targetspec.Specer) fs2.Path {
+	target := specer.Spec()
+
 	folder := "__target_" + target.Name
 	if target.ConcurrentExecution {
 		folder = "__target_tmp_" + instance.UID + "_" + target.Name
 	}
 
-	p := e.HomeDir.Join("sandbox", target.Package.Path, folder)
+	p := e.Root.Home.Join("sandbox", target.Package.Path, folder)
 
 	if target.ConcurrentExecution {
-		e.RegisterRemove(p.Abs())
+		e.Finalizers.RegisterRemove(p.Abs())
 	}
 
 	return p
 }
 
 func (e *Engine) Clean(async bool) error {
-	return deleteDir(e.HomeDir.Abs(), async)
+	return deleteDir(e.Root.Home.Abs(), async)
 }
 
 func (e *Engine) CleanTarget(target *Target, async bool) error {
@@ -635,92 +568,6 @@ func deleteDir(dir string, async bool) error {
 	return nil
 }
 
-func (e *Engine) parseConfigs() error {
-	log.Tracef("Profiles: %v", e.Config.Profiles)
-
-	cfg := config.Config{}
-	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
-	cfg.CacheHistory = 3
-	cfg.Engine.GC = true
-	cfg.Engine.CacheHints = true
-	cfg.CacheOrder = config.CacheOrderLatency
-	cfg.Platforms = map[string]config.Platform{
-		"local": {
-			Name:     "local",
-			Provider: "local",
-			Priority: 100,
-		},
-	}
-	cfg.Watch.Ignore = append(cfg.Watch.Ignore, e.HomeDir.Join(".heph/**/*").Abs())
-
-	err := config.ParseAndApply("/etc/.hephconfig", &cfg)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	err = config.ParseAndApply(e.Root.Join(".hephconfig").Abs(), &cfg)
-	if err != nil {
-		return err
-	}
-
-	err = config.ParseAndApply(e.Root.Join(".hephconfig.local").Abs(), &cfg)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-
-	for _, profile := range e.Config.Profiles {
-		err := config.ParseAndApply(e.Root.Join(".hephconfig."+profile).Abs(), &cfg)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-
-	e.Config.Config = cfg
-
-	for name, cache := range cfg.Caches {
-		uri := cache.URI
-		if !strings.HasSuffix(uri, "/") {
-			uri += "/"
-		}
-		loc, err := vfssimple.NewLocation(uri)
-		if err != nil {
-			return fmt.Errorf("cache %v :%w", name, err)
-		}
-
-		e.Config.Caches = append(e.Config.Caches, CacheConfig{
-			Name:     name,
-			Cache:    cache,
-			Location: loc,
-		})
-	}
-
-	return nil
-}
-
-func (e *Engine) HasLabel(label string) bool {
-	return e.Labels.Has(label)
-}
-
-func (e *Engine) GeneratedTargets() []*Target {
-	targets := make([]*Target, 0)
-
-	for _, target := range e.Targets.Slice() {
-		if !target.Gen {
-			continue
-		}
-
-		targets = append(targets, target)
-	}
-
-	return targets
-}
-
-func (e *Engine) registerLabels(labels []string) {
-	for _, label := range labels {
-		e.Labels.Add(label)
-	}
-}
-
 func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
 	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
 		return target.Deps.All()
@@ -764,7 +611,7 @@ func (e *Engine) GetWatcherList(files []fs2.Path) []string {
 				break
 			}
 
-			if !strings.HasPrefix(filep, e.Root.Abs()) {
+			if !strings.HasPrefix(filep, e.Root.Root.Abs()) {
 				break
 			}
 
@@ -779,128 +626,4 @@ func (e *Engine) GetWatcherList(files []fs2.Path) []string {
 	sort.Strings(paths)
 
 	return paths
-}
-
-func (e *Engine) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {
-	descendants := NewTargets(0)
-
-	for _, path := range paths {
-		for _, target := range targets {
-			for _, file := range target.HashDeps.Files {
-				if file.RelRoot() == path {
-					descendants.Add(target)
-					break
-				}
-			}
-		}
-	}
-
-	descendants.Sort()
-
-	return descendants.Slice(), nil
-}
-
-func (e *Engine) RegisterRemove(path string) {
-	e.RegisterExitHandler(func() {
-		err := os.RemoveAll(path)
-		if err != nil {
-			log.Error(err)
-		}
-	})
-}
-
-func (e *Engine) RegisterRemoveWithLocker(l flock.Locker, path string) {
-	e.RegisterExitHandler(func() {
-		ctx := context.Background()
-		ok, err := l.TryLock(ctx)
-		if err != nil {
-			log.Errorf("lock rm %v: %v", path, err)
-			return
-		}
-		if !ok {
-			return
-		}
-		defer l.Unlock()
-
-		err = os.RemoveAll(path)
-		if err != nil {
-			log.Error(err)
-		}
-	})
-}
-
-func (e *Engine) RegisterExitHandlerWithErr(f func(error)) {
-	if e.exitHandlersRunning {
-		return
-	}
-
-	e.exitHandlersm.Lock()
-	defer e.exitHandlersm.Unlock()
-
-	e.exitHandlers = append(e.exitHandlers, f)
-}
-
-func (e *Engine) RegisterExitHandler(f func()) {
-	e.RegisterExitHandlerWithErr(func(error) {
-		f()
-	})
-}
-
-func (e *Engine) RunExitHandlers(err error) {
-	e.exitHandlersm.Lock()
-	defer e.exitHandlersm.Unlock()
-
-	e.exitHandlersRunning = true
-	defer func() {
-		e.exitHandlersRunning = false
-	}()
-
-	for i := len(e.exitHandlers) - 1; i >= 0; i-- {
-		h := e.exitHandlers[i]
-		h(err)
-	}
-
-	e.exitHandlers = nil
-}
-
-func (e *Engine) GetCodegenOrigin(path string) (*Target, bool) {
-	if dep, ok := e.codegenPaths[path]; ok {
-		return dep, ok
-	}
-
-	for cpath, dep := range e.codegenPaths {
-		if ok, _ := utils.PathMatchExactOrPrefixAny(path, cpath); ok {
-			return dep, true
-		}
-	}
-
-	return nil, false
-}
-
-func (e *Engine) linkedTargets() *Targets {
-	targets := NewTargets(e.Targets.Len())
-
-	for _, target := range e.Targets.Slice() {
-		if !target.linked {
-			continue
-		}
-
-		targets.Add(target)
-	}
-
-	return targets
-}
-
-func (e *Engine) toolTargets() *Targets {
-	targets := NewTargets(e.Targets.Len())
-
-	for _, target := range e.Targets.Slice() {
-		if !target.IsTool() {
-			continue
-		}
-
-		targets.Add(target)
-	}
-
-	return targets
 }

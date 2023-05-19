@@ -1,89 +1,27 @@
 package engine
 
 import (
-	"errors"
+	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
-	"sync"
 )
 
 type ActualOutNamedPaths = tgt.NamedPaths[fs.Paths, fs.Path]
 
 type Target struct {
-	*tgt.Target
+	*graph.Target
+
 	WorkdirRoot        fs.Path
 	SandboxRoot        fs.Path
 	actualSupportFiles fs.Paths
 	actualOutFiles     *ActualOutNamedPaths
 	OutExpansionRoot   *fs.Path
 
-	processed  bool
-	linked     bool
-	deeplinked bool
-	linking    bool
-	linkingCh  chan struct{}
-	linkingErr error
-	// Deps + HashDeps + TargetTools
-	linkingDeps *Targets
-	m           sync.Mutex
-
-	artifacts *ArtifactOrchestrator
-
 	runLock         flock.Locker
 	postRunWarmLock flock.Locker
 	cacheLocks      map[string]flock.Locker
-}
-
-func (t *Target) transitivelyWalk(m map[string]struct{}, f func(t *Target) error) error {
-	targets := append([]*Target{t}, t.linkingDeps.Slice()...)
-
-	for _, t := range targets {
-		if _, ok := m[t.FQN]; ok {
-			continue
-		}
-		m[t.FQN] = struct{}{}
-
-		err := f(t)
-		if err != nil {
-			return err
-		}
-
-		err = t.transitivelyWalk(m, f)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *Target) TransitivelyWalk(f func(t *Target) error) error {
-	m := map[string]struct{}{}
-
-	err := t.transitivelyWalk(m, f)
-	if err != nil && !errors.Is(err, tgt.ErrStopWalk) {
-		return err
-	}
-
-	return nil
-}
-
-func (t *Target) resetLinking() {
-	t.deeplinked = false
-
-	spec := t.TargetSpec
-
-	if t.linkingErr != nil || len(spec.Deps.Exprs) > 0 || len(spec.HashDeps.Exprs) > 0 || len(spec.Tools.Exprs) > 0 {
-		depsCap := 0
-		if t.linkingDeps != nil {
-			depsCap = len(t.linkingDeps.Slice())
-		}
-		t.linkingDeps = NewTargets(depsCap)
-		t.linked = false
-		t.linkingErr = nil
-	}
 }
 
 func (t *Target) ID() string {
