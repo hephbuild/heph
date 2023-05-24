@@ -68,7 +68,7 @@ func Cp(from, to string) error {
 		}
 
 		if filepath.IsAbs(link) {
-			return fmt.Errorf("absolute link not allowed")
+			return fmt.Errorf("absolute link not allowed: %v -> %v", from, link)
 		}
 
 		err = CreateParentDir(to)

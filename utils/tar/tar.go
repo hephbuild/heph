@@ -30,7 +30,7 @@ func tarWriteEntry(file TarFile, tw *tar.Writer, info os.FileInfo) error {
 		link = l
 
 		if filepath.IsAbs(link) {
-			return fmt.Errorf("absolute link not allowed")
+			return fmt.Errorf("absolute link not allowed: %v -> %v", file.From, link)
 		}
 	}
 
