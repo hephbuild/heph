@@ -33,7 +33,7 @@ func multiWriterNil(ws ...io.Writer) io.Writer {
 }
 
 func isWriterTerminal(w io.Writer) bool {
-	if f, ok := w.(*os.File); ok {
+	if f, ok := w.(interface{ Fd() uintptr }); ok {
 		return isatty.IsTerminal(f.Fd())
 	}
 

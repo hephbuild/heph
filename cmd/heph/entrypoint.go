@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/vfssimple"
@@ -47,7 +48,7 @@ func Execute() {
 
 	if err := execute(); err != nil {
 		exitCode := 1
-		var eerr ErrorWithExitCode
+		var eerr bootstrap.ErrorWithExitCode
 		if errors.As(err, &eerr) {
 			exitCode = eerr.ExitCode
 			// This is required in case ErrorWithExitCode does not have an Err set, just an ExitCode

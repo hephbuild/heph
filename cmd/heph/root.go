@@ -2,18 +2,17 @@ package main
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/finalizers"
-	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"os"
 	"runtime"
 	"runtime/pprof"
 )
-
-var isTerm bool
 
 var logLevel *string
 var profiles *[]string
@@ -36,14 +35,27 @@ var summaryGen *bool
 var jaegerEndpoint *string
 var ignoreUnknownTarget *bool
 
-func init() {
-	if os.Stderr != nil {
-		isTerm = isatty.IsTerminal(os.Stderr.Fd())
+func getRunOpts() bootstrap.RunOpts {
+	return bootstrap.RunOpts{
+		NoInline:    *noInline,
+		Plain:       *plain,
+		PrintOutput: bootstrap.BoolStr{Bool: printOutput.bool, Str: printOutput.str},
+		CatOutput:   bootstrap.BoolStr{Bool: catOutput.bool, Str: catOutput.str},
+		NoCache:     *nocache,
 	}
+}
 
+func getRROpts() engine.TargetRunRequestOpts {
+	return engine.TargetRunRequestOpts{
+		NoCache:       *nocache,
+		Shell:         *shell,
+		PreserveCache: printOutput.bool || catOutput.bool,
+		NoPTY:         *nopty,
+	}
+}
+
+func init() {
 	log.Setup()
-
-	setupPoolStyles(os.Stderr)
 
 	log.SetLevel(log.InfoLevel)
 
@@ -148,7 +160,7 @@ var rootCmd = &cobra.Command{
 			return err
 		}
 
-		return ErrorWithExitCode{
+		return bootstrap.ErrorWithExitCode{
 			ExitCode: 1,
 		}
 	},
@@ -177,7 +189,7 @@ var runCmd = &cobra.Command{
 			return nil
 		}
 
-		err = run(cmd.Context(), bs.Engine, rrs, !fromStdin)
+		err = bootstrap.Run(cmd.Context(), bs.Engine, rrs, getRunOpts(), !fromStdin)
 		if err != nil {
 			return err
 		}

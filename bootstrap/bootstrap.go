@@ -47,13 +47,14 @@ func findRoot(cwd string) (string, error) {
 	return "", errors.New("root not found, are you running this command in the repo directory?")
 }
 
-type Opts struct {
+type BootOpts struct {
 	Profiles              []string
 	Workers               int
 	Params                map[string]string
 	Summary               bool
 	JaegerEndpoint        string
 	DisableCloudTelemetry bool
+	Pool                  *worker.Pool
 }
 
 type BaseBootstrap struct {
@@ -62,7 +63,7 @@ type BaseBootstrap struct {
 	Config *config.Config
 }
 
-func BootBase(ctx context.Context, opts Opts) (BaseBootstrap, error) {
+func BootBase(ctx context.Context, opts BootOpts) (BaseBootstrap, error) {
 	bs := BaseBootstrap{}
 
 	cwd, err := Getwd()
@@ -121,7 +122,7 @@ type Bootstrap struct {
 	PlatformProviders []platform.PlatformProvider
 }
 
-func Boot(ctx context.Context, opts Opts) (Bootstrap, error) {
+func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	bs := Bootstrap{}
 
 	bbs, err := BootBase(ctx, opts)
@@ -132,8 +133,6 @@ func Boot(ctx context.Context, opts Opts) (Bootstrap, error) {
 
 	root := bbs.Root
 	cfg := bbs.Config
-
-	// Maybe split Bootstrap here to allow to always CheckAndUpdate, even on undefined command
 
 	fins := &finalizers.Finalizers{}
 	bs.Finalizers = fins
@@ -163,10 +162,13 @@ func Boot(ctx context.Context, opts Opts) (Bootstrap, error) {
 		rootSpan.EndError(err)
 	})
 
-	pool := worker.NewPool(opts.Workers)
-	fins.Register(func() {
-		pool.Stop(nil)
-	})
+	pool := opts.Pool
+	if pool == nil {
+		pool = worker.NewPool(opts.Workers)
+		fins.Register(func() {
+			pool.Stop(nil)
+		})
+	}
 	bs.Pool = pool
 
 	pkgs := packages.NewRegistry(packages.Registry{
@@ -270,8 +272,9 @@ type EngineBootstrap struct {
 	Engine *engine.Engine
 }
 
-func BootWithEngine(ctx context.Context, opts Opts) (EngineBootstrap, error) {
+func BootWithEngine(ctx context.Context, opts BootOpts) (EngineBootstrap, error) {
 	ebs := EngineBootstrap{}
+
 	bs, err := Boot(ctx, opts)
 	if err != nil {
 		return ebs, err

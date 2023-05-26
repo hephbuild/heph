@@ -142,6 +142,12 @@ func (t TargetSpec) Spec() TargetSpec {
 	return t
 }
 
+func AsSpecers[T Specer](a []T) []Specer {
+	return ads.Map(a, func(t T) Specer {
+		return t
+	})
+}
+
 type TargetSource struct {
 	Name string
 	Pos  syntax.Position

@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/worker/poolui"
 	"strings"
 	"time"
 )
@@ -17,18 +18,18 @@ type PreRunOpts struct {
 	LinkAll      bool
 }
 
-func bootstrapOptions() (bootstrap.Opts, error) {
+func bootstrapOptions() (bootstrap.BootOpts, error) {
 	paramsm := map[string]string{}
 	for _, s := range *params {
 		parts := strings.SplitN(s, "=", 2)
 		if len(parts) != 2 {
-			return bootstrap.Opts{}, fmt.Errorf("parameter must be name=value, got `%v`", s)
+			return bootstrap.BootOpts{}, fmt.Errorf("parameter must be name=value, got `%v`", s)
 		}
 
 		paramsm[parts[0]] = parts[1]
 	}
 
-	return bootstrap.Opts{
+	return bootstrap.BootOpts{
 		Profiles:              *profiles,
 		Workers:               workers,
 		Params:                paramsm,
@@ -150,7 +151,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 		opts.PoolWaitName = "PreRun gen"
 	}
 
-	err = WaitPool(opts.PoolWaitName, e.Pool, deps)
+	err = poolui.Wait(opts.PoolWaitName, e.Pool, deps, *plain)
 	if err != nil {
 		return err
 	}

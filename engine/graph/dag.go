@@ -190,11 +190,12 @@ func (d *DAG) GetLeaves() []*Target {
 	return d.mapToArray(leaves)
 }
 
-func (d *DAG) GetFileDescendants(paths []string, targets []*Target) ([]*Target, error) {
+// GetFileDescendants returns targets directly depending on file
+func (d *DAG) GetFileDescendants(paths []string, universe []*Target) ([]*Target, error) {
 	descendants := NewTargets(0)
 
 	for _, path := range paths {
-		for _, target := range targets {
+		for _, target := range universe {
 			for _, file := range target.HashDeps.Files {
 				if file.RelRoot() == path {
 					descendants.Add(target)

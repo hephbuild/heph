@@ -1,15 +1,15 @@
-package main
+package bootstrap
 
 import (
 	"context"
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/engine"
-	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker/poolui"
 	"os"
 	"os/exec"
 )
@@ -27,11 +27,19 @@ func (e ErrorWithExitCode) Unwrap() error {
 	return e.Err
 }
 
-func run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, inlineSingle bool) error {
-	return runMode(ctx, e, rrs, inlineSingle, "")
+func Run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, runopts RunOpts, inlineSingle bool) error {
+	return RunMode(ctx, e, rrs, runopts, inlineSingle, "", sandbox.IOConfig{
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		Stdin:  os.Stdin,
+	})
 }
 
-func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, inlineSingle bool, mode string) error {
+func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, runopts RunOpts, inlineSingle bool, mode string, iocfg sandbox.IOConfig) error {
+	for i := range rrs {
+		rrs[i].Mode = mode
+	}
+
 	shellCount := rrs.Count(func(rr engine.TargetRunRequest) bool {
 		return rr.Shell
 	})
@@ -47,11 +55,8 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	}
 
 	var inlineRR *engine.TargetRunRequest
-	var inlineTarget *graph.Target = nil
-	if len(rrs) == 1 && inlineSingle && !*noInline {
+	if len(rrs) == 1 && inlineSingle && !runopts.NoInline {
 		inlineRR = &rrs[0]
-		inlineRR.Mode = mode
-		inlineTarget = inlineRR.Target
 	}
 
 	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
@@ -59,10 +64,9 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 
-	// Passing inlineTarget directly results in a crash...
-	var skip targetspec.Specer
-	if inlineTarget != nil {
-		skip = inlineTarget
+	var skip []targetspec.Specer
+	if inlineRR != nil {
+		skip = []targetspec.Specer{inlineRR.Target}
 	}
 	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 	if err != nil {
@@ -79,26 +83,26 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	runDeps.AddChild(tdeps)
 	runDeps.AddChild(fgDeps)
 
-	err = WaitPool("Run", e.Pool, runDeps)
+	err = poolui.Wait("Run", e.Pool, runDeps, runopts.Plain)
 	if err != nil {
 		return err
 	}
 
 	if inlineRR == nil {
-		if printOutput.bool {
+		if runopts.PrintOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
 				target := e.Targets.FindGraph(target)
-				err = printTargetOutputPaths(target, printOutput.str)
+				err = PrintTargetOutputPaths(target, runopts.PrintOutput.Str)
 				if err != nil {
 					return err
 				}
 			}
 		}
 
-		if catOutput.bool {
+		if runopts.CatOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
 				target := e.Targets.FindGraph(target)
-				err = printTargetOutputContent(target, catOutput.str)
+				err = PrintTargetOutputContent(target, runopts.CatOutput.Str)
 				if err != nil {
 					return err
 				}
@@ -108,17 +112,12 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return nil
 	}
 
-	cfg := sandbox.IOConfig{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
-		Stdin:  os.Stdin,
-	}
-	if printOutput.bool || catOutput.bool {
+	if runopts.PrintOutput.Bool || runopts.CatOutput.Bool {
 		log.Debugf("Redirecting stdout to stderr")
-		cfg.Stdout = os.Stderr
+		iocfg.Stdout = os.Stderr
 	}
 
-	err = e.Run(ctx, *inlineRR, cfg)
+	err = e.Run(ctx, *inlineRR, iocfg)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {
@@ -131,15 +130,15 @@ func runMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return err
 	}
 
-	inlineTargetEngine := e.Targets.FindGraph(inlineTarget)
+	inlineTarget := e.Targets.FindGraph(inlineRR.Target)
 
-	if printOutput.bool {
-		err = printTargetOutputPaths(inlineTargetEngine, printOutput.str)
+	if runopts.PrintOutput.Bool {
+		err = PrintTargetOutputPaths(inlineTarget, runopts.PrintOutput.Str)
 		if err != nil {
 			return err
 		}
-	} else if catOutput.bool {
-		err = printTargetOutputContent(inlineTargetEngine, catOutput.str)
+	} else if runopts.CatOutput.Bool {
+		err = PrintTargetOutputContent(inlineTarget, runopts.CatOutput.Str)
 		if err != nil {
 			return err
 		}

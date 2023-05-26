@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/engine/graph"
@@ -11,11 +12,10 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/worker/poolui"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,7 +29,6 @@ var include []string
 var exclude []string
 var spec bool
 var transitive bool
-var output string
 var all bool
 
 func init() {
@@ -43,7 +42,6 @@ func init() {
 	queryCmd.AddCommand(pkgsCmd)
 	queryCmd.AddCommand(revdepsCmd)
 	queryCmd.AddCommand(depsCmd)
-	queryCmd.AddCommand(outCmd)
 	queryCmd.AddCommand(hashoutCmd)
 	queryCmd.AddCommand(hashinCmd)
 	queryCmd.AddCommand(outRootCmd)
@@ -56,8 +54,6 @@ func init() {
 
 	revdepsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
-
-	outCmd.Flags().StringVar(&output, "output", "", "Output name")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 
@@ -97,15 +93,15 @@ var queryCmd = &cobra.Command{
 		}
 
 		targets := bs.Graph.Targets()
-		if hasStdin(args) {
-			stargets, err := parseTargetsFromStdin(bs.Graph.Targets())
+		if bootstrap.HasStdin(args) {
+			tps, _, err := bootstrap.ParseTargetPathsAndArgs(args, true)
 			if err != nil {
 				return err
 			}
 
-			targets = graph.NewTargets(len(stargets))
-			for _, target := range stargets {
-				targets.Add(bs.Engine.Graph.Targets().Find(target.FQN))
+			targets = graph.NewTargets(len(tps))
+			for _, target := range tps {
+				targets.Add(bs.Engine.Graph.Targets().Find(target.Full()))
 			}
 		} else {
 			if !all {
@@ -610,74 +606,6 @@ var revdepsCmd = &cobra.Command{
 	},
 }
 
-func printTargetOutputContent(target *engine.Target, output string) error {
-	return targetOutputsFunc(target, output, func(path fs.Path) error {
-		f, err := os.Open(path.Abs())
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		_, err = io.Copy(os.Stdout, f)
-		return err
-	})
-}
-
-func printTargetOutputPaths(target *engine.Target, output string) error {
-	return targetOutputsFunc(target, output, func(path fs.Path) error {
-		fmt.Println(path.Abs())
-		return nil
-	})
-}
-
-func targetOutputsFunc(target *engine.Target, output string, f func(path fs.Path) error) error {
-	paths := target.ActualOutFiles().All()
-	if output != "" {
-		if !target.ActualOutFiles().HasName(output) {
-			return fmt.Errorf("%v: output `%v` does not exist", target.FQN, output)
-		}
-		paths = target.ActualOutFiles().Name(output)
-	} else if len(paths) == 0 {
-		return fmt.Errorf("%v: does not output anything", target.FQN)
-	}
-
-	for _, path := range paths {
-		f(path)
-	}
-
-	return nil
-}
-
-var outCmd = &cobra.Command{
-	Use:               "out <target>",
-	Short:             "Prints targets output path",
-	Args:              cobra.ExactArgs(1),
-	ValidArgsFunction: ValidArgsFunctionTargets,
-	Hidden:            true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log.Warnf("Deprecated, use heph run xxx --print-out")
-
-		ctx := cmd.Context()
-
-		bs, target, err := parseTargetFromArgs(ctx, args)
-		if err != nil {
-			return err
-		}
-
-		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: target, NoCache: *nocache}}, false)
-		if err != nil {
-			return err
-		}
-
-		err = printTargetOutputPaths(bs.Engine.Targets.FindGraph(target), output)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	},
-}
-
 var cacheRootCmd = &cobra.Command{
 	Use:               "cacheroot <target>",
 	Short:             "Prints targets cache root",
@@ -691,7 +619,7 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, NoCache: *nocache}}, false)
+		err = bootstrap.Run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, TargetRunRequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
@@ -739,7 +667,7 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		err = run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, NoCache: *nocache}}, false)
+		err = bootstrap.Run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, TargetRunRequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
@@ -768,12 +696,12 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, gtarget)
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, []targetspec.Specer{gtarget})
 		if err != nil {
 			return err
 		}
 
-		err = WaitPool("Run", bs.Engine.Pool, tdeps.All())
+		err = poolui.Wait("Run", bs.Engine.Pool, tdeps.All(), *plain)
 		if err != nil {
 			return err
 		}

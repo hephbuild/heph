@@ -3,6 +3,7 @@ package log
 import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/liblog"
+	"io"
 	"os"
 )
 
@@ -34,15 +35,19 @@ func Setup() {
 		return defaultLogger
 	})
 
-	renderer = liblog.NewConsoleRenderer(os.Stderr)
+	renderer = liblog.NewConsoleRenderer(Writer())
 
-	tuiInterceptCore = newInterceptCore(renderer, liblog.NewLock(liblog.NewCore(liblog.NewConsoleWith(os.Stderr, renderer))))
+	tuiInterceptCore = newInterceptCore(renderer, liblog.NewLock(liblog.NewCore(liblog.NewConsoleWith(Writer(), renderer))))
 
 	defaultLogger = liblog.NewLogger(liblog.NewLevelEnabler(tuiInterceptCore, IsLevelEnabled))
 }
 
 func Renderer() *lipgloss.Renderer {
 	return renderer
+}
+
+func Writer() io.Writer {
+	return os.Stderr
 }
 
 func Default() liblog.Logger {

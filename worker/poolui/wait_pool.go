@@ -1,4 +1,4 @@
-package main
+package poolui
 
 import (
 	"errors"
@@ -7,16 +7,24 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/xlipgloss"
 	"github.com/hephbuild/heph/worker"
-	"github.com/muesli/termenv"
+	"github.com/mattn/go-isatty"
 	"go.uber.org/multierr"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
-func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+var isTerm bool
+
+func init() {
+	if os.Stderr != nil {
+		isTerm = isatty.IsTerminal(os.Stderr.Fd())
+	}
+}
+
+func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	start := time.Now()
 	printProgress := func() {
 		s := deps.TransitiveCount()
@@ -71,21 +79,28 @@ func logPoolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	}
 }
 
-func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
+var m sync.Mutex
+
+func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
+	if !m.TryLock() {
+		panic("concurrent call of poolui.Wait")
+	}
+	defer m.Unlock()
+
 	log.Tracef("WaitPool %v", name)
 	defer func() {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
 
-	tui := isTerm && !*plain
+	tui := isTerm && !plain
 
 	if tui {
-		err := poolUI(name, deps, pool)
+		err := interactiveUI(name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)
 		}
 	} else {
-		err := logPoolUI(name, deps, pool)
+		err := logUI(name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("logpoolui: %w", err)
 		}
@@ -106,7 +121,7 @@ func WaitPool(name string, pool *worker.Pool, deps *worker.WaitGroup) error {
 	return multierr.Combine(perr, derr)
 }
 
-func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
 		return UpdateMessage{
@@ -115,7 +130,7 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 		}
 	}
 
-	r := &renderer{
+	r := &view{
 		name:  name,
 		pool:  pool,
 		start: time.Now(),
@@ -154,9 +169,10 @@ func poolUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 		}()
 	}
 
-	err := p.Start()
-	log.SetPrint(0, nil)
+	defer log.SetPrint(0, nil)
 
+	_, err := p.Run()
+	p.ReleaseTerminal()
 	if err != nil {
 		return err
 	}
@@ -174,7 +190,7 @@ type UpdateMessage struct {
 	summary bool
 }
 
-type renderer struct {
+type view struct {
 	name        string
 	start       time.Time
 	cancel      func()
@@ -184,7 +200,7 @@ type renderer struct {
 	UpdateMessage
 }
 
-func (r *renderer) Init() tea.Cmd {
+func (r *view) Init() tea.Cmd {
 	r.onInit()
 	return nil
 }
@@ -210,7 +226,7 @@ func printJobsWaitStack(jobs []*worker.Job, d int) []string {
 	return strs
 }
 
-func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (r *view) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case UpdateMessage:
 		r.UpdateMessage = msg
@@ -237,15 +253,12 @@ func (r *renderer) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return r, nil
 }
 
-var styleWorkerStart = lipgloss.NewStyle().Bold(true)
-var styleFaint = lipgloss.NewStyle().Faint(true)
+var lrenderer = log.Renderer()
 
-// Deprecated: use lipgloss.Renderer() and propagate wherever its needed
-func setupPoolStyles(w *os.File) {
-	lipgloss.SetColorProfile(termenv.NewOutput(w, xlipgloss.EnvForceTTY()).ColorProfile())
-}
+var styleWorkerStart = lipgloss.NewStyle().Renderer(lrenderer).Bold(true)
+var styleFaint = lipgloss.NewStyle().Renderer(lrenderer).Faint(true)
 
-func (r *renderer) View() string {
+func (r *view) View() string {
 	start := utils.RoundDuration(time.Since(r.start), 1).String()
 
 	if r.summary {
