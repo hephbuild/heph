@@ -8,9 +8,11 @@ import (
 	"github.com/bep/debounce"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/fsnotify/fsnotify"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/worker/poolui"
 	"github.com/spf13/cobra"
 	"os"
 	"path/filepath"
@@ -84,7 +86,7 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 			return
 		}
 
-		err = WaitPool("Gen Run", w.e.Pool, wg)
+		err = poolui.Wait("Gen Run", w.e.Pool, wg, *plain)
 		if err != nil {
 			log.Error(err)
 			return
@@ -107,7 +109,7 @@ func (w *watchCtx) run(r watchRun, fromStdin bool) {
 		}
 	}
 
-	err := runMode(ctx, w.e, r.rrs, !fromStdin, "watch")
+	err := bootstrap.runMode(ctx, w.e, r.rrs, !fromStdin, "watch")
 
 	if *summary || *summaryGen {
 		PrintSummary(w.e.Summary, *summaryGen)

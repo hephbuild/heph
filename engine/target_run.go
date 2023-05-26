@@ -625,8 +625,10 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		}
 
 		if rr.Shell {
-			if _, ok := env["TERM"]; !ok {
-				env["TERM"] = os.Getenv("TERM")
+			for _, e := range []string{"TERM", "COLORTERM"} {
+				if _, ok := env[e]; !ok {
+					env[e] = os.Getenv(e)
+				}
 			}
 		}
 

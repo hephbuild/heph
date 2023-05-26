@@ -14,6 +14,7 @@ import (
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/vfssimple"
 	"os"
+	"strings"
 )
 
 type LocalCacheState struct {
@@ -111,4 +112,18 @@ func (e *LocalCacheState) linkLatestCache(target *Target, from string) error {
 	}
 
 	return nil
+}
+
+func (e *LocalCacheState) ResetCacheHashInput(target *graph.Target) {
+	ks := make([]string, 0)
+
+	for k := range e.cacheHashInput.Raw() {
+		if strings.HasPrefix(k, target.FQN) {
+			ks = append(ks, k)
+		}
+	}
+
+	for _, k := range ks {
+		e.cacheHashInput.Delete(k)
+	}
 }

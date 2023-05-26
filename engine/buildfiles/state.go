@@ -11,7 +11,7 @@ import (
 	"sync"
 )
 
-const buildFilesPattern = "**/{BUILD,BUILD.*}"
+const BuildFilesPattern = "**/{BUILD,BUILD.*}"
 
 func init() {
 	resolve.AllowGlobalReassign = true
@@ -42,7 +42,7 @@ func (s *State) CollectFiles(root string) (packages.SourceFiles, error) {
 
 	files := make(packages.SourceFiles, 0)
 
-	err := utils.StarWalk(root, buildFilesPattern, s.Ignore, func(path string, d fs.DirEntry, err error) error {
+	err := utils.StarWalk(root, BuildFilesPattern, s.Ignore, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

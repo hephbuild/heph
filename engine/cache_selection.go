@@ -6,6 +6,7 @@ import (
 	"github.com/c2fo/vfs/v6/backend/os"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
@@ -112,7 +113,6 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error)
 
 	h := hash.NewHash()
 	h.I64(1)
-	h.String(e.Config.Version.String)
 	hash.HashArray(h, e.Config.Caches, func(c graph.CacheConfig) string {
 		return c.Name + "|" + c.URI
 	})
@@ -120,8 +120,8 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error)
 	cacheHash := h.Sum()
 	cachePath := e.tmpRoot("caches_order").Abs()
 
-	names, err := utils.HashCache(cachePath, cacheHash, func() ([]string, error) {
-		log.Infof("Measuring caches latency...")
+	names, _ := utils.HashCache(cachePath, cacheHash, func() ([]string, error) {
+		observability.Status(ctx, observability.StringStatus("Measuring caches latency..."))
 		ordered := orderCaches(ctx, e.Config.Caches)
 
 		return ads.Map(ordered, func(c graph.CacheConfig) string {

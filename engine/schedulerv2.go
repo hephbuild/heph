@@ -6,12 +6,13 @@ import (
 	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker"
 )
 
-func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip targetspec.Specer) (_ *WaitGroupMap, rerr error) {
+func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (_ *WaitGroupMap, rerr error) {
 	targetsSet := rrs.Targets()
 
 	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
@@ -32,11 +33,13 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	targetSchedJobs := &maps.Map[string, *worker.Job]{}
 
 	sched := &schedulerv2{
-		Engine:         e,
-		octx:           octx,
-		sctx:           octx,
-		rrs:            rrs,
-		skip:           skip,
+		Engine: e,
+		octx:   octx,
+		sctx:   octx,
+		rrs:    rrs,
+		skip: ads.Map(skip, func(t targetspec.Specer) string {
+			return t.Spec().FQN
+		}),
 		rrTargets:      targetsSet,
 		allTargetMetas: e.Targets,
 
@@ -62,7 +65,7 @@ type schedulerv2 struct {
 	octx context.Context
 	sctx context.Context
 	rrs  TargetRunRequests
-	skip targetspec.Specer
+	skip []string
 
 	rrTargets       *graph.Targets
 	allTargetMetas  *TargetMetas
@@ -93,7 +96,7 @@ func (s *schedulerv2) schedule() error {
 			pmdeps.AddChild(s.pullMetaDeps.Get(parent.FQN))
 		}
 
-		isSkip := s.skip != nil && s.skip.Spec().FQN == target.FQN
+		isSkip := ads.Contains(s.skip, target.FQN)
 		isInRRs := s.rrTargets.Has(target.Target)
 
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{

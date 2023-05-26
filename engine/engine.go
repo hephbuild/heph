@@ -66,11 +66,15 @@ type Engine struct {
 }
 
 type TargetRunRequest struct {
-	Target  *graph.Target
-	Args    []string
+	Target *graph.Target
+	Args   []string
+	Mode   string // run or watch
+	TargetRunRequestOpts
+}
+
+type TargetRunRequestOpts struct {
 	NoCache bool
 	Shell   bool
-	Mode    string // run or watch
 	// Force preserving cache for uncached targets when --print-out is enabled
 	PreserveCache bool
 	NoPTY         bool
@@ -122,6 +126,9 @@ func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
 func New(e Engine) *Engine {
 	e.Targets = NewTargetMetas(func(fqn string) *Target {
 		gtarget := e.Graph.Targets().Find(fqn)
+		if gtarget == nil {
+			return nil
+		}
 
 		t := &Target{
 			Target:           gtarget,
@@ -244,7 +251,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -268,7 +275,7 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 

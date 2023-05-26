@@ -1,6 +1,9 @@
 package main
 
-import "github.com/spf13/pflag"
+import (
+	"github.com/spf13/pflag"
+	"strconv"
+)
 
 func NewBoolStrFlag(bs *boolStr, name, shorthand, usage string) *pflag.Flag {
 	flag := &pflag.Flag{
@@ -21,12 +24,15 @@ type boolStr struct {
 }
 
 func (bs *boolStr) Set(s string) error {
-	if s == "true" {
+	b, err := strconv.ParseBool(s)
+	if err == nil {
 		s = ""
+	} else {
+		b = true
 	}
 
 	*bs = boolStr{
-		bool: true,
+		bool: b,
 		str:  s,
 	}
 

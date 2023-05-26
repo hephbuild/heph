@@ -306,7 +306,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	if t.TargetSpec.Cache.Enabled {
 		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
-			return fmt.Errorf("%v cannot cache target which isnt sandboxed", t.FQN)
+			return fmt.Errorf("%v cannot cache target which isn't sandboxed", t.FQN)
 		}
 	}
 
