@@ -11,6 +11,7 @@ import (
 	"github.com/mattn/go-isatty"
 	"go.uber.org/multierr"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -79,20 +80,13 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	}
 }
 
-var m sync.Mutex
-
 func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
-	if !m.TryLock() {
-		panic("concurrent call of poolui.Wait")
-	}
-	defer m.Unlock()
+	tui := isTerm && !plain
 
 	log.Tracef("WaitPool %v", name)
 	defer func() {
 		log.Tracef("WaitPool %v DONE", name)
 	}()
-
-	tui := isTerm && !plain
 
 	if tui {
 		err := interactiveUI(name, deps, pool)
@@ -121,7 +115,22 @@ func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) er
 	return multierr.Combine(perr, derr)
 }
 
+var TUIm sync.Mutex
+var TUIStack []byte
+
 func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+	if !TUIm.TryLock() {
+		TUIm.Lock()
+		//panic(fmt.Sprintf("concurrent call of poolui.Wait, already running at:\n%s\ntrying to run at", stack))
+	}
+
+	TUIStack = debug.Stack()
+
+	defer func() {
+		TUIStack = nil
+		TUIm.Unlock()
+	}()
+
 	msg := func() UpdateMessage {
 		s := deps.TransitiveCount()
 		return UpdateMessage{

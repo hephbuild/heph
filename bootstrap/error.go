@@ -7,8 +7,8 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/worker"
 	"go.uber.org/multierr"
+	"io"
 	"os"
-	"os/exec"
 )
 
 func PrintHumanError(err error) {
@@ -20,7 +20,7 @@ func PrintHumanError(err error) {
 		if skipSpacing {
 			skipSpacing = false
 		} else {
-			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(log.Writer())
 		}
 	}
 
@@ -36,12 +36,14 @@ func PrintHumanError(err error) {
 				logFile := lerr.LogFile
 				info, _ := os.Stat(logFile)
 				if info.Size() > 0 {
-					fmt.Fprintln(os.Stderr)
-					c := exec.Command("cat", logFile)
-					c.Stdout = os.Stderr
-					_ = c.Run()
-					fmt.Fprintln(os.Stderr)
-					fmt.Fprintf(os.Stderr, "The log file can be found at %v\n", logFile)
+					fmt.Fprintln(log.Writer())
+					f, err := os.Open(logFile)
+					if err == nil {
+						_, _ = io.Copy(log.Writer(), f)
+						f.Close()
+						fmt.Fprintln(log.Writer())
+					}
+					log.Errorf("The log file can be found at %v", logFile)
 				}
 
 				log.Error(lerr.Error())
@@ -65,7 +67,7 @@ func PrintHumanError(err error) {
 	}
 
 	if len(errs) > 1 || skippedCount > 0 {
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(log.Writer())
 		skippedStr := ""
 		if skippedCount > 0 {
 			skippedStr = fmt.Sprintf(" %v skipped", skippedCount)

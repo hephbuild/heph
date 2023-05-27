@@ -9,12 +9,14 @@ import (
 	"github.com/hephbuild/heph/engine/hroot"
 	"github.com/hephbuild/heph/engine/observability"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/vfssimple"
 	"os"
 	"strings"
+	"time"
 )
 
 type LocalCacheState struct {
@@ -30,6 +32,7 @@ type LocalCacheState struct {
 	cacheHashOutputTargetMutex maps.KMutex
 	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
 	gcLock                     flock.Locker
+	cacheHashInputPathsModtime *maps.Map[string, map[string]time.Time]
 }
 
 func NewState(root *hroot.State, g *graph.State, obs *observability.Observability) (*LocalCacheState, error) {
@@ -50,6 +53,7 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 		cacheHashInput:             &maps.Map[string, string]{},
 		cacheHashOutputTargetMutex: maps.KMutex{},
 		cacheHashOutput:            &maps.Map[string, string]{},
+		cacheHashInputPathsModtime: &maps.Map[string, map[string]time.Time]{},
 		gcLock:                     flock.NewFlock("Global GC", root.Home.Join("tmp", "gc.lock").Abs()),
 	}
 
@@ -86,7 +90,7 @@ func (e *LocalCacheState) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	err = e.GenArtifacts(ctx, dir, target, allArtifacts, compress)
-	if rerr != nil {
+	if err != nil {
 		return err
 	}
 
@@ -114,16 +118,14 @@ func (e *LocalCacheState) linkLatestCache(target *Target, from string) error {
 	return nil
 }
 
-func (e *LocalCacheState) ResetCacheHashInput(target *graph.Target) {
-	ks := make([]string, 0)
+func (e *LocalCacheState) ResetCacheHashInput(spec targetspec.Specer) {
+	target := spec.Spec()
 
-	for k := range e.cacheHashInput.Raw() {
-		if strings.HasPrefix(k, target.FQN) {
-			ks = append(ks, k)
-		}
-	}
+	e.cacheHashInput.DeleteP(func(k string) bool {
+		return strings.HasPrefix(k, target.FQN)
+	})
 
-	for _, k := range ks {
-		e.cacheHashInput.Delete(k)
-	}
+	e.cacheHashInputPathsModtime.DeleteP(func(k string) bool {
+		return strings.HasPrefix(k, target.FQN)
+	})
 }

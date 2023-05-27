@@ -37,7 +37,6 @@ type State struct {
 	ignore   []string
 	close    func()
 	rrs      engine.TargetRunRequests
-	m        sync.Mutex
 	bootopts bootstrap.BootOpts
 	runopts  bootstrap.RunOpts
 	rropts   engine.TargetRunRequestOpts
@@ -134,8 +133,9 @@ func (s *State) watchFiles() error {
 	defer close(triggerCh)
 
 	go func() {
-		for events := range triggerCh {
-			events := s.cleanEvents(events)
+		for rawEvents := range triggerCh {
+			rawEvents := rawEvents
+			events := s.cleanEvents(rawEvents)
 
 			if events != nil && len(events) == 0 {
 				continue
@@ -156,7 +156,7 @@ func (s *State) watchFiles() error {
 				}
 
 				eventsAccumulator = ads.Filter(eventsAccumulator, func(event fsEvent) bool {
-					return !ads.Contains(events, event)
+					return !ads.Contains(rawEvents, event)
 				})
 			}()
 		}
@@ -282,9 +282,6 @@ func (s *State) cleanEventsWithBootstrap(bs bootstrap.EngineBootstrap, ogevents 
 }
 
 func (s *State) trigger(ctx context.Context, events []fsEvent) error {
-	s.m.Lock()
-	defer s.m.Unlock()
-
 	bs := s.cbs
 
 	//for _, event := range events {
@@ -427,7 +424,9 @@ func (s *State) watchSigs() error {
 				err := s.handleSig(ctx, e)
 				if err != nil {
 					if errors.Is(err, context.Canceled) {
-						status("Got changes, killed")
+						if s.ctx.Err() == nil {
+							status("Got changes, killed")
+						}
 						return
 					}
 

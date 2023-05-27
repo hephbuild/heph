@@ -262,6 +262,13 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 		}
 	}
 
+	// Save files modtime
+	e.LocalCache.ResetCacheHashInput(target)
+	_, err = e.LocalCache.hashInput(target, false)
+	if err != nil {
+		return nil, err
+	}
+
 	err = sandbox.Make(ctx, sandbox.MakeConfig{
 		Dir:       target.SandboxRoot.Abs(),
 		BinDir:    binDir,
@@ -270,6 +277,12 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 		LinkFiles: linkSrcRec.Src(),
 		FilesTar:  append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if modtime have changed
+	_, err = e.LocalCache.hashInput(target, true)
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +846,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 
 	cacheDir := e.cacheDir(target)
 
-	doneMarker := cacheDir.Join(target.Artifacts.InputHash.Name()).Abs()
+	doneMarker := cacheDir.Join(target.Artifacts.InputHash.FileName()).Abs()
 	if !fs.PathExists(doneMarker) {
 		return nil
 	}

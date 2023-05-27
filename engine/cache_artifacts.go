@@ -61,9 +61,12 @@ type hashOutputArtifact struct {
 }
 
 func (a hashOutputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
-	outputHash := a.LocalState.hashOutput(a.Target, a.Output)
+	outputHash, err := a.LocalState.hashOutput(a.Target, a.Output)
+	if err != nil {
+		return err
+	}
 
-	_, err := io.WriteString(gctx.Writer(), outputHash)
+	_, err = io.WriteString(gctx.Writer(), outputHash)
 	return err
 }
 
@@ -73,9 +76,12 @@ type hashInputArtifact struct {
 }
 
 func (a hashInputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
-	inputHash := a.LocalState.hashInput(a.Target)
+	inputHash, err := a.LocalState.hashInput(a.Target, false)
+	if err != nil {
+		return err
+	}
 
-	_, err := io.WriteString(gctx.Writer(), inputHash)
+	_, err = io.WriteString(gctx.Writer(), inputHash)
 	return err
 }
 
@@ -123,6 +129,11 @@ var gitCommitOnce utils.Once[string]
 var gitRefOnce utils.Once[string]
 
 func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+	inputHash, err := a.LocalState.hashInput(a.Target, false)
+	if err != nil {
+		return err
+	}
+
 	d := ManifestData{
 		GitCommit: gitCommitOnce.MustDo(func() (string, error) {
 			return a.git("rev-parse", "HEAD"), nil
@@ -130,7 +141,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) err
 		GitRef: gitRefOnce.MustDo(func() (string, error) {
 			return a.git("rev-parse", "--abbrev-ref", "HEAD"), nil
 		}),
-		InputHash:  a.LocalState.hashInput(a.Target),
+		InputHash:  inputHash,
 		DepsHashes: map[string]map[string]string{},
 		OutHashes:  map[string]string{},
 		Timestamp:  time.Now(),
@@ -146,11 +157,19 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) err
 		if d.DepsHashes[dep.Target.FQN] == nil {
 			d.DepsHashes[dep.Target.FQN] = map[string]string{}
 		}
-		d.DepsHashes[dep.Target.FQN][dep.Output] = e.hashOutput(e.Targets.FindTGT(dep.Target), dep.Output)
+		var err error
+		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.hashOutput(e.Targets.FindTGT(dep.Target), dep.Output)
+		if err != nil {
+			return err
+		}
 	}
 
 	for _, name := range a.Target.OutWithSupport.Names() {
-		d.OutHashes[name] = e.hashOutput(a.Target, name)
+		var err error
+		d.OutHashes[name], err = e.hashOutput(a.Target, name)
+		if err != nil {
+			return err
+		}
 	}
 
 	enc := json.NewEncoder(gctx.Writer())
