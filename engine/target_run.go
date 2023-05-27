@@ -648,13 +648,6 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		_, hasPathInEnv := env["PATH"]
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
-		logFilePath = e.sandboxRoot(target).Join("log.txt").Abs()
-
-		logFile, err := os.Create(logFilePath)
-		if err != nil {
-			return err
-		}
-
 		execCtx := ctx
 		if target.Timeout > 0 {
 			var cancel context.CancelFunc
@@ -666,7 +659,17 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 
 		obw := e.Observability.LogsWriter(execCtx)
 
-		obw = multiWriterNil(obw, logFile)
+		var logFile *os.File
+		if !rr.Shell {
+			logFilePath = e.sandboxRoot(target).Join("log.txt").Abs()
+
+			logFile, err := os.Create(logFilePath)
+			if err != nil {
+				return err
+			}
+
+			obw = multiWriterNil(obw, logFile)
+		}
 
 		if obw != nil {
 			var szch chan *ptylib.Winsize

@@ -1,16 +1,17 @@
-package engine
+package hbuiltin
 
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/buildfiles"
+	"github.com/hephbuild/heph/engine/hroot"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.starlark.net/starlark"
 	"io"
 	"io/fs"
 	"os"
@@ -62,7 +63,7 @@ func TestTargetSpec(t *testing.T) {
 			b, err := io.ReadAll(f)
 			require.NoError(t, err)
 
-			f.Close()
+			_ = f.Close()
 
 			parts := strings.SplitN(string(b), "===\n", 2)
 			build := strings.TrimSpace(parts[0])
@@ -71,29 +72,45 @@ func TestTargetSpec(t *testing.T) {
 				expected = strings.ReplaceAll(expected, r.Spec, r.Actual)
 			}
 
-			var spec targetspec.TargetSpec
+			f, err = os.CreateTemp("", "")
+			require.NoError(t, err)
+			defer os.Remove(f.Name())
+			_, err = io.Copy(f, strings.NewReader(build))
+			require.NoError(t, err)
+			_ = f.Close()
 
-			e := &runBuildEngine{
-				registerTarget: func(rspec targetspec.TargetSpec) error {
-					spec = rspec
+			root, err := hroot.NewState("/tmp")
+			require.NoError(t, err)
 
-					return nil
-				},
-			}
+			pkgs := packages.NewRegistry(packages.Registry{
+				Root: root,
+			})
+			bfs := buildfiles.NewState(buildfiles.State{
+				Packages: pkgs,
+			})
 
-			thread := buildfiles.NewStarlarkThread()
-			thread.SetLocal("__engine", e)
-			thread.SetLocal("__pkg", &packages.Package{
+			pkg := &packages.Package{
 				Path: "some/test",
 				Root: fs2.NewPath(
 					"/tmp/some/test",
 					"some/test",
 				),
+			}
+
+			var spec targetspec.TargetSpec
+
+			opts := Bootstrap(Opts{
+				Pkgs:   pkgs,
+				Root:   root,
+				Config: &config.Config{},
+				RegisterTarget: func(rspec targetspec.TargetSpec) error {
+					spec = rspec
+
+					return nil
+				},
 			})
 
-			predeclaredGlobalsOnce(nil)
-
-			_, err = starlark.ExecFile(thread, file, build, predeclared(predeclaredGlobals))
+			err = bfs.RunBuildFile(pkg, f.Name(), opts)
 			require.NoError(t, err)
 
 			spec.Source = nil
