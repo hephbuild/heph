@@ -21,6 +21,7 @@ import (
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolui"
+	fs2 "io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -473,6 +474,44 @@ func printEvents(events []fsEvent) {
 
 var successStyle = lipgloss.NewStyle().Renderer(log.Renderer()).Foreground(lipgloss.Color("#00FF00"))
 
+func (s *State) updateWatchers() error {
+	bs := s.cbs
+
+	if bs.Root == nil {
+		return nil
+	}
+
+	err := s.watcher.Add(bs.Root.Root.Abs())
+	if err != nil {
+		return err
+	}
+
+	ignore := append(bs.Config.Watch.Ignore, s.ignore...)
+
+	return filepath.WalkDir(bs.Root.Root.Abs(), func(path string, d fs2.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			match, err := utils.PathMatchAny(path, ignore...)
+			if err != nil {
+				return err
+			}
+			if match {
+				return filepath.SkipDir
+			}
+
+			err = s.watcher.Add(path)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+}
+
 func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	status("Got update...")
 
@@ -484,29 +523,9 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 		s.cbs = e.bs
 	}
 
-	for _, path := range s.watcher.WatchList() {
-		_ = s.watcher.Remove(path)
-	}
-
-	err := s.watcher.Add(e.bs.Root.Root.Abs())
+	err := s.updateWatchers()
 	if err != nil {
 		return err
-	}
-
-	ancestors, err := e.bs.Graph.DAG().GetOrderedAncestors(e.rrs.Targets().Slice(), true)
-	if err != nil {
-		return err
-	}
-
-	for _, target := range ancestors {
-		for _, file := range target.Deps.All().Files {
-			dir := filepath.Dir(file.Abs())
-
-			err := s.watcher.Add(dir)
-			if err != nil {
-				return err
-			}
-		}
 	}
 
 	for _, rr := range e.rrs {

@@ -145,7 +145,7 @@ func New(e Engine) *Engine {
 			t.runLock = e.lockFactory(t, "run")
 		}
 
-		t.cacheLocks = map[string]flock.Locker{}
+		t.cacheLocks = make(map[string]flock.Locker, len(t.Artifacts.All()))
 		for _, artifact := range t.Artifacts.All() {
 			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 		}
@@ -157,7 +157,7 @@ func New(e Engine) *Engine {
 			t.WorkdirRoot = t.SandboxRoot
 		}
 
-		t.cacheLocks = map[string]flock.Locker{}
+		t.cacheLocks = make(map[string]flock.Locker, len(t.Artifacts.All()))
 		for _, artifact := range t.Artifacts.All() {
 			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 		}
