@@ -35,7 +35,10 @@ func (e *Engine) localCacheLocation(target *Target) (vfs.Location, error) {
 
 func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Location, error) {
 	// TODO: cache
-	inputHash := e.LocalCache.hashInput(target)
+	inputHash, err := e.LocalCache.hashInput(target, false)
+	if err != nil {
+		return nil, err
+	}
 
 	return loc.NewLocation(filepath.Join(target.Package.Path, target.Name, inputHash) + "/")
 }

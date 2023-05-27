@@ -19,74 +19,105 @@ import (
 	"time"
 )
 
-func (e *LocalCacheState) hashFile(h hash.Hash, file fs.Path) error {
-	return e.hashFilePath(h, file.Abs())
-}
-
-func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) {
+func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) error {
 	for _, dep := range targets {
 		if len(dep.Target.Out.Names()) == 0 {
 			continue
 		}
 
 		h.String(dep.Target.FQN)
-		dh := e.hashOutput(e.find(dep.Target), dep.Output)
+		dh, err := e.hashOutput(e.find(dep.Target), dep.Output)
+		if err != nil {
+			return err
+		}
 		h.String(dh)
 
 		if dep.Mode != targetspec.TargetSpecDepModeCopy {
 			h.String(string(dep.Mode))
 		}
 	}
+
+	return nil
 }
 
-func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) {
+func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) (map[string]time.Time, error) {
+	m := make(map[string]time.Time, len(files))
+
 	for _, dep := range files {
 		h.String(dep.RelRoot())
+		p := dep.Abs()
 
 		switch hashMethod {
 		case targetspec.HashFileContent:
-			err := e.hashFile(h, dep)
+			modtime, err := e.hashFilePath(h, p)
 			if err != nil {
-				panic(fmt.Errorf("hashDeps: hashFile %v %w", dep.Abs(), err))
+				return nil, fmt.Errorf("hashDeps: hashFile %v %w", dep.Abs(), err)
 			}
+			m[dep.Abs()] = modtime
 		case targetspec.HashFileModTime:
-			err := e.hashFileModTime(h, dep)
+			modtime, err := e.hashFileModTimePath(h, p)
 			if err != nil {
-				panic(fmt.Errorf("hashDeps: hashFileModTime %v %w", dep.Abs(), err))
+				return nil, fmt.Errorf("hashDeps: hashFileModTime %v %w", dep.Abs(), err)
 			}
+			m[dep.Abs()] = modtime
 		default:
-			panic(fmt.Sprintf("unhandled hash_input: %v", hashMethod))
+			return nil, fmt.Errorf("unhandled hash method: %v", hashMethod)
 		}
 	}
+
+	return m, nil
 }
 
-func (e *LocalCacheState) hashFilePath(h hash.Hash, path string) error {
+var ErrFileModifiedWhileHashing = errors.New("modified while hashing")
+
+func (e *LocalCacheState) hashFilePath(h hash.Hash, path string) (time.Time, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("stat: %w", err)
+		return time.Time{}, fmt.Errorf("stat: %w", err)
 	}
 
 	if info.Mode().Type() == os.ModeSymlink {
 		link, err := os.Readlink(path)
 		if err != nil {
-			return err
+			return time.Time{}, err
 		}
 
 		h.String(link)
-		return nil
+		return time.Time{}, nil
 	}
+
+	before := info.ModTime()
 
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return time.Time{}, fmt.Errorf("open: %w", err)
 	}
-	defer f.Close()
 
-	return e.hashFileReader(h, info, f)
+	err = e.hashFileReader(h, info, f)
+	_ = f.Close()
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	info, err = os.Lstat(path)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("stat: %w", err)
+	}
+
+	after := info.ModTime()
+
+	if before != after {
+		return time.Time{}, fmt.Errorf("%v: %w", path, ErrFileModifiedWhileHashing)
+	}
+
+	return after, nil
 }
+
+var ErrFileModifiedSinceHashing = errors.New("modified since hashing")
 
 func (e *LocalCacheState) hashFilePerm(h hash.Hash, m os.FileMode) {
 	// TODO: figure out a way to properly hash file permission, taking into account different umask
+	// See: https://medium.com/@tahteche/how-git-treats-changes-in-file-permissions-f71874ca239d
 	//h.UI32(uint32(m.Perm()))
 }
 
@@ -135,48 +166,22 @@ func (e *LocalCacheState) hashTar(h hash.Hash, r io.Reader) error {
 	})
 }
 
-func (e *LocalCacheState) hashFileModTime(h hash.Hash, file fs.Path) error {
-	return e.hashFileModTimePath(h, file.Abs())
-}
-
-func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) error {
+func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Time, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("stat: %w", err)
+		return time.Time{}, fmt.Errorf("stat: %w", err)
 	}
 
 	if info.Mode().Type() == os.ModeSymlink {
-		return fmt.Errorf("symlink cannot be hashed")
+		return time.Time{}, fmt.Errorf("symlink cannot be hashed")
 	}
+
+	modtime := info.ModTime()
 
 	e.hashFilePerm(h, info.Mode())
-	h.I64(info.ModTime().UnixNano())
+	h.I64(modtime.UnixNano())
 
-	return nil
-}
-
-func (e *LocalCacheState) hashInputFiles(h hash.Hash, target *Target) error {
-	e.hashFiles(h, targetspec.HashFileModTime, target.Deps.All().Files)
-
-	for _, dep := range target.Deps.All().Targets {
-		err := e.hashInputFiles(h, e.find(dep.Target))
-		if err != nil {
-			return err
-		}
-	}
-
-	if target.DifferentHashDeps {
-		e.hashFiles(h, targetspec.HashFileModTime, target.HashDeps.Files)
-
-		for _, dep := range target.HashDeps.Targets {
-			err := e.hashInputFiles(h, e.find(dep.Target))
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
+	return modtime, nil
 }
 
 func (e *LocalCacheState) find(t *tgt.Target) *Target {
@@ -184,7 +189,7 @@ func (e *LocalCacheState) find(t *tgt.Target) *Target {
 }
 
 func (e *LocalCacheState) HashInput(target *Target) string {
-	return e.hashInput(target)
+	return e.mustHashInput(target)
 }
 
 func hashCacheId(target *Target) string {
@@ -196,7 +201,15 @@ func hashCacheId(target *Target) string {
 	return target.FQN + idh.Sum()
 }
 
-func (e *LocalCacheState) hashInput(target *Target) string {
+func (e *LocalCacheState) mustHashInput(target *Target) string {
+	h, err := e.hashInput(target, false)
+	if err != nil {
+		panic(err)
+	}
+	return h
+}
+
+func (e *LocalCacheState) hashInput(target *Target, safe bool) (string, error) {
 	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
 	mu.Lock()
 	defer mu.Unlock()
@@ -204,7 +217,22 @@ func (e *LocalCacheState) hashInput(target *Target) string {
 	cacheId := hashCacheId(target)
 
 	if h, ok := e.cacheHashInput.GetOk(cacheId); ok {
-		return h
+		if safe {
+			if m, ok := e.cacheHashInputPathsModtime.GetOk(cacheId); ok {
+				for p, t := range m {
+					info, err := os.Lstat(p)
+					if err != nil {
+						return "", err
+					}
+
+					if info.ModTime() != t {
+						return "", fmt.Errorf("%v: %w", p, ErrFileModifiedSinceHashing)
+					}
+				}
+			}
+		}
+
+		return h, nil
 	}
 
 	start := time.Now()
@@ -212,14 +240,17 @@ func (e *LocalCacheState) hashInput(target *Target) string {
 		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	h := hash.NewDebuggableHash(target.FQN + "_hash_input")
+	h := hash.NewDebuggableHash(cacheId + "_hash_input")
 	h.I64(8) // Force break all caches
 
 	h.String("=")
 	for _, dep := range target.Tools.Targets {
 		h.String(dep.Name)
 
-		dh := e.hashOutput(e.find(dep.Target), dep.Output)
+		dh, err := e.hashOutput(e.find(dep.Target), dep.Output)
+		if err != nil {
+			return "", err
+		}
 		h.String(dh)
 	}
 
@@ -229,20 +260,45 @@ func (e *LocalCacheState) hashInput(target *Target) string {
 	})
 
 	h.String("=")
+	var pathsModtime map[string]time.Time
 	if target.DifferentHashDeps {
 		h.String("=")
-		e.hashDepsTargets(h, target.HashDeps.Targets)
-		e.hashFiles(h, target.HashFile, target.HashDeps.Files)
+		err := e.hashDepsTargets(h, target.HashDeps.Targets)
+		if err != nil {
+			return "", err
+		}
+		pathsModtime, err = e.hashFiles(h, target.HashFile, target.HashDeps.Files)
+		if err != nil {
+			return "", err
+		}
 	} else {
 		h.String("=")
+		pathsModtime = make(map[string]time.Time)
 		for _, name := range target.Deps.Names() {
 			h.String("=")
 			h.String(name)
 
 			deps := target.Deps.Name(name)
 
-			e.hashDepsTargets(h, deps.Targets)
-			e.hashFiles(h, target.HashFile, deps.Files)
+			err := e.hashDepsTargets(h, deps.Targets)
+			if err != nil {
+				return "", err
+			}
+
+			m, err := e.hashFiles(h, target.HashFile, deps.Files)
+			if err != nil {
+				return "", err
+			}
+
+			for p, t := range m {
+				if pt, ok := pathsModtime[p]; ok {
+					if t != pt {
+						return "", fmt.Errorf("%v: %w", p, ErrFileModifiedWhileHashing)
+					}
+				} else {
+					pathsModtime[p] = t
+				}
+			}
 		}
 	}
 
@@ -284,24 +340,38 @@ func (e *LocalCacheState) hashInput(target *Target) string {
 	sh := h.Sum()
 
 	e.cacheHashInput.Set(cacheId, sh)
+	e.cacheHashInputPathsModtime.Set(cacheId, pathsModtime)
 
-	return sh
+	return sh, nil
 }
 
 func (e *LocalCacheState) HashOutput(target *Target, output string) string {
-	return e.hashOutput(target, output)
+	return e.mustHashOutput(target, output)
 }
 
-func (e *LocalCacheState) hashOutput(target *Target, output string) string {
+func (e *LocalCacheState) mustHashOutput(target *Target, output string) string {
+	h, err := e.hashOutput(target, output)
+	if err != nil {
+		panic(err)
+	}
+
+	return h
+}
+
+func (e *LocalCacheState) hashOutput(target *Target, output string) (string, error) {
 	mu := e.cacheHashOutputTargetMutex.Get(target.FQN + "|" + output)
 	mu.Lock()
 	defer mu.Unlock()
 
-	hashInput := e.hashInput(target)
+	hashInput, err := e.hashInput(target, false)
+	if err != nil {
+		return "", err
+	}
+
 	cacheId := target.FQN + "|" + output + "_" + hashInput
 
 	if h, ok := e.cacheHashOutput.GetOk(cacheId); ok {
-		return h
+		return h, nil
 	}
 
 	start := time.Now()
@@ -310,7 +380,7 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) string {
 	}()
 
 	if !target.OutWithSupport.HasName(output) {
-		panic(fmt.Sprintf("%v does not output `%v`", target, output))
+		return "", fmt.Errorf("%v does not output `%v`", target, output)
 	}
 
 	file := e.cacheDir(target).Join(target.Artifacts.OutHash(output).FileName()).Abs()
@@ -322,29 +392,32 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) string {
 	if sh := strings.TrimSpace(string(b)); len(sh) > 0 {
 		e.cacheHashOutput.Set(cacheId, sh)
 
-		return sh
+		return sh, nil
 	}
 
 	// Sanity check, will bomb if not called in the right order
 	_ = target.ActualOutFiles()
 
-	h := hash.NewDebuggableHash(target.FQN + "_hash_out_" + output)
+	h := hash.NewDebuggableHash(cacheId + "_hash_out")
 
 	h.String(output)
 
 	r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(output), e.cacheDir(target).Abs())
 	if err != nil {
-		panic(fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.FQN, output, err))
+		return "", fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.FQN, output, err)
 	}
 	defer r.Close()
 
 	err = e.hashTar(h, r)
 	if err != nil {
-		panic(fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, output, err))
+		return "", fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, output, err)
 	}
 
 	if target.HasSupportFiles && output != targetspec.SupportFilesOutput {
-		sh := e.hashOutput(target, targetspec.SupportFilesOutput)
+		sh, err := e.hashOutput(target, targetspec.SupportFilesOutput)
+		if err != nil {
+			return "", err
+		}
 		h.String(sh)
 	}
 
@@ -352,11 +425,11 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) string {
 
 	e.cacheHashOutput.Set(cacheId, sh)
 
-	return sh
+	return sh, nil
 }
 
 func (e *LocalCacheState) cacheDir(target *Target) fs.Path {
-	return e.cacheDirForHash(target, e.hashInput(target))
+	return e.cacheDirForHash(target, e.mustHashInput(target))
 }
 
 func (e *LocalCacheState) cacheDirForHash(target *Target, inputHash string) fs.Path {

@@ -61,6 +61,17 @@ func (m *Map[K, V]) Delete(k K) {
 	delete(m.m, k)
 }
 
+func (m *Map[K, V]) DeleteP(p func(K) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for k := range m.m {
+		if p(k) {
+			delete(m.m, k)
+		}
+	}
+}
+
 func (m *Map[K, V]) GetOk(k K) (V, bool) {
 	return m.getFast(k)
 }
