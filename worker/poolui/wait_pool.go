@@ -120,8 +120,8 @@ var TUIStack []byte
 
 func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	if !TUIm.TryLock() {
-		TUIm.Lock()
 		//panic(fmt.Sprintf("concurrent call of poolui.Wait, already running at:\n%s\ntrying to run at", stack))
+		return logUI(name, deps, pool)
 	}
 
 	TUIStack = debug.Stack()
