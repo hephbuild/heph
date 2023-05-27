@@ -19,7 +19,7 @@ type State struct {
 
 	targetsLock  maps.KMutex
 	targets      *Targets
-	tools        *Targets
+	Tools        *Targets
 	codegenPaths map[string]*Target
 	dag          *DAG
 	labels       *sets.StringSet
@@ -125,7 +125,7 @@ func NewState(root *hroot.State, cfg *config.Config) (*State, error) {
 		Config:       &Config{Config: cfg},
 		targetsLock:  maps.KMutex{},
 		targets:      targets,
-		tools:        NewTargets(0),
+		Tools:        NewTargets(0),
 		codegenPaths: map[string]*Target{},
 		dag:          &DAG{dag.NewDAG(), targets},
 		labels:       sets.NewStringSet(0),

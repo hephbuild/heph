@@ -40,7 +40,7 @@ func (ts *Targets) FQNs() []string {
 		return nil
 	}
 
-	fqns := make([]string, 0)
+	fqns := make([]string, 0, len(ts.Slice()))
 	for _, target := range ts.Slice() {
 		fqns = append(fqns, target.FQN)
 	}
@@ -53,7 +53,7 @@ func (ts *Targets) Specs() targetspec.TargetSpecs {
 		return nil
 	}
 
-	specs := make([]targetspec.TargetSpec, 0)
+	specs := make([]targetspec.TargetSpec, 0, len(ts.Slice()))
 	for _, target := range ts.Slice() {
 		specs = append(specs, target.TargetSpec)
 	}

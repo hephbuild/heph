@@ -1,5 +1,3 @@
-//go:build ignored
-
 package engine
 
 import (
@@ -29,7 +27,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 	log.Tracef("Installing tools")
 
-	fqns := e.tools.FQNs()
+	fqns := e.Graph.Tools.FQNs()
 	sort.Strings(fqns)
 
 	h := hash.NewHash()
@@ -40,7 +38,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 	toolsHash := h.Sum()
 
-	hashPath := e.HomeDir.Join("tmp", "tools_install").Abs()
+	hashPath := e.Root.Home.Join("tmp", "tools_install").Abs()
 
 	b, err := os.ReadFile(hashPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -52,7 +50,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 		return nil
 	}
 
-	dir := e.HomeDir.Join("bin")
+	dir := e.Root.Home.Join("bin")
 
 	err = os.RemoveAll(dir.Abs())
 	if err != nil {
@@ -64,7 +62,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 		return err
 	}
 
-	for _, target := range e.tools.Slice() {
+	for _, target := range e.Graph.Tools.Slice() {
 		log.Tracef("Installing tool %v", target.FQN)
 
 		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.FQN)

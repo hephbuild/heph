@@ -84,7 +84,7 @@ func (e *State) processTarget(t *Target) error {
 	}
 
 	if t.IsTool() {
-		e.tools.Add(t)
+		e.Tools.Add(t)
 	}
 
 	e.registerLabels(t.Labels)
