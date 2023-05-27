@@ -92,12 +92,6 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 				}
 			}
 
-			observability.Status(ctx, observability.StringStatus("Storing cache..."))
-			err = e.StoreAutocompleteCache(ctx)
-			if err != nil {
-				log.Warnf("autocomplete cache: %v", err)
-			}
-
 			return nil
 		},
 	})

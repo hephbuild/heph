@@ -52,8 +52,6 @@ type Engine struct {
 
 	DisableNamedCacheWrite bool
 
-	autocompleteHash string
-
 	toolsLock             flock.Locker
 	autocompleteCacheLock flock.Locker
 

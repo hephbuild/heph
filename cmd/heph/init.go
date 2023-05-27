@@ -165,20 +165,6 @@ func preRunAutocomplete(ctx context.Context, includePrivate bool) (targetspec.Ta
 		return nil, nil, err
 	}
 
-	cache, err := bs.Engine.LoadAutocompleteCache()
-	if err != nil {
-		log.Warnf("autocomplete cache: %v", err)
-	}
-
-	if cache != nil {
-		targets := cache.Targets
-		if !includePrivate {
-			targets = cache.PublicTargets()
-		}
-
-		return targets, cache.Labels(), nil
-	}
-
 	err = preRunWithGenWithOpts(ctx, PreRunOpts{Engine: bs.Engine})
 	if err != nil {
 		return nil, nil, err
