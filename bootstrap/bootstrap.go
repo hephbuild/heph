@@ -225,20 +225,12 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 		}
 	}
 
-	// TODO
-	//if cfg.Engine.InstallTools {
-	//	err = e.InstallTools(ctx)
-	//	if err != nil {
-	//		return bs, err
-	//	}
-	//}
-
 	bs.PlatformProviders = platform.Bootstrap(cfg)
 
 	return bs, nil
 }
 
-func BootEngine(bs Bootstrap) (*engine.Engine, error) {
+func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 	localCache, err := engine.NewState(bs.Root, bs.Graph, bs.Observability)
 	if err != nil {
 		return nil, err
@@ -264,6 +256,13 @@ func BootEngine(bs Bootstrap) (*engine.Engine, error) {
 
 	localCache.Targets = e.Targets
 
+	if bs.Config.Engine.InstallTools {
+		err = e.InstallTools(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return e, nil
 }
 
@@ -281,7 +280,7 @@ func BootWithEngine(ctx context.Context, opts BootOpts) (EngineBootstrap, error)
 	}
 	ebs.Bootstrap = bs
 
-	e, err := BootEngine(bs)
+	e, err := BootEngine(ctx, bs)
 	if err != nil {
 		return ebs, err
 	}
