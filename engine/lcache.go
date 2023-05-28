@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/hroot"
 	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/flock"
@@ -67,9 +68,9 @@ func (e *LocalCacheState) storeCache(ctx context.Context, target *Target, outRoo
 	}
 
 	if target.Cache.Enabled {
-		observability.Status(ctx, TargetStatus(target, "Caching..."))
+		status.Emit(ctx, TargetStatus(target, "Caching..."))
 	} else if len(target.Artifacts.Out) > 0 {
-		observability.Status(ctx, TargetStatus(target, "Storing output..."))
+		status.Emit(ctx, TargetStatus(target, "Storing output..."))
 	}
 
 	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target.Target.Target)

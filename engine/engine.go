@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/hroot"
 	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
@@ -277,7 +278,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func TargetStatus(t targetspec.Specer, status string) observability.StatusFactory {
+func TargetStatus(t targetspec.Specer, status string) status.Statuser {
 	return targetStatus{t.Spec().FQN, "", status}
 }
 
@@ -306,7 +307,7 @@ func (t targetStatus) String(r *lipgloss.Renderer) string {
 	return target.Render(t.fqn) + outputStr + " " + t.status
 }
 
-func TargetOutputStatus(t *Target, output string, status string) observability.StatusFactory {
+func TargetOutputStatus(t *Target, output string, status string) status.Statuser {
 	if output == "" {
 		output = "-"
 	}

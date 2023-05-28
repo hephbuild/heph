@@ -6,7 +6,7 @@ import (
 	"github.com/c2fo/vfs/v6/backend/os"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
@@ -121,7 +121,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error)
 	cachePath := e.tmpRoot("caches_order").Abs()
 
 	names, _ := utils.HashCache(cachePath, cacheHash, func() ([]string, error) {
-		observability.Status(ctx, observability.StringStatus("Measuring caches latency..."))
+		status.Emit(ctx, status.String("Measuring caches latency..."))
 		ordered := orderCaches(ctx, e.Config.Caches)
 
 		return ads.Map(ordered, func(c graph.CacheConfig) string {
@@ -139,10 +139,17 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error)
 	for _, name := range names {
 		c := cacheMap[name]
 		if c.Secondary {
+			// Use only one secondary
 			if hasSecondary {
 				continue
 			}
 			hasSecondary = true
+		} else {
+			// It's a primary cache, and its first, stop looking for other caches
+			if len(ordered) == 0 {
+				ordered = append(ordered, c)
+				break
+			}
 		}
 		ordered = append(ordered, c)
 	}

@@ -1,4 +1,4 @@
-package observability
+package status
 
 import (
 	"context"
@@ -6,22 +6,22 @@ import (
 	"github.com/hephbuild/heph/log/log"
 )
 
-type StatusHandler interface {
-	Status(status StatusFactory)
+type Handler interface {
+	Status(status Statuser)
 }
 
-type StatusFactory interface {
+type Statuser interface {
 	String(r *lipgloss.Renderer) string
 }
 
 type ctxkey struct{}
 
-func ContextWithStatus(ctx context.Context, handler StatusHandler) context.Context {
+func ContextWithStatus(ctx context.Context, handler Handler) context.Context {
 	return context.WithValue(ctx, ctxkey{}, handler)
 }
 
-func Status(ctx context.Context, s StatusFactory) {
-	if h, ok := ctx.Value(ctxkey{}).(StatusHandler); ok {
+func Emit(ctx context.Context, s Statuser) {
+	if h, ok := ctx.Value(ctxkey{}).(Handler); ok {
 		h.Status(s)
 	} else {
 		r := log.Renderer()
@@ -29,7 +29,7 @@ func Status(ctx context.Context, s StatusFactory) {
 	}
 }
 
-func StringStatus(status string) StatusFactory {
+func String(status string) Statuser {
 	return stringStatus(status)
 }
 

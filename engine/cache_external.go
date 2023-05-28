@@ -7,7 +7,7 @@ import (
 	"github.com/c2fo/vfs/v6"
 	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/worker"
@@ -168,7 +168,7 @@ func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache g
 		return nil
 	}
 
-	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
+	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target.Target, cache.Name, artifact)
 	defer span.EndError(rerr)
@@ -195,7 +195,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 		span.EndError(rerr)
 	}()
 
-	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	err := target.cacheLocks[artifact.Name()].Lock(ctx)
 	if err != nil {
@@ -241,7 +241,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 }
 
 func (e *Engine) existsExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (bool, error) {
-	observability.Status(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
+	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	root, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {
