@@ -3,6 +3,7 @@ package flock
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/engine/status"
 	log "github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/utils/fs"
 	"golang.org/x/sys/unix"
@@ -101,9 +102,9 @@ func (l *Flock) Lock(ctx context.Context) error {
 			}
 
 			if len(pid) > 0 {
-				logger.Warnf("Looks like process with PID %s has already acquired the lock for %s. Waiting for it to finish...", pid, l.name)
+				status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", pid, l.name)))
 			} else {
-				logger.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", l.name)
+				status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", l.name)))
 			}
 		}()
 

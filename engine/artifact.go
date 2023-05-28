@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/fs"
@@ -40,7 +40,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 				return uncompressedPath, nil
 			}
 
-			observability.Status(ctx, TargetOutputStatus(target, artifact.Name(), "Decompressing..."))
+			status.Emit(ctx, TargetOutputStatus(target, artifact.Name(), "Decompressing..."))
 
 			log.Debugf("ungz %v to %v", gzPath, uncompressedPath)
 

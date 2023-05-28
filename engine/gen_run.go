@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
@@ -76,7 +76,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 		Name: "finalize gen",
 		Deps: ge.deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			observability.Status(ctx, observability.StringStatus("Finalizing gen..."))
+			status.Emit(ctx, status.String("Finalizing gen..."))
 
 			// free references to starlark
 			for _, p := range e.Packages.All() {
@@ -84,7 +84,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 			}
 
 			if linkAll {
-				observability.Status(ctx, observability.StringStatus("Linking targets..."))
+				status.Emit(ctx, status.String("Linking targets..."))
 
 				err := e.Graph.LinkTargets(ctx, false, nil)
 				if err != nil {
@@ -127,7 +127,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 		Name: "ScheduleGeneratedPipeline " + e.Name,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			observability.Status(ctx, observability.StringStatus(fmt.Sprintf("Finalizing generated %v...", e.Name)))
+			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated %v...", e.Name)))
 
 			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
@@ -207,7 +207,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 				})
 
 				for _, file := range files {
-					observability.Status(ctx, observability.StringStatus(fmt.Sprintf("Running %v", file.RelRoot())))
+					status.Emit(ctx, status.String(fmt.Sprintf("Running %v", file.RelRoot())))
 
 					ppath := filepath.Dir(file.RelRoot())
 					pkg := e.Packages.GetOrCreate(packages.Package{

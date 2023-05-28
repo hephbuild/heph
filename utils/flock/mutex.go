@@ -3,7 +3,7 @@ package flock
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/engine/status"
 )
 
 func NewMutex(name string) Locker {
@@ -42,7 +42,8 @@ func (m *mutex) Lock(ctx context.Context) error {
 		return nil
 	}
 
-	log.Warnf("Looks like another process has already acquired the lock for %s. Waiting for it to finish...", m.name)
+	status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", m.name)))
+
 	select {
 	case m.ch <- struct{}{}:
 		return nil

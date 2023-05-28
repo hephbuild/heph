@@ -17,7 +17,7 @@ func HashCache[T any](path, h string, do func() (T, error)) (T, error) {
 
 	b, err := os.ReadFile(path)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Warnf("cache: %v", err)
+		log.Warnf("cache: %v: %v", path, err)
 	}
 
 	log.Tracef("hash: %v", h)
@@ -25,7 +25,7 @@ func HashCache[T any](path, h string, do func() (T, error)) (T, error) {
 	if len(b) > 0 {
 		err = json.Unmarshal(b, &data)
 		if err != nil {
-			log.Warnf("cache: %v", err)
+			log.Warnf("cache: json: %v: %v", path, err)
 		}
 	}
 

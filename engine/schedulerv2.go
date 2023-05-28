@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
@@ -103,7 +103,7 @@ func (s *schedulerv2) schedule() error {
 			Name: "pull_meta " + target.FQN,
 			Deps: pmdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				observability.Status(ctx, TargetStatus(target, "Scheduling analysis..."))
+				status.Emit(ctx, TargetStatus(target, "Scheduling analysis..."))
 
 				if isSkip {
 					d, err := s.ScheduleTargetDepsOnce(ctx, target)

@@ -8,7 +8,7 @@ import (
 	ptylib "github.com/creack/pty"
 	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/hephprovider"
 	"github.com/hephbuild/heph/log/log"
@@ -148,7 +148,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
-	observability.Status(ctx, TargetStatus(target, "Creating sandbox..."))
+	status.Emit(ctx, TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
@@ -581,7 +581,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		dir = e.Cwd
 	}
 
-	observability.Status(ctx, TargetStatus(target, "Running..."))
+	status.Emit(ctx, TargetStatus(target, "Running..."))
 
 	var logFilePath string
 	if target.IsGroup() && !rr.Shell {
@@ -793,7 +793,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				observability.Status(ctx, TargetStatus(target, "Clearing sandbox..."))
+				status.Emit(ctx, TargetStatus(target, "Clearing sandbox..."))
 				err = deleteDir(target.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
@@ -881,7 +881,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	}
 
 	if shouldExpand {
-		observability.Status(ctx, TargetStatus(target, "Expanding cache..."))
+		status.Emit(ctx, TargetStatus(target, "Expanding cache..."))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
 		err := os.RemoveAll(tmpOutDir)
@@ -931,7 +931,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	target.OutExpansionRoot = &outDir
 
 	if len(target.OutWithSupport.All()) > 0 {
-		observability.Status(ctx, TargetStatus(target, "Hydrating output..."))
+		status.Emit(ctx, TargetStatus(target, "Hydrating output..."))
 	}
 
 	err = e.populateActualFilesFromTar(ctx, target, outputs)
@@ -961,7 +961,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 
 func (e *Engine) gc(ctx context.Context, target *Target) error {
 	if target.Cache.Enabled && e.Config.Engine.GC {
-		observability.Status(ctx, TargetStatus(target, "GC..."))
+		status.Emit(ctx, TargetStatus(target, "GC..."))
 
 		err := e.LocalCache.GCTargets([]*Target{target}, nil, false)
 		if err != nil {
@@ -977,7 +977,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 		return nil
 	}
 
-	observability.Status(ctx, TargetStatus(target, "Linking output..."))
+	status.Emit(ctx, TargetStatus(target, "Linking output..."))
 
 	for name, paths := range target.Out.Named() {
 		if err := ctx.Err(); err != nil {

@@ -46,7 +46,7 @@ if [ "$1" = "--dev" ]; then
 elif [ "$1" = "--build" ]; then
     # For local consumption only
     echo "Building..."
-    go build -o /tmp/heph heph/cmd/heph
+    go build -o /tmp/heph github.com/hephbuild/heph/cmd/heph
 	  mv /tmp/heph "$LOCATION/bin/heph"
 else
     echo "Downloading Heph ${VERSION}..."

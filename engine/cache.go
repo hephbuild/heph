@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/engine/artifacts"
 	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/engine/status"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/utils/fs"
@@ -42,7 +43,7 @@ func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outp
 }
 
 func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
-	observability.Status(ctx, TargetStatus(target, "Checking local cache..."))
+	status.Emit(ctx, TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false, uncompress)
@@ -54,7 +55,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 		return false, true, nil
 	}
 
-	observability.Status(ctx, TargetStatus(target, "Checking remote caches..."))
+	status.Emit(ctx, TargetStatus(target, "Checking remote caches..."))
 
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
