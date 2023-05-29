@@ -2,8 +2,8 @@ package engine
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/engine/graph"
 	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/graph"
 )
 
 var utilFunctions = map[string]exprs.Func{

@@ -8,7 +8,7 @@ import (
 	"github.com/hephbuild/heph/hephprovider"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/flock"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/mitchellh/go-homedir"
 	"io"
 	"net/http"
@@ -30,7 +30,7 @@ func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
 		return nil
 	}
 
-	lock := flock.NewFlock("heph update", filepath.Join(homeDir, "update.lock"))
+	lock := locks.NewFlock("heph update", filepath.Join(homeDir, "update.lock"))
 	err = lock.Lock(ctx)
 	if err != nil {
 		return fmt.Errorf("Failed to lock %v", err)

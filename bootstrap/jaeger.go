@@ -2,8 +2,8 @@ package bootstrap
 
 import (
 	"context"
-	"github.com/hephbuild/heph/engine/observability"
-	obotlp "github.com/hephbuild/heph/engine/observability/otlp"
+	"github.com/hephbuild/heph/observability"
+	obotlp "github.com/hephbuild/heph/observability/otlp"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"go.opentelemetry.io/otel/exporters/jaeger"
 	"go.opentelemetry.io/otel/sdk/resource"

@@ -1,7 +1,7 @@
 package engine
 
 import (
-	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/sets"
 )

@@ -1,11 +1,11 @@
 package tgt
 
 import (
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"sort"
 )
 
-type NamedPaths[TS ~[]T, T fs.RelablePath] struct {
+type NamedPaths[TS ~[]T, T xfs.RelablePath] struct {
 	names  []string
 	named  map[string]TS
 	namedm map[string]map[string]struct{}
@@ -95,8 +95,8 @@ func (tp *NamedPaths[TS, T]) Sort() {
 	}
 }
 
-func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) fs.Paths {
-	ps := make(fs.Paths, 0, len(paths))
+func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) xfs.Paths {
+	ps := make(xfs.Paths, 0, len(paths))
 	for _, path := range paths {
 		ps = append(ps, path.WithRoot(root))
 	}
@@ -104,10 +104,10 @@ func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) fs.Paths {
 	return ps
 }
 
-func (tp NamedPaths[TS, T]) WithRoot(root string) *NamedPaths[fs.Paths, fs.Path] {
-	ntp := &NamedPaths[fs.Paths, fs.Path]{
+func (tp NamedPaths[TS, T]) WithRoot(root string) *NamedPaths[xfs.Paths, xfs.Path] {
+	ntp := &NamedPaths[xfs.Paths, xfs.Path]{
 		names: tp.names,
-		named: map[string]fs.Paths{},
+		named: map[string]xfs.Paths{},
 		all:   tp.withRoot(tp.all, root),
 	}
 

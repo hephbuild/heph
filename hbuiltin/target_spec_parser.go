@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xfs"
 	"go.starlark.net/starlark"
 	"runtime"
 	"strconv"
@@ -155,7 +156,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 	}
 
-	utils.SortP(t.Out,
+	ads.SortP(t.Out,
 		func(i, j *targetspec.TargetSpecOutFile) int {
 			return strings.Compare(i.Path, j.Path)
 		},
@@ -229,7 +230,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 
 		for _, file := range t.Out {
-			if utils.IsGlob(file.Path) {
+			if xfs.IsGlob(file.Path) {
 				return targetspec.TargetSpec{}, fmt.Errorf("codegen targets must not have glob outputs")
 			}
 		}
@@ -379,7 +380,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspe
 		td = d
 	}
 
-	utils.SortP(td.Exprs,
+	ads.SortP(td.Exprs,
 		func(i, j *targetspec.TargetSpecDepExpr) int {
 			return strings.Compare(i.Expr.String, j.Expr.String)
 		},
@@ -388,7 +389,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspe
 		},
 	)
 
-	utils.SortP(td.Targets,
+	ads.SortP(td.Targets,
 		func(i, j *targetspec.TargetSpecDepTarget) int {
 			return strings.Compare(i.Target, j.Target)
 		},
@@ -397,7 +398,7 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspe
 		},
 	)
 
-	utils.SortP(td.Files,
+	ads.SortP(td.Files,
 		func(i, j *targetspec.TargetSpecDepFile) int {
 			return strings.Compare(i.Path, j.Path)
 		},

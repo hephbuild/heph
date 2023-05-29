@@ -4,23 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/observability"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/rcache"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 )
 
 // Deprecated: use LocalCache.cacheDir
-func (e *Engine) cacheDir(target *Target) fs.Path {
+func (e *Engine) cacheDir(target *Target) xfs.Path {
 	return e.LocalCache.cacheDir(target)
 }
 
 // Deprecated: use LocalCache.cacheDirForHash
-func (e *Engine) cacheDirForHash(target *Target, inputHash string) fs.Path {
+func (e *Engine) cacheDirForHash(target *Target, inputHash string) xfs.Path {
 	return e.LocalCache.cacheDirForHash(target, inputHash)
 }
 
@@ -168,7 +168,7 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 
 	for _, name := range []string{artifact.FileName(), artifact.GzFileName()} {
 		p := cacheDir.Join(name).Abs()
-		if fs.PathExists(p) {
+		if xfs.PathExists(p) {
 			setCacheHit(true)
 			return true
 		}

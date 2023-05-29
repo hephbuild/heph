@@ -5,21 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	fs2 "github.com/hephbuild/heph/utils/fs"
-	"github.com/hephbuild/heph/utils/hio"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xio"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-type TarFile struct {
+type File struct {
 	From string
 	To   string
 }
 
-func tarWriteEntry(file TarFile, tw *tar.Writer, info os.FileInfo) error {
+func tarWriteEntry(file File, tw *tar.Writer, info os.FileInfo) error {
 	var link string
 	if info.Mode().Type() == os.ModeSymlink {
 		l, err := os.Readlink(file.From)
@@ -62,7 +62,7 @@ func tarWriteEntry(file TarFile, tw *tar.Writer, info os.FileInfo) error {
 	return nil
 }
 
-func tarWriteDir(file TarFile, tw *tar.Writer) error {
+func tarWriteDir(file File, tw *tar.Writer) error {
 	return filepath.WalkDir(file.From, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -82,14 +82,14 @@ func tarWriteDir(file TarFile, tw *tar.Writer) error {
 			return err
 		}
 
-		return tarWriteEntry(TarFile{
+		return tarWriteEntry(File{
 			From: path,
 			To:   filepath.Join(file.To, rel),
 		}, tw, info)
 	})
 }
 
-func Tar(w io.Writer, files []TarFile) error {
+func Tar(w io.Writer, files []File) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
@@ -157,7 +157,7 @@ func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
 }
 
 func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
-	inc, cancel := hio.ContextReader(ctx, in)
+	inc, cancel := xio.ContextReader(ctx, in)
 	defer cancel()
 
 	return Untar(inc, to, o)
@@ -188,7 +188,7 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 			o.Dedup.Add(dest)
 		}
 
-		err := fs2.CreateParentDir(dest)
+		err := xfs.CreateParentDir(dest)
 		if err != nil {
 			return err
 		}
@@ -213,7 +213,7 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 
 			recordFile(hdr.Name)
 
-			if fs2.PathExists(dest) {
+			if xfs.PathExists(dest) {
 				return nil
 			}
 
@@ -230,7 +230,7 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 }
 
 func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string, error) {
-	if fs2.PathExists(listPath) {
+	if xfs.PathExists(listPath) {
 		f, err := os.Open(listPath)
 		if err != nil {
 			return nil, err
@@ -246,7 +246,7 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string
 
 	recordFile, complete := tarListFactory(listPath)
 
-	inc, cancel := hio.ContextReader(ctx, in)
+	inc, cancel := xio.ContextReader(ctx, in)
 	defer cancel()
 
 	err := Walk(inc, func(hdr *tar.Header, tr *tar.Reader) error {
@@ -271,7 +271,7 @@ func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Rea
 	}
 	defer tarf.Close()
 
-	tarfc, cancel := hio.ContextReader(ctx, tarf)
+	tarfc, cancel := xio.ContextReader(ctx, tarf)
 	defer cancel()
 
 	return Walk(tarfc, fs...)

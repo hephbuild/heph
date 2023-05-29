@@ -2,8 +2,8 @@ package tgt
 
 import (
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xfs"
 	"strings"
 )
 
@@ -24,15 +24,15 @@ func (t TargetWithOutput) Full() string {
 
 type TargetDeps struct {
 	Targets []TargetWithOutput
-	Files   []fs.Path
+	Files   []xfs.Path
 }
 
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
-	nd.Targets = utils.DedupAppend(d.Targets, func(t TargetWithOutput) string {
+	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) string {
 		return t.Full()
 	}, deps.Targets...)
-	nd.Files = utils.DedupAppend(d.Files, func(path fs.Path) string {
+	nd.Files = ads.DedupAppend(d.Files, func(path xfs.Path) string {
 		return path.RelRoot()
 	}, deps.Files...)
 
@@ -40,16 +40,16 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 }
 
 func (d *TargetDeps) Dedup() {
-	d.Targets = utils.Dedup(d.Targets, func(t TargetWithOutput) string {
+	d.Targets = ads.Dedup(d.Targets, func(t TargetWithOutput) string {
 		return t.Full()
 	})
-	d.Files = utils.Dedup(d.Files, func(path fs.Path) string {
+	d.Files = ads.Dedup(d.Files, func(path xfs.Path) string {
 		return path.RelRoot()
 	})
 }
 
 func (d TargetDeps) Sort() {
-	utils.SortP(d.Targets,
+	ads.SortP(d.Targets,
 		func(i, j *TargetWithOutput) int {
 			return strings.Compare(i.Target.FQN, j.Target.FQN)
 		},
@@ -58,7 +58,7 @@ func (d TargetDeps) Sort() {
 		},
 	)
 
-	utils.Sort(d.Files, func(i, j fs.Path) int {
+	ads.Sort(d.Files, func(i, j xfs.Path) int {
 		return strings.Compare(i.RelRoot(), j.RelRoot())
 	})
 }

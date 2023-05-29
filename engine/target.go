@@ -1,27 +1,27 @@
 package engine
 
 import (
-	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/flock"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xfs"
 )
 
-type ActualOutNamedPaths = tgt.NamedPaths[fs.Paths, fs.Path]
+type ActualOutNamedPaths = tgt.NamedPaths[xfs.Paths, xfs.Path]
 
 type Target struct {
 	*graph.Target
 
-	WorkdirRoot        fs.Path
-	SandboxRoot        fs.Path
-	actualSupportFiles fs.Paths
+	WorkdirRoot        xfs.Path
+	SandboxRoot        xfs.Path
+	actualSupportFiles xfs.Paths
 	actualOutFiles     *ActualOutNamedPaths
-	OutExpansionRoot   *fs.Path
+	OutExpansionRoot   *xfs.Path
 
-	runLock         flock.Locker
-	postRunWarmLock flock.Locker
-	cacheLocks      map[string]flock.Locker
+	runLock         locks.Locker
+	postRunWarmLock locks.Locker
+	cacheLocks      map[string]locks.Locker
 }
 
 func (t *Target) ID() string {
@@ -40,7 +40,7 @@ func (t *Target) String() string {
 	return t.FQN
 }
 
-func (t *Target) ActualSupportFiles() fs.Paths {
+func (t *Target) ActualSupportFiles() xfs.Paths {
 	if t.actualSupportFiles == nil {
 		panic("actualSupportFiles is nil for " + t.FQN)
 	}

@@ -4,12 +4,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine/buildfiles"
-	"github.com/hephbuild/heph/engine/hroot"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
-	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"io"
@@ -91,7 +91,7 @@ func TestTargetSpec(t *testing.T) {
 
 			pkg := &packages.Package{
 				Path: "some/test",
-				Root: fs2.NewPath(
+				Root: xfs.NewPath(
 					"/tmp/some/test",
 					"some/test",
 				),

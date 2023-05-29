@@ -4,27 +4,26 @@ import (
 	"context"
 	"fmt"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/buildfiles"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/hroot"
-	"github.com/hephbuild/heph/engine/observability"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/buildfiles"
+	graph2 "github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
+	observability2 "github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
-	"github.com/hephbuild/heph/utils/flock"
-	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/instance"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
 	"io/fs"
 	"os"
@@ -39,25 +38,25 @@ import (
 type Engine struct {
 	Cwd               string
 	Root              *hroot.State
-	Config            *graph.Config
-	Observability     *observability.Observability
+	Config            *graph2.Config
+	Observability     *observability2.Observability
 	GetFlowID         func() string
 	PlatformProviders []platform.PlatformProvider
 	LocalCache        *LocalCacheState
 	RemoteCacheHints  *rcache.HintStore
 	Packages          *packages.Registry
 	BuildFilesState   *buildfiles.State
-	Graph             *graph.State
+	Graph             *graph2.State
 	Pool              *worker.Pool
 	Finalizers        *finalizers.Finalizers
 
 	DisableNamedCacheWrite bool
 
-	toolsLock             flock.Locker
-	autocompleteCacheLock flock.Locker
+	toolsLock             locks.Locker
+	autocompleteCacheLock locks.Locker
 
-	orderedCachesLock flock.Locker
-	orderedCaches     []graph.CacheConfig
+	orderedCachesLock locks.Locker
+	orderedCaches     []graph2.CacheConfig
 
 	Targets *TargetMetas
 
@@ -65,7 +64,7 @@ type Engine struct {
 }
 
 type TargetRunRequest struct {
-	Target *graph.Target
+	Target *graph2.Target
 	Args   []string
 	Mode   string // run or watch
 	TargetRunRequestOpts
@@ -91,7 +90,7 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 	return false
 }
 
-func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
+func (rrs TargetRunRequests) Get(t *graph2.Target) TargetRunRequest {
 	for _, rr := range rrs {
 		if rr.Target.FQN == t.FQN {
 			return rr
@@ -101,8 +100,8 @@ func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
 	return TargetRunRequest{Target: t}
 }
 
-func (rrs TargetRunRequests) Targets() *graph.Targets {
-	ts := graph.NewTargets(len(rrs))
+func (rrs TargetRunRequests) Targets() *graph2.Targets {
+	ts := graph2.NewTargets(len(rrs))
 
 	for _, rr := range rrs {
 		ts.Add(rr.Target)
@@ -131,20 +130,20 @@ func New(e Engine) *Engine {
 
 		t := &Target{
 			Target:           gtarget,
-			WorkdirRoot:      fs2.Path{},
-			SandboxRoot:      fs2.Path{},
+			WorkdirRoot:      xfs.Path{},
+			SandboxRoot:      xfs.Path{},
 			OutExpansionRoot: nil, // Set during execution
 			runLock:          nil, // Set after
 			postRunWarmLock:  e.lockFactory(gtarget, "postrunwarm"),
 			cacheLocks:       nil, // Set after
 		}
 		if t.ConcurrentExecution {
-			t.runLock = flock.NewMutex(t.FQN)
+			t.runLock = locks.NewMutex(t.FQN)
 		} else {
 			t.runLock = e.lockFactory(t, "run")
 		}
 
-		t.cacheLocks = make(map[string]flock.Locker, len(t.Artifacts.All()))
+		t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
 		for _, artifact := range t.Artifacts.All() {
 			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 		}
@@ -156,24 +155,24 @@ func New(e Engine) *Engine {
 			t.WorkdirRoot = t.SandboxRoot
 		}
 
-		t.cacheLocks = make(map[string]flock.Locker, len(t.Artifacts.All()))
+		t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
 		for _, artifact := range t.Artifacts.All() {
 			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 		}
 
 		return t
 	})
-	e.toolsLock = flock.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
-	e.autocompleteCacheLock = flock.NewFlock("Autocomplete cache", e.Root.Home.Join("tmp", "ac_cache.lock").Abs())
-	e.orderedCachesLock = flock.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
+	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
+	e.autocompleteCacheLock = locks.NewFlock("Autocomplete cache", e.Root.Home.Join("tmp", "ac_cache.lock").Abs())
+	e.orderedCachesLock = locks.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
 	return &e
 }
 
-func (e *Engine) lockFactory(t targetspec.Specer, resource string) flock.Locker {
+func (e *Engine) lockFactory(t targetspec.Specer, resource string) locks.Locker {
 	ts := t.Spec()
 	p := e.lockPath(t, resource)
 
-	return flock.NewFlock(ts.FQN+" ("+resource+")", p)
+	return locks.NewFlock(ts.FQN+" ("+resource+")", p)
 }
 
 type ErrorWithLogFile struct {
@@ -196,7 +195,7 @@ func (t ErrorWithLogFile) Is(target error) bool {
 }
 
 type TargetFailedError struct {
-	Target *graph.Target
+	Target *graph2.Target
 	Err    error
 }
 
@@ -250,7 +249,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph2.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -318,7 +317,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.FQN,
 		Deps: deps,
-		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
+		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability2.TargetSpan) {
 			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -383,7 +382,7 @@ func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, out
 	return tp, nil
 }
 
-func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (fs2.Paths, error) {
+func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (xfs.Paths, error) {
 	r, err := artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
 	if err != nil {
 		return nil, err
@@ -395,9 +394,9 @@ func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, art
 		return nil, err
 	}
 
-	ps := make(fs2.Paths, len(files))
+	ps := make(xfs.Paths, len(files))
 	for i, file := range files {
-		ps[i] = fs2.NewRelPath(file).WithRoot(target.OutExpansionRoot.Abs())
+		ps[i] = xfs.NewRelPath(file).WithRoot(target.OutExpansionRoot.Abs())
 	}
 
 	ps.Sort()
@@ -405,20 +404,20 @@ func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, art
 	return ps, nil
 }
 
-func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs2.Paths, error) {
-	outSet := sets.NewSet(func(p fs2.Path) string {
+func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xfs.Paths, error) {
+	outSet := sets.NewSet(func(p xfs.Path) string {
 		return p.RelRoot()
 	}, len(files))
 
 	for _, file := range files {
 		pattern := file.RelRoot()
 
-		if !utils.IsGlob(pattern) && !fs2.PathExists(filepath.Join(root, pattern)) {
+		if !xfs.IsGlob(pattern) && !xfs.PathExists(filepath.Join(root, pattern)) {
 			return nil, fmt.Errorf("%v did not output %v", target.FQN, file.RelRoot())
 		}
 
-		err := utils.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			outSet.Add(fs2.NewPath(root, path))
+		err := xfs.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+			outSet.Add(xfs.NewPath(root, path))
 
 			return nil
 		})
@@ -427,7 +426,7 @@ func (e *Engine) collectOut(target *Target, files fs2.RelPaths, root string) (fs
 		}
 	}
 
-	out := fs2.Paths(outSet.Slice())
+	out := xfs.Paths(outSet.Slice())
 	out.Sort()
 
 	return out, nil
@@ -438,7 +437,7 @@ func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoo
 	defer span.EndError(rerr)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
-	target.actualSupportFiles = make(fs2.Paths, 0)
+	target.actualSupportFiles = make(xfs.Paths, 0)
 
 	var err error
 
@@ -461,7 +460,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	log.Tracef("populateActualFilesFromTar %v", target.FQN)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
-	target.actualSupportFiles = make(fs2.Paths, 0)
+	target.actualSupportFiles = make(xfs.Paths, 0)
 
 	var err error
 
@@ -482,7 +481,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	return nil
 }
 
-func (e *Engine) sandboxRoot(specer targetspec.Specer) fs2.Path {
+func (e *Engine) sandboxRoot(specer targetspec.Specer) xfs.Path {
 	target := specer.Spec()
 
 	folder := "__target_" + target.Name
@@ -539,19 +538,19 @@ func deleteDir(dir string, async bool) error {
 	rm, err := exec.LookPath("rm")
 	if err != nil {
 		return err
-	} else if !fs2.PathExists(dir) {
+	} else if !xfs.PathExists(dir) {
 		return nil // not an error, just don't need to do anything.
 	}
 
 	log.Tracef("Deleting %v", dir)
 
 	if async {
-		newDir := fs2.RandPath(os.TempDir(), filepath.Base(dir), "")
+		newDir := xfs.RandPath(os.TempDir(), filepath.Base(dir), "")
 
 		err = os.Rename(dir, newDir)
 		if err != nil {
 			// May be because os.TempDir() and the current dir aren't on the same device, try a sibling folder
-			newDir = fs2.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
+			newDir = xfs.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
 
 			err1 := os.Rename(dir, newDir)
 			if err1 != nil {
@@ -574,27 +573,27 @@ func deleteDir(dir string, async bool) error {
 	return nil
 }
 
-func (e *Engine) GetFileDeps(targets ...*Target) []fs2.Path {
+func (e *Engine) GetFileDeps(targets ...*Target) []xfs.Path {
 	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
 		return target.Deps.All()
 	})
 }
 
-func (e *Engine) GetFileHashDeps(targets ...*Target) []fs2.Path {
+func (e *Engine) GetFileHashDeps(targets ...*Target) []xfs.Path {
 	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
 		return target.HashDeps
 	})
 }
 
-func (e *Engine) getFileDeps(targets []*Target, f func(*Target) tgt.TargetDeps) []fs2.Path {
-	filesm := map[string]fs2.Path{}
+func (e *Engine) getFileDeps(targets []*Target, f func(*Target) tgt.TargetDeps) []xfs.Path {
+	filesm := map[string]xfs.Path{}
 	for _, target := range targets {
 		for _, file := range f(target).Files {
 			filesm[file.Abs()] = file
 		}
 	}
 
-	files := make([]fs2.Path, 0, len(filesm))
+	files := make([]xfs.Path, 0, len(filesm))
 	for _, file := range filesm {
 		files = append(files, file)
 	}
@@ -606,7 +605,7 @@ func (e *Engine) getFileDeps(targets []*Target, f func(*Target) tgt.TargetDeps) 
 	return files
 }
 
-func (e *Engine) GetWatcherList(files []fs2.Path) []string {
+func (e *Engine) GetWatcherList(files []xfs.Path) []string {
 	pm := map[string]struct{}{}
 
 	for _, file := range files {

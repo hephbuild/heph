@@ -6,24 +6,24 @@ import (
 	"errors"
 	"fmt"
 	ptylib "github.com/creack/pty"
-	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hephprovider"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
 	"io"
-	fs2 "io/fs"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -32,11 +32,11 @@ import (
 	"time"
 )
 
-func (e *Engine) tmpRoot(elem ...string) fs.Path {
+func (e *Engine) tmpRoot(elem ...string) xfs.Path {
 	return e.Root.Home.Join("tmp").Join(elem...)
 }
 
-func (e *Engine) tmpTargetRoot(target targetspec.Specer) fs.Path {
+func (e *Engine) tmpTargetRoot(target targetspec.Specer) xfs.Path {
 	spec := target.Spec()
 	return e.Root.Home.Join("tmp", spec.Package.Path, "__target_"+spec.Name)
 }
@@ -54,7 +54,7 @@ func normalizeEnv(k string) string {
 func (e *Engine) createFile(target *Target, name, path string, rec *SrcRecorder, fun func(writer io.Writer) error) (error, func()) {
 	tmppath := e.tmpTargetRoot(target).Join(name).Abs()
 
-	err := fs.CreateParentDir(tmppath)
+	err := xfs.CreateParentDir(tmppath)
 	if err != nil {
 		return err, func() {}
 	}
@@ -154,8 +154,8 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	if target.RestoreCache {
 		latestDir := e.cacheDirForHash(target, "latest")
 
-		if fs.PathExists(latestDir.Abs()) {
-			done := utils.TraceTiming("Restoring cache")
+		if xfs.PathExists(latestDir.Abs()) {
+			done := log.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
 				art := target.Artifacts.OutTar(name)
@@ -182,7 +182,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 		length += deplength
 	}
 
-	traceFilesList := utils.TraceTiming("Building sandbox files list")
+	traceFilesList := log.TraceTiming("Building sandbox files list")
 
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
@@ -287,7 +287,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 		return nil, err
 	}
 
-	traceSrcEnv := utils.TraceTiming("Building src env")
+	traceSrcEnv := log.TraceTiming("Building src env")
 
 	env := make(map[string]string)
 	env["TARGET"] = target.FQN
@@ -370,7 +370,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 			namedOut[name] = ads.GrowExtra(namedOut[name], len(paths))
 
 			for _, path := range paths {
-				if utils.IsGlob(path.RelRoot()) {
+				if xfs.IsGlob(path.RelRoot()) {
 					// Skip glob
 					continue
 				}
@@ -382,7 +382,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 				if target.Sandbox {
 					// Create the output folder, as a convenience
-					err := fs.CreateParentDir(path.Abs())
+					err := xfs.CreateParentDir(path.Abs())
 					if err != nil {
 						return nil, err
 					}
@@ -589,7 +589,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 	} else if target.IsTextFile() {
 		to := target.Out.All()[0].WithRoot(target.SandboxRoot.Abs()).Abs()
 
-		err := fs.CreateParentDir(to)
+		err := xfs.CreateParentDir(to)
 		if err != nil {
 			return err
 		}
@@ -850,7 +850,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	cacheDir := e.cacheDir(target)
 
 	doneMarker := cacheDir.Join(target.Artifacts.InputHash.FileName()).Abs()
-	if !fs.PathExists(doneMarker) {
+	if !xfs.PathExists(doneMarker) {
 		return nil
 	}
 
@@ -863,11 +863,11 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	outDirHash := "2|" + strings.Join(outputs, ",")
 
 	shouldExpand := false
-	if !fs.PathExists(outDir.Abs()) {
+	if !xfs.PathExists(outDir.Abs()) {
 		shouldExpand = true
 	} else {
 		b, err := os.ReadFile(outDirHashPath)
-		if err != nil && !errors.Is(err, fs2.ErrNotExist) {
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("outdirhash: %w", err)
 		}
 
@@ -1021,7 +1021,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 					}
 				}
 
-				err = fs.CreateParentDir(to)
+				err = xfs.CreateParentDir(to)
 				if err != nil {
 					return err
 				}

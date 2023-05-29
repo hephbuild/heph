@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/engine"
-	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 )
 

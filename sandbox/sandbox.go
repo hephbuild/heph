@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 	"os/exec"
@@ -19,9 +18,9 @@ type MakeConfig struct {
 	Dir       string
 	BinDir    string
 	Bin       map[string]string
-	Files     []tar.TarFile
+	Files     []tar.File
 	FilesTar  []string
-	LinkFiles []tar.TarFile
+	LinkFiles []tar.File
 }
 
 type MakeBinConfig struct {
@@ -106,14 +105,14 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 		untarDedup.Add(to)
 
-		err := fs.Cp(file.From, to)
+		err := xfs.Cp(file.From, to)
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}
 	}
 
 	for _, tarFile := range cfg.FilesTar {
-		done := utils.TraceTimingDone("untar " + tarFile)
+		done := log.TraceTimingDone("untar " + tarFile)
 		err := tar.UntarPath(ctx, tarFile, cfg.Dir, tar.UntarOptions{
 			Dedup: untarDedup,
 		})
@@ -135,7 +134,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 		untarDedup.Add(to)
 
-		err := fs.CreateParentDir(to)
+		err := xfs.CreateParentDir(to)
 		if err != nil {
 			return err
 		}

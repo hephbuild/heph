@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/xfs"
 	"go.uber.org/multierr"
 	"os"
 	"os/exec"
@@ -16,7 +16,7 @@ import (
 func build(srcDir, goos, goarch, out string) error {
 	log.Infof("Building heph %v/%v...", goos, goarch)
 
-	err := fs.CreateParentDir(out)
+	err := xfs.CreateParentDir(out)
 	if err != nil {
 		return err
 	}

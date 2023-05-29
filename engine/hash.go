@@ -4,14 +4,14 @@ import (
 	tar2 "archive/tar"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 	"strings"
@@ -40,7 +40,7 @@ func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithO
 	return nil
 }
 
-func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files fs.Paths) (map[string]time.Time, error) {
+func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files xfs.Paths) (map[string]time.Time, error) {
 	m := make(map[string]time.Time, len(files))
 
 	for _, dep := range files {
@@ -428,11 +428,11 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) (string, err
 	return sh, nil
 }
 
-func (e *LocalCacheState) cacheDir(target *Target) fs.Path {
+func (e *LocalCacheState) cacheDir(target *Target) xfs.Path {
 	return e.cacheDirForHash(target, e.mustHashInput(target))
 }
 
-func (e *LocalCacheState) cacheDirForHash(target *Target, inputHash string) fs.Path {
+func (e *LocalCacheState) cacheDirForHash(target *Target, inputHash string) xfs.Path {
 	// TODO: cache
 	folder := "__target_" + target.Name
 	if !target.Cache.Enabled {

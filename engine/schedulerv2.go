@@ -3,8 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"

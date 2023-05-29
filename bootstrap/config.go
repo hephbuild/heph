@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine/hroot"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"os"
 )

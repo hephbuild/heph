@@ -4,13 +4,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine/buildfiles"
+	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xfs"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkjson"
 	"go.starlark.net/starlarkstruct"
@@ -247,7 +248,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 	allExclude = append(allExclude, opts.Config.BuildFiles.Glob.Exclude...)
 
 	elems := sets.NewStringSet(0)
-	err := utils.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
+	err := xfs.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}

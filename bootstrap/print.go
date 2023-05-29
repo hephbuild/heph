@@ -3,13 +3,13 @@ package bootstrap
 import (
 	"fmt"
 	"github.com/hephbuild/heph/engine"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 )
 
 func PrintTargetOutputContent(target *engine.Target, output string) error {
-	return targetOutputsFunc(target, output, func(path fs.Path) error {
+	return targetOutputsFunc(target, output, func(path xfs.Path) error {
 		f, err := os.Open(path.Abs())
 		if err != nil {
 			return err
@@ -22,13 +22,13 @@ func PrintTargetOutputContent(target *engine.Target, output string) error {
 }
 
 func PrintTargetOutputPaths(target *engine.Target, output string) error {
-	return targetOutputsFunc(target, output, func(path fs.Path) error {
+	return targetOutputsFunc(target, output, func(path xfs.Path) error {
 		fmt.Println(path.Abs())
 		return nil
 	})
 }
 
-func targetOutputsFunc(target *engine.Target, output string, f func(path fs.Path) error) error {
+func targetOutputsFunc(target *engine.Target, output string, f func(path xfs.Path) error) error {
 	paths := target.ActualOutFiles().All()
 	if output != "" {
 		if !target.ActualOutFiles().HasName(output) {

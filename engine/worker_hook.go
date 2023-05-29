@@ -2,7 +2,7 @@ package engine
 
 import (
 	"context"
-	"github.com/hephbuild/heph/engine/observability"
+	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/worker"
 )
 
