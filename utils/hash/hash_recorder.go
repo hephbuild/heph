@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
-	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -93,13 +93,13 @@ func (r *hasherRecorder) record(value interface{}) {
 }
 
 func (r *hasherRecorder) dump(sum string) error {
-	err := fs2.CreateParentDir(r.file)
+	err := xfs.CreateParentDir(r.file)
 	if err != nil {
 		return err
 	}
 
 	filename := r.file
-	if fs2.PathExists(filename) {
+	if xfs.PathExists(filename) {
 		b, err := os.ReadFile(filename)
 		if err != nil {
 			return err

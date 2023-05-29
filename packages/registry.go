@@ -3,8 +3,8 @@ package packages
 import (
 	"fmt"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine/hroot"
-	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/hroot"
+	"github.com/hephbuild/heph/utils/xfs"
 	"path"
 	"sort"
 	"strings"
@@ -19,13 +19,13 @@ type Registry struct {
 	Root           *hroot.State
 	Roots          map[string]config.Root
 	RootsCachePath string
-	fetchRootCache map[string]fs2.Path
+	fetchRootCache map[string]xfs.Path
 	sorted         bool
 }
 
 func NewRegistry(r Registry) *Registry {
 	r.packagesm = map[string]*Package{}
-	r.fetchRootCache = map[string]fs2.Path{}
+	r.fetchRootCache = map[string]xfs.Path{}
 
 	return &r
 }

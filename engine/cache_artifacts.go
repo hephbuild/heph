@@ -6,8 +6,8 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/tar"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 	"os/exec"
@@ -24,7 +24,7 @@ type outTarArtifact struct {
 func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
 	target := a.Target
 
-	var paths fs.Paths
+	var paths xfs.Paths
 	if a.Output == targetspec.SupportFilesOutput {
 		paths = target.ActualSupportFiles()
 	} else {
@@ -32,7 +32,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error
 	}
 	log.Tracef("Creating archive %v %v", target.FQN, a.Output)
 
-	files := make([]tar.TarFile, 0)
+	files := make([]tar.File, 0)
 	for _, file := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -40,7 +40,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error
 
 		file := file.WithRoot(a.OutRoot)
 
-		files = append(files, tar.TarFile{
+		files = append(files, tar.File{
 			From: file.Abs(),
 			To:   file.RelRoot(),
 		})

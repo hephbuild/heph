@@ -6,12 +6,12 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
-	"github.com/hephbuild/heph/engine/graph"
+	graph2 "github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker/poolui"
 	"github.com/spf13/cobra"
@@ -99,7 +99,7 @@ var queryCmd = &cobra.Command{
 				return err
 			}
 
-			targets = graph.NewTargets(len(tps))
+			targets = graph2.NewTargets(len(tps))
 			for _, target := range tps {
 				targets.Add(bs.Engine.Graph.Targets().Find(target.Full()))
 			}
@@ -113,21 +113,21 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		includeMatchers := make(graph.TargetMatchers, 0)
+		includeMatchers := make(graph2.TargetMatchers, 0)
 		for _, s := range include {
-			includeMatchers = append(includeMatchers, graph.ParseTargetSelector("", s))
+			includeMatchers = append(includeMatchers, graph2.ParseTargetSelector("", s))
 		}
-		excludeMatchers := make(graph.TargetMatchers, 0)
+		excludeMatchers := make(graph2.TargetMatchers, 0)
 		for _, s := range exclude {
-			excludeMatchers = append(excludeMatchers, graph.ParseTargetSelector("", s))
+			excludeMatchers = append(excludeMatchers, graph2.ParseTargetSelector("", s))
 		}
 
-		matcher := graph.YesMatcher()
+		matcher := graph2.YesMatcher()
 		if len(includeMatchers) > 0 {
-			matcher = graph.OrMatcher(includeMatchers...)
+			matcher = graph2.OrMatcher(includeMatchers...)
 		}
 		if len(excludeMatchers) > 0 {
-			matcher = graph.AndMatcher(matcher, graph.NotMatcher(graph.OrMatcher(excludeMatchers...)))
+			matcher = graph2.AndMatcher(matcher, graph2.NotMatcher(graph2.OrMatcher(excludeMatchers...)))
 		}
 
 		selected := make([]*tgt.Target, 0)
@@ -287,13 +287,13 @@ var graphDotCmd = &cobra.Command{
 				if err != nil {
 					return err
 				}
-				dag = &graph.DAG{DAG: gdag}
+				dag = &graph2.DAG{DAG: gdag}
 			case "descendants":
 				gdag, _, err := dag.GetDescendantsGraph(args[1])
 				if err != nil {
 					return err
 				}
-				dag = &graph.DAG{DAG: gdag}
+				dag = &graph2.DAG{DAG: gdag}
 			default:
 				return fmt.Errorf("must be one of ancestors, descendants")
 			}
@@ -308,7 +308,7 @@ digraph G  {
 	node [fontsize=10, shape=box, height=0.25]
 	edge [fontsize=10]
 `)
-		id := func(target *graph.Target) string {
+		id := func(target *graph2.Target) string {
 			return strconv.Quote(target.FQN)
 		}
 
@@ -535,7 +535,7 @@ var depsCmd = &cobra.Command{
 			ancestors = append(ancestors, anc.FQN)
 		}
 
-		ancestors = utils.DedupKeepLast(ancestors, func(s string) string {
+		ancestors = ads.DedupKeepLast(ancestors, func(s string) string {
 			return s
 		})
 		sort.Strings(ancestors)
@@ -593,7 +593,7 @@ var revdepsCmd = &cobra.Command{
 			descendants = append(descendants, anc.FQN)
 		}
 
-		descendants = utils.DedupKeepLast(descendants, func(s string) string {
+		descendants = ads.DedupKeepLast(descendants, func(s string) string {
 			return s
 		})
 		sort.Strings(descendants)
@@ -696,7 +696,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, []targetspec.Specer{gtarget})
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph2.Target{gtarget}, []targetspec.Specer{gtarget})
 		if err != nil {
 			return err
 		}

@@ -3,7 +3,7 @@ package hephprovider
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils"
-	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -20,7 +20,7 @@ func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (str
 	if root := os.Getenv(EnvDistRoot); root != "" {
 		if outDir != root {
 			// In the case of e2e test, a sandbox is created inside the sandbox
-			err := fs2.CpHardlink(root, outDir)
+			err := xfs.CpHardlink(root, outDir)
 			if err != nil {
 				return "", "", err
 			}
@@ -30,7 +30,7 @@ func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (str
 
 		p := filepath.Join(root, hephBinName(goos, goarch))
 
-		if !fs2.PathExists(p) {
+		if !xfs.PathExists(p) {
 			return "", "", fmt.Errorf("hephbuild: dist: %v: %w", p, fs.ErrNotExist)
 		}
 
@@ -60,7 +60,7 @@ func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (str
 				return "", "", fmt.Errorf("hephbuild: invalid os/arch: %v/%v, expected one of %v", goos, goarch, m.Keys())
 			}
 
-			if !fs2.PathExists(p) {
+			if !xfs.PathExists(p) {
 				return "", "", fmt.Errorf("hephbuild: %v: %w", p, fs.ErrNotExist)
 			}
 
@@ -75,7 +75,7 @@ func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (str
 		if exe != "" {
 			p := filepath.Join(outDir, hephBinName(goos, goarch))
 
-			err := fs2.CpHardlink(exe, p)
+			err := xfs.CpHardlink(exe, p)
 			return p, outDir, err
 		}
 	}

@@ -3,12 +3,12 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/flock"
-	"github.com/hephbuild/heph/utils/fs"
-	"github.com/hephbuild/heph/utils/hio"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xio"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,14 +16,14 @@ import (
 
 func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, dir string) (string, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
-	if fs.PathExists(uncompressedPath) {
+	if xfs.PathExists(uncompressedPath) {
 		return uncompressedPath, nil
 	}
 
 	if artifact.Compressible() {
 		gzPath := filepath.Join(dir, artifact.GzFileName())
-		if fs.PathExists(gzPath) {
-			l := flock.NewFlock("", gzPath+".lock")
+		if xfs.PathExists(gzPath) {
+			l := locks.NewFlock("", gzPath+".lock")
 			err := l.Lock(ctx)
 			if err != nil {
 				return "", err
@@ -36,7 +36,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 				}
 			}()
 
-			if fs.PathExists(uncompressedPath) {
+			if xfs.PathExists(uncompressedPath) {
 				return uncompressedPath, nil
 			}
 
@@ -44,7 +44,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 
 			log.Debugf("ungz %v to %v", gzPath, uncompressedPath)
 
-			tmpp := fs.ProcessUniquePath(uncompressedPath)
+			tmpp := xfs.ProcessUniquePath(uncompressedPath)
 
 			tf, err := os.Create(tmpp)
 			if err != nil {
@@ -58,7 +58,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 			}
 			defer gr.Close()
 
-			grc, cancel := hio.ContextReader(ctx, gr)
+			grc, cancel := xio.ContextReader(ctx, gr)
 			defer cancel()
 
 			_, err = io.Copy(tf, grc)

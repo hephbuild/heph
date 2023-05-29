@@ -7,7 +7,7 @@ import (
 
 type SrcRecorder struct {
 	srcTar    []string
-	src       []tar.TarFile
+	src       []tar.File
 	namedSrc  map[string][]string
 	srcOrigin map[string]string
 
@@ -48,7 +48,7 @@ func (s *SrcRecorder) AddTar(tar string) {
 func (s *SrcRecorder) Add(name, from, to, origin string) {
 	s.init()
 
-	s.src = append(s.src, tar.TarFile{
+	s.src = append(s.src, tar.File{
 		From: from,
 		To:   to,
 	})
@@ -63,7 +63,7 @@ func (s *SrcRecorder) Origin() map[string]string {
 	return s.srcOrigin
 }
 
-func (s *SrcRecorder) Src() []tar.TarFile {
+func (s *SrcRecorder) Src() []tar.File {
 	return s.src
 }
 

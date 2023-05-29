@@ -3,7 +3,7 @@ package hephprovider
 import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"net/http"
 	"os"
@@ -23,7 +23,7 @@ func Download(dir, binName, version, goos, goarch string) (string, error) {
 	}
 	dstPath := filepath.Join(dir, binName)
 
-	if fs.PathExists(dstPath) {
+	if xfs.PathExists(dstPath) {
 		log.Debugf("%v already exists", dstPath)
 
 		return dstPath, nil

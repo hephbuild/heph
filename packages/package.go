@@ -1,7 +1,7 @@
 package packages
 
 import (
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"go.starlark.net/starlark"
 	"path"
 	"path/filepath"
@@ -9,7 +9,7 @@ import (
 
 type Package struct {
 	Path        string
-	Root        fs.Path
+	Root        xfs.Path
 	Globals     starlark.StringDict `json:"-" msgpack:"-"`
 	SourceFiles SourceFiles
 }

@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	fs2 "github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -119,7 +119,7 @@ func ExtractLibs(binPath string, extras []string, libPath, ldPath string) error 
 		return err
 	}
 
-	err = fs2.CreateParentDir(ldPath)
+	err = xfs.CreateParentDir(ldPath)
 	if err != nil {
 		return err
 	}
@@ -134,12 +134,12 @@ func ExtractLibs(binPath string, extras []string, libPath, ldPath string) error 
 
 		if strings.Contains(name, "ld-linux") {
 			foundld = true
-			err := fs2.Cp(path, ldPath)
+			err := xfs.Cp(path, ldPath)
 			if err != nil {
 				return err
 			}
 		} else {
-			err := fs2.Cp(path, filepath.Join(libPath, name))
+			err := xfs.Cp(path, filepath.Join(libPath, name))
 			if err != nil {
 				return err
 			}

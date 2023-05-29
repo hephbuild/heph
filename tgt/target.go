@@ -3,10 +3,10 @@ package tgt
 import (
 	"errors"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 )
 
-type OutNamedPaths = NamedPaths[fs.RelPaths, fs.RelPath]
+type OutNamedPaths = NamedPaths[xfs.RelPaths, xfs.RelPath]
 
 type Target struct {
 	targetspec.TargetSpec

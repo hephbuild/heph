@@ -5,8 +5,8 @@ import (
 	"errors"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/hash"
+	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 	"sort"
 	"strings"
@@ -78,7 +78,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 		}
 	}
 
-	err = fs.CreateParentDir(hashPath)
+	err = xfs.CreateParentDir(hashPath)
 	if err != nil {
 		return err
 	}

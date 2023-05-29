@@ -3,7 +3,7 @@ package finalizers
 import (
 	"context"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/flock"
+	"github.com/hephbuild/heph/utils/locks"
 	"os"
 	"sync"
 )
@@ -40,7 +40,7 @@ func (e *Finalizers) RegisterRemove(path string) {
 	})
 }
 
-func (e *Finalizers) RegisterRemoveWithLocker(l flock.Locker, path string) {
+func (e *Finalizers) RegisterRemoveWithLocker(l locks.Locker, path string) {
 	e.Register(func() {
 		ctx := context.Background()
 		ok, err := l.TryLock(ctx)

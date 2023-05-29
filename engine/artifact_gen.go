@@ -5,11 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine/artifacts"
+	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/mds"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 	"path/filepath"
@@ -49,7 +49,7 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 		p = filepath.Join(dir, a.GzFileName())
 	}
 
-	tmpp := fs.ProcessUniquePath(p)
+	tmpp := xfs.ProcessUniquePath(p)
 	defer os.Remove(tmpp)
 
 	f, err := os.Create(tmpp)

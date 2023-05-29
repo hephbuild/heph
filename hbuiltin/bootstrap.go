@@ -1,9 +1,9 @@
 package hbuiltin
 
 import (
+	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine/buildfiles"
-	"github.com/hephbuild/heph/engine/hroot"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils"

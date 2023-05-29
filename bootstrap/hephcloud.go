@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/cloudclient"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine/hroot"
-	"github.com/hephbuild/heph/engine/observability"
-	obhephcloud "github.com/hephbuild/heph/engine/observability/hephcloud"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/observability"
+	obhephcloud "github.com/hephbuild/heph/observability/hephcloud"
 	"github.com/hephbuild/heph/utils/finalizers"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 	"strings"
 )
@@ -54,7 +54,7 @@ func (c Cloud) GetAuthData() (*CloudAuthData, error) {
 func (c Cloud) StoreCloudAuthData(data CloudAuthData) error {
 	path := c.Root.Home.Join(cloudAuthFile).Abs()
 
-	err := fs.CreateParentDir(path)
+	err := xfs.CreateParentDir(path)
 	if err != nil {
 		return err
 	}
@@ -64,7 +64,7 @@ func (c Cloud) StoreCloudAuthData(data CloudAuthData) error {
 		return err
 	}
 
-	err = fs.WriteFileSync(path, b, os.ModePerm)
+	err = xfs.WriteFileSync(path, b, os.ModePerm)
 	if err != nil {
 		return err
 	}

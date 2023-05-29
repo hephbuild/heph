@@ -175,7 +175,9 @@ var runCmd = &cobra.Command{
 	Args:              cobra.MinimumNArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, rrs, err := parseTargetsAndArgs(cmd.Context(), args)
+		ctx := cmd.Context()
+
+		bs, rrs, err := parseTargetsAndArgs(ctx, args)
 		if err != nil {
 			return err
 		}
@@ -189,7 +191,7 @@ var runCmd = &cobra.Command{
 			return nil
 		}
 
-		err = bootstrap.Run(cmd.Context(), bs.Engine, rrs, getRunOpts(), !fromStdin)
+		err = bootstrap.Run(ctx, bs.Engine, rrs, getRunOpts(), !fromStdin)
 		if err != nil {
 			return err
 		}

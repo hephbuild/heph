@@ -1,7 +1,7 @@
 package main
 
 import (
-	obsummary "github.com/hephbuild/heph/engine/observability/summary"
+	summary2 "github.com/hephbuild/heph/observability/summary"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/olekukonko/tablewriter"
@@ -9,7 +9,7 @@ import (
 	"sort"
 )
 
-func summarySpanString(phases ...*obsummary.TargetStatsSpan) string {
+func summarySpanString(phases ...*summary2.TargetStatsSpan) string {
 	opts := make([]summaryOpt, 0)
 	for _, phase := range phases {
 		opts = append(opts, summaryOpt{span: phase})
@@ -18,7 +18,7 @@ func summarySpanString(phases ...*obsummary.TargetStatsSpan) string {
 }
 
 type summaryOpt struct {
-	span      *obsummary.TargetStatsSpan
+	span      *summary2.TargetStatsSpan
 	decorator func(s string) string
 }
 
@@ -41,7 +41,7 @@ func summarySpanStringOpt(phases ...summaryOpt) string {
 	return ""
 }
 
-func artifactString(a obsummary.TargetStatsArtifact, hitText string) string {
+func artifactString(a summary2.TargetStatsArtifact, hitText string) string {
 	if a.Name == "" {
 		return ""
 	}
@@ -55,8 +55,8 @@ func artifactString(a obsummary.TargetStatsArtifact, hitText string) string {
 	return s
 }
 
-func PrintSummary(stats *obsummary.Summary, withGen bool) {
-	targets := make([]*obsummary.TargetStats, 0)
+func PrintSummary(stats *summary2.Summary, withGen bool) {
+	targets := make([]*summary2.TargetStats, 0)
 	for _, span := range stats.Spans {
 		if !withGen && span.Gen {
 			continue

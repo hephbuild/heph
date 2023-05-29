@@ -5,15 +5,15 @@ import (
 	"errors"
 	"fmt"
 	vfsos "github.com/c2fo/vfs/v6/backend/os"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/hroot"
-	"github.com/hephbuild/heph/engine/observability"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils/flock"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/vfssimple"
 	"os"
 	"strings"
@@ -22,7 +22,7 @@ import (
 
 type LocalCacheState struct {
 	Location      *vfsos.Location
-	Path          fs.Path
+	Path          xfs.Path
 	Targets       *TargetMetas
 	Root          *hroot.State
 	Graph         *graph.State
@@ -32,7 +32,7 @@ type LocalCacheState struct {
 	cacheHashInput             *maps.Map[string, string]
 	cacheHashOutputTargetMutex maps.KMutex
 	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
-	gcLock                     flock.Locker
+	gcLock                     locks.Locker
 	cacheHashInputPathsModtime *maps.Map[string, map[string]time.Time]
 }
 
@@ -55,7 +55,7 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 		cacheHashOutputTargetMutex: maps.KMutex{},
 		cacheHashOutput:            &maps.Map[string, string]{},
 		cacheHashInputPathsModtime: &maps.Map[string, map[string]time.Time]{},
-		gcLock:                     flock.NewFlock("Global GC", root.Home.Join("tmp", "gc.lock").Abs()),
+		gcLock:                     locks.NewFlock("Global GC", root.Home.Join("tmp", "gc.lock").Abs()),
 	}
 
 	return s, nil
@@ -95,7 +95,7 @@ func (e *LocalCacheState) storeCache(ctx context.Context, target *Target, outRoo
 		return err
 	}
 
-	err = fs.CreateParentDir(dir)
+	err = xfs.CreateParentDir(dir)
 	if err != nil {
 		return err
 	}

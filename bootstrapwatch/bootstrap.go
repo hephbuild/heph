@@ -8,20 +8,19 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hephbuild/heph/bootstrap"
+	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/engine"
-	"github.com/hephbuild/heph/engine/buildfiles"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/hroot"
+	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/fs"
 	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolui"
-	fs2 "io/fs"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sync"
@@ -246,7 +245,7 @@ func (s *State) cleanEvents(events []fsEvent) []fsEvent {
 			e.Op |= fsnotify.Write
 		}
 
-		if e.Op.Has(fsnotify.Create) && !fs.PathExists(e.Name) {
+		if e.Op.Has(fsnotify.Create) && !xfs.PathExists(e.Name) {
 			continue
 		}
 
@@ -263,7 +262,7 @@ func (s *State) cleanEvents(events []fsEvent) []fsEvent {
 func (s *State) cleanEventsWithBootstrap(bs bootstrap.EngineBootstrap, ogevents []fsEvent) []fsEvent {
 	events := make([]fsEvent, 0, len(ogevents))
 	for _, e := range ogevents {
-		match, err := utils.PathMatchAny(e.RelPath, append(s.ignore, bs.Config.Watch.Ignore...)...)
+		match, err := xfs.PathMatchAny(e.RelPath, append(s.ignore, bs.Config.Watch.Ignore...)...)
 		if err != nil {
 			log.Error(e.RelPath, err)
 		}
@@ -296,7 +295,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 			break
 		}
 
-		if ok, _ := utils.PathMatchAny(e.RelPath, buildfiles.BuildFilesPattern); ok {
+		if ok, _ := xfs.PathMatchAny(e.RelPath, buildfiles.Pattern); ok {
 			log.Debug("New Engine: BUILD", e)
 			bs = bootstrap.EngineBootstrap{}
 			break
@@ -488,13 +487,13 @@ func (s *State) updateWatchers() error {
 
 	ignore := append(bs.Config.Watch.Ignore, s.ignore...)
 
-	return filepath.WalkDir(bs.Root.Root.Abs(), func(path string, d fs2.DirEntry, err error) error {
+	return filepath.WalkDir(bs.Root.Root.Abs(), func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
 		if d.IsDir() {
-			match, err := utils.PathMatchAny(path, ignore...)
+			match, err := xfs.PathMatchAny(path, ignore...)
 			if err != nil {
 				return err
 			}

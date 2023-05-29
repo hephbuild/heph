@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/engine/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
 	"io/fs"

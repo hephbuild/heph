@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
-	"github.com/hephbuild/heph/engine/artifacts"
-	"github.com/hephbuild/heph/engine/graph"
-	"github.com/hephbuild/heph/engine/status"
+	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/worker"
 	"os"
 	"path/filepath"
@@ -84,7 +84,7 @@ func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Locati
 func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string) error {
 	log.Tracef("vfs copy %v to %v", from.URI(), to.URI())
 
-	doneTrace := utils.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
+	doneTrace := log.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
 	defer doneTrace()
 
 	sf, err := from.NewFile(path)
@@ -93,7 +93,7 @@ func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path st
 	}
 	defer sf.Close()
 
-	doneCloser := utils.CloserContext(sf, ctx)
+	doneCloser := xio.CloserContext(sf, ctx)
 	defer doneCloser()
 
 	ok, err := sf.Exists()

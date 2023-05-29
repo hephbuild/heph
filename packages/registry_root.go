@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/flock"
-	fs2 "github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io/fs"
 	"net/url"
 	"os"
@@ -33,15 +33,15 @@ func (e *Registry) loadFromRoot(pkgName, rest, rootName string, cfg config.Root)
 	return pkg, nil
 }
 
-func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) (fs2.Path, error) {
+func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) (xfs.Path, error) {
 	if p, ok := e.fetchRootCache[name]; ok {
 		return p, nil
 	}
 
-	lock := flock.NewFlock("root "+name, filepath.Join(e.RootsCachePath, "root_"+name+".lock"))
+	lock := locks.NewFlock("root "+name, filepath.Join(e.RootsCachePath, "root_"+name+".lock"))
 	err := lock.Lock(ctx)
 	if err != nil {
-		return fs2.Path{}, fmt.Errorf("Failed to lock %v", err)
+		return xfs.Path{}, fmt.Errorf("Failed to lock %v", err)
 	}
 	defer lock.Unlock()
 
@@ -49,7 +49,7 @@ func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) 
 
 	u, err := url.Parse(cfg.URI)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	if u.Scheme == "file" {
@@ -65,7 +65,7 @@ func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) 
 
 	b, err := os.ReadFile(metaPath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	var fileCfg config.Root
@@ -85,37 +85,37 @@ func (e *Registry) FetchRoot(ctx context.Context, name string, cfg config.Root) 
 
 	err = os.RemoveAll(root.Abs())
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	err = os.MkdirAll(root.Abs(), os.ModePerm)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
-	var backendRoot fs2.Path
+	var backendRoot xfs.Path
 	switch u.Scheme {
 	case "git":
 		backendRoot, err = e.fetchGitRoot(ctx, u, srcRoot)
 		if err != nil {
-			return fs2.Path{}, err
+			return xfs.Path{}, err
 		}
 	case "file":
 		backendRoot = e.fetchFsRoot(u)
 	default:
-		return fs2.Path{}, fmt.Errorf("unsupported scheme %v", u.Scheme)
+		return xfs.Path{}, fmt.Errorf("unsupported scheme %v", u.Scheme)
 	}
 
 	metaFile, err := os.Create(metaPath)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 	defer metaFile.Close()
 
 	enc := json.NewEncoder(metaFile)
 	err = enc.Encode(cfg)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	e.fetchRootCache[name] = backendRoot
@@ -184,23 +184,23 @@ func parseGitURI(uri *url.URL) (GitURI, error) {
 	}, nil
 }
 
-func (e *Registry) fetchGitRoot(ctx context.Context, uri *url.URL, srcRoot fs2.Path) (fs2.Path, error) {
+func (e *Registry) fetchGitRoot(ctx context.Context, uri *url.URL, srcRoot xfs.Path) (xfs.Path, error) {
 	err := os.MkdirAll(srcRoot.Abs(), os.ModePerm)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	guri, err := parseGitURI(uri)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	tpl, err := template.New("clone").Parse(cloneScript)
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
-	tmp := fs2.RandPath(os.TempDir(), "heph_root", "")
+	tmp := xfs.RandPath(os.TempDir(), "heph_root", "")
 	defer os.RemoveAll(tmp)
 
 	var b bytes.Buffer
@@ -212,18 +212,18 @@ func (e *Registry) fetchGitRoot(ctx context.Context, uri *url.URL, srcRoot fs2.P
 		"Ref":  guri.Ref,
 	})
 	if err != nil {
-		return fs2.Path{}, err
+		return xfs.Path{}, err
 	}
 
 	cmd := exec.CommandContext(ctx, "bash", "-eux", "-c", b.String())
 	ob, err := cmd.CombinedOutput()
 	if err != nil {
-		return fs2.Path{}, fmt.Errorf("%v: %s", err, ob)
+		return xfs.Path{}, fmt.Errorf("%v: %s", err, ob)
 	}
 
 	return srcRoot, nil
 }
 
-func (e *Registry) fetchFsRoot(uri *url.URL) fs2.Path {
+func (e *Registry) fetchFsRoot(uri *url.URL) xfs.Path {
 	return e.Root.Root.Join(strings.TrimPrefix(uri.Path, "/"))
 }

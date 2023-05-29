@@ -2,8 +2,8 @@ package tgt
 
 import (
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/fs"
+	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xfs"
 	"strings"
 )
 
@@ -11,7 +11,7 @@ type TargetTool struct {
 	Target *Target
 	Output string
 	Name   string
-	File   fs.RelPath
+	File   xfs.RelPath
 }
 
 type TargetTools struct {
@@ -33,13 +33,13 @@ func (t TargetTools) HasHeph() bool {
 
 func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt := TargetTools{}
-	tt.TargetReferences = utils.DedupAppend(t.TargetReferences, func(t *Target) string {
+	tt.TargetReferences = ads.DedupAppend(t.TargetReferences, func(t *Target) string {
 		return t.FQN
 	}, tools.TargetReferences...)
-	tt.Targets = utils.DedupAppend(t.Targets, func(tool TargetTool) string {
+	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) string {
 		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
 	}, tools.Targets...)
-	tt.Hosts = utils.DedupAppend(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	}, tools.Hosts...)
 
@@ -51,19 +51,19 @@ func (t TargetTools) Empty() bool {
 }
 
 func (t TargetTools) Dedup() {
-	t.Hosts = utils.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+	t.Hosts = ads.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	})
-	t.Targets = utils.Dedup(t.Targets, func(tool TargetTool) string {
+	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) string {
 		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
 	})
-	t.TargetReferences = utils.Dedup(t.TargetReferences, func(target *Target) string {
+	t.TargetReferences = ads.Dedup(t.TargetReferences, func(target *Target) string {
 		return target.FQN
 	})
 }
 
 func (t TargetTools) Sort() {
-	utils.SortP(t.Hosts,
+	ads.SortP(t.Hosts,
 		func(i, j *targetspec.TargetSpecHostTool) int {
 			return strings.Compare(i.BinName, j.BinName)
 		},
@@ -72,7 +72,7 @@ func (t TargetTools) Sort() {
 		},
 	)
 
-	utils.SortP(t.Targets,
+	ads.SortP(t.Targets,
 		func(i, j *TargetTool) int {
 			return strings.Compare(i.Target.FQN, j.Target.FQN)
 		},
@@ -81,7 +81,7 @@ func (t TargetTools) Sort() {
 		},
 	)
 
-	utils.Sort(t.TargetReferences,
+	ads.Sort(t.TargetReferences,
 		func(i, j *Target) int {
 			return strings.Compare(i.FQN, j.FQN)
 		},
