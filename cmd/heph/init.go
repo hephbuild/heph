@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/worker/poolui"
+	"os"
 	"strings"
 	"time"
 )
@@ -36,6 +37,7 @@ func bootstrapOptions() (bootstrap.BootOpts, error) {
 		Summary:               *summary || *summaryGen,
 		JaegerEndpoint:        *jaegerEndpoint,
 		DisableCloudTelemetry: *noCloudTelemetry,
+		FlowID:                strings.TrimSpace(os.Getenv("HEPH_FLOW_ID")),
 	}, nil
 }
 

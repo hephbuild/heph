@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/utils/xcontext"
 	"runtime"
 )
 
@@ -43,13 +44,17 @@ func (p *localExecutor) Exec(ctx context.Context, o ExecOptions, execArgs []stri
 		return err
 	}
 
+	sctx, hctx, cancel := xcontext.NewSoftCancel(ctx)
+	defer cancel()
+
 	cmd := sandbox.Exec(sandbox.ExecConfig{
-		Context:  ctx,
-		BinDir:   o.BinDir,
-		Dir:      o.WorkDir,
-		Env:      env,
-		IOConfig: o.IOCfg,
-		ExecArgs: execArgs,
+		Context:     hctx,
+		SoftContext: sctx,
+		BinDir:      o.BinDir,
+		Dir:         o.WorkDir,
+		Env:         env,
+		IOConfig:    o.IOCfg,
+		ExecArgs:    execArgs,
 	})
 
 	err = cmd.Run()

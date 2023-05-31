@@ -42,10 +42,6 @@ func (l Logger) log(lvl Level, args ...any) {
 	l.logs(lvl, strings.Join(argsstr, " "))
 }
 func (l Logger) logs(lvl Level, s string) {
-	if !l.core.Enabled(lvl) {
-		return
-	}
-
 	err := l.core.Log(Entry{
 		Timestamp: time.Now(),
 		Level:     lvl,

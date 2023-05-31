@@ -83,14 +83,14 @@ type sigEvent struct {
 	events []fsEvent
 }
 
-func Boot(ctx context.Context, root *hroot.State, opts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []targetspec.TargetPath, targs []string, ignore []string) (*State, error) {
+func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []targetspec.TargetPath, targs []string, ignore []string) (*State, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
-	pool := worker.NewPool(opts.Workers)
-	opts.Pool = pool
+	pool := worker.NewPool(bootopts.Workers)
+	bootopts.Pool = pool
 
 	sigCh := make(chan sigEvent)
 
@@ -100,7 +100,7 @@ func Boot(ctx context.Context, root *hroot.State, opts bootstrap.BootOpts, cliop
 		ctx:      ctx,
 		runopts:  cliopts,
 		rropts:   rropts,
-		bootopts: opts,
+		bootopts: bootopts,
 		watcher:  watcher,
 		pool:     pool,
 		tps:      tps,
@@ -131,6 +131,11 @@ func (s *State) watchFiles() error {
 	defer close(eventsCh)
 	triggerCh := make(chan []fsEvent, 0)
 	defer close(triggerCh)
+
+	done := false
+	defer func() {
+		done = true
+	}()
 
 	go func() {
 		for rawEvents := range triggerCh {
@@ -185,6 +190,9 @@ func (s *State) watchFiles() error {
 			m.Unlock()
 
 			debounced(func() {
+				if done {
+					return
+				}
 				triggerCh <- eventsAccumulator
 			})
 		}
@@ -303,11 +311,17 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	}
 
 	if bs.Engine == nil {
-		cbs, err := bootstrap.BootWithEngine(ctx, s.bootopts)
+		cbs, err := bootstrap.BootWithEngine(s.ctx, s.bootopts)
 		if err != nil {
 			return fmt.Errorf("boot: %w", err)
 		}
 		bs = cbs
+
+		if cbs.Cloud.Hook != nil {
+			s.bootopts.FlowID = cbs.Cloud.Hook.FlowId
+		} else {
+			s.bootopts.FlowID = ""
+		}
 	}
 
 	// TODO: interrupt console only if gen needs running

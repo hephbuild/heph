@@ -1,4 +1,4 @@
-package utils
+package xrand
 
 import (
 	"encoding/hex"

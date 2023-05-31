@@ -26,6 +26,11 @@ import (
 
 func Getwd() (string, error) {
 	if ecwd := os.Getenv("HEPH_CWD"); ecwd != "" {
+		err := os.Chdir(ecwd)
+		if err != nil {
+			return "", err
+		}
+
 		return ecwd, nil
 	}
 
@@ -55,6 +60,8 @@ type BootOpts struct {
 	JaegerEndpoint        string
 	DisableCloudTelemetry bool
 	Pool                  *worker.Pool
+
+	FlowID string
 }
 
 type BaseBootstrap struct {
@@ -145,7 +152,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 		return bs, fmt.Errorf("jaeger: %w", err)
 	}
 
-	cloud, err := setupHephcloud(ctx, root, cfg, fins, obs, !opts.DisableCloudTelemetry)
+	cloud, err := setupHephcloud(ctx, root, cfg, fins, obs, !opts.DisableCloudTelemetry, opts.FlowID)
 	if err != nil {
 		return bs, fmt.Errorf("cloud: %w", err)
 	}

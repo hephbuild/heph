@@ -14,6 +14,14 @@ import (
 	"os"
 )
 
+func SpanEndNotExist(span observability.SpanError, err error) {
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		span.EndError(nil)
+	} else {
+		span.EndError(err)
+	}
+}
+
 // Deprecated: use LocalCache.cacheDir
 func (e *Engine) cacheDir(target *Target) xfs.Path {
 	return e.LocalCache.cacheDir(target)
@@ -112,7 +120,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 
 func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
 	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.Target.Target, cache.Name, outputs, onlyMeta)
-	defer span.EndError(rerr)
+	defer SpanEndNotExist(span, rerr)
 
 	err := e.downloadExternalCache(ctx, target, cache, target.Artifacts.InputHash)
 	if err != nil {

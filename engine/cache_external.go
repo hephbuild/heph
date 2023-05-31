@@ -189,10 +189,10 @@ func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache g
 func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	ctx, span := e.Observability.SpanCacheDownload(ctx, target.Target.Target, cache.Name, artifact)
 	defer func() {
-		if rerr != nil && errors.Is(rerr, os.ErrNotExist) {
+		if errors.Is(rerr, os.ErrNotExist) {
 			span.SetCacheHit(false)
 		}
-		span.EndError(rerr)
+		SpanEndNotExist(span, rerr)
 	}()
 
 	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))

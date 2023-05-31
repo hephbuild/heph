@@ -190,8 +190,8 @@ func (d *DAG) GetLeaves() []*Target {
 	return d.mapToArray(leaves)
 }
 
-// GetFileDescendants returns targets directly depending on file
-func (d *DAG) GetFileDescendants(paths []string, universe []*Target) ([]*Target, error) {
+// GetFileChildren returns targets directly depending on file
+func (d *DAG) GetFileChildren(paths []string, universe []*Target) []*Target {
 	descendants := NewTargets(0)
 
 	for _, path := range paths {
@@ -207,7 +207,7 @@ func (d *DAG) GetFileDescendants(paths []string, universe []*Target) ([]*Target,
 
 	descendants.Sort()
 
-	return descendants.Slice(), nil
+	return descendants.Slice()
 }
 
 func (d *DAG) mapToArray(m map[string]interface{}) []*Target {

@@ -21,6 +21,7 @@ type Cloud struct {
 	Root       *hroot.State
 	Client     *cloudclient.HephClient
 	AuthClient *cloudclient.HephClient
+	Hook       *obhephcloud.Hook
 }
 
 type CloudAuthData struct {
@@ -78,7 +79,7 @@ func (c Cloud) DeleteCloudAuthData() error {
 	return os.RemoveAll(path)
 }
 
-func setupHephcloud(ctx context.Context, root *hroot.State, cfg *config.Config, fins *finalizers.Finalizers, obs *observability.Observability, installObs bool) (Cloud, error) {
+func setupHephcloud(ctx context.Context, root *hroot.State, cfg *config.Config, fins *finalizers.Finalizers, obs *observability.Observability, installObs bool, flowId string) (Cloud, error) {
 	cloud := Cloud{Root: root}
 
 	if cfg.Cloud.URL != "" && cfg.Cloud.Project != "" {
@@ -112,7 +113,9 @@ func setupHephcloud(ctx context.Context, root *hroot.State, cfg *config.Config, 
 						Client:    client,
 						ProjectID: cfg.Cloud.Project,
 						Config:    cfg,
+						FlowId:    flowId,
 					})
+					cloud.Hook = hook
 					obs.RegisterHook(hook)
 
 					flush := hook.Start(ctx)

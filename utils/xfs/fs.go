@@ -2,14 +2,14 @@ package xfs
 
 import (
 	"errors"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/xrand"
 	"io"
 	"os"
 	"path/filepath"
 )
 
 func RandPath(base, prefix, suffix string) string {
-	return filepath.Join(base, prefix+utils.RandStr(16)+suffix)
+	return filepath.Join(base, prefix+xrand.RandStr(16)+suffix)
 }
 
 func IsDirEmpty(name string) (bool, error) {
