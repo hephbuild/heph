@@ -6,13 +6,14 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
-	graph2 "github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolui"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -99,7 +100,7 @@ var queryCmd = &cobra.Command{
 				return err
 			}
 
-			targets = graph2.NewTargets(len(tps))
+			targets = graph.NewTargets(len(tps))
 			for _, target := range tps {
 				targets.Add(bs.Engine.Graph.Targets().Find(target.Full()))
 			}
@@ -113,21 +114,21 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		includeMatchers := make(graph2.TargetMatchers, 0)
+		includeMatchers := make(graph.TargetMatchers, 0)
 		for _, s := range include {
-			includeMatchers = append(includeMatchers, graph2.ParseTargetSelector("", s))
+			includeMatchers = append(includeMatchers, graph.ParseTargetSelector("", s))
 		}
-		excludeMatchers := make(graph2.TargetMatchers, 0)
+		excludeMatchers := make(graph.TargetMatchers, 0)
 		for _, s := range exclude {
-			excludeMatchers = append(excludeMatchers, graph2.ParseTargetSelector("", s))
+			excludeMatchers = append(excludeMatchers, graph.ParseTargetSelector("", s))
 		}
 
-		matcher := graph2.YesMatcher()
+		matcher := graph.YesMatcher()
 		if len(includeMatchers) > 0 {
-			matcher = graph2.OrMatcher(includeMatchers...)
+			matcher = graph.OrMatcher(includeMatchers...)
 		}
 		if len(excludeMatchers) > 0 {
-			matcher = graph2.AndMatcher(matcher, graph2.NotMatcher(graph2.OrMatcher(excludeMatchers...)))
+			matcher = graph.AndMatcher(matcher, graph.NotMatcher(graph.OrMatcher(excludeMatchers...)))
 		}
 
 		selected := make([]*tgt.Target, 0)
@@ -287,13 +288,13 @@ var graphDotCmd = &cobra.Command{
 				if err != nil {
 					return err
 				}
-				dag = &graph2.DAG{DAG: gdag}
+				dag = &graph.DAG{DAG: gdag}
 			case "descendants":
 				gdag, _, err := dag.GetDescendantsGraph(args[1])
 				if err != nil {
 					return err
 				}
-				dag = &graph2.DAG{DAG: gdag}
+				dag = &graph.DAG{DAG: gdag}
 			default:
 				return fmt.Errorf("must be one of ancestors, descendants")
 			}
@@ -308,7 +309,7 @@ digraph G  {
 	node [fontsize=10, shape=box, height=0.25]
 	edge [fontsize=10]
 `)
-		id := func(target *graph2.Target) string {
+		id := func(target *graph.Target) string {
 			return strconv.Quote(target.FQN)
 		}
 
@@ -550,7 +551,7 @@ var depsCmd = &cobra.Command{
 
 var revdepsCmd = &cobra.Command{
 	Use:   "revdeps <target>",
-	Short: "Prints targets dependent on the input",
+	Short: "Prints targets that depend on the input target or file",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
@@ -568,37 +569,73 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
+		var targets []targetspec.Specer
+		var fn func(target targetspec.Specer) ([]*graph.Target, error)
+
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
-			return err
+			p, err := filepath.Abs(args[0])
+			if err != nil {
+				return err
+			}
+
+			if !xfs.PathExists(p) {
+				return fmt.Errorf("%v: is not a file and %w", args[0], err)
+			}
+
+			rel, err := filepath.Rel(bs.Root.Root.Abs(), p)
+			if err != nil {
+				return err
+			}
+
+			if strings.Contains(rel, "..") {
+				return fmt.Errorf("%v is outside repo", p)
+			}
+
+			children := bs.Graph.DAG().GetFileChildren([]string{rel}, bs.Graph.Targets().Slice())
+			if err != nil {
+				return err
+			}
+
+			targets = targetspec.AsSpecers(children)
+			fn = func(target targetspec.Specer) ([]*graph.Target, error) {
+				return []*graph.Target{bs.Graph.Targets().Find(target.Spec().FQN)}, nil
+			}
+			if transitive {
+				fn = func(target targetspec.Specer) ([]*graph.Target, error) {
+					desc, err := bs.Graph.DAG().GetDescendants(target)
+					desc = append(desc, bs.Graph.Targets().Find(target.Spec().FQN))
+					return desc, err
+				}
+			}
+		} else {
+			target := bs.Graph.Targets().Find(tp.Full())
+			if target == nil {
+				return engine.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
+			}
+
+			targets = []targetspec.Specer{target}
+			fn = bs.Graph.DAG().GetChildren
+			if transitive {
+				fn = bs.Graph.DAG().GetDescendants
+			}
 		}
 
-		target := bs.Graph.Targets().Find(tp.Full())
-		if target == nil {
-			return engine.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
+		revdeps := sets.NewStringSet(0)
+
+		for _, target := range targets {
+			ancs, err := fn(target)
+			if err != nil {
+				return err
+			}
+			for _, anc := range ancs {
+				revdeps.Add(anc.FQN)
+			}
 		}
 
-		fn := bs.Graph.DAG().GetChildren
-		if transitive {
-			fn = bs.Graph.DAG().GetDescendants
-		}
+		sort.Strings(revdeps.Slice())
 
-		descendants := make([]string, 0)
-
-		ancs, err := fn(target)
-		if err != nil {
-			return err
-		}
-		for _, anc := range ancs {
-			descendants = append(descendants, anc.FQN)
-		}
-
-		descendants = ads.DedupKeepLast(descendants, func(s string) string {
-			return s
-		})
-		sort.Strings(descendants)
-
-		for _, fqn := range descendants {
+		for _, fqn := range revdeps.Slice() {
 			fmt.Println(fqn)
 		}
 
@@ -696,7 +733,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph2.Target{gtarget}, []targetspec.Specer{gtarget})
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, []targetspec.Specer{gtarget})
 		if err != nil {
 			return err
 		}

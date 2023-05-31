@@ -29,8 +29,8 @@ type Hook struct {
 	Config    *config.Config
 	Client    graphql.Client
 	ProjectID string
+	FlowId    string
 
-	flowId       string
 	invocationID string
 
 	events queue.Queue[cloudclient.Event]
@@ -70,6 +70,8 @@ func (h *Hook) Start(ctx context.Context) func() {
 			select {
 			case <-stopCh:
 				return
+			case <-ctx.Done():
+				return
 			case <-t.C:
 				err := h.sendSpans(ctx)
 				if err != nil {
@@ -87,6 +89,8 @@ func (h *Hook) Start(ctx context.Context) func() {
 		for {
 			select {
 			case <-stopCh:
+				return
+			case <-ctx.Done():
 				return
 			case <-t.C:
 				err := h.sendLogs(ctx)
@@ -274,17 +278,12 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (contex
 		StartTime: span.StartTime(),
 	}
 
-	if flowId := strings.TrimSpace(os.Getenv("HEPH_FLOW_ID")); flowId == "" {
-		name := strings.TrimSpace(os.Getenv("HEPH_FLOW_NAME"))
-		if name == "" {
-			name = strings.Join(args, " ")
-		}
-
+	if flowId := h.FlowId; flowId == "" {
 		res, err := cloudclient.RegisterFlowInvocation(ctx, h.Client, h.ProjectID, cloudclient.FlowInput{
-			Name: name,
+			Name: strings.Join(args, " "),
 		}, invInput)
 		if err != nil {
-			log.Error(err)
+			log.Error(fmt.Errorf("RegisterFlowInvocation: %v", err))
 			return ctx, nil
 		}
 
@@ -296,16 +295,16 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (contex
 		}
 
 		h.invocationID = edges[0].Node.Id
-		h.flowId = res.RegisterFlowInvocation.Id
+		h.FlowId = res.RegisterFlowInvocation.Id
 	} else {
 		res, err := cloudclient.RegisterInvocation(ctx, h.Client, flowId, invInput)
 		if err != nil {
-			log.Error(err)
+			log.Error(fmt.Errorf("RegisterInvocation: %v", err))
 			return ctx, nil
 		}
 
 		h.invocationID = res.RegisterInvocation.Id
-		h.flowId = flowId
+		h.FlowId = flowId
 	}
 
 	stopCh := make(chan struct{})
@@ -318,7 +317,7 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (contex
 			case <-time.After(10 * time.Second):
 				_, err := cloudclient.SendInvocationHeartbeat(ctx, h.Client, h.invocationID)
 				if err != nil {
-					log.Error(err)
+					log.Error(fmt.Errorf("heartbeat: %v", err))
 				}
 			}
 		}
@@ -332,7 +331,7 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (contex
 			Error:        span.Error() != nil,
 		})
 		if err != nil {
-			log.Error(err)
+			log.Error(fmt.Errorf("end invocation: %v", err))
 		}
 	})
 }
@@ -398,5 +397,5 @@ func (h *Hook) OnLogs(ctx context.Context) io.Writer {
 }
 
 func (h *Hook) GetFlowID() string {
-	return h.flowId
+	return h.FlowId
 }

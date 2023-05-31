@@ -1,7 +1,6 @@
 package main
 
 import (
-	"github.com/hephbuild/heph/bootstrap"
 	"github.com/spf13/cobra"
 )
 
@@ -33,9 +32,4 @@ func ValidArgsFunctionLabelsOrTargets(cmd *cobra.Command, args []string, toCompl
 	}
 
 	return suggestions, directive
-}
-
-// Deprecated: use bootstrap.PrintHumanError
-func printHumanError(err error) {
-	bootstrap.PrintHumanError(err)
 }

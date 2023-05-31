@@ -37,7 +37,7 @@ var cloudLoginCmd = &cobra.Command{
 			return err
 		}
 
-		if bs.Cloud.AuthClient == nil {
+		if bs.Cloud.Client == nil {
 			return fmt.Errorf("cloud not configured")
 		}
 

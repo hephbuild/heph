@@ -2,11 +2,12 @@ package xfs
 
 import (
 	"github.com/hephbuild/heph/utils/instance"
+	"github.com/hephbuild/heph/utils/xrand"
 	"os"
 )
 
 func ProcessUniquePath(p string) string {
-	return p + "_tmp_" + instance.UID
+	return p + "_tmp_" + instance.UID + "_" + xrand.RandStr(7)
 }
 
 type AtomicFile struct {

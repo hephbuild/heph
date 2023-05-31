@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -156,11 +157,12 @@ type IOConfig struct {
 
 type ExecConfig struct {
 	IOConfig
-	Context  context.Context
-	BinDir   string
-	Dir      string
-	Env      map[string]string
-	ExecArgs []string
+	SoftContext context.Context
+	Context     context.Context
+	BinDir      string
+	Dir         string
+	Env         map[string]string
+	ExecArgs    []string
 }
 
 func AddPathEnv(env map[string]string, binDir string, isolatePath bool) {
@@ -187,7 +189,36 @@ func envMapToArray(m map[string]string) []string {
 	return env
 }
 
-func Exec(cfg ExecConfig) *exec.Cmd {
+type Cmd struct {
+	*exec.Cmd
+	SoftContext context.Context
+}
+
+func (c *Cmd) Start() error {
+	panic("not implemented")
+}
+
+func (c *Cmd) watchSoftContext() {
+	<-c.SoftContext.Done()
+	p := c.Cmd.Process
+	if p == nil {
+		return
+	}
+	_ = p.Signal(syscall.SIGINT)
+}
+
+func (c *Cmd) Run() error {
+	go c.watchSoftContext()
+
+	err := c.Cmd.Run()
+	if cerr := c.SoftContext.Err(); cerr != nil {
+		err = cerr
+	}
+
+	return err
+}
+
+func Exec(cfg ExecConfig) *Cmd {
 	args := cfg.ExecArgs
 
 	err := os.MkdirAll(cfg.Dir, os.ModePerm)
@@ -210,5 +241,5 @@ func Exec(cfg ExecConfig) *exec.Cmd {
 		cmd.SysProcAttr.Setpgid = false
 	}
 
-	return cmd
+	return &Cmd{cmd, cfg.SoftContext}
 }

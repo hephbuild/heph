@@ -193,6 +193,8 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 
 	err := l.Lock(ctx)
 	assert.ErrorContains(t, err, "context deadline exceeded")
+
+	time.Sleep(time.Second)
 }
 
 func testLockerTry(t *testing.T, factory func() Locker) {

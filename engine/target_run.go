@@ -663,10 +663,11 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		if !rr.Shell {
 			logFilePath = e.sandboxRoot(target).Join("log.txt").Abs()
 
-			logFile, err := os.Create(logFilePath)
+			logFile, err = os.Create(logFilePath)
 			if err != nil {
 				return err
 			}
+			defer logFile.Close()
 
 			obw = multiWriterNil(obw, logFile)
 		}
@@ -735,7 +736,9 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 			}
 
 			if cerr := ctx.Err(); cerr != nil {
-				err = fmt.Errorf("%w: %v", cerr, err)
+				if !errors.Is(cerr, err) {
+					err = fmt.Errorf("%w: %v", cerr, err)
+				}
 			}
 
 			err := fmt.Errorf("exec: %w", err)
