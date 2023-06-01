@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -38,6 +39,14 @@ func genArray(es []string, l int, nl bool) string {
 	return sb.String()
 }
 
+func genDict(d map[string]interface{}, l int, nl bool) string {
+	if len(d) == 0 {
+		return "{}"
+	}
+
+	return genArgValue1(d, l, nl)
+}
+
 func genStringArray(es []string, l int) string {
 	qes := make([]string, 0, len(es))
 	for _, e := range es {
@@ -64,7 +73,7 @@ func joinedArrays(es []string) string {
 	return strings.Join(es, "+")
 }
 
-func genVariant(v PkgCfgVariant, tags, ldflags bool) string {
+func genVariant(v PkgCfgVariant, tags, ldflags, lddeps bool) string {
 	if v.OS == "" || v.ARCH == "" {
 		panic("empty os/arch")
 	}
@@ -72,17 +81,30 @@ func genVariant(v PkgCfgVariant, tags, ldflags bool) string {
 	s := fmt.Sprintf("os=%v, arch=%v", strconv.Quote(v.OS), strconv.Quote(v.ARCH))
 
 	if tags && len(v.Tags) > 0 {
-		s += ", tags=" + genStringArrayInline(v.Tags, 0)
+		s += ",\n    tags=" + genStringArrayInline(v.Tags, 0)
 	}
 
-	if ldflags && v.LDFlags != "" {
-		s += ", ldflags=" + strconv.Quote(v.LDFlags)
+	if ldflags && v.Link.LDFlags != "" {
+		s += ",\n    ldflags=" + strconv.Quote(v.Link.LDFlags)
+	}
+
+	if lddeps && len(v.Link.Deps) > 0 {
+		s += ",\n    deps=" + genDict(v.Link.Deps, 1, true)
 	}
 
 	return s
 }
 
-func genArgValue(v interface{}, nl string) string {
+func genArgValue(v interface{}, withNl bool) string {
+	return genArgValue1(v, 0, withNl)
+}
+
+func genArgValue1(v interface{}, p int, withNl bool) string {
+	var nl string
+	if withNl {
+		nl = "\n"
+	}
+
 	switch v := v.(type) {
 	case string:
 		return strconv.Quote(v)
@@ -98,20 +120,48 @@ func genArgValue(v interface{}, nl string) string {
 		rv := reflect.ValueOf(v)
 		switch rv.Kind() {
 		case reflect.Map:
-			es := make([]string, 0)
+
+			d := map[string]interface{}{}
+
 			it := rv.MapRange()
 			for it.Next() {
-				k := it.Key().Interface()
+				k := it.Key().Interface().(string)
 				v := it.Value().Interface()
 
-				es = append(es, genArgValue(k, "")+":"+genArgValue(v, ""))
+				d[k] = v
 			}
 
-			return "{" + nl + strings.Join(es, ","+nl) + nl + "}"
+			ks := make([]string, 0, len(d))
+			for k := range d {
+				ks = append(ks, k)
+			}
+			sort.Strings(ks)
+
+			var sb strings.Builder
+			sb.WriteString("{\n")
+			for _, k := range ks {
+				e := d[k]
+
+				for i := 0; i < p+1; i++ {
+					sb.WriteString("    ")
+				}
+				sb.WriteString(genArgValue(k, false))
+				sb.WriteString(": ")
+				sb.WriteString(genArgValue(e, false))
+				sb.WriteString(",")
+				if withNl {
+					sb.WriteString("\n")
+				}
+			}
+			for i := 0; i < p; i++ {
+				sb.WriteString("    ")
+			}
+			sb.WriteString("}")
+			return sb.String()
 		case reflect.Slice, reflect.Array:
 			vs := make([]string, 0)
 			for i := 0; i < rv.Len(); i++ {
-				vs = append(vs, genArgValue(rv.Index(i).Interface(), ""))
+				vs = append(vs, genArgValue(rv.Index(i).Interface(), false))
 			}
 
 			return "[" + nl + strings.Join(vs, ","+nl) + nl + "]"
@@ -125,7 +175,7 @@ func genArgs(m map[string]interface{}) string {
 	kvs := make([]string, 0)
 
 	for k, v := range m {
-		kvs = append(kvs, k+"="+genArgValue(v, "\n"))
+		kvs = append(kvs, k+"="+genArgValue(v, true))
 	}
 
 	return strings.Join(kvs, ",\n")

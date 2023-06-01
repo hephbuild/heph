@@ -50,10 +50,10 @@ func (t LibTest) Data() interface{} {
 
 		"Variant":        variant,
 		"VID":            VID(variant),
-		"VariantArgs":    genVariant(variant, true, false),
-		"VariantBinArgs": genVariant(variant, true, false),
+		"VariantArgs":    genVariant(variant, true, false, false),
+		"VariantBinArgs": genVariant(variant, true, false, false),
 		"IfTest":         fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
-		"RunArgs":        genArgValue(t.RunExtra, "\n"),
+		"RunArgs":        genDict(t.RunExtra, 0, true),
 	}
 }
 

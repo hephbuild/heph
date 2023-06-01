@@ -12,7 +12,9 @@ go_mod(cfg={
             {
                 'os': get_os(),
                 'arch': get_arch(),
-                'ldflags': "-X 'main.Version=overriden'",
+                'link': {
+                    'ldflags': "-X 'main.Version=overriden'",
+                },
                 'name': 'withflags'
             }
         ],
