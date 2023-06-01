@@ -114,6 +114,8 @@ func TestPathMatch(t *testing.T) {
 		{"some/path/to/file", []string{"some/path"}, true},
 		{"some/path/to/file", []string{"some/path/to"}, true},
 		{"some/path/to/file", []string{"some/path/to/file"}, true},
+		{"some/path/to/file3", []string{"some/path/to/file"}, false},
+		{"file3", []string{"file"}, false},
 		{"some/path/to/file", []string{"path/to"}, false},
 		{"some/path/to/file", []string{"some/path/*"}, false},
 		{"some/path/to/file", []string{"some/path/**/*"}, true},
@@ -122,6 +124,28 @@ func TestPathMatch(t *testing.T) {
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.path, test.matchers), func(t *testing.T) {
 			actual, err := PathMatchAny(test.path, test.matchers...)
+			require.NoError(t, err)
+
+			assert.Equal(t, test.expected, actual)
+		})
+	}
+}
+
+func TestPathMatchExactOrPrefixAny(t *testing.T) {
+	tests := []struct {
+		path     string
+		prefix   string
+		expected bool
+	}{
+		{"some/path/to/file", "some/path", true},
+		{"some/path/to/file", "some/path/to", true},
+		{"some/path/to/file", "some/path/to/file", true},
+		{"some/path/to/file3", "some/path/to/file", false},
+		{"file3", "file", false},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%v %v", test.path, test.prefix), func(t *testing.T) {
+			actual, err := PathMatchExactOrPrefixAny(test.path, test.prefix)
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, actual)

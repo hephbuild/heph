@@ -97,13 +97,8 @@ func BootBase(ctx context.Context, opts BootOpts) (BaseBootstrap, error) {
 		return bs, fmt.Errorf("config: %w", err)
 	}
 
-	for _, s := range opts.Params {
-		parts := strings.SplitN(s, "=", 2)
-		if len(parts) != 2 {
-			return bs, fmt.Errorf("parameter must be name=value, got `%v`", s)
-		}
-
-		cfg.Params[parts[0]] = parts[1]
+	for k, v := range opts.Params {
+		cfg.Params[k] = v
 	}
 
 	bs.Config = cfg
@@ -172,9 +167,6 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	pool := opts.Pool
 	if pool == nil {
 		pool = worker.NewPool(opts.Workers)
-		fins.Register(func() {
-			pool.Stop(nil)
-		})
 	}
 	bs.Pool = pool
 
