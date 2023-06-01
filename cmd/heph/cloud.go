@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"strings"
 	"syscall"
 )
 
@@ -126,27 +127,27 @@ var cloudStartFlowCmd = &cobra.Command{
 	Use:  "start-flow",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		//ctx := cmd.Context()
-		//
-		//bs, err := bootstrapInit(ctx)
-		//if err != nil {
-		//	return err
-		//}
-		//
-		//metasm := map[string]string{}
-		//for _, s := range *metas {
-		//	parts := strings.SplitN(s, "=", 2)
-		//	if len(parts) != 2 {
-		//		return fmt.Errorf("malformed meta `%v`", s)
-		//	}
-		//
-		//	metasm[parts[0]] = parts[1]
-		//}
-		//
-		//err = Engine.StartFlow(ctx, args[0], metasm)
-		//if err != nil {
-		//	return err
-		//}
+		ctx := cmd.Context()
+
+		bs, err := bootstrapInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		metasm := map[string]string{}
+		for _, s := range *metas {
+			parts := strings.SplitN(s, "=", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("malformed meta `%v`", s)
+			}
+
+			metasm[parts[0]] = parts[1]
+		}
+
+		err = bs.Cloud.StartFlow(ctx, args[0], metasm)
+		if err != nil {
+			return err
+		}
 
 		return nil
 	},
@@ -156,17 +157,17 @@ var cloudStopFlowCmd = &cobra.Command{
 	Use:  "stop-flow",
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		//ctx := cmd.Context()
-		//
-		//bs, err := bootstrapInit(ctx)
-		//if err != nil {
-		//	return err
-		//}
-		//
-		//err = Engine.StopCurrentFlow(ctx)
-		//if err != nil {
-		//	return err
-		//}
+		ctx := cmd.Context()
+
+		bs, err := bootstrapInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		err = bs.Cloud.StopCurrentFlow(ctx)
+		if err != nil {
+			return err
+		}
 
 		return nil
 	},
@@ -176,26 +177,26 @@ var cloudFlowGetCmd = &cobra.Command{
 	Use:  "get",
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		//ctx := cmd.Context()
-		//
-		//bs, err := bootstrapInit(ctx)
-		//if err != nil {
-		//	return err
-		//}
-		//
-		//flow, err := Engine.GetCurrentFlowDetails(ctx)
-		//if err != nil {
-		//	return err
-		//}
-		//
-		//switch args[0] {
-		//case "id":
-		//	fmt.Println(flow.ID)
-		//case "url":
-		//	fmt.Println(flow.URL)
-		//default:
-		//	return fmt.Errorf("invalid flow attribute %v", args[0])
-		//}
+		ctx := cmd.Context()
+
+		bs, err := bootstrapInit(ctx)
+		if err != nil {
+			return err
+		}
+
+		flow, err := bs.Cloud.GetCurrentFlowDetails(ctx)
+		if err != nil {
+			return err
+		}
+
+		switch args[0] {
+		case "id":
+			fmt.Println(flow.ID)
+		case "url":
+			fmt.Println(flow.URL)
+		default:
+			return fmt.Errorf("invalid flow attribute %v", args[0])
+		}
 
 		return nil
 	},
