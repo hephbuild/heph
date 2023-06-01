@@ -101,6 +101,8 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 
 	Finalizers.RegisterWithErr(func(err error) {
 		bs.Finalizers.Run(err)
+
+		bs.Pool.Stop(err)
 	})
 
 	return bs, nil

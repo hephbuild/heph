@@ -258,15 +258,17 @@ func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph2.
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
+type keyFgWaitGroup struct{}
+
 func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *worker.WaitGroup) {
 	deps := &worker.WaitGroup{}
-	ctx = context.WithValue(ctx, "heph_pool_deps", deps)
+	ctx = context.WithValue(ctx, keyFgWaitGroup{}, deps)
 
 	return ctx, deps
 }
 
 func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
-	if deps, ok := ctx.Value("heph_pool_deps").(*worker.WaitGroup); ok {
+	if deps, ok := ctx.Value(keyFgWaitGroup{}).(*worker.WaitGroup); ok {
 		return deps
 	}
 

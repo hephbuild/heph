@@ -27,9 +27,9 @@ func (a *state) New(parent context.Context) (context.Context, context.Context, f
 	scctx, scancel := context.WithCancel(parent)
 	hcctx, hcancel := context.WithCancel(context.Background())
 
-	hctx := ctxSoftCancel{
-		parent: parent,
-		cancel: hcctx,
+	hctx := CancellableContext{
+		Parent: parent,
+		Cancel: hcctx,
 	}
 
 	e := &entry{
@@ -73,34 +73,34 @@ func (a *state) hardCancel() bool {
 	return true
 }
 
-type key struct{}
+type keySoftCancelState struct{}
 
 // NewSoftCancel See softCancel.New
 func NewSoftCancel(parent context.Context) (context.Context, context.Context, context.CancelFunc) {
-	sc := parent.Value(key{}).(*state)
+	sc := parent.Value(keySoftCancelState{}).(*state)
 
 	return sc.New(parent)
 }
 
-type ctxSoftCancel struct {
-	parent context.Context
-	cancel context.Context
+type CancellableContext struct {
+	// Parent is used for Value()
+	Parent context.Context
+	// Cancel is used to inherit cancellation
+	Cancel context.Context
 }
 
-func (c ctxSoftCancel) Deadline() (time.Time, bool)       { return c.cancel.Deadline() }
-func (c ctxSoftCancel) Done() <-chan struct{}             { return c.cancel.Done() }
-func (c ctxSoftCancel) Err() error                        { return c.cancel.Err() }
-func (c ctxSoftCancel) Value(key interface{}) interface{} { return c.parent.Value(key) }
+func (c CancellableContext) Deadline() (time.Time, bool)       { return c.Cancel.Deadline() }
+func (c CancellableContext) Done() <-chan struct{}             { return c.Cancel.Done() }
+func (c CancellableContext) Err() error                        { return c.Cancel.Err() }
+func (c CancellableContext) Value(key interface{}) interface{} { return c.Parent.Value(key) }
 
 func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	sc := &state{}
-
-	ctx = context.WithValue(ctx, key{}, sc)
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	sc := &state{}
 
 	go func() {
 		<-sigCh
@@ -131,6 +131,8 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		}
 		os.Exit(128 + sigN)
 	}()
+
+	ctx = context.WithValue(ctx, keySoftCancelState{}, sc)
 
 	return ctx, cancel
 }
