@@ -30,7 +30,7 @@ func (l Lib) Data() map[string]interface{} {
 		"SFiles":     genStringArray(l.SFiles, 2),
 		"GenEmbed":   l.GenEmbed,
 		"SrcDep":     genStringArray(l.SrcDep, 2),
-		"Variant":    genVariant(l.Variant, true, false),
+		"Variant":    genVariant(l.Variant, true, false, false),
 	}
 }
 

@@ -407,7 +407,7 @@ def _std_pkgs(os, arch):
         }
     )
 
-def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), tags=[], ldflags=''):
+def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), tags=[], ldflags='', deps={}):
     if not out:
         out = heph.pkg.name()
 
@@ -422,7 +422,7 @@ def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), ta
             'libs': libs,
             'main': main,
             'std': _std_pkgs(os, arch),
-        },
+        }|deps,
         run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {} $SRC_MAIN'.format(ldflags)],
         out_env='rel_root',
         tools=[go],

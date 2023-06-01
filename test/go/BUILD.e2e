@@ -29,3 +29,9 @@ e2e_test(
     cmd="heph run //test/go/mod-ldflags:run-withflags",
     expected_output="overriden",
 )
+
+e2e_test(
+    name="sanity_lddeps",
+    cmd="heph run //test/go/mod-lddeps:run",
+    expected_output="coolversion",
+)
