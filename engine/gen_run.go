@@ -3,7 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
-	graph2 "github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
@@ -103,7 +103,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 	return deps, nil
 }
 
-func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph2.Target) error {
+func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
 	for _, target := range targets {
 		if !target.Gen {
 			panic(fmt.Errorf("%v is not a gen target", target.FQN))
@@ -117,7 +117,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 		return err
 	}
 
-	newTargets := graph2.NewTargets(0)
+	newTargets := graph.NewTargets(0)
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
 		e.scheduleRunGenerated(ctx, e.Targets.FindGraph(target), sdeps.Get(target.FQN), deps, newTargets)
@@ -131,7 +131,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 
 			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
-			genTargets := make([]*graph2.Target, 0)
+			genTargets := make([]*graph.Target, 0)
 			for _, t := range newTargets.Slice() {
 				if t.Gen {
 					genTargets = append(genTargets, t)
@@ -169,7 +169,7 @@ func (e *Engine) linkGenTargets(ctx context.Context) error {
 	return nil
 }
 
-func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph2.Targets) {
+func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: "rungen_" + target.FQN,
 		Deps: runDeps,
@@ -180,7 +180,7 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target,
 	deps.Add(j)
 }
 
-func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *graph2.Targets) error {
+func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *graph.Targets) error {
 	files := target.ActualOutFiles().All()
 
 	chunks := ads.Chunk(files, len(e.Pool.Workers))

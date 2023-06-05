@@ -3,7 +3,7 @@ package otlp
 import (
 	"context"
 	"github.com/hephbuild/heph/artifacts"
-	observability2 "github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/tgt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -31,17 +31,17 @@ func artifactSpanAttr(a artifacts.Artifact) trace.SpanStartOption {
 }
 
 type Hook struct {
-	observability2.BaseHook
+	observability.BaseHook
 	Tracer   trace.Tracer
 	RootSpan trace.Span
 }
 
-func (h *Hook) newSpan(ctx context.Context, span observability2.SpanError, spanName string, opts ...trace.SpanStartOption) (context.Context, observability2.SpanHook) {
+func (h *Hook) newSpan(ctx context.Context, span observability.SpanError, spanName string, opts ...trace.SpanStartOption) (context.Context, observability.SpanHook) {
 	_, ctx, fin := h.spanFactory(ctx, span, spanName, opts...)
 	return ctx, fin
 }
 
-func (h *Hook) spanFactory(ctx context.Context, span observability2.SpanError, spanName string, opts ...trace.SpanStartOption) (trace.Span, context.Context, observability2.SpanHook) {
+func (h *Hook) spanFactory(ctx context.Context, span observability.SpanError, spanName string, opts ...trace.SpanStartOption) (trace.Span, context.Context, observability.SpanHook) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -53,7 +53,7 @@ func (h *Hook) spanFactory(ctx context.Context, span observability2.SpanError, s
 	opts = append(opts, trace.WithTimestamp(span.StartTime()))
 
 	ctx, tspan := h.Tracer.Start(ctx, spanName, opts...)
-	if observability2.IsDuringGen(ctx) {
+	if observability.IsDuringGen(ctx) {
 		tspan.SetAttributes(attribute.Bool("heph.during_gen", true))
 	}
 
@@ -64,7 +64,7 @@ func (h *Hook) spanFactory(ctx context.Context, span observability2.SpanError, s
 		tspan.AddEvent("heph.queued", trace.WithTimestamp(span.QueuedTime()))
 	}
 
-	return tspan, ctx, observability2.FinalizerSpanHook(func() {
+	return tspan, ctx, observability.FinalizerSpanHook(func() {
 		err := span.Error()
 		if err != nil {
 			tspan.RecordError(err)
@@ -74,7 +74,7 @@ func (h *Hook) spanFactory(ctx context.Context, span observability2.SpanError, s
 	})
 }
 
-func (h *Hook) OnRoot(ctx context.Context, span *observability2.BaseSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnRoot(ctx context.Context, span *observability.BaseSpan) (context.Context, observability.SpanHook) {
 	args := append([]string{"heph"}, os.Args[1:]...)
 	tspan, ctx, fin := h.spanFactory(ctx, span, strings.Join(args, " "), trace.WithAttributes(attribute.StringSlice("heph.args", args)))
 	h.RootSpan = tspan
@@ -82,42 +82,42 @@ func (h *Hook) OnRoot(ctx context.Context, span *observability2.BaseSpan) (conte
 	return ctx, fin
 }
 
-func (h *Hook) OnRun(ctx context.Context, span *observability2.TargetSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnRun(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "run", targetSpanAttr(span.Target()))
 }
 
-func (h *Hook) OnGenPass(ctx context.Context, span *observability2.BaseSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnGenPass(ctx context.Context, span *observability.BaseSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "gen_pass")
 }
 
-func (h *Hook) OnCacheDownload(ctx context.Context, span *observability2.TargetArtifactCacheSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnCacheDownload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "cache_download", targetSpanAttr(span.Target()), artifactSpanAttr(span.Artifact()))
 }
 
-func (h *Hook) OnCacheUpload(ctx context.Context, span *observability2.TargetArtifactCacheSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnCacheUpload(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "cache_upload", targetSpanAttr(span.Target()), artifactSpanAttr(span.Artifact()))
 }
 
-func (h *Hook) OnRunPrepare(ctx context.Context, span *observability2.TargetSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnRunPrepare(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "run_prepare", targetSpanAttr(span.Target()))
 }
 
-func (h *Hook) OnRunExec(ctx context.Context, span *observability2.TargetExecSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnRunExec(ctx context.Context, span *observability.TargetExecSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "run_exec", targetSpanAttr(span.Target()))
 }
 
-func (h *Hook) OnCollectOutput(ctx context.Context, span *observability2.TargetSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnCollectOutput(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "collect_output", targetSpanAttr(span.Target()))
 }
 
-func (h *Hook) OnLocalCacheStore(ctx context.Context, span *observability2.TargetSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnLocalCacheStore(ctx context.Context, span *observability.TargetSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "local_cache_store", targetSpanAttr(span.Target()))
 }
 
-func (h *Hook) OnLocalCacheCheck(ctx context.Context, span *observability2.TargetArtifactCacheSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnLocalCacheCheck(ctx context.Context, span *observability.TargetArtifactCacheSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "local_cache_check", targetSpanAttr(span.Target()), artifactSpanAttr(span.Artifact()))
 }
 
-func (h *Hook) OnExternalCacheGet(ctx context.Context, span *observability2.ExternalCacheGetSpan) (context.Context, observability2.SpanHook) {
+func (h *Hook) OnExternalCacheGet(ctx context.Context, span *observability.ExternalCacheGetSpan) (context.Context, observability.SpanHook) {
 	return h.newSpan(ctx, span, "external_cache_get", targetSpanAttr(span.Target()))
 }
