@@ -278,13 +278,11 @@ var setupCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := bootstrapInit(ctx)
+		// bootstrap.BootEngine installs the tools
+		_, err := engineInit(ctx)
 		if err != nil {
 			return err
 		}
-
-		// TODO
-		_ = bs
 
 		return nil
 	},
