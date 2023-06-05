@@ -953,7 +953,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	}
 
 	if runGc {
-		err = e.gc(ctx, target)
+		err = e.gc(ctx, target.Target)
 		if err != nil {
 			log.Errorf("gc %v: %v", target.FQN, err)
 		}
@@ -962,11 +962,11 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	return nil
 }
 
-func (e *Engine) gc(ctx context.Context, target *Target) error {
+func (e *Engine) gc(ctx context.Context, target *graph.Target) error {
 	if target.Cache.Enabled && e.Config.Engine.GC {
 		status.Emit(ctx, TargetStatus(target, "GC..."))
 
-		err := e.LocalCache.GCTargets([]*Target{target}, nil, false)
+		err := e.LocalCache.GCTargets([]*graph.Target{target}, nil, false)
 		if err != nil {
 			return err
 		}
