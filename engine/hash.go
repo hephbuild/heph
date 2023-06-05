@@ -432,11 +432,13 @@ func (e *LocalCacheState) cacheDir(target *Target) xfs.Path {
 	return e.cacheDirForHash(target, e.mustHashInput(target))
 }
 
-func (e *LocalCacheState) cacheDirForHash(target *Target, inputHash string) xfs.Path {
+func (e *LocalCacheState) cacheDirForHash(target targetspec.Specer, inputHash string) xfs.Path {
+	spec := target.Spec()
+
 	// TODO: cache
-	folder := "__target_" + target.Name
-	if !target.Cache.Enabled {
-		folder = "__target_tmp_" + instance.UID + "_" + target.Name
+	folder := "__target_" + spec.Name
+	if !spec.Cache.Enabled {
+		folder = "__target_tmp_" + instance.UID + "_" + spec.Name
 	}
-	return e.Root.Home.Join("cache", target.Package.Path, folder, inputHash)
+	return e.Root.Home.Join("cache", spec.Package.Path, folder, inputHash)
 }

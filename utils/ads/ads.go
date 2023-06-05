@@ -49,11 +49,22 @@ func ContainsAny[T comparable](a []T, e []T) bool {
 }
 
 func Filter[T any](a []T, f func(T) bool) []T {
-	o := make([]T, 0)
+	o := a
+	alloc := false
 
-	for _, e := range a {
-		if f(e) {
-			o = append(o, e)
+	for i, e := range a {
+		if !alloc {
+			if !f(e) {
+				o = make([]T, i)
+				alloc = true
+				if i > 0 {
+					copy(o, a[:i])
+				}
+			}
+		} else {
+			if f(e) {
+				o = append(o, e)
+			}
 		}
 	}
 

@@ -574,13 +574,15 @@ var revdepsCmd = &cobra.Command{
 
 		tp, err := targetspec.TargetParse("", args[0])
 		if err != nil {
+			tperr := err
+
 			p, err := filepath.Abs(args[0])
 			if err != nil {
 				return err
 			}
 
 			if !xfs.PathExists(p) {
-				return fmt.Errorf("%v: is not a file and %w", args[0], err)
+				return fmt.Errorf("%v: is not a file and %w", args[0], tperr)
 			}
 
 			rel, err := filepath.Rel(bs.Root.Root.Abs(), p)
