@@ -235,12 +235,19 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		return nil, err
 	}
 
+	var getFlowId func() string
+	if hook := bs.Cloud.Hook; hook != nil {
+		getFlowId = func() string {
+			return hook.FlowId
+		}
+	}
+
 	e := engine.New(engine.Engine{
 		Cwd:                    bs.Cwd,
 		Root:                   bs.Root,
 		Config:                 bs.Graph.Config,
 		Observability:          bs.Observability,
-		GetFlowID:              nil, // TODO
+		GetFlowID:              getFlowId,
 		PlatformProviders:      bs.PlatformProviders,
 		LocalCache:             localCache,
 		RemoteCacheHints:       &rcache.HintStore{},
