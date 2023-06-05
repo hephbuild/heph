@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/engine"
-	graph2 "github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/worker/poolui"
 )
 
-func generateRRs(ctx context.Context, g *graph2.State, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
-	targets := graph2.NewTargets(len(tps))
+func generateRRs(ctx context.Context, g *graph.State, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
+	targets := graph.NewTargets(len(tps))
 	for _, tp := range tps {
 		target := g.Targets().Find(tp.Full())
 		if target == nil {
@@ -21,7 +21,7 @@ func generateRRs(ctx context.Context, g *graph2.State, tps []targetspec.TargetPa
 		targets.Add(target)
 	}
 
-	check := func(target *graph2.Target) error {
+	check := func(target *graph.Target) error {
 		if bailOutOnExpr {
 			if len(target.TargetSpec.Deps.Exprs) > 0 {
 				return fmt.Errorf("%v has expr, bailing out", target.FQN)

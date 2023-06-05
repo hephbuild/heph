@@ -6,10 +6,10 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/buildfiles"
-	graph2 "github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
-	observability2 "github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
@@ -38,15 +38,15 @@ import (
 type Engine struct {
 	Cwd               string
 	Root              *hroot.State
-	Config            *graph2.Config
-	Observability     *observability2.Observability
+	Config            *graph.Config
+	Observability     *observability.Observability
 	GetFlowID         func() string
 	PlatformProviders []platform.PlatformProvider
 	LocalCache        *LocalCacheState
 	RemoteCacheHints  *rcache.HintStore
 	Packages          *packages.Registry
 	BuildFilesState   *buildfiles.State
-	Graph             *graph2.State
+	Graph             *graph.State
 	Pool              *worker.Pool
 	Finalizers        *finalizers.Finalizers
 
@@ -56,7 +56,7 @@ type Engine struct {
 	autocompleteCacheLock locks.Locker
 
 	orderedCachesLock locks.Locker
-	orderedCaches     []graph2.CacheConfig
+	orderedCaches     []graph.CacheConfig
 
 	Targets *TargetMetas
 
@@ -64,7 +64,7 @@ type Engine struct {
 }
 
 type TargetRunRequest struct {
-	Target *graph2.Target
+	Target *graph.Target
 	Args   []string
 	Mode   string // run or watch
 	TargetRunRequestOpts
@@ -90,7 +90,7 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 	return false
 }
 
-func (rrs TargetRunRequests) Get(t *graph2.Target) TargetRunRequest {
+func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
 	for _, rr := range rrs {
 		if rr.Target.FQN == t.FQN {
 			return rr
@@ -100,8 +100,8 @@ func (rrs TargetRunRequests) Get(t *graph2.Target) TargetRunRequest {
 	return TargetRunRequest{Target: t}
 }
 
-func (rrs TargetRunRequests) Targets() *graph2.Targets {
-	ts := graph2.NewTargets(len(rrs))
+func (rrs TargetRunRequests) Targets() *graph.Targets {
+	ts := graph.NewTargets(len(rrs))
 
 	for _, rr := range rrs {
 		ts.Add(rr.Target)
@@ -195,7 +195,7 @@ func (t ErrorWithLogFile) Is(target error) bool {
 }
 
 type TargetFailedError struct {
-	Target *graph2.Target
+	Target *graph.Target
 	Err    error
 }
 
@@ -249,7 +249,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph2.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -319,7 +319,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.FQN,
 		Deps: deps,
-		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability2.TargetSpan) {
+		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
 			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
