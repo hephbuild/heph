@@ -178,10 +178,9 @@ func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error
 		}()
 	}
 
-	defer log.SetPrint(0, nil)
-
 	_, err := p.Run()
-	p.ReleaseTerminal()
+	log.SetPrint(0, nil)
+	_ = p.ReleaseTerminal()
 	if err != nil {
 		return err
 	}
