@@ -105,7 +105,7 @@ func RunGen(ctx context.Context, e *engine.Engine, poolName string, linkAll, pla
 		poolName = "PreRun gen"
 	}
 
-	err = poolui.Wait(poolName, e.Pool, deps, plain)
+	err = poolui.Wait(ctx, poolName, e.Pool, deps, plain)
 	if err != nil {
 		return err
 	}

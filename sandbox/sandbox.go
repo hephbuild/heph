@@ -212,7 +212,11 @@ func (c *Cmd) Run() error {
 
 	err := c.Cmd.Run()
 	if cerr := c.SoftContext.Err(); cerr != nil {
-		err = cerr
+		if err != nil {
+			err = fmt.Errorf("%v: %w", err, cerr)
+		} else {
+			err = cerr
+		}
 	}
 
 	return err

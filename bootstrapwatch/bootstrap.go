@@ -354,7 +354,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	tdeps := tdepsMap.All()
 
-	err = poolui.Wait("Change", bs.Pool, tdeps, s.runopts.Plain)
+	err = poolui.Wait(ctx, "Change", bs.Pool, tdeps, s.runopts.Plain)
 	if err != nil {
 		return err
 	}

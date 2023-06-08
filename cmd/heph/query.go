@@ -739,7 +739,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		err = poolui.Wait("Run", bs.Engine.Pool, tdeps.All(), *plain)
+		err = poolui.Wait(ctx, "Run", bs.Engine.Pool, tdeps.All(), *plain)
 		if err != nil {
 			return err
 		}

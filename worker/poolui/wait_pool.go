@@ -1,12 +1,14 @@
 package poolui
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/worker"
 	"github.com/mattn/go-isatty"
 	"go.uber.org/multierr"
@@ -80,7 +82,7 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	}
 }
 
-func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
+func Wait(ctx context.Context, name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
 	tui := isTerm && !plain
 
 	log.Tracef("WaitPool %v", name)
@@ -89,7 +91,7 @@ func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) er
 	}()
 
 	if tui {
-		err := interactiveUI(name, deps, pool)
+		err := interactiveUI(ctx, name, deps, pool)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)
 		}
@@ -118,7 +120,7 @@ func Wait(name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) er
 var TUIm sync.Mutex
 var TUIStack []byte
 
-func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
+func interactiveUI(ctx context.Context, name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	if !TUIm.TryLock() {
 		//panic(fmt.Sprintf("concurrent call of poolui.Wait, already running at:\n%s\ntrying to run at", stack))
 		return logUI(name, deps, pool)
@@ -144,7 +146,7 @@ func interactiveUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error
 		pool:  pool,
 		start: time.Now(),
 		cancel: func() {
-			pool.Stop(fmt.Errorf("user canceled"))
+			xcontext.Cancel(ctx)
 		},
 		UpdateMessage: msg(),
 	}
