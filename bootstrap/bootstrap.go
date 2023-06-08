@@ -61,6 +61,8 @@ type BootOpts struct {
 	DisableCloudTelemetry bool
 	Pool                  *worker.Pool
 
+	PostBootBase func(bs BaseBootstrap) error
+
 	FlowID string
 }
 
@@ -106,6 +108,13 @@ func BootBase(ctx context.Context, opts BootOpts) (BaseBootstrap, error) {
 	err = upgrade.CheckAndUpdate(ctx, *cfg)
 	if err != nil {
 		return bs, fmt.Errorf("upgrade: %w", err)
+	}
+
+	if opts.PostBootBase != nil {
+		err := opts.PostBootBase(bs)
+		if err != nil {
+			return bs, err
+		}
 	}
 
 	return bs, nil

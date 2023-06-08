@@ -75,12 +75,9 @@ var queryCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		err := blockReadStdin(args)
-		if err != nil {
-			return err
-		}
-
-		bs, err := engineInit(ctx)
+		bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+			return bootstrap.BlockReadStdin(args)
+		})
 		if err != nil {
 			return err
 		}
@@ -114,11 +111,11 @@ var queryCmd = &cobra.Command{
 			}
 		}
 
-		includeMatchers := make(graph.TargetMatchers, 0)
+		includeMatchers := make(graph.TargetMatchers, 0, len(include))
 		for _, s := range include {
 			includeMatchers = append(includeMatchers, graph.ParseTargetSelector("", s))
 		}
-		excludeMatchers := make(graph.TargetMatchers, 0)
+		excludeMatchers := make(graph.TargetMatchers, 0, len(include))
 		for _, s := range exclude {
 			excludeMatchers = append(excludeMatchers, graph.ParseTargetSelector("", s))
 		}
@@ -263,12 +260,14 @@ var graphDotCmd = &cobra.Command{
 	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := engineInit(cmd.Context())
+		ctx := cmd.Context()
+
+		bs, err := engineInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		err = preRunWithGenWithOpts(cmd.Context(), PreRunOpts{
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
 			Engine:  bs.Engine,
 			LinkAll: true,
 		})
@@ -556,7 +555,7 @@ var revdepsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx)
+		bs, err := engineInit(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -799,7 +798,7 @@ var orderedCachesCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx)
+		bs, err := engineInit(ctx, nil)
 		if err != nil {
 			return err
 		}

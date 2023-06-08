@@ -20,7 +20,7 @@ type PreRunOpts struct {
 }
 
 func bootstrapOptions() (bootstrap.BootOpts, error) {
-	paramsm := map[string]string{}
+	paramsm := make(map[string]string, len(*params))
 	for _, s := range *params {
 		parts := strings.SplitN(s, "=", 2)
 		if len(parts) != 2 {
@@ -43,7 +43,7 @@ func bootstrapOptions() (bootstrap.BootOpts, error) {
 
 var engineAlreadyInit bool
 
-func engineInit(ctx context.Context) (bootstrap.EngineBootstrap, error) {
+func engineInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) error) (bootstrap.EngineBootstrap, error) {
 	if engineAlreadyInit {
 		panic("cannot call engineInit multiple times")
 	}
@@ -53,6 +53,9 @@ func engineInit(ctx context.Context) (bootstrap.EngineBootstrap, error) {
 	if err != nil {
 		return bootstrap.EngineBootstrap{}, err
 	}
+
+	// This allows to block reading stdin right after a potential CheckAndUpgrade has run
+	opts.PostBootBase = postBoot
 
 	bs, err := bootstrap.BootWithEngine(ctx, opts)
 	if err != nil {
@@ -109,7 +112,7 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 }
 
 func preRunWithGen(ctx context.Context) (bootstrap.EngineBootstrap, error) {
-	bs, err := engineInit(ctx)
+	bs, err := engineInit(ctx, nil)
 	if err != nil {
 		return bs, err
 	}
@@ -126,13 +129,6 @@ func preRunWithGen(ctx context.Context) (bootstrap.EngineBootstrap, error) {
 
 func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	e := opts.Engine
-	if e == nil {
-		bs, err := engineInit(ctx)
-		if err != nil {
-			return err
-		}
-		e = bs.Engine
-	}
 
 	if *noGen {
 		log.Info("Generated targets disabled")
@@ -164,7 +160,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 }
 
 func preRunAutocomplete(ctx context.Context, includePrivate bool) (targetspec.TargetSpecs, []string, error) {
-	bs, err := engineInit(ctx)
+	bs, err := engineInit(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
