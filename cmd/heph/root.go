@@ -182,7 +182,7 @@ var runCmd = &cobra.Command{
 			return err
 		}
 
-		fromStdin := hasStdin(args)
+		fromStdin := bootstrap.HasStdin(args)
 
 		if len(rrs) == 0 {
 			if !fromStdin {
@@ -252,7 +252,7 @@ var validateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx)
+		bs, err := engineInit(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -279,7 +279,7 @@ var setupCmd = &cobra.Command{
 		ctx := cmd.Context()
 
 		// bootstrap.BootEngine installs the tools
-		_, err := engineInit(ctx)
+		_, err := engineInit(ctx, nil)
 		if err != nil {
 			return err
 		}

@@ -9,27 +9,14 @@ import (
 	"github.com/hephbuild/heph/log/log"
 )
 
-// Deprecated: use bootstrap.BlockReadStdin
-func blockReadStdin(args []string) error {
-	return bootstrap.BlockReadStdin(args)
-}
-
-// Deprecated: use bootstrap.HasStdin
-func hasStdin(args []string) bool {
-	return bootstrap.HasStdin(args)
-}
-
 func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, *graph.Target, error) {
 	if len(args) != 1 {
 		return bootstrap.EngineBootstrap{}, nil, fmt.Errorf("expected one arg")
 	}
 
-	err := blockReadStdin(args)
-	if err != nil {
-		return bootstrap.EngineBootstrap{}, nil, err
-	}
-
-	bs, err := engineInit(ctx)
+	bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+		return bootstrap.BlockReadStdin(args)
+	})
 	if err != nil {
 		return bs, nil, err
 	}
@@ -53,12 +40,9 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 }
 
 func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, engine.TargetRunRequests, error) {
-	err := blockReadStdin(args)
-	if err != nil {
-		return bootstrap.EngineBootstrap{}, nil, err
-	}
-
-	bs, err := engineInit(ctx)
+	bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+		return bootstrap.BlockReadStdin(args)
+	})
 	if err != nil {
 		return bootstrap.EngineBootstrap{}, nil, err
 	}
