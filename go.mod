@@ -13,8 +13,8 @@ require (
 	github.com/blevesearch/bleve_index_api v1.0.5
 	github.com/bmatcuk/doublestar/v4 v4.6.0
 	github.com/c2fo/vfs/v6 v6.6.0
-	github.com/charmbracelet/bubbles v0.15.0
-	github.com/charmbracelet/bubbletea v0.24.0
+	github.com/charmbracelet/bubbles v0.16.1
+	github.com/charmbracelet/bubbletea v0.24.2
 	github.com/charmbracelet/lipgloss v0.7.1
 	github.com/coreos/go-semver v0.3.0
 	github.com/creack/pty v1.1.9
