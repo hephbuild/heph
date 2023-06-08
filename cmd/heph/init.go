@@ -151,7 +151,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 		opts.PoolWaitName = "PreRun gen"
 	}
 
-	err = poolui.Wait(opts.PoolWaitName, e.Pool, deps, *plain)
+	err = poolui.Wait(ctx, opts.PoolWaitName, e.Pool, deps, *plain)
 	if err != nil {
 		return err
 	}

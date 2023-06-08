@@ -83,7 +83,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	runDeps.AddChild(tdeps)
 	runDeps.AddChild(fgDeps)
 
-	err = poolui.Wait("Run", e.Pool, runDeps, runopts.Plain)
+	err = poolui.Wait(ctx, "Run", e.Pool, runDeps, runopts.Plain)
 	if err != nil {
 		return err
 	}

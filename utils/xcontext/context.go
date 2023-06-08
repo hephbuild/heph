@@ -94,6 +94,14 @@ func (c CancellableContext) Done() <-chan struct{}             { return c.Cancel
 func (c CancellableContext) Err() error                        { return c.Cancel.Err() }
 func (c CancellableContext) Value(key interface{}) interface{} { return c.Parent.Value(key) }
 
+type keyCancel struct{}
+
+func Cancel(ctx context.Context) {
+	cancel := ctx.Value(keyCancel{}).(context.CancelFunc)
+
+	cancel()
+}
+
 func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -108,7 +116,7 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		if sc.has() {
 			hardCanceled := false
 			go func() {
-				<-time.After(time.Second)
+				<-time.After(200 * time.Millisecond)
 				if hardCanceled {
 					return
 				}
@@ -116,7 +124,7 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 			}()
 			select {
 			case <-sigCh:
-			case <-time.After(30 * time.Second):
+			case <-time.After(5 * time.Second):
 			}
 			hardCanceled = true
 			sc.hardCancel()
@@ -133,6 +141,9 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	}()
 
 	ctx = context.WithValue(ctx, keySoftCancelState{}, sc)
+	ctx = context.WithValue(ctx, keyCancel{}, context.CancelFunc(func() {
+		sigCh <- os.Interrupt
+	}))
 
 	return ctx, cancel
 }
