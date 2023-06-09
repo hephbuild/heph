@@ -83,7 +83,7 @@ func (e *LocalCacheState) hashFilePath(h hash.Hash, path string) (time.Time, err
 		}
 
 		h.String(link)
-		return time.Time{}, nil
+		return info.ModTime(), nil
 	}
 
 	before := info.ModTime()
