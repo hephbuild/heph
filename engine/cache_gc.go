@@ -180,18 +180,6 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 }
 
 func (e *LocalCacheState) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
-	err := e.gcLock.Lock(ctx)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		err := e.gcLock.Unlock()
-		if err != nil {
-			log.Errorf("gc: %v", err)
-		}
-	}()
-
 	targetDirs, err := e.gcCollectTargetDirs(e.Path.Abs())
 	if err != nil {
 		return err

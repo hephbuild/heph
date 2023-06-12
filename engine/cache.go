@@ -161,7 +161,13 @@ func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs 
 	return true, nil
 }
 
-func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, skipSpan bool) bool {
+func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, skipSpan bool) (bool, error) {
+	unlock, err := e.LocalCache.LockArtifact(ctx, target, artifact)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
 	setCacheHit := func(bool) {}
 	if !skipSpan {
 		var span *observability.TargetArtifactCacheSpan
@@ -178,29 +184,32 @@ func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, arti
 		p := cacheDir.Join(name).Abs()
 		if xfs.PathExists(p) {
 			setCacheHit(true)
-			return true
+			return true, nil
 		}
 	}
 
 	setCacheHit(false)
-	return false
+	return false, nil
 }
 
 func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan, uncompress bool) (bool, error) {
-	if !e.getLocalCacheArtifact(ctx, target, target.Artifacts.InputHash, skipSpan) {
+	ok, err := e.getLocalCacheArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
+	if !ok || err != nil {
 		return false, nil
 	}
 
 	for _, output := range outputs {
-		if !e.getLocalCacheArtifact(ctx, target, target.Artifacts.OutHash(output), skipSpan) {
-			return false, nil
+		ok, err := e.getLocalCacheArtifact(ctx, target, target.Artifacts.OutHash(output), skipSpan)
+		if !ok || err != nil {
+			return false, err
 		}
 
 		if !onlyMeta {
 			art := target.Artifacts.OutTar(output)
 
-			if !e.getLocalCacheArtifact(ctx, target, art, skipSpan) {
-				return false, nil
+			ok, err := e.getLocalCacheArtifact(ctx, target, art, skipSpan)
+			if !ok || err != nil {
+				return false, err
 			}
 
 			if uncompress {

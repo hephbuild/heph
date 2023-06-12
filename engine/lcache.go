@@ -11,7 +11,6 @@ import (
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/vfssimple"
@@ -32,7 +31,6 @@ type LocalCacheState struct {
 	cacheHashInput             *maps.Map[string, string]
 	cacheHashOutputTargetMutex maps.KMutex
 	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
-	gcLock                     locks.Locker
 	cacheHashInputPathsModtime *maps.Map[string, map[string]time.Time]
 }
 
@@ -55,7 +53,6 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 		cacheHashOutputTargetMutex: maps.KMutex{},
 		cacheHashOutput:            &maps.Map[string, string]{},
 		cacheHashInputPathsModtime: &maps.Map[string, map[string]time.Time]{},
-		gcLock:                     locks.NewFlock("Global GC", root.Home.Join("tmp", "gc.lock").Abs()),
 	}
 
 	return s, nil

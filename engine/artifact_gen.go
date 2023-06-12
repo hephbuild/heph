@@ -135,21 +135,53 @@ func (e *LocalCacheState) orderedArtifactProducers(t *Target, outRoot, logFilePa
 	return all
 }
 
-func (e *LocalCacheState) GenArtifacts(ctx context.Context, dir string, target *Target, allArtifacts []ArtifactWithProducer, compress bool) error {
-	for _, artifact := range allArtifacts {
-		err := target.cacheLocks[artifact.Name()].Lock(ctx)
-		if err != nil {
-			return fmt.Errorf("lock %v %v: %w", target.FQN, artifact.Name(), err)
-		}
+func (e *LocalCacheState) LockArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (func() error, error) {
+	l := target.cacheLocks[artifact.Name()]
+	err := l.Lock(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("lock %v %v: %w", target.FQN, artifact.Name(), err)
 	}
-	defer func() {
-		for _, artifact := range allArtifacts {
-			err := target.cacheLocks[artifact.Name()].Unlock()
+
+	return func() error {
+		err := l.Unlock()
+		if err != nil {
+			return fmt.Errorf("unlock %v %v: %w", target.FQN, artifact.Name(), err)
+		}
+
+		return nil
+	}, nil
+}
+
+func (e *LocalCacheState) LockArtifacts(ctx context.Context, target *Target, allArtifacts []ArtifactWithProducer) (func(), error) {
+	unlockers := make([]func() error, 0, len(allArtifacts))
+
+	unlocker := func() {
+		for _, unlock := range unlockers {
+			err := unlock()
 			if err != nil {
-				log.Errorf("unlock %v %v: %v", target.FQN, artifact.Name(), err)
+				log.Errorf("unlock %v: %v", target.FQN, err)
 			}
 		}
-	}()
+	}
+
+	for _, artifact := range allArtifacts {
+		unlock, err := e.LockArtifact(ctx, target, artifact)
+		if err != nil {
+			unlocker()
+			return nil, err
+		}
+		unlockers = append(unlockers, unlock)
+	}
+
+	return unlocker, nil
+}
+
+func (e *LocalCacheState) GenArtifacts(ctx context.Context, dir string, target *Target, allArtifacts []ArtifactWithProducer, compress bool) error {
+	unlock, err := e.LockArtifacts(ctx, target, allArtifacts)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	for _, artifact := range allArtifacts {
 		_, err := GenArtifact(ctx, dir, artifact, compress)

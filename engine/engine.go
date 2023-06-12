@@ -155,11 +155,6 @@ func New(e Engine) *Engine {
 			t.WorkdirRoot = t.SandboxRoot
 		}
 
-		t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
-		for _, artifact := range t.Artifacts.All() {
-			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
-		}
-
 		return t
 	})
 	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())

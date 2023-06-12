@@ -195,18 +195,13 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 		SpanEndNotExist(span, rerr)
 	}()
 
-	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
-
-	err := target.cacheLocks[artifact.Name()].Lock(ctx)
-	if err != nil {
+	unlock, err := e.LocalCache.LockArtifact(ctx, target, artifact)
+	if rerr != nil {
 		return err
 	}
-	defer func() {
-		err := target.cacheLocks[artifact.Name()].Unlock()
-		if err != nil {
-			log.Errorf("unlock %v %v: %v", target.FQN, artifact.Name(), err)
-		}
-	}()
+	defer unlock()
+
+	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
