@@ -43,7 +43,7 @@ func (j *JSONFormatter) level(lvl Level) string {
 }
 
 func (j *JSONFormatter) Format(entry Entry) Buffer {
-	buf := fmtBufPool.Get().(*bytes.Buffer)
+	buf := fmtBufPool.Get()
 	buf.Reset()
 
 	m := map[string]string{

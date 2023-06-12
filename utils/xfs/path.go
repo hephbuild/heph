@@ -2,9 +2,9 @@ package xfs
 
 import (
 	"encoding/json"
+	"github.com/hephbuild/heph/utils/xsync"
 	"path/filepath"
 	"sort"
-	"sync"
 )
 
 type Paths []Path
@@ -109,7 +109,7 @@ func (p Path) Root() string {
 }
 
 var joinsPoolSize = 10
-var joinsPool = sync.Pool{New: func() any {
+var joinsPool = xsync.Pool[[]string]{New: func() []string {
 	return make([]string, joinsPoolSize)
 }}
 
@@ -124,7 +124,7 @@ func (p Path) Join(elem ...string) Path {
 
 		var gjoins []string
 		if endIndex < joinsPoolSize {
-			gjoins = joinsPool.Get().([]string)
+			gjoins = joinsPool.Get()
 			defer joinsPool.Put(gjoins)
 		} else {
 			gjoins = make([]string, endIndex+1)

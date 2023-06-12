@@ -1,10 +1,13 @@
 package liblog
 
 import (
+	"bytes"
 	"fmt"
+	"github.com/hephbuild/heph/utils/xsync"
 	"os"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func NewLogger(core Core) Logger {
@@ -24,28 +27,52 @@ func (l Logger) logf(lvl Level, f string, args ...interface{}) {
 	l.logs(lvl, fmt.Sprintf(f, args...))
 }
 
+var sbPool = xsync.Pool[*bytes.Buffer]{New: func() *bytes.Buffer {
+	return new(bytes.Buffer)
+}}
+
 func (l Logger) log(lvl Level, args ...any) {
 	if !l.core.Enabled(lvl) {
 		return
 	}
 
-	argsstr := make([]string, len(args))
-	for i, arg := range args {
-		switch thing := arg.(type) {
+	switch len(args) {
+	case 0:
+		l.logs(lvl, "")
+	case 1:
+		switch thing := args[0].(type) {
 		case string:
-			argsstr[i] = thing
+			l.logs(lvl, thing)
 		default:
-			argsstr[i] = fmt.Sprint(thing)
+			l.logs(lvl, fmt.Sprint(thing))
 		}
-	}
+	default:
+		sb := sbPool.Get()
+		defer sbPool.Put(sb)
 
-	l.logs(lvl, strings.Join(argsstr, " "))
+		sb.Reset()
+
+		for i, arg := range args {
+			if i != 0 {
+				sb.WriteString(" ")
+			}
+			switch thing := arg.(type) {
+			case string:
+				sb.WriteString(thing)
+			default:
+				fmt.Fprint(sb, thing)
+			}
+		}
+
+		l.logs(lvl, sb.String())
+		sb.Reset()
+	}
 }
 func (l Logger) logs(lvl Level, s string) {
 	err := l.core.Log(Entry{
 		Timestamp: time.Now(),
 		Level:     lvl,
-		Message:   s,
+		Message:   strings.TrimRightFunc(s, unicode.IsSpace),
 		Fields:    l.fields,
 	})
 	if err != nil {

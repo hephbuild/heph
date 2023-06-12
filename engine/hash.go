@@ -12,10 +12,10 @@ import (
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xsync"
 	"io"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -121,8 +121,8 @@ func (e *LocalCacheState) hashFilePerm(h hash.Hash, m os.FileMode) {
 	//h.UI32(uint32(m.Perm()))
 }
 
-var copyBufPool = sync.Pool{
-	New: func() interface{} {
+var copyBufPool = xsync.Pool[[]byte]{
+	New: func() []byte {
 		return make([]byte, 32*1024)
 	},
 }
@@ -130,7 +130,7 @@ var copyBufPool = sync.Pool{
 func (e *LocalCacheState) hashFileReader(h hash.Hash, info os.FileInfo, f io.Reader) error {
 	e.hashFilePerm(h, info.Mode())
 
-	buf := copyBufPool.Get().([]byte)
+	buf := copyBufPool.Get()
 	defer copyBufPool.Put(buf)
 
 	_, err := io.CopyBuffer(h, f, buf)

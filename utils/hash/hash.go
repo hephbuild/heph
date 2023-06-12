@@ -3,10 +3,10 @@ package hash
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"github.com/hephbuild/heph/utils/xsync"
 	"github.com/zeebo/xxh3"
 	"io"
 	"sort"
-	"sync"
 )
 
 type Hash interface {
@@ -66,14 +66,12 @@ func (h *hasher) String(val string) {
 	h.h.WriteString(val)
 }
 
-var buf8Pool = sync.Pool{
-	New: func() any {
-		return make([]byte, 8)
-	},
-}
+var buf8Pool = xsync.Pool[[]byte]{New: func() []byte {
+	return make([]byte, 8)
+}}
 
 func (h *hasher) I64(val int64) {
-	b := buf8Pool.Get().([]byte)
+	b := buf8Pool.Get()
 	defer buf8Pool.Put(b)
 
 	binary.BigEndian.PutUint64(b, uint64(val))
@@ -81,7 +79,7 @@ func (h *hasher) I64(val int64) {
 }
 
 func (h *hasher) UI32(val uint32) {
-	b := buf8Pool.Get().([]byte)
+	b := buf8Pool.Get()
 	defer buf8Pool.Put(b)
 
 	binary.BigEndian.PutUint32(b, val)

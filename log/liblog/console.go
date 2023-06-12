@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/utils/xlipgloss"
+	"github.com/hephbuild/heph/utils/xsync"
 	"github.com/muesli/termenv"
 	"io"
 	"strings"
-	"sync"
 	"unicode"
 )
 
@@ -44,7 +44,7 @@ type ConsoleFormatter struct {
 	reqidStyle     lipgloss.Style
 }
 
-var fmtBufPool = sync.Pool{New: func() any {
+var fmtBufPool = xsync.Pool[*bytes.Buffer]{New: func() *bytes.Buffer {
 	return new(bytes.Buffer)
 }}
 
@@ -72,7 +72,7 @@ const componentKey = "component"
 const reqidKey = "req_id"
 
 func (f *ConsoleFormatter) Format(entry Entry) Buffer {
-	buf := fmtBufPool.Get().(*bytes.Buffer)
+	buf := fmtBufPool.Get()
 	buf.Reset()
 
 	buf.WriteString(f.lvlStyle(entry.Level).Render(entry.Level.String() + "|"))
