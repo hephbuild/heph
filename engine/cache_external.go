@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/worker"
 	"os"
@@ -43,7 +44,7 @@ func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Loca
 	return loc.NewLocation(filepath.Join(target.Package.Path, target.Name, inputHash) + "/")
 }
 
-func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string) (bool, error) {
+func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string, atomic bool) (bool, error) {
 	tof, err := to.NewFile(path)
 	if err != nil {
 		return false, err
@@ -73,7 +74,7 @@ func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Locati
 	_ = tof.Close()
 	_ = fromf.Close()
 
-	err = e.vfsCopyFile(ctx, from, to, path)
+	err = e.vfsCopyFile(ctx, from, to, path, atomic)
 	if err != nil {
 		return false, err
 	}
@@ -81,7 +82,7 @@ func (e *Engine) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Locati
 	return true, nil
 }
 
-func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string) error {
+func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string, atomic bool) error {
 	log.Tracef("vfs copy %v to %v", from.URI(), to.URI())
 
 	doneTrace := log.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
@@ -89,7 +90,7 @@ func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path st
 
 	sf, err := from.NewFile(path)
 	if err != nil {
-		return fmt.Errorf("NewFile: %w", err)
+		return fmt.Errorf("NewFile sf: %w", err)
 	}
 	defer sf.Close()
 
@@ -107,11 +108,41 @@ func (e *Engine) vfsCopyFile(ctx context.Context, from, to vfs.Location, path st
 		return fmt.Errorf("copy %v: %w", sf.URI(), os.ErrNotExist)
 	}
 
-	df, err := sf.CopyToLocation(to)
-	if err != nil {
-		return fmt.Errorf("CopyToLocation: %w", err)
+	if atomic {
+
+		dftmp, err := to.NewFile(path + "_tmp_" + instance.UID)
+		if err != nil {
+			return fmt.Errorf("NewFile df: %w", err)
+		}
+		defer dftmp.Close()
+
+		err = sf.CopyToFile(dftmp)
+		if err != nil {
+			return err
+		}
+
+		df, err := to.NewFile(path)
+		if err != nil {
+			return fmt.Errorf("NewFile df: %w", err)
+		}
+		defer df.Close()
+
+		err = dftmp.MoveToFile(df)
+		if err != nil {
+			return fmt.Errorf("Move: %w", err)
+		}
+	} else {
+		df, err := to.NewFile(path)
+		if err != nil {
+			return fmt.Errorf("NewFile df: %w", err)
+		}
+		defer df.Close()
+
+		err = sf.CopyToFile(df)
+		if err != nil {
+			return err
+		}
 	}
-	defer df.Close()
 
 	return nil
 }
@@ -178,7 +209,7 @@ func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache g
 		return err
 	}
 
-	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, ArtifactExternalFileName(artifact))
+	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, ArtifactExternalFileName(artifact), false)
 	if err != nil {
 		return err
 	}
@@ -213,7 +244,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 		return err
 	}
 
-	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, ArtifactExternalFileName(artifact))
+	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, ArtifactExternalFileName(artifact), true)
 	if err != nil {
 		return err
 	}

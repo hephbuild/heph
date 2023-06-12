@@ -6,7 +6,9 @@ import (
 	"github.com/hephbuild/heph/utils/xlipgloss"
 	"github.com/muesli/termenv"
 	"io"
+	"strings"
 	"sync"
+	"unicode"
 )
 
 var LevelColors = map[Level]lipgloss.TerminalColor{
@@ -92,7 +94,8 @@ func (f *ConsoleFormatter) Format(entry Entry) Buffer {
 		}
 	}
 
-	buf.WriteString(entry.Message)
+	buf.WriteString(strings.TrimRightFunc(entry.Message, unicode.IsSpace))
+
 	tabbed := false
 	for _, f := range entry.Fields {
 		if f.Key == componentKey {

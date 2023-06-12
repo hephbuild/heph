@@ -269,6 +269,10 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		Targets:                nil, // Will be set as part of engine.New
 	})
 
+	bs.Finalizers.RegisterWithErr(func(err error) {
+		e.Finalizers.Run(err)
+	})
+
 	localCache.Targets = e.Targets
 
 	if bs.Config.Engine.InstallTools {
