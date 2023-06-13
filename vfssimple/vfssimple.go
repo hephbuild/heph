@@ -26,7 +26,7 @@ import (
 
 func WithContext(ctx context.Context) {
 	gsfs := backend.Backend(gs.Scheme).(*gs.FileSystem)
-	gsfs.WithContext(ctx)
+	gsfs = gsfs.WithContext(ctx)
 	backend.Register(gs.Scheme, gsfs)
 }
 

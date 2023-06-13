@@ -3,7 +3,7 @@ package graph
 import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/xsync"
 	"strings"
 )
 
@@ -23,8 +23,8 @@ type ArtifactOrchestrator struct {
 	Manifest  artifacts.Artifact
 	Out       map[string]ArtifactsOut
 
-	allOnce        utils.Once[[]artifacts.Artifact]
-	allReverseOnce utils.Once[[]artifacts.Artifact]
+	allOnce        xsync.Once[[]artifacts.Artifact]
+	allReverseOnce xsync.Once[[]artifacts.Artifact]
 }
 
 func (o *ArtifactOrchestrator) All() []artifacts.Artifact {

@@ -2,8 +2,8 @@ package main
 
 import (
 	summary2 "github.com/hephbuild/heph/observability/summary"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xtime"
 	"github.com/olekukonko/tablewriter"
 	"os"
 	"sort"
@@ -29,7 +29,7 @@ func summarySpanStringOpt(phases ...summaryOpt) string {
 			continue
 		}
 
-		s := utils.RoundDuration(span.End.Sub(span.Start), 1).String()
+		s := xtime.RoundDuration(span.End.Sub(span.Start), 1).String()
 
 		if opt.decorator != nil {
 			return opt.decorator(s)
@@ -45,7 +45,7 @@ func artifactString(a summary2.TargetStatsArtifact, hitText string) string {
 	if a.Name == "" {
 		return ""
 	}
-	s := utils.RoundDuration(a.Duration(), 1).String()
+	s := xtime.RoundDuration(a.Duration(), 1).String()
 	if hitText != "" && a.CacheHit {
 		s += " (" + hitText + ")"
 	}
@@ -85,7 +85,7 @@ func PrintSummary(stats *summary2.Summary, withGen bool) {
 			summarySpanString(target.Exec),
 			summarySpanString(target.CollectOutput),
 			summarySpanString(target.CacheStore),
-			utils.RoundDuration(target.Duration(), 1).String(),
+			xtime.RoundDuration(target.Duration(), 1).String(),
 		}
 
 		data = append(data, row)
@@ -146,7 +146,7 @@ func PrintSummary(stats *summary2.Summary, withGen bool) {
 	table.SetAutoWrapText(false)
 	table.SetHeader([]string{"Target", "Cache Pull", "Prepare", "Exec", "Collect Output", "Cache Store", "Total"})
 	if stats.RootSpan != nil {
-		table.SetFooter([]string{"Total", "", "", "", "", "", utils.RoundDuration(stats.RootSpan.EndTime().Sub(stats.RootSpan.StartTime()), 1).String()})
+		table.SetFooter([]string{"Total", "", "", "", "", "", xtime.RoundDuration(stats.RootSpan.EndTime().Sub(stats.RootSpan.StartTime()), 1).String()})
 	}
 	table.SetBorder(true)
 	table.AppendBulk(data)

@@ -197,7 +197,6 @@ type Pool struct {
 
 	doneCh chan struct{}
 	o      sync.Once
-	cond   sync.Cond
 
 	jobsCh  chan *Job
 	wg      sync.WaitGroup

@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
@@ -31,6 +32,7 @@ var exclude []string
 var spec bool
 var transitive bool
 var all bool
+var debugTransitive bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -57,6 +59,7 @@ func init() {
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
+	targetCmd.Flags().BoolVar(&debugTransitive, "debug-transitive", false, "Print transitive details")
 
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
@@ -428,53 +431,12 @@ var targetCmd = &cobra.Command{
 		}
 
 		fmt.Println(target.FQN)
+		fmt.Println()
 
-		fmt.Println("Transitive:")
-		printTools("    ", target.OwnTransitive.Tools)
-		printDeps("    ", target.OwnTransitive.Deps)
-		fmt.Println("    pass_env:", target.OwnTransitive.PassEnv)
-		fmt.Println("    runtime_pass_env:", target.OwnTransitive.RuntimePassEnv)
-
-		fmt.Println("Deep Transitive:")
-		printTools("    ", target.DeepOwnTransitive.Tools)
-		printDeps("    ", target.DeepOwnTransitive.Deps)
-		fmt.Println("    pass_env:", target.DeepOwnTransitive.PassEnv)
-		fmt.Println("    runtime_pass_env:", target.DeepOwnTransitive.RuntimePassEnv)
-
-		fmt.Println("Deps:")
-		printTools("    ", target.Tools)
-		printDeps("    ", target.Deps)
-
-		fmt.Println("Deps from transitive:")
-		printTools("    ", target.TransitiveDeps.Tools)
-		printDeps("    ", target.TransitiveDeps.Deps)
-		fmt.Println("    pass_env:", target.TransitiveDeps.PassEnv)
-		fmt.Println("    runtime_pass_env:", target.TransitiveDeps.RuntimePassEnv)
+		graphprint.Print(os.Stdout, target, debugTransitive)
 
 		return nil
 	},
-}
-
-func printDeps(indent string, deps tgt.TargetNamedDeps) {
-	fmt.Println(indent + "Targets:")
-	for _, t := range deps.All().Targets {
-		fmt.Printf(indent+"  %v\n", t.Target.FQN)
-	}
-	fmt.Println(indent + "Files:")
-	for _, t := range deps.All().Files {
-		fmt.Printf(indent+"  %v\n", t.RelRoot())
-	}
-}
-
-func printTools(indent string, tools tgt.TargetTools) {
-	fmt.Println(indent + "Tools:")
-	for _, t := range tools.Targets {
-		fmt.Printf(indent+"  %v\n", t.Target.FQN)
-	}
-	fmt.Println(indent + "Host tools:")
-	for _, t := range tools.Hosts {
-		fmt.Printf(indent+"  %v\n", t.Name)
-	}
 }
 
 var pkgsCmd = &cobra.Command{

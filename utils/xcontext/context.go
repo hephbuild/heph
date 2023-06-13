@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xsync"
 	"os"
 	"os/signal"
 	"sync"
@@ -19,6 +20,14 @@ type entry struct {
 type state struct {
 	ctxs []*entry
 	m    sync.Mutex
+	w    *xsync.Wait
+}
+
+func newSoftCancelState() *state {
+	s := &state{}
+	s.w = xsync.NewWait(&s.m)
+
+	return s
 }
 
 // New returns one context that will be canceled by soft cancel first, the second one will act as a force cancel
@@ -37,18 +46,36 @@ func (a *state) New(parent context.Context) (context.Context, context.Context, f
 		hardCancel: hcancel,
 	}
 
-	a.m.Lock()
-	a.ctxs = append(a.ctxs, e)
-	a.m.Unlock()
+	a.add(e)
 
 	return scctx, hctx, func() {
 		e.softCancel()
 		e.hardCancel()
 
-		a.m.Lock()
-		a.ctxs = ads.Remove(a.ctxs, e)
-		a.m.Unlock()
+		a.remove(e)
 	}
+}
+
+func (a *state) wait() <-chan struct{} {
+	return a.w.Wait(func() bool {
+		return len(a.ctxs) == 0
+	})
+}
+
+func (a *state) add(e *entry) {
+	a.m.Lock()
+	defer a.m.Unlock()
+
+	a.ctxs = append(a.ctxs, e)
+}
+
+func (a *state) remove(e *entry) {
+	a.m.Lock()
+	defer a.m.Unlock()
+
+	a.ctxs = ads.Remove(a.ctxs, e)
+
+	a.w.Broadcast()
 }
 
 func (a *state) has() bool {
@@ -108,7 +135,7 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
-	sc := &state{}
+	sc := newSoftCancelState()
 
 	go func() {
 		<-sigCh
@@ -120,17 +147,27 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 				if hardCanceled {
 					return
 				}
-				log.Warnf("Attempting to soft cancel... ctrl+c one more time to force")
+				log.Warnf("Attempting to cancel... ctrl+c one more time to force")
 			}()
 			select {
 			case <-sigCh:
 			case <-time.After(5 * time.Second):
 			}
+			log.Warnf("Forcing cancellation...")
 			hardCanceled = true
 			sc.hardCancel()
+			select {
+			// Wait for soft cancel to all be unregistered, should be instant, unless something is stuck
+			case <-sc.wait():
+				// Wait for graceful exit
+				<-time.After(2 * time.Second)
+			case <-time.After(2 * time.Second):
+				// All soft cancel did not unregister, something is stuck...
+			}
+		} else {
+			<-time.After(2 * time.Second)
 		}
 
-		<-time.After(2 * time.Second)
 		log.Error("Something seems to be stuck, ctrl+c one more time to forcefully exit")
 		sig := <-sigCh
 		sigN := 0
@@ -145,5 +182,8 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		sigCh <- os.Interrupt
 	}))
 
-	return ctx, cancel
+	return ctx, func() {
+		cancel()
+		sc.hardCancel()
+	}
 }

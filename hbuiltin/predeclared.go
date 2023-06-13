@@ -7,11 +7,11 @@ import (
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xsync"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkjson"
 	"go.starlark.net/starlarkstruct"
@@ -54,7 +54,7 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 	predeclaredHash = hash.HashBytes(predeclaredSrc)
 }
 
-var predeclaredFunctionOnce = utils.Once[starlark.StringDict]{}
+var predeclaredFunctionOnce = xsync.Once[starlark.StringDict]{}
 
 func predeclared_functions() starlark.StringDict {
 	return predeclaredFunctionOnce.MustDo(func() (starlark.StringDict, error) {

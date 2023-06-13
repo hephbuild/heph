@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xsync"
 	"io"
 	"os"
 	"os/exec"
@@ -125,8 +125,8 @@ func (a manifestArtifact) git(args ...string) string {
 	return strings.TrimSpace(string(b))
 }
 
-var gitCommitOnce utils.Once[string]
-var gitRefOnce utils.Once[string]
+var gitCommitOnce xsync.Once[string]
+var gitRefOnce xsync.Once[string]
 
 func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
 	inputHash, err := a.LocalState.hashInput(a.Target, false)

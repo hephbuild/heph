@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
+	"github.com/hephbuild/heph/utils/xsync"
 	"go.starlark.net/syntax"
 	"os/exec"
 	"sort"
@@ -238,7 +238,7 @@ type TargetSpecHostTool struct {
 	Path    string
 }
 
-var binCache = maps.Map[string, utils.Once[string]]{}
+var binCache = maps.Map[string, xsync.Once[string]]{}
 
 func (t TargetSpecHostTool) ResolvedPath() (string, error) {
 	if t.Path != "" {

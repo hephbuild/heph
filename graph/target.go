@@ -84,3 +84,12 @@ func (t *Target) String() string {
 func (t *Target) HasAnyLabel(labels []string) bool {
 	return ads.ContainsAny(t.Labels, labels)
 }
+
+func (t *Target) EmptyDeps() bool {
+	return t.Tools.Empty() &&
+		t.Deps.Empty() &&
+		len(t.Env) == 0 &&
+		len(t.PassEnv) == 0 &&
+		len(t.RuntimeEnv) == 0 &&
+		len(t.RuntimePassEnv) == 0
+}

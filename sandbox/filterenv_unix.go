@@ -3,7 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/xsync"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -80,7 +80,7 @@ func maxArgs() (int64, error) {
 	return max, nil
 }
 
-var maxArgsOnce utils.Once[int64]
+var maxArgsOnce xsync.Once[int64]
 
 func FilterLongEnv(env map[string]string, args []string) error {
 	max, err := maxArgsOnce.Do(maxArgs)

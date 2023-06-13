@@ -3,9 +3,9 @@ package hephprovider
 import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xsync"
 	"go.uber.org/multierr"
 	"os"
 	"os/exec"
@@ -55,7 +55,7 @@ func key(goos, goarch string) string {
 
 type buildMatrix = maps.OMap[string, string]
 
-var buildOnce = utils.Once[*buildMatrix]{}
+var buildOnce = xsync.Once[*buildMatrix]{}
 
 func buildAll(srcDir, outDir string) (*buildMatrix, error) {
 	return buildOnce.Do(func() (*buildMatrix, error) {

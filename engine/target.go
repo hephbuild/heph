@@ -3,7 +3,6 @@ package engine
 import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 )
@@ -46,8 +45,4 @@ func (t *Target) ActualSupportFiles() xfs.Paths {
 	}
 
 	return t.actualSupportFiles
-}
-
-func (t *Target) HasAnyLabel(labels []string) bool {
-	return ads.ContainsAny(t.Labels, labels)
 }

@@ -7,8 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/xcontext"
+	"github.com/hephbuild/heph/utils/xtime"
 	"github.com/hephbuild/heph/worker"
 	"github.com/mattn/go-isatty"
 	"go.uber.org/multierr"
@@ -31,7 +31,7 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	start := time.Now()
 	printProgress := func() {
 		s := deps.TransitiveCount()
-		log.Infof("Progress %v: %v/%v %v", name, s.Done, s.All, utils.RoundDuration(time.Since(start), 1).String())
+		log.Infof("Progress %v: %v/%v %v", name, s.Done, s.All, xtime.RoundDuration(time.Since(start), 1).String())
 	}
 
 	printWorkersStatus := func() {
@@ -53,7 +53,7 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				status = "Waiting..."
 			}
 
-			runtime := fmt.Sprintf("%v", utils.RoundDuration(duration, 1).String())
+			runtime := fmt.Sprintf("%v", xtime.RoundDuration(duration, 1).String())
 
 			fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
 		}
@@ -269,7 +269,7 @@ var styleWorkerStart = lipgloss.NewStyle().Renderer(lrenderer).Bold(true)
 var styleFaint = lipgloss.NewStyle().Renderer(lrenderer).Faint(true)
 
 func (r *view) View() string {
-	start := utils.RoundDuration(time.Since(r.start), 1).String()
+	start := xtime.RoundDuration(time.Since(r.start), 1).String()
 
 	if r.summary {
 		count := fmt.Sprint(r.stats.Done)
@@ -292,7 +292,7 @@ func (r *view) View() string {
 	for _, w := range r.workers {
 		runtime := ""
 		if j := w.CurrentJob; j != nil {
-			runtime = fmt.Sprintf("=> [%5s]", utils.FormatDuration(time.Since(j.TimeStart)))
+			runtime = fmt.Sprintf("=> [%5s]", xtime.FormatDuration(time.Since(j.TimeStart)))
 		}
 
 		status := w.GetStatus().String(log.Renderer())

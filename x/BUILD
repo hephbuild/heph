@@ -18,6 +18,16 @@ done
 )
 
 target(
+    name="trap",
+    run="""
+trap '' 2
+echo "This won't be killed by ctrl-c"
+sleep 99999 
+      """,
+    cache=False,
+)
+
+target(
     name="infinite-running",
     run="""
 for j in {1..99999}; do
