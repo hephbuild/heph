@@ -5,10 +5,12 @@ import (
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtime"
 	"github.com/hephbuild/heph/worker"
+	"github.com/muesli/reflow/wrap"
 	"strings"
 	"time"
 )
@@ -28,7 +30,7 @@ func New(ctx context.Context, name string, deps *worker.WaitGroup, pool *worker.
 		cancel: func() {
 			xcontext.Cancel(ctx)
 		},
-		logEntryCh:   make(chan log.FormattableEntry),
+		logEntryCh:   make(chan liblog.Entry),
 		quitWhenDone: quitWhenDone,
 	}
 }
@@ -39,7 +41,7 @@ type Model struct {
 	start        time.Time
 	cancel       func()
 	pool         *worker.Pool
-	logEntryCh   chan log.FormattableEntry
+	logEntryCh   chan liblog.Entry
 	width        int
 	quitWhenDone bool
 	UpdateMessage
@@ -129,9 +131,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, m.doUpdateMsgTicker()
-	case log.FormattableEntry:
+	case liblog.Entry:
 		return m, tea.Batch(func() tea.Msg {
-			return tea.Println(msg.Format(m.width))()
+			lfmt := liblog.NewConsoleFormatter(log.Renderer())
+
+			buf := lfmt.Format(msg)
+			defer buf.Free()
+
+			b := buf.Bytes()
+
+			if m.width > 0 && len(b) > m.width {
+				b = wrap.Bytes(b, m.width)
+			}
+
+			return tea.Println(string(b))()
 		}, m.nextLogEntryCmd)
 	}
 

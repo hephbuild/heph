@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/hroot"
+	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	obsummary "github.com/hephbuild/heph/observability/summary"
 	"github.com/hephbuild/heph/packages"
@@ -73,6 +75,8 @@ type BaseBootstrap struct {
 }
 
 func BootBase(ctx context.Context, opts BootOpts) (BaseBootstrap, error) {
+	lipgloss.SetDefaultRenderer(log.Renderer())
+
 	bs := BaseBootstrap{}
 
 	cwd, err := Getwd()

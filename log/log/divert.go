@@ -1,25 +1,21 @@
 package log
 
 import (
-	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/liblog"
-	"github.com/muesli/reflow/wrap"
 	"sync"
 )
 
-func newDivertCore(r *lipgloss.Renderer, core liblog.Core) *divertCore {
+func newDivertCore(core liblog.Core) *divertCore {
 	return &divertCore{
-		fmt:  liblog.NewConsoleFormatter(r),
 		core: core,
 	}
 }
 
 type divertCore struct {
-	fmt  *liblog.ConsoleFormatter
 	core liblog.Core
 
 	m      sync.Mutex
-	ch     chan FormattableEntry
+	ch     chan liblog.Entry
 	chDone chan struct{}
 }
 
@@ -27,7 +23,7 @@ func (t *divertCore) Enabled(l liblog.Level) bool {
 	return t.core.Enabled(l)
 }
 
-func (t *divertCore) divert(ch chan FormattableEntry) {
+func (t *divertCore) divert(ch chan liblog.Entry) {
 	t.m.Lock()
 	defer t.m.Unlock()
 
@@ -42,25 +38,6 @@ func (t *divertCore) divert(ch chan FormattableEntry) {
 	}
 }
 
-type FormattableEntry struct {
-	Entry liblog.Entry
-
-	fmt *liblog.ConsoleFormatter
-}
-
-func (f FormattableEntry) Format(termWidth int) string {
-	buf := f.fmt.Format(f.Entry)
-	defer buf.Free()
-
-	b := buf.Bytes()
-
-	if termWidth > 0 && len(b) > termWidth {
-		b = wrap.Bytes(b, termWidth)
-	}
-
-	return string(b)
-}
-
 func (t *divertCore) Log(entry liblog.Entry) error {
 	t.m.Lock()
 	ch, chDone := t.ch, t.chDone
@@ -68,10 +45,8 @@ func (t *divertCore) Log(entry liblog.Entry) error {
 
 	if ch != nil {
 		select {
-		case ch <- FormattableEntry{
-			Entry: entry,
-			fmt:   t.fmt,
-		}:
+		case ch <- entry:
+			// Successfully diverted
 			return nil
 		case <-chDone:
 			// Another diversion is in place, try again

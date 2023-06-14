@@ -485,7 +485,7 @@ func printEvents(events []fsEvent) {
 	}
 }
 
-var successStyle = lipgloss.NewStyle().Renderer(log.Renderer()).Foreground(lipgloss.Color("#00FF00"))
+var successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
 
 func (s *State) updateWatchers() error {
 	bs := s.cbs

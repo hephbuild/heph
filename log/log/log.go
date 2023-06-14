@@ -16,7 +16,7 @@ func newDefaultLogger() liblog.Logger {
 var renderer *lipgloss.Renderer
 var divert *divertCore
 
-func SetDiversion(ch chan FormattableEntry) {
+func SetDiversion(ch chan liblog.Entry) {
 	divert.divert(ch)
 }
 
@@ -35,7 +35,7 @@ func Setup() {
 
 	renderer = liblog.NewConsoleRenderer(Writer())
 
-	divert = newDivertCore(renderer, liblog.NewLock(liblog.NewCore(liblog.NewConsoleWith(Writer(), renderer))))
+	divert = newDivertCore(liblog.NewLock(liblog.NewCore(liblog.NewConsoleWith(Writer(), renderer))))
 
 	defaultLogger = liblog.NewLogger(liblog.NewLevelEnabler(divert, IsLevelEnabled))
 }
