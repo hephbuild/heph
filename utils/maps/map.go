@@ -1,8 +1,8 @@
 package maps
 
 import (
+	"github.com/hephbuild/heph/utils/mds"
 	"golang.org/x/exp/constraints"
-	"sort"
 	"sync"
 )
 
@@ -16,17 +16,7 @@ func (m *OMap[K, V]) Keys() []K {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ks := make([]K, 0, len(m.m))
-
-	for k := range m.m {
-		ks = append(ks, k)
-	}
-
-	sort.Slice(ks, func(i, j int) bool {
-		return ks[i] < ks[j]
-	})
-
-	return ks
+	return mds.Keys(m.m)
 }
 
 type Map[K comparable, V any] struct {

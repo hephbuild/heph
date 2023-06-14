@@ -20,7 +20,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		FQN:                 pkg.TargetAddr(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run,
-		Doc:                 args.Doc,
+		Doc:                 strings.TrimSpace(args.Doc),
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
 		Entrypoint:          args.Entrypoint,

@@ -143,6 +143,8 @@ func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
 
 func stackTrace(thread *starlark.Thread) []targetspec.TargetSource {
 	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) targetspec.TargetSource {
+		c.Pos.Col = 0 //  We don't really care about the column...
+
 		return targetspec.TargetSource{
 			Name: c.Name,
 			Pos:  c.Pos,

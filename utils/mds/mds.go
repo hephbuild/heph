@@ -1,8 +1,11 @@
 package mds
 
-import "sort"
+import (
+	"golang.org/x/exp/constraints"
+	"sort"
+)
 
-func Keys[K string, V any](m map[K]V) []K {
+func Keys[K constraints.Ordered, V any](m map[K]V) []K {
 	ks := make([]K, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)

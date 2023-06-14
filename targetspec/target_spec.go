@@ -220,6 +220,14 @@ func (t TargetSpec) equalJson(spec TargetSpec) bool {
 	return true
 }
 
+func (t TargetSpec) SourceFile() string {
+	if len(t.Source) == 0 {
+		return ""
+	}
+
+	return t.Source[0].Pos.String()
+}
+
 type TargetSpecTargetTool struct {
 	Name   string
 	Target string

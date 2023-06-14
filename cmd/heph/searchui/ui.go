@@ -8,10 +8,8 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/bbt"
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/targetspec"
-	"golang.org/x/term"
-	"os"
+	"strings"
 	"time"
 )
 
@@ -28,11 +26,12 @@ type bbtfzf struct {
 	searchResult bbtSearchResult
 	targets      targetspec.TargetSpecs
 	debounce     bbt.Debounce
-	cursor       int
 	search       search.Func
 	deets        bool
-	deetsTarget  *graph.Target
 	bs           bootstrap.EngineBootstrap
+	list         *list[targetspec.TargetSpec]
+
+	width, height int
 }
 
 type bbtSearchResult struct {
@@ -51,18 +50,52 @@ func newBbtSearch(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) 
 		panic(err)
 	}
 
+	l := &list[targetspec.TargetSpec]{
+		render: func(sugg targetspec.TargetSpec, _ int, selected bool) string {
+			var buf bytes.Buffer
+
+			style := styleRow
+			if selected {
+				style = styleRowCurrent
+			}
+
+			prefix := ""
+			if sugg.Doc != "" {
+				prefix = " "
+				doc := sugg.Doc
+				if i := strings.Index(sugg.Doc, "\n"); i > 0 {
+					doc = doc[:i]
+				}
+				buf.WriteString(style.Render(doc))
+				buf.WriteString("\n")
+			}
+
+			buf.WriteString(style.Render(prefix + fqnStyle.Render(sugg.FQN)))
+			buf.WriteString("\n")
+
+			return buf.String()
+		},
+		itemHeight: func(item targetspec.TargetSpec, index int, selected bool) int {
+			if item.Doc != "" {
+				return 2
+			}
+
+			return 1
+		},
+	}
+
 	return &bbtfzf{
+		list:     l,
 		bs:       bs,
 		targets:  targets,
 		ti:       ti,
-		cursor:   -1,
 		search:   search,
 		debounce: bbt.NewDebounce(50 * time.Millisecond),
 	}
 }
 
 func (m *bbtfzf) Init() tea.Cmd {
-	return textinput.Blink
+	return tea.Batch(textinput.Blink)
 }
 
 func (m *bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -74,42 +107,38 @@ func (m *bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
 		case tea.KeyEnter:
-			return m, func() tea.Msg {
-				m.deets = true
-				return tea.EnterAltScreen()
-			}
+			m.deets = true
+			cmd = tea.EnterAltScreen
 		case tea.KeyEsc:
-			return m, func() tea.Msg {
-				m.deets = false
-				return tea.ExitAltScreen()
-			}
-		case tea.KeyUp:
-			if m.cursor >= 0 {
-				m.cursor--
-			}
-		case tea.KeyDown:
-			if m.cursor < len(m.searchResult.res.Targets) {
-				m.cursor++
-			}
+			m.deets = false
+			cmd = tea.ExitAltScreen
 		}
 	case bbtSearchResult:
 		m.searchResult = msg
-		if m.cursor > len(m.searchResult.res.Targets)-1 {
-			m.cursor = len(m.searchResult.res.Targets) - 1
-		}
+		m.list.SetItems(msg.res.Targets)
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
 	}
 
-	var searchm tea.Cmd
+	var scmd tea.Cmd
 	if query := m.ti.Value(); query != m.searchResult.query {
-		searchm = m.debounce.Do(func() tea.Msg {
-			res, err := m.search(query, 10)
+		scmd = m.debounce.Do(func() tea.Msg {
+			res, err := m.search(query, 999)
 			return bbtSearchResult{res: res, err: err, query: query}
 		})
 	}
 
-	m.ti, cmd = m.ti.Update(msg)
+	if m.deets {
+		m.list.height = m.height - 2 - 2 - 1
+	} else {
+		m.list.height = 15
+	}
 
-	return m, tea.Batch(cmd, searchm)
+	var ticmd, lcmd tea.Cmd
+	m.ti, ticmd = m.ti.Update(msg)
+	m.list, lcmd = m.list.Update(msg)
+
+	return m, tea.Batch(ticmd, lcmd, scmd, cmd)
 }
 
 var styleRow = lipgloss.NewStyle().Border(lipgloss.HiddenBorder(), false, false, false, true)
@@ -129,41 +158,52 @@ func (m *bbtfzf) listView() string {
 		buf.WriteString("\n")
 	}
 
-	for i, sugg := range m.searchResult.res.Targets {
-		style := styleRow
-		if i == m.cursor {
-			style = styleRowCurrent
-		}
-
-		prefix := ""
-		if sugg.Doc != "" {
-			prefix = " "
-			buf.WriteString(style.Render(sugg.Doc))
-			buf.WriteString("\n")
-		}
-
-		buf.WriteString(style.Render(prefix + fqnStyle.Render(sugg.FQN)))
-		buf.WriteString("\n")
-	}
+	buf.WriteString(m.list.View())
 
 	return buf.String()
 }
 
 func (m *bbtfzf) deetsView() string {
-	physicalWidth, _, _ := term.GetSize(int(os.Stderr.Fd()))
-
-	docStyle := lipgloss.NewStyle().Padding(1, 2, 1, 2)
-
-	if physicalWidth > 0 {
-		docStyle = docStyle.Width(physicalWidth)
+	docStyle := lipgloss.NewStyle().Padding(1, 2)
+	if m.width > 0 {
+		docStyle = docStyle.Width(m.width)
 	}
 
-	left := lipgloss.NewStyle().Width(physicalWidth / 2)
-	right := lipgloss.NewStyle().Width(physicalWidth / 2)
+	paneWidth := (m.width-2-2)/2 - 1
 
-	doc := lipgloss.JoinHorizontal(lipgloss.Top, left.Render(m.listView()), right.Render("right"))
+	left := lipgloss.NewStyle().Width(paneWidth)
+	right := lipgloss.NewStyle().Width(paneWidth)
+
+	doc := lipgloss.JoinHorizontal(lipgloss.Top, left.MarginRight(2).Render(m.listView()), right.Render(m.deetsRightPane(paneWidth)))
 
 	return docStyle.Render(doc)
+}
+
+var styleTitle = lipgloss.NewStyle().Bold(true)
+var styleLocation = lipgloss.NewStyle().Faint(true)
+
+func (m *bbtfzf) deetsRightPane(width int) string {
+	t, ok := m.list.get()
+	if !ok {
+		return ""
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString(styleTitle.Width(width).Render(t.FQN))
+	sb.WriteString("\n")
+	if len(t.Source) > 0 {
+		sb.WriteString(styleLocation.Width(width).Render(t.SourceFile()))
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\n")
+
+	if t.Doc != "" {
+		sb.WriteString(t.Doc)
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
 }
 
 func (m *bbtfzf) View() string {
