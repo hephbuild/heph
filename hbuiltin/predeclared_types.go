@@ -17,7 +17,6 @@ type TargetArgs struct {
 	Entrypoint          string
 	Platforms           TargetArgsPlatforms
 	RunInCwd            bool
-	Quiet               bool
 	PassArgs            bool
 	Cache               TargetArgsCache
 	RestoreCache        bool

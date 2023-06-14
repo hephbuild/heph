@@ -43,6 +43,12 @@ func (tp *NamedPaths[TS, T]) Names() []string {
 	return tp.names
 }
 
+func (tp *NamedPaths[TS, T]) IsNamed() bool {
+	names := tp.Names()
+
+	return len(names) != 1 || names[0] != ""
+}
+
 func (tp *NamedPaths[TS, T]) ProvisionName(name string) {
 	if tp.named == nil {
 		tp.named = map[string]TS{}

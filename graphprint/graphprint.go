@@ -48,7 +48,6 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 			fmt.Fprintln(w, "Hash Deps:")
 			printDeps(w, indent, target.HashDeps)
 		}
-		printEnvs(w, indent, target.PassEnv, target.RuntimePassEnv, target.Env, target.RuntimeEnv)
 	}
 
 	if transitive {
@@ -58,6 +57,50 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 			printNamedDeps(w, indent, target.TransitiveDeps.Deps)
 			printTransitiveEnvs(w, indent, target.TransitiveDeps)
 		}
+	}
+
+	printEnvs(w, "", target.PassEnv, target.RuntimePassEnv, target.Env, target.RuntimeEnv)
+
+	if len(target.Out.All()) > 0 {
+		if target.Out.IsNamed() {
+			fmt.Fprintln(w, "Out:")
+			ogindent := indent
+
+			indent := ogindent + ogindent
+
+			for _, name := range target.Out.Names() {
+				out := target.Out.Name(name)
+
+				if name == "" {
+					name = "<>"
+				}
+				fmt.Fprintln(w, indent+name+":")
+
+				indent := ogindent + ogindent + ogindent
+
+				for _, path := range out {
+					fmt.Fprintln(w, indent+path.RelRoot())
+				}
+			}
+		} else {
+			fmt.Fprintln(w, "Out:")
+			for _, path := range target.Out.All() {
+				fmt.Fprintln(w, indent+path.RelRoot())
+			}
+		}
+	}
+
+	fmt.Fprintln(w, "Sandbox:", target.Sandbox)
+	fmt.Fprintln(w, "Cache:")
+	fmt.Fprintln(w, indent, "Enabled:", target.Cache.Enabled)
+	if target.Cache.Enabled {
+		fmt.Fprintln(w, indent, "History:", target.Cache.History)
+		if target.Cache.Named != nil {
+			fmt.Fprintln(w, indent, "Named:", strings.Join(target.Cache.Named, ", "))
+		}
+	}
+	if len(target.Labels) > 0 {
+		fmt.Fprintln(w, "Labels:", strings.Join(target.Labels, ", "))
 	}
 }
 

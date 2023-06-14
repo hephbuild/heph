@@ -49,7 +49,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}),
 		Package:  pkg,
 		PassArgs: args.PassArgs,
-		Quiet:    args.Quiet,
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named.Array,

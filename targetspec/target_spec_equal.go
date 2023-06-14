@@ -83,10 +83,6 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
-	if t.Quiet != spec.Quiet {
-		return false
-	}
-
 	if t.Dir != spec.Dir {
 		return false
 	}

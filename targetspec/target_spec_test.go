@@ -100,7 +100,6 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		Package:           pkg,
 		Run:               []string{"some", "command"},
 		Entrypoint:        "exec",
-		Quiet:             false,
 		Dir:               "",
 		PassArgs:          false,
 		Deps:              deps,

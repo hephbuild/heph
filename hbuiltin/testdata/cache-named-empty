@@ -32,7 +32,6 @@ target(
         }
     ],
     "ConcurrentExecution": false,
-    "Quiet": false,
     "Dir": "",
     "PassArgs": false,
     "Deps": {

@@ -62,3 +62,7 @@ func (d TargetDeps) Sort() {
 		return strings.Compare(i.RelRoot(), j.RelRoot())
 	})
 }
+
+func (d TargetDeps) Empty() bool {
+	return len(d.Targets) == 0 && len(d.Files) == 0
+}

@@ -88,6 +88,7 @@ func (t *Target) HasAnyLabel(labels []string) bool {
 func (t *Target) EmptyDeps() bool {
 	return t.Tools.Empty() &&
 		t.Deps.Empty() &&
+		t.HashDeps.Empty() &&
 		len(t.Env) == 0 &&
 		len(t.PassEnv) == 0 &&
 		len(t.RuntimeEnv) == 0 &&

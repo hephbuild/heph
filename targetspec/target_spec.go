@@ -104,7 +104,6 @@ type TargetSpec struct {
 	Entrypoint          string
 	Platforms           []TargetPlatform
 	ConcurrentExecution bool
-	Quiet               bool
 	Dir                 string
 	PassArgs            bool
 	Deps                TargetSpecDeps
