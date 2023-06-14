@@ -474,16 +474,16 @@ var depsCmd = &cobra.Command{
 			fn = bs.Graph.DAG().GetAncestors
 		}
 
-		ancestors := make([]string, 0)
 		ancs, err := fn(target.Target)
 		if err != nil {
 			return err
 		}
-		for _, anc := range ancs {
-			ancestors = append(ancestors, anc.FQN)
-		}
 
-		ancestors = ads.DedupKeepLast(ancestors, func(s string) string {
+		ancestors := ads.Map(ancs, func(t *graph.Target) string {
+			return t.FQN
+		})
+
+		ancestors = ads.Dedup(ancestors, func(s string) string {
 			return s
 		})
 		sort.Strings(ancestors)

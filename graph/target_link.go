@@ -404,10 +404,10 @@ func (e *State) registerDag(t *Target) error {
 		}
 	}
 
-	for _, tool := range t.Tools.Targets {
-		err := addEdge(tool.Target, t)
+	for _, target := range t.Tools.TargetReferences {
+		err := addEdge(target, t)
 		if err != nil {
-			return fmt.Errorf("tool: %v to %v: %w", tool.Target.FQN, t.FQN, err)
+			return fmt.Errorf("tool: %v to %v: %w", target.FQN, t.FQN, err)
 		}
 	}
 
