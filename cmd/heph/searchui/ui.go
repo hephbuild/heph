@@ -1,16 +1,22 @@
-package search
+package searchui
 
 import (
+	"bytes"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/bbt"
+	"github.com/hephbuild/heph/cmd/heph/search"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/targetspec"
+	"golang.org/x/term"
+	"os"
 	"time"
 )
 
-func TUI(targets targetspec.TargetSpecs) error {
-	p := tea.NewProgram(newBbtSearch(targets))
+func TUI(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) error {
+	p := tea.NewProgram(newBbtSearch(targets, bs))
 	if err := p.Start(); err != nil {
 		return err
 	}
@@ -23,26 +29,30 @@ type bbtfzf struct {
 	targets      targetspec.TargetSpecs
 	debounce     bbt.Debounce
 	cursor       int
-	search       Func
+	search       search.Func
+	deets        bool
+	deetsTarget  *graph.Target
+	bs           bootstrap.EngineBootstrap
 }
 
 type bbtSearchResult struct {
 	query string
-	res   Result
+	res   search.Result
 	err   error
 }
 
-func newBbtSearch(targets targetspec.TargetSpecs) bbtfzf {
+func newBbtSearch(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) *bbtfzf {
 	ti := textinput.New()
 	ti.Placeholder = "Search..."
 	ti.Focus()
 
-	search, err := NewSearch(targets)
+	search, err := search.NewSearch(targets)
 	if err != nil {
 		panic(err)
 	}
 
-	return bbtfzf{
+	return &bbtfzf{
+		bs:       bs,
 		targets:  targets,
 		ti:       ti,
 		cursor:   -1,
@@ -51,11 +61,11 @@ func newBbtSearch(targets targetspec.TargetSpecs) bbtfzf {
 	}
 }
 
-func (m bbtfzf) Init() tea.Cmd {
+func (m *bbtfzf) Init() tea.Cmd {
 	return textinput.Blink
 }
 
-func (m bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
@@ -65,10 +75,12 @@ func (m bbtfzf) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case tea.KeyEnter:
 			return m, func() tea.Msg {
+				m.deets = true
 				return tea.EnterAltScreen()
 			}
 		case tea.KeyEsc:
 			return m, func() tea.Msg {
+				m.deets = false
 				return tea.ExitAltScreen()
 			}
 		case tea.KeyUp:
@@ -106,11 +118,15 @@ var styleError = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff0000"))
 
 var fqnStyle = lipgloss.NewStyle().Inline(true).Bold(true)
 
-func (m bbtfzf) View() string {
-	s := m.ti.View() + "\n"
+func (m *bbtfzf) listView() string {
+	var buf bytes.Buffer
+
+	buf.WriteString(m.ti.View())
+	buf.WriteString("\n")
 
 	if err := m.searchResult.err; err != nil {
-		s += styleError.Render(err.Error()) + "\n"
+		buf.WriteString(styleError.Render(err.Error()))
+		buf.WriteString("\n")
 	}
 
 	for i, sugg := range m.searchResult.res.Targets {
@@ -122,13 +138,38 @@ func (m bbtfzf) View() string {
 		prefix := ""
 		if sugg.Doc != "" {
 			prefix = " "
-			s += style.Render(sugg.Doc)
-			s += "\n"
+			buf.WriteString(style.Render(sugg.Doc))
+			buf.WriteString("\n")
 		}
 
-		s += style.Render(prefix + fqnStyle.Render(sugg.FQN))
-		s += "\n"
+		buf.WriteString(style.Render(prefix + fqnStyle.Render(sugg.FQN)))
+		buf.WriteString("\n")
 	}
 
-	return s
+	return buf.String()
+}
+
+func (m *bbtfzf) deetsView() string {
+	physicalWidth, _, _ := term.GetSize(int(os.Stderr.Fd()))
+
+	docStyle := lipgloss.NewStyle().Padding(1, 2, 1, 2)
+
+	if physicalWidth > 0 {
+		docStyle = docStyle.Width(physicalWidth)
+	}
+
+	left := lipgloss.NewStyle().Width(physicalWidth / 2)
+	right := lipgloss.NewStyle().Width(physicalWidth / 2)
+
+	doc := lipgloss.JoinHorizontal(lipgloss.Top, left.Render(m.listView()), right.Render("right"))
+
+	return docStyle.Render(doc)
+}
+
+func (m *bbtfzf) View() string {
+	if m.deets {
+		return m.deetsView()
+	} else {
+		return m.listView()
+	}
 }

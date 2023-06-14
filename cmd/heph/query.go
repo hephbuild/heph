@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
+	"github.com/hephbuild/heph/cmd/heph/searchui"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/graphprint"
@@ -15,7 +16,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker/poolui"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
 	"os"
@@ -37,7 +38,6 @@ var debugTransitive bool
 func init() {
 	queryCmd.AddCommand(configCmd)
 	queryCmd.AddCommand(codegenCmd)
-	queryCmd.AddCommand(fzfCmd)
 	queryCmd.AddCommand(graphCmd)
 	queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
@@ -64,7 +64,6 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 	queryCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
-	fzfCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
 
 	queryCmd.RegisterFlagCompletionFunc("include", ValidArgsFunctionLabelsOrTargets)
 	queryCmd.RegisterFlagCompletionFunc("exclude", ValidArgsFunctionLabelsOrTargets)
@@ -147,39 +146,26 @@ var queryCmd = &cobra.Command{
 	},
 }
 
-var fzfCmd = &cobra.Command{
-	Use:   "fzf",
-	Short: "Fuzzy search targets",
-	Args:  cobra.RangeArgs(0, 1),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log.Warnf("Deprecated, use heph search")
-
-		targets, _, err := preRunAutocomplete(cmd.Context(), all)
-		if err != nil {
-			return err
-		}
-
-		if len(args) == 0 {
-			return search.TUI(targets)
-		}
-
-		return search.Search(targets, args[0])
-	},
-}
-
 var searchCmd = &cobra.Command{
 	Use:     "search [target]",
 	Aliases: []string{"s"},
 	Short:   "Search targets",
 	Args:    cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		targets, _, err := preRunAutocomplete(cmd.Context(), all)
+		ctx := cmd.Context()
+
+		bs, err := engineInit(ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		targets, _, err := preRunAutocompleteWithBootstrap(ctx, bs, all)
 		if err != nil {
 			return err
 		}
 
 		if len(args) == 0 {
-			return search.TUI(targets)
+			return searchui.TUI(targets, bs)
 		}
 
 		return search.Search(targets, strings.Join(args, " "))
@@ -701,7 +687,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		err = poolui.Wait(ctx, "Run", bs.Engine.Pool, tdeps.All(), *plain)
+		err = poolwait.Wait(ctx, "Run", bs.Engine.Pool, tdeps.All(), *plain)
 		if err != nil {
 			return err
 		}

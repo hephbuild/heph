@@ -19,7 +19,7 @@ import (
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolui"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -354,7 +354,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	tdeps := tdepsMap.All()
 
-	err = poolui.Wait(ctx, "Change", bs.Pool, tdeps, s.runopts.Plain)
+	err = poolwait.Wait(ctx, "Change", bs.Pool, tdeps, s.runopts.Plain)
 	if err != nil {
 		return err
 	}

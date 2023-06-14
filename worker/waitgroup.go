@@ -122,12 +122,8 @@ func (wg *WaitGroup) Done() <-chan struct{} {
 }
 
 func (wg *WaitGroup) IsDone() bool {
-	if wg.doneCh == nil {
-		return false
-	}
-
 	select {
-	case <-wg.doneCh:
+	case <-wg.Done():
 		return true
 	default:
 		return false

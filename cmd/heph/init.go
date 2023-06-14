@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/worker/poolui"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
 	"strings"
 	"time"
@@ -151,7 +151,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 		opts.PoolWaitName = "PreRun gen"
 	}
 
-	err = poolui.Wait(ctx, opts.PoolWaitName, e.Pool, deps, *plain)
+	err = poolwait.Wait(ctx, opts.PoolWaitName, e.Pool, deps, *plain)
 	if err != nil {
 		return err
 	}
@@ -165,7 +165,11 @@ func preRunAutocomplete(ctx context.Context, includePrivate bool) (targetspec.Ta
 		return nil, nil, err
 	}
 
-	err = preRunWithGenWithOpts(ctx, PreRunOpts{Engine: bs.Engine})
+	return preRunAutocompleteWithBootstrap(ctx, bs, includePrivate)
+}
+
+func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.EngineBootstrap, includePrivate bool) (targetspec.TargetSpecs, []string, error) {
+	err := preRunWithGenWithOpts(ctx, PreRunOpts{Engine: bs.Engine})
 	if err != nil {
 		return nil, nil, err
 	}

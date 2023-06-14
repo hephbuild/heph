@@ -9,7 +9,7 @@ import (
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolui"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
 	"os/exec"
 )
@@ -83,7 +83,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	runDeps.AddChild(tdeps)
 	runDeps.AddChild(fgDeps)
 
-	err = poolui.Wait(ctx, "Run", e.Pool, runDeps, runopts.Plain)
+	err = poolwait.Wait(ctx, "Run", e.Pool, runDeps, runopts.Plain)
 	if err != nil {
 		return err
 	}

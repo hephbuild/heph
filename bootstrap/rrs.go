@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
-	"github.com/hephbuild/heph/worker/poolui"
+	"github.com/hephbuild/heph/worker/poolwait"
 )
 
 func generateRRs(ctx context.Context, g *graph.State, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
@@ -105,7 +105,7 @@ func RunGen(ctx context.Context, e *engine.Engine, poolName string, linkAll, pla
 		poolName = "PreRun gen"
 	}
 
-	err = poolui.Wait(ctx, poolName, e.Pool, deps, plain)
+	err = poolwait.Wait(ctx, poolName, e.Pool, deps, plain)
 	if err != nil {
 		return err
 	}
