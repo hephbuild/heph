@@ -1,6 +1,6 @@
 package ads
 
-func DedupAppend[T any](as []T, id func(T) string, vs ...T) []T {
+func DedupAppend[T any, K comparable](as []T, id func(T) K, vs ...T) []T {
 	if len(vs) == 0 {
 		return as
 	}
@@ -14,8 +14,8 @@ func DedupAppend[T any](as []T, id func(T) string, vs ...T) []T {
 	return as
 }
 
-func DedupAppender[T any](as []T, id func(T) string, cap int) func([]T, T) []T {
-	value := make(map[string]struct{}, len(as)+cap)
+func DedupAppender[T any, K comparable](as []T, id func(T) K, cap int) func([]T, T) []T {
+	value := make(map[K]struct{}, len(as)+cap)
 	for _, a := range as {
 		id := id(a)
 
@@ -33,52 +33,17 @@ func DedupAppender[T any](as []T, id func(T) string, cap int) func([]T, T) []T {
 	}
 }
 
-func Dedup[T any](as []T, id func(T) string) []T {
-	value := make(map[string]struct{}, len(as))
+func Dedup[T any, K comparable](as []T, id func(T) K) []T {
+	value := make(map[K]struct{}, len(as))
 
-	nas := as
-	copied := false
-	for i, a := range as {
-		id := id(a)
+	return Filter(as, func(e T) bool {
+		id := id(e)
 
 		if _, ok := value[id]; ok {
-			if !copied {
-				nas = make([]T, i, len(as))
-				copy(nas, as[:i])
-				copied = true
-			}
-			continue
+			return false
 		}
+
 		value[id] = struct{}{}
-		if copied {
-			nas = append(nas, a)
-		}
-	}
-
-	return nas
-}
-
-func DedupKeepLast[T any](as []T, id func(T) string) []T {
-	value := make(map[string]T, len(as))
-	pos := make(map[string]int, len(as))
-
-	for i, a := range as {
-		a := a
-		id := id(a)
-
-		value[id] = a
-		pos[id] = i
-	}
-
-	nas := make([]T, 0, len(as))
-	for i, a := range as {
-		id := id(a)
-
-		pi := pos[id]
-		if pi == i {
-			nas = append(nas, value[id])
-		}
-	}
-
-	return nas
+		return true
+	})
 }

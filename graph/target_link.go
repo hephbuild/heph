@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"os"
@@ -733,6 +734,8 @@ func (e *State) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadc
 			return tgt.TargetDeps{}, err
 		}
 
+		td.Targets = ads.GrowExtra(td.Targets, len(targets))
+
 		for _, target := range targets {
 			if len(target.Out.Names()) == 0 {
 				td.Targets = append(td.Targets, tgt.TargetWithOutput{
@@ -749,6 +752,7 @@ func (e *State) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadc
 		}
 	}
 
+	td.Targets = ads.GrowExtra(td.Targets, len(deps.Targets))
 	for _, spec := range deps.Targets {
 		dt := e.Targets().Find(spec.Target)
 		if dt == nil {
@@ -789,6 +793,7 @@ func (e *State) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadc
 		}
 	}
 
+	td.Files = ads.GrowExtra(td.Files, len(deps.Files))
 	for _, file := range deps.Files {
 		var p xfs.Path
 		if strings.HasPrefix(file.Path, "/") {
@@ -813,16 +818,14 @@ func (e *State) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadc
 	}
 
 	if InlineGroups {
-		targets := make([]tgt.TargetWithOutput, 0, len(td.Targets))
-		for _, dep := range td.Targets {
+		td.Targets = ads.MapFlat(td.Targets, func(dep tgt.TargetWithOutput) []tgt.TargetWithOutput {
 			if dep.Target.IsGroup() {
-				targets = append(targets, dep.Target.Deps.All().Targets...)
 				td.Files = append(td.Files, dep.Target.Deps.All().Files...)
+				return dep.Target.Deps.All().Targets
 			} else {
-				targets = append(targets, dep)
+				return []tgt.TargetWithOutput{dep}
 			}
-		}
-		td.Targets = targets
+		})
 	}
 
 	td.Dedup()

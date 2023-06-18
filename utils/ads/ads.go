@@ -15,19 +15,6 @@ func Map[T, O any](a []T, f func(T) O) []O {
 	return out
 }
 
-func MapFilter[T, O any](a []T, f func(T) (O, bool)) []O {
-	out := make([]O, 0, len(a))
-
-	for _, e := range a {
-		v, ok := f(e)
-		if ok {
-			out = append(out, v)
-		}
-	}
-
-	return out
-}
-
 func Contains[T comparable](a []T, e T) bool {
 	for _, ae := range a {
 		if ae == e {
@@ -53,8 +40,10 @@ func Filter[T any](a []T, f func(T) bool) []T {
 	alloc := false
 
 	for i, e := range a {
+		keep := f(e)
+
 		if !alloc {
-			if !f(e) {
+			if !keep {
 				o = make([]T, i)
 				alloc = true
 				if i > 0 {
@@ -62,10 +51,34 @@ func Filter[T any](a []T, f func(T) bool) []T {
 				}
 			}
 		} else {
-			if f(e) {
+			if keep {
 				o = append(o, e)
 			}
 		}
+	}
+
+	return o
+}
+
+func MapFlat[T comparable](a []T, f func(T) []T) []T {
+	o := a
+	alloc := false
+
+	for i, e := range a {
+		fr := f(e)
+		if !alloc {
+			if len(fr) == 1 && fr[0] == e {
+				continue
+			}
+
+			o = make([]T, i, len(o))
+			alloc = true
+			if i > 0 {
+				copy(o, a[:i])
+			}
+		}
+
+		o = append(o, fr...)
 	}
 
 	return o

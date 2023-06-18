@@ -9,10 +9,12 @@ VERSION=`curl -fsSL $DEFAULT_URL_BASE/latest_version`
 # Find the os / arch to download. You can do this quite nicely with go env
 # but we use this script on machines that don't necessarily have Go itself.
 OS=`uname`
+sedi='-i'
 if [ "$OS" = "Linux" ]; then
     GOOS="linux"
 elif [ "$OS" = "Darwin" ]; then
     GOOS="darwin"
+    sedi='-i ""'
 elif [ "$OS" = "FreeBSD" ]; then
     GOOS="freebsd"
 else
@@ -41,7 +43,7 @@ if [ "$1" = "--dev" ]; then
     # For local consumption only
     echo "Dev mode"
     cp dev_run.sh /tmp/heph
-	  sed -i "" "s|<HEPH_SRC_ROOT>|$(pwd)|g" /tmp/heph
+	  sed $sedi "s|<HEPH_SRC_ROOT>|$(pwd)|g" /tmp/heph
 	  mv /tmp/heph "$LOCATION/bin/heph"
 elif [ "$1" = "--build" ]; then
     # For local consumption only
