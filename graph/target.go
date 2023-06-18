@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"errors"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"sync"
@@ -19,42 +18,8 @@ type Target struct {
 	linkingCh  chan struct{}
 	linkingErr error
 	// Deps + HashDeps + TargetTools
-	LinkingDeps *Targets
-	m           sync.Mutex
-}
-
-func (t *Target) transitivelyWalk(m map[string]struct{}, f func(t *Target) error) error {
-	targets := append([]*Target{t}, t.LinkingDeps.Slice()...)
-
-	for _, t := range targets {
-		if _, ok := m[t.FQN]; ok {
-			continue
-		}
-		m[t.FQN] = struct{}{}
-
-		err := f(t)
-		if err != nil {
-			return err
-		}
-
-		err = t.transitivelyWalk(m, f)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (t *Target) TransitivelyWalk(f func(t *Target) error) error {
-	m := map[string]struct{}{}
-
-	err := t.transitivelyWalk(m, f)
-	if err != nil && !errors.Is(err, tgt.ErrStopWalk) {
-		return err
-	}
-
-	return nil
+	AllTargetDeps *Targets
+	m             sync.Mutex
 }
 
 func (t *Target) resetLinking() {
@@ -64,10 +29,10 @@ func (t *Target) resetLinking() {
 
 	if t.linkingErr != nil || len(spec.Deps.Exprs) > 0 || len(spec.HashDeps.Exprs) > 0 || len(spec.Tools.Exprs) > 0 {
 		depsCap := 0
-		if t.LinkingDeps != nil {
-			depsCap = len(t.LinkingDeps.Slice())
+		if t.AllTargetDeps != nil {
+			depsCap = len(t.AllTargetDeps.Slice())
 		}
-		t.LinkingDeps = NewTargets(depsCap)
+		t.AllTargetDeps = NewTargets(depsCap)
 		t.linked = false
 		t.linkingErr = nil
 	}

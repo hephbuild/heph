@@ -2,7 +2,6 @@ package graph
 
 import (
 	"github.com/hephbuild/heph/artifacts"
-	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/xsync"
 	"strings"
 )
@@ -56,10 +55,7 @@ func (e *State) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 		Out:       map[string]ArtifactsOut{},
 	}
 
-	names := target.OutWithSupport.Names()
-	names = targetspec.SortOutputsForHashing(names)
-
-	for _, name := range names {
+	for _, name := range target.OutWithSupport.Names() {
 		o.Out[name] = ArtifactsOut{
 			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, false),
 			artifacts.New("out_"+name+".tar", strings.TrimSpace(name+" tar"), true, true),

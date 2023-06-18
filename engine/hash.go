@@ -185,7 +185,7 @@ func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Ti
 }
 
 func (e *LocalCacheState) find(t *tgt.Target) *Target {
-	return e.Targets.FindFQN(t.FQN)
+	return e.Targets.Find(t)
 }
 
 func (e *LocalCacheState) HashInput(target *Target) string {
@@ -194,7 +194,7 @@ func (e *LocalCacheState) HashInput(target *Target) string {
 
 func hashCacheId(target *Target) string {
 	idh := hash.NewHash()
-	for _, fqn := range target.LinkingDeps.FQNs() {
+	for _, fqn := range target.AllTargetDeps.FQNs() {
 		idh.String(fqn)
 	}
 

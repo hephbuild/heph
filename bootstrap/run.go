@@ -91,7 +91,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	if inlineRR == nil {
 		if runopts.PrintOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
-				target := e.Targets.FindGraph(target)
+				target := e.Targets.Find(target)
 				err = PrintTargetOutputPaths(target, runopts.PrintOutput.Str)
 				if err != nil {
 					return err
@@ -101,7 +101,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 
 		if runopts.CatOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
-				target := e.Targets.FindGraph(target)
+				target := e.Targets.Find(target)
 				err = PrintTargetOutputContent(target, runopts.CatOutput.Str)
 				if err != nil {
 					return err
@@ -130,7 +130,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return err
 	}
 
-	inlineTarget := e.Targets.FindGraph(inlineRR.Target)
+	inlineTarget := e.Targets.Find(inlineRR.Target)
 
 	if runopts.PrintOutput.Bool {
 		err = PrintTargetOutputPaths(inlineTarget, runopts.PrintOutput.Str)

@@ -610,7 +610,7 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		target := bs.Engine.Targets.FindGraph(gtarget)
+		target := bs.Engine.Targets.Find(gtarget)
 
 		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
 
@@ -658,7 +658,7 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		target := bs.Engine.Targets.FindGraph(gtarget)
+		target := bs.Engine.Targets.Find(gtarget)
 
 		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {
@@ -692,7 +692,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		target := bs.Engine.Targets.FindGraph(gtarget)
+		target := bs.Engine.Targets.Find(gtarget)
 
 		fmt.Println(bs.Engine.LocalCache.HashInput(target))
 

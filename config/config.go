@@ -2,6 +2,7 @@ package config
 
 import (
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/mds"
 	"os"
 	"path/filepath"
 	"sort"
@@ -55,10 +56,7 @@ type Config struct {
 }
 
 func (c Config) OrderedPlatforms() []Platform {
-	platforms := make([]Platform, 0, len(c.Platforms))
-	for _, p := range c.Platforms {
-		platforms = append(platforms, p)
-	}
+	platforms := mds.Values(c.Platforms)
 	sort.Slice(platforms, func(i, j int) bool {
 		// Order priority DESC
 		return platforms[i].Priority > platforms[j].Priority

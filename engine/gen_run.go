@@ -120,7 +120,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	newTargets := graph.NewTargets(0)
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		e.scheduleRunGenerated(ctx, e.Targets.FindGraph(target), sdeps.Get(target.FQN), deps, newTargets)
+		e.scheduleRunGenerated(ctx, e.Targets.Find(target), sdeps.Get(target.FQN), deps, newTargets)
 	}
 
 	j := e.Pool.Schedule(ctx, &worker.Job{

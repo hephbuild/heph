@@ -79,7 +79,7 @@ type schedulerv2 struct {
 
 func (s *schedulerv2) schedule() error {
 	for _, target := range s.toAssess.Slice() {
-		target := s.allTargetMetas.FindGraph(target)
+		target := s.allTargetMetas.Find(target)
 
 		targetDeps := s.deps.Get(target.FQN)
 		targetDeps.AddSem()
@@ -220,7 +220,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target targets
 
 	runDeps := &worker.WaitGroup{}
 	for _, parent := range parents {
-		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, s.allTargetMetas.FindGraph(parent), true, true, true)
+		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, s.allTargetMetas.Find(parent), true, true, true)
 		if err != nil {
 			return nil, err
 		}

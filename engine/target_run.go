@@ -86,7 +86,7 @@ type runPrepare struct {
 }
 
 func (e *Engine) toolAbsPath(tt tgt.TargetTool) string {
-	return tt.File.WithRoot(e.Targets.FindTGT(tt.Target).OutExpansionRoot.Abs()).Abs()
+	return tt.File.WithRoot(e.Targets.Find(tt.Target).OutExpansionRoot.Abs()).Abs()
 }
 
 func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
@@ -97,13 +97,13 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
-		if e.Targets.FindTGT(tool.Target).actualOutFiles == nil {
+		if e.Targets.Find(tool.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
-		if e.Targets.FindTGT(dep.Target).actualOutFiles == nil {
+		if e.Targets.Find(dep.Target).actualOutFiles == nil {
 			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
 		}
 	}
@@ -175,7 +175,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	for _, deps := range target.Deps.Named() {
 		var deplength int
 		for _, dep := range deps.Targets {
-			deplength += len(e.Targets.FindTGT(dep.Target).ActualOutFiles().Name(dep.Output))
+			deplength += len(e.Targets.Find(dep.Target).ActualOutFiles().Name(dep.Output))
 		}
 		deplength += len(deps.Files)
 
@@ -187,7 +187,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	srcRecNameToDepName := make(map[string]string, length)
 	for name, deps := range target.Deps.Named() {
 		for _, dep := range deps.Targets {
-			dept := e.Targets.FindTGT(dep.Target)
+			dept := e.Targets.Find(dep.Target)
 
 			if len(dept.ActualOutFiles().All()) == 0 {
 				continue
@@ -449,7 +449,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	}
 
 	for k, expr := range target.RuntimeEnv {
-		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.FindTGT(expr.Target)))
+		val, err := exprs.Exec(expr.Value, e.queryFunctions(e.Targets.Find(expr.Target)))
 		if err != nil {
 			return nil, fmt.Errorf("runtime env `%v`: %w", expr, err)
 		}
@@ -514,7 +514,7 @@ func (e *Engine) WriteableCaches(ctx context.Context, target *Target) ([]graph.C
 }
 
 func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
-	target := e.Targets.FindGraph(rr.Target)
+	target := e.Targets.Find(rr.Target)
 
 	ctx, rspan := e.Observability.SpanRun(ctx, target.Target.Target)
 	defer rspan.EndError(rerr)
@@ -820,7 +820,7 @@ func (e *Engine) chooseExecutor(labels map[string]string, options map[string]int
 		executor, err := p.NewExecutor(labels, options)
 		if err != nil {
 			log.Errorf("%v: %v", p.Name, err)
-			return nil, err
+			continue
 		}
 
 		if executor == nil {

@@ -24,7 +24,7 @@ type Targets struct {
 func NewTargetsFromGraph(tsm *TargetMetas, gts *graph.Targets) *Targets {
 	ts := NewTargets(gts.Len())
 	for _, target := range gts.Slice() {
-		ts.Add(tsm.FindGraph(target))
+		ts.Add(tsm.Find(target))
 	}
 	return ts
 }

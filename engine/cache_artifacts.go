@@ -158,7 +158,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) err
 			d.DepsHashes[dep.Target.FQN] = map[string]string{}
 		}
 		var err error
-		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.hashOutput(e.Targets.FindTGT(dep.Target), dep.Output)
+		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.hashOutput(e.Targets.Find(dep.Target), dep.Output)
 		if err != nil {
 			return err
 		}

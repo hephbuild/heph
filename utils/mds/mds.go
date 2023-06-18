@@ -16,6 +16,14 @@ func Keys[K constraints.Ordered, V any](m map[K]V) []K {
 	return ks
 }
 
+func Values[K comparable, V any](m map[K]V) []V {
+	vs := make([]V, 0, len(m))
+	for _, v := range m {
+		vs = append(vs, v)
+	}
+	return vs
+}
+
 func Map[K, KO comparable, V, VO any](m map[K]V, f func(K, V) (KO, VO)) map[KO]VO {
 	out := make(map[KO]VO, len(m))
 

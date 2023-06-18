@@ -166,15 +166,15 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	//logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
 	t.m.Lock()
-	if t.LinkingDeps == nil {
-		t.LinkingDeps = NewTargets(0)
+	if t.AllTargetDeps == nil {
+		t.AllTargetDeps = NewTargets(0)
 	}
 
 	if t.deeplinked {
 		t.m.Unlock()
 		return nil
 	} else if t.linked {
-		for _, dep := range t.LinkingDeps.Slice() {
+		for _, dep := range t.AllTargetDeps.Slice() {
 			err := e.LinkTarget(dep, breadcrumb)
 			if err != nil {
 				t.linkingErr = err
@@ -201,15 +201,14 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	defer func() {
 		t.linkingErr = rerr
-		close(t.linkingCh)
 		t.linking = false
 		if rerr == nil {
 			t.linked = true
 			t.deeplinked = true
 		}
+		close(t.linkingCh)
+		t.m.Unlock()
 	}()
-
-	defer t.m.Unlock()
 
 	var err error
 
@@ -368,8 +367,9 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	if err != nil {
 		return err
 	}
-	t.LinkingDeps.AddAll(parents)
-	t.LinkingDeps.Sort()
+
+	t.AllTargetDeps.AddAll(parents)
+	t.AllTargetDeps.Sort()
 
 	return nil
 }

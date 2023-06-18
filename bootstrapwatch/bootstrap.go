@@ -366,7 +366,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 		for _, rr := range rrs {
 			currHash := s.triggeredHashed.Get(rr.Target.FQN)
 
-			changeTarget := bs.Engine.Targets.FindGraph(rr.Target)
+			changeTarget := bs.Engine.Targets.Find(rr.Target)
 			changeHash := bs.Engine.LocalCache.HashInput(changeTarget)
 
 			if currHash != changeHash {
@@ -544,7 +544,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	for _, rr := range e.rrs {
 		s.cbs.Engine.LocalCache.ResetCacheHashInput(rr.Target)
 
-		target := e.bs.Engine.Targets.FindGraph(rr.Target)
+		target := e.bs.Engine.Targets.Find(rr.Target)
 		hash := e.bs.Engine.LocalCache.HashInput(target)
 		s.triggeredHashed.Set(rr.Target.FQN, hash)
 	}
