@@ -4,6 +4,18 @@ import "sort"
 
 type Comparer[T any] func(i, j T) int
 
+func sortCompare[T any](ai, aj T, comparers []Comparer[T]) bool {
+	for _, compare := range comparers {
+		r := compare(ai, aj)
+
+		if r != 0 {
+			return r < 0
+		}
+	}
+
+	return false
+}
+
 type sorter[T any] struct {
 	a         []T
 	comparers []Comparer[T]
@@ -17,15 +29,7 @@ func (s *sorter[T]) Less(i, j int) bool {
 	ai := s.a[i]
 	aj := s.a[j]
 
-	for _, compare := range s.comparers {
-		r := compare(ai, aj)
-
-		if r != 0 {
-			return r < 0
-		}
-	}
-
-	return false
+	return sortCompare(ai, aj, s.comparers)
 }
 
 func (s *sorter[T]) Swap(i, j int) {
@@ -51,15 +55,7 @@ func (s *sorterp[T]) Less(i, j int) bool {
 	ai := &s.a[i]
 	aj := &s.a[j]
 
-	for _, compare := range s.comparers {
-		r := compare(ai, aj)
-
-		if r != 0 {
-			return r < 0
-		}
-	}
-
-	return false
+	return sortCompare(ai, aj, s.comparers)
 }
 
 func (s *sorterp[T]) Swap(i, j int) {

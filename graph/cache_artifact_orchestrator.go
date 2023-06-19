@@ -28,7 +28,7 @@ type ArtifactOrchestrator struct {
 
 func (o *ArtifactOrchestrator) All() []artifacts.Artifact {
 	return o.allOnce.MustDo(func() ([]artifacts.Artifact, error) {
-		all := make([]artifacts.Artifact, 0, len(o.Out)+2)
+		all := make([]artifacts.Artifact, 0, len(o.Out)+3)
 		all = append(all, o.InputHash)
 		all = append(all, o.Manifest)
 		all = append(all, o.Log)
