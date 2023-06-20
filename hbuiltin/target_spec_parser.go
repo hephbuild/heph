@@ -173,12 +173,12 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	}
 
 	for k, v := range t.SrcEnv.Named {
-		if !validate(v, targetspec.FileEnvValues) {
+		if !ads.Contains(targetspec.FileEnvValues, v) {
 			return targetspec.TargetSpec{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, printOneOf(targetspec.FileEnvValues), v)
 		}
 	}
 
-	if !validate(t.SrcEnv.Default, targetspec.FileEnvValues) {
+	if !ads.Contains(targetspec.FileEnvValues, t.SrcEnv.Default) {
 		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv.Default)
 	}
 
@@ -189,21 +189,21 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			t.OutEnv = targetspec.FileEnvRelPkg
 		}
 	}
-	if !validate(t.OutEnv, targetspec.FileEnvValues) {
+	if !ads.Contains(targetspec.FileEnvValues, t.OutEnv) {
 		return targetspec.TargetSpec{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.OutEnv)
 	}
 
 	if t.HashFile == "" {
 		t.HashFile = targetspec.HashFileContent
 	}
-	if !validate(t.HashFile, targetspec.HashFileValues) {
+	if !ads.Contains(targetspec.HashFileValues, t.HashFile) {
 		return targetspec.TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(targetspec.HashFileValues), t.HashFile)
 	}
 
 	if t.Entrypoint == "" {
 		t.Entrypoint = targetspec.EntrypointBash
 	}
-	if !validate(t.Entrypoint, targetspec.EntrypointValues) {
+	if !ads.Contains(targetspec.EntrypointValues, t.Entrypoint) {
 		return targetspec.TargetSpec{}, fmt.Errorf("entrypoint must be one of %v, got %v", printOneOf(targetspec.EntrypointValues), t.Entrypoint)
 	}
 
@@ -220,7 +220,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	}
 
 	if t.Codegen != "" {
-		if !validate(t.Codegen, targetspec.CodegenValues) {
+		if !ads.Contains(targetspec.CodegenValues, t.Codegen) {
 			return targetspec.TargetSpec{}, fmt.Errorf("codegen must be one of %v, got %v", printOneOf(targetspec.CodegenValues), t.Codegen)
 		}
 
@@ -415,14 +415,4 @@ func printOneOf(valid []string) string {
 	}
 
 	return strings.Join(valid, ", ")
-}
-
-func validate(s string, valid []string) bool {
-	for _, vs := range valid {
-		if vs == s {
-			return true
-		}
-	}
-
-	return false
 }

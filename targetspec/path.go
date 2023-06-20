@@ -157,8 +157,7 @@ func (p TargetOutputPath) validate() error {
 	}
 
 	k := fnv1a.Init32
-	k = fnv1a.AddString32(k, p.Package)
-	k = fnv1a.AddString32(k, p.Name)
+	k = fnv1a.AddString32(k, p.Output)
 
 	if targetOutputPathValidateCache.Has(k) {
 		return nil
