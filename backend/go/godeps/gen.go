@@ -95,7 +95,7 @@ type RenderUnit struct {
 }
 
 func getImportsPackages(variant PkgCfgVariant, pkgs *Packages, imports []string) []*Package {
-	depsPkgs := make([]*Package, 0)
+	depsPkgs := make([]*Package, 0, len(imports))
 
 	for _, p := range imports {
 		pkg := pkgs.Find(p, variant)
@@ -194,7 +194,7 @@ func generate() []RenderUnit {
 		fmt.Println("PKG", pkg.ImportPath, VID(pkg.Variant))
 
 		if len(pkg.DepsErrors) > 0 {
-			errs := make([]string, 0)
+			errs := make([]string, 0, len(pkg.DepsErrors))
 			for _, err := range pkg.DepsErrors {
 				errs = append(errs, err.String())
 			}
@@ -244,27 +244,29 @@ func generate() []RenderUnit {
 			}
 
 			if lib != nil && pkg.IsPartOfModule && pkg.Name == "main" {
-				bin := &Bin{
-					TargetName:    targetName("go_bin#build", pkg.Variant),
-					TargetPackage: lib.Target.Package,
-					MainLib:       lib.Target.Full(),
-					Variant:       pkg.Variant,
+				for _, variant := range pkgCfg.UniqueLinkVariants(pkg.Variant) {
+					bin := &Bin{
+						TargetName:    targetName("go_bin#build", variant),
+						TargetPackage: lib.Target.Package,
+						MainLib:       lib.Target.Full(),
+						Variant:       variant,
+					}
+
+					_, deps := splitOutPkgs(variant, pkg.Deps)
+
+					for _, p := range deps {
+						t := libTarget(pkgs, pkgs.MustFind(p, variant))
+
+						bin.Libs = append(bin.Libs, t.Full())
+					}
+
+					units = append(units, RenderUnit{
+						Render: func(w io.Writer) {
+							RenderBin(w, bin)
+						},
+						Dir: bin.TargetPackage,
+					})
 				}
-
-				_, deps := splitOutPkgs(pkg.Variant, pkg.Deps)
-
-				for _, p := range deps {
-					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
-
-					bin.Libs = append(bin.Libs, t.Full())
-				}
-
-				units = append(units, RenderUnit{
-					Render: func(w io.Writer) {
-						RenderBin(w, bin)
-					},
-					Dir: bin.TargetPackage,
-				})
 			}
 
 			if pkg.IsPartOfModule && !pkgCfg.Test.Skip && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {

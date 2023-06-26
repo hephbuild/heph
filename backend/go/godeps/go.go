@@ -314,17 +314,7 @@ func goListWithTransitiveTestDeps() *Packages {
 	for _, pkg := range goListImportPaths("./...") {
 		cfg := Config.GetPkgCfg(pkg)
 
-		variants := cfg.Variants
-		if len(variants) == 0 {
-			variants = append(variants, PkgCfgVariant{
-				PkgCfgCompileVariant: PkgCfgCompileVariant{
-					OS:   Env.GOOS,
-					ARCH: Env.GOARCH,
-				},
-			})
-		}
-
-		for _, variant := range variants {
+		for _, variant := range cfg.VariantsDefault() {
 			vid := VID(variant)
 
 			pv := pkgsPerVariant[vid]
@@ -350,9 +340,8 @@ func goListWithTransitiveTestDeps() *Packages {
 	}
 
 	for _, pkg := range allPkgs.Array()[:] {
+		// We only care about transitive test deps of the stuff we will test
 		if pkg.IsPartOfModule {
-			// We only care about transitive test deps of the stuff we will test
-
 			testDeps := make([]string, 0)
 
 			for _, depPath := range pkg.TestImports {

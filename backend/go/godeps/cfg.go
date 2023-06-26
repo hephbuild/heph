@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -100,6 +101,42 @@ type PkgCfg struct {
 		Run  Extra `json:"run"`
 	} `json:"test"`
 	Variants []PkgCfgVariant `json:"variants"`
+}
+
+func (c PkgCfg) UniqueLinkVariants(v PkgCfgVariant) []PkgCfgVariant {
+	variants := make([]PkgCfgVariant, 0)
+	m := map[string]struct{}{}
+
+	for _, variant := range c.VariantsDefault() {
+		if VID(variant) != VID(v) {
+			continue
+		}
+
+		k := fmt.Sprintf("%v_%v_%#v_%#v", VID(variant), variant.Link.Flags, variant.Link.Deps, variant.Link.HashDeps)
+
+		if _, ok := m[k]; ok {
+			continue
+		}
+		m[k] = struct{}{}
+
+		variants = append(variants, variant)
+	}
+
+	return variants
+}
+
+func (c PkgCfg) VariantsDefault() []PkgCfgVariant {
+	variants := c.Variants
+	if len(variants) == 0 {
+		variants = append(variants, PkgCfgVariant{
+			PkgCfgCompileVariant: PkgCfgCompileVariant{
+				OS:   Env.GOOS,
+				ARCH: Env.GOARCH,
+			},
+		})
+	}
+
+	return variants
 }
 
 type Cfg struct {
