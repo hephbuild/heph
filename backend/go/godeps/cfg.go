@@ -80,8 +80,9 @@ type PkgCfgVariant struct {
 	Name string `json:"name"`
 	PkgCfgCompileVariant
 	Link struct {
-		LDFlags string                 `json:"ldflags"`
-		Deps    map[string]interface{} `json:"deps"`
+		Flags    string                 `json:"flags"`
+		Deps     map[string]interface{} `json:"deps"`
+		HashDeps map[string]interface{} `json:"hash_deps"`
 	} `json:"link"`
 }
 

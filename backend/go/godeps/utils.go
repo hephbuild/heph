@@ -65,15 +65,7 @@ func genStringArrayInline(es []string, l int) string {
 	return genArray(qes, l, false)
 }
 
-func joinedArrays(es []string) string {
-	if len(es) == 0 {
-		return "[]"
-	}
-
-	return strings.Join(es, "+")
-}
-
-func genVariant(v PkgCfgVariant, tags, ldflags, lddeps bool) string {
+func genVariant(v PkgCfgVariant, tags, linkflags, linkdeps bool) string {
 	if v.OS == "" || v.ARCH == "" {
 		panic("empty os/arch")
 	}
@@ -84,12 +76,18 @@ func genVariant(v PkgCfgVariant, tags, ldflags, lddeps bool) string {
 		s += ",\n    tags=" + genStringArrayInline(v.Tags, 0)
 	}
 
-	if ldflags && v.Link.LDFlags != "" {
-		s += ",\n    ldflags=" + strconv.Quote(v.Link.LDFlags)
+	if linkflags && v.Link.Flags != "" {
+		s += ",\n    flags=" + strconv.Quote(v.Link.Flags)
 	}
 
-	if lddeps && len(v.Link.Deps) > 0 {
-		s += ",\n    deps=" + genDict(v.Link.Deps, 1, true)
+	if linkdeps {
+		if len(v.Link.Deps) > 0 {
+			s += ",\n    deps=" + genDict(v.Link.Deps, 1, true)
+		}
+
+		if len(v.Link.HashDeps) > 0 {
+			s += ",\n    hash_deps=" + genDict(v.Link.HashDeps, 1, true)
+		}
 	}
 
 	return s

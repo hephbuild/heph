@@ -14,7 +14,7 @@ go_mod(cfg={
                 'os': get_os(),
                 'arch': get_arch(),
                 'link': {
-                    'ldflags': '-X "main.Version=$(cat $SRC_VERSION)"',
+                    'flags': '-X "main.Version=$(cat $SRC_VERSION)"',
                     'deps': {
                         'version': version,
                     },
