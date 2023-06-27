@@ -227,7 +227,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 	}()
 
 	unlock, err := e.LocalCache.LockArtifact(ctx, target, artifact)
-	if rerr != nil {
+	if err != nil {
 		return err
 	}
 	defer unlock()
