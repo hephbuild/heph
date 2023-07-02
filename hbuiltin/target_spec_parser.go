@@ -86,10 +86,15 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		return targetspec.TargetSpec{}, err
 	}
 	if args.HashDeps.Array != nil {
-		t.DifferentHashDeps = true
 		t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
 		if err != nil {
 			return targetspec.TargetSpec{}, err
+		}
+
+		if t.Deps.Equal(t.HashDeps) {
+			t.HashDeps = t.Deps
+		} else {
+			t.DifferentHashDeps = true
 		}
 	} else {
 		t.HashDeps = t.Deps
@@ -253,6 +258,10 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 
 	if args.Cache.Enabled && args.ConcurrentExecution {
 		return targetspec.TargetSpec{}, fmt.Errorf("concurrent_execution and cache are incompatible")
+	}
+
+	if t.Cache.Enabled && t.RunInCwd {
+		return targetspec.TargetSpec{}, fmt.Errorf("cannot run in cwd and cache")
 	}
 
 	return t, nil

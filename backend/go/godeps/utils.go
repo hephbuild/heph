@@ -81,11 +81,11 @@ func genVariant(v PkgCfgVariant, tags, linkflags, linkdeps bool) string {
 	}
 
 	if linkdeps {
-		if len(v.Link.Deps) > 0 {
+		if v.Link.Deps != nil {
 			s += ",\n    deps=" + genDict(v.Link.Deps, 1, true)
 		}
 
-		if len(v.Link.HashDeps) > 0 {
+		if v.Link.HashDeps != nil {
 			s += ",\n    hash_deps=" + genDict(v.Link.HashDeps, 1, true)
 		}
 	}

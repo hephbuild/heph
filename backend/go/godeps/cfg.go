@@ -82,8 +82,8 @@ type PkgCfgVariant struct {
 	PkgCfgCompileVariant
 	Link struct {
 		Flags    string                 `json:"flags"`
-		Deps     map[string]interface{} `json:"deps"`
-		HashDeps map[string]interface{} `json:"hash_deps"`
+		Deps     map[string]interface{} `json:"deps,omitempty"`
+		HashDeps map[string]interface{} `json:"hash_deps,omitempty"`
 	} `json:"link"`
 }
 

@@ -407,7 +407,7 @@ def _std_pkgs(os, arch):
         }
     )
 
-def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), tags=[], flags='', deps={}, hash_deps=None):
+def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), tags=[], flags='', deps={}, hash_deps={}):
     if not out:
         out = heph.pkg.name()
 
@@ -428,7 +428,7 @@ def go_build_bin(name, main, libs=[], out=None, os=get_os(), arch=get_arch(), ta
         name=name,
         doc="Build {} {}/{} {}".format(heph.pkg.dir(), os, arch, ' '.join(tags)).strip(),
         deps=_deps|deps,
-        hash_deps=None if not hash_deps else _deps|hash_deps,
+        hash_deps=_deps|hash_deps,
         run=_go_gen_importcfg()+['go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {} $SRC_MAIN'.format(flags)],
         out_env='rel_root',
         tools=[go],
