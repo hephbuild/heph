@@ -255,6 +255,10 @@ func (this TargetSpecExprTool) Equal(that TargetSpecExprTool) bool {
 		return false
 	}
 
+	if this.Name != that.Name {
+		return false
+	}
+
 	return true
 }
 
@@ -272,6 +276,14 @@ func (this TargetSpecTransitive) Equal(that TargetSpecTransitive) bool {
 	}
 
 	if !mapEqual(this.Env, that.Env) {
+		return false
+	}
+
+	if !arrEqual(this.RuntimePassEnv, that.RuntimePassEnv) {
+		return false
+	}
+
+	if !mapEqual(this.RuntimeEnv, that.RuntimeEnv) {
 		return false
 	}
 
