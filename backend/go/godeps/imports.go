@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"go/build"
@@ -56,14 +57,31 @@ func listImports() {
 		fmt.Println("===")
 		fmt.Println("PKG", rel)
 
-		fmt.Println("TAGS", strings.Join(p.AllTags, ","))
-
 		allFiles := p.GoFiles
 		allFiles = append(allFiles, p.TestGoFiles...)
 		allFiles = append(allFiles, p.XTestGoFiles...)
 
 		for _, file := range allFiles {
 			fmt.Println(file)
+
+			f, err := os.Open(filepath.Join(path, file))
+			if err != nil {
+				return err
+			}
+
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				t := scanner.Text()
+				if strings.Contains(t, "go:build") || strings.Contains(t, "+build") {
+					fmt.Println("BUILDCONSTRAINT", t)
+				}
+			}
+
+			_ = f.Close()
+
+			if err := scanner.Err(); err != nil {
+				return err
+			}
 		}
 
 		fmt.Println("+++")
