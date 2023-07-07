@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 func listImports() {
@@ -54,6 +55,8 @@ func listImports() {
 
 		fmt.Println("===")
 		fmt.Println("PKG", rel)
+
+		fmt.Println("TAGS", strings.Join(p.AllTags, ","))
 
 		allFiles := p.GoFiles
 		allFiles = append(allFiles, p.TestGoFiles...)

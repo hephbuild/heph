@@ -65,6 +65,8 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 	queryCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
 
+	searchCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
+
 	queryCmd.RegisterFlagCompletionFunc("include", ValidArgsFunctionLabelsOrTargets)
 	queryCmd.RegisterFlagCompletionFunc("exclude", ValidArgsFunctionLabelsOrTargets)
 }
