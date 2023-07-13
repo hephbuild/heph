@@ -156,7 +156,7 @@ func (s *State) watchFiles() error {
 
 				err := s.trigger(ctx, events)
 				if err != nil {
-					log.Error(err)
+					bootstrap.PrintHumanError(err)
 					return
 				}
 
