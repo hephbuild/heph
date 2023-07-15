@@ -1,6 +1,7 @@
 package tgt
 
 import (
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
 	"sort"
 )
@@ -102,12 +103,9 @@ func (tp *NamedPaths[TS, T]) Sort() {
 }
 
 func (tp NamedPaths[TS, T]) withRoot(paths []T, root string) xfs.Paths {
-	ps := make(xfs.Paths, 0, len(paths))
-	for _, path := range paths {
-		ps = append(ps, path.WithRoot(root))
-	}
-
-	return ps
+	return ads.Map(paths, func(path T) xfs.Path {
+		return path.WithRoot(root)
+	})
 }
 
 func (tp NamedPaths[TS, T]) WithRoot(root string) *NamedPaths[xfs.Paths, xfs.Path] {

@@ -2,6 +2,7 @@ package xfs
 
 import (
 	"encoding/json"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xsync"
 	"path/filepath"
 	"sort"
@@ -16,13 +17,9 @@ func (ps Paths) Sort() {
 }
 
 func (ps Paths) WithRoot(root string) Paths {
-	nps := make(Paths, 0, len(ps))
-
-	for _, p := range ps {
-		nps = append(nps, p.WithRoot(root))
-	}
-
-	return nps
+	return ads.Map(ps, func(p Path) Path {
+		return p.WithRoot(root)
+	})
 }
 
 type RelPaths []RelPath
