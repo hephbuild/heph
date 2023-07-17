@@ -30,6 +30,15 @@ type Target struct {
 	DeepOwnTransitive TargetTransitive
 }
 
+func (t *Target) TGTTarget() *Target {
+	return t
+}
+
+type Targeter interface {
+	targetspec.Specer
+	TGTTarget() *Target
+}
+
 type TargetRuntimeEnv struct {
 	Value  string
 	Target *Target

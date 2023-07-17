@@ -277,8 +277,6 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		e.Finalizers.Run(err)
 	})
 
-	localCache.Targets = e.Targets
-
 	if bs.Config.Engine.InstallTools {
 		err = e.InstallTools(ctx)
 		if err != nil {
