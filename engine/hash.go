@@ -192,13 +192,16 @@ func (e *LocalCacheState) HashInput(target *Target) string {
 	return e.mustHashInput(target)
 }
 
-func hashCacheId(target *Target) string {
+func hashCacheId(target *Target) targetCacheKey {
 	idh := hash.NewHash()
 	for _, fqn := range target.AllTargetDeps.FQNs() {
 		idh.String(fqn)
 	}
 
-	return target.FQN + idh.Sum()
+	return targetCacheKey{
+		fqn:  target.FQN,
+		hash: idh.Sum(),
+	}
 }
 
 func (e *LocalCacheState) mustHashInput(target *Target) string {
@@ -240,7 +243,9 @@ func (e *LocalCacheState) hashInput(target *Target, safe bool) (string, error) {
 		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
 	}()
 
-	h := hash.NewDebuggableHash(cacheId + "_hash_input")
+	h := hash.NewDebuggableHash(func() string {
+		return cacheId.String() + "_hash_input"
+	})
 	h.I64(8) // Force break all caches
 
 	h.String("=")
@@ -368,7 +373,11 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) (string, err
 		return "", err
 	}
 
-	cacheId := target.FQN + "|" + output + "_" + hashInput
+	cacheId := targetOutCacheKey{
+		fqn:    target.FQN,
+		output: output,
+		hash:   hashInput,
+	}
 
 	if h, ok := e.cacheHashOutput.GetOk(cacheId); ok {
 		return h, nil
@@ -398,7 +407,9 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) (string, err
 	// Sanity check, will bomb if not called in the right order
 	_ = target.ActualOutFiles()
 
-	h := hash.NewDebuggableHash(cacheId + "_hash_out")
+	h := hash.NewDebuggableHash(func() string {
+		return cacheId.String() + "_hash_out"
+	})
 
 	h.String(output)
 

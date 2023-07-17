@@ -15,9 +15,27 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/vfssimple"
 	"os"
-	"strings"
 	"time"
 )
+
+type targetCacheKey struct {
+	fqn  string
+	hash string
+}
+
+func (k targetCacheKey) String() string {
+	return k.fqn + "_" + k.hash
+}
+
+type targetOutCacheKey struct {
+	fqn    string
+	output string
+	hash   string
+}
+
+func (k targetOutCacheKey) String() string {
+	return k.fqn + "|" + k.output + "_" + k.hash
+}
 
 type LocalCacheState struct {
 	Location      *vfsos.Location
@@ -28,10 +46,10 @@ type LocalCacheState struct {
 	Observability *observability.Observability
 
 	cacheHashInputTargetMutex  maps.KMutex
-	cacheHashInput             *maps.Map[string, string]
+	cacheHashInput             *maps.Map[targetCacheKey, string]
 	cacheHashOutputTargetMutex maps.KMutex
-	cacheHashOutput            *maps.Map[string, string] // TODO: LRU
-	cacheHashInputPathsModtime *maps.Map[string, map[string]time.Time]
+	cacheHashOutput            *maps.Map[targetOutCacheKey, string] // TODO: LRU
+	cacheHashInputPathsModtime *maps.Map[targetCacheKey, map[string]time.Time]
 }
 
 func NewState(root *hroot.State, g *graph.State, obs *observability.Observability) (*LocalCacheState, error) {
@@ -49,10 +67,10 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 		Graph:                      g,
 		Observability:              obs,
 		cacheHashInputTargetMutex:  maps.KMutex{},
-		cacheHashInput:             &maps.Map[string, string]{},
+		cacheHashInput:             &maps.Map[targetCacheKey, string]{},
 		cacheHashOutputTargetMutex: maps.KMutex{},
-		cacheHashOutput:            &maps.Map[string, string]{},
-		cacheHashInputPathsModtime: &maps.Map[string, map[string]time.Time]{},
+		cacheHashOutput:            &maps.Map[targetOutCacheKey, string]{},
+		cacheHashInputPathsModtime: &maps.Map[targetCacheKey, map[string]time.Time]{},
 	}
 
 	return s, nil
@@ -119,11 +137,11 @@ func (e *LocalCacheState) linkLatestCache(target *Target, from string) error {
 func (e *LocalCacheState) ResetCacheHashInput(spec targetspec.Specer) {
 	target := spec.Spec()
 
-	e.cacheHashInput.DeleteP(func(k string) bool {
-		return strings.HasPrefix(k, target.FQN)
+	e.cacheHashInput.DeleteP(func(k targetCacheKey) bool {
+		return k.fqn == target.FQN
 	})
 
-	e.cacheHashInputPathsModtime.DeleteP(func(k string) bool {
-		return strings.HasPrefix(k, target.FQN)
+	e.cacheHashInputPathsModtime.DeleteP(func(k targetCacheKey) bool {
+		return k.fqn == target.FQN
 	})
 }

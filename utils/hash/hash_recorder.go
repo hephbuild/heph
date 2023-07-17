@@ -145,9 +145,9 @@ func newHashRecorder(id string) Hash {
 	}
 }
 
-func NewDebuggableHash(id string) Hash {
+func NewDebuggableHash(id func() string) Hash {
 	if len(debugHashFolder) > 0 {
-		return newHashRecorder(id)
+		return newHashRecorder(id())
 	}
 
 	return NewHash()
