@@ -40,7 +40,7 @@ func (k targetOutCacheKey) String() string {
 type LocalCacheState struct {
 	Location      *vfsos.Location
 	Path          xfs.Path
-	Targets       *TargetMetas
+	Targets       *graph.Targets
 	Root          *hroot.State
 	Graph         *graph.State
 	Observability *observability.Observability
@@ -62,7 +62,7 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 	s := &LocalCacheState{
 		Location:                   loc.(*vfsos.Location),
 		Path:                       cachePath,
-		Targets:                    nil, //  Will be set manually after Engine init
+		Targets:                    g.Targets(),
 		Root:                       root,
 		Graph:                      g,
 		Observability:              obs,

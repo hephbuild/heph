@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -184,15 +185,17 @@ func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Ti
 	return modtime, nil
 }
 
-func (e *LocalCacheState) find(t *tgt.Target) *Target {
-	return e.Targets.Find(t)
+func (e *LocalCacheState) find(t targetspec.Specer) graph.Targeter {
+	return e.Targets.Find(t.Spec().FQN)
 }
 
-func (e *LocalCacheState) HashInput(target *Target) string {
+func (e *LocalCacheState) HashInput(target graph.Targeter) string {
 	return e.mustHashInput(target)
 }
 
-func hashCacheId(target *Target) targetCacheKey {
+func hashCacheId(gtarget graph.Targeter) targetCacheKey {
+	target := gtarget.GraphTarget()
+
 	idh := hash.NewHash()
 	for _, fqn := range target.AllTargetDeps.FQNs() {
 		idh.String(fqn)
@@ -204,7 +207,7 @@ func hashCacheId(target *Target) targetCacheKey {
 	}
 }
 
-func (e *LocalCacheState) mustHashInput(target *Target) string {
+func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 	h, err := e.hashInput(target, false)
 	if err != nil {
 		panic(err)
@@ -212,7 +215,9 @@ func (e *LocalCacheState) mustHashInput(target *Target) string {
 	return h
 }
 
-func (e *LocalCacheState) hashInput(target *Target, safe bool) (string, error) {
+func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, error) {
+	target := gtarget.GraphTarget()
+
 	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
 	mu.Lock()
 	defer mu.Unlock()
@@ -350,11 +355,11 @@ func (e *LocalCacheState) hashInput(target *Target, safe bool) (string, error) {
 	return sh, nil
 }
 
-func (e *LocalCacheState) HashOutput(target *Target, output string) string {
+func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) string {
 	return e.mustHashOutput(target, output)
 }
 
-func (e *LocalCacheState) mustHashOutput(target *Target, output string) string {
+func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) string {
 	h, err := e.hashOutput(target, output)
 	if err != nil {
 		panic(err)
@@ -363,7 +368,9 @@ func (e *LocalCacheState) mustHashOutput(target *Target, output string) string {
 	return h
 }
 
-func (e *LocalCacheState) hashOutput(target *Target, output string) (string, error) {
+func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (string, error) {
+	target := gtarget.GraphTarget()
+
 	mu := e.cacheHashOutputTargetMutex.Get(target.FQN + "|" + output)
 	mu.Lock()
 	defer mu.Unlock()
@@ -404,9 +411,6 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) (string, err
 		return sh, nil
 	}
 
-	// Sanity check, will bomb if not called in the right order
-	_ = target.ActualOutFiles()
-
 	h := hash.NewDebuggableHash(func() string {
 		return cacheId.String() + "_hash_out"
 	})
@@ -439,7 +443,7 @@ func (e *LocalCacheState) hashOutput(target *Target, output string) (string, err
 	return sh, nil
 }
 
-func (e *LocalCacheState) cacheDir(target *Target) xfs.Path {
+func (e *LocalCacheState) cacheDir(target graph.Targeter) xfs.Path {
 	return e.cacheDirForHash(target, e.mustHashInput(target))
 }
 

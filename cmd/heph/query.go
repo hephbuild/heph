@@ -679,12 +679,12 @@ var hashinCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, gtarget, err := parseTargetFromArgs(ctx, args)
+		bs, target, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{gtarget}, []targetspec.Specer{gtarget})
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []targetspec.Specer{target})
 		if err != nil {
 			return err
 		}
@@ -693,8 +693,6 @@ var hashinCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-
-		target := bs.Engine.Targets.Find(gtarget)
 
 		fmt.Println(bs.Engine.LocalCache.HashInput(target))
 

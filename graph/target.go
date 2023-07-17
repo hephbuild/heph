@@ -22,6 +22,15 @@ type Target struct {
 	m             sync.Mutex
 }
 
+type Targeter interface {
+	tgt.Targeter
+	GraphTarget() *Target
+}
+
+func (t *Target) GraphTarget() *Target {
+	return t
+}
+
 func (t *Target) resetLinking() {
 	t.deeplinked = false
 
