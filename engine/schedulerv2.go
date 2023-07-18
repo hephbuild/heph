@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
@@ -103,7 +104,7 @@ func (s *schedulerv2) schedule() error {
 			Name: "pull_meta " + target.FQN,
 			Deps: pmdeps,
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				status.Emit(ctx, TargetStatus(target, "Scheduling analysis..."))
+				status.Emit(ctx, tgt.TargetStatus(target, "Scheduling analysis..."))
 
 				if isSkip {
 					d, err := s.ScheduleTargetDepsOnce(ctx, target)

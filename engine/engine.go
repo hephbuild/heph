@@ -3,18 +3,17 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/sandbox"
-	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
@@ -42,7 +41,7 @@ type Engine struct {
 	Observability     *observability.Observability
 	GetFlowID         func() string
 	PlatformProviders []platform.PlatformProvider
-	LocalCache        *LocalCacheState
+	LocalCache        *lcache.LocalCacheState
 	RemoteCacheHints  *rcache.HintStore
 	Packages          *packages.Registry
 	BuildFilesState   *buildfiles.State
@@ -135,17 +134,11 @@ func New(e Engine) *Engine {
 			OutExpansionRoot: nil, // Set during execution
 			runLock:          nil, // Set after
 			postRunWarmLock:  e.lockFactory(gtarget, "postrunwarm"),
-			cacheLocks:       nil, // Set after
 		}
 		if t.ConcurrentExecution {
 			t.runLock = locks.NewMutex(t.FQN)
 		} else {
 			t.runLock = e.lockFactory(t, "run")
-		}
-
-		t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
-		for _, artifact := range t.Artifacts.All() {
-			t.cacheLocks[artifact.Name()] = e.lockFactory(t, "cache_"+artifact.Name())
 		}
 
 		t.SandboxRoot = e.sandboxRoot(t).Join("_dir")
@@ -272,42 +265,6 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 
 func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-}
-
-func TargetStatus(t targetspec.Specer, status string) status.Statuser {
-	return targetStatus{t.Spec().FQN, "", status}
-}
-
-type targetStatus struct {
-	fqn, output, status string
-}
-
-var (
-	targetColor = lipgloss.AdaptiveColor{Light: "#FFBB00", Dark: "#FFCA33"}
-	targetStyle = struct {
-		target, output lipgloss.Style
-	}{
-		lipgloss.NewStyle().Foreground(targetColor),
-		lipgloss.NewStyle().Foreground(targetColor).Bold(true),
-	}
-)
-
-func (t targetStatus) String(r *lipgloss.Renderer) string {
-	target, output := targetStyle.target.Renderer(r), targetStyle.output.Renderer(r)
-
-	outputStr := ""
-	if t.output != "" {
-		outputStr = output.Render("|" + t.output)
-	}
-
-	return target.Render(t.fqn) + outputStr + " " + t.status
-}
-
-func TargetOutputStatus(t *Target, output string, status string) status.Statuser {
-	if output == "" {
-		output = "-"
-	}
-	return targetStatus{t.FQN, output, status}
 }
 
 func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
@@ -521,11 +478,9 @@ func (e *Engine) CleanTargetLock(target *Target) error {
 		return err
 	}
 
-	for _, l := range target.cacheLocks {
-		err = l.Clean()
-		if err != nil {
-			return err
-		}
+	err = e.LocalCache.CleanTargetLock(target)
+	if err != nil {
+		return err
 	}
 
 	return nil

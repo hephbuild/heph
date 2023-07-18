@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
@@ -40,7 +41,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact 
 				return uncompressedPath, nil
 			}
 
-			status.Emit(ctx, TargetOutputStatus(target, artifact.Name(), "Decompressing..."))
+			status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), "Decompressing..."))
 
 			log.Debugf("ungz %v to %v", gzPath, uncompressedPath)
 

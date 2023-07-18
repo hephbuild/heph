@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/tar"
@@ -21,7 +23,7 @@ type outTarArtifact struct {
 	OutRoot string
 }
 
-func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
 	target := a.Target
 
 	var paths xfs.Paths
@@ -55,13 +57,13 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error
 }
 
 type hashOutputArtifact struct {
-	LocalState *LocalCacheState
-	Target     *Target
+	LocalState *lcache.LocalCacheState
+	Target     graph.Targeter
 	Output     string
 }
 
-func (a hashOutputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
-	outputHash, err := a.LocalState.hashOutput(a.Target, a.Output)
+func (a hashOutputArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
+	outputHash, err := a.LocalState.HashOutput(a.Target, a.Output)
 	if err != nil {
 		return err
 	}
@@ -71,12 +73,12 @@ func (a hashOutputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) e
 }
 
 type hashInputArtifact struct {
-	LocalState *LocalCacheState
-	Target     *Target
+	LocalState *lcache.LocalCacheState
+	Target     graph.Targeter
 }
 
-func (a hashInputArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
-	inputHash, err := a.LocalState.hashInput(a.Target, false)
+func (a hashInputArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
+	inputHash, err := a.LocalState.HashInput(a.Target)
 	if err != nil {
 		return err
 	}
@@ -89,9 +91,9 @@ type logArtifact struct {
 	LogFilePath string
 }
 
-func (a logArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
+func (a logArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
 	if a.LogFilePath == "" {
-		return ArtifactSkip
+		return lcache.ArtifactSkip
 	}
 
 	f, err := os.Open(a.LogFilePath)
@@ -105,8 +107,8 @@ func (a logArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
 }
 
 type manifestArtifact struct {
-	LocalState *LocalCacheState
-	Target     *Target
+	LocalState *lcache.LocalCacheState
+	Target     graph.Targeter
 }
 
 type ManifestData struct {
@@ -128,8 +130,8 @@ func (a manifestArtifact) git(args ...string) string {
 var gitCommitOnce xsync.Once[string]
 var gitRefOnce xsync.Once[string]
 
-func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) error {
-	inputHash, err := a.LocalState.hashInput(a.Target, false)
+func (a manifestArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
+	inputHash, err := a.LocalState.HashInput(a.Target)
 	if err != nil {
 		return err
 	}
@@ -149,8 +151,10 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) err
 
 	e := a.LocalState
 
-	allDeps := a.Target.Deps.Merge(a.Target.Deps)
-	for _, dep := range allDeps.All().Targets {
+	target := a.Target.GraphTarget()
+
+	allDeps := target.Deps.All().Merge(target.HashDeps)
+	for _, dep := range allDeps.Targets {
 		if !dep.Target.Out.HasName(dep.Output) {
 			continue
 		}
@@ -158,15 +162,15 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *ArtifactGenContext) err
 			d.DepsHashes[dep.Target.FQN] = map[string]string{}
 		}
 		var err error
-		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.hashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.HashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
 		if err != nil {
 			return err
 		}
 	}
 
-	for _, name := range a.Target.OutWithSupport.Names() {
+	for _, name := range target.OutWithSupport.Names() {
 		var err error
-		d.OutHashes[name], err = e.hashOutput(a.Target, name)
+		d.OutHashes[name], err = e.HashOutput(a.Target, name)
 		if err != nil {
 			return err
 		}

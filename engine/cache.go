@@ -10,6 +10,7 @@ import (
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 )
@@ -51,7 +52,7 @@ func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outp
 }
 
 func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []string, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
-	status.Emit(ctx, TargetStatus(target, "Checking local cache..."))
+	status.Emit(ctx, tgt.TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false, uncompress)
@@ -63,7 +64,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 		return false, true, nil
 	}
 
-	status.Emit(ctx, TargetStatus(target, "Checking remote caches..."))
+	status.Emit(ctx, tgt.TargetStatus(target, "Checking remote caches..."))
 
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/worker"
@@ -36,7 +37,7 @@ func (e *Engine) localCacheLocation(target *Target) (vfs.Location, error) {
 
 func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Location, error) {
 	// TODO: cache
-	inputHash, err := e.LocalCache.hashInput(target, false)
+	inputHash, err := e.LocalCache.HashInput(target)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +200,7 @@ func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache g
 		return nil
 	}
 
-	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
+	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target.Target, cache.Name, artifact)
 	defer span.EndError(rerr)
@@ -232,7 +233,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 	}
 	defer unlock()
 
-	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	localRoot, err := e.localCacheLocation(target)
 	if err != nil {
@@ -267,7 +268,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 }
 
 func (e *Engine) existsExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (bool, error) {
-	status.Emit(ctx, TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
+	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	root, err := e.remoteCacheLocation(cache.Location, target)
 	if err != nil {

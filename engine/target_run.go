@@ -148,7 +148,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	sandboxRoot := e.sandboxRoot(target)
 	binDir := sandboxRoot.Join("_bin").Abs()
 
-	status.Emit(ctx, TargetStatus(target, "Creating sandbox..."))
+	status.Emit(ctx, tgt.TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
@@ -264,7 +264,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	// Save files modtime
 	e.LocalCache.ResetCacheHashInput(target)
-	_, err = e.LocalCache.hashInput(target, false)
+	_, err = e.LocalCache.HashInput(target)
 	if err != nil {
 		return nil, err
 	}
@@ -282,7 +282,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	}
 
 	// Check if modtime have changed
-	_, err = e.LocalCache.hashInput(target, true)
+	_, err = e.LocalCache.HashInputSafely(target)
 	if err != nil {
 		return nil, err
 	}
@@ -585,7 +585,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		dir = e.Cwd
 	}
 
-	status.Emit(ctx, TargetStatus(target, "Running..."))
+	status.Emit(ctx, tgt.TargetStatus(target, "Running..."))
 
 	var logFilePath string
 	if target.IsGroup() && !rr.Shell {
@@ -777,7 +777,9 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		return fmt.Errorf("wcs: %w", err)
 	}
 
-	err = e.LocalCache.storeCache(ctx, target, outRoot.Abs(), logFilePath, len(writeableCaches) > 0)
+	allArtifacts := e.orderedArtifactProducers(target, outRoot.Abs(), logFilePath)
+
+	err = e.LocalCache.StoreCache(ctx, target, allArtifacts, len(writeableCaches) > 0)
 	if err != nil {
 		return fmt.Errorf("cache: store: %w", err)
 	}
@@ -800,7 +802,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				status.Emit(ctx, TargetStatus(target, "Clearing sandbox..."))
+				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
 				err = deleteDir(target.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
@@ -854,6 +856,11 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 		}
 	}()
 
+	hash, err := e.LocalCache.HashInput(target)
+	if err != nil {
+		return err
+	}
+
 	cacheDir := e.cacheDir(target)
 
 	doneMarker := cacheDir.Join(target.Artifacts.InputHash.FileName()).Abs()
@@ -888,7 +895,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	}
 
 	if shouldExpand {
-		status.Emit(ctx, TargetStatus(target, "Expanding cache..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "Expanding cache..."))
 		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
 
 		err := os.RemoveAll(tmpOutDir)
@@ -938,7 +945,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	target.OutExpansionRoot = &outDir
 
 	if len(target.OutWithSupport.All()) > 0 {
-		status.Emit(ctx, TargetStatus(target, "Hydrating output..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "Hydrating output..."))
 	}
 
 	err = e.populateActualFilesFromTar(ctx, target, outputs)
@@ -968,7 +975,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 
 func (e *Engine) gc(ctx context.Context, target *graph.Target) error {
 	if target.Cache.Enabled && e.Config.Engine.GC {
-		status.Emit(ctx, TargetStatus(target, "GC..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "GC..."))
 
 		err := e.LocalCache.GCTargets([]*graph.Target{target}, nil, false)
 		if err != nil {
@@ -984,7 +991,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 		return nil
 	}
 
-	status.Emit(ctx, TargetStatus(target, "Linking output..."))
+	status.Emit(ctx, tgt.TargetStatus(target, "Linking output..."))
 
 	for name, paths := range target.Out.Named() {
 		if err := ctx.Err(); err != nil {
