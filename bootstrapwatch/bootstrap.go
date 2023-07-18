@@ -367,7 +367,10 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 			currHash := s.triggeredHashed.Get(rr.Target.FQN)
 
 			changeTarget := bs.Engine.Targets.Find(rr.Target)
-			changeHash := bs.Engine.LocalCache.HashInput(changeTarget)
+			changeHash, err := bs.Engine.LocalCache.HashInput(changeTarget)
+			if err != nil {
+				return err
+			}
 
 			if currHash != changeHash {
 				filteredRRs = append(filteredRRs, rr)
@@ -545,7 +548,10 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 		s.cbs.Engine.LocalCache.ResetCacheHashInput(rr.Target)
 
 		target := e.bs.Engine.Targets.Find(rr.Target)
-		hash := e.bs.Engine.LocalCache.HashInput(target)
+		hash, err := e.bs.Engine.LocalCache.HashInput(target)
+		if err != nil {
+			return err
+		}
 		s.triggeredHashed.Set(rr.Target.FQN, hash)
 	}
 

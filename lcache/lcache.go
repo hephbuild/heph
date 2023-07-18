@@ -1,4 +1,4 @@
-package engine
+package lcache
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/vfssimple"
@@ -41,6 +43,7 @@ type LocalCacheState struct {
 	Location      *vfsos.Location
 	Path          xfs.Path
 	Targets       *graph.Targets
+	TargetMetas   *TargetMetas
 	Root          *hroot.State
 	Graph         *graph.State
 	Observability *observability.Observability
@@ -60,12 +63,34 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 	}
 
 	s := &LocalCacheState{
-		Location:                   loc.(*vfsos.Location),
-		Path:                       cachePath,
-		Targets:                    g.Targets(),
-		Root:                       root,
-		Graph:                      g,
-		Observability:              obs,
+		Location:      loc.(*vfsos.Location),
+		Path:          cachePath,
+		Targets:       g.Targets(),
+		Root:          root,
+		Graph:         g,
+		Observability: obs,
+		TargetMetas: NewTargetMetas(func(fqn string) *Target {
+			gtarget := g.Targets().Find(fqn)
+
+			t := &Target{
+				Target:     gtarget,
+				cacheLocks: map[string]locks.Locker{},
+			}
+
+			t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
+			for _, artifact := range t.Artifacts.All() {
+				ts := t.Spec()
+				resource := artifact.Name()
+
+				p := lockPath(root, t, "cache_"+resource)
+
+				l := locks.NewFlock(ts.FQN+" ("+resource+")", p)
+
+				t.cacheLocks[artifact.Name()] = l
+			}
+
+			return t
+		}),
 		cacheHashInputTargetMutex:  maps.KMutex{},
 		cacheHashInput:             &maps.Map[targetCacheKey, string]{},
 		cacheHashOutputTargetMutex: maps.KMutex{},
@@ -76,22 +101,22 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 	return s, nil
 }
 
-func (e *LocalCacheState) storeCache(ctx context.Context, target *Target, outRoot string, logFilePath string, compress bool) (rerr error) {
+func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, allArtifacts []ArtifactWithProducer, compress bool) (rerr error) {
+	target := ttarget.GraphTarget()
+
 	if target.ConcurrentExecution {
 		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
 		return nil
 	}
 
 	if target.Cache.Enabled {
-		status.Emit(ctx, TargetStatus(target, "Caching..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "Caching..."))
 	} else if len(target.Artifacts.Out) > 0 {
-		status.Emit(ctx, TargetStatus(target, "Storing output..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "Storing output..."))
 	}
 
-	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target.Target.Target)
+	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target.Target)
 	defer span.EndError(rerr)
-
-	allArtifacts := e.orderedArtifactProducers(target, outRoot, logFilePath)
 
 	dir := e.cacheDir(target).Abs()
 
@@ -118,7 +143,7 @@ func (e *LocalCacheState) storeCache(ctx context.Context, target *Target, outRoo
 	return e.linkLatestCache(target, dir)
 }
 
-func (e *LocalCacheState) linkLatestCache(target *Target, from string) error {
+func (e *LocalCacheState) linkLatestCache(target targetspec.Specer, from string) error {
 	latestDir := e.cacheDirForHash(target, "latest")
 
 	err := os.RemoveAll(latestDir.Abs())

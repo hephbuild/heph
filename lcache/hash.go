@@ -1,4 +1,4 @@
-package engine
+package lcache
 
 import (
 	tar2 "archive/tar"
@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -189,8 +190,12 @@ func (e *LocalCacheState) find(t targetspec.Specer) graph.Targeter {
 	return e.Targets.Find(t.Spec().FQN)
 }
 
-func (e *LocalCacheState) HashInput(target graph.Targeter) string {
-	return e.mustHashInput(target)
+func (e *LocalCacheState) HashInput(target graph.Targeter) (string, error) {
+	return e.hashInput(target, false)
+}
+
+func (e *LocalCacheState) HashInputSafely(target graph.Targeter) (string, error) {
+	return e.hashInput(target, true)
 }
 
 func hashCacheId(gtarget graph.Targeter) targetCacheKey {
@@ -355,8 +360,8 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	return sh, nil
 }
 
-func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) string {
-	return e.mustHashOutput(target, output)
+func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) (string, error) {
+	return e.hashOutput(target, output)
 }
 
 func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) string {
@@ -456,4 +461,24 @@ func (e *LocalCacheState) cacheDirForHash(target targetspec.Specer, inputHash st
 		folder = "__target_tmp_" + instance.UID + "_" + spec.Name
 	}
 	return e.Root.Home.Join("cache", spec.Package.Path, folder, inputHash)
+}
+
+func lockPath(root *hroot.State, target targetspec.Specer, resource string) string {
+	spec := target.Spec()
+
+	folder := "__target_" + spec.Name
+	return root.Home.Join("tmp", spec.Package.Path, folder, resource+".lock").Abs()
+}
+
+func (e *LocalCacheState) CleanTargetLock(starget targetspec.Specer) error {
+	target := e.TargetMetas.Find(starget)
+
+	for _, l := range target.cacheLocks {
+		err := l.Clean()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

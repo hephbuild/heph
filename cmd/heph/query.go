@@ -664,7 +664,11 @@ var hashoutCmd = &cobra.Command{
 
 		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {
-			fmt.Println(name+":", bs.Engine.LocalCache.HashOutput(target, name))
+			h, err := bs.Engine.LocalCache.HashOutput(target, name)
+			if err != nil {
+				return err
+			}
+			fmt.Println(name+":", h)
 		}
 
 		return nil
@@ -694,7 +698,11 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(bs.Engine.LocalCache.HashInput(target))
+		h, err := bs.Engine.LocalCache.HashInput(target)
+		if err != nil {
+			return err
+		}
+		fmt.Println(h)
 
 		return nil
 	},

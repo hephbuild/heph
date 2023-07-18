@@ -20,7 +20,6 @@ type Target struct {
 
 	runLock         locks.Locker
 	postRunWarmLock locks.Locker
-	cacheLocks      map[string]locks.Locker
 }
 
 func (t *Target) ID() string {

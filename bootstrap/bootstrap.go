@@ -11,6 +11,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/hroot"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	obsummary "github.com/hephbuild/heph/observability/summary"
@@ -243,7 +244,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 }
 
 func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
-	localCache, err := engine.NewState(bs.Root, bs.Graph, bs.Observability)
+	localCache, err := lcache.NewState(bs.Root, bs.Graph, bs.Observability)
 	if err != nil {
 		return nil, err
 	}

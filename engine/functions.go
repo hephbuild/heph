@@ -75,7 +75,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", fmt.Errorf("cannot get input of %v", t.FQN)
 			}
 
-			return e.LocalCache.hashInput(t, false)
+			return e.LocalCache.HashInput(t)
 		},
 		"hash_output": func(expr exprs.Expr) (string, error) {
 			fqn, err := expr.MustPosArg(0)
@@ -98,7 +98,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			}
 
 			output := expr.PosArg(1, "")
-			return e.LocalCache.mustHashOutput(e.Targets.Find(t), output), nil
+			return e.LocalCache.HashOutput(e.Targets.Find(t), output)
 		},
 		"repo_root": func(expr exprs.Expr) (string, error) {
 			return e.Root.Root.Abs(), nil
