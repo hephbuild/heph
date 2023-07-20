@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
 	"runtime"
 	"strconv"
@@ -24,31 +25,8 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
 		Entrypoint:          args.Entrypoint,
-		Platforms: ads.Map(args.Platforms, func(d *starlark.Dict) targetspec.TargetPlatform {
-			labels := map[string]string{}
-			options := map[string]interface{}{}
-			for _, k := range d.Keys() {
-				ks := k.(starlark.String).GoString()
-				if ks == "options" {
-					v, _, _ := d.Get(k)
-
-					for _, t := range v.(*starlark.Dict).Items() {
-						options[t[0].(starlark.String).GoString()] = utils.FromStarlark(t[1])
-					}
-
-					continue
-				}
-				v, _, _ := d.Get(k)
-				labels[ks] = v.(starlark.String).GoString()
-			}
-
-			return targetspec.TargetPlatform{
-				Labels:  labels,
-				Options: options,
-			}
-		}),
-		Package:  pkg,
-		PassArgs: args.PassArgs,
+		Package:             pkg,
+		PassArgs:            args.PassArgs,
 		Cache: targetspec.TargetSpecCache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named.Array,
@@ -100,6 +78,11 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		t.HashDeps = t.Deps
 	}
 
+	t.Platforms, err = ads.MapE(args.Platforms, platformFromArgs)
+	if err != nil {
+		return targetspec.TargetSpec{}, err
+	}
+
 	t.Transitive.Tools, err = toolsSpecFromArgs(t, args.Transitive.Tools)
 	if err != nil {
 		return targetspec.TargetSpec{}, err
@@ -114,6 +97,10 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	t.Transitive.RuntimeEnv = args.Transitive.RuntimeEnv.ArrMap
 	t.Transitive.PassEnv = args.Transitive.PassEnv
 	t.Transitive.RuntimePassEnv = args.Transitive.RuntimePassEnv
+	t.Transitive.Platforms, err = ads.MapE(args.Transitive.Platforms, platformFromArgs)
+	if err != nil {
+		return targetspec.TargetSpec{}, err
+	}
 
 	if len(args.Out.ArrMap) > 0 {
 		for k, vs := range args.Out.ArrMap {
@@ -219,6 +206,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 				"os":   runtime.GOOS,
 				"arch": runtime.GOARCH,
 			},
+			Default: true,
 		}}
 	} else if len(t.Platforms) != 1 {
 		return targetspec.TargetSpec{}, fmt.Errorf("only a single platform is supported, for now")
@@ -265,6 +253,38 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	}
 
 	return t, nil
+}
+
+func platformFromArgs(d xstarlark.Distruct) (targetspec.TargetPlatform, error) {
+	labels := map[string]string{}
+	options := map[string]interface{}{}
+	for _, item := range d.Items() {
+		k := item.Key
+		v := item.Value
+
+		if k == "options" {
+			od, err := xstarlark.UnpackDistruct(v)
+			if err != nil {
+				return targetspec.TargetPlatform{}, err
+			}
+
+			for _, t := range od.Items() {
+				options[t.Key] = utils.FromStarlark(t.Value)
+			}
+
+			continue
+		}
+		vs, ok := v.(starlark.String)
+		if !ok {
+			return targetspec.TargetPlatform{}, fmt.Errorf("%v is %v, expected string", k, v.String())
+		}
+		labels[k] = vs.GoString()
+	}
+
+	return targetspec.TargetPlatform{
+		Labels:  labels,
+		Options: options,
+	}, nil
 }
 
 func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (targetspec.TargetSpecDeps, error) {

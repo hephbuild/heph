@@ -3,8 +3,8 @@ package hbuiltin
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
-	"go.starlark.net/starlarkstruct"
 )
 
 type TargetArgs struct {
@@ -15,7 +15,7 @@ type TargetArgs struct {
 	ConcurrentExecution bool
 	FileContent         string
 	Entrypoint          string
-	Platforms           TargetArgsPlatforms
+	Platforms           xstarlark.Listable[xstarlark.Distruct]
 	RunInCwd            bool
 	PassArgs            bool
 	Cache               TargetArgsCache
@@ -42,36 +42,6 @@ type TargetArgs struct {
 	GenDepsMeta         bool
 }
 
-type TargetArgsPlatforms []*starlark.Dict
-
-func (c *TargetArgsPlatforms) Unpack(v starlark.Value) error {
-	if _, ok := v.(starlark.NoneType); ok {
-		return nil
-	}
-
-	if v, ok := v.(*starlark.Dict); ok {
-		*c = []*starlark.Dict{v}
-		return nil
-	}
-
-	if v, ok := v.(*starlark.List); ok {
-		platforms := make([]*starlark.Dict, 0, v.Len())
-		it := v.Iterate()
-		defer it.Done()
-
-		var e starlark.Value
-		for it.Next(&e) {
-			e := e
-			platforms = append(platforms, e.(*starlark.Dict))
-		}
-
-		*c = platforms
-		return nil
-	}
-
-	return fmt.Errorf("platforms must be list")
-}
-
 type TargetArgsTransitive struct {
 	Deps           ArrayMapStrArray
 	Tools          ArrayMapStr
@@ -79,6 +49,7 @@ type TargetArgsTransitive struct {
 	PassEnv        ArrayStr
 	RuntimeEnv     ArrayMapStr
 	RuntimePassEnv ArrayStr
+	Platforms      xstarlark.Listable[xstarlark.Distruct]
 }
 
 func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
@@ -86,56 +57,27 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	if d, ok := v.(*starlarkstruct.Struct); ok {
-		cs := TargetArgsTransitive{}
-
-		for _, n := range d.AttrNames() {
-			v, err := d.Attr(n)
-			if err != nil {
-				return err
-			}
-
-			switch n {
-			case "deps":
-				err := cs.Deps.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "tools":
-				err := cs.Tools.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "env":
-				err := cs.Env.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "runtime_env":
-				err := cs.RuntimeEnv.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "pass_env":
-				err := cs.PassEnv.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "runtime_pass_env":
-				err := cs.RuntimePassEnv.Unpack(v)
-				if err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("invalid arg %v, call heph.target_spec()", n)
-			}
-		}
-
-		*c = cs
-		return nil
+	d, err := xstarlark.UnpackDistruct(v)
+	if err != nil {
+		return err
 	}
 
-	return fmt.Errorf("please use heph.target_spec()")
+	var cs TargetArgsTransitive
+	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
+		"deps?", &cs.Deps,
+		"tools?", &cs.Tools,
+		"env?", &cs.Env,
+		"runtime_env?", &cs.RuntimeEnv,
+		"pass_env?", &cs.PassEnv,
+		"runtime_pass_env?", &cs.RuntimePassEnv,
+		"platforms?", &cs.Platforms,
+	)
+	if err != nil {
+		return err
+	}
+
+	*c = cs
+	return nil
 }
 
 type TargetArgsCache struct {
@@ -145,42 +87,6 @@ type TargetArgsCache struct {
 }
 
 func (c *TargetArgsCache) Unpack(v starlark.Value) error {
-	d, ok := v.(*starlarkstruct.Struct)
-	if ok {
-		cs := TargetArgsCache{
-			Enabled: true,
-		}
-
-		for _, n := range d.AttrNames() {
-			v, err := d.Attr(n)
-			if err != nil {
-				return err
-			}
-
-			switch n {
-			case "named":
-				err := cs.Named.Unpack(v)
-				if err != nil {
-					return err
-				}
-			case "history":
-				vsi, err := starlark.NumberToInt(v)
-				if err != nil {
-					return err
-				}
-
-				vi, _ := vsi.Int64()
-
-				cs.History = int(vi)
-			default:
-				return fmt.Errorf("invalid arg %v, call heph.cache()", n)
-			}
-		}
-
-		*c = cs
-		return nil
-	}
-
 	b, ok := v.(starlark.Bool)
 	if ok {
 		*c = TargetArgsCache{
@@ -189,7 +95,25 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	return fmt.Errorf("cache must be bool or use heph.cache(), got %v", v.Type())
+	d, err := xstarlark.UnpackDistruct(v)
+	if err != nil {
+		return err
+	}
+
+	cs := TargetArgsCache{
+		Enabled: true,
+	}
+
+	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
+		"named?", &cs.Named,
+		"history?", &cs.History,
+	)
+	if err != nil {
+		return err
+	}
+
+	*c = cs
+	return nil
 }
 
 type BoolArray struct {
@@ -419,7 +343,7 @@ func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
 					return err
 				}
 			default:
-				return fmt.Errorf("val must be string or []string, got %v", v.Type())
+				return fmt.Errorf("val must be string or []string, got %v", valv.Type())
 			}
 		}
 

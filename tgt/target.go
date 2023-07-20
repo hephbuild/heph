@@ -19,6 +19,7 @@ type Target struct {
 	Env            map[string]string
 	RuntimeEnv     map[string]TargetRuntimeEnv
 	RuntimePassEnv []string
+	Platforms      []targetspec.TargetPlatform
 
 	// Collected transitive deps from deps/tools
 	TransitiveDeps TargetTransitive

@@ -1,5 +1,7 @@
 package tgt
 
+import "github.com/hephbuild/heph/targetspec"
+
 type TargetTransitive struct {
 	Tools          TargetTools
 	Deps           TargetNamedDeps
@@ -7,6 +9,7 @@ type TargetTransitive struct {
 	RuntimeEnv     map[string]TargetRuntimeEnv
 	PassEnv        []string
 	RuntimePassEnv []string
+	Platforms      []targetspec.TargetPlatform
 }
 
 func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {

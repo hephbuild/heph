@@ -1,6 +1,6 @@
 module github.com/hephbuild/heph
 
-go 1.19
+go 1.20
 
 replace github.com/spf13/cobra v1.6.1 => github.com/raphaelvigee/cobra v0.0.0-20221020122344-217ca52feee0
 

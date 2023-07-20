@@ -56,6 +56,7 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 			printTools(w, indent, target.TransitiveDeps.Tools)
 			printNamedDeps(w, indent, target.TransitiveDeps.Deps)
 			printTransitiveEnvs(w, indent, target.TransitiveDeps)
+			printPlatforms(w, indent, target.TransitiveDeps.Platforms)
 		}
 	}
 
@@ -90,6 +91,8 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 		}
 	}
 
+	printPlatforms(w, "", target.Platforms)
+
 	fmt.Fprintln(w, "Sandbox:", target.Sandbox)
 	fmt.Fprintln(w, "Cache:")
 	fmt.Fprintln(w, indent, "Enabled:", target.Cache.Enabled)
@@ -101,6 +104,26 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 	}
 	if len(target.Labels) > 0 {
 		fmt.Fprintln(w, "Labels:", strings.Join(target.Labels, ", "))
+	}
+}
+
+func printPlatforms(w io.Writer, i string, platforms []targetspec.TargetPlatform) {
+	fmt.Fprintln(w, i+"Platforms:")
+
+	for _, p := range platforms {
+		fmt.Fprintln(w, i+indent+"- labels:")
+		for k, v := range p.Labels {
+			fmt.Fprintln(w, i+indent+indent+"  "+k+":", v)
+		}
+
+		if len(p.Options) > 0 {
+			fmt.Fprintln(w, i+indent+"  options:")
+			for k, v := range p.Options {
+				fmt.Fprintln(w, i+indent+indent+"  "+k+":", v)
+			}
+		}
+
+		fmt.Fprintln(w, i+indent+"  default:", p.Default)
 	}
 }
 

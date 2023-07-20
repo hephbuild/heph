@@ -6,6 +6,10 @@ import (
 )
 
 func Map[T, O any](a []T, f func(T) O) []O {
+	if a == nil {
+		return nil
+	}
+
 	out := make([]O, len(a))
 
 	for i, e := range a {
@@ -13,6 +17,24 @@ func Map[T, O any](a []T, f func(T) O) []O {
 	}
 
 	return out
+}
+
+func MapE[T, O any](a []T, f func(T) (O, error)) ([]O, error) {
+	if a == nil {
+		return nil, nil
+	}
+
+	out := make([]O, len(a))
+
+	var err error
+	for i, e := range a {
+		out[i], err = f(e)
+		if err != nil {
+			return out, err
+		}
+	}
+
+	return out, nil
 }
 
 func Contains[T comparable](a []T, e T) bool {

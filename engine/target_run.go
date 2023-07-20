@@ -327,6 +327,10 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	if !(target.SrcEnv.Default == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
+			if strings.HasPrefix(name, "_") {
+				continue
+			}
+
 			fileEnv := target.SrcEnv.Get(srcRecNameToDepName[name])
 			if fileEnv == targetspec.FileEnvIgnore {
 				continue

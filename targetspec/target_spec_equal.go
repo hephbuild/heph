@@ -40,7 +40,7 @@ func arrEqualFunc[T interface{ Equal(T) bool }](a, b []T) bool {
 	return true
 }
 
-func mapEqual(a, b map[string]string) bool {
+func mapEqual[K, V comparable](a, b map[K]V) bool {
 	if (a == nil || b == nil) && (a != nil || b != nil) {
 		return false
 	}
@@ -171,6 +171,10 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 		return false
 	}
 
+	if !arrEqualFunc(t.Platforms, spec.Platforms) {
+		return false
+	}
+
 	return true
 }
 
@@ -284,6 +288,22 @@ func (this TargetSpecTransitive) Equal(that TargetSpecTransitive) bool {
 	}
 
 	if !mapEqual(this.RuntimeEnv, that.RuntimeEnv) {
+		return false
+	}
+
+	return true
+}
+
+func (this TargetPlatform) Equal(that TargetPlatform) bool {
+	if !mapEqual(this.Options, that.Options) {
+		return false
+	}
+
+	if !mapEqual(this.Labels, that.Labels) {
+		return false
+	}
+
+	if this.Default != that.Default {
 		return false
 	}
 

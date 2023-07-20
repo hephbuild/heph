@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/heimdalr/dag"
@@ -273,6 +274,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	}
 	t.OwnTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
 	t.OwnTransitive.RuntimePassEnv = t.TargetSpec.Transitive.RuntimePassEnv
+	t.OwnTransitive.Platforms = t.TargetSpec.Transitive.Platforms
 
 	t.DeepOwnTransitive, err = e.collectDeepTransitive(t.OwnTransitive, breadcrumb)
 	if err != nil {
@@ -325,7 +327,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	// Apply transitive deps
 	//log.Tracef(logPrefix + "Linking transitive")
-	t.TransitiveDeps, err = e.collectTransitiveFromDeps(t, breadcrumb)
+	t.TransitiveDeps, t.Platforms, err = e.collectTransitiveFromDeps(t, breadcrumb)
 	if err != nil {
 		return err
 	}
@@ -646,7 +648,7 @@ func (e *State) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *sets.
 	return dtr, nil
 }
 
-func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
+func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, []targetspec.TargetPlatform, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
@@ -657,7 +659,62 @@ func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet)
 		targets.Add(e.Targets().Find(ref.FQN))
 	}
 
-	return e.collectTransitive(targets.Slice(), breadcrumb)
+	tr, err := e.collectTransitive(targets.Slice(), breadcrumb)
+	if err != nil {
+		return tgt.TargetTransitive{}, nil, err
+	}
+
+	platforms, err := e.computePlatformsFromTransitiveTargets(t, targets.Slice())
+	if err != nil {
+		return tr, nil, err
+	}
+
+	return tr, platforms, nil
+}
+
+func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Target) ([]targetspec.TargetPlatform, error) {
+	if !t.HasDefaultPlatforms() {
+		return t.TargetSpec.Platforms, nil
+	}
+
+	if len(targets) == 0 {
+		return t.TargetSpec.Platforms, nil
+	}
+
+	transitivePlatforms := sets.NewSet(func(plats []targetspec.TargetPlatform) string {
+		b, err := json.Marshal(plats)
+		if err != nil {
+			panic(err)
+		}
+
+		return string(b)
+	}, 0)
+
+	for _, target := range targets {
+		if len(target.Transitive.Platforms) == 0 {
+			continue
+		}
+
+		transitivePlatforms.Add(target.Transitive.Platforms)
+	}
+
+	switch transitivePlatforms.Len() {
+	case 0:
+		return t.TargetSpec.Platforms, nil
+	case 1:
+		return transitivePlatforms.Slice()[0], nil
+	}
+
+	configs := strings.Join(ads.Map(transitivePlatforms.Slice(), func(tr []targetspec.TargetPlatform) string {
+		b, err := json.Marshal(tr)
+		if err != nil {
+			panic(err)
+		}
+
+		return " - " + string(b)
+	}), "\n")
+
+	return nil, fmt.Errorf("has conflicting transitive platform config, you must override `platforms`, got:\n%v", configs)
 }
 
 func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {

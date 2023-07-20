@@ -159,6 +159,7 @@ func (s TargetSource) String() string {
 type TargetPlatform struct {
 	Labels  map[string]string
 	Options map[string]interface{}
+	Default bool
 }
 
 type TargetSpecTransitive struct {
@@ -168,6 +169,7 @@ type TargetSpecTransitive struct {
 	PassEnv        []string
 	RuntimePassEnv []string
 	RuntimeEnv     map[string]string
+	Platforms      []TargetPlatform
 }
 
 func (t TargetSpec) IsPrivate() bool {
@@ -184,6 +186,10 @@ func (t TargetSpec) IsTool() bool {
 
 func (t TargetSpec) IsTextFile() bool {
 	return len(t.Run) == 2 && t.Run[0] == "text_file"
+}
+
+func (t TargetSpec) HasDefaultPlatforms() bool {
+	return len(t.Platforms) == 1 && t.Platforms[0].Default
 }
 
 func (t TargetSpec) Json() []byte {
