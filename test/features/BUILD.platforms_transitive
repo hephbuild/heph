@@ -54,12 +54,13 @@ target(
     cache=False,
 )
 
-target(
-    name="plat_tr_conflicting",
-    run=print_os,
-    tools=[sometool1, sometool2, sometool3],
-    cache=False,
-)
+if heph.param('e2e-plat_tr_conflicting'):
+    target(
+        name="plat_tr_conflicting",
+        run=print_os,
+        tools=[sometool1, sometool2, sometool3],
+        cache=False,
+    )
 
 target(
     name="plat_tr_conflicting_ok",
@@ -82,7 +83,7 @@ e2e_test(
 
 e2e_test(
     name="e2e_plat_tr_conflicting",
-    cmd="heph run //test/features:plat_tr_conflicting",
+    cmd="heph -p e2e-plat_tr_conflicting=1 run //test/features:plat_tr_conflicting",
     expected_failure=True,
 )
 

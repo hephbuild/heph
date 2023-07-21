@@ -35,3 +35,8 @@ e2e_test(
     cmd="heph run //test/go/mod-lddeps:run",
     expected_output="coolversion",
 )
+
+e2e_test(
+    name="sanity_buildconstraint",
+    cmd="heph run //test/go/buildconstraint:build_all",
+)

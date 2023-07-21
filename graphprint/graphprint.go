@@ -219,10 +219,18 @@ func printTools(w io.Writer, indent string, tools tgt.TargetTools) {
 	if len(tools.Hosts) > 0 {
 		fmt.Fprintln(w, indent+"Host tools:")
 		for _, t := range tools.Hosts {
-			p, err := t.ResolvedPath()
-			if err != nil {
-				p = fmt.Sprintf("error: %v", err)
+
+			var p string
+			if t.BinName == "heph" {
+				p = "heph"
+			} else {
+				var err error
+				p, err = t.ResolvedPath()
+				if err != nil {
+					p = fmt.Sprintf("error: %v", err)
+				}
 			}
+
 			fmt.Printf(indent+"  %v (%v)\n", t.Name, p)
 		}
 	}

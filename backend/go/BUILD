@@ -98,10 +98,14 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg+":_go_mod_gen")
 
-def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
+def go_mod(mod_pkgs=[], cfg={}, replace={}, work=False):
+    goenv={}
+    if not work:
+        goenv["GOWORK"]="off"
+
     gomodsum = group(
         name="_mod",
-        deps=glob("go.mod")+glob("go.sum"),
+        deps=["go.mod"]+glob("go.sum"),
     )
 
     src = group(
@@ -138,10 +142,11 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         deps=godeps_deps,
         tools=godeps,
         gen_deps_meta=True,
+        env=goenv,
     )
 
     mod_gen_kwargs={}
-    if not sandbox:
+    if work:
         mod_gen_kwargs={
             "sandbox": False,
             "out_in_sandbox": True
@@ -158,7 +163,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
             "GOOS": get_os(),
             "GOARCH": get_arch(),
             # "DEBUG": "1",
-        },
+        }|goenv,
         gen=True,
         gen_deps_meta=True,
         **mod_gen_kwargs,
@@ -170,6 +175,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         run='go mod tidy -v',
         tools=[go],
         deps=[src],
+        env=goenv,
         sandbox=False,
         cache=False,
     )
@@ -180,6 +186,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         run="go fmt ./...",
         tools=[go],
         deps=[src],
+        env=goenv,
         sandbox=False,
         cache=False,
     )
@@ -190,6 +197,7 @@ def go_mod(mod_pkgs=[], cfg={}, replace={}, sandbox=True):
         run="go vet ./...",
         tools=[go],
         deps=[src],
+        env=goenv,
         sandbox=False,
         cache=False,
     )

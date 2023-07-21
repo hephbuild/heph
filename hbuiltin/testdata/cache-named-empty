@@ -28,7 +28,8 @@ target(
                 "name": "local",
                 "os": "<OS>"
             },
-            "Options": null
+            "Options": null,
+            "Default": true
         }
     ],
     "ConcurrentExecution": false,
@@ -89,7 +90,8 @@ target(
         "Env": null,
         "PassEnv": null,
         "RuntimePassEnv": null,
-        "RuntimeEnv": null
+        "RuntimeEnv": null,
+        "Platforms": null
     },
     "Timeout": 0,
     "GenDepsMeta": false
