@@ -11,6 +11,7 @@ import (
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/hephbuild/heph/utils/xsync"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkjson"
@@ -124,23 +125,6 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	return p
 }
 
-func listForeach(l *starlark.List, f func(int, starlark.Value) error) error {
-	iter := l.Iterate()
-	defer iter.Done()
-
-	var i int
-	var e starlark.Value
-	for iter.Next(&e) {
-		err := f(i, e)
-		if err != nil {
-			return err
-		}
-		i++
-	}
-
-	return nil
-}
-
 func stackTrace(thread *starlark.Thread) []targetspec.TargetSource {
 	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) targetspec.TargetSource {
 		c.Pos.Col = 0 //  We don't really care about the column...
@@ -233,7 +217,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 
 	var (
 		pattern string
-		exclude ArrayStr
+		exclude xstarlark.Listable[string]
 	)
 
 	if err := starlark.UnpackArgs(

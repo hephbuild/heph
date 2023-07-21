@@ -3,7 +3,30 @@ package xstarlark
 import (
 	"fmt"
 	"go.starlark.net/starlark"
+	"strings"
 )
+
+type unpackError struct {
+	err error
+}
+
+func (e unpackError) Unwrap() error {
+	return e.err
+}
+
+func (e unpackError) Error() string {
+	s := e.err.Error()
+
+	return strings.ReplaceAll(s, "XXX: for parameter 1: ", "")
+}
+
+func unpackSingle(v starlark.Value, target any) error {
+	err := starlark.UnpackPositionalArgs("XXX", starlark.Tuple{v}, nil, 0, target)
+	if err != nil {
+		return unpackError{err}
+	}
+	return nil
+}
 
 type Listable[T any] []T
 
@@ -20,12 +43,16 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 		var e starlark.Value
 		var i int
 		for it.Next(&e) {
-			var single T
-			err := starlark.UnpackPositionalArgs(fmt.Sprint(i), starlark.Tuple{v}, nil, 0, &single)
-			if err != nil {
-				return err
+			if _, ok := e.(starlark.NoneType); ok {
+				continue
 			}
-			values = append(values, e.(T))
+
+			var single T
+			err := unpackSingle(e, &single)
+			if err != nil {
+				return fmt.Errorf("index %v: %w", i, err)
+			}
+			values = append(values, single)
 			i++
 		}
 
@@ -34,7 +61,7 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 	}
 
 	var single T
-	err := starlark.UnpackPositionalArgs("value", starlark.Tuple{v}, nil, 0, &single)
+	err := unpackSingle(v, &single)
 	if err != nil {
 		return err
 	}

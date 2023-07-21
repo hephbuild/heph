@@ -48,9 +48,12 @@ def tool_target(run=[], *args, **kwargs):
     _fail_if_present(kwargs, "pass_args")
     _fail_if_present(kwargs, "concurrent_execution")
 
+    if type(run) != "list":
+        run=[run]
+
     return target(
         entrypoint='exec',
-        run=['heph_tool']+([run] or []),
+        run=['heph_tool']+run,
         run_in_cwd=True,
         sandbox=False,
         cache=False,

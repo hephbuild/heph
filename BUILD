@@ -119,7 +119,7 @@ for os in ["linux", "darwin"]:
 target(
     name="cp_builds",
     run="cp * $1",
-    deps=[builds],
+    deps=builds,
     cache=False,
     pass_args=True,
 )

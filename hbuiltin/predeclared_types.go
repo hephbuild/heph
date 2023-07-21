@@ -2,7 +2,6 @@ package hbuiltin
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
 )
@@ -11,7 +10,7 @@ type TargetArgs struct {
 	Name                string
 	Pkg                 string
 	Doc                 string
-	Run                 ArrayStr
+	Run                 xstarlark.Listable[string]
 	ConcurrentExecution bool
 	FileContent         string
 	Entrypoint          string
@@ -20,7 +19,7 @@ type TargetArgs struct {
 	PassArgs            bool
 	Cache               TargetArgsCache
 	RestoreCache        bool
-	SupportFiles        ArrayStr
+	SupportFiles        xstarlark.Listable[string]
 	SandboxEnabled      bool
 	OutInSandbox        bool
 	Gen                 bool
@@ -28,11 +27,11 @@ type TargetArgs struct {
 	Deps                ArrayMapStrArray
 	HashDeps            ArrayMapStrArray
 	Tools               ArrayMapStr
-	Labels              ArrayStr
+	Labels              xstarlark.Listable[string]
 	Out                 ArrayMapStrArray
 	Env                 ArrayMapStr
-	PassEnv             ArrayStr
-	RuntimePassEnv      ArrayStr
+	PassEnv             xstarlark.Listable[string]
+	RuntimePassEnv      xstarlark.Listable[string]
 	RuntimeEnv          ArrayMapStr
 	SrcEnv              SrcEnv
 	OutEnv              string
@@ -46,9 +45,9 @@ type TargetArgsTransitive struct {
 	Deps           ArrayMapStrArray
 	Tools          ArrayMapStr
 	Env            ArrayMapStr
-	PassEnv        ArrayStr
+	PassEnv        xstarlark.Listable[string]
 	RuntimeEnv     ArrayMapStr
-	RuntimePassEnv ArrayStr
+	RuntimePassEnv xstarlark.Listable[string]
 	Platforms      xstarlark.Listable[xstarlark.Distruct]
 }
 
@@ -130,11 +129,8 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 		}
 		return nil
 	case *starlark.List:
-		arr := make([]string, 0, e.Len())
-		err := listForeach(e, func(i int, value starlark.Value) error {
-			arr = append(arr, value.(starlark.String).GoString())
-			return nil
-		})
+		var arr xstarlark.Listable[string]
+		err := arr.Unpack(v)
 		if err != nil {
 			return err
 		}
@@ -147,64 +143,6 @@ func (d *BoolArray) Unpack(v starlark.Value) error {
 	}
 
 	return fmt.Errorf("must be bool or []string, got %v", v.Type())
-}
-
-type ArrayStr []string
-
-func (d *ArrayStr) Unpack(v starlark.Value) error {
-	if _, ok := v.(starlark.NoneType); ok {
-		return nil
-	}
-
-	if vs, ok := v.(starlark.String); ok {
-		*d = ArrayStr{string(vs)}
-		return nil
-	}
-
-	if vl, ok := v.(*starlark.List); ok {
-		arr := make([]string, 0, vl.Len())
-
-		err := listForeach(vl, func(i int, value starlark.Value) error {
-			switch e := value.(type) {
-			case starlark.NoneType:
-				// ignore
-				return nil
-			case starlark.String:
-				arr = append(arr, string(e))
-				return nil
-			case *starlark.List:
-				if e.Len() == 0 {
-					return nil
-				}
-
-				err := listForeach(e, func(i int, value starlark.Value) error {
-					if _, ok := value.(starlark.NoneType); ok {
-						return nil
-					}
-
-					dep, ok := value.(starlark.String)
-					if !ok {
-						return fmt.Errorf("dep must be string, got %v", value.Type())
-					}
-
-					arr = append(arr, string(dep))
-					return nil
-				})
-				return err
-			}
-
-			return fmt.Errorf("element at index %v must be string, got %v", i, value.Type())
-		})
-		if err != nil {
-			return err
-		}
-
-		*d = arr
-
-		return nil
-	}
-
-	return fmt.Errorf("must be list or string, got %v", v.Type())
 }
 
 type ArrayMapStr struct {
@@ -256,41 +194,8 @@ func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
 		}
 		return nil
 	case *starlark.List:
-		arr := make([]string, 0, v.Len())
-
-		err := listForeach(v, func(i int, value starlark.Value) error {
-			switch e := value.(type) {
-			case starlark.NoneType:
-				// ignore
-				return nil
-			case starlark.String:
-				arr = append(arr, string(e))
-				return nil
-			case *starlark.List:
-				if e.Len() == 0 {
-					return nil
-				}
-
-				arr = ads.GrowExtra(arr, e.Len())
-
-				err := listForeach(e, func(i int, value starlark.Value) error {
-					if _, ok := value.(starlark.NoneType); ok {
-						return nil
-					}
-
-					dep, ok := value.(starlark.String)
-					if !ok {
-						return fmt.Errorf("dep must be string, got %v", value.Type())
-					}
-
-					arr = append(arr, string(dep))
-					return nil
-				})
-				return err
-			}
-
-			return fmt.Errorf("at %v: element must be string []string, got %v", i, value.Type())
-		})
+		var arr xstarlark.Listable[string]
+		err := arr.Unpack(v)
 		if err != nil {
 			return err
 		}
@@ -313,38 +218,14 @@ func (d *ArrayMapStrArray) Unpack(v starlark.Value) error {
 
 			key := string(skey)
 
-			valv := e.Index(1)
-			switch val := valv.(type) {
-			case starlark.NoneType:
-				continue
-			case starlark.String:
-				arr = append(arr, string(val))
-				arrMap[key] = append(arrMap[key], string(val))
-			case *starlark.List:
-				arr = ads.GrowExtra(arr, val.Len())
-				arrMap[key] = ads.GrowExtra(arrMap[key], val.Len())
-
-				err := listForeach(val, func(i int, value starlark.Value) error {
-					if _, ok := value.(starlark.NoneType); ok {
-						return nil
-					}
-
-					val, ok := value.(starlark.String)
-					if !ok {
-						return fmt.Errorf("value must be string, got %v", value.Type())
-					}
-
-					arr = append(arr, string(val))
-					arrMap[key] = append(arrMap[key], string(val))
-
-					return nil
-				})
-				if err != nil {
-					return err
-				}
-			default:
-				return fmt.Errorf("val must be string or []string, got %v", valv.Type())
+			var vals xstarlark.Listable[string]
+			err := vals.Unpack(e.Index(1))
+			if err != nil {
+				return fmt.Errorf("\"%v\": %w", key, err)
 			}
+
+			arr = append(arr, vals...)
+			arrMap[key] = append(arrMap[key], vals...)
 		}
 
 		*d = ArrayMapStrArray{
