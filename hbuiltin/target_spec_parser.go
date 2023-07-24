@@ -1,6 +1,7 @@
 package hbuiltin
 
 import (
+	"bufio"
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/packages"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec, error) {
@@ -21,7 +23,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		FQN:                 pkg.TargetAddr(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run,
-		Doc:                 strings.TrimSpace(args.Doc),
+		Doc:                 docFromArg(args.Doc),
 		FileContent:         []byte(args.FileContent),
 		ConcurrentExecution: args.ConcurrentExecution,
 		Entrypoint:          args.Entrypoint,
@@ -253,6 +255,48 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	}
 
 	return t, nil
+}
+
+func docFromArg(doc string) string {
+	if len(doc) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	var setuped bool
+	var prefix string
+	scanner := bufio.NewScanner(strings.NewReader(doc))
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if !setuped {
+			if len(strings.TrimSpace(line)) == 0 {
+				continue
+			}
+
+			i := strings.IndexFunc(line, func(r rune) bool {
+				return !unicode.IsSpace(r)
+			})
+			if i >= 0 {
+				prefix = line[:i]
+			}
+
+			setuped = true
+		}
+
+		line = strings.TrimPrefix(line, prefix)
+
+		line = strings.TrimRightFunc(line, unicode.IsSpace)
+
+		sb.WriteString(line)
+		sb.WriteString("\n")
+	}
+
+	if err := scanner.Err(); err != nil {
+		panic(err)
+	}
+
+	return strings.TrimSpace(sb.String()) + "\n"
 }
 
 func platformFromArgs(d xstarlark.Distruct) (targetspec.TargetPlatform, error) {

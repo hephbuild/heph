@@ -141,3 +141,30 @@ func TestTargetSpec(t *testing.T) {
 		})
 	}
 }
+
+func TestDocFromArgs(t *testing.T) {
+	tests := []struct {
+		doc      string
+		expected string
+	}{
+		{
+			"\n \nsome title\n\nsome content:\n  - with\n  - bullets\n",
+			"some title\n\nsome content:\n  - with\n  - bullets\n",
+		},
+		{
+			"\n \n    some title\n\n    some content:\n      - with\n      - bullets\n",
+			"some title\n\nsome content:\n  - with\n  - bullets\n",
+		},
+		{
+			"\n \n\tsome title\n\n\tsome content:\n\t  - with\n\t  - bullets\n",
+			"some title\n\nsome content:\n  - with\n  - bullets\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(strings.NewReplacer("\n", `\n`, " ", `\s`, "\t", `\t`).Replace(test.doc), func(t *testing.T) {
+			actual := docFromArg(test.doc)
+
+			assert.Equal(t, test.expected, actual)
+		})
+	}
+}
