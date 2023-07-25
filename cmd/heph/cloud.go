@@ -44,20 +44,25 @@ var cloudLoginCmd = &cobra.Command{
 
 		fmt.Println(bs.Config.Cloud.URL)
 
-		fmt.Print("Email: ")
-		var email string
-		_, err = fmt.Scanln(&email)
-		if err != nil {
-			return err
-		}
+		var email, pass string
 
-		fmt.Print("Password: ")
-		passb, err := term.ReadPassword(syscall.Stdin)
-		fmt.Println()
-		if err != nil {
-			return err
+		if len(args) < 2 {
+			fmt.Print("Email: ")
+			_, err = fmt.Scanln(&email)
+			if err != nil {
+				return err
+			}
+
+			fmt.Print("Password: ")
+			passb, err := term.ReadPassword(syscall.Stdin)
+			fmt.Println()
+			if err != nil {
+				return err
+			}
+			pass = string(passb)
+		} else {
+			email, pass = args[0], args[1]
 		}
-		pass := string(passb)
 
 		res, err := cloudclient.Login(ctx, bs.Cloud.Client, email, pass)
 		if err != nil {

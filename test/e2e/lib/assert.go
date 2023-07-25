@@ -18,7 +18,7 @@ func AssertFileContentEqual(p, expected string) error {
 	return nil
 }
 
-func AssertEqual(actual, expected string) error {
+func AssertEqual[T comparable](actual, expected T) error {
 	if actual != expected {
 		return fmt.Errorf("> is not equal, got:\n%v\n> expected:\n%v", actual, expected)
 	}
@@ -26,7 +26,7 @@ func AssertEqual(actual, expected string) error {
 	return nil
 }
 
-func AssertNotEqual(actual, expected string) error {
+func AssertNotEqual[T comparable](actual, expected T) error {
 	if actual == expected {
 		return fmt.Errorf("> is equal, got:\n%v", actual)
 	}

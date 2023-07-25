@@ -1,8 +1,10 @@
 package queue
 
 import (
+	"context"
 	"github.com/hephbuild/heph/log/log"
 	"sync"
+	"time"
 )
 
 type Queue[T any] struct {
@@ -26,7 +28,17 @@ func (q *Queue[T]) Enqueue(vs ...T) {
 }
 
 func (q *Queue[T]) DequeueChunk(chunkSize int, f func(vs []T) error) error {
+	return q.DequeueChunkContext(context.Background(), chunkSize, f)
+}
+
+func (q *Queue[T]) DequeueChunkContext(ctx context.Context, chunkSize int, f func(vs []T) error) error {
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		vs := q.Dequeue(chunkSize)
 
 		if len(vs) == 0 {
@@ -47,12 +59,37 @@ func (q *Queue[T]) DequeueChunk(chunkSize int, f func(vs []T) error) error {
 
 func (q *Queue[T]) Dequeue(chunkSize int) []T {
 	q.m.Lock()
+	defer q.m.Unlock()
+
 	vs := q.vs
 	if len(vs) > chunkSize {
 		vs = vs[:chunkSize]
 	}
 	q.vs = q.vs[len(vs):]
-	q.m.Unlock()
 
 	return vs
+}
+
+func (q *Queue[T]) Len() int {
+	q.m.Lock()
+	defer q.m.Unlock()
+	return len(q.vs)
+}
+
+func (q *Queue[T]) Empty() <-chan struct{} {
+	ch := make(chan struct{})
+
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+
+		for range t.C {
+			if q.Len() == 0 {
+				close(ch)
+				return
+			}
+		}
+	}()
+
+	return ch
 }

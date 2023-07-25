@@ -8,12 +8,22 @@ import (
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolui"
 	"os"
-	"runtime/debug"
 	"sync"
 )
 
 var tuim sync.Mutex
-var tuiStack []byte
+
+//var tuiStack []byte
+
+func runProgram(p *tea.Program) error {
+	defer func() {
+		log.SetDiversion(nil)
+		_ = p.ReleaseTerminal()
+	}()
+
+	_, err := p.Run()
+	return err
+}
 
 func termUI(ctx context.Context, name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	if !tuim.TryLock() {
@@ -21,10 +31,10 @@ func termUI(ctx context.Context, name string, deps *worker.WaitGroup, pool *work
 		return logUI(name, deps, pool)
 	}
 
-	tuiStack = debug.Stack()
+	//tuiStack = debug.Stack()
 
 	defer func() {
-		tuiStack = nil
+		//tuiStack = nil
 		tuim.Unlock()
 	}()
 
@@ -32,9 +42,7 @@ func termUI(ctx context.Context, name string, deps *worker.WaitGroup, pool *work
 
 	p := tea.NewProgram(r, tea.WithOutput(os.Stderr), tea.WithoutSignalHandler())
 
-	_, err := p.Run()
-	log.SetDiversion(nil)
-	_ = p.ReleaseTerminal()
+	err := runProgram(p)
 	if err != nil {
 		return err
 	}
