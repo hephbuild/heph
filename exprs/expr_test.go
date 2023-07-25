@@ -22,6 +22,8 @@ func TestExec(t *testing.T) {
 		{e: `hello $( world)`, o: `hello $( world)`},
 		{e: `$(hello "world")`, o: `hello world`},
 		{e: `$(hello world)`, o: `hello world`},
+		{e: `$(hello world-dashed)`, o: `hello world-dashed`},
+		{e: `$(hello world_underscored)`, o: `hello world_underscored`},
 		{e: `$(hello 3)`, o: `hello 3`},
 		{e: `$(hello "wo\"rld")`, o: `hello wo"rld`},
 		{e: `$(hello "world $(hey)")`, o: `hello world $(hey)`},

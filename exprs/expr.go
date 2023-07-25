@@ -247,7 +247,7 @@ func (p *executor) parseString(stop func(rune) bool) (string, error) {
 }
 
 func (p *executor) isIdentChar() bool {
-	return p.curbtw('a', 'z') || p.curbtw('A', 'Z') || p.curbtw('0', '9') || p.cur() == '_'
+	return p.curbtw('a', 'z') || p.curbtw('A', 'Z') || p.curbtw('0', '9') || p.cur() == '_' || p.cur() == '-'
 }
 
 func (p *executor) parseIdent() string {
