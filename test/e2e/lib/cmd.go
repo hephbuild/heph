@@ -10,8 +10,10 @@ type RunOpts struct {
 	LogLevel string
 	Shell    bool
 	NoInline bool
+	NoPty    bool
 	Silent   bool
 	Env      map[string]string
+	Targets  []string
 }
 
 func (o RunOpts) Args(runArgs ...string) []string {
@@ -28,6 +30,9 @@ func (o RunOpts) Args(runArgs ...string) []string {
 	args = append(args, runArgs...)
 	if o.NoInline {
 		args = append(args, "--no-inline")
+	}
+	if o.NoPty {
+		args = append(args, "--no-pty")
 	}
 	return args
 }

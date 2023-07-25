@@ -21,6 +21,9 @@ func RunO(tgt string, o RunOpts) error {
 	if o.Shell {
 		cmd.Stdin = os.Stdin
 	}
+	if len(o.Targets) > 0 {
+		cmd.Stdin = strings.NewReader(strings.Join(o.Targets, "\n"))
+	}
 
 	return cmd.Run()
 }

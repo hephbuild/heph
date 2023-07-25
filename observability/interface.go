@@ -342,7 +342,7 @@ func (b BaseHook) OnCacheUpload(ctx context.Context, _ *TargetArtifactCacheSpan)
 func (b BaseHook) OnRunPrepare(ctx context.Context, _ *TargetSpan) (context.Context, SpanHook) {
 	return ctx, nil
 }
-func (b BaseHook) OnRunExec(ctx context.Context, span *TargetExecSpan) (context.Context, SpanHook) {
+func (b BaseHook) OnRunExec(ctx context.Context, _ *TargetExecSpan) (context.Context, SpanHook) {
 	return ctx, nil
 }
 func (b BaseHook) OnCollectOutput(ctx context.Context, _ *TargetSpan) (context.Context, SpanHook) {

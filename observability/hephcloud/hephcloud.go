@@ -14,6 +14,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/queue"
 	"io"
 	"os"
@@ -39,7 +40,8 @@ type Hook struct {
 }
 
 func NewHook(h *Hook) *Hook {
-	h.events.Max = (200 * oneMegabyte) / int(unsafe.Sizeof(cloudclient.Event{}))
+	// queue 200 MB worth of events
+	h.events.Max = (200 * oneMegabyteInBytes) / int(unsafe.Sizeof(cloudclient.Event{}))
 	return h
 }
 
@@ -57,9 +59,12 @@ func (l *spanLogBuffer) Write(p []byte) (n int, err error) {
 }
 
 func (h *Hook) Start(ctx context.Context) func() {
-	stopCh := make(chan struct{})
 	spansDoneCh := make(chan struct{})
 	logsDoneCh := make(chan struct{})
+
+	terminate := false
+
+	ctx, cancel := context.WithCancelCause(context.Background())
 
 	go func() {
 		defer close(spansDoneCh)
@@ -68,11 +73,12 @@ func (h *Hook) Start(ctx context.Context) func() {
 
 		for {
 			select {
-			case <-stopCh:
-				return
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				if terminate && h.events.Len() == 0 {
+					return
+				}
 				err := h.sendSpans(ctx)
 				if err != nil {
 					log.Error("heph spans:", err)
@@ -88,11 +94,12 @@ func (h *Hook) Start(ctx context.Context) func() {
 
 		for {
 			select {
-			case <-stopCh:
-				return
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				if terminate && h.logsAllEmpty() {
+					return
+				}
 				err := h.sendLogs(ctx)
 				if err != nil {
 					log.Error("heph logs:", err)
@@ -102,41 +109,69 @@ func (h *Hook) Start(ctx context.Context) func() {
 	}()
 
 	return func() {
-		close(stopCh)
-		h.events.DisableRescheduling = true
-		h.logsm.Lock()
-		for _, buf := range h.logs {
-			buf.q.DisableRescheduling = true
-		}
-		h.logsm.Unlock()
+		terminate = true
+		defer cancel(context.Canceled)
+		t := time.AfterFunc(30*time.Second, func() {
+			cancel(context.DeadlineExceeded)
+		})
+		defer t.Stop()
+
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+				log.Info("Sending remaining telemetry...")
+			}
+		}()
+
 		<-spansDoneCh
 		<-logsDoneCh
 
-		err := h.sendSpans(context.Background())
-		if err != nil {
-			log.Error("heph spans flush:", err)
+		if l := h.events.Len(); l > 0 {
+			log.Warnf("Unsent spans: %v", l)
 		}
 
-		err = h.sendLogs(context.Background())
-		if err != nil {
-			log.Error("heph logs flush:", err)
+		unsentBytes := uint64(0)
+		for _, buf := range h.logsCopy() {
+			unsentBytes += uint64(buf.q.Len())
+		}
+		if unsentBytes > 0 {
+			log.Warnf("Unsent log bytes: %v", unsentBytes)
 		}
 	}
 }
 
-const oneMegabyte = 1000000
+const oneMegabyteInBytes = 1000000
+
+func (h *Hook) logsCopy() []*spanLogBuffer {
+	h.logsm.Lock()
+	defer h.logsm.Unlock()
+
+	return ads.Copy(h.logs)
+}
+
+func (h *Hook) logsAllEmpty() bool {
+	h.logsm.Lock()
+	defer h.logsm.Unlock()
+
+	for _, buf := range h.logs {
+		if buf.q.Len() != 0 {
+			return false
+		}
+	}
+
+	return true
+}
 
 func (h *Hook) sendLogs(ctx context.Context) error {
-	logs := h.logs[:]
+	chunkSize := oneMegabyteInBytes
 
-	chunkSize := oneMegabyte
-
-	for _, buf := range logs {
+	for _, buf := range h.logsCopy() {
 		if buf.spanId == "" {
 			continue
 		}
 
-		err := buf.q.DequeueChunk(chunkSize, func(b []byte) error {
+		err := buf.q.DequeueChunkContext(ctx, chunkSize, func(b []byte) error {
 			_, err := cloudclient.SendLogs(ctx, h.Client, buf.spanId, string(b))
 
 			return err
@@ -150,7 +185,7 @@ func (h *Hook) sendLogs(ctx context.Context) error {
 }
 
 func (h *Hook) sendSpans(ctx context.Context) error {
-	return h.events.DequeueChunk(1000, func(events []cloudclient.Event) error {
+	return h.events.DequeueChunkContext(ctx, 1000, func(events []cloudclient.Event) error {
 		gqlEvents := make([]json.RawMessage, 0, len(events))
 		for _, event := range events {
 			b, err := ajson.Marshal(event)
@@ -167,8 +202,11 @@ func (h *Hook) sendSpans(ctx context.Context) error {
 			return err
 		}
 
-		for _, span := range res.IngestSpans {
-			for _, buf := range h.logs {
+		h.logsm.Lock()
+		defer h.logsm.Unlock()
+
+		for _, buf := range h.logs {
+			for _, span := range res.IngestSpans {
 				if buf.localSpanId == span.SpanId {
 					buf.spanId = span.Id
 					break
@@ -359,13 +397,22 @@ func (h *Hook) OnRunExec(ctx context.Context, span *observability.TargetExecSpan
 
 	h.logsm.Lock()
 	w := &spanLogBuffer{localSpanId: fmt.Sprint(span.ID())}
-	w.q.Max = 200 * oneMegabyte
+	w.q.Max = 200 * oneMegabyteInBytes
 	h.logs = append(h.logs, w)
 	h.logsm.Unlock()
 
 	cctx = context.WithValue(cctx, execLogsKey{}, w)
 
 	return cctx, observability.AllSpanHook(func() {
+		if span.FinalState() != observability.StateUnknown {
+			go func() {
+				<-w.q.Empty()
+				h.logsm.Lock()
+				h.logs = ads.Remove(h.logs, w)
+				h.logsm.Unlock()
+			}()
+		}
+
 		h.enqueueEvent(eventFactory(ctx, cloudclient.TargetExecSpanEventRUN_EXEC, span))
 	})
 }
