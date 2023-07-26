@@ -63,6 +63,7 @@ godeps = target(
         tools=go,
     ),
     env={
+        "GOWORK": "off",
         "OS": get_os(),
         "ARCH": get_arch(),
     },
@@ -75,6 +76,7 @@ generate_testmain = target(
     out={"generate_testmain": "generate_testmain/generate_testmain"},
     tools=[go],
     env={
+        "GOWORK": "off",
         "OS": get_os(),
         "ARCH": get_arch(),
     },
