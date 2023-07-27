@@ -13,7 +13,6 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
-	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
@@ -260,33 +259,6 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (*WaitGroupMap, error) {
-	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-}
-
-func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
-	j := e.Pool.Schedule(ctx, &worker.Job{
-		Name: rr.Target.FQN,
-		Deps: deps,
-		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
-			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
-		}),
-		Do: func(w *worker.Worker, ctx context.Context) error {
-			err := e.Run(ctx, rr, sandbox.IOConfig{})
-			if err != nil {
-				return TargetFailedError{
-					Target: rr.Target,
-					Err:    err,
-				}
-			}
-
-			return nil
-		},
-	})
-
-	return j, nil
-}
-
 func (e *Engine) collectNamedOut(target *Target, namedPaths *tgt.OutNamedPaths, root string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
@@ -434,10 +406,6 @@ func (e *Engine) sandboxRoot(specer targetspec.Specer) xfs.Path {
 	}
 
 	return p
-}
-
-func (e *Engine) Clean(async bool) error {
-	return xfs.DeleteDir(e.Root.Home.Abs(), async)
 }
 
 func (e *Engine) CleanTarget(target *Target, async bool) error {

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
@@ -12,6 +14,33 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker"
 )
+
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (*WaitGroupMap, error) {
+	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
+}
+
+func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
+	j := e.Pool.Schedule(ctx, &worker.Job{
+		Name: rr.Target.FQN,
+		Deps: deps,
+		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
+			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
+		}),
+		Do: func(w *worker.Worker, ctx context.Context) error {
+			err := e.Run(ctx, rr, sandbox.IOConfig{})
+			if err != nil {
+				return TargetFailedError{
+					Target: rr.Target,
+					Err:    err,
+				}
+			}
+
+			return nil
+		},
+	})
+
+	return j, nil
+}
 
 func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (_ *WaitGroupMap, rerr error) {
 	targetsSet := rrs.Targets()
