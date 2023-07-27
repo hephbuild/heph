@@ -12,6 +12,7 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/worker"
 	"os"
+	"sync"
 )
 
 func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint, uncompress bool) (bool, error) {
@@ -45,12 +46,12 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 		return false, true, nil
 	}
 
-	status.Emit(ctx, tgt.TargetStatus(target, "Checking remote caches..."))
-
 	orderedCaches, err := e.OrderedCaches(ctx)
 	if err != nil {
 		return false, false, fmt.Errorf("orderedcaches: %w", err)
 	}
+
+	var statusOnce sync.Once
 
 	for _, cache := range orderedCaches {
 		if !cache.Read {
@@ -64,6 +65,10 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 		if followHint && e.RemoteCache.Hints.Get(target.FQN, cache.Name).Skip() {
 			continue
 		}
+
+		statusOnce.Do(func() {
+			status.Emit(ctx, tgt.TargetStatus(target, "Checking remote caches..."))
+		})
 
 		externalCached, err := e.pullExternalCache(ctx, target, outputs, onlyMeta, cache)
 		if err != nil {
