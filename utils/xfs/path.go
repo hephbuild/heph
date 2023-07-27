@@ -30,6 +30,12 @@ func (ps RelPaths) Sort() {
 	})
 }
 
+func (ps RelPaths) WithRoot(abs string) Paths {
+	return ads.Map(ps, func(p RelPath) Path {
+		return p.WithRoot(abs)
+	})
+}
+
 type Path struct {
 	root    string
 	relRoot string

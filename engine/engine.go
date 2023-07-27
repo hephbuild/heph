@@ -21,17 +21,13 @@ import (
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/sets"
-	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
 	"io/fs"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 )
 
 type Engine struct {
@@ -337,25 +333,12 @@ func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, out
 }
 
 func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (xfs.Paths, error) {
-	r, err := artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target))
+	paths, err := e.LocalCache.PathsFromArtifact(ctx, target, artifact)
 	if err != nil {
 		return nil, err
 	}
 
-	ps := make(xfs.Paths, len(files))
-	for i, file := range files {
-		ps[i] = xfs.NewRelPath(file).WithRoot(target.OutExpansionRoot.Abs())
-	}
-
-	ps.Sort()
-
-	return ps, nil
+	return paths.WithRoot(target.OutExpansionRoot.Abs()), nil
 }
 
 func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xfs.Paths, error) {
@@ -453,18 +436,17 @@ func (e *Engine) sandboxRoot(specer targetspec.Specer) xfs.Path {
 }
 
 func (e *Engine) Clean(async bool) error {
-	return deleteDir(e.Root.Home.Abs(), async)
+	return xfs.DeleteDir(e.Root.Home.Abs(), async)
 }
 
 func (e *Engine) CleanTarget(target *Target, async bool) error {
 	sandboxDir := e.sandboxRoot(target)
-	err := deleteDir(sandboxDir.Abs(), async)
+	err := xfs.DeleteDir(sandboxDir.Abs(), async)
 	if err != nil {
 		return err
 	}
 
-	cacheDir := e.cacheDirForHash(target, "")
-	err = deleteDir(cacheDir.Abs(), async)
+	err = e.LocalCache.CleanTarget(target, async)
 	if err != nil {
 		return err
 	}
@@ -481,45 +463,6 @@ func (e *Engine) CleanTargetLock(target *Target) error {
 	err = e.LocalCache.CleanTargetLock(target)
 	if err != nil {
 		return err
-	}
-
-	return nil
-}
-
-func deleteDir(dir string, async bool) error {
-	rm, err := exec.LookPath("rm")
-	if err != nil {
-		return err
-	} else if !xfs.PathExists(dir) {
-		return nil // not an error, just don't need to do anything.
-	}
-
-	log.Tracef("Deleting %v", dir)
-
-	if async {
-		newDir := xfs.RandPath(os.TempDir(), filepath.Base(dir), "")
-
-		err = os.Rename(dir, newDir)
-		if err != nil {
-			// May be because os.TempDir() and the current dir aren't on the same device, try a sibling folder
-			newDir = xfs.RandPath(filepath.Dir(dir), filepath.Base(dir), "")
-
-			err1 := os.Rename(dir, newDir)
-			if err1 != nil {
-				log.Warnf("rename failed %v, deleting synchronously", err)
-				return deleteDir(dir, false)
-			}
-		}
-
-		// Note that we can't fork() directly and continue running Go code, but ForkExec() works okay.
-		// Hence why we're using rm rather than fork() + os.RemoveAll.
-		_, err = syscall.ForkExec(rm, []string{rm, "-rf", newDir}, nil)
-		return err
-	}
-
-	out, err := exec.Command(rm, "-rf", dir).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to remove directory: %s", string(out))
 	}
 
 	return nil

@@ -1,9 +1,10 @@
-package engine
+package lcache
 
 import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
@@ -15,7 +16,7 @@ import (
 	"path/filepath"
 )
 
-func UncompressedPathFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, dir string) (string, error) {
+func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, dir string) (string, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	if xfs.PathExists(uncompressedPath) {
 		return uncompressedPath, nil
