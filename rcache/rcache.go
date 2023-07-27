@@ -33,12 +33,14 @@ func artifactExternalFileName(a artifacts.Artifact) string {
 type RemoteCache struct {
 	LocalCache    *lcache.LocalCacheState
 	Observability *observability.Observability
+	Hints         *HintStore
 }
 
 func New(localCache *lcache.LocalCacheState, observability *observability.Observability) *RemoteCache {
 	return &RemoteCache{
 		LocalCache:    localCache,
 		Observability: observability,
+		Hints:         &HintStore{},
 	}
 }
 
