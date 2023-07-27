@@ -240,7 +240,7 @@ func NewPool(n int) *Pool {
 					continue
 				}
 
-				j.ctx = status.ContextWithStatus(j.ctx, w)
+				j.ctx = status.ContextWithHandler(j.ctx, w)
 
 				j.TimeStart = time.Now()
 				j.State = StateRunning

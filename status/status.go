@@ -14,14 +14,14 @@ type Statuser interface {
 	String(r *lipgloss.Renderer) string
 }
 
-type ctxkey struct{}
+type handlerKey struct{}
 
-func ContextWithStatus(ctx context.Context, handler Handler) context.Context {
-	return context.WithValue(ctx, ctxkey{}, handler)
+func ContextWithHandler(ctx context.Context, handler Handler) context.Context {
+	return context.WithValue(ctx, handlerKey{}, handler)
 }
 
 func Emit(ctx context.Context, s Statuser) {
-	if h, ok := ctx.Value(ctxkey{}).(Handler); ok {
+	if h, ok := ctx.Value(handlerKey{}).(Handler); ok {
 		h.Status(s)
 	} else {
 		r := log.Renderer()
