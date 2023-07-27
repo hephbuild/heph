@@ -860,6 +860,10 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 		return fmt.Errorf("expand: %w", err)
 	}
 
+	if outDir == xfs.NilPath {
+		return nil
+	}
+
 	target.OutExpansionRoot = &outDir
 
 	if len(target.OutWithSupport.All()) > 0 {
