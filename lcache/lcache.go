@@ -134,6 +134,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	if err != nil {
 		return err
 	}
+
 	dir := e.cacheDir(target).Abs()
 
 	err = os.RemoveAll(dir)

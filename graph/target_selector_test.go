@@ -10,13 +10,11 @@ import (
 
 func targetFactory(pkg string, fqn string, labels []string) *Target {
 	return &Target{
-		Target: &Target{
-			Target: specs.Target{
-				FQN:    "//" + pkg + ":" + fqn,
-				Labels: labels,
-				Package: &packages.Package{
-					Path: pkg,
-				},
+		Target: specs.Target{
+			FQN:    "//" + pkg + ":" + fqn,
+			Labels: labels,
+			Package: &packages.Package{
+				Path: pkg,
 			},
 		},
 	}

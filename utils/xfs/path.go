@@ -36,6 +36,8 @@ func (ps RelPaths) WithRoot(abs string) Paths {
 	})
 }
 
+var NilPath = Path{}
+
 type Path struct {
 	root    string
 	relRoot string
