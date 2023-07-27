@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -37,9 +36,7 @@ func (e *State) Register(spec specs.Target) error {
 	}
 
 	t := &Target{
-		Target: &tgt.Target{
-			Target: spec,
-		},
+		Target: spec,
 	}
 
 	err = e.processTarget(t)
@@ -124,7 +121,7 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 	return nil
 }
 
-func (e *State) filterOutCodegenFromDeps(t *Target, td tgt.TargetDeps) tgt.TargetDeps {
+func (e *State) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	files := make(xfs.Paths, 0, len(td.Files))
 	for _, file := range td.Files {
 		if dep, ok := e.GetCodegenOrigin(file.RelRoot()); ok {
@@ -138,7 +135,7 @@ func (e *State) filterOutCodegenFromDeps(t *Target, td tgt.TargetDeps) tgt.Targe
 	return td
 }
 
-func (e *State) preventDepOnTool(t *Target, td tgt.TargetDeps) error {
+func (e *State) preventDepOnTool(t *Target, td TargetDeps) error {
 	for _, target := range td.Targets {
 		if target.Target.IsTool() {
 			return fmt.Errorf("cannot depend on %v because it is a tool", target.Target.FQN)
@@ -255,7 +252,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	}
 
 	// Resolve transitive spec
-	t.OwnTransitive = tgt.TargetTransitive{}
+	t.OwnTransitive = TargetTransitive{}
 	t.OwnTransitive.Tools, err = e.linkTargetTools(t, t.Spec().Transitive.Tools, breadcrumb)
 	if err != nil {
 		return err
@@ -265,11 +262,11 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		return err
 	}
 	t.OwnTransitive.Env = t.Spec().Transitive.Env
-	t.OwnTransitive.RuntimeEnv = map[string]tgt.TargetRuntimeEnv{}
+	t.OwnTransitive.RuntimeEnv = map[string]TargetRuntimeEnv{}
 	for k, v := range t.Spec().Transitive.RuntimeEnv {
-		t.OwnTransitive.RuntimeEnv[k] = tgt.TargetRuntimeEnv{
+		t.OwnTransitive.RuntimeEnv[k] = TargetRuntimeEnv{
 			Value:  v,
-			Target: t.Target,
+			Target: t,
 		}
 	}
 	t.OwnTransitive.PassEnv = t.Spec().Transitive.PassEnv
@@ -294,8 +291,8 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		return xfs.NewRelPath(relRoot)
 	}
 
-	t.Out = &tgt.OutNamedPaths{}
-	t.OutWithSupport = &tgt.OutNamedPaths{}
+	t.Out = &OutNamedPaths{}
+	t.OutWithSupport = &OutNamedPaths{}
 	for _, file := range t.Spec().Out {
 		if file.Name != specs.SupportFilesOutput {
 			t.Out.Add(file.Name, relPathFactory(file.Path))
@@ -317,11 +314,11 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	t.Env = map[string]string{}
 	e.applyEnv(t, t.Spec().PassEnv, t.Spec().Env)
 
-	t.RuntimeEnv = map[string]tgt.TargetRuntimeEnv{}
+	t.RuntimeEnv = map[string]TargetRuntimeEnv{}
 	for k, v := range t.Spec().RuntimeEnv {
-		t.RuntimeEnv[k] = tgt.TargetRuntimeEnv{
+		t.RuntimeEnv[k] = TargetRuntimeEnv{
 			Value:  v,
-			Target: t.Target,
+			Target: t,
 		}
 	}
 
@@ -382,7 +379,7 @@ func (e *State) registerDag(t *Target) error {
 		return err
 	}
 
-	addEdge := func(src *tgt.Target, dst *Target) error {
+	addEdge := func(src *Target, dst *Target) error {
 		ok, err := e.dag.IsEdge(src.FQN, dst.FQN)
 		if ok || err != nil {
 			return err
@@ -417,7 +414,7 @@ func (e *State) registerDag(t *Target) error {
 	return nil
 }
 
-func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (tgt.TargetNamedDeps, error) {
+func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (TargetNamedDeps, error) {
 	m := map[string]specs.Deps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
@@ -437,22 +434,22 @@ func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets
 		m[itm.Name] = a
 	}
 
-	td := tgt.TargetNamedDeps{}
+	td := TargetNamedDeps{}
 	for name, deps := range m {
 		ldeps, err := e.linkTargetDeps(t, deps, breadcrumb)
 		if err != nil {
-			return tgt.TargetNamedDeps{}, err
+			return TargetNamedDeps{}, err
 		}
 
 		err = e.preventDepOnTool(t, ldeps)
 		if err != nil {
-			return tgt.TargetNamedDeps{}, err
+			return TargetNamedDeps{}, err
 		}
 
 		td.Set(name, ldeps)
 	}
 
-	td.Map(func(deps tgt.TargetDeps) tgt.TargetDeps {
+	td.Map(func(deps TargetDeps) TargetDeps {
 		return e.filterOutCodegenFromDeps(t, deps)
 	})
 
@@ -462,27 +459,27 @@ func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets
 	return td, nil
 }
 
-func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *sets.StringSet) (tgt.TargetTools, error) {
+func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *sets.StringSet) (TargetTools, error) {
 	type targetTool struct {
 		Target *Target
 		Output string
 		Name   string
 	}
 
-	refs := make([]*tgt.Target, 0, len(toolsSpecs.Targets))
+	refs := make([]*Target, 0, len(toolsSpecs.Targets))
 	targetTools := make([]targetTool, 0)
 	for _, tool := range toolsSpecs.Targets {
 		tt := e.Targets().Find(tool.Target)
 		if tt == nil {
-			return tgt.TargetTools{}, NewTargetNotFoundError(tool.Target)
+			return TargetTools{}, NewTargetNotFoundError(tool.Target)
 		}
 
 		err := e.LinkTarget(tt, breadcrumb)
 		if err != nil {
-			return tgt.TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
+			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
-		refs = append(refs, tt.Target)
+		refs = append(refs, tt)
 
 		if tool.Output == "" {
 			for _, name := range tt.Out.Names() {
@@ -506,7 +503,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 
 		targets, err := e.targetExpr(t, expr, breadcrumb)
 		if err != nil {
-			return tgt.TargetTools{}, err
+			return TargetTools{}, err
 		}
 
 		for _, target := range targets {
@@ -514,11 +511,11 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 				Target: target,
 				Name:   tool.Name,
 			})
-			refs = append(refs, target.Target)
+			refs = append(refs, target)
 		}
 	}
 
-	tools := make([]tgt.TargetTool, 0, len(toolsSpecs.Targets))
+	tools := make([]TargetTool, 0, len(toolsSpecs.Targets))
 
 	for _, tool := range targetTools {
 		tt := tool.Target
@@ -535,7 +532,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			npaths := tt.Out.Name(tool.Output)
 
 			if len(npaths) == 0 {
-				return tgt.TargetTools{}, fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
+				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
 			}
 
 			paths = map[string]xfs.RelPaths{
@@ -545,7 +542,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			paths = tt.Out.Named()
 
 			if len(paths) == 0 && tool.Target.DeepOwnTransitive.Empty() {
-				return tgt.TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
+				return TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
 			}
 
 			if name != "" {
@@ -563,7 +560,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 
 		for name, paths := range paths {
 			if len(paths) != 1 {
-				return tgt.TargetTools{}, fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.FQN)
+				return TargetTools{}, fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.FQN)
 			}
 
 			path := paths[0]
@@ -572,8 +569,8 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 				name = filepath.Base(path.RelRoot())
 			}
 
-			tools = append(tools, tgt.TargetTool{
-				Target: tt.Target,
+			tools = append(tools, TargetTool{
+				Target: tt,
 				Output: tool.Output,
 				Name:   name,
 				File:   path,
@@ -581,7 +578,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 		}
 	}
 
-	tt := tgt.TargetTools{
+	tt := TargetTools{
 		TargetReferences: refs,
 		Targets:          tools,
 		Hosts:            toolsSpecs.Hosts,
@@ -625,7 +622,7 @@ func (e *State) applyEnv(t *Target, passEnv []string, env map[string]string) {
 	}
 }
 
-func (e *State) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
+func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.StringSet) (TargetTransitive, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
@@ -641,14 +638,14 @@ func (e *State) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *sets.
 
 	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)
 	if err != nil {
-		return tgt.TargetTransitive{}, err
+		return TargetTransitive{}, err
 	}
 	dtr = dtr.Merge(tr)
 
 	return dtr, nil
 }
 
-func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, []specs.Platform, error) {
+func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (TargetTransitive, []specs.Platform, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
@@ -661,7 +658,7 @@ func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet)
 
 	tr, err := e.collectTransitive(targets.Slice(), breadcrumb)
 	if err != nil {
-		return tgt.TargetTransitive{}, nil, err
+		return TargetTransitive{}, nil, err
 	}
 
 	platforms, err := e.computePlatformsFromTransitiveTargets(t, targets.Slice())
@@ -717,8 +714,8 @@ func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Targ
 	return nil, fmt.Errorf("has conflicting transitive platform config, you must override `platforms`, got:\n%v", configs)
 }
 
-func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, error) {
-	tt := tgt.TargetTransitive{}
+func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (TargetTransitive, error) {
+	tt := TargetTransitive{}
 
 	for _, dep := range deps {
 		tt = tt.Merge(dep.DeepOwnTransitive)
@@ -727,14 +724,14 @@ func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (t
 	for _, dep := range tt.Deps.All().Targets {
 		err := e.LinkTarget(e.Targets().Find(dep.Target.FQN), breadcrumb)
 		if err != nil {
-			return tgt.TargetTransitive{}, err
+			return TargetTransitive{}, err
 		}
 	}
 
 	for _, t := range tt.Tools.TargetReferences {
 		err := e.LinkTarget(e.Targets().Find(t.FQN), breadcrumb)
 		if err != nil {
-			return tgt.TargetTransitive{}, err
+			return TargetTransitive{}, err
 		}
 	}
 
@@ -780,28 +777,28 @@ func (e *State) targetExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSe
 
 const InlineGroups = true
 
-func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (tgt.TargetDeps, error) {
-	td := tgt.TargetDeps{}
+func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (TargetDeps, error) {
+	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {
 		expr := expr.Expr
 
 		targets, err := e.targetExpr(t, expr, breadcrumb)
 		if err != nil {
-			return tgt.TargetDeps{}, err
+			return TargetDeps{}, err
 		}
 
 		td.Targets = ads.GrowExtra(td.Targets, len(targets))
 
 		for _, target := range targets {
 			if len(target.Out.Names()) == 0 {
-				td.Targets = append(td.Targets, tgt.TargetWithOutput{
-					Target: target.Target,
+				td.Targets = append(td.Targets, TargetWithOutput{
+					Target: target,
 				})
 			} else {
 				for _, name := range target.Out.Names() {
-					td.Targets = append(td.Targets, tgt.TargetWithOutput{
-						Target: target.Target,
+					td.Targets = append(td.Targets, TargetWithOutput{
+						Target: target,
 						Output: name,
 					})
 				}
@@ -813,24 +810,24 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 	for _, spec := range deps.Targets {
 		dt := e.Targets().Find(spec.Target)
 		if dt == nil {
-			return tgt.TargetDeps{}, NewTargetNotFoundError(spec.Target)
+			return TargetDeps{}, NewTargetNotFoundError(spec.Target)
 		}
 
 		err := e.LinkTarget(dt, breadcrumb)
 		if err != nil {
-			return tgt.TargetDeps{}, err
+			return TargetDeps{}, err
 		}
 
 		if spec.Output == "" {
 			if len(dt.Out.Names()) == 0 {
-				td.Targets = append(td.Targets, tgt.TargetWithOutput{
-					Target: dt.Target,
+				td.Targets = append(td.Targets, TargetWithOutput{
+					Target: dt,
 					Mode:   spec.Mode,
 				})
 			} else {
 				for _, name := range dt.Out.Names() {
-					td.Targets = append(td.Targets, tgt.TargetWithOutput{
-						Target: dt.Target,
+					td.Targets = append(td.Targets, TargetWithOutput{
+						Target: dt,
 						Output: name,
 						Mode:   spec.Mode,
 					})
@@ -838,11 +835,11 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 			}
 		} else {
 			if !dt.Out.HasName(spec.Output) {
-				return tgt.TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
+				return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
 			}
 
-			td.Targets = append(td.Targets, tgt.TargetWithOutput{
-				Target:     dt.Target,
+			td.Targets = append(td.Targets, TargetWithOutput{
+				Target:     dt,
 				Output:     spec.Output,
 				SpecOutput: spec.Output,
 				Mode:       spec.Mode,
@@ -868,19 +865,19 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 		}
 
 		if !xfs.PathExists(p.Abs()) {
-			return tgt.TargetDeps{}, fmt.Errorf("%v: %w", p.Abs(), os.ErrNotExist)
+			return TargetDeps{}, fmt.Errorf("%v: %w", p.Abs(), os.ErrNotExist)
 		}
 
 		td.Files = append(td.Files, p)
 	}
 
 	if InlineGroups {
-		td.Targets = ads.MapFlat(td.Targets, func(dep tgt.TargetWithOutput) []tgt.TargetWithOutput {
+		td.Targets = ads.MapFlat(td.Targets, func(dep TargetWithOutput) []TargetWithOutput {
 			if dep.Target.IsGroup() {
 				td.Files = append(td.Files, dep.Target.Deps.All().Files...)
 				return dep.Target.Deps.All().Targets
 			} else {
-				return []tgt.TargetWithOutput{dep}
+				return []TargetWithOutput{dep}
 			}
 		})
 	}

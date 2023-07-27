@@ -101,7 +101,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 }
 
 func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
-	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.Target.Target, cache.Name, outputs, onlyMeta)
+	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.GraphTarget(), cache.Name, outputs, onlyMeta)
 	defer rcache.SpanEndIgnoreNotExist(span, rerr)
 
 	err := e.RemoteCache.DownloadArtifact(ctx, target, cache, target.Artifacts.InputHash)

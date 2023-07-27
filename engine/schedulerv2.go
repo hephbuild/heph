@@ -24,7 +24,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 		Name: rr.Target.FQN,
 		Deps: deps,
 		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
-			return e.Observability.SpanRun(job.Ctx(), rr.Target.Target)
+			return e.Observability.SpanRun(job.Ctx(), rr.Target.GraphTarget())
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			err := e.Run(ctx, rr, sandbox.IOConfig{})

@@ -127,7 +127,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 		status.Emit(ctx, tgt.TargetStatus(target, "Storing output..."))
 	}
 
-	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target.Target)
+	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target)
 	defer span.EndError(rerr)
 
 	hash, err := e.HashInput(target)
@@ -198,7 +198,7 @@ func (e *LocalCacheState) HasArtifact(ctx context.Context, target graph.Targeter
 	setCacheHit := func(bool) {}
 	if !skipSpan {
 		var span *observability.TargetArtifactCacheSpan
-		ctx, span = e.Observability.SpanLocalCacheCheck(ctx, target.TGTTarget(), artifact)
+		ctx, span = e.Observability.SpanLocalCacheCheck(ctx, target.GraphTarget(), artifact)
 		defer span.End()
 		setCacheHit = func(v bool) {
 			span.SetCacheHit(v)

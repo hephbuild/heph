@@ -7,10 +7,10 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 )
 
-type TargetMetas = tgt.TargetMetas[*Target]
+type TargetMetas = graph.TargetMetas[*Target]
 
 func NewTargetMetas(factory func(fqn string) *Target) *TargetMetas {
-	return tgt.NewTargetMetas(factory)
+	return graph.NewTargetMetas(factory)
 }
 
 type ActualOutNamedPaths = tgt.NamedPaths[xfs.Paths, xfs.Path]

@@ -1,13 +1,35 @@
 package graph
 
 import (
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xfs"
 	"sync"
 )
 
+type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
+
 type Target struct {
-	*tgt.Target
+	specs.Target
+
+	Tools          TargetTools
+	Deps           TargetNamedDeps
+	HashDeps       TargetDeps
+	OutWithSupport *OutNamedPaths
+	Out            *OutNamedPaths
+	Env            map[string]string
+	RuntimeEnv     map[string]TargetRuntimeEnv
+	RuntimePassEnv []string
+	Platforms      []specs.Platform
+
+	// Collected transitive deps from deps/tools
+	TransitiveDeps TargetTransitive
+
+	// Own transitive config
+	OwnTransitive TargetTransitive
+	// Own transitive config plus their own transitive
+	DeepOwnTransitive TargetTransitive
 
 	Artifacts *ArtifactOrchestrator
 
@@ -20,15 +42,6 @@ type Target struct {
 	// Deps + HashDeps + TargetTools
 	AllTargetDeps *Targets
 	m             sync.Mutex
-}
-
-type Targeter interface {
-	tgt.Targeter
-	GraphTarget() *Target
-}
-
-func (t *Target) GraphTarget() *Target {
-	return t
 }
 
 func (t *Target) resetLinking() {
@@ -67,4 +80,34 @@ func (t *Target) EmptyDeps() bool {
 		len(t.PassEnv) == 0 &&
 		len(t.RuntimeEnv) == 0 &&
 		len(t.RuntimePassEnv) == 0
+}
+
+type Targeter interface {
+	specs.Specer
+	GraphTarget() *Target
+}
+
+func (t *Target) GraphTarget() *Target {
+	return t
+}
+
+type TargetRuntimeEnv struct {
+	Value  string
+	Target *Target
+}
+
+func (t *Target) ToolTarget() TargetTool {
+	if !t.IsTool() {
+		panic("not a tool target")
+	}
+
+	ts := t.Spec().Tools.Targets[0]
+
+	for _, tool := range t.Tools.Targets {
+		if tool.Target.FQN == ts.Target {
+			return tool
+		}
+	}
+
+	panic("unable to find tool target bin")
 }

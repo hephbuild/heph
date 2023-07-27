@@ -2,15 +2,16 @@ package main
 
 import (
 	"github.com/hephbuild/heph/cmd/heph/search"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"sort"
 	"strings"
 )
 
-func sortedTargets(targets []*tgt.Target, skipPrivate bool) []*tgt.Target {
-	stargets := make([]*tgt.Target, 0)
+func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
+	stargets := make([]*graph.Target, 0)
 	for _, target := range targets {
 		if skipPrivate && target.IsPrivate() {
 			continue
@@ -26,7 +27,7 @@ func sortedTargets(targets []*tgt.Target, skipPrivate bool) []*tgt.Target {
 	return stargets
 }
 
-func sortedTargetNames(targets []*tgt.Target, skipPrivate bool) []string {
+func sortedTargetNames(targets []*graph.Target, skipPrivate bool) []string {
 	names := make([]string, 0)
 	for _, t := range sortedTargets(targets, skipPrivate) {
 		names = append(names, t.FQN)
@@ -36,13 +37,9 @@ func sortedTargetNames(targets []*tgt.Target, skipPrivate bool) []string {
 }
 
 func autocompletePrefix(suggestions, ss []string, comp string) []string {
-	for _, s := range ss {
-		if strings.HasPrefix(s, comp) {
-			suggestions = append(suggestions, s)
-		}
-	}
-
-	return suggestions
+	return append(suggestions, ads.Filter(ss, func(s string) bool {
+		return strings.HasPrefix(s, comp)
+	})...)
 }
 
 func autocompleteTargetName(targets specs.Targets, s string) (bool, []string) {
@@ -76,10 +73,9 @@ func autocompleteLabel(labels []string, s string) []string {
 	matches := fuzzy.RankFindNormalizedFold(s, labels)
 	sort.Sort(matches)
 
-	suggestions := make([]string, 0)
-	for _, s := range matches {
-		suggestions = append(suggestions, s.Target)
-	}
+	suggestions := ads.Map(matches, func(t fuzzy.Rank) string {
+		return t.Target
+	})
 
 	if len(suggestions) > 5 {
 		suggestions = suggestions[:5]

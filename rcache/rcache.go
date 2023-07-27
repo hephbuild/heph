@@ -62,7 +62,7 @@ func (e *RemoteCache) ArtifactExists(ctx context.Context, cache graph.CacheConfi
 }
 
 func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targeter, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	ctx, span := e.Observability.SpanCacheDownload(ctx, target.TGTTarget(), cache.Name, artifact)
+	ctx, span := e.Observability.SpanCacheDownload(ctx, target.GraphTarget(), cache.Name, artifact)
 	defer func() {
 		if errors.Is(rerr, os.ErrNotExist) {
 			span.SetCacheHit(false)
@@ -133,7 +133,7 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
-	ctx, span := e.Observability.SpanCacheUpload(ctx, target.Target, cache.Name, artifact)
+	ctx, span := e.Observability.SpanCacheUpload(ctx, target, cache.Name, artifact)
 	defer span.EndError(rerr)
 
 	remoteRoot, err := e.remoteCacheLocation(cache.Location, target)

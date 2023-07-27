@@ -83,14 +83,14 @@ type runPrepare struct {
 	Executor platform.Executor
 }
 
-func (e *Engine) toolAbsPath(tt tgt.TargetTool) string {
+func (e *Engine) toolAbsPath(tt graph.TargetTool) string {
 	return tt.File.WithRoot(e.Targets.Find(tt.Target).OutExpansionRoot.Abs()).Abs()
 }
 
 func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
 	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
 
-	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target.Target)
+	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target)
 	defer span.EndError(rerr)
 
 	// Sanity checks
@@ -518,7 +518,7 @@ func (e *Engine) WriteableCaches(ctx context.Context, target *Target) ([]graph.C
 func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
 	target := e.Targets.Find(rr.Target)
 
-	ctx, rspan := e.Observability.SpanRun(ctx, target.Target.Target)
+	ctx, rspan := e.Observability.SpanRun(ctx, target.Target)
 	defer rspan.EndError(rerr)
 
 	err := e.Graph.LinkTarget(target.Target, nil)
@@ -657,7 +657,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 			defer cancel()
 		}
 
-		execCtx, execSpan := e.Observability.SpanRunExec(execCtx, target.Target.Target)
+		execCtx, execSpan := e.Observability.SpanRunExec(execCtx, target.Target)
 
 		obw := e.Observability.LogsWriter(execCtx)
 

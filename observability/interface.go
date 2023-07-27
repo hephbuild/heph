@@ -4,7 +4,7 @@ import (
 	"context"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/artifacts"
-	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/graph"
 	"io"
 	"sync/atomic"
 	"time"
@@ -39,7 +39,7 @@ type SpanError interface {
 
 type SpanTarget interface {
 	Span
-	Target() *tgt.Target
+	Target() *graph.Target
 }
 
 type SpanTargetArtifact interface {
@@ -219,14 +219,14 @@ func (s *BaseSpan) registerHook(hook SpanHook) {
 
 type TargetSpan struct {
 	BaseSpan
-	target *tgt.Target
+	target *graph.Target
 }
 
 func (s *TargetSpan) spanDedupId() interface{} {
 	return s.target.FQN
 }
 
-func (s *TargetSpan) Target() *tgt.Target {
+func (s *TargetSpan) Target() *graph.Target {
 	return s.target
 }
 

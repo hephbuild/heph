@@ -4,14 +4,13 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/stretchr/testify/assert"
 	"testing"
 )
 
 func targetFactory(pkg string, fqn string, labels []string) *Target {
 	return &Target{
-		Target: &tgt.Target{
+		Target: &Target{
 			Target: specs.Target{
 				FQN:    "//" + pkg + ":" + fqn,
 				Labels: labels,

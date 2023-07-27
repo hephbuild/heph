@@ -11,9 +11,9 @@ import (
 	"github.com/aarondl/opt/null"
 	"github.com/hephbuild/heph/cloudclient"
 	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/queue"
 	"io"
@@ -246,7 +246,7 @@ func (h *Hook) enqueueEvent(event cloudclient.Event) {
 
 type span interface {
 	observability.SpanError
-	Target() *tgt.Target
+	Target() *graph.Target
 }
 
 func nullFromTime(t time.Time) null.Val[time.Time] {
