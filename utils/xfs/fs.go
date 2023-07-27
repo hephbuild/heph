@@ -2,10 +2,14 @@ package xfs
 
 import (
 	"errors"
+	"fmt"
+	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/xrand"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 )
 
 func RandPath(base, prefix, suffix string) string {
@@ -71,4 +75,43 @@ func WriteFileSync(name string, data []byte, perm os.FileMode) error {
 		err = err1
 	}
 	return err
+}
+
+func DeleteDir(dir string, async bool) error {
+	rm, err := exec.LookPath("rm")
+	if err != nil {
+		return err
+	} else if !PathExists(dir) {
+		return nil // not an error, just don't need to do anything.
+	}
+
+	log.Tracef("Deleting %v", dir)
+
+	if async {
+		newDir := RandPath(os.TempDir(), filepath.Base(dir), "")
+
+		err = os.Rename(dir, newDir)
+		if err != nil {
+			// May be because os.TempDir() and the current dir aren't on the same device, try a sibling folder
+			newDir = RandPath(filepath.Dir(dir), filepath.Base(dir), "")
+
+			err1 := os.Rename(dir, newDir)
+			if err1 != nil {
+				log.Warnf("rename failed %v, deleting synchronously", err)
+				return DeleteDir(dir, false)
+			}
+		}
+
+		// Note that we can't fork() directly and continue running Go code, but ForkExec() works okay.
+		// Hence why we're using rm rather than fork() + os.RemoveAll.
+		_, err = syscall.ForkExec(rm, []string{rm, "-rf", newDir}, nil)
+		return err
+	}
+
+	out, err := exec.Command(rm, "-rf", dir).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to remove directory: %s", string(out))
+	}
+
+	return nil
 }

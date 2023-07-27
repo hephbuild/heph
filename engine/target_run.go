@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	ptylib "github.com/creack/pty"
-	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hephprovider"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/sandbox"
@@ -18,12 +18,10 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
 	"io"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -152,16 +150,16 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
-		latestDir := e.cacheDirForHash(target, "latest")
+		latestDir := e.LocalCache.LatestCacheDir(target)
 
 		if xfs.PathExists(latestDir.Abs()) {
 			done := log.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
 				art := target.Artifacts.OutTar(name)
-				p, err := UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
+				p, err := lcache.UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
 				if err != nil {
-					log.Errorf("restore cache: out %v|%v: tar does not exist", target.FQN, art.Name())
+					log.Errorf("restore cache: out %v|%v: %v", target.FQN, art.Name(), err)
 					continue
 				}
 				restoreSrcRec.AddTar(p)
@@ -199,7 +197,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 				}
 			} else {
 				art := dept.Artifacts.OutTar(dep.Output)
-				p, err := UncompressedPathFromArtifact(ctx, dept, art, e.cacheDir(dept).Abs())
+				p, err := e.LocalCache.UncompressedPathFromArtifact(ctx, dept, art)
 				if err != nil {
 					return nil, err
 				}
@@ -785,7 +783,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 	}
 
 	if !target.Cache.Enabled && !rr.PreserveCache {
-		e.Finalizers.RegisterRemove(e.cacheDir(target).Abs())
+		e.LocalCache.RegisterRemove(target)
 	}
 
 	if len(writeableCaches) > 0 {
@@ -803,7 +801,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
-				err = deleteDir(target.SandboxRoot.Abs(), false)
+				err = xfs.DeleteDir(target.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
 				}
@@ -839,10 +837,6 @@ func (e *Engine) chooseExecutor(labels map[string]string, options map[string]int
 	return nil, fmt.Errorf("no platform available for %v", labels)
 }
 
-func (e *Engine) tarListPath(artifact artifacts.Artifact, target *Target) string {
-	return e.cacheDir(target).Join(artifact.Name() + ".list").Abs()
-}
-
 func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []string, runGc bool) error {
 	err := target.postRunWarmLock.Lock(ctx)
 	if err != nil {
@@ -861,85 +855,9 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 		return err
 	}
 
-	cacheDir := e.cacheDir(target)
-
-	doneMarker := cacheDir.Join(target.Artifacts.InputHash.FileName()).Abs()
-	if !xfs.PathExists(doneMarker) {
-		return nil
-	}
-
-	outDir := e.cacheDir(target).Join("_output")
-	outDirHashPath := e.cacheDir(target).Join("_output_hash").Abs()
-
-	// TODO: This can be a problem, where 2 targets depends on the same target, but with different outputs,
-	// leading to the expand overriding each other
-
-	outDirHash := "2|" + strings.Join(outputs, ",")
-
-	shouldExpand := false
-	if !xfs.PathExists(outDir.Abs()) {
-		shouldExpand = true
-	} else {
-		b, err := os.ReadFile(outDirHashPath)
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("outdirhash: %w", err)
-		}
-
-		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
-			shouldExpand = true
-		}
-	}
-
-	if len(outputs) == 0 {
-		shouldExpand = false
-	}
-
-	if shouldExpand {
-		status.Emit(ctx, tgt.TargetStatus(target, "Expanding cache..."))
-		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
-
-		err := os.RemoveAll(tmpOutDir)
-		if err != nil {
-			return err
-		}
-
-		err = os.MkdirAll(tmpOutDir, os.ModePerm)
-		if err != nil {
-			return err
-		}
-
-		untarDedup := sets.NewStringSet(0)
-
-		for _, name := range outputs {
-			r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), cacheDir.Abs())
-			if err != nil {
-				return err
-			}
-
-			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
-				ListPath: e.tarListPath(target.Artifacts.OutTar(name), target),
-				Dedup:    untarDedup,
-			})
-			_ = r.Close()
-			if err != nil {
-				return fmt.Errorf("%v: untar: %w", name, err)
-			}
-		}
-
-		err = os.RemoveAll(outDir.Abs())
-		if err != nil {
-			return err
-		}
-
-		err = os.Rename(tmpOutDir, outDir.Abs())
-		if err != nil {
-			return err
-		}
-
-		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
-		if err != nil {
-			return fmt.Errorf("outdirhash: %w", err)
-		}
+	outDir, err := e.LocalCache.Expand(ctx, target, outputs)
+	if err != nil {
+		return fmt.Errorf("expand: %w", err)
 	}
 
 	target.OutExpansionRoot = &outDir
@@ -958,7 +876,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 		return fmt.Errorf("codegenlink: %w", err)
 	}
 
-	err = e.LocalCache.linkLatestCache(target, cacheDir.Abs())
+	err = e.LocalCache.LinkLatestCache(target, hash)
 	if err != nil {
 		return fmt.Errorf("linklatest: %w", err)
 	}
@@ -1000,7 +918,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 
 		switch target.Codegen {
 		case targetspec.CodegenCopy, targetspec.CodegenCopyNoExclude:
-			tarf, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), e.cacheDir(target).Abs())
+			tarf, err := e.LocalCache.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), target)
 			if err != nil {
 				return err
 			}

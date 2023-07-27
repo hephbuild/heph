@@ -25,16 +25,6 @@ func ArtifactExternalFileName(a artifacts.Artifact) string {
 	return a.FileName()
 }
 
-func (e *Engine) localCacheLocation(target *Target) (vfs.Location, error) {
-	// TODO: cache
-	rel, err := filepath.Rel(e.LocalCache.Path.Abs(), e.cacheDir(target).Abs())
-	if err != nil {
-		return nil, err
-	}
-
-	return e.LocalCache.Location.NewLocation(rel + "/")
-}
-
 func (e *Engine) remoteCacheLocation(loc vfs.Location, target *Target) (vfs.Location, error) {
 	// TODO: cache
 	inputHash, err := e.LocalCache.HashInput(target)
@@ -182,7 +172,7 @@ func (e *Engine) scheduleStoreExternalCacheArtifact(ctx context.Context, target 
 }
 
 func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
-	localRoot, err := e.localCacheLocation(target)
+	localRoot, err := e.LocalCache.VFSLocation(target)
 	if err != nil {
 		return err
 	}
@@ -193,11 +183,11 @@ func (e *Engine) storeExternalCache(ctx context.Context, target *Target, cache g
 	}
 
 	if !exists {
-		if artifact.GenRequired() {
-			return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.FQN, artifact.Name())
+		if !artifact.GenRequired() {
+			return nil
 		}
 
-		return nil
+		return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.FQN, artifact.Name())
 	}
 
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
@@ -235,7 +225,7 @@ func (e *Engine) downloadExternalCache(ctx context.Context, target *Target, cach
 
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
-	localRoot, err := e.localCacheLocation(target)
+	localRoot, err := e.LocalCache.VFSLocation(target)
 	if err != nil {
 		return err
 	}
@@ -285,7 +275,7 @@ func (e *Engine) existsExternalCache(ctx context.Context, target *Target, cache 
 }
 
 func (e *Engine) existsLocalCache(ctx context.Context, target *Target, artifact artifacts.Artifact) (bool, error) {
-	root, err := e.localCacheLocation(target)
+	root, err := e.LocalCache.VFSLocation(target)
 	if err != nil {
 		return false, err
 	}

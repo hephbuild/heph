@@ -4,14 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 )
 
@@ -21,16 +19,6 @@ func SpanEndNotExist(span observability.SpanError, err error) {
 	} else {
 		span.EndError(err)
 	}
-}
-
-// Deprecated: use LocalCache.cacheDir
-func (e *Engine) cacheDir(target *Target) xfs.Path {
-	return e.LocalCache.cacheDir(target)
-}
-
-// Deprecated: use LocalCache.cacheDirForHash
-func (e *Engine) cacheDirForHash(target *Target, inputHash string) xfs.Path {
-	return e.LocalCache.cacheDirForHash(target, inputHash)
 }
 
 func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint, uncompress bool) (bool, error) {
@@ -55,7 +43,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 	status.Emit(ctx, tgt.TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
-	cached, err := e.getLocalCache(ctx, target, outputs, onlyMetaLocal, false, uncompress)
+	cached, err := e.LocalCache.GetLocalCache(ctx, target, outputs, onlyMetaLocal, false, uncompress)
 	if err != nil {
 		return false, false, fmt.Errorf("getlocal: %w", err)
 	}
@@ -91,7 +79,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 		}
 
 		if externalCached {
-			cached, err := e.getLocalCache(ctx, target, outputs, onlyMeta, true, uncompress)
+			cached, err := e.LocalCache.GetLocalCache(ctx, target, outputs, onlyMeta, true, uncompress)
 			if err != nil {
 				log.Errorf("local: %v", err)
 				continue
@@ -158,69 +146,6 @@ func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs 
 	}
 
 	span.SetCacheHit(true)
-
-	return true, nil
-}
-
-func (e *Engine) getLocalCacheArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact, skipSpan bool) (bool, error) {
-	unlock, err := e.LocalCache.LockArtifact(ctx, target, artifact)
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
-
-	setCacheHit := func(bool) {}
-	if !skipSpan {
-		var span *observability.TargetArtifactCacheSpan
-		ctx, span = e.Observability.SpanLocalCacheCheck(ctx, target.Target.Target, artifact)
-		defer span.End()
-		setCacheHit = func(v bool) {
-			span.SetCacheHit(v)
-		}
-	}
-
-	cacheDir := e.cacheDir(target)
-
-	for _, name := range []string{artifact.FileName(), artifact.GzFileName()} {
-		p := cacheDir.Join(name).Abs()
-		if xfs.PathExists(p) {
-			setCacheHit(true)
-			return true, nil
-		}
-	}
-
-	setCacheHit(false)
-	return false, nil
-}
-
-func (e *Engine) getLocalCache(ctx context.Context, target *Target, outputs []string, onlyMeta, skipSpan, uncompress bool) (bool, error) {
-	ok, err := e.getLocalCacheArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
-	if !ok || err != nil {
-		return false, nil
-	}
-
-	for _, output := range outputs {
-		ok, err := e.getLocalCacheArtifact(ctx, target, target.Artifacts.OutHash(output), skipSpan)
-		if !ok || err != nil {
-			return false, err
-		}
-
-		if !onlyMeta {
-			art := target.Artifacts.OutTar(output)
-
-			ok, err := e.getLocalCacheArtifact(ctx, target, art, skipSpan)
-			if !ok || err != nil {
-				return false, err
-			}
-
-			if uncompress {
-				_, err := UncompressedPathFromArtifact(ctx, target, art, e.cacheDir(target).Abs())
-				if err != nil {
-					return false, err
-				}
-			}
-		}
-	}
 
 	return true, nil
 }
