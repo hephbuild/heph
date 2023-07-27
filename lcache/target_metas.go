@@ -1,11 +1,11 @@
 package lcache
 
 import (
-	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/graph"
 )
 
-type TargetMetas = tgt.TargetMetas[*Target]
+type TargetMetas = graph.TargetMetas[*Target]
 
 func NewTargetMetas(factory func(fqn string) *Target) *TargetMetas {
-	return tgt.NewTargetMetas(factory)
+	return graph.NewTargetMetas(factory)
 }

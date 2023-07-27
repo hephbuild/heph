@@ -4,7 +4,7 @@ import (
 	"context"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/artifacts"
-	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/graph"
 	"io"
 	"time"
 )
@@ -66,7 +66,7 @@ func (t *Observability) SpanRoot(ctx context.Context) (context.Context, *BaseSpa
 	return newSpan(ctx, t.hooks, span, Hook.OnRoot)
 }
 
-func (t *Observability) SpanRun(ctx context.Context, target *tgt.Target) (context.Context, *TargetSpan) {
+func (t *Observability) SpanRun(ctx context.Context, target *graph.Target) (context.Context, *TargetSpan) {
 	span := &TargetSpan{target: target}
 	return newSpanWithDedup("Run", ctx, t.hooks, span, Hook.OnRun)
 }
@@ -80,42 +80,42 @@ func (t *Observability) SpanGenPass(ctx context.Context) (context.Context, *Base
 	return ctx, span
 }
 
-func (t *Observability) SpanCacheDownload(ctx context.Context, target *tgt.Target, cache string, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
+func (t *Observability) SpanCacheDownload(ctx context.Context, target *graph.Target, cache string, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
 	span := &TargetArtifactCacheSpan{TargetArtifactSpan: TargetArtifactSpan{TargetSpan: TargetSpan{target: target}, artifact: artifact}, Cache: cache}
 	return newSpanWithDedup("CacheDownload", ctx, t.hooks, span, Hook.OnCacheDownload)
 }
 
-func (t *Observability) SpanCacheUpload(ctx context.Context, target *tgt.Target, cache string, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
+func (t *Observability) SpanCacheUpload(ctx context.Context, target *graph.Target, cache string, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
 	span := &TargetArtifactCacheSpan{TargetArtifactSpan: TargetArtifactSpan{TargetSpan: TargetSpan{target: target}, artifact: artifact}, Cache: cache}
 	return newSpanWithDedup("CacheUpload", ctx, t.hooks, span, Hook.OnCacheUpload)
 }
 
-func (t *Observability) SpanRunPrepare(ctx context.Context, target *tgt.Target) (context.Context, *TargetSpan) {
+func (t *Observability) SpanRunPrepare(ctx context.Context, target *graph.Target) (context.Context, *TargetSpan) {
 	span := &TargetSpan{target: target}
 	return newSpanWithDedup("RunPrepare", ctx, t.hooks, span, Hook.OnRunPrepare)
 }
 
-func (t *Observability) SpanRunExec(ctx context.Context, target *tgt.Target) (context.Context, *TargetExecSpan) {
+func (t *Observability) SpanRunExec(ctx context.Context, target *graph.Target) (context.Context, *TargetExecSpan) {
 	span := &TargetExecSpan{TargetSpan: TargetSpan{target: target}, ExecId: uuid.New()}
 	return newSpanWithDedup("RunExec", ctx, t.hooks, span, Hook.OnRunExec)
 }
 
-func (t *Observability) SpanCollectOutput(ctx context.Context, target *tgt.Target) (context.Context, *TargetSpan) {
+func (t *Observability) SpanCollectOutput(ctx context.Context, target *graph.Target) (context.Context, *TargetSpan) {
 	span := &TargetSpan{target: target}
 	return newSpanWithDedup("CollectOutput", ctx, t.hooks, span, Hook.OnCollectOutput)
 }
 
-func (t *Observability) SpanLocalCacheStore(ctx context.Context, target *tgt.Target) (context.Context, *TargetSpan) {
+func (t *Observability) SpanLocalCacheStore(ctx context.Context, target *graph.Target) (context.Context, *TargetSpan) {
 	span := &TargetSpan{target: target}
 	return newSpanWithDedup("LocalCacheStore", ctx, t.hooks, span, Hook.OnLocalCacheStore)
 }
 
-func (t *Observability) SpanLocalCacheCheck(ctx context.Context, target *tgt.Target, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
+func (t *Observability) SpanLocalCacheCheck(ctx context.Context, target *graph.Target, artifact artifacts.Artifact) (context.Context, *TargetArtifactCacheSpan) {
 	span := &TargetArtifactCacheSpan{TargetArtifactSpan: TargetArtifactSpan{TargetSpan: TargetSpan{target: target}, artifact: artifact}}
 	return newSpanWithDedup("LocalCacheCheck", ctx, t.hooks, span, Hook.OnLocalCacheCheck)
 }
 
-func (t *Observability) SpanExternalCacheGet(ctx context.Context, target *tgt.Target, cache string, outputs []string, onlyMeta bool) (context.Context, *ExternalCacheGetSpan) {
+func (t *Observability) SpanExternalCacheGet(ctx context.Context, target *graph.Target, cache string, outputs []string, onlyMeta bool) (context.Context, *ExternalCacheGetSpan) {
 	span := &ExternalCacheGetSpan{TargetSpan: TargetSpan{target: target}, Cache: cache, Outputs: outputs, OnlyMeta: onlyMeta}
 	return newSpanWithDedup("ExternalCacheGet", ctx, t.hooks, span, Hook.OnExternalCacheGet)
 }

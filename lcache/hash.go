@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/tar"
@@ -21,7 +20,7 @@ import (
 	"time"
 )
 
-func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithOutput) error {
+func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []graph.TargetWithOutput) error {
 	for _, dep := range targets {
 		if len(dep.Target.Out.Names()) == 0 {
 			continue

@@ -14,7 +14,6 @@ import (
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/instance"
@@ -259,7 +258,7 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) collectNamedOut(target *Target, namedPaths *tgt.OutNamedPaths, root string) (*ActualOutNamedPaths, error) {
+func (e *Engine) collectNamedOut(target *Target, namedPaths *graph.OutNamedPaths, root string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
@@ -343,7 +342,7 @@ func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xf
 }
 
 func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
-	ctx, span := e.Observability.SpanCollectOutput(ctx, target.Target.Target)
+	ctx, span := e.Observability.SpanCollectOutput(ctx, target.GraphTarget())
 	defer span.EndError(rerr)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
@@ -438,18 +437,18 @@ func (e *Engine) CleanTargetLock(target *Target) error {
 }
 
 func (e *Engine) GetFileDeps(targets ...*Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
+	return e.getFileDeps(targets, func(target *Target) graph.TargetDeps {
 		return target.Deps.All()
 	})
 }
 
 func (e *Engine) GetFileHashDeps(targets ...*Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *Target) tgt.TargetDeps {
+	return e.getFileDeps(targets, func(target *Target) graph.TargetDeps {
 		return target.HashDeps
 	})
 }
 
-func (e *Engine) getFileDeps(targets []*Target, f func(*Target) tgt.TargetDeps) []xfs.Path {
+func (e *Engine) getFileDeps(targets []*Target, f func(*Target) graph.TargetDeps) []xfs.Path {
 	filesm := map[string]xfs.Path{}
 	for _, target := range targets {
 		for _, file := range f(target).Files {

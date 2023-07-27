@@ -3,8 +3,8 @@ package otlp
 import (
 	"context"
 	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/observability"
-	"github.com/hephbuild/heph/tgt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-func targetSpanAttr(t *tgt.Target) trace.SpanStartOption {
+func targetSpanAttr(t *graph.Target) trace.SpanStartOption {
 	attrs := []attribute.KeyValue{
 		{
 			Key:   "heph.target",

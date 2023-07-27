@@ -12,7 +12,6 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -132,10 +131,10 @@ var queryCmd = &cobra.Command{
 			matcher = graph.AndMatcher(matcher, graph.NotMatcher(graph.OrMatcher(excludeMatchers...)))
 		}
 
-		selected := make([]*tgt.Target, 0)
+		selected := make([]*graph.Target, 0)
 		for _, target := range targets.Slice() {
 			if matcher(target) {
-				selected = append(selected, target.Target)
+				selected = append(selected, target)
 			}
 		}
 
@@ -362,7 +361,7 @@ var changesCmd = &cobra.Command{
 			return err
 		}
 
-		affectedTargets := make([]*tgt.Target, 0)
+		affectedTargets := make([]*graph.Target, 0)
 		affectedFiles := strings.Split(string(out), "\n")
 
 		allTargets := bs.Graph.Targets().Slice()
@@ -373,7 +372,7 @@ var changesCmd = &cobra.Command{
 				for _, file := range t.HashDeps.Files {
 					if strings.HasPrefix(affectedFile, file.RelRoot()) {
 						log.Tracef("%v affects %v", affectedFile, t.FQN)
-						affectedTargets = append(affectedTargets, t.Target)
+						affectedTargets = append(affectedTargets, t)
 						allTargets = append(allTargets[:ti], allTargets[ti+1:]...)
 						continue targets
 					}

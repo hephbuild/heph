@@ -1,4 +1,4 @@
-package tgt
+package graph
 
 import (
 	"github.com/hephbuild/heph/specs"

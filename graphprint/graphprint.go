@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/tgt"
 	"io"
 	"strings"
 )
@@ -139,13 +138,13 @@ func targetDescriptor(t specs.Target, output string, mode specs.DepMode) string 
 	return sb.String()
 }
 
-func printTargetDeps(w io.Writer, indent string, deps tgt.TargetDeps) {
+func printTargetDeps(w io.Writer, indent string, deps graph.TargetDeps) {
 	for _, t := range deps.Targets {
 		fmt.Fprintln(w, indent+"  "+targetDescriptor(t.Target.Spec(), t.Output, t.Mode))
 	}
 }
 
-func printNamedDeps(w io.Writer, indent string, deps tgt.TargetNamedDeps) {
+func printNamedDeps(w io.Writer, indent string, deps graph.TargetNamedDeps) {
 	ogindent := indent
 
 	if deps.IsNamed() {
@@ -170,7 +169,7 @@ func printNamedDeps(w io.Writer, indent string, deps tgt.TargetNamedDeps) {
 	}
 }
 
-func printDeps(w io.Writer, indent string, deps tgt.TargetDeps) {
+func printDeps(w io.Writer, indent string, deps graph.TargetDeps) {
 	if len(deps.Targets) > 0 {
 		fmt.Fprintln(w, indent+"Targets:")
 		printTargetDeps(w, indent, deps)
@@ -184,11 +183,11 @@ func printDeps(w io.Writer, indent string, deps tgt.TargetDeps) {
 	}
 }
 
-func printTransitiveEnvs(w io.Writer, indent string, tr tgt.TargetTransitive) {
+func printTransitiveEnvs(w io.Writer, indent string, tr graph.TargetTransitive) {
 	printEnvs(w, indent, tr.PassEnv, tr.RuntimePassEnv, tr.Env, tr.RuntimeEnv)
 }
 
-func printEnvs(w io.Writer, indent string, passEnv, runtimePassEnv []string, env map[string]string, runtimeEnv map[string]tgt.TargetRuntimeEnv) {
+func printEnvs(w io.Writer, indent string, passEnv, runtimePassEnv []string, env map[string]string, runtimeEnv map[string]graph.TargetRuntimeEnv) {
 	if len(passEnv) > 0 {
 		fmt.Fprintln(w, indent+"Pass Env:", strings.Join(passEnv, ", "))
 	}
@@ -209,7 +208,7 @@ func printEnvs(w io.Writer, indent string, passEnv, runtimePassEnv []string, env
 	}
 }
 
-func printTools(w io.Writer, indent string, tools tgt.TargetTools) {
+func printTools(w io.Writer, indent string, tools graph.TargetTools) {
 	if len(tools.Targets) > 0 {
 		fmt.Fprintln(w, indent+"Tools:")
 		for _, t := range tools.Targets {
