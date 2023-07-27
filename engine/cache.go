@@ -6,20 +6,11 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
 	"os"
 )
-
-func SpanEndNotExist(span observability.SpanError, err error) {
-	if err == nil || errors.Is(err, os.ErrNotExist) {
-		span.EndError(nil)
-	} else {
-		span.EndError(err)
-	}
-}
 
 func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *Target, outputs []string, followHint, uncompress bool) (bool, error) {
 	pulled, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint, uncompress)
@@ -109,9 +100,9 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 
 func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
 	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.Target.Target, cache.Name, outputs, onlyMeta)
-	defer SpanEndNotExist(span, rerr)
+	defer rcache.SpanEndIgnoreNotExist(span, rerr)
 
-	err := e.downloadExternalCache(ctx, target, cache, target.Artifacts.InputHash)
+	err := e.RemoteCache.DownloadArtifact(ctx, target, cache, target.Artifacts.InputHash)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			span.SetCacheHit(false)
@@ -123,7 +114,7 @@ func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs 
 	for _, output := range outputs {
 		tarArtifact := target.Artifacts.OutTar(output)
 		if onlyMeta {
-			exists, err := e.existsExternalCache(ctx, target, cache, tarArtifact)
+			exists, err := e.RemoteCache.ArtifactExists(ctx, cache, target, tarArtifact)
 			if err != nil {
 				return false, err
 			}
@@ -133,13 +124,13 @@ func (e *Engine) pullExternalCache(ctx context.Context, target *Target, outputs 
 				return false, nil
 			}
 		} else {
-			err := e.downloadExternalCache(ctx, target, cache, tarArtifact)
+			err := e.RemoteCache.DownloadArtifact(ctx, target, cache, tarArtifact)
 			if err != nil {
 				return false, err
 			}
 		}
 
-		err = e.downloadExternalCache(ctx, target, cache, target.Artifacts.OutHash(output))
+		err = e.RemoteCache.DownloadArtifact(ctx, target, cache, target.Artifacts.OutHash(output))
 		if err != nil {
 			return false, err
 		}

@@ -399,3 +399,15 @@ func (e *LocalCacheState) VFSLocation(target graph.Targeter) (vfs.Location, erro
 func (e *LocalCacheState) RegisterRemove(target graph.Targeter) {
 	e.Finalizers.RegisterRemove(e.cacheDir(target).Abs())
 }
+
+func (e *LocalCacheState) Exists(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
+	root := e.cacheDir(target)
+
+	for _, name := range []string{artifact.GzFileName(), artifact.FileName()} {
+		if xfs.PathExists(root.Join(name).Abs()) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
