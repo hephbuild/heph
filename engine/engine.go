@@ -38,6 +38,7 @@ type Engine struct {
 	GetFlowID         func() string
 	PlatformProviders []platform.PlatformProvider
 	LocalCache        *lcache.LocalCacheState
+	RemoteCache       *rcache.RemoteCache
 	RemoteCacheHints  *rcache.HintStore
 	Packages          *packages.Registry
 	BuildFilesState   *buildfiles.State
@@ -350,7 +351,7 @@ func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xf
 		pattern := file.RelRoot()
 
 		if !xfs.IsGlob(pattern) && !xfs.PathExists(filepath.Join(root, pattern)) {
-			return nil, fmt.Errorf("%v did not output %v", target.FQN, file.RelRoot())
+			return nil, fmt.Errorf("%v did not output %v", target.FQN, pattern)
 		}
 
 		err := xfs.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
