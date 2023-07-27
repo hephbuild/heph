@@ -34,7 +34,7 @@ func (t *Target) GraphTarget() *Target {
 func (t *Target) resetLinking() {
 	t.deeplinked = false
 
-	spec := t.TargetSpec
+	spec := t.Spec()
 
 	if t.linkingErr != nil || len(spec.Deps.Exprs) > 0 || len(spec.HashDeps.Exprs) > 0 || len(spec.Tools.Exprs) > 0 {
 		depsCap := 0

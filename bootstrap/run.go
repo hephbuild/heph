@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
@@ -64,9 +64,9 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 
-	var skip []targetspec.Specer
+	var skip []specs.Specer
 	if inlineRR != nil {
-		skip = []targetspec.Specer{inlineRR.Target}
+		skip = []specs.Specer{inlineRR.Target}
 	}
 	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 	if err != nil {

@@ -1,7 +1,7 @@
 package graph
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"strings"
@@ -48,17 +48,10 @@ func (ts *Targets) FQNs() []string {
 	return fqns
 }
 
-func (ts *Targets) Specs() targetspec.TargetSpecs {
-	if ts == nil {
-		return nil
-	}
-
-	specs := make([]targetspec.TargetSpec, 0, len(ts.Slice()))
-	for _, target := range ts.Slice() {
-		specs = append(specs, target.TargetSpec)
-	}
-
-	return specs
+func (ts *Targets) Specs() specs.Targets {
+	return ads.Map(ts.Slice(), func(t *Target) specs.Target {
+		return t.Spec()
+	})
 }
 
 func (ts *Targets) Public() *Targets {

@@ -18,7 +18,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/upgrade"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/worker"
@@ -208,7 +208,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 			Pkgs:   pkgs,
 			Root:   root,
 			Config: cfg,
-			RegisterTarget: func(spec targetspec.TargetSpec) error {
+			RegisterTarget: func(spec specs.Target) error {
 				return g.Register(spec)
 			},
 		})

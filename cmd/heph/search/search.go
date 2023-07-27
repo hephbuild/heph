@@ -6,18 +6,18 @@ import (
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
 	"github.com/blevesearch/bleve/v2/analysis/token/lowercase"
 	"github.com/blevesearch/bleve/v2/analysis/tokenizer/regexp"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/sets"
 )
 
 type Result struct {
-	Targets targetspec.TargetSpecs
+	Targets specs.Targets
 	Total   uint64
 }
 
 type Func func(querys string, max int) (Result, error)
 
-func Search(targets targetspec.TargetSpecs, query string) error {
+func Search(targets specs.Targets, query string) error {
 	search, err := NewSearch(targets)
 	if err != nil {
 		return err
@@ -39,8 +39,8 @@ func Search(targets targetspec.TargetSpecs, query string) error {
 	return nil
 }
 
-func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
-	ts := sets.NewSetFrom(func(t targetspec.TargetSpec) string {
+func NewSearch(targets specs.Targets) (Func, error) {
+	ts := sets.NewSetFrom(func(t specs.Target) string {
 		return t.FQN
 	}, targets)
 
@@ -121,7 +121,7 @@ func NewSearch(targets targetspec.TargetSpecs) (Func, error) {
 			return Result{}, err
 		}
 
-		targets := sets.NewSet(func(t targetspec.TargetSpec) string {
+		targets := sets.NewSet(func(t specs.Target) string {
 			return t.FQN
 		}, searchResults.Hits.Len())
 		for _, hit := range searchResults.Hits {

@@ -1,7 +1,7 @@
 package tgt
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
 	"strings"
@@ -18,7 +18,7 @@ type TargetTools struct {
 	// Holds targets references that do not have output (for transitive for ex)
 	TargetReferences []*Target
 	Targets          []TargetTool
-	Hosts            []targetspec.TargetSpecHostTool
+	Hosts            []specs.HostTool
 }
 
 func (t TargetTools) HasHeph() bool {
@@ -39,7 +39,7 @@ func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) string {
 		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
 	}, tools.Targets...)
-	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool specs.HostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	}, tools.Hosts...)
 
@@ -51,7 +51,7 @@ func (t TargetTools) Empty() bool {
 }
 
 func (t TargetTools) Dedup() {
-	t.Hosts = ads.Dedup(t.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+	t.Hosts = ads.Dedup(t.Hosts, func(tool specs.HostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	})
 	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) string {
@@ -64,10 +64,10 @@ func (t TargetTools) Dedup() {
 
 func (t TargetTools) Sort() {
 	ads.SortP(t.Hosts,
-		func(i, j *targetspec.TargetSpecHostTool) int {
+		func(i, j *specs.HostTool) int {
 			return strings.Compare(i.BinName, j.BinName)
 		},
-		func(i, j *targetspec.TargetSpecHostTool) int {
+		func(i, j *specs.HostTool) int {
 			return strings.Compare(i.Name, j.Name)
 		},
 	)

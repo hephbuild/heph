@@ -1,7 +1,7 @@
 package tgt
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
 	"strings"
@@ -11,7 +11,7 @@ type TargetWithOutput struct {
 	Target     *Target
 	Output     string
 	SpecOutput string
-	Mode       targetspec.TargetSpecDepMode
+	Mode       specs.DepMode
 }
 
 func (t TargetWithOutput) Full() string {

@@ -8,7 +8,7 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -97,13 +97,13 @@ func TestTargetSpec(t *testing.T) {
 				),
 			}
 
-			var spec targetspec.TargetSpec
+			var spec specs.Target
 
 			opts := Bootstrap(Opts{
 				Pkgs:   pkgs,
 				Root:   root,
 				Config: &config.Config{},
-				RegisterTarget: func(rspec targetspec.TargetSpec) error {
+				RegisterTarget: func(rspec specs.Target) error {
 					spec = rspec
 
 					return nil

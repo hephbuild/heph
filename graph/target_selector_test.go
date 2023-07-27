@@ -3,7 +3,7 @@ package graph
 import (
 	"fmt"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/stretchr/testify/assert"
 	"testing"
@@ -12,7 +12,7 @@ import (
 func targetFactory(pkg string, fqn string, labels []string) *Target {
 	return &Target{
 		Target: &tgt.Target{
-			TargetSpec: targetspec.TargetSpec{
+			Target: specs.Target{
 				FQN:    "//" + pkg + ":" + fqn,
 				Labels: labels,
 				Package: &packages.Package{

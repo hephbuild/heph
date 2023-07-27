@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/xfs"
 	"os"
@@ -67,7 +67,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.FQN)
 
-		tp, err := targetspec.TargetParse("", target.FQN)
+		tp, err := specs.TargetParse("", target.FQN)
 		if err != nil {
 			return err
 		}

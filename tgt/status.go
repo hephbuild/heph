@@ -2,11 +2,11 @@ package tgt
 
 import (
 	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
-	"github.com/hephbuild/heph/targetspec"
 )
 
-func TargetStatus(t targetspec.Specer, status string) status.Statuser {
+func TargetStatus(t specs.Specer, status string) status.Statuser {
 	return targetStatus{t.Spec().FQN, "", status}
 }
 
@@ -35,7 +35,7 @@ func (t targetStatus) String(r *lipgloss.Renderer) string {
 	return target.Render(t.fqn) + outputStr + " " + t.status
 }
 
-func TargetOutputStatus(t targetspec.Specer, output string, status string) status.Statuser {
+func TargetOutputStatus(t specs.Specer, output string, status string) status.Statuser {
 	if output == "" {
 		output = "-"
 	}

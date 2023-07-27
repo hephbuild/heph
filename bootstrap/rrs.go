@@ -6,11 +6,11 @@ import (
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, tps []targetspec.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
+func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
 	targets := graph.NewTargets(len(tps))
 	for _, tp := range tps {
 		target := g.Targets().Find(tp.Full())
@@ -23,7 +23,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []targetspec.TargetPat
 
 	check := func(target *graph.Target) error {
 		if bailOutOnExpr {
-			if len(target.TargetSpec.Deps.Exprs) > 0 {
+			if len(target.Spec().Deps.Exprs) > 0 {
 				return fmt.Errorf("%v has expr, bailing out", target.FQN)
 			}
 		}
@@ -75,7 +75,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []targetspec.TargetPat
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *engine.Engine, tps []targetspec.TargetPath, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
+func GenerateRRs(ctx context.Context, e *engine.Engine, tps []specs.TargetPath, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
 	if len(tps) == 0 {
 		return nil, nil
 	}

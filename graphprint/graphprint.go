@@ -3,7 +3,7 @@ package graphprint
 import (
 	"fmt"
 	"github.com/hephbuild/heph/graph"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"io"
 	"strings"
@@ -107,7 +107,7 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 	}
 }
 
-func printPlatforms(w io.Writer, i string, platforms []targetspec.TargetPlatform) {
+func printPlatforms(w io.Writer, i string, platforms []specs.Platform) {
 	fmt.Fprintln(w, i+"Platforms:")
 
 	for _, p := range platforms {
@@ -127,13 +127,13 @@ func printPlatforms(w io.Writer, i string, platforms []targetspec.TargetPlatform
 	}
 }
 
-func targetDescriptor(t targetspec.TargetSpec, output string, mode targetspec.TargetSpecDepMode) string {
+func targetDescriptor(t specs.Target, output string, mode specs.DepMode) string {
 	var sb strings.Builder
 	sb.WriteString(t.FQN)
 	if len(output) > 0 {
 		sb.WriteString(fmt.Sprintf("|%v", output))
 	}
-	if mode != "" && mode != targetspec.TargetSpecDepModeCopy {
+	if mode != "" && mode != specs.DepModeCopy {
 		sb.WriteString(fmt.Sprintf(" mode=%v", mode))
 	}
 	return sb.String()

@@ -13,7 +13,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
@@ -152,7 +152,7 @@ func New(e Engine) *Engine {
 	return &e
 }
 
-func (e *Engine) lockFactory(t targetspec.Specer, resource string) locks.Locker {
+func (e *Engine) lockFactory(t specs.Specer, resource string) locks.Locker {
 	ts := t.Spec()
 	p := e.lockPath(t, resource)
 
@@ -233,7 +233,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []specs.Specer) (*WaitGroupMap, error) {
 	rrs := make([]TargetRunRequest, 0, len(targets))
 	for _, target := range targets {
 		rrs = append(rrs, TargetRunRequest{Target: target})
@@ -357,7 +357,7 @@ func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoo
 	}
 
 	if target.HasSupportFiles {
-		target.actualSupportFiles, err = e.collectOut(target, target.OutWithSupport.Name(targetspec.SupportFilesOutput), outRoot)
+		target.actualSupportFiles, err = e.collectOut(target, target.OutWithSupport.Name(specs.SupportFilesOutput), outRoot)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
@@ -380,7 +380,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	}
 
 	if target.HasSupportFiles {
-		art := target.Artifacts.OutTar(targetspec.SupportFilesOutput)
+		art := target.Artifacts.OutTar(specs.SupportFilesOutput)
 
 		target.actualSupportFiles, err = e.collectOutFromArtifact(ctx, target, art)
 		if err != nil {
@@ -391,7 +391,7 @@ func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target,
 	return nil
 }
 
-func (e *Engine) sandboxRoot(specer targetspec.Specer) xfs.Path {
+func (e *Engine) sandboxRoot(specer specs.Specer) xfs.Path {
 	target := specer.Spec()
 
 	folder := "__target_" + target.Name

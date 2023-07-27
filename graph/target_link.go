@@ -8,7 +8,7 @@ import (
 	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
@@ -18,7 +18,7 @@ import (
 	"strings"
 )
 
-func (e *State) Register(spec targetspec.TargetSpec) error {
+func (e *State) Register(spec specs.Target) error {
 	err := e.processTargetSpec(&spec)
 	if err != nil {
 		return err
@@ -29,7 +29,7 @@ func (e *State) Register(spec targetspec.TargetSpec) error {
 	defer l.Unlock()
 
 	if t := e.targets.Find(spec.FQN); t != nil {
-		if !t.TargetSpec.Equal(spec) {
+		if !t.Spec().Equal(spec) {
 			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
 		}
 
@@ -38,7 +38,7 @@ func (e *State) Register(spec targetspec.TargetSpec) error {
 
 	t := &Target{
 		Target: &tgt.Target{
-			TargetSpec: spec,
+			Target: spec,
 		},
 	}
 
@@ -52,9 +52,9 @@ func (e *State) Register(spec targetspec.TargetSpec) error {
 	return nil
 }
 
-func (e *State) processTargetSpec(t *targetspec.TargetSpec) error {
+func (e *State) processTargetSpec(t *specs.Target) error {
 	// Validate FQN
-	_, err := targetspec.TargetParse("", t.FQN)
+	_, err := specs.TargetParse("", t.FQN)
 	if err != nil {
 		return fmt.Errorf("%v: %w", t.FQN, err)
 	}
@@ -72,8 +72,8 @@ func (e *State) processTarget(t *Target) error {
 	}
 
 	switch t.Codegen {
-	case targetspec.CodegenCopy, targetspec.CodegenLink:
-		for _, file := range t.TargetSpec.Out {
+	case specs.CodegenCopy, specs.CodegenLink:
+		for _, file := range t.Spec().Out {
 			p := t.Package.Root.Join(file.Path).RelRoot()
 
 			if ct, ok := e.codegenPaths[p]; ok && ct != t {
@@ -220,21 +220,21 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	//log.Tracef(logPrefix + "Linking tools")
 
-	t.Tools, err = e.linkTargetTools(t, t.TargetSpec.Tools, breadcrumb)
+	t.Tools, err = e.linkTargetTools(t, t.Spec().Tools, breadcrumb)
 	if err != nil {
 		return err
 	}
 
 	//log.Tracef(logPrefix + "Linking deps")
-	t.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Deps, breadcrumb)
+	t.Deps, err = e.linkTargetNamedDeps(t, t.Spec().Deps, breadcrumb)
 	if err != nil {
 		return fmt.Errorf("%v: deps: %w", t.FQN, err)
 	}
 
 	// Resolve hash deps specs
-	if t.TargetSpec.DifferentHashDeps {
+	if t.Spec().DifferentHashDeps {
 		//log.Tracef(logPrefix + "Linking hashdeps")
-		t.HashDeps, err = e.linkTargetDeps(t, t.TargetSpec.HashDeps, breadcrumb)
+		t.HashDeps, err = e.linkTargetDeps(t, t.Spec().HashDeps, breadcrumb)
 		if err != nil {
 			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
 		}
@@ -248,7 +248,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	}
 
 	if t.IsTool() {
-		ts := t.TargetSpec.Tools
+		ts := t.Spec().Tools
 		if len(ts.Targets) != 1 || len(ts.Hosts) > 0 {
 			return fmt.Errorf("is a tool, mut have a single `tool` with a single output")
 		}
@@ -256,25 +256,25 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	// Resolve transitive spec
 	t.OwnTransitive = tgt.TargetTransitive{}
-	t.OwnTransitive.Tools, err = e.linkTargetTools(t, t.TargetSpec.Transitive.Tools, breadcrumb)
+	t.OwnTransitive.Tools, err = e.linkTargetTools(t, t.Spec().Transitive.Tools, breadcrumb)
 	if err != nil {
 		return err
 	}
-	t.OwnTransitive.Deps, err = e.linkTargetNamedDeps(t, t.TargetSpec.Transitive.Deps, breadcrumb)
+	t.OwnTransitive.Deps, err = e.linkTargetNamedDeps(t, t.Spec().Transitive.Deps, breadcrumb)
 	if err != nil {
 		return err
 	}
-	t.OwnTransitive.Env = t.TargetSpec.Transitive.Env
+	t.OwnTransitive.Env = t.Spec().Transitive.Env
 	t.OwnTransitive.RuntimeEnv = map[string]tgt.TargetRuntimeEnv{}
-	for k, v := range t.TargetSpec.Transitive.RuntimeEnv {
+	for k, v := range t.Spec().Transitive.RuntimeEnv {
 		t.OwnTransitive.RuntimeEnv[k] = tgt.TargetRuntimeEnv{
 			Value:  v,
 			Target: t.Target,
 		}
 	}
-	t.OwnTransitive.PassEnv = t.TargetSpec.Transitive.PassEnv
-	t.OwnTransitive.RuntimePassEnv = t.TargetSpec.Transitive.RuntimePassEnv
-	t.OwnTransitive.Platforms = t.TargetSpec.Transitive.Platforms
+	t.OwnTransitive.PassEnv = t.Spec().Transitive.PassEnv
+	t.OwnTransitive.RuntimePassEnv = t.Spec().Transitive.RuntimePassEnv
+	t.OwnTransitive.Platforms = t.Spec().Transitive.Platforms
 
 	t.DeepOwnTransitive, err = e.collectDeepTransitive(t.OwnTransitive, breadcrumb)
 	if err != nil {
@@ -296,8 +296,8 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	t.Out = &tgt.OutNamedPaths{}
 	t.OutWithSupport = &tgt.OutNamedPaths{}
-	for _, file := range t.TargetSpec.Out {
-		if file.Name != targetspec.SupportFilesOutput {
+	for _, file := range t.Spec().Out {
+		if file.Name != specs.SupportFilesOutput {
 			t.Out.Add(file.Name, relPathFactory(file.Path))
 		}
 		t.OutWithSupport.Add(file.Name, relPathFactory(file.Path))
@@ -305,20 +305,20 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	t.Out.Sort()
 	t.OutWithSupport.Sort()
 
-	if t.TargetSpec.Cache.Enabled {
-		if !t.TargetSpec.Sandbox && !t.TargetSpec.OutInSandbox {
+	if t.Spec().Cache.Enabled {
+		if !t.Spec().Sandbox && !t.Spec().OutInSandbox {
 			return fmt.Errorf("%v cannot cache target which isn't sandboxed", t.FQN)
 		}
 	}
 
 	t.RuntimePassEnv = []string{}
-	t.RuntimePassEnv = append(t.RuntimePassEnv, t.TargetSpec.RuntimePassEnv...)
+	t.RuntimePassEnv = append(t.RuntimePassEnv, t.Spec().RuntimePassEnv...)
 
 	t.Env = map[string]string{}
-	e.applyEnv(t, t.TargetSpec.PassEnv, t.TargetSpec.Env)
+	e.applyEnv(t, t.Spec().PassEnv, t.Spec().Env)
 
 	t.RuntimeEnv = map[string]tgt.TargetRuntimeEnv{}
-	for k, v := range t.TargetSpec.RuntimeEnv {
+	for k, v := range t.Spec().RuntimeEnv {
 		t.RuntimeEnv[k] = tgt.TargetRuntimeEnv{
 			Value:  v,
 			Target: t.Target,
@@ -417,8 +417,8 @@ func (e *State) registerDag(t *Target) error {
 	return nil
 }
 
-func (e *State) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *sets.StringSet) (tgt.TargetNamedDeps, error) {
-	m := map[string]targetspec.TargetSpecDeps{}
+func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (tgt.TargetNamedDeps, error) {
+	m := map[string]specs.Deps{}
 	for _, itm := range deps.Targets {
 		a := m[itm.Name]
 		a.Targets = append(m[itm.Name].Targets, itm)
@@ -462,7 +462,7 @@ func (e *State) linkTargetNamedDeps(t *Target, deps targetspec.TargetSpecDeps, b
 	return td, nil
 }
 
-func (e *State) linkTargetTools(t *Target, toolsSpecs targetspec.TargetSpecTools, breadcrumb *sets.StringSet) (tgt.TargetTools, error) {
+func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *sets.StringSet) (tgt.TargetTools, error) {
 	type targetTool struct {
 		Target *Target
 		Output string
@@ -648,7 +648,7 @@ func (e *State) collectDeepTransitive(tr tgt.TargetTransitive, breadcrumb *sets.
 	return dtr, nil
 }
 
-func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, []targetspec.TargetPlatform, error) {
+func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (tgt.TargetTransitive, []specs.Platform, error) {
 	targets := sets.NewSet(func(t *Target) string {
 		return t.FQN
 	}, 0)
@@ -672,16 +672,16 @@ func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet)
 	return tr, platforms, nil
 }
 
-func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Target) ([]targetspec.TargetPlatform, error) {
+func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Target) ([]specs.Platform, error) {
 	if !t.HasDefaultPlatforms() {
-		return t.TargetSpec.Platforms, nil
+		return t.Spec().Platforms, nil
 	}
 
 	if len(targets) == 0 {
-		return t.TargetSpec.Platforms, nil
+		return t.Spec().Platforms, nil
 	}
 
-	transitivePlatforms := sets.NewSet(func(plats []targetspec.TargetPlatform) string {
+	transitivePlatforms := sets.NewSet(func(plats []specs.Platform) string {
 		b, err := json.Marshal(plats)
 		if err != nil {
 			panic(err)
@@ -700,12 +700,12 @@ func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Targ
 
 	switch transitivePlatforms.Len() {
 	case 0:
-		return t.TargetSpec.Platforms, nil
+		return t.Spec().Platforms, nil
 	case 1:
 		return transitivePlatforms.Slice()[0], nil
 	}
 
-	configs := strings.Join(ads.Map(transitivePlatforms.Slice(), func(tr []targetspec.TargetPlatform) string {
+	configs := strings.Join(ads.Map(transitivePlatforms.Slice(), func(tr []specs.Platform) string {
 		b, err := json.Marshal(tr)
 		if err != nil {
 			panic(err)
@@ -780,7 +780,7 @@ func (e *State) targetExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSe
 
 const InlineGroups = true
 
-func (e *State) linkTargetDeps(t *Target, deps targetspec.TargetSpecDeps, breadcrumb *sets.StringSet) (tgt.TargetDeps, error) {
+func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (tgt.TargetDeps, error) {
 	td := tgt.TargetDeps{}
 
 	for _, expr := range deps.Exprs {

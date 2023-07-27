@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/stretchr/testify/assert"
 	"testing"
@@ -27,8 +27,8 @@ func TestAutocomplete(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			targets := ads.Map(test.targets, func(fqn string) targetspec.TargetSpec {
-				return targetspec.TargetSpec{FQN: fqn}
+			targets := ads.Map(test.targets, func(fqn string) specs.Target {
+				return specs.Target{FQN: fqn}
 			})
 
 			_, suggestions := autocompleteLabelOrTarget(targets, test.labels, test.complete)

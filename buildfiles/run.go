@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
@@ -183,7 +183,7 @@ func (e *runContext) load(thread *starlark.Thread, module string) (starlark.Stri
 		return globals, nil
 	}
 
-	p, err := targetspec.TargetParse("", module)
+	p, err := specs.TargetParse("", module)
 	if err != nil {
 		return nil, err
 	}

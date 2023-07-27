@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -18,8 +18,8 @@ import (
 	"unicode"
 )
 
-func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec, error) {
-	t := targetspec.TargetSpec{
+func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) {
+	t := specs.Target{
 		FQN:                 pkg.TargetAddr(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run,
@@ -29,7 +29,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		Entrypoint:          args.Entrypoint,
 		Package:             pkg,
 		PassArgs:            args.PassArgs,
-		Cache: targetspec.TargetSpecCache{
+		Cache: specs.Cache{
 			Enabled: args.Cache.Enabled,
 			Named:   args.Cache.Named.Array,
 			History: args.Cache.History,
@@ -45,7 +45,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		RunInCwd:       args.RunInCwd,
 		Gen:            args.Gen,
 		RuntimeEnv:     args.RuntimeEnv.ArrMap,
-		SrcEnv: targetspec.TargetSpecSrcEnv{
+		SrcEnv: specs.TargetSpecSrcEnv{
 			Default: args.SrcEnv.Default,
 			Named:   args.SrcEnv.Named,
 		},
@@ -58,17 +58,17 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 
 	t.Tools, err = toolsSpecFromArgs(t, args.Tools)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 
 	t.Deps, err = depsSpecFromArgs(t, args.Deps)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 	if args.HashDeps.Array != nil {
 		t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
 		if err != nil {
-			return targetspec.TargetSpec{}, err
+			return specs.Target{}, err
 		}
 
 		if t.Deps.Equal(t.HashDeps) {
@@ -82,17 +82,17 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 
 	t.Platforms, err = ads.MapE(args.Platforms, platformFromArgs)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 
 	t.Transitive.Tools, err = toolsSpecFromArgs(t, args.Transitive.Tools)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 
 	t.Transitive.Deps, err = depsSpecFromArgs(t, args.Transitive.Deps)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 
 	t.Transitive.Env = args.Transitive.Env.ArrMap
@@ -101,7 +101,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 	t.Transitive.RuntimePassEnv = args.Transitive.RuntimePassEnv
 	t.Transitive.Platforms, err = ads.MapE(args.Transitive.Platforms, platformFromArgs)
 	if err != nil {
-		return targetspec.TargetSpec{}, err
+		return specs.Target{}, err
 	}
 
 	if len(args.Out.ArrMap) > 0 {
@@ -111,7 +111,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			}
 
 			for _, v := range vs {
-				t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+				t.Out = append(t.Out, specs.OutFile{
 					Name: k,
 					Path: v,
 				})
@@ -124,7 +124,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			}
 
 			for _, v := range v {
-				t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+				t.Out = append(t.Out, specs.OutFile{
 					Name: k,
 					Path: v,
 				})
@@ -132,7 +132,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		}
 	} else {
 		for _, file := range args.Out.Array {
-			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
+			t.Out = append(t.Out, specs.OutFile{
 				Path: file,
 			})
 		}
@@ -142,67 +142,67 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 		t.HasSupportFiles = true
 
 		for _, file := range args.SupportFiles {
-			t.Out = append(t.Out, targetspec.TargetSpecOutFile{
-				Name: targetspec.SupportFilesOutput,
+			t.Out = append(t.Out, specs.OutFile{
+				Name: specs.SupportFilesOutput,
 				Path: file,
 			})
 		}
 	}
 
 	ads.SortP(t.Out,
-		func(i, j *targetspec.TargetSpecOutFile) int {
+		func(i, j *specs.OutFile) int {
 			return strings.Compare(i.Path, j.Path)
 		},
-		func(i, j *targetspec.TargetSpecOutFile) int {
+		func(i, j *specs.OutFile) int {
 			return strings.Compare(i.Name, j.Name)
 		},
 	)
 
 	if t.SrcEnv.Default == "" {
 		if t.OutInSandbox {
-			t.SrcEnv.Default = targetspec.FileEnvAbs
+			t.SrcEnv.Default = specs.FileEnvAbs
 		} else {
-			t.SrcEnv.Default = targetspec.FileEnvRelPkg
+			t.SrcEnv.Default = specs.FileEnvRelPkg
 		}
 	}
 
 	for k, v := range t.SrcEnv.Named {
-		if !ads.Contains(targetspec.FileEnvValues, v) {
-			return targetspec.TargetSpec{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, printOneOf(targetspec.FileEnvValues), v)
+		if !ads.Contains(specs.FileEnvValues, v) {
+			return specs.Target{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, printOneOf(specs.FileEnvValues), v)
 		}
 	}
 
-	if !ads.Contains(targetspec.FileEnvValues, t.SrcEnv.Default) {
-		return targetspec.TargetSpec{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.SrcEnv.Default)
+	if !ads.Contains(specs.FileEnvValues, t.SrcEnv.Default) {
+		return specs.Target{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(specs.FileEnvValues), t.SrcEnv.Default)
 	}
 
 	if t.OutEnv == "" {
 		if t.OutInSandbox {
-			t.OutEnv = targetspec.FileEnvAbs
+			t.OutEnv = specs.FileEnvAbs
 		} else {
-			t.OutEnv = targetspec.FileEnvRelPkg
+			t.OutEnv = specs.FileEnvRelPkg
 		}
 	}
-	if !ads.Contains(targetspec.FileEnvValues, t.OutEnv) {
-		return targetspec.TargetSpec{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(targetspec.FileEnvValues), t.OutEnv)
+	if !ads.Contains(specs.FileEnvValues, t.OutEnv) {
+		return specs.Target{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(specs.FileEnvValues), t.OutEnv)
 	}
 
 	if t.HashFile == "" {
-		t.HashFile = targetspec.HashFileContent
+		t.HashFile = specs.HashFileContent
 	}
-	if !ads.Contains(targetspec.HashFileValues, t.HashFile) {
-		return targetspec.TargetSpec{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(targetspec.HashFileValues), t.HashFile)
+	if !ads.Contains(specs.HashFileValues, t.HashFile) {
+		return specs.Target{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(specs.HashFileValues), t.HashFile)
 	}
 
 	if t.Entrypoint == "" {
-		t.Entrypoint = targetspec.EntrypointBash
+		t.Entrypoint = specs.EntrypointBash
 	}
-	if !ads.Contains(targetspec.EntrypointValues, t.Entrypoint) {
-		return targetspec.TargetSpec{}, fmt.Errorf("entrypoint must be one of %v, got %v", printOneOf(targetspec.EntrypointValues), t.Entrypoint)
+	if !ads.Contains(specs.EntrypointValues, t.Entrypoint) {
+		return specs.Target{}, fmt.Errorf("entrypoint must be one of %v, got %v", printOneOf(specs.EntrypointValues), t.Entrypoint)
 	}
 
 	if len(t.Platforms) == 0 {
-		t.Platforms = []targetspec.TargetPlatform{{
+		t.Platforms = []specs.Platform{{
 			Labels: map[string]string{
 				"name": "local",
 				"os":   runtime.GOOS,
@@ -211,21 +211,21 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			Default: true,
 		}}
 	} else if len(t.Platforms) != 1 {
-		return targetspec.TargetSpec{}, fmt.Errorf("only a single platform is supported, for now")
+		return specs.Target{}, fmt.Errorf("only a single platform is supported, for now")
 	}
 
 	if t.Codegen != "" {
-		if !ads.Contains(targetspec.CodegenValues, t.Codegen) {
-			return targetspec.TargetSpec{}, fmt.Errorf("codegen must be one of %v, got %v", printOneOf(targetspec.CodegenValues), t.Codegen)
+		if !ads.Contains(specs.CodegenValues, t.Codegen) {
+			return specs.Target{}, fmt.Errorf("codegen must be one of %v, got %v", printOneOf(specs.CodegenValues), t.Codegen)
 		}
 
 		if !t.Sandbox {
-			return targetspec.TargetSpec{}, fmt.Errorf("codegen is only suported in sandboxed targets")
+			return specs.Target{}, fmt.Errorf("codegen is only suported in sandboxed targets")
 		}
 
 		for _, file := range t.Out {
 			if xfs.IsGlob(file.Path) {
-				return targetspec.TargetSpec{}, fmt.Errorf("codegen targets must not have glob outputs")
+				return specs.Target{}, fmt.Errorf("codegen targets must not have glob outputs")
 			}
 		}
 	}
@@ -236,22 +236,22 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (targetspec.TargetSpec
 			if strings.Contains(err.Error(), "missing unit in duration") {
 				v, err := strconv.ParseInt(args.Timeout, 10, 64)
 				if err != nil {
-					return targetspec.TargetSpec{}, err
+					return specs.Target{}, err
 				}
 
 				t.Timeout = time.Duration(v) * time.Second
 			} else {
-				return targetspec.TargetSpec{}, fmt.Errorf("timeout: %w", err)
+				return specs.Target{}, fmt.Errorf("timeout: %w", err)
 			}
 		}
 	}
 
 	if args.Cache.Enabled && args.ConcurrentExecution {
-		return targetspec.TargetSpec{}, fmt.Errorf("concurrent_execution and cache are incompatible")
+		return specs.Target{}, fmt.Errorf("concurrent_execution and cache are incompatible")
 	}
 
 	if t.Cache.Enabled && t.RunInCwd {
-		return targetspec.TargetSpec{}, fmt.Errorf("cannot run in cwd and cache")
+		return specs.Target{}, fmt.Errorf("cannot run in cwd and cache")
 	}
 
 	return t, nil
@@ -299,7 +299,7 @@ func docFromArg(doc string) string {
 	return strings.TrimSpace(sb.String()) + "\n"
 }
 
-func platformFromArgs(d xstarlark.Distruct) (targetspec.TargetPlatform, error) {
+func platformFromArgs(d xstarlark.Distruct) (specs.Platform, error) {
 	labels := map[string]string{}
 	options := map[string]interface{}{}
 	for _, item := range d.Items() {
@@ -309,7 +309,7 @@ func platformFromArgs(d xstarlark.Distruct) (targetspec.TargetPlatform, error) {
 		if k == "options" {
 			od, err := xstarlark.UnpackDistruct(v)
 			if err != nil {
-				return targetspec.TargetPlatform{}, err
+				return specs.Platform{}, err
 			}
 
 			for _, t := range od.Items() {
@@ -320,47 +320,47 @@ func platformFromArgs(d xstarlark.Distruct) (targetspec.TargetPlatform, error) {
 		}
 		vs, ok := v.(starlark.String)
 		if !ok {
-			return targetspec.TargetPlatform{}, fmt.Errorf("%v is %v, expected string", k, v.String())
+			return specs.Platform{}, fmt.Errorf("%v is %v, expected string", k, v.String())
 		}
 		labels[k] = vs.GoString()
 	}
 
-	return targetspec.TargetPlatform{
+	return specs.Platform{
 		Labels:  labels,
 		Options: options,
 	}, nil
 }
 
-func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (targetspec.TargetSpecDeps, error) {
-	td := targetspec.TargetSpecDeps{}
+func depsSpecFromArr(t specs.Target, arr []string, name string) (specs.Deps, error) {
+	td := specs.Deps{}
 
 	for _, dep := range arr {
 		if expr, err := exprs.Parse(dep); err == nil {
-			td.Exprs = append(td.Exprs, targetspec.TargetSpecDepExpr{
+			td.Exprs = append(td.Exprs, specs.DepExpr{
 				Name: name,
 				Expr: expr,
 			})
 			continue
 		}
 
-		if dtp, options, err := targetspec.TargetOutputOptionsParse(t.Package.Path, dep); err == nil {
-			tspec := targetspec.TargetSpecDepTarget{
+		if dtp, options, err := specs.TargetOutputOptionsParse(t.Package.Path, dep); err == nil {
+			tspec := specs.DepTarget{
 				Name:   name,
 				Target: dtp.TargetPath.Full(),
 				Output: dtp.Output,
-				Mode:   targetspec.TargetSpecDepModeCopy,
+				Mode:   specs.DepModeCopy,
 			}
 
 			for k, v := range options {
 				switch k {
 				case "mode":
-					mode := targetspec.TargetSpecDepMode(v)
-					if !ads.Contains(targetspec.TargetSpecDepModes, mode) {
-						return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid mode: %v", v)
+					mode := specs.DepMode(v)
+					if !ads.Contains(specs.DepModes, mode) {
+						return specs.Deps{}, fmt.Errorf("invalid mode: %v", v)
 					}
 					tspec.Mode = mode
 				default:
-					return targetspec.TargetSpecDeps{}, fmt.Errorf("invalid option %v=%v", k, v)
+					return specs.Deps{}, fmt.Errorf("invalid option %v=%v", k, v)
 				}
 			}
 			td.Targets = append(td.Targets, tspec)
@@ -368,7 +368,7 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 		}
 
 		// Is probably file
-		td.Files = append(td.Files, targetspec.TargetSpecDepFile{
+		td.Files = append(td.Files, specs.DepFile{
 			Name: name,
 			Path: dep,
 		})
@@ -377,19 +377,19 @@ func depsSpecFromArr(t targetspec.TargetSpec, arr []string, name string) (target
 	return td, nil
 }
 
-func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools, name, tool string) error {
+func toolsSpecFromString(t specs.Target, ts *specs.Tools, name, tool string) error {
 	expr, err := exprs.Parse(tool)
 	if err == nil {
-		ts.Exprs = append(ts.Exprs, targetspec.TargetSpecExprTool{
+		ts.Exprs = append(ts.Exprs, specs.ExprTool{
 			Name: name,
 			Expr: expr,
 		})
 		return nil
 	}
 
-	tp, err := targetspec.TargetOutputParse(t.Package.Path, tool)
+	tp, err := specs.TargetOutputParse(t.Package.Path, tool)
 	if err == nil {
-		ts.Targets = append(ts.Targets, targetspec.TargetSpecTargetTool{
+		ts.Targets = append(ts.Targets, specs.TargetTool{
 			Name:   name,
 			Target: tp.TargetPath.Full(),
 			Output: tp.Output,
@@ -401,7 +401,7 @@ func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools
 		name = tool
 	}
 
-	ts.Hosts = append(ts.Hosts, targetspec.TargetSpecHostTool{
+	ts.Hosts = append(ts.Hosts, specs.HostTool{
 		Name:    name,
 		BinName: tool,
 	})
@@ -409,21 +409,21 @@ func toolsSpecFromString(t targetspec.TargetSpec, ts *targetspec.TargetSpecTools
 	return nil
 }
 
-func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMapStr) (targetspec.TargetSpecTools, error) {
-	ts := targetspec.TargetSpecTools{}
+func toolsSpecFromArgs(t specs.Target, tools ArrayMapStr) (specs.Tools, error) {
+	ts := specs.Tools{}
 
 	if len(tools.ArrMap) > 0 {
 		for name, s := range tools.ArrMap {
 			err := toolsSpecFromString(t, &ts, name, s)
 			if err != nil {
-				return targetspec.TargetSpecTools{}, err
+				return specs.Tools{}, err
 			}
 		}
 	} else {
 		for _, s := range tools.Array {
 			err := toolsSpecFromString(t, &ts, "", s)
 			if err != nil {
-				return targetspec.TargetSpecTools{}, err
+				return specs.Tools{}, err
 			}
 		}
 	}
@@ -431,8 +431,8 @@ func toolsSpecFromArgs(t targetspec.TargetSpec, tools ArrayMapStr) (targetspec.T
 	return ts, nil
 }
 
-func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspec.TargetSpecDeps, error) {
-	var td targetspec.TargetSpecDeps
+func depsSpecFromArgs(t specs.Target, deps ArrayMapStrArray) (specs.Deps, error) {
+	var td specs.Deps
 	if len(deps.ArrMap) > 0 {
 		for name, arr := range deps.ArrMap {
 			d, err := depsSpecFromArr(t, arr, name)
@@ -453,28 +453,28 @@ func depsSpecFromArgs(t targetspec.TargetSpec, deps ArrayMapStrArray) (targetspe
 	}
 
 	ads.SortP(td.Exprs,
-		func(i, j *targetspec.TargetSpecDepExpr) int {
+		func(i, j *specs.DepExpr) int {
 			return strings.Compare(i.Expr.String, j.Expr.String)
 		},
-		func(i, j *targetspec.TargetSpecDepExpr) int {
+		func(i, j *specs.DepExpr) int {
 			return strings.Compare(i.Name, j.Name)
 		},
 	)
 
 	ads.SortP(td.Targets,
-		func(i, j *targetspec.TargetSpecDepTarget) int {
+		func(i, j *specs.DepTarget) int {
 			return strings.Compare(i.Target, j.Target)
 		},
-		func(i, j *targetspec.TargetSpecDepTarget) int {
+		func(i, j *specs.DepTarget) int {
 			return strings.Compare(i.Name, j.Name)
 		},
 	)
 
 	ads.SortP(td.Files,
-		func(i, j *targetspec.TargetSpecDepFile) int {
+		func(i, j *specs.DepFile) int {
 			return strings.Compare(i.Path, j.Path)
 		},
-		func(i, j *targetspec.TargetSpecDepFile) int {
+		func(i, j *specs.DepFile) int {
 			return strings.Compare(i.Name, j.Name)
 		},
 	)

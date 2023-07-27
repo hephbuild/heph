@@ -2,14 +2,14 @@ package tgt
 
 import (
 	"errors"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/xfs"
 )
 
 type OutNamedPaths = NamedPaths[xfs.RelPaths, xfs.RelPath]
 
 type Target struct {
-	targetspec.TargetSpec
+	specs.Target
 
 	Tools          TargetTools
 	Deps           TargetNamedDeps
@@ -19,7 +19,7 @@ type Target struct {
 	Env            map[string]string
 	RuntimeEnv     map[string]TargetRuntimeEnv
 	RuntimePassEnv []string
-	Platforms      []targetspec.TargetPlatform
+	Platforms      []specs.Platform
 
 	// Collected transitive deps from deps/tools
 	TransitiveDeps TargetTransitive
@@ -35,7 +35,7 @@ func (t *Target) TGTTarget() *Target {
 }
 
 type Targeter interface {
-	targetspec.Specer
+	specs.Specer
 	TGTTarget() *Target
 }
 
@@ -49,7 +49,7 @@ func (t *Target) ToolTarget() TargetTool {
 		panic("not a tool target")
 	}
 
-	ts := t.TargetSpec.Tools.Targets[0]
+	ts := t.Spec().Tools.Targets[0]
 
 	for _, tool := range t.Tools.Targets {
 		if tool.Target.FQN == ts.Target {

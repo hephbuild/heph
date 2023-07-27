@@ -1,7 +1,7 @@
 package graph
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"strings"
 )
 
@@ -66,7 +66,7 @@ func ParseTargetSelector(pkg, s string) TargetMatcher {
 		s = strings.TrimSuffix(s, "/")
 	}
 
-	tp, err := targetspec.TargetParse(pkg, s)
+	tp, err := specs.TargetParse(pkg, s)
 	if err == nil {
 		if isAllDeep {
 			return func(target *Target) bool {

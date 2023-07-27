@@ -1,12 +1,12 @@
 package search
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"sort"
 )
 
-func FuzzyFindTarget(targets targetspec.TargetSpecs, s string, max int) targetspec.TargetSpecs {
+func FuzzyFindTarget(targets specs.Targets, s string, max int) specs.Targets {
 	if s == "" {
 		return nil
 	}
@@ -25,7 +25,7 @@ func FuzzyFindTarget(targets targetspec.TargetSpecs, s string, max int) targetsp
 		suggestions = suggestions[:max]
 	}
 
-	suggTargets := make(targetspec.TargetSpecs, 0, len(suggestions))
+	suggTargets := make(specs.Targets, 0, len(suggestions))
 	for _, suggestion := range suggestions {
 		spec, ok := targets.Get(suggestion)
 		if !ok {

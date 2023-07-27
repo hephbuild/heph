@@ -7,14 +7,14 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-func (e *LocalCacheState) LockArtifact(ctx context.Context, starget targetspec.Specer, artifact artifacts.Artifact) (func() error, error) {
+func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer, artifact artifacts.Artifact) (func() error, error) {
 	target := starget.Spec()
 	l := e.TargetMetas.Find(target).cacheLocks[artifact.Name()]
 	err := l.Lock(ctx)
@@ -32,7 +32,7 @@ func (e *LocalCacheState) LockArtifact(ctx context.Context, starget targetspec.S
 	}, nil
 }
 
-func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget targetspec.Specer, allArtifacts []ArtifactWithProducer) (func(), error) {
+func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget specs.Specer, allArtifacts []ArtifactWithProducer) (func(), error) {
 	target := starget.Spec()
 
 	unlockers := make([]func() error, 0, len(allArtifacts))
@@ -58,7 +58,7 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget targetspec.
 	return unlocker, nil
 }
 
-func (e *LocalCacheState) GenArtifacts(ctx context.Context, dir string, target targetspec.Specer, allArtifacts []ArtifactWithProducer, compress bool) error {
+func (e *LocalCacheState) GenArtifacts(ctx context.Context, dir string, target specs.Specer, allArtifacts []ArtifactWithProducer, compress bool) error {
 	unlock, err := e.LockArtifacts(ctx, target, allArtifacts)
 	if err != nil {
 		return err

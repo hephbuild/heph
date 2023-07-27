@@ -1,4 +1,4 @@
-package targetspec
+package specs
 
 import (
 	"encoding/json"
@@ -72,9 +72,9 @@ func SortOutputsForHashing(names []string) []string {
 	return names
 }
 
-type TargetSpecs []TargetSpec
+type Targets []Target
 
-func (ts TargetSpecs) FQNs() []string {
+func (ts Targets) FQNs() []string {
 	fqns := make([]string, 0, len(ts))
 	for _, t := range ts {
 		fqns = append(fqns, t.FQN)
@@ -83,17 +83,17 @@ func (ts TargetSpecs) FQNs() []string {
 	return fqns
 }
 
-func (ts TargetSpecs) Get(fqn string) (TargetSpec, bool) {
+func (ts Targets) Get(fqn string) (Target, bool) {
 	for _, t := range ts {
 		if t.FQN == fqn {
 			return t, true
 		}
 	}
 
-	return TargetSpec{}, false
+	return Target{}, false
 }
 
-type TargetSpec struct {
+type Target struct {
 	Name    string
 	FQN     string
 	Package *packages.Package
@@ -102,16 +102,16 @@ type TargetSpec struct {
 	Run                 []string
 	FileContent         []byte // Used by special target `text_file`
 	Entrypoint          string
-	Platforms           []TargetPlatform
+	Platforms           []Platform
 	ConcurrentExecution bool
 	Dir                 string
 	PassArgs            bool
-	Deps                TargetSpecDeps
-	HashDeps            TargetSpecDeps
+	Deps                Deps
+	HashDeps            Deps
 	DifferentHashDeps   bool
-	Tools               TargetSpecTools
-	Out                 []TargetSpecOutFile
-	Cache               TargetSpecCache
+	Tools               Tools
+	Out                 []OutFile
+	Cache               Cache
 	RestoreCache        bool
 	HasSupportFiles     bool
 	Sandbox             bool
@@ -123,21 +123,21 @@ type TargetSpec struct {
 	RuntimePassEnv      []string
 	RunInCwd            bool
 	Gen                 bool
-	Source              []TargetSource
+	Source              []Source
 	RuntimeEnv          map[string]string
 	SrcEnv              TargetSpecSrcEnv
 	OutEnv              string
 	HashFile            string
-	Transitive          TargetSpecTransitive
+	Transitive          Transitive
 	Timeout             time.Duration
 	GenDepsMeta         bool
 }
 
 type Specer interface {
-	Spec() TargetSpec
+	Spec() Target
 }
 
-func (t TargetSpec) Spec() TargetSpec {
+func (t Target) Spec() Target {
 	return t
 }
 
@@ -147,52 +147,52 @@ func AsSpecers[T Specer](a []T) []Specer {
 	})
 }
 
-type TargetSource struct {
+type Source struct {
 	Name string
 	Pos  syntax.Position
 }
 
-func (s TargetSource) String() string {
+func (s Source) String() string {
 	return s.Name + " " + s.Pos.String()
 }
 
-type TargetPlatform struct {
+type Platform struct {
 	Labels  map[string]string
 	Options map[string]interface{}
 	Default bool
 }
 
-type TargetSpecTransitive struct {
-	Deps           TargetSpecDeps
-	Tools          TargetSpecTools
+type Transitive struct {
+	Deps           Deps
+	Tools          Tools
 	Env            map[string]string
 	PassEnv        []string
 	RuntimePassEnv []string
 	RuntimeEnv     map[string]string
-	Platforms      []TargetPlatform
+	Platforms      []Platform
 }
 
-func (t TargetSpec) IsPrivate() bool {
+func (t Target) IsPrivate() bool {
 	return strings.HasPrefix(t.Name, "_")
 }
 
-func (t TargetSpec) IsGroup() bool {
+func (t Target) IsGroup() bool {
 	return len(t.Run) == 1 && t.Run[0] == "group"
 }
 
-func (t TargetSpec) IsTool() bool {
+func (t Target) IsTool() bool {
 	return len(t.Run) > 0 && t.Run[0] == "heph_tool"
 }
 
-func (t TargetSpec) IsTextFile() bool {
+func (t Target) IsTextFile() bool {
 	return len(t.Run) == 2 && t.Run[0] == "text_file"
 }
 
-func (t TargetSpec) HasDefaultPlatforms() bool {
+func (t Target) HasDefaultPlatforms() bool {
 	return len(t.Platforms) == 1 && t.Platforms[0].Default
 }
 
-func (t TargetSpec) Json() []byte {
+func (t Target) Json() []byte {
 	t.Package = nil
 	t.Source = nil
 
@@ -204,11 +204,11 @@ func (t TargetSpec) Json() []byte {
 	return b
 }
 
-func (t TargetSpec) Equal(spec TargetSpec) bool {
+func (t Target) Equal(spec Target) bool {
 	return t.equalStruct(spec)
 }
 
-func (t TargetSpec) equalJson(spec TargetSpec) bool {
+func (t Target) equalJson(spec Target) bool {
 	tj := t.Json()
 	sj := spec.Json()
 
@@ -225,7 +225,7 @@ func (t TargetSpec) equalJson(spec TargetSpec) bool {
 	return true
 }
 
-func (t TargetSpec) SourceFile() string {
+func (t Target) SourceFile() string {
 	if len(t.Source) == 0 {
 		return ""
 	}
@@ -233,19 +233,19 @@ func (t TargetSpec) SourceFile() string {
 	return t.Source[0].Pos.String()
 }
 
-type TargetSpecTargetTool struct {
+type TargetTool struct {
 	Name   string
 	Target string
 	Output string
 }
 
-type TargetSpecExprTool struct {
+type ExprTool struct {
 	Name   string
 	Expr   exprs.Expr
 	Output string
 }
 
-type TargetSpecHostTool struct {
+type HostTool struct {
 	Name    string
 	BinName string
 	Path    string
@@ -253,7 +253,7 @@ type TargetSpecHostTool struct {
 
 var binCache = maps.Map[string, xsync.Once[string]]{}
 
-func (t TargetSpecHostTool) ResolvedPath() (string, error) {
+func (t HostTool) ResolvedPath() (string, error) {
 	if t.Path != "" {
 		return t.Path, nil
 	}
@@ -269,59 +269,59 @@ func (t TargetSpecHostTool) ResolvedPath() (string, error) {
 	})
 }
 
-type TargetSpecDeps struct {
-	Targets []TargetSpecDepTarget
-	Files   []TargetSpecDepFile
-	Exprs   []TargetSpecDepExpr
+type Deps struct {
+	Targets []DepTarget
+	Files   []DepFile
+	Exprs   []DepExpr
 }
 
-type TargetSpecTools struct {
-	Targets []TargetSpecTargetTool
-	Hosts   []TargetSpecHostTool
-	Exprs   []TargetSpecExprTool
+type Tools struct {
+	Targets []TargetTool
+	Hosts   []HostTool
+	Exprs   []ExprTool
 }
 
-type TargetSpecDepMode string
+type DepMode string
 
 const (
-	TargetSpecDepModeCopy TargetSpecDepMode = "copy"
-	TargetSpecDepModeLink TargetSpecDepMode = "link"
+	DepModeCopy DepMode = "copy"
+	DepModeLink DepMode = "link"
 )
 
-var TargetSpecDepModes = []TargetSpecDepMode{
-	TargetSpecDepModeCopy,
-	TargetSpecDepModeLink,
+var DepModes = []DepMode{
+	DepModeCopy,
+	DepModeLink,
 }
 
-type TargetSpecDepTarget struct {
+type DepTarget struct {
 	Name   string
 	Output string
 	Target string
-	Mode   TargetSpecDepMode
+	Mode   DepMode
 }
 
-type TargetSpecDepExpr struct {
+type DepExpr struct {
 	Name string
 	Expr exprs.Expr
 }
 
-type TargetSpecDepFile struct {
+type DepFile struct {
 	Name string
 	Path string
 }
 
-type TargetSpecOutFile struct {
+type OutFile struct {
 	Name string
 	Path string
 }
 
-type TargetSpecCache struct {
+type Cache struct {
 	Enabled bool
 	Named   []string
 	History int
 }
 
-func (c TargetSpecCache) NamedEnabled(name string) bool {
+func (c Cache) NamedEnabled(name string) bool {
 	if c.Named == nil {
 		return true
 	}

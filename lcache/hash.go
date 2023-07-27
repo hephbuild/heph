@@ -8,7 +8,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/instance"
@@ -34,7 +34,7 @@ func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []tgt.TargetWithO
 		}
 		h.String(dh)
 
-		if dep.Mode != targetspec.TargetSpecDepModeCopy {
+		if dep.Mode != specs.DepModeCopy {
 			h.String(string(dep.Mode))
 		}
 	}
@@ -50,13 +50,13 @@ func (e *LocalCacheState) hashFiles(h hash.Hash, hashMethod string, files xfs.Pa
 		p := dep.Abs()
 
 		switch hashMethod {
-		case targetspec.HashFileContent:
+		case specs.HashFileContent:
 			modtime, err := e.hashFilePath(h, p)
 			if err != nil {
 				return nil, fmt.Errorf("hashDeps: hashFile %v %w", dep.Abs(), err)
 			}
 			m[dep.Abs()] = modtime
-		case targetspec.HashFileModTime:
+		case specs.HashFileModTime:
 			modtime, err := e.hashFileModTimePath(h, p)
 			if err != nil {
 				return nil, fmt.Errorf("hashDeps: hashFileModTime %v %w", dep.Abs(), err)
@@ -186,7 +186,7 @@ func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Ti
 	return modtime, nil
 }
 
-func (e *LocalCacheState) find(t targetspec.Specer) graph.Targeter {
+func (e *LocalCacheState) find(t specs.Specer) graph.Targeter {
 	return e.Targets.Find(t.Spec().FQN)
 }
 
@@ -270,7 +270,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	}
 
 	h.String("=")
-	hash.HashArray(h, target.Tools.Hosts, func(tool targetspec.TargetSpecHostTool) string {
+	hash.HashArray(h, target.Tools.Hosts, func(tool specs.HostTool) string {
 		return tool.Name
 	})
 
@@ -329,7 +329,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	}
 
 	h.String("=")
-	hash.HashArray(h, target.TargetSpec.Out, func(file targetspec.TargetSpecOutFile) string {
+	hash.HashArray(h, target.Spec().Out, func(file specs.OutFile) string {
 		return file.Name + file.Path
 	})
 
@@ -433,8 +433,8 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 		return "", fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, output, err)
 	}
 
-	if target.HasSupportFiles && output != targetspec.SupportFilesOutput {
-		sh, err := e.hashOutput(target, targetspec.SupportFilesOutput)
+	if target.HasSupportFiles && output != specs.SupportFilesOutput {
+		sh, err := e.hashOutput(target, specs.SupportFilesOutput)
 		if err != nil {
 			return "", err
 		}
@@ -452,7 +452,7 @@ func (e *LocalCacheState) cacheDir(target graph.Targeter) xfs.Path {
 	return e.cacheDirForHash(target, e.mustHashInput(target))
 }
 
-func (e *LocalCacheState) cacheDirForHash(target targetspec.Specer, inputHash string) xfs.Path {
+func (e *LocalCacheState) cacheDirForHash(target specs.Specer, inputHash string) xfs.Path {
 	spec := target.Spec()
 
 	// TODO: cache
@@ -463,14 +463,14 @@ func (e *LocalCacheState) cacheDirForHash(target targetspec.Specer, inputHash st
 	return e.Root.Home.Join("cache", spec.Package.Path, folder, inputHash)
 }
 
-func lockPath(root *hroot.State, target targetspec.Specer, resource string) string {
+func lockPath(root *hroot.State, target specs.Specer, resource string) string {
 	spec := target.Spec()
 
 	folder := "__target_" + spec.Name
 	return root.Home.Join("tmp", spec.Package.Path, folder, resource+".lock").Abs()
 }
 
-func (e *LocalCacheState) CleanTargetLock(starget targetspec.Specer) error {
+func (e *LocalCacheState) CleanTargetLock(starget specs.Specer) error {
 	target := e.TargetMetas.Find(starget)
 
 	for _, l := range target.cacheLocks {
