@@ -59,7 +59,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 			continue
 		}
 
-		if followHint && e.RemoteCacheHints.Get(target.FQN, cache.Name).Skip() {
+		if followHint && e.RemoteCache.Hints.Get(target.FQN, cache.Name).Skip() {
 			continue
 		}
 
@@ -89,7 +89,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 				}
 
 				for _, child := range children {
-					e.RemoteCacheHints.Set(child.FQN, cache.Name, rcache.HintSkip{})
+					e.RemoteCache.Hints.Set(child.FQN, cache.Name, rcache.HintSkip{})
 				}
 			}
 		}

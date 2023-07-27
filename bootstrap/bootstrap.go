@@ -267,7 +267,6 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		PlatformProviders:      bs.PlatformProviders,
 		LocalCache:             localCache,
 		RemoteCache:            remoteCache,
-		RemoteCacheHints:       &rcache.HintStore{},
 		Packages:               bs.Packages,
 		BuildFilesState:        bs.BuildFiles,
 		Graph:                  bs.Graph,
