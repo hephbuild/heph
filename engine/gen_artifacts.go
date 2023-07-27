@@ -6,7 +6,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xsync"
@@ -27,7 +27,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext
 	target := a.Target
 
 	var paths xfs.Paths
-	if a.Output == targetspec.SupportFilesOutput {
+	if a.Output == specs.SupportFilesOutput {
 		paths = target.ActualSupportFiles()
 	} else {
 		paths = target.ActualOutFiles().Name(a.Output)

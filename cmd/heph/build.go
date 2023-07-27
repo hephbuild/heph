@@ -2,7 +2,7 @@ package main
 
 import (
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	"sort"
@@ -45,7 +45,7 @@ func autocompletePrefix(suggestions, ss []string, comp string) []string {
 	return suggestions
 }
 
-func autocompleteTargetName(targets targetspec.TargetSpecs, s string) (bool, []string) {
+func autocompleteTargetName(targets specs.Targets, s string) (bool, []string) {
 	if s == "" {
 		return false, targets.FQNs()
 	}
@@ -57,19 +57,19 @@ func autocompleteTargetName(targets targetspec.TargetSpecs, s string) (bool, []s
 	return true, fuzzyFindTargetName(targets, s, 10)
 }
 
-func fuzzyFindTargetName(targets targetspec.TargetSpecs, s string, max int) []string {
+func fuzzyFindTargetName(targets specs.Targets, s string, max int) []string {
 	suggestions := search.FuzzyFindTarget(targets, s, max)
 	return suggestions.FQNs()
 }
 
-var labelChars = []rune(targetspec.Alphanum + `_`)
+var labelChars = []rune(specs.Alphanum + `_`)
 
 func autocompleteLabel(labels []string, s string) []string {
 	if s == "" {
 		return labels
 	}
 
-	if !targetspec.ContainsOnly(s, labelChars) {
+	if !specs.ContainsOnly(s, labelChars) {
 		return nil
 	}
 
@@ -88,7 +88,7 @@ func autocompleteLabel(labels []string, s string) []string {
 	return suggestions
 }
 
-func autocompleteLabelOrTarget(targets targetspec.TargetSpecs, labels []string, s string) (bool, []string) {
+func autocompleteLabelOrTarget(targets specs.Targets, labels []string, s string) (bool, []string) {
 	type res struct {
 		f bool     // isFuzzy
 		s []string // suggestions

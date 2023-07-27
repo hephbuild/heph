@@ -7,8 +7,8 @@ import (
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
-	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
@@ -195,7 +195,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 					Pkgs:   e.Packages,
 					Root:   e.Root,
 					Config: e.Config.Config,
-					RegisterTarget: func(spec targetspec.TargetSpec) error {
+					RegisterTarget: func(spec specs.Target) error {
 						err := e.Graph.Register(spec)
 						if err != nil {
 							return err

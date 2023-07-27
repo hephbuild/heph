@@ -3,11 +3,11 @@ package engine
 import (
 	"fmt"
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 )
 
 type specer interface {
-	Specs() targetspec.TargetSpecs
+	Specs() specs.Targets
 }
 
 func NewTargetNotFoundError(target string, targets specer) error {

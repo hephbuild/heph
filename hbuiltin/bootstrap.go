@@ -5,7 +5,7 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/hash"
 	"go.starlark.net/starlark"
@@ -65,7 +65,7 @@ type Opts struct {
 	Pkgs           *packages.Registry
 	Root           *hroot.State
 	Config         *config.Config
-	RegisterTarget func(t targetspec.TargetSpec) error
+	RegisterTarget func(t specs.Target) error
 }
 
 func getOpts(thread *starlark.Thread) Opts {

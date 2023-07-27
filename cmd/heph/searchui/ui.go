@@ -8,12 +8,12 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/bbt"
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"strings"
 	"time"
 )
 
-func TUI(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) error {
+func TUI(targets specs.Targets, bs bootstrap.EngineBootstrap) error {
 	p := tea.NewProgram(newBbtSearch(targets, bs))
 	if err := p.Start(); err != nil {
 		return err
@@ -24,12 +24,12 @@ func TUI(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) error {
 type bbtfzf struct {
 	ti           textinput.Model
 	searchResult bbtSearchResult
-	targets      targetspec.TargetSpecs
+	targets      specs.Targets
 	debounce     bbt.Debounce
 	search       search.Func
 	deets        bool
 	bs           bootstrap.EngineBootstrap
-	list         *list[targetspec.TargetSpec]
+	list         *list[specs.Target]
 
 	width, height int
 }
@@ -40,7 +40,7 @@ type bbtSearchResult struct {
 	err   error
 }
 
-func newBbtSearch(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) *bbtfzf {
+func newBbtSearch(targets specs.Targets, bs bootstrap.EngineBootstrap) *bbtfzf {
 	ti := textinput.New()
 	ti.Placeholder = "Search..."
 	ti.Focus()
@@ -50,8 +50,8 @@ func newBbtSearch(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) 
 		panic(err)
 	}
 
-	l := &list[targetspec.TargetSpec]{
-		render: func(sugg targetspec.TargetSpec, _ int, selected bool) string {
+	l := &list[specs.Target]{
+		render: func(sugg specs.Target, _ int, selected bool) string {
 			var buf bytes.Buffer
 
 			style := styleRow
@@ -75,7 +75,7 @@ func newBbtSearch(targets targetspec.TargetSpecs, bs bootstrap.EngineBootstrap) 
 
 			return buf.String()
 		},
-		itemHeight: func(item targetspec.TargetSpec, index int, selected bool) int {
+		itemHeight: func(item specs.Target, index int, selected bool) int {
 			if item.Doc != "" {
 				return 2
 			}

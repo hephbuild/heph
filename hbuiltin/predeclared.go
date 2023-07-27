@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/sets"
@@ -125,11 +125,11 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	return p
 }
 
-func stackTrace(thread *starlark.Thread) []targetspec.TargetSource {
-	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) targetspec.TargetSource {
+func stackTrace(thread *starlark.Thread) []specs.Source {
+	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) specs.Source {
 		c.Pos.Col = 0 //  We don't really care about the column...
 
-		return targetspec.TargetSource{
+		return specs.Source{
 			Name: c.Name,
 			Pos:  c.Pos,
 		}
@@ -185,7 +185,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	}
 
 	if sargs.Pkg != "" {
-		tp, err := targetspec.TargetParse("", sargs.Pkg)
+		tp, err := specs.TargetParse("", sargs.Pkg)
 		if err != nil {
 			return nil, err
 		}
@@ -287,7 +287,7 @@ func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	trace := ads.Map(stackTrace(thread), func(t targetspec.TargetSource) string {
+	trace := ads.Map(stackTrace(thread), func(t specs.Source) string {
 		return t.String()
 	})
 	traceStr := strings.Join(trace, "\n")
@@ -313,7 +313,7 @@ func canonicalize(thread *starlark.Thread, fn *starlark.Builtin, args starlark.T
 
 	pkg := getPackage(thread)
 
-	tp, err := targetspec.TargetOutputParse(pkg.Path, value)
+	tp, err := specs.TargetOutputParse(pkg.Path, value)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +350,7 @@ func split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 
 	pkg := getPackage(thread)
 
-	tp, err := targetspec.TargetOutputParse(pkg.Path, value)
+	tp, err := specs.TargetOutputParse(pkg.Path, value)
 	if err != nil {
 		return nil, err
 	}

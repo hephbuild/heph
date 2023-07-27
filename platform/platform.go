@@ -3,7 +3,7 @@ package platform
 import (
 	"context"
 	"github.com/hephbuild/heph/sandbox"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 )
 
 type Provider interface {
@@ -14,7 +14,7 @@ type ExecOptions struct {
 	WorkDir  string
 	BinDir   string
 	HomeDir  string
-	Target   targetspec.TargetSpec
+	Target   specs.Target
 	Env      map[string]string
 	Run      []string
 	TermArgs []string

@@ -11,8 +11,8 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
-	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
@@ -159,7 +159,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	return e.LinkLatestCache(target, hash)
 }
 
-func (e *LocalCacheState) LinkLatestCache(target targetspec.Specer, hash string) error {
+func (e *LocalCacheState) LinkLatestCache(target specs.Specer, hash string) error {
 	latestDir := e.cacheDirForHash(target, "latest").Abs()
 	fromDir := e.cacheDirForHash(target, hash).Abs()
 
@@ -176,7 +176,7 @@ func (e *LocalCacheState) LinkLatestCache(target targetspec.Specer, hash string)
 	return nil
 }
 
-func (e *LocalCacheState) ResetCacheHashInput(spec targetspec.Specer) {
+func (e *LocalCacheState) ResetCacheHashInput(spec specs.Specer) {
 	target := spec.Spec()
 
 	e.cacheHashInput.DeleteP(func(k targetCacheKey) bool {
@@ -373,7 +373,7 @@ func (e *LocalCacheState) PathsFromArtifact(ctx context.Context, target graph.Ta
 	return ps, nil
 }
 
-func (e *LocalCacheState) CleanTarget(target targetspec.Specer, async bool) error {
+func (e *LocalCacheState) CleanTarget(target specs.Specer, async bool) error {
 	cacheDir := e.cacheDirForHash(target, "")
 	err := xfs.DeleteDir(cacheDir.Abs(), async)
 	if err != nil {
@@ -383,7 +383,7 @@ func (e *LocalCacheState) CleanTarget(target targetspec.Specer, async bool) erro
 	return nil
 }
 
-func (e *LocalCacheState) LatestCacheDir(target targetspec.Specer) xfs.Path {
+func (e *LocalCacheState) LatestCacheDir(target specs.Specer) xfs.Path {
 	return e.cacheDirForHash(target, "latest")
 }
 

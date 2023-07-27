@@ -13,8 +13,8 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
-	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
@@ -34,12 +34,12 @@ func (e *Engine) tmpRoot(elem ...string) xfs.Path {
 	return e.Root.Home.Join("tmp").Join(elem...)
 }
 
-func (e *Engine) tmpTargetRoot(target targetspec.Specer) xfs.Path {
+func (e *Engine) tmpTargetRoot(target specs.Specer) xfs.Path {
 	spec := target.Spec()
 	return e.Root.Home.Join("tmp", spec.Package.Path, "__target_"+spec.Name)
 }
 
-func (e *Engine) lockPath(target targetspec.Specer, resource string) string {
+func (e *Engine) lockPath(target specs.Specer, resource string) string {
 	return e.tmpTargetRoot(target).Join(resource + ".lock").Abs()
 }
 
@@ -191,7 +191,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 				continue
 			}
 
-			if dep.Mode == targetspec.TargetSpecDepModeLink {
+			if dep.Mode == specs.DepModeLink {
 				for _, file := range dept.ActualOutFiles().Name(dep.Output) {
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
@@ -323,25 +323,25 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 		env[hephprovider.EnvDistRoot] = hephDistRoot
 	}
 
-	if !(target.SrcEnv.Default == targetspec.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
+	if !(target.SrcEnv.Default == specs.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
 		for name, paths := range envSrcRec.Named() {
 			if strings.HasPrefix(name, "_") {
 				continue
 			}
 
 			fileEnv := target.SrcEnv.Get(srcRecNameToDepName[name])
-			if fileEnv == targetspec.FileEnvIgnore {
+			if fileEnv == specs.FileEnvIgnore {
 				continue
 			}
 
 			spaths := make([]string, 0, len(paths))
 			for _, path := range paths {
 				switch fileEnv {
-				case targetspec.FileEnvAbs:
+				case specs.FileEnvAbs:
 					spaths = append(spaths, target.SandboxRoot.Join(path).Abs())
-				case targetspec.FileEnvRelRoot:
+				case specs.FileEnvRelRoot:
 					spaths = append(spaths, path)
-				case targetspec.FileEnvRelPkg:
+				case specs.FileEnvRelPkg:
 					p := "/root"
 					rel, err := filepath.Rel(filepath.Join(p, target.Package.Path), filepath.Join(p, path))
 					if err != nil {
@@ -365,7 +365,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	traceSrcEnv()
 
-	if target.OutEnv != targetspec.FileEnvIgnore {
+	if target.OutEnv != specs.FileEnvIgnore {
 		out := target.Out.WithRoot(target.SandboxRoot.Abs()).Named()
 		namedOut := map[string][]string{}
 		for name, paths := range out {
@@ -392,11 +392,11 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 				var pathv string
 				switch target.OutEnv {
-				case targetspec.FileEnvAbs:
+				case specs.FileEnvAbs:
 					pathv = path.Abs()
-				case targetspec.FileEnvRelRoot:
+				case specs.FileEnvRelRoot:
 					pathv = path.RelRoot()
-				case targetspec.FileEnvRelPkg:
+				case specs.FileEnvRelPkg:
 					fakeRoot := "/root"
 					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.Path), filepath.Join(fakeRoot, path.RelRoot()))
 					if err != nil {
@@ -614,11 +614,11 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 	} else {
 		var entrypoint platform.Entrypoint
 		switch target.Entrypoint {
-		case targetspec.EntrypointBash:
+		case specs.EntrypointBash:
 			entrypoint = platform.BashEntrypoint
-		case targetspec.EntrypointSh:
+		case specs.EntrypointSh:
 			entrypoint = platform.ShEntrypoint
-		case targetspec.EntrypointExec:
+		case specs.EntrypointExec:
 			entrypoint = platform.ExecEntrypoint
 		default:
 			panic("unhandled entrypoint: " + target.Entrypoint)
@@ -719,7 +719,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 				WorkDir:  dir,
 				BinDir:   binDir,
 				HomeDir:  e.Root.Home.Abs(),
-				Target:   target.TargetSpec,
+				Target:   target.Spec(),
 				Env:      env,
 				Run:      run,
 				TermArgs: rr.Args,
@@ -917,7 +917,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 		}
 
 		switch target.Codegen {
-		case targetspec.CodegenCopy, targetspec.CodegenCopyNoExclude:
+		case specs.CodegenCopy, specs.CodegenCopyNoExclude:
 			tarf, err := e.LocalCache.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), target)
 			if err != nil {
 				return err
@@ -928,7 +928,7 @@ func (e *Engine) codegenLink(ctx context.Context, target *Target) error {
 			if err != nil {
 				return err
 			}
-		case targetspec.CodegenLink:
+		case specs.CodegenLink:
 			for _, path := range paths {
 				from := path.WithRoot(target.OutExpansionRoot.Abs()).Abs()
 				to := path.WithRoot(e.Root.Root.Abs()).Abs()

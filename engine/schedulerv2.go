@@ -6,8 +6,8 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
-	"github.com/hephbuild/heph/targetspec"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
@@ -15,7 +15,7 @@ import (
 	"github.com/hephbuild/heph/worker"
 )
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (*WaitGroupMap, error) {
+func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []specs.Specer) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
@@ -42,7 +42,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 	return j, nil
 }
 
-func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip []targetspec.Specer) (_ *WaitGroupMap, rerr error) {
+func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip []specs.Specer) (_ *WaitGroupMap, rerr error) {
 	targetsSet := rrs.Targets()
 
 	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
@@ -67,7 +67,7 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 		octx:   octx,
 		sctx:   octx,
 		rrs:    rrs,
-		skip: ads.Map(skip, func(t targetspec.Specer) string {
+		skip: ads.Map(skip, func(t specs.Specer) string {
 			return t.Spec().FQN
 		}),
 		rrTargets:      targetsSet,
@@ -177,7 +177,7 @@ func (s *schedulerv2) schedule() error {
 	return nil
 }
 
-func (s *schedulerv2) parentTargetDeps(target targetspec.Specer) (*worker.WaitGroup, error) {
+func (s *schedulerv2) parentTargetDeps(target specs.Specer) (*worker.WaitGroup, error) {
 	deps := &worker.WaitGroup{}
 	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
@@ -242,7 +242,7 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Ta
 	return j, nil
 }
 
-func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target targetspec.Specer) (*worker.WaitGroup, error) {
+func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.Specer) (*worker.WaitGroup, error) {
 	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err

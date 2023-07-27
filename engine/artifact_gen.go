@@ -3,7 +3,7 @@ package engine
 import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/lcache"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/mds"
 )
 
@@ -23,7 +23,7 @@ func (e *Engine) orderedArtifactProducers(t *Target, outRoot, logFilePath string
 		LogFilePath: logFilePath,
 	}})
 	names := mds.Keys(arts.Out)
-	names = targetspec.SortOutputsForHashing(names)
+	names = specs.SortOutputsForHashing(names)
 	for _, name := range names {
 		a := arts.Out[name]
 		all = append(all, artifactProducer{a.Tar(), outTarArtifact{

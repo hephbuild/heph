@@ -2,7 +2,7 @@ package graph
 
 import (
 	"github.com/heimdalr/dag"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"sort"
@@ -14,7 +14,7 @@ type DAG struct {
 }
 
 // returns parents first
-func (d *DAG) orderedWalker(target *Target, rel func(targetspec.Specer) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
+func (d *DAG) orderedWalker(target *Target, rel func(specs.Specer) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
 	if _, ok := ancsm[target.FQN]; ok {
 		return nil
 	}
@@ -134,7 +134,7 @@ func (d *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 	return ancs, nil
 }
 
-func (d *DAG) GetAncestors(target targetspec.Specer) ([]*Target, error) {
+func (d *DAG) GetAncestors(target specs.Specer) ([]*Target, error) {
 	return d.GetAncestorsOfFQN(target.Spec().FQN)
 }
 
@@ -147,7 +147,7 @@ func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
 	return d.mapToArray(ancestors), nil
 }
 
-func (d *DAG) GetDescendants(target targetspec.Specer) ([]*Target, error) {
+func (d *DAG) GetDescendants(target specs.Specer) ([]*Target, error) {
 	return d.GetDescendantsOfFQN(target.Spec().FQN)
 }
 
@@ -160,7 +160,7 @@ func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
 	return d.mapToArray(ancestors), nil
 }
 
-func (d *DAG) GetParents(target targetspec.Specer) ([]*Target, error) {
+func (d *DAG) GetParents(target specs.Specer) ([]*Target, error) {
 	ancestors, err := d.DAG.GetParents(target.Spec().FQN)
 	if err != nil {
 		return nil, err
@@ -175,7 +175,7 @@ func (d *DAG) GetVertices() []*Target {
 	return d.mapToArray(vertices)
 }
 
-func (d *DAG) GetChildren(target targetspec.Specer) ([]*Target, error) {
+func (d *DAG) GetChildren(target specs.Specer) ([]*Target, error) {
 	ancestors, err := d.DAG.GetChildren(target.Spec().FQN)
 	if err != nil {
 		return nil, err

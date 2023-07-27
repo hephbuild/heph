@@ -6,7 +6,7 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
 	"strings"
@@ -159,7 +159,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	return nil
 }
 
-func preRunAutocomplete(ctx context.Context, includePrivate bool) (targetspec.TargetSpecs, []string, error) {
+func preRunAutocomplete(ctx context.Context, includePrivate bool) (specs.Targets, []string, error) {
 	bs, err := engineInit(ctx, nil)
 	if err != nil {
 		return nil, nil, err
@@ -168,7 +168,7 @@ func preRunAutocomplete(ctx context.Context, includePrivate bool) (targetspec.Ta
 	return preRunAutocompleteWithBootstrap(ctx, bs, includePrivate)
 }
 
-func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.EngineBootstrap, includePrivate bool) (targetspec.TargetSpecs, []string, error) {
+func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.EngineBootstrap, includePrivate bool) (specs.Targets, []string, error) {
 	err := preRunWithGenWithOpts(ctx, PreRunOpts{Engine: bs.Engine})
 	if err != nil {
 		return nil, nil, err

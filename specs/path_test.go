@@ -1,4 +1,4 @@
-package targetspec
+package specs
 
 import (
 	"fmt"

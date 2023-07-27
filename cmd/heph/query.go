@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
@@ -406,7 +406,7 @@ var targetCmd = &cobra.Command{
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetEscapeHTML(false)
 			enc.SetIndent("", "    ")
-			if err := enc.Encode(target.TargetSpec); err != nil {
+			if err := enc.Encode(target.Spec()); err != nil {
 				return err
 			}
 
@@ -518,10 +518,10 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		var targets []targetspec.Specer
-		var fn func(target targetspec.Specer) ([]*graph.Target, error)
+		var targets []specs.Specer
+		var fn func(target specs.Specer) ([]*graph.Target, error)
 
-		tp, err := targetspec.TargetParse("", args[0])
+		tp, err := specs.TargetParse("", args[0])
 		if err != nil {
 			tperr := err
 
@@ -548,12 +548,12 @@ var revdepsCmd = &cobra.Command{
 				return err
 			}
 
-			targets = targetspec.AsSpecers(children)
-			fn = func(target targetspec.Specer) ([]*graph.Target, error) {
+			targets = specs.AsSpecers(children)
+			fn = func(target specs.Specer) ([]*graph.Target, error) {
 				return []*graph.Target{bs.Graph.Targets().Find(target.Spec().FQN)}, nil
 			}
 			if transitive {
-				fn = func(target targetspec.Specer) ([]*graph.Target, error) {
+				fn = func(target specs.Specer) ([]*graph.Target, error) {
 					desc, err := bs.Graph.DAG().GetDescendants(target)
 					desc = append(desc, bs.Graph.Targets().Find(target.Spec().FQN))
 					return desc, err
@@ -565,7 +565,7 @@ var revdepsCmd = &cobra.Command{
 				return engine.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
 			}
 
-			targets = []targetspec.Specer{target}
+			targets = []specs.Specer{target}
 			fn = bs.Graph.DAG().GetChildren
 			if transitive {
 				fn = bs.Graph.DAG().GetDescendants
@@ -627,7 +627,7 @@ var parseTargetCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		tp, err := targetspec.TargetOutputParse("", args[0])
+		tp, err := specs.TargetOutputParse("", args[0])
 		if err != nil {
 			return err
 		}
@@ -662,7 +662,7 @@ var hashoutCmd = &cobra.Command{
 
 		target := bs.Engine.Targets.Find(gtarget)
 
-		names := targetspec.SortOutputsForHashing(target.ActualOutFiles().Names())
+		names := specs.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {
 			h, err := bs.Engine.LocalCache.HashOutput(target, name)
 			if err != nil {
@@ -688,7 +688,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []targetspec.Specer{target})
+		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []specs.Specer{target})
 		if err != nil {
 			return err
 		}

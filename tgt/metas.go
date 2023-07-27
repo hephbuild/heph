@@ -1,7 +1,7 @@
 package tgt
 
 import (
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/maps"
 )
 
@@ -13,7 +13,7 @@ func (m *TargetMetas[T]) FindFQN(fqn string) T {
 	return m.m.Get(fqn)
 }
 
-func (m *TargetMetas[T]) Find(spec targetspec.Specer) T {
+func (m *TargetMetas[T]) Find(spec specs.Specer) T {
 	return m.FindFQN(spec.Spec().FQN)
 }
 

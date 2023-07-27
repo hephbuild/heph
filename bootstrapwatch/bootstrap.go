@@ -14,7 +14,7 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
-	"github.com/hephbuild/heph/targetspec"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -29,7 +29,7 @@ import (
 
 type State struct {
 	root  *hroot.State
-	tps   []targetspec.TargetPath
+	tps   []specs.TargetPath
 	targs []string
 
 	ctx      context.Context
@@ -83,7 +83,7 @@ type sigEvent struct {
 	events []fsEvent
 }
 
-func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []targetspec.TargetPath, targs []string, ignore []string) (*State, error) {
+func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []specs.TargetPath, targs []string, ignore []string) (*State, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -347,7 +347,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	}
 
 	// Run the rrs's deps, excluding the rrs's themselves
-	tdepsMap, err := bs.Engine.ScheduleTargetRRsWithDeps(ctx, rrs, targetspec.AsSpecers(rrs.Targets().Slice()))
+	tdepsMap, err := bs.Engine.ScheduleTargetRRsWithDeps(ctx, rrs, specs.AsSpecers(rrs.Targets().Slice()))
 	if err != nil {
 		return err
 	}

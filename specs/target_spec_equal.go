@@ -1,4 +1,4 @@
-package targetspec
+package specs
 
 func basicArrEqual[T any](a, b []T) bool {
 	if (a == nil || b == nil) && (a != nil || b != nil) {
@@ -58,7 +58,7 @@ func mapEqual[K, V comparable](a, b map[K]V) bool {
 	return true
 }
 
-func (t TargetSpec) equalStruct(spec TargetSpec) bool {
+func (t Target) equalStruct(spec Target) bool {
 	if t.Name != spec.Name {
 		return false
 	}
@@ -178,7 +178,7 @@ func (t TargetSpec) equalStruct(spec TargetSpec) bool {
 	return true
 }
 
-func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
+func (this Cache) Equal(that Cache) bool {
 	if this.Enabled != that.Enabled {
 		return false
 	}
@@ -194,7 +194,7 @@ func (this TargetSpecCache) Equal(that TargetSpecCache) bool {
 	return true
 }
 
-func (this TargetSpecTools) Equal(that TargetSpecTools) bool {
+func (this Tools) Equal(that Tools) bool {
 	if !arrEqual(this.Targets, that.Targets) {
 		return false
 	}
@@ -210,7 +210,7 @@ func (this TargetSpecTools) Equal(that TargetSpecTools) bool {
 	return true
 }
 
-func (this TargetSpecDeps) Equal(that TargetSpecDeps) bool {
+func (this Deps) Equal(that Deps) bool {
 	if !arrEqual(this.Targets, that.Targets) {
 		return false
 	}
@@ -226,7 +226,7 @@ func (this TargetSpecDeps) Equal(that TargetSpecDeps) bool {
 	return true
 }
 
-func (this TargetSpecDepFile) Equal(that TargetSpecDepFile) bool {
+func (this DepFile) Equal(that DepFile) bool {
 	if this.Path != that.Path {
 		return false
 	}
@@ -238,7 +238,7 @@ func (this TargetSpecDepFile) Equal(that TargetSpecDepFile) bool {
 	return true
 }
 
-func (this TargetSpecDepExpr) Equal(that TargetSpecDepExpr) bool {
+func (this DepExpr) Equal(that DepExpr) bool {
 	if this.Expr.String != that.Expr.String {
 		return false
 	}
@@ -250,7 +250,7 @@ func (this TargetSpecDepExpr) Equal(that TargetSpecDepExpr) bool {
 	return true
 }
 
-func (this TargetSpecExprTool) Equal(that TargetSpecExprTool) bool {
+func (this ExprTool) Equal(that ExprTool) bool {
 	if this.Expr.String != that.Expr.String {
 		return false
 	}
@@ -266,7 +266,7 @@ func (this TargetSpecExprTool) Equal(that TargetSpecExprTool) bool {
 	return true
 }
 
-func (this TargetSpecTransitive) Equal(that TargetSpecTransitive) bool {
+func (this Transitive) Equal(that Transitive) bool {
 	if !this.Deps.Equal(that.Deps) {
 		return false
 	}
@@ -294,7 +294,7 @@ func (this TargetSpecTransitive) Equal(that TargetSpecTransitive) bool {
 	return true
 }
 
-func (this TargetPlatform) Equal(that TargetPlatform) bool {
+func (this Platform) Equal(that Platform) bool {
 	if !mapEqual(this.Options, that.Options) {
 		return false
 	}

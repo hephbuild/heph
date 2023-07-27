@@ -1,4 +1,4 @@
-package targetspec
+package specs
 
 import (
 	"fmt"
@@ -10,23 +10,23 @@ import (
 	"time"
 )
 
-func genTargetSpec(name string, factor int) TargetSpec {
+func genTargetSpec(name string, factor int) Target {
 	pkg := &packages.Package{
 		Path: "aaa",
 	}
 
-	var deps TargetSpecDeps
+	var deps Deps
 	for i := 0; i < factor; i++ {
-		deps.Targets = append(deps.Targets, TargetSpecDepTarget{
+		deps.Targets = append(deps.Targets, DepTarget{
 			Name:   "aaa",
 			Output: "aaa",
 			Target: "//aaa",
 		})
-		deps.Files = append(deps.Files, TargetSpecDepFile{
+		deps.Files = append(deps.Files, DepFile{
 			Name: "aaa",
 			Path: "aaa",
 		})
-		deps.Exprs = append(deps.Exprs, TargetSpecDepExpr{
+		deps.Exprs = append(deps.Exprs, DepExpr{
 			Name: "aaa",
 			Expr: exprs.Expr{
 				String:    "$(aaa)",
@@ -37,9 +37,9 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		})
 	}
 
-	var exprTools []TargetSpecExprTool
+	var exprTools []ExprTool
 	for i := 0; i < factor; i++ {
-		exprTools = append(exprTools, TargetSpecExprTool{
+		exprTools = append(exprTools, ExprTool{
 			Expr: exprs.Expr{
 				String:    "$(aaa)",
 				Function:  "aaa",
@@ -50,25 +50,25 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		})
 	}
 
-	var targetTools []TargetSpecTargetTool
+	var targetTools []TargetTool
 	for i := 0; i < factor; i++ {
-		targetTools = append(targetTools, TargetSpecTargetTool{
+		targetTools = append(targetTools, TargetTool{
 			Target: "//:aaa",
 			Output: "aaa",
 		})
 	}
 
-	var hostTools []TargetSpecHostTool
+	var hostTools []HostTool
 	for i := 0; i < factor; i++ {
-		hostTools = append(hostTools, TargetSpecHostTool{
+		hostTools = append(hostTools, HostTool{
 			Name: "aaa",
 			Path: "/bin/aaa",
 		})
 	}
 
-	var out []TargetSpecOutFile
+	var out []OutFile
 	for i := 0; i < factor; i++ {
-		out = append(out, TargetSpecOutFile{
+		out = append(out, OutFile{
 			Name: "",
 			Path: "",
 		})
@@ -94,7 +94,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		passEnv = append(passEnv, fmt.Sprintf("ENV%v", i))
 	}
 
-	return TargetSpec{
+	return Target{
 		Name:              name,
 		FQN:               "//:" + name,
 		Package:           pkg,
@@ -105,13 +105,13 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		Deps:              deps,
 		HashDeps:          deps,
 		DifferentHashDeps: true,
-		Tools: TargetSpecTools{
+		Tools: Tools{
 			Targets: targetTools,
 			Hosts:   hostTools,
 			Exprs:   exprTools,
 		},
 		Out: out,
-		Cache: TargetSpecCache{
+		Cache: Cache{
 			Enabled: true,
 			Named:   cacheNames,
 		},
@@ -122,7 +122,7 @@ func genTargetSpec(name string, factor int) TargetSpec {
 		PassEnv:    passEnv,
 		RunInCwd:   false,
 		Gen:        false,
-		Source:     []TargetSource{{Name: "some_source" + time.Now().String()}},
+		Source:     []Source{{Name: "some_source" + time.Now().String()}},
 		RuntimeEnv: nil,
 		SrcEnv:     TargetSpecSrcEnv{},
 		OutEnv:     "",
@@ -141,7 +141,7 @@ func TestTargetSpec_Equal(t *testing.T) {
 	assert.True(t, t1.Equal(t2))
 }
 
-func benchmarkTargetSpecEqual(b *testing.B, factor int, f func(t1, t2 TargetSpec) bool) {
+func benchmarkTargetSpecEqual(b *testing.B, factor int, f func(t1, t2 Target) bool) {
 	t1 := genTargetSpec("aaa", factor)
 	t2 := genTargetSpec("aaa", factor)
 
@@ -155,13 +155,13 @@ func benchmarkTargetSpecEqual(b *testing.B, factor int, f func(t1, t2 TargetSpec
 }
 
 func benchmarkTargetSpecEqualJson(b *testing.B, factor int) {
-	benchmarkTargetSpecEqual(b, factor, func(t1, t2 TargetSpec) bool {
+	benchmarkTargetSpecEqual(b, factor, func(t1, t2 Target) bool {
 		return t1.equalJson(t2)
 	})
 }
 
 func benchmarkTargetSpecEqualStruct(b *testing.B, factor int) {
-	benchmarkTargetSpecEqual(b, factor, func(t1, t2 TargetSpec) bool {
+	benchmarkTargetSpecEqual(b, factor, func(t1, t2 Target) bool {
 		return t1.equalStruct(t2)
 	})
 }
