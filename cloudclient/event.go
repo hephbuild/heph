@@ -38,7 +38,7 @@ type Event struct {
 	QueuedTime    null.Val[time.Time]                `json:"queued_time,omitempty"`
 	StartTime     null.Val[time.Time]                `json:"start_time,omitempty"`
 	EndTime       null.Val[time.Time]                `json:"end_time,omitempty"`
-	TargetFQN     null.Val[string]                   `json:"target_fqn,omitempty"`
+	TargetAddr    null.Val[string]                   `json:"target_fqn,omitempty"`
 	ArtifactName  null.Val[string]                   `json:"artifact_name,omitempty"`
 	CacheHit      null.Val[bool]                     `json:"cache_hit,omitempty"`
 	ParentID      null.Val[string]                   `json:"parent_id,omitempty"`

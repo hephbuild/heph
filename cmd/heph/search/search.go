@@ -29,7 +29,7 @@ func Search(targets specs.Targets, query string) error {
 	}
 
 	for _, target := range res.Targets {
-		fmt.Println(target.FQN)
+		fmt.Println(target.Addr)
 	}
 
 	if res.Total > 10 {
@@ -41,7 +41,7 @@ func Search(targets specs.Targets, query string) error {
 
 func NewSearch(targets specs.Targets) (Func, error) {
 	ts := sets.NewSetFrom(func(t specs.Target) string {
-		return t.FQN
+		return t.Addr
 	}, targets)
 
 	mapping := bleve.NewIndexMapping()
@@ -75,7 +75,7 @@ func NewSearch(targets specs.Targets) (Func, error) {
 	specMapping := bleve.NewDocumentMapping()
 	mapping.AddDocumentMapping("spec", specMapping)
 
-	for _, name := range []string{"fqn", "pkg", "name", "doc"} {
+	for _, name := range []string{"addr", "pkg", "name", "doc"} {
 		simpleMapping := bleve.NewTextFieldMapping()
 		simpleMapping.Analyzer = "techy"
 		simpleMapping.Store = false
@@ -83,15 +83,15 @@ func NewSearch(targets specs.Targets) (Func, error) {
 	}
 
 	for _, target := range targets {
-		err = idx.Index(target.FQN, struct {
+		err = idx.Index(target.Addr, struct {
 			Name    string `json:"name"`
 			Package string `json:"pkg"`
-			FQN     string `json:"fqn"`
+			Addr    string `json:"addr"`
 			Doc     string `json:"doc"`
 		}{
 			Name:    target.Name,
 			Package: target.Package.Path,
-			FQN:     target.FQN,
+			Addr:    target.Addr,
 			Doc:     target.Doc,
 		})
 		if err != nil {
@@ -122,7 +122,7 @@ func NewSearch(targets specs.Targets) (Func, error) {
 		}
 
 		targets := sets.NewSet(func(t specs.Target) string {
-			return t.FQN
+			return t.Addr
 		}, searchResults.Hits.Len())
 		for _, hit := range searchResults.Hits {
 			targets.Add(ts.GetKey(hit.ID))

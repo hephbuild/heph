@@ -96,7 +96,7 @@ func genTargetSpec(name string, factor int) Target {
 
 	return Target{
 		Name:              name,
-		FQN:               "//:" + name,
+		Addr:              "//:" + name,
 		Package:           pkg,
 		Run:               []string{"some", "command"},
 		Entrypoint:        "exec",

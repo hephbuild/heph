@@ -24,7 +24,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetPath, ar
 	check := func(target *graph.Target) error {
 		if bailOutOnExpr {
 			if len(target.Spec().Deps.Exprs) > 0 {
-				return fmt.Errorf("%v has expr, bailing out", target.FQN)
+				return fmt.Errorf("%v has expr, bailing out", target.Addr)
 			}
 		}
 
@@ -53,7 +53,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetPath, ar
 			TargetRunRequestOpts: opts,
 		}
 		if len(rr.Args) > 0 && target.Cache.Enabled {
-			log.Warnf("%v: args are being passed, disabling cache", target.FQN)
+			log.Warnf("%v: args are being passed, disabling cache", target.Addr)
 			rr.NoCache = true
 		}
 

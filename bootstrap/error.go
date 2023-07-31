@@ -29,7 +29,7 @@ func PrintHumanError(err error) {
 
 		var terr engine.TargetFailedError
 		if errors.As(err, &terr) {
-			log.Errorf("%v failed", terr.Target.FQN)
+			log.Errorf("%v failed", terr.Target.Addr)
 
 			var lerr engine.ErrorWithLogFile
 			if errors.As(err, &lerr) {

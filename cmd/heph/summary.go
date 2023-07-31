@@ -73,7 +73,7 @@ func PrintSummary(stats *summary2.Summary, withGen bool) {
 	for _, target := range targets {
 		row := []string{
 			func() string {
-				s := target.FQN
+				s := target.Addr
 				if target.HasError() {
 					s += " (error)"
 				}

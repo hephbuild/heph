@@ -63,7 +63,7 @@ func (t Target) equalStruct(spec Target) bool {
 		return false
 	}
 
-	if t.FQN != spec.FQN {
+	if t.Addr != spec.Addr {
 		return false
 	}
 

@@ -23,13 +23,13 @@ func (e *State) Register(spec specs.Target) error {
 		return err
 	}
 
-	l := e.targetsLock.Get(spec.FQN)
+	l := e.targetsLock.Get(spec.Addr)
 	l.Lock()
 	defer l.Unlock()
 
-	if t := e.targets.Find(spec.FQN); t != nil {
+	if t := e.targets.Find(spec.Addr); t != nil {
 		if !t.Spec().Equal(spec) {
-			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.FQN, t.Source, t.Json(), spec.Json())
+			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Source, t.Json(), spec.Json())
 		}
 
 		return nil
@@ -50,10 +50,10 @@ func (e *State) Register(spec specs.Target) error {
 }
 
 func (e *State) processTargetSpec(t *specs.Target) error {
-	// Validate FQN
-	_, err := specs.TargetParse("", t.FQN)
+	// Validate Addr
+	_, err := specs.TargetParse("", t.Addr)
 	if err != nil {
-		return fmt.Errorf("%v: %w", t.FQN, err)
+		return fmt.Errorf("%v: %w", t.Addr, err)
 	}
 
 	if t.Cache.History == 0 {
@@ -65,7 +65,7 @@ func (e *State) processTargetSpec(t *specs.Target) error {
 
 func (e *State) processTarget(t *Target) error {
 	if t.processed {
-		panic(fmt.Errorf("%v has already been processed", t.FQN))
+		panic(fmt.Errorf("%v has already been processed", t.Addr))
 	}
 
 	switch t.Codegen {
@@ -74,7 +74,7 @@ func (e *State) processTarget(t *Target) error {
 			p := t.Package.Root.Join(file.Path).RelRoot()
 
 			if ct, ok := e.codegenPaths[p]; ok && ct != t {
-				return fmt.Errorf("%v: target %v codegen already outputs %v", t.FQN, ct.FQN, p)
+				return fmt.Errorf("%v: target %v codegen already outputs %v", t.Addr, ct.Addr, p)
 			}
 
 			e.codegenPaths[p] = t
@@ -109,11 +109,11 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 			return err
 		}
 
-		//log.Tracef("# Linking target %v %v/%v", target.FQN, i+1, len(targets))
+		//log.Tracef("# Linking target %v %v/%v", target.Addr, i+1, len(targets))
 		err := e.LinkTarget(target, nil)
 		if err != nil {
 			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, TargetNotFoundErr{})) {
-				return fmt.Errorf("%v: %w", target.FQN, err)
+				return fmt.Errorf("%v: %w", target.Addr, err)
 			}
 		}
 	}
@@ -125,7 +125,7 @@ func (e *State) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 	files := make(xfs.Paths, 0, len(td.Files))
 	for _, file := range td.Files {
 		if dep, ok := e.GetCodegenOrigin(file.RelRoot()); ok {
-			log.Tracef("%v: %v removed from deps, and %v outputs it", t.FQN, file.RelRoot(), dep.FQN)
+			log.Tracef("%v: %v removed from deps, and %v outputs it", t.Addr, file.RelRoot(), dep.Addr)
 		} else {
 			files = append(files, file)
 		}
@@ -138,7 +138,7 @@ func (e *State) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
 func (e *State) preventDepOnTool(t *Target, td TargetDeps) error {
 	for _, target := range td.Targets {
 		if target.Target.IsTool() {
-			return fmt.Errorf("cannot depend on %v because it is a tool", target.Target.FQN)
+			return fmt.Errorf("cannot depend on %v because it is a tool", target.Target.Addr)
 		}
 	}
 
@@ -147,19 +147,19 @@ func (e *State) preventDepOnTool(t *Target, td TargetDeps) error {
 
 func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	if !t.processed {
-		panic(fmt.Sprintf("%v has not been processed", t.FQN))
+		panic(fmt.Sprintf("%v has not been processed", t.Addr))
 	}
 
 	if breadcrumb != nil {
-		if breadcrumb.Has(t.FQN) {
-			fqns := append(breadcrumb.Slice(), t.FQN)
-			return fmt.Errorf("linking cycle: %v", fqns)
+		if breadcrumb.Has(t.Addr) {
+			addrs := append(breadcrumb.Slice(), t.Addr)
+			return fmt.Errorf("linking cycle: %v", addrs)
 		}
 		breadcrumb = breadcrumb.Copy()
 	} else {
 		breadcrumb = sets.NewStringSet(1)
 	}
-	breadcrumb.Add(t.FQN)
+	breadcrumb.Add(t.Addr)
 
 	//logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
@@ -210,9 +210,9 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	var err error
 
-	//log.Tracef(logPrefix+"Linking %v", t.FQN)
+	//log.Tracef(logPrefix+"Linking %v", t.Addr)
 	//defer func() {
-	//	log.Tracef(logPrefix+"Linking %v done", t.FQN)
+	//	log.Tracef(logPrefix+"Linking %v done", t.Addr)
 	//}()
 
 	//log.Tracef(logPrefix + "Linking tools")
@@ -225,7 +225,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	//log.Tracef(logPrefix + "Linking deps")
 	t.Deps, err = e.linkTargetNamedDeps(t, t.Spec().Deps, breadcrumb)
 	if err != nil {
-		return fmt.Errorf("%v: deps: %w", t.FQN, err)
+		return fmt.Errorf("%v: deps: %w", t.Addr, err)
 	}
 
 	// Resolve hash deps specs
@@ -233,7 +233,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		//log.Tracef(logPrefix + "Linking hashdeps")
 		t.HashDeps, err = e.linkTargetDeps(t, t.Spec().HashDeps, breadcrumb)
 		if err != nil {
-			return fmt.Errorf("%v: hashdeps: %w", t.FQN, err)
+			return fmt.Errorf("%v: hashdeps: %w", t.Addr, err)
 		}
 		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
 		err = e.preventDepOnTool(t, t.HashDeps)
@@ -304,7 +304,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	if t.Spec().Cache.Enabled {
 		if !t.Spec().Sandbox && !t.Spec().OutInSandbox {
-			return fmt.Errorf("%v cannot cache target which isn't sandboxed", t.FQN)
+			return fmt.Errorf("%v cannot cache target which isn't sandboxed", t.Addr)
 		}
 	}
 
@@ -380,18 +380,18 @@ func (e *State) registerDag(t *Target) error {
 	}
 
 	addEdge := func(src *Target, dst *Target) error {
-		ok, err := e.dag.IsEdge(src.FQN, dst.FQN)
+		ok, err := e.dag.IsEdge(src.Addr, dst.Addr)
 		if ok || err != nil {
 			return err
 		}
 
-		return e.dag.AddEdge(src.FQN, dst.FQN)
+		return e.dag.AddEdge(src.Addr, dst.Addr)
 	}
 
 	for _, dep := range t.Deps.All().Targets {
 		err := addEdge(dep.Target, t)
 		if err != nil {
-			return fmt.Errorf("dep: %v to %v: %w", dep.Target.FQN, t.FQN, err)
+			return fmt.Errorf("dep: %v to %v: %w", dep.Target.Addr, t.Addr, err)
 		}
 	}
 
@@ -399,7 +399,7 @@ func (e *State) registerDag(t *Target) error {
 		for _, dep := range t.HashDeps.Targets {
 			err := addEdge(dep.Target, t)
 			if err != nil {
-				return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.FQN, t.FQN, err)
+				return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.Addr, t.Addr, err)
 			}
 		}
 	}
@@ -407,7 +407,7 @@ func (e *State) registerDag(t *Target) error {
 	for _, target := range t.Tools.TargetReferences {
 		err := addEdge(target, t)
 		if err != nil {
-			return fmt.Errorf("tool: %v to %v: %w", target.FQN, t.FQN, err)
+			return fmt.Errorf("tool: %v to %v: %w", target.Addr, t.Addr, err)
 		}
 	}
 
@@ -532,7 +532,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			npaths := tt.Out.Name(tool.Output)
 
 			if len(npaths) == 0 {
-				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.FQN, tool.Output)
+				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.Addr, tool.Output)
 			}
 
 			paths = map[string]xfs.RelPaths{
@@ -542,7 +542,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			paths = tt.Out.Named()
 
 			if len(paths) == 0 && tool.Target.DeepOwnTransitive.Empty() {
-				return TargetTools{}, fmt.Errorf("%v has no output", tt.FQN)
+				return TargetTools{}, fmt.Errorf("%v has no output", tt.Addr)
 			}
 
 			if name != "" {
@@ -560,7 +560,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 
 		for name, paths := range paths {
 			if len(paths) != 1 {
-				return TargetTools{}, fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.FQN)
+				return TargetTools{}, fmt.Errorf("%v: each named output can only output one file to be used as a tool", tt.Addr)
 			}
 
 			path := paths[0]
@@ -624,16 +624,16 @@ func (e *State) applyEnv(t *Target, passEnv []string, env map[string]string) {
 
 func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.StringSet) (TargetTransitive, error) {
 	targets := sets.NewSet(func(t *Target) string {
-		return t.FQN
+		return t.Addr
 	}, 0)
 	for _, dep := range tr.Deps.All().Targets {
-		targets.Add(e.Targets().Find(dep.Target.FQN))
+		targets.Add(e.Targets().Find(dep.Target.Addr))
 	}
 	for _, dep := range tr.Tools.Targets {
-		targets.Add(e.Targets().Find(dep.Target.FQN))
+		targets.Add(e.Targets().Find(dep.Target.Addr))
 	}
 	for _, t := range tr.Tools.TargetReferences {
-		targets.Add(e.Targets().Find(t.FQN))
+		targets.Add(e.Targets().Find(t.Addr))
 	}
 
 	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)
@@ -647,13 +647,13 @@ func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.Stri
 
 func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (TargetTransitive, []specs.Platform, error) {
 	targets := sets.NewSet(func(t *Target) string {
-		return t.FQN
+		return t.Addr
 	}, 0)
 	for _, dep := range t.Deps.All().Targets {
-		targets.Add(e.Targets().Find(dep.Target.FQN))
+		targets.Add(e.Targets().Find(dep.Target.Addr))
 	}
 	for _, ref := range t.Tools.TargetReferences {
-		targets.Add(e.Targets().Find(ref.FQN))
+		targets.Add(e.Targets().Find(ref.Addr))
 	}
 
 	tr, err := e.collectTransitive(targets.Slice(), breadcrumb)
@@ -722,14 +722,14 @@ func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (T
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
-		err := e.LinkTarget(e.Targets().Find(dep.Target.FQN), breadcrumb)
+		err := e.LinkTarget(e.Targets().Find(dep.Target.Addr), breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
 	}
 
 	for _, t := range tt.Tools.TargetReferences {
-		err := e.LinkTarget(e.Targets().Find(t.FQN), breadcrumb)
+		err := e.LinkTarget(e.Targets().Find(t.Addr), breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
@@ -835,7 +835,7 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 			}
 		} else {
 			if !dt.Out.HasName(spec.Output) {
-				return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.FQN, spec.Output)
+				return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.Addr, spec.Output)
 			}
 
 			td.Targets = append(td.Targets, TargetWithOutput{

@@ -106,7 +106,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
 	for _, target := range targets {
 		if !target.Gen {
-			panic(fmt.Errorf("%v is not a gen target", target.FQN))
+			panic(fmt.Errorf("%v is not a gen target", target.Addr))
 		}
 	}
 
@@ -120,7 +120,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	newTargets := graph.NewTargets(0)
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		e.scheduleRunGenerated(ctx, e.Targets.Find(target), sdeps.Get(target.FQN), deps, newTargets)
+		e.scheduleRunGenerated(ctx, e.Targets.Find(target), sdeps.Get(target.Addr), deps, newTargets)
 	}
 
 	j := e.Pool.Schedule(ctx, &worker.Job{
@@ -171,7 +171,7 @@ func (e *Engine) linkGenTargets(ctx context.Context) error {
 
 func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
-		Name: "rungen_" + target.FQN,
+		Name: "rungen_" + target.Addr,
 		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			return e.scheduleRunGeneratedFiles(ctx, target, deps, targets)
@@ -189,7 +189,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 		files := files
 
 		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("rungen %v chunk %v", target.FQN, i),
+			Name: fmt.Sprintf("rungen %v chunk %v", target.Addr, i),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				opts := hbuiltin.Bootstrap(hbuiltin.Opts{
 					Pkgs:   e.Packages,
@@ -201,7 +201,7 @@ func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Ta
 							return err
 						}
 
-						targets.Add(e.Graph.Targets().Find(spec.FQN))
+						targets.Add(e.Graph.Targets().Find(spec.Addr))
 						return nil
 					},
 				})

@@ -83,7 +83,7 @@ func predeclared_functions() starlark.StringDict {
 					Members: starlark.StringDict{
 						"name": starlark.NewBuiltin("heph.pkg.name", package_name),
 						"dir":  starlark.NewBuiltin("heph.pkg.dir", package_dir),
-						"addr": starlark.NewBuiltin("heph.pkg.addr", package_fqn),
+						"addr": starlark.NewBuiltin("heph.pkg.addr", package_addr),
 					},
 				},
 				"path": &starlarkstruct.Module{
@@ -208,7 +208,7 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		return nil, err
 	}
 
-	return starlark.String(t.FQN), nil
+	return starlark.String(t.Addr), nil
 }
 
 func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
@@ -263,7 +263,7 @@ func package_dir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tu
 	return starlark.String(pkg.Path), nil
 }
 
-func package_fqn(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func package_addr(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	pkg := getPackage(thread)
 
 	return starlark.String(pkg.Addr()), nil

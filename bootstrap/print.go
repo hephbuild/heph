@@ -32,11 +32,11 @@ func targetOutputsFunc(target *engine.Target, output string, f func(path xfs.Pat
 	paths := target.ActualOutFiles().All()
 	if output != "" {
 		if !target.ActualOutFiles().HasName(output) {
-			return fmt.Errorf("%v: output `%v` does not exist", target.FQN, output)
+			return fmt.Errorf("%v: output `%v` does not exist", target.Addr, output)
 		}
 		paths = target.ActualOutFiles().Name(output)
 	} else if len(paths) == 0 {
-		return fmt.Errorf("%v: does not output anything", target.FQN)
+		return fmt.Errorf("%v: does not output anything", target.Addr)
 	}
 
 	for _, path := range paths {

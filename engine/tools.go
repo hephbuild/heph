@@ -27,13 +27,13 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 	log.Tracef("Installing tools")
 
-	fqns := e.Graph.Tools.FQNs()
-	sort.Strings(fqns)
+	addrs := e.Graph.Tools.Addrs()
+	sort.Strings(addrs)
 
 	h := hash.NewHash()
 	h.String(e.Config.Version.String)
-	for _, fqn := range fqns {
-		h.String(fqn)
+	for _, addr := range addrs {
+		h.String(addr)
 	}
 
 	toolsHash := h.Sum()
@@ -63,11 +63,11 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 	}
 
 	for _, target := range e.Graph.Tools.Slice() {
-		log.Tracef("Installing tool %v", target.FQN)
+		log.Tracef("Installing tool %v", target.Addr)
 
-		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.FQN)
+		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.Addr)
 
-		tp, err := specs.TargetParse("", target.FQN)
+		tp, err := specs.TargetParse("", target.Addr)
 		if err != nil {
 			return err
 		}

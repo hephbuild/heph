@@ -32,7 +32,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext
 	} else {
 		paths = target.ActualOutFiles().Name(a.Output)
 	}
-	log.Tracef("Creating archive %v %v", target.FQN, a.Output)
+	log.Tracef("Creating archive %v %v", target.Addr, a.Output)
 
 	files := make([]tar.File, 0)
 	for _, file := range paths {
@@ -158,11 +158,11 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenConte
 		if !dep.Target.Out.HasName(dep.Output) {
 			continue
 		}
-		if d.DepsHashes[dep.Target.FQN] == nil {
-			d.DepsHashes[dep.Target.FQN] = map[string]string{}
+		if d.DepsHashes[dep.Target.Addr] == nil {
+			d.DepsHashes[dep.Target.Addr] = map[string]string{}
 		}
 		var err error
-		d.DepsHashes[dep.Target.FQN][dep.Output], err = e.HashOutput(e.Targets.Find(dep.Target.FQN), dep.Output)
+		d.DepsHashes[dep.Target.Addr][dep.Output], err = e.HashOutput(e.Targets.Find(dep.Target.Addr), dep.Output)
 		if err != nil {
 			return err
 		}

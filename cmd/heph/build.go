@@ -21,7 +21,7 @@ func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
 	}
 
 	sort.Slice(stargets, func(i, j int) bool {
-		return stargets[i].FQN < stargets[j].FQN
+		return stargets[i].Addr < stargets[j].Addr
 	})
 
 	return stargets
@@ -30,7 +30,7 @@ func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
 func sortedTargetNames(targets []*graph.Target, skipPrivate bool) []string {
 	names := make([]string, 0)
 	for _, t := range sortedTargets(targets, skipPrivate) {
-		names = append(names, t.FQN)
+		names = append(names, t.Addr)
 	}
 
 	return names
@@ -44,11 +44,11 @@ func autocompletePrefix(suggestions, ss []string, comp string) []string {
 
 func autocompleteTargetName(targets specs.Targets, s string) (bool, []string) {
 	if s == "" {
-		return false, targets.FQNs()
+		return false, targets.Addrs()
 	}
 
 	if strings.HasPrefix(s, "/") {
-		return false, autocompletePrefix(nil, targets.FQNs(), s)
+		return false, autocompletePrefix(nil, targets.Addrs(), s)
 	}
 
 	return true, fuzzyFindTargetName(targets, s, 10)
@@ -56,7 +56,7 @@ func autocompleteTargetName(targets specs.Targets, s string) (bool, []string) {
 
 func fuzzyFindTargetName(targets specs.Targets, s string, max int) []string {
 	suggestions := search.FuzzyFindTarget(targets, s, max)
-	return suggestions.FQNs()
+	return suggestions.Addrs()
 }
 
 var labelChars = []rune(specs.Alphanum + `_`)

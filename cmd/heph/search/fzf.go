@@ -11,9 +11,9 @@ func FuzzyFindTarget(targets specs.Targets, s string, max int) specs.Targets {
 		return nil
 	}
 
-	fqns := targets.FQNs()
+	addrs := targets.Addrs()
 
-	matches := fuzzy.RankFindNormalizedFold(s, fqns)
+	matches := fuzzy.RankFindNormalizedFold(s, addrs)
 	sort.Sort(matches)
 
 	var suggestions []string

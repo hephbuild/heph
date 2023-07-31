@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-func Scenario(run func() error, print bool, expectedUniqueFqn int, expectedLogBytes int64) {
+func Scenario(run func() error, print bool, expectedUniqueAddr int, expectedLogBytes int64) {
 	srv, cloud := NewHephcloudServer()
 	defer srv.Close()
 
@@ -22,9 +22,9 @@ func Scenario(run func() error, print bool, expectedUniqueFqn int, expectedLogBy
 	fmt.Printf("Got %v bytes of span logs\n", cloud.LogBytes())
 
 	var count int
-	for fqn, spans := range cloud.SpansPerFQN() {
+	for addr, spans := range cloud.SpansPerAddr() {
 		if print {
-			fmt.Println(fqn)
+			fmt.Println(addr)
 		}
 		for _, span := range spans {
 			if span.Event != "RUN_EXEC" {
@@ -37,8 +37,8 @@ func Scenario(run func() error, print bool, expectedUniqueFqn int, expectedLogBy
 		}
 	}
 
-	if expectedUniqueFqn >= 0 {
-		Must(AssertEqual(count, expectedUniqueFqn))
+	if expectedUniqueAddr >= 0 {
+		Must(AssertEqual(count, expectedUniqueAddr))
 	}
 
 	if expectedLogBytes >= 0 {

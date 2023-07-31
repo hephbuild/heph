@@ -364,7 +364,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 		filteredRRs = rrs
 	} else {
 		for _, rr := range rrs {
-			currHash := s.triggeredHashed.Get(rr.Target.FQN)
+			currHash := s.triggeredHashed.Get(rr.Target.Addr)
 
 			changeTarget := bs.Engine.Targets.Find(rr.Target)
 			changeHash, err := bs.Engine.LocalCache.HashInput(changeTarget)
@@ -552,7 +552,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 		if err != nil {
 			return err
 		}
-		s.triggeredHashed.Set(rr.Target.FQN, hash)
+		s.triggeredHashed.Set(rr.Target.Addr, hash)
 	}
 
 	// TODO: Split each rr into its own RunMode so that it can be canceled separately

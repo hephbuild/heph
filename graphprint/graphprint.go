@@ -128,7 +128,7 @@ func printPlatforms(w io.Writer, i string, platforms []specs.Platform) {
 
 func targetDescriptor(t specs.Target, output string, mode specs.DepMode) string {
 	var sb strings.Builder
-	sb.WriteString(t.FQN)
+	sb.WriteString(t.Addr)
 	if len(output) > 0 {
 		sb.WriteString(fmt.Sprintf("|%v", output))
 	}

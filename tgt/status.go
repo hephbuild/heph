@@ -7,11 +7,11 @@ import (
 )
 
 func TargetStatus(t specs.Specer, status string) status.Statuser {
-	return targetStatus{t.Spec().FQN, "", status}
+	return targetStatus{t.Spec().Addr, "", status}
 }
 
 type targetStatus struct {
-	fqn, output, status string
+	addr, output, status string
 }
 
 var (
@@ -32,12 +32,12 @@ func (t targetStatus) String(r *lipgloss.Renderer) string {
 		outputStr = output.Render("|" + t.output)
 	}
 
-	return target.Render(t.fqn) + outputStr + " " + t.status
+	return target.Render(t.addr) + outputStr + " " + t.status
 }
 
 func TargetOutputStatus(t specs.Specer, output string, status string) status.Statuser {
 	if output == "" {
 		output = "-"
 	}
-	return targetStatus{t.Spec().FQN, output, status}
+	return targetStatus{t.Spec().Addr, output, status}
 }

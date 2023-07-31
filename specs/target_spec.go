@@ -74,18 +74,15 @@ func SortOutputsForHashing(names []string) []string {
 
 type Targets []Target
 
-func (ts Targets) FQNs() []string {
-	fqns := make([]string, 0, len(ts))
-	for _, t := range ts {
-		fqns = append(fqns, t.FQN)
-	}
-
-	return fqns
+func (ts Targets) Addrs() []string {
+	return ads.Map(ts, func(t Target) string {
+		return t.Addr
+	})
 }
 
-func (ts Targets) Get(fqn string) (Target, bool) {
+func (ts Targets) Get(addr string) (Target, bool) {
 	for _, t := range ts {
-		if t.FQN == fqn {
+		if t.Addr == addr {
 			return t, true
 		}
 	}
@@ -95,7 +92,7 @@ func (ts Targets) Get(fqn string) (Target, bool) {
 
 type Target struct {
 	Name    string
-	FQN     string
+	Addr    string
 	Package *packages.Package
 	Doc     string
 

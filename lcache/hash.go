@@ -26,7 +26,7 @@ func (e *LocalCacheState) hashDepsTargets(h hash.Hash, targets []graph.TargetWit
 			continue
 		}
 
-		h.String(dep.Target.FQN)
+		h.String(dep.Target.Addr)
 		dh, err := e.hashOutput(e.find(dep.Target), dep.Output)
 		if err != nil {
 			return err
@@ -186,7 +186,7 @@ func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Ti
 }
 
 func (e *LocalCacheState) find(t specs.Specer) graph.Targeter {
-	return e.Targets.Find(t.Spec().FQN)
+	return e.Targets.Find(t.Spec().Addr)
 }
 
 func (e *LocalCacheState) HashInput(target graph.Targeter) (string, error) {
@@ -201,12 +201,12 @@ func hashCacheId(gtarget graph.Targeter) targetCacheKey {
 	target := gtarget.GraphTarget()
 
 	idh := hash.NewHash()
-	for _, fqn := range target.AllTargetDeps.FQNs() {
-		idh.String(fqn)
+	for _, addr := range target.AllTargetDeps.Addrs() {
+		idh.String(addr)
 	}
 
 	return targetCacheKey{
-		fqn:  target.FQN,
+		addr: target.Addr,
 		hash: idh.Sum(),
 	}
 }
@@ -222,7 +222,7 @@ func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, error) {
 	target := gtarget.GraphTarget()
 
-	mu := e.cacheHashInputTargetMutex.Get(target.FQN)
+	mu := e.cacheHashInputTargetMutex.Get(target.Addr)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -249,7 +249,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 
 	start := time.Now()
 	defer func() {
-		log.Debugf("hashinput %v took %v", target.FQN, time.Since(start))
+		log.Debugf("hashinput %v took %v", target.Addr, time.Since(start))
 	}()
 
 	h := hash.NewDebuggableHash(func() string {
@@ -375,7 +375,7 @@ func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) s
 func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (string, error) {
 	target := gtarget.GraphTarget()
 
-	mu := e.cacheHashOutputTargetMutex.Get(target.FQN + "|" + output)
+	mu := e.cacheHashOutputTargetMutex.Get(target.Addr + "|" + output)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -385,7 +385,7 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 	}
 
 	cacheId := targetOutCacheKey{
-		fqn:    target.FQN,
+		addr:   target.Addr,
 		output: output,
 		hash:   hashInput,
 	}
@@ -396,7 +396,7 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 
 	start := time.Now()
 	defer func() {
-		log.Debugf("hashoutput %v|%v took %v", target.FQN, output, time.Since(start))
+		log.Debugf("hashoutput %v|%v took %v", target.Addr, output, time.Since(start))
 	}()
 
 	if !target.OutWithSupport.HasName(output) {
@@ -423,13 +423,13 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 
 	r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(output), e.cacheDir(target).Abs())
 	if err != nil {
-		return "", fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.FQN, output, err)
+		return "", fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.Addr, output, err)
 	}
 	defer r.Close()
 
 	err = e.hashTar(h, r)
 	if err != nil {
-		return "", fmt.Errorf("hashOutput: %v: hashTar %v %w", target.FQN, output, err)
+		return "", fmt.Errorf("hashOutput: %v: hashTar %v %w", target.Addr, output, err)
 	}
 
 	if target.HasSupportFiles && output != specs.SupportFilesOutput {

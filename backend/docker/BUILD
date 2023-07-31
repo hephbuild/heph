@@ -72,7 +72,7 @@ def docker_image(name, dockerfile, deps={}, run=[], build_args=[], platform=None
 
     return build
 
-def docker_fqn(name, repo, image, tag):
+def docker_addr(name, repo, image, tag):
     if not heph.is_target(repo):
         repo = text_file(name="_{}_repo".format(name), text=repo)
 
@@ -93,23 +93,23 @@ def docker_fqn(name, repo, image, tag):
         }
     )
 
-def docker_push(name, image_build, fqn, **kwargs):
+def docker_push(name, image_build, addr, **kwargs):
     return target(
         name=name,
         run=[
-            'FQN=$(cat $SRC_FQN)',
-            'echo "FQN: $FQN"',
+            'ADDR=$(cat $SRC_ADDR)',
+            'echo "ADDR: $ADDR"',
             'docker load -i $SRC_TAR',
-            'docker tag $(cat $SRC_IMG) $FQN',
-            'docker push $FQN',
-            'echo $FQN > $OUT'
+            'docker tag $(cat $SRC_IMG) $ADDR',
+            'docker push $ADDR',
+            'echo $ADDR > $OUT'
         ],
         deps={
             'img': image_build+"|iid",
             'tar': image_build+"|tar",
-            'fqn': fqn,
+            'addr': addr,
         },
-        out='push_fqn',
+        out='push_addr',
         tools=docker,
         **kwargs,
     )

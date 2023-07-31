@@ -20,7 +20,7 @@ import (
 
 func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) {
 	t := specs.Target{
-		FQN:                 pkg.TargetAddr(args.Name),
+		Addr:                pkg.TargetAddr(args.Name),
 		Name:                args.Name,
 		Run:                 args.Run,
 		Doc:                 docFromArg(args.Doc),

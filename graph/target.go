@@ -61,11 +61,11 @@ func (t *Target) resetLinking() {
 }
 
 func (t *Target) ID() string {
-	return t.FQN
+	return t.Addr
 }
 
 func (t *Target) String() string {
-	return t.FQN
+	return t.Addr
 }
 
 func (t *Target) HasAnyLabel(labels []string) bool {
@@ -104,7 +104,7 @@ func (t *Target) ToolTarget() TargetTool {
 	ts := t.Spec().Tools.Targets[0]
 
 	for _, tool := range t.Tools.Targets {
-		if tool.Target.FQN == ts.Target {
+		if tool.Target.Addr == ts.Target {
 			return tool
 		}
 	}

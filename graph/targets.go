@@ -7,9 +7,9 @@ import (
 	"strings"
 )
 
-func Contains(ts []*Target, fqn string) bool {
+func Contains(ts []*Target, addr string) bool {
 	for _, t := range ts {
-		if t.FQN == fqn {
+		if t.Addr == addr {
 			return true
 		}
 	}
@@ -27,7 +27,7 @@ func NewTargets(cap int) *Targets {
 			panic("target must not be nil")
 		}
 
-		return t.FQN
+		return t.Addr
 	}, cap)
 
 	return &Targets{
@@ -35,17 +35,17 @@ func NewTargets(cap int) *Targets {
 	}
 }
 
-func (ts *Targets) FQNs() []string {
+func (ts *Targets) Addrs() []string {
 	if ts == nil {
 		return nil
 	}
 
-	fqns := make([]string, 0, len(ts.Slice()))
+	addrs := make([]string, 0, len(ts.Slice()))
 	for _, target := range ts.Slice() {
-		fqns = append(fqns, target.FQN)
+		addrs = append(addrs, target.Addr)
 	}
 
-	return fqns
+	return addrs
 }
 
 func (ts *Targets) Specs() specs.Targets {
@@ -74,7 +74,7 @@ func (ts *Targets) Sort() {
 	a := ts.Slice()
 
 	ads.Sort(a, func(i, j *Target) int {
-		return strings.Compare(i.FQN, j.FQN)
+		return strings.Compare(i.Addr, j.Addr)
 	})
 }
 
@@ -88,10 +88,10 @@ func (ts *Targets) Copy() *Targets {
 	}
 }
 
-func (ts *Targets) Find(fqn string) *Target {
+func (ts *Targets) Find(addr string) *Target {
 	if ts == nil {
 		return nil
 	}
 
-	return ts.GetKey(fqn)
+	return ts.GetKey(addr)
 }

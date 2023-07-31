@@ -9,15 +9,15 @@ type TargetMetas[T any] struct {
 	m *maps.Map[string, T]
 }
 
-func (m *TargetMetas[T]) FindFQN(fqn string) T {
-	return m.m.Get(fqn)
+func (m *TargetMetas[T]) FindAddr(addr string) T {
+	return m.m.Get(addr)
 }
 
 func (m *TargetMetas[T]) Find(spec specs.Specer) T {
-	return m.FindFQN(spec.Spec().FQN)
+	return m.FindAddr(spec.Spec().Addr)
 }
 
-func NewTargetMetas[T any](factory func(fqn string) T) *TargetMetas[T] {
+func NewTargetMetas[T any](factory func(addr string) T) *TargetMetas[T] {
 	return &TargetMetas[T]{
 		m: &maps.Map[string, T]{Default: factory},
 	}

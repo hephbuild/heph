@@ -5,7 +5,7 @@ target(
 ===
 {
     "Name": "a",
-    "FQN": "//some/test:a",
+    "Addr": "//some/test:a",
     "Package": {
         "Path": "some/test",
         "Root": {

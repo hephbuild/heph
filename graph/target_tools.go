@@ -34,10 +34,10 @@ func (t TargetTools) HasHeph() bool {
 func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt := TargetTools{}
 	tt.TargetReferences = ads.DedupAppend(t.TargetReferences, func(t *Target) string {
-		return t.FQN
+		return t.Addr
 	}, tools.TargetReferences...)
 	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) string {
-		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
+		return tool.Name + "|" + tool.Target.Addr + "|" + tool.Output
 	}, tools.Targets...)
 	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool specs.HostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
@@ -55,10 +55,10 @@ func (t TargetTools) Dedup() {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	})
 	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) string {
-		return tool.Name + "|" + tool.Target.FQN + "|" + tool.Output
+		return tool.Name + "|" + tool.Target.Addr + "|" + tool.Output
 	})
 	t.TargetReferences = ads.Dedup(t.TargetReferences, func(target *Target) string {
-		return target.FQN
+		return target.Addr
 	})
 }
 
@@ -74,7 +74,7 @@ func (t TargetTools) Sort() {
 
 	ads.SortP(t.Targets,
 		func(i, j *TargetTool) int {
-			return strings.Compare(i.Target.FQN, j.Target.FQN)
+			return strings.Compare(i.Target.Addr, j.Target.Addr)
 		},
 		func(i, j *TargetTool) int {
 			return strings.Compare(i.Name, j.Name)
@@ -83,7 +83,7 @@ func (t TargetTools) Sort() {
 
 	ads.Sort(t.TargetReferences,
 		func(i, j *Target) int {
-			return strings.Compare(i.FQN, j.FQN)
+			return strings.Compare(i.Addr, j.Addr)
 		},
 		func(i, j *Target) int {
 			return strings.Compare(i.Name, j.Name)

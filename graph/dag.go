@@ -15,10 +15,10 @@ type DAG struct {
 
 // returns parents first
 func (d *DAG) orderedWalker(target *Target, rel func(specs.Specer) ([]*Target, error), ancsm map[string]struct{}, minDepth, depth int, f func(*Target)) error {
-	if _, ok := ancsm[target.FQN]; ok {
+	if _, ok := ancsm[target.Addr]; ok {
 		return nil
 	}
-	ancsm[target.FQN] = struct{}{}
+	ancsm[target.Addr] = struct{}{}
 
 	parents, err := rel(target)
 	if err != nil {
@@ -64,15 +64,15 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 			return
 		}
 
-		ancsout.Get(t.FQN).Add(output)
+		ancsout.Get(t.Addr).Add(output)
 	}
 
 	addAllOut := func(t *Target) {
-		ancsout.Get(t.FQN).AddAll(t.OutWithSupport.Names())
+		ancsout.Get(t.Addr).AddAll(t.OutWithSupport.Names())
 	}
 
 	maybeAddAllOuts := func(t *Target, output string) {
-		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets.Slice(), t.FQN) {
+		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets.Slice(), t.Addr) {
 			addAllOut(t)
 		} else {
 			addOut(t, output)
@@ -82,11 +82,11 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	err := d.getOrderedAncestors(targets.Slice(), includeRoot, func(target *Target) {
 		deps := target.Deps.All().Merge(target.HashDeps)
 		for _, dep := range deps.Targets {
-			maybeAddAllOuts(d.targets.Find(dep.Target.FQN), dep.Output)
+			maybeAddAllOuts(d.targets.Find(dep.Target.Addr), dep.Output)
 		}
 
 		for _, tool := range target.Tools.Targets {
-			maybeAddAllOuts(d.targets.Find(tool.Target.FQN), tool.Output)
+			maybeAddAllOuts(d.targets.Find(tool.Target.Addr), tool.Output)
 		}
 
 		ancs.Add(target)
@@ -135,11 +135,11 @@ func (d *DAG) GetOrderedDescendants(targets []*Target, includeRoot bool) ([]*Tar
 }
 
 func (d *DAG) GetAncestors(target specs.Specer) ([]*Target, error) {
-	return d.GetAncestorsOfFQN(target.Spec().FQN)
+	return d.GetAncestorsOfAddr(target.Spec().Addr)
 }
 
-func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
-	ancestors, err := d.DAG.GetAncestors(fqn)
+func (d *DAG) GetAncestorsOfAddr(addr string) ([]*Target, error) {
+	ancestors, err := d.DAG.GetAncestors(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -148,11 +148,11 @@ func (d *DAG) GetAncestorsOfFQN(fqn string) ([]*Target, error) {
 }
 
 func (d *DAG) GetDescendants(target specs.Specer) ([]*Target, error) {
-	return d.GetDescendantsOfFQN(target.Spec().FQN)
+	return d.GetDescendantsOfAddr(target.Spec().Addr)
 }
 
-func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
-	ancestors, err := d.DAG.GetDescendants(fqn)
+func (d *DAG) GetDescendantsOfAddr(addr string) ([]*Target, error) {
+	ancestors, err := d.DAG.GetDescendants(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +161,7 @@ func (d *DAG) GetDescendantsOfFQN(fqn string) ([]*Target, error) {
 }
 
 func (d *DAG) GetParents(target specs.Specer) ([]*Target, error) {
-	ancestors, err := d.DAG.GetParents(target.Spec().FQN)
+	ancestors, err := d.DAG.GetParents(target.Spec().Addr)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (d *DAG) GetVertices() []*Target {
 }
 
 func (d *DAG) GetChildren(target specs.Specer) ([]*Target, error) {
-	ancestors, err := d.DAG.GetChildren(target.Spec().FQN)
+	ancestors, err := d.DAG.GetChildren(target.Spec().Addr)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +218,7 @@ func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
 	}
 
 	sort.Slice(a, func(i, j int) bool {
-		return a[i].FQN < a[j].FQN
+		return a[i].Addr < a[j].Addr
 	})
 
 	return a

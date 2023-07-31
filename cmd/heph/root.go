@@ -220,7 +220,7 @@ var cleanCmd = &cobra.Command{
 		targets := rrs.Targets()
 
 		for _, target := range targets.Slice() {
-			log.Tracef("Cleaning %v...", target.FQN)
+			log.Tracef("Cleaning %v...", target.Addr)
 			err := bs.Engine.CleanTarget(bs.Engine.Targets.Find(target), true)
 			if err != nil {
 				return err

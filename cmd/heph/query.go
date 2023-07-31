@@ -209,7 +209,7 @@ var codegenCmd = &cobra.Command{
 		paths := make([]string, 0)
 
 		for p, t := range bs.Graph.CodegenPaths() {
-			paths = append(paths, fmt.Sprintf("%v: %v", p, t.FQN))
+			paths = append(paths, fmt.Sprintf("%v: %v", p, t.Addr))
 		}
 
 		sort.Strings(paths)
@@ -233,7 +233,7 @@ var graphCmd = &cobra.Command{
 			return err
 		}
 
-		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(target.FQN)
+		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(target.Addr)
 		if err != nil {
 			return err
 		}
@@ -299,7 +299,7 @@ digraph G  {
 	edge [fontsize=10]
 `)
 		id := func(target *graph.Target) string {
-			return strconv.Quote(target.FQN)
+			return strconv.Quote(target.Addr)
 		}
 
 		for _, target := range dag.GetVertices() {
@@ -309,7 +309,7 @@ digraph G  {
 				continue
 			}
 
-			log.Tracef("walk %v", target.FQN)
+			log.Tracef("walk %v", target.Addr)
 
 			parentsStart := time.Now()
 			parents, err := dag.GetParents(target)
@@ -318,15 +318,15 @@ digraph G  {
 				panic(err)
 			}
 
-			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.FQN, extra)
+			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.Addr, extra)
 
 			skip := sets.NewStringSet(0)
 			//for _, tool := range target.Tools.Targets {
-			//	skip.Add(tool.Target.FQN)
+			//	skip.Add(tool.Target.Addr)
 			//}
 
 			for _, ancestor := range parents {
-				if skip.Has(ancestor.FQN) {
+				if skip.Has(ancestor.Addr) {
 					continue
 				}
 
@@ -371,7 +371,7 @@ var changesCmd = &cobra.Command{
 			for ti, t := range allTargets {
 				for _, file := range t.HashDeps.Files {
 					if strings.HasPrefix(affectedFile, file.RelRoot()) {
-						log.Tracef("%v affects %v", affectedFile, t.FQN)
+						log.Tracef("%v affects %v", affectedFile, t.Addr)
 						affectedTargets = append(affectedTargets, t)
 						allTargets = append(allTargets[:ti], allTargets[ti+1:]...)
 						continue targets
@@ -381,7 +381,7 @@ var changesCmd = &cobra.Command{
 		}
 
 		for _, t := range affectedTargets {
-			fmt.Println(t.FQN)
+			fmt.Println(t.Addr)
 		}
 
 		return nil
@@ -417,7 +417,7 @@ var targetCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(target.FQN)
+		fmt.Println(target.Addr)
 		fmt.Println()
 
 		graphprint.Print(os.Stdout, target, debugTransitive)
@@ -481,7 +481,7 @@ var depsCmd = &cobra.Command{
 		}
 
 		ancestors := ads.Map(ancs, func(t *graph.Target) string {
-			return t.FQN
+			return t.Addr
 		})
 
 		ancestors = ads.Dedup(ancestors, func(s string) string {
@@ -489,8 +489,8 @@ var depsCmd = &cobra.Command{
 		})
 		sort.Strings(ancestors)
 
-		for _, fqn := range ancestors {
-			fmt.Println(fqn)
+		for _, addr := range ancestors {
+			fmt.Println(addr)
 		}
 
 		return nil
@@ -549,12 +549,12 @@ var revdepsCmd = &cobra.Command{
 
 			targets = specs.AsSpecers(children)
 			fn = func(target specs.Specer) ([]*graph.Target, error) {
-				return []*graph.Target{bs.Graph.Targets().Find(target.Spec().FQN)}, nil
+				return []*graph.Target{bs.Graph.Targets().Find(target.Spec().Addr)}, nil
 			}
 			if transitive {
 				fn = func(target specs.Specer) ([]*graph.Target, error) {
 					desc, err := bs.Graph.DAG().GetDescendants(target)
-					desc = append(desc, bs.Graph.Targets().Find(target.Spec().FQN))
+					desc = append(desc, bs.Graph.Targets().Find(target.Spec().Addr))
 					return desc, err
 				}
 			}
@@ -579,14 +579,14 @@ var revdepsCmd = &cobra.Command{
 				return err
 			}
 			for _, anc := range ancs {
-				revdeps.Add(anc.FQN)
+				revdeps.Add(anc.Addr)
 			}
 		}
 
 		sort.Strings(revdeps.Slice())
 
-		for _, fqn := range revdeps.Slice() {
-			fmt.Println(fqn)
+		for _, addr := range revdeps.Slice() {
+			fmt.Println(addr)
 		}
 
 		return nil

@@ -27,8 +27,8 @@ func TestAutocomplete(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			targets := ads.Map(test.targets, func(fqn string) specs.Target {
-				return specs.Target{FQN: fqn}
+			targets := ads.Map(test.targets, func(addr string) specs.Target {
+				return specs.Target{Addr: addr}
 			})
 
 			_, suggestions := autocompleteLabelOrTarget(targets, test.labels, test.complete)

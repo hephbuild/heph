@@ -81,7 +81,7 @@ func ParseTargetSelector(pkg, s string) TargetMatcher {
 		}
 
 		return func(target *Target) bool {
-			return target.FQN == tp.Full()
+			return target.Addr == tp.Full()
 		}
 	}
 

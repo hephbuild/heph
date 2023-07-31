@@ -30,22 +30,22 @@ func (q fzfQuery) Searcher(ctx context.Context, i index.IndexReader, m mapping.I
 			return false
 		}
 
-		fqn := ""
+		addr := ""
 		doc.VisitFields(func(field index.Field) {
-			if field.Name() == "fqn" {
-				fqn = string(field.Value())
+			if field.Name() == "addr" {
+				addr = string(field.Value())
 			}
 		})
-		if fqn == "" {
+		if addr == "" {
 			return false
 		}
 
-		ld := fuzzy.RankMatchNormalizedFold(q.s, fqn)
+		ld := fuzzy.RankMatchNormalizedFold(q.s, addr)
 		if ld < 0 {
 			return false
 		}
 
-		score := math.Min(1, math.Pow(2, -float64(ld)/float64(len(fqn))))
+		score := math.Min(1, math.Pow(2, -float64(ld)/float64(len(addr))))
 		d.Score = (d.Score + score*q.boost) / (q.boost + 1)
 
 		return true

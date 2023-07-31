@@ -16,7 +16,7 @@ func targetSpanAttr(t *graph.Target) trace.SpanStartOption {
 	attrs := []attribute.KeyValue{
 		{
 			Key:   "heph.target",
-			Value: attribute.StringValue(t.FQN),
+			Value: attribute.StringValue(t.Addr),
 		},
 	}
 

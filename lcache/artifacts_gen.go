@@ -19,13 +19,13 @@ func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer
 	l := e.TargetMetas.Find(target).cacheLocks[artifact.Name()]
 	err := l.Lock(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("lock %v %v: %w", target.FQN, artifact.Name(), err)
+		return nil, fmt.Errorf("lock %v %v: %w", target.Addr, artifact.Name(), err)
 	}
 
 	return func() error {
 		err := l.Unlock()
 		if err != nil {
-			return fmt.Errorf("unlock %v %v: %w", target.FQN, artifact.Name(), err)
+			return fmt.Errorf("unlock %v %v: %w", target.Addr, artifact.Name(), err)
 		}
 
 		return nil
@@ -41,7 +41,7 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget specs.Spece
 		for _, unlock := range unlockers {
 			err := unlock()
 			if err != nil {
-				log.Errorf("unlock %v: %v", target.FQN, err)
+				log.Errorf("unlock %v: %v", target.Addr, err)
 			}
 		}
 	}

@@ -86,7 +86,7 @@ func (e *State) findParent(t *Target, expr exprs.Expr) (*Target, error) {
 	}
 
 	if must {
-		return nil, fmt.Errorf("not target matching %v found in parent of %v", selector, t.FQN)
+		return nil, fmt.Errorf("not target matching %v found in parent of %v", selector, t.Addr)
 	}
 
 	return nil, nil

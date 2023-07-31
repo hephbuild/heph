@@ -128,7 +128,7 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 			return nil
 		}
 
-		return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.FQN, artifact.Name())
+		return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.Addr, artifact.Name())
 	}
 
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))

@@ -76,7 +76,7 @@ type TargetRunRequests []TargetRunRequest
 
 func (rrs TargetRunRequests) Has(t *Target) bool {
 	for _, rr := range rrs {
-		if rr.Target.FQN == t.FQN {
+		if rr.Target.Addr == t.Addr {
 			return true
 		}
 	}
@@ -86,7 +86,7 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 
 func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
 	for _, rr := range rrs {
-		if rr.Target.FQN == t.FQN {
+		if rr.Target.Addr == t.Addr {
 			return rr
 		}
 	}
@@ -116,8 +116,8 @@ func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
 }
 
 func New(e Engine) *Engine {
-	e.Targets = NewTargetMetas(func(fqn string) *Target {
-		gtarget := e.Graph.Targets().Find(fqn)
+	e.Targets = NewTargetMetas(func(addr string) *Target {
+		gtarget := e.Graph.Targets().Find(addr)
 		if gtarget == nil {
 			return nil
 		}
@@ -131,7 +131,7 @@ func New(e Engine) *Engine {
 			postRunWarmLock:  e.lockFactory(gtarget, "postrunwarm"),
 		}
 		if t.ConcurrentExecution {
-			t.runLock = locks.NewMutex(t.FQN)
+			t.runLock = locks.NewMutex(t.Addr)
 		} else {
 			t.runLock = e.lockFactory(t, "run")
 		}
@@ -155,7 +155,7 @@ func (e *Engine) lockFactory(t specs.Specer, resource string) locks.Locker {
 	ts := t.Spec()
 	p := e.lockPath(t, resource)
 
-	return locks.NewFlock(ts.FQN+" ("+resource+")", p)
+	return locks.NewFlock(ts.Addr+" ("+resource+")", p)
 }
 
 type ErrorWithLogFile struct {
@@ -322,7 +322,7 @@ func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xf
 		pattern := file.RelRoot()
 
 		if !xfs.IsGlob(pattern) && !xfs.PathExists(filepath.Join(root, pattern)) {
-			return nil, fmt.Errorf("%v did not output %v", target.FQN, pattern)
+			return nil, fmt.Errorf("%v did not output %v", target.Addr, pattern)
 		}
 
 		err := xfs.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
@@ -366,7 +366,7 @@ func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoo
 }
 
 func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target, outputs []string) error {
-	log.Tracef("populateActualFilesFromTar %v", target.FQN)
+	log.Tracef("populateActualFilesFromTar %v", target.Addr)
 
 	target.actualOutFiles = &ActualOutNamedPaths{}
 	target.actualSupportFiles = make(xfs.Paths, 0)

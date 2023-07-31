@@ -23,19 +23,19 @@ var utilFunctions = map[string]exprs.Func{
 
 func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 	getTarget := func(expr exprs.Expr) (*Target, error) {
-		fqn := expr.PosArg(0, t.FQN)
+		addr := expr.PosArg(0, t.Addr)
 
-		target := e.Targets.FindFQN(fqn)
+		target := e.Targets.FindAddr(addr)
 		if target == nil {
-			return nil, NewTargetNotFoundError(fqn, e.Graph.Targets())
+			return nil, NewTargetNotFoundError(addr, e.Graph.Targets())
 		}
 
 		return target, nil
 	}
 
 	m := map[string]exprs.Func{
-		"target_fqn": func(expr exprs.Expr) (string, error) {
-			return t.FQN, nil
+		"target_addr": func(expr exprs.Expr) (string, error) {
+			return t.Addr, nil
 		},
 		"outdir": func(expr exprs.Expr) (string, error) {
 			t, err := getTarget(expr)
@@ -49,12 +49,12 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			}
 			universe = append(universe, t.Target)
 
-			if !graph.Contains(universe, t.FQN) {
-				return "", fmt.Errorf("cannot get outdir of %v", t.FQN)
+			if !graph.Contains(universe, t.Addr) {
+				return "", fmt.Errorf("cannot get outdir of %v", t.Addr)
 			}
 
 			if t.OutExpansionRoot == nil {
-				return "", fmt.Errorf("%v has not been cached yet", t.FQN)
+				return "", fmt.Errorf("%v has not been cached yet", t.Addr)
 			}
 
 			return t.OutExpansionRoot.Join(t.Package.Path).Abs(), nil
@@ -71,21 +71,21 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			}
 			universe = append(universe, t.Target)
 
-			if !graph.Contains(universe, t.FQN) {
-				return "", fmt.Errorf("cannot get input of %v", t.FQN)
+			if !graph.Contains(universe, t.Addr) {
+				return "", fmt.Errorf("cannot get input of %v", t.Addr)
 			}
 
 			return e.LocalCache.HashInput(t)
 		},
 		"hash_output": func(expr exprs.Expr) (string, error) {
-			fqn, err := expr.MustPosArg(0)
+			addr, err := expr.MustPosArg(0)
 			if err != nil {
 				return "", err
 			}
 
-			t := e.Graph.Targets().Find(fqn)
+			t := e.Graph.Targets().Find(addr)
 			if t == nil {
-				return "", NewTargetNotFoundError(fqn, e.Graph.Targets())
+				return "", NewTargetNotFoundError(addr, e.Graph.Targets())
 			}
 
 			universe, err := e.Graph.DAG().GetParents(t)
@@ -93,8 +93,8 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			if !graph.Contains(universe, t.FQN) {
-				return "", fmt.Errorf("cannot get output of %v", t.FQN)
+			if !graph.Contains(universe, t.Addr) {
+				return "", fmt.Errorf("cannot get output of %v", t.Addr)
 			}
 
 			output := expr.PosArg(1, "")

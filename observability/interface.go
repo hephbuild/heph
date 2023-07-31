@@ -223,7 +223,7 @@ type TargetSpan struct {
 }
 
 func (s *TargetSpan) spanDedupId() interface{} {
-	return s.target.FQN
+	return s.target.Addr
 }
 
 func (s *TargetSpan) Target() *graph.Target {

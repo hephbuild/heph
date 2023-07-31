@@ -6,6 +6,6 @@ import (
 
 type TargetMetas = graph.TargetMetas[*Target]
 
-func NewTargetMetas(factory func(fqn string) *Target) *TargetMetas {
+func NewTargetMetas(factory func(addr string) *Target) *TargetMetas {
 	return graph.NewTargetMetas(factory)
 }

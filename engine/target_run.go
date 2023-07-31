@@ -88,7 +88,7 @@ func (e *Engine) toolAbsPath(tt graph.TargetTool) string {
 }
 
 func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_ *runPrepare, rerr error) {
-	log.Debugf("Preparing %v: %v", target.FQN, target.WorkdirRoot.RelRoot())
+	log.Debugf("Preparing %v: %v", target.Addr, target.WorkdirRoot.RelRoot())
 
 	ctx, span := e.Observability.SpanRunPrepare(ctx, target.Target)
 	defer span.EndError(rerr)
@@ -96,13 +96,13 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
 		if e.Targets.Find(tool.Target).actualOutFiles == nil {
-			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.FQN, tool.Target.FQN))
+			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.Addr, tool.Target.Addr))
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
 		if e.Targets.Find(dep.Target).actualOutFiles == nil {
-			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.FQN, dep.Target.FQN))
+			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.Addr, dep.Target.Addr))
 		}
 	}
 
@@ -159,7 +159,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 				art := target.Artifacts.OutTar(name)
 				p, err := lcache.UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
 				if err != nil {
-					log.Errorf("restore cache: out %v|%v: %v", target.FQN, art.Name(), err)
+					log.Errorf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
 					continue
 				}
 				restoreSrcRec.AddTar(p)
@@ -288,7 +288,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 	traceSrcEnv := log.TraceTiming("Building src env")
 
 	env := make(map[string]string)
-	env["TARGET"] = target.FQN
+	env["TARGET"] = target.Addr
 	env["PACKAGE"] = target.Package.Path
 	env["ROOT"] = target.WorkdirRoot.Abs()
 	env["SANDBOX"] = target.SandboxRoot.Abs()
@@ -526,20 +526,20 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		return err
 	}
 
-	log.Tracef("%v locking run", target.FQN)
+	log.Tracef("%v locking run", target.Addr)
 	err = target.runLock.Lock(ctx)
 	if err != nil {
 		return err
 	}
 
 	defer func() {
-		log.Tracef("%v unlocking run", target.FQN)
+		log.Tracef("%v unlocking run", target.Addr)
 		err := target.runLock.Unlock()
 		if err != nil {
-			log.Errorf("Failed to unlock %v: %v", target.FQN, err)
+			log.Errorf("Failed to unlock %v: %v", target.Addr, err)
 		}
 
-		log.Tracef("Target DONE %v", target.FQN)
+		log.Tracef("Target DONE %v", target.Addr)
 	}()
 
 	if err := ctx.Err(); err != nil {
@@ -553,7 +553,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 
 		start := time.Now()
 		defer func() {
-			log.Debugf("%v done in %v", target.FQN, time.Since(start))
+			log.Debugf("%v done in %v", target.Addr, time.Since(start))
 		}()
 
 		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.OutWithSupport.Names(), true, false)
@@ -577,7 +577,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 	dir := filepath.Join(target.WorkdirRoot.Abs(), target.Package.Path)
 	if target.RunInCwd {
 		if target.Cache.Enabled {
-			return fmt.Errorf("%v cannot run in cwd and cache", target.FQN)
+			return fmt.Errorf("%v cannot run in cwd and cache", target.Addr)
 		}
 
 		dir = e.Cwd
@@ -626,7 +626,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 
 		run := make([]string, 0)
 		if target.IsTool() {
-			log.Tracef("%v is tool, replacing run", target.FQN)
+			log.Tracef("%v is tool, replacing run", target.Addr)
 			run = append(target.Run[1:], e.toolAbsPath(target.ToolTarget()))
 		} else {
 			for _, s := range target.Run {
@@ -798,7 +798,7 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 
 	if !e.Config.Engine.KeepSandbox {
 		e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("clear sandbox %v", target.FQN),
+			Name: fmt.Sprintf("clear sandbox %v", target.Addr),
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
 				err = xfs.DeleteDir(target.SandboxRoot.Abs(), false)
@@ -888,7 +888,7 @@ func (e *Engine) postRunOrWarm(ctx context.Context, target *Target, outputs []st
 	if runGc {
 		err = e.gc(ctx, target.Target)
 		if err != nil {
-			log.Errorf("gc %v: %v", target.FQN, err)
+			log.Errorf("gc %v: %v", target.Addr, err)
 		}
 	}
 

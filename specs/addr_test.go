@@ -10,7 +10,7 @@ func TestTargetParse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		fqn  string
+		addr string
 		pkg  string
 		name string
 	}{
@@ -31,8 +31,8 @@ func TestTargetParse(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.fqn, func(t *testing.T) {
-			tp, err := TargetParse(test.pkg, test.fqn)
+		t.Run(test.addr, func(t *testing.T) {
+			tp, err := TargetParse(test.pkg, test.addr)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)
@@ -44,7 +44,7 @@ func TestTargetParseError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		fqn   string
+		addr  string
 		error string
 	}{
 		{
@@ -61,8 +61,8 @@ func TestTargetParseError(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.fqn, func(t *testing.T) {
-			_, err := TargetParse("", test.fqn)
+		t.Run(test.addr, func(t *testing.T) {
+			_, err := TargetParse("", test.addr)
 			assert.ErrorContains(t, err, test.error)
 		})
 	}
@@ -72,7 +72,7 @@ func TestTargetOutputParse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		fqn    string
+		addr   string
 		pkg    string
 		name   string
 		output string
@@ -97,8 +97,8 @@ func TestTargetOutputParse(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.fqn, func(t *testing.T) {
-			tp, err := TargetOutputParse(test.pkg, test.fqn)
+		t.Run(test.addr, func(t *testing.T) {
+			tp, err := TargetOutputParse(test.pkg, test.addr)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)
@@ -111,7 +111,7 @@ func TestTargetOutputParseError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		fqn   string
+		addr  string
 		error string
 	}{
 		{
@@ -124,8 +124,8 @@ func TestTargetOutputParseError(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.fqn, func(t *testing.T) {
-			_, _, err := TargetOutputOptionsParse("", test.fqn)
+		t.Run(test.addr, func(t *testing.T) {
+			_, _, err := TargetOutputOptionsParse("", test.addr)
 			assert.ErrorContains(t, err, test.error)
 		})
 	}
@@ -135,7 +135,7 @@ func TestTargetOutputOptionsParse(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		fqn     string
+		addr    string
 		pkg     string
 		name    string
 		output  string
@@ -164,8 +164,8 @@ func TestTargetOutputOptionsParse(t *testing.T) {
 		},
 	}
 	for _, test := range tests {
-		t.Run(test.fqn, func(t *testing.T) {
-			tp, options, err := TargetOutputOptionsParse("", test.fqn)
+		t.Run(test.addr, func(t *testing.T) {
+			tp, options, err := TargetOutputOptionsParse("", test.addr)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)

@@ -62,7 +62,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 			continue
 		}
 
-		if followHint && e.RemoteCache.Hints.Get(target.FQN, cache.Name).Skip() {
+		if followHint && e.RemoteCache.Hints.Get(target.Addr, cache.Name).Skip() {
 			continue
 		}
 
@@ -87,7 +87,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 				return true, true, nil
 			}
 
-			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.FQN, cache.Name)
+			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.Addr, cache.Name)
 		} else {
 			if e.Config.Engine.CacheHints {
 				children, err := e.Graph.DAG().GetDescendants(target.Target)
@@ -96,7 +96,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *Target, outputs []s
 				}
 
 				for _, child := range children {
-					e.RemoteCache.Hints.Set(child.FQN, cache.Name, rcache.HintSkip{})
+					e.RemoteCache.Hints.Set(child.Addr, cache.Name, rcache.HintSkip{})
 				}
 			}
 		}
@@ -168,12 +168,12 @@ func (e *Engine) scheduleStoreExternalCache(ctx context.Context, target *Target,
 
 func (e *Engine) scheduleStoreExternalCacheArtifact(ctx context.Context, target *Target, cache graph.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
 	return e.Pool.Schedule(ctx, &worker.Job{
-		Name: fmt.Sprintf("cache %v %v %v", target.FQN, cache.Name, artifact.Name()),
+		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			err := e.RemoteCache.StoreArtifact(ctx, target, cache, artifact)
 			if err != nil {
-				return fmt.Errorf("store remote cache %v: %v %w", cache.Name, target.FQN, err)
+				return fmt.Errorf("store remote cache %v: %v %w", cache.Name, target.Addr, err)
 			}
 
 			return nil

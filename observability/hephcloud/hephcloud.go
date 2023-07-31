@@ -270,7 +270,7 @@ func eventFactory(ctx context.Context, eventType cloudclient.TargetExecSpanEvent
 		QueuedTime:    nullFromTime(span.QueuedTime()),
 		StartTime:     nullFromTime(span.StartTime()),
 		EndTime:       nullFromTime(span.EndTime()),
-		TargetFQN:     null.From(span.Target().FQN),
+		TargetAddr:    null.From(span.Target().Addr),
 		ParentID:      null.From(parentId),
 	}
 

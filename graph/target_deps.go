@@ -16,10 +16,10 @@ type TargetWithOutput struct {
 
 func (t TargetWithOutput) Full() string {
 	if t.Output == "" {
-		return t.Target.FQN
+		return t.Target.Addr
 	}
 
-	return t.Target.FQN + "|" + t.Output
+	return t.Target.Addr + "|" + t.Output
 }
 
 type TargetDeps struct {
@@ -51,7 +51,7 @@ func (d *TargetDeps) Dedup() {
 func (d TargetDeps) Sort() {
 	ads.SortP(d.Targets,
 		func(i, j *TargetWithOutput) int {
-			return strings.Compare(i.Target.FQN, j.Target.FQN)
+			return strings.Compare(i.Target.Addr, j.Target.Addr)
 		},
 		func(i, j *TargetWithOutput) int {
 			return strings.Compare(i.Output, j.Output)

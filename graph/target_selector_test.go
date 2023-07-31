@@ -8,10 +8,10 @@ import (
 	"testing"
 )
 
-func targetFactory(pkg string, fqn string, labels []string) *Target {
+func targetFactory(pkg string, addr string, labels []string) *Target {
 	return &Target{
 		Target: specs.Target{
-			FQN:    "//" + pkg + ":" + fqn,
+			Addr:   "//" + pkg + ":" + addr,
 			Labels: labels,
 			Package: &packages.Package{
 				Path: pkg,
@@ -39,7 +39,7 @@ func TestParseTargetSelector(t *testing.T) {
 		{"//some/pkg/...", t2, true},
 	}
 	for _, test := range tests {
-		t.Run(fmt.Sprintf("%v %v", test.selector, test.t.FQN), func(t *testing.T) {
+		t.Run(fmt.Sprintf("%v %v", test.selector, test.t.Addr), func(t *testing.T) {
 			m := ParseTargetSelector("", test.selector)
 
 			assert.Equal(t, test.expected, m(test.t))

@@ -25,7 +25,7 @@ func prepare[S interface {
 	observability.SpanTarget
 	observability.SpanError
 }](s *Summary, ctx context.Context, span S) (*TargetStats, *TargetStatsSpan) {
-	fqn := span.Target().FQN
+	addr := span.Target().Addr
 
 	s.spansm.Lock()
 	defer s.spansm.Unlock()
@@ -34,12 +34,12 @@ func prepare[S interface {
 		s.Spans = map[string]*TargetStats{}
 	}
 
-	stat, ok := s.Spans[fqn]
+	stat, ok := s.Spans[addr]
 	if !ok {
 		stat = &TargetStats{
-			FQN: fqn,
+			Addr: addr,
 		}
-		s.Spans[fqn] = stat
+		s.Spans[addr] = stat
 	}
 
 	tstat := &TargetStatsSpan{}

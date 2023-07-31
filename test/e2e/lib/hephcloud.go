@@ -34,7 +34,7 @@ type Span struct {
 	Event      string `json:"event"`
 	SpanID     string `json:"span_id"`
 	FinalState string `json:"final_state"`
-	TargetFQN  string `json:"target_fqn"`
+	TargetAddr string `json:"target_fqn"`
 }
 
 func (h *MockCloud) Spans() map[string]Span {
@@ -45,10 +45,10 @@ func (h *MockCloud) LogBytes() int64 {
 	return h.logsBytes
 }
 
-func (h *MockCloud) SpansPerFQN() map[string][]Span {
+func (h *MockCloud) SpansPerAddr() map[string][]Span {
 	spans := map[string][]Span{}
 	for _, span := range h.spans {
-		spans[span.TargetFQN] = append(spans[span.TargetFQN], span)
+		spans[span.TargetAddr] = append(spans[span.TargetAddr], span)
 	}
 
 	return spans

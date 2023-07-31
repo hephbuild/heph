@@ -70,7 +70,7 @@ func newBbtSearch(targets specs.Targets, bs bootstrap.EngineBootstrap) *bbtfzf {
 				buf.WriteString("\n")
 			}
 
-			buf.WriteString(style.Render(prefix + fqnStyle.Render(sugg.FQN)))
+			buf.WriteString(style.Render(prefix + addrStyle.Render(sugg.Addr)))
 			buf.WriteString("\n")
 
 			return buf.String()
@@ -145,7 +145,7 @@ var styleRow = lipgloss.NewStyle().Border(lipgloss.HiddenBorder(), false, false,
 var styleRowCurrent = lipgloss.NewStyle().Border(lipgloss.ThickBorder(), false, false, false, true)
 var styleError = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff0000"))
 
-var fqnStyle = lipgloss.NewStyle().Inline(true).Bold(true)
+var addrStyle = lipgloss.NewStyle().Inline(true).Bold(true)
 
 func (m *bbtfzf) listView() string {
 	var buf bytes.Buffer
@@ -190,7 +190,7 @@ func (m *bbtfzf) deetsRightPane(width int) string {
 
 	var sb strings.Builder
 
-	sb.WriteString(styleTitle.Width(width).Render(t.FQN))
+	sb.WriteString(styleTitle.Width(width).Render(t.Addr))
 	sb.WriteString("\n")
 	if len(t.Source) > 0 {
 		sb.WriteString(styleLocation.Width(width).Render(t.SourceFile()))

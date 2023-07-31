@@ -9,7 +9,7 @@ import (
 
 type TargetMetas = graph.TargetMetas[*Target]
 
-func NewTargetMetas(factory func(fqn string) *Target) *TargetMetas {
+func NewTargetMetas(factory func(addr string) *Target) *TargetMetas {
 	return graph.NewTargetMetas(factory)
 }
 
@@ -29,24 +29,24 @@ type Target struct {
 }
 
 func (t *Target) ID() string {
-	return t.FQN
+	return t.Addr
 }
 
 func (t *Target) ActualOutFiles() *ActualOutNamedPaths {
 	if t.actualOutFiles == nil {
-		panic("actualOutFiles is nil for " + t.FQN)
+		panic("actualOutFiles is nil for " + t.Addr)
 	}
 
 	return t.actualOutFiles
 }
 
 func (t *Target) String() string {
-	return t.FQN
+	return t.Addr
 }
 
 func (t *Target) ActualSupportFiles() xfs.Paths {
 	if t.actualSupportFiles == nil {
-		panic("actualSupportFiles is nil for " + t.FQN)
+		panic("actualSupportFiles is nil for " + t.Addr)
 	}
 
 	return t.actualSupportFiles

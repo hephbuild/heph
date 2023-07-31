@@ -31,22 +31,22 @@ import (
 )
 
 type targetCacheKey struct {
-	fqn  string
+	addr string
 	hash string
 }
 
 func (k targetCacheKey) String() string {
-	return k.fqn + "_" + k.hash
+	return k.addr + "_" + k.hash
 }
 
 type targetOutCacheKey struct {
-	fqn    string
+	addr   string
 	output string
 	hash   string
 }
 
 func (k targetOutCacheKey) String() string {
-	return k.fqn + "|" + k.output + "_" + k.hash
+	return k.addr + "|" + k.output + "_" + k.hash
 }
 
 type LocalCacheState struct {
@@ -81,8 +81,8 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 		Graph:         g,
 		Observability: obs,
 		Finalizers:    finalizers,
-		TargetMetas: NewTargetMetas(func(fqn string) *Target {
-			gtarget := g.Targets().Find(fqn)
+		TargetMetas: NewTargetMetas(func(addr string) *Target {
+			gtarget := g.Targets().Find(addr)
 
 			t := &Target{
 				Target:     gtarget,
@@ -96,7 +96,7 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 
 				p := lockPath(root, t, "cache_"+resource)
 
-				l := locks.NewFlock(ts.FQN+" ("+resource+")", p)
+				l := locks.NewFlock(ts.Addr+" ("+resource+")", p)
 
 				t.cacheLocks[artifact.Name()] = l
 			}
@@ -117,7 +117,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	target := ttarget.GraphTarget()
 
 	if target.ConcurrentExecution {
-		log.Debugf("%v concurrent execution, skipping storeCache", target.FQN)
+		log.Debugf("%v concurrent execution, skipping storeCache", target.Addr)
 		return nil
 	}
 
@@ -181,11 +181,11 @@ func (e *LocalCacheState) ResetCacheHashInput(spec specs.Specer) {
 	target := spec.Spec()
 
 	e.cacheHashInput.DeleteP(func(k targetCacheKey) bool {
-		return k.fqn == target.FQN
+		return k.addr == target.Addr
 	})
 
 	e.cacheHashInputPathsModtime.DeleteP(func(k targetCacheKey) bool {
-		return k.fqn == target.FQN
+		return k.addr == target.Addr
 	})
 }
 

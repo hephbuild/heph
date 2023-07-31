@@ -34,7 +34,7 @@ func (as TargetStatsArtifacts) Find(name string) TargetStatsArtifact {
 }
 
 type TargetStats struct {
-	FQN               string
+	Addr              string
 	Prepare           *TargetStatsSpan
 	Exec              *TargetStatsSpan
 	CollectOutput     *TargetStatsSpan
