@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
 	"go.uber.org/multierr"
 	"io"
 	"os"
@@ -57,6 +58,12 @@ type Artifact interface {
 	DisplayName() string
 	GenRequired() bool
 	Compressible() bool
+}
+
+func ToSlice[T Artifact](as []T) []Artifact {
+	return ads.Map(as, func(t T) Artifact {
+		return t
+	})
 }
 
 type readerMultiCloser struct {

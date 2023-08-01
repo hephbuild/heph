@@ -113,25 +113,12 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	target := ttarget.GraphTarget()
 
+	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
+
 	localRoot, err := e.LocalCache.VFSLocation(target)
 	if err != nil {
 		return err
 	}
-
-	exists, err := e.LocalCache.Exists(ctx, target, artifact)
-	if err != nil {
-		return err
-	}
-
-	if !exists {
-		if !artifact.GenRequired() {
-			return nil
-		}
-
-		return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.Addr, artifact.Name())
-	}
-
-	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
 
 	ctx, span := e.Observability.SpanCacheUpload(ctx, target, cache.Name, artifact)
 	defer span.EndError(rerr)

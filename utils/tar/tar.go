@@ -157,7 +157,7 @@ func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
 }
 
 func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
-	inc, cancel := xio.ContextReader(ctx, in)
+	inc, cancel := xio.ContextCloser(ctx, in)
 	defer cancel()
 
 	return Untar(inc, to, o)
@@ -246,7 +246,7 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string
 
 	recordFile, complete := tarListFactory(listPath)
 
-	inc, cancel := xio.ContextReader(ctx, in)
+	inc, cancel := xio.ContextCloser(ctx, in)
 	defer cancel()
 
 	err := Walk(inc, func(hdr *tar.Header, tr *tar.Reader) error {
@@ -271,7 +271,7 @@ func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Rea
 	}
 	defer tarf.Close()
 
-	tarfc, cancel := xio.ContextReader(ctx, tarf)
+	tarfc, cancel := xio.ContextCloser(ctx, tarf)
 	defer cancel()
 
 	return Walk(tarfc, fs...)

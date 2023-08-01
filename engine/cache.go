@@ -171,7 +171,20 @@ func (e *Engine) scheduleStoreExternalCacheArtifact(ctx context.Context, target 
 		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			err := e.RemoteCache.StoreArtifact(ctx, target, cache, artifact)
+			exists, err := e.LocalCache.Exists(ctx, target, artifact)
+			if err != nil {
+				return err
+			}
+
+			if !exists {
+				if !artifact.GenRequired() {
+					return nil
+				}
+
+				return fmt.Errorf("%v: %v is supposed to exist but doesn't", target.Addr, artifact.Name())
+			}
+
+			err = e.RemoteCache.StoreArtifact(ctx, target, cache, artifact)
 			if err != nil {
 				return fmt.Errorf("store remote cache %v: %v %w", cache.Name, target.Addr, err)
 			}

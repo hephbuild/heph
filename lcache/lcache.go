@@ -66,6 +66,8 @@ type LocalCacheState struct {
 	cacheHashInputPathsModtime *maps.Map[targetCacheKey, map[string]time.Time]
 }
 
+const LatestDir = "latest"
+
 func NewState(root *hroot.State, g *graph.State, obs *observability.Observability, finalizers *finalizers.Finalizers) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
@@ -113,7 +115,7 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 	return s, nil
 }
 
-func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, allArtifacts []ArtifactWithProducer, compress bool) (rerr error) {
+func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, artifacts []ArtifactWithProducer, compress bool) (rerr error) {
 	target := ttarget.GraphTarget()
 
 	if target.ConcurrentExecution {
@@ -135,24 +137,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 		return err
 	}
 
-	dir := e.cacheDir(target).Abs()
-
-	err = os.RemoveAll(dir)
-	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(dir, os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	err = e.GenArtifacts(ctx, dir, target, allArtifacts, compress)
-	if err != nil {
-		return err
-	}
-
-	err = xfs.CreateParentDir(dir)
+	err = e.GenArtifacts(ctx, target, artifacts, compress)
 	if err != nil {
 		return err
 	}
@@ -161,10 +146,15 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 }
 
 func (e *LocalCacheState) LinkLatestCache(target specs.Specer, hash string) error {
-	latestDir := e.cacheDirForHash(target, "latest").Abs()
+	latestDir := e.cacheDirForHash(target, LatestDir).Abs()
 	fromDir := e.cacheDirForHash(target, hash).Abs()
 
 	err := os.RemoveAll(latestDir)
+	if err != nil {
+		return err
+	}
+
+	err = xfs.CreateParentDir(latestDir)
 	if err != nil {
 		return err
 	}
@@ -260,6 +250,14 @@ func (e *LocalCacheState) UncompressedReaderFromArtifact(artifact artifacts.Arti
 
 func (e *LocalCacheState) UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, error) {
 	return UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDir(target).Abs())
+}
+
+func (e *LocalCacheState) LatestCacheDirExists(target specs.Specer) bool {
+	return xfs.PathExists(e.cacheDirForHash(target, LatestDir).Abs())
+}
+
+func (e *LocalCacheState) LatestUncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, error) {
+	return UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDirForHash(target, LatestDir).Abs())
 }
 
 func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.Targeter) string {
@@ -382,10 +380,6 @@ func (e *LocalCacheState) CleanTarget(target specs.Specer, async bool) error {
 	}
 
 	return nil
-}
-
-func (e *LocalCacheState) LatestCacheDir(target specs.Specer) xfs.Path {
-	return e.cacheDirForHash(target, "latest")
 }
 
 func (e *LocalCacheState) VFSLocation(target graph.Targeter) (vfs.Location, error) {

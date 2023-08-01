@@ -96,14 +96,14 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 
 		var latestTarget string
 		for _, entry := range dirEntries {
-			if entry.Name() == "latest" {
+			if entry.Name() == LatestDir {
 				latestTarget, _ = os.Readlink(filepath.Join(dir, entry.Name()))
 			}
 		}
 
 		entries := make([]gcEntry, 0)
 		for _, entry := range dirEntries {
-			if entry.Name() == "latest" {
+			if entry.Name() == LatestDir {
 				continue
 			}
 

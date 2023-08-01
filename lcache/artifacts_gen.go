@@ -6,15 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xio"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer, artifact artifacts.Artifact) (func() error, error) {
+func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer, artifact artifacts.Artifact) (func(), error) {
 	target := starget.Spec()
 	l := e.TargetMetas.Find(target).cacheLocks[artifact.Name()]
 	err := l.Lock(ctx)
@@ -22,31 +24,24 @@ func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer
 		return nil, fmt.Errorf("lock %v %v: %w", target.Addr, artifact.Name(), err)
 	}
 
-	return func() error {
+	return func() {
 		err := l.Unlock()
 		if err != nil {
-			return fmt.Errorf("unlock %v %v: %w", target.Addr, artifact.Name(), err)
+			log.Errorf("unlock %v %v: %v", target.Addr, artifact.Name(), err)
 		}
-
-		return nil
 	}, nil
 }
 
-func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget specs.Specer, allArtifacts []ArtifactWithProducer) (func(), error) {
-	target := starget.Spec()
-
-	unlockers := make([]func() error, 0, len(allArtifacts))
+func (e *LocalCacheState) LockArtifacts(ctx context.Context, target specs.Specer, artifacts []artifacts.Artifact) (func(), error) {
+	unlockers := make([]func(), 0, len(artifacts))
 
 	unlocker := func() {
 		for _, unlock := range unlockers {
-			err := unlock()
-			if err != nil {
-				log.Errorf("unlock %v: %v", target.Addr, err)
-			}
+			unlock()
 		}
 	}
 
-	for _, artifact := range allArtifacts {
+	for _, artifact := range artifacts {
 		unlock, err := e.LockArtifact(ctx, target, artifact)
 		if err != nil {
 			unlocker()
@@ -58,15 +53,34 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, starget specs.Spece
 	return unlocker, nil
 }
 
-func (e *LocalCacheState) GenArtifacts(ctx context.Context, dir string, target specs.Specer, allArtifacts []ArtifactWithProducer, compress bool) error {
-	unlock, err := e.LockArtifacts(ctx, target, allArtifacts)
+func (e *LocalCacheState) GenArtifacts(ctx context.Context, target graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
+	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
-	for _, artifact := range allArtifacts {
-		_, err := GenArtifact(ctx, dir, artifact, compress)
+	dir := e.cacheDir(target).Abs()
+
+	err = os.RemoveAll(dir)
+	if err != nil {
+		return err
+	}
+
+	err = os.MkdirAll(dir, os.ModePerm)
+	if err != nil {
+		return err
+	}
+
+	for _, artifact := range arts {
+		shouldCompress := artifact.Compressible() && compress
+
+		p := filepath.Join(dir, artifact.FileName())
+		if shouldCompress {
+			p = filepath.Join(dir, artifact.GzFileName())
+		}
+
+		err := GenArtifact(ctx, p, artifact, shouldCompress)
 		if err != nil {
 			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
 		}
@@ -87,32 +101,23 @@ func (g *ArtifactGenContext) Writer() io.Writer {
 
 var ArtifactSkip = errors.New("skip artifact")
 
-func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compress bool) (string, error) {
-	shouldCompress := a.Compressible() && compress
-
-	p := filepath.Join(dir, a.FileName())
-	if shouldCompress {
-		p = filepath.Join(dir, a.GzFileName())
-	}
-
+func GenArtifact(ctx context.Context, p string, a ArtifactWithProducer, compress bool) error {
 	tmpp := xfs.ProcessUniquePath(p)
 	defer os.Remove(tmpp)
 
 	f, err := os.Create(tmpp)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer f.Close()
 
-	go func() {
-		<-ctx.Done()
-		_ = f.Close()
-	}()
+	f, done := xio.ContextCloser(ctx, f)
+	defer done()
 
 	gctx := ArtifactGenContext{}
 	gctx.w = f
 
-	if shouldCompress {
+	if compress {
 		gw := gzip.NewWriter(f)
 		defer gw.Close()
 
@@ -123,15 +128,15 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 	if err != nil {
 		if errors.Is(err, ArtifactSkip) {
 			if a.GenRequired() {
-				return "", fmt.Errorf("%v is required, but returned: %w", a.Name(), err)
+				return fmt.Errorf("is required, but returned: %w", err)
 			}
-			return "", nil
+			return nil
 		}
-		return "", fmt.Errorf("%v: %w", a.Name(), err)
+		return fmt.Errorf("%v: %w", a.Name(), err)
 	}
 
 	if !gctx.accessedWriter {
-		return "", fmt.Errorf("%v did not produce output", a.Name())
+		return fmt.Errorf("did not produce output")
 	}
 
 	_ = gctx.w.Close()
@@ -139,8 +144,8 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 
 	err = os.Rename(tmpp, p)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	return p, nil
+	return nil
 }

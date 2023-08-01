@@ -5,18 +5,18 @@ import (
 	"io"
 )
 
-func ContextReader[R io.Closer](ctx context.Context, r R) (R, func()) {
+func ContextCloser[C io.Closer](ctx context.Context, c C) (C, func()) {
 	ch := make(chan struct{})
 
 	go func() {
 		select {
 		case <-ch:
 		case <-ctx.Done():
-			_ = r.Close()
+			_ = c.Close()
 		}
 	}()
 
-	return r, func() {
+	return c, func() {
 		close(ch)
 	}
 }

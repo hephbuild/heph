@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hephprovider"
-	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/sandbox"
@@ -150,14 +149,12 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 
 	restoreSrcRec := &SrcRecorder{}
 	if target.RestoreCache {
-		latestDir := e.LocalCache.LatestCacheDir(target)
-
-		if xfs.PathExists(latestDir.Abs()) {
+		if e.LocalCache.LatestCacheDirExists(target) {
 			done := log.TraceTiming("Restoring cache")
 
 			for _, name := range target.OutWithSupport.Names() {
 				art := target.Artifacts.OutTar(name)
-				p, err := lcache.UncompressedPathFromArtifact(ctx, target, art, latestDir.Abs())
+				p, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
 					log.Errorf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
 					continue
@@ -775,9 +772,9 @@ func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOC
 		return fmt.Errorf("wcs: %w", err)
 	}
 
-	allArtifacts := e.orderedArtifactProducers(target, outRoot.Abs(), logFilePath)
+	artifactProducers := e.orderedArtifactProducers(target, outRoot.Abs(), logFilePath)
 
-	err = e.LocalCache.StoreCache(ctx, target, allArtifacts, len(writeableCaches) > 0)
+	err = e.LocalCache.StoreCache(ctx, target, artifactProducers, len(writeableCaches) > 0)
 	if err != nil {
 		return fmt.Errorf("cache: store: %w", err)
 	}

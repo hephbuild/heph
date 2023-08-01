@@ -60,7 +60,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, ar
 			}
 			defer gr.Close()
 
-			grc, cancel := xio.ContextReader(ctx, gr)
+			grc, cancel := xio.ContextCloser(ctx, gr)
 			defer cancel()
 
 			_, err = io.Copy(tf, grc)
