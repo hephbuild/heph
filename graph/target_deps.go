@@ -23,15 +23,21 @@ func (t TargetWithOutput) Full() string {
 }
 
 type TargetDeps struct {
-	Targets []TargetWithOutput
-	Files   []xfs.Path
+	Targets    []TargetWithOutput // Targets with groups inlined
+	RawTargets []TargetWithOutput // Targets with no inlining
+	Files      []xfs.Path
 }
 
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
+
 	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) string {
 		return t.Full()
 	}, deps.Targets...)
+	nd.RawTargets = ads.DedupAppend(d.RawTargets, func(t TargetWithOutput) string {
+		return t.Full()
+	}, deps.RawTargets...)
+
 	nd.Files = ads.DedupAppend(d.Files, func(path xfs.Path) string {
 		return path.RelRoot()
 	}, deps.Files...)

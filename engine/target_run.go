@@ -156,7 +156,7 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 				art := target.Artifacts.OutTar(name)
 				p, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
-					log.Errorf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
+					log.Warnf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
 					continue
 				}
 				restoreSrcRec.AddTar(p)

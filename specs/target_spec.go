@@ -178,7 +178,7 @@ func (t Target) IsGroup() bool {
 }
 
 func (t Target) IsTool() bool {
-	return len(t.Run) > 0 && t.Run[0] == "heph_tool"
+	return len(t.Run) >= 1 && t.Run[0] == "heph_tool"
 }
 
 func (t Target) IsTextFile() bool {

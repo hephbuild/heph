@@ -122,15 +122,14 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 }
 
 func (e *State) filterOutCodegenFromDeps(t *Target, td TargetDeps) TargetDeps {
-	files := make(xfs.Paths, 0, len(td.Files))
-	for _, file := range td.Files {
+	td.Files = ads.Filter(td.Files, func(file xfs.Path) bool {
 		if dep, ok := e.GetCodegenOrigin(file.RelRoot()); ok {
-			log.Tracef("%v: %v removed from deps, and %v outputs it", t.Addr, file.RelRoot(), dep.Addr)
-		} else {
-			files = append(files, file)
+			log.Tracef("%v: %v removed from deps, as %v outputs it", t.Addr, file.RelRoot(), dep.Addr)
+			return false
 		}
-	}
-	td.Files = files
+
+		return true
+	})
 
 	return td
 }
@@ -626,20 +625,22 @@ func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.Stri
 	targets := sets.NewSet(func(t *Target) string {
 		return t.Addr
 	}, 0)
+
 	for _, dep := range tr.Deps.All().Targets {
-		targets.Add(e.Targets().Find(dep.Target.Addr))
+		targets.Add(dep.Target)
 	}
 	for _, dep := range tr.Tools.Targets {
-		targets.Add(e.Targets().Find(dep.Target.Addr))
+		targets.Add(dep.Target)
 	}
 	for _, t := range tr.Tools.TargetReferences {
-		targets.Add(e.Targets().Find(t.Addr))
+		targets.Add(t)
 	}
 
-	dtr, err := e.collectTransitive(targets.Slice(), breadcrumb)
+	dtr, err := e.collectTransitive(breadcrumb, targets.Slice())
 	if err != nil {
 		return TargetTransitive{}, err
 	}
+
 	dtr = dtr.Merge(tr)
 
 	return dtr, nil
@@ -649,14 +650,20 @@ func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet)
 	targets := sets.NewSet(func(t *Target) string {
 		return t.Addr
 	}, 0)
+
+	// Include targets from group deps
 	for _, dep := range t.Deps.All().Targets {
-		targets.Add(e.Targets().Find(dep.Target.Addr))
+		targets.Add(dep.Target)
+	}
+	// Include group targets too
+	for _, dep := range t.Deps.All().RawTargets {
+		targets.Add(dep.Target)
 	}
 	for _, ref := range t.Tools.TargetReferences {
-		targets.Add(e.Targets().Find(ref.Addr))
+		targets.Add(ref)
 	}
 
-	tr, err := e.collectTransitive(targets.Slice(), breadcrumb)
+	tr, err := e.collectTransitive(breadcrumb, targets.Slice())
 	if err != nil {
 		return TargetTransitive{}, nil, err
 	}
@@ -714,7 +721,7 @@ func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Targ
 	return nil, fmt.Errorf("has conflicting transitive platform config, you must override `platforms`, got:\n%v", configs)
 }
 
-func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (TargetTransitive, error) {
+func (e *State) collectTransitive(breadcrumb *sets.StringSet, deps []*Target) (TargetTransitive, error) {
 	tt := TargetTransitive{}
 
 	for _, dep := range deps {
@@ -722,14 +729,14 @@ func (e *State) collectTransitive(deps []*Target, breadcrumb *sets.StringSet) (T
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
-		err := e.LinkTarget(e.Targets().Find(dep.Target.Addr), breadcrumb)
+		err := e.LinkTarget(dep.Target, breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
 	}
 
 	for _, t := range tt.Tools.TargetReferences {
-		err := e.LinkTarget(e.Targets().Find(t.Addr), breadcrumb)
+		err := e.LinkTarget(t, breadcrumb)
 		if err != nil {
 			return TargetTransitive{}, err
 		}
@@ -870,6 +877,8 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 
 		td.Files = append(td.Files, p)
 	}
+
+	td.RawTargets = td.Targets
 
 	if InlineGroups {
 		td.Targets = ads.MapFlat(td.Targets, func(dep TargetWithOutput) []TargetWithOutput {
