@@ -241,7 +241,12 @@ var gcCmd = &cobra.Command{
 			return err
 		}
 
-		return bs.Engine.LocalCache.GC(cmd.Context(), log.Infof, false)
+		err = bs.Engine.LocalCache.GC(cmd.Context(), log.Infof, false)
+		if err != nil {
+			return err
+		}
+
+		return nil
 	},
 }
 

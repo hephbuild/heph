@@ -14,4 +14,16 @@ func main() {
 
 	fmt.Println("### test_named")
 	Must(Run("//:test_named"))
+
+	fmt.Println("### test_unamed-group_named-dep")
+	output := MustV(RunOutput("//:test_unamed-group_named-dep"))
+	Must(AssertFileContentEqual(output[0], "SRC=t2"))
+
+	fmt.Println("### test_named-group_named-dep")
+	output = MustV(RunOutput("//:test_named-group_named-dep"))
+	Must(AssertFileContentEqual(output[0], "SRC=t2"))
+
+	fmt.Println("### test_named-group_unnamed-dep")
+	output = MustV(RunOutput("//:test_named-group_unnamed-dep"))
+	Must(AssertFileContentEqual(output[0], "SRC_T1=t1\nSRC_T2=t2"))
 }

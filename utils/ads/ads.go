@@ -83,11 +83,22 @@ func Filter[T any](a []T, f func(T) bool) []T {
 }
 
 func MapFlat[T comparable](a []T, f func(T) []T) []T {
+	o, _ := MapFlatE(a, func(t T) ([]T, error) {
+		return f(t), nil
+	})
+	return o
+}
+
+func MapFlatE[T comparable](a []T, f func(T) ([]T, error)) ([]T, error) {
 	o := a
 	alloc := false
 
 	for i, e := range a {
-		fr := f(e)
+		fr, err := f(e)
+		if err != nil {
+			return o, err
+		}
+
 		if !alloc {
 			if len(fr) == 1 && fr[0] == e {
 				continue
@@ -103,7 +114,7 @@ func MapFlat[T comparable](a []T, f func(T) []T) []T {
 		o = append(o, fr...)
 	}
 
-	return o
+	return o, nil
 }
 
 func Find[T any](a []T, f func(T) bool) (T, bool) {

@@ -784,6 +784,14 @@ func (e *State) targetExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSe
 
 const InlineGroups = true
 
+type ErrDoesNotHaveOutput struct {
+	Addr, Output string
+}
+
+func (e ErrDoesNotHaveOutput) Error() string {
+	return fmt.Sprintf("%v does not have named output `%v`", e.Addr, e.Output)
+}
+
 func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.StringSet) (TargetDeps, error) {
 	td := TargetDeps{}
 
@@ -795,14 +803,13 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 			return TargetDeps{}, err
 		}
 
-		td.Targets = ads.GrowExtra(td.Targets, len(targets))
-
 		for _, target := range targets {
 			if len(target.Out.Names()) == 0 {
 				td.Targets = append(td.Targets, TargetWithOutput{
 					Target: target,
 				})
 			} else {
+				td.Targets = ads.GrowExtra(td.Targets, len(target.Out.Names()))
 				for _, name := range target.Out.Names() {
 					td.Targets = append(td.Targets, TargetWithOutput{
 						Target: target,
@@ -830,26 +837,30 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 				td.Targets = append(td.Targets, TargetWithOutput{
 					Target: dt,
 					Mode:   spec.Mode,
+					Name:   "",
 				})
 			} else {
+				td.Targets = ads.GrowExtra(td.Targets, len(dt.Out.Names()))
+
 				for _, name := range dt.Out.Names() {
 					td.Targets = append(td.Targets, TargetWithOutput{
 						Target: dt,
 						Output: name,
 						Mode:   spec.Mode,
+						Name:   name,
 					})
 				}
 			}
 		} else {
-			if !dt.Out.HasName(spec.Output) {
-				return TargetDeps{}, fmt.Errorf("%v does not have named output `%v`", dt.Addr, spec.Output)
+			if !dt.IsGroup() && !dt.Out.HasName(spec.Output) {
+				return TargetDeps{}, ErrDoesNotHaveOutput{dt.Addr, spec.Output}
 			}
 
 			td.Targets = append(td.Targets, TargetWithOutput{
-				Target:     dt,
-				Output:     spec.Output,
-				SpecOutput: spec.Output,
-				Mode:       spec.Mode,
+				Target: dt,
+				Output: spec.Output,
+				Mode:   spec.Mode,
+				Name:   "",
 			})
 		}
 	}
@@ -881,14 +892,73 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 	td.RawTargets = td.Targets
 
 	if InlineGroups {
-		td.Targets = ads.MapFlat(td.Targets, func(dep TargetWithOutput) []TargetWithOutput {
-			if dep.Target.IsGroup() {
-				td.Files = append(td.Files, dep.Target.Deps.All().Files...)
-				return dep.Target.Deps.All().Targets
+		var err error
+		td.Targets, err = ads.MapFlatE(td.Targets, func(tdep TargetWithOutput) ([]TargetWithOutput, error) {
+			if !tdep.Target.IsGroup() {
+				return []TargetWithOutput{tdep}, nil
+			}
+
+			td.Files = append(td.Files, tdep.Target.Deps.All().Files...)
+			td.RawTargets = append(td.RawTargets, tdep.Target.Deps.All().RawTargets...)
+
+			dt := tdep.Target
+
+			if tdep.Output == "" {
+				if !dt.Deps.IsNamed() {
+					return ads.Map(dt.Deps.All().Targets, func(dep TargetWithOutput) TargetWithOutput {
+						dep.Name = ""
+						return dep
+					}), nil
+				}
+
+				deps := make([]TargetWithOutput, 0)
+				for _, name := range dt.Deps.Names() {
+					deps = append(deps, ads.Map(dt.Deps.Name(name).Targets, func(dep TargetWithOutput) TargetWithOutput {
+						return TargetWithOutput{
+							Name:   name,
+							Target: dep.Target,
+							Output: dep.Output,
+							Mode:   tdep.Mode,
+						}
+					})...)
+				}
+
+				return deps, nil
+			}
+
+			if dt.Deps.IsNamed() {
+				if !dt.Deps.HasName(tdep.Output) {
+					return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
+				}
+
+				return ads.Map(dt.Deps.Name(tdep.Output).Targets, func(dep TargetWithOutput) TargetWithOutput {
+					return TargetWithOutput{
+						Name:   tdep.Name,
+						Target: dep.Target,
+						Output: dep.Output,
+						Mode:   tdep.Mode,
+					}
+				}), nil
 			} else {
-				return []TargetWithOutput{dep}
+				deps := ads.Filter(dt.Deps.All().Targets, func(dep TargetWithOutput) bool {
+					return dep.Output == tdep.Output
+				})
+
+				deps = ads.Map(deps, func(dep TargetWithOutput) TargetWithOutput {
+					dep.Name = tdep.Name
+					return dep
+				})
+
+				if len(deps) == 0 {
+					return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
+				}
+
+				return deps, nil
 			}
 		})
+		if err != nil {
+			return TargetDeps{}, err
+		}
 	}
 
 	td.Dedup()

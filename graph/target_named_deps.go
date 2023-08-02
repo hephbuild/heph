@@ -39,6 +39,14 @@ func (tp *TargetNamedDeps) All() TargetDeps {
 	return tp.all
 }
 
+func (tp *TargetNamedDeps) HasName(name string) bool {
+	if tp.named == nil {
+		return false
+	}
+
+	return tp.names.Has(name)
+}
+
 func (tp *TargetNamedDeps) Name(name string) TargetDeps {
 	if tp.named == nil {
 		return TargetDeps{}

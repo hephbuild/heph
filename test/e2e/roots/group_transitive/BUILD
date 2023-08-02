@@ -20,8 +20,8 @@ t2=target(
     )
 )
 
-g=group(
-    name="group",
+g1=group(
+    name="group1",
     deps=t1,
     transitive=heph.target_spec(
         env={
@@ -41,7 +41,7 @@ run_sandbox = [
 
 target(
     name='test_unamed',
-    deps=g,
+    deps=g1,
     run=run_sandbox+[
         'echo $SRC',
         'echo $SRC_T2',
@@ -51,10 +51,49 @@ target(
 
 target(
     name='test_named',
-    deps={'g': g},
+    deps={'g': g1},
     run=run_sandbox+[
         'echo $SRC_G',
         'echo $SRC_T2',
     ],
     cache=False,
+)
+
+grep_env = [
+    "env > e",
+    "(cat e | grep -E 'SRC' | sort || true) > $OUT",
+]
+
+g2=group(
+    name="group2",
+    deps=t2,
+)
+
+target(
+    name='test_unamed-group_named-dep',
+    deps=g2+"|t2",
+    run=grep_env,
+    cache=False,
+    out="src",
+)
+
+g3=group(
+    name="group3",
+    deps={'t2': t2, 't1': t1},
+)
+
+target(
+    name='test_named-group_named-dep',
+    deps=g3+"|t2",
+    run=grep_env,
+    cache=False,
+    out="src",
+)
+
+target(
+    name='test_named-group_unnamed-dep',
+    deps=g3,
+    run=grep_env,
+    cache=False,
+    out="src",
 )

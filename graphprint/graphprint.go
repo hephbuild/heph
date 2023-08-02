@@ -11,6 +11,14 @@ import (
 const indent = "  "
 
 func Print(w io.Writer, target *graph.Target, transitive bool) {
+	fmt.Fprintln(w, target.Addr)
+	fmt.Fprintln(w)
+
+	if target.IsGroup() {
+		fmt.Fprintln(w, "> Group target")
+		fmt.Fprintln(w)
+	}
+
 	if len(target.Run) > 0 {
 		fmt.Fprintln(w, "Run:")
 		for _, s := range target.Run {
@@ -40,7 +48,7 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 	}
 
 	if !target.EmptyDeps() {
-		fmt.Fprintln(w, "Deps:")
+		fmt.Fprintln(w, "Input:")
 		printTools(w, indent, target.Tools)
 		printNamedDeps(w, indent, target.Deps)
 		if target.DifferentHashDeps {
@@ -61,31 +69,36 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 
 	printEnvs(w, "", target.PassEnv, target.RuntimePassEnv, target.Env, target.RuntimeEnv)
 
-	if len(target.Out.All()) > 0 {
-		if target.Out.IsNamed() {
-			fmt.Fprintln(w, "Out:")
-			ogindent := indent
+	if target.IsGroup() {
+		fmt.Fprintln(w, "Out:")
+		fmt.Fprintln(w, indent+"> Will output its deps")
+	} else {
+		if len(target.Out.All()) > 0 {
+			if target.Out.IsNamed() {
+				fmt.Fprintln(w, "Out:")
+				ogindent := indent
 
-			indent := ogindent + ogindent
+				indent := ogindent + ogindent
 
-			for _, name := range target.Out.Names() {
-				out := target.Out.Name(name)
+				for _, name := range target.Out.Names() {
+					out := target.Out.Name(name)
 
-				if name == "" {
-					name = "<>"
+					if name == "" {
+						name = "<>"
+					}
+					fmt.Fprintln(w, indent+name+":")
+
+					indent := ogindent + ogindent + ogindent
+
+					for _, path := range out {
+						fmt.Fprintln(w, indent+path.RelRoot())
+					}
 				}
-				fmt.Fprintln(w, indent+name+":")
-
-				indent := ogindent + ogindent + ogindent
-
-				for _, path := range out {
+			} else {
+				fmt.Fprintln(w, "Out:")
+				for _, path := range target.Out.All() {
 					fmt.Fprintln(w, indent+path.RelRoot())
 				}
-			}
-		} else {
-			fmt.Fprintln(w, "Out:")
-			for _, path := range target.Out.All() {
-				fmt.Fprintln(w, indent+path.RelRoot())
 			}
 		}
 	}

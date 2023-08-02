@@ -417,9 +417,6 @@ var targetCmd = &cobra.Command{
 			return err
 		}
 
-		fmt.Println(target.Addr)
-		fmt.Println()
-
 		graphprint.Print(os.Stdout, target, debugTransitive)
 
 		return nil

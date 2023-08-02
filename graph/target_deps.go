@@ -8,10 +8,18 @@ import (
 )
 
 type TargetWithOutput struct {
-	Target     *Target
-	Output     string
-	SpecOutput string
-	Mode       specs.DepMode
+	Target *Target
+	Output string
+	Mode   specs.DepMode
+	Name   string
+}
+
+type TargetWithOutputComparable struct {
+	addr, output string
+}
+
+func (t TargetWithOutput) Comparable() TargetWithOutputComparable {
+	return TargetWithOutputComparable{t.Target.Addr, t.Output}
 }
 
 func (t TargetWithOutput) Full() string {
@@ -31,11 +39,11 @@ type TargetDeps struct {
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
 
-	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) string {
-		return t.Full()
+	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) TargetWithOutputComparable {
+		return t.Comparable()
 	}, deps.Targets...)
-	nd.RawTargets = ads.DedupAppend(d.RawTargets, func(t TargetWithOutput) string {
-		return t.Full()
+	nd.RawTargets = ads.DedupAppend(d.RawTargets, func(t TargetWithOutput) TargetWithOutputComparable {
+		return t.Comparable()
 	}, deps.RawTargets...)
 
 	nd.Files = ads.DedupAppend(d.Files, func(path xfs.Path) string {
@@ -46,8 +54,11 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 }
 
 func (d *TargetDeps) Dedup() {
-	d.Targets = ads.Dedup(d.Targets, func(t TargetWithOutput) string {
-		return t.Full()
+	d.Targets = ads.Dedup(d.Targets, func(t TargetWithOutput) TargetWithOutputComparable {
+		return t.Comparable()
+	})
+	d.RawTargets = ads.Dedup(d.RawTargets, func(t TargetWithOutput) TargetWithOutputComparable {
+		return t.Comparable()
 	})
 	d.Files = ads.Dedup(d.Files, func(path xfs.Path) string {
 		return path.RelRoot()

@@ -202,11 +202,11 @@ func (e *Engine) runPrepare(ctx context.Context, target *Target, mode string) (_
 			}
 
 			srcName := name
-			if dep.SpecOutput == "" && dep.Output != "" {
+			if dep.Name != "" {
 				if srcName != "" {
 					srcName += "_"
 				}
-				srcName += dep.Output
+				srcName += dep.Name
 			}
 
 			for _, file := range dept.ActualOutFiles().Name(dep.Output) {

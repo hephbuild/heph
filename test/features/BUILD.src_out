@@ -28,7 +28,7 @@ SRC=f1
 """.strip(),
 )
 
-target(
+named_src_out=target(
     name="named_src_out",
     deps={'d1': f1, 'd2': f2},
     out={"out1": "out1file", "out2": "out2file"},
@@ -64,5 +64,21 @@ SRC_D1=f1
 SRC_D2_OUT1=out1file
 SRC_D2_OUT2=out2file
 SRC_D3=out1file
+""".strip(),
+)
+
+target(
+    name="unamed_src",
+    deps=named_src_out,
+    run=grep_env,
+    cache=False,
+)
+
+e2e_test(
+    name="e2e_unamed_src",
+    cmd="heph run //test/features:unamed_src",
+    expected_output="""
+SRC_OUT1=out1file
+SRC_OUT2=out2file
 """.strip(),
 )
