@@ -59,14 +59,12 @@ func fuzzyFindTargetName(targets specs.Targets, s string, max int) []string {
 	return suggestions.Addrs()
 }
 
-var labelChars = []rune(specs.Alphanum + `_`)
-
 func autocompleteLabel(labels []string, s string) []string {
 	if s == "" {
 		return labels
 	}
 
-	if !specs.ContainsOnly(s, labelChars) {
+	if err := specs.LabelValidate(s); err != nil {
 		return nil
 	}
 

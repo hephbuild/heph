@@ -116,11 +116,11 @@ func TestTargetOutputParseError(t *testing.T) {
 	}{
 		{
 			"//some/path:test||",
-			"package name must match",
+			"output name must match",
 		},
 		{
 			"//some/path:test|test|",
-			"package name must match",
+			"output name must match",
 		},
 	}
 	for _, test := range tests {

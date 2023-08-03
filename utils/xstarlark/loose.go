@@ -36,13 +36,14 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 	}
 
 	if v, ok := v.(*starlark.List); ok {
-		values := make([]T, 0, v.Len())
 		it := v.Iterate()
 		defer it.Done()
 
+		values := make([]T, 0, v.Len())
 		var e starlark.Value
-		var i int
+		i := -1
 		for it.Next(&e) {
+			i++
 			if _, ok := e.(starlark.NoneType); ok {
 				continue
 			}
@@ -53,7 +54,6 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 				return fmt.Errorf("index %v: %w", i, err)
 			}
 			values = append(values, single)
-			i++
 		}
 
 		*c = values

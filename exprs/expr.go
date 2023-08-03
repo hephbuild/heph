@@ -135,6 +135,19 @@ func (p *executor) exec() (string, error) {
 	return out.String(), nil
 }
 
+type errAt struct {
+	err error
+	at  int
+}
+
+func (e errAt) Unwrap() error {
+	return e.err
+}
+
+func (e errAt) Error() string {
+	return fmt.Sprintf("%v at %v", e.err, e.at)
+}
+
 func (p *executor) parseExecExpr() (string, error) {
 	start := p.i
 	e, err := p.parseExpr(true)
@@ -144,7 +157,7 @@ func (p *executor) parseExecExpr() (string, error) {
 
 	s, err := p.execExpr(e)
 	if err != nil {
-		return "", fmt.Errorf("%w at %v", err, start)
+		return "", errAt{err, start}
 	}
 
 	return s, nil

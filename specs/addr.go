@@ -1,10 +1,9 @@
 package specs
 
 import (
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/maps"
-	"github.com/segmentio/fasthash/fnv1a"
 	"path"
 	"strings"
 )
@@ -21,13 +20,13 @@ func (p TargetPath) Full() string {
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
 const numbers = `0123456789`
 
-var Alphanum = letters + numbers
+var alphanum = letters + numbers
 
-var packageChars = []rune(Alphanum + `-._/`)
-var targetNameChars = []rune(Alphanum + `-.+_#@=,{}`)
-var outputNameChars = []rune(Alphanum + `-_`)
+var packageChars = []rune(alphanum + `-._/`)
+var targetNameChars = []rune(alphanum + `-.+_#@=,{}`)
+var outputNameChars = []rune(alphanum + `-_`)
 
-func ContainsOnly(s string, chars []rune) bool {
+func containsOnly(s string, chars []rune) bool {
 	if len(s) == 0 {
 		return true
 	}
@@ -41,26 +40,32 @@ func ContainsOnly(s string, chars []rune) bool {
 	return true
 }
 
-var targetPathValidateCache maps.Map[uint32, struct{}]
+type errMustMatch struct {
+	name  string
+	runes []rune
+	s     string
+}
+
+func (e errMustMatch) Error() string {
+	return fmt.Sprintf("%v must match: %v (got %v)", e.name, string(e.runes), e.s)
+}
+
+func mustContainOnly(name, s string, rs []rune) error {
+	if !containsOnly(s, rs) {
+		return errMustMatch{name, rs, s}
+	}
+
+	return nil
+}
 
 func (p TargetPath) validate() error {
-	k := fnv1a.Init32
-	k = fnv1a.AddString32(k, p.Package)
-	k = fnv1a.AddString32(k, p.Name)
-
-	if targetPathValidateCache.Has(k) {
-		return nil
+	if err := mustContainOnly("package name", p.Package, packageChars); err != nil {
+		return err
 	}
 
-	if !ContainsOnly(p.Package, packageChars) {
-		return fmt.Errorf("package name must match: %v (got %v)", string(packageChars), p.Package)
+	if err := mustContainOnly("target name", p.Name, targetNameChars); err != nil {
+		return err
 	}
-
-	if !ContainsOnly(p.Name, targetNameChars) {
-		return fmt.Errorf("target name must match: %v (got %v)", string(targetNameChars), p.Name)
-	}
-
-	targetPathValidateCache.Set(k, struct{}{})
 
 	return nil
 }
@@ -83,17 +88,21 @@ func TargetParse(pkg string, s string) (TargetPath, error) {
 	return tp, err
 }
 
-type invalidTargetError struct {
+type errInvalidTarget struct {
 	s string
 }
 
-func (e invalidTargetError) Error() string {
+func (e errInvalidTarget) Error() string {
 	return fmt.Sprintf("invalid target: %v", e.s)
 }
 
+var errNoNamedOutput = errors.New("cannot reference a named output")
+var errGotMultipleColon = errors.New("invalid target, got multiple `:`")
+var errRelativeTargetNoPkg = errors.New("relative target provided with no package")
+
 func targetParse(pkg string, s string) (TargetPath, error) {
 	if strings.Contains(s, "|") {
-		return TargetPath{}, fmt.Errorf("cannot reference a named output: %v", s)
+		return TargetPath{}, errNoNamedOutput
 	}
 
 	if strings.HasPrefix(s, "//") {
@@ -101,7 +110,7 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 		i := strings.Index(s, ":")
 		if i >= 0 {
 			if strings.Index(s[i+1:], ":") != -1 {
-				return TargetPath{}, fmt.Errorf("invalid target, got multiple `:`")
+				return TargetPath{}, errGotMultipleColon
 			}
 
 			return TargetPath{
@@ -123,7 +132,7 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 		}
 	} else if strings.HasPrefix(s, ":") {
 		if pkg == "" {
-			return TargetPath{}, fmt.Errorf("relative target provided with no package")
+			return TargetPath{}, errRelativeTargetNoPkg
 		}
 
 		return TargetPath{
@@ -132,7 +141,7 @@ func targetParse(pkg string, s string) (TargetPath, error) {
 		}, nil
 	}
 
-	return TargetPath{}, invalidTargetError{s: s}
+	return TargetPath{}, errInvalidTarget{s: s}
 }
 
 type TargetOutputPath struct {
@@ -148,26 +157,15 @@ func (p TargetOutputPath) Full() string {
 	return p.TargetPath.Full()
 }
 
-var targetOutputPathValidateCache maps.Map[uint32, struct{}]
-
 func (p TargetOutputPath) validate() error {
 	err := p.TargetPath.validate()
 	if err != nil {
 		return err
 	}
 
-	k := fnv1a.Init32
-	k = fnv1a.AddString32(k, p.Output)
-
-	if targetOutputPathValidateCache.Has(k) {
-		return nil
+	if err := mustContainOnly("output name", p.Output, outputNameChars); err != nil {
+		return err
 	}
-
-	if !ContainsOnly(p.Output, outputNameChars) {
-		return fmt.Errorf("package name must match: %v (got %v)", string(outputNameChars), p.Output)
-	}
-
-	targetOutputPathValidateCache.Set(k, struct{}{})
 
 	return nil
 }
@@ -186,12 +184,22 @@ func TargetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 	return tp, err
 }
 
+type errInvalidOptions struct {
+	parts []string
+}
+
+func (e errInvalidOptions) Error() string {
+	return fmt.Sprintf("invalid target option, %v", e.parts)
+}
+
+var errInvalidOptionsExpectedCloseBracket = errors.New("invalid target options, expected }")
+
 func TargetOutputOptionsParse(pkg string, s string) (TargetOutputPath, map[string]string, error) {
 	var options map[string]string
 	if strings.HasPrefix(s, "{") {
 		i := strings.Index(s, "}")
 		if i < 0 {
-			return TargetOutputPath{}, nil, fmt.Errorf("invalid target options, expected }")
+			return TargetOutputPath{}, nil, errInvalidOptionsExpectedCloseBracket
 		}
 
 		ostr := s[1:i]
@@ -200,7 +208,7 @@ func TargetOutputOptionsParse(pkg string, s string) (TargetOutputPath, map[strin
 			for _, part := range strings.Split(ostr, ",") {
 				parts := strings.Split(part, "=")
 				if len(parts) != 2 {
-					return TargetOutputPath{}, nil, fmt.Errorf("invalid target option, %v", parts)
+					return TargetOutputPath{}, nil, errInvalidOptions{parts}
 				}
 
 				options[parts[0]] = parts[1]
@@ -237,4 +245,14 @@ func targetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 		TargetPath: tp,
 		Output:     output,
 	}, nil
+}
+
+var labelChars = []rune(alphanum + `_-`)
+
+func LabelValidate(s string) error {
+	if err := mustContainOnly("label", s, labelChars); err != nil {
+		return err
+	}
+
+	return nil
 }

@@ -166,14 +166,21 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		}
 	}
 
+	for _, label := range t.Labels {
+		err := specs.LabelValidate(label)
+		if err != nil {
+			return specs.Target{}, err
+		}
+	}
+
 	for k, v := range t.SrcEnv.Named {
 		if !ads.Contains(specs.FileEnvValues, v) {
-			return specs.Target{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, printOneOf(specs.FileEnvValues), v)
+			return specs.Target{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, joinOneOf(specs.FileEnvValues), v)
 		}
 	}
 
 	if !ads.Contains(specs.FileEnvValues, t.SrcEnv.Default) {
-		return specs.Target{}, fmt.Errorf("src_env must be one of %v, got %v", printOneOf(specs.FileEnvValues), t.SrcEnv.Default)
+		return specs.Target{}, fmt.Errorf("src_env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.SrcEnv.Default)
 	}
 
 	if t.OutEnv == "" {
@@ -184,21 +191,21 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		}
 	}
 	if !ads.Contains(specs.FileEnvValues, t.OutEnv) {
-		return specs.Target{}, fmt.Errorf("out_env must be one of %v, got %v", printOneOf(specs.FileEnvValues), t.OutEnv)
+		return specs.Target{}, fmt.Errorf("out_env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.OutEnv)
 	}
 
 	if t.HashFile == "" {
 		t.HashFile = specs.HashFileContent
 	}
 	if !ads.Contains(specs.HashFileValues, t.HashFile) {
-		return specs.Target{}, fmt.Errorf("hash_file must be one of %v, got %v", printOneOf(specs.HashFileValues), t.HashFile)
+		return specs.Target{}, fmt.Errorf("hash_file must be one of %v, got %v", joinOneOf(specs.HashFileValues), t.HashFile)
 	}
 
 	if t.Entrypoint == "" {
 		t.Entrypoint = specs.EntrypointBash
 	}
 	if !ads.Contains(specs.EntrypointValues, t.Entrypoint) {
-		return specs.Target{}, fmt.Errorf("entrypoint must be one of %v, got %v", printOneOf(specs.EntrypointValues), t.Entrypoint)
+		return specs.Target{}, fmt.Errorf("entrypoint must be one of %v, got %v", joinOneOf(specs.EntrypointValues), t.Entrypoint)
 	}
 
 	if len(t.Platforms) == 0 {
@@ -216,7 +223,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 
 	if t.Codegen != "" {
 		if !ads.Contains(specs.CodegenValues, t.Codegen) {
-			return specs.Target{}, fmt.Errorf("codegen must be one of %v, got %v", printOneOf(specs.CodegenValues), t.Codegen)
+			return specs.Target{}, fmt.Errorf("codegen must be one of %v, got %v", joinOneOf(specs.CodegenValues), t.Codegen)
 		}
 
 		if !t.Sandbox {
@@ -482,7 +489,8 @@ func depsSpecFromArgs(t specs.Target, deps ArrayMapStrArray) (specs.Deps, error)
 	return td, nil
 }
 
-func printOneOf(valid []string) string {
+func joinOneOf(valid []string) string {
+	valid = ads.Copy(valid)
 	for i, s := range valid {
 		valid[i] = fmt.Sprintf("`%v`", s)
 	}
