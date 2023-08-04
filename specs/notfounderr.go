@@ -5,7 +5,7 @@ import (
 )
 
 type specer interface {
-	Specs() Targets
+	Suggest(s string) Targets
 }
 
 func NewTargetNotFoundError(target string, targets specer) error {
@@ -23,6 +23,13 @@ type TargetNotFoundErr struct {
 func (e TargetNotFoundErr) Error() string {
 	if e.String == "" {
 		return "target not found"
+	}
+
+	if e.Targets != nil {
+		suggestions := e.Targets.Suggest(e.String).Addrs()
+		if len(suggestions) > 0 {
+			return fmt.Sprintf("target %v not found, did you mean %v ?", e.String, suggestions[0])
+		}
 	}
 
 	return fmt.Sprintf("target %v not found", e.String)

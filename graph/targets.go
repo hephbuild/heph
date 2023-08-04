@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
@@ -19,6 +20,10 @@ func Contains(ts []*Target, addr string) bool {
 
 type Targets struct {
 	*sets.Set[string, *Target]
+}
+
+func (ts *Targets) Suggest(s string) specs.Targets {
+	return search.FuzzyFindTarget(ts.Specs(), s, 1)
 }
 
 func NewTargets(cap int) *Targets {
