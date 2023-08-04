@@ -185,14 +185,14 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	}
 
 	if sargs.Pkg != "" {
-		tp, err := specs.TargetParse("", sargs.Pkg)
+		pkgp, err := specs.ParsePkgAddr(sargs.Pkg, true)
 		if err != nil {
 			return nil, err
 		}
 
 		pkg = opts.Pkgs.GetOrCreate(packages.Package{
-			Path: tp.Package,
-			Root: opts.Root.Root.Join(tp.Package),
+			Path: pkgp,
+			Root: opts.Root.Root.Join(pkgp),
 		})
 	}
 

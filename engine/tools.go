@@ -67,7 +67,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 
 		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.Addr)
 
-		tp, err := specs.TargetParse("", target.Addr)
+		tp, err := specs.ParseTargetAddr("", target.Addr)
 		if err != nil {
 			return err
 		}

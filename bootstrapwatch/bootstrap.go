@@ -29,7 +29,7 @@ import (
 
 type State struct {
 	root  *hroot.State
-	tps   []specs.TargetPath
+	tps   []specs.TargetAddr
 	targs []string
 
 	ctx      context.Context
@@ -83,7 +83,7 @@ type sigEvent struct {
 	events []fsEvent
 }
 
-func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []specs.TargetPath, targs []string, ignore []string) (*State, error) {
+func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []specs.TargetAddr, targs []string, ignore []string) (*State, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err

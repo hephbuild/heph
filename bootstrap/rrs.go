@@ -10,7 +10,7 @@ import (
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetPath, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
+func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetAddr, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
 	targets := graph.NewTargets(len(tps))
 	for _, tp := range tps {
 		target := g.Targets().Find(tp.Full())
@@ -75,7 +75,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetPath, ar
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *engine.Engine, tps []specs.TargetPath, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
+func GenerateRRs(ctx context.Context, e *engine.Engine, tps []specs.TargetAddr, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
 	if len(tps) == 0 {
 		return nil, nil
 	}

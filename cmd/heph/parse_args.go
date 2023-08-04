@@ -56,7 +56,7 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 }
 
 func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string, stdin bool) (engine.TargetRunRequests, error) {
-	tps, targs, err := bootstrap.ParseTargetPathsAndArgs(args, stdin)
+	tps, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, stdin)
 	if err != nil {
 		return nil, err
 	}

@@ -32,7 +32,7 @@ func TestTargetParse(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.addr, func(t *testing.T) {
-			tp, err := TargetParse(test.pkg, test.addr)
+			tp, err := ParseTargetAddr(test.pkg, test.addr)
 			assert.NoError(t, err)
 			assert.Equal(t, test.pkg, tp.Package)
 			assert.Equal(t, test.name, tp.Name)
@@ -62,7 +62,7 @@ func TestTargetParseError(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.addr, func(t *testing.T) {
-			_, err := TargetParse("", test.addr)
+			_, err := ParseTargetAddr("", test.addr)
 			assert.ErrorContains(t, err, test.error)
 		})
 	}

@@ -19,6 +19,12 @@ e2e_test(
 )
 
 e2e_test(
+    name="sanity_count_tests2",
+    cmd="heph query '//test/go/... && test' | wc -l | xargs",
+    expected_output="21",
+)
+
+e2e_test(
     name="sanity_ldflags_default",
     cmd="heph run //test/go/mod-ldflags:run-default",
     expected_output="default",

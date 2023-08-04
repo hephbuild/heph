@@ -51,7 +51,7 @@ func (e *State) Register(spec specs.Target) error {
 
 func (e *State) processTargetSpec(t *specs.Target) error {
 	// Validate Addr
-	_, err := specs.TargetParse("", t.Addr)
+	_, err := specs.ParseTargetAddr("", t.Addr)
 	if err != nil {
 		return fmt.Errorf("%v: %w", t.Addr, err)
 	}

@@ -3,6 +3,8 @@ package graph
 import (
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/ads"
 	"strconv"
 	"strings"
 )
@@ -13,10 +15,12 @@ func (e *State) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
 		return nil, err
 	}
 
-	pkgMatcher := ParseTargetSelector(t.Package.Path, s)
+	pkgMatcher, err := specs.ParseMatcherInPkg(t.Package.Path, s)
+	if err != nil {
+		return nil, err
+	}
 
-	var includeMatchers TargetMatchers
-	var excludeMatchers TargetMatchers
+	var include, exclude []string
 	must := false
 
 	for _, arg := range expr.NamedArgs {
@@ -24,37 +28,26 @@ func (e *State) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
 		case "must":
 			must = true
 		case "include", "exclude":
-			m := ParseTargetSelector(t.Package.Path, arg.Value)
 			if arg.Name == "exclude" {
-				excludeMatchers = append(excludeMatchers, m)
+				exclude = append(exclude, arg.Value)
 			} else {
-				includeMatchers = append(includeMatchers, m)
+				include = append(include, arg.Value)
 			}
 		default:
 			return nil, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
 		}
 	}
 
-	matchers := TargetMatchers{
-		pkgMatcher,
-	}
-	if len(includeMatchers) > 0 {
-		matchers = append(matchers, OrMatcher(includeMatchers...))
-	}
-	if len(excludeMatchers) > 0 {
-		matchers = append(matchers, NotMatcher(OrMatcher(excludeMatchers...)))
+	matcher, err := specs.MatcherFromIncludeExclude(t.Package.Path, include, exclude)
+	if err != nil {
+		return nil, err
 	}
 
-	matcher := AndMatcher(matchers...)
+	matcher = specs.AndNodeFactory(pkgMatcher, matcher)
 
-	targets := make([]*Target, 0)
-	for _, target := range e.Targets().Slice() {
-		if !matcher(target) {
-			continue
-		}
-
-		targets = append(targets, target)
-	}
+	targets := ads.Filter(e.Targets().Slice(), func(target *Target) bool {
+		return matcher.Match(target)
+	})
 
 	if must && len(targets) == 0 {
 		return nil, fmt.Errorf("must match a target, found none")

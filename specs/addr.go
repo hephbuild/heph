@@ -4,16 +4,23 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
-	"path"
 	"strings"
 )
 
-type TargetPath struct {
+type TargetAddr struct {
 	Package string
 	Name    string
 }
 
-func (p TargetPath) Full() string {
+func (p TargetAddr) Match(t Specer) bool {
+	return t.Spec().Addr == p.Full()
+}
+
+func (p TargetAddr) String() string {
+	return p.Full()
+}
+
+func (p TargetAddr) Full() string {
 	return "//" + p.Package + ":" + p.Name
 }
 
@@ -58,34 +65,72 @@ func mustContainOnly(name, s string, rs []rune) error {
 	return nil
 }
 
-func (p TargetPath) validate() error {
+var errTargetNameEmpty = errors.New("target name is empty")
+
+func (p TargetAddr) validate(mode int) error {
 	if err := mustContainOnly("package name", p.Package, packageChars); err != nil {
 		return err
 	}
 
-	if err := mustContainOnly("target name", p.Name, targetNameChars); err != nil {
-		return err
+	if mode&allowTarget != 0 {
+		if mode == allowTarget && p.Name == "" {
+			return errTargetNameEmpty
+		}
+
+		if err := mustContainOnly("target name", p.Name, targetNameChars); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func (p TargetPath) IsPrivate() bool {
+func (p TargetAddr) IsPrivate() bool {
 	return strings.HasPrefix(p.Name, "_")
 }
 
-func TargetParse(pkg string, s string) (TargetPath, error) {
-	tp, err := targetParse(pkg, s)
+func ParseTargetAddr(pkg string, s string) (TargetAddr, error) {
+	tp, err := addrParse(pkg, s, allowTarget)
 	if err != nil {
-		return TargetPath{}, err
+		return TargetAddr{}, err
 	}
 
-	err = tp.validate()
+	err = tp.validate(allowTarget)
 	if err != nil {
 		return tp, err
 	}
 
 	return tp, err
+}
+
+func ParseTargetAddrOptional(s string) (TargetAddr, error) {
+	tp, err := addrParse("", s, allowTarget|allowPkg)
+	if err != nil {
+		return TargetAddr{}, err
+	}
+
+	err = tp.validate(allowTarget | allowPkg)
+	if err != nil {
+		return tp, err
+	}
+
+	return tp, err
+}
+
+func ParsePkgAddr(s string, validate bool) (string, error) {
+	tp, err := addrParse("", s, allowPkg)
+	if err != nil {
+		return "", err
+	}
+
+	if validate {
+		err = tp.validate(allowPkg)
+		if err != nil {
+			return tp.Package, err
+		}
+	}
+
+	return tp.Package, err
 }
 
 type errInvalidTarget struct {
@@ -99,66 +144,71 @@ func (e errInvalidTarget) Error() string {
 var errNoNamedOutput = errors.New("cannot reference a named output")
 var errGotMultipleColon = errors.New("invalid target, got multiple `:`")
 var errRelativeTargetNoPkg = errors.New("relative target provided with no package")
+var errTargetAddr = errors.New("found target addr, expected package addr")
 
-func targetParse(pkg string, s string) (TargetPath, error) {
+const (
+	allowTarget = 1 << iota
+	allowPkg
+)
+
+func addrParse(pkg string, s string, mode int) (TargetAddr, error) {
 	if strings.Contains(s, "|") {
-		return TargetPath{}, errNoNamedOutput
+		return TargetAddr{}, errNoNamedOutput
 	}
 
 	if strings.HasPrefix(s, "//") {
 		s := s[2:]
-		i := strings.Index(s, ":")
-		if i >= 0 {
+		if i := strings.Index(s, ":"); i != -1 {
 			if strings.Index(s[i+1:], ":") != -1 {
-				return TargetPath{}, errGotMultipleColon
+				return TargetAddr{}, errGotMultipleColon
 			}
 
-			return TargetPath{
+			if mode&allowTarget == 0 {
+				return TargetAddr{}, errTargetAddr
+			}
+
+			return TargetAddr{
 				Package: s[:i],
 				Name:    s[i+1:],
 			}, nil
-		} else {
-			pkg := s
-
-			name := ""
-			if pkg != "" {
-				name = path.Base(pkg)
-			}
-
-			return TargetPath{
-				Package: pkg,
-				Name:    name,
+		} else if mode&allowPkg != 0 {
+			return TargetAddr{
+				Package: s,
 			}, nil
 		}
 	} else if strings.HasPrefix(s, ":") {
-		if pkg == "" {
-			return TargetPath{}, errRelativeTargetNoPkg
+		if mode&allowTarget == 0 {
+			return TargetAddr{}, errTargetAddr
 		}
 
-		return TargetPath{
+		if pkg == "" {
+			return TargetAddr{}, errRelativeTargetNoPkg
+		}
+
+		return TargetAddr{
 			Package: pkg,
 			Name:    s[1:],
 		}, nil
 	}
 
-	return TargetPath{}, errInvalidTarget{s: s}
+	return TargetAddr{}, errInvalidTarget{s: s}
 }
 
 type TargetOutputPath struct {
-	TargetPath
+	TargetAddr
 	Output string
 }
 
 func (p TargetOutputPath) Full() string {
 	if p.Output != "" {
-		return p.TargetPath.Full() + "|" + p.Output
+		return p.TargetAddr.Full() + "|" + p.Output
 	}
 
-	return p.TargetPath.Full()
+	return p.TargetAddr.Full()
 }
 
 func (p TargetOutputPath) validate() error {
-	err := p.TargetPath.validate()
+	err := p.TargetAddr.validate(allowTarget)
 	if err != nil {
 		return err
 	}
@@ -236,13 +286,13 @@ func targetOutputParse(pkg string, s string) (TargetOutputPath, error) {
 		output = s[i+1:]
 	}
 
-	tp, err := TargetParse(pkg, parseStr)
+	tp, err := ParseTargetAddr(pkg, parseStr)
 	if err != nil {
 		return TargetOutputPath{}, err
 	}
 
 	return TargetOutputPath{
-		TargetPath: tp,
+		TargetAddr: tp,
 		Output:     output,
 	}, nil
 }

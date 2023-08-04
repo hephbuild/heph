@@ -353,7 +353,7 @@ func depsSpecFromArr(t specs.Target, arr []string, name string) (specs.Deps, err
 		if dtp, options, err := specs.TargetOutputOptionsParse(t.Package.Path, dep); err == nil {
 			tspec := specs.DepTarget{
 				Name:   name,
-				Target: dtp.TargetPath.Full(),
+				Target: dtp.TargetAddr.Full(),
 				Output: dtp.Output,
 				Mode:   specs.DepModeCopy,
 			}
@@ -398,7 +398,7 @@ func toolsSpecFromString(t specs.Target, ts *specs.Tools, name, tool string) err
 	if err == nil {
 		ts.Targets = append(ts.Targets, specs.TargetTool{
 			Name:   name,
-			Target: tp.TargetPath.Full(),
+			Target: tp.TargetAddr.Full(),
 			Output: tp.Output,
 		})
 		return nil

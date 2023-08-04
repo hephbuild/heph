@@ -183,14 +183,14 @@ func (e *runContext) load(thread *starlark.Thread, module string) (starlark.Stri
 		return globals, nil
 	}
 
-	p, err := specs.TargetParse("", module)
+	pkgp, err := specs.ParsePkgAddr(module, false)
 	if err != nil {
 		return nil, err
 	}
 
 	bc := thread.Local("__bc").(*breadcrumb)
 
-	dirPkg, file := path.Split(p.Package)
+	dirPkg, file := path.Split(pkgp)
 	dirPkg = strings.TrimSuffix(dirPkg, "/")
 	if file != "" {
 		pkg, err := e.loadFromRootsOrCreatePackage(dirPkg)
@@ -215,7 +215,7 @@ func (e *runContext) load(thread *starlark.Thread, module string) (starlark.Stri
 		}
 	}
 
-	pkg, err := e.loadFromRootsOrCreatePackage(p.Package)
+	pkg, err := e.loadFromRootsOrCreatePackage(pkgp)
 	if err != nil {
 		return nil, err
 	}

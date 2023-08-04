@@ -95,7 +95,7 @@ var queryCmd = &cobra.Command{
 
 		targets := bs.Graph.Targets()
 		if bootstrap.HasStdin(args) {
-			tps, _, err := bootstrap.ParseTargetPathsAndArgs(args, true)
+			tps, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 			if err != nil {
 				return err
 			}
@@ -108,35 +108,40 @@ var queryCmd = &cobra.Command{
 			if !all {
 				targets = targets.Public()
 			}
+		}
 
-			if len(include) == 0 && len(exclude) == 0 && !all {
-				return fmt.Errorf("specify at least one of --include or --exclude")
+		matcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
+		if err != nil {
+			return err
+		}
+
+		if matcher == specs.AllMatcher {
+			inputExpr := ""
+			if !bootstrap.HasStdin(args) && len(args) >= 1 {
+				inputExpr = args[0]
+			} else if bootstrap.HasStdin(args) && len(args) >= 2 {
+				inputExpr = args[1]
 			}
-		}
 
-		includeMatchers := make(graph.TargetMatchers, 0, len(include))
-		for _, s := range include {
-			includeMatchers = append(includeMatchers, graph.ParseTargetSelector("", s))
-		}
-		excludeMatchers := make(graph.TargetMatchers, 0, len(include))
-		for _, s := range exclude {
-			excludeMatchers = append(excludeMatchers, graph.ParseTargetSelector("", s))
-		}
+			if inputExpr != "" {
+				m, err := specs.ParseMatcher(inputExpr)
+				if err != nil {
+					return err
+				}
 
-		matcher := graph.YesMatcher()
-		if len(includeMatchers) > 0 {
-			matcher = graph.OrMatcher(includeMatchers...)
-		}
-		if len(excludeMatchers) > 0 {
-			matcher = graph.AndMatcher(matcher, graph.NotMatcher(graph.OrMatcher(excludeMatchers...)))
-		}
-
-		selected := make([]*graph.Target, 0)
-		for _, target := range targets.Slice() {
-			if matcher(target) {
-				selected = append(selected, target)
+				matcher = m
+			} else {
+				if !all {
+					return fmt.Errorf("you must specify a query, or -a")
+				}
 			}
+		} else {
+			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
 		}
+
+		selected := ads.Filter(targets.Slice(), func(target *graph.Target) bool {
+			return matcher.Match(target)
+		})
 
 		if len(selected) == 0 {
 			return nil
@@ -517,7 +522,7 @@ var revdepsCmd = &cobra.Command{
 		var targets []specs.Specer
 		var fn func(target specs.Specer) ([]*graph.Target, error)
 
-		tp, err := specs.TargetParse("", args[0])
+		tp, err := specs.ParseTargetAddr("", args[0])
 		if err != nil {
 			tperr := err
 

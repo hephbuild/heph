@@ -19,9 +19,9 @@ func BlockReadStdin(args []string) error {
 }
 
 // cache reading stdin
-var targetsFromStdin []specs.TargetPath
+var targetsFromStdin []specs.TargetAddr
 
-func parseTargetPathsFromStdin() ([]specs.TargetPath, error) {
+func parseTargetPathsFromStdin() ([]specs.TargetAddr, error) {
 	if targetsFromStdin != nil {
 		return targetsFromStdin, nil
 	}
@@ -35,7 +35,7 @@ func parseTargetPathsFromStdin() ([]specs.TargetPath, error) {
 			continue
 		}
 
-		tp, err := specs.TargetParse("", t)
+		tp, err := specs.ParseTargetAddr("", t)
 		if err != nil {
 			return nil, err
 		}
@@ -50,8 +50,8 @@ func HasStdin(args []string) bool {
 	return len(args) == 1 && args[0] == "-"
 }
 
-func ParseTargetPathsAndArgs(args []string, stdin bool) ([]specs.TargetPath, []string, error) {
-	var tps []specs.TargetPath
+func ParseTargetAddrsAndArgs(args []string, stdin bool) ([]specs.TargetAddr, []string, error) {
+	var tps []specs.TargetAddr
 	var targs []string
 	if stdin && HasStdin(args) {
 		// Block and read stdin here to prevent multiple bubbletea running at the same time
@@ -65,11 +65,11 @@ func ParseTargetPathsAndArgs(args []string, stdin bool) ([]specs.TargetPath, []s
 			return nil, nil, nil
 		}
 
-		tp, err := specs.TargetParse("", args[0])
+		tp, err := specs.ParseTargetAddr("", args[0])
 		if err != nil {
 			return nil, nil, err
 		}
-		tps = []specs.TargetPath{tp}
+		tps = []specs.TargetAddr{tp}
 
 		targs = args[1:]
 	}

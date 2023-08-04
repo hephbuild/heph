@@ -24,7 +24,7 @@ var watchCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		tps, targs, err := bootstrap.ParseTargetPathsAndArgs(args, true)
+		tps, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 		if err != nil {
 			return err
 		}
