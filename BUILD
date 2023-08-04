@@ -24,7 +24,7 @@ yarn_toolchain(
 
 target(
     name="test_light_e2e",
-    run="heph query light_e2e | heph run -",
+    run="heph run light_e2e",
     tools=['heph'],
     pass_env=["PATH", "TERM"],
     sandbox=False,
@@ -33,7 +33,7 @@ target(
 
 target(
     name="test_e2e",
-    run="heph query e2e | heph run -",
+    run="heph run e2e",
     tools=['heph'],
     pass_env=["PATH", "TERM"],
     sandbox=False,
@@ -42,7 +42,7 @@ target(
 
 target(
     name="test_intg",
-    run="heph query '//test/... && test' | heph run -",
+    run="heph run '//test/... && test'",
     tools=['heph'],
     pass_env=["PATH", "TERM"],
     sandbox=False,
@@ -62,7 +62,7 @@ target(
 
 target(
     name="build_all",
-    run="heph query build | heph run -",
+    run="heph run build",
     tools=['heph'],
     pass_env="*",
     sandbox=False,

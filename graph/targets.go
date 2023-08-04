@@ -40,12 +40,9 @@ func (ts *Targets) Addrs() []string {
 		return nil
 	}
 
-	addrs := make([]string, 0, len(ts.Slice()))
-	for _, target := range ts.Slice() {
-		addrs = append(addrs, target.Addr)
-	}
-
-	return addrs
+	return ads.Map(ts.Slice(), func(t *Target) string {
+		return t.Addr
+	})
 }
 
 func (ts *Targets) Specs() specs.Targets {
@@ -94,4 +91,40 @@ func (ts *Targets) Find(addr string) *Target {
 	}
 
 	return ts.GetKey(addr)
+}
+
+func (ts *Targets) Filter(m specs.Matcher) ([]*Target, error) {
+	switch m := m.(type) {
+	case specs.TargetAddr:
+		target := ts.Find(m.Full())
+		if target == nil {
+			return nil, specs.NewTargetNotFoundError(m.Full(), ts)
+		}
+
+		return []*Target{target}, nil
+	case specs.TargetAddrs:
+		if len(m) == 0 {
+			return nil, nil
+		}
+
+		out := NewTargets(len(m))
+		for _, tp := range m {
+			target := ts.Find(tp.Full())
+			if target == nil {
+				return nil, specs.NewTargetNotFoundError(tp.Full(), ts)
+			}
+
+			out.Add(target)
+		}
+
+		return out.Slice(), nil
+	default:
+		out := NewTargets(0)
+		for _, target := range ts.Slice() {
+			if m.Match(target) {
+				out.Add(target)
+			}
+		}
+		return out.Slice(), nil
+	}
 }

@@ -28,9 +28,9 @@ import (
 )
 
 type State struct {
-	root  *hroot.State
-	tps   []specs.TargetAddr
-	targs []string
+	root    *hroot.State
+	matcher specs.Matcher
+	targs   []string
 
 	ctx      context.Context
 	watcher  *fsnotify.Watcher
@@ -83,7 +83,7 @@ type sigEvent struct {
 	events []fsEvent
 }
 
-func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, tps []specs.TargetAddr, targs []string, ignore []string) (*State, error) {
+func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, m specs.Matcher, targs []string, ignore []string) (*State, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -103,7 +103,7 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 		bootopts: bootopts,
 		watcher:  watcher,
 		pool:     pool,
-		tps:      tps,
+		matcher:  m,
 		targs:    targs,
 		sigCh:    sigCh,
 		close: func() {
@@ -331,7 +331,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	status("Figuring out if anything changed...")
 	printEvents(events)
 
-	rrs, err := bootstrap.GenerateRRs(ctx, bs.Engine, s.tps, s.targs, s.rropts, s.runopts.Plain)
+	rrs, err := bootstrap.GenerateRRs(ctx, bs.Engine, s.matcher, s.targs, s.rropts, s.runopts.Plain)
 	if err != nil {
 		return err
 	}

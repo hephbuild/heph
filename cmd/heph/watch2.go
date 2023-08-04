@@ -24,7 +24,7 @@ var watchCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		tps, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
+		m, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 		if err != nil {
 			return err
 		}
@@ -39,7 +39,7 @@ var watchCmd = &cobra.Command{
 			return err
 		}
 
-		ws, err := bootstrapwatch.Boot(ctx, bbs.Root, opts, getRunOpts(), getRROpts(), tps, targs, *watchIgnore)
+		ws, err := bootstrapwatch.Boot(ctx, bbs.Root, opts, getRunOpts(), getRROpts(), m, targs, *watchIgnore)
 		if err != nil {
 			return err
 		}

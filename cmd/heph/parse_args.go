@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/specs"
 )
 
 func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, *graph.Target, error) {
@@ -21,7 +22,7 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 		return bs, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, false)
+	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, false, true)
 	if err != nil {
 		return bs, nil, err
 	}
@@ -33,7 +34,7 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 		if len(args) > 0 {
 			s = args[0]
 		}
-		return bs, nil, engine.NewTargetNotFoundError(s, bs.Graph.Targets())
+		return bs, nil, specs.NewTargetNotFoundError(s, bs.Graph.Targets())
 	}
 
 	return bs, rrs[0].Target, nil
@@ -47,7 +48,7 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 		return bootstrap.EngineBootstrap{}, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, true)
+	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, true, false)
 	if err != nil {
 		return bootstrap.EngineBootstrap{}, nil, err
 	}
@@ -55,17 +56,19 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 	return bs, rrs, err
 }
 
-func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string, stdin bool) (engine.TargetRunRequests, error) {
-	tps, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, stdin)
+func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string, stdin, explicit bool) (engine.TargetRunRequests, error) {
+	m, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, stdin)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(tps) == 0 {
-		return nil, nil
+	if explicit {
+		if !specs.IsMatcherExplicit(m) {
+			return nil, fmt.Errorf("only explicit selector allowed (only exact target)")
+		}
 	}
 
-	return bootstrap.GenerateRRs(ctx, e, tps, targs, engine.TargetRunRequestOpts{
+	return bootstrap.GenerateRRs(ctx, e, m, targs, engine.TargetRunRequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,
 		PreserveCache: printOutput.bool || catOutput.bool,

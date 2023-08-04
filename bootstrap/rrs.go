@@ -10,15 +10,10 @@ import (
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetAddr, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
-	targets := graph.NewTargets(len(tps))
-	for _, tp := range tps {
-		target := g.Targets().Find(tp.Full())
-		if target == nil {
-			return nil, engine.NewTargetNotFoundError(tp.Full(), g.Targets())
-		}
-
-		targets.Add(target)
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
+	targets, err := g.Targets().Filter(m)
+	if err != nil {
+		return nil, err
 	}
 
 	check := func(target *graph.Target) error {
@@ -31,8 +26,8 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetAddr, ar
 		return nil
 	}
 
-	rrs := make(engine.TargetRunRequests, 0, targets.Len())
-	for _, target := range targets.Slice() {
+	rrs := make(engine.TargetRunRequests, 0, len(targets))
+	for _, target := range targets {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -60,7 +55,7 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetAddr, ar
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
+	ancs, err := g.DAG().GetOrderedAncestors(targets, true)
 	if err != nil {
 		return nil, err
 	}
@@ -75,24 +70,22 @@ func generateRRs(ctx context.Context, g *graph.State, tps []specs.TargetAddr, ar
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *engine.Engine, tps []specs.TargetAddr, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
-	if len(tps) == 0 {
-		return nil, nil
+func GenerateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
+	if specs.IsMatcherExplicit(m) {
+		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
+		if err == nil {
+			return rrs, nil
+		} else {
+			log.Debugf("generateRRs: %v", err)
+		}
 	}
 
-	rrs, err := generateRRs(ctx, e.Graph, tps, targs, true, opts)
-	if err == nil {
-		return rrs, nil
-	} else {
-		log.Debugf("generateRRs: %v", err)
-	}
-
-	err = RunGen(ctx, e, "", false, plain)
+	err := RunGen(ctx, e, "", false, plain)
 	if err != nil {
 		return nil, err
 	}
 
-	return generateRRs(ctx, e.Graph, tps, targs, false, opts)
+	return generateRRs(ctx, e.Graph, m, targs, false, opts)
 }
 
 func RunGen(ctx context.Context, e *engine.Engine, poolName string, linkAll, plain bool) error {

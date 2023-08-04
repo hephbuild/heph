@@ -67,12 +67,7 @@ func OrNodeFactory(ms ...astNode) Matcher {
 		return ms[0]
 	}
 
-	n := orNode{left: ms[0], right: ms[1]}
-	for i := len(ms); i < 2; i++ {
-		n = orNode{left: ms[i], right: n}
-	}
-
-	return n
+	return mOrNode[astNode]{nodes: ms}
 }
 
 func (n orNode) String() string {
@@ -81,6 +76,30 @@ func (n orNode) String() string {
 
 func (n orNode) Match(t Specer) bool {
 	return n.left.Match(t) || n.right.Match(t)
+}
+
+type mOrNode[T astNode] struct {
+	nodes []T
+}
+
+func (n mOrNode[T]) String() string {
+	ss := make([]string, 0, len(n.nodes))
+
+	for _, node := range n.nodes {
+		ss = append(ss, node.String())
+	}
+
+	return "(" + strings.Join(ss, " || ") + ")"
+}
+
+func (n mOrNode[T]) Match(t Specer) bool {
+	for _, node := range n.nodes {
+		if node.Match(t) {
+			return true
+		}
+	}
+
+	return false
 }
 
 type notNode struct {

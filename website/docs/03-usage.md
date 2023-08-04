@@ -15,6 +15,12 @@ heph run //path/to:target
 or to run a collection of targets, identified by labels:
 
 ```shell
+heph query test
+```
+
+Another way to achieve the same thing is to compose commands together:
+
+```shell
 heph query test | heph run -
 ```
 
@@ -23,7 +29,7 @@ heph query test | heph run -
 You can also compose the query, for example:
 
 ```shell
-heph query '(//some/pkg/... && test) && !e2e-test' | heph run -
+heph run '(//some/pkg/... && test) && !e2e-test' 
 ```
 
 See `heph query -h` for available query commands.
@@ -57,15 +63,16 @@ This will run the target and print the output path to stdout.
 A very useful tool is `heph watch`. It works similarly to `heph run` but will continuously watch all input files and will rerun targets that have been affected by file changes. When doing TDD for example it can be used to have a very quick save-test loop:
 
 ```shell
-heph query '//path/to/service/... && test' | heph watch -
+heph watch '//path/to/service/... && test'
 ```
 
 This will output the targets in the `path/to/service` directory that have the `test` label, and will pipe the result into `heph watch` which will watch for file changes and run the targets. 
 
 > **Tip**: you can speed up the typing by using the aliases: 
 > ```shell
-> heph q -i test | heph w - # heph watch
-> heph q -i test | heph r - # heph run
+> heph q test # heph query 
+> heph r -    # heph run
+> heph w -    # heph watch
 > ```
 > And leverage completion: see `heph completion <zsh|fish|bash> --help` for details
 

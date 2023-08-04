@@ -93,20 +93,20 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		targets := bs.Graph.Targets()
+		targets := bs.Graph.Targets().Slice()
 		if bootstrap.HasStdin(args) {
-			tps, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
+			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 			if err != nil {
 				return err
 			}
 
-			targets = graph.NewTargets(len(tps))
-			for _, target := range tps {
-				targets.Add(bs.Engine.Graph.Targets().Find(target.Full()))
+			targets, err = bs.Engine.Graph.Targets().Filter(m)
+			if err != nil {
+				return err
 			}
 		} else {
 			if !all {
-				targets = targets.Public()
+				targets = bs.Graph.Targets().Public().Slice()
 			}
 		}
 
@@ -139,7 +139,7 @@ var queryCmd = &cobra.Command{
 			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
 		}
 
-		selected := ads.Filter(targets.Slice(), func(target *graph.Target) bool {
+		selected := ads.Filter(targets, func(target *graph.Target) bool {
 			return matcher.Match(target)
 		})
 
@@ -563,7 +563,7 @@ var revdepsCmd = &cobra.Command{
 		} else {
 			target := bs.Graph.Targets().Find(tp.Full())
 			if target == nil {
-				return engine.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
+				return specs.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
 			}
 
 			targets = []specs.Specer{target}

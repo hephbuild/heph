@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/specs"
 )
 
 var utilFunctions = map[string]exprs.Func{
@@ -27,7 +28,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 
 		target := e.Targets.FindAddr(addr)
 		if target == nil {
-			return nil, NewTargetNotFoundError(addr, e.Graph.Targets())
+			return nil, specs.NewTargetNotFoundError(addr, e.Graph.Targets())
 		}
 
 		return target, nil
@@ -85,7 +86,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 
 			t := e.Graph.Targets().Find(addr)
 			if t == nil {
-				return "", NewTargetNotFoundError(addr, e.Graph.Targets())
+				return "", specs.NewTargetNotFoundError(addr, e.Graph.Targets())
 			}
 
 			universe, err := e.Graph.DAG().GetParents(t)

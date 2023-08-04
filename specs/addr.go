@@ -24,6 +24,33 @@ func (p TargetAddr) Full() string {
 	return "//" + p.Package + ":" + p.Name
 }
 
+type TargetAddrs []TargetAddr
+
+func (p TargetAddrs) Match(t Specer) bool {
+	return mOrNode[TargetAddr]{nodes: p}.Match(t)
+}
+
+func (p TargetAddrs) String() string {
+	return mOrNode[TargetAddr]{nodes: p}.String()
+}
+
+func IsMatcherExplicit(m Matcher) bool {
+	if _, ok := m.(TargetAddrs); ok {
+		return true
+	}
+
+	if _, ok := m.(TargetAddr); ok {
+		return true
+	}
+
+	return false
+}
+
+func IsMatcherTargetAddr(m Matcher) bool {
+	_, ok := m.(TargetAddr)
+	return ok
+}
+
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
 const numbers = `0123456789`
 

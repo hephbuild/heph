@@ -3,8 +3,10 @@ package bootstrap
 import (
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/worker"
 	"go.uber.org/multierr"
 	"io"
@@ -61,6 +63,17 @@ func PrintHumanError(err error) {
 				skipSpacing = true
 				log.Debugf("skipped: %v", jerr)
 			} else {
+				var terr specs.TargetNotFoundErr
+				if errors.As(err, &terr) {
+					if terr.Targets != nil {
+						suggestions := search.FuzzyFindTarget(terr.Targets.Specs(), terr.String, 1).Addrs()
+						if len(suggestions) > 0 {
+							log.Error(fmt.Sprintf("target %v not found, did you mean %v ?", terr.String, suggestions[0]))
+							continue
+						}
+					}
+				}
+
 				log.Error(err)
 			}
 		}

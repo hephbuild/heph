@@ -183,9 +183,7 @@ var runCmd = &cobra.Command{
 		fromStdin := bootstrap.HasStdin(args)
 
 		if len(rrs) == 0 {
-			if !fromStdin {
-				_ = cmd.Help()
-			}
+			log.Info("no target match")
 			return nil
 		}
 
