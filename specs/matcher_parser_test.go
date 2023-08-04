@@ -25,6 +25,7 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to:target || label", "(//path/to:target || label)"},
 		{"//path/to/...", "//path/to/..."},
 		{"//path/to/.", "//path/to/."},
+		{"//path/to", "//path/to"},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {
@@ -39,6 +40,22 @@ func TestParseMatcher(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, ast.String())
+		})
+	}
+}
+
+func TestParseMatcherErr(t *testing.T) {
+	tests := []struct {
+		expr     string
+		expected string
+	}{
+		{"~", "Unexpected character ~"},
+		{"//path/to:target label", "Unexpected token label: label"},
+	}
+	for _, test := range tests {
+		t.Run(test.expr, func(t *testing.T) {
+			_, err := ParseMatcher(test.expr)
+			assert.ErrorContains(t, err, test.expected)
 		})
 	}
 }

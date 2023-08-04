@@ -149,12 +149,29 @@ func (n pkgNode) Match(t Specer) bool {
 		return tpkg == mpkg
 	}
 
-	return false
+	return tpkg == n.pkg
+}
+
+func printToken(t token) string {
+	switch t.typ {
+	case tokenAddr:
+		return fmt.Sprintf("addr: %v", t.value)
+	case tokenLabel:
+		return fmt.Sprintf("label: %v", t.value)
+	default:
+		return t.value
+	}
 }
 
 func parse(tokens []token) astNode {
 	var index int
-	return parseExpr(tokens, &index)
+	ast := parseExpr(tokens, &index)
+
+	if index != len(tokens)-1 {
+		panic(fmt.Sprintf("Unexpected token %v", printToken(tokens[index])))
+	}
+
+	return ast
 }
 
 func parseExpr(tokens []token, index *int) astNode {
@@ -225,7 +242,12 @@ func parseFactor(tokens []token, index *int) astNode {
 			return tp
 		}
 	default:
-		panic(fmt.Sprintf("Unexpected token: %v", tokens[*index]))
+		tok := tokens[*index]
+		if tok.typ == tokenEOF {
+			panic(fmt.Sprintf("Unexpected end of expression"))
+		}
+
+		panic(fmt.Sprintf("Unexpected token: %v", printToken(tok)))
 	}
 }
 

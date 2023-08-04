@@ -27,7 +27,7 @@ func isLabelChar(c uint8) bool {
 	return ads.Contains(labelChars, rune(c))
 }
 
-func isTargetChar(c uint8) bool {
+func isAddrChar(c uint8) bool {
 	return ads.Contains(packageChars, rune(c)) ||
 		ads.Contains(targetNameChars, rune(c)) ||
 		rune(c) == '/' ||
@@ -66,17 +66,17 @@ func lex(input string) []token {
 			}
 			tokens = append(tokens, token{typ: tokenLabel, value: input[:i]})
 			input = input[i:]
-		case isTargetChar(input[0]):
+		case isAddrChar(input[0]):
 			i := 1
 			for ; i < len(input); i++ {
-				if !(isTargetChar(input[i])) {
+				if !(isAddrChar(input[i])) {
 					break
 				}
 			}
 			tokens = append(tokens, token{typ: tokenAddr, value: input[:i]})
 			input = input[i:]
 		default:
-			panic(fmt.Sprintf("unhandled character %v", string(input[0])))
+			panic(fmt.Sprintf("Unexpected character %v", string(input[0])))
 		}
 	}
 
