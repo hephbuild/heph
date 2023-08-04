@@ -33,7 +33,6 @@ var params *[]string
 var summary *bool
 var summaryGen *bool
 var jaegerEndpoint *string
-var ignoreUnknownTarget *bool
 
 func getRunOpts() bootstrap.RunOpts {
 	return bootstrap.RunOpts{
@@ -83,7 +82,6 @@ func init() {
 	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
 	summaryGen = rootCmd.PersistentFlags().Bool("summary-gen", false, "Prints execution stats, including during gen")
 	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
-	ignoreUnknownTarget = rootCmd.PersistentFlags().Bool("ignore-unknown", false, "Ignore unknown targets")
 	noCloudTelemetry = rootCmd.PersistentFlags().Bool("no-cloud-telemetry", false, "Disable cloud reporting")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
