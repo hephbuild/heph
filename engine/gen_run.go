@@ -67,14 +67,15 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 		return nil, err
 	}
 
-	go func() {
-		<-ge.deps.Done()
-		span.End()
-	}()
-
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: "finalize gen",
 		Deps: ge.deps,
+		Hook: worker.StageHook{
+			OnEnd: func(job *worker.Job) context.Context {
+				span.EndError(job.Err())
+				return nil
+			},
+		},
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			status.Emit(ctx, status.String("Finalizing gen..."))
 
