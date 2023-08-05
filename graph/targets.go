@@ -98,7 +98,7 @@ func (ts *Targets) Find(addr string) *Target {
 	return ts.GetKey(addr)
 }
 
-func (ts *Targets) Filter(m specs.Matcher) ([]*Target, error) {
+func (ts *Targets) Filter(m specs.Matcher) (*Targets, error) {
 	switch m := m.(type) {
 	case specs.TargetAddr:
 		target := ts.Find(m.Full())
@@ -106,7 +106,9 @@ func (ts *Targets) Filter(m specs.Matcher) ([]*Target, error) {
 			return nil, specs.NewTargetNotFoundError(m.Full(), ts)
 		}
 
-		return []*Target{target}, nil
+		out := NewTargets(1)
+		out.Add(target)
+		return out, nil
 	case specs.TargetAddrs:
 		if len(m) == 0 {
 			return nil, nil
@@ -122,7 +124,7 @@ func (ts *Targets) Filter(m specs.Matcher) ([]*Target, error) {
 			out.Add(target)
 		}
 
-		return out.Slice(), nil
+		return out, nil
 	default:
 		out := NewTargets(0)
 		for _, target := range ts.Slice() {
@@ -130,6 +132,6 @@ func (ts *Targets) Filter(m specs.Matcher) ([]*Target, error) {
 				out.Add(target)
 			}
 		}
-		return out.Slice(), nil
+		return out, nil
 	}
 }

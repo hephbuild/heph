@@ -26,8 +26,8 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		return nil
 	}
 
-	rrs := make(engine.TargetRunRequests, 0, len(targets))
-	for _, target := range targets {
+	rrs := make(engine.TargetRunRequests, 0, targets.Len())
+	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -55,7 +55,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := g.DAG().GetOrderedAncestors(targets, true)
+	ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
 	if err != nil {
 		return nil, err
 	}

@@ -125,32 +125,33 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		targets := bs.Graph.Targets().Slice()
+		targets := bs.Graph.Targets()
 		if bootstrap.HasStdin(args) {
 			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 			if err != nil {
 				return err
 			}
 
-			targets, err = bs.Engine.Graph.Targets().Filter(m)
+			targets, err = bs.Graph.Targets().Filter(m)
 			if err != nil {
 				return err
 			}
 		} else {
 			if !all {
-				targets = bs.Graph.Targets().Public().Slice()
+				targets = bs.Graph.Targets().Public()
 			}
 		}
 
-		selected := ads.Filter(targets, func(target *graph.Target) bool {
-			return matcher.Match(target)
-		})
+		selected, err := targets.Filter(matcher)
+		if err != nil {
+			return err
+		}
 
-		if len(selected) == 0 {
+		if selected.Len() == 0 {
 			return nil
 		}
 
-		fmt.Println(strings.Join(sortedTargetNames(selected, false), "\n"))
+		fmt.Println(strings.Join(sortedTargetNames(selected.Slice(), false), "\n"))
 		return nil
 	},
 }
