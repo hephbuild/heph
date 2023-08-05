@@ -226,13 +226,13 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 				Root: p,
 			})
 
-			err = buildfilesState.RunBuildFiles(opts)
+			err = buildfilesState.RunBuildFiles(ctx, opts)
 			if err != nil {
 				return bs, fmt.Errorf("buildfiles: root %v: %w", name, err)
 			}
 		}
 
-		err := buildfilesState.RunBuildFiles(opts)
+		err := buildfilesState.RunBuildFiles(ctx, opts)
 		if err != nil {
 			return bs, fmt.Errorf("buildfiles: %w", err)
 		}

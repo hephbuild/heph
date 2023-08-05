@@ -68,6 +68,9 @@ func init() {
 
 	queryCmd.RegisterFlagCompletionFunc("include", ValidArgsFunctionLabelsOrTargets)
 	queryCmd.RegisterFlagCompletionFunc("exclude", ValidArgsFunctionLabelsOrTargets)
+
+	queryCmd.Flags().MarkHidden("include")
+	queryCmd.Flags().MarkHidden("exclude")
 }
 
 var queryCmd = &cobra.Command{
@@ -77,6 +80,35 @@ var queryCmd = &cobra.Command{
 	Args:    cobra.RangeArgs(0, 1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
+
+		matcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
+		if err != nil {
+			return err
+		}
+
+		if matcher == specs.AllMatcher {
+			inputExpr := ""
+			if !bootstrap.HasStdin(args) && len(args) >= 1 {
+				inputExpr = args[0]
+			} else if bootstrap.HasStdin(args) && len(args) >= 2 {
+				inputExpr = args[1]
+			}
+
+			if inputExpr != "" {
+				m, err := specs.ParseMatcher(inputExpr)
+				if err != nil {
+					return err
+				}
+
+				matcher = m
+			} else {
+				if !all {
+					return fmt.Errorf("you must specify a query, or -a")
+				}
+			}
+		} else {
+			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
+		}
 
 		bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
 			return bootstrap.BlockReadStdin(args)
@@ -108,35 +140,6 @@ var queryCmd = &cobra.Command{
 			if !all {
 				targets = bs.Graph.Targets().Public().Slice()
 			}
-		}
-
-		matcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
-		if err != nil {
-			return err
-		}
-
-		if matcher == specs.AllMatcher {
-			inputExpr := ""
-			if !bootstrap.HasStdin(args) && len(args) >= 1 {
-				inputExpr = args[0]
-			} else if bootstrap.HasStdin(args) && len(args) >= 2 {
-				inputExpr = args[1]
-			}
-
-			if inputExpr != "" {
-				m, err := specs.ParseMatcher(inputExpr)
-				if err != nil {
-					return err
-				}
-
-				matcher = m
-			} else {
-				if !all {
-					return fmt.Errorf("you must specify a query, or -a")
-				}
-			}
-		} else {
-			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
 		}
 
 		selected := ads.Filter(targets, func(target *graph.Target) bool {

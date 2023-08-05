@@ -1,6 +1,7 @@
 package buildfiles
 
 import (
+	"context"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/utils/maps"
@@ -37,13 +38,17 @@ func NewState(s State) *State {
 	return &s
 }
 
-func (s *State) CollectFiles(root string) (packages.SourceFiles, error) {
+func (s *State) CollectFiles(ctx context.Context, root string) (packages.SourceFiles, error) {
 	done := log.TraceTimingDone("RunBuildFiles:walk")
 	defer done()
 
 	files := make(packages.SourceFiles, 0)
 
 	err := xfs.StarWalk(root, Pattern, s.Ignore, func(path string, d fs.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if d.IsDir() {
 			return nil
 		}
@@ -60,11 +65,11 @@ func (s *State) CollectFiles(root string) (packages.SourceFiles, error) {
 	return files, nil
 }
 
-func (s *State) RunBuildFiles(options RunOptions) error {
+func (s *State) RunBuildFiles(ctx context.Context, options RunOptions) error {
 	rootPkg := options.RootPkg
 	rootAbs := rootPkg.Root.Abs()
 
-	files, err := s.CollectFiles(rootAbs)
+	files, err := s.CollectFiles(ctx, rootAbs)
 	if err != nil {
 		return err
 	}
