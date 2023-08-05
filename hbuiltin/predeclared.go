@@ -201,7 +201,17 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 		return nil, err
 	}
 
-	t.Source = stackTrace(thread)
+	t.Source = ads.MapFlat(stackTrace(thread), func(source specs.Source) []specs.Source {
+		if source.Name == "_internal_target" && source.Pos.Filename() == "<builtin>" {
+			return nil
+		}
+
+		if source.Pos.Filename() == "<builtin>" {
+			source.Pos.Line = 0
+		}
+
+		return []specs.Source{source}
+	})
 
 	err = opts.RegisterTarget(t)
 	if err != nil {
