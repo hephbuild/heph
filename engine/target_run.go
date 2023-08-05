@@ -512,11 +512,15 @@ func (e *Engine) WriteableCaches(ctx context.Context, target *Target) ([]graph.C
 	return wcs, nil
 }
 
-func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
-	target := e.Targets.Find(rr.Target)
-
-	ctx, rspan := e.Observability.SpanRun(ctx, target.Target)
+func (e *Engine) RunWithSpan(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) (rerr error) {
+	ctx, rspan := e.Observability.SpanRun(ctx, rr.Target)
 	defer rspan.EndError(rerr)
+
+	return e.Run(ctx, rr, iocfg)
+}
+
+func (e *Engine) Run(ctx context.Context, rr TargetRunRequest, iocfg sandbox.IOConfig) error {
+	target := e.Targets.Find(rr.Target)
 
 	err := e.Graph.LinkTarget(target.Target, nil)
 	if err != nil {

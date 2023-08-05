@@ -117,7 +117,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		iocfg.Stdout = os.Stderr
 	}
 
-	err = e.Run(ctx, *inlineRR, iocfg)
+	err = e.RunWithSpan(ctx, *inlineRR, iocfg)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {

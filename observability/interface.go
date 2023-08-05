@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
 	"io"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -123,6 +124,8 @@ type BaseSpan struct {
 	startTime     time.Time
 	endTime       time.Time
 	state         State
+
+	m sync.Mutex
 }
 
 var idc uint64
@@ -178,13 +181,20 @@ func (s *BaseSpan) EndError(err error) {
 }
 
 func (s *BaseSpan) EndErrorState(err error, state State) {
+	s.m.Lock()
+	defer s.m.Unlock()
+
 	if s.finalized {
 		return
 	}
 
+	s.finalized = true
+
 	s.err = err
 	s.state = state
-	s.End()
+	s.endTime = time.Now()
+
+	s.runHooks(SpanHook.OnEnd)
 }
 
 func (s *BaseSpan) FinalState() State {
@@ -192,17 +202,7 @@ func (s *BaseSpan) FinalState() State {
 }
 
 func (s *BaseSpan) End() {
-	if s.finalized {
-		return
-	}
-
-	s.finalized = true
-	s.endTime = time.Now()
-	if s.state == StateUnknown {
-		s.state = StateSuccess
-	}
-
-	s.runHooks(SpanHook.OnEnd)
+	s.EndErrorState(nil, StateSuccess)
 }
 
 func (s *BaseSpan) runHooks(h func(SpanHook)) {
