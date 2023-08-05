@@ -60,7 +60,7 @@ var predeclaredFunctionOnce = xsync.Once[starlark.StringDict]{}
 func predeclared_functions() starlark.StringDict {
 	return predeclaredFunctionOnce.MustDo(func() (starlark.StringDict, error) {
 		p := starlark.StringDict{}
-		p["_internal_target"] = starlark.NewBuiltin("_internal_target", internal_target)
+		p["target"] = starlark.NewBuiltin("target", target)
 		p["glob"] = starlark.NewBuiltin("glob", glob)
 		p["get_os"] = starlark.NewBuiltin("get_os", get_os)
 		p["get_arch"] = starlark.NewBuiltin("get_arch", get_arch)
@@ -136,11 +136,13 @@ func stackTrace(thread *starlark.Thread) []specs.Source {
 	})
 }
 
-func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	opts := getOpts(thread)
 	pkg := getPackage(thread)
 
 	var sargs TargetArgs
+	sargs.SandboxEnabled = true
+	sargs.Cache.Enabled = true
 
 	if err := starlark.UnpackArgs(
 		"target", args, kwargs,
@@ -202,10 +204,6 @@ func internal_target(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 	}
 
 	t.Source = ads.MapFlat(stackTrace(thread), func(source specs.Source) []specs.Source {
-		if source.Name == "_internal_target" && source.Pos.Filename() == "<builtin>" {
-			return nil
-		}
-
 		if source.Pos.Filename() == "<builtin>" {
 			source.Pos.Line = 0
 		}
