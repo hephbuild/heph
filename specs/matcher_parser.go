@@ -3,6 +3,7 @@ package specs
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"regexp"
 	"strings"
 )
 
@@ -83,11 +84,9 @@ type mOrNode[T astNode] struct {
 }
 
 func (n mOrNode[T]) String() string {
-	ss := make([]string, 0, len(n.nodes))
-
-	for _, node := range n.nodes {
-		ss = append(ss, node.String())
-	}
+	ss := ads.Map(n.nodes, func(t T) string {
+		return t.String()
+	})
 
 	return "(" + strings.Join(ss, " || ") + ")"
 }
@@ -150,6 +149,36 @@ func (n pkgNode) Match(t Specer) bool {
 	}
 
 	return tpkg == n.pkg
+}
+
+type targetNameNode struct {
+	regex *regexp.Regexp
+}
+
+func (n targetNameNode) String() string {
+	return ":" + n.regex.String()
+}
+
+func (n targetNameNode) Match(t Specer) bool {
+	return n.regex.MatchString(t.Spec().Name)
+}
+
+type funcNode struct {
+	name string
+	args []astNode
+}
+
+func (n funcNode) String() string {
+	ss := ads.Map(n.args, func(t astNode) string {
+		return t.String()
+	})
+
+	return n.name + "(" + strings.Join(ss, ", ") + ")"
+}
+
+func (n funcNode) Match(t Specer) bool {
+	// todo
+	return false
 }
 
 func printToken(t token) string {
@@ -218,7 +247,7 @@ func parseFactor(tokens []token, index *int) astNode {
 		*index++
 		expr := parseExpr(tokens, index)
 		if tokens[*index].typ != tokenRParen {
-			panic("Expected closing parenthesis")
+			panic(fmt.Sprintf("Expected closing parenthesis, got %v", printToken(tokens[*index])))
 		}
 		*index++
 		return expr
@@ -231,6 +260,15 @@ func parseFactor(tokens []token, index *int) astNode {
 		value := tokens[*index].value
 		*index++
 
+		if strings.HasPrefix(value, ":") {
+			r, err := regexp.Compile("^" + strings.ReplaceAll(value[1:], "*", ".*") + "$")
+			if err != nil {
+				panic(err)
+			}
+
+			return targetNameNode{regex: r}
+		}
+
 		tp, err := ParseTargetAddrOptional(value)
 		if err != nil {
 			panic(err)
@@ -240,6 +278,25 @@ func parseFactor(tokens []token, index *int) astNode {
 			return pkgNode{pkg: tp.Package}
 		} else {
 			return tp
+		}
+	case tokenFunction:
+		value := tokens[*index].value
+		*index++
+
+		args := make([]astNode, 0)
+
+		for {
+			if tokens[*index].typ == tokenRParen {
+				*index++
+				return funcNode{name: value, args: args}
+			}
+
+			if len(args) > 0 && tokens[*index].typ != tokenComma {
+				panic(fmt.Sprintf("Expected comma, got %v", printToken(tokens[*index])))
+			}
+
+			expr := parseTerm(tokens, index)
+			args = append(args, expr)
 		}
 	default:
 		tok := tokens[*index]

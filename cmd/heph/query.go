@@ -12,7 +12,6 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
@@ -33,6 +32,7 @@ var spec bool
 var transitive bool
 var all bool
 var debugTransitive bool
+var filter string
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -56,6 +56,9 @@ func init() {
 
 	revdepsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
 	depsCmd.Flags().BoolVar(&transitive, "transitive", false, "Transitively")
+	revdepsCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
+	depsCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
+	queryCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 	targetCmd.Flags().BoolVar(&debugTransitive, "debug-transitive", false, "Print transitive details")
@@ -90,8 +93,8 @@ var queryCmd = &cobra.Command{
 			inputExpr := ""
 			if !bootstrap.HasStdin(args) && len(args) >= 1 {
 				inputExpr = args[0]
-			} else if bootstrap.HasStdin(args) && len(args) >= 2 {
-				inputExpr = args[1]
+			} else if filter != "" {
+				inputExpr = filter
 			}
 
 			if inputExpr != "" {
@@ -486,17 +489,24 @@ var depsCmd = &cobra.Command{
 			return err
 		}
 
-		ancestors := ads.Map(ancs, func(t *graph.Target) string {
-			return t.Addr
-		})
+		deps := graph.NewTargetsFrom(ancs)
 
-		ancestors = ads.Dedup(ancestors, func(s string) string {
-			return s
-		})
-		sort.Strings(ancestors)
+		if filter != "" {
+			m, err := specs.ParseMatcher(filter)
+			if err != nil {
+				return err
+			}
 
-		for _, addr := range ancestors {
-			fmt.Println(addr)
+			deps, err = deps.Filter(m)
+			if err != nil {
+				return err
+			}
+		}
+
+		deps.Sort()
+
+		for _, t := range deps.Slice() {
+			fmt.Println(t.Addr)
 		}
 
 		return nil
@@ -577,22 +587,33 @@ var revdepsCmd = &cobra.Command{
 			}
 		}
 
-		revdeps := sets.NewStringSet(0)
+		revdeps := graph.NewTargets(0)
 
 		for _, target := range targets {
 			ancs, err := fn(target)
 			if err != nil {
 				return err
 			}
-			for _, anc := range ancs {
-				revdeps.Add(anc.Addr)
+
+			revdeps.AddAll(ancs)
+		}
+
+		if filter != "" {
+			m, err := specs.ParseMatcher(filter)
+			if err != nil {
+				return err
+			}
+
+			revdeps, err = revdeps.Filter(m)
+			if err != nil {
+				return err
 			}
 		}
 
-		sort.Strings(revdeps.Slice())
+		revdeps.Sort()
 
-		for _, addr := range revdeps.Slice() {
-			fmt.Println(addr)
+		for _, t := range revdeps.Slice() {
+			fmt.Println(t.Addr)
 		}
 
 		return nil

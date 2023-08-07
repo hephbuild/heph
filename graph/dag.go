@@ -10,7 +10,6 @@ import (
 
 type DAG struct {
 	*dag.DAG
-	targets *Targets
 }
 
 // returns parents first
@@ -82,11 +81,11 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	err := d.getOrderedAncestors(targets.Slice(), includeRoot, func(target *Target) {
 		deps := target.Deps.All().Merge(target.HashDeps)
 		for _, dep := range deps.Targets {
-			maybeAddAllOuts(d.targets.Find(dep.Target.Addr), dep.Output)
+			maybeAddAllOuts(dep.Target, dep.Output)
 		}
 
 		for _, tool := range target.Tools.Targets {
-			maybeAddAllOuts(d.targets.Find(tool.Target.Addr), tool.Output)
+			maybeAddAllOuts(tool.Target, tool.Output)
 		}
 
 		ancs.Add(target)

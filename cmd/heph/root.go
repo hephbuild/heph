@@ -90,6 +90,10 @@ func init() {
 	params = rootCmd.PersistentFlags().StringArrayP("param", "p", nil, "Set parameter name=value")
 
 	rootCmd.Flags().SetInterspersed(false)
+
+	rootCmd.PersistentFlags().MarkHidden("cpuprofile")
+	rootCmd.PersistentFlags().MarkHidden("memprofile")
+	rootCmd.PersistentFlags().MarkHidden("jaeger")
 }
 
 var cpuProfileFile *os.File

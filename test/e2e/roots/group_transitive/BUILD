@@ -20,6 +20,12 @@ t2=target(
     )
 )
 
+t3=target(
+    name='t3',
+    run='echo hello > $OUT_T3',
+    out={'t3': 't3'},
+)
+
 g1=group(
     name="group1",
     deps=t1,
@@ -93,6 +99,27 @@ target(
 target(
     name='test_named-group_unnamed-dep',
     deps=g3,
+    run=grep_env,
+    cache=False,
+    out="src",
+)
+
+gd1=group(
+    name="group-deep1",
+    deps=t1,
+    transitive=heph.target_spec(
+        deps=t3,
+    )
+)
+
+gd2=group(
+    name="group-deep2",
+    deps=[gd1, t2],
+)
+
+target(
+    name='test_deep-group',
+    deps=gd2,
     run=grep_env,
     cache=False,
     out="src",

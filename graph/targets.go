@@ -40,6 +40,13 @@ func NewTargets(cap int) *Targets {
 	}
 }
 
+func NewTargetsFrom(ts []*Target) *Targets {
+	s := NewTargets(len(ts))
+	s.AddAll(ts)
+
+	return s
+}
+
 func (ts *Targets) Addrs() []string {
 	if ts == nil {
 		return nil
@@ -106,9 +113,7 @@ func (ts *Targets) Filter(m specs.Matcher) (*Targets, error) {
 			return nil, specs.NewTargetNotFoundError(m.Full(), ts)
 		}
 
-		out := NewTargets(1)
-		out.Add(target)
-		return out, nil
+		return NewTargetsFrom([]*Target{target}), nil
 	case specs.TargetAddrs:
 		if len(m) == 0 {
 			return nil, nil

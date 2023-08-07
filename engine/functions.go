@@ -99,7 +99,7 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			}
 
 			output := expr.PosArg(1, "")
-			return e.LocalCache.HashOutput(e.Targets.Find(t), output)
+			return e.LocalCache.HashOutput(t, output)
 		},
 		"repo_root": func(expr exprs.Expr) (string, error) {
 			return e.Root.Root.Abs(), nil

@@ -119,15 +119,14 @@ func (e *State) toolTargets() *Targets {
 }
 
 func NewState(root *hroot.State, cfg *config.Config) (*State, error) {
-	targets := NewTargets(0)
 	s := &State{
 		Root:         root,
 		Config:       &Config{Config: cfg},
 		targetsLock:  maps.KMutex{},
-		targets:      targets,
+		targets:      NewTargets(0),
 		Tools:        NewTargets(0),
 		codegenPaths: map[string]*Target{},
-		dag:          &DAG{dag.NewDAG(), targets},
+		dag:          &DAG{dag.NewDAG()},
 		labels:       sets.NewStringSet(0),
 	}
 

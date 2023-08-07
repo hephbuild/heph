@@ -26,6 +26,7 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to/...", "//path/to/..."},
 		{"//path/to/.", "//path/to/."},
 		{"//path/to", "//path/to"},
+		//{"deps(//path/to)", "deps(//path/to)"},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {

@@ -14,8 +14,10 @@ const (
 	tokenNot
 	tokenLParen
 	tokenRParen
+	tokenComma
 	tokenLabel
 	tokenAddr
+	tokenFunction
 )
 
 type token struct {
@@ -31,8 +33,11 @@ func isAddrChar(c uint8) bool {
 	return ads.Contains(packageChars, rune(c)) ||
 		ads.Contains(targetNameChars, rune(c)) ||
 		rune(c) == '/' ||
-		rune(c) == ':'
+		rune(c) == ':' ||
+		rune(c) == '*'
 }
+
+const featureFunctions = false
 
 func lex(input string) []token {
 	var tokens []token
@@ -57,6 +62,9 @@ func lex(input string) []token {
 		case input[0] == ')':
 			tokens = append(tokens, token{typ: tokenRParen, value: ")"})
 			input = input[1:]
+		case input[0] == ',':
+			tokens = append(tokens, token{typ: tokenComma, value: ","})
+			input = input[1:]
 		case isLabelChar(input[0]):
 			i := 1
 			for ; i < len(input); i++ {
@@ -64,7 +72,14 @@ func lex(input string) []token {
 					break
 				}
 			}
-			tokens = append(tokens, token{typ: tokenLabel, value: input[:i]})
+
+			if featureFunctions && i < len(input) && input[i] == '(' {
+				tokens = append(tokens, token{typ: tokenFunction, value: input[:i]})
+				i++
+			} else {
+				tokens = append(tokens, token{typ: tokenLabel, value: input[:i]})
+			}
+
 			input = input[i:]
 		case isAddrChar(input[0]):
 			i := 1
