@@ -4,52 +4,62 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/status"
+	golock "github.com/viney-shih/go-lock"
 )
 
-func NewMutex(name string) Locker {
-	return &mutex{name: name, ch: make(chan struct{}, 1)}
+func NewMutex(name string) RWLocker {
+	return &mutex{name: name, m: golock.NewCASMutex()}
 }
 
 type mutex struct {
 	name string
-	ch   chan struct{}
+	m    *golock.CASMutex
 }
 
-func (m *mutex) Unlock() error {
-	select {
-	case <-m.ch:
-		return nil
-	default:
-		return fmt.Errorf("unlock of unlocked mutex")
-	}
-}
-
-func (m *mutex) TryLock(context.Context) (bool, error) {
-	select {
-	case m.ch <- struct{}{}:
-		return true, nil
-	default:
-		return false, nil
-	}
+func (m *mutex) TryLock(ctx context.Context) (bool, error) {
+	return m.m.TryLock(), ctx.Err()
 }
 
 func (m *mutex) Lock(ctx context.Context) error {
-	ok, err := m.TryLock(ctx)
-	if err != nil {
-		return err
-	}
+	ok := m.m.TryLock()
 	if ok {
 		return nil
 	}
 
 	status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", m.name)))
 
-	select {
-	case m.ch <- struct{}{}:
+	m.m.TryLockWithContext(ctx)
+
+	return ctx.Err()
+}
+
+func (m *mutex) Unlock() error {
+	m.m.Unlock()
+
+	return nil
+}
+
+func (m *mutex) TryRLock(ctx context.Context) (bool, error) {
+	return m.m.RTryLock(), ctx.Err()
+}
+
+func (m *mutex) RLock(ctx context.Context) error {
+	ok := m.m.RTryLock()
+	if ok {
 		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("acquire lock for %v: %v", m.name, ctx.Err())
 	}
+
+	status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", m.name)))
+
+	m.m.RTryLockWithContext(ctx)
+
+	return ctx.Err()
+}
+
+func (m *mutex) RUnlock() error {
+	m.m.RUnlock()
+
+	return nil
 }
 
 func (*mutex) Clean() error {

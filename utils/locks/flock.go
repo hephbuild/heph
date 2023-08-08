@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func NewFlock(name, p string) Locker {
+func NewFlock(name, p string) RWLocker {
 	if name == "" || log.Default().IsLevelEnabled(log.DebugLevel) {
 		name = p
 	}
@@ -23,37 +23,75 @@ func NewFlock(name, p string) Locker {
 
 type Flock struct {
 	name string
-	m    sync.Mutex
+	m    sync.RWMutex
 	path string
 	f    *os.File
 }
 
-func (l *Flock) tryLock(ctx context.Context, onErr func(f *os.File) (bool, error)) (bool, error) {
+// if we use os.File.Fd(), the file is set to blocking mode, preventing the fd to be closed on failure to acquire lock
+func fileDoFd(f *os.File, fun func(fd uintptr) error) error {
+	rawConn, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var rerr error
+	werr := rawConn.Write(func(fd uintptr) (done bool) {
+		rerr = fun(fd)
+		return true
+	})
+	if werr != nil {
+		return werr
+	}
+	return rerr
+}
+
+func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, how int) (bool, error)) (bool, error) {
 	logger := log.FromContext(ctx)
 
-	l.m.Lock()
-	defer l.m.Unlock()
+	fhow := syscall.O_RDWR
+	lhow := syscall.LOCK_EX
+	if ro {
+		fhow = syscall.O_RDONLY
+		lhow = syscall.LOCK_SH
+
+		l.m.RLock()
+		defer l.m.RUnlock()
+	} else {
+		l.m.Lock()
+		defer l.m.Unlock()
+	}
 
 	err := xfs.CreateParentDir(l.path)
 	if err != nil {
 		return false, err
 	}
 
-	f, err := os.OpenFile(l.path, os.O_RDWR|os.O_CREATE, 0644)
+	f, err := os.OpenFile(l.path, fhow|os.O_CREATE, 0644)
 	if err != nil {
 		return false, err
 	}
+	defer func() {
+		if f != l.f {
+			f.Close()
+		}
+	}()
 
 	logger.Debugf("Attempting to acquire lock for %s...", f.Name())
-	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	err = fileDoFd(f, func(fd uintptr) error {
+		return syscall.Flock(int(fd), lhow|syscall.LOCK_NB)
+	})
 	if err != nil {
 		if errno, _ := err.(unix.Errno); errno == unix.EWOULDBLOCK {
-			ok, err := onErr(f)
-			if !ok || err != nil {
-				if err != nil {
-					err = fmt.Errorf("acquire lock for %s: %w", l.name, err)
-				}
-				return false, err
+			ok, err := onErr(f, lhow)
+			if err != nil {
+				return false, fmt.Errorf("acquire lock for %s: %w", l.name, err)
+			}
+
+			if !ok {
+				logger.Debugf("Failed to acquire lock for %s", f.Name())
+
+				return false, nil
 			}
 		} else {
 			return false, err
@@ -69,16 +107,8 @@ func (l *Flock) tryLock(ctx context.Context, onErr func(f *os.File) (bool, error
 	return true, nil
 }
 
-func (l *Flock) TryLock(ctx context.Context) (bool, error) {
-	return l.tryLock(ctx, func(f *os.File) (bool, error) {
-		return false, nil
-	})
-}
-
-func (l *Flock) Lock(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-
-	_, err := l.tryLock(ctx, func(f *os.File) (bool, error) {
+func (l *Flock) lock(ctx context.Context, ro bool) error {
+	_, err := l.tryLock(ctx, ro, func(f *os.File, how int) (bool, error) {
 		l.m.Unlock()
 		defer l.m.Lock()
 
@@ -88,11 +118,6 @@ func (l *Flock) Lock(ctx context.Context) error {
 		pidb, _ := os.ReadFile(f.Name())
 		pid := string(pidb)
 		go func() {
-			if strconv.Itoa(os.Getpid()) == pid {
-				logger.Debugf("Looks another routine has already acquired the lock for %s. Waiting for it to finish...", l.name)
-				return
-			}
-
 			select {
 			case <-doneCh:
 				// don't log
@@ -102,7 +127,11 @@ func (l *Flock) Lock(ctx context.Context) error {
 			}
 
 			if len(pid) > 0 {
-				status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", pid, l.name)))
+				if strconv.Itoa(os.Getpid()) == pid {
+					status.Emit(ctx, status.String(fmt.Sprintf("Another job locked %v, waiting...", l.name)))
+				} else {
+					status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", pid, l.name)))
+				}
 			} else {
 				status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", l.name)))
 			}
@@ -111,8 +140,13 @@ func (l *Flock) Lock(ctx context.Context) error {
 		lockCh := make(chan error, 1)
 
 		go func() {
-			// This will block forever if the ctx completes before
-			lockCh <- syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+			err := fileDoFd(f, func(fd uintptr) error {
+				lockCh <- syscall.Flock(int(fd), how)
+				return nil
+			})
+			if err != nil {
+				lockCh <- err
+			}
 		}()
 
 		select {
@@ -126,7 +160,18 @@ func (l *Flock) Lock(ctx context.Context) error {
 
 		return true, nil
 	})
+
 	return err
+}
+
+func (l *Flock) TryLock(ctx context.Context) (bool, error) {
+	return l.tryLock(ctx, false, func(f *os.File, how int) (bool, error) {
+		return false, nil
+	})
+}
+
+func (l *Flock) Lock(ctx context.Context) error {
+	return l.lock(ctx, false)
 }
 
 func (l *Flock) Unlock() error {
@@ -134,7 +179,9 @@ func (l *Flock) Unlock() error {
 	defer l.m.Unlock()
 
 	f := l.f
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+	if err := fileDoFd(f, func(fd uintptr) error {
+		return syscall.Flock(int(fd), syscall.LOCK_UN)
+	}); err != nil {
 		return fmt.Errorf("release lock for %s: %s", l.path, err)
 	}
 	if err := f.Close(); err != nil {
@@ -144,6 +191,20 @@ func (l *Flock) Unlock() error {
 	f = nil
 
 	return nil
+}
+
+func (l *Flock) TryRLock(ctx context.Context) (bool, error) {
+	return l.tryLock(ctx, true, func(f *os.File, how int) (bool, error) {
+		return false, nil
+	})
+}
+
+func (l *Flock) RLock(ctx context.Context) error {
+	return l.lock(ctx, true)
+}
+
+func (l *Flock) RUnlock() error {
+	return l.Unlock()
 }
 
 func (l *Flock) Clean() error {

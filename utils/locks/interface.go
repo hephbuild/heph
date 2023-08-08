@@ -8,3 +8,10 @@ type Locker interface {
 	Unlock() error
 	Clean() error
 }
+
+type RWLocker interface {
+	Locker
+	RLock(ctx context.Context) error
+	TryRLock(ctx context.Context) (bool, error)
+	RUnlock() error
+}

@@ -90,6 +90,16 @@ func TestFlockSingleInstanceTry(t *testing.T) {
 	})
 }
 
+func TestFlockRLock(t *testing.T) {
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	testRLockTry(t, func() RWLocker {
+		return NewFlock("lock", filepath.Join(dir, t.Name()+".lock"))
+	})
+}
+
 func TestMutex(t *testing.T) {
 	l := NewMutex("lock")
 	testLocker(t, func() Locker {
@@ -107,6 +117,18 @@ func TestMutexContext(t *testing.T) {
 func TestMutexTry(t *testing.T) {
 	l := NewMutex("lock")
 	testLockerTry(t, func() Locker {
+		return l
+	})
+}
+
+func TestMutexRLock(t *testing.T) {
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	l := NewMutex(t.Name())
+
+	testRLockTry(t, func() RWLocker {
 		return l
 	})
 }
@@ -217,4 +239,51 @@ func testLockerTry(t *testing.T, factory func() Locker) {
 	ok, err = l2.TryLock(ctx)
 	require.NoError(t, err)
 	assert.True(t, ok)
+}
+
+func testRLockTry(t *testing.T, factory func() RWLocker) {
+	l1 := factory()
+	l2 := factory()
+	l3 := factory()
+
+	logger := testlog.NewLogger(t)
+	ctx := liblog.ContextWith(context.Background(), logger)
+
+	// 2 RLock
+	err := l1.RLock(ctx)
+	require.NoError(t, err)
+
+	err = l2.RLock(ctx)
+	require.NoError(t, err)
+
+	// Try to Lock
+	ok, err := l3.TryLock(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, false, ok)
+
+	// Unlock one of them
+	err = l1.RUnlock()
+	require.NoError(t, err)
+
+	ok, err = l3.TryLock(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, false, ok)
+
+	// Unlock the second
+	err = l2.RUnlock()
+	require.NoError(t, err)
+
+	// Try to Lock after all are unlocked
+	ok, err = l3.TryLock(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, true, ok)
+
+	// Try to RLock after Lock
+	ok, err = l1.TryRLock(ctx)
+	require.NoError(t, err)
+
+	assert.Equal(t, false, ok)
 }
