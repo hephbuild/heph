@@ -244,7 +244,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 }
 
 func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
-	localCache, err := lcache.NewState(bs.Root, bs.Graph, bs.Observability, bs.Finalizers)
+	localCache, err := lcache.NewState(bs.Root, bs.Graph.Targets(), bs.Observability, bs.Finalizers)
 	if err != nil {
 		return nil, err
 	}

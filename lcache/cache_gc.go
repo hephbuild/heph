@@ -185,5 +185,5 @@ func (e *LocalCacheState) GC(ctx context.Context, flog func(string, ...interface
 		return err
 	}
 
-	return e.runGc(e.Graph.Targets().Slice(), targetDirs, flog, dryrun)
+	return e.runGc(e.Targets.Slice(), targetDirs, flog, dryrun)
 }

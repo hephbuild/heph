@@ -46,8 +46,7 @@ type Engine struct {
 
 	DisableNamedCacheWrite bool
 
-	toolsLock             locks.Locker
-	autocompleteCacheLock locks.Locker
+	toolsLock locks.Locker
 
 	orderedCachesLock locks.Locker
 	orderedCaches     []graph.CacheConfig
@@ -146,7 +145,6 @@ func New(e Engine) *Engine {
 		return t
 	})
 	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
-	e.autocompleteCacheLock = locks.NewFlock("Autocomplete cache", e.Root.Home.Join("tmp", "ac_cache.lock").Abs())
 	e.orderedCachesLock = locks.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
 	return &e
 }

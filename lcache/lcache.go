@@ -55,7 +55,6 @@ type LocalCacheState struct {
 	Targets       *graph.Targets
 	TargetMetas   *TargetMetas
 	Root          *hroot.State
-	Graph         *graph.State
 	Observability *observability.Observability
 	Finalizers    *finalizers.Finalizers
 
@@ -68,7 +67,7 @@ type LocalCacheState struct {
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, g *graph.State, obs *observability.Observability, finalizers *finalizers.Finalizers) (*LocalCacheState, error) {
+func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -78,13 +77,12 @@ func NewState(root *hroot.State, g *graph.State, obs *observability.Observabilit
 	s := &LocalCacheState{
 		Location:      loc.(*vfsos.Location),
 		Path:          cachePath,
-		Targets:       g.Targets(),
+		Targets:       targets,
 		Root:          root,
-		Graph:         g,
 		Observability: obs,
 		Finalizers:    finalizers,
 		TargetMetas: NewTargetMetas(func(addr string) *Target {
-			gtarget := g.Targets().Find(addr)
+			gtarget := targets.Find(addr)
 
 			t := &Target{
 				Target:     gtarget,
