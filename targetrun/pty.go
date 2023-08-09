@@ -1,4 +1,4 @@
-package engine
+package targetrun
 
 import (
 	ptylib "github.com/creack/pty"

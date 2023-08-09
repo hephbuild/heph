@@ -361,3 +361,15 @@ func (b BaseHook) OnExternalCacheGet(ctx context.Context, _ *ExternalCacheGetSpa
 func (b BaseHook) OnLogs(ctx context.Context) io.Writer {
 	return nil
 }
+
+func DoVE[T any](span SpanError, f func() (T, error)) (_ T, rerr error) {
+	defer span.EndError(rerr)
+
+	return f()
+}
+
+func DoE(span SpanError, f func() error) (rerr error) {
+	defer span.EndError(rerr)
+
+	return f()
+}

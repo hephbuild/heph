@@ -1,4 +1,4 @@
-package engine
+package targetrun
 
 import (
 	"context"
@@ -18,7 +18,7 @@ import (
 )
 
 type outTarArtifact struct {
-	Target  *Target
+	Target  *lcache.Target
 	Output  string
 	OutRoot string
 }
@@ -26,21 +26,21 @@ type outTarArtifact struct {
 func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
 	target := a.Target
 
-	var paths xfs.Paths
+	var rpaths xfs.RelPaths
 	if a.Output == specs.SupportFilesOutput {
-		paths = target.ActualSupportFiles()
+		rpaths = target.ActualSupportFiles()
 	} else {
-		paths = target.ActualOutFiles().Name(a.Output)
+		rpaths = target.ActualOutFiles().Name(a.Output)
 	}
 	log.Tracef("Creating archive %v %v", target.Addr, a.Output)
+
+	paths := rpaths.WithRoot(a.OutRoot)
 
 	files := make([]tar.File, 0)
 	for _, file := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-
-		file := file.WithRoot(a.OutRoot)
 
 		files = append(files, tar.File{
 			From: file.Abs(),

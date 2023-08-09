@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
@@ -121,7 +122,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	newTargets := graph.NewTargets(0)
 	deps := &worker.WaitGroup{}
 	for _, target := range targets {
-		e.scheduleRunGenerated(ctx, e.Targets.Find(target), sdeps.Get(target.Addr), deps, newTargets)
+		e.scheduleRunGenerated(ctx, target, sdeps.Get(target.Addr), deps, newTargets)
 	}
 
 	j := e.Pool.Schedule(ctx, &worker.Job{
@@ -170,19 +171,21 @@ func (e *Engine) linkGenTargets(ctx context.Context) error {
 	return nil
 }
 
-func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
+func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: "rungen_" + target.Addr,
 		Deps: runDeps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			return e.scheduleRunGeneratedFiles(ctx, target, deps, targets)
+			ltarget := e.LocalCache.Metas.Find(target)
+
+			return e.scheduleRunGeneratedFiles(ctx, ltarget, deps, targets)
 		},
 	})
 	deps.Add(j)
 }
 
-func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *Target, deps *worker.WaitGroup, targets *graph.Targets) error {
-	files := target.ActualOutFiles().All()
+func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
+	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
 	chunks := ads.Chunk(files, len(e.Pool.Workers))
 

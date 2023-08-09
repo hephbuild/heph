@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/spf13/cobra"
@@ -44,8 +44,8 @@ func getRunOpts() bootstrap.RunOpts {
 	}
 }
 
-func getRROpts() engine.TargetRunRequestOpts {
-	return engine.TargetRunRequestOpts{
+func getRROpts() targetrun.RequestOpts {
+	return targetrun.RequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,
 		PreserveCache: printOutput.bool || catOutput.bool,
@@ -221,7 +221,7 @@ var cleanCmd = &cobra.Command{
 
 		for _, target := range targets.Slice() {
 			log.Tracef("Cleaning %v...", target.Addr)
-			err := bs.Engine.CleanTarget(bs.Engine.Targets.Find(target), true)
+			err := bs.Engine.CleanTarget(target, true)
 			if err != nil {
 				return err
 			}

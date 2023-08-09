@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
@@ -19,7 +20,7 @@ func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunReq
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, deps *worker.WaitGroup) (*worker.Job, error) {
+func (e *Engine) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.Addr,
 		Deps: deps,
@@ -29,10 +30,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr TargetRunRequest, dep
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			err := e.Run(ctx, rr, sandbox.IOConfig{})
 			if err != nil {
-				return TargetFailedError{
-					Target: rr.Target,
-					Err:    err,
-				}
+				return targetrun.WrapTargetFailed(err, rr.Target)
 			}
 
 			return nil
@@ -70,8 +68,7 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 		skip: ads.Map(skip, func(t specs.Specer) string {
 			return t.Spec().Addr
 		}),
-		rrTargets:      targetsSet,
-		allTargetMetas: e.Targets,
+		rrTargets: targetsSet,
 
 		toAssess:     toAssess,
 		outputs:      outputs,
@@ -98,7 +95,6 @@ type schedulerv2 struct {
 	skip []string
 
 	rrTargets       *graph.Targets
-	allTargetMetas  *TargetMetas
 	toAssess        *graph.Targets
 	outputs         *maps.Map[string, *sets.Set[string, string]]
 	deps            *WaitGroupMap
@@ -109,7 +105,7 @@ type schedulerv2 struct {
 
 func (s *schedulerv2) schedule() error {
 	for _, target := range s.toAssess.Slice() {
-		target := s.allTargetMetas.Find(target)
+		target := target
 
 		targetDeps := s.deps.Get(target.Addr)
 		targetDeps.AddSem()
@@ -127,7 +123,7 @@ func (s *schedulerv2) schedule() error {
 		}
 
 		isSkip := ads.Contains(s.skip, target.Addr)
-		isInRRs := s.rrTargets.Has(target.Target)
+		isInRRs := s.rrTargets.Has(target)
 
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{
 			Name: "pull_meta " + target.Addr,
@@ -144,7 +140,7 @@ func (s *schedulerv2) schedule() error {
 					return nil
 				}
 
-				rr := s.rrs.Get(target.Target)
+				rr := s.rrs.Get(target)
 				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs, false)
 				if err != nil {
 					return err
@@ -190,7 +186,7 @@ func (s *schedulerv2) parentTargetDeps(target specs.Specer) (*worker.WaitGroup, 
 	return deps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target, outputs []string, uncompress bool) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.Target, outputs []string, uncompress bool) (*worker.Job, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -215,7 +211,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *Target
 	}), nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *Target, outputs []string, uncompress bool) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *graph.Target, outputs []string, uncompress bool) (*worker.Job, error) {
 	lock := s.targetSchedLock.Get(target.Addr)
 	lock.Lock()
 	defer lock.Unlock()
@@ -250,7 +246,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 
 	runDeps := &worker.WaitGroup{}
 	for _, parent := range parents {
-		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, s.allTargetMetas.Find(parent), true, true, true)
+		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
 		if err != nil {
 			return nil, err
 		}
@@ -260,7 +256,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 	return runDeps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *Target, useCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
+func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *graph.Target, useCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -305,7 +301,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 	return group, nil
 }
 
-func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *Target) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *graph.Target) (*worker.Job, error) {
 	lock := s.targetSchedLock.Get(target.Addr)
 	lock.Lock()
 	defer lock.Unlock()
@@ -329,7 +325,7 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *Target)
 	}
 	deps.AddChild(runDeps)
 
-	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target.Target), runDeps)
+	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target), runDeps)
 	if err != nil {
 		return nil, err
 	}

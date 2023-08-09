@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
@@ -40,7 +41,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		rrs[i].Mode = mode
 	}
 
-	shellCount := rrs.Count(func(rr engine.TargetRunRequest) bool {
+	shellCount := rrs.Count(func(rr targetrun.Request) bool {
 		return rr.Shell
 	})
 
@@ -54,7 +55,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		}
 	}
 
-	var inlineRR *engine.TargetRunRequest
+	var inlineRR *targetrun.Request
 	if len(rrs) == 1 && inlineSingle && !runopts.NoInline {
 		inlineRR = &rrs[0]
 	}
@@ -91,7 +92,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 	if inlineRR == nil {
 		if runopts.PrintOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
-				target := e.Targets.Find(target)
+				target := e.LocalCache.Metas.Find(target)
 				err = PrintTargetOutputPaths(target, runopts.PrintOutput.Str)
 				if err != nil {
 					return err
@@ -101,7 +102,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 
 		if runopts.CatOutput.Bool {
 			for _, target := range rrs.Targets().Slice() {
-				target := e.Targets.Find(target)
+				target := e.LocalCache.Metas.Find(target)
 				err = PrintTargetOutputContent(target, runopts.CatOutput.Str)
 				if err != nil {
 					return err
@@ -130,7 +131,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 		return err
 	}
 
-	inlineTarget := e.Targets.Find(inlineRR.Target)
+	inlineTarget := e.LocalCache.Metas.Find(inlineRR.Target)
 
 	if runopts.PrintOutput.Bool {
 		err = PrintTargetOutputPaths(inlineTarget, runopts.PrintOutput.Str)

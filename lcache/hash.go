@@ -197,20 +197,6 @@ func (e *LocalCacheState) HashInputSafely(target graph.Targeter) (string, error)
 	return e.hashInput(target, true)
 }
 
-func hashCacheId(gtarget graph.Targeter) targetCacheKey {
-	target := gtarget.GraphTarget()
-
-	idh := hash.NewHash()
-	for _, addr := range target.AllTargetDeps.Addrs() {
-		idh.String(addr)
-	}
-
-	return targetCacheKey{
-		addr: target.Addr,
-		hash: idh.Sum(),
-	}
-}
-
 func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 	h, err := e.hashInput(target, false)
 	if err != nil {
@@ -221,25 +207,21 @@ func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 
 func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, error) {
 	target := gtarget.GraphTarget()
+	targetm := e.Metas.Find(gtarget)
 
-	mu := e.cacheHashInputTargetMutex.Get(target.Addr)
-	mu.Lock()
-	defer mu.Unlock()
+	targetm.cacheHashInputTargetMutex.Lock()
+	defer targetm.cacheHashInputTargetMutex.Unlock()
 
-	cacheId := hashCacheId(target)
-
-	if h, ok := e.cacheHashInput.GetOk(cacheId); ok {
+	if h := targetm.inputHash; h != "" {
 		if safe {
-			if m, ok := e.cacheHashInputPathsModtime.GetOk(cacheId); ok {
-				for p, t := range m {
-					info, err := os.Lstat(p)
-					if err != nil {
-						return "", err
-					}
+			for p, t := range targetm.cacheHashInputPathsModtime {
+				info, err := os.Lstat(p)
+				if err != nil {
+					return "", err
+				}
 
-					if info.ModTime() != t {
-						return "", fmt.Errorf("%v: %w", p, ErrFileModifiedSinceHashing)
-					}
+				if info.ModTime() != t {
+					return "", fmt.Errorf("%v: %w", p, ErrFileModifiedSinceHashing)
 				}
 			}
 		}
@@ -253,7 +235,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	}()
 
 	h := hash.NewDebuggableHash(func() string {
-		return cacheId.String() + "_hash_input"
+		return target.Addr + "_" + targetm.depsHash + "_hash_input"
 	})
 	h.I64(8) // Force break all caches
 
@@ -351,12 +333,10 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	})
 	h.String(target.OutEnv)
 
-	sh := h.Sum()
+	targetm.inputHash = h.Sum()
+	targetm.cacheHashInputPathsModtime = pathsModtime
 
-	e.cacheHashInput.Set(cacheId, sh)
-	e.cacheHashInputPathsModtime.Set(cacheId, pathsModtime)
-
-	return sh, nil
+	return targetm.inputHash, nil
 }
 
 func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) (string, error) {
@@ -374,23 +354,13 @@ func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) s
 
 func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (string, error) {
 	target := gtarget.GraphTarget()
+	targetm := e.Metas.Find(gtarget)
 
-	mu := e.cacheHashOutputTargetMutex.Get(target.Addr + "|" + output)
+	mu := targetm.cacheHashOutputTargetMutex.Get(output)
 	mu.Lock()
 	defer mu.Unlock()
 
-	hashInput, err := e.hashInput(target, false)
-	if err != nil {
-		return "", err
-	}
-
-	cacheId := targetOutCacheKey{
-		addr:   target.Addr,
-		output: output,
-		hash:   hashInput,
-	}
-
-	if h, ok := e.cacheHashOutput.GetOk(cacheId); ok {
+	if h, ok := targetm.cacheHashOutput.GetOk(output); ok {
 		return h, nil
 	}
 
@@ -410,13 +380,13 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 	}
 
 	if sh := strings.TrimSpace(string(b)); len(sh) > 0 {
-		e.cacheHashOutput.Set(cacheId, sh)
+		targetm.cacheHashOutput.Set(output, sh)
 
 		return sh, nil
 	}
 
 	h := hash.NewDebuggableHash(func() string {
-		return cacheId.String() + "_hash_out"
+		return target.Addr + "|" + output + "_" + targetm.inputHash + "_hash_out"
 	})
 
 	h.String(output)
@@ -442,7 +412,7 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 
 	sh := h.Sum()
 
-	e.cacheHashOutput.Set(cacheId, sh)
+	targetm.cacheHashOutput.Set(output, sh)
 
 	return sh, nil
 }
@@ -466,18 +436,5 @@ func lockPath(root *hroot.State, target specs.Specer, resource string) string {
 	spec := target.Spec()
 
 	folder := "__target_" + spec.Name
-	return root.Home.Join("tmp", spec.Package.Path, folder, resource+".lock").Abs()
-}
-
-func (e *LocalCacheState) CleanTargetLock(starget specs.Specer) error {
-	target := e.TargetMetas.Find(starget)
-
-	for _, l := range target.cacheLocks {
-		err := l.Clean()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return root.Tmp.Join(spec.Package.Path, folder, resource+".lock").Abs()
 }

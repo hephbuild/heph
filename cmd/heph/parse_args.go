@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 )
 
 func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, *graph.Target, error) {
@@ -68,7 +69,7 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 		}
 	}
 
-	return bootstrap.GenerateRRs(ctx, e, m, targs, engine.TargetRunRequestOpts{
+	return bootstrap.GenerateRRs(ctx, e, m, targs, targetrun.RequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,
 		PreserveCache: printOutput.bool || catOutput.bool,

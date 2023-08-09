@@ -7,10 +7,11 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts engine.TargetRunRequestOpts) (engine.TargetRunRequests, error) {
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (engine.TargetRunRequests, error) {
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
@@ -42,10 +43,10 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 			return nil, err
 		}
 
-		rr := engine.TargetRunRequest{
-			Target:               target,
-			Args:                 args,
-			TargetRunRequestOpts: opts,
+		rr := targetrun.Request{
+			Target:      target,
+			Args:        args,
+			RequestOpts: opts,
 		}
 		if len(rr.Args) > 0 && target.Cache.Enabled {
 			log.Warnf("%v: args are being passed, disabling cache", target.Addr)
@@ -70,7 +71,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string, opts engine.TargetRunRequestOpts, plain bool) (engine.TargetRunRequests, error) {
+func GenerateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (engine.TargetRunRequests, error) {
 	if specs.IsMatcherExplicit(m) {
 		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
 		if err == nil {

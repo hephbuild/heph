@@ -1,9 +1,11 @@
-package engine
+package bootstrap
 
 import (
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/specs"
 )
 
@@ -22,13 +24,18 @@ var utilFunctions = map[string]exprs.Func{
 	},
 }
 
-func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
-	getTarget := func(expr exprs.Expr) (*Target, error) {
+func QueryFunctions(
+	root *hroot.State,
+	localCache *lcache.LocalCacheState,
+	g *graph.State,
+	t *graph.Target,
+) map[string]exprs.Func {
+	getTarget := func(expr exprs.Expr) (*graph.Target, error) {
 		addr := expr.PosArg(0, t.Addr)
 
-		target := e.Targets.FindAddr(addr)
+		target := g.Targets().Find(addr)
 		if target == nil {
-			return nil, specs.NewTargetNotFoundError(addr, e.Graph.Targets())
+			return nil, specs.NewTargetNotFoundError(addr, g.Targets())
 		}
 
 		return target, nil
@@ -44,21 +51,19 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			universe, err := e.Graph.DAG().GetParents(t.Target)
+			universe, err := g.DAG().GetParents(t.Target)
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t.Target)
+			universe = append(universe, t)
+
+			ltarget := localCache.Metas.Find(t)
 
 			if !graph.Contains(universe, t.Addr) {
 				return "", fmt.Errorf("cannot get outdir of %v", t.Addr)
 			}
 
-			if t.OutExpansionRoot == nil {
-				return "", fmt.Errorf("%v has not been cached yet", t.Addr)
-			}
-
-			return t.OutExpansionRoot.Join(t.Package.Path).Abs(), nil
+			return ltarget.OutExpansionRoot().Join(t.Package.Path).Abs(), nil
 		},
 		"hash_input": func(expr exprs.Expr) (string, error) {
 			t, err := getTarget(expr)
@@ -66,17 +71,17 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			universe, err := e.Graph.DAG().GetParents(t.Target)
+			universe, err := g.DAG().GetParents(t.Target)
 			if err != nil {
 				return "", err
 			}
-			universe = append(universe, t.Target)
+			universe = append(universe, t)
 
 			if !graph.Contains(universe, t.Addr) {
 				return "", fmt.Errorf("cannot get input of %v", t.Addr)
 			}
 
-			return e.LocalCache.HashInput(t)
+			return localCache.HashInput(t)
 		},
 		"hash_output": func(expr exprs.Expr) (string, error) {
 			addr, err := expr.MustPosArg(0)
@@ -84,12 +89,12 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 				return "", err
 			}
 
-			t := e.Graph.Targets().Find(addr)
+			t := g.Targets().Find(addr)
 			if t == nil {
-				return "", specs.NewTargetNotFoundError(addr, e.Graph.Targets())
+				return "", specs.NewTargetNotFoundError(addr, g.Targets())
 			}
 
-			universe, err := e.Graph.DAG().GetParents(t)
+			universe, err := g.DAG().GetParents(t)
 			if err != nil {
 				return "", err
 			}
@@ -99,10 +104,10 @@ func (e *Engine) queryFunctions(t *Target) map[string]exprs.Func {
 			}
 
 			output := expr.PosArg(1, "")
-			return e.LocalCache.HashOutput(t, output)
+			return localCache.HashOutput(t, output)
 		},
 		"repo_root": func(expr exprs.Expr) (string, error) {
-			return e.Root.Root.Abs(), nil
+			return root.Root.Abs(), nil
 		},
 	}
 

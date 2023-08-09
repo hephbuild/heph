@@ -2,26 +2,20 @@ package engine
 
 import (
 	"context"
-	"fmt"
-	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
-	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/packages"
-	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
-	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/locks"
-	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,20 +23,20 @@ import (
 )
 
 type Engine struct {
-	Cwd               string
-	Root              *hroot.State
-	Config            *graph.Config
-	Observability     *observability.Observability
-	GetFlowID         func() string
-	PlatformProviders []platform.PlatformProvider
-	LocalCache        *lcache.LocalCacheState
-	RemoteCache       *rcache.RemoteCache
-	RemoteCacheHints  *rcache.HintStore
-	Packages          *packages.Registry
-	BuildFilesState   *buildfiles.State
-	Graph             *graph.State
-	Pool              *worker.Pool
-	Finalizers        *finalizers.Finalizers
+	Cwd              string
+	Root             *hroot.State
+	Config           *graph.Config
+	Observability    *observability.Observability
+	GetFlowID        func() string
+	LocalCache       *lcache.LocalCacheState
+	RemoteCache      *rcache.RemoteCache
+	RemoteCacheHints *rcache.HintStore
+	Packages         *packages.Registry
+	BuildFilesState  *buildfiles.State
+	Graph            *graph.State
+	Pool             *worker.Pool
+	Finalizers       *finalizers.Finalizers
+	Runner           *targetrun.Runner
 
 	DisableNamedCacheWrite bool
 
@@ -51,29 +45,12 @@ type Engine struct {
 	orderedCachesLock locks.Locker
 	orderedCaches     []graph.CacheConfig
 
-	Targets *TargetMetas
-
 	RanGenPass bool
 }
 
-type TargetRunRequest struct {
-	Target *graph.Target
-	Args   []string
-	Mode   string // run or watch
-	TargetRunRequestOpts
-}
+type TargetRunRequests []targetrun.Request
 
-type TargetRunRequestOpts struct {
-	NoCache bool
-	Shell   bool
-	// Force preserving cache for uncached targets when --print-out is enabled
-	PreserveCache bool
-	NoPTY         bool
-}
-
-type TargetRunRequests []TargetRunRequest
-
-func (rrs TargetRunRequests) Has(t *Target) bool {
+func (rrs TargetRunRequests) Has(t *graph.Target) bool {
 	for _, rr := range rrs {
 		if rr.Target.Addr == t.Addr {
 			return true
@@ -83,14 +60,14 @@ func (rrs TargetRunRequests) Has(t *Target) bool {
 	return false
 }
 
-func (rrs TargetRunRequests) Get(t *graph.Target) TargetRunRequest {
+func (rrs TargetRunRequests) Get(t *graph.Target) targetrun.Request {
 	for _, rr := range rrs {
 		if rr.Target.Addr == t.Addr {
 			return rr
 		}
 	}
 
-	return TargetRunRequest{Target: t}
+	return targetrun.Request{Target: t}
 }
 
 func (rrs TargetRunRequests) Targets() *graph.Targets {
@@ -103,7 +80,7 @@ func (rrs TargetRunRequests) Targets() *graph.Targets {
 	return ts
 }
 
-func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
+func (rrs TargetRunRequests) Count(f func(rr targetrun.Request) bool) int {
 	c := 0
 	for _, rr := range rrs {
 		if f(rr) {
@@ -115,83 +92,9 @@ func (rrs TargetRunRequests) Count(f func(rr TargetRunRequest) bool) int {
 }
 
 func New(e Engine) *Engine {
-	e.Targets = NewTargetMetas(func(addr string) *Target {
-		gtarget := e.Graph.Targets().Find(addr)
-		if gtarget == nil {
-			return nil
-		}
-
-		t := &Target{
-			Target:           gtarget,
-			WorkdirRoot:      xfs.Path{},
-			SandboxRoot:      xfs.Path{},
-			OutExpansionRoot: nil, // Set during execution
-			runLock:          nil, // Set after
-			postRunWarmLock:  e.lockFactory(gtarget, "postrunwarm"),
-		}
-		if t.ConcurrentExecution {
-			t.runLock = locks.NewMutex(t.Addr)
-		} else {
-			t.runLock = e.lockFactory(t, "run")
-		}
-
-		t.SandboxRoot = e.sandboxRoot(t).Join("_dir")
-
-		t.WorkdirRoot = e.Root.Root
-		if t.Sandbox {
-			t.WorkdirRoot = t.SandboxRoot
-		}
-
-		return t
-	})
 	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
 	e.orderedCachesLock = locks.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
 	return &e
-}
-
-func (e *Engine) lockFactory(t specs.Specer, resource string) locks.Locker {
-	ts := t.Spec()
-	p := e.lockPath(t, resource)
-
-	return locks.NewFlock(ts.Addr+" ("+resource+")", p)
-}
-
-type ErrorWithLogFile struct {
-	LogFile string
-	Err     error
-}
-
-func (t ErrorWithLogFile) Error() string {
-	return t.Err.Error()
-}
-
-func (t ErrorWithLogFile) Unwrap() error {
-	return t.Err
-}
-
-func (t ErrorWithLogFile) Is(target error) bool {
-	_, ok := target.(TargetFailedError)
-
-	return ok
-}
-
-type TargetFailedError struct {
-	Target *graph.Target
-	Err    error
-}
-
-func (t TargetFailedError) Error() string {
-	return t.Err.Error()
-}
-
-func (t TargetFailedError) Unwrap() error {
-	return t.Err
-}
-
-func (t TargetFailedError) Is(target error) bool {
-	_, ok := target.(TargetFailedError)
-
-	return ok
 }
 
 type WaitGroupMap struct {
@@ -231,10 +134,9 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 }
 
 func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []specs.Specer) (*WaitGroupMap, error) {
-	rrs := make([]TargetRunRequest, 0, len(targets))
-	for _, target := range targets {
-		rrs = append(rrs, TargetRunRequest{Target: target})
-	}
+	rrs := ads.Map(targets, func(t *graph.Target) targetrun.Request {
+		return targetrun.Request{Target: t}
+	})
 
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
@@ -256,163 +158,8 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) collectNamedOut(target *Target, namedPaths *graph.OutNamedPaths, root string) (*ActualOutNamedPaths, error) {
-	tp := &ActualOutNamedPaths{}
-
-	for name, paths := range namedPaths.Named() {
-		tp.ProvisionName(name)
-
-		files, err := e.collectOut(target, paths, root)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, file := range files {
-			tp.Add(name, file)
-		}
-	}
-
-	return tp, nil
-}
-
-func (e *Engine) collectNamedOutFromTar(ctx context.Context, target *Target, outputs []string) (*ActualOutNamedPaths, error) {
-	tp := &ActualOutNamedPaths{}
-
-	for name := range target.Out.Named() {
-		if !ads.Contains(outputs, name) {
-			continue
-		}
-
-		tp.ProvisionName(name)
-
-		artifact := target.Artifacts.OutTar(name)
-
-		files, err := e.collectOutFromArtifact(ctx, target, artifact)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, file := range files {
-			tp.Add(name, file.WithRoot(target.OutExpansionRoot.Abs()))
-		}
-	}
-
-	tp.Sort()
-
-	return tp, nil
-}
-
-func (e *Engine) collectOutFromArtifact(ctx context.Context, target *Target, artifact artifacts.Artifact) (xfs.Paths, error) {
-	paths, err := e.LocalCache.PathsFromArtifact(ctx, target, artifact)
-	if err != nil {
-		return nil, err
-	}
-
-	return paths.WithRoot(target.OutExpansionRoot.Abs()), nil
-}
-
-func (e *Engine) collectOut(target *Target, files xfs.RelPaths, root string) (xfs.Paths, error) {
-	outSet := sets.NewSet(func(p xfs.Path) string {
-		return p.RelRoot()
-	}, len(files))
-
-	for _, file := range files {
-		pattern := file.RelRoot()
-
-		if !xfs.IsGlob(pattern) && !xfs.PathExists(filepath.Join(root, pattern)) {
-			return nil, fmt.Errorf("%v did not output %v", target.Addr, pattern)
-		}
-
-		err := xfs.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
-			outSet.Add(xfs.NewPath(root, path))
-
-			return nil
-		})
-		if err != nil {
-			return nil, fmt.Errorf("collect output %v: %w", file.RelRoot(), err)
-		}
-	}
-
-	out := xfs.Paths(outSet.Slice())
-	out.Sort()
-
-	return out, nil
-}
-
-func (e *Engine) populateActualFiles(ctx context.Context, target *Target, outRoot string) (rerr error) {
-	ctx, span := e.Observability.SpanCollectOutput(ctx, target.GraphTarget())
-	defer span.EndError(rerr)
-
-	target.actualOutFiles = &ActualOutNamedPaths{}
-	target.actualSupportFiles = make(xfs.Paths, 0)
-
-	var err error
-
-	target.actualOutFiles, err = e.collectNamedOut(target, target.Out, outRoot)
-	if err != nil {
-		return fmt.Errorf("out: %w", err)
-	}
-
-	if target.HasSupportFiles {
-		target.actualSupportFiles, err = e.collectOut(target, target.OutWithSupport.Name(specs.SupportFilesOutput), outRoot)
-		if err != nil {
-			return fmt.Errorf("support: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (e *Engine) populateActualFilesFromTar(ctx context.Context, target *Target, outputs []string) error {
-	log.Tracef("populateActualFilesFromTar %v", target.Addr)
-
-	target.actualOutFiles = &ActualOutNamedPaths{}
-	target.actualSupportFiles = make(xfs.Paths, 0)
-
-	var err error
-
-	target.actualOutFiles, err = e.collectNamedOutFromTar(ctx, target, outputs)
-	if err != nil {
-		return fmt.Errorf("out: %w", err)
-	}
-
-	if target.HasSupportFiles {
-		art := target.Artifacts.OutTar(specs.SupportFilesOutput)
-
-		target.actualSupportFiles, err = e.collectOutFromArtifact(ctx, target, art)
-		if err != nil {
-			return fmt.Errorf("support: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (e *Engine) sandboxRoot(specer specs.Specer) xfs.Path {
-	target := specer.Spec()
-
-	folder := "__target_" + target.Name
-	if target.ConcurrentExecution {
-		folder = "__target_tmp_" + instance.UID + "_" + target.Name
-	}
-
-	p := e.Root.Home.Join("sandbox", target.Package.Path, folder)
-
-	if target.ConcurrentExecution {
-		e.Finalizers.RegisterRemove(p.Abs())
-	}
-
-	return p
-}
-
-func (e *Engine) CleanTarget(target *Target, async bool) error {
-	sandboxDir := e.sandboxRoot(target)
-	err := xfs.DeleteDir(sandboxDir.Abs(), async)
-	if err != nil {
-		return err
-	}
-
-	err = e.LocalCache.CleanTarget(target, async)
+func (e *Engine) CleanTarget(target *graph.Target, async bool) error {
+	err := e.LocalCache.CleanTarget(target, async)
 	if err != nil {
 		return err
 	}
@@ -420,33 +167,19 @@ func (e *Engine) CleanTarget(target *Target, async bool) error {
 	return nil
 }
 
-func (e *Engine) CleanTargetLock(target *Target) error {
-	err := target.runLock.Clean()
-	if err != nil {
-		return err
-	}
-
-	err = e.LocalCache.CleanTargetLock(target)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (e *Engine) GetFileDeps(targets ...*Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *Target) graph.TargetDeps {
+func (e *Engine) GetFileDeps(targets ...*graph.Target) []xfs.Path {
+	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
 		return target.Deps.All()
 	})
 }
 
-func (e *Engine) GetFileHashDeps(targets ...*Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *Target) graph.TargetDeps {
+func (e *Engine) GetFileHashDeps(targets ...*graph.Target) []xfs.Path {
+	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
 		return target.HashDeps
 	})
 }
 
-func (e *Engine) getFileDeps(targets []*Target, f func(*Target) graph.TargetDeps) []xfs.Path {
+func (e *Engine) getFileDeps(targets []*graph.Target, f func(*graph.Target) graph.TargetDeps) []xfs.Path {
 	filesm := map[string]xfs.Path{}
 	for _, target := range targets {
 		for _, file := range f(target).Files {

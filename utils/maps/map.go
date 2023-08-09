@@ -104,6 +104,15 @@ func (m *Map[K, V]) Has(k K) bool {
 	return ok
 }
 
+func (m *Map[K, V]) Walk(f func(k K, v V)) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for k, v := range m.m {
+		f(k, v)
+	}
+}
+
 func (m *Map[K, V]) Raw() map[K]V {
 	return m.m
 }

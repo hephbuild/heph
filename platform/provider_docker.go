@@ -154,7 +154,12 @@ func dockerVersion(exe string) (*dockerVersionData, error) {
 	cmd := exec.Command(exe, "version", "--format", "{{json .Server}}")
 	b, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %s", err, bytes.TrimSpace(b))
+		b = bytes.TrimSpace(b)
+		if string(b) == "null" {
+			return nil, fmt.Errorf("make sure docker daemon is running and accessible")
+		}
+
+		return nil, fmt.Errorf("%w: %s", err, b)
 	}
 
 	var data dockerVersionData
@@ -174,7 +179,7 @@ func NewDockerProvider(name string, options map[string]interface{}) (Provider, e
 
 	versionData, err := dockerVersion(exe)
 	if err != nil {
-		return nil, fmt.Errorf("version: %w", err)
+		return nil, fmt.Errorf("unable to obtain version: %w", err)
 	}
 
 	goos := versionData.Os

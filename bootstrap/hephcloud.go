@@ -86,7 +86,7 @@ type FlowDetails struct {
 }
 
 func (c Cloud) currentFlowPath() string {
-	return c.Root.Home.Join("tmp", "current_flow").Abs()
+	return c.Root.Tmp.Join("current_flow").Abs()
 }
 
 func (c Cloud) StartFlow(ctx context.Context, name string, metas map[string]string) error {

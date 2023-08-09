@@ -1,4 +1,4 @@
-package engine
+package targetrun
 
 import (
 	"github.com/hephbuild/heph/artifacts"
@@ -15,7 +15,7 @@ type artifactProducer struct {
 // orderedArtifactProducers returns artifact in hashing order
 // For hashing to work properly, support_files tar must go first, then support_files hash
 // then the other artifacts
-func (e *Engine) orderedArtifactProducers(t *Target, outRoot, logFilePath string) []lcache.ArtifactWithProducer {
+func (e *Runner) orderedArtifactProducers(t *lcache.Target, outRoot, logFilePath string) []lcache.ArtifactWithProducer {
 	arts := t.Artifacts
 
 	all := make([]lcache.ArtifactWithProducer, 0, len(arts.Out)+2)

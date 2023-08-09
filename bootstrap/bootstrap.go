@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/hroot"
@@ -19,6 +20,7 @@ import (
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/upgrade"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/worker"
@@ -258,22 +260,35 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		}
 	}
 
+	runner := &targetrun.Runner{
+		Root:              bs.Root,
+		Observability:     bs.Observability,
+		Finalizers:        bs.Finalizers,
+		LocalCache:        localCache,
+		PlatformProviders: bs.PlatformProviders,
+		GetFlowID:         getFlowId,
+		QueryFunctions: func(target *graph.Target) map[string]exprs.Func {
+			return QueryFunctions(bs.Root, localCache, bs.Graph, target)
+		},
+		Cwd:    bs.Cwd,
+		Config: bs.Config,
+		Pool:   bs.Pool,
+	}
+
 	e := engine.New(engine.Engine{
-		Cwd:                    bs.Cwd,
-		Root:                   bs.Root,
-		Config:                 bs.Graph.Config,
-		Observability:          bs.Observability,
-		GetFlowID:              getFlowId,
-		PlatformProviders:      bs.PlatformProviders,
-		LocalCache:             localCache,
-		RemoteCache:            remoteCache,
-		Packages:               bs.Packages,
-		BuildFilesState:        bs.BuildFiles,
-		Graph:                  bs.Graph,
-		Pool:                   bs.Pool,
-		Finalizers:             &finalizers.Finalizers{},
-		DisableNamedCacheWrite: false,
-		Targets:                nil, // Will be set as part of engine.New
+		Cwd:             bs.Cwd,
+		Root:            bs.Root,
+		Config:          bs.Graph.Config,
+		Observability:   bs.Observability,
+		GetFlowID:       getFlowId,
+		LocalCache:      localCache,
+		RemoteCache:     remoteCache,
+		Packages:        bs.Packages,
+		BuildFilesState: bs.BuildFiles,
+		Graph:           bs.Graph,
+		Pool:            bs.Pool,
+		Finalizers:      &finalizers.Finalizers{},
+		Runner:          runner,
 	})
 
 	bs.Finalizers.RegisterWithErr(func(err error) {

@@ -3,13 +3,43 @@ package bootstrap
 import (
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker"
 	"go.uber.org/multierr"
 	"io"
 	"os"
 )
+
+func printErrTargetFailed(err error) bool {
+	var lerr targetrun.TargetFailed
+	if errors.As(err, &lerr) {
+		log.Errorf("%v failed: %v", lerr.Target.Addr, lerr.Err)
+
+		logFile := lerr.LogFile
+		if logFile != "" {
+			info, _ := os.Stat(logFile)
+			if info != nil && info.Size() > 0 {
+				fmt.Fprintln(log.Writer())
+				f, err := os.Open(logFile)
+				if err == nil {
+					_, _ = io.Copy(log.Writer(), f)
+					f.Close()
+					fmt.Fprintln(log.Writer())
+				}
+				log.Errorf("The log file can be found at %v", logFile)
+			}
+		}
+
+		for _, err := range multierr.Errors(lerr.Err) {
+			log.Error(err)
+		}
+
+		return true
+	}
+
+	return false
+}
 
 func PrintHumanError(err error) {
 	errs := multierr.Errors(worker.CollectRootErrors(err))
@@ -25,35 +55,8 @@ func PrintHumanError(err error) {
 	}
 
 	for _, err := range errs {
-		separate()
-
-		var terr engine.TargetFailedError
-		if errors.As(err, &terr) {
-			log.Errorf("%v failed", terr.Target.Addr)
-
-			var lerr engine.ErrorWithLogFile
-			if errors.As(err, &lerr) {
-				logFile := lerr.LogFile
-				info, _ := os.Stat(logFile)
-				if info.Size() > 0 {
-					fmt.Fprintln(log.Writer())
-					f, err := os.Open(logFile)
-					if err == nil {
-						_, _ = io.Copy(log.Writer(), f)
-						f.Close()
-						fmt.Fprintln(log.Writer())
-					}
-					log.Errorf("The log file can be found at %v", logFile)
-				}
-
-				log.Error(lerr.Error())
-			} else {
-				for _, err := range multierr.Errors(terr) {
-					skipSpacing = true
-					separate()
-					log.Error(err)
-				}
-			}
+		if printErrTargetFailed(err) {
+			// Printed !
 		} else {
 			var jerr worker.JobError
 			if errors.As(err, &jerr) && jerr.Skipped() {
@@ -61,7 +64,11 @@ func PrintHumanError(err error) {
 				skipSpacing = true
 				log.Debugf("skipped: %v", jerr)
 			} else {
-				log.Error(err)
+				for _, err := range multierr.Errors(err) {
+					skipSpacing = true
+					separate()
+					log.Error(err)
+				}
 			}
 		}
 	}

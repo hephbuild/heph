@@ -6,12 +6,12 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/cmd/heph/searchui"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
@@ -633,14 +633,14 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, TargetRunRequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Engine, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
 
-		target := bs.Engine.Targets.Find(gtarget)
+		target := bs.Engine.LocalCache.Metas.Find(gtarget)
 
-		fmt.Println(filepath.Dir(target.OutExpansionRoot.Abs()))
+		fmt.Println(filepath.Dir(target.OutExpansionRoot().Abs()))
 
 		return nil
 	},
@@ -681,12 +681,12 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Engine, []engine.TargetRunRequest{{Target: gtarget, TargetRunRequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Engine, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
 
-		target := bs.Engine.Targets.Find(gtarget)
+		target := bs.Engine.LocalCache.Metas.Find(gtarget)
 
 		names := specs.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {

@@ -14,7 +14,6 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
@@ -27,42 +26,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync"
 )
-
-type targetCacheKey struct {
-	addr string
-	hash string
-}
-
-func (k targetCacheKey) String() string {
-	return k.addr + "_" + k.hash
-}
-
-type targetOutCacheKey struct {
-	addr   string
-	output string
-	hash   string
-}
-
-func (k targetOutCacheKey) String() string {
-	return k.addr + "|" + k.output + "_" + k.hash
-}
 
 type LocalCacheState struct {
 	Location      *vfsos.Location
 	Path          xfs.Path
 	Targets       *graph.Targets
-	TargetMetas   *TargetMetas
+	Metas         *TargetMetas[*Target]
 	Root          *hroot.State
 	Observability *observability.Observability
 	Finalizers    *finalizers.Finalizers
-
-	cacheHashInputTargetMutex  maps.KMutex
-	cacheHashInput             *maps.Map[targetCacheKey, string]
-	cacheHashOutputTargetMutex maps.KMutex
-	cacheHashOutput            *maps.Map[targetOutCacheKey, string] // TODO: LRU
-	cacheHashInputPathsModtime *maps.Map[targetCacheKey, map[string]time.Time]
 }
 
 const LatestDir = "latest"
@@ -81,17 +55,26 @@ func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Obse
 		Root:          root,
 		Observability: obs,
 		Finalizers:    finalizers,
-		TargetMetas: NewTargetMetas(func(addr string) *Target {
-			gtarget := targets.Find(addr)
+		Metas: NewTargetMetas(func(k targetMetaKey) *Target {
+			gtarget := targets.Find(k.addr)
 
 			t := &Target{
-				Target:     gtarget,
-				cacheLocks: map[string]locks.Locker{},
+				Target:                     gtarget,
+				depsHash:                   k.depshash,
+				inputHash:                  "",
+				actualOutFiles:             nil,
+				cacheLocks:                 nil, // Set after
+				cacheHashInputTargetMutex:  sync.Mutex{},
+				cacheHashOutputTargetMutex: maps.KMutex{},
+				cacheHashOutput:            &maps.Map[string, string]{},
+				cacheHashInputPathsModtime: nil,
+				expandLock:                 locks.NewFlock(gtarget.Addr+" (expand)", lockPath(root, gtarget, "expand")),
 			}
+
+			ts := t.Spec()
 
 			t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
 			for _, artifact := range t.Artifacts.All() {
-				ts := t.Spec()
 				resource := artifact.Name()
 
 				p := lockPath(root, t, "cache_"+resource)
@@ -103,11 +86,6 @@ func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Obse
 
 			return t
 		}),
-		cacheHashInputTargetMutex:  maps.KMutex{},
-		cacheHashInput:             &maps.Map[targetCacheKey, string]{},
-		cacheHashOutputTargetMutex: maps.KMutex{},
-		cacheHashOutput:            &maps.Map[targetOutCacheKey, string]{},
-		cacheHashInputPathsModtime: &maps.Map[targetCacheKey, map[string]time.Time]{},
 	}
 
 	return s, nil
@@ -166,15 +144,7 @@ func (e *LocalCacheState) LinkLatestCache(target specs.Specer, hash string) erro
 }
 
 func (e *LocalCacheState) ResetCacheHashInput(spec specs.Specer) {
-	target := spec.Spec()
-
-	e.cacheHashInput.DeleteP(func(k targetCacheKey) bool {
-		return k.addr == target.Addr
-	})
-
-	e.cacheHashInputPathsModtime.DeleteP(func(k targetCacheKey) bool {
-		return k.addr == target.Addr
-	})
+	e.Metas.Delete(spec)
 }
 
 func (e *LocalCacheState) HasArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, skipSpan bool) (bool, error) {
@@ -265,15 +235,32 @@ func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.
 func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, outputs []string) (xfs.Path, error) {
 	target := ttarget.GraphTarget()
 
-	cacheDir := e.cacheDir(target)
+	doneMarker, err := e.ArtifactExists(ctx, target, target.Artifacts.InputHash)
+	if err != nil {
+		return xfs.Path{}, err
+	}
 
-	doneMarker := cacheDir.Join(target.Artifacts.InputHash.FileName()).Abs()
-	if !xfs.PathExists(doneMarker) {
+	if !doneMarker {
 		return xfs.Path{}, nil
 	}
 
-	outDir := e.cacheDir(target).Join("_output")
-	outDirHashPath := e.cacheDir(target).Join("_output_hash").Abs()
+	ltarget := e.Metas.Find(target)
+	err = ltarget.expandLock.Lock(ctx)
+	if err != nil {
+		return xfs.Path{}, err
+	}
+
+	defer func() {
+		err := ltarget.expandLock.Unlock()
+		if err != nil {
+			log.Error("unlock %v", err)
+		}
+	}()
+
+	cacheDir := e.cacheDir(target)
+
+	outDir := cacheDir.Join("_output")
+	outDirHashPath := cacheDir.Join("_output_hash").Abs()
 
 	// TODO: This can be a problem, where 2 targets depends on the same target, but with different outputs,
 	// leading to the expand overriding each other
@@ -346,28 +333,38 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		}
 	}
 
+	e.Metas.Find(target).outExpansionRoot = outDir
+
 	return outDir, nil
 }
 
-func (e *LocalCacheState) PathsFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (xfs.RelPaths, error) {
-	r, err := e.UncompressedReaderFromArtifact(artifact, target)
-	if err != nil {
-		return nil, err
+type ActualFileCollector interface {
+	PopulateActualFiles(ctx context.Context, t *Target, outputs []string) error
+}
+
+type TargetOpts struct {
+	ActualFilesCollector        ActualFileCollector
+	ActualFilesCollectorOutputs []string
+}
+
+func (e *LocalCacheState) Target(ctx context.Context, target graph.Targeter, o TargetOpts) (*Target, error) {
+	t := e.Metas.Find(target)
+
+	if o.ActualFilesCollector != nil {
+		// TODO: make a bit smarter so that it doesnt collect them again if the request outputs is already done
+
+		status.Emit(ctx, tgt.TargetStatus(target, "Hydrating output..."))
+
+		ctx, span := e.Observability.SpanCollectOutput(ctx, target.GraphTarget())
+		err := observability.DoE(span, func() error {
+			return o.ActualFilesCollector.PopulateActualFiles(ctx, t, o.ActualFilesCollectorOutputs)
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
-	defer r.Close()
 
-	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target))
-	if err != nil {
-		return nil, err
-	}
-
-	ps := xfs.RelPaths(ads.Map(files, func(path string) xfs.RelPath {
-		return xfs.NewRelPath(path)
-	}))
-
-	ps.Sort()
-
-	return ps, nil
+	return t, nil
 }
 
 func (e *LocalCacheState) CleanTarget(target specs.Specer, async bool) error {
@@ -393,7 +390,7 @@ func (e *LocalCacheState) RegisterRemove(target graph.Targeter) {
 	e.Finalizers.RegisterRemove(e.cacheDir(target).Abs())
 }
 
-func (e *LocalCacheState) Exists(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
+func (e *LocalCacheState) ArtifactExists(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
 	root := e.cacheDir(target)
 
 	for _, name := range []string{artifact.GzFileName(), artifact.FileName()} {

@@ -2,13 +2,13 @@ package bootstrap
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/engine"
+	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"os"
 )
 
-func PrintTargetOutputContent(target *engine.Target, output string) error {
+func PrintTargetOutputContent(target *lcache.Target, output string) error {
 	return targetOutputsFunc(target, output, func(path xfs.Path) error {
 		f, err := os.Open(path.Abs())
 		if err != nil {
@@ -21,14 +21,14 @@ func PrintTargetOutputContent(target *engine.Target, output string) error {
 	})
 }
 
-func PrintTargetOutputPaths(target *engine.Target, output string) error {
+func PrintTargetOutputPaths(target *lcache.Target, output string) error {
 	return targetOutputsFunc(target, output, func(path xfs.Path) error {
 		fmt.Println(path.Abs())
 		return nil
 	})
 }
 
-func targetOutputsFunc(target *engine.Target, output string, f func(path xfs.Path) error) error {
+func targetOutputsFunc(target *lcache.Target, output string, f func(path xfs.Path) error) error {
 	paths := target.ActualOutFiles().All()
 	if output != "" {
 		if !target.ActualOutFiles().HasName(output) {
@@ -39,7 +39,7 @@ func targetOutputsFunc(target *engine.Target, output string, f func(path xfs.Pat
 		return fmt.Errorf("%v: does not output anything", target.Addr)
 	}
 
-	for _, path := range paths {
+	for _, path := range paths.WithRoot(target.OutExpansionRoot().Abs()) {
 		err := f(path)
 		if err != nil {
 			return err

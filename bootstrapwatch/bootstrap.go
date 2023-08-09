@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -39,7 +40,7 @@ type State struct {
 	rrs      engine.TargetRunRequests
 	bootopts bootstrap.BootOpts
 	runopts  bootstrap.RunOpts
-	rropts   engine.TargetRunRequestOpts
+	rropts   targetrun.RequestOpts
 	cbs      bootstrap.EngineBootstrap
 	pool     *worker.Pool
 	sigCh    chan sigEvent
@@ -83,7 +84,7 @@ type sigEvent struct {
 	events []fsEvent
 }
 
-func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts engine.TargetRunRequestOpts, m specs.Matcher, targs []string, ignore []string) (*State, error) {
+func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, cliopts bootstrap.RunOpts, rropts targetrun.RequestOpts, m specs.Matcher, targs []string, ignore []string) (*State, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err

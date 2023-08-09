@@ -101,9 +101,12 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, how
 
 	l.f = f
 
-	if err := f.Truncate(0); err == nil {
-		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+	if !ro {
+		if err := f.Truncate(0); err == nil {
+			_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
+		}
 	}
+
 	return true, nil
 }
 
@@ -140,6 +143,8 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 		lockCh := make(chan error, 1)
 
 		go func() {
+			defer close(lockCh)
+
 			err := fileDoFd(f, func(fd uintptr) error {
 				lockCh <- syscall.Flock(int(fd), how)
 				return nil
@@ -179,6 +184,10 @@ func (l *Flock) Unlock() error {
 	defer l.m.Unlock()
 
 	f := l.f
+
+	// Try to wipe the pid if we have write perm
+	_ = f.Truncate(0)
+
 	if err := fileDoFd(f, func(fd uintptr) error {
 		return syscall.Flock(int(fd), syscall.LOCK_UN)
 	}); err != nil {

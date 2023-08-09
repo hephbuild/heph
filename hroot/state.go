@@ -10,6 +10,7 @@ import (
 type State struct {
 	Root xfs.Path
 	Home xfs.Path
+	Tmp  xfs.Path
 }
 
 func NewState(rootPath string) (*State, error) {
@@ -27,5 +28,6 @@ func NewState(rootPath string) (*State, error) {
 	return &State{
 		Root: root,
 		Home: home,
+		Tmp:  home.Join("tmp"),
 	}, nil
 }

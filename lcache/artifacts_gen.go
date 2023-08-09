@@ -8,7 +8,6 @@ import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
 	"io"
@@ -16,23 +15,23 @@ import (
 	"path/filepath"
 )
 
-func (e *LocalCacheState) LockArtifact(ctx context.Context, starget specs.Specer, artifact artifacts.Artifact) (func(), error) {
-	target := starget.Spec()
-	l := e.TargetMetas.Find(target).cacheLocks[artifact.Name()]
+func (e *LocalCacheState) LockArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (func(), error) {
+	starget := target.Spec()
+	l := e.Metas.Find(target).cacheLocks[artifact.Name()]
 	err := l.Lock(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("lock %v %v: %w", target.Addr, artifact.Name(), err)
+		return nil, fmt.Errorf("lock %v %v: %w", starget.Addr, artifact.Name(), err)
 	}
 
 	return func() {
 		err := l.Unlock()
 		if err != nil {
-			log.Errorf("unlock %v %v: %v", target.Addr, artifact.Name(), err)
+			log.Errorf("unlock %v %v: %v", starget.Addr, artifact.Name(), err)
 		}
 	}, nil
 }
 
-func (e *LocalCacheState) LockArtifacts(ctx context.Context, target specs.Specer, artifacts []artifacts.Artifact) (func(), error) {
+func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Targeter, artifacts []artifacts.Artifact) (func(), error) {
 	unlockers := make([]func(), 0, len(artifacts))
 
 	unlocker := func() {
