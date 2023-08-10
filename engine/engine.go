@@ -16,9 +16,7 @@ import (
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 )
 
@@ -193,32 +191,4 @@ func (e *Engine) getFileDeps(targets []*graph.Target, f func(*graph.Target) grap
 	})
 
 	return files
-}
-
-func (e *Engine) GetWatcherList(files []xfs.Path) []string {
-	pm := map[string]struct{}{}
-
-	for _, file := range files {
-		filep := file.Abs()
-		for {
-			filep = filepath.Dir(filep)
-			if filep == "." || filep == "/" {
-				break
-			}
-
-			if !strings.HasPrefix(filep, e.Root.Root.Abs()) {
-				break
-			}
-
-			pm[filep] = struct{}{}
-		}
-	}
-
-	paths := make([]string, 0)
-	for p := range pm {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-
-	return paths
 }

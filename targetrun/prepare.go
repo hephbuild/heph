@@ -232,7 +232,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 			}
 
 			if dep.Mode == specs.DepModeLink {
-				outDir := e.LocalCache.Metas.Find(target).OutExpansionRoot().Abs()
+				outDir := e.LocalCache.Metas.Find(dept).OutExpansionRoot().Abs()
 				for _, file := range dept.ActualOutFiles().WithRoot(outDir).Name(dep.Output) {
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
