@@ -42,9 +42,6 @@ type Engine struct {
 
 	toolsLock locks.Locker
 
-	orderedCachesLock locks.Locker
-	orderedCaches     []graph.CacheConfig
-
 	RanGenPass bool
 }
 
@@ -93,7 +90,6 @@ func (rrs TargetRunRequests) Count(f func(rr targetrun.Request) bool) int {
 
 func New(e Engine) *Engine {
 	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
-	e.orderedCachesLock = locks.NewFlock("Order cache", e.Root.Home.Join("tmp", "order_cache.lock").Abs())
 	return &e
 }
 

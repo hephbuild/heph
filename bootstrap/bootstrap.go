@@ -251,7 +251,7 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		return nil, err
 	}
 
-	remoteCache := rcache.New(localCache, bs.Observability)
+	remoteCache := rcache.New(bs.Root, bs.Graph.Config, localCache, bs.Observability)
 
 	var getFlowId func() string
 	if hook := bs.Cloud.Hook; hook != nil {

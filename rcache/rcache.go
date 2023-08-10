@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/locks"
 	"os"
 	"path/filepath"
 )
@@ -31,16 +33,24 @@ func artifactExternalFileName(a artifacts.Artifact) string {
 }
 
 type RemoteCache struct {
+	Root          *hroot.State
+	Config        *graph.Config
 	LocalCache    *lcache.LocalCacheState
 	Observability *observability.Observability
 	Hints         *HintStore
+
+	orderedCachesLock locks.Locker
+	orderedCaches     []graph.CacheConfig
 }
 
-func New(localCache *lcache.LocalCacheState, observability *observability.Observability) *RemoteCache {
+func New(root *hroot.State, config *graph.Config, localCache *lcache.LocalCacheState, observability *observability.Observability) *RemoteCache {
 	return &RemoteCache{
-		LocalCache:    localCache,
-		Observability: observability,
-		Hints:         &HintStore{},
+		Root:              root,
+		Config:            config,
+		LocalCache:        localCache,
+		Observability:     observability,
+		Hints:             &HintStore{},
+		orderedCachesLock: locks.NewFlock("Order cache", root.Tmp.Join("order_cache.lock").Abs()),
 	}
 }
 

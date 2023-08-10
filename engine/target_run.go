@@ -58,7 +58,7 @@ func (e *Engine) WriteableCaches(ctx context.Context, starget specs.Specer) ([]g
 		return nil, nil
 	}
 
-	orderedCaches, err := e.OrderedCaches(ctx)
+	orderedCaches, err := e.RemoteCache.OrderedCaches(ctx)
 	if err != nil {
 		return nil, err
 	}

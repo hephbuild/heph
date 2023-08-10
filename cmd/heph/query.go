@@ -785,7 +785,7 @@ var orderedCachesCmd = &cobra.Command{
 			return err
 		}
 
-		orderedCaches, err := bs.Engine.OrderedCaches(ctx)
+		orderedCaches, err := bs.Engine.RemoteCache.OrderedCaches(ctx)
 		if err != nil {
 			return err
 		}

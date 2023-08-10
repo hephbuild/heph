@@ -55,7 +55,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *graph.Target, outpu
 		return false, true, nil
 	}
 
-	orderedCaches, err := e.OrderedCaches(ctx)
+	orderedCaches, err := e.RemoteCache.OrderedCaches(ctx)
 	if err != nil {
 		return false, false, fmt.Errorf("orderedcaches: %w", err)
 	}

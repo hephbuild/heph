@@ -1,4 +1,4 @@
-package engine
+package rcache
 
 import (
 	"context"
@@ -12,7 +12,6 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"sort"
 	"time"
@@ -47,7 +46,7 @@ func (c orderCacheContainer) calculateLatency(ctx context.Context) (time.Duratio
 			if err != nil {
 				return -1, err
 			}
-			_, _ = io.Copy(ioutil.Discard, res.Body)
+			_, _ = io.Copy(io.Discard, res.Body)
 			_ = res.Body.Close()
 
 			duration := time.Since(start)
@@ -92,7 +91,7 @@ func orderCaches(ctx context.Context, caches []graph.CacheConfig) []graph.CacheC
 	})
 }
 
-func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error) {
+func (e *RemoteCache) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error) {
 	if len(e.Config.Caches) <= 1 || e.Config.CacheOrder != config.CacheOrderLatency {
 		return e.Config.Caches, nil
 	}
@@ -118,7 +117,7 @@ func (e *Engine) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error)
 	})
 
 	cacheHash := h.Sum()
-	cachePath := e.tmpRoot("caches_order").Abs()
+	cachePath := e.Root.Tmp.Join("caches_order").Abs()
 
 	names, _ := utils.HashCache(cachePath, cacheHash, func() ([]string, error) {
 		status.Emit(ctx, status.String("Measuring caches latency..."))
