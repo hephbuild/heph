@@ -3,7 +3,7 @@ export PS1='$ '
 export BASH_SILENCE_DEPRECATION_WARNING=1
 
 {{ if .Cmds }}
-trace-off() {
+traceoff() {
   { set +x; } 2>/dev/null
 }
 
@@ -11,10 +11,10 @@ run() {
 	{{.Cmds}}
 }
 xrun() {
-  trap trace-off ERR
+  trap traceoff ERR
   set -x
   {{.Cmds}}
-  trace-off
+  traceoff
 }
 show() {
 	echo '{{.CmdsStr}}'

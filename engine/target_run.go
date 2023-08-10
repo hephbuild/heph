@@ -140,7 +140,7 @@ func (e *Engine) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox.IO
 		}
 	}
 
-	err = e.postRunOrWarm(ctx, gtarget, target.Out.Names())
+	err = e.postRunOrWarm(ctx, gtarget, target.OutWithSupport.Names())
 	if err != nil {
 		return err
 	}
