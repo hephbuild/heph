@@ -3,6 +3,7 @@ package xreflow
 import (
 	"bytes"
 	"github.com/muesli/reflow/ansi"
+	"github.com/muesli/reflow/truncate"
 	"github.com/muesli/reflow/wrap"
 	"strings"
 )
@@ -26,6 +27,21 @@ func WrapString(s string, limit int) string {
 			buf.WriteString("\n")
 		}
 	}
+
+	return buf.String()
+}
+
+func TruncateString(s string, limit uint) string {
+	ts := truncate.String(s, limit)
+
+	if ts == s {
+		return s
+	}
+
+	var buf bytes.Buffer
+	w := ansi.Writer{Forward: &buf}
+	_, _ = w.Write([]byte(ts))
+	w.ResetAnsi()
 
 	return buf.String()
 }

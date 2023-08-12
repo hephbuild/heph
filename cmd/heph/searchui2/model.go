@@ -239,11 +239,21 @@ func (m model) View() string {
 			return terminalStyle.Render(m.run.View())
 		}
 
-		return lipgloss.JoinVertical(
-			lipgloss.Top,
-			m.search.View(),
+		components := make([]string, 0)
+		components = append(components, m.search.View())
+
+		if m.results.err != nil {
+			components = append(components, m.results.err.Error())
+		}
+
+		components = append(components,
 			m.list.View(),
 			m.help.View(m.keys),
+		)
+
+		return lipgloss.JoinVertical(
+			lipgloss.Top,
+			components...,
 		)
 	}
 

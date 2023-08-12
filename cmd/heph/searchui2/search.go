@@ -4,9 +4,9 @@ import (
 	"context"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/heph/cmd/heph/bbt"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/xtime"
 	"time"
 )
 
@@ -23,13 +23,13 @@ func newTargetSearchModel(targets specs.Targets) targetSearchModel {
 	return targetSearchModel{
 		textField: textField,
 		search:    searchf,
-		debounce:  bbt.NewDebounce(50 * time.Millisecond),
+		debounce:  xtime.NewDebounce(10 * time.Millisecond),
 	}
 }
 
 type targetSearchModel struct {
 	textField    textinput.Model
-	debounce     bbt.Debounce
+	debounce     *xtime.Debounce
 	search       search.FuncCtx
 	searchCancel context.CancelFunc
 
@@ -58,11 +58,20 @@ func (m targetSearchModel) Update(msg tea.Msg) (targetSearchModel, tea.Cmd) {
 	}
 
 	if query := m.textField.Value(); query != m.searchResult.query {
-		cmd = m.debounce.Do(func() tea.Msg {
-			res, err := m.search(context.Background(), query, 200)
-			return targetSearchResults{res: res, err: err, query: query}
+		ch := make(chan targetSearchResults)
+
+		m.debounce.Do(func(ctx context.Context) {
+			res, err := m.search(ctx, query, 200)
+			ch <- targetSearchResults{res: res, err: err, query: query}
 		})
-		cmds = append(cmds, cmd)
+
+		cmds = append(cmds, func() tea.Msg {
+			msg, ok := <-ch
+			if ok {
+				return msg
+			}
+			return nil
+		})
 	}
 
 	m.textField, cmd = m.textField.Update(msg)
