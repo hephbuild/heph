@@ -187,8 +187,8 @@ var runCmd = &cobra.Command{
 		fromStdin := bootstrap.HasStdin(args)
 
 		if len(rrs) == 0 {
-			log.Info("no target match")
-			return nil
+			log.Error("no target match")
+			return bootstrap.ErrorWithExitCode{ExitCode: 1}
 		}
 
 		err = bootstrap.Run(ctx, bs.Engine, rrs, getRunOpts(), !fromStdin)
