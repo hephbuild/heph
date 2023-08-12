@@ -180,9 +180,26 @@ var searchCmd = &cobra.Command{
 
 		if len(args) == 0 {
 			p := tea.NewProgram(searchui2.New(targets, bs))
-			if _, err := p.Run(); err != nil {
+
+			m, err := p.Run()
+			if err != nil {
 				return err
 			}
+
+			if t := m.(searchui2.Model).RunTarget(); t != nil {
+				t := bs.Graph.Targets().Find(t.Addr)
+
+				rrs, err := generateRRs(ctx, bs.Engine, t.AddrStruct(), nil)
+				if err != nil {
+					return err
+				}
+
+				err = bootstrap.Run(ctx, bs.Engine, rrs, getRunOpts(), true)
+				if err != nil {
+					return err
+				}
+			}
+
 			return nil
 		}
 

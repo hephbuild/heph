@@ -12,7 +12,13 @@ import (
 	"strings"
 )
 
+type Model interface {
+	RunTarget() *specs.Target
+}
+
 type model struct {
+	runTarget *specs.Target
+
 	ide           bool
 	width, height int
 	colWidth      int
@@ -26,6 +32,10 @@ type model struct {
 	run targetRunModel
 
 	running bool
+}
+
+func (m model) RunTarget() *specs.Target {
+	return m.runTarget
 }
 
 func (m model) Init() tea.Cmd {
@@ -102,6 +112,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			t := m.selectedTarget()
 
 			if t != nil {
+				if !m.ide {
+					m.runTarget = t
+					return m, tea.Quit
+				}
+
 				return m, func() tea.Msg {
 					return targetRunStartMsg{
 						target: t.Addr,

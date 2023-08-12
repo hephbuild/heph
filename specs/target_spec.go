@@ -173,6 +173,13 @@ func (t Target) IsPrivate() bool {
 	return strings.HasPrefix(t.Name, "_")
 }
 
+func (t Target) AddrStruct() TargetAddr {
+	return TargetAddr{
+		Package: t.Package.Path,
+		Name:    t.Name,
+	}
+}
+
 func (t Target) IsGroup() bool {
 	return len(t.Run) == 1 && t.Run[0] == "group"
 }

@@ -69,6 +69,10 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 		}
 	}
 
+	return generateRRs(ctx, e, m, targs)
+}
+
+func generateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string) (engine.TargetRunRequests, error) {
 	return bootstrap.GenerateRRs(ctx, e, m, targs, targetrun.RequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,
