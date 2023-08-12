@@ -5,6 +5,7 @@ import (
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/xpanic"
 	"github.com/hephbuild/heph/worker"
 	"github.com/hephbuild/heph/worker/poolui"
 	"os"
@@ -18,7 +19,9 @@ var tuim sync.Mutex
 func runProgram(p *tea.Program) error {
 	defer func() {
 		log.SetDiversion(nil)
-		_ = p.ReleaseTerminal()
+		_ = xpanic.Recover(func() error {
+			return p.ReleaseTerminal()
+		})
 	}()
 
 	_, err := p.Run()

@@ -6,6 +6,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/xpanic"
 	"github.com/muesli/termenv"
 	"io"
 	"runtime/debug"
@@ -207,16 +208,6 @@ type Pool struct {
 	idc     uint64
 }
 
-func safelyJobDo(j *Job, w *Worker) (err error) {
-	defer func() {
-		if rerr := recover(); rerr != nil {
-			err = fmt.Errorf("panic in %v: %v => %v", j.Name, rerr, string(debug.Stack()))
-		}
-	}()
-
-	return j.Do(w, j.ctx)
-}
-
 func NewPool(n int) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -247,7 +238,11 @@ func NewPool(n int) *Pool {
 				w.CurrentJob = j
 
 				j.RunHook()
-				err := safelyJobDo(j, w)
+				err := xpanic.Recover(func() error {
+					return j.Do(w, j.ctx)
+				}, xpanic.Wrap(func(err any) error {
+					return fmt.Errorf("panic in %v: %v => %v", j.Name, err, string(debug.Stack()))
+				}))
 
 				j.TimeEnd = time.Now()
 				w.CurrentJob = nil

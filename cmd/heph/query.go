@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/cmd/heph/searchui"
+	"github.com/hephbuild/heph/cmd/heph/searchui2"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
@@ -178,7 +179,11 @@ var searchCmd = &cobra.Command{
 		}
 
 		if len(args) == 0 {
-			return searchui.TUI(targets, bs)
+			p := tea.NewProgram(searchui2.New(targets, bs))
+			if _, err := p.Run(); err != nil {
+				return err
+			}
+			return nil
 		}
 
 		return search.Search(targets, strings.Join(args, " "))

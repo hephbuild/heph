@@ -3,6 +3,7 @@ package specs
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xpanic"
 	"regexp"
 	"strings"
 )
@@ -309,19 +310,12 @@ func parseFactor(tokens []token, index *int) astNode {
 }
 
 func lexAndParse(input string) (_ astNode, err error) {
-	defer func() {
-		if rerr := recover(); rerr != nil {
-			if rerrr, ok := rerr.(error); ok {
-				err = rerrr
-			} else {
-				err = fmt.Errorf("%v", rerr)
-			}
-		}
-	}()
-	tokens := lex(input)
-	ast := parse(tokens)
+	return xpanic.RecoverV(func() (astNode, error) {
+		tokens := lex(input)
+		ast := parse(tokens)
 
-	return ast, nil
+		return ast, nil
+	})
 }
 
 func ParseMatcher(input string) (Matcher, error) {

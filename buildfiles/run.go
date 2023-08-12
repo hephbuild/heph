@@ -12,9 +12,9 @@ import (
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xpanic"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.starlark.net/starlark"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -230,18 +230,6 @@ func (e *runContext) load(thread *starlark.Thread, module string) (starlark.Stri
 	return pkg.Globals, nil
 }
 
-func safelyCompileProgram(in io.Reader) (_ *starlark.Program, err error) {
-	// Sometimes starlark.CompiledProgram bombs when concurrent read/write on the file is happening...
-
-	defer func() {
-		if rerr := recover(); rerr != nil {
-			err = fmt.Errorf("buildProgram paniced: %v", rerr)
-		}
-	}()
-
-	return starlark.CompiledProgram(in)
-}
-
 type encodableProgram struct {
 	prog *starlark.Program
 }
@@ -251,7 +239,11 @@ func (m encodableProgram) EncodeMsgpack(enc *msgpack.Encoder) error {
 }
 
 func (m *encodableProgram) DecodeMsgpack(dec *msgpack.Decoder) error {
-	p, err := safelyCompileProgram(dec.Buffered())
+	p, err := xpanic.RecoverV(func() (*starlark.Program, error) {
+		// Sometimes starlark.CompiledProgram bombs when concurrent read/write on the file is happening...
+
+		return starlark.CompiledProgram(dec.Buffered())
+	})
 	if err != nil {
 		return err
 	}

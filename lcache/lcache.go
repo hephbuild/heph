@@ -353,7 +353,9 @@ func (e *LocalCacheState) Target(ctx context.Context, target graph.Targeter, o T
 	if o.ActualFilesCollector != nil {
 		// TODO: make a bit smarter so that it doesnt collect them again if the request outputs is already done
 
-		status.Emit(ctx, tgt.TargetStatus(target, "Hydrating output..."))
+		if len(o.ActualFilesCollectorOutputs) > 0 || target.Spec().HasSupportFiles {
+			status.Emit(ctx, tgt.TargetStatus(target, "Hydrating output..."))
+		}
 
 		ctx, span := e.Observability.SpanCollectOutput(ctx, target.GraphTarget())
 		err := observability.DoE(span, func() error {

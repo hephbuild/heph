@@ -1,6 +1,7 @@
 package search
 
 import (
+	"context"
 	"fmt"
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/analysis/analyzer/custom"
@@ -16,6 +17,7 @@ type Result struct {
 }
 
 type Func func(querys string, max int) (Result, error)
+type FuncCtx func(ctx context.Context, querys string, max int) (Result, error)
 
 func Search(targets specs.Targets, query string) error {
 	search, err := NewSearch(targets)
@@ -40,6 +42,17 @@ func Search(targets specs.Targets, query string) error {
 }
 
 func NewSearch(targets specs.Targets) (Func, error) {
+	search, err := NewSearchCtx(targets)
+	if err != nil {
+		return nil, err
+	}
+
+	return func(querys string, max int) (Result, error) {
+		return search(context.Background(), querys, max)
+	}, nil
+}
+
+func NewSearchCtx(targets specs.Targets) (FuncCtx, error) {
 	ts := sets.NewSetFrom(func(t specs.Target) string {
 		return t.Addr
 	}, targets)
@@ -99,7 +112,7 @@ func NewSearch(targets specs.Targets) (Func, error) {
 		}
 	}
 
-	return func(querys string, max int) (Result, error) {
+	return func(ctx context.Context, querys string, max int) (Result, error) {
 		if querys == "" {
 			return Result{}, nil
 		}
@@ -116,7 +129,7 @@ func NewSearch(targets specs.Targets) (Func, error) {
 		sreq := bleve.NewSearchRequest(q)
 		sreq.Size = max
 
-		searchResults, err := idx.Search(sreq)
+		searchResults, err := idx.SearchInContext(ctx, sreq)
 		if err != nil {
 			return Result{}, err
 		}
