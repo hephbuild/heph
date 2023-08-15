@@ -1,4 +1,4 @@
-package engine
+package scheduler
 
 import (
 	"context"
@@ -16,7 +16,7 @@ import (
 	"sync"
 )
 
-func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *graph.Target, outputs []string, followHint, uncompress bool) (bool, error) {
+func (e *Scheduler) pullOrGetCacheAndPost(ctx context.Context, target *graph.Target, outputs []string, followHint, uncompress bool) (bool, error) {
 	_, cached, err := e.pullOrGetCache(ctx, target, outputs, false, false, followHint, uncompress)
 	if err != nil {
 		return false, fmt.Errorf("pullorget: %w", err)
@@ -34,7 +34,7 @@ func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *graph.Target
 		return false, err
 	}
 
-	err = e.postRunOrWarm(ctx, target, outputs)
+	err = e.LocalCache.Post(ctx, target, outputs)
 	if err != nil {
 		return false, fmt.Errorf("postrunwarm: %w", err)
 	}
@@ -42,7 +42,7 @@ func (e *Engine) pullOrGetCacheAndPost(ctx context.Context, target *graph.Target
 	return true, nil
 }
 
-func (e *Engine) pullOrGetCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
+func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
 	status.Emit(ctx, tgt.TargetStatus(target, "Checking local cache..."))
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
@@ -114,7 +114,7 @@ func (e *Engine) pullOrGetCache(ctx context.Context, target *graph.Target, outpu
 	return false, false, nil
 }
 
-func (e *Engine) pullExternalCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
+func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
 	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.GraphTarget(), cache.Name, outputs, onlyMeta)
 	defer rcache.SpanEndIgnoreNotExist(span, rerr)
 
@@ -157,7 +157,7 @@ func (e *Engine) pullExternalCache(ctx context.Context, target *graph.Target, ou
 	return true, nil
 }
 
-func (e *Engine) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache graph.CacheConfig) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache graph.CacheConfig) *worker.Job {
 	// input hash is used as a marker that everything went well,
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
@@ -175,7 +175,7 @@ func (e *Engine) scheduleStoreExternalCache(ctx context.Context, target *graph.T
 	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps)
 }
 
-func (e *Engine) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache graph.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache graph.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
 	return e.Pool.Schedule(ctx, &worker.Job{
 		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
 		Deps: deps,

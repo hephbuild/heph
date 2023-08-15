@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
@@ -14,7 +14,7 @@ import (
 )
 
 type PreRunOpts struct {
-	Engine       *engine.Engine
+	Scheduler    *scheduler.Scheduler
 	PoolWaitName string
 	LinkAll      bool
 }
@@ -41,23 +41,23 @@ func bootstrapOptions() (bootstrap.BootOpts, error) {
 	}, nil
 }
 
-var engineAlreadyInit bool
+var schedulerAlreadyInit bool
 
-func engineInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) error) (bootstrap.EngineBootstrap, error) {
-	if engineAlreadyInit {
-		panic("cannot call engineInit multiple times")
+func schedulerInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) error) (bootstrap.SchedulerBootstrap, error) {
+	if schedulerAlreadyInit {
+		panic("cannot call schedulerInit multiple times")
 	}
-	engineAlreadyInit = true
+	schedulerAlreadyInit = true
 
 	opts, err := bootstrapOptions()
 	if err != nil {
-		return bootstrap.EngineBootstrap{}, err
+		return bootstrap.SchedulerBootstrap{}, err
 	}
 
 	// This allows to block reading stdin right after a potential CheckAndUpgrade has run
 	opts.PostBootBase = postBoot
 
-	bs, err := bootstrap.BootWithEngine(ctx, opts)
+	bs, err := bootstrap.BootWithScheduler(ctx, opts)
 	if err != nil {
 		return bs, err
 	}
@@ -65,19 +65,19 @@ func engineInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) erro
 	Finalizers.RegisterWithErr(func(err error) {
 		bs.Finalizers.Run(err)
 
-		if !bs.Engine.Pool.IsDone() {
+		if !bs.Scheduler.Pool.IsDone() {
 			log.Tracef("Waiting for all pool items to finish")
 			select {
-			case <-bs.Engine.Pool.Done():
+			case <-bs.Scheduler.Pool.Done():
 			case <-time.After(time.Second):
 				log.Infof("Waiting for background jobs to finish...")
-				<-bs.Engine.Pool.Done()
+				<-bs.Scheduler.Pool.Done()
 			}
 			log.Tracef("All pool items finished")
 
-			bs.Engine.Pool.Stop(nil)
+			bs.Scheduler.Pool.Stop(nil)
 
-			err := bs.Engine.Pool.Err()
+			err := bs.Scheduler.Pool.Err()
 			if err != nil {
 				log.Error(err)
 			}
@@ -111,14 +111,14 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 	return bs, nil
 }
 
-func preRunWithGen(ctx context.Context) (bootstrap.EngineBootstrap, error) {
-	bs, err := engineInit(ctx, nil)
+func preRunWithGen(ctx context.Context) (bootstrap.SchedulerBootstrap, error) {
+	bs, err := schedulerInit(ctx, nil)
 	if err != nil {
 		return bs, err
 	}
 
 	err = preRunWithGenWithOpts(ctx, PreRunOpts{
-		Engine: bs.Engine,
+		Scheduler: bs.Scheduler,
 	})
 	if err != nil {
 		return bs, err
@@ -128,7 +128,7 @@ func preRunWithGen(ctx context.Context) (bootstrap.EngineBootstrap, error) {
 }
 
 func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
-	e := opts.Engine
+	e := opts.Scheduler
 
 	if *noGen {
 		log.Info("Generated targets disabled")
@@ -160,7 +160,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 }
 
 func preRunAutocomplete(ctx context.Context, includePrivate bool) (specs.Targets, []string, error) {
-	bs, err := engineInit(ctx, nil)
+	bs, err := schedulerInit(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -168,16 +168,16 @@ func preRunAutocomplete(ctx context.Context, includePrivate bool) (specs.Targets
 	return preRunAutocompleteWithBootstrap(ctx, bs, includePrivate)
 }
 
-func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.EngineBootstrap, includePrivate bool) (specs.Targets, []string, error) {
-	err := preRunWithGenWithOpts(ctx, PreRunOpts{Engine: bs.Engine})
+func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.SchedulerBootstrap, includePrivate bool) (specs.Targets, []string, error) {
+	err := preRunWithGenWithOpts(ctx, PreRunOpts{Scheduler: bs.Scheduler})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	targets := bs.Engine.Graph.Targets()
+	targets := bs.Scheduler.Graph.Targets()
 	if !includePrivate {
 		targets = targets.Public()
 	}
 
-	return targets.Specs(), bs.Engine.Graph.Labels().Slice(), nil
+	return targets.Specs(), bs.Scheduler.Graph.Labels().Slice(), nil
 }

@@ -7,7 +7,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
@@ -19,6 +18,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/rcache"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/upgrade"
@@ -245,8 +245,10 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	return bs, nil
 }
 
-func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
-	localCache, err := lcache.NewState(bs.Root, bs.Graph.Targets(), bs.Observability, bs.Finalizers)
+func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, error) {
+	fins := &finalizers.Finalizers{}
+
+	localCache, err := lcache.NewState(bs.Root, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC)
 	if err != nil {
 		return nil, err
 	}
@@ -263,7 +265,7 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 	runner := &targetrun.Runner{
 		Root:              bs.Root,
 		Observability:     bs.Observability,
-		Finalizers:        bs.Finalizers,
+		Finalizers:        fins,
 		LocalCache:        localCache,
 		PlatformProviders: bs.PlatformProviders,
 		GetFlowID:         getFlowId,
@@ -275,7 +277,7 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		Pool:   bs.Pool,
 	}
 
-	e := engine.New(engine.Engine{
+	e := scheduler.New(scheduler.Scheduler{
 		Cwd:             bs.Cwd,
 		Root:            bs.Root,
 		Config:          bs.Graph.Config,
@@ -287,16 +289,16 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 		BuildFilesState: bs.BuildFiles,
 		Graph:           bs.Graph,
 		Pool:            bs.Pool,
-		Finalizers:      &finalizers.Finalizers{},
+		Finalizers:      fins,
 		Runner:          runner,
 	})
 
 	bs.Finalizers.RegisterWithErr(func(err error) {
-		e.Finalizers.Run(err)
+		fins.Run(err)
 	})
 
 	if bs.Config.Engine.InstallTools {
-		err = e.InstallTools(ctx)
+		err = InstallTools(ctx, bs.Root, bs.Graph, bs.Config.Version.String)
 		if err != nil {
 			return nil, err
 		}
@@ -305,13 +307,13 @@ func BootEngine(ctx context.Context, bs Bootstrap) (*engine.Engine, error) {
 	return e, nil
 }
 
-type EngineBootstrap struct {
+type SchedulerBootstrap struct {
 	Bootstrap
-	Engine *engine.Engine
+	Scheduler *scheduler.Scheduler
 }
 
-func BootWithEngine(ctx context.Context, opts BootOpts) (EngineBootstrap, error) {
-	ebs := EngineBootstrap{}
+func BootWithScheduler(ctx context.Context, opts BootOpts) (SchedulerBootstrap, error) {
+	ebs := SchedulerBootstrap{}
 
 	bs, err := Boot(ctx, opts)
 	if err != nil {
@@ -319,11 +321,11 @@ func BootWithEngine(ctx context.Context, opts BootOpts) (EngineBootstrap, error)
 	}
 	ebs.Bootstrap = bs
 
-	e, err := BootEngine(ctx, bs)
+	e, err := BootScheduler(ctx, bs)
 	if err != nil {
 		return ebs, err
 	}
-	ebs.Engine = e
+	ebs.Scheduler = e
 
 	return ebs, nil
 }

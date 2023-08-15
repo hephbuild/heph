@@ -9,7 +9,6 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/buildfiles"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
@@ -37,11 +36,11 @@ type State struct {
 	watcher  *fsnotify.Watcher
 	ignore   []string
 	close    func()
-	rrs      engine.TargetRunRequests
+	rrs      targetrun.Requests
 	bootopts bootstrap.BootOpts
 	runopts  bootstrap.RunOpts
 	rropts   targetrun.RequestOpts
-	cbs      bootstrap.EngineBootstrap
+	cbs      bootstrap.SchedulerBootstrap
 	pool     *worker.Pool
 	sigCh    chan sigEvent
 
@@ -79,8 +78,8 @@ type fsEvent struct {
 }
 
 type sigEvent struct {
-	bs     bootstrap.EngineBootstrap
-	rrs    engine.TargetRunRequests
+	bs     bootstrap.SchedulerBootstrap
+	rrs    targetrun.Requests
 	events []fsEvent
 }
 
@@ -268,7 +267,7 @@ func (s *State) cleanEvents(events []fsEvent) []fsEvent {
 	return filteredEvents
 }
 
-func (s *State) cleanEventsWithBootstrap(bs bootstrap.EngineBootstrap, ogevents []fsEvent) []fsEvent {
+func (s *State) cleanEventsWithBootstrap(bs bootstrap.SchedulerBootstrap, ogevents []fsEvent) []fsEvent {
 	events := make([]fsEvent, 0, len(ogevents))
 	for _, e := range ogevents {
 		match, err := xfs.PathMatchAny(e.RelPath, append(s.ignore, bs.Config.Watch.Ignore...)...)
@@ -299,20 +298,20 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	for _, e := range events {
 		if e.Op.Has(fsnotify.Create) || e.Op.Has(fsnotify.Remove) || e.Op.Has(fsnotify.Rename) {
-			log.Debug("New Engine: C/REM/REN", e)
-			bs = bootstrap.EngineBootstrap{}
+			log.Debug("New Scheduler: C/REM/REN", e)
+			bs = bootstrap.SchedulerBootstrap{}
 			break
 		}
 
 		if ok, _ := xfs.PathMatchAny(e.RelPath, buildfiles.Pattern); ok {
-			log.Debug("New Engine: BUILD", e)
-			bs = bootstrap.EngineBootstrap{}
+			log.Debug("New Scheduler: BUILD", e)
+			bs = bootstrap.SchedulerBootstrap{}
 			break
 		}
 	}
 
-	if bs.Engine == nil {
-		cbs, err := bootstrap.BootWithEngine(s.ctx, s.bootopts)
+	if bs.Scheduler == nil {
+		cbs, err := bootstrap.BootWithScheduler(s.ctx, s.bootopts)
 		if err != nil {
 			return fmt.Errorf("boot: %w", err)
 		}
@@ -332,7 +331,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	status("Figuring out if anything changed...")
 	printEvents(events)
 
-	rrs, err := bootstrap.GenerateRRs(ctx, bs.Engine, s.matcher, s.targs, s.rropts, s.runopts.Plain)
+	rrs, err := bootstrap.GenerateRRs(ctx, bs.Scheduler, s.matcher, s.targs, s.rropts, s.runopts.Plain)
 	if err != nil {
 		return err
 	}
@@ -343,12 +342,12 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 			return err
 		}
 		for _, ancestor := range ancestors {
-			bs.Engine.LocalCache.ResetCacheHashInput(ancestor)
+			bs.Scheduler.LocalCache.ResetCacheHashInput(ancestor)
 		}
 	}
 
 	// Run the rrs's deps, excluding the rrs's themselves
-	tdepsMap, err := bs.Engine.ScheduleTargetRRsWithDeps(ctx, rrs, specs.AsSpecers(rrs.Targets().Slice()))
+	tdepsMap, err := bs.Scheduler.ScheduleTargetRRsWithDeps(ctx, rrs, specs.AsSpecers(rrs.Targets().Slice()))
 	if err != nil {
 		return err
 	}
@@ -360,14 +359,14 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 		return err
 	}
 
-	var filteredRRs engine.TargetRunRequests
-	if s.cbs.Engine == nil {
+	var filteredRRs targetrun.Requests
+	if s.cbs.Scheduler == nil {
 		filteredRRs = rrs
 	} else {
 		for _, rr := range rrs {
 			currHash := s.triggeredHashed.Get(rr.Target.Addr)
 
-			changeHash, err := bs.Engine.LocalCache.HashInput(rr.Target)
+			changeHash, err := bs.Scheduler.LocalCache.HashInput(rr.Target)
 			if err != nil {
 				return err
 			}
@@ -380,8 +379,8 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	if len(filteredRRs) == 0 {
 		status("Nothing changed!")
-		if bs.Engine != s.cbs.Engine {
-			bs.Engine.Finalizers.Run(nil)
+		if bs.Scheduler != s.cbs.Scheduler {
+			bs.Scheduler.Finalizers.Run(nil)
 		}
 		return nil
 	}
@@ -531,7 +530,7 @@ func (s *State) updateWatchers() error {
 func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	status("Got update...")
 
-	if s.cbs.Engine != e.bs.Engine {
+	if s.cbs.Scheduler != e.bs.Scheduler {
 		if s.cbs.Finalizers != nil {
 			s.cbs.Finalizers.Run(nil)
 		}
@@ -545,9 +544,9 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	}
 
 	for _, rr := range e.rrs {
-		s.cbs.Engine.LocalCache.ResetCacheHashInput(rr.Target)
+		s.cbs.Scheduler.LocalCache.ResetCacheHashInput(rr.Target)
 
-		hash, err := e.bs.Engine.LocalCache.HashInput(rr.Target)
+		hash, err := e.bs.Scheduler.LocalCache.HashInput(rr.Target)
 		if err != nil {
 			return err
 		}
@@ -559,7 +558,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	connectConsole()
 	defer disconnectConsole()
 
-	err = bootstrap.RunMode(ctx, s.cbs.Engine, e.rrs, s.runopts, true, "watch", sandbox.IOConfig{
+	err = bootstrap.RunMode(ctx, s.cbs.Scheduler, e.rrs, s.runopts, true, "watch", sandbox.IOConfig{
 		Stdout: ConsoleStdout,
 		Stderr: ConsoleStderr,
 		//Stdin:  os.Stdin,

@@ -1,8 +1,7 @@
-package engine
+package observability
 
 import (
 	"context"
-	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/worker"
 )
 
@@ -22,7 +21,7 @@ func (s *workerStageStore[S]) createSpan(job *worker.Job) (context.Context, S) {
 	return ctx, span
 }
 
-func WorkerStageFactory[S observability.SpanError](f createSpanFunc[S]) worker.Hook {
+func WorkerStageFactory[S SpanError](f createSpanFunc[S]) worker.Hook {
 	ss := &workerStageStore[S]{createSpanFunc: f}
 	return worker.StageHook{
 		OnScheduled: func(job *worker.Job) context.Context {
@@ -46,9 +45,9 @@ func WorkerStageFactory[S observability.SpanError](f createSpanFunc[S]) worker.H
 		},
 		OnEnd: func(job *worker.Job) context.Context {
 			if err := job.Err(); err != nil {
-				state := observability.StateFailed
+				state := StateFailed
 				if job.State == worker.StateSkipped {
-					state = observability.StateSkipped
+					state = StateSkipped
 				}
 				ss.span.EndErrorState(err, state)
 			} else {

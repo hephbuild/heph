@@ -4,26 +4,26 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 )
 
-func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, *graph.Target, error) {
+func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.SchedulerBootstrap, *graph.Target, error) {
 	if len(args) != 1 {
-		return bootstrap.EngineBootstrap{}, nil, fmt.Errorf("expected one arg")
+		return bootstrap.SchedulerBootstrap{}, nil, fmt.Errorf("expected one arg")
 	}
 
-	bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+	bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
 		return bootstrap.BlockReadStdin(args)
 	})
 	if err != nil {
 		return bs, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, false, true)
+	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, false, true)
 	if err != nil {
 		return bs, nil, err
 	}
@@ -41,23 +41,23 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.EngineBo
 	return bs, rrs[0].Target, nil
 }
 
-func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.EngineBootstrap, engine.TargetRunRequests, error) {
-	bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.SchedulerBootstrap, targetrun.Requests, error) {
+	bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
 		return bootstrap.BlockReadStdin(args)
 	})
 	if err != nil {
-		return bootstrap.EngineBootstrap{}, nil, err
+		return bootstrap.SchedulerBootstrap{}, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithEngine(ctx, bs.Engine, args, true, false)
+	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, true, false)
 	if err != nil {
-		return bootstrap.EngineBootstrap{}, nil, err
+		return bootstrap.SchedulerBootstrap{}, nil, err
 	}
 
 	return bs, rrs, err
 }
 
-func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args []string, stdin, explicit bool) (engine.TargetRunRequests, error) {
+func parseTargetsAndArgsWithScheduler(ctx context.Context, e *scheduler.Scheduler, args []string, stdin, explicit bool) (targetrun.Requests, error) {
 	m, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, stdin)
 	if err != nil {
 		return nil, err
@@ -72,7 +72,7 @@ func parseTargetsAndArgsWithEngine(ctx context.Context, e *engine.Engine, args [
 	return generateRRs(ctx, e, m, targs)
 }
 
-func generateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string) (engine.TargetRunRequests, error) {
+func generateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string) (targetrun.Requests, error) {
 	return bootstrap.GenerateRRs(ctx, e, m, targs, targetrun.RequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,

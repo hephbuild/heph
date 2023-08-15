@@ -10,7 +10,7 @@ import (
 
 const plainResults = 15
 
-func New(targets specs.Targets, bs bootstrap.EngineBootstrap) tea.Model {
+func New(targets specs.Targets, bs bootstrap.SchedulerBootstrap) tea.Model {
 	h := help.New()
 
 	l := list.New(nil, itemDelegate{}, 0, plainResults+1)

@@ -1,11 +1,14 @@
-package engine
+package bootstrap
 
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/hash"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 	"sort"
@@ -17,28 +20,30 @@ var toolTemplate = strings.TrimSpace(`
 exec heph run TARGET -- "$@" 
 `)
 
-func (e *Engine) InstallTools(ctx context.Context) error {
-	err := e.toolsLock.Lock(ctx)
+func InstallTools(ctx context.Context, root *hroot.State, graph *graph.State, version string) error {
+	l := locks.NewFlock("Tools", root.Tmp.Join("tools.lock").Abs())
+
+	err := l.Lock(ctx)
 	if err != nil {
 		return err
 	}
 
-	defer e.toolsLock.Unlock()
+	defer l.Unlock()
 
 	log.Tracef("Installing tools")
 
-	addrs := e.Graph.Tools.Addrs()
+	addrs := graph.Tools.Addrs()
 	sort.Strings(addrs)
 
 	h := hash.NewHash()
-	h.String(e.Config.Version.String)
+	h.String(version)
 	for _, addr := range addrs {
 		h.String(addr)
 	}
 
 	toolsHash := h.Sum()
 
-	hashPath := e.Root.Home.Join("tmp", "tools_install").Abs()
+	hashPath := root.Tmp.Join("tools_install").Abs()
 
 	b, err := os.ReadFile(hashPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -46,11 +51,11 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 	}
 
 	if string(b) == toolsHash {
-		log.Tracef("tools already installed")
+		log.Tracef("tools already up to date")
 		return nil
 	}
 
-	dir := e.Root.Home.Join("bin")
+	dir := root.Home.Join("bin")
 
 	err = os.RemoveAll(dir.Abs())
 	if err != nil {
@@ -62,7 +67,7 @@ func (e *Engine) InstallTools(ctx context.Context) error {
 		return err
 	}
 
-	for _, target := range e.Graph.Tools.Slice() {
+	for _, target := range graph.Tools.Slice() {
 		log.Tracef("Installing tool %v", target.Addr)
 
 		wrapper := strings.ReplaceAll(toolTemplate, "TARGET", target.Addr)

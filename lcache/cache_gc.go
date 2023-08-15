@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+func (e *LocalCacheState) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
+	targetDirs, err := e.gcCollectTargetDirs(e.Path.Abs())
+	if err != nil {
+		return err
+	}
+
+	return e.runGc(e.Targets.Slice(), targetDirs, flog, dryrun)
+}
+
 func (e *LocalCacheState) GCTargets(targets []*graph.Target, flog func(string, ...interface{}), dryrun bool) error {
 	return e.runGc(targets, nil, flog, dryrun)
 }
@@ -177,13 +186,4 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 	}
 
 	return nil
-}
-
-func (e *LocalCacheState) GC(ctx context.Context, flog func(string, ...interface{}), dryrun bool) error {
-	targetDirs, err := e.gcCollectTargetDirs(e.Path.Abs())
-	if err != nil {
-		return err
-	}
-
-	return e.runGc(e.Targets.Slice(), targetDirs, flog, dryrun)
 }

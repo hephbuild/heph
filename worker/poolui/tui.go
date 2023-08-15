@@ -151,10 +151,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-var lrenderer = log.Renderer()
-
-var styleWorkerStart = lipgloss.NewStyle().Renderer(lrenderer).Bold(true)
-var styleFaint = lipgloss.NewStyle().Renderer(lrenderer).Faint(true)
+var styleWorkerStart = lipgloss.NewStyle().Renderer(log.Renderer()).Bold(true)
+var styleFaint = lipgloss.NewStyle().Renderer(log.Renderer()).Faint(true)
 
 func (m *Model) View() string {
 	start := xtime.RoundDuration(time.Since(m.start), 1).String()

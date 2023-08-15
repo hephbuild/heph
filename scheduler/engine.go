@@ -1,4 +1,4 @@
-package engine
+package scheduler
 
 import (
 	"context"
@@ -20,7 +20,7 @@ import (
 	"sync"
 )
 
-type Engine struct {
+type Scheduler struct {
 	Cwd              string
 	Root             *hroot.State
 	Config           *graph.Config
@@ -36,58 +36,13 @@ type Engine struct {
 	Finalizers       *finalizers.Finalizers
 	Runner           *targetrun.Runner
 
-	DisableNamedCacheWrite bool
-
 	toolsLock locks.Locker
 
 	RanGenPass bool
 }
 
-type TargetRunRequests []targetrun.Request
-
-func (rrs TargetRunRequests) Has(t *graph.Target) bool {
-	for _, rr := range rrs {
-		if rr.Target.Addr == t.Addr {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (rrs TargetRunRequests) Get(t *graph.Target) targetrun.Request {
-	for _, rr := range rrs {
-		if rr.Target.Addr == t.Addr {
-			return rr
-		}
-	}
-
-	return targetrun.Request{Target: t}
-}
-
-func (rrs TargetRunRequests) Targets() *graph.Targets {
-	ts := graph.NewTargets(len(rrs))
-
-	for _, rr := range rrs {
-		ts.Add(rr.Target)
-	}
-
-	return ts
-}
-
-func (rrs TargetRunRequests) Count(f func(rr targetrun.Request) bool) int {
-	c := 0
-	for _, rr := range rrs {
-		if f(rr) {
-			c++
-		}
-	}
-
-	return c
-}
-
-func New(e Engine) *Engine {
-	e.toolsLock = locks.NewFlock("Tools", e.Root.Home.Join("tmp", "tools.lock").Abs())
+func New(e Scheduler) *Scheduler {
+	e.toolsLock = locks.NewFlock("Tools", e.Root.Tmp.Join("tools.lock").Abs())
 	return &e
 }
 
@@ -127,7 +82,7 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Engine) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []specs.Specer) (*WaitGroupMap, error) {
+func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []specs.Specer) (*WaitGroupMap, error) {
 	rrs := ads.Map(targets, func(t *graph.Target) targetrun.Request {
 		return targetrun.Request{Target: t}
 	})
@@ -152,7 +107,7 @@ func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
 	return nil
 }
 
-func (e *Engine) CleanTarget(target *graph.Target, async bool) error {
+func (e *Scheduler) CleanTarget(target *graph.Target, async bool) error {
 	err := e.LocalCache.CleanTarget(target, async)
 	if err != nil {
 		return err
@@ -161,19 +116,19 @@ func (e *Engine) CleanTarget(target *graph.Target, async bool) error {
 	return nil
 }
 
-func (e *Engine) GetFileDeps(targets ...*graph.Target) []xfs.Path {
+func (e *Scheduler) GetFileDeps(targets ...*graph.Target) []xfs.Path {
 	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
 		return target.Deps.All()
 	})
 }
 
-func (e *Engine) GetFileHashDeps(targets ...*graph.Target) []xfs.Path {
+func (e *Scheduler) GetFileHashDeps(targets ...*graph.Target) []xfs.Path {
 	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
 		return target.HashDeps
 	})
 }
 
-func (e *Engine) getFileDeps(targets []*graph.Target, f func(*graph.Target) graph.TargetDeps) []xfs.Path {
+func (e *Scheduler) getFileDeps(targets []*graph.Target, f func(*graph.Target) graph.TargetDeps) []xfs.Path {
 	filesm := map[string]xfs.Path{}
 	for _, target := range targets {
 		for _, file := range f(target).Files {

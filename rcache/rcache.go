@@ -9,8 +9,10 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/locks"
 	"os"
 	"path/filepath"
@@ -144,4 +146,50 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 	}
 
 	return nil
+}
+
+func (e *RemoteCache) WriteableCaches(ctx context.Context, starget specs.Specer) ([]graph.CacheConfig, error) {
+	target := starget.Spec()
+
+	if !target.Cache.Enabled {
+		return nil, nil
+	}
+
+	wcs := ads.Filter(e.Config.Caches, func(cache graph.CacheConfig) bool {
+		if !cache.Write {
+			return false
+		}
+
+		if !target.Cache.NamedEnabled(cache.Name) {
+			return false
+		}
+
+		return true
+	})
+
+	if len(wcs) == 0 {
+		return nil, nil
+	}
+
+	orderedCaches, err := e.OrderedCaches(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reset and re-add in order
+	wcs = nil
+
+	for _, cache := range orderedCaches {
+		if !cache.Write {
+			continue
+		}
+
+		if !target.Cache.NamedEnabled(cache.Name) {
+			continue
+		}
+
+		wcs = append(wcs, cache)
+	}
+
+	return wcs, nil
 }

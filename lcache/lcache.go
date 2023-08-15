@@ -37,11 +37,12 @@ type LocalCacheState struct {
 	Root          *hroot.State
 	Observability *observability.Observability
 	Finalizers    *finalizers.Finalizers
+	EnableGC      bool
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers) (*LocalCacheState, error) {
+func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -55,6 +56,7 @@ func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Obse
 		Root:          root,
 		Observability: obs,
 		Finalizers:    finalizers,
+		EnableGC:      gc,
 		Metas: NewTargetMetas(func(k targetMetaKey) *Target {
 			gtarget := targets.Find(k.addr)
 
@@ -402,4 +404,39 @@ func (e *LocalCacheState) ArtifactExists(ctx context.Context, target graph.Targe
 	}
 
 	return false, nil
+}
+
+func (e *LocalCacheState) Post(ctx context.Context, target *graph.Target, outputs []string) error {
+	ltarget := e.Metas.Find(target)
+
+	hash, err := e.HashInput(target)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.Expand(ctx, target, outputs)
+	if err != nil {
+		return fmt.Errorf("expand: %w", err)
+	}
+
+	err = e.codegenLink(ctx, ltarget)
+	if err != nil {
+		return fmt.Errorf("codegenlink: %w", err)
+	}
+
+	err = e.LinkLatestCache(target, hash)
+	if err != nil {
+		return fmt.Errorf("linklatest: %w", err)
+	}
+
+	if target.Cache.Enabled && e.EnableGC {
+		status.Emit(ctx, tgt.TargetStatus(target, "GC..."))
+
+		err := e.GCTargets([]*graph.Target{target}, nil, false)
+		if err != nil {
+			log.Errorf("gc %v: %v", target.Addr, err)
+		}
+	}
+
+	return nil
 }

@@ -1,4 +1,4 @@
-package engine
+package scheduler
 
 import (
 	"context"
@@ -17,13 +17,13 @@ import (
 	"time"
 )
 
-type runGenEngine struct {
+type runGenScheduler struct {
 	Name string
 	deps *worker.WaitGroup
-	*Engine
+	*Scheduler
 }
 
-func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.WaitGroup, rerr error) {
+func (e *Scheduler) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.WaitGroup, rerr error) {
 	if e.RanGenPass {
 		return &worker.WaitGroup{}, nil
 	}
@@ -52,10 +52,10 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 
 	log.Debugf("Run gen pass")
 
-	ge := runGenEngine{
-		Name:   "Main",
-		Engine: e,
-		deps:   &worker.WaitGroup{},
+	ge := runGenScheduler{
+		Name:      "Main",
+		Scheduler: e,
+		deps:      &worker.WaitGroup{},
 	}
 
 	err := ge.linkGenTargets(ctx)
@@ -105,7 +105,7 @@ func (e *Engine) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.W
 	return deps, nil
 }
 
-func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
+func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
 	for _, target := range targets {
 		if !target.Gen {
 			panic(fmt.Errorf("%v is not a gen target", target.Addr))
@@ -160,7 +160,7 @@ func (e *runGenEngine) ScheduleGeneratedPipeline(ctx context.Context, targets []
 	return nil
 }
 
-func (e *Engine) linkGenTargets(ctx context.Context) error {
+func (e *Scheduler) linkGenTargets(ctx context.Context) error {
 	linkStartTime := time.Now()
 	err := e.Graph.LinkTargets(ctx, false, e.Graph.GeneratedTargets())
 	if err != nil {
@@ -171,7 +171,7 @@ func (e *Engine) linkGenTargets(ctx context.Context) error {
 	return nil
 }
 
-func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
+func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: "rungen_" + target.Addr,
 		Deps: runDeps,
@@ -184,7 +184,7 @@ func (e *runGenEngine) scheduleRunGenerated(ctx context.Context, target *graph.T
 	deps.Add(j)
 }
 
-func (e *runGenEngine) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
+func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
 	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
 	chunks := ads.Chunk(files, len(e.Pool.Workers))

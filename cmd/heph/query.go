@@ -114,7 +114,7 @@ var queryCmd = &cobra.Command{
 			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
 		}
 
-		bs, err := engineInit(ctx, func(bootstrap.BaseBootstrap) error {
+		bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
 			return bootstrap.BlockReadStdin(args)
 		})
 		if err != nil {
@@ -122,7 +122,7 @@ var queryCmd = &cobra.Command{
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:       bs.Engine,
+			Scheduler:    bs.Scheduler,
 			PoolWaitName: "Query gen",
 		})
 		if err != nil {
@@ -168,7 +168,7 @@ var searchCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx, nil)
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
@@ -189,12 +189,12 @@ var searchCmd = &cobra.Command{
 			if t := m.(searchui2.Model).RunTarget(); t != nil {
 				t := bs.Graph.Targets().Find(t.Addr)
 
-				rrs, err := generateRRs(ctx, bs.Engine, t.AddrStruct(), nil)
+				rrs, err := generateRRs(ctx, bs.Scheduler, t.AddrStruct(), nil)
 				if err != nil {
 					return err
 				}
 
-				err = bootstrap.Run(ctx, bs.Engine, rrs, getRunOpts(), true)
+				err = bootstrap.Run(ctx, bs.Scheduler, rrs, getRunOpts(), true)
 				if err != nil {
 					return err
 				}
@@ -286,14 +286,14 @@ var graphDotCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx, nil)
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:  bs.Engine,
-			LinkAll: true,
+			Scheduler: bs.Scheduler,
+			LinkAll:   true,
 		})
 		if err != nil {
 			return err
@@ -542,14 +542,14 @@ var revdepsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx, nil)
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			LinkAll: true,
-			Engine:  bs.Engine,
+			LinkAll:   true,
+			Scheduler: bs.Scheduler,
 		})
 		if err != nil {
 			return err
@@ -655,12 +655,12 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Engine, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
 
-		target := bs.Engine.LocalCache.Metas.Find(gtarget)
+		target := bs.Scheduler.LocalCache.Metas.Find(gtarget)
 
 		fmt.Println(filepath.Dir(target.OutExpansionRoot().Abs()))
 
@@ -703,16 +703,16 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Engine, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
 
-		target := bs.Engine.LocalCache.Metas.Find(gtarget)
+		target := bs.Scheduler.LocalCache.Metas.Find(gtarget)
 
 		names := specs.SortOutputsForHashing(target.ActualOutFiles().Names())
 		for _, name := range names {
-			h, err := bs.Engine.LocalCache.HashOutput(target, name)
+			h, err := bs.Scheduler.LocalCache.HashOutput(target, name)
 			if err != nil {
 				return err
 			}
@@ -736,17 +736,17 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Engine.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []specs.Specer{target})
+		tdeps, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []specs.Specer{target})
 		if err != nil {
 			return err
 		}
 
-		err = poolwait.Wait(ctx, "Run", bs.Engine.Pool, tdeps.All(), *plain)
+		err = poolwait.Wait(ctx, "Run", bs.Scheduler.Pool, tdeps.All(), *plain)
 		if err != nil {
 			return err
 		}
 
-		h, err := bs.Engine.LocalCache.HashInput(target)
+		h, err := bs.Scheduler.LocalCache.HashInput(target)
 		if err != nil {
 			return err
 		}
@@ -802,12 +802,12 @@ var orderedCachesCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx, nil)
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		orderedCaches, err := bs.Engine.RemoteCache.OrderedCaches(ctx)
+		orderedCaches, err := bs.Scheduler.RemoteCache.OrderedCaches(ctx)
 		if err != nil {
 			return err
 		}

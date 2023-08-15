@@ -5,13 +5,13 @@ package hephcloud
 import (
 	"context"
 	"github.com/Khan/genqlient/graphql"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/scheduler"
 )
 
 type Hook struct {
 	observability.BaseHook
-	Config    engine.Config
+	Config    scheduler.Config
 	Client    graphql.Client
 	ProjectID string
 }

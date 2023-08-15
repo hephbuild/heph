@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker"
@@ -28,7 +28,7 @@ func (e ErrorWithExitCode) Unwrap() error {
 	return e.Err
 }
 
-func Run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, runopts RunOpts, inlineSingle bool) error {
+func Run(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests, runopts RunOpts, inlineSingle bool) error {
 	return RunMode(ctx, e, rrs, runopts, inlineSingle, "", sandbox.IOConfig{
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
@@ -36,7 +36,7 @@ func Run(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, ru
 	})
 }
 
-func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests, runopts RunOpts, inlineSingle bool, mode string, iocfg sandbox.IOConfig) error {
+func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests, runopts RunOpts, inlineSingle bool, mode string, iocfg sandbox.IOConfig) error {
 	for i := range rrs {
 		rrs[i].Mode = mode
 	}
@@ -62,7 +62,7 @@ func RunMode(ctx context.Context, e *engine.Engine, rrs engine.TargetRunRequests
 
 	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
 	// The DoneSem() must be called after all the tdeps have finished
-	ctx, fgDeps := engine.ContextWithForegroundWaitGroup(ctx)
+	ctx, fgDeps := scheduler.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 
 	var skip []specs.Specer

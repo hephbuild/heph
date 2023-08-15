@@ -191,7 +191,7 @@ var runCmd = &cobra.Command{
 			return bootstrap.ErrorWithExitCode{ExitCode: 1}
 		}
 
-		err = bootstrap.Run(ctx, bs.Engine, rrs, getRunOpts(), !fromStdin)
+		err = bootstrap.Run(ctx, bs.Scheduler, rrs, getRunOpts(), !fromStdin)
 		if err != nil {
 			return err
 		}
@@ -221,7 +221,7 @@ var cleanCmd = &cobra.Command{
 
 		for _, target := range targets.Slice() {
 			log.Tracef("Cleaning %v...", target.Addr)
-			err := bs.Engine.CleanTarget(target, true)
+			err := bs.Scheduler.CleanTarget(target, true)
 			if err != nil {
 				return err
 			}
@@ -241,7 +241,7 @@ var gcCmd = &cobra.Command{
 			return err
 		}
 
-		err = bs.Engine.LocalCache.GC(cmd.Context(), log.Infof, false)
+		err = bs.Scheduler.LocalCache.GC(cmd.Context(), log.Infof, false)
 		if err != nil {
 			return err
 		}
@@ -257,14 +257,14 @@ var validateCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := engineInit(ctx, nil)
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
 		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Engine:  bs.Engine,
-			LinkAll: true,
+			Scheduler: bs.Scheduler,
+			LinkAll:   true,
 		})
 		if err != nil {
 			return err
@@ -283,8 +283,8 @@ var setupCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		// bootstrap.BootEngine installs the tools
-		_, err := engineInit(ctx, nil)
+		// bootstrap.BootScheduler installs the tools
+		_, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}

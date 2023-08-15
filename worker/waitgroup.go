@@ -92,6 +92,7 @@ func (wg *WaitGroup) broadcast() {
 
 func (wg *WaitGroup) wait() {
 	wg.cond.L.Lock()
+	defer wg.cond.L.Unlock()
 
 	var err error
 	for {
@@ -107,8 +108,6 @@ func (wg *WaitGroup) wait() {
 		wg.err = err
 	}
 	close(wg.doneCh)
-
-	wg.cond.L.Unlock()
 }
 
 func (wg *WaitGroup) Done() <-chan struct{} {

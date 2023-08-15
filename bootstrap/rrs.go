@@ -3,15 +3,15 @@ package bootstrap
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/engine"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (engine.TargetRunRequests, error) {
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (targetrun.Requests, error) {
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
@@ -27,7 +27,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		return nil
 	}
 
-	rrs := make(engine.TargetRunRequests, 0, targets.Len())
+	rrs := make(targetrun.Requests, 0, targets.Len())
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -71,7 +71,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (engine.TargetRunRequests, error) {
+func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
 	if specs.IsMatcherExplicit(m) {
 		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
 		if err == nil {
@@ -89,7 +89,7 @@ func GenerateRRs(ctx context.Context, e *engine.Engine, m specs.Matcher, targs [
 	return generateRRs(ctx, e.Graph, m, targs, false, opts)
 }
 
-func RunGen(ctx context.Context, e *engine.Engine, poolName string, linkAll, plain bool) error {
+func RunGen(ctx context.Context, e *scheduler.Scheduler, poolName string, linkAll, plain bool) error {
 	deps, err := e.ScheduleGenPass(ctx, linkAll)
 	if err != nil {
 		return err

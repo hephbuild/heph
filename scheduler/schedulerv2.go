@@ -1,4 +1,4 @@
-package engine
+package scheduler
 
 import (
 	"context"
@@ -16,15 +16,15 @@ import (
 	"github.com/hephbuild/heph/worker"
 )
 
-func (e *Engine) ScheduleTargetRRsWithDeps(ctx context.Context, rrs TargetRunRequests, skip []specs.Specer) (*WaitGroupMap, error) {
+func (e *Scheduler) ScheduleTargetRRsWithDeps(ctx context.Context, rrs targetrun.Requests, skip []specs.Specer) (*WaitGroupMap, error) {
 	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
 }
 
-func (e *Engine) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps *worker.WaitGroup) (*worker.Job, error) {
+func (e *Scheduler) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.Addr,
 		Deps: deps,
-		Hook: WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
+		Hook: observability.WorkerStageFactory(func(job *worker.Job) (context.Context, *observability.TargetSpan) {
 			return e.Observability.SpanRun(job.Ctx(), rr.Target.GraphTarget())
 		}),
 		Do: func(w *worker.Worker, ctx context.Context) error {
@@ -40,7 +40,7 @@ func (e *Engine) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, de
 	return j, nil
 }
 
-func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRunRequests, skip []specs.Specer) (_ *WaitGroupMap, rerr error) {
+func (e *Scheduler) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs targetrun.Requests, skip []specs.Specer) (_ *WaitGroupMap, rerr error) {
 	targetsSet := rrs.Targets()
 
 	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
@@ -61,10 +61,10 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 	targetSchedJobs := &maps.Map[string, *worker.Job]{}
 
 	sched := &schedulerv2{
-		Engine: e,
-		octx:   octx,
-		sctx:   octx,
-		rrs:    rrs,
+		Scheduler: e,
+		octx:      octx,
+		sctx:      octx,
+		rrs:       rrs,
 		skip: ads.Map(skip, func(t specs.Specer) string {
 			return t.Spec().Addr
 		}),
@@ -88,10 +88,10 @@ func (e *Engine) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs TargetRun
 }
 
 type schedulerv2 struct {
-	*Engine
+	*Scheduler
 	octx context.Context
 	sctx context.Context
-	rrs  TargetRunRequests
+	rrs  targetrun.Requests
 	skip []string
 
 	rrTargets       *graph.Targets
@@ -270,7 +270,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 			if target.Cache.Enabled && useCached {
 				outputs := s.outputs.Get(target.Addr).Slice()
 
-				_, cached, err := s.Engine.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
+				_, cached, err := s.Scheduler.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
 				if err != nil {
 					return err
 				}

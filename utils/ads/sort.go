@@ -1,6 +1,9 @@
 package ads
 
-import "sort"
+import (
+	"golang.org/x/exp/slices"
+	"sort"
+)
 
 type Comparer[T any] func(i, j T) int
 
@@ -16,30 +19,11 @@ func sortCompare[T any](ai, aj T, comparers []Comparer[T]) bool {
 	return false
 }
 
-type sorter[T any] struct {
-	a         []T
-	comparers []Comparer[T]
-}
-
-func (s *sorter[T]) Len() int {
-	return len(s.a)
-}
-
-func (s *sorter[T]) Less(i, j int) bool {
-	ai := s.a[i]
-	aj := s.a[j]
-
-	return sortCompare(ai, aj, s.comparers)
-}
-
-func (s *sorter[T]) Swap(i, j int) {
-	s.a[i], s.a[j] = s.a[j], s.a[i]
-}
-
 // Sort sorts by passing a copy of the data around
 func Sort[T any](a []T, comparers ...Comparer[T]) {
-	s := &sorter[T]{a, comparers}
-	sort.Sort(s)
+	slices.SortFunc(a, func(a, b T) bool {
+		return sortCompare(a, b, comparers)
+	})
 }
 
 type sorterp[T any] struct {
