@@ -106,7 +106,7 @@ func Cp(from, to string) error {
 		return logerr("cp7", err)
 	}
 
-	err = tof.Close()
+	err = CloseEnsureROFD(tof)
 	if err != nil {
 		return err
 	}

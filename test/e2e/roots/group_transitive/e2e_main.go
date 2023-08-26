@@ -29,5 +29,5 @@ func main() {
 
 	fmt.Println("### test_deep-group")
 	output = MustV(RunOutput("//:test_deep-group"))
-	Must(AssertFileContentEqual(output[0], "SRC=t1 t2 t3"))
+	Must(AssertFileContentEqual(output[0], "SRC=t1 t2 t3\nSRC_T3=t3"))
 }

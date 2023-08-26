@@ -1,6 +1,9 @@
 package graph
 
-import "github.com/hephbuild/heph/specs"
+import (
+	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/ads"
+)
 
 type TargetTransitive struct {
 	Tools          TargetTools
@@ -18,15 +21,13 @@ func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 		RuntimeEnv: map[string]TargetRuntimeEnv{},
 	}
 
-	if otr.Tools.Empty() {
-		ntr.Tools = tr.Tools
-	} else {
+	ntr.Tools = tr.Tools
+	if !otr.Tools.Empty() {
 		ntr.Tools = tr.Tools.Merge(otr.Tools)
 	}
 
-	if otr.Deps.Empty() {
-		ntr.Deps = tr.Deps
-	} else {
+	ntr.Deps = tr.Deps
+	if !otr.Deps.Empty() {
 		ntr.Deps = tr.Deps.Merge(otr.Deps)
 	}
 
@@ -44,8 +45,8 @@ func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 		ntr.RuntimeEnv[k] = v
 	}
 
-	ntr.PassEnv = append(tr.PassEnv, otr.PassEnv...)
-	ntr.RuntimePassEnv = append(tr.RuntimePassEnv, otr.RuntimePassEnv...)
+	ntr.PassEnv = ads.DedupAppendIdentity(tr.PassEnv, otr.PassEnv...)
+	ntr.RuntimePassEnv = ads.DedupAppendIdentity(tr.RuntimePassEnv, otr.RuntimePassEnv...)
 
 	return ntr
 }

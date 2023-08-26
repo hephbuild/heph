@@ -4,7 +4,7 @@ load("//backend/node", "yarn_toolchain")
 
 go_toolchain(
     name="go",
-    version="1.20.6",
+    version="1.21.0",
     architectures=[
         "darwin_amd64", "darwin_arm64",
         "linux_amd64", "linux_arm64",

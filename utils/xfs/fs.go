@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/xrand"
 	"io"
 	"os"
@@ -75,6 +76,37 @@ func WriteFileSync(name string, data []byte, perm os.FileMode) error {
 		err = err1
 	}
 	return err
+}
+
+// CloseEnsureROFD ensures the fd is ro; fixing the issue described in https://github.com/rust-lang/rust/issues/114554
+func CloseEnsureROFD(f *os.File) error {
+	err := flock.Flock(f, false, true)
+	if err != nil {
+		return err
+	}
+
+	err = f.Close()
+	if err != nil {
+		return err
+	}
+
+	f, err = os.OpenFile(f.Name(), os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	err = flock.Flock(f, false, true)
+	if err != nil {
+		return err
+	}
+
+	err = f.Close()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func DeleteDir(dir string, async bool) error {

@@ -312,7 +312,7 @@ func untarFile(hdr *tar.Header, tr *tar.Reader, to string, ro bool) error {
 		return err
 	}
 
-	err = f.Close()
+	err = xfs.CloseEnsureROFD(f)
 	if err != nil {
 		return err
 	}

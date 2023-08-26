@@ -14,6 +14,14 @@ type TargetTool struct {
 	File   xfs.RelPath
 }
 
+type targetToolComparable struct {
+	name, addr, output string
+}
+
+func (t TargetTool) comparable() targetToolComparable {
+	return targetToolComparable{t.Name, t.Target.Addr, t.Output}
+}
+
 type TargetTools struct {
 	// Holds targets references that do not have output (for transitive for ex)
 	TargetReferences []*Target
@@ -36,11 +44,11 @@ func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt.TargetReferences = ads.DedupAppend(t.TargetReferences, func(t *Target) string {
 		return t.Addr
 	}, tools.TargetReferences...)
-	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) string {
-		return tool.Name + "|" + tool.Target.Addr + "|" + tool.Output
+	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) targetToolComparable {
+		return tool.comparable()
 	}, tools.Targets...)
-	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool specs.HostTool) string {
-		return tool.Name + "|" + tool.BinName + "|" + tool.Path
+	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool specs.HostTool) specs.HostTool {
+		return tool
 	}, tools.Hosts...)
 
 	return tt
@@ -51,11 +59,11 @@ func (t TargetTools) Empty() bool {
 }
 
 func (t *TargetTools) Dedup() {
-	t.Hosts = ads.Dedup(t.Hosts, func(tool specs.HostTool) string {
-		return tool.Name + "|" + tool.BinName + "|" + tool.Path
+	t.Hosts = ads.Dedup(t.Hosts, func(tool specs.HostTool) specs.HostTool {
+		return tool
 	})
-	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) string {
-		return tool.Name + "|" + tool.Target.Addr + "|" + tool.Output
+	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) targetToolComparable {
+		return tool.comparable()
 	})
 	t.TargetReferences = ads.Dedup(t.TargetReferences, func(target *Target) string {
 		return target.Addr

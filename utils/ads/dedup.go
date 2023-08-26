@@ -1,5 +1,11 @@
 package ads
 
+func DedupAppendIdentity[T comparable](as []T, vs ...T) []T {
+	return DedupAppend(as, func(t T) T {
+		return t
+	}, vs...)
+}
+
 func DedupAppend[T any, K comparable](as []T, id func(T) K, vs ...T) []T {
 	if len(vs) == 0 {
 		return as

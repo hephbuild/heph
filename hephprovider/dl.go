@@ -55,5 +55,10 @@ func Download(dir, binName, version, goos, goarch string) (string, error) {
 		return "", err
 	}
 
+	err = xfs.CloseEnsureROFD(dst)
+	if err != nil {
+		return "", err
+	}
+
 	return dstPath, nil
 }

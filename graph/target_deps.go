@@ -14,15 +14,15 @@ type TargetWithOutput struct {
 	Name   string
 }
 
-type TargetWithOutputComparable struct {
-	addr, output string
+type targetWithOutputComparable struct {
+	name, addr, output string
 }
 
-func (t TargetWithOutput) Comparable() TargetWithOutputComparable {
-	return TargetWithOutputComparable{t.Target.Addr, t.Output}
+func (t *TargetWithOutput) comparable() targetWithOutputComparable {
+	return targetWithOutputComparable{t.Name, t.Target.Addr, t.Output}
 }
 
-func (t TargetWithOutput) Full() string {
+func (t *TargetWithOutput) Full() string {
 	if t.Output == "" {
 		return t.Target.Addr
 	}
@@ -39,11 +39,11 @@ type TargetDeps struct {
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
 
-	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) TargetWithOutputComparable {
-		return t.Comparable()
+	nd.Targets = ads.DedupAppend(d.Targets, func(t TargetWithOutput) targetWithOutputComparable {
+		return t.comparable()
 	}, deps.Targets...)
-	nd.RawTargets = ads.DedupAppend(d.RawTargets, func(t TargetWithOutput) TargetWithOutputComparable {
-		return t.Comparable()
+	nd.RawTargets = ads.DedupAppend(d.RawTargets, func(t TargetWithOutput) targetWithOutputComparable {
+		return t.comparable()
 	}, deps.RawTargets...)
 
 	nd.Files = ads.DedupAppend(d.Files, func(path xfs.Path) string {
@@ -54,11 +54,11 @@ func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 }
 
 func (d *TargetDeps) Dedup() {
-	d.Targets = ads.Dedup(d.Targets, func(t TargetWithOutput) TargetWithOutputComparable {
-		return t.Comparable()
+	d.Targets = ads.Dedup(d.Targets, func(t TargetWithOutput) targetWithOutputComparable {
+		return t.comparable()
 	})
-	d.RawTargets = ads.Dedup(d.RawTargets, func(t TargetWithOutput) TargetWithOutputComparable {
-		return t.Comparable()
+	d.RawTargets = ads.Dedup(d.RawTargets, func(t TargetWithOutput) targetWithOutputComparable {
+		return t.comparable()
 	})
 	d.Files = ads.Dedup(d.Files, func(path xfs.Path) string {
 		return path.RelRoot()
@@ -81,5 +81,5 @@ func (d TargetDeps) Sort() {
 }
 
 func (d TargetDeps) Empty() bool {
-	return len(d.Targets) == 0 && len(d.Files) == 0
+	return len(d.Targets) == 0 && len(d.RawTargets) == 0 && len(d.Files) == 0
 }

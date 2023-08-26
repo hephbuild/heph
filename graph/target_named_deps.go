@@ -95,5 +95,5 @@ func (tp *TargetNamedDeps) Merge(deps TargetNamedDeps) TargetNamedDeps {
 }
 
 func (tp *TargetNamedDeps) Empty() bool {
-	return len(tp.All().Targets) == 0 && len(tp.All().Files) == 0
+	return tp.All().Empty()
 }
