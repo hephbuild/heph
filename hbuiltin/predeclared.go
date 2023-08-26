@@ -13,8 +13,8 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/hephbuild/heph/utils/xsync"
+	starlarkjson "go.starlark.net/lib/json"
 	"go.starlark.net/starlark"
-	"go.starlark.net/starlarkjson"
 	"go.starlark.net/starlarkstruct"
 	"io/fs"
 	"path/filepath"
@@ -203,12 +203,12 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 		return nil, err
 	}
 
-	t.Source = ads.MapFlat(stackTrace(thread), func(source specs.Source) []specs.Source {
+	t.Source = ads.Map(stackTrace(thread), func(source specs.Source) specs.Source {
 		if source.Pos.Filename() == "<builtin>" {
 			source.Pos.Line = 0
 		}
 
-		return []specs.Source{source}
+		return source
 	})
 
 	err = opts.RegisterTarget(t)

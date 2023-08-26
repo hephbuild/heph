@@ -42,8 +42,6 @@ func FromStarlark(v starlark.Value) interface{} {
 	default:
 		panic(fmt.Sprintf("FromStarlark: unhandled type %T", v))
 	}
-
-	return nil
 }
 
 func FromGo(v interface{}) starlark.Value {

@@ -16,10 +16,6 @@ import (
 	"github.com/hephbuild/heph/worker"
 )
 
-func (e *Scheduler) ScheduleTargetRRsWithDeps(ctx context.Context, rrs targetrun.Requests, skip []specs.Specer) (*WaitGroupMap, error) {
-	return e.ScheduleV2TargetRRsWithDeps(ctx, rrs, skip)
-}
-
 func (e *Scheduler) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps *worker.WaitGroup) (*worker.Job, error) {
 	j := e.Pool.Schedule(ctx, &worker.Job{
 		Name: rr.Target.Addr,
@@ -40,7 +36,7 @@ func (e *Scheduler) ScheduleTargetRun(ctx context.Context, rr targetrun.Request,
 	return j, nil
 }
 
-func (e *Scheduler) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs targetrun.Requests, skip []specs.Specer) (_ *WaitGroupMap, rerr error) {
+func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetrun.Requests, skip []specs.Specer) (_ *WaitGroupMap, rerr error) {
 	targetsSet := rrs.Targets()
 
 	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
@@ -54,12 +50,6 @@ func (e *Scheduler) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs target
 		outputs.Set(target.Addr, ss)
 	}
 
-	deps := &WaitGroupMap{}
-	pullMetaDeps := &WaitGroupMap{}
-
-	targetSchedLock := &maps.KMutex{}
-	targetSchedJobs := &maps.Map[string, *worker.Job]{}
-
 	sched := &schedulerv2{
 		Scheduler: e,
 		octx:      octx,
@@ -72,11 +62,11 @@ func (e *Scheduler) ScheduleV2TargetRRsWithDeps(octx context.Context, rrs target
 
 		toAssess:     toAssess,
 		outputs:      outputs,
-		deps:         deps,
-		pullMetaDeps: pullMetaDeps,
+		deps:         &WaitGroupMap{},
+		pullMetaDeps: &WaitGroupMap{},
 
-		targetSchedLock: targetSchedLock,
-		targetSchedJobs: targetSchedJobs,
+		targetSchedLock: &maps.KMutex{},
+		targetSchedJobs: &maps.Map[string, *worker.Job]{},
 	}
 
 	err = sched.schedule()
@@ -314,16 +304,6 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *graph.T
 	if err != nil {
 		return nil, err
 	}
-
-	deps := &worker.WaitGroup{}
-	parents, err := s.Graph.DAG().GetParents(target)
-	if err != nil {
-		return nil, err
-	}
-	for _, parent := range parents {
-		deps.AddChild(s.deps.Get(parent.Addr))
-	}
-	deps.AddChild(runDeps)
 
 	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target), runDeps)
 	if err != nil {

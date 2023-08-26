@@ -205,7 +205,7 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 							return err
 						}
 
-						targets.Add(e.Graph.Targets().Find(spec.Addr))
+						targets.Add(e.Graph.Targets().FindT(spec))
 						return nil
 					},
 				})

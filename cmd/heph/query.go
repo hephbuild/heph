@@ -8,12 +8,11 @@ import (
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/cmd/heph/searchui2"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/graphdot"
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
-	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"github.com/spf13/cobra"
@@ -22,9 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"time"
 )
 
 var include []string
@@ -187,7 +184,7 @@ var searchCmd = &cobra.Command{
 			}
 
 			if t := m.(searchui2.Model).RunTarget(); t != nil {
-				t := bs.Graph.Targets().Find(t.Addr)
+				t := bs.Graph.Targets().FindT(t)
 
 				rrs, err := generateRRs(ctx, bs.Scheduler, t.AddrStruct(), nil)
 				if err != nil {
@@ -262,17 +259,42 @@ var graphCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, target, err := parseTargetFromArgs(cmd.Context(), args)
+		ctx := cmd.Context()
+
+		bs, err := schedulerInit(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(target.Addr)
+		err = preRunWithGenWithOpts(ctx, PreRunOpts{
+			Scheduler: bs.Scheduler,
+			LinkAll:   true,
+		})
 		if err != nil {
 			return err
 		}
 
+		rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, false, true)
+		if err != nil {
+			return err
+		}
+
+		id := rrs[0].Target.Addr
+
+		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(id)
+		if err != nil {
+			return err
+		}
+
+		desc, _, err := bs.Graph.DAG().GetDescendantsGraph(id)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("Ancestors:")
 		fmt.Print(ances.String())
+		fmt.Println("Descendants:")
+		fmt.Print(desc.String())
 
 		return nil
 	},
@@ -323,53 +345,7 @@ var graphDotCmd = &cobra.Command{
 			}
 		}
 
-		fmt.Printf(`
-digraph G  {
-	fontname="Helvetica,Arial,sans-serif"
-	node [fontname="Helvetica,Arial,sans-serif"]
-	edge [fontname="Helvetica,Arial,sans-serif"]
-	rankdir="LR"
-	node [fontsize=10, shape=box, height=0.25]
-	edge [fontsize=10]
-`)
-		id := func(target *graph.Target) string {
-			return strconv.Quote(target.Addr)
-		}
-
-		for _, target := range dag.GetVertices() {
-			extra := ""
-			if target.IsGroup() {
-				//extra = ` color="red"`
-				continue
-			}
-
-			log.Tracef("walk %v", target.Addr)
-
-			parentsStart := time.Now()
-			parents, err := dag.GetParents(target)
-			log.Debugf("parents took %v (got %v)", time.Since(parentsStart), len(parents))
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Printf("    %v [label=\"%v\"%v];\n", id(target), target.Addr, extra)
-
-			skip := sets.NewStringSet(0)
-			//for _, tool := range target.Tools.Targets {
-			//	skip.Add(tool.Target.Addr)
-			//}
-
-			for _, ancestor := range parents {
-				if skip.Has(ancestor.Addr) {
-					continue
-				}
-
-				fmt.Printf("    %v -> %v;\n", id(ancestor), id(target))
-			}
-			fmt.Println()
-		}
-
-		fmt.Println("}")
+		graphdot.Print(dag, false)
 
 		return nil
 	},
@@ -469,10 +445,7 @@ var pkgsCmd = &cobra.Command{
 			return err
 		}
 
-		pkgs := make([]*packages.Package, 0)
-		for _, p := range bs.Packages.All() {
-			pkgs = append(pkgs, p)
-		}
+		pkgs := bs.Packages.All()
 		sort.SliceStable(pkgs, func(i, j int) bool {
 			return pkgs[i].Path < pkgs[j].Path
 		})
@@ -587,12 +560,12 @@ var revdepsCmd = &cobra.Command{
 
 			targets = specs.AsSpecers(children)
 			fn = func(target specs.Specer) ([]*graph.Target, error) {
-				return []*graph.Target{bs.Graph.Targets().Find(target.Spec().Addr)}, nil
+				return []*graph.Target{bs.Graph.Targets().FindT(target)}, nil
 			}
 			if transitive {
 				fn = func(target specs.Specer) ([]*graph.Target, error) {
 					desc, err := bs.Graph.DAG().GetDescendants(target)
-					desc = append(desc, bs.Graph.Targets().Find(target.Spec().Addr))
+					desc = append(desc, bs.Graph.Targets().FindT(target))
 					return desc, err
 				}
 			}

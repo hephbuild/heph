@@ -28,7 +28,11 @@ func NewSetFrom[K comparable, T any](f func(T) K, vs []T) *Set[K, T] {
 type StringSet = Set[string, string]
 
 func NewStringSet(cap int) *StringSet {
-	return NewSet(func(s string) string {
+	return NewIdentitySet[string](cap)
+}
+
+func NewIdentitySet[T comparable](cap int) *Set[T, T] {
+	return NewSet(func(s T) T {
 		return s
 	}, cap)
 }
@@ -91,7 +95,7 @@ func (ts *Set[K, T]) Slice() []T {
 		return nil
 	}
 
-	return ts.a
+	return ts.a[:]
 }
 
 func (ts *Set[K, T]) Len() int {

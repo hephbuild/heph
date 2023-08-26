@@ -36,7 +36,6 @@ type State struct {
 	watcher  *fsnotify.Watcher
 	ignore   []string
 	close    func()
-	rrs      targetrun.Requests
 	bootopts bootstrap.BootOpts
 	runopts  bootstrap.RunOpts
 	rropts   targetrun.RequestOpts

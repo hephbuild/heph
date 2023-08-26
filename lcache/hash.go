@@ -186,7 +186,7 @@ func (e *LocalCacheState) hashFileModTimePath(h hash.Hash, path string) (time.Ti
 }
 
 func (e *LocalCacheState) find(t specs.Specer) graph.Targeter {
-	return e.Targets.Find(t.Spec().Addr)
+	return e.Targets.FindT(t)
 }
 
 func (e *LocalCacheState) HashInput(target graph.Targeter) (string, error) {

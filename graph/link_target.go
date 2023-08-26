@@ -27,7 +27,7 @@ func (e *State) Register(spec specs.Target) error {
 	l.Lock()
 	defer l.Unlock()
 
-	if t := e.targets.Find(spec.Addr); t != nil {
+	if t := e.targets.FindT(spec); t != nil {
 		if !t.Spec().Equal(spec) {
 			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Source, t.Json(), spec.Json())
 		}

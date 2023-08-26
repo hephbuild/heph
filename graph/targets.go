@@ -80,9 +80,7 @@ func (ts *Targets) Sort() {
 		return
 	}
 
-	a := ts.Slice()
-
-	ads.Sort(a, func(i, j *Target) int {
+	ads.Sort(ts.Slice(), func(i, j *Target) int {
 		return strings.Compare(i.Addr, j.Addr)
 	})
 }
@@ -95,6 +93,10 @@ func (ts *Targets) Copy() *Targets {
 	return &Targets{
 		Set: ts.Set.Copy(),
 	}
+}
+
+func (ts *Targets) FindT(s specs.Specer) *Target {
+	return ts.Find(s.Spec().Addr)
 }
 
 func (ts *Targets) Find(addr string) *Target {

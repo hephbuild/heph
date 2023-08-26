@@ -170,7 +170,6 @@ func (j *Job) IsDone() bool {
 
 type Worker struct {
 	status     status.Statuser
-	statusm    sync.Mutex
 	CurrentJob *Job
 }
 

@@ -28,10 +28,9 @@ func newTargetSearchModel(targets specs.Targets) targetSearchModel {
 }
 
 type targetSearchModel struct {
-	textField    textinput.Model
-	debounce     *xtime.Debounce
-	search       search.FuncCtx
-	searchCancel context.CancelFunc
+	textField textinput.Model
+	debounce  *xtime.Debounce
+	search    search.FuncCtx
 
 	searchResult targetSearchResults
 }

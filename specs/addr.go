@@ -186,7 +186,7 @@ func addrParse(pkg string, s string, mode int) (TargetAddr, error) {
 	if strings.HasPrefix(s, "//") {
 		s := s[2:]
 		if i := strings.Index(s, ":"); i != -1 {
-			if strings.Index(s[i+1:], ":") != -1 {
+			if strings.Contains(s[i+1:], ":") {
 				return TargetAddr{}, errGotMultipleColon
 			}
 

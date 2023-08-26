@@ -162,7 +162,7 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenConte
 			d.DepsHashes[dep.Target.Addr] = map[string]string{}
 		}
 		var err error
-		d.DepsHashes[dep.Target.Addr][dep.Output], err = e.HashOutput(e.Targets.Find(dep.Target.Addr), dep.Output)
+		d.DepsHashes[dep.Target.Addr][dep.Output], err = e.HashOutput(e.Targets.FindT(dep.Target), dep.Output)
 		if err != nil {
 			return err
 		}

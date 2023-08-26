@@ -50,7 +50,7 @@ func (t TargetTools) Empty() bool {
 	return len(t.Targets) == 0 && len(t.Hosts) == 0 && len(t.TargetReferences) == 0
 }
 
-func (t TargetTools) Dedup() {
+func (t *TargetTools) Dedup() {
 	t.Hosts = ads.Dedup(t.Hosts, func(tool specs.HostTool) string {
 		return tool.Name + "|" + tool.BinName + "|" + tool.Path
 	})

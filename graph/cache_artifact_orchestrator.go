@@ -22,8 +22,7 @@ type ArtifactOrchestrator struct {
 	Manifest  artifacts.Artifact
 	Out       map[string]ArtifactsOut
 
-	allOnce        xsync.Once[[]artifacts.Artifact]
-	allReverseOnce xsync.Once[[]artifacts.Artifact]
+	allOnce xsync.Once[[]artifacts.Artifact]
 }
 
 func (o *ArtifactOrchestrator) All() []artifacts.Artifact {

@@ -302,7 +302,7 @@ func parseFactor(tokens []token, index *int) astNode {
 	default:
 		tok := tokens[*index]
 		if tok.typ == tokenEOF {
-			panic(fmt.Sprintf("Unexpected end of expression"))
+			panic("Unexpected end of expression")
 		}
 
 		panic(fmt.Sprintf("Unexpected token: %v", printToken(tok)))

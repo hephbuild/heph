@@ -5,7 +5,7 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
-	"sort"
+	"golang.org/x/exp/slices"
 )
 
 type DAG struct {
@@ -52,9 +52,7 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	ancs := NewTargets(0)
 	ancsout := &maps.Map[string, *sets.Set[string, string]]{
 		Default: func(k string) *sets.Set[string, string] {
-			return sets.NewSet(func(s string) string {
-				return s
-			}, 0)
+			return sets.NewStringSet(0)
 		},
 	}
 
@@ -71,7 +69,7 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	}
 
 	maybeAddAllOuts := func(t *Target, output string) {
-		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || Contains(targets.Slice(), t.Addr) {
+		if t.RestoreCache || t.HasSupportFiles || len(t.Codegen) > 0 || targets.Has(t) {
 			addAllOut(t)
 		} else {
 			addOut(t, output)
@@ -210,14 +208,14 @@ func (d *DAG) GetFileChildren(paths []string, universe []*Target) []*Target {
 }
 
 func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
-	a := make([]*Target, 0)
+	a := make([]*Target, 0, len(m))
 	for _, anci := range m {
 		anc := anci.(*Target)
 		a = append(a, anc)
 	}
 
-	sort.Slice(a, func(i, j int) bool {
-		return a[i].Addr < a[j].Addr
+	slices.SortFunc(a, func(a, b *Target) bool {
+		return a.Addr < b.Addr
 	})
 
 	return a
