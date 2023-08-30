@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"golang.org/x/exp/slices"
+	"strings"
 )
 
 type DAG struct {
@@ -214,8 +215,8 @@ func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
 		a = append(a, anc)
 	}
 
-	slices.SortFunc(a, func(a, b *Target) bool {
-		return a.Addr < b.Addr
+	slices.SortFunc(a, func(a, b *Target) int {
+		return strings.Compare(a.Addr, b.Addr)
 	})
 
 	return a

@@ -3,7 +3,8 @@ package tgt
 import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
-	"sort"
+	"golang.org/x/exp/slices"
+	"strings"
 )
 
 type NamedPaths[TS ~[]T, T xfs.RelablePath] struct {
@@ -91,13 +92,13 @@ func (tp *NamedPaths[TS, T]) Add(name string, p T) {
 }
 
 func (tp *NamedPaths[TS, T]) Sort() {
-	sort.Slice(tp.all, func(i, j int) bool {
-		return tp.all[i].RelRoot() < tp.all[j].RelRoot()
+	slices.SortFunc(tp.all, func(a, b T) int {
+		return strings.Compare(a.RelRoot(), b.RelRoot())
 	})
 
 	for name := range tp.named {
-		sort.Slice(tp.named[name], func(i, j int) bool {
-			return tp.named[name][i].RelRoot() < tp.named[name][j].RelRoot()
+		slices.SortFunc(tp.named[name], func(a, b T) int {
+			return strings.Compare(a.RelRoot(), b.RelRoot())
 		})
 	}
 }

@@ -1,12 +1,13 @@
 package main
 
 import (
+	"cmp"
 	summary2 "github.com/hephbuild/heph/observability/summary"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xtime"
 	"github.com/olekukonko/tablewriter"
+	"golang.org/x/exp/slices"
 	"os"
-	"sort"
 )
 
 func summarySpanString(phases ...*summary2.TargetStatsSpan) string {
@@ -65,8 +66,8 @@ func PrintSummary(stats *summary2.Summary, withGen bool) {
 		targets = append(targets, span)
 	}
 
-	sort.Slice(targets, func(i, j int) bool {
-		return targets[i].Duration() > targets[j].Duration()
+	slices.SortFunc(targets, func(a, b *summary2.TargetStats) int {
+		return cmp.Compare(b.Duration(), a.Duration())
 	})
 
 	data := make([][]string, 0)
@@ -101,7 +102,7 @@ func PrintSummary(stats *summary2.Summary, withGen bool) {
 			artifactsSet.Add(artifact.Name)
 		}
 		artifacts := artifactsSet.Slice()
-		sort.Strings(artifacts)
+		slices.Sort(artifacts)
 
 		for _, name := range artifacts {
 			artifactLocalGet := target.ArtifactsLocalGet.Find(name)

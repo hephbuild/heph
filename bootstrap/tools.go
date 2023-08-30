@@ -10,8 +10,8 @@ import (
 	"github.com/hephbuild/heph/utils/hash"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
+	"golang.org/x/exp/slices"
 	"os"
-	"sort"
 	"strings"
 )
 
@@ -33,7 +33,7 @@ func InstallTools(ctx context.Context, root *hroot.State, graph *graph.State, ve
 	log.Tracef("Installing tools")
 
 	addrs := graph.Tools.Addrs()
-	sort.Strings(addrs)
+	slices.Sort(addrs)
 
 	h := hash.NewHash()
 	h.String(version)

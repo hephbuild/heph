@@ -1,11 +1,12 @@
 package config
 
 import (
+	"cmp"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/mds"
+	"golang.org/x/exp/slices"
 	"os"
 	"path/filepath"
-	"sort"
 )
 import (
 	"gopkg.in/yaml.v3"
@@ -57,9 +58,9 @@ type Config struct {
 
 func (c Config) OrderedPlatforms() []Platform {
 	platforms := mds.Values(c.Platforms)
-	sort.Slice(platforms, func(i, j int) bool {
+	slices.SortFunc(platforms, func(a, b Platform) int {
 		// Order priority DESC
-		return platforms[i].Priority > platforms[j].Priority
+		return cmp.Compare(b.Priority, a.Priority)
 	})
 
 	return platforms

@@ -193,7 +193,8 @@ func (e *LocalCacheState) HashInput(target graph.Targeter) (string, error) {
 	return e.hashInput(target, false)
 }
 
-func (e *LocalCacheState) HashInputSafely(target graph.Targeter) (string, error) {
+// VerifyHashInput will make sure files haven't been changed since last hashing
+func (e *LocalCacheState) VerifyHashInput(target graph.Targeter) (string, error) {
 	return e.hashInput(target, true)
 }
 
@@ -205,7 +206,7 @@ func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 	return h
 }
 
-func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, error) {
+func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string, error) {
 	target := gtarget.GraphTarget()
 	targetm := e.Metas.Find(gtarget)
 
@@ -213,7 +214,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, safe bool) (string, 
 	defer targetm.cacheHashInputTargetMutex.Unlock()
 
 	if h := targetm.inputHash; h != "" {
-		if safe {
+		if verify {
 			for p, t := range targetm.cacheHashInputPathsModtime {
 				info, err := os.Lstat(p)
 				if err != nil {

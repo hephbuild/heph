@@ -5,10 +5,10 @@ import (
 	"errors"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/ads"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -141,12 +141,12 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 		}
 
 		// Sort fresher first
-		sort.Slice(entries, func(i, j int) bool {
-			if entries[i].Latest {
+		ads.SortFunc(entries, func(a, b gcEntry) bool {
+			if a.Latest {
 				return true
 			}
 
-			return entries[i].Time.Unix() > entries[j].Time.Unix()
+			return a.Time.Unix() > b.Time.Unix()
 		})
 
 		targetKeep := target.Cache.History

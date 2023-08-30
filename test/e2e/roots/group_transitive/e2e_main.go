@@ -30,4 +30,14 @@ func main() {
 	fmt.Println("### test_deep-group")
 	output = MustV(RunOutput("//:test_deep-group"))
 	Must(AssertFileContentEqual(output[0], "SRC=t1 t2 t3\nSRC_T3=t3"))
+
+	fmt.Println("### test_tool_group1")
+	output = MustV(RunOutput("//:test_tool_group1"))
+	Must(AssertFileContentEqual(output[0], "SRC_T3=t3"))
+	Must(AssertFileContentLinesPrefix(output[1], []string{"TOOL_T1="}))
+
+	fmt.Println("### test_tool_group2")
+	output = MustV(RunOutput("//:test_tool_group2"))
+	//Must(AssertFileContentEqual(output[0], "XXX")) TODO: figure out why transitive do not appear here
+	Must(AssertFileContentLinesPrefix(output[1], []string{"TOOL_T1=", "TOOL_T2=", "TOOL_T3="}))
 }

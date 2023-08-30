@@ -65,10 +65,11 @@ target(
     cache=False,
 )
 
-grep_env = [
-    "env > e",
-    "(cat e | grep -E 'SRC' | sort || true) > $OUT",
-]
+def grep_env(match, out="$OUT"):
+    return [
+        "env > e",
+        "(cat e | grep -E '"+match+"' | sort || true) > "+out,
+    ]
 
 g2=group(
     name="group2",
@@ -78,7 +79,7 @@ g2=group(
 target(
     name='test_unamed-group_named-dep',
     deps=g2+"|t2",
-    run=grep_env,
+    run=grep_env('SRC'),
     cache=False,
     out="src",
 )
@@ -91,7 +92,7 @@ g3=group(
 target(
     name='test_named-group_named-dep',
     deps=g3+"|t2",
-    run=grep_env,
+    run=grep_env('SRC'),
     cache=False,
     out="src",
 )
@@ -99,7 +100,7 @@ target(
 target(
     name='test_named-group_unnamed-dep',
     deps=g3,
-    run=grep_env,
+    run=grep_env('SRC'),
     cache=False,
     out="src",
 )
@@ -120,7 +121,29 @@ gd2=group(
 target(
     name='test_deep-group',
     deps=gd2,
-    run=grep_env,
+    run=grep_env('SRC'),
     cache=False,
     out="src",
+)
+
+target(
+    name='test_tool_group1',
+    tools=gd1,
+    run=grep_env('TOOL_', '$OUT_XTOOL')+grep_env('SRC', '$OUT_XDEPS'),
+    cache=False,
+    out={
+        'xtool': 'tool',
+        'xdeps': 'deps',
+    },
+)
+
+target(
+    name='test_tool_group2',
+    tools=gd2,
+    run=grep_env('TOOL_', '$OUT_XTOOL')+grep_env('SRC', '$OUT_XDEPS'),
+    cache=False,
+    out={
+        'xtool': 'tool',
+        'xdeps': 'deps',
+    },
 )

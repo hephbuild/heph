@@ -4,15 +4,16 @@ import (
 	"encoding/json"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xsync"
+	"golang.org/x/exp/slices"
 	"path/filepath"
-	"sort"
+	"strings"
 )
 
 type Paths []Path
 
 func (ps Paths) Sort() {
-	sort.Slice(ps, func(i, j int) bool {
-		return ps[i].RelRoot() < ps[j].RelRoot()
+	slices.SortFunc(ps, func(a, b Path) int {
+		return strings.Compare(a.RelRoot(), b.RelRoot())
 	})
 }
 
@@ -25,8 +26,8 @@ func (ps Paths) WithRoot(root string) Paths {
 type RelPaths []RelPath
 
 func (ps RelPaths) Sort() {
-	sort.Slice(ps, func(i, j int) bool {
-		return ps[i].RelRoot() < ps[j].RelRoot()
+	slices.SortFunc(ps, func(a, b RelPath) int {
+		return strings.Compare(a.RelRoot(), b.RelRoot())
 	})
 }
 

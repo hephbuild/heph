@@ -117,10 +117,6 @@ func (ts *Targets) Filter(m specs.Matcher) (*Targets, error) {
 
 		return NewTargetsFrom([]*Target{target}), nil
 	case specs.TargetAddrs:
-		if len(m) == 0 {
-			return nil, nil
-		}
-
 		out := NewTargets(len(m))
 		for _, tp := range m {
 			target := ts.Find(tp.Full())

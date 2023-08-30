@@ -55,6 +55,8 @@ func (c ActualFileCollectorDir) collectNamedOut(target *graph.Target, namedPaths
 		tp.AddAll(name, files)
 	}
 
+	tp.Sort()
+
 	return tp, nil
 }
 

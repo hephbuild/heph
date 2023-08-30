@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/sets"
 	"io"
 	"strings"
+	"sync"
 )
 
 const indent = "  "
@@ -59,11 +61,10 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 
 	if transitive {
 		if !target.TransitiveDeps.Empty() {
-			fmt.Fprintln(w, "Deps from transitive:")
+			fmt.Fprintln(w, "From transitive:")
 			printTools(w, indent, target.TransitiveDeps.Tools)
 			printNamedDeps(w, indent, target.TransitiveDeps.Deps)
 			printTransitiveEnvs(w, indent, target.TransitiveDeps)
-			printPlatforms(w, indent, target.TransitiveDeps.Platforms)
 		}
 	}
 
@@ -158,6 +159,10 @@ func printTargetDeps(w io.Writer, indent string, deps graph.TargetDeps) {
 }
 
 func printNamedDeps(w io.Writer, indent string, deps graph.TargetNamedDeps) {
+	if deps.Empty() {
+		return
+	}
+
 	ogindent := indent
 
 	if deps.IsNamed() {
@@ -222,10 +227,29 @@ func printEnvs(w io.Writer, indent string, passEnv, runtimePassEnv []string, env
 }
 
 func printTools(w io.Writer, indent string, tools graph.TargetTools) {
+	targets := sets.NewStringSet(0)
+	for _, target := range tools.Targets {
+		targets.Add(target.Full())
+	}
+
 	if len(tools.Targets) > 0 {
 		fmt.Fprintln(w, indent+"Tools:")
 		for _, t := range tools.Targets {
 			fmt.Printf(indent+"  %v\n", targetDescriptor(t.Target.Spec(), t.Output, ""))
+		}
+	}
+	if len(tools.TargetReferences) > 0 {
+		var once sync.Once
+		for _, t := range tools.TargetReferences {
+			if targets.Has(t.Target.Addr) {
+				continue
+			}
+
+			once.Do(func() {
+				fmt.Fprintln(w, indent+"Tools references:")
+			})
+
+			fmt.Printf(indent+"  %v\n", t.Target.Addr)
 		}
 	}
 	if len(tools.Hosts) > 0 {

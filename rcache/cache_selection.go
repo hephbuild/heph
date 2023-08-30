@@ -11,9 +11,9 @@ import (
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/hash"
+	"golang.org/x/exp/slices"
 	"io"
 	"net/http"
-	"sort"
 	"time"
 )
 
@@ -82,8 +82,12 @@ func orderCaches(ctx context.Context, caches []graph.CacheConfig) []graph.CacheC
 		orderedCaches = append(orderedCaches, oc)
 	}
 
-	sort.SliceStable(orderedCaches, func(i, j int) bool {
-		return orderedCaches[i].latency < orderedCaches[j].latency
+	slices.SortStableFunc(orderedCaches, func(a, b orderCacheContainer) int {
+		if a.latency == b.latency {
+			return 0
+		}
+
+		return int(a.latency - b.latency)
 	})
 
 	return ads.Map(orderedCaches, func(c orderCacheContainer) graph.CacheConfig {

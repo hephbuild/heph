@@ -5,8 +5,8 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/utils/xfs"
+	"golang.org/x/exp/slices"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 )
@@ -33,8 +33,8 @@ func NewRegistry(r Registry) *Registry {
 func (e *Registry) All() []*Package {
 	e.packagesMutex.Lock()
 	if !e.sorted {
-		sort.Slice(e.packages, func(i, j int) bool {
-			return strings.Compare(e.packages[i].Path, e.packages[j].Path) < 0
+		slices.SortFunc(e.packages, func(a, b *Package) int {
+			return strings.Compare(a.Path, b.Path)
 		})
 		e.sorted = true
 	}

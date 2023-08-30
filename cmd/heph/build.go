@@ -1,12 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/lithammer/fuzzysearch/fuzzy"
-	"sort"
+	"golang.org/x/exp/slices"
 	"strings"
 )
 
@@ -20,8 +21,8 @@ func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
 		stargets = append(stargets, target)
 	}
 
-	sort.Slice(stargets, func(i, j int) bool {
-		return stargets[i].Addr < stargets[j].Addr
+	slices.SortFunc(stargets, func(a, b *graph.Target) int {
+		return strings.Compare(a.Addr, b.Addr)
 	})
 
 	return stargets
@@ -69,7 +70,9 @@ func autocompleteLabel(labels []string, s string) []string {
 	}
 
 	matches := fuzzy.RankFindNormalizedFold(s, labels)
-	sort.Sort(matches)
+	slices.SortStableFunc(matches, func(a, b fuzzy.Rank) int {
+		return cmp.Compare(a.Distance, b.Distance)
+	})
 
 	suggestions := ads.Map(matches, func(t fuzzy.Rank) string {
 		return t.Target

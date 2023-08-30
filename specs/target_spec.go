@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/utils/xsync"
 	"go.starlark.net/syntax"
 	"os/exec"
-	"sort"
 	"strings"
 	"time"
 )
@@ -63,11 +62,11 @@ const SupportFilesOutput = "@support_files"
 
 func SortOutputsForHashing(names []string) []string {
 	names = ads.Copy(names)
-	sort.Slice(names, func(i, j int) bool {
-		if names[i] == SupportFilesOutput {
+	ads.SortFunc(names, func(a, b string) bool {
+		if a == SupportFilesOutput {
 			return true
 		}
-		return strings.Compare(names[i], names[j]) < 0
+		return strings.Compare(a, b) < 0
 	})
 	return names
 }

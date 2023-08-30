@@ -2,7 +2,7 @@ package mds
 
 import (
 	"golang.org/x/exp/constraints"
-	"sort"
+	"golang.org/x/exp/slices"
 )
 
 func Keys[K constraints.Ordered, V any](m map[K]V) []K {
@@ -10,9 +10,7 @@ func Keys[K constraints.Ordered, V any](m map[K]V) []K {
 	for k := range m {
 		ks = append(ks, k)
 	}
-	sort.Slice(ks, func(i, j int) bool {
-		return ks[i] < ks[j]
-	})
+	slices.Sort(ks)
 	return ks
 }
 

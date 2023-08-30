@@ -246,7 +246,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	if t.IsTool() {
 		ts := t.Spec().Tools
 		if len(ts.Targets) != 1 || len(ts.Hosts) > 0 {
-			return fmt.Errorf("is a tool, mut have a single `tool` with a single output")
+			return fmt.Errorf("is a tool, must have a single `tool` with a single output")
 		}
 	}
 
@@ -270,7 +270,6 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	}
 	t.OwnTransitive.PassEnv = t.Spec().Transitive.PassEnv
 	t.OwnTransitive.RuntimePassEnv = t.Spec().Transitive.RuntimePassEnv
-	t.OwnTransitive.Platforms = t.Spec().Transitive.Platforms
 
 	t.DeepOwnTransitive, err = e.collectDeepTransitive(t.OwnTransitive, breadcrumb)
 	if err != nil {
@@ -459,14 +458,11 @@ func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets
 }
 
 func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *sets.StringSet) (TargetTools, error) {
-	type targetTool struct {
-		Target *Target
-		Output string
-		Name   string
-	}
+	refs := sets.NewSet(func(t *Target) string {
+		return t.Addr
+	}, len(toolsSpecs.Targets))
 
-	refs := make([]*Target, 0, len(toolsSpecs.Targets))
-	targetTools := make([]targetTool, 0)
+	targetTools := make([]TargetWithOutput, 0)
 	for _, tool := range toolsSpecs.Targets {
 		tt := e.Targets().Find(tool.Target)
 		if tt == nil {
@@ -478,18 +474,18 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			return TargetTools{}, fmt.Errorf("tool: %v: %w", tool, err)
 		}
 
-		refs = append(refs, tt)
+		refs.Add(tt)
 
 		if tool.Output == "" {
 			for _, name := range tt.Out.Names() {
-				targetTools = append(targetTools, targetTool{
+				targetTools = append(targetTools, TargetWithOutput{
 					Target: tt,
 					Output: name,
 					Name:   tool.Name,
 				})
 			}
 		} else {
-			targetTools = append(targetTools, targetTool{
+			targetTools = append(targetTools, TargetWithOutput{
 				Target: tt,
 				Output: tool.Output,
 				Name:   tool.Name,
@@ -506,18 +502,33 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 		}
 
 		for _, target := range targets {
-			targetTools = append(targetTools, targetTool{
+			targetTools = append(targetTools, TargetWithOutput{
 				Target: target,
 				Name:   tool.Name,
 			})
-			refs = append(refs, target)
 		}
 	}
 
-	tools := make([]TargetTool, 0, len(toolsSpecs.Targets))
+	if InlineGroups {
+		var err error
+		targetTools, err = ads.MapFlatE(targetTools, func(tdep TargetWithOutput) ([]TargetWithOutput, error) {
+			if !tdep.Target.IsGroup() {
+				return []TargetWithOutput{tdep}, nil
+			}
+
+			return inlineGroups(tdep)
+		})
+		if err != nil {
+			return TargetTools{}, err
+		}
+	}
+
+	tools := make([]TargetTool, 0, len(targetTools))
 
 	for _, tool := range targetTools {
 		tt := tool.Target
+
+		refs.Add(tt)
 
 		var name string
 		if tool.Name != "" {
@@ -531,7 +542,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 			npaths := tt.Out.Name(tool.Output)
 
 			if len(npaths) == 0 {
-				return TargetTools{}, fmt.Errorf("%v|%v has no output", tt.Addr, tool.Output)
+				return TargetTools{}, ErrDoesNotHaveOutput{tt.Addr, tool.Output}
 			}
 
 			paths = map[string]xfs.RelPaths{
@@ -578,7 +589,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 	}
 
 	tt := TargetTools{
-		TargetReferences: refs,
+		TargetReferences: refs.Slice(),
 		Targets:          tools,
 		Hosts:            toolsSpecs.Hosts,
 	}
@@ -629,12 +640,13 @@ func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.Stri
 	for _, dep := range tr.Deps.All().Targets {
 		targets.Add(dep.Target)
 	}
+	for _, dep := range tr.Deps.All().RawTargets {
+		targets.Add(dep.Target)
+	}
 	for _, dep := range tr.Tools.Targets {
 		targets.Add(dep.Target)
 	}
-	for _, t := range tr.Tools.TargetReferences {
-		targets.Add(t)
-	}
+	targets.AddAll(tr.Tools.TargetReferences)
 
 	dtr, err := e.collectTransitive(breadcrumb, targets.Slice())
 	if err != nil {
@@ -651,17 +663,18 @@ func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet)
 		return t.Addr
 	}, 0)
 
-	// Include targets from group deps
 	for _, dep := range t.Deps.All().Targets {
 		targets.Add(dep.Target)
 	}
-	// Include group targets too
+	// Include group targets
 	for _, dep := range t.Deps.All().RawTargets {
 		targets.Add(dep.Target)
 	}
-	for _, ref := range t.Tools.TargetReferences {
-		targets.Add(ref)
+	for _, tool := range t.Tools.Targets {
+		targets.Add(tool.Target)
 	}
+	// Include group targets
+	targets.AddAll(t.Tools.TargetReferences)
 
 	tr, err := e.collectTransitive(breadcrumb, targets.Slice())
 	if err != nil {
@@ -721,11 +734,18 @@ func (e *State) computePlatformsFromTransitiveTargets(t *Target, targets []*Targ
 	return nil, fmt.Errorf("has conflicting transitive platform config, you must override `platforms`, got:\n%v", configs)
 }
 
-func (e *State) collectTransitive(breadcrumb *sets.StringSet, deps []*Target) (TargetTransitive, error) {
+func (e *State) collectTransitive(breadcrumb *sets.StringSet, targets []*Target) (TargetTransitive, error) {
 	tt := TargetTransitive{}
 
-	for _, dep := range deps {
-		tt = tt.Merge(dep.DeepOwnTransitive)
+	for _, target := range targets {
+		err := e.LinkTarget(target, breadcrumb)
+		if err != nil {
+			return TargetTransitive{}, err
+		}
+	}
+
+	for _, target := range targets {
+		tt = tt.Merge(target.DeepOwnTransitive)
 	}
 
 	for _, dep := range tt.Deps.All().Targets {
@@ -901,60 +921,7 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 			td.Files = append(td.Files, tdep.Target.Deps.All().Files...)
 			td.RawTargets = append(td.RawTargets, tdep.Target.Deps.All().RawTargets...)
 
-			dt := tdep.Target
-
-			if tdep.Output == "" {
-				if !dt.Deps.IsNamed() {
-					return ads.Map(dt.Deps.All().Targets, func(dep TargetWithOutput) TargetWithOutput {
-						dep.Name = ""
-						return dep
-					}), nil
-				}
-
-				deps := make([]TargetWithOutput, 0)
-				for _, name := range dt.Deps.Names() {
-					deps = append(deps, ads.Map(dt.Deps.Name(name).Targets, func(dep TargetWithOutput) TargetWithOutput {
-						return TargetWithOutput{
-							Name:   name,
-							Target: dep.Target,
-							Output: dep.Output,
-							Mode:   tdep.Mode,
-						}
-					})...)
-				}
-
-				return deps, nil
-			}
-
-			if dt.Deps.IsNamed() {
-				if !dt.Deps.HasName(tdep.Output) {
-					return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
-				}
-
-				return ads.Map(dt.Deps.Name(tdep.Output).Targets, func(dep TargetWithOutput) TargetWithOutput {
-					return TargetWithOutput{
-						Name:   tdep.Name,
-						Target: dep.Target,
-						Output: dep.Output,
-						Mode:   tdep.Mode,
-					}
-				}), nil
-			} else {
-				deps := ads.Filter(dt.Deps.All().Targets, func(dep TargetWithOutput) bool {
-					return dep.Output == tdep.Output
-				})
-
-				deps = ads.Map(deps, func(dep TargetWithOutput) TargetWithOutput {
-					dep.Name = tdep.Name
-					return dep
-				})
-
-				if len(deps) == 0 {
-					return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
-				}
-
-				return deps, nil
-			}
+			return inlineGroups(tdep)
 		})
 		if err != nil {
 			return TargetDeps{}, err
@@ -965,4 +932,61 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 	td.Sort()
 
 	return td, nil
+}
+
+func inlineGroups(tdep TargetWithOutput) ([]TargetWithOutput, error) {
+	dt := tdep.Target
+
+	if tdep.Output == "" {
+		if !dt.Deps.IsNamed() {
+			return ads.Map(dt.Deps.All().Targets, func(dep TargetWithOutput) TargetWithOutput {
+				dep.Name = ""
+				return dep
+			}), nil
+		}
+
+		deps := make([]TargetWithOutput, 0)
+		for _, name := range dt.Deps.Names() {
+			deps = append(deps, ads.Map(dt.Deps.Name(name).Targets, func(dep TargetWithOutput) TargetWithOutput {
+				return TargetWithOutput{
+					Name:   name,
+					Target: dep.Target,
+					Output: dep.Output,
+					Mode:   tdep.Mode,
+				}
+			})...)
+		}
+
+		return deps, nil
+	}
+
+	if dt.Deps.IsNamed() {
+		if !dt.Deps.HasName(tdep.Output) {
+			return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
+		}
+
+		return ads.Map(dt.Deps.Name(tdep.Output).Targets, func(dep TargetWithOutput) TargetWithOutput {
+			return TargetWithOutput{
+				Name:   tdep.Name,
+				Target: dep.Target,
+				Output: dep.Output,
+				Mode:   tdep.Mode,
+			}
+		}), nil
+	} else {
+		deps := ads.Filter(dt.Deps.All().Targets, func(dep TargetWithOutput) bool {
+			return dep.Output == tdep.Output
+		})
+
+		deps = ads.Map(deps, func(dep TargetWithOutput) TargetWithOutput {
+			dep.Name = tdep.Name
+			return dep
+		})
+
+		if len(deps) == 0 {
+			return nil, ErrDoesNotHaveOutput{dt.Addr, tdep.Output}
+		}
+
+		return deps, nil
+	}
 }

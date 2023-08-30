@@ -7,21 +7,31 @@ import (
 
 type Comparer[T any] func(i, j T) int
 
-func sortCompare[T any](ai, aj T, comparers []Comparer[T]) bool {
+func sortCompare[T any](ai, aj T, comparers []Comparer[T]) int {
 	for _, compare := range comparers {
 		r := compare(ai, aj)
 
 		if r != 0 {
-			return r < 0
+			return r
 		}
 	}
 
-	return false
+	return 0
+}
+
+func SortFunc[S ~[]E, E any](x S, less func(a, b E) bool) {
+	slices.SortFunc(x, func(a, b E) int {
+		if less(a, b) {
+			return -1
+		}
+
+		return +1
+	})
 }
 
 // Sort sorts by passing a copy of the data around
 func Sort[T any](a []T, comparers ...Comparer[T]) {
-	slices.SortFunc(a, func(a, b T) bool {
+	slices.SortFunc(a, func(a, b T) int {
 		return sortCompare(a, b, comparers)
 	})
 }
@@ -39,7 +49,7 @@ func (s *sorterp[T]) Less(i, j int) bool {
 	ai := &s.a[i]
 	aj := &s.a[j]
 
-	return sortCompare(ai, aj, s.comparers)
+	return sortCompare(ai, aj, s.comparers) < 0
 }
 
 func (s *sorterp[T]) Swap(i, j int) {

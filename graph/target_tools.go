@@ -22,6 +22,14 @@ func (t TargetTool) comparable() targetToolComparable {
 	return targetToolComparable{t.Name, t.Target.Addr, t.Output}
 }
 
+func (t TargetTool) Full() string {
+	if t.Output != "" {
+		return t.Target.Addr + "|" + t.Output
+	}
+
+	return t.Target.Addr
+}
+
 type TargetTools struct {
 	// Holds targets references that do not have output (for transitive for ex)
 	TargetReferences []*Target
@@ -44,12 +52,8 @@ func (t TargetTools) Merge(tools TargetTools) TargetTools {
 	tt.TargetReferences = ads.DedupAppend(t.TargetReferences, func(t *Target) string {
 		return t.Addr
 	}, tools.TargetReferences...)
-	tt.Targets = ads.DedupAppend(t.Targets, func(tool TargetTool) targetToolComparable {
-		return tool.comparable()
-	}, tools.Targets...)
-	tt.Hosts = ads.DedupAppend(t.Hosts, func(tool specs.HostTool) specs.HostTool {
-		return tool
-	}, tools.Hosts...)
+	tt.Targets = ads.DedupAppend(t.Targets, TargetTool.comparable, tools.Targets...)
+	tt.Hosts = ads.DedupAppendIdentity(t.Hosts, tools.Hosts...)
 
 	return tt
 }
@@ -59,15 +63,11 @@ func (t TargetTools) Empty() bool {
 }
 
 func (t *TargetTools) Dedup() {
-	t.Hosts = ads.Dedup(t.Hosts, func(tool specs.HostTool) specs.HostTool {
-		return tool
-	})
-	t.Targets = ads.Dedup(t.Targets, func(tool TargetTool) targetToolComparable {
-		return tool.comparable()
-	})
 	t.TargetReferences = ads.Dedup(t.TargetReferences, func(target *Target) string {
 		return target.Addr
 	})
+	t.Targets = ads.Dedup(t.Targets, TargetTool.comparable)
+	t.Hosts = ads.DedupIdentity(t.Hosts)
 }
 
 func (t TargetTools) Sort() {

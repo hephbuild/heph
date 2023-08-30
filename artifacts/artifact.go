@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
-	"go.uber.org/multierr"
+	"github.com/hephbuild/heph/utils/xio"
 	"io"
 	"os"
 	"path/filepath"
@@ -66,24 +66,6 @@ func ToSlice[T Artifact](as []T) []Artifact {
 	})
 }
 
-type readerMultiCloser struct {
-	io.Reader
-	cs []io.Closer
-}
-
-func (r readerMultiCloser) Close() error {
-	var err error
-
-	for _, c := range r.cs {
-		cerr := c.Close()
-		if cerr != nil {
-			err = multierr.Append(err, cerr)
-		}
-	}
-
-	return err
-}
-
 func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadCloser, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	f, err := os.Open(uncompressedPath)
@@ -109,10 +91,7 @@ func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadClose
 				return nil, fmt.Errorf("new: %w", err)
 			}
 
-			return readerMultiCloser{
-				Reader: gr,
-				cs:     []io.Closer{gr, f},
-			}, nil
+			return xio.ReadCloser(gr, xio.MultiCloser(gr.Close, f.Close)), nil
 		}
 	}
 

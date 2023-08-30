@@ -260,6 +260,12 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 		}
 
 		for _, file := range deps.Files {
+			if e.LocalCache.IsCodegenLink(file.Abs()) {
+				log.Tracef("%v: is old codegen link, deleting...", file.Abs())
+				_ = os.Remove(file.Abs())
+				continue
+			}
+
 			srcRecNameToDepName[name] = name
 			srcRec.Add(name, file.Abs(), file.RelRoot(), "")
 		}
@@ -321,7 +327,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 	}
 
 	// Check if modtime have changed
-	_, err = e.LocalCache.HashInputSafely(target)
+	_, err = e.LocalCache.VerifyHashInput(target)
 	if err != nil {
 		return nil, err
 	}

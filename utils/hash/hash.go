@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"github.com/hephbuild/heph/utils/xsync"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/exp/slices"
 	"io"
-	"sort"
 )
 
 type Hash interface {
@@ -26,7 +26,7 @@ func HashArray[T any](h Hash, a []T, f func(T) string) {
 		entries = append(entries, f(e))
 	}
 
-	sort.Strings(entries)
+	slices.Sort(entries)
 
 	for _, entry := range entries {
 		h.String(entry)
@@ -39,7 +39,7 @@ func HashMap[K comparable, V any](h Hash, a map[K]V, f func(K, V) string) {
 		entries = append(entries, f(k, v))
 	}
 
-	sort.Strings(entries)
+	slices.Sort(entries)
 
 	for _, entry := range entries {
 		h.String(entry)

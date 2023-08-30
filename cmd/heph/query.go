@@ -11,16 +11,17 @@ import (
 	"github.com/hephbuild/heph/graphdot"
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"github.com/spf13/cobra"
+	"golang.org/x/exp/slices"
 	"gopkg.in/yaml.v3"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -243,7 +244,7 @@ var codegenCmd = &cobra.Command{
 			paths = append(paths, fmt.Sprintf("%v: %v", p, t.Addr))
 		}
 
-		sort.Strings(paths)
+		slices.Sort(paths)
 
 		for _, s := range paths {
 			fmt.Println(s)
@@ -446,8 +447,8 @@ var pkgsCmd = &cobra.Command{
 		}
 
 		pkgs := bs.Packages.All()
-		sort.SliceStable(pkgs, func(i, j int) bool {
-			return pkgs[i].Path < pkgs[j].Path
+		slices.SortFunc(pkgs, func(a, b *packages.Package) int {
+			return strings.Compare(a.Path, b.Path)
 		})
 
 		for _, p := range pkgs {
@@ -740,7 +741,7 @@ var labelsCmd = &cobra.Command{
 		}
 
 		labels := bs.Graph.Labels().Slice()
-		sort.Strings(labels)
+		slices.Sort(labels)
 
 		for _, label := range labels {
 			fmt.Println(label)

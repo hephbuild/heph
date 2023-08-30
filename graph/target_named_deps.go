@@ -2,7 +2,7 @@ package graph
 
 import (
 	"github.com/hephbuild/heph/utils/sets"
-	"sort"
+	"golang.org/x/exp/slices"
 )
 
 type TargetNamedDeps struct {
@@ -22,7 +22,7 @@ func (tp *TargetNamedDeps) Set(name string, p TargetDeps) {
 	tp.named[name] = p
 	tp.all = tp.all.Merge(p)
 	tp.names.Add(name)
-	sort.Strings(tp.names.Slice())
+	slices.Sort(tp.names.Slice())
 }
 
 func (tp *TargetNamedDeps) IsNamed() bool {

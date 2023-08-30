@@ -2,10 +2,11 @@ package sandbox
 
 import (
 	"bytes"
+	"cmp"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/xsync"
+	"golang.org/x/exp/slices"
 	"os/exec"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -24,8 +25,8 @@ func envSrcKeys(env map[string]string) []string {
 		keys = append(keys, k)
 	}
 
-	sort.Slice(keys, func(i, j int) bool {
-		return len(keys[i]) < len(keys[j])
+	slices.SortFunc(keys, func(a, b string) int {
+		return cmp.Compare(len(a), len(b))
 	})
 
 	return keys

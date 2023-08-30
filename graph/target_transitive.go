@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 )
 
@@ -12,7 +11,6 @@ type TargetTransitive struct {
 	RuntimeEnv     map[string]TargetRuntimeEnv
 	PassEnv        []string
 	RuntimePassEnv []string
-	Platforms      []specs.Platform
 }
 
 func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
@@ -23,12 +21,12 @@ func (tr TargetTransitive) Merge(otr TargetTransitive) TargetTransitive {
 
 	ntr.Tools = tr.Tools
 	if !otr.Tools.Empty() {
-		ntr.Tools = tr.Tools.Merge(otr.Tools)
+		ntr.Tools = ntr.Tools.Merge(otr.Tools)
 	}
 
 	ntr.Deps = tr.Deps
 	if !otr.Deps.Empty() {
-		ntr.Deps = tr.Deps.Merge(otr.Deps)
+		ntr.Deps = ntr.Deps.Merge(otr.Deps)
 	}
 
 	for k, v := range tr.Env {

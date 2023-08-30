@@ -2,7 +2,6 @@ package ads
 
 import (
 	"fmt"
-	"sort"
 )
 
 func Map[T, O any](a []T, f func(T) O) []O {
@@ -208,13 +207,13 @@ func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j 
 	}
 
 	for _, g := range ga {
-		sort.Slice(g.Items, func(i, j int) bool {
-			return less(g.Items[i], g.Items[j])
+		SortFunc(g.Items, func(a, b T) bool {
+			return less(a, b)
 		})
 	}
 
-	sort.Slice(ga, func(i, j int) bool {
-		return less(ga[i].Items[0], ga[j].Items[0])
+	SortFunc(ga, func(a, b Group[T, K]) bool {
+		return less(a.Items[0], b.Items[0])
 	})
 
 	return ga

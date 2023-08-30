@@ -16,7 +16,8 @@ import (
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"sort"
+	"golang.org/x/exp/slices"
+	"strings"
 	"sync"
 )
 
@@ -141,8 +142,8 @@ func (e *Scheduler) getFileDeps(targets []*graph.Target, f func(*graph.Target) g
 		files = append(files, file)
 	}
 
-	sort.SliceStable(files, func(i, j int) bool {
-		return files[i].RelRoot() < files[j].RelRoot()
+	slices.SortStableFunc(files, func(a, b xfs.Path) int {
+		return strings.Compare(a.RelRoot(), b.RelRoot())
 	})
 
 	return files

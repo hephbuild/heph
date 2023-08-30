@@ -76,3 +76,30 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 
 	return nil
 }
+
+func (e *LocalCacheState) IsCodegenLink(path string) bool {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+
+	isLink := info.Mode().Type() == os.ModeSymlink
+
+	if !isLink {
+		return false
+	}
+
+	target, err := os.Readlink(path)
+	if err != nil {
+		log.Debugf("IsCodegenLink: Readlink: %v", err)
+		return false
+	}
+
+	match, err := xfs.PathMatchAny(target, e.Path.Abs()+"/**/*")
+	if err != nil {
+		log.Debugf("IsCodegenLink: PathMatchAny: %v", err)
+		return false
+	}
+
+	return match
+}

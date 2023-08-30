@@ -1,9 +1,10 @@
 package search
 
 import (
+	"cmp"
 	"github.com/hephbuild/heph/specs"
 	"github.com/lithammer/fuzzysearch/fuzzy"
-	"sort"
+	"golang.org/x/exp/slices"
 )
 
 func FuzzyFindTarget(targets specs.Targets, s string, max int) specs.Targets {
@@ -14,7 +15,9 @@ func FuzzyFindTarget(targets specs.Targets, s string, max int) specs.Targets {
 	addrs := targets.Addrs()
 
 	matches := fuzzy.RankFindNormalizedFold(s, addrs)
-	sort.Sort(matches)
+	slices.SortFunc(matches, func(a, b fuzzy.Rank) int {
+		return cmp.Compare(a.Distance, b.Distance)
+	})
 
 	var suggestions []string
 	for _, s := range matches {

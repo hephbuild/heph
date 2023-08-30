@@ -39,6 +39,12 @@ func DedupAppender[T any, K comparable](as []T, id func(T) K, cap int) func([]T,
 	}
 }
 
+func DedupIdentity[T comparable](as []T) []T {
+	return Dedup(as, func(t T) T {
+		return t
+	})
+}
+
 func Dedup[T any, K comparable](as []T, id func(T) K) []T {
 	value := make(map[K]struct{}, len(as))
 
