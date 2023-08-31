@@ -5,7 +5,6 @@ e2e_test(
     cmd="heph run //test/node:version",
     expected_output="""
 node: v16.15.1
-npx: 8.11.0
 npm: 8.11.0
 yarn: 1.22.19""".strip(),
 )

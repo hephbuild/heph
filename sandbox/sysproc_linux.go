@@ -6,7 +6,7 @@ import (
 
 func sysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
-		Pdeathsig: syscall.SIGHUP,
+		Pdeathsig: syscall.SIGKILL,
 		Setpgid:   true,
 	}
 }

@@ -7,10 +7,16 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
 	"os"
 )
+
+func (e *LocalCacheState) tmpTargetRoot(target specs.Specer) xfs.Path {
+	spec := target.Spec()
+	return e.Root.Tmp.Join(spec.Package.Path, "__target_"+spec.Name)
+}
 
 func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error {
 	if target.Codegen == "" {
@@ -18,6 +24,21 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 	}
 
 	status.Emit(ctx, tgt.TargetStatus(target, "Linking output..."))
+
+	lock := locks.NewFlock(target.Addr+" (codegen)", e.tmpTargetRoot(target).Join("codegen.lock").Abs())
+
+	log.Tracef("%v locking run", target.Addr)
+	err := lock.Lock(ctx)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		err := lock.Unlock()
+		if err != nil {
+			log.Errorf("Failed to unlock %v: %v", target.Addr, err)
+		}
+	}()
 
 	for name, paths := range target.Out.Named() {
 		if err := ctx.Err(); err != nil {
@@ -56,7 +77,7 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 					}
 
 					err := os.Remove(to)
-					if err != nil {
+					if err != nil && !errors.Is(err, os.ErrNotExist) {
 						return err
 					}
 				}

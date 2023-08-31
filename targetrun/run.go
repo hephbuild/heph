@@ -41,11 +41,15 @@ type RequestOpts struct {
 func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*Target, error) {
 	target := rr.Target
 
+	completedCh := make(chan struct{})
+	// This needs to happen after the lock is released
+	defer close(completedCh)
+
 	var runLock locks.Locker
 	if target.ConcurrentExecution {
 		runLock = locks.NewMutex(target.Addr)
 	} else {
-		runLock = locks.NewFlock("run", e.tmpTargetRoot(target).Join("run.lock").Abs())
+		runLock = locks.NewFlock(target.Addr+" (run)", e.tmpTargetRoot(target).Join("run.lock").Abs())
 	}
 
 	log.Tracef("%v locking run", target.Addr)
@@ -283,7 +287,26 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 
 		e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.Addr),
+			// We need to make sure to wait for the lock to be released before proceeding
+			Deps: worker.WaitGroupChan(completedCh),
 			Do: func(w *worker.Worker, ctx context.Context) error {
+				log.Tracef("%v locking run", target.Addr)
+				locked, err := runLock.TryLock(ctx)
+				if err != nil {
+					return err
+				}
+
+				if !locked {
+					return nil
+				}
+
+				defer func() {
+					err := runLock.Unlock()
+					if err != nil {
+						log.Errorf("Failed to unlock %v: %v", target.Addr, err)
+					}
+				}()
+
 				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
 				err = xfs.DeleteDir(dir, false)
 				if err != nil {

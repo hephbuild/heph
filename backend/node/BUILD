@@ -91,7 +91,6 @@ def node_install(name):
         name=name,
         run=[
             'echo node: $(node -v)',
-            'echo npx: $(npx -v)',
             'echo npm: $(npm -v)',
             'echo yarn: $(yarn -v)',
         ],

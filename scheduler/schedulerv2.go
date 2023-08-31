@@ -131,7 +131,7 @@ func (s *schedulerv2) schedule() error {
 				}
 
 				rr := s.rrs.Get(target)
-				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs, false)
+				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs || target.Codegen != "", false)
 				if err != nil {
 					return err
 				}
