@@ -3,14 +3,19 @@ package lcache
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
+	"github.com/hephbuild/heph/utils/xmath"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -52,7 +57,9 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Target
 	return unlocker, nil
 }
 
-func (e *LocalCacheState) GenArtifacts(ctx context.Context, target graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
+func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
+	target := gtarget.GraphTarget()
+
 	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
 	if err != nil {
 		return err
@@ -74,12 +81,25 @@ func (e *LocalCacheState) GenArtifacts(ctx context.Context, target graph.Targete
 	for _, artifact := range arts {
 		shouldCompress := artifact.Compressible() && compress
 
-		p := filepath.Join(dir, artifact.FileName())
-		if shouldCompress {
-			p = filepath.Join(dir, artifact.GzFileName())
+		var progress func(size, written int64)
+		if status.IsInteractive(ctx) {
+			progress = func(size, written int64) {
+				percent := math.Round(xmath.Percent(written, size))
+
+				var s string
+				if target.Cache.Enabled {
+					s = xmath.FormatPercent("Caching %P...", percent)
+				} else if len(target.Artifacts.Out) > 0 {
+					s = xmath.FormatPercent("Storing %P...", percent)
+				}
+
+				if s != "" {
+					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), s))
+				}
+			}
 		}
 
-		err := GenArtifact(ctx, p, artifact, shouldCompress)
+		err := GenArtifact(ctx, dir, artifact, shouldCompress, progress)
 		if err != nil {
 			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
 		}
@@ -90,17 +110,41 @@ func (e *LocalCacheState) GenArtifacts(ctx context.Context, target graph.Targete
 
 type ArtifactGenContext struct {
 	w              io.WriteCloser
+	tracker        xio.Tracker
 	accessedWriter bool
+	progress       func(size int64, written int64)
+}
+
+func (g *ArtifactGenContext) EstimatedWriteSize(size int64) {
+	progress := g.progress
+	if progress == nil {
+		return
+	}
+
+	g.tracker.OnWrite = func(written int64) {
+		progress(size, written)
+	}
 }
 
 func (g *ArtifactGenContext) Writer() io.Writer {
 	g.accessedWriter = true
-	return g.w
+	return io.MultiWriter(g.w, &g.tracker)
 }
 
 var ArtifactSkip = errors.New("skip artifact")
 
-func GenArtifact(ctx context.Context, p string, a ArtifactWithProducer, compress bool) error {
+type ArtifactManifest struct {
+	Size int64
+}
+
+func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compress bool, progress func(size, written int64)) error {
+	compress = a.Compressible() && compress
+
+	p := filepath.Join(dir, a.FileName())
+	if compress {
+		p = filepath.Join(dir, a.GzFileName())
+	}
+
 	tmpp := xfs.ProcessUniquePath(p)
 	defer os.Remove(tmpp)
 
@@ -110,10 +154,12 @@ func GenArtifact(ctx context.Context, p string, a ArtifactWithProducer, compress
 	}
 	defer f.Close()
 
-	f, done := xio.ContextCloser(ctx, f)
+	done := xio.ContextCloser(ctx, f)
 	defer done()
 
-	gctx := ArtifactGenContext{}
+	gctx := ArtifactGenContext{
+		progress: progress,
+	}
 	gctx.w = f
 
 	if compress {
@@ -144,6 +190,22 @@ func GenArtifact(ctx context.Context, p string, a ArtifactWithProducer, compress
 	err = os.Rename(tmpp, p)
 	if err != nil {
 		return err
+	}
+
+	if a.GenerateManifest() {
+		mp := filepath.Join(dir, a.ManifestFileName())
+
+		b, err := json.Marshal(ArtifactManifest{
+			Size: gctx.tracker.Written,
+		})
+		if err != nil {
+			return err
+		}
+
+		err = os.WriteFile(mp, b, os.ModePerm)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

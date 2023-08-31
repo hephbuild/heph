@@ -2,6 +2,7 @@ package lcache
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/c2fo/vfs/v6"
@@ -20,9 +21,11 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/vfssimple"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -104,7 +107,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	if target.Cache.Enabled {
 		status.Emit(ctx, tgt.TargetStatus(target, "Caching..."))
 	} else if len(target.Artifacts.Out) > 0 {
-		status.Emit(ctx, tgt.TargetStatus(target, "Storing output..."))
+		status.Emit(ctx, tgt.TargetStatus(target, "Storing..."))
 	}
 
 	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target)
@@ -180,6 +183,35 @@ func (e *LocalCacheState) HasArtifact(ctx context.Context, target graph.Targeter
 	return false, nil
 }
 
+func (e *LocalCacheState) LatestArtifactManifest(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool) {
+	return e.artifactManifest(ctx, e.cacheDirForHash(target, LatestDir), target, artifact)
+}
+
+func (e *LocalCacheState) ArtifactManifest(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool) {
+	return e.artifactManifest(ctx, e.cacheDir(target), target, artifact)
+}
+
+func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool) {
+	p := dir.Join(artifact.ManifestFileName()).Abs()
+
+	b, err := os.ReadFile(p)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Warnf("%v: %v: manifest: %v", target.Spec().Addr, artifact.Name(), err)
+		}
+		return ArtifactManifest{}, false
+	}
+
+	var m ArtifactManifest
+	err = json.Unmarshal(b, &m)
+	if err != nil {
+		log.Warnf("%v: %v: manifest: %v (%s)", target.Spec().Addr, artifact.Name(), err, b)
+		return ArtifactManifest{}, false
+	}
+
+	return m, true
+}
+
 func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	target := ttarget.GraphTarget()
 
@@ -203,7 +235,7 @@ func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targe
 			}
 
 			if uncompress {
-				_, err := UncompressedPathFromArtifact(ctx, target, art, e.cacheDir(target).Abs())
+				_, _, err := e.UncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
 					return false, err
 				}
@@ -214,20 +246,41 @@ func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targe
 	return true, nil
 }
 
-func (e *LocalCacheState) UncompressedReaderFromArtifact(artifact artifacts.Artifact, target graph.Targeter) (io.ReadCloser, error) {
-	return artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
+func (e *LocalCacheState) UncompressedReaderFromArtifact(artifact artifacts.Artifact, target graph.Targeter) (io.ReadCloser, ArtifactManifest, error) {
+	stats, _ := e.ArtifactManifest(context.TODO(), target, artifact)
+
+	r, err := artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
+	if err != nil {
+		return nil, stats, err
+	}
+
+	return r, stats, nil
 }
 
-func (e *LocalCacheState) UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, error) {
-	return UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDir(target).Abs())
+func (e *LocalCacheState) UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, ArtifactManifest, error) {
+	stats, _ := e.ArtifactManifest(ctx, target, artifact)
+
+	p, err := UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDir(target).Abs(), stats.Size)
+	if err != nil {
+		return "", stats, err
+	}
+
+	return p, stats, err
 }
 
 func (e *LocalCacheState) LatestCacheDirExists(target specs.Specer) bool {
 	return xfs.PathExists(e.cacheDirForHash(target, LatestDir).Abs())
 }
 
-func (e *LocalCacheState) LatestUncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, error) {
-	return UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDirForHash(target, LatestDir).Abs())
+func (e *LocalCacheState) LatestUncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, ArtifactManifest, error) {
+	stats, _ := e.LatestArtifactManifest(ctx, target, artifact)
+
+	p, err := UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDirForHash(target, LatestDir).Abs(), 0)
+	if err != nil {
+		return "", stats, err
+	}
+
+	return p, stats, err
 }
 
 func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.Targeter) string {
@@ -304,14 +357,28 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		untarDedup := sets.NewStringSet(0)
 
 		for _, name := range outputs {
-			r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), cacheDir.Abs())
+			artifact := target.Artifacts.OutTar(name)
+
+			manifest, _ := e.ArtifactManifest(ctx, target, artifact)
+
+			r, err := artifacts.UncompressedReaderFromArtifact(artifact, cacheDir.Abs())
 			if err != nil {
 				return outDir, err
+			}
+
+			var progress func(written int64)
+			if manifest.Size > 0 && status.IsInteractive(ctx) {
+				progress = func(written int64) {
+					percent := math.Round(xmath.Percent(written, manifest.Size))
+
+					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Expanding cache %P...", percent)))
+				}
 			}
 
 			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
 				ListPath: e.tarListPath(target.Artifacts.OutTar(name), target),
 				Dedup:    untarDedup,
+				Progress: progress,
 			})
 			_ = r.Close()
 			if err != nil {

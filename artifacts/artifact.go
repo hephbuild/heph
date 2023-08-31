@@ -16,6 +16,7 @@ type container struct {
 	displayName  string
 	genRequired  bool
 	compressible bool
+	manifest     bool
 }
 
 func (a container) Compressible() bool {
@@ -34,6 +35,10 @@ func (a container) GzFileName() string {
 	return a.name + ".gz"
 }
 
+func (a container) ManifestFileName() string {
+	return a.name + ".manifest.json"
+}
+
 func (a container) DisplayName() string {
 	return a.displayName
 }
@@ -42,22 +47,29 @@ func (a container) GenRequired() bool {
 	return a.genRequired
 }
 
-func New(name, displayName string, genRequired, compressible bool) Artifact {
+func (a container) GenerateManifest() bool {
+	return a.manifest
+}
+
+func New(name, displayName string, genRequired, compressible, manifest bool) Artifact {
 	return container{
 		name:         name,
 		displayName:  displayName,
 		genRequired:  genRequired,
 		compressible: compressible,
+		manifest:     manifest,
 	}
 }
 
 type Artifact interface {
 	Name() string
 	FileName() string
+	ManifestFileName() string
 	GzFileName() string
 	DisplayName() string
 	GenRequired() bool
 	Compressible() bool
+	GenerateManifest() bool
 }
 
 func ToSlice[T Artifact](as []T) []Artifact {

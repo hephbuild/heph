@@ -5,7 +5,7 @@ import (
 	"io"
 )
 
-func ContextCloser[C io.Closer](ctx context.Context, c C) (C, func()) {
+func ContextCloser[C io.Closer](ctx context.Context, c C) func() {
 	ch := make(chan struct{})
 
 	go func() {
@@ -16,7 +16,7 @@ func ContextCloser[C io.Closer](ctx context.Context, c C) (C, func()) {
 		}
 	}()
 
-	return c, func() {
+	return func() {
 		close(ch)
 	}
 }

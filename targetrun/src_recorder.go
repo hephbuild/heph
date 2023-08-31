@@ -1,19 +1,20 @@
 package targetrun
 
 import (
+	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/utils/tar"
 	"sync"
 )
 
 type SrcRecorder struct {
-	srcTar    []string
+	srcTar    []sandbox.TarFile
 	src       []tar.File
 	namedSrc  map[string][]string
 	srcOrigin map[string]string
 
 	o sync.Once
 
-	Parent *SrcRecorder
+	Forward *SrcRecorder
 }
 
 func (s *SrcRecorder) init() {
@@ -33,29 +34,32 @@ func (s *SrcRecorder) addNamed(name, path, origin string) {
 	}
 }
 
-func (s *SrcRecorder) AddTar(tar string) {
+func (s *SrcRecorder) AddTar(tar string, size int64) {
 	s.init()
 
 	for _, itar := range s.srcTar {
-		if itar == tar {
+		if itar.Path == tar {
 			return
 		}
 	}
 
-	s.srcTar = append(s.srcTar, tar)
+	s.srcTar = append(s.srcTar, sandbox.TarFile{
+		Path: tar,
+		Size: size,
+	})
 }
 
 func (s *SrcRecorder) Add(name, from, to, origin string) {
 	s.init()
 
-	s.src = append(s.src, tar.File{
+	s.src = append(s.src, sandbox.File{
 		From: from,
 		To:   to,
 	})
 	s.addNamed(name, to, origin)
 
-	if s.Parent != nil {
-		s.Parent.Add(name, from, to, origin)
+	if s.Forward != nil {
+		s.Forward.Add(name, from, to, origin)
 	}
 }
 
@@ -63,11 +67,11 @@ func (s *SrcRecorder) Origin() map[string]string {
 	return s.srcOrigin
 }
 
-func (s *SrcRecorder) Src() []tar.File {
+func (s *SrcRecorder) Src() []sandbox.File {
 	return s.src
 }
 
-func (s *SrcRecorder) SrcTar() []string {
+func (s *SrcRecorder) SrcTar() []sandbox.TarFile {
 	return s.srcTar
 }
 

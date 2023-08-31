@@ -23,6 +23,7 @@ require (
 	github.com/heimdalr/dag v1.2.1
 	github.com/hinshun/vt10x v0.0.0-20220301184237-5011da428d02
 	github.com/lithammer/fuzzysearch v1.1.8
+	github.com/machinebox/progress v0.2.0
 	github.com/mattn/go-isatty v0.0.19
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/muesli/reflow v0.3.0
@@ -94,6 +95,7 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.2.0 // indirect
+	github.com/matryer/is v1.4.1 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.14 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect

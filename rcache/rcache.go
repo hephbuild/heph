@@ -100,6 +100,12 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 		return err
 	}
 
+	// Optionally download manifest
+	_, err = e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.ManifestFileName(), true)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
 	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifactExternalFileName(artifact), true)
 	if err != nil {
 		return err
@@ -141,6 +147,11 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 	}
 
 	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifactExternalFileName(artifact), false)
+	if err != nil {
+		return err
+	}
+
+	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifact.ManifestFileName(), false)
 	if err != nil {
 		return err
 	}

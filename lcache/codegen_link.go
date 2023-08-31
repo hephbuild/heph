@@ -26,7 +26,7 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 
 		switch target.Codegen {
 		case specs.CodegenCopy, specs.CodegenCopyNoExclude:
-			tarf, err := e.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), target)
+			tarf, _, err := e.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), target)
 			if err != nil {
 				return err
 			}

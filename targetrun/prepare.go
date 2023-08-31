@@ -22,6 +22,7 @@ import (
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/worker"
 	"io"
 	"os"
@@ -194,7 +195,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 	// Records all src as files (even tar) to be used for creating SRC vars later
 	envSrcRec := &SrcRecorder{}
 	// Records src that should be copied, tar & files
-	srcRec := &SrcRecorder{Parent: envSrcRec}
+	srcRec := &SrcRecorder{Forward: envSrcRec}
 	// Records symlinks that should be created
 	linkSrcRec := &SrcRecorder{}
 	binDir := e.sandboxRoot(target).Join("_bin").Abs()
@@ -208,12 +209,12 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 
 			for _, name := range target.OutWithSupport.Names() {
 				art := target.Artifacts.OutTar(name)
-				p, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
+				p, stats, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
 					log.Warnf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
 					continue
 				}
-				restoreSrcRec.AddTar(p)
+				restoreSrcRec.AddTar(p, stats.Size)
 			}
 
 			done()
@@ -238,11 +239,11 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 				}
 			} else {
 				art := dept.Artifacts.OutTar(dep.Output)
-				p, err := e.LocalCache.UncompressedPathFromArtifact(ctx, dept, art)
+				p, stats, err := e.LocalCache.UncompressedPathFromArtifact(ctx, dept, art)
 				if err != nil {
 					return nil, err
 				}
-				srcRec.AddTar(p)
+				srcRec.AddTar(p, stats.Size)
 			}
 
 			srcName := name
@@ -314,17 +315,33 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 		return nil, err
 	}
 
-	err = sandbox.Make(ctx, sandbox.MakeConfig{
+	makeCfg := sandbox.MakeConfig{
 		Dir:       rtarget.SandboxRoot.Abs(),
 		BinDir:    binDir,
 		Bin:       bin,
 		Files:     append(srcRec.Src(), restoreSrcRec.Src()...),
 		LinkFiles: linkSrcRec.Src(),
 		FilesTar:  append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
-	})
+	}
+
+	if status.IsInteractive(ctx) {
+		makeCfg.ProgressFiles = func(percent float64) {
+			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying files %P...", percent)))
+		}
+		makeCfg.ProgressTars = func(percent float64) {
+			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying dependencies %P...", percent)))
+		}
+		makeCfg.ProgressLinks = func(percent float64) {
+			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: creating links %P...", percent)))
+		}
+	}
+
+	err = sandbox.Make(ctx, makeCfg)
 	if err != nil {
 		return nil, err
 	}
+
+	status.Emit(ctx, tgt.TargetStatus(target, "Creating sandbox..."))
 
 	// Check if modtime have changed
 	_, err = e.LocalCache.VerifyHashInput(target)

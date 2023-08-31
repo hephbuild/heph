@@ -7,9 +7,14 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xmath"
+	"github.com/hephbuild/heph/utils/xprogress"
+	"time"
 )
 
 func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Target, outputs []string) error {
@@ -28,7 +33,7 @@ func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Targe
 	if target.HasSupportFiles {
 		art := target.Artifacts.OutTar(specs.SupportFilesOutput)
 
-		target.actualSupportFiles, err = e.outputFileListFromArtifact(ctx, target, art)
+		target.actualSupportFiles, err = e.outputFileListFromArtifact(ctx, target, art, nil)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
@@ -38,18 +43,33 @@ func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Targe
 }
 
 func (e *LocalCacheState) collectNamedOutFromTar(ctx context.Context, target *graph.Target, outputs []string) (*ActualOutNamedPaths, error) {
+	u := xprogress.NewUnit()
+	for _, name := range outputs {
+		artifact := target.Artifacts.OutTar(name)
+
+		stats, _ := e.ArtifactManifest(ctx, target, artifact)
+
+		u.AddSize(stats.Size)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		progressCh := xprogress.NewTicker(ctx, u, 10*time.Millisecond)
+
+		for p := range progressCh {
+			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Hydrating output %P...", p.Progress()*100)))
+		}
+	}()
+
 	tp := &ActualOutNamedPaths{}
 
-	for name := range target.Out.Named() {
-		if !ads.Contains(outputs, name) {
-			continue
-		}
-
+	for _, name := range outputs {
 		tp.ProvisionName(name)
 
 		artifact := target.Artifacts.OutTar(name)
 
-		files, err := e.outputFileListFromArtifact(ctx, target, artifact)
+		files, err := e.outputFileListFromArtifact(ctx, target, artifact, u)
 		if err != nil {
 			return nil, err
 		}
@@ -62,14 +82,31 @@ func (e *LocalCacheState) collectNamedOutFromTar(ctx context.Context, target *gr
 	return tp, nil
 }
 
-func (e *LocalCacheState) outputFileListFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (xfs.RelPaths, error) {
-	r, err := e.UncompressedReaderFromArtifact(artifact, target)
+func (e *LocalCacheState) outputFileListFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, u *xprogress.Unit) (xfs.RelPaths, error) {
+	r, stats, err := e.UncompressedReaderFromArtifact(artifact, target)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
 
-	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target))
+	if u == nil {
+		u = xprogress.NewUnit()
+		u.SetSize(stats.Size)
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		go func() {
+			progressCh := xprogress.NewTicker(ctx, u, 10*time.Millisecond)
+
+			for p := range progressCh {
+				status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Hydrating output %P...", p.Progress()*100)))
+			}
+		}()
+	}
+
+	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target), func(read int64) {
+		u.AddN(read)
+	})
 	if err != nil {
 		return nil, err
 	}

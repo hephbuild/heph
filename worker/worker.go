@@ -109,14 +109,14 @@ type Job struct {
 }
 
 func (j *Job) RunHook() {
-	ctx := j.ctx
 	if h := j.Hook; h != nil {
+		ctx := j.ctx
 		jctx := h.Run(j)
 		if jctx != nil {
 			ctx = jctx
 		}
+		j.ctx = ctx
 	}
-	j.ctx = ctx
 }
 
 func (j *Job) Ctx() context.Context {

@@ -45,7 +45,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 	if target.ConcurrentExecution {
 		runLock = locks.NewMutex(target.Addr)
 	} else {
-		runLock = locks.NewFlock("run", e.tmpTargetRoot(target).Join("run.lock").Abs())
+		runLock = locks.NewFlock(target.Addr+" (run)", e.tmpTargetRoot(target).Join("run.lock").Abs())
 	}
 
 	log.Tracef("%v locking run", target.Addr)

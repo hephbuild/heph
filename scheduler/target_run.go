@@ -45,7 +45,9 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 		return fmt.Errorf("wcs: %w", err)
 	}
 
-	rr.Compress = len(writeableCaches) > 0
+	if !rr.Compress {
+		rr.Compress = len(writeableCaches) > 0
+	}
 
 	target, err := e.Runner.Run(ctx, rr, iocfg)
 	if err != nil {
