@@ -83,9 +83,9 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	return wg
 }
 
-func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, skip []specs.Specer) (*WaitGroupMap, error) {
+func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, pullCache bool, skip []specs.Specer) (*WaitGroupMap, error) {
 	rrs := ads.Map(targets, func(t *graph.Target) targetrun.Request {
-		return targetrun.Request{Target: t}
+		return targetrun.Request{Target: t, RequestOpts: targetrun.RequestOpts{PullCache: pullCache}}
 	})
 
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)

@@ -29,6 +29,7 @@ var printOutput boolStr
 var catOutput boolStr
 var nocache *bool
 var nopty *bool
+var alwaysOut *bool
 var params *[]string
 var summary *bool
 var summaryGen *bool
@@ -45,11 +46,16 @@ func getRunOpts() bootstrap.RunOpts {
 }
 
 func getRROpts() targetrun.RequestOpts {
+	return getRROptsX(false)
+}
+
+func getRROptsX(pull bool) targetrun.RequestOpts {
 	return targetrun.RequestOpts{
 		NoCache:       *nocache,
 		Shell:         *shell,
 		PreserveCache: printOutput.bool || catOutput.bool,
 		NoPTY:         *nopty,
+		PullCache:     pull || *alwaysOut || printOutput.bool || catOutput.bool,
 	}
 }
 
@@ -62,6 +68,7 @@ func init() {
 	noInline = runCmd.Flags().Bool("no-inline", false, "Force running in workers")
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output paths, --print-out=<name> to filter output"))
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&catOutput, "cat-out", "", "Print target output content, --cat-out=<name> to filter output"))
+	alwaysOut = runCmd.Flags().Bool("always-out", false, "Ensure output will be present in cache")
 
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)

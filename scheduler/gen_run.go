@@ -114,7 +114,7 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 	start := time.Now()
 
-	sdeps, err := e.ScheduleTargetsWithDeps(ctx, targets, nil)
+	sdeps, err := e.ScheduleTargetsWithDeps(ctx, targets, true, nil)
 	if err != nil {
 		return err
 	}

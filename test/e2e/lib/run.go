@@ -13,7 +13,7 @@ func Run(tgt string) error {
 }
 
 func RunO(tgt string, o RunOpts) error {
-	cmd := commandO(o, "run", tgt)
+	cmd := commandO(o, "run", tgt, "--always-out")
 	if !o.Silent {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr

@@ -73,10 +73,5 @@ func parseTargetsAndArgsWithScheduler(ctx context.Context, e *scheduler.Schedule
 }
 
 func generateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string) (targetrun.Requests, error) {
-	return bootstrap.GenerateRRs(ctx, e, m, targs, targetrun.RequestOpts{
-		NoCache:       *nocache,
-		Shell:         *shell,
-		PreserveCache: printOutput.bool || catOutput.bool,
-		NoPTY:         *nopty,
-	}, *plain)
+	return bootstrap.GenerateRRs(ctx, e, m, targs, getRROpts(), *plain)
 }

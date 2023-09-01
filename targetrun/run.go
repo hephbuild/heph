@@ -36,6 +36,7 @@ type RequestOpts struct {
 	// Force preserving cache for uncached targets when --print-out is enabled
 	PreserveCache bool
 	NoPTY         bool
+	PullCache     bool
 }
 
 func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*Target, error) {

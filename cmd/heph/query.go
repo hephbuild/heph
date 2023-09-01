@@ -629,7 +629,7 @@ var cacheRootCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROptsX(true)}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
@@ -677,7 +677,7 @@ var hashoutCmd = &cobra.Command{
 			return err
 		}
 
-		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROpts()}}, getRunOpts(), false)
+		err = bootstrap.Run(ctx, bs.Scheduler, []targetrun.Request{{Target: gtarget, RequestOpts: getRROptsX(true)}}, getRunOpts(), false)
 		if err != nil {
 			return err
 		}
@@ -710,7 +710,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, []specs.Specer{target})
+		tdeps, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, false, []specs.Specer{target})
 		if err != nil {
 			return err
 		}

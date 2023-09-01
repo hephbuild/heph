@@ -113,7 +113,6 @@ func (s *schedulerv2) schedule() error {
 		}
 
 		isSkip := ads.Contains(s.skip, target.Addr)
-		isInRRs := s.rrTargets.Has(target)
 
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{
 			Name: "pull_meta " + target.Addr,
@@ -131,7 +130,11 @@ func (s *schedulerv2) schedule() error {
 				}
 
 				rr := s.rrs.Get(target)
-				g, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, target, !rr.NoCache, isInRRs || target.Codegen != "", false)
+				g, err := s.ScheduleTargetGetCacheOrRunOnce(
+					ctx, target, !rr.NoCache,
+					s.rrs.Get(target).PullCache || target.Codegen != "",
+					false,
+				)
 				if err != nil {
 					return err
 				}

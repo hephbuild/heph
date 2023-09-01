@@ -71,7 +71,7 @@ func ValidateCache(tgt string, outputs []string, fromRemote, compressed, uncompr
 
 	root, err := TargetCacheRoot(tgt)
 	if err != nil {
-		return err
+		return fmt.Errorf("TargetCacheRoot: %w", err)
 	}
 
 	fmt.Println(tgt+" cache folder:", root)
