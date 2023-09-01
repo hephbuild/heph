@@ -118,7 +118,11 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 
 			p := filepath.Join(dir, entry.Name())
 
-			info, _ := os.Lstat(p)
+			info, err := os.Lstat(p)
+			if err != nil {
+				continue
+			}
+
 			t := info.ModTime()
 
 			entries = append(entries, gcEntry{
