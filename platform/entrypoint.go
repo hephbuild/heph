@@ -72,26 +72,23 @@ func (b shInteractiveEntrypoint) ExecArgs(ctx EntrypointContext) ([]string, erro
 func NewInteractiveEntrypoint(tmpDir, cmds string, entrypoint Entrypoint) (EntrypointExec, func(), error) {
 	cmds = strings.TrimSpace(cmds)
 
-	var initfile string
-	if len(cmds) > 0 {
-		f, err := os.CreateTemp(tmpDir, "")
-		if err != nil {
-			return nil, nil, err
-		}
-
-		content, err := RenderInitFile(cmds)
-		if err != nil {
-			return nil, nil, err
-		}
-		_, _ = io.WriteString(f, content)
-
-		err = f.Close()
-		if err != nil {
-			return nil, nil, err
-		}
-
-		initfile = f.Name()
+	f, err := os.CreateTemp(tmpDir, "")
+	if err != nil {
+		return nil, nil, err
 	}
+
+	content, err := RenderInitFile(cmds)
+	if err != nil {
+		return nil, nil, err
+	}
+	_, _ = io.WriteString(f, content)
+
+	err = f.Close()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	initfile = f.Name()
 
 	entrypointExec, err := entrypoint.ShellEntrypoint(initfile)
 	if err != nil {
