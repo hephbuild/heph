@@ -1,8 +1,14 @@
 #!/bin/bash
 
-BIN="$1"
+# npx is slightly broken: https://github.com/npm/npm/issues/4603
 
-# https://stackoverflow.com/a/2701420/3212099
-shift;
+# Extracts PATH from npm
+NPATH="$(npm exec -c 'echo $PATH')"
 
-exec "./node_modules/.bin/${BIN}" "$@"
+if [ $? -ne 0 ]; then
+  NPATH="./node_modules/.bin:$PATH"
+fi
+
+export PATH=$NPATH
+
+exec "$@"
