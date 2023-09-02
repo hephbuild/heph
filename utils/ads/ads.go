@@ -237,3 +237,13 @@ func Grow[T any](slice []T, newCap int) []T {
 
 	return newSlice
 }
+
+func Reduce[T any, O any](a []T, f func(O, T) O, initial O) O {
+	out := initial
+
+	for _, v := range a {
+		out = f(out, v)
+	}
+
+	return out
+}

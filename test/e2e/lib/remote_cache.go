@@ -15,7 +15,8 @@ func ValidateRemoteCache(root, tgt string, outputs []string) error {
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)
-		expected = append(expected, "out_.tar.gz"+output)
+		expected = append(expected, fmt.Sprintf("out_%v.tar.gz", output))
+		expected = append(expected, fmt.Sprintf("out_%v.tar.manifest.json", output))
 	}
 
 	tp, err := ParseTargetPath(tgt)

@@ -11,12 +11,14 @@ import (
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
+	"github.com/hephbuild/heph/utils/xmath"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 )
 
-func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, dir string) (string, error) {
+func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, dir string, size int64) (string, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	if xfs.PathExists(uncompressedPath) {
 		return uncompressedPath, nil
@@ -60,15 +62,24 @@ func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, ar
 			}
 			defer gr.Close()
 
-			grc, cancel := xio.ContextCloser(ctx, gr)
+			cancel := xio.ContextCloser(ctx, gr)
 			defer cancel()
 
-			_, err = io.Copy(tf, grc)
+			if size > 0 && status.IsInteractive(ctx) {
+				_, err = xio.Copy(tf, gr, func(written int64) {
+					percent := math.Round(xmath.Percent(written, size))
+
+					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Decompressing [P]...", percent)))
+				})
+			} else {
+				_, err = io.Copy(tf, gr)
+			}
+
 			if err != nil {
 				return "", fmt.Errorf("ungz: cp: %w", err)
 			}
 
-			_ = grc.Close()
+			_ = gr.Close()
 			_ = tf.Close()
 
 			err = os.Rename(tmpp, uncompressedPath)

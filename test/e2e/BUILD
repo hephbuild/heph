@@ -9,6 +9,8 @@ for file in main_files:
     dir=heph.path.dir(file)
     filename=heph.path.base(file)
 
+    skip = len(glob(dir+"/.skip"))
+
     name='e2e_'+dir.replace('roots/', '').replace('/', '_')
     if filename != "e2e_main.go":
         name+='_'+filename.replace('e2e_main', '').replace('.go', '').strip('.')
@@ -43,7 +45,7 @@ for file in main_files:
         ],
         cache=False,
         tools=[build, 'heph', 'docker'],
-        labels=['e2e'],
+        labels=['skip-e2e'] if skip else ['e2e'],
         src_env='abs',
         pass_env=['TERM', 'PATH'],
     )

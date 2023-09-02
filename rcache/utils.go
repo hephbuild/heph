@@ -24,7 +24,11 @@ func (e *RemoteCache) remoteCacheLocation(loc vfs.Location, ttarget graph.Target
 	return loc.NewLocation(path.Join(target.Package.Path, target.Name, inputHash) + "/")
 }
 
-func (e *RemoteCache) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string, atomic bool) (bool, error) {
+func (e *RemoteCache) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.Location, path string, atomic bool, progress func(percent float64)) (bool, error) {
+	if progress != nil {
+		progress(-1)
+	}
+
 	tof, err := to.NewFile(path)
 	if err != nil {
 		return false, err
@@ -54,7 +58,7 @@ func (e *RemoteCache) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.L
 	_ = tof.Close()
 	_ = fromf.Close()
 
-	err = e.vfsCopyFile(ctx, from, to, path, atomic)
+	err = e.vfsCopyFile(ctx, from, to, path, atomic, progress)
 	if err != nil {
 		return false, err
 	}
@@ -62,8 +66,12 @@ func (e *RemoteCache) vfsCopyFileIfNotExists(ctx context.Context, from, to vfs.L
 	return true, nil
 }
 
-func (e *RemoteCache) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string, atomic bool) error {
+func (e *RemoteCache) vfsCopyFile(ctx context.Context, from, to vfs.Location, path string, atomic bool, progress func(percent float64)) error {
 	log.Tracef("vfs copy %v to %v", from.URI(), to.URI())
+
+	if progress != nil {
+		progress(-1)
+	}
 
 	doneTrace := log.TraceTimingDone(fmt.Sprintf("vfs copy to %v", to.URI()))
 	defer doneTrace()
@@ -95,9 +103,13 @@ func (e *RemoteCache) vfsCopyFile(ctx context.Context, from, to vfs.Location, pa
 		}
 		defer dftmp.Close()
 
-		err = sf.CopyToFile(dftmp)
+		err = CopyWithProgress(sf, dftmp, progress)
 		if err != nil {
 			return err
+		}
+
+		if progress != nil {
+			progress(-1)
 		}
 
 		df, err := to.NewFile(path)
@@ -117,7 +129,7 @@ func (e *RemoteCache) vfsCopyFile(ctx context.Context, from, to vfs.Location, pa
 		}
 		defer df.Close()
 
-		err = sf.CopyToFile(df)
+		err = CopyWithProgress(sf, df, progress)
 		if err != nil {
 			return err
 		}

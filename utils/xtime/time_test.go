@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestFormatDuration(t *testing.T) {
+func TestFormatFixedWidthDuration(t *testing.T) {
 	tests := []struct {
 		d time.Duration
 		e string
@@ -25,7 +25,7 @@ func TestFormatDuration(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprint(test.d), func(t *testing.T) {
-			actual := FormatDuration(test.d)
+			actual := FormatFixedWidthDuration(test.d)
 			assert.Equal(t, test.e, actual)
 		})
 	}

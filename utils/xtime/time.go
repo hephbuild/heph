@@ -21,7 +21,7 @@ func RoundDuration(d time.Duration, digits int) time.Duration {
 	return d
 }
 
-func FormatDuration(d time.Duration) string {
+func FormatFixedWidthDuration(d time.Duration) string {
 	d = RoundDuration(d, 1)
 
 	if d < 100*time.Millisecond {
@@ -37,7 +37,7 @@ func FormatDuration(d time.Duration) string {
 			return strconv.FormatInt(int64(d/time.Second), 10) + ".0s"
 		}
 
-		return RoundDuration(d, 1).String()
+		return d.String()
 	}
 
 	return RoundDuration(d, 0).String()

@@ -67,6 +67,7 @@ func ValidateCache(tgt string, outputs []string, fromRemote, compressed, uncompr
 			expected = append(expected, fmt.Sprintf("out_%v.tar", output))
 		}
 		expected = append(expected, fmt.Sprintf("out_%v.tar.list", output))
+		expected = append(expected, fmt.Sprintf("out_%v.tar.manifest.json", output))
 	}
 
 	root, err := TargetCacheRoot(tgt)

@@ -1,0 +1,5 @@
+caches:
+  master:
+    uri: <URI>
+    read: true
+    write: true

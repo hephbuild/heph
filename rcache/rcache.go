@@ -14,6 +14,7 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xmath"
 	"os"
 	"path/filepath"
 )
@@ -100,13 +101,30 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 		return err
 	}
 
-	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifactExternalFileName(artifact), true)
+	// Optionally download manifest
+	_, err = e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifact.ManifestFileName(), true, nil)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	var progress func(percent float64)
+	if status.IsInteractive(ctx) {
+		progress = func(percent float64) {
+			status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
+				xmath.FormatPercent(fmt.Sprintf("Downloading from %v [P]...", cache.Name), percent)),
+			)
+		}
+	}
+
+	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifactExternalFileName(artifact), true, progress)
 	if err != nil {
 		return err
 	}
 
 	// A file may exist locally, but not remotely (coming from another source), make sure that it actually exists there
 	if !copied {
+		status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
+
 		remoteExist, err := e.ArtifactExists(ctx, cache, target, artifact)
 		if err != nil {
 			return err
@@ -140,9 +158,27 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 		return err
 	}
 
-	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifactExternalFileName(artifact), false)
+	var progress func(percent float64)
+	if status.IsInteractive(ctx) {
+		progress = func(percent float64) {
+			status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
+				xmath.FormatPercent(fmt.Sprintf("Uploading to %v [P]...", cache.Name), percent)),
+			)
+		}
+	}
+
+	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifactExternalFileName(artifact), false, progress)
 	if err != nil {
 		return err
+	}
+
+	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
+
+	if artifact.GenerateManifest() {
+		err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifact.ManifestFileName(), false, nil)
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 
 	return nil

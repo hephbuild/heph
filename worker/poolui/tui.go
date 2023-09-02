@@ -178,7 +178,7 @@ func (m *Model) View() string {
 	for _, w := range m.workers {
 		runtime := ""
 		if j := w.CurrentJob; j != nil {
-			runtime = fmt.Sprintf("=> [%5s]", xtime.FormatDuration(time.Since(j.TimeStart)))
+			runtime = fmt.Sprintf("=> [%5s]", xtime.FormatFixedWidthDuration(time.Since(j.TimeStart)))
 		}
 
 		status := w.GetStatus().String(log.Renderer())

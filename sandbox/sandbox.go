@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xmath"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,21 +18,29 @@ import (
 	"time"
 )
 
+type File = tar.File
+
+type TarFile struct {
+	Path string
+	Size int64
+}
+
 type MakeConfig struct {
-	Dir       string
-	BinDir    string
-	Bin       map[string]string
-	Files     []tar.File
-	FilesTar  []string
-	LinkFiles []tar.File
+	Dir           string
+	BinDir        string
+	Bin           map[string]string
+	Files         []File
+	FilesTar      []TarFile
+	LinkFiles     []File
+	ProgressFiles func(percent float64)
+	ProgressTars  func(percent float64)
+	ProgressLinks func(percent float64)
 }
 
 type MakeBinConfig struct {
 	Dir string
 	Bin map[string]string
 }
-
-type Spec = MakeConfig
 
 func MakeBin(cfg MakeBinConfig) error {
 	start := time.Now()
@@ -94,9 +105,15 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 	// TODO: figure out if different origins would override each other
 	untarDedup := sets.NewStringSet(0)
 
-	for _, file := range cfg.Files {
+	for i, file := range cfg.Files {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		if cfg.ProgressFiles != nil {
+			percent := math.Round(xmath.Percent(i, len(cfg.Files)))
+
+			cfg.ProgressFiles(percent)
 		}
 
 		to := filepath.Join(cfg.Dir, file.To)
@@ -110,22 +127,68 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}
+
+		if cfg.ProgressFiles != nil {
+			percent := math.Round(xmath.Percent(i+1, len(cfg.Files)))
+
+			cfg.ProgressFiles(percent)
+		}
+	}
+
+	tarSizeSum := ads.Reduce(cfg.FilesTar, func(s int64, file TarFile) int64 {
+		// Do not show partial (and wrong) percentage
+		if s < 0 {
+			return -1
+		}
+		if file.Size == 0 {
+			return -1
+		}
+		return s + file.Size
+	}, int64(0))
+	var tarSizeWritten int64
+
+	var progress func(written int64)
+	if cfg.ProgressTars != nil {
+		if tarSizeSum > 0 {
+			progress = func(written int64) {
+				percent := math.Round(xmath.Percent(written+tarSizeWritten, tarSizeSum))
+
+				cfg.ProgressTars(percent)
+			}
+
+			progress(0)
+		} else {
+			cfg.ProgressTars(-1)
+		}
 	}
 
 	for _, tarFile := range cfg.FilesTar {
-		done := log.TraceTimingDone("untar " + tarFile)
-		err := tar.UntarPath(ctx, tarFile, cfg.Dir, tar.UntarOptions{
-			Dedup: untarDedup,
+		done := log.TraceTimingDone("untar " + tarFile.Path)
+		err := tar.UntarPath(ctx, tarFile.Path, cfg.Dir, tar.UntarOptions{
+			Dedup:    untarDedup,
+			Progress: progress,
 		})
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}
 		done()
+
+		tarSizeWritten += tarFile.Size
+
+		if progress != nil {
+			progress(tarSizeWritten)
+		}
 	}
 
-	for _, file := range cfg.LinkFiles {
+	for i, file := range cfg.LinkFiles {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		if cfg.ProgressLinks != nil {
+			percent := math.Round(xmath.Percent(i, len(cfg.LinkFiles)))
+
+			cfg.ProgressLinks(percent)
 		}
 
 		to := filepath.Join(cfg.Dir, file.To)
@@ -143,6 +206,12 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		err = os.Link(file.From, to)
 		if err != nil {
 			return fmt.Errorf("make: link %v to %v: %w", file.From, to, err)
+		}
+
+		if cfg.ProgressLinks != nil {
+			percent := math.Round(xmath.Percent(i+1, len(cfg.LinkFiles)))
+
+			cfg.ProgressLinks(percent)
 		}
 	}
 

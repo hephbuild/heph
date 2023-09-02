@@ -8,10 +8,12 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
+	"github.com/hephbuild/heph/utils/xprogress"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type File struct {
@@ -144,6 +146,7 @@ type UntarOptions struct {
 	ListPath string
 	RO       bool
 	Dedup    *sets.StringSet
+	Progress func(written int64)
 }
 
 func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
@@ -157,11 +160,14 @@ func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
 }
 
 func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
-	inc, cancel := xio.ContextCloser(ctx, in)
+	cancel := xio.ContextCloser(ctx, in)
 	defer cancel()
 
-	return Untar(inc, to, o)
+	return Untar(in, to, o)
 }
+
+// See https://unix.stackexchange.com/a/557487
+const HeaderOverhead = 512
 
 func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 	recordFile := func(string) {}
@@ -175,6 +181,22 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 			}
 
 			_, err = complete()
+		}()
+	}
+
+	if o.Progress != nil {
+		u := xprogress.NewCounter()
+		pin := xprogress.NewReaderTap(in, u)
+		in = pin
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		go func() {
+			progressChan := xprogress.NewTicker(ctx, u, 10*time.Millisecond)
+			for p := range progressChan {
+				o.Progress(p.N())
+			}
 		}()
 	}
 
@@ -229,7 +251,7 @@ func Untar(in io.Reader, to string, o UntarOptions) (err error) {
 	})
 }
 
-func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string, error) {
+func UntarList(ctx context.Context, in io.ReadCloser, listPath string, progresss func(read int64)) ([]string, error) {
 	if xfs.PathExists(listPath) {
 		f, err := os.Open(listPath)
 		if err != nil {
@@ -246,10 +268,23 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string) ([]string
 
 	recordFile, complete := tarListFactory(listPath)
 
-	inc, cancel := xio.ContextCloser(ctx, in)
+	cancel := xio.ContextCloser(ctx, in)
 	defer cancel()
 
-	err := Walk(inc, func(hdr *tar.Header, tr *tar.Reader) error {
+	c := xprogress.NewCounter()
+	if progresss != nil {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		go func() {
+			progressChan := xprogress.NewTicker(ctx, c, 10*time.Millisecond)
+			for p := range progressChan {
+				progresss(p.N())
+			}
+		}()
+	}
+
+	err := Walk(xprogress.NewReaderTap(in, c), func(hdr *tar.Header, tr *tar.Reader) error {
 		switch hdr.Typeflag {
 		case tar.TypeReg, tar.TypeSymlink:
 			recordFile(hdr.Name)
@@ -271,10 +306,10 @@ func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Rea
 	}
 	defer tarf.Close()
 
-	tarfc, cancel := xio.ContextCloser(ctx, tarf)
+	cancel := xio.ContextCloser(ctx, tarf)
 	defer cancel()
 
-	return Walk(tarfc, fs...)
+	return Walk(tarf, fs...)
 }
 
 func Walk(tarf io.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {

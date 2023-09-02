@@ -117,6 +117,12 @@ func (s *schedulerv2) schedule() error {
 		pj := s.Pool.Schedule(s.sctx, &worker.Job{
 			Name: "pull_meta " + target.Addr,
 			Deps: pmdeps,
+			Hook: worker.StageHook{
+				OnEnd: func(job *worker.Job) context.Context {
+					targetDeps.DoneSem()
+					return nil
+				},
+			},
 			Do: func(w *worker.Worker, ctx context.Context) error {
 				status.Emit(ctx, tgt.TargetStatus(target, "Scheduling analysis..."))
 
@@ -143,10 +149,6 @@ func (s *schedulerv2) schedule() error {
 				return nil
 			},
 		})
-		go func() {
-			<-pj.Wait()
-			targetDeps.DoneSem()
-		}()
 		targetDeps.Add(pj)
 
 		children, err := s.Graph.DAG().GetChildren(target)

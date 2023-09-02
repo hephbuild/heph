@@ -37,6 +37,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext
 	paths := rpaths.WithRoot(a.OutRoot)
 
 	files := make([]tar.File, 0)
+	var size int64
 	for _, file := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -46,7 +47,15 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext
 			From: file.Abs(),
 			To:   file.RelRoot(),
 		})
+
+		info, _ := os.Lstat(file.Abs())
+		if info != nil {
+			size += info.Size()
+			size += tar.HeaderOverhead
+		}
 	}
+
+	gctx.EstimatedWriteSize(size)
 
 	err := tar.Tar(gctx.Writer(), files)
 	if err != nil {
@@ -101,6 +110,11 @@ func (a logArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) e
 		return err
 	}
 	defer f.Close()
+
+	info, _ := f.Stat()
+	if info != nil {
+		gctx.EstimatedWriteSize(info.Size())
+	}
 
 	_, err = io.Copy(gctx.Writer(), f)
 	return err

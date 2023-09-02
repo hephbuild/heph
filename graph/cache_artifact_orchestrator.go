@@ -48,16 +48,16 @@ func (o *ArtifactOrchestrator) OutTar(name string) artifacts.Artifact {
 
 func (e *State) newArtifactOrchestrator(target *Target) *ArtifactOrchestrator {
 	o := &ArtifactOrchestrator{
-		InputHash: artifacts.New("hash_input", "#input", true, false),
-		Manifest:  artifacts.New("manifest.json", "manifest", true, false),
-		Log:       artifacts.New("log.txt", "log", false, false),
+		InputHash: artifacts.New("hash_input", "#input", true, false, false),
+		Manifest:  artifacts.New("manifest.json", "manifest", true, false, false),
+		Log:       artifacts.New("log.txt", "log", false, false, false),
 		Out:       map[string]ArtifactsOut{},
 	}
 
 	for _, name := range target.OutWithSupport.Names() {
 		o.Out[name] = ArtifactsOut{
-			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, false),
-			artifacts.New("out_"+name+".tar", strings.TrimSpace(name+" tar"), true, true),
+			artifacts.New("hash_out_"+name, strings.TrimSpace(name+" #out"), true, false, false),
+			artifacts.New("out_"+name+".tar", strings.TrimSpace(name+" tar"), true, true, true),
 		}
 	}
 
