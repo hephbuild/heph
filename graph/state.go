@@ -1,21 +1,17 @@
 package graph
 
 import (
-	"fmt"
-	"github.com/c2fo/vfs/v6"
 	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/vfssimple"
-	"strings"
 )
 
 type State struct {
 	Root   *hroot.State
-	Config *Config
+	Config *config.Config
 
 	targetsLock  maps.KMutex
 	targets      *Targets
@@ -23,17 +19,6 @@ type State struct {
 	codegenPaths map[string]*Target
 	dag          *DAG
 	labels       *sets.StringSet
-}
-
-type Config struct {
-	*config.Config
-	Caches []CacheConfig
-}
-
-type CacheConfig struct {
-	Name string
-	config.Cache
-	Location vfs.Location `yaml:"-"`
 }
 
 func (e *State) CodegenPaths() map[string]*Target {
@@ -118,10 +103,10 @@ func (e *State) toolTargets() *Targets {
 	return targets
 }
 
-func NewState(root *hroot.State, cfg *config.Config) (*State, error) {
-	s := &State{
+func NewState(root *hroot.State, cfg *config.Config) *State {
+	return &State{
 		Root:         root,
-		Config:       &Config{Config: cfg},
+		Config:       cfg,
 		targetsLock:  maps.KMutex{},
 		targets:      NewTargets(0),
 		Tools:        NewTargets(0),
@@ -129,23 +114,4 @@ func NewState(root *hroot.State, cfg *config.Config) (*State, error) {
 		dag:          &DAG{dag.NewDAG()},
 		labels:       sets.NewStringSet(0),
 	}
-
-	for name, cache := range cfg.Caches {
-		uri := cache.URI
-		if !strings.HasSuffix(uri, "/") {
-			uri += "/"
-		}
-		loc, err := vfssimple.NewLocation(uri)
-		if err != nil {
-			return nil, fmt.Errorf("cache %v :%w", name, err)
-		}
-
-		s.Config.Caches = append(s.Config.Caches, CacheConfig{
-			Name:     name,
-			Cache:    cache,
-			Location: loc,
-		})
-	}
-
-	return s, nil
 }

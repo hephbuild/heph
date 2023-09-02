@@ -5,7 +5,6 @@ import (
 	"github.com/c2fo/vfs/v6/backend/gs"
 	"github.com/c2fo/vfs/v6/backend/os"
 	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils"
@@ -18,7 +17,7 @@ import (
 )
 
 type orderCacheContainer struct {
-	cache   graph.CacheConfig
+	cache   CacheConfig
 	latency time.Duration
 }
 
@@ -62,7 +61,7 @@ func (c orderCacheContainer) calculateLatency(ctx context.Context) (time.Duratio
 	return -1, nil
 }
 
-func orderCaches(ctx context.Context, caches []graph.CacheConfig) []graph.CacheConfig {
+func orderCaches(ctx context.Context, caches []CacheConfig) []CacheConfig {
 	if len(caches) <= 1 {
 		return caches
 	}
@@ -90,12 +89,12 @@ func orderCaches(ctx context.Context, caches []graph.CacheConfig) []graph.CacheC
 		return int(a.latency - b.latency)
 	})
 
-	return ads.Map(orderedCaches, func(c orderCacheContainer) graph.CacheConfig {
+	return ads.Map(orderedCaches, func(c orderCacheContainer) CacheConfig {
 		return c.cache
 	})
 }
 
-func (e *RemoteCache) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, error) {
+func (e *RemoteCache) OrderedCaches(ctx context.Context) ([]CacheConfig, error) {
 	if len(e.Config.Caches) <= 1 || e.Config.CacheOrder != config.CacheOrderLatency {
 		return e.Config.Caches, nil
 	}
@@ -116,7 +115,7 @@ func (e *RemoteCache) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, e
 
 	h := hash.NewHash()
 	h.I64(1)
-	hash.HashArray(h, e.Config.Caches, func(c graph.CacheConfig) string {
+	hash.HashArray(h, e.Config.Caches, func(c CacheConfig) string {
 		return c.Name + "|" + c.URI
 	})
 
@@ -127,18 +126,18 @@ func (e *RemoteCache) OrderedCaches(ctx context.Context) ([]graph.CacheConfig, e
 		status.Emit(ctx, status.String("Measuring caches latency..."))
 		ordered := orderCaches(ctx, e.Config.Caches)
 
-		return ads.Map(ordered, func(c graph.CacheConfig) string {
+		return ads.Map(ordered, func(c CacheConfig) string {
 			return c.Name
 		}), nil
 	})
 
-	cacheMap := map[string]graph.CacheConfig{}
+	cacheMap := map[string]CacheConfig{}
 	for _, c := range e.Config.Caches {
 		cacheMap[c.Name] = c
 	}
 
 	hasSecondary := false
-	ordered := make([]graph.CacheConfig, 0, len(names))
+	ordered := make([]CacheConfig, 0, len(names))
 	for _, name := range names {
 		c := cacheMap[name]
 		if c.Secondary {

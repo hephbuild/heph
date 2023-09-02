@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"github.com/hephbuild/heph/buildfiles"
+	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
@@ -24,7 +25,7 @@ import (
 type Scheduler struct {
 	Cwd              string
 	Root             *hroot.State
-	Config           *graph.Config
+	Config           *config.Config
 	Observability    *observability.Observability
 	GetFlowID        func() string
 	LocalCache       *lcache.LocalCacheState

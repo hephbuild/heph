@@ -114,7 +114,7 @@ func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, ou
 	return false, false, nil
 }
 
-func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta bool, cache graph.CacheConfig) (_ bool, rerr error) {
+func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta bool, cache rcache.CacheConfig) (_ bool, rerr error) {
 	ctx, span := e.Observability.SpanExternalCacheGet(ctx, target.GraphTarget(), cache.Name, outputs, onlyMeta)
 	defer rcache.SpanEndIgnoreNotExist(span, rerr)
 
@@ -157,7 +157,7 @@ func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target,
 	return true, nil
 }
 
-func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache graph.CacheConfig) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache rcache.CacheConfig) *worker.Job {
 	// input hash is used as a marker that everything went well,
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
@@ -175,7 +175,7 @@ func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *grap
 	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps)
 }
 
-func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache graph.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
 	return e.Pool.Schedule(ctx, &worker.Job{
 		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
 		Deps: deps,

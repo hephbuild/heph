@@ -199,10 +199,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	})
 	bs.BuildFiles = buildfilesState
 
-	g, err := graph.NewState(root, cfg)
-	if err != nil {
-		return bs, fmt.Errorf("graph: %w", err)
-	}
+	g := graph.NewState(root, cfg)
 	bs.Graph = g
 
 	{
@@ -253,7 +250,10 @@ func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, err
 		return nil, err
 	}
 
-	remoteCache := rcache.New(bs.Root, bs.Graph.Config, localCache, bs.Observability)
+	remoteCache, err := rcache.New(bs.Root, bs.Config, localCache, bs.Observability)
+	if err != nil {
+		return nil, err
+	}
 
 	var getFlowId func() string
 	if hook := bs.Cloud.Hook; hook != nil {
@@ -280,7 +280,7 @@ func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, err
 	e := scheduler.New(scheduler.Scheduler{
 		Cwd:             bs.Cwd,
 		Root:            bs.Root,
-		Config:          bs.Graph.Config,
+		Config:          bs.Config,
 		Observability:   bs.Observability,
 		GetFlowID:       getFlowId,
 		LocalCache:      localCache,

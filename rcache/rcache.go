@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/c2fo/vfs/v6"
 	"github.com/hephbuild/heph/artifacts"
+	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
@@ -15,8 +17,10 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xmath"
+	"github.com/hephbuild/heph/vfssimple"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func SpanEndIgnoreNotExist(span observability.SpanError, err error) {
@@ -37,27 +41,57 @@ func artifactExternalFileName(a artifacts.Artifact) string {
 
 type RemoteCache struct {
 	Root          *hroot.State
-	Config        *graph.Config
+	Config        *Config
 	LocalCache    *lcache.LocalCacheState
 	Observability *observability.Observability
 	Hints         *HintStore
 
 	orderedCachesLock locks.Locker
-	orderedCaches     []graph.CacheConfig
+	orderedCaches     []CacheConfig
 }
 
-func New(root *hroot.State, config *graph.Config, localCache *lcache.LocalCacheState, observability *observability.Observability) *RemoteCache {
+type Config struct {
+	*config.Config
+	Caches []CacheConfig
+}
+
+type CacheConfig struct {
+	Name string
+	config.Cache
+	Location vfs.Location `yaml:"-"`
+}
+
+func New(root *hroot.State, cconfig *config.Config, localCache *lcache.LocalCacheState, observability *observability.Observability) (*RemoteCache, error) {
+	cfg := &Config{Config: cconfig}
+
+	for name, cache := range cconfig.Caches {
+		uri := cache.URI
+		if !strings.HasSuffix(uri, "/") {
+			uri += "/"
+		}
+		loc, err := vfssimple.NewLocation(uri)
+		if err != nil {
+			return nil, fmt.Errorf("cache %v :%w", name, err)
+		}
+
+		cfg.Caches = append(cfg.Caches, CacheConfig{
+			Name:     name,
+			Cache:    cache,
+			Location: loc,
+		})
+	}
+
 	return &RemoteCache{
 		Root:              root,
-		Config:            config,
+		Config:            cfg,
 		LocalCache:        localCache,
 		Observability:     observability,
 		Hints:             &HintStore{},
 		orderedCachesLock: locks.NewFlock("Order cache", root.Tmp.Join("order_cache.lock").Abs()),
-	}
+	}, nil
 }
 
-func (e *RemoteCache) ArtifactExists(ctx context.Context, cache graph.CacheConfig, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
+func (e *RemoteCache) ArtifactExists(ctx context.Context, cache CacheConfig, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Checking from %v...", cache.Name)))
 
 	root, err := e.remoteCacheLocation(cache.Location, target)
@@ -74,7 +108,7 @@ func (e *RemoteCache) ArtifactExists(ctx context.Context, cache graph.CacheConfi
 	return f.Exists()
 }
 
-func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targeter, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
+func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targeter, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	ctx, span := e.Observability.SpanCacheDownload(ctx, target.GraphTarget(), cache.Name, artifact)
 	defer func() {
 		if errors.Is(rerr, os.ErrNotExist) {
@@ -140,7 +174,7 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 	return nil
 }
 
-func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter, cache graph.CacheConfig, artifact artifacts.Artifact) (rerr error) {
+func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter, cache CacheConfig, artifact artifacts.Artifact) (rerr error) {
 	target := ttarget.GraphTarget()
 
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Uploading to %v...", cache.Name)))
@@ -184,14 +218,14 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 	return nil
 }
 
-func (e *RemoteCache) WriteableCaches(ctx context.Context, starget specs.Specer) ([]graph.CacheConfig, error) {
+func (e *RemoteCache) WriteableCaches(ctx context.Context, starget specs.Specer) ([]CacheConfig, error) {
 	target := starget.Spec()
 
 	if !target.Cache.Enabled {
 		return nil, nil
 	}
 
-	wcs := ads.Filter(e.Config.Caches, func(cache graph.CacheConfig) bool {
+	wcs := ads.Filter(e.Config.Caches, func(cache CacheConfig) bool {
 		if !cache.Write {
 			return false
 		}

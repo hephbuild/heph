@@ -198,7 +198,7 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 				opts := hbuiltin.Bootstrap(hbuiltin.Opts{
 					Pkgs:   e.Packages,
 					Root:   e.Root,
-					Config: e.Config.Config,
+					Config: e.Config,
 					RegisterTarget: func(spec specs.Target) error {
 						err := e.Graph.Register(spec)
 						if err != nil {
