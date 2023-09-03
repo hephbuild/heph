@@ -1,13 +1,11 @@
 package targetrun
 
 import (
-	"errors"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/mds"
 	"github.com/hephbuild/heph/utils/xfs"
-	"os"
 )
 
 type artifactProducer struct {
@@ -55,13 +53,6 @@ func (e *Runner) orderedArtifactProducers(t *lcache.Target, outRoot, logFilePath
 			Paths:     t.ActualRestoreCacheFiles(),
 			OutRoot:   outRoot,
 			SkipEmpty: true,
-			OnStatErr: func(err error) (bool, error) {
-				if errors.Is(err, os.ErrNotExist) {
-					return true, nil
-				}
-
-				return false, err
-			},
 		}})
 	}
 	all = append(all, artifactProducer{arts.Manifest, manifestArtifact{

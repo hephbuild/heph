@@ -78,7 +78,7 @@ func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Target
 		return err
 	}
 
-	for _, artifact := range arts {
+	for i, artifact := range arts {
 		shouldCompress := artifact.Compressible() && compress
 
 		var progress func(size, written int64)
@@ -94,7 +94,9 @@ func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Target
 				}
 
 				if s != "" {
-					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), s))
+					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(),
+						fmt.Sprintf("%v/%v %v", i+1, len(arts), s)),
+					)
 				}
 			}
 		}

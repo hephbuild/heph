@@ -28,7 +28,7 @@ func (e TargetNotFoundErr) Error() string {
 	if e.Targets != nil {
 		suggestions := e.Targets.Suggest(e.String).Addrs()
 		if len(suggestions) > 0 {
-			return fmt.Sprintf("target %v not found, did you mean %v ?", e.String, suggestions[0])
+			return fmt.Sprintf("target %v not found (did you mean %v ?)", e.String, suggestions[0])
 		}
 	}
 

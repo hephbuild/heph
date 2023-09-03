@@ -41,16 +41,7 @@ func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext
 
 		info, err := os.Lstat(file.Abs())
 		if err != nil {
-			if a.OnStatErr != nil {
-				var skip bool
-				skip, err = a.OnStatErr(err)
-				if skip {
-					continue
-				}
-			}
-			if err != nil {
-				return err
-			}
+			return err
 		}
 
 		if info != nil {
