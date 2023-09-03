@@ -159,8 +159,8 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 
 	gctx := ArtifactGenContext{
 		progress: progress,
+		w:        f,
 	}
-	gctx.w = f
 
 	if compress {
 		gw := gzip.NewWriter(f)
@@ -177,7 +177,7 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 			}
 			return nil
 		}
-		return fmt.Errorf("%v: %w", a.Name(), err)
+		return err
 	}
 
 	if !gctx.accessedWriter {

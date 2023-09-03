@@ -18,7 +18,7 @@ type TargetArgs struct {
 	RunInCwd            bool
 	PassArgs            bool
 	Cache               TargetArgsCache
-	RestoreCache        bool
+	RestoreCache        TargetArgsRestoreCache
 	SupportFiles        xstarlark.Listable[string]
 	SandboxEnabled      bool
 	OutInSandbox        bool
@@ -86,6 +86,10 @@ type TargetArgsCache struct {
 }
 
 func (c *TargetArgsCache) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
 	b, ok := v.(starlark.Bool)
 	if ok {
 		*c = TargetArgsCache{
@@ -94,16 +98,11 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 		return nil
 	}
 
-	d, err := xstarlark.UnpackDistruct(v)
-	if err != nil {
-		return err
-	}
-
 	cs := TargetArgsCache{
 		Enabled: true,
 	}
 
-	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
+	err := xstarlark.UnpackDistructTo(v,
 		"named?", &cs.Named,
 		"history?", &cs.History,
 	)
@@ -112,6 +111,52 @@ func (c *TargetArgsCache) Unpack(v starlark.Value) error {
 	}
 
 	*c = cs
+
+	return nil
+}
+
+type TargetArgsRestoreCache struct {
+	Enabled bool
+	Key     string
+	Paths   xstarlark.Listable[string]
+}
+
+func (c *TargetArgsRestoreCache) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
+	if b, ok := v.(starlark.Bool); ok {
+		*c = TargetArgsRestoreCache{
+			Enabled: bool(b),
+		}
+		return nil
+	}
+
+	var l xstarlark.Listable[string]
+	err := xstarlark.UnpackOne(v, &l)
+	if err == nil {
+		*c = TargetArgsRestoreCache{
+			Enabled: true,
+			Paths:   l,
+		}
+		return nil
+	}
+
+	cs := TargetArgsRestoreCache{
+		Enabled: true,
+	}
+
+	err = xstarlark.UnpackDistructTo(v,
+		"paths?", &cs.Paths,
+		"key?", &cs.Key,
+	)
+	if err != nil {
+		return err
+	}
+
+	*c = cs
+
 	return nil
 }
 

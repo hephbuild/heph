@@ -175,6 +175,10 @@ func (t Target) equalStruct(spec Target) bool {
 		return false
 	}
 
+	if !t.RestoreCache.Equal(spec.RestoreCache) {
+		return false
+	}
+
 	return true
 }
 
@@ -304,6 +308,22 @@ func (this Platform) Equal(that Platform) bool {
 	}
 
 	if this.Default != that.Default {
+		return false
+	}
+
+	return true
+}
+
+func (this RestoreCache) Equal(that RestoreCache) bool {
+	if this.Enabled != that.Enabled {
+		return false
+	}
+
+	if this.Key != that.Key {
+		return false
+	}
+
+	if !arrEqual(this.Paths, that.Paths) {
 		return false
 	}
 

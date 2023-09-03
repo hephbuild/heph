@@ -292,13 +292,23 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	t.Out = &OutNamedPaths{}
 	t.OutWithSupport = &OutNamedPaths{}
 	for _, file := range t.Spec().Out {
+		// SupportFilesOutput should be excluded from normal outputs
 		if file.Name != specs.SupportFilesOutput {
 			t.Out.Add(file.Name, relPathFactory(file.Path))
 		}
+
 		t.OutWithSupport.Add(file.Name, relPathFactory(file.Path))
 	}
 	t.Out.Sort()
 	t.OutWithSupport.Sort()
+
+	t.RestoreCachePaths = nil
+	if t.Spec().RestoreCache.Enabled {
+		t.RestoreCachePaths = ads.Map(t.Spec().RestoreCache.Paths, func(p string) xfs.RelPath {
+			return relPathFactory(p)
+		})
+		t.RestoreCachePaths.Sort()
+	}
 
 	if t.Spec().Cache.Enabled {
 		if !t.Spec().Sandbox && !t.Spec().OutInSandbox {
@@ -358,7 +368,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		return err
 	}
 
-	t.Artifacts = e.newArtifactOrchestrator(t)
+	t.Artifacts = e.newArtifactRegistry(t)
 
 	parents, err := e.DAG().GetParents(t)
 	if err != nil {

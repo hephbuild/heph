@@ -19,7 +19,7 @@ func (e *LocalCacheState) tmpTargetRoot(target specs.Specer) xfs.Path {
 }
 
 func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error {
-	if target.Codegen == "" {
+	if target.Codegen == specs.CodegenNone {
 		return nil
 	}
 

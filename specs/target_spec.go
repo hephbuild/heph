@@ -38,6 +38,7 @@ var (
 )
 
 var (
+	CodegenNone          = ""
 	CodegenLink          = "link"
 	CodegenCopy          = "copy"
 	CodegenCopyNoExclude = "copy_noexclude"
@@ -45,12 +46,12 @@ var (
 	CodegenValues = []string{CodegenLink, CodegenCopy, CodegenCopyNoExclude}
 )
 
-type TargetSpecSrcEnv struct {
+type SrcEnv struct {
 	Default string
 	Named   map[string]string
 }
 
-func (e TargetSpecSrcEnv) Get(name string) string {
+func (e SrcEnv) Get(name string) string {
 	if v, ok := e.Named[name]; ok {
 		return v
 	}
@@ -108,7 +109,7 @@ type Target struct {
 	Tools               Tools
 	Out                 []OutFile
 	Cache               Cache
-	RestoreCache        bool
+	RestoreCache        RestoreCache
 	HasSupportFiles     bool
 	Sandbox             bool
 	OutInSandbox        bool
@@ -121,7 +122,7 @@ type Target struct {
 	Gen                 bool
 	Source              []Source
 	RuntimeEnv          map[string]string
-	SrcEnv              TargetSpecSrcEnv
+	SrcEnv              SrcEnv
 	OutEnv              string
 	HashFile            string
 	Transitive          Transitive
@@ -336,4 +337,10 @@ func (c Cache) NamedEnabled(name string) bool {
 	}
 
 	return false
+}
+
+type RestoreCache struct {
+	Enabled bool
+	Key     string
+	Paths   []string
 }

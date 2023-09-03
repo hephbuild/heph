@@ -229,7 +229,7 @@ func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, ta
 	return m, true
 }
 
-func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, onlyMeta, skipSpan, uncompress bool) (bool, error) {
+func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	target := ttarget.GraphTarget()
 
 	ok, err := e.HasArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
@@ -251,6 +251,21 @@ func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targe
 				return false, err
 			}
 
+			if uncompress {
+				_, _, err := e.UncompressedPathFromArtifact(ctx, target, art)
+				if err != nil {
+					return false, err
+				}
+			}
+		}
+	}
+
+	if art, ok := target.Artifacts.GetRestoreCache(); !onlyMeta && withRestoreCache && ok {
+		ok, err := e.HasArtifact(ctx, target, art, skipSpan)
+		if err != nil {
+			return false, err
+		}
+		if ok {
 			if uncompress {
 				_, _, err := e.UncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {

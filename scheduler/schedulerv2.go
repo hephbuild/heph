@@ -136,9 +136,10 @@ func (s *schedulerv2) schedule() error {
 				}
 
 				rr := s.rrs.Get(target)
+
 				g, err := s.ScheduleTargetGetCacheOrRunOnce(
 					ctx, target, !rr.NoCache,
-					s.rrs.Get(target).PullCache || target.Codegen != "",
+					rr.PullCache || target.Codegen != specs.CodegenNone,
 					false,
 				)
 				if err != nil {
@@ -181,7 +182,7 @@ func (s *schedulerv2) parentTargetDeps(target specs.Specer) (*worker.WaitGroup, 
 	return deps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.Target, outputs []string, uncompress bool) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, uncompress bool) (*worker.Job, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -192,7 +193,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.
 		Name: "cache get " + target.Addr,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			cached, err := s.pullOrGetCacheAndPost(ctx, target, outputs, false, uncompress)
+			cached, err := s.pullOrGetCacheAndPost(ctx, target, outputs, withRestoreCache, false, uncompress)
 			if err != nil {
 				return err
 			}
@@ -206,7 +207,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.
 	}), nil
 }
 
-func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *graph.Target, outputs []string, uncompress bool) (*worker.Job, error) {
+func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, uncompress bool) (*worker.Job, error) {
 	lock := s.targetSchedLock.Get(target.Addr)
 	lock.Lock()
 	defer lock.Unlock()
@@ -215,7 +216,7 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *gr
 		return j, nil
 	}
 
-	j, err := s.ScheduleTargetCacheGet(ctx, target, outputs, uncompress)
+	j, err := s.ScheduleTargetCacheGet(ctx, target, outputs, withRestoreCache, uncompress)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +252,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 	return runDeps, nil
 }
 
-func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *graph.Target, useCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
+func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *graph.Target, allowCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -262,17 +263,17 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 		Name: "get cache or run once " + target.Addr,
 		Deps: deps,
 		Do: func(w *worker.Worker, ctx context.Context) error {
-			if target.Cache.Enabled && useCached {
+			if target.Cache.Enabled && allowCached {
 				outputs := s.outputs.Get(target.Addr).Slice()
 
-				_, cached, err := s.Scheduler.pullOrGetCache(ctx, target, outputs, true, !pullIfCached, true, uncompress)
+				_, cached, err := s.Scheduler.pullOrGetCache(ctx, target, outputs, false, true, !pullIfCached, true, uncompress)
 				if err != nil {
 					return err
 				}
 
 				if cached {
 					if pullIfCached {
-						j, err := s.ScheduleTargetCacheGetOnce(ctx, target, outputs, uncompress)
+						j, err := s.ScheduleTargetCacheGetOnce(ctx, target, outputs, true, uncompress)
 						if err != nil {
 							return err
 						}
@@ -309,6 +310,8 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *graph.T
 	if err != nil {
 		return nil, err
 	}
+
+	// TODO: if RestoreCache, try to download the latest artifacts from its lineage
 
 	j, err := s.ScheduleTargetRun(ctx, s.rrs.Get(target), runDeps)
 	if err != nil {

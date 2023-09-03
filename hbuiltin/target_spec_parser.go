@@ -34,7 +34,11 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 			Named:   args.Cache.Named.Array,
 			History: args.Cache.History,
 		},
-		RestoreCache:   args.RestoreCache,
+		RestoreCache: specs.RestoreCache{
+			Enabled: args.RestoreCache.Enabled,
+			Key:     args.RestoreCache.Key,
+			Paths:   args.RestoreCache.Paths,
+		},
 		Sandbox:        args.SandboxEnabled,
 		OutInSandbox:   args.OutInSandbox,
 		Codegen:        args.Codegen,
@@ -45,7 +49,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		RunInCwd:       args.RunInCwd,
 		Gen:            args.Gen,
 		RuntimeEnv:     args.RuntimeEnv.ArrMap,
-		SrcEnv: specs.TargetSpecSrcEnv{
+		SrcEnv: specs.SrcEnv{
 			Default: args.SrcEnv.Default,
 			Named:   args.SrcEnv.Named,
 		},
@@ -221,7 +225,11 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		return specs.Target{}, fmt.Errorf("only a single platform is supported, for now")
 	}
 
-	if t.Codegen != "" {
+	if t.Codegen == "" {
+		t.Codegen = specs.CodegenNone
+	}
+
+	if t.Codegen != specs.CodegenNone {
 		if !ads.Contains(specs.CodegenValues, t.Codegen) {
 			return specs.Target{}, fmt.Errorf("codegen must be one of %v, got %v", joinOneOf(specs.CodegenValues), t.Codegen)
 		}
@@ -253,12 +261,16 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		}
 	}
 
-	if args.Cache.Enabled && args.ConcurrentExecution {
+	if t.Cache.Enabled && t.ConcurrentExecution {
 		return specs.Target{}, fmt.Errorf("concurrent_execution and cache are incompatible")
 	}
 
+	if !t.Cache.Enabled && t.RestoreCache.Enabled {
+		return specs.Target{}, fmt.Errorf("restore_cache requires cache to be enabled")
+	}
+
 	if t.Cache.Enabled && t.RunInCwd {
-		return specs.Target{}, fmt.Errorf("cannot run in cwd and cache")
+		return specs.Target{}, fmt.Errorf("run in cwd is incompatble with cache")
 	}
 
 	return t, nil

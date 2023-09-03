@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
@@ -203,15 +204,21 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 	status.Emit(ctx, tgt.TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
-	if target.RestoreCache {
+	if target.RestoreCache.Enabled {
 		if e.LocalCache.LatestCacheDirExists(target) {
 			done := log.TraceTiming("Restoring cache")
 
-			for _, name := range target.OutWithSupport.Names() {
-				art := target.Artifacts.OutTar(name)
+			arts := ads.Map(target.OutWithSupport.Names(), func(name string) artifacts.Artifact {
+				return target.Artifacts.OutTar(name)
+			})
+			if a, ok := target.Artifacts.GetRestoreCache(); ok {
+				arts = append(arts, a)
+			}
+
+			for _, art := range arts {
 				p, stats, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
-					log.Warnf("restore cache: out %v|%v: %v", target.Addr, art.Name(), err)
+					log.Warnf("%v: skipping restore cache: out %v: %v", target.Addr, art.Name(), err)
 					// We do not want partial restore
 					restoreSrcRec.Reset()
 					break

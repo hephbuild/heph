@@ -20,7 +20,7 @@ func (e unpackError) Error() string {
 	return strings.ReplaceAll(s, "XXX: for parameter 1: ", "")
 }
 
-func unpackSingle(v starlark.Value, target any) error {
+func UnpackOne(v starlark.Value, target any) error {
 	err := starlark.UnpackPositionalArgs("XXX", starlark.Tuple{v}, nil, 0, target)
 	if err != nil {
 		return unpackError{err}
@@ -49,7 +49,7 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 			}
 
 			var single T
-			err := unpackSingle(e, &single)
+			err := UnpackOne(e, &single)
 			if err != nil {
 				return fmt.Errorf("index %v: %w", i, err)
 			}
@@ -61,7 +61,7 @@ func (c *Listable[T]) Unpack(v starlark.Value) error {
 	}
 
 	var single T
-	err := unpackSingle(v, &single)
+	err := UnpackOne(v, &single)
 	if err != nil {
 		return err
 	}

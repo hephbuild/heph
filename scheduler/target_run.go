@@ -27,7 +27,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 			return fmt.Errorf("args are not supported with cache")
 		}
 
-		cached, err := e.pullOrGetCacheAndPost(ctx, gtarget, gtarget.OutWithSupport.Names(), true, false)
+		cached, err := e.pullOrGetCacheAndPost(ctx, gtarget, gtarget.OutWithSupport.Names(), false, true, false)
 		if err != nil {
 			return err
 		}

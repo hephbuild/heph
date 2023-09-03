@@ -5,6 +5,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
+	"strings"
 )
 
 type KV interface {
@@ -61,18 +62,18 @@ func (s *dictkv) Items() StringItems {
 	return s.items
 }
 
-func kvFrom(v starlark.Value) (KV, bool) {
+func kvFrom(v starlark.Value) (KV, error) {
 	switch v := v.(type) {
 	case *starlark.Dict:
 		kv := &dictkv{}
 		kv.dict = v
-		return kv, true
+		return kv, nil
 	case *starlarkstruct.Struct:
 		kv := &structkv{}
 		kv.s = v
-		return kv, true
+		return kv, nil
 	default:
-		return nil, false
+		return nil, fmt.Errorf("expected struct or dict, got %v", v.Type())
 	}
 }
 
@@ -96,11 +97,41 @@ func (s *Distruct) Items() StringItems {
 }
 
 func (s *Distruct) Unpack(v starlark.Value) error {
-	kv, ok := kvFrom(v)
-	if !ok {
-		return fmt.Errorf("must be a struct or dict")
+	kv, err := kvFrom(v)
+	if err != nil {
+		return err
 	}
 
 	s.items = kv.Items()
 	return nil
+}
+
+func keysFromPairs(pairs ...interface{}) []string {
+	keys := make([]string, 0, len(pairs)/2)
+
+	for i, v := range pairs {
+		if i%2 != 0 {
+			continue
+		}
+
+		s, ok := v.(string)
+		if !ok {
+			continue
+		}
+
+		s = strings.TrimSuffix(s, "?")
+
+		keys = append(keys, s)
+	}
+
+	return keys
+}
+
+func UnpackDistructTo(v starlark.Value, pairs ...interface{}) error {
+	d, err := UnpackDistruct(v)
+	if err != nil {
+		return fmt.Errorf("expected struct or dict with keys %v, got %v", keysFromPairs(pairs), v.Type())
+	}
+
+	return starlark.UnpackArgs("", nil, d.Items().Tuples(), pairs...)
 }

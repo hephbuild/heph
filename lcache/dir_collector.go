@@ -19,6 +19,7 @@ type ActualFileCollectorDir struct {
 func (c ActualFileCollectorDir) PopulateActualFiles(ctx context.Context, target *Target, outputs []string) error {
 	target.actualOutFiles = &ActualOutNamedPaths{}
 	target.actualSupportFiles = make(xfs.RelPaths, 0)
+	target.actualRestoreCacheFiles = make(xfs.RelPaths, 0)
 
 	var err error
 
@@ -29,6 +30,13 @@ func (c ActualFileCollectorDir) PopulateActualFiles(ctx context.Context, target 
 
 	if target.HasSupportFiles {
 		target.actualSupportFiles, err = c.collectOut(target.Target, target.OutWithSupport.Name(specs.SupportFilesOutput), c.Dir)
+		if err != nil {
+			return fmt.Errorf("support: %w", err)
+		}
+	}
+
+	if len(target.RestoreCachePaths) > 0 {
+		target.actualRestoreCacheFiles, err = c.collectOut(target.Target, target.RestoreCachePaths, c.Dir)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}

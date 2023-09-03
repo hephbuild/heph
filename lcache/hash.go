@@ -334,6 +334,14 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	})
 	h.String(target.OutEnv)
 
+	if target.RestoreCache.Enabled {
+		h.String("=")
+		h.String(target.RestoreCache.Key)
+		hash.HashArray(h, target.RestoreCache.Paths, func(s string) string {
+			return s
+		})
+	}
+
 	targetm.inputHash = h.Sum()
 	targetm.cacheHashInputPathsModtime = pathsModtime
 

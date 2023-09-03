@@ -6,7 +6,6 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/tar"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xsync"
@@ -18,41 +17,55 @@ import (
 )
 
 type outTarArtifact struct {
-	Target  *lcache.Target
-	Output  string
-	OutRoot string
+	Target    *lcache.Target
+	Name      string
+	Paths     xfs.RelPaths
+	OutRoot   string
+	SkipEmpty bool
+	OnStatErr func(err error) (bool, error)
 }
 
 func (a outTarArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenContext) error {
 	target := a.Target
 
-	var rpaths xfs.RelPaths
-	if a.Output == specs.SupportFilesOutput {
-		rpaths = target.ActualSupportFiles()
-	} else {
-		rpaths = target.ActualOutFiles().Name(a.Output)
-	}
-	log.Tracef("Creating archive %v %v", target.Addr, a.Output)
+	log.Tracef("Creating archive %v %v", target.Addr, a.Name)
 
-	paths := rpaths.WithRoot(a.OutRoot)
+	paths := a.Paths.WithRoot(a.OutRoot)
 
-	files := make([]tar.File, 0)
+	files := make([]tar.File, 0, len(paths))
 	var size int64
 	for _, file := range paths {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		files = append(files, tar.File{
-			From: file.Abs(),
-			To:   file.RelRoot(),
-		})
+		info, err := os.Lstat(file.Abs())
+		if err != nil {
+			if a.OnStatErr != nil {
+				var skip bool
+				skip, err = a.OnStatErr(err)
+				if skip {
+					continue
+				}
+			}
+			if err != nil {
+				return err
+			}
+		}
 
-		info, _ := os.Lstat(file.Abs())
 		if info != nil {
 			size += info.Size()
 			size += tar.HeaderOverhead
 		}
+
+		files = append(files, tar.File{
+			From: file.Abs(),
+			To:   file.RelRoot(),
+		})
+	}
+
+	if a.SkipEmpty && len(files) == 0 {
+		return lcache.ArtifactSkip
 	}
 
 	gctx.EstimatedWriteSize(size)

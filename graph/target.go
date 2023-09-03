@@ -13,15 +13,16 @@ type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
 type Target struct {
 	specs.Target
 
-	Tools          TargetTools
-	Deps           TargetNamedDeps
-	HashDeps       TargetDeps
-	OutWithSupport *OutNamedPaths
-	Out            *OutNamedPaths
-	Env            map[string]string
-	RuntimeEnv     map[string]TargetRuntimeEnv
-	RuntimePassEnv []string
-	Platforms      []specs.Platform
+	Tools             TargetTools
+	Deps              TargetNamedDeps
+	HashDeps          TargetDeps
+	OutWithSupport    *OutNamedPaths
+	Out               *OutNamedPaths
+	RestoreCachePaths xfs.RelPaths
+	Env               map[string]string
+	RuntimeEnv        map[string]TargetRuntimeEnv
+	RuntimePassEnv    []string
+	Platforms         []specs.Platform
 
 	// Collected transitive deps from deps/tools
 	TransitiveDeps TargetTransitive
@@ -31,7 +32,7 @@ type Target struct {
 	// Own transitive config plus their own transitive
 	DeepOwnTransitive TargetTransitive
 
-	Artifacts *ArtifactOrchestrator
+	Artifacts *ArtifactRegistry
 
 	processed  bool
 	linked     bool

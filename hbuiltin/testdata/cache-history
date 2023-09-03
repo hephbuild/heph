@@ -55,7 +55,11 @@ target(
         "Named": null,
         "History": 1
     },
-    "RestoreCache": false,
+    "RestoreCache": {
+        "Enabled": false,
+        "Key": "",
+        "Paths": null
+    },
     "HasSupportFiles": false,
     "Sandbox": true,
     "OutInSandbox": false,

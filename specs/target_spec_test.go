@@ -124,7 +124,7 @@ func genTargetSpec(name string, factor int) Target {
 		Gen:        false,
 		Source:     []Source{{Name: "some_source" + time.Now().String()}},
 		RuntimeEnv: nil,
-		SrcEnv:     TargetSpecSrcEnv{},
+		SrcEnv:     SrcEnv{},
 		OutEnv:     "",
 		HashFile:   "",
 	}

@@ -20,14 +20,19 @@ type Target struct {
 	outExpansionRoot xfs.Path
 	expandLock       locks.Locker
 
-	actualOutFiles     *ActualOutNamedPaths
-	actualSupportFiles xfs.RelPaths
+	actualOutFiles          *ActualOutNamedPaths
+	actualSupportFiles      xfs.RelPaths
+	actualRestoreCacheFiles xfs.RelPaths
 
 	cacheLocks                 map[string]locks.Locker
 	cacheHashInputTargetMutex  sync.Mutex
 	cacheHashOutputTargetMutex maps.KMutex
 	cacheHashOutput            *maps.Map[string, string]
 	cacheHashInputPathsModtime map[string]time.Time
+}
+
+func (t *Target) String() string {
+	return t.Addr
 }
 
 func (t *Target) OutExpansionRoot() xfs.Path {
@@ -50,14 +55,18 @@ func (t *Target) ActualOutFiles() *ActualOutNamedPaths {
 	return t.actualOutFiles
 }
 
-func (t *Target) String() string {
-	return t.Addr
-}
-
 func (t *Target) ActualSupportFiles() xfs.RelPaths {
 	if t.actualSupportFiles == nil {
 		panic("actualSupportFiles is nil for " + t.Addr)
 	}
 
 	return t.actualSupportFiles
+}
+
+func (t *Target) ActualRestoreCacheFiles() xfs.RelPaths {
+	if t.actualRestoreCacheFiles == nil {
+		panic("actualRestoreCacheFiles is nil for " + t.Addr)
+	}
+
+	return t.actualRestoreCacheFiles
 }
