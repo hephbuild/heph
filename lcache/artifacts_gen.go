@@ -9,11 +9,15 @@ import (
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/utils/xmath"
+	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"io"
 	"math"
 	"os"
@@ -57,6 +61,137 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Target
 	return unlocker, nil
 }
 
+// createDepsGenArtifacts returns the deps for each artifact by name
+// For hashing to work properly:
+//   - each hash must be preceded by its tar
+//   - support_files must be first then the other artifacts
+func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []ArtifactWithProducer) (map[string]*worker.WaitGroup, map[string]*worker.WaitGroup) {
+	arts := target.Artifacts
+
+	deps := map[string]*worker.WaitGroup{}
+	for _, artifact := range artsp {
+		wg := &worker.WaitGroup{}
+		deps[artifact.Name()] = wg
+	}
+
+	signals := map[string]*worker.WaitGroup{}
+	for _, artifact := range artsp {
+		wg := &worker.WaitGroup{}
+		wg.AddSem()
+		signals[artifact.Name()] = wg
+	}
+
+	var support *worker.WaitGroup
+	if target.HasSupportFiles {
+		support = signals[arts.OutHash(specs.SupportFilesOutput).Name()]
+	}
+
+	for _, output := range target.OutWithSupport.Names() {
+		tname := arts.OutTar(output).Name()
+		hname := arts.OutHash(output).Name()
+
+		deps[hname].AddChild(signals[tname])
+
+		if support != nil && output != specs.SupportFilesOutput {
+			deps[tname].AddChild(support)
+		}
+	}
+
+	meta := []string{arts.InputHash.Name(), arts.Manifest.Name()}
+
+	allButMeta := &worker.WaitGroup{}
+	for _, art := range artsp {
+		if !ads.Contains(meta, art.Name()) {
+			allButMeta.AddChild(signals[art.Name()])
+		}
+	}
+
+	for _, name := range meta {
+		deps[name].AddChild(allButMeta)
+	}
+
+	return deps, signals
+}
+
+func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (_ *worker.WaitGroup, rerr error) {
+	target := gtarget.GraphTarget()
+
+	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if rerr != nil {
+			unlock()
+		}
+	}()
+
+	dir := e.cacheDir(target).Abs()
+
+	err = os.RemoveAll(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	err = os.MkdirAll(dir, os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	allDeps := &worker.WaitGroup{}
+
+	deps, signals := e.createDepsGenArtifacts(target, arts)
+
+	for _, artifact := range arts {
+		artifact := artifact
+
+		shouldCompress := artifact.Compressible() && compress
+
+		j := e.Pool.Schedule(ctx, &worker.Job{
+			Name: fmt.Sprintf("store %v|%v", target.Addr, artifact.Name()),
+			Deps: deps[artifact.Name()],
+			Hook: worker.StageHook{
+				OnEnd: func(job *worker.Job) context.Context {
+					signals[artifact.Name()].DoneSem()
+					return nil
+				},
+			},
+			Do: func(w *worker.Worker, ctx context.Context) error {
+				err := GenArtifact(ctx, dir, artifact, shouldCompress, func(percent float64) {
+					var s string
+					if target.Cache.Enabled {
+						s = xmath.FormatPercent("Caching [P]...", percent)
+					} else if len(target.Artifacts.Out) > 0 {
+						s = xmath.FormatPercent("Storing [P]...", percent)
+					}
+
+					if s != "" {
+						status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.Name(), s))
+					}
+				})
+				if err != nil {
+					return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
+				}
+
+				return nil
+			},
+		})
+		allDeps.Add(j)
+	}
+
+	go func() {
+		<-allDeps.Done()
+		unlock()
+	}()
+
+	if fgDeps := poolwait.ForegroundWaitGroup(ctx); fgDeps != nil {
+		fgDeps.AddChild(allDeps)
+	}
+
+	return allDeps, nil
+}
+
+// Deprecated: use ScheduleGenArtifacts instead
 func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
 	target := gtarget.GraphTarget()
 
@@ -81,27 +216,20 @@ func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Target
 	for i, artifact := range arts {
 		shouldCompress := artifact.Compressible() && compress
 
-		var progress func(size, written int64)
-		if status.IsInteractive(ctx) {
-			progress = func(size, written int64) {
-				percent := math.Round(xmath.Percent(written, size))
-
-				var s string
-				if target.Cache.Enabled {
-					s = xmath.FormatPercent("Caching [P]...", percent)
-				} else if len(target.Artifacts.Out) > 0 {
-					s = xmath.FormatPercent("Storing [P]...", percent)
-				}
-
-				if s != "" {
-					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(),
-						fmt.Sprintf("%v/%v %v", i+1, len(arts), s)),
-					)
-				}
+		err := GenArtifact(ctx, dir, artifact, shouldCompress, func(percent float64) {
+			var s string
+			if target.Cache.Enabled {
+				s = xmath.FormatPercent("Caching [P]...", percent)
+			} else if len(target.Artifacts.Out) > 0 {
+				s = xmath.FormatPercent("Storing [P]...", percent)
 			}
-		}
 
-		err := GenArtifact(ctx, dir, artifact, shouldCompress, progress)
+			if s != "" {
+				status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.Name(),
+					fmt.Sprintf("%v/%v %v", i+1, len(arts), s)),
+				)
+			}
+		})
 		if err != nil {
 			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
 		}
@@ -114,7 +242,7 @@ type ArtifactGenContext struct {
 	w              io.WriteCloser
 	tracker        xio.Tracker
 	accessedWriter bool
-	progress       func(size int64, written int64)
+	progress       func(percent float64)
 }
 
 func (g *ArtifactGenContext) EstimatedWriteSize(size int64) {
@@ -124,7 +252,7 @@ func (g *ArtifactGenContext) EstimatedWriteSize(size int64) {
 	}
 
 	g.tracker.OnWrite = func(written int64) {
-		progress(size, written)
+		progress(math.Round(xmath.Percent(written, size)))
 	}
 }
 
@@ -139,7 +267,11 @@ type ArtifactManifest struct {
 	Size int64
 }
 
-func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compress bool, progress func(size, written int64)) error {
+func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compress bool, progress func(percent float64)) error {
+	if progress != nil {
+		progress(-1)
+	}
+
 	compress = a.Compressible() && compress
 
 	p := filepath.Join(dir, a.FileName())

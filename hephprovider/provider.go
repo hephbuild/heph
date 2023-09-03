@@ -1,6 +1,7 @@
 package hephprovider
 
 import (
+	"context"
 	"fmt"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -16,7 +17,7 @@ const (
 	EnvSrcRoot       = "HEPH_SRC_ROOT"
 )
 
-func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (string, string, error) {
+func GetHephPath(ctx context.Context, outDir, goos, goarch, version string, shouldBuildAll bool) (string, string, error) {
 	if root := os.Getenv(EnvDistRoot); root != "" {
 		if outDir != root {
 			// In the case of e2e test, a sandbox is created inside the sandbox
@@ -50,7 +51,7 @@ func GetHephPath(outDir, goos, goarch, version string, shouldBuildAll bool) (str
 				return p, "", nil
 			}
 
-			m, err := buildAll(srcDir, outDir)
+			m, err := buildAll(ctx, srcDir, outDir)
 			if err != nil {
 				return "", "", err
 			}

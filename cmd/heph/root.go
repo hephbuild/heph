@@ -33,6 +33,7 @@ var noInline *bool
 var printOutput boolStr
 var catOutput boolStr
 var nocache *bool
+var force *bool
 var nopty *bool
 var alwaysOut *bool
 var params *[]string
@@ -47,7 +48,6 @@ func getRunOpts() bootstrap.RunOpts {
 		Plain:       *plain,
 		PrintOutput: bootstrap.BoolStr{Bool: printOutput.bool, Str: printOutput.str},
 		CatOutput:   bootstrap.BoolStr{Bool: catOutput.bool, Str: catOutput.str},
-		NoCache:     *nocache,
 	}
 }
 
@@ -58,6 +58,7 @@ func getRROpts() targetrun.RequestOpts {
 func getRROptsX(pull bool) targetrun.RequestOpts {
 	return targetrun.RequestOpts{
 		NoCache:       *nocache,
+		Force:         *force || *nocache,
 		Shell:         *shell,
 		PreserveCache: printOutput.bool || catOutput.bool,
 		NoPTY:         *nopty,
@@ -93,7 +94,8 @@ func init() {
 	logLevel = rootCmd.PersistentFlags().String("log_level", log.InfoLevel.String(), "log level")
 	profiles = rootCmd.PersistentFlags().StringArray("profile", config.ProfilesFromEnv(), "config profiles")
 	porcelain = rootCmd.PersistentFlags().Bool("porcelain", false, "Machine readable output, disables all logging")
-	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache")
+	nocache = rootCmd.PersistentFlags().Bool("no-cache", false, "Disables cache, cache restore and force run")
+	force = rootCmd.PersistentFlags().Bool("force", false, "Forcefully run a target")
 	nopty = rootCmd.PersistentFlags().Bool("no-pty", false, "Disables PTY")
 	summary = rootCmd.PersistentFlags().Bool("summary", false, "Prints execution stats")
 	summaryGen = rootCmd.PersistentFlags().Bool("summary-gen", false, "Prints execution stats, including during gen")

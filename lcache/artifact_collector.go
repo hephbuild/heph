@@ -76,7 +76,7 @@ func (e *LocalCacheState) collectNamedOutFromTar(ctx context.Context, target *gr
 		progressCh := xprogress.NewTicker(ctx, c, 10*time.Millisecond)
 
 		for p := range progressCh {
-			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Hydrating output [P]...", math.Round(xmath.Percent(p.N(), sizeSum)))))
+			status.EmitInteractive(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Hydrating output [P]...", math.Round(xmath.Percent(p.N(), sizeSum)))))
 		}
 	}()
 
@@ -116,7 +116,7 @@ func (e *LocalCacheState) outputFileListFromArtifact(ctx context.Context, target
 			progressCh := xprogress.NewTicker(ctx, u, 10*time.Millisecond)
 
 			for p := range progressCh {
-				status.Emit(ctx, tgt.TargetStatus(target,
+				status.EmitInteractive(ctx, tgt.TargetStatus(target,
 					xmath.FormatPercent("Hydrating output [P]...", math.Round(xmath.Percent(p.N(), stats.Size)))),
 				)
 			}

@@ -92,23 +92,6 @@ func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*grap
 	return e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 }
 
-type keyFgWaitGroup struct{}
-
-func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *worker.WaitGroup) {
-	deps := &worker.WaitGroup{}
-	ctx = context.WithValue(ctx, keyFgWaitGroup{}, deps)
-
-	return ctx, deps
-}
-
-func ForegroundWaitGroup(ctx context.Context) *worker.WaitGroup {
-	if deps, ok := ctx.Value(keyFgWaitGroup{}).(*worker.WaitGroup); ok {
-		return deps
-	}
-
-	return nil
-}
-
 func (e *Scheduler) CleanTarget(target *graph.Target, async bool) error {
 	err := e.LocalCache.CleanTarget(target, async)
 	if err != nil {

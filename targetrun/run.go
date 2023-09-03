@@ -32,6 +32,7 @@ type Request struct {
 
 type RequestOpts struct {
 	NoCache bool
+	Force   bool
 	Shell   bool
 	// Force preserving cache for uncached targets when --print-out is enabled
 	PreserveCache bool
@@ -272,7 +273,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 		return nil, err
 	}
 
-	artifactProducers := e.orderedArtifactProducers(ltarget, rtarget.OutRoot.Abs(), logFilePath)
+	artifactProducers := e.artifactWithProducers(ltarget, rtarget.OutRoot.Abs(), logFilePath)
 
 	err = e.LocalCache.StoreCache(ctx, target, artifactProducers, rr.Compress)
 	if err != nil {

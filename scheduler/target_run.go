@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/worker/poolwait"
 )
 
 func (e *Scheduler) RunWithSpan(ctx context.Context, rr targetrun.Request, iocfg sandbox.IOConfig) (rerr error) {
@@ -22,7 +23,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 
 	gtarget := rr.Target
 
-	if gtarget.Cache.Enabled && !rr.Shell && !rr.NoCache {
+	if gtarget.Cache.Enabled && !rr.Shell && !rr.Force {
 		if len(rr.Args) > 0 {
 			return fmt.Errorf("args are not supported with cache")
 		}
@@ -63,7 +64,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 		for _, cache := range writeableCaches {
 			j := e.scheduleStoreExternalCache(ctx, target.Target, cache)
 
-			if poolDeps := ForegroundWaitGroup(ctx); poolDeps != nil {
+			if poolDeps := poolwait.ForegroundWaitGroup(ctx); poolDeps != nil {
 				poolDeps.Add(j)
 			}
 		}

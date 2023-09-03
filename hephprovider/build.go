@@ -1,8 +1,11 @@
 package hephprovider
 
 import (
+	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xsync"
@@ -57,16 +60,26 @@ type buildMatrix = maps.OMap[string, string]
 
 var buildOnce = xsync.Once[*buildMatrix]{}
 
-func buildAll(srcDir, outDir string) (*buildMatrix, error) {
+func buildAll(ctx context.Context, srcDir, outDir string) (*buildMatrix, error) {
+	status.Emit(ctx, status.String("Building heph..."))
+
 	return buildOnce.Do(func() (*buildMatrix, error) {
-		return doBuildAll(srcDir, outDir)
+		return doBuildAll(ctx, srcDir, outDir)
 	})
 }
 
-func doBuildAll(srcDir, outDir string) (*buildMatrix, error) {
+func doBuildAll(ctx context.Context, srcDir, outDir string) (*buildMatrix, error) {
 	log.Debugf("building heph: src:%v out:%v matrix: %v", srcDir, outDir, matrix)
 
-	err := os.MkdirAll(outDir, os.ModePerm)
+	l := locks.NewFlock("", filepath.Join(outDir, "lock"))
+	err := l.Lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	defer l.Unlock()
+
+	err = os.MkdirAll(outDir, os.ModePerm)
 	if err != nil {
 		return nil, err
 	}

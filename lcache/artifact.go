@@ -69,7 +69,7 @@ func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, ar
 				_, err = xio.Copy(tf, gr, func(written int64) {
 					percent := math.Round(xmath.Percent(written, size))
 
-					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Decompressing [P]...", percent)))
+					status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Decompressing [P]...", percent)))
 				})
 			} else {
 				_, err = io.Copy(tf, gr)

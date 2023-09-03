@@ -23,6 +23,7 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/vfssimple"
+	"github.com/hephbuild/heph/worker"
 	"io"
 	"io/fs"
 	"math"
@@ -33,19 +34,21 @@ import (
 )
 
 type LocalCacheState struct {
-	Location      *vfsos.Location
-	Path          xfs.Path
-	Targets       *graph.Targets
-	Metas         *TargetMetas[*Target]
-	Root          *hroot.State
-	Observability *observability.Observability
-	Finalizers    *finalizers.Finalizers
-	EnableGC      bool
+	Location        *vfsos.Location
+	Path            xfs.Path
+	Targets         *graph.Targets
+	Metas           *TargetMetas[*Target]
+	Root            *hroot.State
+	Observability   *observability.Observability
+	Finalizers      *finalizers.Finalizers
+	EnableGC        bool
+	ParallelCaching bool
+	Pool            *worker.Pool
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc bool) (*LocalCacheState, error) {
+func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -53,13 +56,15 @@ func NewState(root *hroot.State, targets *graph.Targets, obs *observability.Obse
 	}
 
 	s := &LocalCacheState{
-		Location:      loc.(*vfsos.Location),
-		Path:          cachePath,
-		Targets:       targets,
-		Root:          root,
-		Observability: obs,
-		Finalizers:    finalizers,
-		EnableGC:      gc,
+		Location:        loc.(*vfsos.Location),
+		Path:            cachePath,
+		Targets:         targets,
+		Root:            root,
+		Observability:   obs,
+		Finalizers:      finalizers,
+		EnableGC:        gc,
+		ParallelCaching: parallelCaching,
+		Pool:            pool,
 		Metas: NewTargetMetas(func(k targetMetaKey) *Target {
 			gtarget := targets.Find(k.addr)
 
@@ -118,9 +123,22 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 		return err
 	}
 
-	err = e.GenArtifacts(ctx, target, artifacts, compress)
-	if err != nil {
-		return err
+	if e.ParallelCaching {
+		genDeps, err := e.ScheduleGenArtifacts(ctx, target, artifacts, compress)
+		if err != nil {
+			return err
+		}
+
+		err = worker.WaitWaitGroup(ctx, genDeps)
+		if err != nil {
+			return err
+		}
+
+	} else {
+		err := e.GenArtifacts(ctx, target, artifacts, compress)
+		if err != nil {
+			return err
+		}
 	}
 
 	return e.LinkLatestCache(target, hash)
@@ -399,11 +417,11 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 			}
 
 			var progress func(written int64)
-			if manifest.Size > 0 && status.IsInteractive(ctx) {
+			if manifest.Size > 0 {
 				progress = func(written int64) {
 					percent := math.Round(xmath.Percent(written, manifest.Size))
 
-					status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Expanding cache [P]...", percent)))
+					status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.Name(), xmath.FormatPercent("Expanding cache [P]...", percent)))
 				}
 			}
 

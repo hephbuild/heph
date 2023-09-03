@@ -13,26 +13,25 @@ type artifactProducer struct {
 	lcache.ArtifactProducer
 }
 
-// orderedArtifactProducers returns artifact in hashing order
-// For hashing to work properly, support_files tar must go first, then support_files hash
-// then the other artifacts
-func (e *Runner) orderedArtifactProducers(t *lcache.Target, outRoot, logFilePath string) []lcache.ArtifactWithProducer {
+func (e *Runner) artifactWithProducers(t *lcache.Target, outRoot, logFilePath string) []lcache.ArtifactWithProducer {
 	arts := t.Artifacts
 
-	all := make([]lcache.ArtifactWithProducer, 0, len(arts.Out)+2)
+	all := make([]lcache.ArtifactWithProducer, 0, len(arts.Out)+4)
 	all = append(all, artifactProducer{arts.Log, logArtifact{
 		LogFilePath: logFilePath,
 	}})
-	names := mds.Keys(arts.Out)
-	names = specs.SortOutputsForHashing(names)
-	for _, name := range names {
-		a := arts.Out[name]
+
+	outputs := mds.Keys(arts.Out)
+	outputs = specs.SortOutputsForHashing(outputs)
+
+	for _, output := range outputs {
+		a := arts.Out[output]
 
 		var rpaths xfs.RelPaths
-		if name == specs.SupportFilesOutput {
+		if output == specs.SupportFilesOutput {
 			rpaths = t.ActualSupportFiles()
 		} else {
-			rpaths = t.ActualOutFiles().Name(name)
+			rpaths = t.ActualOutFiles().Name(output)
 		}
 		all = append(all, artifactProducer{a.Tar(), outTarArtifact{
 			Target:  t,
@@ -43,7 +42,7 @@ func (e *Runner) orderedArtifactProducers(t *lcache.Target, outRoot, logFilePath
 		all = append(all, artifactProducer{a.Hash(), hashOutputArtifact{
 			LocalState: e.LocalCache,
 			Target:     t,
-			Output:     name,
+			Output:     output,
 		}})
 	}
 	if a, ok := arts.GetRestoreCache(); ok {

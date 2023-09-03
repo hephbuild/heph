@@ -12,10 +12,11 @@ type FileConfig struct {
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`
 	Engine struct {
-		GC           *bool `yaml:"gc"`
-		CacheHints   *bool `yaml:"cache_hints"`
-		InstallTools *bool `yaml:"install_tools"`
-		KeepSandbox  *bool `yaml:"keep_sandbox"`
+		GC              *bool `yaml:"gc"`
+		CacheHints      *bool `yaml:"cache_hints"`
+		InstallTools    *bool `yaml:"install_tools"`
+		KeepSandbox     *bool `yaml:"keep_sandbox"`
+		ParallelCaching *bool `yaml:"parallel_caching"`
 	} `yaml:"engine"`
 	Platforms  map[string]FilePlatform `yaml:"platforms"`
 	BuildFiles struct {
@@ -56,6 +57,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Engine.KeepSandbox != nil {
 		c.Engine.KeepSandbox = *fc.Engine.KeepSandbox
+	}
+
+	if fc.Engine.ParallelCaching != nil {
+		c.Engine.ParallelCaching = *fc.Engine.ParallelCaching
 	}
 
 	if fc.Engine.GC != nil {

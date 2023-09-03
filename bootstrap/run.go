@@ -62,7 +62,7 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 
 	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
 	// The DoneSem() must be called after all the tdeps have finished
-	ctx, fgDeps := scheduler.ContextWithForegroundWaitGroup(ctx)
+	ctx, fgDeps := poolwait.ContextWithForegroundWaitGroup(ctx)
 	fgDeps.AddSem()
 
 	var skip []specs.Specer

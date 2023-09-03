@@ -88,7 +88,7 @@ backend_pkg = heph.pkg.addr()
 def go_install(name, pkg, version, bin_name):
     return target(
         name=name,
-        run="export GOBIN=$(pwd)/gobin && go install {}@{}".format(pkg, version),
+        run="export GOBIN=$(pwd)/gobin && go install -modcacherw {}@{}".format(pkg, version),
         tools=[go],
         out="gobin/"+bin_name,
         env={

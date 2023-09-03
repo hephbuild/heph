@@ -30,10 +30,11 @@ type Config struct {
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`
 	Engine struct {
-		GC           bool `yaml:"gc"`
-		CacheHints   bool `yaml:"cache_hints"`
-		InstallTools bool `yaml:"install_tools"`
-		KeepSandbox  bool `yaml:"keep_sandbox"`
+		GC              bool `yaml:"gc"`
+		CacheHints      bool `yaml:"cache_hints"`
+		InstallTools    bool `yaml:"install_tools"`
+		KeepSandbox     bool `yaml:"keep_sandbox"`
+		ParallelCaching bool `yaml:"parallel_caching"`
 	} `yaml:"engine"`
 	Platforms  map[string]Platform `yaml:"platforms"`
 	BuildFiles struct {

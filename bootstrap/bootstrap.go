@@ -245,7 +245,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, error) {
 	fins := &finalizers.Finalizers{}
 
-	localCache, err := lcache.NewState(bs.Root, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC)
+	localCache, err := lcache.NewState(bs.Root, bs.Pool, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC, bs.Config.Engine.ParallelCaching)
 	if err != nil {
 		return nil, err
 	}

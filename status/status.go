@@ -8,6 +8,7 @@ import (
 
 type Handler interface {
 	Status(status Statuser)
+	Interactive() bool
 }
 
 type Statuser interface {
@@ -20,26 +21,54 @@ func ContextWithHandler(ctx context.Context, handler Handler) context.Context {
 	return context.WithValue(ctx, handlerKey{}, handler)
 }
 
-var lastLogEmitted string
+func HandlerFromContext(ctx context.Context) (Handler, bool) {
+	h, ok := ctx.Value(handlerKey{}).(Handler)
+	return h, ok
+}
 
-func Emit(ctx context.Context, s Statuser) {
-	if h, ok := ctx.Value(handlerKey{}).(Handler); ok {
-		h.Status(s)
-	} else {
-		r := log.Renderer()
+type defaultHandler struct {
+	lastEmitted string
+}
 
-		str := s.String(r)
+func (h *defaultHandler) Interactive() bool {
+	return false
+}
 
-		if str != lastLogEmitted {
-			log.Default().Info(str)
-			lastLogEmitted = str
-		}
+func (h *defaultHandler) Status(s Statuser) {
+	r := log.Renderer()
+
+	str := s.String(r)
+
+	if str != h.lastEmitted {
+		log.Default().Info(str)
+		h.lastEmitted = str
 	}
 }
 
+var DefaultHandler Handler = &defaultHandler{}
+
+func Emit(ctx context.Context, s Statuser) {
+	h, ok := HandlerFromContext(ctx)
+	if !ok {
+		h = DefaultHandler
+	}
+	h.Status(s)
+}
+
+func EmitInteractive(ctx context.Context, s Statuser) {
+	h, ok := HandlerFromContext(ctx)
+	if !ok {
+		h = DefaultHandler
+	}
+	if !h.Interactive() {
+		return
+	}
+	h.Status(s)
+}
+
 func IsInteractive(ctx context.Context) bool {
-	if _, ok := ctx.Value(handlerKey{}).(Handler); ok {
-		return true
+	if h, ok := ctx.Value(handlerKey{}).(Handler); ok {
+		return h.Interactive()
 	}
 
 	return false

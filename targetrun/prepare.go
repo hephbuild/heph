@@ -134,6 +134,8 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	ctx, span := e.Observability.SpanRunPrepare(ctx, target)
 	defer span.EndError(rerr)
 
+	status.Emit(ctx, tgt.TargetStatus(target, "Preparing..."))
+
 	rtarget := &Target{
 		Target:      target,
 		SandboxRoot: e.sandboxRoot(target).Join("_dir"),
@@ -179,7 +181,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		var err error
 		if t.BinName == "heph" {
 			bin[t.Name], hephDistRoot, err = hephprovider.GetHephPath(
-				e.Root.Tmp.Join("__heph", utils.Version).Abs(),
+				ctx, e.Root.Tmp.Join("__heph", utils.Version).Abs(),
 				executor.Os(), executor.Arch(), utils.Version,
 				true, /*!platform.HasHostFsAccess(executor)*/
 			)
@@ -205,7 +207,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	status.Emit(ctx, tgt.TargetStatus(target, "Creating sandbox..."))
 
 	restoreSrcRec := &SrcRecorder{}
-	if target.RestoreCache.Enabled {
+	if target.RestoreCache.Enabled && !rr.NoCache {
 		if e.LocalCache.LatestCacheDirExists(target) {
 			done := log.TraceTiming("Restoring cache")
 
@@ -332,18 +334,15 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		Files:     append(srcRec.Src(), restoreSrcRec.Src()...),
 		LinkFiles: linkSrcRec.Src(),
 		FilesTar:  append(srcRec.SrcTar(), restoreSrcRec.SrcTar()...),
-	}
-
-	if status.IsInteractive(ctx) {
-		makeCfg.ProgressFiles = func(percent float64) {
-			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying files [P]...", percent)))
-		}
-		makeCfg.ProgressTars = func(percent float64) {
-			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying deps [P]...", percent)))
-		}
-		makeCfg.ProgressLinks = func(percent float64) {
-			status.Emit(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: linking deps [P]...", percent)))
-		}
+		ProgressFiles: func(percent float64) {
+			status.EmitInteractive(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying files [P]...", percent)))
+		},
+		ProgressTars: func(percent float64) {
+			status.EmitInteractive(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: copying deps [P]...", percent)))
+		},
+		ProgressLinks: func(percent float64) {
+			status.EmitInteractive(ctx, tgt.TargetStatus(target, xmath.FormatPercent("Preparing sandbox: linking deps [P]...", percent)))
+		},
 	}
 
 	err = sandbox.Make(ctx, makeCfg)

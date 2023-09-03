@@ -100,12 +100,94 @@ type Job struct {
 	doneCh chan struct{}
 	err    error
 
+	runCh    chan error
+	pauseCh  chan struct{}
+	pausedCh chan struct{}
+	resumeCh chan struct{}
+
 	TimeScheduled time.Time
 	TimeQueued    time.Time
 	TimeStart     time.Time
 	TimeEnd       time.Time
 
 	m sync.Mutex
+}
+
+func (j *Job) prepare() (<-chan error, <-chan struct{}) {
+	j.m.Lock()
+	defer j.m.Unlock()
+
+	if j.runCh == nil {
+		j.runCh = make(chan error)
+	}
+
+	j.pauseCh = make(chan struct{})
+
+	return j.runCh, j.pauseCh
+}
+
+func (j *Job) pause() chan struct{} {
+	j.m.Lock()
+
+	if j.resumeCh != nil {
+		panic("pause on paused job")
+	}
+
+	j.resumeCh = make(chan struct{})
+	j.pausedCh = make(chan struct{})
+
+	close(j.pauseCh)
+
+	return j.resumeCh
+}
+
+func (j *Job) pauseAck(w *Worker) {
+	defer j.m.Unlock()
+
+	h, _ := status.HandlerFromContext(j.ctx)
+	h.(*dynamicStatusHandler).Set(nil)
+	w.CurrentJob = nil
+
+	close(j.pausedCh)
+}
+
+func (j *Job) resume(w *Worker) {
+	j.m.Lock()
+	defer j.m.Unlock()
+
+	if j.resumeCh == nil {
+		panic("resume on unpaused job")
+	}
+
+	w.CurrentJob = j
+
+	// Change status.Handler to current worker
+	h, _ := status.HandlerFromContext(j.ctx)
+	h.(*dynamicStatusHandler).Set(w)
+
+	close(j.resumeCh)
+	j.resumeCh = nil
+}
+
+func (j *Job) run(w *Worker) {
+	j.ctx = status.ContextWithHandler(j.ctx, &dynamicStatusHandler{Handler: w})
+
+	j.TimeStart = time.Now()
+	j.State = StateRunning
+	w.CurrentJob = j
+
+	j.RunHook()
+	err := xpanic.Recover(func() error {
+		return j.Do(w, j.ctx)
+	}, xpanic.Wrap(func(err any) error {
+		return fmt.Errorf("panic in %v: %v => %v", j.Name, err, string(debug.Stack()))
+	}))
+
+	j.TimeEnd = time.Now()
+	w.Status(status.String(""))
+	w.CurrentJob = nil
+
+	j.runCh <- err
 }
 
 func (j *Job) RunHook() {
@@ -162,6 +244,7 @@ func (j *Job) doneWithState(state JobState) {
 	j.State = state
 	close(j.doneCh)
 	j.RunHook()
+	//j.cancel()
 }
 
 func (j *Job) IsDone() bool {
@@ -185,9 +268,13 @@ var stringRenderer = lipgloss.NewRenderer(io.Discard, termenv.WithColorCache(tru
 
 func (w *Worker) Status(status status.Statuser) {
 	w.status = status
-	if status := status.String(stringRenderer); status != "" {
-		log.Debug(status)
+	if s := status.String(stringRenderer); s != "" {
+		log.Debug(s)
 	}
+}
+
+func (w *Worker) Interactive() bool {
+	return true
 }
 
 type Pool struct {
@@ -230,24 +317,22 @@ func NewPool(n int) *Pool {
 					continue
 				}
 
-				j.ctx = status.ContextWithHandler(j.ctx, w)
+				runCh, pauseCh := j.prepare()
 
-				j.TimeStart = time.Now()
-				j.State = StateRunning
-				w.CurrentJob = j
+				if j.resumeCh == nil {
+					go func() {
+						j.run(w)
+					}()
+				} else {
+					j.resume(w)
+				}
 
-				j.RunHook()
-				err := xpanic.Recover(func() error {
-					return j.Do(w, j.ctx)
-				}, xpanic.Wrap(func(err any) error {
-					return fmt.Errorf("panic in %v: %v => %v", j.Name, err, string(debug.Stack()))
-				}))
-
-				j.TimeEnd = time.Now()
-				w.CurrentJob = nil
-				w.Status(status.String(""))
-
-				p.finalize(j, err, false)
+				select {
+				case err := <-runCh:
+					p.finalize(j, err, false)
+				case <-pauseCh:
+					j.pauseAck(w)
+				}
 			}
 		}()
 	}
@@ -267,7 +352,7 @@ func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	job.ID = atomic.AddUint64(&p.idc, 1)
 	job.State = StateScheduled
 	job.TimeScheduled = time.Now()
-	job.ctx = ctx
+	job.ctx = ContextWithPoolJob(ctx, p, job)
 	job.cancel = cancel
 	job.doneCh = make(chan struct{})
 	if job.Deps == nil {

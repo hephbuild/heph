@@ -138,7 +138,7 @@ func (s *schedulerv2) schedule() error {
 				rr := s.rrs.Get(target)
 
 				g, err := s.ScheduleTargetGetCacheOrRunOnce(
-					ctx, target, !rr.NoCache,
+					ctx, target, !rr.Force && !rr.NoCache,
 					rr.PullCache || target.Codegen != specs.CodegenNone,
 					false,
 				)

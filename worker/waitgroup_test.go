@@ -169,3 +169,50 @@ func TestStress(t *testing.T) {
 
 	assert.Equal(t, int32(400), tr.c)
 }
+
+func TestPause(t *testing.T) {
+	t.Parallel()
+
+	// Pool only has a single worker
+	p := NewPool(1)
+	defer p.Stop(nil)
+	ctx := context.Background()
+
+	var c int64
+
+	mj := p.Schedule(ctx, &Job{
+		Do: func(w *Worker, ctx context.Context) error {
+			// Spawn another job
+			j := p.Schedule(ctx, &Job{
+				Do: func(w *Worker, ctx context.Context) error {
+					atomic.AddInt64(&c, 1)
+					return nil
+				},
+			})
+
+			// Wait for that job, this would deadlock without the Wait
+			Wait(ctx, func() {
+				<-j.Wait()
+			})
+
+			// Repeat
+
+			j = p.Schedule(ctx, &Job{
+				Do: func(w *Worker, ctx context.Context) error {
+					atomic.AddInt64(&c, 1)
+					return nil
+				},
+			})
+
+			Wait(ctx, func() {
+				<-j.Wait()
+			})
+
+			return nil
+		},
+	})
+
+	<-mj.Wait()
+
+	assert.Equal(t, int64(2), c)
+}

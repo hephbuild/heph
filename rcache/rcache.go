@@ -141,16 +141,11 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 		return err
 	}
 
-	var progress func(percent float64)
-	if status.IsInteractive(ctx) {
-		progress = func(percent float64) {
-			status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
-				xmath.FormatPercent(fmt.Sprintf("Downloading from %v [P]...", cache.Name), percent)),
-			)
-		}
-	}
-
-	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifactExternalFileName(artifact), true, progress)
+	copied, err := e.vfsCopyFileIfNotExists(ctx, remoteRoot, localRoot, artifactExternalFileName(artifact), true, func(percent float64) {
+		status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
+			xmath.FormatPercent(fmt.Sprintf("Downloading from %v [P]...", cache.Name), percent)),
+		)
+	})
 	if err != nil {
 		return err
 	}
@@ -192,16 +187,11 @@ func (e *RemoteCache) StoreArtifact(ctx context.Context, ttarget graph.Targeter,
 		return err
 	}
 
-	var progress func(percent float64)
-	if status.IsInteractive(ctx) {
-		progress = func(percent float64) {
-			status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
-				xmath.FormatPercent(fmt.Sprintf("Uploading to %v [P]...", cache.Name), percent)),
-			)
-		}
-	}
-
-	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifactExternalFileName(artifact), false, progress)
+	err = e.vfsCopyFile(ctx, localRoot, remoteRoot, artifactExternalFileName(artifact), false, func(percent float64) {
+		status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(),
+			xmath.FormatPercent(fmt.Sprintf("Uploading to %v [P]...", cache.Name), percent)),
+		)
+	})
 	if err != nil {
 		return err
 	}

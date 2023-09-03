@@ -5,7 +5,6 @@ type RunOpts struct {
 	Plain       bool    // Disable TUI
 	PrintOutput BoolStr // Print output paths
 	CatOutput   BoolStr // Print output content
-	NoCache     bool    // Disable cache
 }
 
 type BoolStr struct {
