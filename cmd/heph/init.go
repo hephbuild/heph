@@ -91,6 +91,15 @@ func schedulerInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) e
 	return bs, nil
 }
 
+func bootstrapBase(ctx context.Context) (bootstrap.BaseBootstrap, error) {
+	opts, err := bootstrapOptions()
+	if err != nil {
+		return bootstrap.BaseBootstrap{}, err
+	}
+
+	return bootstrap.BootBase(ctx, opts)
+}
+
 func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 	opts, err := bootstrapOptions()
 	if err != nil {

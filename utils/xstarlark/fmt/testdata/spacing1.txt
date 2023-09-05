@@ -1,0 +1,6 @@
+for k in a:
+  aaa
+
+----
+for k in a:
+  aaa

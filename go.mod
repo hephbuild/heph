@@ -4,6 +4,8 @@ go 1.20
 
 replace github.com/spf13/cobra v1.7.0 => github.com/raphaelvigee/cobra v0.0.0-20221020122344-217ca52feee0
 
+replace go.starlark.net => github.com/raphaelvigee/starlark-go v0.0.0-20230906105503-b71494f27e4a
+
 require (
 	github.com/Khan/genqlient v0.6.0
 	github.com/aarondl/json v0.0.0-20221020222930-8b0db17ef1bf

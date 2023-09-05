@@ -5,11 +5,9 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/mds"
 	"golang.org/x/exp/slices"
+	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
-)
-import (
-	"gopkg.in/yaml.v3"
 )
 
 type BaseConfig struct {
@@ -48,6 +46,9 @@ type Config struct {
 	Watch struct {
 		Ignore []string `yaml:"ignore"`
 	} `yaml:"watch"`
+	Fmt struct {
+		IndentSize int `yaml:"indent_size,omitempty"`
+	} `yaml:"fmt"`
 	Params map[string]string `yaml:"params"`
 
 	Extras `yaml:",inline"`

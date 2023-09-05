@@ -1,0 +1,3 @@
+a='echo "blah \\"quotedblah\\" blah"'
+----
+a = 'echo "blah \\"quotedblah\\" blah"'

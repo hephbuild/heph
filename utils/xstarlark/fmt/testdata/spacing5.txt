@@ -1,0 +1,11 @@
+if True:
+  do()
+
+var = {
+  "key": value,
+}
+----
+if True:
+  do()
+
+var = {"key": value}

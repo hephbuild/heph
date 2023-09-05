@@ -25,6 +25,7 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 		},
 	}
 	cfg.Watch.Ignore = append(cfg.Watch.Ignore, root.Home.Join("**/*").Abs())
+	cfg.Fmt.IndentSize = 4
 
 	err := config.ParseAndApply("/etc/.hephconfig", &cfg)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {

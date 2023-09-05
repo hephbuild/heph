@@ -1,0 +1,11 @@
+a = """
+hello \
+some \
+arg
+"""
+----
+a = """
+hello \
+some \
+arg
+"""

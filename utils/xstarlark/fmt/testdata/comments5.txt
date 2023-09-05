@@ -1,0 +1,11 @@
+target(
+    name="a",
+    # some com
+)
+a=b
+----
+target(
+  name = "a",
+  # some com
+)
+a = b

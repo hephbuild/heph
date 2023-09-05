@@ -3,12 +3,17 @@ package main
 import (
 	"fmt"
 	"github.com/hephbuild/heph/bootstrap"
+	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
+	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/spf13/cobra"
+	"go.uber.org/multierr"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -34,6 +39,7 @@ var params *[]string
 var summary *bool
 var summaryGen *bool
 var jaegerEndpoint *string
+var check *bool
 
 func getRunOpts() bootstrap.RunOpts {
 	return bootstrap.RunOpts{
@@ -70,6 +76,8 @@ func init() {
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&catOutput, "cat-out", "", "Print target output content, --cat-out=<name> to filter output"))
 	alwaysOut = runCmd.Flags().Bool("always-out", false, "Ensure output will be present in cache")
 
+	check = fmtCmd.Flags().Bool("check", false, "Only check formatting")
+
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
@@ -78,6 +86,7 @@ func init() {
 	rootCmd.AddCommand(validateCmd)
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(searchCmd)
+	rootCmd.AddCommand(fmtCmd)
 
 	cpuprofile = rootCmd.PersistentFlags().String("cpuprofile", "", "CPU Profile file")
 	memprofile = rootCmd.PersistentFlags().String("memprofile", "", "Mem Profile file")
@@ -297,5 +306,56 @@ var setupCmd = &cobra.Command{
 		}
 
 		return nil
+	},
+}
+
+var fmtCmd = &cobra.Command{
+	Use:   "fmt",
+	Short: "Format build files",
+	Args:  cobra.ArbitraryArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		bs, err := bootstrapBase(ctx)
+		if err != nil {
+			return err
+		}
+
+		buildfilesState := buildfiles.NewState(buildfiles.State{
+			Ignore: bs.Config.BuildFiles.Ignore,
+		})
+
+		var files []string
+		if len(args) == 0 {
+			cfiles, err := buildfilesState.CollectFiles(ctx, bs.Root.Root.Abs())
+			if err != nil {
+				return err
+			}
+
+			files = ads.Map(cfiles, func(f *packages.SourceFile) string {
+				return f.Path
+			})
+		} else {
+			files = args
+		}
+
+		cfg := xstarlark.FmtConfig{
+			IndentSize: bs.Config.Fmt.IndentSize,
+		}
+
+		var errs error
+		for _, file := range files {
+			f := xstarlark.FmtFix
+			if *check {
+				f = xstarlark.FmtCheck
+			}
+
+			err := f(file, cfg)
+			if err != nil {
+				errs = multierr.Append(errs, fmt.Errorf("%v: %w", file, err))
+			}
+		}
+
+		return errs
 	},
 }

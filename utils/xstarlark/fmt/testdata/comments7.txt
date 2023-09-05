@@ -1,0 +1,9 @@
+def name():
+    target(
+        # some com
+    )
+----
+def name():
+  target(
+    # some com
+  )

@@ -1,0 +1,10 @@
+def name():
+  call_func()
+for k in a:
+  pass
+----
+def name():
+  call_func()
+
+for k in a:
+  pass

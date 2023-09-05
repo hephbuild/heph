@@ -1,0 +1,16 @@
+# before
+if True: #ifsuff
+    # com1
+    pass #suff1
+    # com2
+    pass #suff2
+#after
+----
+# before
+if True:
+  # com1
+  pass # suff1
+
+  # com2
+  pass # suff2
+# after

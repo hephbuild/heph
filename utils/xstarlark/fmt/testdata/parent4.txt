@@ -1,0 +1,9 @@
+var={
+    # some com
+    "test": "value",
+}
+----
+var = {
+  # some com
+  "test": "value",
+}

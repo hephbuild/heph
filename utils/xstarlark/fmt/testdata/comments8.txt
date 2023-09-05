@@ -1,0 +1,15 @@
+def name(
+    # pre com
+    name = 1,
+    # post com
+):
+    # some body com
+    pass
+----
+def name(
+  # pre com
+  name = 1,
+  # post com
+):
+  # some body com
+  pass

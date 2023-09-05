@@ -28,6 +28,9 @@ type FileConfig struct {
 	Watch struct {
 		Ignore []string `yaml:"ignore,omitempty"`
 	} `yaml:"watch"`
+	Fmt struct {
+		IndentSize int `yaml:"indent_size,omitempty"`
+	} `yaml:"fmt"`
 	Params map[string]string `yaml:"params"`
 	Extras `yaml:",inline"`
 }
@@ -107,6 +110,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)
 	c.BuildFiles.Glob.Exclude = append(c.BuildFiles.Glob.Exclude, fc.BuildFiles.Glob.Exclude...)
 	c.Watch.Ignore = append(c.Watch.Ignore, fc.Watch.Ignore...)
+
+	if fc.Fmt.IndentSize != 0 {
+		c.Fmt.IndentSize = fc.Fmt.IndentSize
+	}
 
 	if c.Extras == nil {
 		c.Extras = map[string]interface{}{}

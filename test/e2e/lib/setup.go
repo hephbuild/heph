@@ -54,3 +54,11 @@ func CleanSetup() error {
 
 	return nil
 }
+
+func Fmt() error {
+	cmd := command("fmt")
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+
+	return cmd.Run()
+}

@@ -1,0 +1,13 @@
+var=[
+	('key1', {
+		'child': some_long_func(),
+	}),
+	('key2', {
+		'child': some_long_func()
+	}),
+]
+----
+var = [
+  ("key1", {"child": some_long_func()}),
+  ("key2", {"child": some_long_func()}),
+]

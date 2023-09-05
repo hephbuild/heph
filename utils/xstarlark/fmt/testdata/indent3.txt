@@ -1,0 +1,19 @@
+target(
+  run = [
+    '''
+      some long script
+      some long script
+      some long script
+    ''',
+  ],
+)
+----
+target(
+  run = [
+    '''
+      some long script
+      some long script
+      some long script
+    ''',
+  ],
+)

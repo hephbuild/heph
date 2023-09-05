@@ -1,0 +1,5 @@
+for k, v in vars:
+    pass
+----
+for (k, v) in vars:
+  pass

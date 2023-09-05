@@ -1,0 +1,5 @@
+a=b
+# after
+----
+a = b
+# after

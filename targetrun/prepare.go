@@ -129,7 +129,7 @@ func (e *Runner) toolAbsPath(tt graph.TargetTool) string {
 	return tt.File.WithRoot(e.LocalCache.Metas.Find(tt.Target).OutExpansionRoot().Abs()).Abs()
 }
 
-func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode string) (_ *Target, rerr error) {
+func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Request) (_ *Target, rerr error) {
 	ctx, span := e.Observability.SpanRunPrepare(ctx, target)
 	defer span.EndError(rerr)
 
@@ -243,7 +243,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 
 			if dep.Mode == specs.DepModeLink {
 				outDir := e.LocalCache.Metas.Find(dept).OutExpansionRoot().Abs()
-				for _, file := range dept.ActualOutFiles().WithRoot(outDir).Name(dep.Output) {
+				for _, file := range dept.ActualOutFiles().Name(dep.Output).WithRoot(outDir) {
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
@@ -366,7 +366,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 	env["ROOT"] = rtarget.WorkdirRoot.Abs()
 	env["SANDBOX"] = rtarget.SandboxRoot.Abs()
 	if !target.Cache.Enabled {
-		mode := mode
+		mode := rr.Mode
 		if mode == "" {
 			mode = "run"
 		}
@@ -396,7 +396,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, mode stri
 		env[hephprovider.EnvDistRoot] = hephDistRoot
 	}
 
-	if !(target.SrcEnv.Default == specs.FileEnvIgnore && len(target.SrcEnv.Named) == 0) {
+	if target.SrcEnv.Default != specs.FileEnvIgnore && len(envSrcRec.Named()) > 0 {
 		for name, paths := range envSrcRec.Named() {
 			if strings.HasPrefix(name, "_") {
 				continue

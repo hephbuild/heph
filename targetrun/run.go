@@ -69,7 +69,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 		log.Tracef("Target DONE %v", target.Addr)
 	}()
 
-	rtarget, err := e.runPrepare(ctx, target, rr.Mode)
+	rtarget, err := e.runPrepare(ctx, target, rr)
 	if err != nil {
 		return nil, fmt.Errorf("prepare: %w", err)
 	}
