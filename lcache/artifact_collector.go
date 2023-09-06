@@ -2,6 +2,7 @@ package lcache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
 	"github.com/hephbuild/heph/graph"
@@ -43,8 +44,8 @@ func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Targe
 
 	if art, ok := target.Artifacts.GetRestoreCache(); ok {
 		target.actualRestoreCacheFiles, err = e.outputFileListFromArtifact(ctx, target, art, nil)
-		if err != nil {
-			return fmt.Errorf("support: %w", err)
+		if err != nil && !errors.Is(err, artifacts.ErrNotFound) {
+			return fmt.Errorf("cache: %w", err)
 		}
 	}
 

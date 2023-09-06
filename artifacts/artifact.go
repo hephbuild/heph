@@ -78,6 +78,8 @@ func ToSlice[T Artifact](as []T) []Artifact {
 	})
 }
 
+var ErrNotFound = errors.New("artifact not found")
+
 func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadCloser, error) {
 	uncompressedPath := filepath.Join(dir, artifact.FileName())
 	f, err := os.Open(uncompressedPath)
@@ -107,5 +109,5 @@ func UncompressedReaderFromArtifact(artifact Artifact, dir string) (io.ReadClose
 		}
 	}
 
-	return nil, fmt.Errorf("%v: artifact not found", artifact.Name())
+	return nil, fmt.Errorf("%v: %w", artifact.Name(), ErrNotFound)
 }
