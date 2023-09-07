@@ -13,6 +13,7 @@ import (
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
+	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/platform"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/specs"
@@ -396,7 +397,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		env[hephprovider.EnvDistRoot] = hephDistRoot
 	}
 
-	if target.SrcEnv.Default != specs.FileEnvIgnore && len(envSrcRec.Named()) > 0 {
+	if target.SrcEnv.Default != specs.FileEnvIgnore {
 		for name, paths := range envSrcRec.Named() {
 			if strings.HasPrefix(name, "_") {
 				continue
@@ -407,25 +408,14 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 				continue
 			}
 
-			spaths := make([]string, 0, len(paths))
-			for _, path := range paths {
-				switch fileEnv {
-				case specs.FileEnvAbs:
-					spaths = append(spaths, rtarget.SandboxRoot.Join(path).Abs())
-				case specs.FileEnvRelRoot:
-					spaths = append(spaths, path)
-				case specs.FileEnvRelPkg:
-					p := "/root"
-					rel, err := filepath.Rel(filepath.Join(p, target.Package.Path), filepath.Join(p, path))
-					if err != nil {
-						return nil, err
-					}
-					rel = strings.TrimPrefix(rel, p)
-					rel = strings.TrimPrefix(rel, "/")
-					spaths = append(spaths, rel)
-				default:
-					panic("unhandled src_env: " + fileEnv)
-				}
+			spaths, err := ads.MapE(
+				paths,
+				func(path string) (string, error) {
+					return envPathFactory(fileEnv, target.Package, xfs.NewRelPath(path).WithRoot(rtarget.SandboxRoot.Abs()))
+				},
+			)
+			if err != nil {
+				return nil, err
 			}
 
 			k := "SRC_" + strings.ToUpper(name)
@@ -440,7 +430,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 
 	if target.OutEnv != specs.FileEnvIgnore {
 		out := target.Out.WithRoot(rtarget.SandboxRoot.Abs()).Named()
-		namedOut := map[string][]string{}
+		namedOut := make(map[string][]string, len(out))
 		for name, paths := range out {
 			namedOut[name] = ads.GrowExtra(namedOut[name], len(paths))
 
@@ -463,23 +453,9 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 					}
 				}
 
-				var pathv string
-				switch target.OutEnv {
-				case specs.FileEnvAbs:
-					pathv = path.Abs()
-				case specs.FileEnvRelRoot:
-					pathv = path.RelRoot()
-				case specs.FileEnvRelPkg:
-					fakeRoot := "/root"
-					rel, err := filepath.Rel(filepath.Join(fakeRoot, target.Package.Path), filepath.Join(fakeRoot, path.RelRoot()))
-					if err != nil {
-						return nil, err
-					}
-					rel = strings.TrimPrefix(rel, fakeRoot)
-					rel = strings.TrimPrefix(rel, "/")
-					pathv = rel
-				default:
-					panic("unhandled out_env: " + target.OutEnv)
+				pathv, err := envPathFactory(target.OutEnv, target.Package, path)
+				if err != nil {
+					return nil, err
 				}
 
 				a := namedOut[name]
@@ -496,6 +472,22 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 
 			env[normalizeEnv(k)] = strings.Join(paths, " ")
 		}
+	}
+
+	if target.RestoreCache.Env != specs.FileEnvIgnore {
+		k := "RESTORE_CACHE"
+
+		paths, err := ads.MapE(
+			target.RestoreCachePaths.WithRoot(rtarget.SandboxRoot.Abs()),
+			func(path xfs.Path) (string, error) {
+				return envPathFactory(target.RestoreCache.Env, target.Package, path)
+			},
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		env[normalizeEnv(k)] = strings.Join(paths, " ")
 	}
 
 	for _, tool := range target.Tools.Targets {
@@ -543,4 +535,24 @@ var envRegex = regexp.MustCompile(`[^A-Za-z0-9_]+`)
 
 func normalizeEnv(k string) string {
 	return envRegex.ReplaceAllString(k, "_")
+}
+
+func envPathFactory(envMode string, pkg *packages.Package, path xfs.Path) (string, error) {
+	switch envMode {
+	case specs.FileEnvAbs:
+		return path.Abs(), nil
+	case specs.FileEnvRelRoot:
+		return path.RelRoot(), nil
+	case specs.FileEnvRelPkg:
+		fakeRoot := "/root"
+		rel, err := filepath.Rel(filepath.Join(fakeRoot, pkg.Path), filepath.Join(fakeRoot, path.RelRoot()))
+		if err != nil {
+			return "", err
+		}
+		rel = strings.TrimPrefix(rel, fakeRoot)
+		rel = strings.TrimPrefix(rel, "/")
+		return rel, nil
+	default:
+		panic("unhandled env mode: " + envMode)
+	}
 }

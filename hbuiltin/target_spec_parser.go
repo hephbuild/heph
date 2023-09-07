@@ -198,6 +198,13 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		return specs.Target{}, fmt.Errorf("out_env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.OutEnv)
 	}
 
+	if t.RestoreCache.Env == "" {
+		t.RestoreCache.Env = specs.FileEnvRelPkg
+	}
+	if !ads.Contains(specs.FileEnvValues, t.RestoreCache.Env) {
+		return specs.Target{}, fmt.Errorf("restore_cache.env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.RestoreCache.Env)
+	}
+
 	if t.HashFile == "" {
 		t.HashFile = specs.HashFileContent
 	}

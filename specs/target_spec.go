@@ -343,4 +343,5 @@ type RestoreCache struct {
 	Enabled bool
 	Key     string
 	Paths   []string
+	Env     string
 }

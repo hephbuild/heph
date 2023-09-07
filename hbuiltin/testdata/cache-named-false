@@ -60,7 +60,8 @@ target(
     "RestoreCache": {
         "Enabled": false,
         "Key": "",
-        "Paths": null
+        "Paths": null,
+        "Env": "rel_pkg"
     },
     "HasSupportFiles": false,
     "Sandbox": true,
