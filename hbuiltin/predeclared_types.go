@@ -119,6 +119,7 @@ type TargetArgsRestoreCache struct {
 	Enabled bool
 	Key     string
 	Paths   xstarlark.Listable[string]
+	Env     string
 }
 
 func (c *TargetArgsRestoreCache) Unpack(v starlark.Value) error {
@@ -150,6 +151,7 @@ func (c *TargetArgsRestoreCache) Unpack(v starlark.Value) error {
 	err = xstarlark.UnpackDistructTo(v,
 		"paths?", &cs.Paths,
 		"key?", &cs.Key,
+		"env?", &cs.Env,
 	)
 	if err != nil {
 		return err

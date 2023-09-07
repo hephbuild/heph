@@ -126,42 +126,23 @@ func (n labelNode) Match(t Specer) bool {
 	return ads.Contains(t.Spec().Labels, n.value)
 }
 
-type pkgNode struct {
-	pkg string
+type targetRegexNode struct {
+	pkg   *regexp.Regexp
+	name  *regexp.Regexp
+	pkgs  string
+	names string
 }
 
-func (n pkgNode) String() string {
-	return "//" + n.pkg
+func (n targetRegexNode) String() string {
+	return "//" + n.pkgs + ":" + n.names
 }
 
-func (n pkgNode) Match(t Specer) bool {
-	tpkg := t.Spec().Package.Path
-
-	if strings.HasSuffix(n.pkg, "...") {
-		mpkg := strings.TrimSuffix(n.pkg, "...")
-		mpkg = strings.TrimSuffix(mpkg, "/")
-
-		return tpkg == mpkg || strings.HasPrefix(tpkg, mpkg+"/")
-	} else if strings.HasSuffix(n.pkg, ".") {
-		mpkg := strings.TrimSuffix(n.pkg, ".")
-		mpkg = strings.TrimSuffix(mpkg, "/")
-
-		return tpkg == mpkg
+func (n targetRegexNode) Match(t Specer) bool {
+	if !n.pkg.MatchString(t.Spec().Package.Path) {
+		return false
 	}
 
-	return tpkg == n.pkg
-}
-
-type targetNameNode struct {
-	regex *regexp.Regexp
-}
-
-func (n targetNameNode) String() string {
-	return ":" + n.regex.String()
-}
-
-func (n targetNameNode) Match(t Specer) bool {
-	return n.regex.MatchString(t.Spec().Name)
+	return n.name.MatchString(t.Spec().Name)
 }
 
 type funcNode struct {
@@ -262,24 +243,14 @@ func parseFactor(tokens []token, index *int) astNode {
 		*index++
 
 		if strings.HasPrefix(value, ":") {
-			r, err := regexp.Compile("^" + strings.ReplaceAll(value[1:], "*", ".*") + "$")
-			if err != nil {
-				panic(err)
-			}
-
-			return targetNameNode{regex: r}
+			value = "//**" + value
 		}
 
-		tp, err := ParseTargetAddrOptional(value)
+		m, err := ParseTargetGlob(value)
 		if err != nil {
 			panic(err)
 		}
-
-		if tp.Name == "" {
-			return pkgNode{pkg: tp.Package}
-		} else {
-			return tp
-		}
+		return m
 	case tokenFunction:
 		value := tokens[*index].value
 		*index++

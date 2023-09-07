@@ -29,7 +29,7 @@ heph query test | heph run -
 You can also compose the query, for example:
 
 ```shell
-heph run '(//some/pkg/... && test) && !e2e-test' 
+heph run '(//some/pkg/** && test) && !e2e-test' 
 ```
 
 See `heph query -h` for available query commands.
@@ -63,7 +63,7 @@ This will run the target and print the output path to stdout.
 A very useful tool is `heph watch`. It works similarly to `heph run` but will continuously watch all input files and will rerun targets that have been affected by file changes. When doing TDD for example it can be used to have a very quick save-test loop:
 
 ```shell
-heph watch '//path/to/service/... && test'
+heph watch '//path/to/service/** && test'
 ```
 
 This will output the targets in the `path/to/service` directory that have the `test` label, and will pipe the result into `heph watch` which will watch for file changes and run the targets. 

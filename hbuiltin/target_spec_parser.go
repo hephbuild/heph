@@ -38,6 +38,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 			Enabled: args.RestoreCache.Enabled,
 			Key:     args.RestoreCache.Key,
 			Paths:   args.RestoreCache.Paths,
+			Env:     args.RestoreCache.Env,
 		},
 		Sandbox:        args.SandboxEnabled,
 		OutInSandbox:   args.OutInSandbox,

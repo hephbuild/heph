@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"regexp"
 	"strings"
 )
 
@@ -44,11 +45,6 @@ func IsMatcherExplicit(m Matcher) bool {
 	}
 
 	return false
-}
-
-func IsMatcherTargetAddr(m Matcher) bool {
-	_, ok := m.(TargetAddr)
-	return ok
 }
 
 const letters = `abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
@@ -99,8 +95,8 @@ func (p TargetAddr) validate(mode int) error {
 		return err
 	}
 
-	if mode&allowTarget != 0 {
-		if mode == allowTarget && p.Name == "" {
+	if mode&allowName != 0 {
+		if mode == allowName && p.Name == "" {
 			return errTargetNameEmpty
 		}
 
@@ -117,31 +113,104 @@ func (p TargetAddr) IsPrivate() bool {
 }
 
 func ParseTargetAddr(pkg string, s string) (TargetAddr, error) {
-	tp, err := addrParse(pkg, s, allowTarget)
+	tp, err := addrParse(pkg, s, allowName)
 	if err != nil {
 		return TargetAddr{}, err
 	}
 
-	err = tp.validate(allowTarget)
+	err = tp.validate(allowName)
 	if err != nil {
 		return tp, err
 	}
 
-	return tp, err
+	return tp, nil
 }
 
-func ParseTargetAddrOptional(s string) (TargetAddr, error) {
-	tp, err := addrParse("", s, allowTarget|allowPkg)
+var (
+	regexPkgAll  = regexp.MustCompile("^.*$")
+	regexNameAll = regexp.MustCompile("^.*$")
+)
+
+const StarPlaceholder = "<STAR>"
+
+func charsRegex(rs []rune) string {
+	return strings.ReplaceAll(string(rs), "-", "\\-")
+}
+
+func ParseTargetGlob(s string) (Matcher, error) {
+	tp, err := addrParse("", s, allowName|allowPkg)
 	if err != nil {
 		return TargetAddr{}, err
 	}
 
-	err = tp.validate(allowTarget | allowPkg)
+	if strings.HasSuffix(tp.Package, "/...") {
+		tp.Package = strings.TrimSuffix(tp.Package, "...") + "**"
+	} else if strings.HasSuffix(tp.Package, "/.") {
+		tp.Package = strings.TrimSuffix(tp.Package, "/.")
+		tp.Name = "*"
+	}
+
+	if tp.Name == "" {
+		tp.Name = "*"
+	}
+
+	if strings.Contains(tp.Name, "*") || strings.Contains(tp.Package, "*") {
+		var pkg *regexp.Regexp
+		if strings.Contains(tp.Package, "*") {
+			if strings.Contains(tp.Package, "***") {
+				return nil, fmt.Errorf("unexpected *** in target path")
+			}
+
+			charClass := "[" + charsRegex(packageChars) + "]*"
+
+			expr := strings.ReplaceAll(tp.Package, "*", StarPlaceholder)
+			expr = regexp.QuoteMeta(expr)
+			expr = strings.ReplaceAll(expr, "/"+StarPlaceholder+StarPlaceholder, charClass)
+			expr = strings.ReplaceAll(expr, StarPlaceholder+StarPlaceholder, charClass)
+			expr = strings.ReplaceAll(expr, StarPlaceholder, strings.ReplaceAll(charClass, "/", ""))
+
+			r, err := regexp.Compile("^" + expr + "$")
+			if err != nil {
+				return nil, err
+			}
+			pkg = r
+		} else {
+			pkg = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Package) + "$")
+		}
+
+		var name *regexp.Regexp
+		if strings.Contains(tp.Name, "*") {
+			if strings.Contains(tp.Name, "**") {
+				return nil, fmt.Errorf("unexpected ** in target name")
+			}
+
+			expr := strings.ReplaceAll(tp.Name, "*", StarPlaceholder)
+			expr = regexp.QuoteMeta(expr)
+			expr = strings.ReplaceAll(expr, StarPlaceholder, "["+charsRegex(targetNameChars)+"]*")
+
+			r, err := regexp.Compile("^" + expr + "$")
+			if err != nil {
+				return nil, err
+			}
+			name = r
+		} else {
+			name = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Name) + "$")
+		}
+
+		return targetRegexNode{
+			pkg:   pkg,
+			pkgs:  tp.Package,
+			name:  name,
+			names: tp.Name,
+		}, nil
+	}
+
+	err = tp.validate(allowName)
 	if err != nil {
 		return tp, err
 	}
 
-	return tp, err
+	return tp, nil
 }
 
 func ParsePkgAddr(s string, validate bool) (string, error) {
@@ -157,7 +226,7 @@ func ParsePkgAddr(s string, validate bool) (string, error) {
 		}
 	}
 
-	return tp.Package, err
+	return tp.Package, nil
 }
 
 type errInvalidTarget struct {
@@ -174,7 +243,7 @@ var errRelativeTargetNoPkg = errors.New("relative target provided with no packag
 var errTargetAddr = errors.New("found target addr, expected package addr")
 
 const (
-	allowTarget = 1 << iota
+	allowName = 1 << iota
 	allowPkg
 )
 
@@ -190,7 +259,7 @@ func addrParse(pkg string, s string, mode int) (TargetAddr, error) {
 				return TargetAddr{}, errGotMultipleColon
 			}
 
-			if mode&allowTarget == 0 {
+			if mode&allowName == 0 {
 				return TargetAddr{}, errTargetAddr
 			}
 
@@ -204,7 +273,7 @@ func addrParse(pkg string, s string, mode int) (TargetAddr, error) {
 			}, nil
 		}
 	} else if strings.HasPrefix(s, ":") {
-		if mode&allowTarget == 0 {
+		if mode&allowName == 0 {
 			return TargetAddr{}, errTargetAddr
 		}
 
@@ -235,7 +304,7 @@ func (p TargetOutputPath) Full() string {
 }
 
 func (p TargetOutputPath) validate() error {
-	err := p.TargetAddr.validate(allowTarget)
+	err := p.TargetAddr.validate(allowName)
 	if err != nil {
 		return err
 	}
