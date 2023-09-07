@@ -221,7 +221,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 			for _, art := range arts {
 				p, stats, err := e.LocalCache.LatestUncompressedPathFromArtifact(ctx, target, art)
 				if err != nil {
-					log.Warnf("%v: skipping restore cache: out %v: %v", target.Addr, art.Name(), err)
+					log.Debug("%v: skipping restore cache: out %v: %v", target.Addr, art.Name(), err)
 					// We do not want partial restore
 					restoreSrcRec.Reset()
 					break
