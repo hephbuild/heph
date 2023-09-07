@@ -38,7 +38,11 @@ func PathMatchExactOrPrefixAny(path string, matchers ...string) (bool, error) {
 }
 
 func PathMatchAny(path string, matchers ...string) (bool, error) {
+	path = filepath.Clean(path)
+
 	for _, matcher := range matchers {
+		matcher = filepath.Clean(matcher)
+
 		if strings.HasSuffix(matcher, "/**/*") {
 			matcher := strings.TrimSuffix(matcher, "/**/*")
 
