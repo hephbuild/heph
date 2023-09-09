@@ -11,8 +11,10 @@ import (
 
 type FmtConfig = starfmt.Config
 
+var Fmt = starfmt.Fmt
+
 func FmtFix(path string, cfg FmtConfig) error {
-	formatted, err := starfmt.Fmt(path, cfg)
+	formatted, err := starfmt.Fmt(path, nil, cfg)
 	if err != nil {
 		if errors.Is(err, starfmt.ErrSkip) {
 			return nil
@@ -44,7 +46,7 @@ func FmtCheck(path string, cfg FmtConfig) error {
 
 	actual := string(b)
 
-	expected, err := starfmt.Fmt(path, cfg)
+	expected, err := starfmt.Fmt(path, nil, cfg)
 	if err != nil {
 		if errors.Is(err, starfmt.ErrSkip) {
 			return nil

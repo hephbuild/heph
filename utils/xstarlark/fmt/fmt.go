@@ -14,8 +14,8 @@ type Config struct {
 	IndentSize int
 }
 
-func Fmt(path string, cfg Config) (string, error) {
-	return fmtSource(path, nil, cfg)
+func Fmt(path string, src io.Reader, cfg Config) (string, error) {
+	return fmtSource(path, src, cfg)
 }
 
 const CommentSkipFile = "heph:fmt skip-file"

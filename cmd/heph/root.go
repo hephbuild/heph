@@ -345,14 +345,36 @@ var fmtCmd = &cobra.Command{
 			IndentSize: bs.Config.Fmt.IndentSize,
 		}
 
-		var errs error
-		for _, file := range files {
-			f := xstarlark.FmtFix
-			if *check {
-				f = xstarlark.FmtCheck
+		if *check {
+			var errs error
+			for _, file := range files {
+				err := xstarlark.FmtCheck(file, cfg)
+				if err != nil {
+					errs = multierr.Append(errs, fmt.Errorf("%v: %w", file, err))
+				}
 			}
 
-			err := f(file, cfg)
+			return errs
+		}
+
+		var errs error
+		for _, file := range files {
+			if file == "-" {
+				if len(files) > 1 {
+					return fmt.Errorf("stdin only compatible with one input")
+				}
+
+				res, err := xstarlark.Fmt("<stdin>", os.Stdin, cfg)
+				if err != nil {
+					return err
+				}
+
+				fmt.Print(res)
+
+				continue
+			}
+
+			err := xstarlark.FmtFix(file, cfg)
 			if err != nil {
 				errs = multierr.Append(errs, fmt.Errorf("%v: %w", file, err))
 			}
