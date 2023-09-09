@@ -81,6 +81,26 @@ func is[T any](v any) bool {
 	return ok
 }
 
+func isTargetLike(node syntax.Node) bool {
+	expr, ok := node.(*syntax.CallExpr)
+	if !ok {
+		return false
+	}
+
+	if len(expr.Args) == 0 {
+		return true
+	}
+
+	for _, arg := range expr.Args {
+		e, ok := arg.(*syntax.BinaryExpr)
+		if !ok || e.Op != syntax.EQ {
+			return false
+		}
+	}
+
+	return true
+}
+
 func shouldSkipLine(topLevel bool, prev, cur syntax.Node) bool {
 	if is[*syntax.LoadStmt](prev) && is[*syntax.LoadStmt](cur) {
 		return false
@@ -90,24 +110,25 @@ func shouldSkipLine(topLevel bool, prev, cur syntax.Node) bool {
 		return true
 	}
 
-	if is[*syntax.LoadStmt](prev) ||
-		is[*syntax.CallExpr](prev) ||
+	if (topLevel && isTargetLike(prev)) ||
+		(topLevel && isTargetLike(cur)) ||
+		is[*syntax.LoadStmt](prev) ||
 		is[*syntax.DefStmt](prev) ||
 		is[*syntax.IfStmt](prev) ||
 		is[*syntax.ForStmt](prev) {
 		return true
 	}
 
-	if topLevel {
-		if e, ok := prev.(*syntax.AssignStmt); ok {
-			if is[*syntax.CallExpr](e.RHS) {
-				return true
-			}
+	if e, ok := prev.(*syntax.AssignStmt); ok {
+		if shouldSkipLine(topLevel, e.RHS, cur) {
+			return true
 		}
 	}
 
 	if e, ok := prev.(*syntax.ExprStmt); ok {
-		return shouldSkipLine(topLevel, e.X, cur)
+		if shouldSkipLine(topLevel, e.X, cur) {
+			return true
+		}
 	}
 
 	prevLine := nodeEndLine(prev)
@@ -481,13 +502,7 @@ func (f *formatter) formatExpr(w Writer, expr syntax.Expr) error {
 		nl := false
 		if isTopLevel(w) {
 			// If all args are named arguments, its most likely a target, force newline
-			nl = true
-			for _, arg := range expr.Args {
-				e, ok := arg.(*syntax.BinaryExpr)
-				if !ok || e.Op != syntax.EQ {
-					nl = false
-				}
-			}
+			nl = isTargetLike(expr)
 		}
 
 		err = f.formatList(w, expr.Args, listComs, nl, "()")
