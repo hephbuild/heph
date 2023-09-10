@@ -1,42 +1,40 @@
 load("//test", "e2e_test")
 
 target(
-    name="uncached_dep",
-    run='echo hello > $OUT',
-    out="some_file",
-    cache=False,
+    name = "uncached_dep",
+    run = "echo hello > $OUT",
+    out = "some_file",
+    cache = False,
 )
 
 target(
-    name="using_uncached_dep",
-    run='cat $SRC',
-    deps=':uncached_dep',
-    cache=False,
+    name = "using_uncached_dep",
+    run = "cat $SRC",
+    deps = ":uncached_dep",
+    cache = False,
 )
 
 e2e_test(
-    name="e2e_uncached_dep",
-    cmd="heph run //test/features:using_uncached_dep",
-    expected_output="hello",
+    name = "e2e_uncached_dep",
+    cmd = "heph run //test/features:using_uncached_dep",
+    expected_output = "hello",
 )
 
 target(
-    name="cached_no_output",
-    run=[
-        'echo 1',
-    ],
-    cache=heph.cache(named=False),
+    name = "cached_no_output",
+    run = ["echo 1"],
+    cache = heph.cache(named = False),
 )
 
-no_out1=e2e_test(
-    name="e2e_cached_no_output1",
-    cmd="rm -rf $(heph query root)/.heph/cache/test/features/__target_cached_no_output || true; heph run //test/features:cached_no_output",
-    expected_output="1",
+no_out1 = e2e_test(
+    name = "e2e_cached_no_output1",
+    cmd = "rm -rf $(heph query root)/.heph/cache/test/features/__target_cached_no_output || true; heph run //test/features:cached_no_output",
+    expected_output = "1",
 )
 
 e2e_test(
-    name="e2e_cached_no_output2",
-    cmd="heph run //test/features:cached_no_output",
-    expected_output="",
-    deps=no_out1,
+    name = "e2e_cached_no_output2",
+    cmd = "heph run //test/features:cached_no_output",
+    expected_output = "",
+    deps = no_out1,
 )

@@ -1,6 +1,6 @@
 target(
-    name="version",
-    run="go version",
-    tools=CONFIG["go_backend"]["go"],
-    cache=False,
+    name = "version",
+    run = "go version",
+    tools = CONFIG["go_backend"]["go"],
+    cache = False,
 )

@@ -1,5 +1,5 @@
 group(
-    name='testdata',
-    deps=glob('testdata/**/*'),
-    labels='go_test_data',
+    name = "testdata",
+    deps = glob("testdata/**/*"),
+    labels = "go_test_data",
 )

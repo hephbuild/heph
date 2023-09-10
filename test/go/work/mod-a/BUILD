@@ -1,3 +1,5 @@
 load("//backend/go", "go_mod")
 
-go_mod(work=True)
+go_mod(
+    work = True,
+)

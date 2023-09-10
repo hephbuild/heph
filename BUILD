@@ -3,92 +3,95 @@ load("//backend/node", "node_toolchain")
 load("//backend/node", "yarn_toolchain")
 
 go_toolchain(
-    name="go",
-    version="1.21.0",
-    architectures=[
-        "darwin_amd64", "darwin_arm64",
-        "linux_amd64", "linux_arm64",
+    name = "go",
+    version = "1.21.0",
+    architectures = [
+        "darwin_amd64",
+        "darwin_arm64",
+        "linux_amd64",
+        "linux_arm64",
     ],
 )
 
 node = node_toolchain(
-    name="node",
-    version="v16.15.1",
+    name = "node",
+    version = "v16.15.1",
 )
 
 yarn_toolchain(
-    name="yarn",
-    version="v1.22.19",
-    node=node,
+    name = "yarn",
+    version = "v1.22.19",
+    node = node,
 )
 
 target(
-    name="test_light_e2e",
-    run="heph run light_e2e",
-    tools=['heph'],
-    pass_env=["PATH", "TERM"],
-    sandbox=False,
-    cache=False,
+    name = "test_light_e2e",
+    run = "heph run light_e2e",
+    tools = ["heph"],
+    pass_env = ["PATH", "TERM"],
+    sandbox = False,
+    cache = False,
 )
 
 target(
-    name="test_e2e",
-    run="heph run e2e",
-    tools=['heph'],
-    pass_env=["PATH", "TERM"],
-    sandbox=False,
-    cache=False,
+    name = "test_e2e",
+    run = "heph run e2e",
+    tools = ["heph"],
+    pass_env = ["PATH", "TERM"],
+    sandbox = False,
+    cache = False,
 )
 
 target(
-    name="test_intg",
-    run="heph run '//test/... && test'",
-    tools=['heph'],
-    pass_env=["PATH", "TERM"],
-    sandbox=False,
-    cache=False,
+    name = "test_intg",
+    run = "heph run '//test/... && test'",
+    tools = ["heph"],
+    pass_env = ["PATH", "TERM"],
+    sandbox = False,
+    cache = False,
 )
 
 go_env_vars = ["GOROOT", "GOPATH", "HOME"]
 
 target(
-    name="test_go",
-    run="CGO_ENABLED=0 go test -v ./...",
-    tools=["go"],
-    cache=False,
-    sandbox=False,
-    pass_env="*",
+    name = "test_go",
+    run = "CGO_ENABLED=0 go test -v ./...",
+    tools = ["go"],
+    cache = False,
+    sandbox = False,
+    pass_env = "*",
 )
 
 target(
-    name="build_all",
-    run="heph run build",
-    tools=['heph'],
-    pass_env="*",
-    sandbox=False,
-    cache=False,
+    name = "build_all",
+    run = "heph run build",
+    tools = ["heph"],
+    pass_env = "*",
+    sandbox = False,
+    cache = False,
 )
 
 extra_src = [
-    'hbuiltin/predeclared.gotpl',
-    'platform/initfile.sh',
+    "hbuiltin/predeclared.gotpl",
+    "platform/initfile.sh",
 ]
-deps = ["go.mod", "go.sum"] +\
-       glob("**/*.go", exclude=["website", "backend", "test"]) +\
-       extra_src
+deps = ["go.mod", "go.sum"] + glob(
+    "**/*.go",
+    exclude = ["website", "backend", "test"],
+) + extra_src
 
 release = "release" in CONFIG["profiles"]
 
 def _gobuild(pkg, args):
     return "go build -trimpath {} -ldflags='-s -w' -o $OUT {}".format(args, pkg)
 
-build_flags=""
+build_flags = ""
 if release:
     version = target(
-        name="version",
-        run="echo ${GITHUB_SHA::7} > $OUT",
-        out="utils/version",
-        pass_env=["GITHUB_SHA"],
+        name = "version",
+        run = "echo ${GITHUB_SHA::7} > $OUT",
+        out = "utils/version",
+        pass_env = ["GITHUB_SHA"],
     )
     deps.append(version)
 
@@ -98,35 +101,38 @@ builds = []
 for os in ["linux", "darwin"]:
     for arch in ["amd64", "arm64"]:
         t = target(
-            name="build_{}_{}".format(os, arch),
-            run=[
+            name = "build_{}_{}".format(os, arch),
+            run = [
                 "go version",
-                _gobuild('github.com/hephbuild/heph/cmd/heph', build_flags),
+                _gobuild(
+                    "github.com/hephbuild/heph/cmd/heph",
+                    build_flags,
+                ),
             ],
-            out="heph_{}_{}".format(os, arch),
-            deps=deps,
-            env={
+            out = "heph_{}_{}".format(os, arch),
+            deps = deps,
+            env = {
                 "GOOS": os,
                 "GOARCH": arch,
                 "CGO_ENABLED": "0",
             },
-            tools=["go"],
-            labels=["build"],
-            pass_env=go_env_vars,
+            tools = ["go"],
+            labels = ["build"],
+            pass_env = go_env_vars,
         )
         builds.append(t)
 
 target(
-    name="cp_builds",
-    run="cp * $1",
-    deps=builds,
-    cache=False,
-    pass_args=True,
+    name = "cp_builds",
+    run = "cp * $1",
+    deps = builds,
+    cache = False,
+    pass_args = True,
 )
 
 target(
-    name="start-jaeger",
-    run="""
+    name = "start-jaeger",
+    run = """
     docker run -d --name jaeger \
       -e COLLECTOR_ZIPKIN_HTTP_PORT=9411 \
       -p 5775:5775/udp \
@@ -138,6 +144,6 @@ target(
       -p 9411:9411 \
       jaegertracing/all-in-one:1.39
       """,
-    cache=False,
-    pass_env="*",
+    cache = False,
+    pass_env = "*",
 )

@@ -8,15 +8,12 @@ yarn = cfg["yarn"]
 if not yarn:
     fail("set node_backend.yarn")
 
-tools=[
-    ('node', [node+'|node']),
-    ('npm', [node+'|npm']),
-    ('npx', [node+'|npx']),
-    ('yarn', [yarn]),
+tools = [
+    ("node", [node + "|node"]),
+    ("npm", [node + "|npm"]),
+    ("npx", [node + "|npx"]),
+    ("yarn", [yarn]),
 ]
 
 for (name, tools) in tools:
-    tool_target(
-        name=name,
-        tools=tools,
-    )
+    tool_target(name = name, tools = tools)

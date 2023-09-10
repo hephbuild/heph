@@ -9,24 +9,24 @@ modes = [
 ]
 
 for (mode, expected) in modes:
-    smode=str(mode)
+    smode = str(mode)
 
-    txt=text_file(
-        name="text_file_"+smode,
-        text=smode,
-        mode=mode,
+    txt = text_file(
+        name = "text_file_" + smode,
+        text = smode,
+        mode = mode,
     )
 
-    t=target(
-        name="_text_file_mode_"+smode,
-        deps=txt,
-        run="ls -l $SRC | awk '{print $1;}' | sed 's/@//'",
-        cache=False,
-        labels='txt_file_mode'
+    t = target(
+        name = "_text_file_mode_" + smode,
+        deps = txt,
+        run = "ls -l $SRC | awk '{print $1;}' | sed 's/@//'",
+        cache = False,
+        labels = "txt_file_mode",
     )
 
     e2e_test(
-        name="e2e_text_file_mode_"+smode,
-        cmd="umask 022 && heph run "+t,
-        expected_output=expected,
+        name = "e2e_text_file_mode_" + smode,
+        cmd = "umask 022 && heph run " + t,
+        expected_output = expected,
     )
