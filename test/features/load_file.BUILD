@@ -1,4 +1,4 @@
-load("//test/features/BUILD.load_file_src", "load_file_source")
+load("//test/features/load_file_src.BUILD", "load_file_source")
 load("//test", "e2e_test")
 
 src=json_file(

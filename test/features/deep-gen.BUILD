@@ -15,7 +15,7 @@ target(
     name="deep_gen_1",
     run="mv $SRC $OUT",
     deps=hello,
-    out="BUILD.deep-gen-1",
+    out="deep-gen-1.BUILD",
     gen=True,
 )
 """
@@ -26,7 +26,7 @@ target(
     name="deep_gen_0",
     run="mv $SRC $OUT",
     deps=deep_gen_1,
-    out="BUILD.deep-gen-0",
+    out="deep-gen-0.BUILD",
     gen=True,
 )
 
