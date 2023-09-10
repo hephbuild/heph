@@ -20,9 +20,10 @@ type FileConfig struct {
 	} `yaml:"engine"`
 	Platforms  map[string]FilePlatform `yaml:"platforms"`
 	BuildFiles struct {
-		Ignore []string            `yaml:"ignore,omitempty"`
-		Roots  map[string]FileRoot `yaml:"roots,omitempty"`
-		Glob   struct {
+		Patterns []string            `yaml:"patterns,omitempty"`
+		Ignore   []string            `yaml:"ignore,omitempty"`
+		Roots    map[string]FileRoot `yaml:"roots,omitempty"`
+		Glob     struct {
 			Exclude []string `yaml:"exclude"`
 		} `yaml:"glob"`
 	} `yaml:"build_files"`
@@ -110,6 +111,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 	}
 	for k, newRoot := range fc.BuildFiles.Roots {
 		c.BuildFiles.Roots[k] = newRoot.ApplyTo(c.BuildFiles.Roots[k])
+	}
+
+	if fc.BuildFiles.Patterns != nil {
+		c.BuildFiles.Patterns = fc.BuildFiles.Patterns
 	}
 
 	c.BuildFiles.Ignore = append(c.BuildFiles.Ignore, fc.BuildFiles.Ignore...)

@@ -195,6 +195,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 
 	buildfilesState := buildfiles.NewState(buildfiles.State{
 		Ignore:   cfg.BuildFiles.Ignore,
+		Patterns: cfg.BuildFiles.Patterns,
 		Packages: pkgs,
 	})
 	bs.BuildFiles = buildfilesState

@@ -8,7 +8,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hephbuild/heph/bootstrap"
-	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
@@ -302,7 +301,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 			break
 		}
 
-		if ok, _ := xfs.PathMatchAny(e.RelPath, buildfiles.Pattern); ok {
+		if ok, _ := xfs.PathMatchAny(e.RelPath, s.cbs.BuildFiles.Patterns...); ok {
 			log.Debug("New Scheduler: BUILD", e)
 			bs = bootstrap.SchedulerBootstrap{}
 			break

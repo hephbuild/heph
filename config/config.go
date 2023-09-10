@@ -38,9 +38,10 @@ type Config struct {
 	} `yaml:"engine"`
 	Platforms  map[string]Platform `yaml:"platforms"`
 	BuildFiles struct {
-		Ignore []string        `yaml:"ignore"`
-		Roots  map[string]Root `yaml:"roots"`
-		Glob   struct {
+		Patterns []string        `yaml:"patterns"`
+		Ignore   []string        `yaml:"ignore"`
+		Roots    map[string]Root `yaml:"roots"`
+		Glob     struct {
 			Exclude []string `yaml:"exclude"`
 		} `yaml:"glob"`
 	} `yaml:"build_files"`

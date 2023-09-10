@@ -324,7 +324,8 @@ var fmtCmd = &cobra.Command{
 		}
 
 		buildfilesState := buildfiles.NewState(buildfiles.State{
-			Ignore: bs.Config.BuildFiles.Ignore,
+			Ignore:   bs.Config.BuildFiles.Ignore,
+			Patterns: bs.Config.BuildFiles.Patterns,
 		})
 
 		var files []string

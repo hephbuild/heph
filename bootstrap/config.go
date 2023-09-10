@@ -18,6 +18,7 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg.Engine.CacheHints = true
 	cfg.Engine.ParallelCaching = true
 	cfg.CacheOrder = config.CacheOrderLatency
+	cfg.BuildFiles.Patterns = []string{"**/{BUILD,*.BUILD}"}
 	cfg.Platforms = map[string]config.Platform{
 		"local": {
 			Name:     "local",
@@ -50,6 +51,10 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf(".hephconfig.%v: %w", profile, err)
 		}
+	}
+
+	if len(cfg.BuildFiles.Patterns) != 1 {
+		return nil, fmt.Errorf("buildfiles.patterns must have a single value")
 	}
 
 	return &cfg, nil
