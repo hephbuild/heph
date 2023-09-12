@@ -24,6 +24,7 @@ type Target struct {
 	actualSupportFiles      xfs.RelPaths
 	actualRestoreCacheFiles xfs.RelPaths
 
+	multiCacheLocks            locks.Locker
 	cacheLocks                 map[string]locks.Locker
 	cacheHashInputTargetMutex  sync.Mutex
 	cacheHashOutputTargetMutex maps.KMutex

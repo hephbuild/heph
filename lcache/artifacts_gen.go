@@ -69,6 +69,17 @@ locks:
 			}
 		}
 
+		// Should be first to prevent concurrent multiple locks attempts
+		l := e.Metas.Find(target).multiCacheLocks
+		err := l.Lock(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		unlockers = append(unlockers, func() {
+			_ = l.Unlock()
+		})
+
 		for _, artifact := range artifacts {
 			ok, unlock, err := e.lockArtifact(ctx, target, artifact, true)
 			if err != nil {

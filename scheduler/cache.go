@@ -45,6 +45,24 @@ func (e *Scheduler) pullOrGetCacheAndPost(ctx context.Context, target *graph.Tar
 func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
 	status.Emit(ctx, tgt.TargetStatus(target, "Checking local cache..."))
 
+	lockArtifacts := make([]artifacts.Artifact, 0, len(outputs)*2+2)
+	lockArtifacts = append(lockArtifacts, target.Artifacts.InputHash)
+	for _, output := range outputs {
+		lockArtifacts = append(lockArtifacts,
+			target.Artifacts.OutTar(output),
+			target.Artifacts.OutHash(output),
+		)
+	}
+	if art, ok := target.Artifacts.GetRestoreCache(); ok {
+		lockArtifacts = append(lockArtifacts, art)
+	}
+
+	unlock, err := e.LocalCache.LockArtifacts(ctx, target, lockArtifacts)
+	if err != nil {
+		return false, false, err
+	}
+	defer unlock()
+
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.LocalCache.GetLocalCache(ctx, target, outputs, withRestoreCache, onlyMetaLocal, false, uncompress)
 	if err != nil {

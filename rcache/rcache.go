@@ -117,12 +117,6 @@ func (e *RemoteCache) DownloadArtifact(ctx context.Context, target graph.Targete
 		SpanEndIgnoreNotExist(span, rerr)
 	}()
 
-	unlock, err := e.LocalCache.LockArtifact(ctx, target, artifact)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
 	status.Emit(ctx, tgt.TargetOutputStatus(target, artifact.DisplayName(), fmt.Sprintf("Downloading from %v...", cache.Name)))
 
 	localRoot, err := e.LocalCache.VFSLocation(target)

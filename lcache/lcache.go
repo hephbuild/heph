@@ -73,6 +73,7 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 				depsHash:                   k.depshash,
 				inputHash:                  "",
 				actualOutFiles:             nil,
+				multiCacheLocks:            locks.NewFlock(gtarget.Addr+" (artifacts)", lockPath(root, gtarget, "artifacts")),
 				cacheLocks:                 nil, // Set after
 				cacheHashInputTargetMutex:  sync.Mutex{},
 				cacheHashOutputTargetMutex: maps.KMutex{},
@@ -89,9 +90,7 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 
 				p := lockPath(root, t, "cache_"+resource)
 
-				l := locks.NewFlock(ts.Addr+" ("+resource+")", p)
-
-				t.cacheLocks[artifact.Name()] = l
+				t.cacheLocks[artifact.Name()] = locks.NewFlock(ts.Addr+" ("+resource+")", p)
 			}
 
 			return t
@@ -248,24 +247,6 @@ func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, ta
 
 func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	target := ttarget.GraphTarget()
-
-	lockArtifacts := make([]artifacts.Artifact, 0, len(outputs)*2+2)
-	lockArtifacts = append(lockArtifacts, target.Artifacts.InputHash)
-	for _, output := range outputs {
-		lockArtifacts = append(lockArtifacts,
-			target.Artifacts.OutTar(output),
-			target.Artifacts.OutHash(output),
-		)
-	}
-	if art, ok := target.Artifacts.GetRestoreCache(); ok {
-		lockArtifacts = append(lockArtifacts, art)
-	}
-
-	unlock, err := e.LockArtifacts(ctx, target, lockArtifacts)
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
 
 	ok, err := e.HasArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
 	if !ok || err != nil {

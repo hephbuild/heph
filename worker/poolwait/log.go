@@ -35,6 +35,7 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 	}
 
 	printWorkersStatus := func() {
+		statusm := map[string]struct{}{}
 		for _, job := range pool.Jobs() {
 			if job.State != worker.StateSuspended {
 				continue
@@ -47,9 +48,17 @@ func logUI(name string, deps *worker.WaitGroup, pool *worker.Pool) error {
 				status = "Suspended..."
 			}
 
+			if _, ok := statusm[status]; ok {
+				continue
+			}
+			statusm[status] = struct{}{}
+
 			runtime := fmt.Sprintf("%v", xtime.RoundDuration(duration, 1).String())
 
 			fmt.Fprintf(os.Stderr, " %v %v\n", runtime, status)
+		}
+		if len(statusm) > 0 {
+			fmt.Fprintf(os.Stderr, "===\n")
 		}
 		for _, w := range pool.Workers {
 			j := w.CurrentJob
