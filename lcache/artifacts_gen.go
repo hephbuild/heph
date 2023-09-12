@@ -20,45 +20,74 @@ import (
 	"github.com/hephbuild/heph/worker/poolwait"
 	"io"
 	"math"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func (e *LocalCacheState) LockArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (func(), error) {
+	_, unlock, err := e.lockArtifact(ctx, target, artifact, false)
+	return unlock, err
+}
+
+func (e *LocalCacheState) lockArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, try bool) (bool, func(), error) {
 	starget := target.Spec()
 	l := e.Metas.Find(target).cacheLocks[artifact.Name()]
-	err := l.Lock(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("lock %v %v: %w", starget.Addr, artifact.Name(), err)
-	}
 
-	return func() {
+	unlock := func() {
 		err := l.Unlock()
 		if err != nil {
 			log.Errorf("unlock %v %v: %v", starget.Addr, artifact.Name(), err)
 		}
-	}, nil
+	}
+
+	if try {
+		ok, err := l.TryLock(ctx)
+		if !ok || err != nil {
+			return false, nil, err
+		}
+		return true, unlock, nil
+	} else {
+		err := l.Lock(ctx)
+		if err != nil {
+			return false, nil, fmt.Errorf("lock %v %v: %w", starget.Addr, artifact.Name(), err)
+		}
+
+		return true, unlock, nil
+	}
 }
 
 func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Targeter, artifacts []artifacts.Artifact) (func(), error) {
-	unlockers := make([]func(), 0, len(artifacts))
+locks:
+	for {
+		unlockers := make([]func(), 0, len(artifacts))
 
-	unlocker := func() {
-		for _, unlock := range unlockers {
-			unlock()
+		unlockAll := func() {
+			for _, unlock := range unlockers {
+				unlock()
+			}
 		}
-	}
 
-	for _, artifact := range artifacts {
-		unlock, err := e.LockArtifact(ctx, target, artifact)
-		if err != nil {
-			unlocker()
-			return nil, err
+		for _, artifact := range artifacts {
+			ok, unlock, err := e.lockArtifact(ctx, target, artifact, true)
+			if err != nil {
+				unlockAll()
+				return nil, err
+			}
+
+			// We failed to acquire one lock, release all and retry, with some jitter
+			if !ok {
+				unlockAll()
+				time.Sleep(time.Duration(10+rand.Intn(50)) * time.Millisecond)
+				continue locks
+			}
+
+			unlockers = append(unlockers, unlock)
 		}
-		unlockers = append(unlockers, unlock)
-	}
 
-	return unlocker, nil
+		return unlockAll, nil
+	}
 }
 
 // createDepsGenArtifacts returns the deps for each artifact by name
