@@ -8,6 +8,8 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/worker"
+	"github.com/shirou/gopsutil/v3/process"
 	"golang.org/x/sys/unix"
 	"os"
 	"strconv"
@@ -99,8 +101,6 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 		doneCh := make(chan struct{})
 		defer close(doneCh)
 
-		pidb, _ := os.ReadFile(f.Name())
-		pid := string(pidb)
 		go func() {
 			select {
 			case <-doneCh:
@@ -110,11 +110,28 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 				// log
 			}
 
-			if len(pid) > 0 {
-				if strconv.Itoa(os.Getpid()) == pid {
+			pidb, _ := os.ReadFile(f.Name())
+			pidStr := string(pidb)
+
+			if len(pidStr) > 0 {
+				pid, err := strconv.Atoi(pidStr)
+				if err != nil {
+					pid = -1
+				}
+
+				if os.Getpid() == pid {
 					status.Emit(ctx, status.String(fmt.Sprintf("Another job locked %v, waiting...", l.name)))
 				} else {
-					status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", pid, l.name)))
+					processDetails := pidStr
+					p, _ := process.NewProcess(int32(pid))
+					if p != nil {
+						cmdLine, _ := p.Cmdline()
+						if len(cmdLine) > 0 {
+							processDetails = fmt.Sprintf("%v (%v)", cmdLine, pid)
+						}
+					}
+
+					status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name)))
 				}
 			} else {
 				status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", l.name)))
@@ -129,13 +146,16 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 			lockCh <- flock.Flock(f, ro, true)
 		}()
 
-		select {
-		case err := <-lockCh:
-			if err != nil {
-				return false, err
+		err := worker.SuspendE(ctx, func() error {
+			select {
+			case err := <-lockCh:
+				return err
+			case <-ctx.Done():
+				return ctx.Err()
 			}
-		case <-ctx.Done():
-			return false, ctx.Err()
+		})
+		if err != nil {
+			return false, err
 		}
 
 		return true, nil

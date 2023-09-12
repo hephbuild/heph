@@ -176,12 +176,6 @@ func (e *LocalCacheState) ResetCacheHashInput(spec specs.Specer) {
 }
 
 func (e *LocalCacheState) HasArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, skipSpan bool) (bool, error) {
-	unlock, err := e.LockArtifact(ctx, target, artifact)
-	if err != nil {
-		return false, err
-	}
-	defer unlock()
-
 	setCacheHit := func(bool) {}
 	if !skipSpan {
 		var span *observability.TargetArtifactCacheSpan
@@ -254,6 +248,12 @@ func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, ta
 
 func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	target := ttarget.GraphTarget()
+
+	unlock, err := e.LockArtifacts(ctx, target, target.Artifacts.All())
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
 
 	ok, err := e.HasArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
 	if !ok || err != nil {

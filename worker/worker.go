@@ -127,6 +127,15 @@ func (j *Job) Status(status status.Statuser) {
 	}
 }
 
+func (j *Job) GetStatus() status.Statuser {
+	s := j.status
+	if s == nil {
+		return status.Clear()
+	}
+
+	return s
+}
+
 func (j *Job) Interactive() bool {
 	return true
 }
@@ -278,12 +287,7 @@ func (w *Worker) GetStatus() status.Statuser {
 		return status.Clear()
 	}
 
-	s := j.status
-	if s == nil {
-		return status.Clear()
-	}
-
-	return s
+	return j.GetStatus()
 }
 
 type Pool struct {

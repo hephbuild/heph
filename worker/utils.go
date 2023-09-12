@@ -88,10 +88,17 @@ func Suspend(ctx context.Context, f func()) {
 	<-resumeCh
 }
 
-func SuspendWaitGroup(ctx context.Context, wg *WaitGroup) error {
+func SuspendE(ctx context.Context, f func() error) error {
+	var err error
 	Suspend(ctx, func() {
-		<-wg.Done()
+		err = f()
 	})
+	return err
+}
 
-	return wg.Err()
+func SuspendWaitGroup(ctx context.Context, wg *WaitGroup) error {
+	return SuspendE(ctx, func() error {
+		<-wg.Done()
+		return wg.Err()
+	})
 }

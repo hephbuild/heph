@@ -162,11 +162,12 @@ func (wg *WaitGroup) TransitiveDo(f func(j *Job)) {
 }
 
 type WaitGroupStats struct {
-	All     uint64
-	Done    uint64
-	Success uint64
-	Failed  uint64
-	Skipped uint64
+	All       uint64
+	Done      uint64
+	Success   uint64
+	Failed    uint64
+	Skipped   uint64
+	Suspended uint64
 }
 
 func (wg *WaitGroup) TransitiveCount() WaitGroupStats {
@@ -186,6 +187,8 @@ func (wg *WaitGroup) TransitiveCount() WaitGroupStats {
 			atomic.AddUint64(&s.Failed, 1)
 		case StateSkipped:
 			atomic.AddUint64(&s.Skipped, 1)
+		case StateSuspended:
+			atomic.AddUint64(&s.Suspended, 1)
 		}
 	})
 

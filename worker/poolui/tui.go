@@ -170,7 +170,11 @@ func (m *Model) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v\n", m.name, m.stats.Done, m.stats.All, start))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v", m.name, m.stats.Done, m.stats.All, start))
+	if m.stats.Suspended > 0 {
+		s.WriteString(fmt.Sprintf(" (%v suspended)", m.stats.Suspended))
+	}
+	s.WriteString("\n")
 	if m.stats.Failed > 0 || m.stats.Skipped > 0 {
 		s.WriteString(fmt.Sprintf("%v failed, %v skipped\n", m.stats.Failed, m.stats.Skipped))
 	}
