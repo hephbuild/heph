@@ -7,6 +7,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtime"
 	"github.com/hephbuild/heph/worker"
@@ -110,10 +111,19 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyRunes:
 			switch msg.String() {
 			case "p":
+				jobs := m.pool.Jobs()
+
 				strs := make([]string, 0)
 				strs = append(strs, "Unfinished jobs:")
-
-				strs = append(strs, printJobsWaitStack(m.pool.Jobs(), 0)...)
+				strs = append(strs, printJobsWaitStack(jobs, 0)...)
+				strs = append(strs, "Suspended jobs:")
+				strs = append(strs, ads.Map(
+					ads.Filter(jobs, func(job *worker.Job) bool {
+						return job.State == worker.StateSuspended
+					}), func(t *worker.Job) string {
+						return t.Name
+					},
+				)...)
 
 				return m, tea.Println(strings.Join(strs, "\n"))
 			}

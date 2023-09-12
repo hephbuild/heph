@@ -4,6 +4,7 @@ import (
 	"github.com/hephbuild/heph/utils/mds"
 	"golang.org/x/exp/constraints"
 	"sync"
+	"time"
 )
 
 type OMap[K constraints.Ordered, V any] struct {
@@ -20,7 +21,8 @@ func (m *OMap[K, V]) Keys() []K {
 }
 
 type Map[K comparable, V any] struct {
-	Default func(k K) V
+	Default    func(k K) V
+	Expiration time.Duration
 
 	mu sync.RWMutex
 	m  map[K]V
@@ -36,12 +38,23 @@ func (m *Map[K, V]) init() {
 }
 
 func (m *Map[K, V]) Set(k K, v V) {
-	m.init()
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.set(k, v)
+}
+
+func (m *Map[K, V]) set(k K, v V) {
+	m.init()
+
 	m.m[k] = v
+
+	if m.Expiration > 0 {
+		go func() {
+			<-time.After(m.Expiration)
+			m.Delete(k)
+		}()
+	}
 }
 
 func (m *Map[K, V]) Delete(k K) {
@@ -92,7 +105,7 @@ func (m *Map[K, V]) GetDefault(k K, def func(K) V) V {
 	v, ok = m.m[k]
 	if !ok {
 		v = def(k)
-		m.m[k] = v
+		m.set(k, v)
 	}
 
 	return v

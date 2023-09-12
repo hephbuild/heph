@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"github.com/shirou/gopsutil/v3/process"
 	"golang.org/x/sys/unix"
 	"os"
 	"strconv"
@@ -122,14 +121,7 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 				if os.Getpid() == pid {
 					status.Emit(ctx, status.String(fmt.Sprintf("Another job locked %v, waiting...", l.name)))
 				} else {
-					processDetails := pidStr
-					p, _ := process.NewProcess(int32(pid))
-					if p != nil {
-						cmdLine, _ := p.Cmdline()
-						if len(cmdLine) > 0 {
-							processDetails = fmt.Sprintf("%v (%v)", cmdLine, pid)
-						}
-					}
+					processDetails := getProcessDetails(pid)
 
 					status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name)))
 				}
