@@ -249,7 +249,19 @@ func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, ta
 func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	target := ttarget.GraphTarget()
 
-	unlock, err := e.LockArtifacts(ctx, target, target.Artifacts.All())
+	lockArtifacts := make([]artifacts.Artifact, 0, len(outputs)*2+2)
+	lockArtifacts = append(lockArtifacts, target.Artifacts.InputHash)
+	for _, output := range outputs {
+		lockArtifacts = append(lockArtifacts,
+			target.Artifacts.OutTar(output),
+			target.Artifacts.OutHash(output),
+		)
+	}
+	if art, ok := target.Artifacts.GetRestoreCache(); ok {
+		lockArtifacts = append(lockArtifacts, art)
+	}
+
+	unlock, err := e.LockArtifacts(ctx, target, lockArtifacts)
 	if err != nil {
 		return false, err
 	}

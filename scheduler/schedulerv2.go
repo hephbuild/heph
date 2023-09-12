@@ -65,8 +65,9 @@ func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetru
 		deps:         &WaitGroupMap{},
 		pullMetaDeps: &WaitGroupMap{},
 
-		targetSchedLock: &maps.KMutex{},
-		targetSchedJobs: &maps.Map[string, *worker.Job]{},
+		targetSchedLock:        &maps.KMutex{},
+		targetSchedJobs:        &maps.Map[string, *worker.Job]{},
+		getCacheOrRunSchedJobs: &maps.Map[getCacheOrRunRequest, *worker.WaitGroup]{},
 	}
 
 	err = sched.schedule()
@@ -77,6 +78,11 @@ func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetru
 	return sched.deps, nil
 }
 
+type getCacheOrRunRequest struct {
+	addr                                  string
+	allowCached, pullIfCached, uncompress bool
+}
+
 type schedulerv2 struct {
 	*Scheduler
 	octx context.Context
@@ -84,13 +90,14 @@ type schedulerv2 struct {
 	rrs  targetrun.Requests
 	skip []string
 
-	rrTargets       *graph.Targets
-	toAssess        *graph.Targets
-	outputs         *maps.Map[string, *sets.Set[string, string]]
-	deps            *WaitGroupMap
-	pullMetaDeps    *WaitGroupMap
-	targetSchedLock *maps.KMutex
-	targetSchedJobs *maps.Map[string, *worker.Job]
+	rrTargets              *graph.Targets
+	toAssess               *graph.Targets
+	outputs                *maps.Map[string, *sets.Set[string, string]]
+	deps                   *WaitGroupMap
+	pullMetaDeps           *WaitGroupMap
+	targetSchedLock        *maps.KMutex
+	targetSchedJobs        *maps.Map[string, *worker.Job]
+	getCacheOrRunSchedJobs *maps.Map[getCacheOrRunRequest, *worker.WaitGroup]
 }
 
 func (s *schedulerv2) schedule() error {
@@ -253,6 +260,21 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 }
 
 func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, target *graph.Target, allowCached, pullIfCached, uncompress bool) (*worker.WaitGroup, error) {
+	l := s.targetSchedLock.Get(target.Addr)
+	l.Lock()
+	defer l.Unlock()
+
+	k := getCacheOrRunRequest{
+		addr:         target.Addr,
+		allowCached:  allowCached,
+		pullIfCached: pullIfCached,
+		uncompress:   uncompress,
+	}
+
+	if g, ok := s.getCacheOrRunSchedJobs.GetOk(k); ok {
+		return g, nil
+	}
+
 	deps, err := s.parentTargetDeps(target)
 	if err != nil {
 		return nil, err
@@ -293,6 +315,8 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 		},
 	})
 	group.Add(j)
+
+	s.getCacheOrRunSchedJobs.Set(k, group)
 
 	return group, nil
 }
