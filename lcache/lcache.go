@@ -101,7 +101,7 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 	return s, nil
 }
 
-func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, artifacts []ArtifactWithProducer, compress bool) (rerr error) {
+func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (rerr error) {
 	target := ttarget.GraphTarget()
 
 	if target.ConcurrentExecution {
@@ -123,19 +123,24 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 		return err
 	}
 
+	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	if e.ParallelCaching {
-		genDeps, err := e.ScheduleGenArtifacts(ctx, target, artifacts, compress)
+		genDeps, err := e.ScheduleGenArtifacts(ctx, target, arts, compress)
 		if err != nil {
 			return err
 		}
 
-		err = worker.WaitWaitGroup(ctx, genDeps)
+		err = worker.SuspendWaitGroup(ctx, genDeps)
 		if err != nil {
 			return err
 		}
-
 	} else {
-		err := e.GenArtifacts(ctx, target, artifacts, compress)
+		err := e.GenArtifacts(ctx, target, arts, compress)
 		if err != nil {
 			return err
 		}

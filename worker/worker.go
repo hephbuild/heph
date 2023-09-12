@@ -25,6 +25,7 @@ const (
 	StateSuccess
 	StateFailed
 	StateSkipped
+	StateSuspended
 )
 
 func (s JobState) IsDone() bool {
@@ -45,6 +46,8 @@ func (s JobState) String() string {
 		return "failed"
 	case StateSkipped:
 		return "skipped"
+	case StateSuspended:
+		return "suspended"
 	case StateUnknown:
 		fallthrough
 	default:
@@ -95,15 +98,17 @@ type Job struct {
 	State JobState
 	Hook  Hook
 
+	status status.Statuser
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	doneCh chan struct{}
 	err    error
 
-	runCh    chan error
-	pauseCh  chan struct{}
-	pausedCh chan struct{}
-	resumeCh chan struct{}
+	runCh       chan error
+	suspendCh   chan struct{}
+	suspendedCh chan struct{}
+	resumeCh    chan struct{}
 
 	TimeScheduled time.Time
 	TimeQueued    time.Time
@@ -113,20 +118,35 @@ type Job struct {
 	m sync.Mutex
 }
 
-func (j *Job) prepare() (<-chan error, <-chan struct{}) {
+var stringRenderer = lipgloss.NewRenderer(io.Discard, termenv.WithColorCache(true))
+
+func (j *Job) Status(status status.Statuser) {
+	j.status = status
+	if s := status.String(stringRenderer); s != "" {
+		log.Debug(s)
+	}
+}
+
+func (j *Job) Interactive() bool {
+	return true
+}
+
+func (j *Job) prepare() (<-chan error, <-chan struct{}, bool) {
 	j.m.Lock()
 	defer j.m.Unlock()
+
+	isInit := j.runCh == nil
 
 	if j.runCh == nil {
 		j.runCh = make(chan error)
 	}
 
-	j.pauseCh = make(chan struct{})
+	j.suspendCh = make(chan struct{})
 
-	return j.runCh, j.pauseCh
+	return j.runCh, j.suspendCh, isInit
 }
 
-func (j *Job) pause() chan struct{} {
+func (j *Job) suspend() chan struct{} {
 	j.m.Lock()
 
 	if j.resumeCh != nil {
@@ -134,43 +154,41 @@ func (j *Job) pause() chan struct{} {
 	}
 
 	j.resumeCh = make(chan struct{})
-	j.pausedCh = make(chan struct{})
+	j.suspendedCh = make(chan struct{})
 
-	close(j.pauseCh)
+	close(j.suspendCh)
 
 	return j.resumeCh
 }
 
-func (j *Job) pauseAck(w *Worker) {
+func (j *Job) suspendAck(w *Worker) {
 	defer j.m.Unlock()
 
-	h, _ := status.HandlerFromContext(j.ctx)
-	h.(*dynamicStatusHandler).Set(nil)
 	w.CurrentJob = nil
+	j.State = StateSuspended
 
-	close(j.pausedCh)
+	close(j.suspendedCh)
 }
 
 func (j *Job) resume(w *Worker) {
 	j.m.Lock()
 	defer j.m.Unlock()
 
-	if j.resumeCh == nil {
+	resumeCh := j.resumeCh
+
+	if resumeCh == nil {
 		panic("resume on unpaused job")
 	}
 
-	w.CurrentJob = j
-
-	// Change status.Handler to current worker
-	h, _ := status.HandlerFromContext(j.ctx)
-	h.(*dynamicStatusHandler).Set(w)
-
-	close(j.resumeCh)
 	j.resumeCh = nil
+	w.CurrentJob = j
+	j.State = StateRunning
+
+	close(resumeCh)
 }
 
 func (j *Job) run(w *Worker) {
-	j.ctx = status.ContextWithHandler(j.ctx, &dynamicStatusHandler{Handler: w})
+	j.ctx = status.ContextWithHandler(j.ctx, j)
 
 	j.TimeStart = time.Now()
 	j.State = StateRunning
@@ -184,7 +202,6 @@ func (j *Job) run(w *Worker) {
 	}))
 
 	j.TimeEnd = time.Now()
-	w.Status(status.String(""))
 	w.CurrentJob = nil
 
 	j.runCh <- err
@@ -252,29 +269,21 @@ func (j *Job) IsDone() bool {
 }
 
 type Worker struct {
-	status     status.Statuser
 	CurrentJob *Job
 }
 
 func (w *Worker) GetStatus() status.Statuser {
-	if w.status == nil {
-		return status.String("")
+	j := w.CurrentJob
+	if j == nil {
+		return status.Clear()
 	}
 
-	return w.status
-}
-
-var stringRenderer = lipgloss.NewRenderer(io.Discard, termenv.WithColorCache(true))
-
-func (w *Worker) Status(status status.Statuser) {
-	w.status = status
-	if s := status.String(stringRenderer); s != "" {
-		log.Debug(s)
+	s := j.status
+	if s == nil {
+		return status.Clear()
 	}
-}
 
-func (w *Worker) Interactive() bool {
-	return true
+	return s
 }
 
 type Pool struct {
@@ -317,9 +326,9 @@ func NewPool(n int) *Pool {
 					continue
 				}
 
-				runCh, pauseCh := j.prepare()
+				runCh, suspendCh, isInit := j.prepare()
 
-				if j.resumeCh == nil {
+				if isInit {
 					go func() {
 						j.run(w)
 					}()
@@ -330,8 +339,8 @@ func NewPool(n int) *Pool {
 				select {
 				case err := <-runCh:
 					p.finalize(j, err, false)
-				case <-pauseCh:
-					j.pauseAck(w)
+				case <-suspendCh:
+					j.suspendAck(w)
 				}
 			}
 		}()

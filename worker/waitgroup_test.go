@@ -191,7 +191,7 @@ func TestPause(t *testing.T) {
 			})
 
 			// Wait for that job, this would deadlock without the Wait
-			Wait(ctx, func() {
+			Suspend(ctx, func() {
 				<-j.Wait()
 			})
 
@@ -204,7 +204,7 @@ func TestPause(t *testing.T) {
 				},
 			})
 
-			Wait(ctx, func() {
+			Suspend(ctx, func() {
 				<-j.Wait()
 			})
 

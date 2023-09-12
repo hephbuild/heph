@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"syscall"
-	"time"
 )
 
 func fileDoFd(f *os.File, fun func(fd uintptr) error) error {
@@ -29,8 +28,6 @@ func Flock(f *os.File, shared, blocking bool) error {
 	if shared {
 		lhow = syscall.LOCK_SH
 	}
-
-	time.Now().Local()
 
 	if !blocking {
 		lhow |= syscall.LOCK_NB

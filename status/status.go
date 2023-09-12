@@ -78,6 +78,12 @@ func String(status string) Statuser {
 	return stringStatus(status)
 }
 
+var statusClear = String("")
+
+func Clear() Statuser {
+	return statusClear
+}
+
 type stringStatus string
 
 func (s stringStatus) String(*lipgloss.Renderer) string {

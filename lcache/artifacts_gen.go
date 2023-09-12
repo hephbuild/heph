@@ -116,19 +116,9 @@ func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []A
 func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (_ *worker.WaitGroup, rerr error) {
 	target := gtarget.GraphTarget()
 
-	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if rerr != nil {
-			unlock()
-		}
-	}()
-
 	dir := e.cacheDir(target).Abs()
 
-	err = os.RemoveAll(dir)
+	err := os.RemoveAll(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -179,11 +169,6 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 		allDeps.Add(j)
 	}
 
-	go func() {
-		<-allDeps.Done()
-		unlock()
-	}()
-
 	if fgDeps := poolwait.ForegroundWaitGroup(ctx); fgDeps != nil {
 		fgDeps.AddChild(allDeps)
 	}
@@ -195,15 +180,9 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
 	target := gtarget.GraphTarget()
 
-	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
 	dir := e.cacheDir(target).Abs()
 
-	err = os.RemoveAll(dir)
+	err := os.RemoveAll(dir)
 	if err != nil {
 		return err
 	}

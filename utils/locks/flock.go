@@ -2,6 +2,7 @@ package locks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	log "github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/status"
@@ -61,7 +62,8 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	logger.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = flock.Flock(f, ro, false)
 	if err != nil {
-		if errno, _ := err.(unix.Errno); errno == unix.EWOULDBLOCK {
+		var errno unix.Errno
+		if ok := errors.As(err, &errno); ok && errno == unix.EWOULDBLOCK {
 			ok, err := onErr(f, ro)
 			if err != nil {
 				return false, fmt.Errorf("acquire lock for %s: %w", l.name, err)
