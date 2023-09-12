@@ -119,13 +119,16 @@ func extractHoistComments(start, end syntax.Position, nodeWhereComIs Node) []syn
 			return nil
 		}
 
-		for _, com := range (*comStoreWhereComIs)[:] {
+		for _, com := range *comStoreWhereComIs {
 			// Is supposed to be part of previous expr
 			if com.Start.Line >= start.Line && com.Start.Line <= end.Line {
 				extracted = append(extracted, com)
-				*comStoreWhereComIs = ads.Remove(*comStoreWhereComIs, com)
 			}
 		}
+
+		*comStoreWhereComIs = ads.Filter(*comStoreWhereComIs, func(com syntax.Comment) bool {
+			return !ads.Contains(extracted, com)
+		})
 	}
 
 	return extracted
