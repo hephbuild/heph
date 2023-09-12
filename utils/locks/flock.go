@@ -188,7 +188,7 @@ func (l *Flock) Unlock() error {
 		return err
 	}
 
-	f = nil
+	l.f = nil
 
 	return nil
 }
