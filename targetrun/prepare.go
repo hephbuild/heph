@@ -23,6 +23,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/instance"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/worker"
@@ -48,12 +49,14 @@ type Runner struct {
 
 type Target struct {
 	*graph.Target
-	WorkdirRoot xfs.Path
-	SandboxRoot xfs.Path
-	OutRoot     xfs.Path
-	Env         map[string]string
-	BinDir      string
-	Executor    platform.Executor
+	SandboxRoot     xfs.Path
+	SandboxLock     locks.Locker
+	SandboxTreeRoot xfs.Path
+	WorkdirRoot     xfs.Path
+	OutRoot         xfs.Path
+	Env             map[string]string
+	BinDir          string
+	Executor        platform.Executor
 }
 
 func (e *Runner) sandboxRoot(specer specs.Specer) xfs.Path {
@@ -137,31 +140,48 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	status.Emit(ctx, tgt.TargetStatus(target, "Preparing..."))
 
 	rtarget := &Target{
-		Target:      target,
-		SandboxRoot: e.sandboxRoot(target).Join("_dir"),
+		Target:          target,
+		SandboxRoot:     e.sandboxRoot(target),
+		SandboxTreeRoot: e.sandboxRoot(target).Join("_dir"),
 	}
-	rtarget.WorkdirRoot = rtarget.SandboxRoot
+	rtarget.SandboxLock = locks.NewFlock(target.Addr+" (sandbox)", rtarget.SandboxRoot.Join("lock.lock").Abs())
+
+	rtarget.WorkdirRoot = rtarget.SandboxTreeRoot
 	if !rtarget.Sandbox {
 		rtarget.WorkdirRoot = e.Root.Root
 	}
 
 	rtarget.OutRoot = rtarget.WorkdirRoot
 	if rtarget.OutInSandbox {
-		rtarget.OutRoot = rtarget.SandboxRoot
+		rtarget.OutRoot = rtarget.SandboxTreeRoot
 	}
+
+	err := rtarget.SandboxLock.Lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if rerr != nil {
+			err := rtarget.SandboxLock.Unlock()
+			if err != nil {
+				log.Errorf("failed to unlock: %v", err)
+			}
+		}
+	}()
 
 	log.Debugf("Preparing %v: %v", target.Addr, rtarget.WorkdirRoot.RelRoot())
 
 	// Sanity checks
 	for _, tool := range target.Tools.Targets {
 		if !e.LocalCache.Metas.Find(tool.Target).HasActualOutFiles() {
-			panic(fmt.Sprintf("%v: %v did not run being being used as a tool", target.Addr, tool.Target.Addr))
+			return nil, fmt.Errorf("%v: %v did not run being being used as a tool", target.Addr, tool.Target.Addr)
 		}
 	}
 
 	for _, dep := range target.Deps.All().Targets {
 		if !e.LocalCache.Metas.Find(dep.Target).HasActualOutFiles() {
-			panic(fmt.Sprintf("%v: %v did not run being being used as a dep", target.Addr, dep.Target.Addr))
+			return nil, fmt.Errorf("%v: %v did not run being being used as a dep", target.Addr, dep.Target.Addr)
 		}
 	}
 
@@ -328,7 +348,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	}
 
 	makeCfg := sandbox.MakeConfig{
-		Dir:       rtarget.SandboxRoot.Abs(),
+		Dir:       rtarget.SandboxTreeRoot.Abs(),
 		BinDir:    binDir,
 		Bin:       bin,
 		Files:     append(srcRec.Src(), restoreSrcRec.Src()...),
@@ -364,7 +384,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	env["TARGET"] = target.Addr
 	env["PACKAGE"] = target.Package.Path
 	env["ROOT"] = rtarget.WorkdirRoot.Abs()
-	env["SANDBOX"] = rtarget.SandboxRoot.Abs()
+	env["SANDBOX"] = rtarget.SandboxTreeRoot.Abs()
 	if !target.Cache.Enabled {
 		mode := rr.Mode
 		if mode == "" {
@@ -410,7 +430,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 			spaths, err := ads.MapE(
 				paths,
 				func(path string) (string, error) {
-					return envPathFactory(fileEnv, target.Package, xfs.NewRelPath(path).WithRoot(rtarget.SandboxRoot.Abs()))
+					return envPathFactory(fileEnv, target.Package, xfs.NewRelPath(path).WithRoot(rtarget.SandboxTreeRoot.Abs()))
 				},
 			)
 			if err != nil {
@@ -428,7 +448,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	traceSrcEnv()
 
 	if target.OutEnv != specs.FileEnvIgnore {
-		out := target.Out.WithRoot(rtarget.SandboxRoot.Abs()).Named()
+		out := target.Out.WithRoot(rtarget.SandboxTreeRoot.Abs()).Named()
 		namedOut := make(map[string][]string, len(out))
 		for name, paths := range out {
 			namedOut[name] = ads.GrowExtra(namedOut[name], len(paths))
@@ -477,7 +497,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		k := "RESTORE_CACHE"
 
 		paths, err := ads.MapE(
-			target.RestoreCachePaths.WithRoot(rtarget.SandboxRoot.Abs()),
+			target.RestoreCachePaths.WithRoot(rtarget.SandboxTreeRoot.Abs()),
 			func(path xfs.Path) (string, error) {
 				return envPathFactory(target.RestoreCache.Env, target.Package, path)
 			},

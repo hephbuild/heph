@@ -288,7 +288,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 			if target.Cache.Enabled && allowCached {
 				outputs := s.outputs.Get(target.Addr).Slice()
 
-				_, cached, err := s.Scheduler.pullOrGetCache(ctx, target, outputs, false, true, !pullIfCached, true, uncompress)
+				_, cached, err := s.Scheduler.pullOrGetCache(ctx, target, outputs, true, false, true, !pullIfCached, true, uncompress)
 				if err != nil {
 					return err
 				}

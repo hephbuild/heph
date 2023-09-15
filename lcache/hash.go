@@ -361,6 +361,21 @@ func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) s
 	return h
 }
 
+func (e *LocalCacheState) hashArtifact(h hash.Hash, target *graph.Target, artifact artifacts.Artifact) error {
+	r, _, err := e.UncompressedReaderFromArtifact(artifact, target)
+	if err != nil {
+		return fmt.Errorf("uncompressedreader %v %w", artifact.Name(), err)
+	}
+	defer r.Close()
+
+	err = e.hashTar(h, r)
+	if err != nil {
+		return fmt.Errorf("hashTar %v %w", artifact.Name(), err)
+	}
+
+	return nil
+}
+
 func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (string, error) {
 	target := gtarget.GraphTarget()
 	targetm := e.Metas.Find(gtarget)
@@ -400,15 +415,9 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 
 	h.String(output)
 
-	r, err := artifacts.UncompressedReaderFromArtifact(target.Artifacts.OutTar(output), e.cacheDir(target).Abs())
+	err = e.hashArtifact(h, target, target.Artifacts.OutTar(output))
 	if err != nil {
-		return "", fmt.Errorf("hashOutput: %v: uncompressedreader %v %w", target.Addr, output, err)
-	}
-	defer r.Close()
-
-	err = e.hashTar(h, r)
-	if err != nil {
-		return "", fmt.Errorf("hashOutput: %v: hashTar %v %w", target.Addr, output, err)
+		return "", err
 	}
 
 	if target.HasSupportFiles && output != specs.SupportFilesOutput {

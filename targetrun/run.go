@@ -14,9 +14,9 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker/poolwait"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -43,37 +43,22 @@ type RequestOpts struct {
 func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*Target, error) {
 	target := rr.Target
 
-	completedCh := make(chan struct{})
-	// This needs to happen after the lock is released
-	defer close(completedCh)
-
-	var runLock locks.Locker
-	if target.ConcurrentExecution {
-		runLock = locks.NewMutex(target.Addr)
-	} else {
-		runLock = locks.NewFlock(target.Addr+" (run)", e.tmpTargetRoot(target).Join("run.lock").Abs())
-	}
-
-	log.Tracef("%v locking run", target.Addr)
-	err := runLock.Lock(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		log.Tracef("%v unlocking run", target.Addr)
-		err := runLock.Unlock()
-		if err != nil {
-			log.Errorf("Failed to unlock %v: %v", target.Addr, err)
-		}
-
-		log.Tracef("Target DONE %v", target.Addr)
-	}()
-
-	rtarget, err := e.runPrepare(ctx, target, rr)
+	rtarget, err := e.runPrepare(ctx, rr.Target, rr)
 	if err != nil {
 		return nil, fmt.Errorf("prepare: %w", err)
 	}
+
+	completedCh := make(chan struct{})
+
+	defer func() {
+		err := rtarget.SandboxLock.Unlock()
+		if err != nil {
+			log.Errorf("failed to unlock: %v", err)
+		}
+
+		// This needs to happen after the lock is released so that sandbox can be cleared, only once in case of concurrent runs
+		close(completedCh)
+	}()
 
 	env := rtarget.Env
 	binDir := rtarget.BinDir
@@ -90,7 +75,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 	status.Emit(ctx, tgt.TargetStatus(target, "Running..."))
 
 	if target.IsTextFile() {
-		to := target.Out.All()[0].WithRoot(rtarget.SandboxRoot.Abs()).Abs()
+		to := target.Out.All()[0].WithRoot(rtarget.SandboxTreeRoot.Abs()).Abs()
 
 		err := xfs.CreateParentDir(to)
 		if err != nil {
@@ -288,15 +273,12 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 	}
 
 	if !e.Config.Engine.KeepSandbox {
-		dir := e.sandboxRoot(target).Abs()
-
-		e.Pool.Schedule(ctx, &worker.Job{
+		j := e.Pool.Schedule(ctx, &worker.Job{
 			Name: fmt.Sprintf("clear sandbox %v", target.Addr),
 			// We need to make sure to wait for the lock to be released before proceeding
 			Deps: worker.WaitGroupChan(completedCh),
 			Do: func(w *worker.Worker, ctx context.Context) error {
-				log.Tracef("%v locking run", target.Addr)
-				locked, err := runLock.TryLock(ctx)
+				locked, err := rtarget.SandboxLock.TryLock(ctx)
 				if err != nil {
 					return err
 				}
@@ -306,14 +288,14 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 				}
 
 				defer func() {
-					err := runLock.Unlock()
+					err := rtarget.SandboxLock.Unlock()
 					if err != nil {
 						log.Errorf("Failed to unlock %v: %v", target.Addr, err)
 					}
 				}()
 
 				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
-				err = xfs.DeleteDir(dir, false)
+				err = xfs.DeleteDir(rtarget.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
 				}
@@ -321,6 +303,9 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 				return nil
 			},
 		})
+		if poolDeps := poolwait.ForegroundWaitGroup(ctx); poolDeps != nil {
+			poolDeps.Add(j)
+		}
 	}
 
 	return rtarget, nil

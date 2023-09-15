@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -337,13 +338,27 @@ func Walk(tarf io.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
 }
 
 func untarFile(hdr *tar.Header, tr *tar.Reader, to string, ro bool) error {
+	info, err := os.Lstat(to)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	if info != nil {
+		// The file is probably not changed... This should prevent an infinite loop of
+		// a file being codegen copy_noexclude & input to another target
+		if hdr.Size == info.Size() && hdr.ModTime == info.ModTime() {
+			return nil
+		}
+	}
+
 	f, err := os.OpenFile(to, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	if _, err := io.CopyN(f, tr, hdr.Size); err != nil {
+	_, err = io.CopyN(f, tr, hdr.Size)
+	if err != nil {
 		return err
 	}
 

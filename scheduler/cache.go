@@ -17,7 +17,13 @@ import (
 )
 
 func (e *Scheduler) pullOrGetCacheAndPost(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, followHint, uncompress bool) (bool, error) {
-	_, cached, err := e.pullOrGetCache(ctx, target, outputs, withRestoreCache, false, false, followHint, uncompress)
+	unlock, err := e.LocalCache.LockAllArtifacts(ctx, target)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
+	_, cached, err := e.pullOrGetCache(ctx, target, outputs, false, withRestoreCache, false, false, followHint, uncompress)
 	if err != nil {
 		return false, fmt.Errorf("pullorget: %w", err)
 	}
@@ -42,14 +48,16 @@ func (e *Scheduler) pullOrGetCacheAndPost(ctx context.Context, target *graph.Tar
 	return true, nil
 }
 
-func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
+func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, outputs []string, lock, withRestoreCache, onlyMeta, onlyMetaLocal, followHint, uncompress bool) (rpulled, rcached bool, rerr error) {
 	status.Emit(ctx, tgt.TargetStatus(target, "Checking local cache..."))
 
-	unlock, err := e.LocalCache.LockAllArtifacts(ctx, target)
-	if err != nil {
-		return false, false, err
+	if lock {
+		unlock, err := e.LocalCache.LockAllArtifacts(ctx, target)
+		if err != nil {
+			return false, false, err
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	// We may want to check that the tar.gz data is available locally, if not it will make sure you can acquire it from cache
 	cached, err := e.LocalCache.GetLocalCache(ctx, target, outputs, withRestoreCache, onlyMetaLocal, false, uncompress)

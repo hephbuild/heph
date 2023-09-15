@@ -100,6 +100,10 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 	return s, nil
 }
 
+func (e *LocalCacheState) LockPath(target graph.Targeter, resource string) string {
+	return lockPath(e.Root, target, resource)
+}
+
 func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (rerr error) {
 	target := ttarget.GraphTarget()
 
