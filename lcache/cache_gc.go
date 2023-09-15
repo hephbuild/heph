@@ -83,7 +83,7 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 		flog("%v:", reldir)
 		target, ok := targetHashDirs[dir]
 		if !ok {
-			flog("Not part of schema or not cached, delete")
+			flog("Not part of graph or not cached, delete")
 			if !dryrun {
 				err := os.RemoveAll(dir)
 				if err != nil {
