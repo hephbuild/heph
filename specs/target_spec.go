@@ -192,6 +192,10 @@ func (t Target) IsTextFile() bool {
 	return len(t.Run) == 2 && t.Run[0] == "text_file"
 }
 
+func (t Target) IsExecutable() bool {
+	return !t.IsGroup() && !t.IsTextFile()
+}
+
 func (t Target) HasDefaultPlatforms() bool {
 	return len(t.Platforms) == 1 && t.Platforms[0].Default
 }

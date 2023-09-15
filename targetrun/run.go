@@ -89,10 +89,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 
 	status.Emit(ctx, tgt.TargetStatus(target, "Running..."))
 
-	var logFilePath string
-	if target.IsGroup() && !rr.Shell {
-		// Ignore
-	} else if target.IsTextFile() {
+	if target.IsTextFile() {
 		to := target.Out.All()[0].WithRoot(rtarget.SandboxRoot.Abs()).Abs()
 
 		err := xfs.CreateParentDir(to)
@@ -115,7 +112,10 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 		if err != nil {
 			return nil, err
 		}
-	} else {
+	}
+
+	var logFilePath string
+	if rr.Shell || target.IsExecutable() {
 		var entrypoint platform.Entrypoint
 		switch target.Entrypoint {
 		case specs.EntrypointBash:
@@ -128,13 +128,16 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 			panic("unhandled entrypoint: " + target.Entrypoint)
 		}
 
-		run := make([]string, 0)
+		var run []string
 		if target.IsTool() {
 			log.Tracef("%v is tool, replacing run", target.Addr)
 			run = append(target.Run[1:], e.toolAbsPath(target.ToolTarget()))
 		} else {
+			run = make([]string, 0, len(target.Run))
+			funcs := e.QueryFunctions(target)
+
 			for _, s := range target.Run {
-				out, err := exprs.Exec(s, e.QueryFunctions(target))
+				out, err := exprs.Exec(s, funcs)
 				if err != nil {
 					return nil, fmt.Errorf("run `%v`: %w", s, err)
 				}

@@ -73,8 +73,8 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 				depsHash:                   k.depshash,
 				inputHash:                  "",
 				actualOutFiles:             nil,
-				multiCacheLocks:            locks.NewFlock(gtarget.Addr+" (artifacts)", lockPath(root, gtarget, "artifacts")),
-				cacheLocks:                 nil, // Set after
+				allArtifactsLock:           locks.NewFlock(gtarget.Addr+" (artifacts)", lockPath(root, gtarget, "all_artifacts")),
+				artifactLocks:              nil, // Set after
 				cacheHashInputTargetMutex:  sync.Mutex{},
 				cacheHashOutputTargetMutex: maps.KMutex{},
 				cacheHashOutput:            &maps.Map[string, string]{},
@@ -84,13 +84,13 @@ func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs 
 
 			ts := t.Spec()
 
-			t.cacheLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
+			t.artifactLocks = make(map[string]locks.Locker, len(t.Artifacts.All()))
 			for _, artifact := range t.Artifacts.All() {
 				resource := artifact.Name()
 
 				p := lockPath(root, t, "cache_"+resource)
 
-				t.cacheLocks[artifact.Name()] = locks.NewFlock(ts.Addr+" ("+resource+")", p)
+				t.artifactLocks[artifact.Name()] = locks.NewFlock(ts.Addr+" ("+resource+")", p)
 			}
 
 			return t
@@ -117,12 +117,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	ctx, span := e.Observability.SpanLocalCacheStore(ctx, target)
 	defer span.EndError(rerr)
 
-	hash, err := e.HashInput(target)
-	if err != nil {
-		return err
-	}
-
-	unlock, err := e.LockArtifacts(ctx, target, artifacts.ToSlice(arts))
+	unlock, err := e.LockAllArtifacts(ctx, target)
 	if err != nil {
 		return err
 	}
@@ -145,7 +140,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 		}
 	}
 
-	return e.LinkLatestCache(target, hash)
+	return nil
 }
 
 func (e *LocalCacheState) LinkLatestCache(target specs.Specer, hash string) error {

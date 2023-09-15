@@ -287,3 +287,89 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 
 	assert.Equal(t, false, ok)
 }
+
+func TestFlockConcurrent(t *testing.T) {
+	dir, err := os.MkdirTemp("", "flock")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	name := t.Name()
+	factory := func(i int) Locker {
+		p := filepath.Join(dir, fmt.Sprintf("%v-%v.lock", name, i))
+
+		return NewFlock(name, p)
+	}
+
+	locks1 := []Locker{
+		factory(1),
+		factory(2),
+		factory(3),
+		factory(4),
+		factory(5),
+		factory(6),
+	}
+
+	locks2 := []Locker{
+		factory(1),
+		factory(2),
+		factory(3),
+		factory(4),
+		factory(5),
+		factory(6),
+	}
+
+	lockAll := func(locks []Locker) error {
+		for _, lock := range locks {
+			err := lock.Lock(context.Background())
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	unlockAll := func(locks []Locker) error {
+		for _, lock := range locks {
+			err := lock.Unlock()
+			if err != nil {
+				// TODO
+			}
+		}
+
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		err := lockAll(locks1)
+		if err != nil {
+			panic(err)
+		}
+
+		err = unlockAll(locks1)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		err := lockAll(locks2)
+		if err != nil {
+			panic(err)
+		}
+
+		err = unlockAll(locks2)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	wg.Wait()
+}

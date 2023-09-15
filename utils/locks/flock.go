@@ -56,7 +56,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}
 	defer func() {
 		if f != l.f {
-			f.Close()
+			_ = f.Close()
 		}
 	}()
 
@@ -94,8 +94,13 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 func (l *Flock) lock(ctx context.Context, ro bool) error {
 	_, err := l.tryLock(ctx, ro, func(f *os.File, ro bool) (bool, error) {
-		l.m.Unlock()
-		defer l.m.Lock()
+		if ro {
+			l.m.RUnlock()
+			defer l.m.RLock()
+		} else {
+			l.m.Unlock()
+			defer l.m.Lock()
+		}
 
 		doneCh := make(chan struct{})
 		defer close(doneCh)
@@ -109,24 +114,35 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 				// log
 			}
 
-			pidb, _ := os.ReadFile(f.Name())
-			pidStr := string(pidb)
-
-			if len(pidStr) > 0 {
-				pid, err := strconv.Atoi(pidStr)
-				if err != nil {
-					pid = -1
+			for {
+				select {
+				case <-doneCh:
+					break
+				default:
 				}
 
-				if os.Getpid() == pid {
-					status.Emit(ctx, status.String(fmt.Sprintf("Another job locked %v, waiting...", l.name)))
+				pidb, _ := os.ReadFile(f.Name())
+				pidStr := string(pidb)
+
+				if len(pidStr) > 0 {
+					pid, err := strconv.Atoi(pidStr)
+					if err != nil {
+						pid = -1
+					}
+
+					if os.Getpid() == pid {
+						status.Emit(ctx, status.String(fmt.Sprintf("Another job locked %v, waiting...", l.name)))
+					} else {
+						processDetails := getProcessDetails(pid)
+
+						status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name)))
+					}
+
+					break
 				} else {
-					processDetails := getProcessDetails(pid)
-
-					status.Emit(ctx, status.String(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name)))
+					status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", l.name)))
+					time.Sleep(time.Second)
 				}
-			} else {
-				status.Emit(ctx, status.String(fmt.Sprintf("Another process locked %v, waiting...", l.name)))
 			}
 		}()
 

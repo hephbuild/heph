@@ -13,6 +13,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/utils/xmath"
@@ -33,7 +34,7 @@ func (e *LocalCacheState) LockArtifact(ctx context.Context, target graph.Targete
 
 func (e *LocalCacheState) lockArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, try bool) (bool, func(), error) {
 	starget := target.Spec()
-	l := e.Metas.Find(target).cacheLocks[artifact.Name()]
+	l := e.Metas.Find(target).artifactLocks[artifact.Name()]
 
 	unlock := func() {
 		err := l.Unlock()
@@ -58,46 +59,76 @@ func (e *LocalCacheState) lockArtifact(ctx context.Context, target graph.Targete
 	}
 }
 
-func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Targeter, artifacts []artifacts.Artifact) (func(), error) {
-locks:
-	for {
-		unlockers := make([]func(), 0, len(artifacts))
+func (e *LocalCacheState) tryLockArtifacts(ctx context.Context, target graph.Targeter, artifacts []artifacts.Artifact) (bool, func(), error) {
+	// Prevents concurrent multiple locks attempts
+	l := e.Metas.Find(target).allArtifactsLock
+	err := l.Lock(ctx)
+	if err != nil {
+		return false, nil, err
+	}
+	defer func() {
+		_ = l.Unlock()
+	}()
 
-		unlockAll := func() {
-			for _, unlock := range unlockers {
-				unlock()
-			}
+	unlockAll := &locks.Multi{}
+
+	for _, artifact := range artifacts {
+		ok, unlock, err := e.lockArtifact(ctx, target, artifact, true)
+		if err != nil || !ok {
+			_ = unlockAll.Unlock()
+			return false, nil, err
 		}
 
-		// Should be first to prevent concurrent multiple locks attempts
-		l := e.Metas.Find(target).multiCacheLocks
-		err := l.Lock(ctx)
+		unlockAll.AddFunc(func() error {
+			unlock()
+			return nil
+		})
+	}
+
+	return true, func() {
+		err := unlockAll.Unlock()
+		if err != nil {
+			log.Errorf("artifacts: unlock: %v", err)
+		}
+	}, nil
+}
+
+func (e *LocalCacheState) LockAllArtifacts(ctx context.Context, target graph.Targeter) (func(), error) {
+	l := e.Metas.Find(target).allArtifactsLock
+	err := l.Lock(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return func() {
+		_ = l.Unlock()
+	}, nil
+}
+
+func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Targeter, artifacts []artifacts.Artifact) (func(), error) {
+	for i := 1; ; i++ {
+		ok, unlock, err := e.tryLockArtifacts(ctx, target, artifacts)
 		if err != nil {
 			return nil, err
 		}
 
-		unlockers = append(unlockers, func() {
-			_ = l.Unlock()
-		})
-
-		for _, artifact := range artifacts {
-			ok, unlock, err := e.lockArtifact(ctx, target, artifact, true)
-			if err != nil {
-				unlockAll()
-				return nil, err
+		// We failed to acquire one lock, retry, with some jitter
+		if !ok {
+			delay := time.Duration(i*i*10) * time.Millisecond
+			if delay > time.Second {
+				delay = time.Second
 			}
+			delay += time.Duration(rand.Int63n(int64(delay / 3)))
 
-			// We failed to acquire one lock, release all and retry, with some jitter
-			if !ok {
-				unlockAll()
-				time.Sleep(time.Duration(10+rand.Intn(50)) * time.Millisecond)
-				continue locks
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
 			}
-
-			unlockers = append(unlockers, unlock)
 		}
 
-		return unlockAll, nil
+		return unlock, nil
 	}
 }
 
