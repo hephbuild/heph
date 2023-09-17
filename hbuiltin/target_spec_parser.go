@@ -171,6 +171,11 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		}
 	}
 
+	t.Annotations = map[string]interface{}{}
+	for _, item := range args.Annotations.Items() {
+		t.Annotations[item.Key] = utils.FromStarlark(item.Value)
+	}
+
 	for _, label := range t.Labels {
 		err := specs.LabelValidate(label)
 		if err != nil {

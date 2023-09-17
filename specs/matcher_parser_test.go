@@ -32,7 +32,7 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to/**", "//path/to/**:*"},
 		{"//path/to:*", "//path/to:*"},
 		{"//path/to", "//path/to:*"},
-		//{"deps(//path/to)", "deps(//path/to)"}, TODO: functions
+		{`has_annotation("some")`, `has_annotation("some")`},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {
@@ -62,6 +62,8 @@ func TestParseMatcherErr(t *testing.T) {
 		{"//path/to:target label", "Unexpected token label: label"},
 		{"//path/to/***:label", "unexpected *** in target path"},
 		{"//path/to:**", "unexpected ** in target name"},
+		{`has_annotation("some)`, "Expected comma, got EOF"},
+		{`has_annotation("some'`, "Expected comma, got EOF"},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {

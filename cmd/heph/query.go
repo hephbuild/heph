@@ -32,6 +32,7 @@ var transitive bool
 var all bool
 var debugTransitive bool
 var filter string
+var jsonOutput bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -65,6 +66,7 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 	queryCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
+	queryCmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
 
 	searchCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
 
@@ -147,6 +149,14 @@ var queryCmd = &cobra.Command{
 		selected, err := targets.Filter(matcher)
 		if err != nil {
 			return err
+		}
+
+		if jsonOutput {
+			err := json.NewEncoder(os.Stdout).Encode(selected.Slice())
+			if err != nil {
+				return err
+			}
+			return nil
 		}
 
 		if selected.Len() == 0 {

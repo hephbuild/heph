@@ -87,7 +87,7 @@ func UnpackDistruct(v starlark.Value) (*Distruct, error) {
 	return &d, nil
 }
 
-// Distruct is a Type that can unpack a struct or dist
+// Distruct is a Type that can unpack a string-keyed dist or struct
 type Distruct struct {
 	items []StringItem
 }

@@ -128,6 +128,7 @@ type Target struct {
 	Transitive          Transitive
 	Timeout             time.Duration
 	GenDepsMeta         bool
+	Annotations         map[string]interface{}
 }
 
 type Specer interface {

@@ -178,6 +178,7 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 		"transitive?", &sargs.Transitive,
 		"timeout?", &sargs.Timeout,
 		"gen_deps_meta?", &sargs.GenDepsMeta,
+		"annotations?", &sargs.Annotations,
 	); err != nil {
 		if sargs.Name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetAddr(sargs.Name), err)

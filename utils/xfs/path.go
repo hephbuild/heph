@@ -62,6 +62,11 @@ func NewPathAbs(root, relRoot, abs string) Path {
 }
 
 func (p *Path) MarshalJSON() ([]byte, error) {
+	abs := p.abs
+	if abs == "" {
+		abs = filepath.Join(p.root, p.relRoot)
+	}
+
 	return json.Marshal(&struct {
 		Root    string
 		RelRoot string
@@ -69,7 +74,7 @@ func (p *Path) MarshalJSON() ([]byte, error) {
 	}{
 		Root:    p.root,
 		RelRoot: p.relRoot,
-		Abs:     p.abs,
+		Abs:     abs,
 	})
 }
 

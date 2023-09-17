@@ -2,7 +2,9 @@ package utils
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
+	"go.starlark.net/starlarkstruct"
 	"reflect"
 )
 
@@ -19,13 +21,31 @@ func FromStarlark(v starlark.Value) interface{} {
 		return vi
 	case starlark.Float:
 		return float64(v)
-	case *starlark.Dict:
-		data := make(map[interface{}]interface{}, v.Len())
+	case *starlarkstruct.Struct:
+		d, err := xstarlark.UnpackDistruct(v)
+		if err != nil {
+			panic(err)
+		}
 
+		data := make(map[string]interface{}, len(d.Items()))
+		for _, e := range d.Items() {
+			data[e.Key] = FromStarlark(e.Value)
+		}
+		return data
+	case *starlark.Dict:
+		d, err := xstarlark.UnpackDistruct(v)
+		if err == nil {
+			data := make(map[string]interface{}, len(d.Items()))
+			for _, e := range d.Items() {
+				data[e.Key] = FromStarlark(e.Value)
+			}
+			return data
+		}
+
+		data := make(map[interface{}]interface{}, v.Len())
 		for _, e := range v.Items() {
 			data[FromStarlark(e.Index(0))] = FromStarlark(e.Index(1))
 		}
-
 		return data
 	case *starlark.List:
 		data := make([]interface{}, 0, v.Len())

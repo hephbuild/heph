@@ -13,7 +13,7 @@ target(
         "Root": {
             "Root": "/tmp/some/test",
             "RelRoot": "some/test",
-            "Abs": ""
+            "Abs": "/tmp/some/test/some/test"
         },
         "SourceFiles": null
     },
@@ -99,5 +99,6 @@ target(
         "Platforms": null
     },
     "Timeout": 0,
-    "GenDepsMeta": false
+    "GenDepsMeta": false,
+    "Annotations": {}
 }

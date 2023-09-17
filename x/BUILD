@@ -77,3 +77,32 @@ target(
     run = "ls -lah $SRC",
     cache = False,
 )
+
+target(
+    name = "with-task-annotation",
+    run = "echo hello",
+    cache = False,
+    annotations = {"vscode-task": {"file": "x/BUILD"}},
+)
+
+target(
+    name = "with-launch-annotation",
+    run = "echo hello",
+    cache = False,
+    annotations = {
+        "vscode-launch": {
+            "file": "x/BUILD",
+            "configuration": {
+                "type": "node",
+                "name": "launch $(addr)",
+                "request": "launch",
+                "runtimeExecutable": "heph",
+                "runtimeArgs": ["run", "$(addr)", "--force"],
+                "skipFiles": ["<node_internals>/**"],
+                # "remoteRoot": "/ws/.heph/sandbox/mgmt/ndsys/__target_test-http.spec.ts/_dir",
+                "localRoot": "${workspaceFolder}",
+                "outputCapture": "std",
+            },
+        },
+    },
+)

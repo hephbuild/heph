@@ -18,6 +18,7 @@ const (
 	tokenLabel
 	tokenAddr
 	tokenFunction
+	tokenString
 )
 
 type token struct {
@@ -36,8 +37,6 @@ func isAddrChar(c uint8) bool {
 		rune(c) == ':' ||
 		rune(c) == '*'
 }
-
-const featureFunctions = false
 
 func lex(input string) []token {
 	var tokens []token
@@ -65,6 +64,16 @@ func lex(input string) []token {
 		case input[0] == ',':
 			tokens = append(tokens, token{typ: tokenComma, value: ","})
 			input = input[1:]
+		case input[0] == '"':
+			i := 1
+			for ; i < len(input); i++ {
+				if input[i] == '"' {
+					i++
+					break
+				}
+			}
+			tokens = append(tokens, token{typ: tokenString, value: input[1 : i-1]})
+			input = input[i:]
 		case isLabelChar(input[0]):
 			i := 1
 			for ; i < len(input); i++ {
@@ -73,7 +82,7 @@ func lex(input string) []token {
 				}
 			}
 
-			if featureFunctions && i < len(input) && input[i] == '(' {
+			if i < len(input) && input[i] == '(' {
 				tokens = append(tokens, token{typ: tokenFunction, value: input[:i]})
 				i++
 			} else {
@@ -95,6 +104,6 @@ func lex(input string) []token {
 		}
 	}
 
-	tokens = append(tokens, token{typ: tokenEOF})
+	tokens = append(tokens, token{typ: tokenEOF, value: "EOF"})
 	return tokens
 }

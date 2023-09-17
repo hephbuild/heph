@@ -25,14 +25,16 @@ func (n allMatcher) Match(t Specer) bool {
 	return true
 }
 
-type astNode = Matcher
-
-type andNode struct {
-	left  astNode
-	right astNode
+type astNode interface {
+	String() string
 }
 
-func AndNodeFactory(ms ...astNode) Matcher {
+type andNode struct {
+	left  Matcher
+	right Matcher
+}
+
+func AndNodeFactory(ms ...Matcher) Matcher {
 	switch len(ms) {
 	case 0:
 		panic("need at least one node")
@@ -57,11 +59,11 @@ func (n andNode) Match(t Specer) bool {
 }
 
 type orNode struct {
-	left  astNode
-	right astNode
+	left  Matcher
+	right Matcher
 }
 
-func OrNodeFactory(ms ...astNode) Matcher {
+func OrNodeFactory(ms ...Matcher) Matcher {
 	switch len(ms) {
 	case 0:
 		panic("need at least one node")
@@ -69,7 +71,7 @@ func OrNodeFactory(ms ...astNode) Matcher {
 		return ms[0]
 	}
 
-	return mOrNode[astNode]{nodes: ms}
+	return mOrNode[Matcher]{nodes: ms}
 }
 
 func (n orNode) String() string {
@@ -80,7 +82,7 @@ func (n orNode) Match(t Specer) bool {
 	return n.left.Match(t) || n.right.Match(t)
 }
 
-type mOrNode[T astNode] struct {
+type mOrNode[T Matcher] struct {
 	nodes []T
 }
 
@@ -103,7 +105,7 @@ func (n mOrNode[T]) Match(t Specer) bool {
 }
 
 type notNode struct {
-	expr astNode
+	expr Matcher
 }
 
 func (n notNode) String() string {
@@ -146,8 +148,9 @@ func (n targetRegexNode) Match(t Specer) bool {
 }
 
 type funcNode struct {
-	name string
-	args []astNode
+	name  string
+	args  []astNode
+	match func(args []astNode, t Specer) bool
 }
 
 func (n funcNode) String() string {
@@ -159,8 +162,24 @@ func (n funcNode) String() string {
 }
 
 func (n funcNode) Match(t Specer) bool {
-	// todo
-	return false
+	return n.match(n.args, t)
+}
+
+var matcherFunctions = map[string]func(args []astNode, t Specer) bool{
+	"has_annotation": func(args []astNode, t Specer) bool {
+		annotation := args[0].(stringNode).value
+
+		_, ok := t.Spec().Annotations[annotation]
+		return ok
+	},
+}
+
+type stringNode struct {
+	value string
+}
+
+func (n stringNode) String() string {
+	return fmt.Sprintf(`"%v"`, n.value)
 }
 
 func printToken(t token) string {
@@ -174,7 +193,7 @@ func printToken(t token) string {
 	}
 }
 
-func parse(tokens []token) astNode {
+func parse(tokens []token) Matcher {
 	var index int
 	ast := parseExpr(tokens, &index)
 
@@ -185,7 +204,7 @@ func parse(tokens []token) astNode {
 	return ast
 }
 
-func parseExpr(tokens []token, index *int) astNode {
+func parseExpr(tokens []token, index *int) Matcher {
 	left := parseTerm(tokens, index)
 
 	for *index < len(tokens) {
@@ -202,7 +221,7 @@ func parseExpr(tokens []token, index *int) astNode {
 	return left
 }
 
-func parseTerm(tokens []token, index *int) astNode {
+func parseTerm(tokens []token, index *int) Matcher {
 	left := parseFactor(tokens, index)
 
 	for *index < len(tokens) {
@@ -219,7 +238,20 @@ func parseTerm(tokens []token, index *int) astNode {
 	return left
 }
 
-func parseFactor(tokens []token, index *int) astNode {
+func parseFunctionArg(tokens []token, index *int) astNode {
+	switch tokens[*index].typ {
+	case tokenString:
+		{
+			node := stringNode{value: tokens[*index].value}
+			*index++
+			return node
+		}
+	}
+
+	return parseTerm(tokens, index)
+}
+
+func parseFactor(tokens []token, index *int) Matcher {
 	switch tokens[*index].typ {
 	case tokenNot:
 		*index++
@@ -252,22 +284,30 @@ func parseFactor(tokens []token, index *int) astNode {
 		}
 		return m
 	case tokenFunction:
-		value := tokens[*index].value
+		funcName := tokens[*index].value
 		*index++
 
-		args := make([]astNode, 0)
+		matchFunc, ok := matcherFunctions[funcName]
+		if !ok {
+			panic(fmt.Sprintf("Unknown function %v", funcName))
+		}
 
+		args := make([]astNode, 0)
 		for {
 			if tokens[*index].typ == tokenRParen {
 				*index++
-				return funcNode{name: value, args: args}
+
+				return funcNode{name: funcName, args: args, match: matchFunc}
 			}
 
-			if len(args) > 0 && tokens[*index].typ != tokenComma {
-				panic(fmt.Sprintf("Expected comma, got %v", printToken(tokens[*index])))
+			if len(args) > 0 {
+				if tokens[*index].typ != tokenComma {
+					panic(fmt.Sprintf("Expected comma, got %v", printToken(tokens[*index])))
+				}
+				*index++ // eat comma
 			}
 
-			expr := parseTerm(tokens, index)
+			expr := parseFunctionArg(tokens, index)
 			args = append(args, expr)
 		}
 	default:
@@ -280,8 +320,8 @@ func parseFactor(tokens []token, index *int) astNode {
 	}
 }
 
-func lexAndParse(input string) (_ astNode, err error) {
-	return xpanic.RecoverV(func() (astNode, error) {
+func lexAndParse(input string) (_ Matcher, err error) {
+	return xpanic.RecoverV(func() (Matcher, error) {
 		tokens := lex(input)
 		ast := parse(tokens)
 
@@ -298,7 +338,7 @@ func ParseMatcherInPkg(pkg, input string) (Matcher, error) {
 }
 
 func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, error) {
-	includeMatchers := make([]astNode, 0, len(include))
+	includeMatchers := make([]Matcher, 0, len(include))
 	for _, s := range include {
 		m, err := ParseMatcherInPkg(pkg, s)
 		if err != nil {
@@ -307,7 +347,7 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 
 		includeMatchers = append(includeMatchers, m)
 	}
-	excludeMatchers := make([]astNode, 0, len(exclude))
+	excludeMatchers := make([]Matcher, 0, len(exclude))
 	for _, s := range exclude {
 		m, err := ParseMatcherInPkg(pkg, s)
 		if err != nil {

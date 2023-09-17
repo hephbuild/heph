@@ -39,6 +39,7 @@ type TargetArgs struct {
 	Transitive          TargetArgsTransitive
 	Timeout             string
 	GenDepsMeta         bool
+	Annotations         xstarlark.Distruct
 }
 
 type TargetArgsTransitive struct {
