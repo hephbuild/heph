@@ -171,7 +171,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		}
 	}
 
-	t.Annotations = map[string]interface{}{}
+	t.Annotations = make(map[string]interface{}, len(args.Annotations.Items()))
 	for _, item := range args.Annotations.Items() {
 		t.Annotations[item.Key] = utils.FromStarlark(item.Value)
 	}

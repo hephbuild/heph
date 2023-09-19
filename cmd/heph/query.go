@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/cmd/heph/search"
 	"github.com/hephbuild/heph/cmd/heph/searchui2"
+	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/graphdot"
 	"github.com/hephbuild/heph/graphprint"
@@ -152,7 +153,23 @@ var queryCmd = &cobra.Command{
 		}
 
 		if jsonOutput {
-			err := json.NewEncoder(os.Stdout).Encode(selected.Slice())
+			selected := selected.Slice()
+
+			for _, target := range selected {
+				err := exprs.ExecDeep(&target.Annotations, map[string]exprs.Func{
+					"addr": func(expr exprs.Expr) (string, error) {
+						return target.Addr, nil
+					},
+					"sandbox_root": func(expr exprs.Expr) (string, error) {
+						return bs.Scheduler.Runner.SandboxTreeRoot(target).Abs(), nil
+					},
+				})
+				if err != nil {
+					return err
+				}
+			}
+
+			err := json.NewEncoder(os.Stdout).Encode(selected)
 			if err != nil {
 				return err
 			}

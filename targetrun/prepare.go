@@ -142,7 +142,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	rtarget := &Target{
 		Target:          target,
 		SandboxRoot:     e.sandboxRoot(target),
-		SandboxTreeRoot: e.sandboxRoot(target).Join("_dir"),
+		SandboxTreeRoot: e.SandboxTreeRoot(target),
 	}
 	rtarget.SandboxLock = locks.NewFlock(target.Addr+" (sandbox)", rtarget.SandboxRoot.Join("lock.lock").Abs())
 
@@ -548,6 +548,10 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	rtarget.Executor = executor
 
 	return rtarget, nil
+}
+
+func (e *Runner) SandboxTreeRoot(target specs.Specer) xfs.Path {
+	return e.sandboxRoot(target).Join("_dir")
 }
 
 var envRegex = regexp.MustCompile(`[^A-Za-z0-9_]+`)
