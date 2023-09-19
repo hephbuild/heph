@@ -47,6 +47,10 @@ func execReflect(v reflect.Value, funcs map[string]Func) (reflect.Value, error) 
 
 		return p, nil
 	case reflect.Interface:
+		if v.IsNil() {
+			return v, nil
+		}
+
 		return execReflect(v.Elem(), funcs)
 	case reflect.Map:
 		return execReflectMap(v, funcs)
@@ -71,6 +75,10 @@ func execReflect(v reflect.Value, funcs map[string]Func) (reflect.Value, error) 
 }
 
 func execReflectMap(obj reflect.Value, funcs map[string]Func) (reflect.Value, error) {
+	if obj.IsNil() {
+		return obj, nil
+	}
+
 	m := reflect.MakeMapWithSize(reflect.MapOf(obj.Type().Key(), obj.Type().Elem()), obj.Len())
 
 	it := obj.MapRange()

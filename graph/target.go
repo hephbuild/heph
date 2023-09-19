@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"encoding/json"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
@@ -95,6 +96,20 @@ func (t *Target) GraphTarget() *Target {
 type TargetRuntimeEnv struct {
 	Value  string
 	Target *Target
+}
+
+func (v TargetRuntimeEnv) MarshalJSON() ([]byte, error) {
+	m := struct {
+		Value  string
+		Target string `json:"omitempty"`
+	}{
+		Value: v.Value,
+	}
+	if v.Target != nil {
+		m.Target = v.Target.Addr
+	}
+
+	return json.Marshal(m)
 }
 
 func (t *Target) ToolTarget() TargetTool {
