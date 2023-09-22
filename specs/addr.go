@@ -126,12 +126,8 @@ func ParseTargetAddr(pkg string, s string) (TargetAddr, error) {
 	return tp, nil
 }
 
-var (
-	regexPkgAll  = regexp.MustCompile("^.*$")
-	regexNameAll = regexp.MustCompile("^.*$")
-)
-
-const StarPlaceholder = "<STAR>"
+// star is a placeholder for regex replacement
+const star = "<STAR>"
 
 func charsRegex(rs []rune) string {
 	return strings.ReplaceAll(string(rs), "-", "\\-")
@@ -163,11 +159,11 @@ func ParseTargetGlob(s string) (Matcher, error) {
 
 			charClass := "[" + charsRegex(packageChars) + "]*"
 
-			expr := strings.ReplaceAll(tp.Package, "*", StarPlaceholder)
+			expr := strings.ReplaceAll(tp.Package, "*", star)
 			expr = regexp.QuoteMeta(expr)
-			expr = strings.ReplaceAll(expr, "/"+StarPlaceholder+StarPlaceholder, charClass)
-			expr = strings.ReplaceAll(expr, StarPlaceholder+StarPlaceholder, charClass)
-			expr = strings.ReplaceAll(expr, StarPlaceholder, strings.ReplaceAll(charClass, "/", ""))
+			expr = strings.ReplaceAll(expr, "/"+star+star, charClass)
+			expr = strings.ReplaceAll(expr, star+star, charClass)
+			expr = strings.ReplaceAll(expr, star, strings.ReplaceAll(charClass, "/", ""))
 
 			r, err := regexp.Compile("^" + expr + "$")
 			if err != nil {
@@ -184,9 +180,9 @@ func ParseTargetGlob(s string) (Matcher, error) {
 				return nil, fmt.Errorf("unexpected ** in target name")
 			}
 
-			expr := strings.ReplaceAll(tp.Name, "*", StarPlaceholder)
+			expr := strings.ReplaceAll(tp.Name, "*", star)
 			expr = regexp.QuoteMeta(expr)
-			expr = strings.ReplaceAll(expr, StarPlaceholder, "["+charsRegex(targetNameChars)+"]*")
+			expr = strings.ReplaceAll(expr, star, "["+charsRegex(targetNameChars)+"]*")
 
 			r, err := regexp.Compile("^" + expr + "$")
 			if err != nil {

@@ -1,0 +1,11 @@
+def name():
+    return target(
+        # com1
+    )
+    # com2
+----
+def name():
+  return target(
+    # com1
+  )
+  # com2

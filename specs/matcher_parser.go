@@ -296,8 +296,7 @@ func parseFactor(tokens []token, index *int) Matcher {
 		for {
 			if tokens[*index].typ == tokenRParen {
 				*index++
-
-				return funcNode{name: funcName, args: args, match: matchFunc}
+				break
 			}
 
 			if len(args) > 0 {
@@ -310,6 +309,8 @@ func parseFactor(tokens []token, index *int) Matcher {
 			expr := parseFunctionArg(tokens, index)
 			args = append(args, expr)
 		}
+
+		return funcNode{name: funcName, args: args, match: matchFunc}
 	default:
 		tok := tokens[*index]
 		if tok.typ == tokenEOF {

@@ -8,7 +8,6 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
-	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
 	"runtime"
@@ -176,23 +175,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		t.Annotations[item.Key] = utils.FromStarlark(item.Value)
 	}
 
-	for _, label := range t.Labels {
-		err := specs.LabelValidate(label)
-		if err != nil {
-			return specs.Target{}, err
-		}
-	}
-
-	for k, v := range t.SrcEnv.Named {
-		if !ads.Contains(specs.FileEnvValues, v) {
-			return specs.Target{}, fmt.Errorf("src_env[%v] must be one of %v, got %v", k, joinOneOf(specs.FileEnvValues), v)
-		}
-	}
-
-	if !ads.Contains(specs.FileEnvValues, t.SrcEnv.Default) {
-		return specs.Target{}, fmt.Errorf("src_env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.SrcEnv.Default)
-	}
-
 	if t.OutEnv == "" {
 		if t.OutInSandbox {
 			t.OutEnv = specs.FileEnvAbs
@@ -200,29 +182,17 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 			t.OutEnv = specs.FileEnvRelPkg
 		}
 	}
-	if !ads.Contains(specs.FileEnvValues, t.OutEnv) {
-		return specs.Target{}, fmt.Errorf("out_env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.OutEnv)
-	}
 
 	if t.RestoreCache.Env == "" {
 		t.RestoreCache.Env = specs.FileEnvRelPkg
-	}
-	if !ads.Contains(specs.FileEnvValues, t.RestoreCache.Env) {
-		return specs.Target{}, fmt.Errorf("restore_cache.env must be one of %v, got %v", joinOneOf(specs.FileEnvValues), t.RestoreCache.Env)
 	}
 
 	if t.HashFile == "" {
 		t.HashFile = specs.HashFileContent
 	}
-	if !ads.Contains(specs.HashFileValues, t.HashFile) {
-		return specs.Target{}, fmt.Errorf("hash_file must be one of %v, got %v", joinOneOf(specs.HashFileValues), t.HashFile)
-	}
 
 	if t.Entrypoint == "" {
 		t.Entrypoint = specs.EntrypointBash
-	}
-	if !ads.Contains(specs.EntrypointValues, t.Entrypoint) {
-		return specs.Target{}, fmt.Errorf("entrypoint must be one of %v, got %v", joinOneOf(specs.EntrypointValues), t.Entrypoint)
 	}
 
 	if len(t.Platforms) == 0 {
@@ -234,28 +204,10 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 			},
 			Default: true,
 		}}
-	} else if len(t.Platforms) != 1 {
-		return specs.Target{}, fmt.Errorf("only a single platform is supported, for now")
 	}
 
 	if t.Codegen == "" {
 		t.Codegen = specs.CodegenNone
-	}
-
-	if t.Codegen != specs.CodegenNone {
-		if !ads.Contains(specs.CodegenValues, t.Codegen) {
-			return specs.Target{}, fmt.Errorf("codegen must be one of %v, got %v", joinOneOf(specs.CodegenValues), t.Codegen)
-		}
-
-		if !t.Sandbox {
-			return specs.Target{}, fmt.Errorf("codegen is only suported in sandboxed targets")
-		}
-
-		for _, file := range t.Out {
-			if xfs.IsGlob(file.Path) {
-				return specs.Target{}, fmt.Errorf("codegen targets must not have glob outputs")
-			}
-		}
 	}
 
 	if len(args.Timeout) > 0 {
@@ -272,18 +224,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 				return specs.Target{}, fmt.Errorf("timeout: %w", err)
 			}
 		}
-	}
-
-	if t.Cache.Enabled && t.ConcurrentExecution {
-		return specs.Target{}, fmt.Errorf("concurrent_execution and cache are incompatible")
-	}
-
-	if !t.Cache.Enabled && t.RestoreCache.Enabled {
-		return specs.Target{}, fmt.Errorf("restore_cache requires cache to be enabled")
-	}
-
-	if t.Cache.Enabled && t.RunInCwd {
-		return specs.Target{}, fmt.Errorf("run in cwd is incompatble with cache")
 	}
 
 	return t, nil
@@ -387,9 +327,6 @@ func depsSpecFromArr(t specs.Target, arr []string, name string) (specs.Deps, err
 				switch k {
 				case "mode":
 					mode := specs.DepMode(v)
-					if !ads.Contains(specs.DepModes, mode) {
-						return specs.Deps{}, fmt.Errorf("invalid mode: %v", v)
-					}
 					tspec.Mode = mode
 				default:
 					return specs.Deps{}, fmt.Errorf("invalid option %v=%v", k, v)
@@ -512,13 +449,4 @@ func depsSpecFromArgs(t specs.Target, deps ArrayMapStrArray) (specs.Deps, error)
 	)
 
 	return td, nil
-}
-
-func joinOneOf(valid []string) string {
-	valid = ads.Copy(valid)
-	for i, s := range valid {
-		valid[i] = fmt.Sprintf("`%v`", s)
-	}
-
-	return strings.Join(valid, ", ")
 }

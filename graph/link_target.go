@@ -23,6 +23,11 @@ func (e *State) Register(spec specs.Target) error {
 		return err
 	}
 
+	err = spec.Validate()
+	if err != nil {
+		return err
+	}
+
 	l := e.targetsLock.Get(spec.Addr)
 	l.Lock()
 	defer l.Unlock()

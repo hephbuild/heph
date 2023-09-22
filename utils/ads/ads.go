@@ -247,3 +247,11 @@ func Reduce[T any, O any](a []T, f func(O, T) O, initial O) O {
 
 	return out
 }
+
+func Last[T any](a []T) T {
+	return a[len(a)-1]
+}
+
+func LastP[T any](a []T) *T {
+	return &a[len(a)-1]
+}

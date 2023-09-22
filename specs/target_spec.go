@@ -43,7 +43,7 @@ var (
 	CodegenCopy          = "copy"
 	CodegenCopyNoExclude = "copy_noexclude"
 
-	CodegenValues = []string{CodegenLink, CodegenCopy, CodegenCopyNoExclude}
+	CodegenValues = []string{CodegenNone, CodegenLink, CodegenCopy, CodegenCopyNoExclude}
 )
 
 type SrcEnv struct {

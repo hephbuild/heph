@@ -3,6 +3,7 @@ package fmt
 import (
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/syntax"
 	"io"
 	"strconv"
@@ -39,8 +40,13 @@ func fmtSource(path string, src io.Reader, cfg Config) (string, error) {
 
 		// This should cover the case of the last comment of a List which get stored as
 		// an After to the file or Before of the next Node
+		hoistCommentBackIntoList(&file, file)
 
-		hoistCommentBackIntoList(file, file)
+		if file.Comments() != nil {
+			// This should cover the case of the last comment of the file get stored as
+			// an After to the file instead of an After to the previous statement
+			hoistCommentBackIntoLastStmt(&file.Comments().After, ads.Last(file.Stmts))
+		}
 	}
 
 	f := formatter{
@@ -144,7 +150,7 @@ func shouldSkipLine(topLevel bool, prev, cur syntax.Node) bool {
 func (f *formatter) formatStmts(w Writer, stmts []syntax.Stmt) error {
 	for i, stmt := range stmts {
 		if i < len(stmts)-1 {
-			hoistCommentBackIntoList(stmt, stmts[i+1])
+			hoistCommentBackIntoList(&stmt, stmts[i+1])
 		}
 
 		if i > 0 && shouldSkipLine(isTopLevel(w), stmts[i-1], stmt) {
@@ -164,6 +170,7 @@ func (f *formatter) formatStmts(w Writer, stmts []syntax.Stmt) error {
 type Node interface {
 	Span() (start, end syntax.Position)
 	Comments() *syntax.Comments
+	AllocComments()
 }
 
 func formatBeforeComments(w Writer, stmt Node) {
@@ -296,33 +303,32 @@ func (f *formatter) formatStmt(w Writer, sstmt syntax.Stmt) error {
 		w.WriteString("return ")
 		return f.formatExpr(w, stmt.Result)
 	case *IfStmt:
-		w.WriteString("if ")
-		err := f.formatExpr(w, stmt.Cond)
-		if err != nil {
-			return err
-		}
-		w.WriteString(":\n")
-		err = f.formatStmts(f.indent(w, 1), stmt.True)
-		if err != nil {
-			return err
-		}
+		for i, condStmt := range stmt.Ifs {
+			formatBeforeComments(w, condStmt)
 
-		for _, elifStmt := range stmt.Elifs {
-			w.WriteString("elif ")
-			err := f.formatExpr(w, elifStmt.Cond)
+			token := "if"
+			if i > 0 {
+				token = "elif"
+			}
+
+			w.WriteString(token)
+			w.WriteString(" ")
+			err := f.formatExpr(w, condStmt.Cond)
 			if err != nil {
 				return err
 			}
 			w.WriteString(":\n")
-			err = f.formatStmts(f.indent(w, 1), elifStmt.True)
+			err = f.formatStmts(f.indent(w, 1), condStmt.True)
 			if err != nil {
 				return err
 			}
+
+			formatAfterComments(w, condStmt, nil)
 		}
 
 		if len(stmt.False) > 0 {
 			w.WriteString("else:\n")
-			err = f.formatStmts(f.indent(w, 1), stmt.False)
+			err := f.formatStmts(f.indent(w, 1), stmt.False)
 			if err != nil {
 				return err
 			}
@@ -512,6 +518,8 @@ func (f *formatter) formatExpr(w Writer, expr syntax.Expr) error {
 	case *syntax.Ident:
 		w.WriteString(expr.Name)
 	case *syntax.BinaryExpr:
+		hoistCommentBackIntoList(&expr.X, expr.Y)
+
 		err := f.formatBinary(w, expr.X, expr.Y, expr.Op.String())
 		if err != nil {
 			return err
