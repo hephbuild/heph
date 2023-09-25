@@ -117,7 +117,7 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 		//log.Tracef("# Linking target %v %v/%v", target.Addr, i+1, len(targets))
 		err := e.LinkTarget(target, nil)
 		if err != nil {
-			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, TargetNotFoundErr{})) {
+			if !ignoreNotFoundError || (ignoreNotFoundError && !errors.Is(err, specs.TargetNotFoundErr{})) {
 				return fmt.Errorf("%v: %w", target.Addr, err)
 			}
 		}
@@ -481,7 +481,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 	for _, tool := range toolsSpecs.Targets {
 		tt := e.Targets().Find(tool.Target)
 		if tt == nil {
-			return TargetTools{}, NewTargetNotFoundError(tool.Target)
+			return TargetTools{}, specs.NewTargetNotFoundError(tool.Target, e.Targets())
 		}
 
 		err := e.LinkTarget(tt, breadcrumb)
@@ -859,7 +859,7 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 	for _, spec := range deps.Targets {
 		dt := e.Targets().Find(spec.Target)
 		if dt == nil {
-			return TargetDeps{}, NewTargetNotFoundError(spec.Target)
+			return TargetDeps{}, specs.NewTargetNotFoundError(spec.Target, e.Targets())
 		}
 
 		err := e.LinkTarget(dt, breadcrumb)

@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
@@ -10,6 +11,8 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
+
+var errHasExprDep = errors.New("has expr, bailing out")
 
 func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (targetrun.Requests, error) {
 	targets, err := g.Targets().Filter(m)
@@ -20,7 +23,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 	check := func(target *graph.Target) error {
 		if bailOutOnExpr {
 			if len(target.Spec().Deps.Exprs) > 0 {
-				return fmt.Errorf("%v has expr, bailing out", target.Addr)
+				return fmt.Errorf("%v: %w", target.Addr, errHasExprDep)
 			}
 		}
 
@@ -74,14 +77,17 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
 	if specs.IsMatcherExplicit(m) {
 		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
-		if err == nil {
-			return rrs, nil
-		} else {
+		if err != nil {
+			if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
+				return nil, err
+			}
 			log.Debugf("generateRRs: %v", err)
+		} else {
+			return rrs, nil
 		}
 	}
 
-	err := RunGen(ctx, e, "", false, plain)
+	err := runGen(ctx, e, "", false, plain)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +95,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 	return generateRRs(ctx, e.Graph, m, targs, false, opts)
 }
 
-func RunGen(ctx context.Context, e *scheduler.Scheduler, poolName string, linkAll, plain bool) error {
+func runGen(ctx context.Context, e *scheduler.Scheduler, poolName string, linkAll, plain bool) error {
 	deps, err := e.ScheduleGenPass(ctx, linkAll)
 	if err != nil {
 		return err

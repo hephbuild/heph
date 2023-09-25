@@ -180,9 +180,3 @@ func StarWalk(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
 		return nil
 	})
 }
-
-func StarWalkAbs(root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
-	return StarWalk(root, pattern, ignore, func(path string, d fs.DirEntry, err error) error {
-		return fn(filepath.Join(root, path), d, err)
-	})
-}

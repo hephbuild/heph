@@ -27,7 +27,7 @@ func (p *Package) Addr() string {
 }
 
 func (p *Package) TargetAddr(name string) string {
-	return "//" + p.Path + ":" + name
+	return p.Addr() + ":" + name
 }
 
 func (p *Package) Child(childPath string) Package {
