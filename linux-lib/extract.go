@@ -3,6 +3,7 @@ package lwl
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
@@ -92,7 +93,7 @@ func expandPaths(paths []string) ([]string, error) {
 	return expPaths, nil
 }
 
-func ExtractLibs(binPath string, extras []string, libPath, ldPath string) error {
+func ExtractLibs(ctx context.Context, binPath string, extras []string, libPath, ldPath string) error {
 	binLibs, err := Analyze(binPath)
 	if err != nil {
 		return err
@@ -134,12 +135,12 @@ func ExtractLibs(binPath string, extras []string, libPath, ldPath string) error 
 
 		if strings.Contains(name, "ld-linux") {
 			foundld = true
-			err := xfs.Cp(path, ldPath)
+			err := xfs.Cp(ctx, path, ldPath)
 			if err != nil {
 				return err
 			}
 		} else {
-			err := xfs.Cp(path, filepath.Join(libPath, name))
+			err := xfs.Cp(ctx, path, filepath.Join(libPath, name))
 			if err != nil {
 				return err
 			}

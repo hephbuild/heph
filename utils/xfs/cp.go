@@ -1,14 +1,16 @@
 package xfs
 
 import (
+	"context"
 	"fmt"
+	"github.com/hephbuild/heph/utils/xio"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 )
 
-func CpHardlink(from, to string) error {
+func CpHardlink(ctx context.Context, from, to string) error {
 	info, err := os.Lstat(from)
 	if err != nil {
 		return err
@@ -27,7 +29,7 @@ func CpHardlink(from, to string) error {
 
 		err = os.Link(from, to)
 		if err != nil {
-			return Cp(from, to)
+			return Cp(ctx, from, to)
 		}
 		return nil
 	}
@@ -38,7 +40,7 @@ func CpHardlink(from, to string) error {
 	}
 
 	for _, entry := range entries {
-		err := CpHardlink(filepath.Join(from, entry.Name()), filepath.Join(to, entry.Name()))
+		err := CpHardlink(ctx, filepath.Join(from, entry.Name()), filepath.Join(to, entry.Name()))
 		if err != nil {
 			return err
 		}
@@ -47,7 +49,7 @@ func CpHardlink(from, to string) error {
 	return nil
 }
 
-func Cp(from, to string) error {
+func Cp(ctx context.Context, from, to string) error {
 	logerr := func(id string, err error) error {
 		return fmt.Errorf("%v %v to %v: %w", id, from, to, err)
 	}
@@ -58,7 +60,7 @@ func Cp(from, to string) error {
 	}
 
 	if info.IsDir() {
-		return cpDir(from, to)
+		return cpDir(ctx, from, to)
 	}
 
 	if !info.Mode().IsRegular() {
@@ -89,6 +91,9 @@ func Cp(from, to string) error {
 		return logerr("cp4", err)
 	}
 	defer fromf.Close()
+
+	done := xio.CloserContext(fromf, ctx)
+	defer done()
 
 	err = CreateParentDir(to)
 	if err != nil {
@@ -124,7 +129,7 @@ func Cp(from, to string) error {
 	return nil
 }
 
-func cpDir(from, to string) error {
+func cpDir(ctx context.Context, from, to string) error {
 	return filepath.WalkDir(from, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -139,6 +144,6 @@ func cpDir(from, to string) error {
 			return err
 		}
 
-		return Cp(path, filepath.Join(to, rel))
+		return Cp(ctx, path, filepath.Join(to, rel))
 	})
 }

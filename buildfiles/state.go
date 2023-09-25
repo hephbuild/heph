@@ -43,7 +43,7 @@ func (s *State) CollectFiles(ctx context.Context, root string) (packages.SourceF
 
 	files := make(packages.SourceFiles, 0)
 
-	err := xfs.StarWalk(root, s.Patterns[0], s.Ignore, func(path string, d fs.DirEntry, err error) error {
+	err := xfs.StarWalk(ctx, root, s.Patterns[0], s.Ignore, func(path string, d fs.DirEntry, err error) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}

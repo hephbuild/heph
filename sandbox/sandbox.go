@@ -123,7 +123,7 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 		untarDedup.Add(to)
 
-		err := xfs.Cp(file.From, to)
+		err := xfs.Cp(ctx, file.From, to)
 		if err != nil {
 			return fmt.Errorf("make: %w", err)
 		}

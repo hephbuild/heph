@@ -23,20 +23,20 @@ func (c ActualFileCollectorDir) PopulateActualFiles(ctx context.Context, target 
 
 	var err error
 
-	target.actualOutFiles, err = c.collectNamedOut(target.Target, target.Out, c.Dir, outputs)
+	target.actualOutFiles, err = c.collectNamedOut(ctx, target.Target, target.Out, c.Dir, outputs)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
 	}
 
 	if target.HasSupportFiles {
-		target.actualSupportFiles, err = c.collectOut(target.Target, target.OutWithSupport.Name(specs.SupportFilesOutput), c.Dir)
+		target.actualSupportFiles, err = c.collectOut(ctx, target.Target, target.OutWithSupport.Name(specs.SupportFilesOutput), c.Dir)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
 	}
 
 	if len(target.RestoreCachePaths) > 0 {
-		target.actualRestoreCacheFiles, err = c.collectOut(target.Target, target.RestoreCachePaths, c.Dir)
+		target.actualRestoreCacheFiles, err = c.collectOut(ctx, target.Target, target.RestoreCachePaths, c.Dir)
 		if err != nil {
 			return fmt.Errorf("support: %w", err)
 		}
@@ -45,7 +45,7 @@ func (c ActualFileCollectorDir) PopulateActualFiles(ctx context.Context, target 
 	return nil
 }
 
-func (c ActualFileCollectorDir) collectNamedOut(target *graph.Target, namedPaths *graph.OutNamedPaths, root string, outputs []string) (*ActualOutNamedPaths, error) {
+func (c ActualFileCollectorDir) collectNamedOut(ctx context.Context, target *graph.Target, namedPaths *graph.OutNamedPaths, root string, outputs []string) (*ActualOutNamedPaths, error) {
 	tp := &ActualOutNamedPaths{}
 
 	for name, paths := range namedPaths.Named() {
@@ -55,7 +55,7 @@ func (c ActualFileCollectorDir) collectNamedOut(target *graph.Target, namedPaths
 
 		tp.ProvisionName(name)
 
-		files, err := c.collectOut(target, paths, root)
+		files, err := c.collectOut(ctx, target, paths, root)
 		if err != nil {
 			return nil, err
 		}
@@ -68,7 +68,7 @@ func (c ActualFileCollectorDir) collectNamedOut(target *graph.Target, namedPaths
 	return tp, nil
 }
 
-func (c ActualFileCollectorDir) collectOut(target *graph.Target, files xfs.RelPaths, root string) (xfs.RelPaths, error) {
+func (c ActualFileCollectorDir) collectOut(ctx context.Context, target *graph.Target, files xfs.RelPaths, root string) (xfs.RelPaths, error) {
 	outSet := sets.NewSet(func(p xfs.RelPath) string {
 		return p.RelRoot()
 	}, len(files))
@@ -80,7 +80,7 @@ func (c ActualFileCollectorDir) collectOut(target *graph.Target, files xfs.RelPa
 			return nil, fmt.Errorf("%v did not output %v", target.Addr, pattern)
 		}
 
-		err := xfs.StarWalk(root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
+		err := xfs.StarWalk(ctx, root, pattern, nil, func(path string, d fs.DirEntry, err error) error {
 			outSet.Add(xfs.NewRelPath(path))
 
 			return nil

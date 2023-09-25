@@ -1,6 +1,7 @@
 package hbuiltin
 
 import (
+	"context"
 	_ "embed"
 	"errors"
 	"fmt"
@@ -223,6 +224,7 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	opts := getOpts(thread)
 	pkg := getPackage(thread)
+	ctx := context.Background()
 
 	var (
 		pattern string
@@ -242,7 +244,7 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 	allExclude = append(allExclude, opts.Config.BuildFiles.Glob.Exclude...)
 
 	elems := sets.NewStringSet(0)
-	err := xfs.StarWalk(pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
+	err := xfs.StarWalk(ctx, pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			return nil
 		}
@@ -419,9 +421,9 @@ func path_dir(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple
 }
 
 func path_join(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-	parts := make([]string, 0, len(args))
-	for _, arg := range args {
-		parts = append(parts, string(arg.(starlark.String)))
-	}
+	parts := ads.Map(args, func(arg starlark.Value) string {
+		return string(arg.(starlark.String))
+	})
+
 	return starlark.String(filepath.Join(parts...)), nil
 }

@@ -1,6 +1,7 @@
 package xfs
 
 import (
+	"context"
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,7 +15,7 @@ func assertWalk(t *testing.T, pattern string, ignored, expected []string) {
 	require.NoError(t, err)
 
 	paths := make([]string, 0)
-	err = StarWalk(wd, pattern, ignored, func(path string, d fs.DirEntry, err error) error {
+	err = StarWalk(context.Background(), wd, pattern, ignored, func(path string, d fs.DirEntry, err error) error {
 		paths = append(paths, path)
 		return nil
 	})

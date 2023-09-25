@@ -21,7 +21,7 @@ func GetHephPath(ctx context.Context, outDir, goos, goarch, version string, shou
 	if root := os.Getenv(EnvDistRoot); root != "" {
 		if outDir != root {
 			// In the case of e2e test, a sandbox is created inside the sandbox
-			err := xfs.CpHardlink(root, outDir)
+			err := xfs.CpHardlink(ctx, root, outDir)
 			if err != nil {
 				return "", "", err
 			}
@@ -76,7 +76,7 @@ func GetHephPath(ctx context.Context, outDir, goos, goarch, version string, shou
 		if exe != "" {
 			p := filepath.Join(outDir, hephBinName(goos, goarch))
 
-			err := xfs.CpHardlink(exe, p)
+			err := xfs.CpHardlink(ctx, exe, p)
 			return p, outDir, err
 		}
 	}

@@ -20,11 +20,13 @@ var lleCmd = &cobra.Command{
 	Short: "Linux Lib Extract",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
 		binPath := args[0]
 		libPath := args[1]
 		ldPath := args[2]
 
-		err := lwl.ExtractLibs(binPath, lleExtra, libPath, ldPath)
+		err := lwl.ExtractLibs(ctx, binPath, lleExtra, libPath, ldPath)
 		if err != nil {
 			return err
 		}
