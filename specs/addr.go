@@ -209,6 +209,29 @@ func ParseTargetGlob(s string) (Matcher, error) {
 	return tp, nil
 }
 
+func ParseLabelGlob(s string) (Matcher, error) {
+	if strings.Contains(s, "*") {
+		if strings.Contains(s, "**") {
+			return nil, fmt.Errorf("unexpected ** in label")
+		}
+
+		charClass := "[" + charsRegex(labelChars) + "]*"
+
+		expr := strings.ReplaceAll(s, "*", star)
+		expr = regexp.QuoteMeta(expr)
+		expr = strings.ReplaceAll(expr, star, charClass)
+
+		r, err := regexp.Compile("^" + expr + "$")
+		if err != nil {
+			return nil, err
+		}
+
+		return labelRegexNode{r: r, value: s}, nil
+	}
+
+	return labelNode{value: s}, nil
+}
+
 func ParsePkgAddr(s string, validate bool) (string, error) {
 	tp, err := addrParse("", s, allowPkg)
 	if err != nil {

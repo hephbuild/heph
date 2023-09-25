@@ -255,3 +255,23 @@ func Last[T any](a []T) T {
 func LastP[T any](a []T) *T {
 	return &a[len(a)-1]
 }
+
+func Some[T any](a []T, f func(e T) bool) bool {
+	for _, e := range a {
+		if f(e) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func All[T any](a []T, f func(e T) bool) bool {
+	for _, e := range a {
+		if !f(e) {
+			return false
+		}
+	}
+
+	return true
+}

@@ -27,7 +27,7 @@ type token struct {
 }
 
 func isLabelChar(c uint8) bool {
-	return ads.Contains(labelChars, rune(c))
+	return ads.Contains(labelChars, rune(c)) || rune(c) == '*'
 }
 
 func isAddrChar(c uint8) bool {

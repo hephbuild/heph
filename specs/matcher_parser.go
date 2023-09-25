@@ -128,6 +128,21 @@ func (n labelNode) Match(t Specer) bool {
 	return ads.Contains(t.Spec().Labels, n.value)
 }
 
+type labelRegexNode struct {
+	r     *regexp.Regexp
+	value string
+}
+
+func (n labelRegexNode) String() string {
+	return n.value
+}
+
+func (n labelRegexNode) Match(t Specer) bool {
+	return ads.Some(t.Spec().Labels, func(s string) bool {
+		return n.r.MatchString(s)
+	})
+}
+
 type targetRegexNode struct {
 	pkg   *regexp.Regexp
 	name  *regexp.Regexp
@@ -268,8 +283,13 @@ func parseFactor(tokens []token, index *int) Matcher {
 	case tokenLabel:
 		value := tokens[*index].value
 		*index++
-		return labelNode{value: value}
 
+		m, err := ParseLabelGlob(value)
+		if err != nil {
+			panic(err)
+		}
+
+		return m
 	case tokenAddr:
 		value := tokens[*index].value
 		*index++

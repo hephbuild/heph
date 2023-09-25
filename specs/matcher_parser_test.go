@@ -33,6 +33,7 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to:*", "//path/to:*"},
 		{"//path/to", "//path/to:*"},
 		{`has_annotation("some")`, `has_annotation("some")`},
+		{`label*`, `label*`},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {
@@ -64,6 +65,7 @@ func TestParseMatcherErr(t *testing.T) {
 		{"//path/to:**", "unexpected ** in target name"},
 		{`has_annotation("some)`, "Expected comma, got EOF"},
 		{`has_annotation("some'`, "Expected comma, got EOF"},
+		{`label**`, "unexpected ** in label"},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {
@@ -113,6 +115,10 @@ func TestMatch(t *testing.T) {
 		{"//some/pkg/d*p:*2", t3, false},
 		{"//some/**/d*p:*2", t2, true},
 		{"//some/**/d*p:*2", t3, false},
+		{"label*", t1, true},
+		{"lab*2", t2, true},
+		{"lab*4", t2, false},
+		{"*2", t2, true},
 	}
 	for _, test := range tests {
 		t.Run(fmt.Sprintf("%v %v", test.selector, test.t.Addr), func(t *testing.T) {
