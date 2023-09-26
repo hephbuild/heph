@@ -1,4 +1,4 @@
-module mod-ssycall
+module mod-syscall
 
 go 1.18
 

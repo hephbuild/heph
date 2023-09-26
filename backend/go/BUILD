@@ -233,7 +233,7 @@ def _go_gen_importcfg():
 def _go_compile_cmd(name, import_path, abi, complete, embed_cfg):
     extra = ""
     if abi:
-        extra += ' -symabis $SRC_ABI -asmhdr "$SANDBOX/$OUT_H"'
+        extra += ' -symabis $SRC_ABI -asmhdr $SRC_ABI_H'
 
     if embed_cfg:
         extra += " -embedcfg $SRC_EMBED"
@@ -299,9 +299,16 @@ def go_library(
         abi = target(
             name = "_" + name + "#abi",
             deps = src_dep if src_dep else s_files,
-            run = 'eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -gensymabis -o "$OUT" $SRC'.format(import_path),
+            run = [
+                'eval $(go env)',
+                'touch $OUT_H', # the go Toolchain does this
+                'go tool asm -I . -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -gensymabis -o "$OUT_SYMABIS" $SRC'.format(import_path),
+            ],
             tools = [go],
-            out = p + "lib.abi",
+            out = {
+                'symabis': p + "symabis",
+                'h': p + "go_asm.h",
+            },
             env = {
                 "GOOS": os,
                 "GOARCH": arch,
@@ -329,7 +336,7 @@ def go_library(
                 "hdr": lib + "|h",
                 "asm": src_dep if src_dep else s_files,
             },
-            run = 'eval `go env` && go tool asm -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -o "$OUT" $SRC_ASM'.format(import_path),
+            run = 'eval `go env` && go tool asm -I . -I $GOROOT/pkg/include -trimpath "$ROOT;$GO_OUTDIR" -D GOOS_$GOOS -D GOARCH_$GOARCH -p {} -o "$OUT" $SRC_ASM'.format(import_path),
             tools = [go],
             out = p + "asm.o",
             env = {
@@ -414,8 +421,9 @@ def go_library(
         "importcfg": p + pkg_name + ".importcfg",
     }
     if abi:
-        deps["abi"] = abi
-        out["h"] = "lib.h"
+        deps["abi"] = abi+"|symabis"
+        deps["abi_h"] = abi+"|h"
+        out["h"] = "go_asm.h"
 
     return target(
         name = name,
