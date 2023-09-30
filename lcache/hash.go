@@ -325,7 +325,14 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	})
 
 	h.String("=")
-	h.Bool(target.Gen)
+	// Maintain backward compat
+	if !target.IsGen() {
+		h.Bool(false)
+	} else {
+		hash.HashArray(h, target.Gen, func(s specs.Matcher) string {
+			return s.String()
+		})
+	}
 
 	h.String("=")
 	h.String(target.SrcEnv.Default)

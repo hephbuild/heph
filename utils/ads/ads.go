@@ -2,6 +2,7 @@ package ads
 
 import (
 	"fmt"
+	"golang.org/x/exp/slices"
 )
 
 func Map[T, O any](a []T, f func(T) O) []O {
@@ -274,4 +275,10 @@ func All[T any](a []T, f func(e T) bool) bool {
 	}
 
 	return true
+}
+
+func Reverse[S ~[]E, E any](a S) S {
+	r := Copy(a)
+	slices.Reverse(r)
+	return r
 }

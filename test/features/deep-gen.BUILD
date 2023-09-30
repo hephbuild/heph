@@ -16,7 +16,7 @@ target(
     run="mv $SRC $OUT",
     deps=hello,
     out="deep-gen-1.BUILD",
-    gen=True,
+    gen=":hello-deep-gen",
 )
 """
 
@@ -30,7 +30,12 @@ target(
     run = "mv $SRC $OUT",
     deps = deep_gen_1,
     out = "deep-gen-0.BUILD",
-    gen = True,
+    gen = [
+        ':deep_gen_1',
+        ':hello_build',
+        # deep:
+        ':hello-deep-gen',
+    ],
 )
 
 e2e_test(

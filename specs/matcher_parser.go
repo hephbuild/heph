@@ -11,18 +11,36 @@ import (
 type Matcher interface {
 	Match(Specer) bool
 	String() string
+	Intersects(Matcher) bool
 }
 
-type allMatcher struct{}
-
-var AllMatcher Matcher = allMatcher{}
-
-func (n allMatcher) String() string {
-	return "<match all>"
+type staticMatcher struct {
+	match bool
+	str   string
 }
 
-func (n allMatcher) Match(t Specer) bool {
-	return true
+var AllMatcher Matcher = staticMatcher{
+	match: true,
+	str:   "<all>",
+}
+
+var NoneMatcher Matcher = staticMatcher{
+	match: false,
+	str:   "<none>",
+}
+
+var PublicMatcher = MustParseMatcher("!:_*")
+
+func (n staticMatcher) String() string {
+	return n.str
+}
+
+func (n staticMatcher) Match(t Specer) bool {
+	return n.match
+}
+
+func (n staticMatcher) Intersects(Matcher) bool {
+	return n.match
 }
 
 type astNode interface {
@@ -58,20 +76,81 @@ func (n andNode) Match(t Specer) bool {
 	return n.left.Match(t) && n.right.Match(t)
 }
 
+func (n andNode) Intersects(i Matcher) bool {
+	if !Intersects(i, n.left) {
+		return false
+	}
+
+	if !Intersects(i, n.right) {
+		return false
+	}
+
+	return true
+}
+
+func Intersects(a, b Matcher) bool {
+	if a == AllMatcher || b == AllMatcher {
+		return true
+	}
+
+	if a == NoneMatcher || b == NoneMatcher {
+		return false
+	}
+
+	if a, ok := a.(Matcher); ok {
+		if b, ok := b.(Matcher); ok {
+			if a.Intersects(b) {
+				return true
+			}
+
+			if b.Intersects(a) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func OrNodeFactory[T Matcher](ms ...T) Matcher {
+	switch len(ms) {
+	case 0:
+		return NoneMatcher
+	case 1:
+		return ms[0]
+	default:
+		or := mOrNode{nodes: make([]Matcher, 0, len(ms))}
+
+		for _, m := range ms {
+			if any(m) == NoneMatcher {
+				continue
+			}
+
+			if any(m) == AllMatcher {
+				return AllMatcher
+			}
+
+			switch n := any(m).(type) {
+			case orNode:
+				or.nodes = append(or.nodes, n.left, n.right)
+			case mOrNode:
+				or.nodes = append(or.nodes, n.nodes...)
+			default:
+				or.nodes = append(or.nodes, m)
+			}
+		}
+
+		if len(or.nodes) == 2 {
+			return orNode{or.nodes[0], or.nodes[1]}
+		}
+
+		return or
+	}
+}
+
 type orNode struct {
 	left  Matcher
 	right Matcher
-}
-
-func OrNodeFactory(ms ...Matcher) Matcher {
-	switch len(ms) {
-	case 0:
-		panic("need at least one node")
-	case 1:
-		return ms[0]
-	}
-
-	return mOrNode[Matcher]{nodes: ms}
 }
 
 func (n orNode) String() string {
@@ -82,21 +161,43 @@ func (n orNode) Match(t Specer) bool {
 	return n.left.Match(t) || n.right.Match(t)
 }
 
-type mOrNode[T Matcher] struct {
-	nodes []T
+func (n orNode) Intersects(i Matcher) bool {
+	if Intersects(n.left, i) {
+		return true
+	}
+
+	if Intersects(n.right, i) {
+		return true
+	}
+
+	return false
 }
 
-func (n mOrNode[T]) String() string {
-	ss := ads.Map(n.nodes, func(t T) string {
+type mOrNode struct {
+	nodes []Matcher
+}
+
+func (n mOrNode) String() string {
+	ss := ads.Map(n.nodes, func(t Matcher) string {
 		return t.String()
 	})
 
 	return "(" + strings.Join(ss, " || ") + ")"
 }
 
-func (n mOrNode[T]) Match(t Specer) bool {
+func (n mOrNode) Match(t Specer) bool {
 	for _, node := range n.nodes {
 		if node.Match(t) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (n mOrNode) Intersects(i Matcher) bool {
+	for _, node := range n.nodes {
+		if Intersects(node, i) {
 			return true
 		}
 	}
@@ -116,6 +217,10 @@ func (n notNode) Match(t Specer) bool {
 	return !n.expr.Match(t)
 }
 
+func (n notNode) Intersects(i Matcher) bool {
+	return !Intersects(n.expr, i)
+}
+
 type labelNode struct {
 	value string
 }
@@ -126,6 +231,10 @@ func (n labelNode) String() string {
 
 func (n labelNode) Match(t Specer) bool {
 	return ads.Contains(t.Spec().Labels, n.value)
+}
+
+func (n labelNode) Intersects(i Matcher) bool {
+	return true
 }
 
 type labelRegexNode struct {
@@ -143,6 +252,10 @@ func (n labelRegexNode) Match(t Specer) bool {
 	})
 }
 
+func (n labelRegexNode) Intersects(i Matcher) bool {
+	return true
+}
+
 type targetRegexNode struct {
 	pkg   *regexp.Regexp
 	name  *regexp.Regexp
@@ -155,11 +268,39 @@ func (n targetRegexNode) String() string {
 }
 
 func (n targetRegexNode) Match(t Specer) bool {
-	if !n.pkg.MatchString(t.Spec().Package.Path) {
+	return n.MatchPackageName(t.Spec().Package.Path, t.Spec().Name)
+}
+
+func (n targetRegexNode) MatchPackageName(pkg, name string) bool {
+	if !n.pkg.MatchString(pkg) {
 		return false
 	}
 
-	return n.name.MatchString(t.Spec().Name)
+	return n.name.MatchString(name)
+}
+
+func (n targetRegexNode) reducePattern(expr string) string {
+	expr = strings.ReplaceAll(expr, "/**/", "/")
+	expr = strings.ReplaceAll(expr, "/**", "")
+	expr = strings.ReplaceAll(expr, "**/", "")
+	expr = strings.ReplaceAll(expr, "**", "")
+	expr = strings.ReplaceAll(expr, "*", "")
+
+	return expr
+}
+
+func (n targetRegexNode) Intersects(i Matcher) bool {
+	if ta, ok := i.(TargetAddr); ok {
+		return n.MatchPackageName(ta.Package, ta.Name)
+	}
+
+	if ta, ok := i.(targetRegexNode); ok {
+		if n.MatchPackageName(n.reducePattern(ta.pkgs), n.reducePattern(ta.names)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 type funcNode struct {
@@ -178,6 +319,10 @@ func (n funcNode) String() string {
 
 func (n funcNode) Match(t Specer) bool {
 	return n.match(n.args, t)
+}
+
+func (n funcNode) Intersects(i Matcher) bool {
+	return true
 }
 
 var matcherFunctions = map[string]func(args []astNode, t Specer) bool{
@@ -354,6 +499,14 @@ func ParseMatcher(input string) (Matcher, error) {
 	return lexAndParse(input)
 }
 
+func MustParseMatcher(input string) Matcher {
+	m, err := ParseMatcher(input)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
 func ParseMatcherInPkg(pkg, input string) (Matcher, error) {
 	return lexAndParse(input)
 }
@@ -378,13 +531,17 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 		excludeMatchers = append(excludeMatchers, m)
 	}
 
-	matcher := AllMatcher
 	if len(includeMatchers) > 0 {
-		matcher = OrNodeFactory(includeMatchers...)
-	}
-	if len(excludeMatchers) > 0 {
-		matcher = andNode{matcher, notNode{OrNodeFactory(excludeMatchers...)}}
-	}
+		matcher := OrNodeFactory(includeMatchers...)
 
-	return matcher, nil
+		if len(excludeMatchers) > 0 {
+			matcher = andNode{matcher, notNode{OrNodeFactory(excludeMatchers...)}}
+		}
+
+		return matcher, nil
+	} else if len(excludeMatchers) > 0 {
+		return notNode{OrNodeFactory(excludeMatchers...)}, nil
+	} else {
+		return nil, nil
+	}
 }

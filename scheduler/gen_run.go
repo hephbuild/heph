@@ -23,13 +23,7 @@ type runGenScheduler struct {
 	*Scheduler
 }
 
-func (e *Scheduler) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worker.WaitGroup, rerr error) {
-	if e.RanGenPass {
-		return &worker.WaitGroup{}, nil
-	}
-
-	genTargets := e.Graph.GeneratedTargets()
-
+func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Target, linkAll bool) (_ *worker.WaitGroup, rerr error) {
 	if len(genTargets) == 0 {
 		log.Debugf("No gen targets, skip gen pass")
 
@@ -58,12 +52,7 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worke
 		deps:      &worker.WaitGroup{},
 	}
 
-	err := ge.linkGenTargets(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	err = ge.ScheduleGeneratedPipeline(ctx, genTargets)
+	err := ge.ScheduleGeneratedPipeline(ctx, genTargets)
 	if err != nil {
 		return nil, err
 	}
@@ -98,8 +87,6 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worke
 		},
 	})
 
-	e.RanGenPass = true
-
 	deps := worker.WaitGroupJob(j)
 
 	return deps, nil
@@ -107,9 +94,14 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, linkAll bool) (_ *worke
 
 func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
 	for _, target := range targets {
-		if !target.Gen {
+		if !target.IsGen() {
 			panic(fmt.Errorf("%v is not a gen target", target.Addr))
 		}
+	}
+
+	err := e.Graph.LinkTargets(ctx, false, targets)
+	if err != nil {
+		return fmt.Errorf("linking: %w", err)
 	}
 
 	start := time.Now()
@@ -133,20 +125,12 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
 
-			genTargets := make([]*graph.Target, 0)
-			for _, t := range newTargets.Slice() {
-				if t.Gen {
-					genTargets = append(genTargets, t)
-				}
-			}
+			genTargets := ads.Filter(newTargets.Slice(), func(target *graph.Target) bool {
+				return target.IsGen()
+			})
 
 			if len(genTargets) > 0 {
-				err := e.linkGenTargets(ctx)
-				if err != nil {
-					return err
-				}
-
-				err = e.ScheduleGeneratedPipeline(ctx, genTargets)
+				err := e.ScheduleGeneratedPipeline(ctx, genTargets)
 				if err != nil {
 					return err
 				}
@@ -156,17 +140,6 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 		},
 	})
 	e.deps.Add(j)
-
-	return nil
-}
-
-func (e *Scheduler) linkGenTargets(ctx context.Context) error {
-	linkStartTime := time.Now()
-	err := e.Graph.LinkTargets(ctx, false, e.Graph.GeneratedTargets())
-	if err != nil {
-		return fmt.Errorf("linking %w", err)
-	}
-	log.Debugf("LinkTargets took %v", time.Since(linkStartTime))
 
 	return nil
 }
@@ -184,7 +157,26 @@ func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *grap
 	deps.Add(j)
 }
 
+type matchGen struct {
+	addr     string
+	matchers []specs.Matcher
+}
+
 func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
+	matchers := append([]matchGen{{
+		addr:     target.Addr,
+		matchers: target.Gen,
+	}})
+
+	for _, source := range target.GenSources() {
+		matchers = append(matchers, matchGen{
+			addr:     source.Addr,
+			matchers: source.Gen,
+		})
+	}
+
+	matchers = ads.Reverse(matchers)
+
 	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
 	chunks := ads.Chunk(files, len(e.Pool.Workers))
@@ -200,12 +192,25 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 					Root:   e.Root,
 					Config: e.Config,
 					RegisterTarget: func(spec specs.Target) error {
+						for _, entry := range matchers {
+							match := ads.Some(entry.matchers, func(m specs.Matcher) bool {
+								return m.Match(spec)
+							})
+
+							if !match {
+								return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
+							}
+						}
+
 						err := e.Graph.Register(spec)
 						if err != nil {
 							return err
 						}
 
-						targets.Add(e.Graph.Targets().FindT(spec))
+						t := e.Graph.Targets().FindT(spec)
+						t.GenSource = target.Target
+
+						targets.Add(t)
 						return nil
 					},
 				})

@@ -47,7 +47,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		PassEnv:        args.PassEnv,
 		RuntimePassEnv: args.RuntimePassEnv,
 		RunInCwd:       args.RunInCwd,
-		Gen:            args.Gen,
 		RuntimeEnv:     args.RuntimeEnv.ArrMap,
 		SrcEnv: specs.SrcEnv{
 			Default: args.SrcEnv.Default,
@@ -59,6 +58,13 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	}
 
 	var err error
+
+	t.Gen, err = ads.MapE(args.Gen, func(s string) (specs.Matcher, error) {
+		return specs.ParseMatcher(s)
+	})
+	if err != nil {
+		return specs.Target{}, err
+	}
 
 	t.Tools, err = toolsSpecFromArgs(t, args.Tools)
 	if err != nil {

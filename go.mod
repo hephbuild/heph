@@ -4,8 +4,6 @@ go 1.20
 
 replace github.com/spf13/cobra v1.7.0 => github.com/raphaelvigee/cobra v0.0.0-20221020122344-217ca52feee0
 
-replace go.starlark.net => github.com/raphaelvigee/starlark-go v0.0.0-20230906105503-b71494f27e4a
-
 require (
 	github.com/Khan/genqlient v0.6.0
 	github.com/aarondl/json v0.0.0-20221020222930-8b0db17ef1bf
@@ -30,6 +28,7 @@ require (
 	github.com/muesli/reflow v0.3.0
 	github.com/muesli/termenv v0.15.2
 	github.com/olekukonko/tablewriter v0.0.5
+	github.com/oulinbao/regexinter v0.1.0
 	github.com/shirou/gopsutil/v3 v3.23.8
 	github.com/spf13/cobra v1.7.0
 	github.com/spf13/pflag v1.0.5
@@ -41,7 +40,7 @@ require (
 	go.opentelemetry.io/otel/exporters/jaeger v1.11.1
 	go.opentelemetry.io/otel/sdk v1.11.1
 	go.opentelemetry.io/otel/trace v1.11.1
-	go.starlark.net v0.0.0-20230302034142-4b1e35fe2254
+	go.starlark.net v0.0.0-20230925163745-10651d5192ab
 	go.uber.org/multierr v1.9.0
 	golang.org/x/exp v0.0.0-20230817173708-d852ddb80c63
 	golang.org/x/sys v0.11.0
@@ -80,7 +79,6 @@ require (
 	github.com/containerd/console v1.0.4-0.20230313162750-1ae8d489ac81 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
-	github.com/glaslos/ssdeep v0.3.3 // indirect
 	github.com/go-logr/logr v1.2.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect

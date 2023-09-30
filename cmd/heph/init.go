@@ -151,7 +151,7 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 		return nil
 	}
 
-	deps, err := e.ScheduleGenPass(ctx, opts.LinkAll)
+	deps, err := e.ScheduleGenPass(ctx, e.Graph.GeneratedTargets(), opts.LinkAll)
 	if err != nil {
 		return err
 	}

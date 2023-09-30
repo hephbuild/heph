@@ -101,12 +101,12 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 	linkDone := log.TraceTiming("link targets")
 	defer linkDone()
 
-	for _, target := range e.Targets().Slice() {
-		target.resetLinking()
-	}
-
 	if targets == nil {
 		targets = e.Targets().Slice()
+	}
+
+	for _, target := range targets {
+		target.resetLinking()
 	}
 
 	for _, target := range targets {
@@ -147,6 +147,11 @@ func (e *State) preventDepOnTool(t *Target, td TargetDeps) error {
 	}
 
 	return nil
+}
+
+func (e *State) RequiredMatchers(ts []*Target) (specs.Matcher, error) {
+	a := newRequiredMatchersAnalyzer(e.Targets(), e.exprFunctions())
+	return a.requiredMatchers(ts...)
 }
 
 func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
@@ -313,12 +318,6 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 			return relPathFactory(p)
 		})
 		t.RestoreCachePaths.Sort()
-	}
-
-	if t.Spec().Cache.Enabled {
-		if !t.Spec().Sandbox && !t.Spec().OutInSandbox {
-			return fmt.Errorf("%v cannot cache target which isn't sandboxed", t.Addr)
-		}
 	}
 
 	t.RuntimePassEnv = []string{}
@@ -509,9 +508,7 @@ func (e *State) linkTargetTools(t *Target, toolsSpecs specs.Tools, breadcrumb *s
 	}
 
 	for _, tool := range toolsSpecs.Exprs {
-		expr := tool.Expr
-
-		targets, err := e.targetExpr(t, expr, breadcrumb)
+		targets, err := e.execExpr(t, tool.Expr, breadcrumb)
 		if err != nil {
 			return TargetTools{}, err
 		}
@@ -780,41 +777,15 @@ func (e *State) collectTransitive(breadcrumb *sets.StringSet, targets []*Target)
 	return tt, nil
 }
 
-func (e *State) targetExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSet) ([]*Target, error) {
-	switch expr.Function {
-	case "collect":
-		targets, err := e.collect(t, expr)
-		if err != nil {
-			return nil, fmt.Errorf("`%v`: %w", expr.String, err)
-		}
+func (e *State) execExpr(t *Target, expr exprs.Expr, breadcrumb *sets.StringSet) ([]*Target, error) {
+	m := e.exprFunctions()
 
-		for _, target := range targets {
-			err := e.LinkTarget(target, breadcrumb)
-			if err != nil {
-				return nil, fmt.Errorf("collect: %w", err)
-			}
-		}
-
-		return targets, nil
-	case "find_parent":
-		target, err := e.findParent(t, expr)
-		if err != nil {
-			return nil, fmt.Errorf("`%v`: %w", expr.String, err)
-		}
-
-		if target != nil {
-			err = e.LinkTarget(target, breadcrumb)
-			if err != nil {
-				return nil, fmt.Errorf("find_parent: %w", err)
-			}
-
-			return []*Target{target}, nil
-		}
-
-		return []*Target{}, nil
-	default:
+	f, ok := m[expr.Function]
+	if !ok {
 		return nil, fmt.Errorf("unhandled function %v", expr.Function)
 	}
+
+	return f.Run(t, expr, breadcrumb)
 }
 
 const InlineGroups = true
@@ -831,9 +802,7 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 	td := TargetDeps{}
 
 	for _, expr := range deps.Exprs {
-		expr := expr.Expr
-
-		targets, err := e.targetExpr(t, expr, breadcrumb)
+		targets, err := e.execExpr(t, expr.Expr, breadcrumb)
 		if err != nil {
 			return TargetDeps{}, err
 		}

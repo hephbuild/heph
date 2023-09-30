@@ -9,6 +9,8 @@ import (
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
@@ -75,40 +77,56 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 }
 
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
-	if specs.IsMatcherExplicit(m) {
-		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
+	allGenTargets := sets.NewStringSet(0)
+
+	for i := 0; ; i++ {
+		targets, err := e.Graph.Targets().Filter(m)
 		if err != nil {
-			if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
+			if !errors.Is(err, specs.TargetNotFoundErr{}) {
 				return nil, err
 			}
-			log.Debugf("generateRRs: %v", err)
-		} else {
-			return rrs, nil
+		}
+
+		var requiredMatchers = m
+		if targets != nil {
+			ms, err := e.Graph.RequiredMatchers(targets.Slice())
+			if err != nil {
+				return nil, err
+			}
+
+			requiredMatchers = specs.OrNodeFactory(requiredMatchers, ms)
+		}
+
+		genTargets := ads.Filter(e.Graph.GeneratedTargets(), func(gent *graph.Target) bool {
+			if allGenTargets.Has(gent.Addr) {
+				// Already ran gen
+				return false
+			}
+
+			gm := specs.OrNodeFactory(gent.Gen...)
+
+			return gm.Intersects(requiredMatchers)
+		})
+
+		if len(genTargets) == 0 {
+			break
+		}
+
+		for _, target := range genTargets {
+			allGenTargets.Add(target.Addr)
+		}
+
+		// Run those gen targets
+		deps, err := e.ScheduleGenPass(ctx, genTargets, false)
+		if err != nil {
+			return nil, err
+		}
+
+		err = poolwait.Wait(ctx, fmt.Sprintf("PreRun gen %v", i), e.Pool, deps, plain)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	err := runGen(ctx, e, "", false, plain)
-	if err != nil {
-		return nil, err
-	}
-
 	return generateRRs(ctx, e.Graph, m, targs, false, opts)
-}
-
-func runGen(ctx context.Context, e *scheduler.Scheduler, poolName string, linkAll, plain bool) error {
-	deps, err := e.ScheduleGenPass(ctx, linkAll)
-	if err != nil {
-		return err
-	}
-
-	if poolName == "" {
-		poolName = "PreRun gen"
-	}
-
-	err = poolwait.Wait(ctx, poolName, e.Pool, deps, plain)
-	if err != nil {
-		return err
-	}
-
-	return nil
 }

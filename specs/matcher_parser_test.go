@@ -17,7 +17,8 @@ func TestParseMatcher(t *testing.T) {
 		{"test", "test"},
 		{":test", "//**:test"},
 		{":t*st", "//**:t*st"},
-		{":", "//**:*"},
+		{":", "<all>"},
+		{`:*`, "<all>"},
 		{"test1 && test2", "(test1 && test2)"},
 		{"test1 && !test2", "(test1 && !test2)"},
 		{"!(test1 && test2)", "!(test1 && test2)"},
@@ -34,6 +35,8 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to", "//path/to:*"},
 		{`has_annotation("some")`, `has_annotation("some")`},
 		{`label*`, `label*`},
+		{`//**/*:*`, "<all>"},
+		{`//**:*`, "<all>"},
 	}
 	for _, test := range tests {
 		t.Run(test.expr, func(t *testing.T) {
@@ -128,6 +131,44 @@ func TestMatch(t *testing.T) {
 			m, _ := ParseMatcher(test.selector)
 
 			assert.Equal(t, test.expected, m.Match(test.t))
+		})
+	}
+}
+
+func TestHasIntersection(t *testing.T) {
+	tests := []struct {
+		expr1, expr2 string
+		expected     bool
+	}{
+		{"//some/path:name", "//some/path:name", true},
+		{"//some/path:name", "//some/path:other", false},
+		{"//some/path/**:*", "//some/path/deep/**:hello*", true},
+		{"//some/path/**:hey*", "//some/path/deep/**:hello*", false},
+		{"(//some/path/**:* && test)", "//some/path/deep/**:hello*", true},
+		{"(//some/path/**:* || test)", "//some/path/deep/**:hello*", true},
+		{"test", "//some/path/deep/**:hello*", true},
+		{"//path/**/to*:*", "//path/to:hello", true},
+		{"//path/**/to*/*:*", "//path/deep/to/some:hello", true},
+		{"//path/**/to/some:*", "//path/**/to*/some:hello", true},
+		{"//path/**/to/some:*", "//path/deep/**/to*/some:hello", true},
+		{"//path/**/to/some:*", "//path/**/deep/to*/some:hello", true},
+		{"//some/**:target || //some/deep/**:target", "//some/deep/very/*:target", true},
+		{"//some/**:target || //some/deep/**:target", "//other/deep/very/*:target", false},
+		{"//some/**:target || //some/deep/**:target", "//some/** && //some/deep/very/*:target", true},
+		{"//some/**:target || //some/deep/**:target", "//other/** && //some/deep/very/*:target", false},
+	}
+	for _, test := range tests {
+		t.Run(test.expr1+" "+test.expr2, func(t *testing.T) {
+			expr1, err := ParseMatcher(test.expr1)
+			require.NoError(t, err)
+			expr2, err := ParseMatcher(test.expr2)
+			require.NoError(t, err)
+
+			actual1 := Intersects(expr1, expr2)
+			assert.Equal(t, test.expected, actual1)
+
+			actual2 := Intersects(expr2, expr1)
+			assert.Equalf(t, actual1, actual2, "(a, b) and (b, a) outcome need to be consistent")
 		})
 	}
 }

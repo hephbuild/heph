@@ -147,7 +147,7 @@ func (t Target) equalStruct(spec Target) bool {
 		return false
 	}
 
-	if t.Gen != spec.Gen {
+	if !arrEqual(t.Gen, spec.Gen) {
 		return false
 	}
 

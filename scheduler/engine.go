@@ -39,8 +39,6 @@ type Scheduler struct {
 	Runner           *targetrun.Runner
 
 	toolsLock locks.Locker
-
-	RanGenPass bool
 }
 
 func New(e Scheduler) *Scheduler {

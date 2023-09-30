@@ -95,7 +95,9 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		if matcher == specs.AllMatcher {
+		if matcher == nil {
+			matcher = specs.AllMatcher
+
 			inputExpr := ""
 			if !bootstrap.HasStdin(args) && len(args) >= 1 {
 				inputExpr = args[0]
@@ -126,10 +128,11 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler:    bs.Scheduler,
-			PoolWaitName: "Query gen",
-		})
+		if !all && !bootstrap.HasStdin(args) {
+			matcher = specs.AndNodeFactory(specs.PublicMatcher, matcher)
+		}
+
+		_, err = generateRRs(ctx, bs.Scheduler, matcher, nil)
 		if err != nil {
 			return err
 		}
@@ -144,10 +147,6 @@ var queryCmd = &cobra.Command{
 			targets, err = bs.Graph.Targets().Filter(m)
 			if err != nil {
 				return err
-			}
-		} else {
-			if !all {
-				targets = bs.Graph.Targets().Public()
 			}
 		}
 

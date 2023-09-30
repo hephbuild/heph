@@ -166,6 +166,33 @@ def go_mod(
             "out_in_sandbox": True,
         }
 
+    mod_pkgs_gen = [
+        "//thirdparty/go/**",
+        ":_std_pkgs_*",
+    ]
+
+    for pkg in mod_pkgs:
+        mod_pkgs_gen += [
+            pkg+"/**:_go_lib*",
+            pkg+"/**:*go*#embedcfg",
+        ]
+
+    mod_pkgs_gen += [
+        heph.pkg.addr()+"/**:_go_lib*",
+        heph.pkg.addr()+"/**:go_bin#build*",
+        heph.pkg.addr()+"/**:_go_test_lib*",
+        heph.pkg.addr()+"/**:_go_xtest_lib*",
+        heph.pkg.addr()+"/**:_go_testmain_lib*",
+        heph.pkg.addr()+"/**:_go_gen_testmain*",
+        heph.pkg.addr()+"/**:_go_test#build*",
+        heph.pkg.addr()+"/**:go_test*",
+        heph.pkg.addr()+"/**:*go*#embedcfg",
+    ]
+
+    # todo
+    if work:
+        mod_pkgs_gen = ":"
+
     target(
         name = "_go_mod_gen",
         run = "godeps mod $SRC_CFG",
@@ -180,7 +207,7 @@ def go_mod(
             "GOOS": get_os(),
             "GOARCH": get_arch(),
         } | goenv,
-        gen = True,
+        gen = mod_pkgs_gen,
         gen_deps_meta = True,
         **mod_gen_kwargs,
     )
