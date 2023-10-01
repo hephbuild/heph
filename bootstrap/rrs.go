@@ -105,7 +105,9 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 
 			gm := specs.OrNodeFactory(gent.Gen...)
 
-			return gm.Intersects(requiredMatchers)
+			r := specs.Intersects(gm, requiredMatchers)
+
+			return r != specs.IntersectFalse
 		})
 
 		if len(genTargets) == 0 {
@@ -114,6 +116,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 
 		for _, target := range genTargets {
 			allGenTargets.Add(target.Addr)
+			log.Warnf("GEN: %v", target.Addr)
 		}
 
 		// Run those gen targets

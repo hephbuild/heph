@@ -21,12 +21,12 @@ func (p TargetAddr) String() string {
 	return p.Full()
 }
 
-func (p TargetAddr) Intersects(other Matcher) bool {
+func (p TargetAddr) Intersects(other Matcher) IntersectResult {
 	if ta, ok := other.(TargetAddr); ok {
-		return p.String() == ta.String()
+		return IntersectResultBool(p.String() == ta.String())
 	}
 
-	return false
+	return IntersectUnknown
 }
 
 func (p TargetAddr) Full() string {
@@ -43,7 +43,7 @@ func (p TargetAddrs) String() string {
 	return OrNodeFactory[TargetAddr](p...).String()
 }
 
-func (p TargetAddrs) Intersects(m Matcher) bool {
+func (p TargetAddrs) Intersects(m Matcher) IntersectResult {
 	return OrNodeFactory[TargetAddr](p...).Intersects(m)
 }
 

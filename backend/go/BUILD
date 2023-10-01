@@ -104,6 +104,20 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg + ":_go_mod_gen")
 
+def _find_go_work():
+    parts = heph.path.split(heph.pkg.dir())
+
+    prefix = "."
+    for i in range(0, len(parts)+1):
+        p = prefix+"/go.work"
+
+        if len(glob(p)) > 0:
+            return p
+
+        prefix += "/.."
+
+    fail("unable to locate work file from "+heph.pkg.dir())
+
 def go_mod(
     mod_pkgs = [],
     cfg = {},
@@ -149,6 +163,11 @@ def go_mod(
 
     godeps_deps = glob("**/*.{mod,sum}") + [src] + mod_pkg_srcs + mod_pkg_modsums
 
+    if work:
+        p = _find_go_work()
+        godeps_deps += [p]
+        godeps_deps += glob(p+".sum")
+
     imports = target(
         name = "_go_mod_gen_imports",
         run = "godeps imports > $OUT",
@@ -158,13 +177,6 @@ def go_mod(
         gen_deps_meta = True,
         env = goenv,
     )
-
-    mod_gen_kwargs = {}
-    if work:
-        mod_gen_kwargs = {
-            "sandbox": False,
-            "out_in_sandbox": True,
-        }
 
     mod_pkgs_gen = [
         "//thirdparty/go/**",
@@ -189,10 +201,6 @@ def go_mod(
         heph.pkg.addr()+"/**:*go*#embedcfg",
     ]
 
-    # todo
-    if work:
-        mod_pkgs_gen = ":"
-
     target(
         name = "_go_mod_gen",
         run = "godeps mod $SRC_CFG",
@@ -209,7 +217,6 @@ def go_mod(
         } | goenv,
         gen = mod_pkgs_gen,
         gen_deps_meta = True,
-        **mod_gen_kwargs,
     )
 
     target(
@@ -244,9 +251,6 @@ def go_mod(
         sandbox = False,
         cache = False,
     )
-
-def go_work():
-    group(name = "_go_work", deps = "go.work")
 
 def _go_gen_importcfg():
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s") + " 100000"

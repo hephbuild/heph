@@ -59,8 +59,8 @@ func (e *State) exprFunctions() map[string]exprFunc {
 
 				return []*Target{}, nil
 			},
-			Analyze: func(t specs.Target, expr exprs.Expr, breadcrumb *sets.StringSet, missing *sets.Set[string, specs.Matcher]) error {
-				missing.Add(specs.AllMatcher)
+			Analyze: func(t specs.Target, expr exprs.Expr, breadcrumb *sets.StringSet, required *sets.Set[string, specs.Matcher]) error {
+				required.Add(specs.AllMatcher)
 
 				return nil
 			},

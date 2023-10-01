@@ -82,6 +82,8 @@ func init() {
 	queryCmd.Flags().MarkHidden("exclude")
 }
 
+var NotThirdpartyMatcher = specs.MustParseMatcher("!//thirdparty/**")
+
 var queryCmd = &cobra.Command{
 	Use:     "query",
 	Aliases: []string{"q"},
@@ -128,8 +130,17 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		if !all && !bootstrap.HasStdin(args) {
-			matcher = specs.AndNodeFactory(specs.PublicMatcher, matcher)
+		if bootstrap.HasStdin(args) {
+			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
+			if err != nil {
+				return err
+			}
+
+			matcher = specs.AndNodeFactory(matcher, m)
+		} else {
+			if !all {
+				matcher = specs.AndNodeFactory(specs.PublicMatcher, NotThirdpartyMatcher, matcher)
+			}
 		}
 
 		_, err = generateRRs(ctx, bs.Scheduler, matcher, nil)
@@ -137,20 +148,7 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		targets := bs.Graph.Targets()
-		if bootstrap.HasStdin(args) {
-			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
-			if err != nil {
-				return err
-			}
-
-			targets, err = bs.Graph.Targets().Filter(m)
-			if err != nil {
-				return err
-			}
-		}
-
-		selected, err := targets.Filter(matcher)
+		selected, err := bs.Graph.Targets().Filter(matcher)
 		if err != nil {
 			return err
 		}

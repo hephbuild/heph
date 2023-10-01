@@ -11,7 +11,23 @@ import (
 type Matcher interface {
 	Match(Specer) bool
 	String() string
-	Intersects(Matcher) bool
+	Intersects(Matcher) IntersectResult
+}
+
+type IntersectResult int
+
+const (
+	IntersectTrue    IntersectResult = 1
+	IntersectFalse                   = 0
+	IntersectUnknown                 = 2
+)
+
+func IntersectResultBool(b bool) IntersectResult {
+	if b {
+		return IntersectTrue
+	} else {
+		return IntersectFalse
+	}
 }
 
 type staticMatcher struct {
@@ -39,8 +55,8 @@ func (n staticMatcher) Match(t Specer) bool {
 	return n.match
 }
 
-func (n staticMatcher) Intersects(Matcher) bool {
-	return n.match
+func (n staticMatcher) Intersects(Matcher) IntersectResult {
+	return IntersectResultBool(n.match)
 }
 
 type astNode interface {
@@ -60,9 +76,12 @@ func AndNodeFactory(ms ...Matcher) Matcher {
 		return ms[0]
 	}
 
-	n := andNode{left: ms[0], right: ms[1]}
-	for i := len(ms); i < 2; i++ {
-		n = andNode{left: ms[i], right: n}
+	n := ms[0]
+	for i, m := range ms {
+		if i == 0 {
+			continue
+		}
+		n = andNode{left: n, right: m}
 	}
 
 	return n
@@ -76,40 +95,30 @@ func (n andNode) Match(t Specer) bool {
 	return n.left.Match(t) && n.right.Match(t)
 }
 
-func (n andNode) Intersects(i Matcher) bool {
-	if !Intersects(i, n.left) {
-		return false
-	}
-
-	if !Intersects(i, n.right) {
-		return false
-	}
-
-	return true
+func (n andNode) Intersects(i Matcher) IntersectResult {
+	return intersectAnd(i, n.left, n.right)
 }
 
-func Intersects(a, b Matcher) bool {
+func Intersects(a, b Matcher) IntersectResult {
 	if a == AllMatcher || b == AllMatcher {
-		return true
+		return IntersectTrue
 	}
 
 	if a == NoneMatcher || b == NoneMatcher {
-		return false
+		return IntersectFalse
 	}
 
-	if a, ok := a.(Matcher); ok {
-		if b, ok := b.(Matcher); ok {
-			if a.Intersects(b) {
-				return true
-			}
-
-			if b.Intersects(a) {
-				return true
-			}
-		}
+	r1 := a.Intersects(b)
+	if r1 != IntersectUnknown {
+		return r1
 	}
 
-	return false
+	r2 := b.Intersects(a)
+	if r2 != IntersectUnknown {
+		return r2
+	}
+
+	return IntersectUnknown
 }
 
 func OrNodeFactory[T Matcher](ms ...T) Matcher {
@@ -161,16 +170,8 @@ func (n orNode) Match(t Specer) bool {
 	return n.left.Match(t) || n.right.Match(t)
 }
 
-func (n orNode) Intersects(i Matcher) bool {
-	if Intersects(n.left, i) {
-		return true
-	}
-
-	if Intersects(n.right, i) {
-		return true
-	}
-
-	return false
+func (n orNode) Intersects(i Matcher) IntersectResult {
+	return intersectOr(i, n.left, n.right)
 }
 
 type mOrNode struct {
@@ -195,14 +196,46 @@ func (n mOrNode) Match(t Specer) bool {
 	return false
 }
 
-func (n mOrNode) Intersects(i Matcher) bool {
-	for _, node := range n.nodes {
-		if Intersects(node, i) {
-			return true
+func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
+	hasUnknown := false
+	for _, node := range ms {
+		r := Intersects(node, i)
+		if r == IntersectTrue {
+			return IntersectTrue
+		}
+		if r == IntersectUnknown {
+			hasUnknown = true
 		}
 	}
 
-	return false
+	if hasUnknown {
+		return IntersectUnknown
+	}
+
+	return IntersectFalse
+}
+
+func intersectAnd(i Matcher, ms ...Matcher) IntersectResult {
+	hasUnknown := false
+	for _, node := range ms {
+		r := Intersects(node, i)
+		if r == IntersectFalse {
+			return IntersectFalse
+		}
+		if r == IntersectUnknown {
+			hasUnknown = true
+		}
+	}
+
+	if hasUnknown {
+		return IntersectUnknown
+	}
+
+	return IntersectTrue
+}
+
+func (n mOrNode) Intersects(i Matcher) IntersectResult {
+	return intersectOr(i, n.nodes...)
 }
 
 type notNode struct {
@@ -217,8 +250,17 @@ func (n notNode) Match(t Specer) bool {
 	return !n.expr.Match(t)
 }
 
-func (n notNode) Intersects(i Matcher) bool {
-	return !Intersects(n.expr, i)
+func (n notNode) Intersects(i Matcher) IntersectResult {
+	r := Intersects(n.expr, i)
+
+	switch r {
+	case IntersectTrue:
+		return IntersectFalse
+	case IntersectFalse:
+		return IntersectTrue
+	default:
+		return IntersectUnknown
+	}
 }
 
 type labelNode struct {
@@ -233,8 +275,13 @@ func (n labelNode) Match(t Specer) bool {
 	return ads.Contains(t.Spec().Labels, n.value)
 }
 
-func (n labelNode) Intersects(i Matcher) bool {
-	return true
+func (n labelNode) Intersects(i Matcher) IntersectResult {
+	switch l := i.(type) {
+	case labelNode:
+		return IntersectResultBool(n.value == l.value)
+	}
+
+	return IntersectUnknown
 }
 
 type labelRegexNode struct {
@@ -252,8 +299,15 @@ func (n labelRegexNode) Match(t Specer) bool {
 	})
 }
 
-func (n labelRegexNode) Intersects(i Matcher) bool {
-	return true
+func (n labelRegexNode) Intersects(i Matcher) IntersectResult {
+	switch l := i.(type) {
+	case labelNode:
+		return IntersectResultBool(n.r.MatchString(l.value))
+	case labelRegexNode:
+		return IntersectResultBool(n.r.MatchString(reducePattern(l.value)))
+	}
+
+	return IntersectUnknown
 }
 
 type targetRegexNode struct {
@@ -279,7 +333,7 @@ func (n targetRegexNode) MatchPackageName(pkg, name string) bool {
 	return n.name.MatchString(name)
 }
 
-func (n targetRegexNode) reducePattern(expr string) string {
+func reducePattern(expr string) string {
 	expr = strings.ReplaceAll(expr, "/**/", "/")
 	expr = strings.ReplaceAll(expr, "/**", "")
 	expr = strings.ReplaceAll(expr, "**/", "")
@@ -289,18 +343,18 @@ func (n targetRegexNode) reducePattern(expr string) string {
 	return expr
 }
 
-func (n targetRegexNode) Intersects(i Matcher) bool {
-	if ta, ok := i.(TargetAddr); ok {
-		return n.MatchPackageName(ta.Package, ta.Name)
+func (n targetRegexNode) Intersects(i Matcher) IntersectResult {
+	switch ta := i.(type) {
+	case TargetAddr:
+		return IntersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
+	case targetRegexNode:
+		return IntersectResultBool(
+			n.MatchPackageName(reducePattern(ta.pkgs), reducePattern(ta.names)) ||
+				ta.MatchPackageName(reducePattern(n.pkgs), reducePattern(n.names)),
+		)
 	}
 
-	if ta, ok := i.(targetRegexNode); ok {
-		if n.MatchPackageName(n.reducePattern(ta.pkgs), n.reducePattern(ta.names)) {
-			return true
-		}
-	}
-
-	return false
+	return IntersectUnknown
 }
 
 type funcNode struct {
@@ -321,8 +375,8 @@ func (n funcNode) Match(t Specer) bool {
 	return n.match(n.args, t)
 }
 
-func (n funcNode) Intersects(i Matcher) bool {
-	return true
+func (n funcNode) Intersects(i Matcher) IntersectResult {
+	return IntersectUnknown
 }
 
 var matcherFunctions = map[string]func(args []astNode, t Specer) bool{

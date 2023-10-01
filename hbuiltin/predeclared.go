@@ -90,9 +90,10 @@ func predeclared_functions() starlark.StringDict {
 				"path": &starlarkstruct.Module{
 					Name: "heph.path",
 					Members: starlark.StringDict{
-						"base": starlark.NewBuiltin("heph.path.base", path_base),
-						"dir":  starlark.NewBuiltin("heph.path.dir", path_dir),
-						"join": starlark.NewBuiltin("heph.path.join", path_join),
+						"base":  starlark.NewBuiltin("heph.path.base", path_base),
+						"dir":   starlark.NewBuiltin("heph.path.dir", path_dir),
+						"join":  starlark.NewBuiltin("heph.path.join", path_join),
+						"split": starlark.NewBuiltin("heph.path.split", path_split),
 					},
 				},
 			},
@@ -426,4 +427,24 @@ func path_join(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tupl
 	})
 
 	return starlark.String(filepath.Join(parts...)), nil
+}
+func path_split(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	var (
+		path string
+	)
+
+	if err := starlark.UnpackArgs(
+		fn.Name(), args, kwargs,
+		"path", &path,
+	); err != nil {
+		return nil, err
+	}
+
+	parts := strings.Split(path, string(filepath.Separator))
+
+	sparts := ads.Map(parts, func(t string) starlark.Value {
+		return starlark.String(t)
+	})
+
+	return starlark.NewList(sparts), nil
 }
