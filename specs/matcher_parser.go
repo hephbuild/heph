@@ -14,6 +14,10 @@ type Matcher interface {
 	Intersects(Matcher) IntersectResult
 }
 
+type StringMatcher interface {
+	MatchString(s string) bool
+}
+
 type IntersectResult int
 
 const (
@@ -22,7 +26,7 @@ const (
 	IntersectUnknown                 = 2
 )
 
-func IntersectResultBool(b bool) IntersectResult {
+func intersectResultBool(b bool) IntersectResult {
 	if b {
 		return IntersectTrue
 	} else {
@@ -56,7 +60,7 @@ func (n staticMatcher) Match(t Specer) bool {
 }
 
 func (n staticMatcher) Intersects(Matcher) IntersectResult {
-	return IntersectResultBool(n.match)
+	return intersectResultBool(n.match)
 }
 
 type astNode interface {
@@ -275,10 +279,14 @@ func (n labelNode) Match(t Specer) bool {
 	return ads.Contains(t.Spec().Labels, n.value)
 }
 
+func (n labelNode) MatchString(s string) bool {
+	return s == n.value
+}
+
 func (n labelNode) Intersects(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
-		return IntersectResultBool(n.value == l.value)
+		return intersectResultBool(n.value == l.value)
 	}
 
 	return IntersectUnknown
@@ -299,33 +307,37 @@ func (n labelRegexNode) Match(t Specer) bool {
 	})
 }
 
+func (n labelRegexNode) MatchString(s string) bool {
+	return n.r.MatchString(s)
+}
+
 func (n labelRegexNode) Intersects(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
-		return IntersectResultBool(n.r.MatchString(l.value))
+		return intersectResultBool(n.r.MatchString(l.value))
 	case labelRegexNode:
-		return IntersectResultBool(n.r.MatchString(reducePattern(l.value)))
+		return intersectResultBool(n.r.MatchString(reducePattern(l.value)))
 	}
 
 	return IntersectUnknown
 }
 
-type targetRegexNode struct {
+type addrRegexNode struct {
 	pkg   *regexp.Regexp
 	name  *regexp.Regexp
 	pkgs  string
 	names string
 }
 
-func (n targetRegexNode) String() string {
+func (n addrRegexNode) String() string {
 	return "//" + n.pkgs + ":" + n.names
 }
 
-func (n targetRegexNode) Match(t Specer) bool {
+func (n addrRegexNode) Match(t Specer) bool {
 	return n.MatchPackageName(t.Spec().Package.Path, t.Spec().Name)
 }
 
-func (n targetRegexNode) MatchPackageName(pkg, name string) bool {
+func (n addrRegexNode) MatchPackageName(pkg, name string) bool {
 	if !n.pkg.MatchString(pkg) {
 		return false
 	}
@@ -343,12 +355,12 @@ func reducePattern(expr string) string {
 	return expr
 }
 
-func (n targetRegexNode) Intersects(i Matcher) IntersectResult {
+func (n addrRegexNode) Intersects(i Matcher) IntersectResult {
 	switch ta := i.(type) {
 	case TargetAddr:
-		return IntersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
-	case targetRegexNode:
-		return IntersectResultBool(
+		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
+	case addrRegexNode:
+		return intersectResultBool(
 			n.MatchPackageName(reducePattern(ta.pkgs), reducePattern(ta.names)) ||
 				ta.MatchPackageName(reducePattern(n.pkgs), reducePattern(n.names)),
 		)
@@ -598,4 +610,28 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 	} else {
 		return nil, nil
 	}
+}
+
+func IsLabelMatcher(m Matcher) bool {
+	if _, ok := m.(labelNode); ok {
+		return true
+	}
+
+	if _, ok := m.(labelRegexNode); ok {
+		return true
+	}
+
+	return false
+}
+
+func IsAddrMatcher(m Matcher) bool {
+	if _, ok := m.(TargetAddr); ok {
+		return true
+	}
+
+	if _, ok := m.(addrRegexNode); ok {
+		return true
+	}
+
+	return false
 }

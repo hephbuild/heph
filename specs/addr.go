@@ -23,7 +23,7 @@ func (p TargetAddr) String() string {
 
 func (p TargetAddr) Intersects(other Matcher) IntersectResult {
 	if ta, ok := other.(TargetAddr); ok {
-		return IntersectResultBool(p.String() == ta.String())
+		return intersectResultBool(p.String() == ta.String())
 	}
 
 	return IntersectUnknown
@@ -224,7 +224,7 @@ func ParseTargetGlob(s string) (Matcher, error) {
 			return nil, err
 		}
 
-		return targetRegexNode{
+		return addrRegexNode{
 			pkg:   pkg,
 			pkgs:  tp.Package,
 			name:  name,

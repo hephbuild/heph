@@ -66,6 +66,12 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		return specs.Target{}, err
 	}
 
+	for i, m := range t.Gen {
+		if !(specs.IsAddrMatcher(m) || specs.IsLabelMatcher(m)) {
+			return specs.Target{}, fmt.Errorf("gen[%v]: must be an addr matcher or a label matcher, got %T", i, m)
+		}
+	}
+
 	t.Tools, err = toolsSpecFromArgs(t, args.Tools)
 	if err != nil {
 		return specs.Target{}, err

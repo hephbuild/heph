@@ -163,19 +163,18 @@ type matchGen struct {
 }
 
 func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
-	matchers := append([]matchGen{{
+	matchers := []matchGen{{
 		addr:     target.Addr,
 		matchers: target.Gen,
-	}})
+	}}
 
+	matchers = ads.GrowExtra(matchers, len(target.GenSources()))
 	for _, source := range target.GenSources() {
 		matchers = append(matchers, matchGen{
 			addr:     source.Addr,
 			matchers: source.Gen,
 		})
 	}
-
-	matchers = ads.Reverse(matchers)
 
 	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
@@ -193,12 +192,30 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 					Config: e.Config,
 					RegisterTarget: func(spec specs.Target) error {
 						for _, entry := range matchers {
-							match := ads.Some(entry.matchers, func(m specs.Matcher) bool {
+							addrMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+								return specs.IsAddrMatcher(m)
+							})
+
+							addrMatch := ads.Some(addrMatchers, func(m specs.Matcher) bool {
 								return m.Match(spec)
 							})
 
-							if !match {
+							if !addrMatch {
 								return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
+							}
+
+							labelMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+								return specs.IsLabelMatcher(m)
+							})
+
+							for _, label := range spec.Labels {
+								labelMatch := ads.Some(labelMatchers, func(m specs.Matcher) bool {
+									return m.(specs.StringMatcher).MatchString(label)
+								})
+
+								if !labelMatch {
+									return fmt.Errorf("label `%v` doest match any gen pattern of %v: %v", label, entry.addr, entry.matchers)
+								}
 							}
 						}
 

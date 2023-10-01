@@ -57,7 +57,7 @@ func ContainsAny[T comparable](a []T, e []T) bool {
 	return false
 }
 
-func Filter[T any](a []T, f func(T) bool) []T {
+func Filter[S ~[]E, E any](a S, f func(E) bool) S {
 	o := a
 	alloc := false
 
@@ -66,7 +66,7 @@ func Filter[T any](a []T, f func(T) bool) []T {
 
 		if !alloc {
 			if !keep {
-				o = make([]T, i)
+				o = make(S, i)
 				alloc = true
 				if i > 0 {
 					copy(o, a[:i])
@@ -138,12 +138,12 @@ func FindIndex[T any](a []T, f func(T) bool) int {
 	return -1
 }
 
-func Copy[T any](a []T) []T {
+func Copy[S ~[]E, E any](a S) S {
 	if a == nil {
 		return nil
 	}
 
-	var empty []T
+	var empty S
 	return append(empty, a...)
 }
 
@@ -220,11 +220,11 @@ func OrderedGroupBy[T any, K comparable](a []T, keyer func(T) K, less func(i, j 
 	return ga
 }
 
-func GrowExtra[T any](slice []T, extraCap int) []T {
+func GrowExtra[S ~[]E, E any](slice S, extraCap int) S {
 	return Grow(slice, len(slice)+extraCap)
 }
 
-func Grow[T any](slice []T, newCap int) []T {
+func Grow[S ~[]E, E any](slice S, newCap int) S {
 	if cap(slice) >= newCap {
 		return slice
 	}
@@ -233,7 +233,7 @@ func Grow[T any](slice []T, newCap int) []T {
 		panic(fmt.Sprintf("Grow: newCap is smaller than existing slice len, slice len: %v, newCap: %v", len(slice), newCap))
 	}
 
-	newSlice := make([]T, len(slice), newCap)
+	newSlice := make(S, len(slice), newCap)
 	copy(newSlice, slice)
 
 	return newSlice

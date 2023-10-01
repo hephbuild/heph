@@ -181,6 +181,11 @@ def go_mod(
     mod_pkgs_gen = [
         "//thirdparty/go/**",
         ":_std_pkgs_*",
+        "go_lib",
+        "go_build_bin",
+        "test",
+        "thirdparty",
+        "go-test",
     ]
 
     for pkg in mod_pkgs:
