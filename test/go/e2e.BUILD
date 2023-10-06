@@ -15,13 +15,13 @@ e2e_test(
 e2e_test(
     name = "sanity_count_tests",
     cmd = "heph query -i //test/go/... | heph query -i test - | wc -l | xargs",
-    expected_output = "22",
+    expected_output = "23",
 )
 
 e2e_test(
     name = "sanity_count_tests2",
     cmd = "heph query '//test/go/... && test' | wc -l | xargs",
-    expected_output = "22",
+    expected_output = "23",
 )
 
 e2e_test(
