@@ -274,16 +274,25 @@ func generate() []RenderUnit {
 				_, pkgDeps := splitOutPkgs(pkg.Variant, pkg.Deps)
 
 				_, pkgTestImports := splitOutPkgs(pkg.Variant, pkg.TestImports)
+				_, pkgXTestImports := splitOutPkgs(pkg.Variant, pkg.XTestImports)
 				_, pkgImports := splitOutPkgs(pkg.Variant, pkg.Imports)
 
 				deps := append(pkgTestDeps, pkgDeps...)
 				imports := append(pkgTestImports, pkgImports...)
+				ximports := append(pkgXTestImports, pkgImports...)
 
 				importLibs := make([]string, 0)
 				for _, p := range imports {
 					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
 
 					importLibs = append(importLibs, t.Full())
+				}
+
+				ximportLibs := make([]string, 0)
+				for _, p := range ximports {
+					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
+
+					ximportLibs = append(ximportLibs, t.Full())
 				}
 
 				depsLibs := make([]string, 0)
@@ -294,7 +303,7 @@ func generate() []RenderUnit {
 				}
 
 				testlib := testLibFactory(targetName("_go_test_lib", pkg.Variant), importLibs, pkg.ImportPath, len(pkg.TestGoFiles) > 0, append(pkg.GoFiles, pkg.TestGoFiles...), pkg.SFiles, append(pkg.EmbedPatterns, pkg.TestEmbedPatterns...), libPkg, pkg.Variant)
-				xtestImportLibs := importLibs
+				xtestImportLibs := ximportLibs
 				if testlib != nil {
 					xtestImportLibs = append(xtestImportLibs, testlib.Target.Full())
 					depsLibs = append(depsLibs, testlib.Target.Full())

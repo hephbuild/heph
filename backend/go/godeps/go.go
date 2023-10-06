@@ -35,16 +35,17 @@ func (e Error) String() string {
 // https://pkg.go.dev/cmd/go#hdr-List_packages_or_modules
 
 type Package struct {
-	Dir         string
-	Root        string
-	Name        string
-	ImportPath  string
-	Module      *Mod
-	Standard    bool
-	Deps        []string
-	Imports     []string
-	TestImports []string
-	GoFiles     []string
+	Dir          string
+	Root         string
+	Name         string
+	ImportPath   string
+	Module       *Mod
+	Standard     bool
+	Deps         []string
+	Imports      []string
+	TestImports  []string
+	XTestImports []string
+	GoFiles      []string
 	//IgnoredGoFiles []string
 	TestGoFiles  []string
 	XTestGoFiles []string
@@ -344,7 +345,7 @@ func goListWithTransitiveTestDeps() *Packages {
 		if pkg.IsPartOfModule {
 			testDeps := make([]string, 0)
 
-			for _, depPath := range pkg.TestImports {
+			for _, depPath := range append(pkg.TestImports, pkg.XTestImports...) {
 				if dpkg := allPkgs.Find(depPath, pkg.Variant); dpkg != nil {
 					testDeps = append(testDeps, dpkg.ImportPath)
 					testDeps = append(testDeps, dpkg.Deps...)
