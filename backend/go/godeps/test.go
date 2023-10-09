@@ -8,52 +8,50 @@ import (
 )
 
 type LibTest struct {
-	TestLib  *Lib
-	XTestLib *Lib
+	TestLib *Lib
 
+	X        bool
 	DepsLibs []string
 
 	ImportPath string
 
-	TestFiles  []string
-	XTestFiles []string
-	RunExtra   map[string]interface{}
+	TestFiles []string
+	RunExtra  map[string]interface{}
 }
 
 func (t LibTest) Data() interface{} {
+	prefix := ""
+	if t.X {
+		prefix = "x"
+	}
+
 	testFilesForAnalysis := make([]string, 0)
 	for _, file := range t.TestFiles {
-		testFilesForAnalysis = append(testFilesForAnalysis, "_test:"+file)
-	}
-	for _, file := range t.XTestFiles {
-		testFilesForAnalysis = append(testFilesForAnalysis, "_xtest:"+file)
+		testFilesForAnalysis = append(testFilesForAnalysis, "_"+prefix+"test:"+file)
 	}
 
 	var variant PkgCfgVariant
 	if t.TestLib != nil {
 		variant = t.TestLib.Variant
-	} else if t.XTestLib != nil {
-		variant = t.XTestLib.Variant
 	}
 
 	return map[string]interface{}{
 		"Config": Config,
+		"Prefix": prefix,
 
 		"ImportPath": t.ImportPath,
 		"DepsLibs":   genStringArray(t.DepsLibs, 2),
 
 		"TestFilesForAnalysis": strings.Join(testFilesForAnalysis, " "),
 
-		"TestLib":  RenderLibCall(t.TestLib),
-		"XTestLib": RenderLibCall(t.XTestLib),
-		"GoFiles":  genStringArray(append(t.TestFiles, t.XTestFiles...), 2),
+		"TestLib": RenderLibCall(t.TestLib),
+		"GoFiles": genStringArray(t.TestFiles, 2),
 
-		"Variant":        variant,
-		"VID":            VID(variant),
-		"VariantArgs":    genVariant(variant, true, false, false),
-		"VariantBinArgs": genVariant(variant, true, false, false),
-		"IfTest":         fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
-		"RunArgs":        genDict(t.RunExtra, 0, true),
+		"Variant":     variant,
+		"VID":         VID(variant),
+		"VariantArgs": genVariant(variant, true, false, false),
+		"IfTest":      fmt.Sprintf("'%v' == get_os() and '%v' == get_arch()", variant.OS, variant.ARCH),
+		"RunArgs":     genDict(t.RunExtra, 0, true),
 	}
 }
 
@@ -67,10 +65,9 @@ load("{{.Config.BackendPkg}}", "go_library")
 load("{{.Config.BackendPkg}}", "go_build_bin")
 
 test_lib = {{.TestLib}}
-xtest_lib = {{.XTestLib}}
 
 gen_testmain = target(
-    name="_go_gen_testmain@{{.VID}}",
+    name="_go_gen_{{.Prefix}}testmain@{{.VID}}",
     deps={{.GoFiles}},
     run='generate_testmain $OUT {{.ImportPath}} {{.TestFilesForAnalysis}}',
     out=['testmain/_testmain.go'],
@@ -82,9 +79,9 @@ gen_testmain = target(
 )
 
 testmain_lib = go_library(
-	name="_go_testmain_lib@{{.VID}}",
+	name="_go_{{.Prefix}}testmain_lib@{{.VID}}",
 	src_dep=gen_testmain,
-	libs=[test_lib, xtest_lib],
+	libs=[test_lib],
 	go_files=['_testmain.go'],
 	import_path="main",
 	dir="testmain",
@@ -93,19 +90,19 @@ testmain_lib = go_library(
 )
 
 test_build = go_build_bin(
-    name="_go_test#build@{{.VID}}",
+    name="_go_{{.Prefix}}test#build@{{.VID}}",
 	main=testmain_lib,
     libs={{.DepsLibs}},
 	out=heph.pkg.name(),
-	{{.VariantBinArgs}}
+	{{.VariantArgs}}
 )
 
 if {{.IfTest}}:
 	rargs = {{.RunArgs}}
 
 	args = {
-		'name': "go_test@{{.VID}}",
-		'doc': 'Run go test {{.ImportPath}} {{.Variant.OS}}/{{.Variant.ARCH}} {{StringsJoin .Variant.Tags ","}}'.strip(), 
+		'name': "go_{{.Prefix}}test@{{.VID}}",
+		'doc': 'Run go {{.Prefix}}test {{.ImportPath}} {{.Variant.OS}}/{{.Variant.ARCH}} {{StringsJoin .Variant.Tags ","}}'.strip(), 
 		'deps': {
 			'bin': test_build,
 			'data': '$(collect "{}/." include="go_test_data")'.format(heph.pkg.addr()),
