@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
 	"github.com/spf13/cobra"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -34,6 +36,7 @@ var all bool
 var debugTransitive bool
 var filter string
 var jsonOutput bool
+var files bool
 
 func init() {
 	queryCmd.AddCommand(configCmd)
@@ -60,6 +63,7 @@ func init() {
 	revdepsCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
 	depsCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
 	queryCmd.Flags().StringVar(&filter, "filter", "", "Filter resulting targets")
+	depsCmd.Flags().BoolVar(&files, "files", false, "Print files instead of targets")
 
 	targetCmd.Flags().BoolVar(&spec, "spec", false, "Print spec")
 	targetCmd.Flags().BoolVar(&debugTransitive, "debug-transitive", false, "Print transitive details")
@@ -502,6 +506,13 @@ var depsCmd = &cobra.Command{
 			return err
 		}
 
+		if files && !transitive {
+			for _, file := range target.Deps.All().Files {
+				fmt.Println(file.Abs())
+			}
+			return nil
+		}
+
 		fn := bs.Graph.DAG().GetParents
 		if transitive {
 			fn = bs.Graph.DAG().GetAncestors
@@ -527,6 +538,26 @@ var depsCmd = &cobra.Command{
 		}
 
 		deps.Sort()
+
+		if files {
+			allFiles := sets.NewStringSet(0)
+			for _, dep := range deps.Slice() {
+				for _, file := range dep.Deps.All().Files {
+					allFiles.Add(file.Abs())
+				}
+			}
+			for _, file := range target.Deps.All().Files {
+				allFiles.Add(file.Abs())
+			}
+
+			sort.Strings(allFiles.Slice())
+
+			for _, f := range allFiles.Slice() {
+				fmt.Println(f)
+			}
+
+			return nil
+		}
 
 		for _, t := range deps.Slice() {
 			fmt.Println(t.Addr)
