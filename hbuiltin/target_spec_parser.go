@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
 	"runtime"
@@ -59,7 +60,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 
 	var err error
 
-	t.Gen, err = ads.MapE(args.Gen, func(s string) (specs.Matcher, error) {
+	t.Gen, err = ads.MapE(sets.NewIdentitySetFrom(args.Gen).Slice(), func(s string) (specs.Matcher, error) {
 		return specs.ParseMatcher(s)
 	})
 	if err != nil {

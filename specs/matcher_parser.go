@@ -11,7 +11,7 @@ import (
 type Matcher interface {
 	Match(Specer) bool
 	String() string
-	Intersects(Matcher) IntersectResult
+	Includes(Matcher) IntersectResult
 }
 
 type StringMatcher interface {
@@ -19,6 +19,14 @@ type StringMatcher interface {
 }
 
 type IntersectResult int
+
+func (r IntersectResult) Bool() bool {
+	if r == IntersectFalse {
+		return false
+	}
+
+	return true
+}
 
 const (
 	IntersectTrue    IntersectResult = 1
@@ -59,7 +67,7 @@ func (n staticMatcher) Match(t Specer) bool {
 	return n.match
 }
 
-func (n staticMatcher) Intersects(Matcher) IntersectResult {
+func (n staticMatcher) Includes(Matcher) IntersectResult {
 	return intersectResultBool(n.match)
 }
 
@@ -85,6 +93,15 @@ func AndNodeFactory(ms ...Matcher) Matcher {
 		if i == 0 {
 			continue
 		}
+
+		if any(m) == NoneMatcher {
+			return NoneMatcher
+		}
+
+		if any(m) == AllMatcher {
+			continue
+		}
+
 		n = andNode{left: n, right: m}
 	}
 
@@ -99,7 +116,7 @@ func (n andNode) Match(t Specer) bool {
 	return n.left.Match(t) && n.right.Match(t)
 }
 
-func (n andNode) Intersects(i Matcher) IntersectResult {
+func (n andNode) Includes(i Matcher) IntersectResult {
 	return intersectAnd(i, n.left, n.right)
 }
 
@@ -112,17 +129,46 @@ func Intersects(a, b Matcher) IntersectResult {
 		return IntersectFalse
 	}
 
-	r1 := a.Intersects(b)
+	if _, ok := isNotAddr(a); ok {
+		return IntersectUnknown
+	}
+
+	if _, ok := isNotAddr(b); ok {
+		return IntersectUnknown
+	}
+
+	r1 := a.Includes(b)
 	if r1 != IntersectUnknown {
 		return r1
 	}
 
-	r2 := b.Intersects(a)
+	r2 := b.Includes(a)
 	if r2 != IntersectUnknown {
 		return r2
 	}
 
 	return IntersectUnknown
+}
+
+func isNotAddr(a Matcher) (Matcher, bool) {
+	switch a := a.(type) {
+	case notNode:
+		switch expr := a.expr.(type) {
+		case TargetAddr, addrRegexNode:
+			return expr, true
+		}
+	}
+
+	return nil, false
+}
+
+func isLeaf(a Matcher) bool {
+	switch a.(type) {
+	case TargetAddr, addrRegexNode, labelNode, labelRegexNode, staticMatcher:
+		return true
+	}
+
+	return false
 }
 
 func OrNodeFactory[T Matcher](ms ...T) Matcher {
@@ -143,6 +189,10 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 				return AllMatcher
 			}
 
+			if any(m) == AllMatcher {
+				return AllMatcher
+			}
+
 			switch n := any(m).(type) {
 			case orNode:
 				or.nodes = append(or.nodes, n.left, n.right)
@@ -153,7 +203,12 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 			}
 		}
 
-		if len(or.nodes) == 2 {
+		switch len(or.nodes) {
+		case 0:
+			return NoneMatcher
+		case 1:
+			return or.nodes[0]
+		case 2:
 			return orNode{or.nodes[0], or.nodes[1]}
 		}
 
@@ -174,7 +229,7 @@ func (n orNode) Match(t Specer) bool {
 	return n.left.Match(t) || n.right.Match(t)
 }
 
-func (n orNode) Intersects(i Matcher) IntersectResult {
+func (n orNode) Includes(i Matcher) IntersectResult {
 	return intersectOr(i, n.left, n.right)
 }
 
@@ -203,7 +258,7 @@ func (n mOrNode) Match(t Specer) bool {
 func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
 	hasUnknown := false
 	for _, node := range ms {
-		r := Intersects(node, i)
+		r := Intersects(i, node)
 		if r == IntersectTrue {
 			return IntersectTrue
 		}
@@ -213,6 +268,10 @@ func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
 	}
 
 	if hasUnknown {
+		if isLeaf(i) {
+			return IntersectFalse
+		}
+
 		return IntersectUnknown
 	}
 
@@ -222,7 +281,7 @@ func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
 func intersectAnd(i Matcher, ms ...Matcher) IntersectResult {
 	hasUnknown := false
 	for _, node := range ms {
-		r := Intersects(node, i)
+		r := Intersects(i, node)
 		if r == IntersectFalse {
 			return IntersectFalse
 		}
@@ -238,7 +297,7 @@ func intersectAnd(i Matcher, ms ...Matcher) IntersectResult {
 	return IntersectTrue
 }
 
-func (n mOrNode) Intersects(i Matcher) IntersectResult {
+func (n mOrNode) Includes(i Matcher) IntersectResult {
 	return intersectOr(i, n.nodes...)
 }
 
@@ -254,7 +313,7 @@ func (n notNode) Match(t Specer) bool {
 	return !n.expr.Match(t)
 }
 
-func (n notNode) Intersects(i Matcher) IntersectResult {
+func (n notNode) Includes(i Matcher) IntersectResult {
 	r := Intersects(n.expr, i)
 
 	switch r {
@@ -262,8 +321,10 @@ func (n notNode) Intersects(i Matcher) IntersectResult {
 		return IntersectFalse
 	case IntersectFalse:
 		return IntersectTrue
-	default:
+	case IntersectUnknown:
 		return IntersectUnknown
+	default:
+		panic("should not happen")
 	}
 }
 
@@ -283,7 +344,7 @@ func (n labelNode) MatchString(s string) bool {
 	return s == n.value
 }
 
-func (n labelNode) Intersects(i Matcher) IntersectResult {
+func (n labelNode) Includes(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
 		return intersectResultBool(n.value == l.value)
@@ -311,12 +372,14 @@ func (n labelRegexNode) MatchString(s string) bool {
 	return n.r.MatchString(s)
 }
 
-func (n labelRegexNode) Intersects(i Matcher) IntersectResult {
+func (n labelRegexNode) Includes(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
 		return intersectResultBool(n.r.MatchString(l.value))
 	case labelRegexNode:
-		return intersectResultBool(n.r.MatchString(reducePattern(l.value)))
+		return intersectResultBool(
+			starIntersect(n.value, l.value, 0, 0),
+		)
 	}
 
 	return IntersectUnknown
@@ -355,15 +418,16 @@ func reducePattern(expr string) string {
 	return expr
 }
 
-func (n addrRegexNode) Intersects(i Matcher) IntersectResult {
+func (n addrRegexNode) Includes(i Matcher) IntersectResult {
 	switch ta := i.(type) {
 	case TargetAddr:
 		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
 	case addrRegexNode:
-		return intersectResultBool(
-			n.MatchPackageName(reducePattern(ta.pkgs), reducePattern(ta.names)) ||
-				ta.MatchPackageName(reducePattern(n.pkgs), reducePattern(n.names)),
-		)
+		//return intersectResultBool(
+		//	n.MatchPackageName(reducePattern(ta.pkgs), reducePattern(ta.names)) ||
+		//		ta.MatchPackageName(reducePattern(n.pkgs), reducePattern(n.names)),
+		//)
+		return intersectResultBool(starIntersect(n.pkgs, ta.pkgs, 0, 0) && starIntersect(n.names, ta.names, 0, 0))
 	}
 
 	return IntersectUnknown
@@ -387,7 +451,7 @@ func (n funcNode) Match(t Specer) bool {
 	return n.match(n.args, t)
 }
 
-func (n funcNode) Intersects(i Matcher) IntersectResult {
+func (n funcNode) Includes(i Matcher) IntersectResult {
 	return IntersectUnknown
 }
 

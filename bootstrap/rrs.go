@@ -107,7 +107,11 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 
 			r := specs.Intersects(gm, requiredMatchers)
 
-			return r != specs.IntersectFalse
+			if r.Bool() {
+				return true
+			}
+
+			return false
 		})
 
 		if len(genTargets) == 0 {
@@ -125,7 +129,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 			return nil, err
 		}
 
-		err = poolwait.Wait(ctx, fmt.Sprintf("PreRun gen %v", i), e.Pool, deps, plain)
+		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain)
 		if err != nil {
 			return nil, err
 		}

@@ -639,6 +639,7 @@ func (e *State) applyEnv(t *Target, passEnv []string, env map[string]string) {
 		}
 		t.Env[name] = value
 	}
+
 	for k, v := range env {
 		t.Env[k] = v
 	}

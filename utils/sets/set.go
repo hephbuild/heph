@@ -37,6 +37,14 @@ func NewIdentitySet[T comparable](cap int) *Set[T, T] {
 	}, cap)
 }
 
+func NewIdentitySetFrom[T comparable](vs []T) *Set[T, T] {
+	s := NewSetFrom[T](func(t T) T {
+		return t
+	}, vs)
+
+	return s
+}
+
 func (ts *Set[K, T]) Add(t T) bool {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
