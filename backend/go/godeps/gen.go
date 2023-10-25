@@ -289,13 +289,6 @@ func generate() []RenderUnit {
 					for _, p := range append(pkgDeps, pkgTestDeps...) {
 						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
 
-						if p == pkg.ImportPath {
-							if testlib != nil {
-								//depsLibs = append(depsLibs, testlib.Target.Full())
-								//continue
-							}
-						}
-
 						depsLibs = append(depsLibs, t.Full())
 					}
 					depsLibs = append(depsLibs, testlib.Target.Full())
@@ -335,21 +328,16 @@ func generate() []RenderUnit {
 					for _, p := range pkgXTestDeps {
 						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
 
-						if p == pkg.ImportPath {
-							if testlib != nil {
-								//depsLibs = append(depsLibs, testlib.Target.Full())
-								//continue
-							}
-						}
-
 						depsLibs = append(depsLibs, t.Full())
 					}
+					depsLibs = append(depsLibs, xtestlib.Target.Full())
 
 					test := &LibTest{
 						X:          true,
 						TestLib:    xtestlib,
 						ImportPath: pkg.ImportPath,
 						RunExtra:   pkgCfg.Test.Run,
+						TestFiles:  pkg.XTestGoFiles,
 						DepsLibs:   depsLibs,
 					}
 
