@@ -191,7 +191,7 @@ def go_mod(
     for pkg in mod_pkgs+['//thirdparty/go']:
         mod_pkgs_gen += [
             pkg+"/**:_go_lib*",
-            ]
+        ]
 
     # Add labels defined in cfg
     for pkg in cfg.values():
@@ -209,9 +209,13 @@ def go_mod(
         heph.pkg.addr()+"/**:_go_test_lib*",
         heph.pkg.addr()+"/**:_go_xtest_lib*",
         heph.pkg.addr()+"/**:_go_testmain_lib*",
+        heph.pkg.addr()+"/**:_go_xtestmain_lib*",
         heph.pkg.addr()+"/**:_go_gen_testmain*",
+        heph.pkg.addr()+"/**:_go_gen_xtestmain*",
         heph.pkg.addr()+"/**:_go_test#build*",
+        heph.pkg.addr()+"/**:_go_xtest#build*",
         heph.pkg.addr()+"/**:go_test*",
+        heph.pkg.addr()+"/**:go_xtest*",
     ]
 
     target(
@@ -305,6 +309,7 @@ def go_mod_download(name, path, version):
         tools = [go],
         out = ["."],
         labels = ["thirdparty"],
+        env = {"GOWORK": "off"},
     )
 
 def go_library(

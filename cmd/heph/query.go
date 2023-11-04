@@ -92,35 +92,13 @@ var queryCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		matcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
+		includeExcludeMatcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
 		if err != nil {
 			return err
 		}
 
-		if matcher == nil {
-			matcher = specs.AllMatcher
-
-			inputExpr := ""
-			if !bootstrap.HasStdin(args) && len(args) >= 1 {
-				inputExpr = args[0]
-			} else if filter != "" {
-				inputExpr = filter
-			}
-
-			if inputExpr != "" {
-				m, err := specs.ParseMatcher(inputExpr)
-				if err != nil {
-					return err
-				}
-
-				matcher = m
-			} else {
-				if !all {
-					return fmt.Errorf("you must specify a query, or -a")
-				}
-			}
-		} else {
-			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
+		if includeExcludeMatcher != nil {
+			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", includeExcludeMatcher.String())
 		}
 
 		bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
@@ -130,6 +108,7 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
+		matcher := specs.AllMatcher
 		if bootstrap.HasStdin(args) {
 			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 			if err != nil {
@@ -138,9 +117,35 @@ var queryCmd = &cobra.Command{
 
 			matcher = specs.AndNodeFactory(matcher, m)
 		} else {
+			if len(args) >= 1 {
+				m, err := specs.ParseMatcher(args[0])
+				if err != nil {
+					return err
+				}
+
+				matcher = specs.AndNodeFactory(matcher, m)
+			} else {
+				if !all && includeExcludeMatcher == nil {
+					return fmt.Errorf("you must specify a query, or -a")
+				}
+			}
+
 			if !all {
 				matcher = specs.AndNodeFactory(specs.PublicMatcher, NotThirdpartyMatcher, matcher)
 			}
+		}
+
+		if filter != "" {
+			m, err := specs.ParseMatcher(filter)
+			if err != nil {
+				return err
+			}
+
+			matcher = specs.AndNodeFactory(matcher, m)
+		}
+
+		if includeExcludeMatcher != nil {
+			matcher = specs.AndNodeFactory(matcher, includeExcludeMatcher)
 		}
 
 		_, err = generateRRs(ctx, bs.Scheduler, matcher, nil)
@@ -331,7 +336,7 @@ var graphCmd = &cobra.Command{
 
 var graphDotCmd = &cobra.Command{
 	Use:               "graphdot [ancestors|descendants <target>]",
-	Short:             "Outputs graph do",
+	Short:             "Outputs graph dot",
 	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {

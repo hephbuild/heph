@@ -90,15 +90,15 @@ func AndNodeFactory(ms ...Matcher) Matcher {
 
 	n := ms[0]
 	for i, m := range ms {
-		if i == 0 {
-			continue
-		}
-
 		if any(m) == NoneMatcher {
 			return NoneMatcher
 		}
 
 		if any(m) == AllMatcher {
+			continue
+		}
+
+		if i == 0 {
 			continue
 		}
 
@@ -129,14 +129,6 @@ func Intersects(a, b Matcher) IntersectResult {
 		return IntersectFalse
 	}
 
-	if _, ok := isNotAddr(a); ok {
-		return IntersectUnknown
-	}
-
-	if _, ok := isNotAddr(b); ok {
-		return IntersectUnknown
-	}
-
 	r1 := a.Includes(b)
 	if r1 != IntersectUnknown {
 		return r1
@@ -148,18 +140,6 @@ func Intersects(a, b Matcher) IntersectResult {
 	}
 
 	return IntersectUnknown
-}
-
-func isNotAddr(a Matcher) (Matcher, bool) {
-	switch a := a.(type) {
-	case notNode:
-		switch expr := a.expr.(type) {
-		case TargetAddr, addrRegexNode:
-			return expr, true
-		}
-	}
-
-	return nil, false
 }
 
 func isLeaf(a Matcher) bool {
@@ -268,10 +248,6 @@ func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
 	}
 
 	if hasUnknown {
-		if isLeaf(i) {
-			return IntersectFalse
-		}
-
 		return IntersectUnknown
 	}
 
@@ -314,18 +290,19 @@ func (n notNode) Match(t Specer) bool {
 }
 
 func (n notNode) Includes(i Matcher) IntersectResult {
-	r := Intersects(n.expr, i)
+	switch n.expr.(type) {
+	case addrRegexNode, TargetAddr, TargetAddrs, labelNode, labelRegexNode:
+		r := Intersects(n.expr, i)
 
-	switch r {
-	case IntersectTrue:
-		return IntersectFalse
-	case IntersectFalse:
-		return IntersectTrue
-	case IntersectUnknown:
-		return IntersectUnknown
-	default:
-		panic("should not happen")
+		switch r {
+		case IntersectTrue:
+			return IntersectFalse
+		case IntersectFalse:
+			return IntersectTrue
+		}
 	}
+
+	return IntersectUnknown
 }
 
 type labelNode struct {
@@ -408,14 +385,52 @@ func (n addrRegexNode) MatchPackageName(pkg, name string) bool {
 	return n.name.MatchString(name)
 }
 
-func reducePattern(expr string) string {
-	expr = strings.ReplaceAll(expr, "/**/", "/")
-	expr = strings.ReplaceAll(expr, "/**", "")
-	expr = strings.ReplaceAll(expr, "**/", "")
-	expr = strings.ReplaceAll(expr, "**", "")
-	expr = strings.ReplaceAll(expr, "*", "")
+func matchPrefix(p, suffix, s, trim string) IntersectResult {
+	if p == s {
+		return IntersectTrue
+	}
 
-	return expr
+	if strings.Count(p, suffix) == 1 && strings.HasSuffix(p, suffix) {
+		prefix := strings.TrimSuffix(p, suffix)
+		if trim != "" {
+			prefix = strings.TrimSuffix(prefix, trim)
+		}
+
+		return intersectResultBool(strings.HasPrefix(s, prefix))
+	}
+
+	return IntersectUnknown
+}
+
+func matchSuffix(p, prefix, s, trim string) IntersectResult {
+	if p == s {
+		return IntersectTrue
+	}
+
+	if strings.Count(p, prefix) == 1 && strings.HasPrefix(p, prefix) {
+		suffix := strings.TrimPrefix(p, prefix)
+		if trim != "" {
+			suffix = strings.TrimPrefix(suffix, trim)
+		}
+
+		return intersectResultBool(strings.HasSuffix(s, suffix))
+	}
+
+	return IntersectUnknown
+}
+
+func matchRegexes(a, b addrRegexNode) IntersectResult {
+	r := matchPrefix(a.pkgs, "**", b.pkgs, "/")
+	if r == IntersectTrue {
+		if r := matchPrefix(a.names, "*", b.names, ""); r != IntersectUnknown {
+			return r
+		}
+		if r := matchSuffix(a.names, "*", b.names, ""); r != IntersectUnknown {
+			return r
+		}
+	}
+
+	return r
 }
 
 func (n addrRegexNode) Includes(i Matcher) IntersectResult {
@@ -423,11 +438,27 @@ func (n addrRegexNode) Includes(i Matcher) IntersectResult {
 	case TargetAddr:
 		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
 	case addrRegexNode:
-		//return intersectResultBool(
-		//	n.MatchPackageName(reducePattern(ta.pkgs), reducePattern(ta.names)) ||
-		//		ta.MatchPackageName(reducePattern(n.pkgs), reducePattern(n.names)),
-		//)
-		return intersectResultBool(starIntersect(n.pkgs, ta.pkgs, 0, 0) && starIntersect(n.names, ta.names, 0, 0))
+		r1 := matchRegexes(n, ta)
+		r2 := matchRegexes(ta, n)
+		if r1 == IntersectTrue || r2 == IntersectTrue {
+			return IntersectTrue
+		}
+		if r1 == IntersectFalse || r2 == IntersectFalse {
+			return IntersectFalse
+		}
+		//r := matchPrefix(n.pkgs, "**", ta.pkgs, "/")
+		//if r == IntersectTrue {
+		//	if r := matchPrefix(n.names, "*", ta.names, ""); r != IntersectUnknown {
+		//		return r
+		//	}
+		//	if r := matchSuffix(n.names, "*", ta.names, ""); r != IntersectUnknown {
+		//		return r
+		//	}
+		//} else if r == IntersectFalse {
+		//	return r
+		//}
+
+		//return intersectResultBool(starIntersect(n.pkgs, ta.pkgs, 0, 0) && starIntersect(n.names, ta.names, 0, 0))
 	}
 
 	return IntersectUnknown

@@ -14,32 +14,15 @@ import (
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-var errHasExprDep = errors.New("has expr, bailing out")
-
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (targetrun.Requests, error) {
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, opts targetrun.RequestOpts) (targetrun.Requests, error) {
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
 	}
 
-	check := func(target *graph.Target) error {
-		if bailOutOnExpr {
-			if len(target.Spec().Deps.Exprs) > 0 {
-				return fmt.Errorf("%v: %w", target.Addr, errHasExprDep)
-			}
-		}
-
-		return nil
-	}
-
 	rrs := make(targetrun.Requests, 0, targets.Len())
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		err := check(target)
-		if err != nil {
 			return nil, err
 		}
 
@@ -61,25 +44,53 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, anc := range ancs {
-		err := check(anc)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
+func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFactory func() (func(gent *graph.Target) bool, error)) error {
 	allGenTargets := sets.NewStringSet(0)
 
 	for i := 0; ; i++ {
+		filter, err := filterFactory()
+		if err != nil {
+			return err
+		}
+
+		genTargets := ads.Filter(e.Graph.GeneratedTargets(), func(gent *graph.Target) bool {
+			if allGenTargets.Has(gent.Addr) {
+				// Already ran gen
+				return false
+			}
+
+			return filter(gent)
+		})
+
+		if len(genTargets) == 0 {
+			break
+		}
+
+		for _, target := range genTargets {
+			allGenTargets.Add(target.Addr)
+			log.Warnf("GEN: %v", target.Addr)
+		}
+
+		// Run those gen targets
+		deps, err := e.ScheduleGenPass(ctx, genTargets, false)
+		if err != nil {
+			return err
+		}
+
+		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
 		targets, err := e.Graph.Targets().Filter(m)
 		if err != nil {
 			if !errors.Is(err, specs.TargetNotFoundErr{}) {
@@ -97,12 +108,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 			requiredMatchers = specs.OrNodeFactory(requiredMatchers, ms)
 		}
 
-		genTargets := ads.Filter(e.Graph.GeneratedTargets(), func(gent *graph.Target) bool {
-			if allGenTargets.Has(gent.Addr) {
-				// Already ran gen
-				return false
-			}
-
+		return func(gent *graph.Target) bool {
 			gm := specs.OrNodeFactory(gent.Gen...)
 
 			r := specs.Intersects(gm, requiredMatchers)
@@ -112,28 +118,11 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 			}
 
 			return false
-		})
-
-		if len(genTargets) == 0 {
-			break
-		}
-
-		for _, target := range genTargets {
-			allGenTargets.Add(target.Addr)
-			log.Warnf("GEN: %v", target.Addr)
-		}
-
-		// Run those gen targets
-		deps, err := e.ScheduleGenPass(ctx, genTargets, false)
-		if err != nil {
-			return nil, err
-		}
-
-		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain)
-		if err != nil {
-			return nil, err
-		}
+		}, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	return generateRRs(ctx, e.Graph, m, targs, false, opts)
+	return generateRRs(ctx, e.Graph, m, targs, opts)
 }
