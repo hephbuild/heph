@@ -3,6 +3,7 @@ package specs
 import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/mds"
 	"github.com/hephbuild/heph/utils/xpanic"
 	"regexp"
 	"strings"
@@ -12,6 +13,11 @@ type Matcher interface {
 	Match(Specer) bool
 	String() string
 	Includes(Matcher) IntersectResult
+	Simplify() Matcher
+}
+
+type MatcherNot interface {
+	Not() Matcher
 }
 
 type StringMatcher interface {
@@ -26,6 +32,17 @@ func (r IntersectResult) Bool() bool {
 	}
 
 	return true
+}
+
+func (r IntersectResult) Not() IntersectResult {
+	switch r {
+	case IntersectTrue:
+		return IntersectFalse
+	case IntersectFalse:
+		return IntersectTrue
+	}
+
+	return IntersectUnknown
 }
 
 const (
@@ -45,6 +62,10 @@ func intersectResultBool(b bool) IntersectResult {
 type staticMatcher struct {
 	match bool
 	str   string
+}
+
+func (n staticMatcher) Simplify() Matcher {
+	return n
 }
 
 var AllMatcher Matcher = staticMatcher{
@@ -80,32 +101,56 @@ type andNode struct {
 	right Matcher
 }
 
-func AndNodeFactory(ms ...Matcher) Matcher {
+func (n andNode) Not() Matcher {
+	return orNode{
+		left:  notNode{n.left},
+		right: notNode{n.right},
+	}
+}
+
+func (n andNode) Simplify() Matcher {
+	return andNode{left: n.left.Simplify(), right: n.right.Simplify()}
+}
+
+func AndNodeFactory[T Matcher](ms ...T) Matcher {
 	switch len(ms) {
 	case 0:
-		panic("need at least one node")
+		return NoneMatcher
 	case 1:
 		return ms[0]
-	}
+	default:
+		or := mAndNode{nodes: make([]Matcher, 0, len(ms))}
 
-	n := ms[0]
-	for i, m := range ms {
-		if any(m) == NoneMatcher {
+		for _, m := range ms {
+			if any(m) == NoneMatcher {
+				return NoneMatcher
+			}
+
+			if any(m) == AllMatcher {
+				continue
+			}
+
+			switch n := any(m).(type) {
+			case andNode:
+				or.nodes = append(or.nodes, n.left, n.right)
+			case mAndNode:
+				or.nodes = append(or.nodes, n.nodes...)
+			default:
+				or.nodes = append(or.nodes, m)
+			}
+		}
+
+		switch len(or.nodes) {
+		case 0:
 			return NoneMatcher
+		case 1:
+			return or.nodes[0]
+		case 2:
+			return andNode{or.nodes[0], or.nodes[1]}
 		}
 
-		if any(m) == AllMatcher {
-			continue
-		}
-
-		if i == 0 {
-			continue
-		}
-
-		n = andNode{left: n, right: m}
+		return or
 	}
-
-	return n
 }
 
 func (n andNode) String() string {
@@ -144,7 +189,16 @@ func Intersects(a, b Matcher) IntersectResult {
 
 func isLeaf(a Matcher) bool {
 	switch a.(type) {
-	case TargetAddr, addrRegexNode, labelNode, labelRegexNode, staticMatcher:
+	case TargetAddr, addrRegexNode, labelNode, labelRegexNode, staticMatcher, funcNode:
+		return true
+	}
+
+	return false
+}
+
+func isLeafGen(a Matcher) bool {
+	switch a.(type) {
+	case TargetAddr, addrRegexNode, labelNode, labelRegexNode:
 		return true
 	}
 
@@ -163,10 +217,6 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 		for _, m := range ms {
 			if any(m) == NoneMatcher {
 				continue
-			}
-
-			if any(m) == AllMatcher {
-				return AllMatcher
 			}
 
 			if any(m) == AllMatcher {
@@ -201,6 +251,20 @@ type orNode struct {
 	right Matcher
 }
 
+func (n orNode) Not() Matcher {
+	return andNode{
+		left:  notNode{n.left},
+		right: notNode{n.right},
+	}
+}
+
+func (n orNode) Simplify() Matcher {
+	return orNode{
+		left:  n.left.Simplify(),
+		right: n.right.Simplify(),
+	}
+}
+
 func (n orNode) String() string {
 	return "(" + n.left.String() + " || " + n.right.String() + ")"
 }
@@ -215,6 +279,18 @@ func (n orNode) Includes(i Matcher) IntersectResult {
 
 type mOrNode struct {
 	nodes []Matcher
+}
+
+func (n mOrNode) Simplify() Matcher {
+	return OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return n.Simplify()
+	})...)
+}
+
+func (n mOrNode) Not() Matcher {
+	return AndNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return notNode{n}
+	})...)
 }
 
 func (n mOrNode) String() string {
@@ -233,6 +309,48 @@ func (n mOrNode) Match(t Specer) bool {
 	}
 
 	return false
+}
+
+func (n mOrNode) Includes(i Matcher) IntersectResult {
+	return intersectOr(i, n.nodes...)
+}
+
+type mAndNode struct {
+	nodes []Matcher
+}
+
+func (n mAndNode) Simplify() Matcher {
+	return AndNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return n.Simplify()
+	})...)
+}
+
+func (n mAndNode) Not() Matcher {
+	return OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return notNode{n}
+	})...)
+}
+
+func (n mAndNode) String() string {
+	ss := ads.Map(n.nodes, func(t Matcher) string {
+		return t.String()
+	})
+
+	return "(" + strings.Join(ss, " && ") + ")"
+}
+
+func (n mAndNode) Match(t Specer) bool {
+	for _, node := range n.nodes {
+		if !node.Match(t) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (n mAndNode) Includes(i Matcher) IntersectResult {
+	return intersectAnd(i, n.nodes...)
 }
 
 func intersectOr(i Matcher, ms ...Matcher) IntersectResult {
@@ -273,12 +391,32 @@ func intersectAnd(i Matcher, ms ...Matcher) IntersectResult {
 	return IntersectTrue
 }
 
-func (n mOrNode) Includes(i Matcher) IntersectResult {
-	return intersectOr(i, n.nodes...)
-}
-
 type notNode struct {
 	expr Matcher
+}
+
+func (n notNode) Simplify() Matcher {
+	var nn Matcher = n
+	if nnn, ok := n.expr.(MatcherNot); ok {
+		nn = nnn.Not().Simplify()
+	} else {
+		nn = notNode{n.expr.Simplify()}
+	}
+
+	for {
+		switch nnn := nn.(type) {
+		case notNode:
+			switch nne := nnn.expr.(type) {
+			case notNode:
+				nn = nne
+				continue
+			}
+		}
+
+		break
+	}
+
+	return nn
 }
 
 func (n notNode) String() string {
@@ -294,12 +432,7 @@ func (n notNode) Includes(i Matcher) IntersectResult {
 	case addrRegexNode, TargetAddr, TargetAddrs, labelNode, labelRegexNode:
 		r := Intersects(n.expr, i)
 
-		switch r {
-		case IntersectTrue:
-			return IntersectFalse
-		case IntersectFalse:
-			return IntersectTrue
-		}
+		return r.Not()
 	}
 
 	return IntersectUnknown
@@ -307,6 +440,10 @@ func (n notNode) Includes(i Matcher) IntersectResult {
 
 type labelNode struct {
 	value string
+}
+
+func (n labelNode) Simplify() Matcher {
+	return n
 }
 
 func (n labelNode) String() string {
@@ -333,6 +470,10 @@ func (n labelNode) Includes(i Matcher) IntersectResult {
 type labelRegexNode struct {
 	r     *regexp.Regexp
 	value string
+}
+
+func (n labelRegexNode) Simplify() Matcher {
+	return n
 }
 
 func (n labelRegexNode) String() string {
@@ -367,10 +508,25 @@ type addrRegexNode struct {
 	name  *regexp.Regexp
 	pkgs  string
 	names string
+	not   bool
+}
+
+func (n addrRegexNode) Simplify() Matcher {
+	return n
+}
+
+func (n addrRegexNode) Not() Matcher {
+	nr := *(&n)
+	nr.not = !nr.not
+	return nr
 }
 
 func (n addrRegexNode) String() string {
-	return "//" + n.pkgs + ":" + n.names
+	s := "//" + n.pkgs + ":" + n.names
+	if n.not {
+		s = "!" + s
+	}
+	return s
 }
 
 func (n addrRegexNode) Match(t Specer) bool {
@@ -385,8 +541,11 @@ func (n addrRegexNode) MatchPackageName(pkg, name string) bool {
 	return n.name.MatchString(name)
 }
 
-func matchPrefix(p, suffix, s, trim string) IntersectResult {
+func matchPrefix(not bool, p, suffix, s, trim string) IntersectResult {
 	if p == s {
+		if not {
+			return IntersectFalse
+		}
 		return IntersectTrue
 	}
 
@@ -396,14 +555,17 @@ func matchPrefix(p, suffix, s, trim string) IntersectResult {
 			prefix = strings.TrimSuffix(prefix, trim)
 		}
 
-		return intersectResultBool(strings.HasPrefix(s, prefix))
+		return intersectResultBool(strings.HasPrefix(s, prefix) == !not)
 	}
 
 	return IntersectUnknown
 }
 
-func matchSuffix(p, prefix, s, trim string) IntersectResult {
+func matchSuffix(not bool, p, prefix, s, trim string) IntersectResult {
 	if p == s {
+		if not {
+			return IntersectFalse
+		}
 		return IntersectTrue
 	}
 
@@ -413,21 +575,30 @@ func matchSuffix(p, prefix, s, trim string) IntersectResult {
 			suffix = strings.TrimPrefix(suffix, trim)
 		}
 
-		return intersectResultBool(strings.HasSuffix(s, suffix))
+		return intersectResultBool(strings.HasSuffix(s, suffix) == !not)
 	}
 
 	return IntersectUnknown
 }
 
 func matchRegexes(a, b addrRegexNode) IntersectResult {
-	r := matchPrefix(a.pkgs, "**", b.pkgs, "/")
+	not := a.not
+
+	r := matchPrefix(false, a.pkgs, "**", b.pkgs, "/")
 	if r == IntersectTrue {
-		if r := matchPrefix(a.names, "*", b.names, ""); r != IntersectUnknown {
+		if not {
+
+		}
+		if r := matchPrefix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
 			return r
 		}
-		if r := matchSuffix(a.names, "*", b.names, ""); r != IntersectUnknown {
+		if r := matchSuffix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
 			return r
 		}
+	}
+
+	if not {
+		r = r.Not()
 	}
 
 	return r
@@ -438,6 +609,28 @@ func (n addrRegexNode) Includes(i Matcher) IntersectResult {
 	case TargetAddr:
 		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
 	case addrRegexNode:
+		if n.not && ta.not {
+			return IntersectUnknown
+		}
+
+		if n.not || ta.not {
+			if n.not {
+				r := matchRegexes(n, ta)
+				if r == IntersectFalse {
+					return IntersectFalse
+				}
+			}
+
+			if ta.not {
+				r := matchRegexes(ta, n)
+				if r == IntersectFalse {
+					return IntersectFalse
+				}
+			}
+
+			return IntersectUnknown
+		}
+
 		r1 := matchRegexes(n, ta)
 		r2 := matchRegexes(ta, n)
 		if r1 == IntersectTrue || r2 == IntersectTrue {
@@ -468,6 +661,10 @@ type funcNode struct {
 	name  string
 	args  []astNode
 	match func(args []astNode, t Specer) bool
+}
+
+func (n funcNode) Simplify() Matcher {
+	return n
 }
 
 func (n funcNode) String() string {
@@ -729,4 +926,63 @@ func IsAddrMatcher(m Matcher) bool {
 	}
 
 	return false
+}
+
+type MatcherKind string
+
+const (
+	KindAddr  MatcherKind = "addr"
+	KindLabel             = "label"
+)
+
+type KindMatcher map[MatcherKind]mOrNode
+
+func (a KindMatcher) getKind(m Matcher) MatcherKind {
+	switch m.(type) {
+	case TargetAddr:
+		return KindAddr
+	case addrRegexNode:
+		return KindAddr
+	case labelNode:
+		return KindLabel
+	case labelRegexNode:
+		return KindLabel
+	default:
+		panic(fmt.Sprintf("unhandled %T", m))
+	}
+}
+
+func (a KindMatcher) Add(m Matcher) {
+	t := a.getKind(m)
+	orm := a[t]
+	orm.nodes = append(orm.nodes, m)
+	a[t] = orm
+}
+
+func (a KindMatcher) AllOr() Matcher {
+	items := mds.Values(a)
+	return OrNodeFactory(items...)
+}
+
+func (a KindMatcher) Match(s Specer) bool {
+	return a.AllOr().Match(s)
+}
+
+func (a KindMatcher) String() string {
+	return a.AllOr().String()
+}
+
+func (a KindMatcher) Includes(m Matcher) IntersectResult {
+	if !isLeafGen(m) {
+		return IntersectUnknown
+	}
+
+	t := a.getKind(m)
+	orm := a[t]
+
+	return orm.Includes(m)
+}
+
+func (a KindMatcher) Simplify() Matcher {
+	return a
 }

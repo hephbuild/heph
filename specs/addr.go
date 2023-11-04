@@ -13,6 +13,10 @@ type TargetAddr struct {
 	Name    string
 }
 
+func (p TargetAddr) Simplify() Matcher {
+	return p
+}
+
 func (p TargetAddr) Match(t Specer) bool {
 	return t.Spec().Addr == p.Full()
 }
@@ -34,6 +38,10 @@ func (p TargetAddr) Full() string {
 }
 
 type TargetAddrs []TargetAddr
+
+func (p TargetAddrs) Simplify() Matcher {
+	return OrNodeFactory[TargetAddr](p...).Simplify()
+}
 
 func (p TargetAddrs) Match(t Specer) bool {
 	return OrNodeFactory[TargetAddr](p...).Match(t)

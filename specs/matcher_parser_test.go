@@ -168,6 +168,7 @@ func TestHasIntersection(t *testing.T) {
 		{"go_lib || //test/go/mod-xtest/**:_go_lib*", "//test/go/mod-xtest/**:* && go_lib", true},
 		{"go_lib || //test/go/mod-something/**:_go_lib*", "//test/go/mod-xtest/**:* && go_lib", true},
 		{"//some/**:*", "!//some/**:abc", true},
+		{"!//some/**:*", "//some/**:abc", false},
 		{"//some/**:*", "!//some/**:*", false},
 		{"//some/deep/**:*", "!//some/**:*", false},
 		{"//some/package:*", "(//**:target || //**:hello)", true},
@@ -179,10 +180,13 @@ func TestHasIntersection(t *testing.T) {
 			expr2, err := ParseMatcher(test.expr2)
 			require.NoError(t, err)
 
-			actual1 := Intersects(expr1, expr2)
+			expr1s := expr1.Simplify()
+			expr2s := expr2.Simplify()
+
+			actual1 := Intersects(expr1s, expr2s)
 			assert.Equal(t, test.expected, actual1.Bool())
 
-			actual2 := Intersects(expr2, expr1)
+			actual2 := Intersects(expr2s, expr1s)
 			assert.Equalf(t, actual1, actual2, "(a, b) and (b, a) outcome need to be consistent")
 		})
 	}

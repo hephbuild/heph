@@ -108,16 +108,22 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 			requiredMatchers = specs.OrNodeFactory(requiredMatchers, ms)
 		}
 
+		requiredMatchersSimpl := requiredMatchers.Simplify()
+
+		log.Warn("  M:", requiredMatchers.String())
+		if requiredMatchers.String() != requiredMatchersSimpl.String() {
+			log.Warn(" MS:", requiredMatchersSimpl.String())
+		}
+
 		return func(gent *graph.Target) bool {
-			gm := specs.OrNodeFactory(gent.Gen...)
-
-			r := specs.Intersects(gm, requiredMatchers)
-
-			if r.Bool() {
-				return true
+			gm := specs.KindMatcher{}
+			for _, m := range gent.Gen {
+				gm.Add(m)
 			}
 
-			return false
+			r := specs.Intersects(gm, requiredMatchersSimpl)
+
+			return r.Bool()
 		}, nil
 	})
 	if err != nil {
