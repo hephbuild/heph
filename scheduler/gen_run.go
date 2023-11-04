@@ -23,16 +23,9 @@ type runGenScheduler struct {
 	*Scheduler
 }
 
-func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Target, linkAll bool) (_ *worker.WaitGroup, rerr error) {
+func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Target) (_ *worker.WaitGroup, rerr error) {
 	if len(genTargets) == 0 {
 		log.Debugf("No gen targets, skip gen pass")
-
-		if linkAll {
-			err := e.Graph.LinkTargets(ctx, false, nil)
-			if err != nil {
-				return nil, fmt.Errorf("linking %w", err)
-			}
-		}
 
 		return &worker.WaitGroup{}, nil
 	}
@@ -74,15 +67,6 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 				p.Globals = nil
 			}
 
-			if linkAll {
-				status.Emit(ctx, status.String("Linking targets..."))
-
-				err := e.Graph.LinkTargets(ctx, false, nil)
-				if err != nil {
-					return err
-				}
-			}
-
 			return nil
 		},
 	})
@@ -99,7 +83,7 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 		}
 	}
 
-	err := e.Graph.LinkTargets(ctx, false, targets)
+	err := e.Graph.LinkTargets(ctx, false, targets, false)
 	if err != nil {
 		return fmt.Errorf("linking: %w", err)
 	}

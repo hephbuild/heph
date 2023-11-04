@@ -47,6 +47,19 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 	return rrs, nil
 }
 
+func RunAllGen(ctx context.Context, e *scheduler.Scheduler, plain bool) error {
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		return func(gent *graph.Target) bool {
+			return true
+		}, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFactory func() (func(gent *graph.Target) bool, error)) error {
 	allGenTargets := sets.NewStringSet(0)
 
@@ -75,7 +88,7 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 		}
 
 		// Run those gen targets
-		deps, err := e.ScheduleGenPass(ctx, genTargets, false)
+		deps, err := e.ScheduleGenPass(ctx, genTargets)
 		if err != nil {
 			return err
 		}

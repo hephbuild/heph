@@ -9,9 +9,12 @@ import (
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/utils/xmath"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,7 +100,7 @@ func (e *State) processTarget(t *Target) error {
 	return nil
 }
 
-func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targets []*Target) error {
+func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targets []*Target, emit bool) error {
 	linkDone := log.TraceTiming("link targets")
 	defer linkDone()
 
@@ -109,9 +112,18 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 		target.resetLinking()
 	}
 
-	for _, target := range targets {
+	if emit {
+		status.Emit(ctx, status.String("Linking targets..."))
+	}
+
+	for i, target := range targets {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+
+		if emit {
+			percent := math.Round(xmath.Percent(i, len(targets)))
+			status.EmitInteractive(ctx, status.String(xmath.FormatPercent("Linking targets [P]...", percent)))
 		}
 
 		//log.Tracef("# Linking target %v %v/%v", target.Addr, i+1, len(targets))

@@ -204,7 +204,7 @@ var searchCmd = &cobra.Command{
 			return err
 		}
 
-		targets, _, err := preRunAutocompleteWithBootstrap(ctx, bs, all)
+		targets, _, err := autocompleteInitWithBootstrap(ctx, bs, all)
 		if err != nil {
 			return err
 		}
@@ -266,7 +266,7 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -300,10 +300,7 @@ var graphCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
@@ -347,10 +344,7 @@ var graphDotCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
@@ -391,7 +385,7 @@ var changesCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(c *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(c.Context())
+		bs, err := schedulerWithGenInit(c.Context())
 		if err != nil {
 			return err
 		}
@@ -474,7 +468,7 @@ var pkgsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := preRunWithGen(ctx)
+		bs, err := schedulerWithGenInit(ctx)
 		if err != nil {
 			return err
 		}
@@ -581,10 +575,7 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			LinkAll:   true,
-			Scheduler: bs.Scheduler,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
@@ -795,7 +786,7 @@ var labelsCmd = &cobra.Command{
 	Short: "Prints labels",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}

@@ -254,7 +254,7 @@ var gcCmd = &cobra.Command{
 	Short:             "GC",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -280,10 +280,7 @@ var validateCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}

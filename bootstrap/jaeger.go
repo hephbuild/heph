@@ -38,9 +38,11 @@ func setupJaeger(fins *finalizers.Finalizers, obs *observability.Observability, 
 
 	obs.RegisterHook(hook)
 
+	ctx := context.Background()
+
 	fins.Register(func() {
-		_ = pr.ForceFlush(context.Background())
-		_ = pr.Shutdown(context.Background())
+		_ = pr.ForceFlush(ctx)
+		_ = pr.Shutdown(ctx)
 	})
 
 	return nil

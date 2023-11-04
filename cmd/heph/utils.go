@@ -5,7 +5,7 @@ import (
 )
 
 func ValidArgsFunctionTargets(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	targets, _, err := preRunAutocomplete(cmd.Context(), false)
+	targets, _, err := autocompleteInit(cmd.Context(), false)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
@@ -20,7 +20,7 @@ func ValidArgsFunctionTargets(cmd *cobra.Command, args []string, toComplete stri
 }
 
 func ValidArgsFunctionLabelsOrTargets(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	targets, labels, err := preRunAutocomplete(cmd.Context(), false)
+	targets, labels, err := autocompleteInit(cmd.Context(), false)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
