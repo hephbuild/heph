@@ -41,6 +41,7 @@ func TestStarWalk_1Star(t *testing.T) {
 	t.Parallel()
 
 	assertWalk1(t, "testdata/some_files/*")
+	assertWalk1(t, "./testdata/some_files/*")
 	assertWalk1(t, "testdata/some*/*")
 	assertWalk(t, "testdata/some_files/a.*", nil, []string{"testdata/some_files/a.txt"})
 	assertWalk(t, "testdata/some_files/*", []string{
