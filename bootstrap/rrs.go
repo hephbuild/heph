@@ -14,15 +14,33 @@ import (
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, opts targetrun.RequestOpts) (targetrun.Requests, error) {
+var errHasExprDep = errors.New("has expr, bailing out")
+
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, opts targetrun.RequestOpts, bailOutOnExpr bool) (targetrun.Requests, error) {
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
 	}
 
+	check := func(target *graph.Target) error { return nil }
+	if bailOutOnExpr {
+		check = func(target *graph.Target) error {
+			if len(target.Spec().Deps.Exprs) > 0 {
+				return fmt.Errorf("%v: %w", target.Addr, errHasExprDep)
+			}
+
+			return nil
+		}
+	}
+
 	rrs := make(targetrun.Requests, 0, targets.Len())
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		err := check(target)
+		if err != nil {
 			return nil, err
 		}
 
@@ -42,6 +60,20 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		}
 
 		rrs = append(rrs, rr)
+	}
+
+	if bailOutOnExpr {
+		ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, anc := range ancs {
+			err := check(anc)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return rrs, nil
@@ -103,7 +135,21 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 }
 
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
+	if !e.Config.Engine.SmartGen {
+		// Forcefully try to generate rrs & link
+		rrs, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
+		if err == nil {
+			return rrs, nil
+		}
+	}
+
 	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		if !e.Config.Engine.SmartGen {
+			return func(gent *graph.Target) bool {
+				return true
+			}, nil
+		}
+
 		targets, err := e.Graph.Targets().Filter(m)
 		if err != nil {
 			if !errors.Is(err, specs.TargetNotFoundErr{}) {
@@ -143,5 +189,5 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 		return nil, err
 	}
 
-	return generateRRs(ctx, e.Graph, m, targs, opts)
+	return generateRRs(ctx, e.Graph, m, targs, opts, false)
 }

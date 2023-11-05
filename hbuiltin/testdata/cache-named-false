@@ -72,7 +72,7 @@ target(
     "PassEnv": null,
     "RuntimePassEnv": null,
     "RunInCwd": false,
-    "Gen": null,
+    "Gen": [],
     "Source": null,
     "RuntimeEnv": null,
     "SrcEnv": {

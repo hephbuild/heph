@@ -46,7 +46,7 @@ func TestStarIntersect(t *testing.T) {
 		{"", "", true, true},
 		{"abc", "abc", true, true},
 		{"ab*", "abc", true, true},
-		{"abc", "ab*", false, false},
+		{"abc", "ab*", true, true},
 		{"a/b/c", "a/b/c", true, true},
 		{"a/b/*", "a/b/c", true, true},
 		//{"a/b/c", "a/b/*", false, false},

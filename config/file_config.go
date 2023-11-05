@@ -17,6 +17,7 @@ type FileConfig struct {
 		InstallTools    *bool `yaml:"install_tools"`
 		KeepSandbox     *bool `yaml:"keep_sandbox"`
 		ParallelCaching *bool `yaml:"parallel_caching"`
+		SmartGen        *bool `yaml:"smart_gen"`
 	} `yaml:"engine"`
 	Platforms  map[string]FilePlatform `yaml:"platforms"`
 	BuildFiles struct {
@@ -62,6 +63,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Engine.ParallelCaching != nil {
 		c.Engine.ParallelCaching = *fc.Engine.ParallelCaching
+	}
+
+	if fc.Engine.SmartGen != nil {
+		c.Engine.SmartGen = *fc.Engine.SmartGen
 	}
 
 	if fc.Engine.GC != nil {

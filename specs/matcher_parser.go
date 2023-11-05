@@ -197,12 +197,7 @@ func isLeaf(a Matcher) bool {
 }
 
 func isLeafGen(a Matcher) bool {
-	switch a.(type) {
-	case TargetAddr, addrRegexNode, labelNode, labelRegexNode:
-		return true
-	}
-
-	return false
+	return IsLabelMatcher(a) || IsAddrMatcher(a)
 }
 
 func OrNodeFactory[T Matcher](ms ...T) Matcher {
@@ -470,6 +465,13 @@ func (n labelNode) Includes(i Matcher) IntersectResult {
 type labelRegexNode struct {
 	r     *regexp.Regexp
 	value string
+	not   bool
+}
+
+func (n labelRegexNode) Not() Matcher {
+	nr := *(&n)
+	nr.not = !nr.not
+	return nr
 }
 
 func (n labelRegexNode) Simplify() Matcher {
@@ -495,6 +497,9 @@ func (n labelRegexNode) Includes(i Matcher) IntersectResult {
 	case labelNode:
 		return intersectResultBool(n.r.MatchString(l.value))
 	case labelRegexNode:
+		if n.not {
+			return IntersectUnknown
+		}
 		return intersectResultBool(
 			starIntersect(n.value, l.value, 0, 0),
 		)
@@ -586,8 +591,8 @@ func matchRegexes(a, b addrRegexNode) IntersectResult {
 
 	r := matchPrefix(false, a.pkgs, "**", b.pkgs, "/")
 	if r == IntersectTrue {
-		if not {
-
+		if not && a.names != "*" {
+			return IntersectUnknown
 		}
 		if r := matchPrefix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
 			return r
@@ -639,19 +644,6 @@ func (n addrRegexNode) Includes(i Matcher) IntersectResult {
 		if r1 == IntersectFalse || r2 == IntersectFalse {
 			return IntersectFalse
 		}
-		//r := matchPrefix(n.pkgs, "**", ta.pkgs, "/")
-		//if r == IntersectTrue {
-		//	if r := matchPrefix(n.names, "*", ta.names, ""); r != IntersectUnknown {
-		//		return r
-		//	}
-		//	if r := matchSuffix(n.names, "*", ta.names, ""); r != IntersectUnknown {
-		//		return r
-		//	}
-		//} else if r == IntersectFalse {
-		//	return r
-		//}
-
-		//return intersectResultBool(starIntersect(n.pkgs, ta.pkgs, 0, 0) && starIntersect(n.names, ta.names, 0, 0))
 	}
 
 	return IntersectUnknown
@@ -747,7 +739,7 @@ func parseTerm(tokens []token, index *int) Matcher {
 		case tokenAnd:
 			*index++
 			right := parseFactor(tokens, index)
-			left = andNode{left: left, right: right}
+			left = AndNodeFactory(left, right)
 		default:
 			return left
 		}

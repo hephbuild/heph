@@ -24,7 +24,7 @@ func TestParseMatcher(t *testing.T) {
 		{"test1 && !test2", "(test1 && !test2)"},
 		{"!(test1 && test2)", "!(test1 && test2)"},
 		{"test1 && (test2)", "(test1 && test2)"},
-		{"test1 && (test2 && test3)", "(test1 && (test2 && test3))"},
+		{"test1 && (test2 && test3)", "(test1 && test2 && test3)"},
 		{"test1 || (test2)", "(test1 || test2)"},
 		{"//path/to:target", "//path/to:target"},
 		{"//path/to:target || label", "(//path/to:target || label)"},
@@ -199,8 +199,8 @@ func TestAndFactory(t *testing.T) {
 	}{
 		{[]Matcher{labelNode{"a"}}, "a"},
 		{[]Matcher{labelNode{"a"}, labelNode{"b"}}, "(a && b)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}}, "((a && b) && c)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}, labelNode{"d"}}, "(((a && b) && c) && d)"},
+		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}}, "(a && b && c)"},
+		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}, labelNode{"d"}}, "(a && b && c && d)"},
 	}
 	for _, test := range tests {
 		t.Run(strings.Join(ads.Map(test.matchers, func(m Matcher) string {
