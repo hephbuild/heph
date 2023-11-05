@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/tuistatus"
 	"os"
 	"strings"
 	"time"
@@ -137,9 +138,16 @@ func linkAll(ctx context.Context, e *scheduler.Scheduler) error {
 		}
 	}
 
-	err := e.Graph.LinkTargets(ctx, true, nil, true)
+	err := tuistatus.DoE(ctx, func(ctx context.Context) error {
+		err := e.Graph.LinkTargets(ctx, true, nil, true)
+		if err != nil {
+			return fmt.Errorf("linking: %w", err)
+		}
+
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("linking: %w", err)
+		return err
 	}
 
 	return nil

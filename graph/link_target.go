@@ -12,6 +12,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
 	"math"
@@ -112,18 +113,18 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 		target.resetLinking()
 	}
 
-	if emit {
+	if emit && !status.IsInteractive(ctx) {
 		status.Emit(ctx, status.String("Linking targets..."))
 	}
 
 	for i, target := range targets {
-		if err := ctx.Err(); err != nil {
-			return err
+		if xcontext.IsDone(ctx) {
+			return ctx.Err()
 		}
 
 		if emit {
 			percent := math.Round(xmath.Percent(i, len(targets)))
-			status.EmitInteractive(ctx, status.String(xmath.FormatPercent("Linking targets [P]...", percent)))
+			status.EmitInteractive(ctx, status.String(xmath.FormatPercent("🔗 Linking targets [P]...", percent)))
 		}
 
 		//log.Tracef("# Linking target %v %v/%v", target.Addr, i+1, len(targets))

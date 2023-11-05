@@ -584,7 +584,7 @@ var revdepsCmd = &cobra.Command{
 		var fn func(target specs.Specer) ([]*graph.Target, error)
 
 		tp, err := specs.ParseTargetAddr("", args[0])
-		if err != nil {
+		if err != nil { // It's probably a file
 			tperr := err
 
 			p, err := filepath.Abs(args[0])

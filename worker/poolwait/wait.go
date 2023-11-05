@@ -5,21 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/worker"
-	"github.com/mattn/go-isatty"
 	"go.uber.org/multierr"
 )
 
-var isTerm bool
-
-func init() {
-	if w := log.Writer(); w != nil {
-		isTerm = isatty.IsTerminal(w.Fd())
-	}
-}
-
 func Wait(ctx context.Context, name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
-	useTUI := isTerm && !plain
+	useTUI := xtea.IsTerm() && !plain
 
 	log.Tracef("WaitPool %v", name)
 	defer func() {
