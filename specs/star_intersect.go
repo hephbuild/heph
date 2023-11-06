@@ -57,33 +57,3 @@ func starIntersect(s1, s2 string, i, j int) bool {
 
 	return s1[i] == s2[j] && starIntersect(s1, s2, i+1, j+1)
 }
-
-func starMatch(s1, s2 string, i, j int) bool {
-	if i == len(s1) && j == len(s2) {
-		return true
-	}
-
-	if i == len(s1) || j == len(s2) {
-		return false
-	}
-
-	if s2[j] == '*' {
-		if j+1 < len(s2) && s2[j+1] == '*' {
-			if starMatch(s1, s2, i+1, j) || starMatch(s1, s2, i+1, j+2) || starMatch(s1, s2, i, j+2) {
-				return true
-			}
-
-			if j+2 < len(s2) && s2[j+2] == '/' {
-				if starMatch(s1, s2, i+1, j) || starMatch(s1, s2, i+1, j+3) || starMatch(s1, s2, i, j+3) {
-					return true
-				}
-			}
-		}
-		if s1[i] == '/' {
-			return starMatch(s1, s2, i, j+1)
-		}
-		return starMatch(s1, s2, i+1, j) || starMatch(s1, s2, i+1, j+1) || starMatch(s1, s2, i, j+1)
-	}
-
-	return s1[i] == s2[j] && starMatch(s1, s2, i+1, j+1)
-}

@@ -47,7 +47,7 @@ type Target struct {
 	m             sync.Mutex
 }
 
-func (t *Target) resetLinking() {
+func (t *Target) ResetLinking() {
 	t.deeplinked = false
 
 	spec := t.Spec()

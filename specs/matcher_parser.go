@@ -64,6 +64,17 @@ type staticMatcher struct {
 	str   string
 }
 
+func (n staticMatcher) Not() Matcher {
+	switch n {
+	case AllMatcher:
+		return NoneMatcher
+	case NoneMatcher:
+		return AllMatcher
+	default:
+		panic("that shouldnt happen")
+	}
+}
+
 func (n staticMatcher) Simplify() Matcher {
 	return n
 }
@@ -394,8 +405,6 @@ func (n notNode) Simplify() Matcher {
 	var nn Matcher = n
 	if nnn, ok := n.expr.(MatcherNot); ok {
 		nn = nnn.Not().Simplify()
-	} else {
-		nn = notNode{n.expr.Simplify()}
 	}
 
 	for {
@@ -403,12 +412,18 @@ func (n notNode) Simplify() Matcher {
 		case notNode:
 			switch nne := nnn.expr.(type) {
 			case notNode:
-				nn = nne
+				nn = nne.expr
 				continue
 			}
 		}
 
 		break
+	}
+
+	if nn == n {
+		nn = notNode{expr: n.expr.Simplify()}
+	} else {
+		nn = nn.Simplify()
 	}
 
 	return nn
@@ -423,18 +438,18 @@ func (n notNode) Match(t Specer) bool {
 }
 
 func (n notNode) Includes(i Matcher) IntersectResult {
-	switch n.expr.(type) {
-	case addrRegexNode, TargetAddr, TargetAddrs, labelNode, labelRegexNode:
-		r := Intersects(n.expr, i)
-
-		return r.Not()
-	}
-
 	return IntersectUnknown
 }
 
 type labelNode struct {
 	value string
+	not   bool
+}
+
+func (n labelNode) Not() Matcher {
+	nr := *(&n)
+	nr.not = !nr.not
+	return nr
 }
 
 func (n labelNode) Simplify() Matcher {
@@ -442,21 +457,42 @@ func (n labelNode) Simplify() Matcher {
 }
 
 func (n labelNode) String() string {
+	if n.not {
+		return "!" + n.value
+	}
 	return n.value
 }
 
 func (n labelNode) Match(t Specer) bool {
-	return ads.Contains(t.Spec().Labels, n.value)
+	return ads.Contains(t.Spec().Labels, n.value) == !n.not
 }
 
 func (n labelNode) MatchString(s string) bool {
-	return s == n.value
+	return (s == n.value) == !n.not
 }
 
 func (n labelNode) Includes(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
-		return intersectResultBool(n.value == l.value)
+		if n.not && l.not {
+			return IntersectTrue
+		}
+
+		r := intersectResultBool(n.value == l.value)
+
+		if n.not || l.not {
+			r = r.Not()
+		}
+
+		return r
+	case labelRegexNode:
+		if n.not && l.not {
+			return IntersectTrue
+		}
+
+		if n.not {
+			return IntersectTrue
+		}
 	}
 
 	return IntersectUnknown
@@ -479,6 +515,9 @@ func (n labelRegexNode) Simplify() Matcher {
 }
 
 func (n labelRegexNode) String() string {
+	if n.not {
+		return "!" + n.value
+	}
 	return n.value
 }
 
@@ -495,14 +534,33 @@ func (n labelRegexNode) MatchString(s string) bool {
 func (n labelRegexNode) Includes(i Matcher) IntersectResult {
 	switch l := i.(type) {
 	case labelNode:
-		return intersectResultBool(n.r.MatchString(l.value))
-	case labelRegexNode:
-		if n.not {
+		if l.not && !n.not {
+			// Force it to run the other way around, to simplify logic
 			return IntersectUnknown
 		}
-		return intersectResultBool(
-			starIntersect(n.value, l.value, 0, 0),
-		)
+
+		if l.not && n.not {
+			return IntersectTrue
+		}
+
+		r := intersectResultBool(n.r.MatchString(l.value))
+		if n.not || l.not {
+			r = r.Not()
+		}
+
+		return r
+	case labelRegexNode:
+		if l.not && n.not {
+			return IntersectTrue
+		}
+
+		r := intersectResultBool(starIntersect(n.value, l.value, 0, 0))
+
+		if n.not || l.not {
+			r = r.Not()
+		}
+
+		return r
 	}
 
 	return IntersectUnknown
@@ -612,10 +670,14 @@ func matchRegexes(a, b addrRegexNode) IntersectResult {
 func (n addrRegexNode) Includes(i Matcher) IntersectResult {
 	switch ta := i.(type) {
 	case TargetAddr:
-		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name))
+		if n.not && ta.not {
+			return IntersectTrue
+		}
+
+		return intersectResultBool(n.MatchPackageName(ta.Package, ta.Name) == !n.not)
 	case addrRegexNode:
 		if n.not && ta.not {
-			return IntersectUnknown
+			return IntersectTrue
 		}
 
 		if n.not || ta.not {
@@ -722,7 +784,7 @@ func parseExpr(tokens []token, index *int) Matcher {
 		case tokenOr:
 			*index++
 			right := parseTerm(tokens, index)
-			left = orNode{left: left, right: right}
+			left = OrNodeFactory(left, right)
 		default:
 			return left
 		}

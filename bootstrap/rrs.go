@@ -116,7 +116,7 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 
 		for _, target := range genTargets {
 			allGenTargets.Add(target.Addr)
-			log.Warnf("GEN: %v", target.Addr)
+			log.Debugf("   GEN: %v", target.Addr)
 		}
 
 		// Run those gen targets
@@ -135,16 +135,20 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 }
 
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
-	if !e.Config.Engine.SmartGen {
-		// Forcefully try to generate rrs & link
-		rrs, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
-		if err == nil {
-			return rrs, nil
-		}
-	}
-
 	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
 		if !e.Config.Engine.SmartGen {
+			for _, target := range e.Graph.Targets().Slice() {
+				target.ResetLinking()
+			}
+
+			// Forcefully try to generate rrs & link, if it errors, more gen may be needed...
+			_, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
+			if err == nil {
+				return func(gent *graph.Target) bool {
+					return false
+				}, nil
+			}
+
 			return func(gent *graph.Target) bool {
 				return true
 			}, nil
@@ -169,9 +173,9 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 
 		requiredMatchersSimpl := requiredMatchers.Simplify()
 
-		log.Warn("  M:", requiredMatchers.String())
+		log.Debug("GRR:  M:", requiredMatchers.String())
 		if requiredMatchers.String() != requiredMatchersSimpl.String() {
-			log.Warn(" MS:", requiredMatchersSimpl.String())
+			log.Debug("GRR: MS:", requiredMatchersSimpl.String())
 		}
 
 		return func(gent *graph.Target) bool {

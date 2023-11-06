@@ -11,6 +11,8 @@ import (
 type TargetAddr struct {
 	Package string
 	Name    string
+
+	not bool
 }
 
 func (p TargetAddr) Simplify() Matcher {
@@ -18,16 +20,40 @@ func (p TargetAddr) Simplify() Matcher {
 }
 
 func (p TargetAddr) Match(t Specer) bool {
-	return t.Spec().Addr == p.Full()
+	return (t.Spec().Addr == p.Full()) == !p.not
 }
 
 func (p TargetAddr) String() string {
+	if p.not {
+		return "!" + p.Full()
+	}
 	return p.Full()
 }
 
+func (n TargetAddr) Not() Matcher {
+	nr := *(&n)
+	nr.not = !nr.not
+	return nr
+}
+
 func (p TargetAddr) Includes(other Matcher) IntersectResult {
-	if ta, ok := other.(TargetAddr); ok {
-		return intersectResultBool(p.String() == ta.String())
+	switch ta := other.(type) {
+	case TargetAddr:
+		if ta.not && p.not {
+			return IntersectTrue
+		}
+
+		r := intersectResultBool(p.Full() == ta.Full())
+
+		if ta.not || p.not {
+			r = r.Not()
+		}
+
+		return r
+	case addrRegexNode:
+		if ta.not && p.not {
+			return IntersectTrue
+		}
 	}
 
 	return IntersectUnknown

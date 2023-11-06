@@ -159,10 +159,37 @@ func TestHasIntersection(t *testing.T) {
 		{"//some/**:target || //some/deep/**:target", "//other/deep/very/*:target", false},
 		{"//some/**:target || //some/deep/**:target", "//some/** && //some/deep/very/*:target", true},
 		{"//some/**:target || //some/deep/**:target", "//other/** && //some/deep/very/*:target", false},
+
 		{"abc", "abc", true},
+		{"abc", "!abc", false},
 		{"abc*", "abc", true},
 		{"*abc", "abc", true},
 		{"*abcd", "abc", false},
+		{"ab*", "abc", true},
+		{"!ab*", "abc", false},
+		{"ab*", "!abc", true},
+		{"abd*", "!abc", true},
+		{"abd", "!abc", true},
+		{"!abd", "!abc", true},
+		{"!a*", "!a*", true},
+		{"!*", "!*", true},
+		{"a*", "a*", true},
+		{"*a", "*a", true},
+
+		{"//some:target", "!//some:target", false},
+		{"!//some:target", "!//some:target", true},
+		{"!//some:*", "//some:target", false},
+		{"//some:*", "!//some:target", true},
+
+		{"//some:*", "!//some:*", false},
+		{"!//some:*", "!//some:*", true},
+		{"!//**:*", "//some:*", false},
+		{"//**:*", "!//some:*", true},
+
+		{"//s*ome:*", "!//some:target", true},
+		{"!//s*ome:*", "//some:target", false},
+		{"!//s*ome:*", "//other:target", true},
+
 		{"//**:something*", "!//thirdparty/**", true},
 		{":something* || mylib", "!:_* && !//thirdparty/** && mylib", true},
 		{"go_lib || //test/go/mod-xtest/**:_go_lib*", "//test/go/mod-xtest/**:* && go_lib", true},
@@ -171,6 +198,7 @@ func TestHasIntersection(t *testing.T) {
 		{"!//some/**:*", "//some/**:abc", false},
 		{"//some/**:*", "!//some/**:*", false},
 		{"//some/deep/**:*", "!//some/**:*", false},
+		{"!//some/deep/**:*", "//some/**:*", true},
 		{"//some/package:*", "(//**:target || //**:hello)", true},
 	}
 	for _, test := range tests {
@@ -197,10 +225,10 @@ func TestAndFactory(t *testing.T) {
 		matchers []Matcher
 		expected string
 	}{
-		{[]Matcher{labelNode{"a"}}, "a"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}}, "(a && b)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}}, "(a && b && c)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}, labelNode{"d"}}, "(a && b && c && d)"},
+		{[]Matcher{labelNode{value: "a"}}, "a"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}}, "(a && b)"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}}, "(a && b && c)"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}, labelNode{value: "d"}}, "(a && b && c && d)"},
 	}
 	for _, test := range tests {
 		t.Run(strings.Join(ads.Map(test.matchers, func(m Matcher) string {
@@ -218,10 +246,10 @@ func TestOrFactory(t *testing.T) {
 		matchers []Matcher
 		expected string
 	}{
-		{[]Matcher{labelNode{"a"}}, "a"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}}, "(a || b)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}}, "(a || b || c)"},
-		{[]Matcher{labelNode{"a"}, labelNode{"b"}, labelNode{"c"}, labelNode{"d"}}, "(a || b || c || d)"},
+		{[]Matcher{labelNode{value: "a"}}, "a"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}}, "(a || b)"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}}, "(a || b || c)"},
+		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}, labelNode{value: "d"}}, "(a || b || c || d)"},
 	}
 	for _, test := range tests {
 		t.Run(strings.Join(ads.Map(test.matchers, func(m Matcher) string {
@@ -230,6 +258,30 @@ func TestOrFactory(t *testing.T) {
 			res := OrNodeFactory(test.matchers...)
 
 			assert.Equal(t, test.expected, res.String())
+		})
+	}
+}
+
+func TestSimplify(t *testing.T) {
+	tests := []struct {
+		s        string
+		expected string
+	}{
+		{"!!a", "a"},
+		{"!a", "!a"},
+		{"!(a || b)", "(!a && !b)"},
+		{"!(a && b)", "(!a || !b)"},
+		{"!(a || b || c)", "(!a && !b && !c)"},
+		{"!(a && b && c)", "(!a || !b || !c)"},
+	}
+	for _, test := range tests {
+		t.Run(test.s, func(t *testing.T) {
+			m, err := ParseMatcher(test.s)
+			require.NoError(t, err)
+
+			ms := m.Simplify()
+
+			assert.Equal(t, test.expected, ms.String())
 		})
 	}
 }

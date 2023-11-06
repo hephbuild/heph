@@ -110,7 +110,7 @@ func (e *State) LinkTargets(ctx context.Context, ignoreNotFoundError bool, targe
 	}
 
 	for _, target := range targets {
-		target.resetLinking()
+		target.ResetLinking()
 	}
 
 	if emit && !status.IsInteractive(ctx) {

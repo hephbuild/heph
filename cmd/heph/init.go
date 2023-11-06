@@ -139,7 +139,7 @@ func linkAll(ctx context.Context, e *scheduler.Scheduler) error {
 	}
 
 	err := tuistatus.DoE(ctx, func(ctx context.Context) error {
-		err := e.Graph.LinkTargets(ctx, true, nil, true)
+		err := e.Graph.LinkTargets(ctx, *noGen, nil, true)
 		if err != nil {
 			return fmt.Errorf("linking: %w", err)
 		}
