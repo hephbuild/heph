@@ -135,20 +135,26 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 }
 
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
-	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
-		if !e.Config.Engine.SmartGen {
+	if !e.Config.Engine.SmartGen {
+		if specs.IsMatcherExplicit(m) {
+			rrs, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
+			if err != nil {
+				if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
+					return nil, err
+				}
+				log.Debugf("generateRRs: %v", err)
+			} else {
+				return rrs, nil
+			}
+
 			for _, target := range e.Graph.Targets().Slice() {
 				target.ResetLinking()
 			}
+		}
+	}
 
-			// Forcefully try to generate rrs & link, if it errors, more gen may be needed...
-			_, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
-			if err == nil {
-				return func(gent *graph.Target) bool {
-					return false
-				}, nil
-			}
-
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		if !e.Config.Engine.SmartGen {
 			return func(gent *graph.Target) bool {
 				return true
 			}, nil
