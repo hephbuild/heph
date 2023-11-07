@@ -54,82 +54,23 @@ func (n staticMatcher) Intersects(Matcher) IntersectResult {
 	return intersectResultBool(n.match)
 }
 
-type andNode struct {
-	left  Matcher
-	right Matcher
-}
-
-func (n andNode) Not() Matcher {
-	return orNode{
-		left:  notNode{n.left},
-		right: notNode{n.right},
-	}
-}
-
-func (n andNode) Simplify() Matcher {
-	return andNode{left: n.left.Simplify(), right: n.right.Simplify()}
-}
-
-func (n andNode) String() string {
-	return "(" + n.left.String() + " && " + n.right.String() + ")"
-}
-
-func (n andNode) Match(t Specer) bool {
-	return n.left.Match(t) && n.right.Match(t)
-}
-
-func (n andNode) Intersects(i Matcher) IntersectResult {
-	return intersectAnd(i, n.left, n.right)
-}
-
 type orNode struct {
-	left  Matcher
-	right Matcher
-}
-
-func (n orNode) Not() Matcher {
-	return andNode{
-		left:  notNode{n.left},
-		right: notNode{n.right},
-	}
-}
-
-func (n orNode) Simplify() Matcher {
-	return orNode{
-		left:  n.left.Simplify(),
-		right: n.right.Simplify(),
-	}
-}
-
-func (n orNode) String() string {
-	return "(" + n.left.String() + " || " + n.right.String() + ")"
-}
-
-func (n orNode) Match(t Specer) bool {
-	return n.left.Match(t) || n.right.Match(t)
-}
-
-func (n orNode) Intersects(i Matcher) IntersectResult {
-	return intersectOr(i, n.left, n.right)
-}
-
-type mOrNode struct {
 	nodes []Matcher
 }
 
-func (n mOrNode) Simplify() Matcher {
+func (n orNode) Simplify() Matcher {
 	return OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
 		return n.Simplify()
 	})...)
 }
 
-func (n mOrNode) Not() Matcher {
+func (n orNode) Not() Matcher {
 	return AndNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
 		return notNode{n}
 	})...)
 }
 
-func (n mOrNode) String() string {
+func (n orNode) String() string {
 	ss := ads.Map(n.nodes, func(t Matcher) string {
 		return t.String()
 	})
@@ -137,7 +78,7 @@ func (n mOrNode) String() string {
 	return "(" + strings.Join(ss, " || ") + ")"
 }
 
-func (n mOrNode) Match(t Specer) bool {
+func (n orNode) Match(t Specer) bool {
 	for _, node := range n.nodes {
 		if node.Match(t) {
 			return true
@@ -147,27 +88,27 @@ func (n mOrNode) Match(t Specer) bool {
 	return false
 }
 
-func (n mOrNode) Intersects(i Matcher) IntersectResult {
+func (n orNode) Intersects(i Matcher) IntersectResult {
 	return intersectOr(i, n.nodes...)
 }
 
-type mAndNode struct {
+type andNode struct {
 	nodes []Matcher
 }
 
-func (n mAndNode) Simplify() Matcher {
+func (n andNode) Simplify() Matcher {
 	return AndNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
 		return n.Simplify()
 	})...)
 }
 
-func (n mAndNode) Not() Matcher {
+func (n andNode) Not() Matcher {
 	return OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
 		return notNode{n}
 	})...)
 }
 
-func (n mAndNode) String() string {
+func (n andNode) String() string {
 	ss := ads.Map(n.nodes, func(t Matcher) string {
 		return t.String()
 	})
@@ -175,7 +116,7 @@ func (n mAndNode) String() string {
 	return "(" + strings.Join(ss, " && ") + ")"
 }
 
-func (n mAndNode) Match(t Specer) bool {
+func (n andNode) Match(t Specer) bool {
 	for _, node := range n.nodes {
 		if !node.Match(t) {
 			return false
@@ -185,7 +126,7 @@ func (n mAndNode) Match(t Specer) bool {
 	return true
 }
 
-func (n mAndNode) Intersects(i Matcher) IntersectResult {
+func (n andNode) Intersects(i Matcher) IntersectResult {
 	return intersectAnd(i, n.nodes...)
 }
 
@@ -591,7 +532,7 @@ const (
 	KindLabel             = "label"
 )
 
-type KindMatcher map[matcherKind]mOrNode
+type KindMatcher map[matcherKind]orNode
 
 func (a KindMatcher) getKind(m Matcher) matcherKind {
 	switch m.(type) {

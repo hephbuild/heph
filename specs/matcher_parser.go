@@ -229,7 +229,7 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 		matcher := OrNodeFactory(includeMatchers...)
 
 		if len(excludeMatchers) > 0 {
-			matcher = andNode{matcher, notNode{OrNodeFactory(excludeMatchers...)}}
+			matcher = AndNodeFactory[Matcher](matcher, notNode{OrNodeFactory(excludeMatchers...)})
 		}
 
 		return matcher, nil

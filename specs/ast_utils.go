@@ -1,5 +1,7 @@
 package specs
 
+import "github.com/hephbuild/heph/utils/ads"
+
 func IsLabelMatcher(m Matcher) bool {
 	if _, ok := m.(labelNode); ok {
 		return true
@@ -24,6 +26,31 @@ func IsAddrMatcher(m Matcher) bool {
 	return false
 }
 
+func flattenAndNodeInto(m Matcher, ms *[]Matcher) bool {
+	if any(m) == NoneMatcher {
+		*ms = []Matcher{NoneMatcher}
+		return true
+	}
+
+	if any(m) == AllMatcher {
+		return false
+	}
+
+	switch m := m.(type) {
+	case andNode:
+		*ms = ads.GrowExtra(*ms, len(m.nodes))
+		for _, cm := range m.nodes {
+			if flattenAndNodeInto(cm, ms) {
+				return true
+			}
+		}
+	default:
+		*ms = append(*ms, m)
+	}
+
+	return false
+}
+
 func AndNodeFactory[T Matcher](ms ...T) Matcher {
 	switch len(ms) {
 	case 0:
@@ -31,24 +58,11 @@ func AndNodeFactory[T Matcher](ms ...T) Matcher {
 	case 1:
 		return ms[0]
 	default:
-		or := mAndNode{nodes: make([]Matcher, 0, len(ms))}
+		or := andNode{nodes: make([]Matcher, 0, len(ms))}
 
 		for _, m := range ms {
-			if any(m) == NoneMatcher {
-				return NoneMatcher
-			}
-
-			if any(m) == AllMatcher {
-				continue
-			}
-
-			switch n := any(m).(type) {
-			case andNode:
-				or.nodes = append(or.nodes, n.left, n.right)
-			case mAndNode:
-				or.nodes = append(or.nodes, n.nodes...)
-			default:
-				or.nodes = append(or.nodes, m)
+			if flattenAndNodeInto(m, &or.nodes) {
+				break
 			}
 		}
 
@@ -57,12 +71,35 @@ func AndNodeFactory[T Matcher](ms ...T) Matcher {
 			return NoneMatcher
 		case 1:
 			return or.nodes[0]
-		case 2:
-			return andNode{or.nodes[0], or.nodes[1]}
 		}
 
 		return or
 	}
+}
+
+func flattenOrNodeInto(m Matcher, ms *[]Matcher) bool {
+	if any(m) == AllMatcher {
+		*ms = []Matcher{AllMatcher}
+		return true
+	}
+
+	if any(m) == NoneMatcher {
+		return false
+	}
+
+	switch m := m.(type) {
+	case orNode:
+		*ms = ads.GrowExtra(*ms, len(m.nodes))
+		for _, cm := range m.nodes {
+			if flattenAndNodeInto(cm, ms) {
+				return true
+			}
+		}
+	default:
+		*ms = append(*ms, m)
+	}
+
+	return false
 }
 
 func OrNodeFactory[T Matcher](ms ...T) Matcher {
@@ -72,24 +109,11 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 	case 1:
 		return ms[0]
 	default:
-		or := mOrNode{nodes: make([]Matcher, 0, len(ms))}
+		or := orNode{nodes: make([]Matcher, 0, len(ms))}
 
 		for _, m := range ms {
-			if any(m) == NoneMatcher {
-				continue
-			}
-
-			if any(m) == AllMatcher {
-				return AllMatcher
-			}
-
-			switch n := any(m).(type) {
-			case orNode:
-				or.nodes = append(or.nodes, n.left, n.right)
-			case mOrNode:
-				or.nodes = append(or.nodes, n.nodes...)
-			default:
-				or.nodes = append(or.nodes, m)
+			if flattenOrNodeInto(m, &or.nodes) {
+				break
 			}
 		}
 
@@ -98,8 +122,6 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 			return NoneMatcher
 		case 1:
 			return or.nodes[0]
-		case 2:
-			return orNode{or.nodes[0], or.nodes[1]}
 		}
 
 		return or

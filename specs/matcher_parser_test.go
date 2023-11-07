@@ -230,6 +230,8 @@ func TestAndFactory(t *testing.T) {
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}}, "(a && b)"},
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}}, "(a && b && c)"},
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}, labelNode{value: "d"}}, "(a && b && c && d)"},
+		{[]Matcher{labelNode{value: "a"}, NoneMatcher, labelNode{value: "b"}}, "<none>"},
+		{[]Matcher{labelNode{value: "a"}, AllMatcher, labelNode{value: "b"}}, "(a && b)"},
 	}
 	for _, test := range tests {
 		t.Run(strings.Join(ads.Map(test.matchers, func(m Matcher) string {
@@ -251,6 +253,8 @@ func TestOrFactory(t *testing.T) {
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}}, "(a || b)"},
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}}, "(a || b || c)"},
 		{[]Matcher{labelNode{value: "a"}, labelNode{value: "b"}, labelNode{value: "c"}, labelNode{value: "d"}}, "(a || b || c || d)"},
+		{[]Matcher{labelNode{value: "a"}, NoneMatcher, labelNode{value: "b"}}, "(a || b)"},
+		{[]Matcher{labelNode{value: "a"}, AllMatcher, labelNode{value: "b"}}, "<all>"},
 	}
 	for _, test := range tests {
 		t.Run(strings.Join(ads.Map(test.matchers, func(m Matcher) string {
@@ -265,15 +269,17 @@ func TestOrFactory(t *testing.T) {
 
 func TestSimplify(t *testing.T) {
 	tests := []struct {
-		s        string
-		expected string
+		s              string
+		expected       string
+		expectedStruct string
 	}{
-		{"!!a", "a"},
-		{"!a", "!a"},
-		{"!(a || b)", "(!a && !b)"},
-		{"!(a && b)", "(!a || !b)"},
-		{"!(a || b || c)", "(!a && !b && !c)"},
-		{"!(a && b && c)", "(!a || !b || !c)"},
+		{"!!a", "a", `specs.labelNode{value:"a", not:false}`},
+		{"!a", "!a", `specs.labelNode{value:"a", not:true}`},
+		{"!(a || b)", "(!a && !b)", ``},
+		{"!(!a || !b)", "(a && b)", ``},
+		{"!(a && b)", "(!a || !b)", ``},
+		{"!(a || b || c)", "(!a && !b && !c)", ``},
+		{"!(a && b && c)", "(!a || !b || !c)", ``},
 	}
 	for _, test := range tests {
 		t.Run(test.s, func(t *testing.T) {
@@ -283,6 +289,11 @@ func TestSimplify(t *testing.T) {
 			ms := m.Simplify()
 
 			assert.Equal(t, test.expected, ms.String())
+
+			if test.expectedStruct != "" {
+				s := fmt.Sprintf("%#v", ms)
+				assert.Equal(t, test.expectedStruct, s)
+			}
 		})
 	}
 }
