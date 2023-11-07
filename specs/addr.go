@@ -36,7 +36,7 @@ func (n TargetAddr) Not() Matcher {
 	return nr
 }
 
-func (p TargetAddr) Includes(other Matcher) IntersectResult {
+func (p TargetAddr) Intersects(other Matcher) IntersectResult {
 	switch ta := other.(type) {
 	case TargetAddr:
 		if ta.not && p.not {
@@ -77,8 +77,8 @@ func (p TargetAddrs) String() string {
 	return OrNodeFactory[TargetAddr](p...).String()
 }
 
-func (p TargetAddrs) Includes(m Matcher) IntersectResult {
-	return OrNodeFactory[TargetAddr](p...).Includes(m)
+func (p TargetAddrs) Intersects(m Matcher) IntersectResult {
+	return OrNodeFactory[TargetAddr](p...).Intersects(m)
 }
 
 func IsMatcherExplicit(m Matcher) bool {

@@ -116,7 +116,7 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 
 		for _, target := range genTargets {
 			allGenTargets.Add(target.Addr)
-			log.Debugf("   GEN: %v", target.Addr)
+			log.Debugf("RG: GEN: %v", target.Addr)
 		}
 
 		// Run those gen targets

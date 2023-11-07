@@ -35,6 +35,7 @@ func TestParseMatcher(t *testing.T) {
 		{"//path/to:*", "//path/to:*"},
 		{"//path/to", "//path/to:*"},
 		{`has_annotation("some")`, `has_annotation("some")`},
+		{`has_annotation("some", "thing")`, `has_annotation("some", "thing")`},
 		{`label*`, `label*`},
 		{`//**/*:*`, "<all>"},
 		{`//**:*`, "<all>"},

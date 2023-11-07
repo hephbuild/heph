@@ -33,7 +33,6 @@ func isLabelChar(c uint8) bool {
 func isAddrChar(c uint8) bool {
 	return ads.Contains(packageChars, rune(c)) ||
 		ads.Contains(targetNameChars, rune(c)) ||
-		rune(c) == '/' ||
 		rune(c) == ':' ||
 		rune(c) == '*'
 }
