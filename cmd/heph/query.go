@@ -295,7 +295,7 @@ var graphCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := schedulerInit(ctx, nil)
+		bs, t, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
@@ -305,12 +305,7 @@ var graphCmd = &cobra.Command{
 			return err
 		}
 
-		rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, false, true)
-		if err != nil {
-			return err
-		}
-
-		id := rrs[0].Target.Addr
+		id := t.Addr
 
 		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(id)
 		if err != nil {
