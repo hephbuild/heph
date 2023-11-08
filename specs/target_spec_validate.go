@@ -55,6 +55,12 @@ func (t Target) Validate() error {
 		return fmt.Errorf("entrypoint must be one of %v, got %v", joinOneOf(EntrypointValues), t.Entrypoint)
 	}
 
+	if t.Cache.Enabled {
+		if !t.Sandbox && !t.OutInSandbox {
+			return fmt.Errorf("cannot cache target which isn't sandboxed")
+		}
+	}
+
 	if len(t.Platforms) != 1 {
 		return fmt.Errorf("only a single platform is supported, for now")
 	}

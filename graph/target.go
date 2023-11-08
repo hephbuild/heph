@@ -14,6 +14,7 @@ type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
 type Target struct {
 	specs.Target
 
+	GenSource         *Target // TODO: support multiple sources
 	Tools             TargetTools
 	Deps              TargetNamedDeps
 	HashDeps          TargetDeps
@@ -46,7 +47,7 @@ type Target struct {
 	m             sync.Mutex
 }
 
-func (t *Target) resetLinking() {
+func (t *Target) ResetLinking() {
 	t.deeplinked = false
 
 	spec := t.Spec()
@@ -82,6 +83,18 @@ func (t *Target) EmptyDeps() bool {
 		len(t.PassEnv) == 0 &&
 		len(t.RuntimeEnv) == 0 &&
 		len(t.RuntimePassEnv) == 0
+}
+
+func (t *Target) GenSources() []*Target {
+	var srcs []*Target
+
+	current := t
+	for current.GenSource != nil {
+		srcs = append(srcs, current.GenSource)
+		current = current.GenSource
+	}
+
+	return srcs
 }
 
 type Targeter interface {

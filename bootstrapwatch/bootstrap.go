@@ -90,6 +90,11 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 	pool := worker.NewPool(bootopts.Workers)
 	bootopts.Pool = pool
 
+	bbs, err := bootstrap.BootBase(ctx, bootopts)
+	if err != nil {
+		return nil, err
+	}
+
 	sigCh := make(chan sigEvent)
 
 	s := &State{
@@ -112,6 +117,11 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 			close(sigCh)
 			pool.Stop(nil)
 		},
+	}
+
+	err = s.updateWatchers(bbs)
+	if err != nil {
+		return s, err
 	}
 
 	return s, nil
@@ -487,9 +497,7 @@ func printEvents(events []fsEvent) {
 
 var successStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00"))
 
-func (s *State) updateWatchers() error {
-	bs := s.cbs
-
+func (s *State) updateWatchers(bs bootstrap.BaseBootstrap) error {
 	if bs.Root == nil {
 		return nil
 	}
@@ -536,7 +544,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 		s.cbs = e.bs
 	}
 
-	err := s.updateWatchers()
+	err := s.updateWatchers(s.cbs.BaseBootstrap)
 	if err != nil {
 		return err
 	}

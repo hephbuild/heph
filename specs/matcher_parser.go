@@ -2,199 +2,38 @@ package specs
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xpanic"
-	"regexp"
 	"strings"
 )
 
 type Matcher interface {
 	Match(Specer) bool
 	String() string
+	Intersects(Matcher) IntersectResult
+	Simplify() Matcher
 }
 
-type allMatcher struct{}
-
-var AllMatcher Matcher = allMatcher{}
-
-func (n allMatcher) String() string {
-	return "<match all>"
+type MatcherNot interface {
+	Not() Matcher
 }
 
-func (n allMatcher) Match(t Specer) bool {
-	return true
+type StringMatcher interface {
+	MatchString(s string) bool
 }
 
-type astNode interface {
-	String() string
-}
+var PublicMatcher = MustParseMatcher("!:_*")
 
-type andNode struct {
-	left  Matcher
-	right Matcher
-}
-
-func AndNodeFactory(ms ...Matcher) Matcher {
-	switch len(ms) {
-	case 0:
-		panic("need at least one node")
-	case 1:
-		return ms[0]
-	}
-
-	n := andNode{left: ms[0], right: ms[1]}
-	for i := len(ms); i < 2; i++ {
-		n = andNode{left: ms[i], right: n}
-	}
-
-	return n
-}
-
-func (n andNode) String() string {
-	return "(" + n.left.String() + " && " + n.right.String() + ")"
-}
-
-func (n andNode) Match(t Specer) bool {
-	return n.left.Match(t) && n.right.Match(t)
-}
-
-type orNode struct {
-	left  Matcher
-	right Matcher
-}
-
-func OrNodeFactory(ms ...Matcher) Matcher {
-	switch len(ms) {
-	case 0:
-		panic("need at least one node")
-	case 1:
-		return ms[0]
-	}
-
-	return mOrNode[Matcher]{nodes: ms}
-}
-
-func (n orNode) String() string {
-	return "(" + n.left.String() + " || " + n.right.String() + ")"
-}
-
-func (n orNode) Match(t Specer) bool {
-	return n.left.Match(t) || n.right.Match(t)
-}
-
-type mOrNode[T Matcher] struct {
-	nodes []T
-}
-
-func (n mOrNode[T]) String() string {
-	ss := ads.Map(n.nodes, func(t T) string {
-		return t.String()
-	})
-
-	return "(" + strings.Join(ss, " || ") + ")"
-}
-
-func (n mOrNode[T]) Match(t Specer) bool {
-	for _, node := range n.nodes {
-		if node.Match(t) {
-			return true
-		}
+func isLeaf(a Matcher) bool {
+	switch a.(type) {
+	case TargetAddr, addrRegexNode, labelNode, labelRegexNode, staticMatcher, funcNode:
+		return true
 	}
 
 	return false
 }
 
-type notNode struct {
-	expr Matcher
-}
-
-func (n notNode) String() string {
-	return "!" + n.expr.String()
-}
-
-func (n notNode) Match(t Specer) bool {
-	return !n.expr.Match(t)
-}
-
-type labelNode struct {
-	value string
-}
-
-func (n labelNode) String() string {
-	return n.value
-}
-
-func (n labelNode) Match(t Specer) bool {
-	return ads.Contains(t.Spec().Labels, n.value)
-}
-
-type labelRegexNode struct {
-	r     *regexp.Regexp
-	value string
-}
-
-func (n labelRegexNode) String() string {
-	return n.value
-}
-
-func (n labelRegexNode) Match(t Specer) bool {
-	return ads.Some(t.Spec().Labels, func(s string) bool {
-		return n.r.MatchString(s)
-	})
-}
-
-type targetRegexNode struct {
-	pkg   *regexp.Regexp
-	name  *regexp.Regexp
-	pkgs  string
-	names string
-}
-
-func (n targetRegexNode) String() string {
-	return "//" + n.pkgs + ":" + n.names
-}
-
-func (n targetRegexNode) Match(t Specer) bool {
-	if !n.pkg.MatchString(t.Spec().Package.Path) {
-		return false
-	}
-
-	return n.name.MatchString(t.Spec().Name)
-}
-
-type funcNode struct {
-	name  string
-	args  []astNode
-	match func(args []astNode, t Specer) bool
-}
-
-func (n funcNode) String() string {
-	ss := ads.Map(n.args, func(t astNode) string {
-		return t.String()
-	})
-
-	return n.name + "(" + strings.Join(ss, ", ") + ")"
-}
-
-func (n funcNode) Match(t Specer) bool {
-	return n.match(n.args, t)
-}
-
-var matcherFunctions = map[string]func(args []astNode, t Specer) bool{
-	"has_annotation": func(args []astNode, t Specer) bool {
-		annotation := args[0].(stringNode).value
-
-		_, ok := t.Spec().Annotations[annotation]
-		return ok
-	},
-}
-
-type stringNode struct {
-	value string
-}
-
-func (n stringNode) String() string {
-	return fmt.Sprintf(`"%v"`, n.value)
+func isLeafGen(a Matcher) bool {
+	return IsLabelMatcher(a) || IsAddrMatcher(a)
 }
 
 func printToken(t token) string {
@@ -227,7 +66,7 @@ func parseExpr(tokens []token, index *int) Matcher {
 		case tokenOr:
 			*index++
 			right := parseTerm(tokens, index)
-			left = orNode{left: left, right: right}
+			left = OrNodeFactory(left, right)
 		default:
 			return left
 		}
@@ -244,7 +83,7 @@ func parseTerm(tokens []token, index *int) Matcher {
 		case tokenAnd:
 			*index++
 			right := parseFactor(tokens, index)
-			left = andNode{left: left, right: right}
+			left = AndNodeFactory(left, right)
 		default:
 			return left
 		}
@@ -354,6 +193,14 @@ func ParseMatcher(input string) (Matcher, error) {
 	return lexAndParse(input)
 }
 
+func MustParseMatcher(input string) Matcher {
+	m, err := ParseMatcher(input)
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
 func ParseMatcherInPkg(pkg, input string) (Matcher, error) {
 	return lexAndParse(input)
 }
@@ -378,13 +225,17 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 		excludeMatchers = append(excludeMatchers, m)
 	}
 
-	matcher := AllMatcher
 	if len(includeMatchers) > 0 {
-		matcher = OrNodeFactory(includeMatchers...)
-	}
-	if len(excludeMatchers) > 0 {
-		matcher = andNode{matcher, notNode{OrNodeFactory(excludeMatchers...)}}
-	}
+		matcher := OrNodeFactory(includeMatchers...)
 
-	return matcher, nil
+		if len(excludeMatchers) > 0 {
+			matcher = AndNodeFactory[Matcher](matcher, notNode{OrNodeFactory(excludeMatchers...)})
+		}
+
+		return matcher, nil
+	} else if len(excludeMatchers) > 0 {
+		return notNode{OrNodeFactory(excludeMatchers...)}, nil
+	} else {
+		return nil, nil
+	}
 }

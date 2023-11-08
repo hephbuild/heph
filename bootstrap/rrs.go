@@ -9,25 +9,28 @@ import (
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker/poolwait"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")
 
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, bailOutOnExpr bool, opts targetrun.RequestOpts) (targetrun.Requests, error) {
+func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, opts targetrun.RequestOpts, bailOutOnExpr bool) (targetrun.Requests, error) {
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
 	}
 
-	check := func(target *graph.Target) error {
-		if bailOutOnExpr {
+	check := func(target *graph.Target) error { return nil }
+	if bailOutOnExpr {
+		check = func(target *graph.Target) error {
 			if len(target.Spec().Deps.Exprs) > 0 {
 				return fmt.Errorf("%v: %w", target.Addr, errHasExprDep)
 			}
-		}
 
-		return nil
+			return nil
+		}
 	}
 
 	rrs := make(targetrun.Requests, 0, targets.Len())
@@ -59,56 +62,142 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		rrs = append(rrs, rr)
 	}
 
-	ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, anc := range ancs {
-		err := check(anc)
+	if bailOutOnExpr {
+		ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
 		if err != nil {
 			return nil, err
+		}
+
+		for _, anc := range ancs {
+			err := check(anc)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	return rrs, nil
 }
 
-func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
-	if specs.IsMatcherExplicit(m) {
-		rrs, err := generateRRs(ctx, e.Graph, m, targs, true, opts)
-		if err != nil {
-			if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
-				return nil, err
-			}
-			log.Debugf("generateRRs: %v", err)
-		} else {
-			return rrs, nil
-		}
-	}
-
-	err := runGen(ctx, e, "", false, plain)
-	if err != nil {
-		return nil, err
-	}
-
-	return generateRRs(ctx, e.Graph, m, targs, false, opts)
-}
-
-func runGen(ctx context.Context, e *scheduler.Scheduler, poolName string, linkAll, plain bool) error {
-	deps, err := e.ScheduleGenPass(ctx, linkAll)
-	if err != nil {
-		return err
-	}
-
-	if poolName == "" {
-		poolName = "PreRun gen"
-	}
-
-	err = poolwait.Wait(ctx, poolName, e.Pool, deps, plain)
+func RunAllGen(ctx context.Context, e *scheduler.Scheduler, plain bool) error {
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		return func(gent *graph.Target) bool {
+			return true
+		}, nil
+	})
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFactory func() (func(gent *graph.Target) bool, error)) error {
+	allGenTargets := sets.NewStringSet(0)
+
+	for i := 0; ; i++ {
+		filter, err := filterFactory()
+		if err != nil {
+			return err
+		}
+
+		genTargets := ads.Filter(e.Graph.GeneratedTargets(), func(gent *graph.Target) bool {
+			if allGenTargets.Has(gent.Addr) {
+				// Already ran gen
+				return false
+			}
+
+			return filter(gent)
+		})
+
+		if len(genTargets) == 0 {
+			break
+		}
+
+		for _, target := range genTargets {
+			allGenTargets.Add(target.Addr)
+			log.Debugf("RG: GEN: %v", target.Addr)
+		}
+
+		// Run those gen targets
+		deps, err := e.ScheduleGenPass(ctx, genTargets)
+		if err != nil {
+			return err
+		}
+
+		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
+	if !e.Config.Engine.SmartGen {
+		if specs.IsMatcherExplicit(m) {
+			rrs, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
+			if err != nil {
+				if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
+					return nil, err
+				}
+				log.Debugf("generateRRs: %v", err)
+			} else {
+				return rrs, nil
+			}
+
+			for _, target := range e.Graph.Targets().Slice() {
+				target.ResetLinking()
+			}
+		}
+	}
+
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		if !e.Config.Engine.SmartGen {
+			return func(gent *graph.Target) bool {
+				return true
+			}, nil
+		}
+
+		targets, err := e.Graph.Targets().Filter(m)
+		if err != nil {
+			if !errors.Is(err, specs.TargetNotFoundErr{}) {
+				return nil, err
+			}
+		}
+
+		var requiredMatchers = m
+		if targets != nil {
+			ms, err := e.Graph.RequiredMatchers(targets.Slice())
+			if err != nil {
+				return nil, err
+			}
+
+			requiredMatchers = specs.OrNodeFactory(requiredMatchers, ms)
+		}
+
+		requiredMatchersSimpl := requiredMatchers.Simplify()
+
+		log.Debug("GRR:  M:", requiredMatchers.String())
+		if requiredMatchers.String() != requiredMatchersSimpl.String() {
+			log.Debug("GRR: MS:", requiredMatchersSimpl.String())
+		}
+
+		return func(gent *graph.Target) bool {
+			gm := specs.KindMatcher{}
+			for _, m := range gent.Gen {
+				gm.Add(m)
+			}
+
+			r := specs.Intersects(gm, requiredMatchersSimpl)
+
+			return r.Bool()
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return generateRRs(ctx, e.Graph, m, targs, opts, false)
 }

@@ -119,8 +119,8 @@ type Target struct {
 	PassEnv             []string
 	RuntimePassEnv      []string
 	RunInCwd            bool
-	Gen                 bool
-	Source              []Source
+	Gen                 []Matcher
+	Source              []Source // TODO: support multiple sources
 	RuntimeEnv          map[string]string
 	SrcEnv              SrcEnv
 	OutEnv              string
@@ -187,6 +187,10 @@ func (t Target) IsGroup() bool {
 
 func (t Target) IsTool() bool {
 	return len(t.Run) >= 1 && t.Run[0] == "heph_tool"
+}
+
+func (t Target) IsGen() bool {
+	return len(t.Gen) > 0
 }
 
 func (t Target) IsTextFile() bool {

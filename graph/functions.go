@@ -4,20 +4,19 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/utils/ads"
 	"strconv"
 	"strings"
 )
 
-func (e *State) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
+func (e *State) collectMatcher(t specs.Target, expr exprs.Expr) (specs.Matcher, bool, error) {
 	s, err := expr.MustPosArg(0)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	pkgMatcher, err := specs.ParseMatcherInPkg(t.Package.Path, s)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	var include, exclude []string
@@ -34,26 +33,40 @@ func (e *State) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
 				include = append(include, arg.Value)
 			}
 		default:
-			return nil, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
+			return nil, false, fmt.Errorf("unhandled %v arg `%v`", expr.Function, arg.Name)
 		}
 	}
 
 	matcher, err := specs.MatcherFromIncludeExclude(t.Package.Path, include, exclude)
 	if err != nil {
+		return nil, false, err
+	}
+
+	if matcher != nil {
+		matcher = specs.AndNodeFactory(pkgMatcher, matcher)
+	} else {
+		matcher = pkgMatcher
+	}
+
+	return matcher, must, nil
+}
+
+func (e *State) collect(t *Target, expr exprs.Expr) ([]*Target, error) {
+	matcher, must, err := e.collectMatcher(t.Spec(), expr)
+	if err != nil {
 		return nil, err
 	}
 
-	matcher = specs.AndNodeFactory(pkgMatcher, matcher)
+	targets, err := e.Targets().Filter(matcher)
+	if err != nil {
+		return nil, err
+	}
 
-	targets := ads.Filter(e.Targets().Slice(), func(target *Target) bool {
-		return matcher.Match(target)
-	})
-
-	if must && len(targets) == 0 {
+	if must && targets.Len() == 0 {
 		return nil, fmt.Errorf("must match a target, found none")
 	}
 
-	return targets, nil
+	return targets.Slice(), nil
 }
 
 func (e *State) findParent(t *Target, expr exprs.Expr) (*Target, error) {

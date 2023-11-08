@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
@@ -76,6 +77,8 @@ func init() {
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&printOutput, "print-out", "o", "Prints target output paths, --print-out=<name> to filter output"))
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&catOutput, "cat-out", "", "Print target output content, --cat-out=<name> to filter output"))
 	alwaysOut = runCmd.Flags().Bool("always-out", false, "Ensure output will be present in cache")
+	runCmd.Flags().BoolVarP(&all, "all", "a", false, "Force run all")
+	runCmd.Flags().MarkHidden("all")
 
 	check = fmtCmd.Flags().Bool("check", false, "Only check formatting")
 
@@ -197,7 +200,13 @@ var runCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, rrs, err := parseTargetsAndArgs(ctx, args)
+		bs, rrs, err := parseTargetsAndArgs(ctx, args, func(m specs.Matcher) error {
+			if !all && m == specs.AllMatcher {
+				return fmt.Errorf("you probably don't want to run all your targets, pass -a to force")
+			}
+
+			return nil
+		})
 		if err != nil {
 			return err
 		}
@@ -230,7 +239,7 @@ var cleanCmd = &cobra.Command{
 	Short:             "Clean",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, rrs, err := parseTargetsAndArgs(cmd.Context(), args)
+		bs, rrs, err := parseTargetsAndArgs(cmd.Context(), args, nil)
 		if err != nil {
 			return err
 		}
@@ -254,7 +263,7 @@ var gcCmd = &cobra.Command{
 	Short:             "GC",
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -280,10 +289,7 @@ var validateCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}

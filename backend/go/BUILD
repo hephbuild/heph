@@ -104,6 +104,20 @@ def go_install(name, pkg, version, bin_name):
 def go_mod_gen_addr(pkg):
     return heph.canonicalize(pkg + ":_go_mod_gen")
 
+def _find_go_work():
+    parts = heph.path.split(heph.pkg.dir())
+
+    prefix = "."
+    for i in range(0, len(parts)+1):
+        p = prefix+"/go.work"
+
+        if len(glob(p)) > 0:
+            return p
+
+        prefix += "/.."
+
+    fail("unable to locate work file from "+heph.pkg.dir())
+
 def go_mod(
     mod_pkgs = [],
     cfg = {},
@@ -149,6 +163,11 @@ def go_mod(
 
     godeps_deps = glob("**/*.{mod,sum}") + [src] + mod_pkg_srcs + mod_pkg_modsums
 
+    if work:
+        p = _find_go_work()
+        godeps_deps += [p]
+        godeps_deps += glob(p+".sum")
+
     imports = target(
         name = "_go_mod_gen_imports",
         run = "godeps imports > $OUT",
@@ -159,12 +178,45 @@ def go_mod(
         env = goenv,
     )
 
-    mod_gen_kwargs = {}
-    if work:
-        mod_gen_kwargs = {
-            "sandbox": False,
-            "out_in_sandbox": True,
-        }
+    mod_pkgs_gen = [
+        ":_std_pkgs_*",
+        "go_lib",
+        "go_build_bin",
+        "test",
+        "thirdparty",
+        "go-test",
+        "//thirdparty/go/**:_go_mod_download*"
+    ]
+
+    for pkg in mod_pkgs+['//thirdparty/go']:
+        mod_pkgs_gen += [
+            pkg+"/**:_go_lib*",
+        ]
+
+    # Add labels defined in cfg
+    for pkg in cfg.values():
+        if "test" in pkg:
+            if "run" in pkg["test"]:
+                if "labels" in pkg["test"]["run"]:
+                    labels = pkg["test"]["run"]["labels"]
+                    if type(labels) != "list":
+                        labels = [labels]
+                    mod_pkgs_gen += labels
+
+    mod_pkgs_gen += [
+        heph.pkg.addr()+"/**:_go_lib*",
+        heph.pkg.addr()+"/**:go_bin#build*",
+        heph.pkg.addr()+"/**:_go_test_lib*",
+        heph.pkg.addr()+"/**:_go_xtest_lib*",
+        heph.pkg.addr()+"/**:_go_testmain_lib*",
+        heph.pkg.addr()+"/**:_go_xtestmain_lib*",
+        heph.pkg.addr()+"/**:_go_gen_testmain*",
+        heph.pkg.addr()+"/**:_go_gen_xtestmain*",
+        heph.pkg.addr()+"/**:_go_test#build*",
+        heph.pkg.addr()+"/**:_go_xtest#build*",
+        heph.pkg.addr()+"/**:go_test*",
+        heph.pkg.addr()+"/**:go_xtest*",
+    ]
 
     target(
         name = "_go_mod_gen",
@@ -180,9 +232,8 @@ def go_mod(
             "GOOS": get_os(),
             "GOARCH": get_arch(),
         } | goenv,
-        gen = True,
+        gen = mod_pkgs_gen,
         gen_deps_meta = True,
-        **mod_gen_kwargs,
     )
 
     target(
@@ -217,9 +268,6 @@ def go_mod(
         sandbox = False,
         cache = False,
     )
-
-def go_work():
-    group(name = "_go_work", deps = "go.work")
 
 def _go_gen_importcfg():
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s") + " 100000"
@@ -261,6 +309,7 @@ def go_mod_download(name, path, version):
         tools = [go],
         out = ["."],
         labels = ["thirdparty"],
+        env = {"GOWORK": "off"},
     )
 
 def go_library(
@@ -279,6 +328,8 @@ def go_library(
     src_dep = None,
     gen_embed = False,
 ):
+    pvt_name = name if name[0] == "_" else "_"+name
+
     p = dir + "/" if dir else ""
 
     if not import_path:
@@ -297,7 +348,7 @@ def go_library(
 
     if len(s_files) > 0:
         abi = target(
-            name = "_" + name + "#abi",
+            name = pvt_name + "#abi",
             deps = src_dep if src_dep else s_files,
             run = [
                 "eval $(go env)",
@@ -316,7 +367,7 @@ def go_library(
             },
         )
         lib = go_library(
-            name = "_" + name + "#lib",
+            name = pvt_name + "#lib",
             import_path = import_path,
             src_dep = src_dep,
             complete = False,
@@ -333,7 +384,7 @@ def go_library(
         asm = []
         for s_file in s_files:
             t = target(
-                name = "_" + name + "#asm_" + heph.path.base(s_file),
+                name = pvt_name + "#asm_" + heph.path.base(s_file),
                 deps = {
                     "lib": lib + "|a",
                     "hdr": lib + "|h",
@@ -407,7 +458,7 @@ def go_library(
         embed_deps["libs"] = [] # remove libs from deps
 
         embed_cfg = target(
-            name = "_" + name + "#embedcfg",
+            name = pvt_name + "#embedcfg",
             run = "godeps embed $SRC_SRC > $OUT",
             deps = embed_deps,
             out = p + pkg_name + ".embedcfg",

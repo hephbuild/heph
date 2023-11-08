@@ -129,6 +129,8 @@ func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 		}
 	}
 
+	pattern = filepath.Clean(pattern)
+
 	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err

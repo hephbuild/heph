@@ -22,7 +22,7 @@ type TargetArgs struct {
 	SupportFiles        xstarlark.Listable[string]
 	SandboxEnabled      bool
 	OutInSandbox        bool
-	Gen                 bool
+	Gen                 xstarlark.Listable[string]
 	Codegen             string
 	Deps                ArrayMapStrArray
 	HashDeps            ArrayMapStrArray

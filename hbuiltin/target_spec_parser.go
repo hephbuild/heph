@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
 	"runtime"
@@ -47,7 +48,6 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		PassEnv:        args.PassEnv,
 		RuntimePassEnv: args.RuntimePassEnv,
 		RunInCwd:       args.RunInCwd,
-		Gen:            args.Gen,
 		RuntimeEnv:     args.RuntimeEnv.ArrMap,
 		SrcEnv: specs.SrcEnv{
 			Default: args.SrcEnv.Default,
@@ -59,6 +59,19 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	}
 
 	var err error
+
+	t.Gen, err = ads.MapE(sets.NewIdentitySetFrom(args.Gen).Slice(), func(s string) (specs.Matcher, error) {
+		return specs.ParseMatcher(s)
+	})
+	if err != nil {
+		return specs.Target{}, err
+	}
+
+	for i, m := range t.Gen {
+		if !(specs.IsAddrMatcher(m) || specs.IsLabelMatcher(m)) {
+			return specs.Target{}, fmt.Errorf("gen[%v]: must be an addr matcher or a label matcher, got %T", i, m)
+		}
+	}
 
 	t.Tools, err = toolsSpecFromArgs(t, args.Tools)
 	if err != nil {

@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+func IsDone(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
+	}
+}
+
 type entry struct {
 	softCancel context.CancelFunc
 	hardCancel context.CancelFunc

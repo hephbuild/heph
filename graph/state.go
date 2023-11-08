@@ -51,7 +51,7 @@ func (e *State) GeneratedTargets() []*Target {
 	targets := make([]*Target, 0)
 
 	for _, target := range e.targets.Slice() {
-		if !target.Gen {
+		if !target.IsGen() {
 			continue
 		}
 

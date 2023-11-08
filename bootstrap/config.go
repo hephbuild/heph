@@ -17,6 +17,7 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg.Engine.GC = true
 	cfg.Engine.CacheHints = true
 	cfg.Engine.ParallelCaching = true
+	cfg.Engine.SmartGen = true
 	cfg.CacheOrder = config.CacheOrderLatency
 	cfg.BuildFiles.Patterns = []string{"**/{BUILD,*.BUILD}"}
 	cfg.Platforms = map[string]config.Platform{

@@ -273,7 +273,7 @@ func (e *runContext) buildProgram(path string, universe starlark.StringDict) (*s
 
 	cachePath := filepath.Join(e.CacheDirPath, hash.HashString(path))
 
-	log.Debugf("BUILD: %v: cache path: %v", path, cachePath)
+	log.Tracef("BUILD: %v: cache path: %v", path, cachePath)
 
 	cfr, err := os.Open(cachePath)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -287,13 +287,13 @@ func (e *runContext) buildProgram(path string, universe starlark.StringDict) (*s
 		err := msgpack.NewDecoder(cfb).Decode(&c)
 		_ = cfr.Close()
 		if err == nil && c.Hash == sum {
-			log.Debugf("BUILD: %v: compiled: %v", path, err)
+			log.Tracef("BUILD: %v: compiled: %v", path, err)
 
 			return c.Data.prog, nil
 		}
-		log.Debugf("BUILD: %v: compiled mismatch: expected %v, got %v, err: %v", path, sum, c.Hash, err)
+		log.Tracef("BUILD: %v: compiled mismatch: expected %v, got %v, err: %v", path, sum, c.Hash, err)
 	} else {
-		log.Debugf("BUILD: %v: no cache", path)
+		log.Tracef("BUILD: %v: no cache", path)
 	}
 
 	_, prog, err := starlark.SourceProgram(path, nil, universe.Has)

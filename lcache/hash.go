@@ -325,7 +325,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	})
 
 	h.String("=")
-	h.Bool(target.Gen)
+	h.Bool(target.IsGen())
 
 	h.String("=")
 	h.String(target.SrcEnv.Default)

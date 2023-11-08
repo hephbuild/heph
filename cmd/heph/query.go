@@ -82,6 +82,8 @@ func init() {
 	queryCmd.Flags().MarkHidden("exclude")
 }
 
+var NotThirdpartyMatcher = specs.MustParseMatcher("!//thirdparty/**")
+
 var queryCmd = &cobra.Command{
 	Use:     "query",
 	Aliases: []string{"q"},
@@ -90,33 +92,13 @@ var queryCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		matcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
+		includeExcludeMatcher, err := specs.MatcherFromIncludeExclude("", include, exclude)
 		if err != nil {
 			return err
 		}
 
-		if matcher == specs.AllMatcher {
-			inputExpr := ""
-			if !bootstrap.HasStdin(args) && len(args) >= 1 {
-				inputExpr = args[0]
-			} else if filter != "" {
-				inputExpr = filter
-			}
-
-			if inputExpr != "" {
-				m, err := specs.ParseMatcher(inputExpr)
-				if err != nil {
-					return err
-				}
-
-				matcher = m
-			} else {
-				if !all {
-					return fmt.Errorf("you must specify a query, or -a")
-				}
-			}
-		} else {
-			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", matcher.String())
+		if includeExcludeMatcher != nil {
+			log.Warnf("--include and --exclude are deprecated, instead use `heph query '%v'`", includeExcludeMatcher.String())
 		}
 
 		bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
@@ -126,32 +108,52 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler:    bs.Scheduler,
-			PoolWaitName: "Query gen",
-		})
-		if err != nil {
-			return err
-		}
-
-		targets := bs.Graph.Targets()
+		matcher := specs.AllMatcher
 		if bootstrap.HasStdin(args) {
 			m, _, err := bootstrap.ParseTargetAddrsAndArgs(args, true)
 			if err != nil {
 				return err
 			}
 
-			targets, err = bs.Graph.Targets().Filter(m)
-			if err != nil {
-				return err
-			}
+			matcher = specs.AndNodeFactory(matcher, m)
 		} else {
+			if len(args) >= 1 {
+				m, err := specs.ParseMatcher(args[0])
+				if err != nil {
+					return err
+				}
+
+				matcher = specs.AndNodeFactory(matcher, m)
+			} else {
+				if !all && includeExcludeMatcher == nil {
+					return fmt.Errorf("you must specify a query, or -a")
+				}
+			}
+
 			if !all {
-				targets = bs.Graph.Targets().Public()
+				matcher = specs.AndNodeFactory(specs.PublicMatcher, NotThirdpartyMatcher, matcher)
 			}
 		}
 
-		selected, err := targets.Filter(matcher)
+		if filter != "" {
+			m, err := specs.ParseMatcher(filter)
+			if err != nil {
+				return err
+			}
+
+			matcher = specs.AndNodeFactory(matcher, m)
+		}
+
+		if includeExcludeMatcher != nil {
+			matcher = specs.AndNodeFactory(matcher, includeExcludeMatcher)
+		}
+
+		_, err = generateRRs(ctx, bs.Scheduler, matcher, nil)
+		if err != nil {
+			return err
+		}
+
+		selected, err := bs.Graph.Targets().Filter(matcher)
 		if err != nil {
 			return err
 		}
@@ -202,7 +204,7 @@ var searchCmd = &cobra.Command{
 			return err
 		}
 
-		targets, _, err := preRunAutocompleteWithBootstrap(ctx, bs, all)
+		targets, _, err := autocompleteInitWithBootstrap(ctx, bs, all)
 		if err != nil {
 			return err
 		}
@@ -264,7 +266,7 @@ var codegenCmd = &cobra.Command{
 	Short: "Prints codegen paths",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}
@@ -293,25 +295,17 @@ var graphCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := schedulerInit(ctx, nil)
+		bs, t, err := parseTargetFromArgs(ctx, args)
 		if err != nil {
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
 
-		rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, false, true)
-		if err != nil {
-			return err
-		}
-
-		id := rrs[0].Target.Addr
+		id := t.Addr
 
 		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(id)
 		if err != nil {
@@ -334,7 +328,7 @@ var graphCmd = &cobra.Command{
 
 var graphDotCmd = &cobra.Command{
 	Use:               "graphdot [ancestors|descendants <target>]",
-	Short:             "Outputs graph do",
+	Short:             "Outputs graph dot",
 	Args:              cobra.ArbitraryArgs,
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -345,10 +339,7 @@ var graphDotCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			Scheduler: bs.Scheduler,
-			LinkAll:   true,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
@@ -389,7 +380,7 @@ var changesCmd = &cobra.Command{
 	Args:              cobra.ExactArgs(1),
 	ValidArgsFunction: ValidArgsFunctionTargets,
 	RunE: func(c *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(c.Context())
+		bs, err := schedulerWithGenInit(c.Context())
 		if err != nil {
 			return err
 		}
@@ -472,7 +463,7 @@ var pkgsCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		bs, err := preRunWithGen(ctx)
+		bs, err := schedulerWithGenInit(ctx)
 		if err != nil {
 			return err
 		}
@@ -579,10 +570,7 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		err = preRunWithGenWithOpts(ctx, PreRunOpts{
-			LinkAll:   true,
-			Scheduler: bs.Scheduler,
-		})
+		err = linkAll(ctx, bs.Scheduler)
 		if err != nil {
 			return err
 		}
@@ -591,7 +579,7 @@ var revdepsCmd = &cobra.Command{
 		var fn func(target specs.Specer) ([]*graph.Target, error)
 
 		tp, err := specs.ParseTargetAddr("", args[0])
-		if err != nil {
+		if err != nil { // It's probably a file
 			tperr := err
 
 			p, err := filepath.Abs(args[0])
@@ -793,7 +781,7 @@ var labelsCmd = &cobra.Command{
 	Short: "Prints labels",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, err := preRunWithGen(cmd.Context())
+		bs, err := schedulerWithGenInit(cmd.Context())
 		if err != nil {
 			return err
 		}

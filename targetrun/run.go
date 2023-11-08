@@ -237,15 +237,18 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 
 			err := fmt.Errorf("exec: %w", err)
 
-			if logFilePath != "" {
+			if iocfg.Stdin == os.Stdin {
 				return nil, TargetFailed{
-					Target:  target,
-					LogFile: logFilePath,
-					Err:     err,
+					Target: target,
+					Err:    err,
 				}
 			}
 
-			return nil, err
+			return nil, TargetFailed{
+				Target:  target,
+				LogFile: logFilePath,
+				Err:     err,
+			}
 		}
 	}
 

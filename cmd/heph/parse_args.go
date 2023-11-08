@@ -23,7 +23,10 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.Schedule
 		return bs, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, false, true)
+	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, parseTargetsAndArgsOptions{
+		useStdin:     false,
+		onlyExplicit: true,
+	})
 	if err != nil {
 		return bs, nil, err
 	}
@@ -41,7 +44,7 @@ func parseTargetFromArgs(ctx context.Context, args []string) (bootstrap.Schedule
 	return bs, rrs[0].Target, nil
 }
 
-func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.SchedulerBootstrap, targetrun.Requests, error) {
+func parseTargetsAndArgs(ctx context.Context, args []string, matcherFilter func(m specs.Matcher) error) (bootstrap.SchedulerBootstrap, targetrun.Requests, error) {
 	bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
 		return bootstrap.BlockReadStdin(args)
 	})
@@ -49,7 +52,11 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.Schedule
 		return bootstrap.SchedulerBootstrap{}, nil, err
 	}
 
-	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, true, false)
+	rrs, err := parseTargetsAndArgsWithScheduler(ctx, bs.Scheduler, args, parseTargetsAndArgsOptions{
+		useStdin:      true,
+		onlyExplicit:  false,
+		matcherFilter: matcherFilter,
+	})
 	if err != nil {
 		return bootstrap.SchedulerBootstrap{}, nil, err
 	}
@@ -57,13 +64,26 @@ func parseTargetsAndArgs(ctx context.Context, args []string) (bootstrap.Schedule
 	return bs, rrs, err
 }
 
-func parseTargetsAndArgsWithScheduler(ctx context.Context, e *scheduler.Scheduler, args []string, stdin, explicit bool) (targetrun.Requests, error) {
-	m, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, stdin)
+type parseTargetsAndArgsOptions struct {
+	useStdin      bool
+	onlyExplicit  bool
+	matcherFilter func(m specs.Matcher) error
+}
+
+func parseTargetsAndArgsWithScheduler(ctx context.Context, e *scheduler.Scheduler, args []string, opts parseTargetsAndArgsOptions) (targetrun.Requests, error) {
+	m, targs, err := bootstrap.ParseTargetAddrsAndArgs(args, opts.useStdin)
 	if err != nil {
 		return nil, err
 	}
 
-	if explicit {
+	if opts.matcherFilter != nil {
+		err := opts.matcherFilter(m)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.onlyExplicit {
 		if !specs.IsMatcherExplicit(m) {
 			return nil, fmt.Errorf("only explicit selector allowed (only exact target)")
 		}

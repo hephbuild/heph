@@ -11,14 +11,52 @@ import (
 type TargetAddr struct {
 	Package string
 	Name    string
+
+	not bool
+}
+
+func (p TargetAddr) Simplify() Matcher {
+	return p
 }
 
 func (p TargetAddr) Match(t Specer) bool {
-	return t.Spec().Addr == p.Full()
+	return (t.Spec().Addr == p.Full()) == !p.not
 }
 
 func (p TargetAddr) String() string {
+	if p.not {
+		return "!" + p.Full()
+	}
 	return p.Full()
+}
+
+func (n TargetAddr) Not() Matcher {
+	nr := *(&n)
+	nr.not = !nr.not
+	return nr
+}
+
+func (p TargetAddr) Intersects(other Matcher) IntersectResult {
+	switch ta := other.(type) {
+	case TargetAddr:
+		if ta.not && p.not {
+			return IntersectTrue
+		}
+
+		r := intersectResultBool(p.Full() == ta.Full())
+
+		if ta.not || p.not {
+			r = r.Not()
+		}
+
+		return r
+	case addrRegexNode:
+		if ta.not && p.not {
+			return IntersectTrue
+		}
+	}
+
+	return IntersectUnknown
 }
 
 func (p TargetAddr) Full() string {
@@ -27,12 +65,20 @@ func (p TargetAddr) Full() string {
 
 type TargetAddrs []TargetAddr
 
+func (p TargetAddrs) Simplify() Matcher {
+	return OrNodeFactory[TargetAddr](p...).Simplify()
+}
+
 func (p TargetAddrs) Match(t Specer) bool {
-	return mOrNode[TargetAddr]{nodes: p}.Match(t)
+	return OrNodeFactory[TargetAddr](p...).Match(t)
 }
 
 func (p TargetAddrs) String() string {
-	return mOrNode[TargetAddr]{nodes: p}.String()
+	return OrNodeFactory[TargetAddr](p...).String()
+}
+
+func (p TargetAddrs) Intersects(m Matcher) IntersectResult {
+	return OrNodeFactory[TargetAddr](p...).Intersects(m)
 }
 
 func IsMatcherExplicit(m Matcher) bool {
@@ -53,7 +99,9 @@ const numbers = `0123456789`
 var alphanum = letters + numbers
 
 var packageChars = []rune(alphanum + `-._/`)
+var packageCharClass = "[a-zA-Z0-9\\-._/]"
 var targetNameChars = []rune(alphanum + `-.+_#@=,{}`)
+var targetNameCharClass = "[a-zA-Z0-9\\-.+_#@=,{}]"
 var outputNameChars = []rune(alphanum + `-_`)
 
 func containsOnly(s string, chars []rune) bool {
@@ -133,6 +181,56 @@ func charsRegex(rs []rune) string {
 	return strings.ReplaceAll(string(rs), "-", "\\-")
 }
 
+func targetRegexesFactory(tp TargetAddr, packageCharClass, targetNameCharClass string) (*regexp.Regexp, *regexp.Regexp, error) {
+	var pkg *regexp.Regexp
+	if strings.Contains(tp.Package, "*") {
+		if strings.Contains(tp.Package, "***") {
+			return nil, nil, fmt.Errorf("unexpected *** in target path")
+		}
+
+		charClassSlash := "(?:/|/" + packageCharClass + "+/)"
+		charClass := packageCharClass + "*"
+		charClassNoSlash := strings.ReplaceAll(charClass, "/", "")
+
+		expr := strings.ReplaceAll(tp.Package, "*", star)
+		expr = regexp.QuoteMeta(expr)
+		expr = strings.ReplaceAll(expr, "/"+star+star+"/", charClassSlash)
+		expr = strings.ReplaceAll(expr, "/"+star+star, charClass)
+		expr = strings.ReplaceAll(expr, star+star+"/", charClass)
+		expr = strings.ReplaceAll(expr, star+star, charClass)
+		expr = strings.ReplaceAll(expr, star, charClassNoSlash)
+
+		r, err := regexp.Compile("^" + expr + "$")
+		if err != nil {
+			return nil, nil, err
+		}
+		pkg = r
+	} else {
+		pkg = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Package) + "$")
+	}
+
+	var name *regexp.Regexp
+	if strings.Contains(tp.Name, "*") {
+		if strings.Contains(tp.Name, "**") {
+			return nil, nil, fmt.Errorf("unexpected ** in target name")
+		}
+
+		expr := strings.ReplaceAll(tp.Name, "*", star)
+		expr = regexp.QuoteMeta(expr)
+		expr = strings.ReplaceAll(expr, star, targetNameCharClass+"*")
+
+		r, err := regexp.Compile("^" + expr + "$")
+		if err != nil {
+			return nil, nil, err
+		}
+		name = r
+	} else {
+		name = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Name) + "$")
+	}
+
+	return pkg, name, nil
+}
+
 func ParseTargetGlob(s string) (Matcher, error) {
 	tp, err := addrParse("", s, allowName|allowPkg)
 	if err != nil {
@@ -151,49 +249,16 @@ func ParseTargetGlob(s string) (Matcher, error) {
 	}
 
 	if strings.Contains(tp.Name, "*") || strings.Contains(tp.Package, "*") {
-		var pkg *regexp.Regexp
-		if strings.Contains(tp.Package, "*") {
-			if strings.Contains(tp.Package, "***") {
-				return nil, fmt.Errorf("unexpected *** in target path")
-			}
-
-			charClass := "[" + charsRegex(packageChars) + "]*"
-
-			expr := strings.ReplaceAll(tp.Package, "*", star)
-			expr = regexp.QuoteMeta(expr)
-			expr = strings.ReplaceAll(expr, "/"+star+star, charClass)
-			expr = strings.ReplaceAll(expr, star+star, charClass)
-			expr = strings.ReplaceAll(expr, star, strings.ReplaceAll(charClass, "/", ""))
-
-			r, err := regexp.Compile("^" + expr + "$")
-			if err != nil {
-				return nil, err
-			}
-			pkg = r
-		} else {
-			pkg = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Package) + "$")
+		if tp.Name == "*" && (tp.Package == "**" || tp.Package == "**/*") {
+			return AllMatcher, nil
 		}
 
-		var name *regexp.Regexp
-		if strings.Contains(tp.Name, "*") {
-			if strings.Contains(tp.Name, "**") {
-				return nil, fmt.Errorf("unexpected ** in target name")
-			}
-
-			expr := strings.ReplaceAll(tp.Name, "*", star)
-			expr = regexp.QuoteMeta(expr)
-			expr = strings.ReplaceAll(expr, star, "["+charsRegex(targetNameChars)+"]*")
-
-			r, err := regexp.Compile("^" + expr + "$")
-			if err != nil {
-				return nil, err
-			}
-			name = r
-		} else {
-			name = regexp.MustCompile("^" + regexp.QuoteMeta(tp.Name) + "$")
+		pkg, name, err := targetRegexesFactory(tp, packageCharClass, targetNameCharClass)
+		if err != nil {
+			return nil, err
 		}
 
-		return targetRegexNode{
+		return addrRegexNode{
 			pkg:   pkg,
 			pkgs:  tp.Package,
 			name:  name,

@@ -7,17 +7,11 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/utils/tuistatus"
 	"os"
 	"strings"
 	"time"
 )
-
-type PreRunOpts struct {
-	Scheduler    *scheduler.Scheduler
-	PoolWaitName string
-	LinkAll      bool
-}
 
 func bootstrapOptions() (bootstrap.BootOpts, error) {
 	paramsm := make(map[string]string, len(*params))
@@ -120,47 +114,38 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 	return bs, nil
 }
 
-func preRunWithGen(ctx context.Context) (bootstrap.SchedulerBootstrap, error) {
+func schedulerWithGenInit(ctx context.Context) (bootstrap.SchedulerBootstrap, error) {
 	bs, err := schedulerInit(ctx, nil)
 	if err != nil {
 		return bs, err
 	}
 
-	err = preRunWithGenWithOpts(ctx, PreRunOpts{
-		Scheduler: bs.Scheduler,
-	})
-	if err != nil {
-		return bs, err
+	if !*noGen {
+		err := bootstrap.RunAllGen(ctx, bs.Scheduler, *plain)
+		if err != nil {
+			return bs, err
+		}
 	}
 
 	return bs, err
 }
 
-func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
-	e := opts.Scheduler
+func linkAll(ctx context.Context, e *scheduler.Scheduler) error {
+	if !*noGen {
+		err := bootstrap.RunAllGen(ctx, e, *plain)
+		if err != nil {
+			return err
+		}
+	}
 
-	if *noGen {
-		log.Info("Generated targets disabled")
-		if opts.LinkAll {
-			err := e.Graph.LinkTargets(ctx, true, nil)
-			if err != nil {
-				return fmt.Errorf("linking %w", err)
-			}
+	err := tuistatus.DoE(ctx, func(ctx context.Context) error {
+		err := e.Graph.LinkTargets(ctx, *noGen, nil, true)
+		if err != nil {
+			return fmt.Errorf("linking: %w", err)
 		}
 
 		return nil
-	}
-
-	deps, err := e.ScheduleGenPass(ctx, opts.LinkAll)
-	if err != nil {
-		return err
-	}
-
-	if opts.PoolWaitName == "" {
-		opts.PoolWaitName = "PreRun gen"
-	}
-
-	err = poolwait.Wait(ctx, opts.PoolWaitName, e.Pool, deps, *plain)
+	})
 	if err != nil {
 		return err
 	}
@@ -168,17 +153,17 @@ func preRunWithGenWithOpts(ctx context.Context, opts PreRunOpts) error {
 	return nil
 }
 
-func preRunAutocomplete(ctx context.Context, includePrivate bool) (specs.Targets, []string, error) {
+func autocompleteInit(ctx context.Context, includePrivate bool) (specs.Targets, []string, error) {
 	bs, err := schedulerInit(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return preRunAutocompleteWithBootstrap(ctx, bs, includePrivate)
+	return autocompleteInitWithBootstrap(ctx, bs, includePrivate)
 }
 
-func preRunAutocompleteWithBootstrap(ctx context.Context, bs bootstrap.SchedulerBootstrap, includePrivate bool) (specs.Targets, []string, error) {
-	err := preRunWithGenWithOpts(ctx, PreRunOpts{Scheduler: bs.Scheduler})
+func autocompleteInitWithBootstrap(ctx context.Context, bs bootstrap.SchedulerBootstrap, includePrivate bool) (specs.Targets, []string, error) {
+	err := bootstrap.RunAllGen(ctx, bs.Scheduler, *plain)
 	if err != nil {
 		return nil, nil, err
 	}

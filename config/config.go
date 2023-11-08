@@ -35,6 +35,7 @@ type Config struct {
 		InstallTools    bool `yaml:"install_tools"`
 		KeepSandbox     bool `yaml:"keep_sandbox"`
 		ParallelCaching bool `yaml:"parallel_caching"`
+		SmartGen        bool `yaml:"smart_gen"`
 	} `yaml:"engine"`
 	Platforms  map[string]Platform `yaml:"platforms"`
 	BuildFiles struct {
