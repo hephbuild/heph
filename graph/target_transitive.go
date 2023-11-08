@@ -5,8 +5,8 @@ import (
 )
 
 type TargetTransitive struct {
-	Tools          TargetTools
-	Deps           TargetNamedDeps
+	Tools          TargetTools     `json:"-"`
+	Deps           TargetNamedDeps `json:"-"`
 	Env            map[string]string
 	RuntimeEnv     map[string]TargetRuntimeEnv
 	PassEnv        []string

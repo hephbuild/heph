@@ -14,10 +14,10 @@ type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
 type Target struct {
 	specs.Target
 
-	GenSource         *Target // TODO: support multiple sources
-	Tools             TargetTools
-	Deps              TargetNamedDeps
-	HashDeps          TargetDeps
+	GenSource         *Target         `json:"-"` // TODO: support multiple sources
+	Tools             TargetTools     `json:"-"`
+	Deps              TargetNamedDeps `json:"-"`
+	HashDeps          TargetDeps      `json:"-"`
 	OutWithSupport    *OutNamedPaths
 	Out               *OutNamedPaths
 	RestoreCachePaths xfs.RelPaths
@@ -34,7 +34,7 @@ type Target struct {
 	// Own transitive config plus their own transitive
 	DeepOwnTransitive TargetTransitive
 
-	Artifacts *ArtifactRegistry
+	Artifacts *ArtifactRegistry `json:"-"`
 
 	processed  bool
 	linked     bool
@@ -43,7 +43,7 @@ type Target struct {
 	linkingCh  chan struct{}
 	linkingErr error
 	// Deps + HashDeps + TargetTools
-	AllTargetDeps *Targets
+	AllTargetDeps *Targets `json:"-"`
 	m             sync.Mutex
 }
 
@@ -108,7 +108,7 @@ func (t *Target) GraphTarget() *Target {
 
 type TargetRuntimeEnv struct {
 	Value  string
-	Target *Target
+	Target *Target `json:"-"`
 }
 
 func (v TargetRuntimeEnv) MarshalJSON() ([]byte, error) {
