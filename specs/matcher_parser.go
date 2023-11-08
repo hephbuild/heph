@@ -110,7 +110,7 @@ func parseFactor(tokens []token, index *int) Matcher {
 	case tokenNot:
 		*index++
 		expr := parseFactor(tokens, index)
-		return notNode{expr: expr}
+		return NotNodeFactory(expr)
 	case tokenLParen:
 		*index++
 		expr := parseExpr(tokens, index)

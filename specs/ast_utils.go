@@ -26,21 +26,24 @@ func IsAddrMatcher(m Matcher) bool {
 	return false
 }
 
-func flattenAndNodeInto(m Matcher, ms *[]Matcher) bool {
+func flattenAndNodeInto(m Matcher, ms *[]Matcher, isLast bool) bool {
 	if any(m) == NoneMatcher {
 		*ms = []Matcher{NoneMatcher}
 		return true
 	}
 
 	if any(m) == AllMatcher {
+		if isLast && len(*ms) == 0 {
+			*ms = []Matcher{AllMatcher}
+		}
 		return false
 	}
 
 	switch m := m.(type) {
 	case andNode:
 		*ms = ads.GrowExtra(*ms, len(m.nodes))
-		for _, cm := range m.nodes {
-			if flattenAndNodeInto(cm, ms) {
+		for i, cm := range m.nodes {
+			if flattenAndNodeInto(cm, ms, isLast && i == len(m.nodes)-1) {
 				return true
 			}
 		}
@@ -49,6 +52,17 @@ func flattenAndNodeInto(m Matcher, ms *[]Matcher) bool {
 	}
 
 	return false
+}
+
+func NotNodeFactory(m Matcher) Matcher {
+	switch m {
+	case AllMatcher:
+		return NoneMatcher
+	case NoneMatcher:
+		return AllMatcher
+	default:
+		return notNode{m}
+	}
 }
 
 func AndNodeFactory[T Matcher](ms ...T) Matcher {
@@ -60,8 +74,8 @@ func AndNodeFactory[T Matcher](ms ...T) Matcher {
 	default:
 		or := andNode{nodes: make([]Matcher, 0, len(ms))}
 
-		for _, m := range ms {
-			if flattenAndNodeInto(m, &or.nodes) {
+		for i, m := range ms {
+			if flattenAndNodeInto(m, &or.nodes, i == len(ms)-1) {
 				break
 			}
 		}
@@ -77,21 +91,24 @@ func AndNodeFactory[T Matcher](ms ...T) Matcher {
 	}
 }
 
-func flattenOrNodeInto(m Matcher, ms *[]Matcher) bool {
+func flattenOrNodeInto(m Matcher, ms *[]Matcher, isLast bool) bool {
 	if any(m) == AllMatcher {
 		*ms = []Matcher{AllMatcher}
 		return true
 	}
 
 	if any(m) == NoneMatcher {
+		if len(*ms) == 0 {
+			*ms = []Matcher{NoneMatcher}
+		}
 		return false
 	}
 
 	switch m := m.(type) {
 	case orNode:
 		*ms = ads.GrowExtra(*ms, len(m.nodes))
-		for _, cm := range m.nodes {
-			if flattenAndNodeInto(cm, ms) {
+		for i, cm := range m.nodes {
+			if flattenOrNodeInto(cm, ms, isLast && i == len(m.nodes)-1) {
 				return true
 			}
 		}
@@ -111,8 +128,8 @@ func OrNodeFactory[T Matcher](ms ...T) Matcher {
 	default:
 		or := orNode{nodes: make([]Matcher, 0, len(ms))}
 
-		for _, m := range ms {
-			if flattenOrNodeInto(m, &or.nodes) {
+		for i, m := range ms {
+			if flattenOrNodeInto(m, &or.nodes, i == len(ms)-1) {
 				break
 			}
 		}
