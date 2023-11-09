@@ -234,7 +234,7 @@ func (m model) details() string {
 
 	sb.WriteString(styleTitle.Render(t.Addr))
 	sb.WriteString("\n")
-	if len(t.Source) > 0 {
+	if len(t.Sources) > 0 {
 		sb.WriteString(styleLocation.Render(t.SourceFile()))
 		sb.WriteString("\n")
 	}

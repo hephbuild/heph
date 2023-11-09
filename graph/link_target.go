@@ -38,8 +38,10 @@ func (e *State) Register(spec specs.Target) error {
 
 	if t := e.targets.FindT(spec); t != nil {
 		if !t.Spec().Equal(spec) {
-			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Source, t.Json(), spec.Json())
+			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Sources[0].SourceFile(), t.Json(), spec.Json())
 		}
+
+		t.Sources = append(t.Sources, spec.Sources...)
 
 		return nil
 	}

@@ -29,7 +29,7 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 	}
 
 	fmt.Fprintln(w, "Source:")
-	for _, s := range target.Source {
+	for _, s := range target.Sources[0].CallFrames {
 		fmt.Fprintln(w, indent, s.String())
 	}
 

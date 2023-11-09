@@ -120,7 +120,7 @@ type Target struct {
 	RuntimePassEnv      []string
 	RunInCwd            bool
 	Gen                 []Matcher
-	Source              []Source // TODO: support multiple sources
+	Sources             []Source
 	RuntimeEnv          map[string]string
 	SrcEnv              SrcEnv
 	OutEnv              string
@@ -146,12 +146,38 @@ func AsSpecers[T Specer](a []T) []Specer {
 }
 
 type Source struct {
-	Name string
-	Pos  syntax.Position
+	CallFrames []SourceCallFrame
 }
 
-func (s Source) String() string {
+func (s Source) SourceFile() string {
+	if len(s.CallFrames) < 1 {
+		return ""
+	}
+
+	return s.CallFrames[0].Pos.String()
+}
+
+type SourceCallFrame struct {
+	Name string
+	Pos  SourceCallFramePosition
+}
+
+func (s SourceCallFrame) String() string {
 	return s.Name + " " + s.Pos.String()
+}
+
+type SourceCallFramePosition struct {
+	syntax.Position
+}
+
+func (u *SourceCallFramePosition) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		File string
+		Line int32
+	}{
+		File: u.Filename(),
+		Line: u.Line,
+	})
 }
 
 type Platform struct {
@@ -207,7 +233,7 @@ func (t Target) HasDefaultPlatforms() bool {
 
 func (t Target) Json() []byte {
 	t.Package = nil
-	t.Source = nil
+	t.Sources = nil
 
 	b, err := json.Marshal(t)
 	if err != nil {
@@ -239,11 +265,11 @@ func (t Target) equalJson(spec Target) bool {
 }
 
 func (t Target) SourceFile() string {
-	if len(t.Source) == 0 {
+	if len(t.Sources) < 1 {
 		return ""
 	}
 
-	return t.Source[0].Pos.String()
+	return t.Sources[0].SourceFile()
 }
 
 type TargetTool struct {

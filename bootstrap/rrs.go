@@ -134,6 +134,42 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 	return nil
 }
 
+func kindMatcher(gent *graph.Target) specs.KindMatcher {
+	gm := specs.KindMatcher{}
+	for _, m := range gent.Gen {
+		gm.Add(m)
+	}
+	return gm
+}
+
+func Query(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, plain bool) ([]specs.Target, error) {
+	mSimpl := m.Simplify()
+
+	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
+		return func(gent *graph.Target) bool {
+			gm := kindMatcher(gent)
+
+			r := specs.Intersects(gm, mSimpl)
+
+			return r.Bool()
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	targets, err := e.Graph.Targets().Filter(m)
+	if err != nil {
+		return nil, err
+	}
+
+	targetSpecs := ads.Map(targets.Slice(), func(t *graph.Target) specs.Target {
+		return t.Target
+	})
+
+	return targetSpecs, nil
+}
+
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain bool) (targetrun.Requests, error) {
 	if !e.Config.Engine.SmartGen {
 		if specs.IsMatcherExplicit(m) {
@@ -185,10 +221,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 		}
 
 		return func(gent *graph.Target) bool {
-			gm := specs.KindMatcher{}
-			for _, m := range gent.Gen {
-				gm.Add(m)
-			}
+			gm := kindMatcher(gent)
 
 			r := specs.Intersects(gm, requiredMatchersSimpl)
 

@@ -113,7 +113,7 @@ func TestTargetSpec(t *testing.T) {
 			err = bfs.RunBuildFile(pkg, f.Name(), opts)
 			require.NoError(t, err)
 
-			spec.Source = nil
+			spec.Sources = nil
 
 			actualb, err := json.MarshalIndent(spec, "", "    ")
 			require.NoError(t, err)

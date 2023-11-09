@@ -22,7 +22,7 @@ type State struct {
 	Patterns []string
 	Ignore   []string
 	Packages *packages.Registry
-	files    []*packages.SourceFile
+	files    []string
 
 	cacheRunBuildFileCache maps.Map[string, starlark.StringDict]
 	cacheRunBuildFileLocks maps.Map[string, *sync.Mutex]
@@ -37,11 +37,11 @@ func NewState(s State) *State {
 	return &s
 }
 
-func (s *State) CollectFiles(ctx context.Context, root string) (packages.SourceFiles, error) {
+func (s *State) CollectFiles(ctx context.Context, root string) ([]string, error) {
 	done := log.TraceTimingDone("RunBuildFiles:walk")
 	defer done()
 
-	files := make(packages.SourceFiles, 0)
+	files := make([]string, 0)
 
 	err := xfs.StarWalk(ctx, root, s.Patterns[0], s.Ignore, func(path string, d fs.DirEntry, err error) error {
 		if err := ctx.Err(); err != nil {
@@ -52,9 +52,7 @@ func (s *State) CollectFiles(ctx context.Context, root string) (packages.SourceF
 			return nil
 		}
 
-		files = append(files, &packages.SourceFile{
-			Path: filepath.Join(root, path),
-		})
+		files = append(files, filepath.Join(root, path))
 		return nil
 	})
 	if err != nil {
@@ -64,18 +62,13 @@ func (s *State) CollectFiles(ctx context.Context, root string) (packages.SourceF
 	return files, nil
 }
 
-func (s *State) RunBuildFiles(ctx context.Context, options RunOptions) error {
+func (s *State) RunBuildFiles(ctx context.Context, files []string, options RunOptions) error {
 	rootPkg := options.RootPkg
 	rootAbs := rootPkg.Root.Abs()
 
-	files, err := s.CollectFiles(ctx, rootAbs)
-	if err != nil {
-		return err
-	}
-
 	pkgs := make([]*packages.Package, 0, len(files))
 	for _, file := range files {
-		dir := filepath.Dir(file.Path)
+		dir := filepath.Dir(file)
 
 		relRoot, err := filepath.Rel(rootAbs, dir)
 		if err != nil {

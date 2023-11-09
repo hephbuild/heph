@@ -11,7 +11,7 @@ type Package struct {
 	Path        string
 	Root        xfs.Path
 	Globals     starlark.StringDict `json:"-" msgpack:"-"`
-	SourceFiles SourceFiles
+	SourceFiles []string
 }
 
 func (p *Package) Name() string {
@@ -44,16 +44,4 @@ func (p *Package) Child(childPath string) Package {
 
 type SourceFile struct {
 	Path string
-}
-
-type SourceFiles []*SourceFile
-
-func (sf SourceFiles) Find(p string) *SourceFile {
-	for _, file := range sf {
-		if file.Path == p {
-			return file
-		}
-	}
-
-	return nil
 }

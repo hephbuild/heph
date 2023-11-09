@@ -73,7 +73,7 @@ target(
     "RuntimePassEnv": null,
     "RunInCwd": false,
     "Gen": [],
-    "Source": null,
+    "Sources": null,
     "RuntimeEnv": null,
     "SrcEnv": {
         "Default": "rel_pkg",

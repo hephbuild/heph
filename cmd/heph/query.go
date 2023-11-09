@@ -148,30 +148,30 @@ var queryCmd = &cobra.Command{
 			matcher = specs.AndNodeFactory(matcher, includeExcludeMatcher)
 		}
 
-		_, err = generateRRs(ctx, bs.Scheduler, matcher, nil)
-		if err != nil {
-			return err
-		}
-
-		selected, err := bs.Graph.Targets().Filter(matcher)
+		selected, err := query(ctx, bs.Scheduler, matcher)
 		if err != nil {
 			return err
 		}
 
 		if jsonOutput {
-			selected := selected.Slice()
-
 			for _, target := range selected {
-				err := exprs.ExecDeep(&target.Annotations, map[string]exprs.Func{
+				funcs := map[string]exprs.Func{
 					"addr": func(expr exprs.Expr) (string, error) {
 						return target.Addr, nil
 					},
 					"sandbox_root": func(expr exprs.Expr) (string, error) {
 						return bs.Scheduler.Runner.SandboxTreeRoot(target).Abs(), nil
 					},
-				})
+				}
+
+				err := exprs.ExecDeep(&target.Doc, funcs)
 				if err != nil {
-					return err
+					return fmt.Errorf("doc: %w", err)
+				}
+
+				err = exprs.ExecDeep(&target.Annotations, funcs)
+				if err != nil {
+					return fmt.Errorf("annotations: %w", err)
 				}
 			}
 
@@ -182,11 +182,11 @@ var queryCmd = &cobra.Command{
 			return nil
 		}
 
-		if selected.Len() == 0 {
+		if len(selected) == 0 {
 			return nil
 		}
 
-		fmt.Println(strings.Join(sortedTargetNames(selected.Slice(), false), "\n"))
+		fmt.Println(strings.Join(sortedTargetNames(selected, false), "\n"))
 		return nil
 	},
 }

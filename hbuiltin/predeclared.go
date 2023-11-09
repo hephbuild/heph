@@ -36,8 +36,10 @@ func predeclaredGlobalsOnce(config starlark.StringDict) {
 	})
 }
 
+const BuiltinFile = "<builtin>"
+
 func computePredeclaredGlobals(config starlark.StringDict) {
-	_, mod, err := starlark.SourceProgram("<builtin>", predeclaredSrc, predeclared(nil).Has)
+	_, mod, err := starlark.SourceProgram(BuiltinFile, predeclaredSrc, predeclared(nil).Has)
 	if err != nil {
 		panic(err)
 	}
@@ -127,14 +129,10 @@ func predeclared(globals ...starlark.StringDict) starlark.StringDict {
 	return p
 }
 
-func stackTrace(thread *starlark.Thread) []specs.Source {
-	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) specs.Source {
+func stackTrace(thread *starlark.Thread) []starlark.CallFrame {
+	return ads.Map(thread.CallStack(), func(c starlark.CallFrame) starlark.CallFrame {
 		c.Pos.Col = 0 //  We don't really care about the column...
-
-		return specs.Source{
-			Name: c.Name,
-			Pos:  c.Pos,
-		}
+		return c
 	})
 }
 
@@ -206,13 +204,18 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 		return nil, err
 	}
 
-	t.Source = ads.Map(stackTrace(thread), func(source specs.Source) specs.Source {
-		if source.Pos.Filename() == "<builtin>" {
-			source.Pos.Line = 0
-		}
+	t.Sources = []specs.Source{{
+		CallFrames: ads.Map(stackTrace(thread), func(source starlark.CallFrame) specs.SourceCallFrame {
+			if source.Pos.Filename() == BuiltinFile {
+				source.Pos.Line = 0
+			}
 
-		return source
-	})
+			return specs.SourceCallFrame{
+				Name: source.Name,
+				Pos:  specs.SourceCallFramePosition{source.Pos},
+			}
+		}),
+	}}
 
 	err = opts.RegisterTarget(t)
 	if err != nil {
@@ -299,8 +302,8 @@ func fail(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 		return nil, err
 	}
 
-	trace := ads.Map(stackTrace(thread), func(t specs.Source) string {
-		return t.String()
+	trace := ads.Map(stackTrace(thread), func(s starlark.CallFrame) string {
+		return fmt.Sprintf("%v\n  %v", s.Name, s.Pos.String())
 	})
 	traceStr := strings.Join(trace, "\n")
 

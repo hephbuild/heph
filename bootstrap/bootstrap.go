@@ -204,7 +204,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	bs.Graph = g
 
 	{
-		opts := hbuiltin.Bootstrap(hbuiltin.Opts{
+		bopts := hbuiltin.Bootstrap(hbuiltin.Opts{
 			Pkgs:   pkgs,
 			Root:   root,
 			Config: cfg,
@@ -214,7 +214,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 		})
 
 		for name, cfg := range cfg.BuildFiles.Roots {
-			opts := opts.Copy()
+			opts := bopts.Copy()
 
 			p, err := pkgs.FetchRoot(ctx, name, cfg)
 			if err != nil {
@@ -226,13 +226,23 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 				Root: p,
 			})
 
-			err = buildfilesState.RunBuildFiles(ctx, opts)
+			files, err := buildfilesState.CollectFiles(ctx, opts.RootPkg.Root.Abs())
+			if err != nil {
+				return bs, err
+			}
+
+			err = buildfilesState.RunBuildFiles(ctx, files, opts)
 			if err != nil {
 				return bs, fmt.Errorf("buildfiles: root %v: %w", name, err)
 			}
 		}
 
-		err := buildfilesState.RunBuildFiles(ctx, opts)
+		files, err := buildfilesState.CollectFiles(ctx, bopts.RootPkg.Root.Abs())
+		if err != nil {
+			return bs, err
+		}
+
+		err = buildfilesState.RunBuildFiles(ctx, files, bopts)
 		if err != nil {
 			return bs, fmt.Errorf("buildfiles: %w", err)
 		}

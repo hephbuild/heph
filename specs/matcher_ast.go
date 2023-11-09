@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/mds"
+	"github.com/hephbuild/heph/utils/xfs"
 	"regexp"
 	"strings"
 )
@@ -514,6 +515,17 @@ var matcherFunctions = map[string]func(args []astNode, t Specer) bool{
 
 		_, ok := t.Spec().Annotations[annotation]
 		return ok
+	},
+	"source_in_tree": func(args []astNode, t Specer) bool {
+		for _, source := range t.Spec().Sources {
+			if ok, _ := xfs.PathMatchAny(source.SourceFile(), "**/.heph/**"); ok {
+				continue
+			}
+
+			return true
+		}
+
+		return false
 	},
 }
 

@@ -6,11 +6,9 @@ import (
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/spf13/cobra"
@@ -336,14 +334,10 @@ var fmtCmd = &cobra.Command{
 
 		var files []string
 		if len(args) == 0 {
-			cfiles, err := buildfilesState.CollectFiles(ctx, bs.Root.Root.Abs())
+			files, err = buildfilesState.CollectFiles(ctx, bs.Root.Root.Abs())
 			if err != nil {
 				return err
 			}
-
-			files = ads.Map(cfiles, func(f *packages.SourceFile) string {
-				return f.Path
-			})
 		} else {
 			files = args
 		}

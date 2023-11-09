@@ -24,12 +24,12 @@ import (
 )
 
 type RunOptions struct {
-	ThreadModifier  func(thread *starlark.Thread, pkg *packages.Package)
-	UniverseFactory func() starlark.StringDict
-	CacheDirPath    string
-	BuildHash       func(hash.Hash)
-	Packages        *packages.Registry
-	RootPkg         *packages.Package
+	ThreadModifier   func(thread *starlark.Thread, pkg *packages.Package)
+	UniverseFactory  func() starlark.StringDict
+	CacheDirPath     string
+	ProgramExtraHash func(hash.Hash)
+	Packages         *packages.Registry
+	RootPkg          *packages.Package
 }
 
 func (o RunOptions) Copy() RunOptions {
@@ -105,7 +105,7 @@ func (e *runContext) runBuildFilesForPackage(pkg *packages.Package, bc *breadcru
 
 	pkg.Globals = starlark.StringDict{}
 	for _, file := range pkg.SourceFiles {
-		globals, err := e.RunBuildFile(pkg, file.Path, nbc)
+		globals, err := e.RunBuildFile(pkg, file, nbc)
 		if err != nil {
 			return err
 		}
@@ -267,7 +267,7 @@ func (e *runContext) buildProgram(path string, universe starlark.StringDict) (*s
 	h.I64(info.ModTime().Unix())
 	h.UI32(uint32(info.Mode().Perm()))
 	h.String(utils.Version)
-	e.BuildHash(h)
+	e.ProgramExtraHash(h)
 
 	sum := h.Sum()
 

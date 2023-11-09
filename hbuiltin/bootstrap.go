@@ -48,7 +48,7 @@ func Bootstrap(opts Opts) buildfiles.RunOptions {
 			return universe
 		},
 		CacheDirPath: opts.Root.Home.Join("__BUILD").Abs(),
-		BuildHash: func(h hash.Hash) {
+		ProgramExtraHash: func(h hash.Hash) {
 			h.String(predeclaredHash)
 		},
 		Packages: opts.Pkgs,

@@ -121,7 +121,7 @@ func genTargetSpec(name string, factor int) Target {
 		Env:        env,
 		PassEnv:    passEnv,
 		RunInCwd:   false,
-		Source:     []Source{{Name: "some_source" + time.Now().String()}},
+		Sources:    []Source{{CallFrames: []SourceCallFrame{{Name: "some_source" + time.Now().String()}}}},
 		RuntimeEnv: nil,
 		SrcEnv:     SrcEnv{},
 		OutEnv:     "",

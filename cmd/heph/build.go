@@ -3,7 +3,6 @@ package main
 import (
 	"cmp"
 	"github.com/hephbuild/heph/cmd/heph/search"
-	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/lithammer/fuzzysearch/fuzzy"
@@ -11,8 +10,8 @@ import (
 	"strings"
 )
 
-func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
-	stargets := make([]*graph.Target, 0)
+func sortedTargets(targets []specs.Target, skipPrivate bool) []specs.Target {
+	stargets := make([]specs.Target, 0)
 	for _, target := range targets {
 		if skipPrivate && target.IsPrivate() {
 			continue
@@ -21,14 +20,14 @@ func sortedTargets(targets []*graph.Target, skipPrivate bool) []*graph.Target {
 		stargets = append(stargets, target)
 	}
 
-	slices.SortFunc(stargets, func(a, b *graph.Target) int {
+	ads.SortP(stargets, func(a, b *specs.Target) int {
 		return strings.Compare(a.Addr, b.Addr)
 	})
 
 	return stargets
 }
 
-func sortedTargetNames(targets []*graph.Target, skipPrivate bool) []string {
+func sortedTargetNames(targets []specs.Target, skipPrivate bool) []string {
 	names := make([]string, 0)
 	for _, t := range sortedTargets(targets, skipPrivate) {
 		names = append(names, t.Addr)
