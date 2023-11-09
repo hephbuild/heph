@@ -80,7 +80,7 @@ func listImports() {
 			_ = f.Close()
 
 			if err := scanner.Err(); err != nil {
-				return err
+				return fmt.Errorf("%v: %w", filepath.Join(root, file), err)
 			}
 		}
 
