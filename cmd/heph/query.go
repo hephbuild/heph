@@ -154,7 +154,7 @@ var queryCmd = &cobra.Command{
 		}
 
 		if jsonOutput {
-			for _, target := range selected {
+			for i, target := range selected {
 				funcs := map[string]exprs.Func{
 					"addr": func(expr exprs.Expr) (string, error) {
 						return target.Addr, nil
@@ -173,6 +173,8 @@ var queryCmd = &cobra.Command{
 				if err != nil {
 					return fmt.Errorf("annotations: %w", err)
 				}
+
+				selected[i] = target
 			}
 
 			err := json.NewEncoder(os.Stdout).Encode(selected)

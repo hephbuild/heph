@@ -82,7 +82,7 @@ target(
     name = "with-task-annotation",
     run = "echo hello",
     cache = False,
-    annotations = {"vscode-task": {"file": "x/BUILD"}},
+    annotations = {"vscode-task": {"file": "BUILD"}},
 )
 
 target(
