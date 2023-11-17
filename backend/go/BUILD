@@ -178,8 +178,10 @@ def go_mod(
         env = goenv,
     )
 
+    (pkg, _, _) = heph.split(go)
+
     mod_pkgs_gen = [
-        ":_std_pkgs_*",
+        "//"+pkg+":_std_pkgs_*",
         "go_lib",
         "go_build_bin",
         "test",

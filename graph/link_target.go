@@ -21,15 +21,15 @@ import (
 	"strings"
 )
 
-func (e *State) Register(spec specs.Target) error {
+func (e *State) Register(spec specs.Target) (*Target, error) {
 	err := e.processTargetSpec(&spec)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	err = spec.Validate()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	l := e.targetsLock.Get(spec.Addr)
@@ -38,12 +38,19 @@ func (e *State) Register(spec specs.Target) error {
 
 	if t := e.targets.FindT(spec); t != nil {
 		if !t.Spec().Equal(spec) {
-			return fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Sources[0].SourceFile(), t.Json(), spec.Json())
+			return nil, fmt.Errorf("%v is already declared and does not equal the one defined in %v\n%s\n\n%s", spec.Addr, t.Sources[0].SourceLocation(), t.Json(), spec.Json())
 		}
 
+		// Add GenSource to existing specs
+		t.Target.GenSources = append(t.Target.GenSources, spec.GenSources...)
+		// And to the graph.Target
+		for _, s := range spec.GenSources {
+			t.GenSources = append(t.GenSources, e.targets.Find(s))
+		}
+		// Add file source
 		t.Sources = append(t.Sources, spec.Sources...)
 
-		return nil
+		return t, nil
 	}
 
 	t := &Target{
@@ -52,12 +59,12 @@ func (e *State) Register(spec specs.Target) error {
 
 	err = e.processTarget(t)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	e.targets.Add(t)
 
-	return nil
+	return t, nil
 }
 
 func (e *State) processTargetSpec(t *specs.Target) error {

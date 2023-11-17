@@ -201,6 +201,8 @@ func TestHasIntersection(t *testing.T) {
 		{"//some/deep/**:*", "!//some/**:*", false},
 		{"!//some/deep/**:*", "//some/**:*", true},
 		{"//some/package:*", "(//**:target || //**:hello)", true},
+
+		{"//some/package:*", "//some/package/*/some:test", false},
 	}
 	for _, test := range tests {
 		t.Run(test.expr1+" "+test.expr2, func(t *testing.T) {
@@ -213,7 +215,7 @@ func TestHasIntersection(t *testing.T) {
 			expr2s := expr2.Simplify()
 
 			actual1 := Intersects(expr1s, expr2s)
-			assert.Equal(t, test.expected, actual1.Bool())
+			assert.Equalf(t, test.expected, actual1.Bool(), "got %v", actual1)
 
 			actual2 := Intersects(expr2s, expr1s)
 			assert.Equalf(t, actual1, actual2, "(a, b) and (b, a) outcome need to be consistent")

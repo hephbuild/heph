@@ -15,6 +15,10 @@ type TargetAddr struct {
 	not bool
 }
 
+func (p TargetAddr) Replace(f Replacer) Matcher {
+	return f(p)
+}
+
 func (p TargetAddr) Simplify() Matcher {
 	return p
 }
@@ -64,6 +68,10 @@ func (p TargetAddr) Full() string {
 }
 
 type TargetAddrs []TargetAddr
+
+func (p TargetAddrs) Replace(f Replacer) Matcher {
+	return OrNodeFactory[TargetAddr](p...).Replace(f)
+}
 
 func (p TargetAddrs) Simplify() Matcher {
 	return OrNodeFactory[TargetAddr](p...).Simplify()

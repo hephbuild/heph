@@ -108,6 +108,7 @@ func (s *State) RunBuildFile(pkg *packages.Package, path string, options RunOpti
 
 func (s *State) runContext(options RunOptions) runContext {
 	return runContext{
+		State:        s,
 		RunOptions:   options,
 		cacheGlobals: &s.cacheRunBuildFileCache,
 		cacheLocks:   &s.cacheRunBuildFileLocks,

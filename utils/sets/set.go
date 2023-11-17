@@ -1,6 +1,9 @@
 package sets
 
-import "sync"
+import (
+	"github.com/hephbuild/heph/utils/ads"
+	"sync"
+)
 
 type Set[K comparable, T any] struct {
 	mu sync.RWMutex
@@ -119,4 +122,17 @@ func (ts *Set[K, T]) Copy() *Set[K, T] {
 	t.AddAll(ts.Slice())
 
 	return t
+}
+
+func (ts *Set[K, T]) Pop(i int) T {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	v := ts.a[i]
+
+	ts.a = ads.Filter(ts.a, func(t T) bool {
+		return ts.f(t) != ts.f(v)
+	})
+
+	return v
 }

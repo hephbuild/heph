@@ -93,9 +93,9 @@ func parseTargetsAndArgsWithScheduler(ctx context.Context, e *scheduler.Schedule
 }
 
 func generateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string) (targetrun.Requests, error) {
-	return bootstrap.GenerateRRs(ctx, e, m, targs, getRROpts(), *plain)
+	return bootstrap.GenerateRRs(ctx, e, m, targs, getRROpts(), *plain, !*noGen)
 }
 
 func query(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher) ([]specs.Target, error) {
-	return bootstrap.Query(ctx, e, m, *plain)
+	return bootstrap.Query(ctx, e, m, *plain, !*noGen)
 }

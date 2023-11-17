@@ -7,6 +7,12 @@ target(
 )
 
 target(
+    name = "_private",
+    run = "echo ran",
+    cache = False,
+)
+
+target(
     name = "long-running",
     run = """
 for j in {1..100}; do

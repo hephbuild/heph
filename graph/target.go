@@ -5,6 +5,7 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"sync"
 )
@@ -14,7 +15,7 @@ type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
 type Target struct {
 	specs.Target
 
-	GenSource         *Target         `json:"-"` // TODO: support multiple sources
+	GenSources        []*Target       `json:"-"`
 	Tools             TargetTools     `json:"-"`
 	Deps              TargetNamedDeps `json:"-"`
 	HashDeps          TargetDeps      `json:"-"`
@@ -85,16 +86,27 @@ func (t *Target) EmptyDeps() bool {
 		len(t.RuntimePassEnv) == 0
 }
 
-func (t *Target) GenSources() []*Target {
-	var srcs []*Target
+func (t *Target) DeepGenSources() []*Target {
+	srcs := sets.NewSet(func(t *Target) string {
+		return t.Addr
+	}, 0)
+	queue := sets.NewSet(func(t *Target) string {
+		return t.Addr
+	}, 0)
 
 	current := t
-	for current.GenSource != nil {
-		srcs = append(srcs, current.GenSource)
-		current = current.GenSource
+	for current.GenSources != nil {
+		srcs.AddAll(current.GenSources)
+		queue.AddAll(current.GenSources)
+
+		if queue.Len() > 0 {
+			current = queue.Pop(0)
+		} else {
+			current = nil
+		}
 	}
 
-	return srcs
+	return srcs.Slice()
 }
 
 type Targeter interface {

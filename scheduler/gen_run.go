@@ -152,8 +152,9 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 		matchers: target.Gen,
 	}}
 
-	matchers = ads.GrowExtra(matchers, len(target.GenSources()))
-	for _, source := range target.GenSources() {
+	deepGenSources := target.DeepGenSources()
+	matchers = ads.GrowExtra(matchers, len(deepGenSources))
+	for _, source := range deepGenSources {
 		matchers = append(matchers, matchGen{
 			addr:     source.Addr,
 			matchers: source.Gen,
@@ -203,13 +204,12 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 							}
 						}
 
-						err := e.Graph.Register(spec)
+						spec.GenSources = []string{target.Addr}
+
+						t, err := e.Graph.Register(spec)
 						if err != nil {
 							return err
 						}
-
-						t := e.Graph.Targets().FindT(spec)
-						t.GenSource = target.Target
 
 						targets.Add(t)
 						return nil

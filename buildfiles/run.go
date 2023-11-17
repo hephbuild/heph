@@ -28,7 +28,6 @@ type RunOptions struct {
 	UniverseFactory  func() starlark.StringDict
 	CacheDirPath     string
 	ProgramExtraHash func(hash.Hash)
-	Packages         *packages.Registry
 	RootPkg          *packages.Package
 }
 
@@ -38,6 +37,7 @@ func (o RunOptions) Copy() RunOptions {
 
 type runContext struct {
 	RunOptions
+	*State
 	cacheGlobals *maps.Map[string, starlark.StringDict]
 	cacheLocks   *maps.Map[string, *sync.Mutex]
 

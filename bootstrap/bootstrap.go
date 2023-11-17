@@ -209,7 +209,8 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 			Root:   root,
 			Config: cfg,
 			RegisterTarget: func(spec specs.Target) error {
-				return g.Register(spec)
+				_, err := g.Register(spec)
+				return err
 			},
 		})
 

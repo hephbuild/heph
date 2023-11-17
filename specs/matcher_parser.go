@@ -6,11 +6,14 @@ import (
 	"strings"
 )
 
+type Replacer = func(m Matcher) Matcher
+
 type Matcher interface {
 	Match(Specer) bool
 	String() string
 	Intersects(Matcher) IntersectResult
 	Simplify() Matcher
+	Replace(f Replacer) Matcher
 }
 
 type MatcherNot interface {
@@ -92,7 +95,7 @@ func parseTerm(tokens []token, index *int) Matcher {
 	return left
 }
 
-func parseFunctionArg(tokens []token, index *int) astNode {
+func parseFunctionArg(tokens []token, index *int) AstNode {
 	switch tokens[*index].typ {
 	case tokenString:
 		{
@@ -151,7 +154,7 @@ func parseFactor(tokens []token, index *int) Matcher {
 			panic(fmt.Sprintf("Unknown function %v", funcName))
 		}
 
-		args := make([]astNode, 0)
+		args := make([]AstNode, 0)
 		for {
 			if tokens[*index].typ == tokenRParen {
 				*index++
@@ -238,4 +241,8 @@ func MatcherFromIncludeExclude(pkg string, include, exclude []string) (Matcher, 
 	} else {
 		return nil, nil
 	}
+}
+
+func MatcherReplace(m Matcher, f func(m Matcher) Matcher) Matcher {
+	return m.Replace(f)
 }

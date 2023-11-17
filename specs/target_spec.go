@@ -90,12 +90,18 @@ func (ts Targets) Get(addr string) (Target, bool) {
 	return Target{}, false
 }
 
+type GenSource struct {
+	Addr    string
+	Sources []Source
+}
+
 type Target struct {
 	Name    string
 	Addr    string
 	Package *packages.Package
 	Doc     string
 
+	GenSources          []string
 	Run                 []string
 	FileContent         []byte // Used by special target `text_file`
 	Entrypoint          string
@@ -131,6 +137,18 @@ type Target struct {
 	Annotations         map[string]interface{}
 }
 
+func (t Target) MarshalJSON() ([]byte, error) {
+	type MTarget Target
+	type mtarget struct {
+		MTarget
+		Private bool
+	}
+	return json.Marshal(mtarget{
+		MTarget: MTarget(t),
+		Private: t.IsPrivate(),
+	})
+}
+
 type Specer interface {
 	Spec() Target
 }
@@ -149,12 +167,20 @@ type Source struct {
 	CallFrames []SourceCallFrame
 }
 
-func (s Source) SourceFile() string {
+func (s Source) SourceLocation() string {
 	if len(s.CallFrames) < 1 {
 		return ""
 	}
 
 	return s.CallFrames[0].Pos.String()
+}
+
+func (s Source) SourceFile() string {
+	if len(s.CallFrames) < 1 {
+		return ""
+	}
+
+	return s.CallFrames[0].Pos.Filename()
 }
 
 type SourceCallFrame struct {
@@ -264,12 +290,12 @@ func (t Target) equalJson(spec Target) bool {
 	return true
 }
 
-func (t Target) SourceFile() string {
+func (t Target) SourceLocation() string {
 	if len(t.Sources) < 1 {
 		return ""
 	}
 
-	return t.Sources[0].SourceFile()
+	return t.Sources[0].SourceLocation()
 }
 
 type TargetTool struct {

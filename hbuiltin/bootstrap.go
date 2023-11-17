@@ -51,7 +51,6 @@ func Bootstrap(opts Opts) buildfiles.RunOptions {
 		ProgramExtraHash: func(h hash.Hash) {
 			h.String(predeclaredHash)
 		},
-		Packages: opts.Pkgs,
 		RootPkg: opts.Pkgs.GetOrCreate(packages.Package{
 			Path: "",
 			Root: opts.Root.Root,

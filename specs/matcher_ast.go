@@ -4,12 +4,11 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/mds"
-	"github.com/hephbuild/heph/utils/xfs"
 	"regexp"
 	"strings"
 )
 
-type astNode interface {
+type AstNode interface {
 	String() string
 }
 
@@ -31,6 +30,10 @@ func (n staticMatcher) Not() Matcher {
 
 func (n staticMatcher) Simplify() Matcher {
 	return n
+}
+
+func (p staticMatcher) Replace(f Replacer) Matcher {
+	return f(p)
 }
 
 var AllMatcher Matcher = staticMatcher{
@@ -57,6 +60,12 @@ func (n staticMatcher) Intersects(Matcher) IntersectResult {
 
 type orNode struct {
 	nodes []Matcher
+}
+
+func (n orNode) Replace(f Replacer) Matcher {
+	return f(OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return n.Replace(f)
+	})...))
 }
 
 func (n orNode) Simplify() Matcher {
@@ -95,6 +104,12 @@ func (n orNode) Intersects(i Matcher) IntersectResult {
 
 type andNode struct {
 	nodes []Matcher
+}
+
+func (n andNode) Replace(f Replacer) Matcher {
+	return f(AndNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
+		return n.Replace(f)
+	})...))
 }
 
 func (n andNode) Simplify() Matcher {
@@ -173,6 +188,10 @@ type notNode struct {
 	expr Matcher
 }
 
+func (p notNode) Replace(f Replacer) Matcher {
+	return f(notNode{p.expr.Replace(f)})
+}
+
 func (n notNode) Simplify() Matcher {
 	var nn Matcher = n
 	if nnn, ok := n.expr.(MatcherNot); ok {
@@ -216,6 +235,10 @@ func (n notNode) Intersects(i Matcher) IntersectResult {
 type labelNode struct {
 	value string
 	not   bool
+}
+
+func (p labelNode) Replace(f Replacer) Matcher {
+	return f(p)
 }
 
 func (n labelNode) Not() Matcher {
@@ -282,6 +305,10 @@ func (n labelRegexNode) Not() Matcher {
 	return nr
 }
 
+func (p labelRegexNode) Replace(f Replacer) Matcher {
+	return f(p)
+}
+
 func (n labelRegexNode) Simplify() Matcher {
 	return n
 }
@@ -344,6 +371,10 @@ type addrRegexNode struct {
 	pkgs  string
 	names string
 	not   bool
+}
+
+func (p addrRegexNode) Replace(f Replacer) Matcher {
+	return f(p)
 }
 
 func (n addrRegexNode) Simplify() Matcher {
@@ -419,10 +450,17 @@ func matchSuffix(not bool, p, prefix, s, trim string) IntersectResult {
 func matchRegexes(a, b addrRegexNode) IntersectResult {
 	not := a.not
 
+	if !strings.Contains(a.pkgs, "**") && !strings.Contains(a.pkgs, "*") {
+		return intersectResultBool((a.String() == b.String()) == !not)
+	}
+
 	r := matchPrefix(false, a.pkgs, "**", b.pkgs, "/")
 	if r == IntersectTrue {
 		if not && a.names != "*" {
 			return IntersectUnknown
+		}
+		if b.names == "*" {
+			return intersectResultBool((b.names == "*") == !not)
 		}
 		if r := matchPrefix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
 			return r
@@ -483,10 +521,23 @@ func (n addrRegexNode) Intersects(i Matcher) IntersectResult {
 	return IntersectUnknown
 }
 
+func IsFuncNode(m Matcher, name string) (bool, []AstNode) {
+	if fm, ok := m.(funcNode); ok {
+		if fm.name == name {
+			return true, fm.args
+		}
+	}
+	return false, nil
+}
+
 type funcNode struct {
 	name  string
-	args  []astNode
-	match func(args []astNode, t Specer) bool
+	args  []AstNode
+	match func(args []AstNode, t Specer) bool
+}
+
+func (p funcNode) Replace(f Replacer) Matcher {
+	return f(p)
 }
 
 func (n funcNode) Simplify() Matcher {
@@ -494,7 +545,7 @@ func (n funcNode) Simplify() Matcher {
 }
 
 func (n funcNode) String() string {
-	ss := ads.Map(n.args, func(t astNode) string {
+	ss := ads.Map(n.args, func(t AstNode) string {
 		return t.String()
 	})
 
@@ -509,23 +560,20 @@ func (n funcNode) Intersects(i Matcher) IntersectResult {
 	return IntersectUnknown
 }
 
-var matcherFunctions = map[string]func(args []astNode, t Specer) bool{
-	"has_annotation": func(args []astNode, t Specer) bool {
+var matcherFunctions = map[string]func(args []AstNode, t Specer) bool{
+	"has_annotation": func(args []AstNode, t Specer) bool {
 		annotation := args[0].(stringNode).value
 
 		_, ok := t.Spec().Annotations[annotation]
 		return ok
 	},
-	"source_in_tree": func(args []astNode, t Specer) bool {
-		for _, source := range t.Spec().Sources {
-			if ok, _ := xfs.PathMatchAny(source.SourceFile(), "**/.heph/**"); ok {
-				continue
-			}
+	"gen_source": func(args []AstNode, t Specer) bool {
+		m := args[0].(Matcher)
 
-			return true
-		}
-
-		return false
+		return ads.Some(t.Spec().GenSources, func(e string) bool {
+			tm, _ := ParseTargetAddr("", e)
+			return Intersects(tm, m).Bool()
+		})
 	},
 }
 
@@ -594,4 +642,10 @@ func (a KindMatcher) Intersects(m Matcher) IntersectResult {
 
 func (a KindMatcher) Simplify() Matcher {
 	return a
+}
+
+func (p KindMatcher) Replace(f Replacer) Matcher {
+	return f(KindMatcher(mds.Map(p, func(k matcherKind, v orNode) (matcherKind, orNode) {
+		return k, v.Replace(f).(orNode)
+	})))
 }
