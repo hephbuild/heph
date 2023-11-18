@@ -744,7 +744,13 @@ var parseTargetCmd = &cobra.Command{
 
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "    ")
-		err = enc.Encode(tp)
+		err = enc.Encode(struct {
+			Package string
+			Name    string
+		}{
+			Package: tp.Package,
+			Name:    tp.Name,
+		})
 		if err != nil {
 			return err
 		}
