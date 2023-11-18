@@ -354,7 +354,7 @@ func (n labelRegexNode) Intersects(i Matcher) IntersectResult {
 			return IntersectTrue
 		}
 
-		r := intersectResultBool(starIntersect(n.value, l.value, 0, 0))
+		r := intersectResultBool(patternsm.Intersects(n.value, l.value))
 
 		if n.not || l.not {
 			r = r.Not()
