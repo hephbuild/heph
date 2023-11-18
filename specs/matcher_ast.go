@@ -1,6 +1,7 @@
 package specs
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/hephbuild/heph/patternsm"
 	"github.com/hephbuild/heph/utils/ads"
@@ -16,6 +17,10 @@ type AstNode interface {
 type staticMatcher struct {
 	match bool
 	str   string
+}
+
+func (m staticMatcher) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (n staticMatcher) Not() Matcher {
@@ -63,6 +68,10 @@ type orNode struct {
 	nodes []Matcher
 }
 
+func (m orNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
+
 func (n orNode) Replace(f Replacer) Matcher {
 	return f(OrNodeFactory(ads.Map(n.nodes, func(n Matcher) Matcher {
 		return n.Replace(f)
@@ -105,6 +114,10 @@ func (n orNode) Intersects(i Matcher) IntersectResult {
 
 type andNode struct {
 	nodes []Matcher
+}
+
+func (m andNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (n andNode) Replace(f Replacer) Matcher {
@@ -189,6 +202,10 @@ type notNode struct {
 	expr Matcher
 }
 
+func (m notNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
+
 func (p notNode) Replace(f Replacer) Matcher {
 	return f(notNode{p.expr.Replace(f)})
 }
@@ -236,6 +253,10 @@ func (n notNode) Intersects(i Matcher) IntersectResult {
 type labelNode struct {
 	value string
 	not   bool
+}
+
+func (m labelNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (p labelNode) Replace(f Replacer) Matcher {
@@ -298,6 +319,10 @@ type labelRegexNode struct {
 	r     *regexp.Regexp
 	value string
 	not   bool
+}
+
+func (m labelRegexNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (n labelRegexNode) Not() Matcher {
@@ -372,6 +397,10 @@ type addrRegexNode struct {
 	pkgs  string
 	names string
 	not   bool
+}
+
+func (m addrRegexNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (p addrRegexNode) Replace(f Replacer) Matcher {
@@ -468,6 +497,10 @@ type funcNode struct {
 	match func(args []AstNode, t Specer) bool
 }
 
+func (m funcNode) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
+
 func (p funcNode) Replace(f Replacer) Matcher {
 	return f(p)
 }
@@ -559,6 +592,10 @@ func (a KindMatcher) Match(s Specer) bool {
 
 func (a KindMatcher) String() string {
 	return a.allOr().String()
+}
+
+func (m KindMatcher) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (a KindMatcher) Intersects(m Matcher) IntersectResult {

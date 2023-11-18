@@ -1,6 +1,7 @@
 package specs
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
@@ -13,6 +14,10 @@ type TargetAddr struct {
 	Name    string
 
 	not bool
+}
+
+func (m TargetAddr) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
 }
 
 func (p TargetAddr) Replace(f Replacer) Matcher {
@@ -68,6 +73,10 @@ func (p TargetAddr) Full() string {
 }
 
 type TargetAddrs []TargetAddr
+
+func (m TargetAddrs) MarshalJSON() ([]byte, error) {
+	return json.Marshal(m.String())
+}
 
 func (p TargetAddrs) Replace(f Replacer) Matcher {
 	return OrNodeFactory[TargetAddr](p...).Replace(f)

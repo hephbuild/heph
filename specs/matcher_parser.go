@@ -1,6 +1,7 @@
 package specs
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/hephbuild/heph/utils/xpanic"
 	"strings"
@@ -9,6 +10,7 @@ import (
 type Replacer = func(m Matcher) Matcher
 
 type Matcher interface {
+	json.Marshaler
 	Match(Specer) bool
 	String() string
 	Intersects(Matcher) IntersectResult

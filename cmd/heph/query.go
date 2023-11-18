@@ -130,7 +130,7 @@ var queryCmd = &cobra.Command{
 				}
 			}
 
-			if !all {
+			if !all && !specs.IsMatcherExplicit(matcher) {
 				matcher = specs.AndNodeFactory(specs.PublicMatcher, NotThirdpartyMatcher, matcher)
 			}
 		}
