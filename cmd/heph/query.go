@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
@@ -18,6 +19,7 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/itchyny/gojq"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/slices"
 	"gopkg.in/yaml.v3"
@@ -35,7 +37,7 @@ var transitive bool
 var all bool
 var debugTransitive bool
 var filter string
-var jsonOutput bool
+var jsonOutput boolStr
 var files bool
 
 func init() {
@@ -71,7 +73,7 @@ func init() {
 	queryCmd.Flags().StringArrayVarP(&include, "include", "i", nil, "Label/Target to include")
 	queryCmd.Flags().StringArrayVarP(&exclude, "exclude", "e", nil, "Label/target to exclude, takes precedence over --include")
 	queryCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
-	queryCmd.Flags().BoolVar(&jsonOutput, "json", false, "JSON output")
+	queryCmd.Flags().AddFlag(NewBoolStrFlag(&jsonOutput, "json", "", "JSON output"))
 
 	searchCmd.Flags().BoolVarP(&all, "all", "a", false, "Outputs private targets")
 
@@ -153,7 +155,19 @@ var queryCmd = &cobra.Command{
 			return err
 		}
 
-		if jsonOutput {
+		if jsonOutput.bool {
+			out := make([]any, 0, len(selected))
+
+			var jqq *gojq.Query
+			if jsonOutput.str != "" {
+				jqq, err = gojq.Parse(jsonOutput.str)
+				if err != nil {
+					return err
+				}
+			}
+
+			var buf bytes.Buffer
+
 			for i, target := range selected {
 				funcs := map[string]exprs.Func{
 					"addr": func(expr exprs.Expr) (string, error) {
@@ -174,10 +188,36 @@ var queryCmd = &cobra.Command{
 					return fmt.Errorf("annotations: %w", err)
 				}
 
-				selected[i] = target
+				if jqq == nil {
+					out = append(out, target)
+				} else {
+					buf.Reset()
+					err = json.NewEncoder(&buf).Encode(target)
+					if err != nil {
+						return err
+					}
+
+					var v any
+					err = json.Unmarshal(buf.Bytes(), &v)
+					if err != nil {
+						return err
+					}
+
+					iter := jqq.RunWithContext(ctx, v)
+					for {
+						v, ok := iter.Next()
+						if !ok {
+							break
+						}
+						if err, ok := v.(error); ok {
+							return fmt.Errorf("%v: %w", i, err)
+						}
+						out = append(out, v)
+					}
+				}
 			}
 
-			err := json.NewEncoder(os.Stdout).Encode(selected)
+			err = json.NewEncoder(os.Stdout).Encode(out)
 			if err != nil {
 				return err
 			}
