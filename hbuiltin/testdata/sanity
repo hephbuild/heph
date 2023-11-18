@@ -17,6 +17,7 @@ target(
         "SourceFiles": null
     },
     "Doc": "",
+    "GenSources": null,
     "Run": null,
     "FileContent": "",
     "Entrypoint": "bash",
@@ -135,5 +136,6 @@ target(
     },
     "Timeout": 0,
     "GenDepsMeta": false,
-    "Annotations": {}
+    "Annotations": {},
+    "Private": false
 }
