@@ -2,6 +2,7 @@ package specs
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/patternsm"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/mds"
 	"regexp"
@@ -407,74 +408,12 @@ func (n addrRegexNode) MatchPackageName(pkg, name string) bool {
 	return n.name.MatchString(name)
 }
 
-func matchPrefix(not bool, p, suffix, s, trim string) IntersectResult {
-	if p == s {
-		if not {
-			return IntersectFalse
-		}
-		return IntersectTrue
-	}
-
-	if strings.Count(p, suffix) == 1 && strings.HasSuffix(p, suffix) {
-		prefix := strings.TrimSuffix(p, suffix)
-		if trim != "" {
-			prefix = strings.TrimSuffix(prefix, trim)
-		}
-
-		return intersectResultBool(strings.HasPrefix(s, prefix) == !not)
-	}
-
-	return IntersectUnknown
+func (n addrRegexNode) includes(ta addrRegexNode) bool {
+	return patternsm.Includes(n.pkgs, ta.pkgs) && patternsm.Includes(n.names, ta.names)
 }
 
-func matchSuffix(not bool, p, prefix, s, trim string) IntersectResult {
-	if p == s {
-		if not {
-			return IntersectFalse
-		}
-		return IntersectTrue
-	}
-
-	if strings.Count(p, prefix) == 1 && strings.HasPrefix(p, prefix) {
-		suffix := strings.TrimPrefix(p, prefix)
-		if trim != "" {
-			suffix = strings.TrimPrefix(suffix, trim)
-		}
-
-		return intersectResultBool(strings.HasSuffix(s, suffix) == !not)
-	}
-
-	return IntersectUnknown
-}
-
-func matchRegexes(a, b addrRegexNode) IntersectResult {
-	not := a.not
-
-	if !strings.Contains(a.pkgs, "**") && !strings.Contains(a.pkgs, "*") {
-		return intersectResultBool((a.String() == b.String()) == !not)
-	}
-
-	r := matchPrefix(false, a.pkgs, "**", b.pkgs, "/")
-	if r == IntersectTrue {
-		if not && a.names != "*" {
-			return IntersectUnknown
-		}
-		if b.names == "*" {
-			return intersectResultBool((b.names == "*") == !not)
-		}
-		if r := matchPrefix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
-			return r
-		}
-		if r := matchSuffix(not, a.names, "*", b.names, ""); r != IntersectUnknown {
-			return r
-		}
-	}
-
-	if not {
-		r = r.Not()
-	}
-
-	return r
+func (n addrRegexNode) intersects(ta addrRegexNode) bool {
+	return patternsm.Intersects(n.pkgs, ta.pkgs) && patternsm.Intersects(n.names, ta.names)
 }
 
 func (n addrRegexNode) Intersects(i Matcher) IntersectResult {
@@ -492,30 +431,23 @@ func (n addrRegexNode) Intersects(i Matcher) IntersectResult {
 
 		if n.not || ta.not {
 			if n.not {
-				r := matchRegexes(n, ta)
-				if r == IntersectFalse {
+				if n.includes(ta) {
 					return IntersectFalse
+				} else {
+					return IntersectTrue
 				}
 			}
 
 			if ta.not {
-				r := matchRegexes(ta, n)
-				if r == IntersectFalse {
+				if ta.includes(n) {
 					return IntersectFalse
+				} else {
+					return IntersectTrue
 				}
 			}
-
-			return IntersectUnknown
 		}
 
-		r1 := matchRegexes(n, ta)
-		r2 := matchRegexes(ta, n)
-		if r1 == IntersectTrue || r2 == IntersectTrue {
-			return IntersectTrue
-		}
-		if r1 == IntersectFalse || r2 == IntersectFalse {
-			return IntersectFalse
-		}
+		return intersectResultBool(n.intersects(ta))
 	}
 
 	return IntersectUnknown

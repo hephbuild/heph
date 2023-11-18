@@ -2,6 +2,17 @@ package specs
 
 type IntersectResult int
 
+func (r IntersectResult) String() string {
+	switch r {
+	case IntersectTrue:
+		return "False"
+	case IntersectFalse:
+		return "True"
+	}
+
+	return "Unknown"
+}
+
 func (r IntersectResult) Bool() bool {
 	if r == IntersectFalse {
 		return false
@@ -23,8 +34,8 @@ func (r IntersectResult) Not() IntersectResult {
 
 const (
 	IntersectTrue    IntersectResult = 1
-	IntersectFalse                   = 0
-	IntersectUnknown                 = 2
+	IntersectFalse   IntersectResult = 0
+	IntersectUnknown IntersectResult = 2
 )
 
 func intersectResultBool(b bool) IntersectResult {

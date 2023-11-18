@@ -153,6 +153,7 @@ func TestHasIntersection(t *testing.T) {
 		{"test", "//some/path/deep/**", true},
 		{"//path/**/to*:*", "//path/to:hello", true},
 		{"//path/**/to*/*:*", "//path/deep/to/some:hello", true},
+		{"//path/**/to/some:hello", "//path/**/to*/some:hello", true},
 		{"//path/**/to/some:*", "//path/**/to*/some:hello", true},
 		{"//path/**/to/some:*", "//path/deep/**/to*/some:hello", true},
 		{"//path/**/to/some:*", "//path/**/deep/to*/some:hello", true},
@@ -183,6 +184,7 @@ func TestHasIntersection(t *testing.T) {
 		{"//some:*", "!//some:target", true},
 
 		{"//some:*", "!//some:*", false},
+		{"!//some:*", "//some/**:*", true},
 		{"!//some:*", "!//some:*", true},
 		{"!//**:*", "//some:*", false},
 		{"//**:*", "!//some:*", true},
