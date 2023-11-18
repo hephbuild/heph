@@ -1,6 +1,7 @@
 package exprs
 
 import (
+	"context"
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,7 +82,7 @@ func TestExecDeep(t *testing.T) {
 		v := *(&test.obj) // Make an addressable copy
 
 		t.Run(fmt.Sprintf("%#v", test.obj), func(t *testing.T) {
-			err := ExecDeep(&v, map[string]Func{
+			err := ExecDeep(context.Background(), &v, map[string]Func{
 				"hello": func(expr Expr) (string, error) {
 					return "hello world", nil
 				},

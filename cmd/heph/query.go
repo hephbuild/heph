@@ -178,12 +178,12 @@ var queryCmd = &cobra.Command{
 					},
 				}
 
-				err := exprs.ExecDeep(&target.Doc, funcs)
+				err := exprs.ExecDeep(ctx, &target.Doc, funcs)
 				if err != nil {
 					return fmt.Errorf("doc: %w", err)
 				}
 
-				err = exprs.ExecDeep(&target.Annotations, funcs)
+				err = exprs.ExecDeep(ctx, &target.Annotations, funcs)
 				if err != nil {
 					return fmt.Errorf("annotations: %w", err)
 				}

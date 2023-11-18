@@ -1,19 +1,20 @@
 package exprs
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 )
 
-func ExecDeep(obj any, funcs map[string]Func) error {
+func ExecDeep(ctx context.Context, obj any, funcs map[string]Func) error {
 	v := reflect.ValueOf(obj)
 	if v.Kind() != reflect.Ptr {
-		panic(fmt.Sprintf("expected pointer, got %T", obj))
+		panic(fmt.Sprintf("expected pointer, got %T", ctx))
 	}
 
 	v = v.Elem()
 
-	nv, err := execReflect(v, funcs)
+	nv, err := execReflect(ctx, v, funcs)
 	if err != nil {
 		return err
 	}
@@ -23,7 +24,11 @@ func ExecDeep(obj any, funcs map[string]Func) error {
 	return nil
 }
 
-func execReflect(v reflect.Value, funcs map[string]Func) (reflect.Value, error) {
+func execReflect(ctx context.Context, v reflect.Value, funcs map[string]Func) (reflect.Value, error) {
+	if err := ctx.Err(); err != nil {
+		return reflect.Value{}, err
+	}
+
 	switch v.Kind() {
 	case reflect.String:
 		v2, err := Exec(v.Interface().(string), funcs)
@@ -37,7 +42,7 @@ func execReflect(v reflect.Value, funcs map[string]Func) (reflect.Value, error) 
 			return v, nil
 		}
 
-		ev, err := execReflect(v.Elem(), funcs)
+		ev, err := execReflect(ctx, v.Elem(), funcs)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -51,30 +56,36 @@ func execReflect(v reflect.Value, funcs map[string]Func) (reflect.Value, error) 
 			return v, nil
 		}
 
-		return execReflect(v.Elem(), funcs)
+		return execReflect(ctx, v.Elem(), funcs)
 	case reflect.Map:
-		return execReflectMap(v, funcs)
+		return execReflectMap(ctx, v, funcs)
 	case reflect.Struct:
-		return execReflectStruct(v, funcs)
+		return execReflectStruct(ctx, v, funcs)
 	case reflect.Slice, reflect.Array:
+		if v.IsNil() {
+			return v, nil
+		}
+
+		s := reflect.MakeSlice(reflect.SliceOf(v.Type().Elem()), 0, v.Len())
+
 		for i := 0; i < v.Len(); i++ {
 			e := v.Index(i)
 
-			ev, err := execReflect(e, funcs)
+			ev, err := execReflect(ctx, e, funcs)
 			if err != nil {
 				return reflect.Value{}, err
 			}
 
-			e.Set(ev)
+			s = reflect.Append(s, ev)
 		}
 
-		return v, nil
+		return s, nil
 	}
 
 	return v, nil
 }
 
-func execReflectMap(obj reflect.Value, funcs map[string]Func) (reflect.Value, error) {
+func execReflectMap(ctx context.Context, obj reflect.Value, funcs map[string]Func) (reflect.Value, error) {
 	if obj.IsNil() {
 		return obj, nil
 	}
@@ -83,12 +94,12 @@ func execReflectMap(obj reflect.Value, funcs map[string]Func) (reflect.Value, er
 
 	it := obj.MapRange()
 	for it.Next() {
-		kv, err := execReflect(it.Key(), funcs)
+		kv, err := execReflect(ctx, it.Key(), funcs)
 		if err != nil {
 			return reflect.Value{}, err
 		}
 
-		vv, err := execReflect(it.Value(), funcs)
+		vv, err := execReflect(ctx, it.Value(), funcs)
 		if err != nil {
 			return reflect.Value{}, err
 		}
@@ -99,7 +110,7 @@ func execReflectMap(obj reflect.Value, funcs map[string]Func) (reflect.Value, er
 	return m, nil
 }
 
-func execReflectStruct(obj reflect.Value, funcs map[string]Func) (reflect.Value, error) {
+func execReflectStruct(ctx context.Context, obj reflect.Value, funcs map[string]Func) (reflect.Value, error) {
 	s := reflect.New(obj.Type()).Elem()
 
 	for i := 0; i < s.NumField(); i++ {
@@ -111,7 +122,7 @@ func execReflectStruct(obj reflect.Value, funcs map[string]Func) (reflect.Value,
 
 		f.Set(obj.Field(i))
 
-		fv, err := execReflect(f, funcs)
+		fv, err := execReflect(ctx, f, funcs)
 		if err != nil {
 			return reflect.Value{}, err
 		}

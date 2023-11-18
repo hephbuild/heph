@@ -44,10 +44,6 @@ func (s *State) CollectFiles(ctx context.Context, root string) ([]string, error)
 	files := make([]string, 0)
 
 	err := xfs.StarWalk(ctx, root, s.Patterns[0], s.Ignore, func(path string, d fs.DirEntry, err error) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
 		if d.IsDir() {
 			return nil
 		}
