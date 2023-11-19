@@ -53,20 +53,8 @@ target(
         "Exprs": null
     },
     "HashDeps": {
-        "Targets": [
-            {
-                "Name": "",
-                "Output": "",
-                "Target": "//some/test:some_target",
-                "Mode": "copy"
-            }
-        ],
-        "Files": [
-            {
-                "Name": "",
-                "Path": "some_file.txt"
-            }
-        ],
+        "Targets": null,
+        "Files": null,
         "Exprs": null
     },
     "RuntimeDeps": {

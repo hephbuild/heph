@@ -106,7 +106,7 @@ func (tp *TargetNamedDeps) Sort() {
 func (tp TargetNamedDeps) Copy() TargetNamedDeps {
 	ntp := TargetNamedDeps{}
 	for name, deps := range tp.Named() {
-		ntp.Set(name, deps.Merge(TargetDeps{}))
+		ntp.Set(name, deps.Copy())
 	}
 
 	return ntp

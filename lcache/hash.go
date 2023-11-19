@@ -207,15 +207,14 @@ func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 }
 
 func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string, error) {
-	target := gtarget.GraphTarget()
-	targetm := e.Metas.Find(gtarget)
+	target := e.Metas.Find(gtarget)
 
-	targetm.cacheHashInputTargetMutex.Lock()
-	defer targetm.cacheHashInputTargetMutex.Unlock()
+	target.cacheHashInputTargetMutex.Lock()
+	defer target.cacheHashInputTargetMutex.Unlock()
 
-	if h := targetm.inputHash; h != "" {
+	if h := target.inputHash; h != "" {
 		if verify {
-			for p, t := range targetm.cacheHashInputPathsModtime {
+			for p, t := range target.cacheHashInputPathsModtime {
 				info, err := os.Lstat(p)
 				if err != nil {
 					return "", err
@@ -236,7 +235,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	}()
 
 	h := hash.NewDebuggableHash(func() string {
-		return target.Addr + "_" + targetm.depsHash + "_hash_input"
+		return target.Addr + "_" + target.depsHash + "_hash_input"
 	})
 	h.I64(8) // Force break all caches
 
@@ -338,10 +337,10 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 		})
 	}
 
-	targetm.inputHash = h.Sum()
-	targetm.cacheHashInputPathsModtime = pathsModtime
+	target.inputHash = h.Sum()
+	target.cacheHashInputPathsModtime = pathsModtime
 
-	return targetm.inputHash, nil
+	return target.inputHash, nil
 }
 
 func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) (string, error) {
