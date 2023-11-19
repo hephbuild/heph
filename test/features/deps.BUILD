@@ -44,3 +44,42 @@ e2e_test(
     cmd = "heph q revdeps '//test/features:deps2'",
     expected_output = "//test/features:deps3".strip(),
 )
+
+target(
+    name = "deps4",
+    deps = 'echo.go',
+    run = 'echo ls && ls',
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps4",
+    cmd = "heph r '//test/features:deps4'",
+    expected_output = "ls\necho.go",
+)
+
+target(
+    name = "deps5",
+    hash_deps = 'echo.go',
+    run = 'echo ls && ls',
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps5",
+    cmd = "heph r '//test/features:deps5'",
+    expected_output = "ls",
+)
+
+target(
+    name = "deps6",
+    runtime_deps = 'echo.go',
+    run = 'echo ls && ls',
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps6",
+    cmd = "heph r '//test/features:deps6'",
+    expected_output = "ls\necho.go",
+)

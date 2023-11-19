@@ -521,7 +521,7 @@ def go_build_bin(
     tags = [],
     flags = "",
     deps = {},
-    hash_deps = {},
+    runtime_deps = None,
 ):
     if not out:
         out = heph.pkg.name()
@@ -536,14 +536,11 @@ def go_build_bin(
         "std": _std_pkgs(os, arch),
     }
 
-    if hash_deps and type(deps) != "dict":
-        hash_deps = {"hash_deps": hash_deps}
-
     return target(
         name = name,
         doc = "Build {} {}/{} {}".format(heph.pkg.dir(), os, arch, " ".join(tags)).strip(),
         deps = _deps | deps,
-        hash_deps = _deps | hash_deps,
+        runtime_deps = runtime_deps,
         run = _go_gen_importcfg() + [
             'go tool link -importcfg "$SANDBOX/importconfig" -o $SANDBOX/$OUT {} $SRC_MAIN'.format(
                 flags,

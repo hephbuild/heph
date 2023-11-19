@@ -111,7 +111,7 @@ type Target struct {
 	PassArgs            bool
 	Deps                Deps
 	HashDeps            Deps
-	DifferentHashDeps   bool
+	RuntimeDeps         Deps
 	Tools               Tools
 	Out                 []OutFile
 	Cache               Cache
@@ -214,6 +214,8 @@ type Platform struct {
 
 type Transitive struct {
 	Deps           Deps
+	HashDeps       Deps
+	RuntimeDeps    Deps
 	Tools          Tools
 	Env            map[string]string
 	PassEnv        []string

@@ -71,6 +71,7 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 	}
 	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 	if err != nil {
+		fgDeps.DoneSem()
 		return err
 	}
 

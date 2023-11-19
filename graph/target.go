@@ -18,6 +18,7 @@ type Target struct {
 	GenSources        []*Target       `json:"-"`
 	Tools             TargetTools     `json:"-"`
 	Deps              TargetNamedDeps `json:"-"`
+	RuntimeDeps       TargetNamedDeps `json:"-"`
 	HashDeps          TargetDeps      `json:"-"`
 	OutWithSupport    *OutNamedPaths
 	Out               *OutNamedPaths
@@ -80,6 +81,7 @@ func (t *Target) EmptyDeps() bool {
 	return t.Tools.Empty() &&
 		t.Deps.Empty() &&
 		t.HashDeps.Empty() &&
+		t.RuntimeDeps.Empty() &&
 		len(t.Env) == 0 &&
 		len(t.PassEnv) == 0 &&
 		len(t.RuntimeEnv) == 0 &&

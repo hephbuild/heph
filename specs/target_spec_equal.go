@@ -99,7 +99,7 @@ func (t Target) equalStruct(spec Target) bool {
 		return false
 	}
 
-	if t.DifferentHashDeps != spec.DifferentHashDeps {
+	if !t.RuntimeDeps.Equal(spec.RuntimeDeps) {
 		return false
 	}
 
@@ -272,6 +272,14 @@ func (this ExprTool) Equal(that ExprTool) bool {
 
 func (this Transitive) Equal(that Transitive) bool {
 	if !this.Deps.Equal(that.Deps) {
+		return false
+	}
+
+	if !this.RuntimeDeps.Equal(that.RuntimeDeps) {
+		return false
+	}
+
+	if !this.HashDeps.Equal(that.HashDeps) {
 		return false
 	}
 

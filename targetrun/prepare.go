@@ -185,6 +185,12 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		}
 	}
 
+	for _, dep := range target.RuntimeDeps.All().Targets {
+		if !e.LocalCache.Metas.Find(dep.Target).HasActualOutFiles() {
+			return nil, fmt.Errorf("%v: %v did not run being being used as a runtimedep", target.Addr, dep.Target.Addr)
+		}
+	}
+
 	plat := target.Platforms[0]
 	executor, err := e.chooseExecutor(plat.Labels, plat.Options, e.PlatformProviders)
 	if err != nil {
@@ -255,8 +261,15 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 
 	traceFilesList := log.TraceTiming("Building sandbox files list")
 
+	allDeps := target.Deps
+	if !target.RuntimeDeps.Empty() {
+		allDeps = allDeps.Merge(target.RuntimeDeps)
+		allDeps.Dedup()
+		allDeps.Sort()
+	}
+
 	srcRecNameToDepName := make(map[string]string)
-	for name, deps := range target.Deps.Named() {
+	for name, deps := range allDeps.Named() {
 		for _, dep := range deps.Targets {
 			dept := e.LocalCache.Metas.Find(dep.Target)
 
@@ -318,7 +331,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		err, cleanDeps := e.createFile(target, "heph_deps", ".heph/deps.json", srcRec, func(f io.Writer) error {
 			m := map[string]interface{}{}
 
-			for name, deps := range target.Deps.Named() {
+			for name, deps := range allDeps.Named() {
 				a := make([]string, 0)
 
 				for _, dep := range deps.Targets {

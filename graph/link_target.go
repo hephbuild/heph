@@ -260,19 +260,19 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	}
 
 	// Resolve hash deps specs
-	if t.Spec().DifferentHashDeps {
-		//log.Tracef(logPrefix + "Linking hashdeps")
-		t.HashDeps, err = e.linkTargetDeps(t, t.Spec().HashDeps, breadcrumb)
-		if err != nil {
-			return fmt.Errorf("%v: hashdeps: %w", t.Addr, err)
-		}
-		t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
-		err = e.preventDepOnTool(t, t.HashDeps)
-		if err != nil {
-			return err
-		}
-	} else {
-		t.HashDeps = t.Deps.All()
+	t.HashDeps, err = e.linkTargetDeps(t, t.Spec().HashDeps, breadcrumb)
+	if err != nil {
+		return fmt.Errorf("%v: hash_deps: %w", t.Addr, err)
+	}
+	t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
+	err = e.preventDepOnTool(t, t.HashDeps)
+	if err != nil {
+		return err
+	}
+
+	t.RuntimeDeps, err = e.linkTargetNamedDeps(t, t.Spec().RuntimeDeps, breadcrumb)
+	if err != nil {
+		return fmt.Errorf("%v: runtime_deps: %w", t.Addr, err)
 	}
 
 	if t.IsTool() {
@@ -373,14 +373,18 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		t.Deps = t.Deps.Merge(t.TransitiveDeps.Deps)
 		t.Deps.Dedup()
 		t.Deps.Sort()
+	}
 
-		if t.DifferentHashDeps {
-			t.HashDeps = t.HashDeps.Merge(t.TransitiveDeps.Deps.All())
-			t.HashDeps.Dedup()
-			t.HashDeps.Sort()
-		} else {
-			t.HashDeps = t.Deps.All()
-		}
+	if !t.TransitiveDeps.HashDeps.Empty() {
+		t.HashDeps = t.HashDeps.Merge(t.TransitiveDeps.HashDeps)
+		t.HashDeps.Dedup()
+		t.HashDeps.Sort()
+	}
+
+	if !t.TransitiveDeps.RuntimeDeps.Empty() {
+		t.Deps = t.Deps.Merge(t.TransitiveDeps.RuntimeDeps)
+		t.Deps.Dedup()
+		t.Deps.Sort()
 	}
 
 	for k, v := range t.TransitiveDeps.RuntimeEnv {
@@ -422,18 +426,11 @@ func (e *State) registerDag(t *Target) error {
 		return e.dag.AddEdge(src.Addr, dst.Addr)
 	}
 
-	for _, dep := range t.Deps.All().Targets {
-		err := addEdge(dep.Target, t)
-		if err != nil {
-			return fmt.Errorf("dep: %v to %v: %w", dep.Target.Addr, t.Addr, err)
-		}
-	}
-
-	if t.DifferentHashDeps {
-		for _, dep := range t.HashDeps.Targets {
+	for k, deps := range map[string]TargetDeps{"deps": t.Deps.All(), "runtime deps": t.RuntimeDeps.All(), "hash deps": t.HashDeps} {
+		for _, dep := range deps.Targets {
 			err := addEdge(dep.Target, t)
 			if err != nil {
-				return fmt.Errorf("hashdep: %v to %v: %w", dep.Target.Addr, t.Addr, err)
+				return fmt.Errorf("%v: %v to %v: %w", k, dep.Target.Addr, t.Addr, err)
 			}
 		}
 	}
@@ -668,19 +665,21 @@ func (e *State) applyEnv(t *Target, passEnv []string, env map[string]string) {
 }
 
 func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.StringSet) (TargetTransitive, error) {
-	targets := sets.NewSet(func(t *Target) string {
-		return t.Addr
-	}, 0)
+	targets := NewTargets(0)
 
-	for _, dep := range tr.Deps.All().Targets {
-		targets.Add(dep.Target)
+	for _, deps := range []TargetDeps{tr.Deps.All(), tr.RuntimeDeps.All(), tr.HashDeps} {
+		for _, dep := range deps.Targets {
+			targets.Add(dep.Target)
+		}
+		for _, dep := range deps.RawTargets {
+			targets.Add(dep.Target)
+		}
 	}
-	for _, dep := range tr.Deps.All().RawTargets {
-		targets.Add(dep.Target)
-	}
+
 	for _, dep := range tr.Tools.Targets {
 		targets.Add(dep.Target)
 	}
+	// Include group targets and host tools
 	targets.AddAll(tr.Tools.TargetReferences)
 
 	dtr, err := e.collectTransitive(breadcrumb, targets.Slice())
@@ -694,21 +693,22 @@ func (e *State) collectDeepTransitive(tr TargetTransitive, breadcrumb *sets.Stri
 }
 
 func (e *State) collectTransitiveFromDeps(t *Target, breadcrumb *sets.StringSet) (TargetTransitive, []specs.Platform, error) {
-	targets := sets.NewSet(func(t *Target) string {
-		return t.Addr
-	}, 0)
+	targets := NewTargets(0)
 
-	for _, dep := range t.Deps.All().Targets {
-		targets.Add(dep.Target)
+	for _, deps := range []TargetDeps{t.Deps.All(), t.RuntimeDeps.All(), t.HashDeps} {
+		for _, dep := range deps.Targets {
+			targets.Add(dep.Target)
+		}
+		// Include group targets
+		for _, dep := range deps.RawTargets {
+			targets.Add(dep.Target)
+		}
 	}
-	// Include group targets
-	for _, dep := range t.Deps.All().RawTargets {
-		targets.Add(dep.Target)
-	}
+
 	for _, tool := range t.Tools.Targets {
 		targets.Add(tool.Target)
 	}
-	// Include group targets
+	// Include group targets and host tools
 	targets.AddAll(t.Tools.TargetReferences)
 
 	tr, err := e.collectTransitive(breadcrumb, targets.Slice())
@@ -783,10 +783,12 @@ func (e *State) collectTransitive(breadcrumb *sets.StringSet, targets []*Target)
 		tt = tt.Merge(target.DeepOwnTransitive)
 	}
 
-	for _, dep := range tt.Deps.All().Targets {
-		err := e.LinkTarget(dep.Target, breadcrumb)
-		if err != nil {
-			return TargetTransitive{}, err
+	for _, deps := range []TargetDeps{tt.Deps.All(), tt.RuntimeDeps.All(), tt.HashDeps} {
+		for _, dep := range deps.Targets {
+			err := e.LinkTarget(dep.Target, breadcrumb)
+			if err != nil {
+				return TargetTransitive{}, err
+			}
 		}
 	}
 
