@@ -365,25 +365,21 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	if !t.TransitiveDeps.Tools.Empty() {
 		t.Tools = t.Tools.Merge(t.TransitiveDeps.Tools)
-		t.Tools.Dedup()
 		t.Tools.Sort()
 	}
 
 	if !t.TransitiveDeps.Deps.Empty() {
 		t.Deps = t.Deps.Merge(t.TransitiveDeps.Deps)
-		t.Deps.Dedup()
 		t.Deps.Sort()
 	}
 
 	if !t.TransitiveDeps.HashDeps.Empty() {
 		t.HashDeps = t.HashDeps.Merge(t.TransitiveDeps.HashDeps)
-		t.HashDeps.Dedup()
 		t.HashDeps.Sort()
 	}
 
 	if !t.TransitiveDeps.RuntimeDeps.Empty() {
 		t.Deps = t.Deps.Merge(t.TransitiveDeps.RuntimeDeps)
-		t.Deps.Dedup()
 		t.Deps.Sort()
 	}
 

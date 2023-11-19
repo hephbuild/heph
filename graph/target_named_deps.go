@@ -11,6 +11,10 @@ type TargetNamedDeps struct {
 	names *sets.StringSet
 }
 
+func (tp *TargetNamedDeps) Add(name string, p TargetDeps) {
+	tp.Set(name, tp.Name(name).Merge(p))
+}
+
 func (tp *TargetNamedDeps) Set(name string, p TargetDeps) {
 	if tp.named == nil {
 		tp.named = map[string]TargetDeps{}
@@ -20,7 +24,10 @@ func (tp *TargetNamedDeps) Set(name string, p TargetDeps) {
 	}
 
 	tp.named[name] = p
+
 	tp.all = tp.all.Merge(p)
+	tp.all.Sort()
+
 	tp.names.Add(name)
 	slices.Sort(tp.names.Slice())
 }
@@ -81,6 +88,10 @@ func (tp *TargetNamedDeps) Sort() {
 	})
 }
 
+func (tp *TargetNamedDeps) Copy() TargetNamedDeps {
+	return tp.Merge(TargetNamedDeps{})
+}
+
 func (tp *TargetNamedDeps) Merge(deps TargetNamedDeps) TargetNamedDeps {
 	ntp := TargetNamedDeps{}
 	for name, deps := range tp.Named() {
@@ -88,7 +99,7 @@ func (tp *TargetNamedDeps) Merge(deps TargetNamedDeps) TargetNamedDeps {
 	}
 
 	for name, deps := range deps.Named() {
-		ntp.Set(name, ntp.Name(name).Merge(deps))
+		ntp.Add(name, deps)
 	}
 
 	return ntp

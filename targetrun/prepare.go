@@ -264,7 +264,6 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 	allDeps := target.Deps
 	if !target.RuntimeDeps.Empty() {
 		allDeps = allDeps.Merge(target.RuntimeDeps)
-		allDeps.Dedup()
 		allDeps.Sort()
 	}
 

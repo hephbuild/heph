@@ -256,14 +256,24 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 		return tool.Name
 	})
 
+	var allHashDeps graph.TargetNamedDeps
+	if !target.HashDeps.Empty() {
+		allHashDeps = target.Deps.Copy()
+		allHashDeps.Add("_", target.HashDeps)
+		allHashDeps.Dedup()
+		allHashDeps.Sort()
+	} else {
+		allHashDeps = target.Deps
+	}
+
 	h.String("=") // Legacy reasons...
 	h.String("=")
 	pathsModtime := make(map[string]time.Time)
-	for _, name := range target.Deps.Names() {
+	for _, name := range allHashDeps.Names() {
 		h.String("=")
 		h.String(name)
 
-		deps := target.Deps.Name(name)
+		deps := allHashDeps.Name(name)
 
 		err := e.hashDepsTargets(h, deps.Targets)
 		if err != nil {
@@ -283,18 +293,6 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 			} else {
 				pathsModtime[p] = t
 			}
-		}
-	}
-
-	if !target.HashDeps.Empty() {
-		h.String("=")
-		err := e.hashDepsTargets(h, target.HashDeps.Targets)
-		if err != nil {
-			return "", err
-		}
-		pathsModtime, err = e.hashFiles(h, target.HashFile, target.HashDeps.Files)
-		if err != nil {
-			return "", err
 		}
 	}
 

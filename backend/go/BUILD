@@ -228,7 +228,7 @@ def go_mod(
             "deps": godeps_deps,
             "cfg": godeps_cfg,
         },
-        hash_deps = [imports, gomodsum, godeps_cfg],
+        hash_deps = [imports, gomodsum],
         tools = godeps,
         env = {
             "GOOS": get_os(),
