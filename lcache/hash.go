@@ -260,7 +260,6 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	if !target.HashDeps.Empty() {
 		allHashDeps = target.Deps.Copy()
 		allHashDeps.Add("_", target.HashDeps)
-		allHashDeps.Dedup()
 		allHashDeps.Sort()
 	} else {
 		allHashDeps = target.Deps

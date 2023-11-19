@@ -65,7 +65,7 @@ func (d *TargetDeps) Dedup() {
 	})
 }
 
-func (d TargetDeps) Sort() {
+func (d *TargetDeps) Sort() {
 	ads.SortP(d.Targets,
 		func(i, j *TargetWithOutput) int {
 			return strings.Compare(i.Target.Addr, j.Target.Addr)

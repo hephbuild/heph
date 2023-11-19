@@ -264,11 +264,6 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 	if err != nil {
 		return fmt.Errorf("%v: hash_deps: %w", t.Addr, err)
 	}
-	t.HashDeps = e.filterOutCodegenFromDeps(t, t.HashDeps)
-	err = e.preventDepOnTool(t, t.HashDeps)
-	if err != nil {
-		return err
-	}
 
 	t.RuntimeDeps, err = e.linkTargetNamedDeps(t, t.Spec().RuntimeDeps, breadcrumb)
 	if err != nil {
@@ -289,6 +284,14 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 		return err
 	}
 	t.OwnTransitive.Deps, err = e.linkTargetNamedDeps(t, t.Spec().Transitive.Deps, breadcrumb)
+	if err != nil {
+		return err
+	}
+	t.OwnTransitive.HashDeps, err = e.linkTargetDeps(t, t.Spec().Transitive.HashDeps, breadcrumb)
+	if err != nil {
+		return err
+	}
+	t.OwnTransitive.RuntimeDeps, err = e.linkTargetNamedDeps(t, t.Spec().Transitive.RuntimeDeps, breadcrumb)
 	if err != nil {
 		return err
 	}
@@ -468,17 +471,8 @@ func (e *State) linkTargetNamedDeps(t *Target, deps specs.Deps, breadcrumb *sets
 			return TargetNamedDeps{}, err
 		}
 
-		err = e.preventDepOnTool(t, ldeps)
-		if err != nil {
-			return TargetNamedDeps{}, err
-		}
-
 		td.Set(name, ldeps)
 	}
-
-	td.Map(func(deps TargetDeps) TargetDeps {
-		return e.filterOutCodegenFromDeps(t, deps)
-	})
 
 	td.Dedup()
 	td.Sort()
@@ -931,6 +925,12 @@ func (e *State) linkTargetDeps(t *Target, deps specs.Deps, breadcrumb *sets.Stri
 		if err != nil {
 			return TargetDeps{}, err
 		}
+	}
+
+	td = e.filterOutCodegenFromDeps(t, td)
+	err := e.preventDepOnTool(t, td)
+	if err != nil {
+		return td, err
 	}
 
 	td.Dedup()

@@ -83,17 +83,9 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		return specs.Target{}, err
 	}
 
-	if args.HashDeps.Array != nil {
-		t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
-		if err != nil {
-			return specs.Target{}, err
-		}
-
-		if t.Deps.Equal(t.HashDeps) {
-			t.HashDeps = t.Deps
-		}
-	} else {
-		t.HashDeps = t.Deps
+	t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
+	if err != nil {
+		return specs.Target{}, err
 	}
 
 	t.RuntimeDeps, err = depsSpecFromArgs(t, args.RuntimeDeps)
