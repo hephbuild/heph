@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"github.com/hephbuild/heph/log/log"
 	"github.com/mattn/go-isatty"
 	"github.com/muesli/termenv"
 	"os"
@@ -194,16 +195,16 @@ func NewDockerProvider(name string, options map[string]interface{}) (Provider, e
 	if v, _ := options["dood"].(bool); v {
 		data, err := dockerInspect(exe)
 		if err != nil {
-			return nil, fmt.Errorf("inspect: %w", err)
-		}
-
-		if len(data) > 0 {
-			for _, bind := range data[0].HostConfig.Binds {
-				parts := strings.Split(bind, ":")
-				if len(parts) >= 2 {
-					host := parts[0]
-					container := parts[1]
-					mountsMap[container] = host
+			log.Warnf("docker: dood: inspect: %v", err)
+		} else {
+			if len(data) > 0 {
+				for _, bind := range data[0].HostConfig.Binds {
+					parts := strings.Split(bind, ":")
+					if len(parts) >= 2 {
+						host := parts[0]
+						container := parts[1]
+						mountsMap[container] = host
+					}
 				}
 			}
 		}
