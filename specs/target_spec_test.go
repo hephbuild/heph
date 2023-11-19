@@ -95,16 +95,16 @@ func genTargetSpec(name string, factor int) Target {
 	}
 
 	return Target{
-		Name:              name,
-		Addr:              "//:" + name,
-		Package:           pkg,
-		Run:               []string{"some", "command"},
-		Entrypoint:        "exec",
-		Dir:               "",
-		PassArgs:          false,
-		Deps:              deps,
-		HashDeps:          deps,
-		DifferentHashDeps: true,
+		Name:        name,
+		Addr:        "//:" + name,
+		Package:     pkg,
+		Run:         []string{"some", "command"},
+		Entrypoint:  "exec",
+		Dir:         "",
+		PassArgs:    false,
+		Deps:        deps,
+		HashDeps:    deps,
+		RuntimeDeps: deps,
 		Tools: Tools{
 			Targets: targetTools,
 			Hosts:   hostTools,
