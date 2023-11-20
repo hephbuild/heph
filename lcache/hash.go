@@ -255,13 +255,11 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 		return tool.Name
 	})
 
-	var allHashDeps graph.TargetNamedDeps
+	allHashDeps := target.Deps
 	if !target.HashDeps.Empty() {
 		allHashDeps = target.Deps.Copy()
 		allHashDeps.Add("_", target.HashDeps)
 		allHashDeps.Sort()
-	} else {
-		allHashDeps = target.Deps
 	}
 
 	h.String("=") // Legacy reasons...

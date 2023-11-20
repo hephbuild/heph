@@ -263,6 +263,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 
 	allDeps := target.Deps
 	if !target.RuntimeDeps.Empty() {
+		allDeps = target.Deps.Copy()
 		allDeps = allDeps.Merge(target.RuntimeDeps)
 		allDeps.Sort()
 	}

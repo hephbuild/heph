@@ -78,7 +78,7 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	}
 
 	err := d.getOrderedAncestors(targets.Slice(), includeRoot, func(target *Target) {
-		deps := target.Deps.All().Merge(target.HashDeps)
+		deps := target.Deps.All().Merge(target.HashDeps).Merge(target.RuntimeDeps.All())
 		for _, dep := range deps.Targets {
 			maybeAddAllOuts(dep.Target, dep.Output)
 		}
