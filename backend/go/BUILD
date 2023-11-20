@@ -108,15 +108,15 @@ def _find_go_work():
     parts = heph.path.split(heph.pkg.dir())
 
     prefix = "."
-    for i in range(0, len(parts)+1):
-        p = prefix+"/go.work"
+    for i in range(0, len(parts) + 1):
+        p = prefix + "/go.work"
 
         if len(glob(p)) > 0:
             return p
 
         prefix += "/.."
 
-    fail("unable to locate work file from "+heph.pkg.dir())
+    fail("unable to locate work file from " + heph.pkg.dir())
 
 def go_mod(
     mod_pkgs = [],
@@ -166,7 +166,7 @@ def go_mod(
     if work:
         p = _find_go_work()
         godeps_deps += [p]
-        godeps_deps += glob(p+".sum")
+        godeps_deps += glob(p + ".sum")
 
     imports = target(
         name = "_go_mod_gen_imports",
@@ -181,19 +181,17 @@ def go_mod(
     (pkg, _, _) = heph.split(go)
 
     mod_pkgs_gen = [
-        "//"+pkg+":_std_pkgs_*",
+        "//" + pkg + ":_std_pkgs_*",
         "go_lib",
         "go_build_bin",
         "test",
         "thirdparty",
         "go-test",
-        "//thirdparty/go/**:_go_mod_download*"
+        "//thirdparty/go/**:_go_mod_download*",
     ]
 
-    for pkg in mod_pkgs+['//thirdparty/go']:
-        mod_pkgs_gen += [
-            pkg+"/**:_go_lib*",
-        ]
+    for pkg in mod_pkgs + ["//thirdparty/go"]:
+        mod_pkgs_gen += [pkg + "/**:_go_lib*"]
 
     # Add labels defined in cfg
     for pkg in cfg.values():
@@ -203,21 +201,22 @@ def go_mod(
                     labels = pkg["test"]["run"]["labels"]
                     if type(labels) != "list":
                         labels = [labels]
+
                     mod_pkgs_gen += labels
 
     mod_pkgs_gen += [
-        heph.pkg.addr()+"/**:_go_lib*",
-        heph.pkg.addr()+"/**:go_bin#build*",
-        heph.pkg.addr()+"/**:_go_test_lib*",
-        heph.pkg.addr()+"/**:_go_xtest_lib*",
-        heph.pkg.addr()+"/**:_go_testmain_lib*",
-        heph.pkg.addr()+"/**:_go_xtestmain_lib*",
-        heph.pkg.addr()+"/**:_go_gen_testmain*",
-        heph.pkg.addr()+"/**:_go_gen_xtestmain*",
-        heph.pkg.addr()+"/**:_go_test#build*",
-        heph.pkg.addr()+"/**:_go_xtest#build*",
-        heph.pkg.addr()+"/**:go_test*",
-        heph.pkg.addr()+"/**:go_xtest*",
+        heph.pkg.addr() + "/**:_go_lib*",
+        heph.pkg.addr() + "/**:go_bin#build*",
+        heph.pkg.addr() + "/**:_go_test_lib*",
+        heph.pkg.addr() + "/**:_go_xtest_lib*",
+        heph.pkg.addr() + "/**:_go_testmain_lib*",
+        heph.pkg.addr() + "/**:_go_xtestmain_lib*",
+        heph.pkg.addr() + "/**:_go_gen_testmain*",
+        heph.pkg.addr() + "/**:_go_gen_xtestmain*",
+        heph.pkg.addr() + "/**:_go_test#build*",
+        heph.pkg.addr() + "/**:_go_xtest#build*",
+        heph.pkg.addr() + "/**:go_test*",
+        heph.pkg.addr() + "/**:go_xtest*",
     ]
 
     target(
@@ -330,7 +329,7 @@ def go_library(
     src_dep = None,
     gen_embed = False,
 ):
-    pvt_name = name if name[0] == "_" else "_"+name
+    pvt_name = name if name[0] == "_" else "_" + name
 
     p = dir + "/" if dir else ""
 

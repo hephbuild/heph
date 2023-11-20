@@ -31,10 +31,10 @@ target(
     deps = deep_gen_1,
     out = "deep-gen-0.BUILD",
     gen = [
-        ':deep_gen_1',
-        ':hello_build',
+        ":deep_gen_1",
+        ":hello_build",
         # deep:
-        ':hello-deep-gen',
+        ":hello-deep-gen",
     ],
 )
 
