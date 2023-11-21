@@ -322,7 +322,7 @@ func generate() []RenderUnit {
 						ximportLibs = append(ximportLibs, t.Full())
 					}
 
-					xtestlib := testLibFactory(targetName("_go_xtest_lib", pkg.Variant), ximportLibs, pkg.ImportPath+"_test", pkg.XTestGoFiles, nil, append(pkg.EmbedPatterns, pkg.XTestEmbedPatterns...), libPkg, pkg.Variant)
+					xtestlib := testLibFactory(targetName("_go_xtest_lib", pkg.Variant), ximportLibs, pkg.ImportPath+"_test", pkg.XTestGoFiles, pkg.SFiles, pkg.XTestEmbedPatterns, libPkg, pkg.Variant)
 
 					depsLibs := make([]string, 0)
 					for _, p := range pkgXTestDeps {
