@@ -36,6 +36,14 @@ type TargetDeps struct {
 	Files      []xfs.Path
 }
 
+func (d TargetDeps) Copy() TargetDeps {
+	return TargetDeps{
+		Targets:    ads.Copy(d.Targets),
+		RawTargets: ads.Copy(d.RawTargets),
+		Files:      ads.Copy(d.Files),
+	}
+}
+
 func (d TargetDeps) Merge(deps TargetDeps) TargetDeps {
 	nd := TargetDeps{}
 
@@ -65,7 +73,7 @@ func (d *TargetDeps) Dedup() {
 	})
 }
 
-func (d TargetDeps) Sort() {
+func (d *TargetDeps) Sort() {
 	ads.SortP(d.Targets,
 		func(i, j *TargetWithOutput) int {
 			return strings.Compare(i.Target.Addr, j.Target.Addr)

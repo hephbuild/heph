@@ -81,9 +81,9 @@ type PkgCfgVariant struct {
 	Name string `json:"name"`
 	PkgCfgCompileVariant
 	Link struct {
-		Flags    string                 `json:"flags"`
-		Deps     map[string]interface{} `json:"deps,omitempty"`
-		HashDeps map[string]interface{} `json:"hash_deps,omitempty"`
+		Flags       string                 `json:"flags"`
+		Deps        map[string]interface{} `json:"deps,omitempty"`
+		RuntimeDeps map[string]interface{} `json:"runtime_deps,omitempty"`
 	} `json:"link"`
 }
 
@@ -112,7 +112,7 @@ func (c PkgCfg) UniqueLinkVariants(v PkgCfgVariant) []PkgCfgVariant {
 			continue
 		}
 
-		k := fmt.Sprintf("%v_%v_%#v_%#v", VID(variant), variant.Link.Flags, variant.Link.Deps, variant.Link.HashDeps)
+		k := fmt.Sprintf("%v_%v_%#v_%#v", VID(variant), variant.Link.Flags, variant.Link.Deps, variant.Link.RuntimeDeps)
 
 		if _, ok := m[k]; ok {
 			continue

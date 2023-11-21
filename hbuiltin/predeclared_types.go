@@ -26,6 +26,7 @@ type TargetArgs struct {
 	Codegen             string
 	Deps                ArrayMapStrArray
 	HashDeps            ArrayMapStrArray
+	RuntimeDeps         ArrayMapStrArray
 	Tools               ArrayMapStr
 	Labels              xstarlark.Listable[string]
 	Out                 ArrayMapStrArray
@@ -44,6 +45,8 @@ type TargetArgs struct {
 
 type TargetArgsTransitive struct {
 	Deps           ArrayMapStrArray
+	HashDeps       ArrayMapStrArray
+	RuntimeDeps    ArrayMapStrArray
 	Tools          ArrayMapStr
 	Env            ArrayMapStr
 	PassEnv        xstarlark.Listable[string]
@@ -65,6 +68,8 @@ func (c *TargetArgsTransitive) Unpack(v starlark.Value) error {
 	var cs TargetArgsTransitive
 	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
 		"deps?", &cs.Deps,
+		"runtime_deps?", &cs.RuntimeDeps,
+		"hash_deps?", &cs.HashDeps,
 		"tools?", &cs.Tools,
 		"env?", &cs.Env,
 		"runtime_env?", &cs.RuntimeEnv,

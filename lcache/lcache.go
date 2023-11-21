@@ -244,9 +244,7 @@ func (e *LocalCacheState) artifactManifest(ctx context.Context, dir xfs.Path, ta
 	return m, true
 }
 
-func (e *LocalCacheState) GetLocalCache(ctx context.Context, ttarget graph.Targeter, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
-	target := ttarget.GraphTarget()
-
+func (e *LocalCacheState) GetLocalCache(ctx context.Context, target *graph.Target, outputs []string, withRestoreCache, onlyMeta, skipSpan, uncompress bool) (bool, error) {
 	ok, err := e.HasArtifact(ctx, target, target.Artifacts.InputHash, skipSpan)
 	if !ok || err != nil {
 		return false, nil

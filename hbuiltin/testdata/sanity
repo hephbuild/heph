@@ -53,23 +53,15 @@ target(
         "Exprs": null
     },
     "HashDeps": {
-        "Targets": [
-            {
-                "Name": "",
-                "Output": "",
-                "Target": "//some/test:some_target",
-                "Mode": "copy"
-            }
-        ],
-        "Files": [
-            {
-                "Name": "",
-                "Path": "some_file.txt"
-            }
-        ],
+        "Targets": null,
+        "Files": null,
         "Exprs": null
     },
-    "DifferentHashDeps": false,
+    "RuntimeDeps": {
+        "Targets": null,
+        "Files": null,
+        "Exprs": null
+    },
     "Tools": {
         "Targets": [
             {
@@ -119,6 +111,16 @@ target(
     "HashFile": "content",
     "Transitive": {
         "Deps": {
+            "Targets": null,
+            "Files": null,
+            "Exprs": null
+        },
+        "HashDeps": {
+            "Targets": null,
+            "Files": null,
+            "Exprs": null
+        },
+        "RuntimeDeps": {
             "Targets": null,
             "Files": null,
             "Exprs": null

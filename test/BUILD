@@ -17,7 +17,7 @@ def e2e_test(
         test_cmd = "%s | tee output && RC=$? " % cmd
 
     if expected_output:
-        test_cmd += "echo '%s' > expected_output && diff -au output expected_output" % expected_output
+        test_cmd += "echo '%s' > expected_output && diff -Nau output expected_output" % expected_output
     elif expect_output_contains:
         test_cmd += '_STR="$(cat output)" _SUBSTR="{}" && if [ "${{_STR##*$_SUBSTR*}}" ]; then echo "FAILED, expected: $_SUBSTR"; exit 1; fi'.format(expect_output_contains)
     elif expect_output_doesnt_contain:

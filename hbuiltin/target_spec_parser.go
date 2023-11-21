@@ -82,19 +82,15 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	if err != nil {
 		return specs.Target{}, err
 	}
-	if args.HashDeps.Array != nil {
-		t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
-		if err != nil {
-			return specs.Target{}, err
-		}
 
-		if t.Deps.Equal(t.HashDeps) {
-			t.HashDeps = t.Deps
-		} else {
-			t.DifferentHashDeps = true
-		}
-	} else {
-		t.HashDeps = t.Deps
+	t.HashDeps, err = depsSpecFromArgs(t, args.HashDeps)
+	if err != nil {
+		return specs.Target{}, err
+	}
+
+	t.RuntimeDeps, err = depsSpecFromArgs(t, args.RuntimeDeps)
+	if err != nil {
+		return specs.Target{}, err
 	}
 
 	t.Platforms, err = ads.MapE(args.Platforms, platformFromArgs)
@@ -108,6 +104,16 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	}
 
 	t.Transitive.Deps, err = depsSpecFromArgs(t, args.Transitive.Deps)
+	if err != nil {
+		return specs.Target{}, err
+	}
+
+	t.Transitive.HashDeps, err = depsSpecFromArgs(t, args.Transitive.HashDeps)
+	if err != nil {
+		return specs.Target{}, err
+	}
+
+	t.Transitive.RuntimeDeps, err = depsSpecFromArgs(t, args.Transitive.RuntimeDeps)
 	if err != nil {
 		return specs.Target{}, err
 	}

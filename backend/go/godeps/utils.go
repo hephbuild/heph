@@ -85,8 +85,8 @@ func genVariant(v PkgCfgVariant, tags, linkflags, linkdeps bool) string {
 			s += ",\n    deps=" + genDict(v.Link.Deps, 1, true)
 		}
 
-		if v.Link.HashDeps != nil {
-			s += ",\n    hash_deps=" + genDict(v.Link.HashDeps, 1, true)
+		if v.Link.RuntimeDeps != nil {
+			s += ",\n    runtime_deps=" + genDict(v.Link.RuntimeDeps, 1, true)
 		}
 	}
 

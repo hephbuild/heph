@@ -15,10 +15,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/locks"
-	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker"
-	"golang.org/x/exp/slices"
-	"strings"
 	"sync"
 )
 
@@ -97,36 +94,4 @@ func (e *Scheduler) CleanTarget(target *graph.Target, async bool) error {
 	}
 
 	return nil
-}
-
-func (e *Scheduler) GetFileDeps(targets ...*graph.Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
-		return target.Deps.All()
-	})
-}
-
-func (e *Scheduler) GetFileHashDeps(targets ...*graph.Target) []xfs.Path {
-	return e.getFileDeps(targets, func(target *graph.Target) graph.TargetDeps {
-		return target.HashDeps
-	})
-}
-
-func (e *Scheduler) getFileDeps(targets []*graph.Target, f func(*graph.Target) graph.TargetDeps) []xfs.Path {
-	filesm := map[string]xfs.Path{}
-	for _, target := range targets {
-		for _, file := range f(target).Files {
-			filesm[file.Abs()] = file
-		}
-	}
-
-	files := make([]xfs.Path, 0, len(filesm))
-	for _, file := range filesm {
-		files = append(files, file)
-	}
-
-	slices.SortStableFunc(files, func(a, b xfs.Path) int {
-		return strings.Compare(a.RelRoot(), b.RelRoot())
-	})
-
-	return files
 }

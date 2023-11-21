@@ -53,10 +53,8 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 		fmt.Fprintln(w, "Input:")
 		printTools(w, indent, target.Tools)
 		printNamedDeps(w, indent, target.Deps)
-		if target.DifferentHashDeps {
-			fmt.Fprintln(w, "Hash Deps:")
-			printDeps(w, indent, target.HashDeps)
-		}
+		printNamedDeps(w, indent, target.RuntimeDeps)
+		printDeps(w, indent, target.HashDeps)
 	}
 
 	if transitive {
@@ -64,6 +62,8 @@ func Print(w io.Writer, target *graph.Target, transitive bool) {
 			fmt.Fprintln(w, "From transitive:")
 			printTools(w, indent, target.TransitiveDeps.Tools)
 			printNamedDeps(w, indent, target.TransitiveDeps.Deps)
+			printDeps(w, indent, target.TransitiveDeps.HashDeps)
+			printNamedDeps(w, indent, target.TransitiveDeps.RuntimeDeps)
 			printTransitiveEnvs(w, indent, target.TransitiveDeps)
 		}
 	}

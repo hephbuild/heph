@@ -138,8 +138,8 @@ type ManifestData struct {
 	Timestamp  time.Time                    `json:"timestamp"`
 }
 
-func (a manifestArtifact) git(args ...string) string {
-	cmd := exec.Command("git", args...)
+func (a manifestArtifact) git(ctx context.Context, args ...string) string {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	b, _ := cmd.Output()
 
 	return strings.TrimSpace(string(b))
@@ -156,10 +156,10 @@ func (a manifestArtifact) Gen(ctx context.Context, gctx *lcache.ArtifactGenConte
 
 	d := ManifestData{
 		GitCommit: gitCommitOnce.MustDo(func() (string, error) {
-			return a.git("rev-parse", "HEAD"), nil
+			return a.git(ctx, "rev-parse", "HEAD"), nil
 		}),
 		GitRef: gitRefOnce.MustDo(func() (string, error) {
-			return a.git("rev-parse", "--abbrev-ref", "HEAD"), nil
+			return a.git(ctx, "rev-parse", "--abbrev-ref", "HEAD"), nil
 		}),
 		InputHash:  inputHash,
 		DepsHashes: map[string]map[string]string{},

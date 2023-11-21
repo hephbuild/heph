@@ -48,6 +48,7 @@ func listImports() {
 
 		fmt.Fprintf(os.Stderr, "found %v imports\n", len(p.Imports))
 		fmt.Fprintf(os.Stderr, "found %v test imports\n", len(p.TestImports))
+		fmt.Fprintf(os.Stderr, "found %v xtest imports\n", len(p.XTestImports))
 
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
@@ -84,26 +85,21 @@ func listImports() {
 			}
 		}
 
-		fmt.Println("+++")
-
-		importsm := map[string]struct{}{}
-
+		fmt.Println("+++ Imports")
+		sort.Strings(p.Imports)
 		for _, i := range p.Imports {
-			importsm[i] = struct{}{}
+			fmt.Println(i)
 		}
 
+		fmt.Println("+++ TestImports")
+		sort.Strings(p.TestImports)
 		for _, i := range p.TestImports {
-			importsm[i] = struct{}{}
+			fmt.Println(i)
 		}
 
-		imports := make([]string, 0)
-		for i := range importsm {
-			imports = append(imports, i)
-		}
-
-		sort.Strings(imports)
-
-		for _, i := range imports {
+		fmt.Println("+++ XTestImports")
+		sort.Strings(p.XTestImports)
+		for _, i := range p.XTestImports {
 			fmt.Println(i)
 		}
 

@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type Request struct {
@@ -202,6 +203,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 			}
 		}
 
+		start := time.Now()
 		err = platform.Exec(
 			execCtx,
 			rtarget.Executor,
@@ -225,6 +227,9 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 		execSpan.EndError(err)
 		if err != nil {
 			if rr.Shell {
+				if time.Since(start) < 5*time.Second {
+					return nil, err
+				}
 				log.Debugf("exec: %v", err)
 				return nil, nil
 			}

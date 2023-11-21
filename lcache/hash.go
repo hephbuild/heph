@@ -207,15 +207,14 @@ func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
 }
 
 func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string, error) {
-	target := gtarget.GraphTarget()
-	targetm := e.Metas.Find(gtarget)
+	target := e.Metas.Find(gtarget)
 
-	targetm.cacheHashInputTargetMutex.Lock()
-	defer targetm.cacheHashInputTargetMutex.Unlock()
+	target.cacheHashInputTargetMutex.Lock()
+	defer target.cacheHashInputTargetMutex.Unlock()
 
-	if h := targetm.inputHash; h != "" {
+	if h := target.inputHash; h != "" {
 		if verify {
-			for p, t := range targetm.cacheHashInputPathsModtime {
+			for p, t := range target.cacheHashInputPathsModtime {
 				info, err := os.Lstat(p)
 				if err != nil {
 					return "", err
@@ -236,7 +235,7 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 	}()
 
 	h := hash.NewDebuggableHash(func() string {
-		return target.Addr + "_" + targetm.depsHash + "_hash_input"
+		return target.Addr + "_" + target.depsHash + "_hash_input"
 	})
 	h.I64(8) // Force break all caches
 
@@ -256,45 +255,39 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 		return tool.Name
 	})
 
+	allHashDeps := target.Deps
+	if !target.HashDeps.Empty() {
+		allHashDeps = target.Deps.Copy()
+		allHashDeps.Add("_", target.HashDeps)
+		allHashDeps.Sort()
+	}
+
+	h.String("=") // Legacy reasons...
 	h.String("=")
-	var pathsModtime map[string]time.Time
-	if target.DifferentHashDeps {
+	pathsModtime := make(map[string]time.Time)
+	for _, name := range allHashDeps.Names() {
 		h.String("=")
-		err := e.hashDepsTargets(h, target.HashDeps.Targets)
+		h.String(name)
+
+		deps := allHashDeps.Name(name)
+
+		err := e.hashDepsTargets(h, deps.Targets)
 		if err != nil {
 			return "", err
 		}
-		pathsModtime, err = e.hashFiles(h, target.HashFile, target.HashDeps.Files)
+
+		m, err := e.hashFiles(h, target.HashFile, deps.Files)
 		if err != nil {
 			return "", err
 		}
-	} else {
-		h.String("=")
-		pathsModtime = make(map[string]time.Time)
-		for _, name := range target.Deps.Names() {
-			h.String("=")
-			h.String(name)
 
-			deps := target.Deps.Name(name)
-
-			err := e.hashDepsTargets(h, deps.Targets)
-			if err != nil {
-				return "", err
-			}
-
-			m, err := e.hashFiles(h, target.HashFile, deps.Files)
-			if err != nil {
-				return "", err
-			}
-
-			for p, t := range m {
-				if pt, ok := pathsModtime[p]; ok {
-					if t != pt {
-						return "", fmt.Errorf("%v: %w", p, ErrFileModifiedWhileHashing)
-					}
-				} else {
-					pathsModtime[p] = t
+		for p, t := range m {
+			if pt, ok := pathsModtime[p]; ok {
+				if t != pt {
+					return "", fmt.Errorf("%v: %w", p, ErrFileModifiedWhileHashing)
 				}
+			} else {
+				pathsModtime[p] = t
 			}
 		}
 	}
@@ -342,10 +335,10 @@ func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string
 		})
 	}
 
-	targetm.inputHash = h.Sum()
-	targetm.cacheHashInputPathsModtime = pathsModtime
+	target.inputHash = h.Sum()
+	target.cacheHashInputPathsModtime = pathsModtime
 
-	return targetm.inputHash, nil
+	return target.inputHash, nil
 }
 
 func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) (string, error) {

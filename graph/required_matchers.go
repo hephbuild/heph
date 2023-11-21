@@ -60,11 +60,14 @@ func (e *requiredMatchersAnalyzer) targetRequiredMatchers(t *Target, breadcrumb 
 		return err
 	}
 
-	if spec.DifferentHashDeps {
-		err := e.computeRequiredMatchersDeps(spec, spec.HashDeps, breadcrumb)
-		if err != nil {
-			return err
-		}
+	err = e.computeRequiredMatchersDeps(spec, spec.HashDeps, breadcrumb)
+	if err != nil {
+		return err
+	}
+
+	err = e.computeRequiredMatchersDeps(spec, spec.RuntimeDeps, breadcrumb)
+	if err != nil {
+		return err
 	}
 
 	err = e.computeRequiredMatchersTools(spec, spec.Tools, breadcrumb)

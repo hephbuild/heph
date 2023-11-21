@@ -44,3 +44,50 @@ e2e_test(
     cmd = "heph q revdeps '//test/features:deps2'",
     expected_output = "//test/features:deps3".strip(),
 )
+
+some_file = text_file(
+    name = "_some_file",
+    text = "hello",
+    out = "file.txt",
+)
+
+deps_run = "set +e; env | grep SRC; ls"
+
+target(
+    name = "deps4",
+    deps = some_file,
+    run = deps_run,
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps4",
+    cmd = "heph r '//test/features:deps4'",
+    expected_output = "SRC=file.txt\nfile.txt",
+)
+
+target(
+    name = "deps5",
+    hash_deps = some_file,
+    run = deps_run,
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps5",
+    cmd = "heph r '//test/features:deps5'",
+    expected_output = "",
+)
+
+target(
+    name = "deps6",
+    runtime_deps = some_file,
+    run = deps_run,
+    cache = False,
+)
+
+e2e_test(
+    name = "e2e_deps6",
+    cmd = "heph r '//test/features:deps6'",
+    expected_output = "SRC=file.txt\nfile.txt",
+)

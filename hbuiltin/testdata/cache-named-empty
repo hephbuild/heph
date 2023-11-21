@@ -46,7 +46,11 @@ target(
         "Files": null,
         "Exprs": null
     },
-    "DifferentHashDeps": false,
+    "RuntimeDeps": {
+        "Targets": null,
+        "Files": null,
+        "Exprs": null
+    },
     "Tools": {
         "Targets": null,
         "Hosts": null,
@@ -84,6 +88,16 @@ target(
     "HashFile": "content",
     "Transitive": {
         "Deps": {
+            "Targets": null,
+            "Files": null,
+            "Exprs": null
+        },
+        "HashDeps": {
+            "Targets": null,
+            "Files": null,
+            "Exprs": null
+        },
+        "RuntimeDeps": {
             "Targets": null,
             "Files": null,
             "Exprs": null
