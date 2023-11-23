@@ -161,7 +161,7 @@ def go_mod(
         },
     )
 
-    godeps_deps = glob("**/*.{mod,sum}") + [src] + mod_pkg_srcs + mod_pkg_modsums
+    godeps_deps = [gomodsum, src] + mod_pkg_srcs + mod_pkg_modsums
 
     if work:
         p = _find_go_work()
@@ -224,8 +224,10 @@ def go_mod(
         run = "godeps mod $SRC_CFG",
         out = "/**/BUILD",
         deps = {
-            "deps": godeps_deps,
             "cfg": godeps_cfg,
+        },
+        runtime_deps = {
+            "deps": godeps_deps,
         },
         hash_deps = [imports, gomodsum],
         tools = godeps,
