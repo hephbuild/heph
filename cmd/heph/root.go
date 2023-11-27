@@ -13,6 +13,8 @@ import (
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/spf13/cobra"
 	"go.uber.org/multierr"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -28,6 +30,7 @@ var cpuprofile *string
 var memprofile *string
 var shell *bool
 var noCloudTelemetry *bool
+var httpPprof *string
 var noInline *bool
 var printOutput boolStr
 var catOutput boolStr
@@ -102,6 +105,7 @@ func init() {
 	summaryGen = rootCmd.PersistentFlags().Bool("summary-gen", false, "Prints execution stats, including during gen")
 	jaegerEndpoint = rootCmd.PersistentFlags().String("jaeger", "", "Jaeger endpoint to collect traces")
 	noCloudTelemetry = rootCmd.PersistentFlags().Bool("no-cloud-telemetry", false, "Disable cloud reporting")
+	httpPprof = rootCmd.PersistentFlags().String("http-pprof", "", "Http pprof address")
 
 	plain = rootCmd.PersistentFlags().Bool("plain", false, "Plain output")
 	rootCmd.PersistentFlags().Var(newWorkersValue(&workers), "workers", "Workers to spawn as a number or percentage")
@@ -171,6 +175,12 @@ var rootCmd = &cobra.Command{
 			if err := pprof.StartCPUProfile(cpuProfileFile); err != nil {
 				return fmt.Errorf("could not start CPU profile: %w", err)
 			}
+		}
+
+		if addr := *httpPprof; addr != "" {
+			go func() {
+				log.Error(http.ListenAndServe(addr, nil))
+			}()
 		}
 
 		return nil
