@@ -131,9 +131,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.UpdateMessage = msg
 		if msg.final {
 			if m.quitWhenDone {
-				return m, func() tea.Msg {
-					return tea.Quit()
-				}
+				return m, tea.Quit
 			}
 		}
 		return m, m.doUpdateMsgTicker()
@@ -188,4 +186,8 @@ func (m *Model) View() string {
 	}
 
 	return s.String()
+}
+
+func (m *Model) Clean() {
+	m.log.Clean()
 }

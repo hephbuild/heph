@@ -6,6 +6,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/status"
+	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xpanic"
 	"github.com/muesli/termenv"
 	"io"
@@ -270,7 +271,7 @@ func (j *Job) doneWithState(state JobState) {
 	j.State = state
 	close(j.doneCh)
 	j.RunHook()
-	//j.cancel()
+	j.cancel()
 }
 
 func (j *Job) IsDone() bool {
@@ -356,11 +357,10 @@ func NewPool(n int) *Pool {
 func (p *Pool) Schedule(ctx context.Context, job *Job) *Job {
 	p.wg.Add(1)
 
-	ctx, cancel := context.WithCancel(ctx)
-	go func() {
-		<-p.ctx.Done()
-		cancel()
-	}()
+	ctx, cancel := context.WithCancel(xcontext.CancellableContext{
+		Parent: ctx,
+		Cancel: p.ctx,
+	})
 
 	job.ID = atomic.AddUint64(&p.idc, 1)
 	job.State = StateScheduled

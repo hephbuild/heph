@@ -10,11 +10,13 @@ import (
 func NewLogModel() LogModel {
 	return LogModel{
 		entryCh: make(chan liblog.Entry),
+		done:    make(chan struct{}),
 	}
 }
 
 type LogModel struct {
 	entryCh chan liblog.Entry
+	done    chan struct{}
 	width   int
 }
 
@@ -47,6 +49,15 @@ func (m LogModel) Update(msg tea.Msg) (LogModel, tea.Cmd) {
 	return m, nil
 }
 
+func (m LogModel) Clean() {
+	close(m.done)
+}
+
 func (m LogModel) Next() tea.Msg {
-	return <-m.entryCh
+	select {
+	case e := <-m.entryCh:
+		return e
+	case <-m.done:
+		return nil
+	}
 }

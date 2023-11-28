@@ -62,11 +62,6 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 		Do: func(w *worker.Worker, ctx context.Context) error {
 			status.Emit(ctx, status.String("Finalizing gen..."))
 
-			// free references to starlark
-			for _, p := range e.Packages.All() {
-				p.Globals = nil
-			}
-
 			return nil
 		},
 	})

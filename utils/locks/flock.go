@@ -150,7 +150,6 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 
 		go func() {
 			defer close(lockCh)
-
 			lockCh <- flock.Flock(f, ro, true)
 		}()
 

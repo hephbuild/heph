@@ -30,7 +30,7 @@ func (wg *WaitGroup) Add(job *Job) {
 	defer wg.m.Unlock()
 
 	go func() {
-		<-job.doneCh
+		<-job.Wait()
 		wg.handleUnitDone()
 	}()
 

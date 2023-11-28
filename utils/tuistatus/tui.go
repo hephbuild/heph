@@ -27,6 +27,7 @@ func do(ctx context.Context, f func(ctx context.Context)) error {
 			f(ctx)
 		},
 	}
+	defer m.Clean()
 
 	err := xtea.RunModel(m, tea.WithInput(nil))
 	if err != nil {

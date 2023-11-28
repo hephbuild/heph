@@ -94,13 +94,13 @@ func NewStarlarkThread() *starlark.Thread {
 }
 
 func (e *runContext) runBuildFilesForPackage(pkg *packages.Package, bc *breadcrumb) error {
-	if pkg.Globals != nil {
-		return nil
-	}
-
 	nbc, err := bc.addPkg(pkg)
 	if err != nil {
 		return err
+	}
+
+	if pkg.Globals != nil {
+		return nil
 	}
 
 	pkg.Globals = starlark.StringDict{}

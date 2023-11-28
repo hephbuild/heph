@@ -63,3 +63,7 @@ func (m model) View() string {
 
 	return m.h.status.String(log.Renderer())
 }
+
+func (m model) Clean() {
+	m.log.Clean()
+}

@@ -247,6 +247,10 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 		if err != nil {
 			return bs, fmt.Errorf("buildfiles: %w", err)
 		}
+
+		for _, p := range bs.Packages.All() {
+			p.Globals = nil
+		}
 	}
 
 	bs.PlatformProviders = platform.Bootstrap(cfg)

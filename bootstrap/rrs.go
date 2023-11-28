@@ -131,6 +131,10 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 		}
 	}
 
+	for _, p := range e.Packages.All() {
+		p.Globals = nil
+	}
+
 	return nil
 }
 

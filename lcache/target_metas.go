@@ -34,10 +34,20 @@ func (m *TargetMetas[T]) findAtHash(spec specs.Specer, h string) T {
 	})
 }
 
+func (m *TargetMetas[T]) Reset() {
+	m.m.DeleteP(func(k targetMetaKey) bool {
+		return true
+	})
+}
+
 func (m *TargetMetas[T]) Delete(spec specs.Specer) {
 	m.m.DeleteP(func(k targetMetaKey) bool {
 		return k.addr == spec.Spec().Addr
 	})
+}
+
+func (m *TargetMetas[T]) Len() int {
+	return len(m.m.Raw())
 }
 
 func NewTargetMetas[T any](factory func(k targetMetaKey) T) *TargetMetas[T] {

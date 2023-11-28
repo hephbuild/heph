@@ -16,6 +16,7 @@ func termUI(ctx context.Context, name string, deps *worker.WaitGroup, pool *work
 	defer xtea.SingleflightDone()
 
 	m := poolui.New(ctx, name, deps, pool, true)
+	defer m.Clean()
 
 	err := xtea.RunModel(m)
 	if err != nil {

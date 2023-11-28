@@ -318,12 +318,19 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 		}
 	}
 
+	usingBs := false
 	if bs.Scheduler == nil {
-		cbs, err := bootstrap.BootWithScheduler(s.ctx, s.bootopts)
+		cbs, err := bootstrap.BootWithScheduler(ctx, s.bootopts)
 		if err != nil {
 			return fmt.Errorf("boot: %w", err)
 		}
 		bs = cbs
+
+		defer func() {
+			if !usingBs {
+				cbs.Finalizers.Run(nil)
+			}
+		}()
 
 		if cbs.Cloud.Hook != nil {
 			s.bootopts.FlowID = cbs.Cloud.Hook.FlowId
@@ -387,11 +394,10 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	if len(filteredRRs) == 0 {
 		status("Nothing changed!")
-		if bs.Scheduler != s.cbs.Scheduler {
-			bs.Scheduler.Finalizers.Run(nil)
-		}
 		return nil
 	}
+
+	usingBs = true
 
 	s.sigCh <- sigEvent{
 		bs:     bs,
@@ -550,7 +556,13 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	}
 
 	for _, rr := range e.rrs {
-		s.cbs.Scheduler.LocalCache.ResetCacheHashInput(rr.Target)
+		ancestors, err := s.cbs.Graph.DAG().GetOrderedAncestors([]*graph.Target{rr.Target}, true)
+		if err != nil {
+			return err
+		}
+		for _, ancestor := range ancestors {
+			s.cbs.Scheduler.LocalCache.ResetCacheHashInput(ancestor)
+		}
 
 		hash, err := e.bs.Scheduler.LocalCache.HashInput(rr.Target)
 		if err != nil {
