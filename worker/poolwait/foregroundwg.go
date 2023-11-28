@@ -14,30 +14,30 @@ func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *work
 	return ctx, deps
 }
 
-// WeakWaitGroup allows to depend on other Job/Worker without keeping them in memory, allowing GC to work
-type WeakWaitGroup struct {
+// GCWaitGroup allows to depend on other Job/Worker without keeping them in memory, allowing GC to work
+type GCWaitGroup struct {
 	Deps *worker.WaitGroup
 }
 
-func (wwg *WeakWaitGroup) Add(j *worker.Job) {
-	wwg.Deps.AddSem()
+func (wwg *GCWaitGroup) Add(j *worker.Job) {
+	wwg.Deps.Add(j)
 	go func() {
 		<-j.Wait()
-		wwg.Deps.DoneSem()
+		wwg.Deps.Remove(j)
 	}()
 }
 
-func (wwg *WeakWaitGroup) AddChild(wg *worker.WaitGroup) {
-	wwg.Deps.AddSem()
+func (wwg *GCWaitGroup) AddChild(wg *worker.WaitGroup) {
+	wwg.Deps.AddChild(wg)
 	go func() {
 		<-wg.Done()
-		wwg.Deps.DoneSem()
+		wwg.Deps.RemoveChild(wg)
 	}()
 }
 
-func ForegroundWaitGroup(ctx context.Context) *WeakWaitGroup {
+func ForegroundWaitGroup(ctx context.Context) *GCWaitGroup {
 	if deps, ok := ctx.Value(keyFgWaitGroup{}).(*worker.WaitGroup); ok {
-		return &WeakWaitGroup{Deps: deps}
+		return &GCWaitGroup{Deps: deps}
 	}
 
 	return nil

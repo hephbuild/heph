@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
 	"go.uber.org/multierr"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,15 @@ func (wg *WaitGroup) Add(job *Job) {
 	wg.jobs = append(wg.jobs, job)
 }
 
+func (wg *WaitGroup) Remove(job *Job) {
+	wg.m.Lock()
+	defer wg.m.Unlock()
+
+	wg.jobs = ads.Filter(wg.jobs, func(wgjob *Job) bool {
+		return job != wgjob
+	})
+}
+
 func (wg *WaitGroup) AddChild(child *WaitGroup) {
 	if child == nil {
 		panic("child cannot be nil")
@@ -51,6 +61,15 @@ func (wg *WaitGroup) AddChild(child *WaitGroup) {
 	}()
 
 	wg.wgs = append(wg.wgs, child)
+}
+
+func (wg *WaitGroup) RemoveChild(child *WaitGroup) {
+	wg.m.Lock()
+	defer wg.m.Unlock()
+
+	wg.wgs = ads.Filter(wg.wgs, func(wgchild *WaitGroup) bool {
+		return child != wgchild
+	})
 }
 
 func (wg *WaitGroup) handleUnitDone() {
