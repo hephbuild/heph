@@ -2,6 +2,7 @@ package lcache
 
 import (
 	tar2 "archive/tar"
+	"context"
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/artifacts"
@@ -198,14 +199,6 @@ func (e *LocalCacheState) VerifyHashInput(target graph.Targeter) (string, error)
 	return e.hashInput(target, true)
 }
 
-func (e *LocalCacheState) mustHashInput(target graph.Targeter) string {
-	h, err := e.hashInput(target, false)
-	if err != nil {
-		panic(err)
-	}
-	return h
-}
-
 func (e *LocalCacheState) hashInput(gtarget graph.Targeter, verify bool) (string, error) {
 	target := e.Metas.Find(gtarget)
 
@@ -345,17 +338,8 @@ func (e *LocalCacheState) HashOutput(target graph.Targeter, output string) (stri
 	return e.hashOutput(target, output)
 }
 
-func (e *LocalCacheState) mustHashOutput(target graph.Targeter, output string) string {
-	h, err := e.hashOutput(target, output)
-	if err != nil {
-		panic(err)
-	}
-
-	return h
-}
-
 func (e *LocalCacheState) hashArtifact(h hash.Hash, target *graph.Target, artifact artifacts.Artifact) error {
-	r, _, err := e.UncompressedReaderFromArtifact(artifact, target)
+	r, _, err := e.UncompressedReaderFromArtifact(context.TODO(), artifact, target)
 	if err != nil {
 		return fmt.Errorf("uncompressedreader %v %w", artifact.Name(), err)
 	}
@@ -390,7 +374,12 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 		return "", fmt.Errorf("%v does not output `%v`", target, output)
 	}
 
-	file := e.cacheDir(target).Join(target.Artifacts.OutHash(output).FileName()).Abs()
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return "", err
+	}
+
+	file := dir.Join(target.Artifacts.OutHash(output).FileName()).Abs()
 	b, err := os.ReadFile(file)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		log.Errorf("reading %v: %v", file, err)
@@ -428,8 +417,13 @@ func (e *LocalCacheState) hashOutput(gtarget graph.Targeter, output string) (str
 	return sh, nil
 }
 
-func (e *LocalCacheState) cacheDir(target graph.Targeter) xfs.Path {
-	return e.cacheDirForHash(target, e.mustHashInput(target))
+func (e *LocalCacheState) cacheDir(target graph.Targeter) (xfs.Path, error) {
+	h, err := e.hashInput(target, false)
+	if err != nil {
+		return xfs.Path{}, err
+	}
+
+	return e.cacheDirForHash(target, h), nil
 }
 
 func (e *LocalCacheState) cacheDirForHash(target specs.Specer, inputHash string) xfs.Path {

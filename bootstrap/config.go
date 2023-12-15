@@ -40,14 +40,9 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 		return nil, fmt.Errorf(".hephconfig: %w", err)
 	}
 
-	err = config.ParseAndApply(root.Root.Join(".hephconfig.local").Abs(), &cfg)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf(".hephconfig: %w", err)
-	}
-
 	log.Tracef("Profiles: %v", cfg.Profiles)
 
-	for _, profile := range cfg.Profiles {
+	for _, profile := range append([]string{"local"}, cfg.Profiles...) {
 		err := config.ParseAndApply(root.Root.Join(".hephconfig."+profile).Abs(), &cfg)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf(".hephconfig.%v: %w", profile, err)

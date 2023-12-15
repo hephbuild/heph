@@ -187,9 +187,14 @@ func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []A
 func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (_ *worker.WaitGroup, rerr error) {
 	target := gtarget.GraphTarget()
 
-	dir := e.cacheDir(target).Abs()
+	dirp, err := e.cacheDir(target)
+	if err != nil {
+		return nil, err
+	}
 
-	err := os.RemoveAll(dir)
+	dir := dirp.Abs()
+
+	err = os.RemoveAll(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -251,9 +256,14 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
 	target := gtarget.GraphTarget()
 
-	dir := e.cacheDir(target).Abs()
+	dirp, err := e.cacheDir(target)
+	if err != nil {
+		return err
+	}
 
-	err := os.RemoveAll(dir)
+	dir := dirp.Abs()
+
+	err = os.RemoveAll(dir)
 	if err != nil {
 		return err
 	}

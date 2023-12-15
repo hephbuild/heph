@@ -53,20 +53,26 @@ func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Targe
 }
 
 func (e *LocalCacheState) collectNamedOutFromTar(ctx context.Context, target *graph.Target, outputs []string) (*ActualOutNamedPaths, error) {
-	sizeSum := ads.Reduce(outputs, func(s int64, name string) int64 {
+	sizeSum, err := ads.ReduceE(outputs, func(s int64, name string) (int64, error) {
 		if s < 0 {
-			return -1
+			return -1, nil
 		}
 
 		artifact := target.Artifacts.OutTar(name)
 
-		stats, _ := e.ArtifactManifest(ctx, target, artifact)
+		stats, _, err := e.ArtifactManifest(ctx, target, artifact)
+		if err != nil {
+			return -1, err
+		}
 		if stats.Size <= 0 {
-			return -1
+			return -1, nil
 		}
 
-		return stats.Size
+		return stats.Size, nil
 	}, int64(0))
+	if err != nil {
+		return nil, err
+	}
 
 	c := xprogress.NewCounter()
 
@@ -101,7 +107,7 @@ func (e *LocalCacheState) collectNamedOutFromTar(ctx context.Context, target *gr
 }
 
 func (e *LocalCacheState) outputFileListFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact, u *xprogress.Counter) (xfs.RelPaths, error) {
-	r, stats, err := e.UncompressedReaderFromArtifact(artifact, target)
+	r, stats, err := e.UncompressedReaderFromArtifact(ctx, artifact, target)
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +129,12 @@ func (e *LocalCacheState) outputFileListFromArtifact(ctx context.Context, target
 		}()
 	}
 
-	files, err := tar.UntarList(ctx, r, e.tarListPath(artifact, target), func(read int64) {
+	tarPath, err := e.tarListPath(artifact, target)
+	if err != nil {
+		return nil, err
+	}
+
+	files, err := tar.UntarList(ctx, r, tarPath, func(read int64) {
 		u.AddN(read)
 	})
 	if err != nil {

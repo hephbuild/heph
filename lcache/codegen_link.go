@@ -47,7 +47,7 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 
 		switch target.Codegen {
 		case specs.CodegenCopy, specs.CodegenCopyNoExclude:
-			tarf, _, err := e.UncompressedReaderFromArtifact(target.Artifacts.OutTar(name), target)
+			tarf, _, err := e.UncompressedReaderFromArtifact(ctx, target.Artifacts.OutTar(name), target)
 			if err != nil {
 				return err
 			}
@@ -73,6 +73,11 @@ func (e *LocalCacheState) codegenLink(ctx context.Context, target *Target) error
 
 					if !isLink {
 						log.Warnf("linking codegen: %v already exists", to)
+						continue
+					}
+
+					currentOrigin, _ := os.Readlink(to)
+					if from == currentOrigin {
 						continue
 					}
 

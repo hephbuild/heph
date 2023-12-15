@@ -184,7 +184,10 @@ func (e *LocalCacheState) HasArtifact(ctx context.Context, target graph.Targeter
 		}
 	}
 
-	cacheDir := e.cacheDir(target)
+	cacheDir, err := e.cacheDir(target)
+	if err != nil {
+		return false, err
+	}
 
 	for _, name := range []string{artifact.FileName(), artifact.GzFileName()} {
 		p := cacheDir.Join(name).Abs()
@@ -202,8 +205,14 @@ func (e *LocalCacheState) LatestArtifactManifest(ctx context.Context, target gra
 	return e.artifactManifestWithFallback(ctx, e.cacheDirForHash(target, LatestDir), target, artifact)
 }
 
-func (e *LocalCacheState) ArtifactManifest(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool) {
-	return e.artifactManifestWithFallback(ctx, e.cacheDir(target), target, artifact)
+func (e *LocalCacheState) ArtifactManifest(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool, error) {
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return ArtifactManifest{}, false, err
+	}
+
+	m, ok := e.artifactManifestWithFallback(ctx, dir, target, artifact)
+	return m, ok, nil
 }
 
 func (e *LocalCacheState) artifactManifestWithFallback(ctx context.Context, dir xfs.Path, target graph.Targeter, artifact artifacts.Artifact) (ArtifactManifest, bool) {
@@ -291,10 +300,18 @@ func (e *LocalCacheState) GetLocalCache(ctx context.Context, target *graph.Targe
 	return true, nil
 }
 
-func (e *LocalCacheState) UncompressedReaderFromArtifact(artifact artifacts.Artifact, target graph.Targeter) (io.ReadCloser, ArtifactManifest, error) {
-	stats, _ := e.ArtifactManifest(context.TODO(), target, artifact)
+func (e *LocalCacheState) UncompressedReaderFromArtifact(ctx context.Context, artifact artifacts.Artifact, target graph.Targeter) (io.ReadCloser, ArtifactManifest, error) {
+	stats, _, err := e.ArtifactManifest(ctx, target, artifact)
+	if err != nil {
+		return nil, ArtifactManifest{}, err
+	}
 
-	r, err := artifacts.UncompressedReaderFromArtifact(artifact, e.cacheDir(target).Abs())
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return nil, ArtifactManifest{}, err
+	}
+
+	r, err := artifacts.UncompressedReaderFromArtifact(artifact, dir.Abs())
 	if err != nil {
 		return nil, stats, err
 	}
@@ -303,9 +320,17 @@ func (e *LocalCacheState) UncompressedReaderFromArtifact(artifact artifacts.Arti
 }
 
 func (e *LocalCacheState) UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (string, ArtifactManifest, error) {
-	stats, _ := e.ArtifactManifest(ctx, target, artifact)
+	stats, _, err := e.ArtifactManifest(ctx, target, artifact)
+	if err != nil {
+		return "", ArtifactManifest{}, err
+	}
 
-	p, err := UncompressedPathFromArtifact(ctx, target, artifact, e.cacheDir(target).Abs(), stats.Size)
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return "", ArtifactManifest{}, err
+	}
+
+	p, err := UncompressedPathFromArtifact(ctx, target, artifact, dir.Abs(), stats.Size)
 	if err != nil {
 		return "", stats, err
 	}
@@ -328,8 +353,12 @@ func (e *LocalCacheState) LatestUncompressedPathFromArtifact(ctx context.Context
 	return p, stats, err
 }
 
-func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.Targeter) string {
-	return e.cacheDir(target).Join(artifact.Name() + ".list").Abs()
+func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.Targeter) (string, error) {
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return "", err
+	}
+	return dir.Join(artifact.Name() + ".list").Abs(), nil
 }
 
 func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, outputs []string) (xfs.Path, error) {
@@ -357,7 +386,10 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		}
 	}()
 
-	cacheDir := e.cacheDir(target)
+	cacheDir, err := e.cacheDir(target)
+	if err != nil {
+		return xfs.Path{}, err
+	}
 
 	outDir := cacheDir.Join("_output")
 	outDirHashPath := cacheDir.Join("_output_hash").Abs()
@@ -387,9 +419,13 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 
 	if shouldExpand {
 		status.Emit(ctx, tgt.TargetStatus(target, "Expanding cache..."))
-		tmpOutDir := e.cacheDir(target).Join("_output_tmp").Abs()
+		dir, err := e.cacheDir(target)
+		if err != nil {
+			return xfs.Path{}, err
+		}
+		tmpOutDir := dir.Join("_output_tmp").Abs()
 
-		err := os.RemoveAll(tmpOutDir)
+		err = os.RemoveAll(tmpOutDir)
 		if err != nil {
 			return outDir, err
 		}
@@ -404,7 +440,10 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		for _, name := range outputs {
 			artifact := target.Artifacts.OutTar(name)
 
-			manifest, _ := e.ArtifactManifest(ctx, target, artifact)
+			manifest, _, err := e.ArtifactManifest(ctx, target, artifact)
+			if err != nil {
+				return xfs.Path{}, err
+			}
 
 			r, err := artifacts.UncompressedReaderFromArtifact(artifact, cacheDir.Abs())
 			if err != nil {
@@ -420,8 +459,13 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 				}
 			}
 
+			tarPath, err := e.tarListPath(target.Artifacts.OutTar(name), target)
+			if err != nil {
+				return xfs.Path{}, err
+			}
+
 			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
-				ListPath: e.tarListPath(target.Artifacts.OutTar(name), target),
+				ListPath: tarPath,
 				Dedup:    untarDedup,
 				Progress: progress,
 			})
@@ -494,7 +538,12 @@ func (e *LocalCacheState) CleanTarget(target specs.Specer, async bool) error {
 }
 
 func (e *LocalCacheState) VFSLocation(target graph.Targeter) (vfs.Location, error) {
-	rel, err := filepath.Rel(e.Path.Abs(), e.cacheDir(target).Abs())
+	dir, err := e.cacheDir(target)
+	if err != nil {
+		return nil, err
+	}
+
+	rel, err := filepath.Rel(e.Path.Abs(), dir.Abs())
 	if err != nil {
 		return nil, err
 	}
@@ -503,11 +552,18 @@ func (e *LocalCacheState) VFSLocation(target graph.Targeter) (vfs.Location, erro
 }
 
 func (e *LocalCacheState) RegisterRemove(target graph.Targeter) {
-	e.Finalizers.RegisterRemove(e.cacheDir(target).Abs())
+	dir, err := e.cacheDir(target)
+	if err == nil {
+		return
+	}
+	e.Finalizers.RegisterRemove(dir.Abs())
 }
 
 func (e *LocalCacheState) ArtifactExists(ctx context.Context, target graph.Targeter, artifact artifacts.Artifact) (bool, error) {
-	root := e.cacheDir(target)
+	root, err := e.cacheDir(target)
+	if err != nil {
+		return false, err
+	}
 
 	for _, name := range []string{artifact.GzFileName(), artifact.FileName()} {
 		if xfs.PathExists(root.Join(name).Abs()) {

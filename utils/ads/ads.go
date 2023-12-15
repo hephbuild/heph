@@ -240,13 +240,24 @@ func Grow[S ~[]E, E any](slice S, newCap int) S {
 }
 
 func Reduce[T any, O any](a []T, f func(O, T) O, initial O) O {
+	out, _ := ReduceE[T, O](a, func(o O, t T) (O, error) {
+		return f(o, t), nil
+	}, initial)
+	return out
+}
+
+func ReduceE[T any, O any](a []T, f func(O, T) (O, error), initial O) (O, error) {
 	out := initial
 
+	var err error
 	for _, v := range a {
-		out = f(out, v)
+		out, err = f(out, v)
+		if err != nil {
+			return out, err
+		}
 	}
 
-	return out
+	return out, nil
 }
 
 func Last[T any](a []T) T {
