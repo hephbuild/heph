@@ -2,10 +2,12 @@ package xfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/hephbuild/heph/utils/ads"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -121,9 +123,18 @@ func starWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 
 	i := indexMeta(pattern)
 	if i == -1 {
-		path := unescapeMeta(pattern)
-
 		// Pattern is actually a pure path
+
+		path := unescapeMeta(pattern)
+		_, err := os.Lstat(path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+
+			return err
+		}
+
 		// If dir: all files recursively would match
 		// If file: it will call fn once with the file
 		alwaysMatch = true
