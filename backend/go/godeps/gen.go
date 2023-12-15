@@ -404,7 +404,6 @@ func generate() []RenderUnit {
 				})
 			}
 		}
-
 	}
 
 	return units

@@ -37,13 +37,21 @@ func NewState(s State) *State {
 	return &s
 }
 
+func (s *State) CollectFilesInRoot(ctx context.Context, root string) ([]string, error) {
+	return s.collectFiles(ctx, root, nil)
+}
+
 func (s *State) CollectFiles(ctx context.Context, root string) ([]string, error) {
+	return s.collectFiles(ctx, root, s.Ignore)
+}
+
+func (s *State) collectFiles(ctx context.Context, root string, ignore []string) ([]string, error) {
 	done := log.TraceTimingDone("RunBuildFiles:walk")
 	defer done()
 
 	files := make([]string, 0)
 
-	err := xfs.StarWalkAbs(ctx, root, s.Patterns[0], s.Ignore, func(path string, d fs.DirEntry, err error) error {
+	err := xfs.StarWalkAbs(ctx, root, s.Patterns[0], ignore, func(path string, d fs.DirEntry, err error) error {
 		files = append(files, path)
 		return nil
 	})

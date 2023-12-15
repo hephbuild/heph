@@ -227,7 +227,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 				Root: p,
 			})
 
-			files, err := buildfilesState.CollectFiles(ctx, opts.RootPkg.Root.Abs())
+			files, err := buildfilesState.CollectFilesInRoot(ctx, opts.RootPkg.Root.Abs())
 			if err != nil {
 				return bs, err
 			}
