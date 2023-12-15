@@ -1,12 +1,19 @@
 version: latest
 build_files:
   ignore:
+    - '**/.git'
+    - '**/node_modules'
     - '**/test/e2e/roots'
   roots:
     go_backend:
       uri: file:///backend/go
     node_backend:
       uri: file:///backend/node
+
+watch:
+  ignore:
+    - '**/.git'
+    - '**/.idea'
 
 platforms:
   docker:

@@ -3,7 +3,9 @@ package xfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/bmatcuk/doublestar/v4"
+	"github.com/hephbuild/heph/utils/ads"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -94,17 +96,37 @@ func IsGlob(path string) bool {
 }
 
 func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
-	i := indexMeta(pattern)
+	return starWalk(ctx, root, pattern, ignore, fn, false)
+}
+
+func StarWalkAbs(ctx context.Context, root, pattern string, ignore []string, fn fs.WalkDirFunc) error {
+	return starWalk(ctx, root, pattern, ignore, fn, true)
+}
+
+func starWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.WalkDirFunc, abs bool) error {
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("root must be abs")
+	}
+
+	if !filepath.IsAbs(pattern) {
+		pattern = filepath.Join(root, pattern)
+	}
+	ignore = ads.Copy(ignore)
+	for i := range ignore {
+		if !filepath.IsAbs(ignore[i]) {
+			ignore[i] = filepath.Join(root, ignore[i])
+		}
+	}
 
 	alwaysMatch := false
 	walkRoot := root
 
+	i := indexMeta(pattern)
 	if i == -1 {
 		// Pattern is actually a pure path
 
-		rel := unescapeMeta(pattern)
-		abs := filepath.Join(root, rel)
-		info, err := os.Lstat(abs)
+		path := unescapeMeta(pattern)
+		info, err := os.Lstat(path)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
@@ -115,21 +137,19 @@ func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 
 		if !info.IsDir() {
 			// It's not a directory, no need to walk
-			return fn(rel, fs.FileInfoToDirEntry(info), nil)
+			walkRoot = path
+			alwaysMatch = true
 		}
 
 		// All files recursively in the dir would match
 		alwaysMatch = true
-		walkRoot = abs
+		walkRoot = path
 	} else if i > 0 {
 		i := strings.LastIndex(pattern[:i], string(filepath.Separator))
 		if i > 0 {
-			p := unescapeMeta(pattern[:i])
-			walkRoot = filepath.Join(root, p)
+			walkRoot = unescapeMeta(pattern[:i])
 		}
 	}
-
-	pattern = filepath.Clean(pattern)
 
 	return filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -140,13 +160,8 @@ func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 			return err
 		}
 
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-
 		if d.IsDir() {
-			skip, err := PathMatchAny(rel, ignore...)
+			skip, err := PathMatchAny(path, ignore...)
 			if err != nil {
 				return err
 			}
@@ -162,14 +177,14 @@ func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 		if alwaysMatch {
 			match = true
 		} else {
-			match, err = doublestar.PathMatch(pattern, rel)
+			match, err = doublestar.PathMatch(pattern, path)
 			if err != nil {
 				return err
 			}
 		}
 
 		if match {
-			skip, err := PathMatchAny(rel, ignore...)
+			skip, err := PathMatchAny(path, ignore...)
 			if err != nil {
 				return err
 			}
@@ -178,9 +193,21 @@ func StarWalk(ctx context.Context, root, pattern string, ignore []string, fn fs.
 				return nil
 			}
 
-			err = fn(rel, d, nil)
-			if err != nil {
-				return err
+			if abs {
+				err = fn(path, d, nil)
+				if err != nil {
+					return err
+				}
+			} else {
+				rel, err := filepath.Rel(root, path)
+				if err != nil {
+					return err
+				}
+
+				err = fn(rel, d, nil)
+				if err != nil {
+					return err
+				}
 			}
 		}
 

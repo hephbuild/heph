@@ -39,6 +39,7 @@ type State struct {
 	runopts  bootstrap.RunOpts
 	rropts   targetrun.RequestOpts
 	cbs      bootstrap.SchedulerBootstrap
+	cbbs     bootstrap.BaseBootstrap
 	pool     *worker.Pool
 	sigCh    chan sigEvent
 
@@ -101,6 +102,7 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 		ignore:   ignore,
 		root:     root,
 		ctx:      ctx,
+		cbbs:     bbs,
 		runopts:  cliopts,
 		rropts:   rropts,
 		bootopts: bootopts,
@@ -189,12 +191,18 @@ func (s *State) watchFiles() error {
 				at = info.ModTime()
 			}
 
-			m.Lock()
-			eventsAccumulator = append(eventsAccumulator, fsEvent{
+			event := fsEvent{
 				Event:   event,
 				RelPath: rel,
 				At:      at,
-			})
+			}
+
+			if s.ignoreEvent(event) {
+				continue
+			}
+
+			m.Lock()
+			eventsAccumulator = append(eventsAccumulator, event)
 			m.Unlock()
 
 			debounced(func() {
@@ -268,33 +276,28 @@ func (s *State) cleanEvents(events []fsEvent) []fsEvent {
 		filteredEvents = append(filteredEvents, e)
 	}
 
-	if bs := s.cbs; bs.Graph != nil {
-		return s.cleanEventsWithBootstrap(bs, filteredEvents)
-	}
-
 	return filteredEvents
 }
 
-func (s *State) cleanEventsWithBootstrap(bs bootstrap.SchedulerBootstrap, ogevents []fsEvent) []fsEvent {
-	events := make([]fsEvent, 0, len(ogevents))
-	for _, e := range ogevents {
-		match, err := xfs.PathMatchAny(e.RelPath, append(s.ignore, bs.Config.Watch.Ignore...)...)
-		if err != nil {
-			log.Error(e.RelPath, err)
-		}
-		if match {
-			continue
-		}
+func (s *State) ignoreEvent(e fsEvent) bool {
+	allignore := append(s.ignore, s.cbbs.Config.Watch.Ignore...)
 
-		// Ignore codegen changes
-		if _, ok := bs.Graph.GetCodegenOrigin(e.RelPath); ok {
-			continue
-		}
-
-		events = append(events, e)
+	match, err := xfs.PathMatchAny(e.RelPath, allignore...)
+	if err != nil {
+		log.Error(e.RelPath, err)
+	}
+	if match {
+		return true
 	}
 
-	return events
+	// Ignore codegen changes
+	if bs := s.cbs; bs.Graph != nil {
+		if _, ok := bs.Graph.GetCodegenOrigin(e.RelPath); ok {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (s *State) trigger(ctx context.Context, events []fsEvent) error {
@@ -548,6 +551,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 		}
 
 		s.cbs = e.bs
+		s.cbbs = e.bs.BaseBootstrap
 	}
 
 	err := s.updateWatchers(s.cbs.BaseBootstrap)

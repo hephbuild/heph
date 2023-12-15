@@ -250,10 +250,6 @@ func glob(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kw
 
 	elems := sets.NewStringSet(0)
 	err := xfs.StarWalk(ctx, pkg.Root.Abs(), pattern, allExclude, func(path string, d fs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
-
 		elems.Add(path)
 
 		return nil

@@ -12,7 +12,7 @@ import (
 func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg := config.Config{}
 	cfg.Profiles = profiles
-	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, "**/.heph")
+	cfg.BuildFiles.Ignore = append(cfg.BuildFiles.Ignore, root.Home.Abs())
 	cfg.CacheHistory = 3
 	cfg.Engine.GC = true
 	cfg.Engine.CacheHints = true
@@ -27,7 +27,7 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 			Priority: 100,
 		},
 	}
-	cfg.Watch.Ignore = append(cfg.Watch.Ignore, root.Home.Join("**/*").Abs())
+	cfg.Watch.Ignore = append(cfg.Watch.Ignore, root.Home.Abs())
 	cfg.Fmt.IndentSize = 4
 
 	err := config.ParseAndApply("/etc/.hephconfig", &cfg)
