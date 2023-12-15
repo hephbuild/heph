@@ -203,7 +203,7 @@ func generate() []RenderUnit {
 			continue
 		}
 
-		_, imports := splitOutPkgs(pkg.Variant, pkg.Imports)
+		_, imports := splitOutPkgs(pkg.Variant, pkg.Deps)
 
 		libPkg := libTarget(pkgs, pkg).Package
 		pkgCfg := Config.GetPkgCfg(pkg.ImportPath)

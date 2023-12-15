@@ -17,6 +17,7 @@ import (
 	"github.com/hephbuild/heph/utils/xsync"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -429,10 +430,12 @@ func (e *LocalCacheState) cacheDir(target graph.Targeter) (xfs.Path, error) {
 func (e *LocalCacheState) cacheDirForHash(target specs.Specer, inputHash string) xfs.Path {
 	spec := target.Spec()
 
+	name := SanitizeTargetName(spec.Name)
+
 	// TODO: cache
-	folder := "__target_" + spec.Name
+	folder := "__target_" + name
 	if !spec.Cache.Enabled {
-		folder = "__target_tmp_" + instance.UID + "_" + spec.Name
+		folder = "__target_tmp_" + instance.UID + "_" + name
 	}
 	return e.Root.Home.Join("cache", spec.Package.Path, folder, inputHash)
 }
@@ -442,4 +445,10 @@ func lockPath(root *hroot.State, target specs.Specer, resource string) string {
 
 	folder := "__target_" + spec.Name
 	return root.Tmp.Join(spec.Package.Path, folder, resource+".lock").Abs()
+}
+
+var metaEscapeReplacer = regexp.MustCompile("[^a-zA-Z0-9_-]+")
+
+func SanitizeTargetName(s string) string {
+	return metaEscapeReplacer.ReplaceAllString(s, "_")
 }

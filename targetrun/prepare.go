@@ -62,9 +62,11 @@ type Target struct {
 func (e *Runner) sandboxRoot(specer specs.Specer) xfs.Path {
 	target := specer.Spec()
 
-	folder := "__target_" + target.Name
+	name := lcache.SanitizeTargetName(target.Name)
+
+	folder := "__target_" + name
 	if target.ConcurrentExecution {
-		folder = "__target_tmp_" + instance.UID + "_" + target.Name
+		folder = "__target_tmp_" + instance.UID + "_" + name
 	}
 
 	p := e.Root.Home.Join("sandbox", target.Package.Path, folder)
