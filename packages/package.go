@@ -5,12 +5,14 @@ import (
 	"go.starlark.net/starlark"
 	"path"
 	"path/filepath"
+	"sync"
 )
 
 type Package struct {
 	Path        string
 	Root        xfs.Path
 	Globals     starlark.StringDict `json:"-" msgpack:"-"`
+	Globalsm    sync.Mutex          `json:"-" msgpack:"-"`
 	SourceFiles []string
 }
 

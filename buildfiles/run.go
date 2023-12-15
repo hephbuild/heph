@@ -99,6 +99,9 @@ func (e *runContext) runBuildFilesForPackage(pkg *packages.Package, bc *breadcru
 		return err
 	}
 
+	pkg.Globalsm.Lock()
+	defer pkg.Globalsm.Unlock()
+
 	if pkg.Globals != nil {
 		return nil
 	}
