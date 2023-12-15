@@ -205,11 +205,11 @@ func generate() []RenderUnit {
 
 		_, imports := splitOutPkgs(pkg.Variant, pkg.Imports)
 
-		if pkg.IsPartOfTree {
-			libPkg := libTarget(pkgs, pkg).Package
-			pkgCfg := Config.GetPkgCfg(pkg.ImportPath)
+		libPkg := libTarget(pkgs, pkg).Package
+		pkgCfg := Config.GetPkgCfg(pkg.ImportPath)
 
-			var lib *Lib
+		var lib *Lib
+		if pkg.IsPartOfTree {
 			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
 				lib = &Lib{
 					Target:     libTarget(pkgs, pkg),
@@ -237,117 +237,6 @@ func generate() []RenderUnit {
 					},
 					Dir: lib.Target.Package,
 				})
-			}
-
-			if lib != nil && pkg.IsPartOfModule && pkg.Name == "main" {
-				for _, variant := range pkgCfg.UniqueLinkVariants(pkg.Variant) {
-					bin := &Bin{
-						TargetName:    targetName("go_bin#build", variant),
-						TargetPackage: lib.Target.Package,
-						MainLib:       lib.Target.Full(),
-						Variant:       variant,
-					}
-
-					_, deps := splitOutPkgs(variant, pkg.Deps)
-
-					for _, p := range deps {
-						t := libTarget(pkgs, pkgs.MustFind(p, variant))
-
-						bin.Libs = append(bin.Libs, t.Full())
-					}
-
-					units = append(units, RenderUnit{
-						Render: func(w io.Writer) {
-							RenderBin(w, bin)
-						},
-						Dir: bin.TargetPackage,
-					})
-				}
-			}
-
-			if pkg.IsPartOfModule && !pkgCfg.Test.Skip && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
-				var testlib *Lib
-				if len(pkg.TestGoFiles) > 0 {
-					_, pkgDeps := splitOutPkgs(pkg.Variant, pkg.Deps)
-					_, pkgImports := splitOutPkgs(pkg.Variant, pkg.Imports)
-
-					_, pkgTestDeps := splitOutPkgs(pkg.Variant, pkg.TestDeps)
-					_, pkgTestImports := splitOutPkgs(pkg.Variant, pkg.TestImports)
-
-					testImports := append(pkgTestImports, pkgImports...)
-
-					importLibs := make([]string, 0)
-					for _, p := range testImports {
-						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
-
-						importLibs = append(importLibs, t.Full())
-					}
-
-					testlib = testLibFactory(targetName("_go_test_lib", pkg.Variant), importLibs, pkg.ImportPath, append(pkg.GoFiles, pkg.TestGoFiles...), pkg.SFiles, append(pkg.EmbedPatterns, pkg.TestEmbedPatterns...), libPkg, pkg.Variant)
-
-					depsLibs := make([]string, 0)
-					for _, p := range append(pkgDeps, pkgTestDeps...) {
-						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
-
-						depsLibs = append(depsLibs, t.Full())
-					}
-					depsLibs = append(depsLibs, testlib.Target.Full())
-
-					test := &LibTest{
-						TestLib:    testlib,
-						ImportPath: pkg.ImportPath,
-						RunExtra:   pkgCfg.Test.Run,
-						TestFiles:  pkg.TestGoFiles,
-						DepsLibs:   depsLibs,
-					}
-
-					units = append(units, RenderUnit{
-						Render: func(w io.Writer) {
-							RenderTest(w, test)
-						},
-						Dir: libPkg,
-					})
-				}
-
-				if len(pkg.XTestGoFiles) > 0 {
-					_, pkgXTestDeps := splitOutPkgs(pkg.Variant, pkg.XTestDeps)
-					_, pkgXTestImports := splitOutPkgs(pkg.Variant, pkg.XTestImports)
-
-					xtestImports := pkgXTestImports
-
-					ximportLibs := make([]string, 0)
-					for _, p := range xtestImports {
-						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
-
-						ximportLibs = append(ximportLibs, t.Full())
-					}
-
-					xtestlib := testLibFactory(targetName("_go_xtest_lib", pkg.Variant), ximportLibs, pkg.ImportPath+"_test", pkg.XTestGoFiles, pkg.SFiles, pkg.XTestEmbedPatterns, libPkg, pkg.Variant)
-
-					depsLibs := make([]string, 0)
-					for _, p := range pkgXTestDeps {
-						t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
-
-						depsLibs = append(depsLibs, t.Full())
-					}
-					depsLibs = append(depsLibs, xtestlib.Target.Full())
-
-					test := &LibTest{
-						X:          true,
-						TestLib:    xtestlib,
-						ImportPath: pkg.ImportPath,
-						RunExtra:   pkgCfg.Test.Run,
-						TestFiles:  pkg.XTestGoFiles,
-						DepsLibs:   depsLibs,
-					}
-
-					units = append(units, RenderUnit{
-						Render: func(w io.Writer) {
-							RenderTest(w, test)
-						},
-						Dir: libPkg,
-					})
-				}
 			}
 		} else {
 			if pkg.Module == nil {
@@ -377,7 +266,7 @@ func generate() []RenderUnit {
 				modsm[target.Full()] = moddl
 			}
 
-			lib := &Lib{
+			lib = &Lib{
 				Target:     libTarget(pkgs, pkg),
 				ImportPath: pkg.ImportPath,
 				ModRoot:    modRoot,
@@ -404,6 +293,118 @@ func generate() []RenderUnit {
 				Dir: lib.Target.Package,
 			})
 		}
+
+		if lib != nil && pkg.Name == "main" {
+			for _, variant := range pkgCfg.UniqueLinkVariants(pkg.Variant) {
+				bin := &Bin{
+					TargetName:    targetName("go_bin#build", variant),
+					TargetPackage: lib.Target.Package,
+					MainLib:       lib.Target.Full(),
+					Variant:       variant,
+				}
+
+				_, deps := splitOutPkgs(variant, pkg.Deps)
+
+				for _, p := range deps {
+					t := libTarget(pkgs, pkgs.MustFind(p, variant))
+
+					bin.Libs = append(bin.Libs, t.Full())
+				}
+
+				units = append(units, RenderUnit{
+					Render: func(w io.Writer) {
+						RenderBin(w, bin)
+					},
+					Dir: bin.TargetPackage,
+				})
+			}
+		}
+
+		if pkg.IsPartOfModule && !pkgCfg.Test.Skip && (len(pkg.TestGoFiles) > 0 || len(pkg.XTestGoFiles) > 0) {
+			var testlib *Lib
+			if len(pkg.TestGoFiles) > 0 {
+				_, pkgDeps := splitOutPkgs(pkg.Variant, pkg.Deps)
+				_, pkgImports := splitOutPkgs(pkg.Variant, pkg.Imports)
+
+				_, pkgTestDeps := splitOutPkgs(pkg.Variant, pkg.TestDeps)
+				_, pkgTestImports := splitOutPkgs(pkg.Variant, pkg.TestImports)
+
+				testImports := append(pkgTestImports, pkgImports...)
+
+				importLibs := make([]string, 0)
+				for _, p := range testImports {
+					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
+
+					importLibs = append(importLibs, t.Full())
+				}
+
+				testlib = testLibFactory(targetName("_go_test_lib", pkg.Variant), importLibs, pkg.ImportPath, append(pkg.GoFiles, pkg.TestGoFiles...), pkg.SFiles, append(pkg.EmbedPatterns, pkg.TestEmbedPatterns...), libPkg, pkg.Variant)
+
+				depsLibs := make([]string, 0)
+				for _, p := range append(pkgDeps, pkgTestDeps...) {
+					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
+
+					depsLibs = append(depsLibs, t.Full())
+				}
+				depsLibs = append(depsLibs, testlib.Target.Full())
+
+				test := &LibTest{
+					TestLib:    testlib,
+					ImportPath: pkg.ImportPath,
+					RunExtra:   pkgCfg.Test.Run,
+					TestFiles:  pkg.TestGoFiles,
+					DepsLibs:   depsLibs,
+				}
+
+				units = append(units, RenderUnit{
+					Render: func(w io.Writer) {
+						RenderTest(w, test)
+					},
+					Dir: libPkg,
+				})
+			}
+
+			if len(pkg.XTestGoFiles) > 0 {
+				_, pkgXTestDeps := splitOutPkgs(pkg.Variant, pkg.XTestDeps)
+				_, pkgXTestImports := splitOutPkgs(pkg.Variant, pkg.XTestImports)
+
+				xtestImports := pkgXTestImports
+
+				ximportLibs := make([]string, 0)
+				for _, p := range xtestImports {
+					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
+
+					ximportLibs = append(ximportLibs, t.Full())
+				}
+
+				xtestlib := testLibFactory(targetName("_go_xtest_lib", pkg.Variant), ximportLibs, pkg.ImportPath+"_test", pkg.XTestGoFiles, pkg.SFiles, pkg.XTestEmbedPatterns, libPkg, pkg.Variant)
+
+				depsLibs := make([]string, 0)
+				for _, p := range pkgXTestDeps {
+					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
+
+					depsLibs = append(depsLibs, t.Full())
+				}
+				depsLibs = append(depsLibs, xtestlib.Target.Full())
+
+				test := &LibTest{
+					X:          true,
+					TestLib:    xtestlib,
+					ImportPath: pkg.ImportPath,
+					RunExtra:   pkgCfg.Test.Run,
+					TestFiles:  pkg.XTestGoFiles,
+					DepsLibs:   depsLibs,
+				}
+
+				units = append(units, RenderUnit{
+					Render: func(w io.Writer) {
+						RenderTest(w, test)
+					},
+					Dir: libPkg,
+				})
+			}
+		}
+
 	}
 
 	return units
