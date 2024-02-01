@@ -28,6 +28,10 @@ func (e *LocalCacheState) PopulateActualFiles(ctx context.Context, target *Targe
 
 	var err error
 
+	outputs = ads.Filter(outputs, func(s string) bool {
+		return s != specs.SupportFilesOutput
+	})
+
 	target.actualOutFiles, err = e.collectNamedOutFromTar(ctx, target.Target, outputs)
 	if err != nil {
 		return fmt.Errorf("out: %w", err)
