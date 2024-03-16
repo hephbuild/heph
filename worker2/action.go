@@ -36,12 +36,31 @@ func (m MapValue) Set(k string, v Value) {
 	m[k] = v
 }
 
-type Action struct {
-	Deps   []Dep
-	Do     func(ctx context.Context, ins InStore, outs OutStore) error
-	Output Value
-
+type Base struct {
 	frozen bool
+	m      sync.Mutex
+}
+
+func (g *Base) Frozen() bool {
+	return g.frozen
+}
+
+func (g *Base) Freeze() {
+	g.m.Lock()
+	defer g.m.Unlock()
+
+	g.frozen = true
+}
+
+type Action struct {
+	Base
+	Deps  []Dep
+	Hooks []Hook
+	Do    func(ctx context.Context, ins InStore, outs OutStore) error
+}
+
+func (a *Action) GetHooks() []Hook {
+	return a.Hooks
 }
 
 func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
@@ -52,18 +71,18 @@ func (a *Action) DirectDeps() []Dep {
 	return a.Deps
 }
 
-func (a *Action) Freeze() {
-	a.frozen = true
-}
-
-func (a *Action) Frozen() bool {
-	return a.frozen
-}
-
 type Group struct {
-	Deps   []Dep
-	m      sync.Mutex
-	frozen bool
+	Base
+	Deps  []Dep
+	Hooks []Hook
+}
+
+func (g *Group) DirectDeps() []Dep {
+	return g.Deps
+}
+
+func (g *Group) GetHooks() []Hook {
+	return g.Hooks
 }
 
 func (g *Group) Add(deps ...Dep) {
@@ -77,21 +96,6 @@ func (g *Group) Add(deps ...Dep) {
 	g.Deps = append(g.Deps, deps...)
 }
 
-func (g *Group) Frozen() bool {
-	return g.frozen
-}
-
-func (g *Group) Freeze() {
-	g.m.Lock()
-	defer g.m.Unlock()
-
-	g.frozen = true
-}
-
-func (g *Group) DirectDeps() []Dep {
-	return g.Deps
-}
-
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	ins.Copy(outs)
 	return nil
@@ -102,6 +106,7 @@ type Dep interface {
 	Freeze()
 	Frozen() bool
 	DirectDeps() []Dep
+	GetHooks() []Hook
 }
 
 type Named struct {

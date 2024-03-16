@@ -19,13 +19,26 @@ type EventSchedule struct {
 	Action Dep
 }
 
+type WithExecution interface {
+	getExecution() *execution
+}
+
 type EventCompleted struct {
 	Execution *execution
+	Output    Value
 	Error     error
+}
+
+func (e EventCompleted) getExecution() *execution {
+	return e.Execution
 }
 
 type EventSkipped struct {
 	Execution *execution
+}
+
+func (e EventSkipped) getExecution() *execution {
+	return e.Execution
 }
 
 type EventWorkerAvailable struct {
@@ -34,6 +47,10 @@ type EventWorkerAvailable struct {
 
 type EventReady struct {
 	Execution *execution
+}
+
+func (e EventReady) getExecution() *execution {
+	return e.Execution
 }
 
 type InStore interface {
@@ -51,7 +68,7 @@ type inStore struct {
 }
 
 func (s *inStore) Copy(outs OutStore) {
-	mv := MapValue{}
+	mv := make(MapValue, len(s.m))
 	for k, v := range s.m {
 		mv.Set(k, v)
 	}
@@ -123,6 +140,7 @@ type Engine struct {
 	executions        []*execution
 	executionsWaiting []*execution
 	eventsCh          chan Event
+	hooks             []Hook
 }
 
 func NewEngine() *Engine {
@@ -227,6 +245,7 @@ func (e *execution) Exec(ctx context.Context) error {
 func (e *execution) Completed(err error) {
 	e.eventsCh <- EventCompleted{
 		Execution: e,
+		Output:    e.outStore.Get(),
 		Error:     err,
 	}
 }
@@ -280,6 +299,10 @@ func (e *Engine) loop() {
 }
 
 func (e *Engine) handle(event Event) {
+	if event, ok := event.(WithExecution); ok {
+		defer e.runHooks(event, event.getExecution())
+	}
+
 	switch event := event.(type) {
 	case EventSchedule:
 		exec := &execution{
@@ -295,6 +318,7 @@ func (e *Engine) handle(event Event) {
 		}
 		e.executions = append(e.executions, exec)
 		go e.waitForDepsAndSchedule(exec)
+		e.runHooks(event, exec)
 	case EventWorkerAvailable, EventReady:
 		startedOne := e.tryExecuteOne()
 		if !startedOne && len(e.executionsWaiting) > 0 && e.allWorkersIdle() {
@@ -317,6 +341,16 @@ func (e *Engine) finalize(exec *execution) {
 	exec.worker = nil
 	e.deleteExecution(exec)
 	e.wg.Done()
+}
+
+func (e *Engine) runHooks(event Event, exec *execution) {
+	for _, hook := range e.hooks {
+		hook(event)
+	}
+
+	for _, hook := range exec.Action.GetHooks() {
+		hook(event)
+	}
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *execution) {
@@ -434,6 +468,10 @@ func (e *Engine) start(exec *execution) (Worker, error) {
 
 func (e *Engine) RegisterWorkerProvider(wp WorkerProvider) {
 	e.workerProviders = append(e.workerProviders, wp)
+}
+
+func (e *Engine) RegisterHook(hook Hook) {
+	e.hooks = append(e.hooks, hook)
 }
 
 func (e *Engine) Run(ctx context.Context) {
