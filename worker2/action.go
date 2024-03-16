@@ -37,8 +37,9 @@ func (m MapValue) Set(k string, v Value) {
 }
 
 type Action struct {
-	Deps []Dep
-	Do   func(ctx context.Context, ins InStore, outs OutStore) error
+	Deps   []Dep
+	Do     func(ctx context.Context, ins InStore, outs OutStore) error
+	Output Value
 
 	frozen bool
 }
