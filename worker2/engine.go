@@ -3,6 +3,7 @@ package worker2
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"slices"
 	"sync"
@@ -135,7 +136,7 @@ func (g *GoroutineWorker) Start(e *Execution) error {
 
 	go func() {
 		g.state = WorkerStateRunning
-		err := e.Exec(g.ctx)
+		err := e.Start(g.ctx)
 		g.state = WorkerStateIdle
 		g.m.Unlock()
 		e.Completed(err)
@@ -244,7 +245,13 @@ func (e *Execution) GetOutput() Value {
 	return e.outStore.Get()
 }
 
-func (e *Execution) Exec(ctx context.Context) error {
+func (e *Execution) Start(ctx context.Context) error {
+	defer func() {
+		if r := recover(); r != nil {
+			e.errCh <- fmt.Errorf("panic: %v", r)
+		}
+	}()
+
 	if e.errCh == nil {
 		e.errCh = make(chan error)
 
@@ -515,16 +522,19 @@ func (e *Engine) mustExecutionForDep(dep Dep, c map[Dep]*Execution) *Execution {
 	}
 
 	e.m.RLock()
-	defer e.m.RUnlock()
-
 	for _, exec := range e.executions {
 		if exec.Action == dep {
+			e.m.RUnlock()
 			c[dep] = exec
 			return exec
 		}
 	}
+	e.m.RUnlock()
 
-	panic("dep doesnt exist")
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	return e.scheduleOne(dep)
 }
 
 func (e *Engine) Schedule(a Dep) {
@@ -536,15 +546,15 @@ func (e *Engine) Schedule(a Dep) {
 	defer e.m.Unlock()
 
 	for _, dep := range deps {
-		e.scheduleOne(dep)
+		_ = e.scheduleOne(dep)
 	}
 }
 
-func (e *Engine) scheduleOne(dep Dep) {
+func (e *Engine) scheduleOne(dep Dep) *Execution {
 	dep = noNamed(dep)
 	for _, exec := range e.executions {
 		if exec.Action == dep {
-			continue
+			return exec
 		}
 	}
 
@@ -564,4 +574,6 @@ func (e *Engine) scheduleOne(dep Dep) {
 	e.runHooks(EventScheduled{Execution: exec}, exec)
 
 	go e.waitForDepsAndSchedule(exec)
+
+	return exec
 }
