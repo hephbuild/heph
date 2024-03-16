@@ -60,7 +60,7 @@ func TestExecHook(t *testing.T) {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
 
-	assert.EqualValues(t, []string{"worker2.EventSchedule", "worker2.EventReady", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 	v, _ := (<-outputCh).Get()
 	assert.Equal(t, int(1), v)
 }
@@ -185,7 +185,7 @@ func TestExecStress(t *testing.T) {
 		Deps: []Dep{},
 	}
 
-	n := 3000
+	n := 10000
 
 	for i := 0; i < n; i++ {
 		i := i
@@ -196,7 +196,7 @@ func TestExecStress(t *testing.T) {
 			},
 		}
 
-		g.Add(Named{Name: fmt.Sprintf("%v", i), Dep: a})
+		g.Add(Named{Name: fmt.Sprint(i), Dep: a})
 	}
 
 	var received any
