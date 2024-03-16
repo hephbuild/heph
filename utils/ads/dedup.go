@@ -20,6 +20,12 @@ func DedupAppend[T any, K comparable](as []T, id func(T) K, vs ...T) []T {
 	return as
 }
 
+func DedupAppenderIdentity[T comparable](as []T, cap int) func([]T, T) []T {
+	return DedupAppender(as, func(t T) T {
+		return t
+	}, cap)
+}
+
 func DedupAppender[T any, K comparable](as []T, id func(T) K, cap int) func([]T, T) []T {
 	value := make(map[K]struct{}, len(as)+cap)
 	for _, a := range as {
