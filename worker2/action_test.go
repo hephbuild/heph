@@ -29,6 +29,35 @@ func TestExecSimple(t *testing.T) {
 	assert.True(t, didRun)
 }
 
+func TestExecHook(t *testing.T) {
+	ch := make(chan Event, 1000)
+	a := &Action{
+		Hooks: []Hook{func(event Event) {
+			ch <- event
+		}},
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			fmt.Println("Running 1")
+			return nil
+		},
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(a)
+
+	e.Wait()
+	close(ch)
+
+	events := make([]string, 0)
+	for event := range ch {
+		events = append(events, fmt.Sprintf("%T", event))
+	}
+
+	assert.EqualValues(t, []string{"worker2.EventSchedule", "worker2.EventReady", "worker2.EventCompleted"}, events)
+}
+
 func TestExecCancel(t *testing.T) {
 	a := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
