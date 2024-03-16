@@ -119,7 +119,7 @@ func (g *GoroutineWorker) Start(a *execution) error {
 
 type Engine struct {
 	wg                sync.WaitGroup
-	workers           []Worker
+	workerProviders   []WorkerProvider
 	executions        []*execution
 	executionsWaiting []*execution
 	eventsCh          chan Event
@@ -129,6 +129,47 @@ func NewEngine() *Engine {
 	return &Engine{
 		eventsCh: make(chan Event, 1000),
 	}
+}
+
+func NewGoroutineWorkerProvider(ctx context.Context) WorkerProvider {
+	wp := &GoroutineWorkerProvider{}
+	for i := 0; i < runtime.NumCPU(); i++ {
+		wp.workers = append(wp.workers, NewGoroutineWorker(ctx))
+	}
+	return wp
+}
+
+type WorkerProvider interface {
+	Start(*execution) (Worker, error)
+	Workers() []Worker
+}
+
+type GoroutineWorkerProvider struct {
+	workers []*GoroutineWorker
+}
+
+func (wp *GoroutineWorkerProvider) Workers() []Worker {
+	workers := make([]Worker, 0, len(wp.workers))
+	for _, worker := range wp.workers {
+		workers = append(workers, worker)
+	}
+	return workers
+}
+
+func (wp *GoroutineWorkerProvider) Start(e *execution) (Worker, error) {
+	for _, w := range wp.workers {
+		err := w.Start(e)
+		if err != nil {
+			if errors.Is(err, ErrWorkerNotAvail) {
+				continue
+			}
+			return nil, err
+		}
+
+		return w, nil
+	}
+
+	return nil, ErrNoWorkerAvail
 }
 
 type ExecState int
@@ -374,10 +415,10 @@ func (e *Engine) start(exec *execution) (Worker, error) {
 		exec.inStore = ins
 	}
 
-	for _, w := range e.workers {
-		err := w.Start(exec)
+	for _, wp := range e.workerProviders {
+		w, err := wp.Start(exec)
 		if err != nil {
-			if errors.Is(err, ErrWorkerNotAvail) {
+			if errors.Is(err, ErrNoWorkerAvail) {
 				continue
 			}
 			panic(err)
@@ -391,14 +432,12 @@ func (e *Engine) start(exec *execution) (Worker, error) {
 	return nil, ErrNoWorkerAvail
 }
 
-func (e *Engine) RegisterWorker(w Worker) {
-	e.workers = append(e.workers, w)
+func (e *Engine) RegisterWorkerProvider(wp WorkerProvider) {
+	e.workerProviders = append(e.workerProviders, wp)
 }
 
 func (e *Engine) Run(ctx context.Context) {
-	for i := 0; i < runtime.NumCPU(); i++ {
-		e.RegisterWorker(NewGoroutineWorker(ctx))
-	}
+	e.RegisterWorkerProvider(NewGoroutineWorkerProvider(ctx))
 
 	e.loop()
 }
@@ -408,9 +447,11 @@ func (e *Engine) Wait() {
 }
 
 func (e *Engine) allWorkersIdle() bool {
-	for _, w := range e.workers {
-		if w.State() != WorkerStateIdle {
-			return false
+	for _, provider := range e.workerProviders {
+		for _, w := range provider.Workers() {
+			if w.State() != WorkerStateIdle {
+				return false
+			}
 		}
 	}
 
