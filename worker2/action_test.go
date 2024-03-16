@@ -31,12 +31,17 @@ func TestExecSimple(t *testing.T) {
 
 func TestExecHook(t *testing.T) {
 	ch := make(chan Event, 1000)
+	outputHook, outputCh := OutputHook()
 	a := &Action{
-		Hooks: []Hook{func(event Event) {
-			ch <- event
-		}},
+		Hooks: []Hook{
+			func(event Event) {
+				ch <- event
+			},
+			outputHook,
+		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
+			os.Set(MemoryValue[int]{V: 1})
 			return nil
 		},
 	}
@@ -56,6 +61,8 @@ func TestExecHook(t *testing.T) {
 	}
 
 	assert.EqualValues(t, []string{"worker2.EventSchedule", "worker2.EventReady", "worker2.EventCompleted"}, events)
+	v, _ := (<-outputCh).Get()
+	assert.Equal(t, int(1), v)
 }
 
 func TestExecCancel(t *testing.T) {

@@ -20,24 +20,24 @@ type EventSchedule struct {
 }
 
 type WithExecution interface {
-	getExecution() *execution
+	getExecution() *Execution
 }
 
 type EventCompleted struct {
-	Execution *execution
+	Execution *Execution
 	Output    Value
 	Error     error
 }
 
-func (e EventCompleted) getExecution() *execution {
+func (e EventCompleted) getExecution() *Execution {
 	return e.Execution
 }
 
 type EventSkipped struct {
-	Execution *execution
+	Execution *Execution
 }
 
-func (e EventSkipped) getExecution() *execution {
+func (e EventSkipped) getExecution() *Execution {
 	return e.Execution
 }
 
@@ -46,10 +46,10 @@ type EventWorkerAvailable struct {
 }
 
 type EventReady struct {
-	Execution *execution
+	Execution *Execution
 }
 
-func (e EventReady) getExecution() *execution {
+func (e EventReady) getExecution() *Execution {
 	return e.Execution
 }
 
@@ -92,19 +92,19 @@ func (s *outStore) Get() Value {
 }
 
 type Worker interface {
-	Start(a *execution) error
+	Start(a *Execution) error
 	State() WorkerState
 }
 
 type GoroutineWorker struct {
-	ch    chan *execution
+	ch    chan *Execution
 	ctx   context.Context
 	state WorkerState
 }
 
 func NewGoroutineWorker(ctx context.Context) *GoroutineWorker {
 	w := &GoroutineWorker{
-		ch:    make(chan *execution),
+		ch:    make(chan *Execution),
 		ctx:   ctx,
 		state: WorkerStateIdle,
 	}
@@ -125,7 +125,7 @@ func (g *GoroutineWorker) Run() {
 	}
 }
 
-func (g *GoroutineWorker) Start(a *execution) error {
+func (g *GoroutineWorker) Start(a *Execution) error {
 	select {
 	case g.ch <- a:
 		return nil
@@ -137,8 +137,8 @@ func (g *GoroutineWorker) Start(a *execution) error {
 type Engine struct {
 	wg                sync.WaitGroup
 	workerProviders   []WorkerProvider
-	executions        []*execution
-	executionsWaiting []*execution
+	executions        []*Execution
+	executionsWaiting []*Execution
 	eventsCh          chan Event
 	hooks             []Hook
 }
@@ -158,7 +158,7 @@ func NewGoroutineWorkerProvider(ctx context.Context) WorkerProvider {
 }
 
 type WorkerProvider interface {
-	Start(*execution) (Worker, error)
+	Start(*Execution) (Worker, error)
 	Workers() []Worker
 }
 
@@ -174,7 +174,7 @@ func (wp *GoroutineWorkerProvider) Workers() []Worker {
 	return workers
 }
 
-func (wp *GoroutineWorkerProvider) Start(e *execution) (Worker, error) {
+func (wp *GoroutineWorkerProvider) Start(e *Execution) (Worker, error) {
 	for _, w := range wp.workers {
 		err := w.Start(e)
 		if err != nil {
@@ -215,7 +215,7 @@ const (
 	WorkerStateRunning
 )
 
-type execution struct {
+type Execution struct {
 	Action   Dep
 	State    ExecState
 	outStore OutStore
@@ -226,7 +226,11 @@ type execution struct {
 	inStore InStore    // gets populated when its deps are ready
 }
 
-func (e *execution) Exec(ctx context.Context) error {
+func (e *Execution) GetOutput() Value {
+	return e.outStore.Get()
+}
+
+func (e *Execution) Exec(ctx context.Context) error {
 	if e.errCh == nil {
 		e.errCh = make(chan error)
 
@@ -242,7 +246,7 @@ func (e *execution) Exec(ctx context.Context) error {
 	}
 }
 
-func (e *execution) Completed(err error) {
+func (e *Execution) Completed(err error) {
 	e.eventsCh <- EventCompleted{
 		Execution: e,
 		Output:    e.outStore.Get(),
@@ -305,7 +309,7 @@ func (e *Engine) handle(event Event) {
 
 	switch event := event.(type) {
 	case EventSchedule:
-		exec := &execution{
+		exec := &Execution{
 			Action:   event.Action,
 			State:    ExecStateScheduled,
 			outStore: &outStore{},
@@ -337,13 +341,13 @@ func (e *Engine) handle(event Event) {
 	}
 }
 
-func (e *Engine) finalize(exec *execution) {
+func (e *Engine) finalize(exec *Execution) {
 	exec.worker = nil
 	e.deleteExecution(exec)
 	e.wg.Done()
 }
 
-func (e *Engine) runHooks(event Event, exec *execution) {
+func (e *Engine) runHooks(event Event, exec *Execution) {
 	for _, hook := range e.hooks {
 		hook(event)
 	}
@@ -353,7 +357,7 @@ func (e *Engine) runHooks(event Event, exec *execution) {
 	}
 }
 
-func (e *Engine) waitForDepsAndSchedule(exec *execution) {
+func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	for {
 		<-time.After(time.Millisecond) // TODO: replace with broadcast
 
@@ -385,18 +389,28 @@ func (e *Engine) waitForDepsAndSchedule(exec *execution) {
 
 	exec.Action.Freeze()
 
+	ins := &inStore{m: map[string]Value{}}
+	for _, dep := range exec.Action.DirectDeps() {
+		if dep, ok := dep.(Named); ok {
+			exec := e.executionForDep(dep.Dep)
+
+			ins.m[dep.Name] = exec.outStore.Get()
+		}
+	}
+	exec.inStore = ins
 	exec.State = ExecStateWaiting
+
 	e.executionsWaiting = append(e.executionsWaiting, exec)
 	go e.notifyReady(exec)
 }
 
-func (e *Engine) notifySkipped(exec *execution) {
+func (e *Engine) notifySkipped(exec *Execution) {
 	e.eventsCh <- EventSkipped{
 		Execution: exec,
 	}
 }
 
-func (e *Engine) notifyReady(exec *execution) {
+func (e *Engine) notifyReady(exec *Execution) {
 	e.eventsCh <- EventReady{
 		Execution: exec,
 	}
@@ -417,38 +431,26 @@ func (e *Engine) tryExecuteOne() bool {
 	return false
 }
 
-func (e *Engine) deleteExecution(exec *execution) {
+func (e *Engine) deleteExecution(exec *Execution) {
 	return // TODO: would need to be deleted once noone depends on it
-	e.executions = ads.Filter(e.executions, func(e *execution) bool {
+	e.executions = ads.Filter(e.executions, func(e *Execution) bool {
 		return e != exec
 	})
 }
 
-func (e *Engine) deleteExecutionWaiting(exec *execution) {
-	e.executionsWaiting = ads.Filter(e.executionsWaiting, func(e *execution) bool {
+func (e *Engine) deleteExecutionWaiting(exec *Execution) {
+	e.executionsWaiting = ads.Filter(e.executionsWaiting, func(e *Execution) bool {
 		return e != exec
 	})
 }
 
 func (e *Engine) gc() {
-	e.executions = ads.Filter(e.executions, func(e *execution) bool {
+	e.executions = ads.Filter(e.executions, func(e *Execution) bool {
 		return e.State.IsFinal()
 	})
 }
 
-func (e *Engine) start(exec *execution) (Worker, error) {
-	if exec.inStore == nil {
-		ins := &inStore{m: map[string]Value{}}
-		for _, dep := range exec.Action.DirectDeps() {
-			if dep, ok := dep.(Named); ok {
-				exec := e.executionForDep(dep.Dep)
-
-				ins.m[dep.Name] = exec.outStore.Get()
-			}
-		}
-		exec.inStore = ins
-	}
-
+func (e *Engine) start(exec *Execution) (Worker, error) {
 	for _, wp := range e.workerProviders {
 		w, err := wp.Start(exec)
 		if err != nil {
@@ -496,7 +498,7 @@ func (e *Engine) allWorkersIdle() bool {
 	return true
 }
 
-func (e *Engine) executionForDep(dep Dep) *execution {
+func (e *Engine) executionForDep(dep Dep) *Execution {
 	for _, exec := range e.executions {
 		if exec.Action == dep {
 			return exec
