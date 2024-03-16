@@ -133,6 +133,7 @@ type Engine struct {
 	wg                sync.WaitGroup
 	workerProviders   []WorkerProvider
 	m                 sync.Mutex
+	c                 *sync.Cond
 	executions        []*Execution
 	executionsWaiting []*Execution
 	eventsCh          chan Event
@@ -142,6 +143,7 @@ type Engine struct {
 func NewEngine() *Engine {
 	return &Engine{
 		eventsCh: make(chan Event, 1000),
+		c:        sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -333,6 +335,7 @@ func (e *Engine) finalize(exec *Execution, state ExecState) {
 	exec.State = state
 	e.deleteExecution(exec)
 	e.wg.Done()
+	e.c.Broadcast()
 }
 
 func (e *Engine) runHooks(event Event, exec *Execution) {
@@ -345,10 +348,10 @@ func (e *Engine) runHooks(event Event, exec *Execution) {
 	}
 }
 
-func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
+func (e *Engine) waitForDeps(exec *Execution) {
+	e.c.L.Lock()
+	defer e.c.L.Unlock()
 	for {
-		<-time.After(200 * time.Millisecond) // TODO: replace with broadcast
-
 		var deepDeps []Dep
 		e.deepDeps(exec.Action, nil, &deepDeps)
 
@@ -373,7 +376,13 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 		if allDepsSucceeded {
 			break
 		}
+
+		e.c.Wait()
 	}
+}
+
+func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
+	e.waitForDeps(exec)
 
 	exec.Action.Freeze()
 
