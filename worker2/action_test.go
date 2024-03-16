@@ -179,3 +179,47 @@ func TestExecGroup(t *testing.T) {
 
 	assert.Equal(t, map[string]any{"v1": 1, "v2": "hello, world"}, received)
 }
+
+func TestExecStress(t *testing.T) {
+	g := &Group{
+		Deps: []Dep{},
+	}
+
+	n := 1000
+
+	for i := 0; i < n; i++ {
+		i := i
+		a := &Action{
+			Do: func(ctx context.Context, ds InStore, os OutStore) error {
+				os.Set(MemoryValue[int]{V: i})
+				return nil
+			},
+		}
+
+		g.Add(Named{Name: fmt.Sprintf("%v", i), Dep: a})
+	}
+
+	var received any
+	a := &Action{
+		Deps: []Dep{Named{Name: "v", Dep: g}},
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			received, _ = ds.Get("v")
+			return nil
+		},
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(a)
+
+	e.Wait()
+
+	expected := map[string]any{}
+	for i := 0; i < n; i++ {
+		expected[fmt.Sprint(i)] = i
+	}
+
+	assert.Equal(t, expected, received)
+}

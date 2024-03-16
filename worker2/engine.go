@@ -3,7 +3,6 @@ package worker2
 import (
 	"context"
 	"errors"
-	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"runtime"
 	"sync"
@@ -14,10 +13,6 @@ var ErrWorkerNotAvail = errors.New("worker not available")
 var ErrNoWorkerAvail = errors.New("no worker available")
 
 type Event any
-
-type EventSchedule struct {
-	Action Dep
-}
 
 type WithExecution interface {
 	getExecution() *Execution
@@ -137,6 +132,7 @@ func (g *GoroutineWorker) Start(a *Execution) error {
 type Engine struct {
 	wg                sync.WaitGroup
 	workerProviders   []WorkerProvider
+	m                 sync.Mutex
 	executions        []*Execution
 	executionsWaiting []*Execution
 	eventsCh          chan Event
@@ -224,6 +220,7 @@ type Execution struct {
 	worker  Worker     // gets populated when a worker accepts it
 	errCh   chan error // gets populated when exec is called
 	inStore InStore    // gets populated when its deps are ready
+	m       sync.Mutex
 }
 
 func (e *Execution) GetOutput() Value {
@@ -258,11 +255,9 @@ func (e *Engine) Schedule(a Dep) {
 	var deps []Dep
 	e.deepDeps(a, nil, &deps)
 	for _, dep := range deps {
-		e.wg.Add(1)
-		e.eventsCh <- EventSchedule{Action: dep}
+		e.executionForDep(dep)
 	}
-	e.wg.Add(1)
-	e.eventsCh <- EventSchedule{Action: a}
+	e.executionForDep(a)
 }
 
 func (e *Engine) deepDeps(a Dep, m map[Dep]struct{}, deps *[]Dep) {
@@ -308,41 +303,34 @@ func (e *Engine) handle(event Event) {
 	}
 
 	switch event := event.(type) {
-	case EventSchedule:
-		exec := &Execution{
-			Action:   event.Action,
-			State:    ExecStateScheduled,
-			outStore: &outStore{},
-			eventsCh: e.eventsCh,
-
-			// see field comments
-			worker:  nil,
-			errCh:   nil,
-			inStore: nil,
-		}
-		e.executions = append(e.executions, exec)
-		go e.waitForDepsAndSchedule(exec)
-		e.runHooks(event, exec)
 	case EventWorkerAvailable, EventReady:
 		startedOne := e.tryExecuteOne()
-		if !startedOne && len(e.executionsWaiting) > 0 && e.allWorkersIdle() {
-			panic(fmt.Errorf("all workers idling, dealock detected"))
+		if !startedOne && len(e.executionsWaiting) > 0 {
+			//if e.allWorkersIdle() {
+			//	panic(fmt.Errorf("all workers idling, dealock detected"))
+			//}
+			// retry
+			time.AfterFunc(time.Millisecond, func() {
+				e.eventsCh <- event
+			})
 		}
 	case EventSkipped:
-		event.Execution.State = ExecStateSkipped
-		e.finalize(event.Execution)
+		e.finalize(event.Execution, ExecStateSkipped)
 	case EventCompleted:
 		if event.Error != nil {
-			event.Execution.State = ExecStateFailed
+			e.finalize(event.Execution, ExecStateFailed)
 		} else {
-			event.Execution.State = ExecStateSucceeded
+			e.finalize(event.Execution, ExecStateSucceeded)
 		}
-		e.finalize(event.Execution)
 	}
 }
 
-func (e *Engine) finalize(exec *Execution) {
+func (e *Engine) finalize(exec *Execution, state ExecState) {
+	exec.m.Lock()
+	defer exec.m.Unlock()
+
 	exec.worker = nil
+	exec.State = state
 	e.deleteExecution(exec)
 	e.wg.Done()
 }
@@ -359,7 +347,7 @@ func (e *Engine) runHooks(event Event, exec *Execution) {
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	for {
-		<-time.After(time.Millisecond) // TODO: replace with broadcast
+		<-time.After(200 * time.Millisecond) // TODO: replace with broadcast
 
 		var deepDeps []Dep
 		e.deepDeps(exec.Action, nil, &deepDeps)
@@ -397,8 +385,14 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 			ins.m[dep.Name] = exec.outStore.Get()
 		}
 	}
+
+	exec.m.Lock()
 	exec.inStore = ins
 	exec.State = ExecStateWaiting
+	exec.m.Unlock()
+
+	e.m.Lock()
+	defer e.m.Unlock()
 
 	e.executionsWaiting = append(e.executionsWaiting, exec)
 	go e.notifyReady(exec)
@@ -433,20 +427,20 @@ func (e *Engine) tryExecuteOne() bool {
 
 func (e *Engine) deleteExecution(exec *Execution) {
 	return // TODO: would need to be deleted once noone depends on it
+	e.m.Lock()
+	defer e.m.Unlock()
+
 	e.executions = ads.Filter(e.executions, func(e *Execution) bool {
 		return e != exec
 	})
 }
 
 func (e *Engine) deleteExecutionWaiting(exec *Execution) {
+	e.m.Lock()
+	defer e.m.Unlock()
+
 	e.executionsWaiting = ads.Filter(e.executionsWaiting, func(e *Execution) bool {
 		return e != exec
-	})
-}
-
-func (e *Engine) gc() {
-	e.executions = ads.Filter(e.executions, func(e *Execution) bool {
-		return e.State.IsFinal()
 	})
 }
 
@@ -499,11 +493,31 @@ func (e *Engine) allWorkersIdle() bool {
 }
 
 func (e *Engine) executionForDep(dep Dep) *Execution {
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	dep = noNamed(dep)
 	for _, exec := range e.executions {
 		if exec.Action == dep {
 			return exec
 		}
 	}
 
-	panic("execution not found")
+	exec := &Execution{
+		Action:   dep,
+		State:    ExecStateScheduled,
+		outStore: &outStore{},
+		eventsCh: e.eventsCh,
+
+		// see field comments
+		worker:  nil,
+		errCh:   nil,
+		inStore: nil,
+	}
+	e.executions = append(e.executions, exec)
+	e.wg.Add(1)
+
+	go e.waitForDepsAndSchedule(exec)
+
+	return exec
 }
