@@ -185,7 +185,7 @@ func TestExecStress(t *testing.T) {
 		Deps: []Dep{},
 	}
 
-	n := 1000
+	n := 3000
 
 	for i := 0; i < n; i++ {
 		i := i
