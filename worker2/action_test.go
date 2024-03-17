@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"testing"
-	"time"
 )
 
 func TestExecSimple(t *testing.T) {
@@ -191,6 +190,8 @@ func TestExecCancel(t *testing.T) {
 		},
 	}
 
+	errCh := a.ErrorCh()
+
 	e := NewEngine()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,10 +201,13 @@ func TestExecCancel(t *testing.T) {
 
 	e.Schedule(a)
 
-	time.Sleep(time.Second)
 	cancel()
 
 	e.Wait()
+
+	err := <-errCh
+
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestExecDeps(t *testing.T) {

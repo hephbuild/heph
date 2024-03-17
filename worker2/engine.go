@@ -274,7 +274,8 @@ func (e *Execution) Start(ctx context.Context) error {
 		e.suspendCh = make(chan struct{})
 
 		go func() {
-			e.errCh <- e.safeExec(ctx)
+			err := e.safeExec(ctx)
+			e.errCh <- err
 		}()
 	} else {
 		e.resumeAckCh <- struct{}{}
