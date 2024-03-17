@@ -39,7 +39,7 @@ func ErrorHook() (Hook, <-chan error) {
 func LogHook() Hook {
 	return func(event Event) {
 		if event, ok := event.(WithExecution); ok {
-			fmt.Printf("%v: %T %+v\n", event.getExecution().Action.GetID(), event, event)
+			fmt.Printf("%v: %T %+v\n", event.getExecution().Dep.GetID(), event, event)
 		} else {
 			fmt.Printf("%T %+v\n", event, event)
 		}

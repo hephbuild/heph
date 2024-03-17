@@ -5,50 +5,25 @@ import (
 	"sync"
 )
 
-type Value interface {
-	Get() (any, error)
+type Dep interface {
+	GetID() string
+	Exec(ctx context.Context, ins InStore, outs OutStore) error
+	Freeze()
+	Frozen() bool
+	DirectDeps() []Dep
+	GetHooks() []Hook
 }
 
-type MemoryValue[T any] struct {
-	V T
-}
-
-func (v MemoryValue[T]) Get() (any, error) {
-	return v.V, nil
-}
-
-type MapValue map[string]Value
-
-func (m MapValue) Get() (any, error) {
-	out := make(map[string]any, len(m))
-	for k, vv := range m {
-		if vv == nil {
-			continue
-		}
-		v, err := vv.Get()
-		if err != nil {
-			return nil, err
-		}
-		out[k] = v
-	}
-
-	return out, nil
-}
-
-func (m MapValue) Set(k string, v Value) {
-	m[k] = v
-}
-
-type Base struct {
+type baseDep struct {
 	frozen bool
 	m      sync.Mutex
 }
 
-func (g *Base) Frozen() bool {
+func (g *baseDep) Frozen() bool {
 	return g.frozen
 }
 
-func (g *Base) Freeze() {
+func (g *baseDep) Freeze() {
 	g.m.Lock()
 	defer g.m.Unlock()
 
@@ -56,7 +31,7 @@ func (g *Base) Freeze() {
 }
 
 type Action struct {
-	Base
+	baseDep
 	ID    string
 	Deps  []Dep
 	Hooks []Hook
@@ -92,7 +67,7 @@ func (a *Action) DirectDeps() []Dep {
 }
 
 type Group struct {
-	Base
+	baseDep
 	ID    string
 	Deps  []Dep
 	Hooks []Hook
@@ -138,16 +113,19 @@ func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	return nil
 }
 
-type Dep interface {
-	GetID() string
-	Exec(ctx context.Context, ins InStore, outs OutStore) error
-	Freeze()
-	Frozen() bool
-	DirectDeps() []Dep
-	GetHooks() []Hook
-}
-
 type Named struct {
 	Name string
 	Dep
+}
+
+func flattenNamed(dep Dep) Dep {
+	for {
+		if ndep, ok := dep.(Named); ok {
+			dep = ndep.Dep
+		} else {
+			break
+		}
+	}
+
+	return dep
 }
