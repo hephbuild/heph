@@ -106,7 +106,7 @@ func (e *Engine) runHooks(event Event, exec *Execution) {
 	}
 }
 
-func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) bool {
+func (e *Engine) waitForDeps(exec *Execution) bool {
 	e.c.L.Lock()
 	defer e.c.L.Unlock()
 
@@ -116,7 +116,7 @@ func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) bool
 
 		allDepsSucceeded := true
 		for _, dep := range deepDeps {
-			depExec := e.mustExecutionForDep(dep, execCache)
+			depExec := e.executionForDep(dep)
 
 			if depExec.State != ExecStateSucceeded {
 				allDepsSucceeded = false
@@ -141,9 +141,7 @@ func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) bool
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
-	execCache := map[Dep]*Execution{}
-
-	shouldRun := e.waitForDeps(exec, execCache)
+	shouldRun := e.waitForDeps(exec)
 	if !shouldRun {
 		return
 	}
@@ -154,7 +152,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	ins := map[string]Value{}
 	for _, dep := range exec.Dep.DirectDeps() {
 		if dep, ok := dep.(Named); ok {
-			exec := e.mustExecutionForDep(dep.Dep, execCache)
+			exec := e.executionForDep(dep.Dep)
 
 			vv := exec.outStore.Get()
 
@@ -221,18 +219,22 @@ func (e *Engine) deleteExecutionWaiting(exec *Execution) {
 }
 
 func (e *Engine) start(exec *Execution) error {
+	var errs error
 	for _, wp := range e.workerProviders {
 		w, err := wp.Start(exec)
 		if err != nil {
 			if errors.Is(err, ErrNoWorkerAvail) {
 				continue
 			}
-			panic(err)
+			errs = errors.Join(errs, err)
+			continue
 		}
 		exec.worker = w
 		exec.State = ExecStateRunning
 		return nil
 	}
+
+	// TODO: log errs
 
 	return ErrNoWorkerAvail
 }
@@ -267,18 +269,18 @@ func (e *Engine) allWorkersIdle() bool {
 	return true
 }
 
-func (e *Engine) mustExecutionForDep(dep Dep, c map[Dep]*Execution) *Execution {
+func (e *Engine) executionForDep(dep Dep) *Execution {
 	dep = flattenNamed(dep)
 
-	if exec, ok := c[dep]; ok {
-		return exec
+	if e := dep.getExecution(); e != nil {
+		return e
 	}
 
 	e.m.RLock()
 	for _, exec := range e.executions {
 		if exec.Dep == dep {
 			e.m.RUnlock()
-			c[dep] = exec
+			dep.setExecution(exec)
 			return exec
 		}
 	}
@@ -322,6 +324,7 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		errCh:  nil,
 		inputs: nil,
 	}
+	dep.setExecution(exec)
 	e.executions = append(e.executions, exec)
 	e.wg.Add(1)
 	e.runHooks(EventScheduled{Execution: exec}, exec)

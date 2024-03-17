@@ -12,22 +12,27 @@ type Dep interface {
 	Frozen() bool
 	DirectDeps() []Dep
 	GetHooks() []Hook
+
+	setExecution(*Execution)
+	getExecution() *Execution
 }
 
 type baseDep struct {
-	frozen bool
-	m      sync.Mutex
+	frozen    bool
+	m         sync.Mutex
+	execution *Execution
 }
 
-func (g *baseDep) Frozen() bool {
-	return g.frozen
+func (a *baseDep) setExecution(e *Execution) {
+	a.execution = e
 }
 
-func (g *baseDep) Freeze() {
-	g.m.Lock()
-	defer g.m.Unlock()
+func (a *baseDep) getExecution() *Execution {
+	return a.execution
+}
 
-	g.frozen = true
+func (a *baseDep) Frozen() bool {
+	return a.frozen
 }
 
 type Action struct {
@@ -36,6 +41,19 @@ type Action struct {
 	Deps  []Dep
 	Hooks []Hook
 	Do    func(ctx context.Context, ins InStore, outs OutStore) error
+}
+
+func (a *Action) Freeze() {
+	a.m.Lock()
+	defer a.m.Unlock()
+
+	for _, dep := range a.Deps {
+		if !dep.Frozen() {
+			panic("attempting to free while all deps arent frozen")
+		}
+	}
+
+	a.frozen = true
 }
 
 func (a *Action) GetID() string {
@@ -106,6 +124,19 @@ func (g *Group) Add(deps ...Dep) {
 	}
 
 	g.Deps = append(g.Deps, deps...)
+}
+
+func (g *Group) Freeze() {
+	g.m.Lock()
+	defer g.m.Unlock()
+
+	for _, dep := range g.Deps {
+		if !dep.Frozen() {
+			panic("attempting to free while all deps arent frozen")
+		}
+	}
+
+	g.frozen = true
 }
 
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
