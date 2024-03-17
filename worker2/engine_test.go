@@ -338,9 +338,17 @@ func TestExecStress(t *testing.T) {
 
 	go e.Run(context.Background())
 
+	totalActions := uint64(n + 1)
+
+	stats1 := CollectStats(a)
+	assert.Equal(t, Stats{All: totalActions}, stats1)
+
 	e.Schedule(a)
 
 	e.Wait()
+
+	stats3 := CollectStats(a)
+	assert.Equal(t, Stats{All: totalActions, Completed: totalActions, Succeeded: totalActions}, stats3)
 
 	expected := map[string]any{}
 	for i := 0; i < n; i++ {
