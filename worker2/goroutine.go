@@ -37,9 +37,16 @@ func (g *GoroutineWorker) Start(e *Execution) error {
 		g.state = WorkerStateIdle
 		g.m.Unlock()
 		if errors.Is(err, ErrSuspended) {
+			e.eventsCh <- EventSuspended{Execution: e}
+
 			go func() {
 				select {
 				case <-ctx.Done():
+					e.eventsCh <- EventCompleted{
+						Execution: e,
+						Output:    e.outStore.Get(),
+						Error:     ctx.Err(),
+					}
 				case <-e.resumeCh:
 					e.eventsCh <- EventReady{Execution: e}
 				}

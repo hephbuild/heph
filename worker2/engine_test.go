@@ -409,23 +409,29 @@ func TestExecProducerConsumer(t *testing.T) {
 
 func TestSuspend(t *testing.T) {
 	t.Parallel()
-	eventCh := make(chan string)
-	event := func(s string) {
+	logCh := make(chan string)
+	log := func(s string) {
 		fmt.Println(s)
-		eventCh <- s
+		logCh <- s
 	}
 	resumeCh := make(chan struct{})
 	resumeAckCh := make(chan struct{})
+	eventCh := make(chan Event, 1000)
 	a := &Action{
+		Hooks: []Hook{
+			func(event Event) {
+				eventCh <- event
+			},
+		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
-			event("enter")
+			log("enter")
 			Wait(ctx, func() {
-				event("start_wait")
+				log("start_wait")
 				<-resumeCh
 				resumeAckCh <- struct{}{}
-				event("end_wait")
+				log("end_wait")
 			})
-			event("leave")
+			log("leave")
 			return nil
 		},
 	}
@@ -436,12 +442,19 @@ func TestSuspend(t *testing.T) {
 
 	e.Schedule(a)
 
-	assert.Equal(t, "enter", <-eventCh)
-	assert.Equal(t, "start_wait", <-eventCh)
+	assert.Equal(t, "enter", <-logCh)
+	assert.Equal(t, "start_wait", <-logCh)
 	close(resumeCh)
 	<-resumeAckCh
-	assert.Equal(t, "end_wait", <-eventCh)
-	assert.Equal(t, "leave", <-eventCh)
+	assert.Equal(t, "end_wait", <-logCh)
+	assert.Equal(t, "leave", <-logCh)
 
 	e.Wait()
+	close(eventCh)
+
+	events := make([]string, 0)
+	for event := range eventCh {
+		events = append(events, fmt.Sprintf("%T", event))
+	}
+	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 }
