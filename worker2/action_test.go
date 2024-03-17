@@ -9,6 +9,7 @@ import (
 )
 
 func TestExecSimple(t *testing.T) {
+	t.Parallel()
 	didRun := false
 	a := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
@@ -30,6 +31,7 @@ func TestExecSimple(t *testing.T) {
 }
 
 func TestExecHook(t *testing.T) {
+	t.Parallel()
 	ch := make(chan Event, 1000)
 	a := &Action{
 		Hooks: []Hook{
@@ -66,6 +68,7 @@ func TestExecHook(t *testing.T) {
 }
 
 func TestExecCancel(t *testing.T) {
+	t.Parallel()
 	a := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			<-ctx.Done()
@@ -89,6 +92,7 @@ func TestExecCancel(t *testing.T) {
 }
 
 func TestExecDeps(t *testing.T) {
+	t.Parallel()
 	a1_1 := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
@@ -136,6 +140,7 @@ func TestExecDeps(t *testing.T) {
 }
 
 func TestExecGroup(t *testing.T) {
+	t.Parallel()
 	a1_1 := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
@@ -181,6 +186,7 @@ func TestExecGroup(t *testing.T) {
 }
 
 func TestExecStress(t *testing.T) {
+	t.Parallel()
 	g := &Group{
 		Deps: []Dep{},
 	}
@@ -225,6 +231,7 @@ func TestExecStress(t *testing.T) {
 }
 
 func TestExecProducerConsumer(t *testing.T) {
+	t.Parallel()
 	g := &Group{
 		Deps: []Dep{},
 	}
@@ -279,4 +286,43 @@ func TestExecProducerConsumer(t *testing.T) {
 	}
 
 	assert.Equal(t, expected, received)
+}
+
+func TestSuspend(t *testing.T) {
+	t.Parallel()
+	eventCh := make(chan string)
+	event := func(s string) {
+		fmt.Println(s)
+		eventCh <- s
+	}
+	resumeCh := make(chan struct{})
+	resumeAckCh := make(chan struct{})
+	a := &Action{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			event("enter")
+			Wait(ctx, func() {
+				event("start_wait")
+				<-resumeCh
+				resumeAckCh <- struct{}{}
+				event("end_wait")
+			})
+			event("leave")
+			return nil
+		},
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(a)
+
+	assert.Equal(t, "enter", <-eventCh)
+	assert.Equal(t, "start_wait", <-eventCh)
+	close(resumeCh)
+	<-resumeAckCh
+	assert.Equal(t, "end_wait", <-eventCh)
+	assert.Equal(t, "leave", <-eventCh)
+
+	e.Wait()
 }
