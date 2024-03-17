@@ -223,3 +223,60 @@ func TestExecStress(t *testing.T) {
 
 	assert.Equal(t, expected, received)
 }
+
+func TestExecProducerConsumer(t *testing.T) {
+	g := &Group{
+		Deps: []Dep{},
+	}
+
+	n := 10000
+
+	producer := &Action{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			fmt.Println("Running producer")
+
+			for i := 0; i < n; i++ {
+				i := i
+
+				a := &Action{
+					Do: func(ctx context.Context, ds InStore, os OutStore) error {
+						fmt.Println("Running inner", i)
+						os.Set(MemoryValue[int]{V: i})
+						return nil
+					},
+				}
+
+				g.Add(Named{Name: fmt.Sprint(i), Dep: a})
+			}
+			return nil
+		},
+	}
+
+	g.Add(producer)
+
+	var received any
+	consumer := &Action{
+		Deps: []Dep{producer, Named{Name: "v", Dep: g}},
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			fmt.Println("Running consumer")
+
+			received, _ = ds.Get("v")
+			return nil
+		},
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(consumer)
+
+	e.Wait()
+
+	expected := map[string]any{}
+	for i := 0; i < n; i++ {
+		expected[fmt.Sprint(i)] = i
+	}
+
+	assert.Equal(t, expected, received)
+}
