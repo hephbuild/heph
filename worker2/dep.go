@@ -13,7 +13,9 @@ type Dep interface {
 	GetDeps() []Dep
 	GetHooks() []Hook
 	Wait() <-chan struct{}
+	DeepDo(f func(Dep))
 
+	deepDo(m map[Dep]struct{}, f func(Dep))
 	setExecution(*Execution)
 	getExecution() *Execution
 }
@@ -89,6 +91,14 @@ func (a *Action) GetDeps() []Dep {
 	return a.Deps
 }
 
+func (a *Action) DeepDo(f func(Dep)) {
+	a.deepDo(nil, f)
+}
+
+func (a *Action) deepDo(m map[Dep]struct{}, f func(Dep)) {
+	deepDo(a, m, f)
+}
+
 type Group struct {
 	baseDep
 	ID    string
@@ -118,6 +128,14 @@ func (g *Group) GetDeps() []Dep {
 
 func (g *Group) GetHooks() []Hook {
 	return g.Hooks
+}
+
+func (g *Group) DeepDo(f func(Dep)) {
+	g.deepDo(nil, f)
+}
+
+func (g *Group) deepDo(m map[Dep]struct{}, f func(Dep)) {
+	deepDo(g, m, f)
 }
 
 func (g *Group) Add(deps ...Dep) {
