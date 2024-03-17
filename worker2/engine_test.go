@@ -40,7 +40,7 @@ func TestExecHook(t *testing.T) {
 		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
-			os.Set(MemoryValue[int]{V: 1})
+			os.Set(NewValue(1))
 			return nil
 		},
 	}
@@ -216,7 +216,7 @@ func TestExecDeps(t *testing.T) {
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
 
-			os.Set(MemoryValue[int]{V: 1})
+			os.Set(NewValue(1))
 			return nil
 		},
 	}
@@ -224,7 +224,7 @@ func TestExecDeps(t *testing.T) {
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 2")
 
-			os.Set(MemoryValue[string]{V: "hello, world"})
+			os.Set(NewValue("hello, world"))
 			return nil
 		},
 	}
@@ -264,7 +264,7 @@ func TestExecGroup(t *testing.T) {
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
 
-			os.Set(MemoryValue[int]{V: 1})
+			os.Set(NewValue(1))
 			return nil
 		},
 	}
@@ -272,7 +272,7 @@ func TestExecGroup(t *testing.T) {
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 2")
 
-			os.Set(MemoryValue[string]{V: "hello, world"})
+			os.Set(NewValue("hello, world"))
 			return nil
 		},
 	}
@@ -316,7 +316,7 @@ func TestExecStress(t *testing.T) {
 		i := i
 		a := &Action{
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
-				os.Set(MemoryValue[int]{V: i})
+				os.Set(NewValue(i))
 				return nil
 			},
 		}
@@ -367,7 +367,7 @@ func TestExecProducerConsumer(t *testing.T) {
 				a := &Action{
 					Do: func(ctx context.Context, ds InStore, os OutStore) error {
 						fmt.Println("Running inner", i)
-						os.Set(MemoryValue[int]{V: i})
+						os.Set(NewValue(i))
 						return nil
 					},
 				}

@@ -4,11 +4,15 @@ type Value interface {
 	Get() (any, error)
 }
 
-type MemoryValue[T any] struct {
+func NewValue[T any](v T) MemValue[T] {
+	return MemValue[T]{V: v}
+}
+
+type MemValue[T any] struct {
 	V T
 }
 
-func (v MemoryValue[T]) Get() (any, error) {
+func (v MemValue[T]) Get() (any, error) {
 	return v.V, nil
 }
 

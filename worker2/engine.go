@@ -32,7 +32,7 @@ func (e *Engine) deepDeps(a Dep, m map[Dep]struct{}, deps *[]Dep) {
 		m = map[Dep]struct{}{}
 	}
 
-	for _, dep := range a.DirectDeps() {
+	for _, dep := range a.GetDeps() {
 		dep := flattenNamed(dep)
 
 		if _, ok := m[dep]; ok {
@@ -150,7 +150,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 
 	exec.m.Lock()
 	ins := map[string]Value{}
-	for _, dep := range exec.Dep.DirectDeps() {
+	for _, dep := range exec.Dep.GetDeps() {
 		if dep, ok := dep.(Named); ok {
 			exec := e.executionForDep(dep.Dep)
 
