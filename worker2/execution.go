@@ -30,10 +30,10 @@ type Execution struct {
 	outStore OutStore
 	eventsCh chan Event
 
-	worker  Worker     // gets populated when a worker accepts it
-	errCh   chan error // gets populated when exec is called
-	inStore InStore    // gets populated when its deps are ready
-	m       sync.Mutex
+	worker Worker           // gets populated when a worker accepts it
+	errCh  chan error       // gets populated when exec is called
+	inputs map[string]Value // gets populated before marking as ready
+	m      sync.Mutex
 
 	suspendCh   chan struct{}
 	resumeCh    chan struct{}
@@ -57,30 +57,46 @@ func (e *Execution) Start(ctx context.Context) error {
 		e.suspendCh = make(chan struct{})
 
 		go func() {
-			err := e.safeExec(ctx)
+			err := e.run(ctx)
 			e.errCh <- err
 		}()
 	} else {
 		e.resumeAckCh <- struct{}{}
+		e.State = ExecStateRunning
 	}
 	e.m.Unlock()
 
 	select {
 	case <-e.suspendCh:
+		e.State = ExecStateSuspended
 		return ErrSuspended
 	case err := <-e.errCh:
 		return err
 	}
 }
 
-func (e *Execution) safeExec(ctx context.Context) (err error) {
+func (e *Execution) run(ctx context.Context) error {
+	ins := &inStore{m: map[string]any{}}
+	for k, value := range e.inputs {
+		vv, err := value.Get()
+		if err != nil {
+			return fmt.Errorf("%v: %w", k, err)
+		}
+
+		ins.m[k] = vv
+	}
+
+	return e.safeExec(ctx, ins)
+}
+
+func (e *Execution) safeExec(ctx context.Context, ins InStore) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
 
-	return e.Dep.Exec(ctx, e.inStore, e.outStore)
+	return e.Dep.Exec(ctx, ins, e.outStore)
 }
 
 func (e *Execution) Suspend() {
