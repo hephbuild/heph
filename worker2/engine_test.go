@@ -237,8 +237,8 @@ func TestExecDeps(t *testing.T) {
 			Named{Name: "v2", Dep: a1_2},
 		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
-			v1, _ := ds.Get("v1")
-			v2, _ := ds.Get("v2")
+			v1 := ds.Get("v1")
+			v2 := ds.Get("v2")
 
 			fmt.Println("Got values", v1, v2)
 
@@ -288,7 +288,7 @@ func TestExecGroup(t *testing.T) {
 	a := &Action{
 		Deps: []Dep{Named{Name: "v", Dep: g}},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
-			received, _ = ds.Get("v")
+			received = ds.Get("v")
 			return nil
 		},
 	}
@@ -328,7 +328,7 @@ func TestExecStress(t *testing.T) {
 	a := &Action{
 		Deps: []Dep{Named{Name: "v", Dep: g}},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
-			received, _ = ds.Get("v")
+			received = ds.Get("v")
 			return nil
 		},
 	}
@@ -386,7 +386,7 @@ func TestExecProducerConsumer(t *testing.T) {
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running consumer")
 
-			received, _ = ds.Get("v")
+			received = ds.Get("v")
 			return nil
 		},
 	}

@@ -1,8 +1,7 @@
 package worker2
 
 type InStore interface {
-	Copy(OutStore)
-	Get(key string) (any, error)
+	Get(key string) any
 }
 
 type OutStore interface {
@@ -11,19 +10,11 @@ type OutStore interface {
 }
 
 type inStore struct {
-	m map[string]Value
+	m map[string]any
 }
 
-func (s *inStore) Copy(outs OutStore) {
-	mv := make(MapValue, len(s.m))
-	for k, v := range s.m {
-		mv.Set(k, v)
-	}
-	outs.Set(mv)
-}
-
-func (s *inStore) Get(name string) (any, error) {
-	return s.m[name].Get()
+func (s *inStore) Get(name string) any {
+	return s.m[name]
 }
 
 type outStore struct {

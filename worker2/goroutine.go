@@ -38,8 +38,11 @@ func (g *GoroutineWorker) Start(e *Execution) error {
 		g.m.Unlock()
 		if errors.Is(err, ErrSuspended) {
 			go func() {
-				<-e.resumeCh
-				e.eventsCh <- EventReady{Execution: e}
+				select {
+				case <-ctx.Done():
+				case <-e.resumeCh:
+					e.eventsCh <- EventReady{Execution: e}
+				}
 			}()
 		} else {
 			e.eventsCh <- EventCompleted{

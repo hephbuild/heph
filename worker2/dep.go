@@ -109,7 +109,8 @@ func (g *Group) Add(deps ...Dep) {
 }
 
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
-	ins.Copy(outs)
+	e := executionFromContext(ctx)
+	outs.Set(MapValue(e.inputs))
 	return nil
 }
 

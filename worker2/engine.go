@@ -133,13 +133,11 @@ func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) bool
 		}
 
 		if allDepsSucceeded {
-			break
+			return true
 		}
 
 		e.c.Wait()
 	}
-
-	return true
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
@@ -152,17 +150,18 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 
 	exec.Dep.Freeze()
 
-	ins := &inStore{m: map[string]Value{}}
+	exec.m.Lock()
+	ins := map[string]Value{}
 	for _, dep := range exec.Dep.DirectDeps() {
 		if dep, ok := dep.(Named); ok {
 			exec := e.mustExecutionForDep(dep.Dep, execCache)
 
-			ins.m[dep.Name] = exec.outStore.Get()
+			vv := exec.outStore.Get()
+
+			ins[dep.Name] = vv
 		}
 	}
-
-	exec.m.Lock()
-	exec.inStore = ins
+	exec.inputs = ins
 	exec.State = ExecStateWaiting
 	exec.m.Unlock()
 
@@ -172,6 +171,14 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 func (e *Engine) notifySkipped(exec *Execution) {
 	e.eventsCh <- EventSkipped{
 		Execution: exec,
+	}
+}
+
+func (e *Engine) notifyCompleted(exec *Execution, output Value, err error) {
+	e.eventsCh <- EventCompleted{
+		Execution: exec,
+		Output:    output,
+		Error:     err,
 	}
 }
 
@@ -192,7 +199,8 @@ func (e *Engine) tryExecuteOne() bool {
 			if errors.Is(err, ErrNoWorkerAvail) {
 				continue
 			}
-			panic(err)
+			e.notifyCompleted(candidate, nil, err)
+			continue
 		}
 		e.deleteExecutionWaiting(candidate)
 		e.runHooks(EventStarted{Execution: candidate}, candidate)
@@ -310,9 +318,9 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		eventsCh: e.eventsCh,
 
 		// see field comments
-		worker:  nil,
-		errCh:   nil,
-		inStore: nil,
+		worker: nil,
+		errCh:  nil,
+		inputs: nil,
 	}
 	e.executions = append(e.executions, exec)
 	e.wg.Add(1)
