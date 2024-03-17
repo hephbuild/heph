@@ -67,6 +67,121 @@ func TestExecHook(t *testing.T) {
 	assert.Equal(t, int(1), v)
 }
 
+func TestExecError(t *testing.T) {
+	t.Parallel()
+	a := &Action{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			return fmt.Errorf("beep bop")
+		},
+	}
+
+	errCh := a.ErrorCh()
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(a)
+
+	e.Wait()
+
+	assert.ErrorContains(t, <-errCh, "beep bop")
+}
+
+func TestExecErrorSkip(t *testing.T) {
+	t.Parallel()
+	a1 := &Action{
+		ID: "a1",
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			return fmt.Errorf("beep bop")
+		},
+	}
+
+	a2 := &Action{
+		ID:   "a2",
+		Deps: []Dep{a1},
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			return nil
+		},
+	}
+
+	a3 := &Action{
+		ID:   "a3",
+		Deps: []Dep{a2},
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			return nil
+		},
+	}
+
+	err1Ch := a1.ErrorCh()
+	err2Ch := a2.ErrorCh()
+	err3Ch := a3.ErrorCh()
+
+	e := NewEngine()
+	e.RegisterHook(LogHook())
+
+	go e.Run(context.Background())
+
+	e.Schedule(a3)
+
+	e.Wait()
+
+	assert.ErrorContains(t, <-err1Ch, "beep bop")
+	assert.ErrorIs(t, <-err2Ch, ErrSkipped)
+	assert.ErrorIs(t, <-err3Ch, ErrSkipped)
+}
+
+func TestExecErrorSkipStress(t *testing.T) {
+	t.Parallel()
+	a1 := &Action{
+		ID: "a1",
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			return fmt.Errorf("beep bop")
+		},
+	}
+
+	g := &Group{}
+
+	var errChs []<-chan error
+
+	for i := 0; i < 100; i++ {
+		a2 := &Action{
+			ID:   fmt.Sprintf("2-%v", i),
+			Deps: []Dep{a1},
+			Do: func(ctx context.Context, ds InStore, os OutStore) error {
+				return nil
+			},
+		}
+
+		errChs = append(errChs, a2.ErrorCh())
+
+		for j := 0; j < 100; j++ {
+			a3 := &Action{
+				ID:   fmt.Sprintf("3-%v", j),
+				Deps: []Dep{a2},
+				Do: func(ctx context.Context, ds InStore, os OutStore) error {
+					return nil
+				},
+			}
+			g.Add(a3)
+
+			errChs = append(errChs, a3.ErrorCh())
+		}
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(g)
+
+	e.Wait()
+
+	for _, errCh := range errChs {
+		assert.ErrorIs(t, <-errCh, ErrSkipped)
+	}
+}
+
 func TestExecCancel(t *testing.T) {
 	t.Parallel()
 	a := &Action{

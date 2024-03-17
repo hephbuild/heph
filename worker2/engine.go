@@ -257,6 +257,10 @@ type Execution struct {
 	resumeAckCh chan struct{}
 }
 
+func (e *Execution) String() string {
+	return e.Action.GetID()
+}
+
 func (e *Execution) GetOutput() Value {
 	return e.outStore.Get()
 }
@@ -415,7 +419,7 @@ func (e *Engine) runHooks(event Event, exec *Execution) {
 	}
 }
 
-func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) {
+func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) bool {
 	e.c.L.Lock()
 	defer e.c.L.Unlock()
 
@@ -434,10 +438,10 @@ func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) {
 			switch depExec.State {
 			case ExecStateSkipped:
 				e.notifySkipped(exec)
-				return
+				return false
 			case ExecStateFailed:
 				e.notifySkipped(exec)
-				return
+				return false
 			}
 		}
 
@@ -447,12 +451,17 @@ func (e *Engine) waitForDeps(exec *Execution, execCache map[Dep]*Execution) {
 
 		e.c.Wait()
 	}
+
+	return true
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	execCache := map[Dep]*Execution{}
 
-	e.waitForDeps(exec, execCache)
+	shouldRun := e.waitForDeps(exec, execCache)
+	if !shouldRun {
+		return
+	}
 
 	exec.Action.Freeze()
 
