@@ -94,6 +94,7 @@ func (e *Engine) finalize(exec *Execution, state ExecState) {
 	e.deleteExecution(exec)
 	e.wg.Done()
 	e.c.Broadcast()
+	close(exec.completedCh)
 }
 
 func (e *Engine) runHooks(event Event, exec *Execution) {
@@ -314,10 +315,11 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 	}
 
 	exec := &Execution{
-		Dep:      dep,
-		State:    ExecStateScheduled,
-		outStore: &outStore{},
-		eventsCh: e.eventsCh,
+		Dep:         dep,
+		State:       ExecStateScheduled,
+		outStore:    &outStore{},
+		eventsCh:    e.eventsCh,
+		completedCh: make(chan struct{}),
 
 		// see field comments
 		worker: nil,

@@ -25,6 +25,7 @@ func TestExecSimple(t *testing.T) {
 	e.Schedule(a)
 
 	e.Wait()
+	<-a.Wait()
 
 	assert.True(t, didRun)
 }
