@@ -31,13 +31,11 @@ func TestExecSimple(t *testing.T) {
 
 func TestExecHook(t *testing.T) {
 	ch := make(chan Event, 1000)
-	outputHook, outputCh := OutputHook()
 	a := &Action{
 		Hooks: []Hook{
 			func(event Event) {
 				ch <- event
 			},
-			outputHook,
 		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
@@ -45,6 +43,8 @@ func TestExecHook(t *testing.T) {
 			return nil
 		},
 	}
+
+	outputCh := a.OutputCh()
 
 	e := NewEngine()
 
@@ -185,7 +185,7 @@ func TestExecStress(t *testing.T) {
 		Deps: []Dep{},
 	}
 
-	n := 10000
+	n := 30000
 
 	for i := 0; i < n; i++ {
 		i := i
