@@ -136,10 +136,22 @@ func (g *GoroutineWorker) Start(e *Execution) error {
 
 	go func() {
 		g.state = WorkerStateRunning
-		err := e.Start(g.ctx)
+		ctx := contextWithExecution(g.ctx, e)
+		err := e.Start(ctx)
 		g.state = WorkerStateIdle
 		g.m.Unlock()
-		e.Completed(err)
+		if errors.Is(err, ErrSuspended) {
+			go func() {
+				<-e.resumeCh
+				e.eventsCh <- EventReady{Execution: e}
+			}()
+		} else {
+			e.eventsCh <- EventCompleted{
+				Execution: e,
+				Output:    e.outStore.Get(),
+				Error:     err,
+			}
+		}
 	}()
 
 	return nil
@@ -239,40 +251,77 @@ type Execution struct {
 	errCh   chan error // gets populated when exec is called
 	inStore InStore    // gets populated when its deps are ready
 	m       sync.Mutex
+
+	suspendCh   chan struct{}
+	resumeCh    chan struct{}
+	resumeAckCh chan struct{}
 }
 
 func (e *Execution) GetOutput() Value {
 	return e.outStore.Get()
 }
 
-func (e *Execution) Start(ctx context.Context) error {
-	defer func() {
-		if r := recover(); r != nil {
-			e.errCh <- fmt.Errorf("panic: %v", r)
-		}
-	}()
+var ErrSuspended = errors.New("suspended")
 
+func (e *Execution) Start(ctx context.Context) error {
+	e.m.Lock()
 	if e.errCh == nil {
 		e.errCh = make(chan error)
+		e.suspendCh = make(chan struct{})
 
 		go func() {
-			e.errCh <- e.Action.Exec(ctx, e.inStore, e.outStore)
+			e.errCh <- e.safeExec(ctx)
 		}()
+	} else {
+		e.resumeAckCh <- struct{}{}
 	}
+	e.m.Unlock()
 
 	select {
-	// TODO implement suspend
+	case <-e.suspendCh:
+		return ErrSuspended
 	case err := <-e.errCh:
 		return err
 	}
 }
 
-func (e *Execution) Completed(err error) {
-	e.eventsCh <- EventCompleted{
-		Execution: e,
-		Output:    e.outStore.Get(),
-		Error:     err,
+func (e *Execution) safeExec(ctx context.Context) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
+	return e.Action.Exec(ctx, e.inStore, e.outStore)
+}
+
+func (e *Execution) Suspend() {
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	if e.resumeCh != nil {
+		panic("attempting to suspend an already suspended execution")
 	}
+
+	e.suspendCh <- struct{}{}
+	e.resumeCh = make(chan struct{})
+	e.resumeAckCh = make(chan struct{})
+}
+
+func (e *Execution) Resume() <-chan struct{} {
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	if e.resumeAckCh == nil {
+		panic("attempting to resume an unsuspended execution")
+	}
+
+	ackCh := e.resumeAckCh
+
+	e.resumeCh <- struct{}{}
+	e.resumeCh = nil
+
+	return ackCh
 }
 
 func (e *Engine) deepDeps(a Dep, m map[Dep]struct{}, deps *[]Dep) {
