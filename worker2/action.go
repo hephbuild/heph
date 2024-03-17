@@ -22,6 +22,9 @@ type MapValue map[string]Value
 func (m MapValue) Get() (any, error) {
 	out := make(map[string]any, len(m))
 	for k, vv := range m {
+		if vv == nil {
+			continue
+		}
 		v, err := vv.Get()
 		if err != nil {
 			return nil, err

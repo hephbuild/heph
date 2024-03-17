@@ -320,9 +320,9 @@ func (e *Engine) handle(event Event) {
 	switch event := event.(type) {
 	case EventReady:
 		e.executionsWaiting = append(e.executionsWaiting, event.Execution)
-		e.notifyTryExecuteOne()
+		go e.notifyTryExecuteOne()
 	case EventWorkerAvailable:
-		e.notifyTryExecuteOne()
+		go e.notifyTryExecuteOne()
 	case EventTryExecuteOne:
 		startedOne := e.tryExecuteOne()
 		if !startedOne && len(e.executionsWaiting) > 0 {
