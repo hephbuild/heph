@@ -10,7 +10,7 @@ type Dep interface {
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
 	Freeze()
 	Frozen() bool
-	DirectDeps() []Dep
+	GetDeps() []Dep
 	GetHooks() []Hook
 
 	setExecution(*Execution)
@@ -80,7 +80,7 @@ func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	return a.Do(ctx, ins, outs)
 }
 
-func (a *Action) DirectDeps() []Dep {
+func (a *Action) GetDeps() []Dep {
 	return a.Deps
 }
 
@@ -107,7 +107,7 @@ func (g *Group) GetID() string {
 	return g.ID
 }
 
-func (g *Group) DirectDeps() []Dep {
+func (g *Group) GetDeps() []Dep {
 	return g.Deps
 }
 

@@ -76,6 +76,10 @@ func (e *Execution) Start(ctx context.Context) error {
 }
 
 func (e *Execution) run(ctx context.Context) error {
+	if g, ok := e.Dep.(*Group); ok {
+		return g.Exec(ctx, nil, e.outStore)
+	}
+
 	ins := &inStore{m: map[string]any{}}
 	for k, value := range e.inputs {
 		vv, err := value.Get()
