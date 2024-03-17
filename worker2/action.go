@@ -57,13 +57,24 @@ func (g *Base) Freeze() {
 
 type Action struct {
 	Base
+	ID    string
 	Deps  []Dep
 	Hooks []Hook
 	Do    func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
+func (a *Action) GetID() string {
+	return a.ID
+}
+
 func (a *Action) OutputCh() <-chan Value {
 	h, ch := OutputHook()
+	a.Hooks = append(a.Hooks, h)
+	return ch
+}
+
+func (a *Action) ErrorCh() <-chan error {
+	h, ch := ErrorHook()
 	a.Hooks = append(a.Hooks, h)
 	return ch
 }
@@ -82,8 +93,25 @@ func (a *Action) DirectDeps() []Dep {
 
 type Group struct {
 	Base
+	ID    string
 	Deps  []Dep
 	Hooks []Hook
+}
+
+func (g *Group) OutputCh() <-chan Value {
+	h, ch := OutputHook()
+	g.Hooks = append(g.Hooks, h)
+	return ch
+}
+
+func (g *Group) ErrorCh() <-chan error {
+	h, ch := ErrorHook()
+	g.Hooks = append(g.Hooks, h)
+	return ch
+}
+
+func (g *Group) GetID() string {
+	return g.ID
 }
 
 func (g *Group) DirectDeps() []Dep {
@@ -111,6 +139,7 @@ func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 }
 
 type Dep interface {
+	GetID() string
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
 	Freeze()
 	Frozen() bool
