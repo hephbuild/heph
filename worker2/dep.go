@@ -12,6 +12,7 @@ type Dep interface {
 	Frozen() bool
 	GetDeps() []Dep
 	GetHooks() []Hook
+	Wait() <-chan struct{}
 
 	setExecution(*Execution)
 	getExecution() *Execution
@@ -29,6 +30,10 @@ func (a *baseDep) setExecution(e *Execution) {
 
 func (a *baseDep) getExecution() *Execution {
 	return a.execution
+}
+
+func (a *baseDep) Wait() <-chan struct{} {
+	return a.getExecution().Wait()
 }
 
 func (a *baseDep) Frozen() bool {

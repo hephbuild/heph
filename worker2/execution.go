@@ -38,10 +38,20 @@ type Execution struct {
 	suspendCh   chan struct{}
 	resumeCh    chan struct{}
 	resumeAckCh chan struct{}
+
+	completedCh chan struct{}
 }
 
 func (e *Execution) String() string {
-	return e.Dep.GetID()
+	if id := e.Dep.GetID(); id != "" {
+		return id
+	}
+
+	return fmt.Sprintf("%p", e)
+}
+
+func (e *Execution) Wait() <-chan struct{} {
+	return e.completedCh
 }
 
 func (e *Execution) GetOutput() Value {
