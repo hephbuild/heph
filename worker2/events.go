@@ -53,3 +53,11 @@ type EventReady struct {
 func (e EventReady) getExecution() *Execution {
 	return e.Execution
 }
+
+type EventSuspended struct {
+	Execution *Execution
+}
+
+func (e EventSuspended) getExecution() *Execution {
+	return e.Execution
+}
