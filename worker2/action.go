@@ -20,7 +20,7 @@ func (v MemoryValue[T]) Get() (any, error) {
 type MapValue map[string]Value
 
 func (m MapValue) Get() (any, error) {
-	out := map[string]any{}
+	out := make(map[string]any, len(m))
 	for k, vv := range m {
 		v, err := vv.Get()
 		if err != nil {
@@ -57,6 +57,12 @@ type Action struct {
 	Deps  []Dep
 	Hooks []Hook
 	Do    func(ctx context.Context, ins InStore, outs OutStore) error
+}
+
+func (a *Action) OutputCh() <-chan Value {
+	h, ch := OutputHook()
+	a.Hooks = append(a.Hooks, h)
+	return ch
 }
 
 func (a *Action) GetHooks() []Hook {
