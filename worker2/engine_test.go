@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"runtime"
 	"testing"
 )
 
@@ -23,9 +24,11 @@ func TestExecSimple(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 
@@ -44,9 +47,11 @@ func TestStatus(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 
@@ -55,7 +60,7 @@ func TestStatus(t *testing.T) {
 
 	var emittedStatus status.Statuser
 	for _, worker := range e.workerProviders[0].Workers() {
-		emittedStatus = worker.(*GoroutineWorker).status
+		emittedStatus = worker.status
 		if emittedStatus != nil {
 			break
 		}
@@ -82,9 +87,11 @@ func TestExecHook(t *testing.T) {
 
 	outputCh := a.OutputCh()
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 
@@ -111,9 +118,11 @@ func TestExecError(t *testing.T) {
 
 	errCh := a.ErrorCh()
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 
@@ -151,10 +160,12 @@ func TestExecErrorSkip(t *testing.T) {
 	err2Ch := a2.ErrorCh()
 	err3Ch := a3.ErrorCh()
 
+	ctx := context.Background()
 	e := NewEngine()
 	e.RegisterHook(LogHook())
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a3)
 
@@ -203,9 +214,11 @@ func TestExecErrorSkipStress(t *testing.T) {
 		}
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(g)
 
@@ -227,10 +240,10 @@ func TestExecCancel(t *testing.T) {
 
 	errCh := a.ErrorCh()
 
-	e := NewEngine()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
 	go e.Run(ctx)
 
@@ -282,9 +295,11 @@ func TestExecDeps(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a2)
 
@@ -328,9 +343,11 @@ func TestExecGroup(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 
@@ -368,9 +385,11 @@ func TestExecStress(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	totalDeps := uint64(n + 2)
 
@@ -434,9 +453,11 @@ func TestExecProducerConsumer(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(consumer)
 
@@ -479,9 +500,11 @@ func TestSuspend(t *testing.T) {
 		},
 	}
 
+	ctx := context.Background()
 	e := NewEngine()
+	e.RegisterWorkerProvider(NewStaticWorkerProvider(ctx, runtime.NumCPU()))
 
-	go e.Run(context.Background())
+	go e.Run(ctx)
 
 	e.Schedule(a)
 

@@ -3,7 +3,6 @@ package worker2
 import (
 	"context"
 	"errors"
-	"runtime"
 	"slices"
 	"sync"
 	"time"
@@ -50,7 +49,9 @@ func (e *Engine) handle(event Event) {
 			//if e.allWorkersIdle() {
 			//	panic(fmt.Errorf("all workers idling, dealock detected"))
 			//}
+
 			// retry
+			// todo: figure out how to remove the need for that
 			time.AfterFunc(100*time.Millisecond, func() {
 				e.eventsCh <- event
 			})
@@ -236,8 +237,6 @@ func (e *Engine) RegisterHook(hook Hook) {
 }
 
 func (e *Engine) Run(ctx context.Context) {
-	e.RegisterWorkerProvider(NewGoroutineWorkerProvider(ctx, runtime.NumCPU()))
-
 	e.loop()
 }
 

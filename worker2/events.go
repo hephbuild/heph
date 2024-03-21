@@ -43,7 +43,7 @@ func (e EventSkipped) getExecution() *Execution {
 }
 
 type EventWorkerAvailable struct {
-	Worker Worker
+	Worker *Worker
 }
 
 type EventReady struct {
