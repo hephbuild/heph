@@ -2,9 +2,13 @@ package worker2
 
 import "sync/atomic"
 
-func deepDo(a Dep, m map[Dep]struct{}, f func(Dep)) {
-	if m == nil {
-		m = map[Dep]struct{}{}
+func deepDo(a Dep, m map[Dep]struct{}, f func(Dep), pre bool) {
+	if pre {
+		if _, ok := m[a]; ok {
+			return
+		}
+		m[a] = struct{}{}
+		f(a)
 	}
 
 	for _, dep := range a.GetDeps() {
@@ -13,11 +17,16 @@ func deepDo(a Dep, m map[Dep]struct{}, f func(Dep)) {
 		if _, ok := m[dep]; ok {
 			continue
 		}
-		m[dep] = struct{}{}
-
-		f(dep)
 
 		dep.deepDo(m, f)
+	}
+
+	if !pre {
+		if _, ok := m[a]; ok {
+			return
+		}
+		m[a] = struct{}{}
+		f(a)
 	}
 }
 

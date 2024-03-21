@@ -1,6 +1,9 @@
 package worker2
 
-import "errors"
+import (
+	"errors"
+	"github.com/hephbuild/heph/status"
+)
 
 type WorkerState int
 
@@ -16,6 +19,7 @@ var ErrNoWorkerAvail = errors.New("no worker available")
 type Worker interface {
 	Start(a *Execution) error
 	State() WorkerState
+	status.Handler
 }
 
 type WorkerProvider interface {
