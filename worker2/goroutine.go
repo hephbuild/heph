@@ -3,13 +3,23 @@ package worker2
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/status"
 	"sync"
 )
 
 type GoroutineWorker struct {
-	m     sync.Mutex
-	ctx   context.Context
-	state WorkerState
+	m      sync.Mutex
+	ctx    context.Context
+	state  WorkerState
+	status status.Statuser
+}
+
+func (g *GoroutineWorker) Status(status status.Statuser) {
+	g.status = status
+}
+
+func (g *GoroutineWorker) Interactive() bool {
+	return true
 }
 
 func NewGoroutineWorker(ctx context.Context) *GoroutineWorker {
@@ -33,6 +43,7 @@ func (g *GoroutineWorker) Start(e *Execution) error {
 	go func() {
 		g.state = WorkerStateRunning
 		ctx := contextWithExecution(g.ctx, e)
+		ctx = status.ContextWithHandler(ctx, g)
 		err := e.Start(ctx)
 		g.state = WorkerStateIdle
 		g.m.Unlock()

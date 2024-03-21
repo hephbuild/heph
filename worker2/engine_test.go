@@ -3,9 +3,14 @@ package worker2
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/status"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"testing"
 )
+
+// Number of actions to be processed during a stress test
+const StressN = 30000
 
 func TestExecSimple(t *testing.T) {
 	t.Parallel()
@@ -28,6 +33,35 @@ func TestExecSimple(t *testing.T) {
 	<-a.Wait()
 
 	assert.True(t, didRun)
+}
+
+func TestStatus(t *testing.T) {
+	t.Parallel()
+	a := &Action{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			status.Emit(ctx, status.String("hello"))
+			return nil
+		},
+	}
+
+	e := NewEngine()
+
+	go e.Run(context.Background())
+
+	e.Schedule(a)
+
+	e.Wait()
+	<-a.Wait()
+
+	var emittedStatus status.Statuser
+	for _, worker := range e.workerProviders[0].Workers() {
+		emittedStatus = worker.(*GoroutineWorker).status
+		if emittedStatus != nil {
+			break
+		}
+	}
+	require.NotNil(t, emittedStatus)
+	assert.Equal(t, "hello", emittedStatus.String(nil))
 }
 
 func TestExecHook(t *testing.T) {
@@ -144,7 +178,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 	var errChs []<-chan error
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < StressN/100; i++ {
 		a2 := &Action{
 			ID:   fmt.Sprintf("2-%v", i),
 			Deps: []Dep{a1},
@@ -311,7 +345,7 @@ func TestExecStress(t *testing.T) {
 		Deps: []Dep{},
 	}
 
-	n := 30000
+	n := StressN
 
 	for i := 0; i < n; i++ {
 		i := i
@@ -338,17 +372,17 @@ func TestExecStress(t *testing.T) {
 
 	go e.Run(context.Background())
 
-	totalActions := uint64(n + 1)
+	totalDeps := uint64(n + 2)
 
 	stats1 := CollectStats(a)
-	assert.Equal(t, Stats{All: totalActions}, stats1)
+	assert.Equal(t, Stats{All: totalDeps}, stats1)
 
 	e.Schedule(a)
 
 	e.Wait()
 
 	stats3 := CollectStats(a)
-	assert.Equal(t, Stats{All: totalActions, Completed: totalActions, Succeeded: totalActions}, stats3)
+	assert.Equal(t, Stats{All: totalDeps, Completed: totalDeps, Succeeded: totalDeps}, stats3)
 
 	expected := map[string]any{}
 	for i := 0; i < n; i++ {

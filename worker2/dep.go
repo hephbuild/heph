@@ -92,11 +92,12 @@ func (a *Action) GetDeps() []Dep {
 }
 
 func (a *Action) DeepDo(f func(Dep)) {
-	a.deepDo(nil, f)
+	m := map[Dep]struct{}{}
+	a.deepDo(m, f)
 }
 
 func (a *Action) deepDo(m map[Dep]struct{}, f func(Dep)) {
-	deepDo(a, m, f)
+	deepDo(a, m, f, true)
 }
 
 type Group struct {
@@ -131,11 +132,12 @@ func (g *Group) GetHooks() []Hook {
 }
 
 func (g *Group) DeepDo(f func(Dep)) {
-	g.deepDo(nil, f)
+	m := map[Dep]struct{}{}
+	g.deepDo(m, f)
 }
 
 func (g *Group) deepDo(m map[Dep]struct{}, f func(Dep)) {
-	deepDo(g, m, f)
+	deepDo(g, m, f, true)
 }
 
 func (g *Group) Add(deps ...Dep) {

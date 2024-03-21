@@ -27,25 +27,6 @@ func NewEngine() *Engine {
 	}
 }
 
-func (e *Engine) deepDeps(a Dep, m map[Dep]struct{}, deps *[]Dep) {
-	if m == nil {
-		m = map[Dep]struct{}{}
-	}
-
-	for _, dep := range a.GetDeps() {
-		dep := flattenNamed(dep)
-
-		if _, ok := m[dep]; ok {
-			continue
-		}
-		m[dep] = struct{}{}
-
-		e.deepDeps(dep, m, deps)
-
-		*deps = append(*deps, dep)
-	}
-}
-
 func (e *Engine) loop() {
 	for event := range e.eventsCh {
 		e.handle(event)
@@ -113,7 +94,13 @@ func (e *Engine) waitForDeps(exec *Execution) bool {
 
 	for {
 		var deepDeps []Dep
-		e.deepDeps(exec.Dep, nil, &deepDeps)
+		exec.Dep.DeepDo(func(dep Dep) {
+			if dep == exec.Dep {
+				return
+			}
+
+			deepDeps = append(deepDeps, dep)
+		})
 
 		allDepsSucceeded := true
 		for _, dep := range deepDeps {
@@ -295,8 +282,10 @@ func (e *Engine) executionForDep(dep Dep) *Execution {
 
 func (e *Engine) Schedule(a Dep) {
 	var deps []Dep
-	e.deepDeps(a, nil, &deps)
-	deps = append(deps, a)
+	a.DeepDo(func(dep Dep) {
+		deps = append(deps, dep)
+	})
+	slices.Reverse(deps)
 
 	e.m.Lock()
 	defer e.m.Unlock()
@@ -308,6 +297,11 @@ func (e *Engine) Schedule(a Dep) {
 
 func (e *Engine) scheduleOne(dep Dep) *Execution {
 	dep = flattenNamed(dep)
+
+	if exec := dep.getExecution(); exec != nil {
+		return exec
+	}
+
 	for _, exec := range e.executions {
 		if exec.Dep == dep {
 			return exec
