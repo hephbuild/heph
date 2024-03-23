@@ -38,6 +38,7 @@ func (w *Worker) Run(e *Execution) {
 	ctx := contextWithExecution(w.ctx, e)
 	ctx = status.ContextWithHandler(ctx, w)
 	err := e.Start(ctx)
+	e.scheduler.Done(e.Dep)
 	w.state = WorkerStateIdle
 
 	if errors.Is(err, ErrSuspended) {

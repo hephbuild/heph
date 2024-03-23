@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"runtime"
 	"testing"
 )
 
@@ -187,12 +188,15 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 	g := &Group{}
 
+	scheduler := NewLimitScheduler(runtime.NumCPU())
+
 	var errChs []<-chan error
 
 	for i := 0; i < StressN/100; i++ {
 		a2 := &Action{
-			ID:   fmt.Sprintf("2-%v", i),
-			Deps: []Dep{a1},
+			ID:        fmt.Sprintf("2-%v", i),
+			Deps:      []Dep{a1},
+			Scheduler: scheduler,
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				return nil
 			},
@@ -202,8 +206,9 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 		for j := 0; j < 100; j++ {
 			a3 := &Action{
-				ID:   fmt.Sprintf("3-%v", j),
-				Deps: []Dep{a2},
+				ID:        fmt.Sprintf("3-%v", j),
+				Deps:      []Dep{a2},
+				Scheduler: scheduler,
 				Do: func(ctx context.Context, ds InStore, os OutStore) error {
 					return nil
 				},
@@ -358,11 +363,14 @@ func TestExecStress(t *testing.T) {
 		Deps: []Dep{},
 	}
 
+	scheduler := NewLimitScheduler(runtime.NumCPU())
+
 	n := StressN
 
 	for i := 0; i < n; i++ {
 		i := i
 		a := &Action{
+			Scheduler: scheduler,
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				os.Set(NewValue(i))
 				return nil
