@@ -1,8 +1,6 @@
 package worker2
 
 import (
-	"context"
-	"errors"
 	"slices"
 	"sync"
 	"time"
@@ -10,7 +8,7 @@ import (
 
 type Engine struct {
 	wg                sync.WaitGroup
-	workerProviders   []WorkerProvider
+	workers           []*Worker
 	m                 sync.RWMutex
 	c                 *sync.Cond
 	executions        []*Execution
@@ -24,6 +22,10 @@ func NewEngine() *Engine {
 		eventsCh: make(chan Event, 1000),
 		c:        sync.NewCond(&sync.Mutex{}),
 	}
+}
+
+func (e *Engine) GetWorkers() []*Worker {
+	return e.workers
 }
 
 func (e *Engine) loop() {
@@ -45,13 +47,7 @@ func (e *Engine) handle(event Event) {
 		go e.notifyTryExecuteOne()
 	case EventTryExecuteOne:
 		startedOne := e.tryExecuteOne()
-		if !startedOne && len(e.executionsWaiting) > 0 {
-			//if e.allWorkersIdle() {
-			//	panic(fmt.Errorf("all workers idling, dealock detected"))
-			//}
-
-			// retry
-			// todo: figure out how to remove the need for that
+		if !startedOne {
 			time.AfterFunc(100*time.Millisecond, func() {
 				e.eventsCh <- event
 			})
@@ -181,14 +177,7 @@ func (e *Engine) notifyReady(exec *Execution) {
 
 func (e *Engine) tryExecuteOne() bool {
 	for _, candidate := range e.executionsWaiting {
-		err := e.start(candidate)
-		if err != nil {
-			if errors.Is(err, ErrNoWorkerAvail) {
-				continue
-			}
-			e.notifyCompleted(candidate, nil, err)
-			continue
-		}
+		e.start(candidate)
 		e.deleteExecutionWaiting(candidate)
 		e.runHooks(EventStarted{Execution: candidate}, candidate)
 		return true
@@ -207,53 +196,38 @@ func (e *Engine) deleteExecutionWaiting(exec *Execution) {
 	})
 }
 
-func (e *Engine) start(exec *Execution) error {
-	var errs error
-	for _, wp := range e.workerProviders {
-		w, err := wp.Start(exec)
-		if err != nil {
-			if errors.Is(err, ErrNoWorkerAvail) {
-				continue
-			}
-			errs = errors.Join(errs, err)
-			continue
-		}
-		exec.worker = w
-		exec.State = ExecStateRunning
-		return nil
+func (e *Engine) start(exec *Execution) {
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	w := &Worker{
+		ctx:   exec.Dep.GetCtx(),
+		state: WorkerStateRunning,
 	}
+	e.workers = append(e.workers, w)
 
-	// TODO: log errs
+	go func() {
+		w.Run(exec)
 
-	return ErrNoWorkerAvail
-}
+		e.m.Lock()
+		defer e.m.Unlock()
 
-func (e *Engine) RegisterWorkerProvider(wp WorkerProvider) {
-	e.workerProviders = append(e.workerProviders, wp)
+		e.workers = slices.DeleteFunc(e.workers, func(worker *Worker) bool {
+			return worker == w
+		})
+	}()
 }
 
 func (e *Engine) RegisterHook(hook Hook) {
 	e.hooks = append(e.hooks, hook)
 }
 
-func (e *Engine) Run(ctx context.Context) {
+func (e *Engine) Run() {
 	e.loop()
 }
 
 func (e *Engine) Wait() {
 	e.wg.Wait()
-}
-
-func (e *Engine) allWorkersIdle() bool {
-	for _, provider := range e.workerProviders {
-		for _, w := range provider.Workers() {
-			if w.State() != WorkerStateIdle {
-				return false
-			}
-		}
-	}
-
-	return true
 }
 
 func (e *Engine) executionForDep(dep Dep) *Execution {
