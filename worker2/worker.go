@@ -6,18 +6,10 @@ import (
 	"github.com/hephbuild/heph/status"
 )
 
-type WorkerState int
-
-const (
-	WorkerStateUnknown WorkerState = iota
-	WorkerStateIdle
-	WorkerStateRunning
-)
-
 type Worker struct {
 	ctx    context.Context
-	state  WorkerState
 	status status.Statuser
+	exec   *Execution
 }
 
 func (w *Worker) Status(status status.Statuser) {
@@ -28,40 +20,34 @@ func (w *Worker) Interactive() bool {
 	return true
 }
 
-func (w *Worker) State() WorkerState {
-	return w.state
-}
-
-func (w *Worker) Run(e *Execution) {
-	w.state = WorkerStateRunning
-	e.worker = w
-	ctx := contextWithExecution(w.ctx, e)
+func (w *Worker) Run() {
+	ctx := contextWithExecution(w.ctx, w.exec)
 	ctx = status.ContextWithHandler(ctx, w)
-	err := e.Start(ctx)
-	e.scheduler.Done(e.Dep)
-	w.state = WorkerStateIdle
+	err := w.exec.Run(ctx)
+	w.status = nil
+	w.exec.scheduler.Done(w.exec.Dep)
 
 	if errors.Is(err, ErrSuspended) {
-		e.eventsCh <- EventSuspended{Execution: e}
+		w.exec.eventsCh <- EventSuspended{Execution: w.exec}
 
 		go func() {
 			select {
 			case <-ctx.Done():
-				e.eventsCh <- EventCompleted{
-					Execution: e,
-					Output:    e.outStore.Get(),
+				w.exec.eventsCh <- EventCompleted{
+					Execution: w.exec,
+					Output:    w.exec.outStore.Get(),
 					Error:     ctx.Err(),
 				}
-			case <-e.resumeCh:
-				e.eventsCh <- EventReady{Execution: e}
+			case <-w.exec.resumeCh:
+				w.exec.eventsCh <- EventReady{Execution: w.exec}
 			}
 		}()
 	} else {
-		e.eventsCh <- EventCompleted{
-			Execution: e,
-			Output:    e.outStore.Get(),
+		w.exec.eventsCh <- EventCompleted{
+			Execution: w.exec,
+			Output:    w.exec.outStore.Get(),
 			Error:     err,
 		}
 	}
-	e.eventsCh <- EventWorkerAvailable{Worker: w}
+	w.exec.eventsCh <- EventWorkerAvailable{Worker: w}
 }

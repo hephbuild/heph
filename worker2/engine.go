@@ -69,7 +69,6 @@ func (e *Engine) finalize(exec *Execution, state ExecState) {
 	exec.m.Lock()
 	defer exec.m.Unlock()
 
-	exec.worker = nil
 	exec.State = state
 	e.deleteExecution(exec)
 	e.wg.Done()
@@ -213,13 +212,13 @@ func (e *Engine) start(exec *Execution) {
 	defer e.m.Unlock()
 
 	w := &Worker{
-		ctx:   exec.Dep.GetCtx(),
-		state: WorkerStateRunning,
+		ctx:  exec.Dep.GetCtx(),
+		exec: exec,
 	}
 	e.workers = append(e.workers, w)
 
 	go func() {
-		w.Run(exec)
+		w.Run()
 
 		e.m.Lock()
 		defer e.m.Unlock()
@@ -301,7 +300,6 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		completedCh: make(chan struct{}),
 
 		// see field comments
-		worker: nil,
 		errCh:  nil,
 		inputs: nil,
 	}
