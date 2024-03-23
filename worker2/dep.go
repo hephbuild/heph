@@ -14,6 +14,7 @@ type Dep interface {
 	GetHooks() []Hook
 	Wait() <-chan struct{}
 	DeepDo(f func(Dep))
+	GetCtx() context.Context
 
 	deepDo(m map[Dep]struct{}, f func(Dep))
 	setExecution(*Execution)
@@ -44,6 +45,7 @@ func (a *baseDep) Frozen() bool {
 
 type Action struct {
 	baseDep
+	Ctx   context.Context
 	ID    string
 	Deps  []Dep
 	Hooks []Hook
@@ -65,6 +67,13 @@ func (a *Action) Freeze() {
 
 func (a *Action) GetID() string {
 	return a.ID
+}
+
+func (a *Action) GetCtx() context.Context {
+	if ctx := a.Ctx; ctx != nil {
+		return ctx
+	}
+	return context.Background()
 }
 
 func (a *Action) OutputCh() <-chan Value {
@@ -138,6 +147,10 @@ func (g *Group) DeepDo(f func(Dep)) {
 
 func (g *Group) deepDo(m map[Dep]struct{}, f func(Dep)) {
 	deepDo(g, m, f, true)
+}
+
+func (g *Group) GetCtx() context.Context {
+	return context.Background()
 }
 
 func (g *Group) Add(deps ...Dep) {
