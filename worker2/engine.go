@@ -8,6 +8,7 @@ import (
 
 type Engine struct {
 	wg                sync.WaitGroup
+	defaultScheduler  Scheduler
 	workers           []*Worker
 	m                 sync.RWMutex
 	c                 *sync.Cond
@@ -19,8 +20,9 @@ type Engine struct {
 
 func NewEngine() *Engine {
 	return &Engine{
-		eventsCh: make(chan Event, 1000),
-		c:        sync.NewCond(&sync.Mutex{}),
+		eventsCh:         make(chan Event, 1000),
+		c:                sync.NewCond(&sync.Mutex{}),
+		defaultScheduler: UnlimitedScheduler{},
 	}
 }
 
@@ -146,7 +148,17 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	}
 	exec.inputs = ins
 	exec.State = ExecStateWaiting
+	exec.scheduler = exec.Dep.GetScheduler()
+	if exec.scheduler == nil {
+		exec.scheduler = e.defaultScheduler
+	}
 	exec.m.Unlock()
+
+	err := exec.scheduler.Schedule(exec.Dep, nil) // TODO: pass a way for the scheduler to write into the input
+	if err != nil {
+		e.notifyCompleted(exec, nil, err)
+		return
+	}
 
 	e.notifyReady(exec)
 }

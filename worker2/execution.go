@@ -30,6 +30,8 @@ type Execution struct {
 	outStore OutStore
 	eventsCh chan Event
 
+	scheduler Scheduler
+
 	worker *Worker          // gets populated when a worker accepts it
 	errCh  chan error       // gets populated when exec is called
 	inputs map[string]Value // gets populated before marking as ready

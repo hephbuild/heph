@@ -19,6 +19,7 @@ type Dep interface {
 	deepDo(m map[Dep]struct{}, f func(Dep))
 	setExecution(*Execution)
 	getExecution() *Execution
+	GetScheduler() Scheduler
 }
 
 type baseDep struct {
@@ -45,11 +46,16 @@ func (a *baseDep) Frozen() bool {
 
 type Action struct {
 	baseDep
-	Ctx   context.Context
-	ID    string
-	Deps  []Dep
-	Hooks []Hook
-	Do    func(ctx context.Context, ins InStore, outs OutStore) error
+	Ctx       context.Context
+	ID        string
+	Deps      []Dep
+	Hooks     []Hook
+	Scheduler Scheduler
+	Do        func(ctx context.Context, ins InStore, outs OutStore) error
+}
+
+func (a *Action) GetScheduler() Scheduler {
+	return a.Scheduler
 }
 
 func (a *Action) Freeze() {
@@ -115,6 +121,8 @@ type Group struct {
 	Deps  []Dep
 	Hooks []Hook
 }
+
+func (g *Group) GetScheduler() Scheduler { return nil }
 
 func (g *Group) OutputCh() <-chan Value {
 	h, ch := OutputHook()
