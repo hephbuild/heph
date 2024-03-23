@@ -11,6 +11,7 @@ type Dep interface {
 	Freeze()
 	Frozen() bool
 	GetDeps() []Dep
+	AddDep(Dep)
 	GetHooks() []Hook
 	Wait() <-chan struct{}
 	DeepDo(f func(Dep))
@@ -106,6 +107,17 @@ func (a *Action) GetDeps() []Dep {
 	return a.Deps
 }
 
+func (a *Action) AddDep(dep Dep) {
+	a.m.Lock()
+	defer a.m.Unlock()
+
+	if a.frozen {
+		panic("action is frozen")
+	}
+
+	a.Deps = append(a.Deps, dep)
+}
+
 func (a *Action) DeepDo(f func(Dep)) {
 	m := map[Dep]struct{}{}
 	a.deepDo(m, f)
@@ -161,7 +173,7 @@ func (g *Group) GetCtx() context.Context {
 	return context.Background()
 }
 
-func (g *Group) Add(deps ...Dep) {
+func (g *Group) AddDep(dep Dep) {
 	g.m.Lock()
 	defer g.m.Unlock()
 
@@ -169,7 +181,7 @@ func (g *Group) Add(deps ...Dep) {
 		panic("group is frozen")
 	}
 
-	g.Deps = append(g.Deps, deps...)
+	g.Deps = append(g.Deps, dep)
 }
 
 func (g *Group) Freeze() {
@@ -206,4 +218,20 @@ func flattenNamed(dep Dep) Dep {
 	}
 
 	return dep
+}
+
+func Serial(deps []Dep) Dep {
+	out := deps[0]
+
+	for i, dep := range deps {
+		if i == 0 {
+			continue
+		}
+
+		prev := out
+		dep.AddDep(prev)
+		out = dep
+	}
+
+	return out
 }

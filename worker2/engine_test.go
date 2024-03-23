@@ -37,6 +37,42 @@ func TestExecSimple(t *testing.T) {
 	assert.True(t, didRun)
 }
 
+func TestExecSerial(t *testing.T) {
+	t.Parallel()
+
+	n := 500
+
+	values := make([]int, 0, n)
+	expected := make([]int, 0, n)
+	deps := make([]Dep, 0, n)
+
+	for i := 0; i < n; i++ {
+		i := i
+		expected = append(expected, i)
+		a := &Action{
+			ID: fmt.Sprint(i),
+			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+				values = append(values, i)
+				return nil
+			},
+		}
+		deps = append(deps, a)
+	}
+
+	serial := Serial(deps)
+
+	e := NewEngine()
+
+	go e.Run()
+
+	e.Schedule(serial)
+
+	e.Wait()
+	<-serial.Wait()
+
+	assert.EqualValues(t, expected, values)
+}
+
 func TestStatus(t *testing.T) {
 	t.Parallel()
 
@@ -213,7 +249,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 					return nil
 				},
 			}
-			g.Add(a3)
+			g.AddDep(a3)
 
 			errChs = append(errChs, a3.ErrorCh())
 		}
@@ -377,7 +413,7 @@ func TestExecStress(t *testing.T) {
 			},
 		}
 
-		g.Add(Named{Name: fmt.Sprint(i), Dep: a})
+		g.AddDep(Named{Name: fmt.Sprint(i), Dep: a})
 	}
 
 	var received any
@@ -436,13 +472,13 @@ func TestExecProducerConsumer(t *testing.T) {
 					},
 				}
 
-				g.Add(Named{Name: fmt.Sprint(i), Dep: a})
+				g.AddDep(Named{Name: fmt.Sprint(i), Dep: a})
 			}
 			return nil
 		},
 	}
 
-	g.Add(producer)
+	g.AddDep(producer)
 
 	var received any
 	consumer := &Action{

@@ -32,7 +32,6 @@ type Execution struct {
 
 	scheduler Scheduler
 
-	worker *Worker          // gets populated when a worker accepts it
 	errCh  chan error       // gets populated when exec is called
 	inputs map[string]Value // gets populated before marking as ready
 	m      sync.Mutex
@@ -62,7 +61,7 @@ func (e *Execution) GetOutput() Value {
 
 var ErrSuspended = errors.New("suspended")
 
-func (e *Execution) Start(ctx context.Context) error {
+func (e *Execution) Run(ctx context.Context) error {
 	e.m.Lock()
 	if e.errCh == nil {
 		e.errCh = make(chan error)
