@@ -2,30 +2,27 @@ package worker2
 
 import (
 	"context"
-	"sync"
 )
 
 type Dep interface {
 	GetID() string
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
 	Freeze()
-	Frozen() bool
-	GetDeps() []Dep
+	IsFrozen() bool
+	GetDepsObj() *Deps
+	GetDependencies() []Dep
 	AddDep(Dep)
 	GetHooks() []Hook
 	Wait() <-chan struct{}
 	DeepDo(f func(Dep))
 	GetCtx() context.Context
 
-	deepDo(m map[Dep]struct{}, f func(Dep))
 	setExecution(*Execution)
 	getExecution() *Execution
 	GetScheduler() Scheduler
 }
 
 type baseDep struct {
-	frozen    bool
-	m         sync.Mutex
 	execution *Execution
 }
 
@@ -41,15 +38,11 @@ func (a *baseDep) Wait() <-chan struct{} {
 	return a.getExecution().Wait()
 }
 
-func (a *baseDep) Frozen() bool {
-	return a.frozen
-}
-
 type Action struct {
 	baseDep
 	Ctx       context.Context
 	ID        string
-	Deps      []Dep
+	Deps      *Deps
 	Hooks     []Hook
 	Scheduler Scheduler
 	Do        func(ctx context.Context, ins InStore, outs OutStore) error
@@ -59,17 +52,12 @@ func (a *Action) GetScheduler() Scheduler {
 	return a.Scheduler
 }
 
+func (a *Action) IsFrozen() bool {
+	return a.GetDepsObj().IsFrozen()
+}
+
 func (a *Action) Freeze() {
-	a.m.Lock()
-	defer a.m.Unlock()
-
-	for _, dep := range a.Deps {
-		if !dep.Frozen() {
-			panic("attempting to free while all deps arent frozen")
-		}
-	}
-
-	a.frozen = true
+	a.Deps.Freeze()
 }
 
 func (a *Action) GetID() string {
@@ -103,34 +91,29 @@ func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	return a.Do(ctx, ins, outs)
 }
 
-func (a *Action) GetDeps() []Dep {
+func (a *Action) GetDepsObj() *Deps {
+	if a.Deps == nil {
+		a.Deps = NewDeps()
+	}
 	return a.Deps
 }
 
+func (a *Action) GetDependencies() []Dep {
+	return a.GetDepsObj().Dependencies()
+}
+
 func (a *Action) AddDep(dep Dep) {
-	a.m.Lock()
-	defer a.m.Unlock()
-
-	if a.frozen {
-		panic("action is frozen")
-	}
-
-	a.Deps = append(a.Deps, dep)
+	a.GetDepsObj().Add(dep)
 }
 
 func (a *Action) DeepDo(f func(Dep)) {
-	m := map[Dep]struct{}{}
-	a.deepDo(m, f)
-}
-
-func (a *Action) deepDo(m map[Dep]struct{}, f func(Dep)) {
-	deepDo(a, m, f, true)
+	deepDo(a, f)
 }
 
 type Group struct {
 	baseDep
 	ID    string
-	Deps  []Dep
+	Deps  *Deps
 	Hooks []Hook
 }
 
@@ -152,8 +135,15 @@ func (g *Group) GetID() string {
 	return g.ID
 }
 
-func (g *Group) GetDeps() []Dep {
+func (g *Group) GetDepsObj() *Deps {
+	if g.Deps == nil {
+		g.Deps = NewDeps()
+	}
 	return g.Deps
+}
+
+func (g *Group) GetDependencies() []Dep {
+	return g.Deps.Dependencies()
 }
 
 func (g *Group) GetHooks() []Hook {
@@ -161,12 +151,7 @@ func (g *Group) GetHooks() []Hook {
 }
 
 func (g *Group) DeepDo(f func(Dep)) {
-	m := map[Dep]struct{}{}
-	g.deepDo(m, f)
-}
-
-func (g *Group) deepDo(m map[Dep]struct{}, f func(Dep)) {
-	deepDo(g, m, f, true)
+	deepDo(g, f)
 }
 
 func (g *Group) GetCtx() context.Context {
@@ -174,27 +159,15 @@ func (g *Group) GetCtx() context.Context {
 }
 
 func (g *Group) AddDep(dep Dep) {
-	g.m.Lock()
-	defer g.m.Unlock()
+	g.GetDepsObj().Add(dep)
+}
 
-	if g.frozen {
-		panic("group is frozen")
-	}
-
-	g.Deps = append(g.Deps, dep)
+func (g *Group) IsFrozen() bool {
+	return g.GetDepsObj().IsFrozen()
 }
 
 func (g *Group) Freeze() {
-	g.m.Lock()
-	defer g.m.Unlock()
-
-	for _, dep := range g.Deps {
-		if !dep.Frozen() {
-			panic("attempting to free while all deps arent frozen")
-		}
-	}
-
-	g.frozen = true
+	g.GetDepsObj().Freeze()
 }
 
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {

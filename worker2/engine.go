@@ -136,7 +136,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 
 	exec.m.Lock()
 	ins := map[string]Value{}
-	for _, dep := range exec.Dep.GetDeps() {
+	for _, dep := range exec.Dep.GetDepsObj().Dependencies() {
 		if dep, ok := dep.(Named); ok {
 			exec := e.executionForDep(dep.Dep)
 
