@@ -402,16 +402,17 @@ func TestExecGroup(t *testing.T) {
 
 func TestExecStress(t *testing.T) {
 	t.Parallel()
+	tracker := &RunningTracker{}
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
-	n := StressN
-
 	g := &Group{Deps: NewDeps()}
+
+	n := StressN
 
 	for i := 0; i < n; i++ {
 		i := i
 		a := &Action{
-			Scheduler: scheduler,
+			Scheduler: tracker.Scheduler(scheduler),
 			Deps:      NewDeps(),
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				os.Set(NewValue(i))
