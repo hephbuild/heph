@@ -25,10 +25,12 @@ const (
 )
 
 type Execution struct {
-	Dep      Dep
-	State    ExecState
-	outStore OutStore
-	eventsCh chan Event
+	Dep       Dep
+	State     ExecState
+	outStore  OutStore
+	eventsCh  chan Event
+	c         *sync.Cond
+	broadcast func()
 
 	scheduler Scheduler
 
@@ -41,6 +43,7 @@ type Execution struct {
 	resumeAckCh chan struct{}
 
 	completedCh chan struct{}
+	started     bool
 }
 
 func (e *Execution) String() string {
@@ -66,6 +69,12 @@ func (e *Execution) Run(ctx context.Context) error {
 	if e.errCh == nil {
 		e.errCh = make(chan error)
 		e.suspendCh = make(chan struct{})
+
+		if e.started {
+			panic("already started")
+		}
+
+		e.started = true
 
 		go func() {
 			err := e.run(ctx)

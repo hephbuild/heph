@@ -2,6 +2,7 @@ package worker2
 
 import (
 	"context"
+	"sync"
 )
 
 type Dep interface {
@@ -10,7 +11,6 @@ type Dep interface {
 	Freeze()
 	IsFrozen() bool
 	GetDepsObj() *Deps
-	GetDependencies() []Dep
 	AddDep(Dep)
 	GetHooks() []Hook
 	Wait() <-chan struct{}
@@ -24,13 +24,18 @@ type Dep interface {
 
 type baseDep struct {
 	execution *Execution
+	m         sync.RWMutex
 }
 
 func (a *baseDep) setExecution(e *Execution) {
+	a.m.Lock()
+	defer a.m.Unlock()
 	a.execution = e
 }
 
 func (a *baseDep) getExecution() *Execution {
+	a.m.RLock()
+	defer a.m.RUnlock()
 	return a.execution
 }
 
@@ -95,11 +100,8 @@ func (a *Action) GetDepsObj() *Deps {
 	if a.Deps == nil {
 		a.Deps = NewDeps()
 	}
+	a.Deps.setOwner(a)
 	return a.Deps
-}
-
-func (a *Action) GetDependencies() []Dep {
-	return a.GetDepsObj().Dependencies()
 }
 
 func (a *Action) AddDep(dep Dep) {
@@ -108,6 +110,12 @@ func (a *Action) AddDep(dep Dep) {
 
 func (a *Action) DeepDo(f func(Dep)) {
 	deepDo(a, f)
+}
+
+func (a *Action) LinkDeps() {
+	for _, dep := range a.GetDepsObj().TransitiveDependencies() {
+		_ = dep.GetDepsObj()
+	}
 }
 
 type Group struct {
@@ -135,15 +143,18 @@ func (g *Group) GetID() string {
 	return g.ID
 }
 
+func (g *Group) LinkDeps() {
+	for _, dep := range g.GetDepsObj().TransitiveDependencies() {
+		_ = dep.GetDepsObj()
+	}
+}
+
 func (g *Group) GetDepsObj() *Deps {
 	if g.Deps == nil {
 		g.Deps = NewDeps()
 	}
+	g.Deps.setOwner(g)
 	return g.Deps
-}
-
-func (g *Group) GetDependencies() []Dep {
-	return g.Deps.Dependencies()
 }
 
 func (g *Group) GetHooks() []Hook {

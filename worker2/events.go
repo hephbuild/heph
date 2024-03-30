@@ -42,10 +42,6 @@ func (e EventSkipped) getExecution() *Execution {
 	return e.Execution
 }
 
-type EventWorkerAvailable struct {
-	Worker *Worker
-}
-
 type EventReady struct {
 	Execution *Execution
 }

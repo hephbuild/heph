@@ -11,16 +11,11 @@ import (
 type DepHook = func(dep Dep)
 
 func NewDeps(deps ...Dep) *Deps {
-	return newDeps("", deps)
+	return newDeps(deps)
 }
 
-func NewDepsID(id string, deps ...Dep) *Deps {
-	return newDeps(id, deps)
-}
-
-func newDeps(id string, deps []Dep) *Deps {
+func newDeps(deps []Dep) *Deps {
 	d := &Deps{
-		id:                  id,
 		deps:                sets.NewIdentitySet[Dep](0),
 		transitiveDeps:      sets.NewIdentitySet[Dep](0),
 		dependees:           sets.NewIdentitySet[*Deps](0),
@@ -31,13 +26,23 @@ func newDeps(id string, deps []Dep) *Deps {
 }
 
 type Deps struct {
-	id                  string
+	owner               Dep
 	deps                *sets.Set[Dep, Dep]
 	transitiveDeps      *sets.Set[Dep, Dep]
 	dependees           *sets.Set[*Deps, *Deps]
 	transitiveDependees *sets.Set[*Deps, *Deps]
 	m                   sync.RWMutex
 	frozen              bool
+}
+
+func (d *Deps) setOwner(dep Dep) {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	if d.owner != nil && d.owner != dep {
+		panic("deps owner is already set")
+	}
+	d.owner = dep
 }
 
 func (d *Deps) IsFrozen() bool {
@@ -61,22 +66,18 @@ func (d *Deps) Freeze() {
 	d.frozen = true
 }
 
-//func (d *Deps) AddHook(hook DepHook) {
-//	d.m.Lock()
-//	defer d.m.Unlock()
-//
-//	d.hooks = append(d.hooks, hook)
-//
-//	for _, dep := range d.deps {
-//		d.runHooks(dep)
-//	}
-//}
-
 func (d *Deps) Dependencies() []Dep {
 	d.m.RLock()
 	defer d.m.RUnlock()
 
 	return d.deps.Slice()
+}
+
+func (d *Deps) Dependees() []*Deps {
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	return d.dependees.Slice()
 }
 
 func (d *Deps) TransitiveDependencies() []Dep {
@@ -130,24 +131,7 @@ func (d *Deps) Add(deps ...Dep) {
 				dep.transitiveDependees.Add(d)
 			}
 		}
-
-		//addedDeps = append(addedDeps, dep)
-
-		//d.runHooks(dep)
 	}
-
-	//for _, dependee := range d.transitiveDependees {
-	//	dependee.computeTransitiveDeps()
-	//}
-
-	//for _, dep := range addedDeps {
-	//	dep.GetDepsObj().AddHook(func(dep Dep) {
-	//		d.m.Lock()
-	//		defer d.m.Unlock()
-	//
-	//		d.computeTransitiveDeps()
-	//	})
-	//}
 }
 
 func (d *Deps) has(dep Dep) bool {
@@ -160,7 +144,7 @@ func (d *Deps) hasDependee(dep *Deps) bool {
 
 func (d *Deps) DebugString() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%v:\n", d.id)
+	fmt.Fprintf(&sb, "%v:\n", d.owner.GetID())
 	deps := ads.Map(d.deps.Slice(), func(d Dep) string {
 		return d.GetID()
 	})
@@ -171,19 +155,13 @@ func (d *Deps) DebugString() string {
 	fmt.Fprintf(&sb, "  tdeps: %v\n", tdeps)
 
 	depdees := ads.Map(d.dependees.Slice(), func(d *Deps) string {
-		return d.id
+		return d.owner.GetID()
 	})
 	tdepdees := ads.Map(d.transitiveDependees.Slice(), func(d *Deps) string {
-		return d.id
+		return d.owner.GetID()
 	})
 	fmt.Fprintf(&sb, "  depdees: %v\n", depdees)
 	fmt.Fprintf(&sb, "  tdepdees: %v\n", tdepdees)
 
 	return sb.String()
 }
-
-//func (d *Deps) runHooks(dep Dep) {
-//	for _, hook := range d.hooks {
-//		hook(dep)
-//	}
-//}

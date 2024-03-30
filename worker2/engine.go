@@ -1,21 +1,19 @@
 package worker2
 
 import (
+	"github.com/bep/debounce"
 	"slices"
 	"sync"
 	"time"
 )
 
 type Engine struct {
-	wg                sync.WaitGroup
-	defaultScheduler  Scheduler
-	workers           []*Worker
-	m                 sync.RWMutex
-	c                 *sync.Cond
-	executions        []*Execution
-	executionsWaiting []*Execution
-	eventsCh          chan Event
-	hooks             []Hook
+	wg               sync.WaitGroup
+	defaultScheduler Scheduler
+	workers          []*Worker
+	m                sync.RWMutex
+	eventsCh         chan Event
+	hooks            []Hook
 }
 
 func NewEngine() *Engine {
@@ -23,69 +21,57 @@ func NewEngine() *Engine {
 		eventsCh:         make(chan Event, 1000),
 		defaultScheduler: UnlimitedScheduler{},
 	}
-	e.c = sync.NewCond(&e.m)
 
 	return e
 }
 
 func (e *Engine) GetWorkers() []*Worker {
-	return e.workers
+	e.m.Lock()
+	defer e.m.Unlock()
+
+	return e.workers[:]
 }
 
 func (e *Engine) loop() {
-	done := false
-	go func() {
-		for {
-			time.Sleep(100 * time.Millisecond)
-			e.c.Broadcast()
-			e.eventsCh <- EventTryExecuteOne{}
-
-			if done {
-				return
-			}
-		}
-	}()
-
 	for event := range e.eventsCh {
 		e.handle(event)
 	}
-
-	done = true
 }
 
 func (e *Engine) handle(event Event) {
-	if event, ok := event.(WithExecution); ok {
-		defer e.runHooks(event, event.getExecution())
-	}
-
 	switch event := event.(type) {
 	case EventReady:
-		e.executionsWaiting = append(e.executionsWaiting, event.Execution)
-		go e.notifyTryExecuteOne()
-	case EventWorkerAvailable:
-		go e.notifyTryExecuteOne()
-	case EventTryExecuteOne:
-		_ = e.tryExecuteOne()
+		e.runHooks(event, event.Execution)
+		e.start(event.Execution)
 	case EventSkipped:
 		e.finalize(event.Execution, ExecStateSkipped)
+		e.runHooks(event, event.Execution)
 	case EventCompleted:
 		if event.Error != nil {
 			e.finalize(event.Execution, ExecStateFailed)
 		} else {
 			e.finalize(event.Execution, ExecStateSucceeded)
 		}
+		e.runHooks(event, event.Execution)
+	default:
+		if event, ok := event.(WithExecution); ok {
+			defer e.runHooks(event, event.getExecution())
+		}
 	}
 }
 
 func (e *Engine) finalize(exec *Execution, state ExecState) {
 	exec.m.Lock()
-	defer exec.m.Unlock()
-
 	exec.State = state
-	e.deleteExecution(exec)
 	e.wg.Done()
-	e.c.Broadcast()
 	close(exec.completedCh)
+	exec.m.Unlock()
+
+	for _, dep := range exec.Dep.GetDepsObj().Dependees() {
+		dexec := dep.owner.getExecution()
+
+		dexec.broadcast()
+	}
 }
 
 func (e *Engine) runHooks(event Event, exec *Execution) {
@@ -99,8 +85,8 @@ func (e *Engine) runHooks(event Event, exec *Execution) {
 }
 
 func (e *Engine) waitForDeps(exec *Execution) bool {
-	e.c.L.Lock()
-	defer e.c.L.Unlock()
+	exec.c.L.Lock()
+	defer exec.c.L.Unlock()
 
 	for {
 		deepDeps := exec.Dep.GetDepsObj().TransitiveDependencies()
@@ -109,16 +95,16 @@ func (e *Engine) waitForDeps(exec *Execution) bool {
 		for _, dep := range deepDeps {
 			depExec := e.executionForDep(dep)
 
-			if depExec.State != ExecStateSucceeded {
+			depExec.m.Lock()
+			state := depExec.State
+			depExec.m.Unlock()
+
+			if state != ExecStateSucceeded {
 				allDepsSucceeded = false
 			}
 
-			switch depExec.State {
-			case ExecStateSkipped:
-				e.notifySkipped(exec)
-				return false
-			case ExecStateFailed:
-				e.notifySkipped(exec)
+			switch state {
+			case ExecStateSkipped, ExecStateFailed:
 				return false
 			}
 		}
@@ -129,13 +115,14 @@ func (e *Engine) waitForDeps(exec *Execution) bool {
 			return true
 		}
 
-		e.c.Wait()
+		exec.c.Wait()
 	}
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	shouldRun := e.waitForDeps(exec)
 	if !shouldRun {
+		e.notifySkipped(exec)
 		return
 	}
 
@@ -143,9 +130,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	ins := map[string]Value{}
 	for _, dep := range exec.Dep.GetDepsObj().Dependencies() {
 		if dep, ok := dep.(Named); ok {
-			e.m.Lock()
 			exec := e.executionForDep(dep.Dep)
-			e.m.Unlock()
 
 			vv := exec.outStore.Get()
 
@@ -183,35 +168,10 @@ func (e *Engine) notifyCompleted(exec *Execution, output Value, err error) {
 	}
 }
 
-func (e *Engine) notifyTryExecuteOne() {
-	e.eventsCh <- EventTryExecuteOne{}
-}
-
 func (e *Engine) notifyReady(exec *Execution) {
 	e.eventsCh <- EventReady{
 		Execution: exec,
 	}
-}
-
-func (e *Engine) tryExecuteOne() bool {
-	for _, candidate := range e.executionsWaiting {
-		e.start(candidate)
-		e.deleteExecutionWaiting(candidate)
-		e.runHooks(EventStarted{Execution: candidate}, candidate)
-		return true
-	}
-
-	return false
-}
-
-func (e *Engine) deleteExecution(exec *Execution) {
-	// TODO: would need to be deleted once noone depends on it
-}
-
-func (e *Engine) deleteExecutionWaiting(exec *Execution) {
-	e.executionsWaiting = slices.DeleteFunc(e.executionsWaiting, func(e *Execution) bool {
-		return e == exec
-	})
 }
 
 func (e *Engine) start(exec *Execution) {
@@ -234,6 +194,8 @@ func (e *Engine) start(exec *Execution) {
 			return worker == w
 		})
 	}()
+
+	e.runHooks(EventStarted{Execution: exec}, exec)
 }
 
 func (e *Engine) RegisterHook(hook Hook) {
@@ -242,6 +204,10 @@ func (e *Engine) RegisterHook(hook Hook) {
 
 func (e *Engine) Run() {
 	e.loop()
+}
+
+func (e *Engine) Stop() {
+	close(e.eventsCh)
 }
 
 func (e *Engine) Wait() {
@@ -255,15 +221,15 @@ func (e *Engine) executionForDep(dep Dep) *Execution {
 		return e
 	}
 
+	e.m.Lock()
+	defer e.m.Unlock()
+
 	return e.scheduleOne(dep)
 }
 
 func (e *Engine) Schedule(a Dep) {
-	var deps []Dep
-	a.DeepDo(func(dep Dep) {
-		deps = append(deps, dep)
-	})
-	slices.Reverse(deps)
+	deps := a.GetDepsObj().TransitiveDependencies()
+	deps = append(deps, a)
 
 	e.m.Lock()
 	defer e.m.Unlock()
@@ -280,12 +246,6 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		return exec
 	}
 
-	for _, exec := range e.executions {
-		if exec.Dep == dep {
-			return exec
-		}
-	}
-
 	exec := &Execution{
 		Dep:         dep,
 		State:       ExecStateScheduled,
@@ -297,8 +257,18 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		errCh:  nil,
 		inputs: nil,
 	}
+	debounceBroadcast := debounce.New(time.Millisecond)
+	exec.broadcast = func() {
+		debounceBroadcast(func() {
+			exec.c.L.Lock()
+			exec.c.Broadcast()
+			exec.c.L.Unlock()
+		})
+	}
+	exec.c = sync.NewCond(&exec.m)
+	// force deps registration
+	_ = dep.GetDepsObj()
 	dep.setExecution(exec)
-	e.executions = append(e.executions, exec)
 	e.wg.Add(1)
 	e.runHooks(EventScheduled{Execution: exec}, exec)
 
