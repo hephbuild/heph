@@ -11,7 +11,7 @@ import (
 )
 
 // Number of actions to be processed during a stress test
-const StressN = 30000
+const StressN = 100000
 
 func TestExecSimple(t *testing.T) {
 	t.Parallel()
@@ -20,7 +20,7 @@ func TestExecSimple(t *testing.T) {
 	a := &Action{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			didRun = true
-			fmt.Println("Running 1")
+			fmt.Println("Running  1")
 			return nil
 		},
 	}
@@ -28,6 +28,7 @@ func TestExecSimple(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
@@ -39,7 +40,6 @@ func TestExecSimple(t *testing.T) {
 
 func TestExecSerial(t *testing.T) {
 	t.Parallel()
-
 	n := 500
 
 	values := make([]int, 0, n)
@@ -64,10 +64,10 @@ func TestExecSerial(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(serial)
 
-	e.Wait()
 	<-serial.Wait()
 
 	assert.EqualValues(t, expected, values)
@@ -90,6 +90,7 @@ func TestStatus(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
@@ -107,7 +108,6 @@ func TestStatus(t *testing.T) {
 
 	close(resumeCh)
 
-	e.Wait()
 	<-a.Wait()
 }
 
@@ -133,6 +133,7 @@ func TestExecHook(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
@@ -162,10 +163,11 @@ func TestExecError(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
-	e.Wait()
+	<-a.Wait()
 
 	assert.ErrorContains(t, <-errCh, "beep bop")
 }
@@ -203,10 +205,11 @@ func TestExecErrorSkip(t *testing.T) {
 	e.RegisterHook(LogHook())
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a3)
 
-	e.Wait()
+	<-a3.Wait()
 
 	assert.ErrorContains(t, <-err1Ch, "beep bop")
 	assert.ErrorIs(t, <-err2Ch, ErrSkipped)
@@ -258,10 +261,11 @@ func TestExecErrorSkipStress(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(g)
 
-	e.Wait()
+	<-g.Wait()
 
 	for _, errCh := range errChs {
 		assert.ErrorIs(t, <-errCh, ErrSkipped)
@@ -287,12 +291,13 @@ func TestExecCancel(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
 	cancel()
 
-	e.Wait()
+	<-a.Wait()
 
 	err := <-errCh
 
@@ -339,10 +344,11 @@ func TestExecDeps(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a2)
 
-	e.Wait()
+	<-a2.Wait()
 
 	assert.Equal(t, "1 hello, world", receivedValue)
 }
@@ -385,17 +391,17 @@ func TestExecGroup(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 
-	e.Wait()
+	<-a.Wait()
 
 	assert.Equal(t, map[string]any{"v1": 1, "v2": "hello, world"}, received)
 }
 
 func TestExecStress(t *testing.T) {
 	t.Parallel()
-
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
 	n := StressN
@@ -428,6 +434,7 @@ func TestExecStress(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	totalDeps := uint64(n + 2)
 
@@ -436,7 +443,7 @@ func TestExecStress(t *testing.T) {
 
 	e.Schedule(a)
 
-	e.Wait()
+	<-a.Wait()
 
 	stats3 := CollectStats(a)
 	assert.Equal(t, Stats{All: totalDeps, Completed: totalDeps, Succeeded: totalDeps}, stats3)
@@ -450,7 +457,6 @@ func TestExecStress(t *testing.T) {
 }
 
 func TestExecProducerConsumer(t *testing.T) {
-	t.Parallel()
 	g := &Group{
 		Deps: NewDeps(),
 	}
@@ -466,7 +472,7 @@ func TestExecProducerConsumer(t *testing.T) {
 
 				a := &Action{
 					Do: func(ctx context.Context, ds InStore, os OutStore) error {
-						fmt.Println("Running inner", i)
+						//fmt.Println("Running inner", i)
 						os.Set(NewValue(i))
 						return nil
 					},
@@ -494,10 +500,11 @@ func TestExecProducerConsumer(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(consumer)
 
-	e.Wait()
+	<-consumer.Wait()
 
 	expected := map[string]any{}
 	for i := 0; i < n; i++ {
@@ -539,6 +546,7 @@ func TestSuspend(t *testing.T) {
 	e := NewEngine()
 
 	go e.Run()
+	defer e.Stop()
 
 	e.Schedule(a)
 

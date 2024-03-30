@@ -49,5 +49,4 @@ func (w *Worker) Run() {
 			Error:     err,
 		}
 	}
-	w.exec.eventsCh <- EventWorkerAvailable{Worker: w}
 }
