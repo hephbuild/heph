@@ -71,14 +71,18 @@ func (ts *Set[K, T]) GetKey(k K) T {
 
 func (ts *Set[K, T]) has(t T) bool {
 	k := ts.f(t)
-	_, ok := ts.m[k]
+	return ts.hask(k)
+}
 
+func (ts *Set[K, T]) hask(k K) bool {
+	_, ok := ts.m[k]
 	return ok
 }
 
 func (ts *Set[K, T]) add(t T) bool {
 	k := ts.f(t)
-	if ts.has(t) {
+
+	if ts.hask(k) {
 		return false
 	}
 

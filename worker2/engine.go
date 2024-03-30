@@ -19,11 +19,13 @@ type Engine struct {
 }
 
 func NewEngine() *Engine {
-	return &Engine{
+	e := &Engine{
 		eventsCh:         make(chan Event, 1000),
-		c:                sync.NewCond(&sync.Mutex{}),
 		defaultScheduler: UnlimitedScheduler{},
 	}
+	e.c = sync.NewCond(&e.m)
+
+	return e
 }
 
 func (e *Engine) GetWorkers() []*Worker {
@@ -31,9 +33,24 @@ func (e *Engine) GetWorkers() []*Worker {
 }
 
 func (e *Engine) loop() {
+	done := false
+	go func() {
+		for {
+			time.Sleep(100 * time.Millisecond)
+			e.c.Broadcast()
+			e.eventsCh <- EventTryExecuteOne{}
+
+			if done {
+				return
+			}
+		}
+	}()
+
 	for event := range e.eventsCh {
 		e.handle(event)
 	}
+
+	done = true
 }
 
 func (e *Engine) handle(event Event) {
@@ -48,12 +65,7 @@ func (e *Engine) handle(event Event) {
 	case EventWorkerAvailable:
 		go e.notifyTryExecuteOne()
 	case EventTryExecuteOne:
-		startedOne := e.tryExecuteOne()
-		if !startedOne {
-			time.AfterFunc(100*time.Millisecond, func() {
-				e.eventsCh <- event
-			})
-		}
+		_ = e.tryExecuteOne()
 	case EventSkipped:
 		e.finalize(event.Execution, ExecStateSkipped)
 	case EventCompleted:
@@ -91,14 +103,7 @@ func (e *Engine) waitForDeps(exec *Execution) bool {
 	defer e.c.L.Unlock()
 
 	for {
-		var deepDeps []Dep
-		exec.Dep.DeepDo(func(dep Dep) {
-			if dep == exec.Dep {
-				return
-			}
-
-			deepDeps = append(deepDeps, dep)
-		})
+		deepDeps := exec.Dep.GetDepsObj().TransitiveDependencies()
 
 		allDepsSucceeded := true
 		for _, dep := range deepDeps {
@@ -119,6 +124,8 @@ func (e *Engine) waitForDeps(exec *Execution) bool {
 		}
 
 		if allDepsSucceeded {
+			exec.Dep.Freeze()
+
 			return true
 		}
 
@@ -132,13 +139,13 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 		return
 	}
 
-	exec.Dep.Freeze()
-
 	exec.m.Lock()
 	ins := map[string]Value{}
 	for _, dep := range exec.Dep.GetDepsObj().Dependencies() {
 		if dep, ok := dep.(Named); ok {
+			e.m.Lock()
 			exec := e.executionForDep(dep.Dep)
+			e.m.Unlock()
 
 			vv := exec.outStore.Get()
 
@@ -247,19 +254,6 @@ func (e *Engine) executionForDep(dep Dep) *Execution {
 	if e := dep.getExecution(); e != nil {
 		return e
 	}
-
-	e.m.RLock()
-	for _, exec := range e.executions {
-		if exec.Dep == dep {
-			e.m.RUnlock()
-			dep.setExecution(exec)
-			return exec
-		}
-	}
-	e.m.RUnlock()
-
-	e.m.Lock()
-	defer e.m.Unlock()
 
 	return e.scheduleOne(dep)
 }

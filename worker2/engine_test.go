@@ -395,16 +395,18 @@ func TestExecGroup(t *testing.T) {
 
 func TestExecStress(t *testing.T) {
 	t.Parallel()
-	g := &Group{}
 
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
 	n := StressN
 
+	g := &Group{Deps: NewDeps()}
+
 	for i := 0; i < n; i++ {
 		i := i
 		a := &Action{
 			Scheduler: scheduler,
+			Deps:      NewDeps(),
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				os.Set(NewValue(i))
 				return nil
@@ -435,8 +437,6 @@ func TestExecStress(t *testing.T) {
 	e.Schedule(a)
 
 	e.Wait()
-
-	return
 
 	stats3 := CollectStats(a)
 	assert.Equal(t, Stats{All: totalDeps, Completed: totalDeps, Succeeded: totalDeps}, stats3)
