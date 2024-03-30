@@ -1,81 +1,53 @@
 package worker2
 
 import (
-	"fmt"
 	"github.com/stretchr/testify/assert"
+	"strings"
 	"testing"
 )
 
-func ids(deps []Dep) []string {
-	ids := make([]string, 0)
-	for _, dep := range deps {
-		ids = append(ids, dep.GetID())
-	}
-
-	return ids
+func s(s string) string {
+	return strings.TrimSpace(s) + "\n"
 }
 
-func ids2(deps []*Deps) []string {
-	ids := make([]string, 0)
-	for _, dep := range deps {
-		ids = append(ids, dep.id)
-	}
+func TestLink(t *testing.T) {
+	d1 := &Action{ID: "1", Deps: NewDepsID("1")}
+	d2 := &Action{ID: "2", Deps: NewDepsID("2", d1)}
 
-	return ids
-}
+	d3 := &Action{ID: "3", Deps: NewDepsID("3")}
+	d4 := &Action{ID: "4", Deps: NewDepsID("4", d3)}
 
-func TestTransitive(t *testing.T) {
-	a1 := &Action{
-		ID:   "1",
-		Deps: NewDepsID("1"),
-	}
+	d3.AddDep(d2)
 
-	a2 := &Action{
-		ID:   "2",
-		Deps: NewDepsID("2", a1),
-	}
+	assert.Equal(t, s(`
+1:
+  deps: []
+  tdeps: []
+  depdees: [2]
+  tdepdees: [2 4 3]
+`), d1.Deps.DebugString())
 
-	//a3 := &Action{
-	//	ID:   "3",
-	//	Deps: NewDeps(a2).WithID("3"),
-	//}
+	assert.Equal(t, s(`
+2:
+  deps: [1]
+  tdeps: [1]
+  depdees: [3]
+  tdepdees: [4 3]
+`), d2.Deps.DebugString())
 
-	assert.EqualValues(t, []string{}, ids(a1.Deps.Dependencies()))
-	assert.EqualValues(t, []string{}, ids(a1.Deps.TransitiveDependencies()))
-	assert.EqualValues(t, []string{"2"}, ids2(a1.Deps.Dependees()))
-	assert.EqualValues(t, []string{"2"}, ids2(a1.Deps.TransitiveDependees()))
+	assert.Equal(t, s(`
+3:
+  deps: [2]
+  tdeps: [2 1]
+  depdees: [4]
+  tdepdees: [4]
+`), d3.Deps.DebugString())
 
-	assert.EqualValues(t, []string{"1"}, ids(a2.Deps.Dependencies()))
-	assert.EqualValues(t, []string{"1"}, ids(a2.Deps.TransitiveDependencies()))
-	assert.EqualValues(t, []string{}, ids2(a2.Deps.Dependees()))
-	assert.EqualValues(t, []string{}, ids2(a2.Deps.TransitiveDependees()))
-
-	//assert.EqualValues(t, []string{"2"}, ids(a3.Deps.Get()))
-	//assert.EqualValues(t, []string{"1", "2"}, ids(a3.Deps.GetTransitive()))
-
-	a0 := &Action{
-		ID:   "0",
-		Deps: NewDepsID("0"),
-	}
-
-	fmt.Println("########### add 0 to 1")
-	a1.Deps.Add(a0)
-
-	assert.EqualValues(t, []string{}, ids(a0.Deps.Dependencies()))
-	assert.EqualValues(t, []string{}, ids(a0.Deps.TransitiveDependencies()))
-	assert.EqualValues(t, []string{"1"}, ids2(a0.Deps.Dependees()))
-	assert.EqualValues(t, []string{"2", "1"}, ids2(a0.Deps.TransitiveDependees()))
-
-	assert.EqualValues(t, []string{"0"}, ids(a1.Deps.Dependencies()))
-	assert.EqualValues(t, []string{"0"}, ids(a1.Deps.TransitiveDependencies()))
-	assert.EqualValues(t, []string{"2"}, ids2(a1.Deps.Dependees()))
-	assert.EqualValues(t, []string{"2"}, ids2(a1.Deps.TransitiveDependees()))
-
-	assert.EqualValues(t, []string{"1"}, ids(a2.Deps.Dependencies()))
-	assert.EqualValues(t, []string{"1", "0"}, ids(a2.Deps.TransitiveDependencies()))
-	assert.EqualValues(t, []string{}, ids2(a2.Deps.Dependees()))
-	assert.EqualValues(t, []string{}, ids2(a2.Deps.TransitiveDependees()))
-
-	//assert.EqualValues(t, []string{"2"}, ids(a3.Deps.Get()))
-	//assert.EqualValues(t, []string{"1", "2", "0"}, ids(a3.Deps.GetTransitive()))
+	assert.Equal(t, s(`
+4:
+  deps: [3]
+  tdeps: [3 2 1]
+  depdees: []
+  tdepdees: []
+`), d4.Deps.DebugString())
 }

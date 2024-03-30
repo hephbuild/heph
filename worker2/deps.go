@@ -1,7 +1,10 @@
 package worker2
 
 import (
-	"golang.org/x/exp/slices"
+	"fmt"
+	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
+	"strings"
 	"sync"
 )
 
@@ -15,25 +18,25 @@ func NewDepsID(id string, deps ...Dep) *Deps {
 	return newDeps(id, deps)
 }
 
-//func NewDepsFrom(deps []Dep) *Deps {
-//	return newDeps("", deps)
-//}
-
 func newDeps(id string, deps []Dep) *Deps {
-	d := &Deps{id: id}
+	d := &Deps{
+		id:                  id,
+		deps:                sets.NewIdentitySet[Dep](0),
+		transitiveDeps:      sets.NewIdentitySet[Dep](0),
+		dependees:           sets.NewIdentitySet[*Deps](0),
+		transitiveDependees: sets.NewIdentitySet[*Deps](0),
+	}
 	d.Add(deps...)
 	return d
 }
 
 type Deps struct {
 	id                  string
-	deps                []Dep
-	depsm               map[Dep]struct{}
-	transitiveDeps      []Dep
-	dependees           []*Deps
-	dependeesm          map[*Deps]struct{}
-	transitiveDependees []*Deps
-	m                   sync.Mutex
+	deps                *sets.Set[Dep, Dep]
+	transitiveDeps      *sets.Set[Dep, Dep]
+	dependees           *sets.Set[*Deps, *Deps]
+	transitiveDependees *sets.Set[*Deps, *Deps]
+	m                   sync.RWMutex
 	frozen              bool
 }
 
@@ -49,7 +52,7 @@ func (d *Deps) Freeze() {
 		return
 	}
 
-	for _, dep := range d.deps {
+	for _, dep := range d.deps.Slice() {
 		if !dep.IsFrozen() {
 			panic("attempting to freeze while all deps aren't frozen")
 		}
@@ -70,19 +73,25 @@ func (d *Deps) Freeze() {
 //}
 
 func (d *Deps) Dependencies() []Dep {
-	return d.deps[:]
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	return d.deps.Slice()
 }
 
 func (d *Deps) TransitiveDependencies() []Dep {
-	return d.transitiveDeps[:]
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	return d.transitiveDeps.Slice()
 }
 
-func (d *Deps) Dependees() []*Deps {
-	return d.dependees[:]
-}
-
-func (d *Deps) TransitiveDependees() []*Deps {
-	return d.transitiveDependees[:]
+func (d *Deps) flattenNamed(deps []Dep) []Dep {
+	fdeps := ads.Copy(deps)
+	for i, tdep := range deps {
+		fdeps[i] = flattenNamed(tdep)
+	}
+	return fdeps
 }
 
 func (d *Deps) Add(deps ...Dep) {
@@ -94,24 +103,15 @@ func (d *Deps) Add(deps ...Dep) {
 		panic("deps is frozen")
 	}
 
-	if d.depsm == nil {
-		d.depsm = map[Dep]struct{}{}
-	}
-
-	if d.dependeesm == nil {
-		d.dependeesm = map[*Deps]struct{}{}
-	}
-
-	//var addedDeps []Dep
 	for _, dep := range deps {
-
 		if !d.has(dep) {
-			d.depsm[dep] = struct{}{}
-			d.deps = append(d.deps, dep)
-			d.computeTransitiveDeps()
+			d.deps.Add(dep)
+			d.transitiveDeps.Add(dep)
+			d.transitiveDeps.AddAll(d.flattenNamed(dep.GetDepsObj().transitiveDeps.Slice()))
 
-			for _, dependee := range d.transitiveDependees {
-				dependee.computeTransitiveDeps()
+			for _, dependee := range d.transitiveDependees.Slice() {
+				dependee.transitiveDeps.Add(dep)
+				dependee.transitiveDeps.AddAll(d.flattenNamed(dep.GetDepsObj().transitiveDeps.Slice()))
 			}
 		}
 
@@ -119,13 +119,15 @@ func (d *Deps) Add(deps ...Dep) {
 			dep := dep.GetDepsObj()
 
 			if !dep.hasDependee(d) {
-				dep.dependeesm[d] = struct{}{}
-				dep.dependees = append(dep.dependees, d)
-				dep.computeTransitiveDependees()
+				dep.dependees.Add(d)
 
-				for _, dep := range dep.transitiveDeps {
-					dep.GetDepsObj().computeTransitiveDependees()
+				for _, dep := range dep.transitiveDeps.Slice() {
+					dep.GetDepsObj().transitiveDependees.AddAll(d.transitiveDependees.Slice())
+					dep.GetDepsObj().transitiveDependees.Add(d)
 				}
+
+				dep.transitiveDependees.AddAll(d.transitiveDependees.Slice())
+				dep.transitiveDependees.Add(d)
 			}
 		}
 
@@ -149,103 +151,39 @@ func (d *Deps) Add(deps ...Dep) {
 }
 
 func (d *Deps) has(dep Dep) bool {
-	_, ok := d.depsm[dep]
-	return ok
+	return d.deps.Has(dep) || d.deps.Has(flattenNamed(dep))
 }
 
 func (d *Deps) hasDependee(dep *Deps) bool {
-	_, ok := d.dependeesm[dep]
-	return ok
+	return d.dependees.Has(dep)
+}
+
+func (d *Deps) DebugString() string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%v:\n", d.id)
+	deps := ads.Map(d.deps.Slice(), func(d Dep) string {
+		return d.GetID()
+	})
+	tdeps := ads.Map(d.transitiveDeps.Slice(), func(d Dep) string {
+		return d.GetID()
+	})
+	fmt.Fprintf(&sb, "  deps: %v\n", deps)
+	fmt.Fprintf(&sb, "  tdeps: %v\n", tdeps)
+
+	depdees := ads.Map(d.dependees.Slice(), func(d *Deps) string {
+		return d.id
+	})
+	tdepdees := ads.Map(d.transitiveDependees.Slice(), func(d *Deps) string {
+		return d.id
+	})
+	fmt.Fprintf(&sb, "  depdees: %v\n", depdees)
+	fmt.Fprintf(&sb, "  tdepdees: %v\n", tdepdees)
+
+	return sb.String()
 }
 
 //func (d *Deps) runHooks(dep Dep) {
 //	for _, hook := range d.hooks {
 //		hook(dep)
-//	}
-//}
-
-func (d *Deps) computeTransitiveDeps() {
-	var transitiveDeps []Dep
-	transitiveDeps = append(transitiveDeps, d.deps...)
-
-	for _, dep := range d.deps {
-		dep := dep.GetDepsObj()
-		dep.computeTransitiveDeps()
-
-		for _, tdep := range dep.transitiveDeps {
-			if !slices.Contains(transitiveDeps, tdep) {
-				transitiveDeps = append(transitiveDeps, tdep)
-			}
-		}
-	}
-
-	d.transitiveDeps = transitiveDeps
-}
-
-//func (d *Deps) computeTransitiveDeps2() {
-//
-//	var transitiveDeps []Dep
-//	d.collectTransitiveDeps(nil, &transitiveDeps)
-//	d.transitiveDeps = transitiveDeps
-//}
-//
-//func (d *Deps) collectTransitiveDeps(m map[Dep]struct{}, tdeps *[]Dep) {
-//	if m == nil {
-//		m = map[Dep]struct{}{}
-//	}
-//
-//	for _, dep := range d.Get() {
-//		if _, ok := m[dep]; ok {
-//			return
-//		}
-//		m[dep] = struct{}{}
-//
-//		dep.GetDepsObj().collectTransitiveDeps(m, tdeps)
-//		dep.GetDepsObj().computeTransitiveDeps()
-//
-//		*tdeps = append(*tdeps, dep)
-//	}
-//}
-
-func (d *Deps) computeTransitiveDependees() {
-	var transitiveDependees []*Deps
-
-	for _, dep := range d.dependees {
-		dep.computeTransitiveDependees()
-
-		for _, tdep := range dep.transitiveDependees {
-			if !slices.Contains(transitiveDependees, tdep) {
-				transitiveDependees = append(transitiveDependees, tdep)
-			}
-		}
-	}
-
-	transitiveDependees = append(transitiveDependees, d.dependees...)
-
-	d.transitiveDependees = transitiveDependees
-}
-
-//func (d *Deps) computeTransitiveDependees2() {
-//
-//	var transitiveDependees []*Deps
-//	d.collectTransitiveDependees(nil, &transitiveDependees)
-//	d.transitiveDependees = transitiveDependees
-//}
-//
-//func (d *Deps) collectTransitiveDependees(m map[*Deps]struct{}, tdeps *[]*Deps) {
-//	if m == nil {
-//		m = map[*Deps]struct{}{}
-//	}
-//
-//	for _, dep := range d.dependees {
-//		if _, ok := m[dep]; ok {
-//			return
-//		}
-//		m[dep] = struct{}{}
-//
-//		dep.collectTransitiveDependees(m, tdeps)
-//		dep.computeTransitiveDependees()
-//
-//		*tdeps = append(*tdeps, dep)
 //	}
 //}

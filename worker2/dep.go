@@ -186,11 +186,9 @@ func flattenNamed(dep Dep) Dep {
 		if ndep, ok := dep.(Named); ok {
 			dep = ndep.Dep
 		} else {
-			break
+			return dep
 		}
 	}
-
-	return dep
 }
 
 func Serial(deps []Dep) Dep {
