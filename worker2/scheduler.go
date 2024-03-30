@@ -1,5 +1,10 @@
 package worker2
 
+import (
+	"golang.org/x/exp/slices"
+	"sync"
+)
+
 type Scheduler interface {
 	Schedule(Dep, InStore) error
 	Done(Dep)
@@ -36,4 +41,53 @@ func (ls *LimitScheduler) Schedule(d Dep, ins InStore) error {
 
 func (ls *LimitScheduler) Done(d Dep) {
 	<-ls.ch
+}
+
+type RunningTracker struct {
+	deps []Dep
+	m    sync.RWMutex
+}
+
+func (t *RunningTracker) Deps() []Dep {
+	t.m.RLock()
+	defer t.m.RUnlock()
+
+	return t.deps[:]
+}
+
+func (t *RunningTracker) Scheduler(s Scheduler) Scheduler {
+	return trackerScheduler{
+		t: t,
+		s: s,
+	}
+}
+
+type trackerScheduler struct {
+	t *RunningTracker
+	s Scheduler
+}
+
+func (t trackerScheduler) Schedule(d Dep, ins InStore) error {
+	err := t.s.Schedule(d, ins)
+	if err != nil {
+		return err
+	}
+
+	t.t.m.Lock()
+	defer t.t.m.Unlock()
+
+	t.t.deps = append(t.t.deps, d)
+
+	return nil
+}
+
+func (t trackerScheduler) Done(d Dep) {
+	t.t.m.Lock()
+	defer t.t.m.Unlock()
+
+	t.t.deps = slices.DeleteFunc(t.t.deps, func(dep Dep) bool {
+		return dep == d
+	})
+
+	t.s.Done(d)
 }
