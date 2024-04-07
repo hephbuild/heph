@@ -11,6 +11,7 @@ import (
 )
 
 type Engine struct {
+	execUid          uint64
 	wg               sync.WaitGroup
 	defaultScheduler Scheduler
 	workers          []*Worker
@@ -125,16 +126,12 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 
 			switch state {
 			case ExecStateSkipped, ExecStateFailed:
-				if _, ok := dep.(*Group); ok && dep.GetName() == "" {
-					errs = append(errs, depExec.Err)
-				} else {
-					errs = append(errs, Error{
-						ID:    depExec.ID,
-						State: depExec.State,
-						Name:  depExec.Dep.GetName(),
-						Err:   depExec.Err,
-					})
-				}
+				errs = append(errs, Error{
+					ID:    depExec.ID,
+					State: depExec.State,
+					Name:  depExec.Dep.GetName(),
+					Err:   depExec.Err,
+				})
 			}
 		}
 
@@ -312,8 +309,6 @@ func (e *Engine) Schedule(a Dep) Dep {
 	return a
 }
 
-var execUid uint64
-
 func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 	dep = flattenNamed(dep)
 
@@ -331,7 +326,7 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 	_ = dep.GetDepsObj()
 
 	exec := &Execution{
-		ID:          atomic.AddUint64(&execUid, 1),
+		ID:          atomic.AddUint64(&e.execUid, 1),
 		Dep:         dep,
 		outStore:    &outStore{},
 		eventsCh:    e.eventsCh,

@@ -15,9 +15,6 @@ import (
 // Number of actions to be processed during a stress test
 const StressN = 100000
 
-// TODO: figure out
-var ErrSkipped = errors.New("skipped")
-
 func TestExecSimple(t *testing.T) {
 	t.Parallel()
 
@@ -78,7 +75,7 @@ func TestExecSerial(t *testing.T) {
 	assert.EqualValues(t, expected, values)
 }
 
-func TestDependOnImplicitlyScheduledGroupExecSimple(t *testing.T) {
+func TestDependOnImplicitlyScheduledGroup(t *testing.T) {
 	t.Parallel()
 
 	g1 := &Group{}
@@ -98,6 +95,10 @@ func TestDependOnImplicitlyScheduledGroupExecSimple(t *testing.T) {
 	defer e.Stop()
 
 	e.Schedule(a1)
+
+	// Group waited on needs to be explicitly scheduled, we can get smarter in the future,
+	// going up in the tree to find the engine and auto-schedule? Not sure if worth the effort
+	e.Schedule(g1)
 
 	<-g1.Wait()
 	<-e.Wait()
@@ -175,7 +176,7 @@ func TestExecHook(t *testing.T) {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
 
-	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 	v, _ := (<-outputCh).Get()
 	assert.Equal(t, int(1), v)
 }
@@ -241,9 +242,28 @@ func TestExecErrorSkip(t *testing.T) {
 
 	<-a3.Wait()
 
-	assert.ErrorContains(t, <-err1Ch, "beep bop")
-	assert.ErrorIs(t, <-err2Ch, ErrSkipped)
-	assert.ErrorIs(t, <-err3Ch, ErrSkipped)
+	err1 := <-err1Ch
+	err2 := <-err2Ch
+	err3 := <-err3Ch
+
+	assert.Equal(t, err1, errors.New("beep bop"))
+	assert.Equal(t, err2, Error{
+		ID:    2,
+		Name:  "a1",
+		State: ExecStateFailed,
+		Err:   errors.New("beep bop"),
+	})
+	assert.Equal(t, err3, Error{
+		ID:    1,
+		Name:  "a2",
+		State: ExecStateSkipped,
+		Err: Error{
+			ID:    2,
+			Name:  "a1",
+			State: ExecStateFailed,
+			Err:   errors.New("beep bop"),
+		},
+	})
 }
 
 func TestExecErrorSkipStress(t *testing.T) {
@@ -259,7 +279,13 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
-	var errChs []<-chan error
+	type errContainer struct {
+		ch <-chan error
+		d  Dep
+	}
+
+	var errChs2 []<-chan error
+	var errChs3 []errContainer
 
 	for i := 0; i < StressN/100; i++ {
 		a2 := NewAction(ActionConfig{
@@ -271,7 +297,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 			},
 		})
 
-		errChs = append(errChs, a2.ErrorCh())
+		errChs2 = append(errChs2, a2.ErrorCh())
 
 		for j := 0; j < 100; j++ {
 			a3 := NewAction(ActionConfig{
@@ -284,7 +310,10 @@ func TestExecErrorSkipStress(t *testing.T) {
 			})
 			g.AddDep(a3)
 
-			errChs = append(errChs, a3.ErrorCh())
+			errChs3 = append(errChs3, errContainer{
+				ch: a3.ErrorCh(),
+				d:  a2,
+			})
 		}
 	}
 
@@ -297,8 +326,31 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 	<-g.Wait()
 
-	for _, errCh := range errChs {
-		assert.ErrorIs(t, <-errCh, ErrSkipped)
+	for _, errCh := range errChs2 {
+		err := <-errCh
+
+		assert.Equal(t, err, Error{
+			ID:    3,
+			Name:  "a1",
+			State: ExecStateFailed,
+			Err:   errors.New("beep bop"),
+		})
+	}
+
+	for _, c := range errChs3 {
+		err := <-c.ch
+
+		assert.Equal(t, err, Error{
+			ID:    c.d.getExecution().ID,
+			Name:  c.d.GetName(),
+			State: ExecStateSkipped,
+			Err: Error{
+				ID:    3,
+				Name:  "a1",
+				State: ExecStateFailed,
+				Err:   errors.New("beep bop"),
+			},
+		})
 	}
 }
 
@@ -593,7 +645,7 @@ func TestSuspend(t *testing.T) {
 	for event := range eventCh {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
-	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 }
 
 func TestSuspendLimit(t *testing.T) {
@@ -617,6 +669,8 @@ func TestSuspendLimit(t *testing.T) {
 
 		e.Schedule(a)
 	}
+
+	e.Schedule(g)
 
 	go e.Run()
 	defer e.Stop()
