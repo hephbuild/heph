@@ -12,11 +12,11 @@ func s(s string) string {
 }
 
 func TestLink(t *testing.T) {
-	d1 := &Action{Name: "1", Deps: NewDeps()}
-	d2 := &Action{Name: "2", Deps: NewDeps(d1)}
+	d1 := &Action{name: "1", deps: NewDeps()}
+	d2 := &Action{name: "2", deps: NewDeps(d1)}
 
-	d3 := &Action{Name: "3", Deps: NewDeps()}
-	d4 := &Action{Name: "4", Deps: NewDeps(d3)}
+	d3 := &Action{name: "3", deps: NewDeps()}
+	d4 := &Action{name: "4", deps: NewDeps(d3)}
 
 	for _, d := range []*Action{d1, d2, d3, d4} {
 		d.LinkDeps()
@@ -98,9 +98,9 @@ func TestLink(t *testing.T) {
 }
 
 func TestCycle1(t *testing.T) {
-	d1 := &Action{Name: "1", Deps: NewDeps()}
-	d2 := &Action{Name: "2", Deps: NewDeps(d1)}
-	d3 := &Action{Name: "3", Deps: NewDeps(d2)}
+	d1 := &Action{name: "1", deps: NewDeps()}
+	d2 := &Action{name: "2", deps: NewDeps(d1)}
+	d3 := &Action{name: "3", deps: NewDeps(d2)}
 
 	assert.PanicsWithValue(t, "cycle", func() {
 		d2.AddDep(d3)
@@ -108,11 +108,11 @@ func TestCycle1(t *testing.T) {
 }
 
 func TestCycle2(t *testing.T) {
-	d1 := &Action{Name: "1", Deps: NewDeps( /* d4 */ )}
-	d2 := &Action{Name: "2", Deps: NewDeps(d1)}
+	d1 := &Action{name: "1", deps: NewDeps( /* d4 */ )}
+	d2 := &Action{name: "2", deps: NewDeps(d1)}
 
-	d3 := &Action{Name: "3", Deps: NewDeps()}
-	d4 := &Action{Name: "4", Deps: NewDeps(d3)}
+	d3 := &Action{name: "3", deps: NewDeps()}
+	d4 := &Action{name: "4", deps: NewDeps(d3)}
 
 	d1.AddDep(d4)
 
@@ -122,22 +122,22 @@ func TestCycle2(t *testing.T) {
 }
 
 func TestRemoveStress(t *testing.T) {
-	root := &Action{Name: "root", Deps: NewDeps()}
+	root := &Action{name: "root", deps: NewDeps()}
 	root.LinkDeps()
 
 	for i := 0; i < 1000; i++ {
-		d := &Action{Name: fmt.Sprint(i)}
+		d := &Action{name: fmt.Sprint(i)}
 		d.LinkDeps()
 		root.AddDep(d)
 
 		for j := 0; j < 1000; j++ {
-			d1 := &Action{Name: fmt.Sprintf("%v-%v", i, j)}
+			d1 := &Action{name: fmt.Sprintf("%v-%v", i, j)}
 			d1.LinkDeps()
 			d.AddDep(d1)
 		}
 	}
 
-	group := &Action{Name: "group", Deps: NewDeps(root)}
+	group := &Action{name: "group", deps: NewDeps(root)}
 	group.LinkDeps()
 
 	group.GetDepsObj().Remove(root)

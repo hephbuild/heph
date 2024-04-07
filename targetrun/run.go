@@ -280,12 +280,12 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 	}
 
 	if !e.Config.Engine.KeepSandbox {
-		e.Pool.Schedule(&worker2.Action{
+		e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
 			Name:  fmt.Sprintf("clear sandbox %v", target.Addr),
 			Ctx:   ctx,
 			Hooks: []worker2.Hook{tracker.Hook()},
 			// We need to make sure to wait for the lock to be released before proceeding
-			Deps: worker2.NewDeps(worker2.NewChanDep(completedCh)),
+			Deps: []worker2.Dep{worker2.NewChanDep(completedCh)},
 			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 				locked, err := rtarget.SandboxLock.TryLock(ctx)
 				if err != nil {
@@ -311,7 +311,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 
 				return nil
 			},
-		})
+		}))
 	}
 
 	return rtarget, nil

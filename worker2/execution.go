@@ -73,6 +73,7 @@ type Execution struct {
 
 	ScheduledAt time.Time
 	StartedAt   time.Time
+	QueuedAt    time.Time
 }
 
 func (e *Execution) String() string {

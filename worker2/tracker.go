@@ -24,10 +24,6 @@ func (t *RunningTracker) Group() *Group {
 	return t.group
 }
 
-func (t *RunningTracker) Register(d Dep) {
-	t.group.AddDep(d)
-}
-
 func (t *RunningTracker) Hook() Hook {
 	if t == nil {
 		return nil

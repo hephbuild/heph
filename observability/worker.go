@@ -22,41 +22,38 @@ func (s *workerStageStore[S]) createSpan(job worker2.Dep) (context.Context, S) {
 }
 
 func WorkerStageFactory[S SpanError](f createSpanFunc[S]) worker2.Hook {
-	return func(event worker2.Event) {
-		// TODO
-	}
-	//ss := &workerStageStore[S]{createSpanFunc: f}
-	//return worker2.StageHook{
-	//	OnScheduled: func(job worker2.Dep) context.Context {
-	//		ctx, span := ss.createSpan(job)
-	//		span.SetScheduledTime(job.TimeScheduled)
-	//
-	//		return ctx
-	//	},
-	//	OnQueued: func(job worker2.Dep) context.Context {
-	//		ss.span.SetQueuedTime(job.TimeQueued)
-	//		return nil
-	//	},
-	//	OnStart: func(job worker2.Dep) context.Context {
-	//		var ctx context.Context
-	//		if !ss.hasSpan {
-	//			ctx, _ = ss.createSpan(job)
-	//		}
-	//
-	//		ss.span.SetStartTime(job.TimeStart)
-	//		return ctx
-	//	},
-	//	OnEnd: func(job worker2.Dep) context.Context {
-	//		if err := job.Err(); err != nil {
-	//			state := StateFailed
-	//			if job.State == worker.StateSkipped {
-	//				state = StateSkipped
-	//			}
-	//			ss.span.EndErrorState(err, state)
-	//		} else {
-	//			ss.span.End()
-	//		}
-	//		return nil
-	//	},
-	//}.Hook()
+	ss := &workerStageStore[S]{createSpanFunc: f}
+	return worker2.StageHook{
+		OnScheduled: func(job worker2.Dep) context.Context {
+			ctx, span := ss.createSpan(job)
+			span.SetScheduledTime(job.GetScheduledAt())
+
+			return ctx
+		},
+		OnQueued: func(job worker2.Dep) context.Context {
+			ss.span.SetQueuedTime(job.GetQueuedAt())
+			return nil
+		},
+		OnStart: func(job worker2.Dep) context.Context {
+			var ctx context.Context
+			if !ss.hasSpan {
+				ctx, _ = ss.createSpan(job)
+			}
+
+			ss.span.SetStartTime(job.GetStartedAt())
+			return ctx
+		},
+		OnEnd: func(job worker2.Dep) context.Context {
+			if err := job.GetErr(); err != nil {
+				state := StateFailed
+				if job.GetState() == worker2.ExecStateSkipped {
+					state = StateSkipped
+				}
+				ss.span.EndErrorState(err, state)
+			} else {
+				ss.span.End()
+			}
+			return nil
+		},
+	}.Hook()
 }

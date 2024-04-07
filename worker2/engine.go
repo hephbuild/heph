@@ -181,6 +181,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	}
 	exec.inputs = ins
 	exec.State = ExecStateQueued
+	exec.QueuedAt = time.Now()
 	exec.scheduler = exec.Dep.GetScheduler()
 	if exec.scheduler == nil {
 		if _, ok := exec.Dep.(*Group); ok {
