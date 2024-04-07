@@ -133,7 +133,7 @@ func (s *schedulerv2) schedule() error {
 			return err
 		}
 
-		pmdeps := &worker2.Group{}
+		pmdeps := worker2.NewGroup()
 		for _, parent := range parents {
 			pmdeps.AddDep(s.pullMetaDeps.Get(parent.Addr))
 		}
@@ -188,7 +188,7 @@ func (s *schedulerv2) schedule() error {
 }
 
 func (s *schedulerv2) parentTargetDeps(target specs.Specer) (worker2.Dep, error) {
-	deps := &worker2.Group{}
+	deps := worker2.NewGroup()
 	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
@@ -254,7 +254,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 		return nil, err
 	}
 
-	runDeps := &worker2.Group{}
+	runDeps := worker2.NewGroup()
 	for _, parent := range parents {
 		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
 		if err != nil {
@@ -287,7 +287,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 		return nil, err
 	}
 
-	group := &worker2.Group{}
+	group := worker2.NewGroup()
 	j := worker2.NewAction(worker2.ActionConfig{
 		Name:  "get cache or run once " + target.Addr,
 		Ctx:   ctx,

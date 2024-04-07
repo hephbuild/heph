@@ -221,16 +221,21 @@ func (a *Action) LinkDeps() {
 	}
 }
 
+type GroupConfig struct {
+	Name string
+	Deps []Dep
+}
+
 type Group struct {
 	baseDep
-	Name string
-	Deps *Deps
+	name string
+	deps *Deps
 }
 
 func (g *Group) GetScheduler() Scheduler { return nil }
 
 func (g *Group) GetName() string {
-	return g.Name
+	return g.name
 }
 
 func (g *Group) LinkDeps() {
@@ -240,20 +245,11 @@ func (g *Group) LinkDeps() {
 }
 
 func (g *Group) GetDepsObj() *Deps {
-	if g.Deps != nil {
-		return g.Deps
+	if g.deps == nil {
+		g.deps = NewDeps()
 	}
-
-	g.m.Lock()
-	defer g.m.Unlock()
-
-	if g.Deps == nil {
-		d := NewDeps()
-		d.setOwner(g)
-		g.Deps = d
-	}
-
-	return g.Deps
+	g.deps.setOwner(g)
+	return g.deps
 }
 
 func (g *Group) GetHooks() []Hook {

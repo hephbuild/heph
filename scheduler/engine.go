@@ -57,7 +57,7 @@ func (wgm *WaitGroupMap) All() worker2.Dep {
 	wgm.mu.Lock()
 	defer wgm.mu.Unlock()
 
-	wg := &worker2.Group{}
+	wg := worker2.NewGroup()
 	wg.LinkDeps()
 
 	for _, e := range wgm.m {
@@ -79,7 +79,7 @@ func (wgm *WaitGroupMap) Get(s string) worker2.Dep {
 		wgm.m = map[string]worker2.Dep{}
 	}
 
-	wg := &worker2.Group{}
+	wg := worker2.NewGroup()
 	wg.LinkDeps()
 	wgm.m[s] = wg
 

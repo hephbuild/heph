@@ -372,7 +372,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 		return err
 	}
 
-	runDeps := &worker2.Group{}
+	runDeps := worker2.NewGroup()
 	runDeps.AddDep(tdepsMap.All())
 	runDeps.AddDep(tracker.Group())
 

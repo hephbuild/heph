@@ -140,7 +140,7 @@ func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *gr
 
 	deps := map[string]*worker2.Group{}
 	for _, artifact := range artsp {
-		wg := &worker2.Group{}
+		wg := worker2.NewGroup()
 		deps[artifact.Name()] = wg
 	}
 
@@ -169,7 +169,7 @@ func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *gr
 
 	meta := []string{arts.InputHash.Name(), arts.Manifest.Name()}
 
-	allButMeta := &worker2.Group{}
+	allButMeta := worker2.NewGroup()
 	for _, art := range artsp {
 		if !ads.Contains(meta, art.Name()) {
 			allButMeta.AddDep(signals[art.Name()])
@@ -203,7 +203,7 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 		return nil, err
 	}
 
-	allDeps := &worker2.Group{}
+	allDeps := worker2.NewGroup()
 
 	deps, signals := e.createDepsGenArtifacts(ctx, target, arts)
 

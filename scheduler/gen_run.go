@@ -27,7 +27,7 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 	if len(genTargets) == 0 {
 		log.Debugf("No gen targets, skip gen pass")
 
-		return &worker2.Group{}, nil
+		return worker2.NewGroup(), nil
 	}
 
 	log.Debugf("Run gen pass")
@@ -95,7 +95,7 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 	}
 
 	newTargets := graph.NewTargets(0)
-	deps := &worker2.Group{}
+	deps := worker2.NewGroup()
 	for _, target := range targets {
 		e.scheduleRunGenerated(ctx, target, sdeps.Get(target.Addr), deps, newTargets)
 	}

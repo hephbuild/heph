@@ -176,7 +176,7 @@ func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *grap
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
 
-	deps := &worker2.Group{}
+	deps := worker2.NewGroup()
 	for _, artifact := range target.Artifacts.All() {
 		if artifact.Name() == inputHashArtifact.Name() {
 			continue

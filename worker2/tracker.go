@@ -7,7 +7,7 @@ import (
 func NewRunningTracker() *RunningTracker {
 	return &RunningTracker{
 		running: sets.NewIdentitySet[*Execution](0),
-		group:   &Group{},
+		group:   NewGroup(),
 	}
 }
 
