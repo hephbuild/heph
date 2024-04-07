@@ -210,6 +210,7 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 	})
 
 	for _, file := range files {
+		file := file
 		j := worker2.NewAction(worker2.ActionConfig{
 			Name:  fmt.Sprintf("rungen %v file %v", target.Addr, file.RelRoot()),
 			Ctx:   ctx,
