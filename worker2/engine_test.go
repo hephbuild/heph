@@ -78,7 +78,7 @@ func TestExecSerial(t *testing.T) {
 func TestDependOnImplicitlyScheduledGroup(t *testing.T) {
 	t.Parallel()
 
-	g1 := &Group{}
+	g1 := NewGroup()
 
 	a1 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
@@ -275,7 +275,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 		},
 	})
 
-	g := &Group{}
+	g := NewGroup()
 
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
@@ -454,12 +454,10 @@ func TestExecGroup(t *testing.T) {
 		},
 	})
 
-	g := &Group{
-		Deps: NewDeps(
-			Named{Name: "v1", Dep: a1_1},
-			Named{Name: "v2", Dep: a1_2},
-		),
-	}
+	g := NewGroup(
+		Named{Name: "v1", Dep: a1_1},
+		Named{Name: "v2", Dep: a1_2},
+	)
 
 	var received any
 	a := NewAction(ActionConfig{
@@ -486,7 +484,7 @@ func TestExecStress(t *testing.T) {
 	t.Parallel()
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
-	g := &Group{Deps: NewDeps()}
+	g := NewGroup()
 
 	n := StressN
 
@@ -538,9 +536,7 @@ func TestExecStress(t *testing.T) {
 }
 
 func TestExecProducerConsumer(t *testing.T) {
-	g := &Group{
-		Deps: NewDeps(),
-	}
+	g := NewGroup()
 
 	n := 10000
 
@@ -654,7 +650,7 @@ func TestSuspendLimit(t *testing.T) {
 	e := NewEngine()
 	e.SetDefaultScheduler(NewLimitScheduler(1))
 
-	g := &Group{}
+	g := NewGroup()
 
 	for i := 0; i < 100; i++ {
 		a := NewAction(ActionConfig{
