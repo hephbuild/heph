@@ -6,50 +6,109 @@ import (
 )
 
 type Dep interface {
-	GetID() string
+	GetName() string
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
-	Freeze()
-	IsFrozen() bool
 	GetDepsObj() *Deps
-	AddDep(Dep)
+	AddDep(...Dep)
 	GetHooks() []Hook
 	Wait() <-chan struct{}
 	DeepDo(f func(Dep))
 	GetCtx() context.Context
+	SetCtx(ctx context.Context)
+	GetErr() error
+	GetState() ExecState
 
 	setExecution(*Execution)
 	getExecution() *Execution
+	getMutex() sync.Locker
 	GetScheduler() Scheduler
+	GetRequest() map[string]int
 }
 
 type baseDep struct {
 	execution *Execution
 	m         sync.RWMutex
+
+	executionPresentCh chan struct{}
+	o                  sync.Once
+}
+
+func (a *baseDep) init() {
+	if a.executionPresentCh == nil {
+		a.executionPresentCh = make(chan struct{})
+	}
 }
 
 func (a *baseDep) setExecution(e *Execution) {
-	a.m.Lock()
-	defer a.m.Unlock()
+	a.o.Do(a.init)
+
+	if a.execution != nil {
+		if a.execution != e {
+			panic("trying to assign different execution to a Dep")
+		}
+		return
+	}
+
 	a.execution = e
+	close(a.executionPresentCh)
 }
 
 func (a *baseDep) getExecution() *Execution {
-	a.m.RLock()
-	defer a.m.RUnlock()
+	a.o.Do(a.init)
+
 	return a.execution
 }
 
 func (a *baseDep) Wait() <-chan struct{} {
-	return a.getExecution().Wait()
+	a.o.Do(a.init)
+
+	if exec := a.execution; exec != nil {
+		return exec.Wait()
+	}
+
+	// Allow to wait Dep that is not scheduled yet
+
+	doneCh := make(chan struct{})
+
+	go func() {
+		<-a.executionPresentCh
+		<-a.execution.Wait()
+		close(doneCh)
+	}()
+
+	return doneCh
+}
+
+func (a *baseDep) getMutex() sync.Locker {
+	return &a.m
+}
+
+func (a *baseDep) GetErr() error {
+	exec := a.execution
+	if exec == nil {
+		return nil
+	}
+
+	return exec.Err
+}
+
+func (a *baseDep) GetState() ExecState {
+	exec := a.execution
+	if exec == nil {
+		return ExecStateUnknown
+	}
+
+	return exec.State
 }
 
 type Action struct {
 	baseDep
 	Ctx       context.Context
-	ID        string
+	Name      string
 	Deps      *Deps
 	Hooks     []Hook
 	Scheduler Scheduler
+	Requests  map[string]int
 	Do        func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
@@ -57,16 +116,12 @@ func (a *Action) GetScheduler() Scheduler {
 	return a.Scheduler
 }
 
-func (a *Action) IsFrozen() bool {
-	return a.GetDepsObj().IsFrozen()
+func (a *Action) GetRequest() map[string]int {
+	return a.Requests
 }
 
-func (a *Action) Freeze() {
-	a.Deps.Freeze()
-}
-
-func (a *Action) GetID() string {
-	return a.ID
+func (a *Action) GetName() string {
+	return a.Name
 }
 
 func (a *Action) GetCtx() context.Context {
@@ -74,6 +129,10 @@ func (a *Action) GetCtx() context.Context {
 		return ctx
 	}
 	return context.Background()
+}
+
+func (a *Action) SetCtx(ctx context.Context) {
+	a.Ctx = ctx
 }
 
 func (a *Action) OutputCh() <-chan Value {
@@ -93,6 +152,9 @@ func (a *Action) GetHooks() []Hook {
 }
 
 func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
+	if a.Do == nil {
+		return nil
+	}
 	return a.Do(ctx, ins, outs)
 }
 
@@ -104,8 +166,8 @@ func (a *Action) GetDepsObj() *Deps {
 	return a.Deps
 }
 
-func (a *Action) AddDep(dep Dep) {
-	a.GetDepsObj().Add(dep)
+func (a *Action) AddDep(deps ...Dep) {
+	a.GetDepsObj().Add(deps...)
 }
 
 func (a *Action) DeepDo(f func(Dep)) {
@@ -120,27 +182,14 @@ func (a *Action) LinkDeps() {
 
 type Group struct {
 	baseDep
-	ID    string
-	Deps  *Deps
-	Hooks []Hook
+	Name string
+	Deps *Deps
 }
 
 func (g *Group) GetScheduler() Scheduler { return nil }
 
-func (g *Group) OutputCh() <-chan Value {
-	h, ch := OutputHook()
-	g.Hooks = append(g.Hooks, h)
-	return ch
-}
-
-func (g *Group) ErrorCh() <-chan error {
-	h, ch := ErrorHook()
-	g.Hooks = append(g.Hooks, h)
-	return ch
-}
-
-func (g *Group) GetID() string {
-	return g.ID
+func (g *Group) GetName() string {
+	return g.Name
 }
 
 func (g *Group) LinkDeps() {
@@ -158,27 +207,27 @@ func (g *Group) GetDepsObj() *Deps {
 }
 
 func (g *Group) GetHooks() []Hook {
-	return g.Hooks
+	return nil
 }
 
 func (g *Group) DeepDo(f func(Dep)) {
 	deepDo(g, f)
 }
 
+func (g *Group) GetRequest() map[string]int {
+	return nil
+}
+
+func (g *Group) SetCtx(ctx context.Context) {
+	// TODO
+}
+
 func (g *Group) GetCtx() context.Context {
 	return context.Background()
 }
 
-func (g *Group) AddDep(dep Dep) {
-	g.GetDepsObj().Add(dep)
-}
-
-func (g *Group) IsFrozen() bool {
-	return g.GetDepsObj().IsFrozen()
-}
-
-func (g *Group) Freeze() {
-	g.GetDepsObj().Freeze()
+func (g *Group) AddDep(deps ...Dep) {
+	g.GetDepsObj().Add(deps...)
 }
 
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
@@ -216,4 +265,40 @@ func Serial(deps []Dep) Dep {
 	}
 
 	return out
+}
+
+func NewChanDep[T any](ch chan T) Dep {
+	return &Action{
+		Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+			return WaitChan(ctx, ch)
+		},
+	}
+}
+
+func NewSemDep() *Sem {
+	wg := &sync.WaitGroup{}
+	return &Sem{
+		Dep: &Action{
+			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+				Wait(ctx, func() {
+					wg.Wait()
+				})
+				return nil
+			},
+		},
+		wg: wg,
+	}
+}
+
+type Sem struct {
+	Dep
+	wg *sync.WaitGroup
+}
+
+func (s *Sem) AddSem(delta int) {
+	s.wg.Add(delta)
+}
+
+func (s *Sem) DoneSem() {
+	s.wg.Done()
 }

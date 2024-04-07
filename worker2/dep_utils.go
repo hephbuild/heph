@@ -37,7 +37,7 @@ func CollectStats(a Dep) Stats {
 		}
 
 		switch j.State {
-		case ExecStateWaiting:
+		case ExecStateQueued:
 			atomic.AddUint64(&s.Waiting, 1)
 		case ExecStateSucceeded:
 			atomic.AddUint64(&s.Succeeded, 1)

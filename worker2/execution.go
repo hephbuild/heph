@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
+	"strconv"
 	"sync"
+	"time"
 )
 
 type ExecState int
@@ -12,11 +15,33 @@ type ExecState int
 func (s ExecState) IsFinal() bool {
 	return s == ExecStateSucceeded || s == ExecStateFailed || s == ExecStateSkipped
 }
+func (s ExecState) String() string {
+	switch s {
+	case ExecStateUnknown:
+		return "Unknown"
+	case ExecStateScheduled:
+		return "Scheduled"
+	case ExecStateQueued:
+		return "Queued"
+	case ExecStateRunning:
+		return "Running"
+	case ExecStateSucceeded:
+		return "Succeeded"
+	case ExecStateFailed:
+		return "Failed"
+	case ExecStateSkipped:
+		return "Skipped"
+	case ExecStateSuspended:
+		return "Suspended"
+	}
+
+	return strconv.Itoa(int(s))
+}
 
 const (
 	ExecStateUnknown ExecState = iota
 	ExecStateScheduled
-	ExecStateWaiting
+	ExecStateQueued
 	ExecStateRunning
 	ExecStateSucceeded
 	ExecStateFailed
@@ -25,8 +50,10 @@ const (
 )
 
 type Execution struct {
+	ID        uint64
 	Dep       Dep
 	State     ExecState
+	Err       error
 	outStore  OutStore
 	eventsCh  chan Event
 	c         *sync.Cond
@@ -43,11 +70,13 @@ type Execution struct {
 	resumeAckCh chan struct{}
 
 	completedCh chan struct{}
-	started     bool
+
+	ScheduledAt time.Time
+	StartedAt   time.Time
 }
 
 func (e *Execution) String() string {
-	if id := e.Dep.GetID(); id != "" {
+	if id := e.Dep.GetName(); id != "" {
 		return id
 	}
 
@@ -70,11 +99,11 @@ func (e *Execution) Run(ctx context.Context) error {
 		e.errCh = make(chan error)
 		e.suspendCh = make(chan struct{})
 
-		if e.started {
-			panic("already started")
+		if !e.StartedAt.IsZero() {
+			panic("double start detected")
 		}
 
-		e.started = true
+		e.StartedAt = time.Now()
 
 		go func() {
 			err := e.run(ctx)
@@ -110,13 +139,15 @@ func (e *Execution) run(ctx context.Context) error {
 		ins.m[k] = vv
 	}
 
+	//return e.Dep.Exec(ctx, ins, e.outStore)
+
 	return e.safeExec(ctx, ins)
 }
 
 func (e *Execution) safeExec(ctx context.Context, ins InStore) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic: %v", r)
+			err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
 		}
 	}()
 

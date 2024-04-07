@@ -15,7 +15,8 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/locks"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
+	"golang.org/x/exp/maps"
 	"sync"
 )
 
@@ -31,11 +32,15 @@ type Scheduler struct {
 	Packages         *packages.Registry
 	BuildFilesState  *buildfiles.State
 	Graph            *graph.State
-	Pool             *worker.Pool
+	Pool             *worker2.Engine
 	Finalizers       *finalizers.Finalizers
 	Runner           *targetrun.Runner
 
 	toolsLock locks.Locker
+}
+
+func (e *Scheduler) TrackScheduler() worker2.Scheduler {
+	return nil
 }
 
 func New(e Scheduler) *Scheduler {
@@ -45,23 +50,24 @@ func New(e Scheduler) *Scheduler {
 
 type WaitGroupMap struct {
 	mu sync.Mutex
-	m  map[string]*worker.WaitGroup
+	m  map[string]worker2.Dep
 }
 
-func (wgm *WaitGroupMap) All() *worker.WaitGroup {
+func (wgm *WaitGroupMap) All() worker2.Dep {
 	wgm.mu.Lock()
 	defer wgm.mu.Unlock()
 
-	wg := &worker.WaitGroup{}
+	wg := &worker2.Group{}
+	wg.LinkDeps()
 
 	for _, e := range wgm.m {
-		wg.AddChild(e)
+		wg.AddDep(e)
 	}
 
 	return wg
 }
 
-func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
+func (wgm *WaitGroupMap) Get(s string) worker2.Dep {
 	wgm.mu.Lock()
 	defer wgm.mu.Unlock()
 
@@ -70,16 +76,21 @@ func (wgm *WaitGroupMap) Get(s string) *worker.WaitGroup {
 	}
 
 	if wgm.m == nil {
-		wgm.m = map[string]*worker.WaitGroup{}
+		wgm.m = map[string]worker2.Dep{}
 	}
 
-	wg := &worker.WaitGroup{}
+	wg := &worker2.Group{}
+	wg.LinkDeps()
 	wgm.m[s] = wg
 
 	return wg
 }
 
-func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, pullCache bool, skip []specs.Specer) (*WaitGroupMap, error) {
+func (wgm *WaitGroupMap) List() []worker2.Dep {
+	return maps.Values(wgm.m)
+}
+
+func (e *Scheduler) ScheduleTargetsWithDeps(ctx context.Context, targets []*graph.Target, pullCache bool, skip []specs.Specer) (*WaitGroupMap, *worker2.RunningTracker, error) {
 	rrs := ads.Map(targets, func(t *graph.Target) targetrun.Request {
 		return targetrun.Request{Target: t, RequestOpts: targetrun.RequestOpts{PullCache: pullCache}}
 	})

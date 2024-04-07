@@ -9,17 +9,54 @@ func contextWithExecution(ctx context.Context, e *Execution) context.Context {
 }
 
 func executionFromContext(ctx context.Context) *Execution {
-	return ctx.Value(executionKey).(*Execution)
+	e, _ := ctx.Value(executionKey).(*Execution)
+	return e
 }
 
 func Wait(ctx context.Context, f func()) {
+	_ = WaitE(ctx, func() error {
+		f()
+		return nil
+	})
+}
+
+func WaitE(ctx context.Context, f func() error) error {
 	e := executionFromContext(ctx)
 	if e == nil {
-		f()
+		err := f()
+		if err != nil {
+			return err
+		}
 	} else {
 		e.Suspend()
-		f()
+		err := f()
 		ack := e.Resume()
 		<-ack
+		if err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func WaitDep(ctx context.Context, dep Dep) error {
+	return WaitE(ctx, func() error {
+		select {
+		case <-dep.Wait():
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
+func WaitChan[T any](ctx context.Context, ch <-chan T) error {
+	return WaitE(ctx, func() error {
+		select {
+		case <-ch:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 }

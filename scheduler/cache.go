@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"os"
 	"sync"
 )
@@ -171,29 +171,31 @@ func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target,
 	return true, nil
 }
 
-func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache rcache.CacheConfig) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, tracker *worker2.RunningTracker) worker2.Dep {
 	// input hash is used as a marker that everything went well,
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
 
-	deps := &worker.WaitGroup{}
+	deps := &worker2.Group{}
 	for _, artifact := range target.Artifacts.All() {
 		if artifact.Name() == inputHashArtifact.Name() {
 			continue
 		}
 
-		j := e.scheduleStoreExternalCacheArtifact(ctx, target, cache, artifact, nil)
-		deps.Add(j)
+		j := e.scheduleStoreExternalCacheArtifact(ctx, target, cache, artifact, nil, tracker)
+		deps.AddDep(j)
 	}
 
-	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps)
+	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps, tracker)
 }
 
-func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
-	return e.Pool.Schedule(ctx, &worker.Job{
-		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
-		Deps: deps,
-		Do: func(w *worker.Worker, ctx context.Context) error {
+func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker2.Group, tracker *worker2.RunningTracker) worker2.Dep {
+	return e.Pool.Schedule(&worker2.Action{
+		Name:  fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
+		Hooks: []worker2.Hook{tracker.Hook()},
+		Deps:  worker2.NewDeps(deps),
+		Ctx:   ctx,
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			exists, err := e.LocalCache.ArtifactExists(ctx, target, artifact)
 			if err != nil {
 				return err

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetrun"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"go.uber.org/multierr"
 	"io"
 	"os"
@@ -42,7 +42,8 @@ func printErrTargetFailed(err error) bool {
 }
 
 func PrintHumanError(err error) {
-	errs := multierr.Errors(worker.CollectRootErrors(err))
+	rootErrs := worker2.CollectRootErrors(err)
+	errs := multierr.Errors(rootErrs)
 	skippedCount := 0
 	skipSpacing := true
 
@@ -58,7 +59,7 @@ func PrintHumanError(err error) {
 		if printErrTargetFailed(err) {
 			// Printed !
 		} else {
-			var jerr worker.JobError
+			var jerr worker2.Error
 			if errors.As(err, &jerr) && jerr.Skipped() {
 				skippedCount++
 				skipSpacing = true

@@ -804,7 +804,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, false, []specs.Specer{target})
+		tdeps, _, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, false, []specs.Specer{target})
 		if err != nil {
 			return err
 		}

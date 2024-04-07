@@ -2,15 +2,15 @@ package poolwait
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/xtea"
-	"github.com/hephbuild/heph/worker"
-	"go.uber.org/multierr"
+	"github.com/hephbuild/heph/worker2"
 )
 
-func Wait(ctx context.Context, name string, pool *worker.Pool, deps *worker.WaitGroup, plain bool) error {
+func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.Dep, plain bool) error {
+	pool.Schedule(deps)
+
 	useTUI := xtea.IsTerm() && !plain
 
 	log.Tracef("WaitPool %v", name)
@@ -30,17 +30,5 @@ func Wait(ctx context.Context, name string, pool *worker.Pool, deps *worker.Wait
 		}
 	}
 
-	perr := pool.Err()
-	derr := deps.Err()
-
-	if perr != nil && derr != nil {
-		if errors.Is(perr, derr) || errors.Is(derr, perr) || derr == perr {
-			return perr
-		}
-
-		perr = fmt.Errorf("pool: %w", perr)
-		derr = fmt.Errorf("deps: %w", derr)
-	}
-
-	return multierr.Combine(perr, derr)
+	return deps.GetErr()
 }

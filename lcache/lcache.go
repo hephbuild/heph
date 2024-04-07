@@ -23,7 +23,7 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/vfssimple"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"io"
 	"io/fs"
 	"math"
@@ -43,12 +43,12 @@ type LocalCacheState struct {
 	Finalizers      *finalizers.Finalizers
 	EnableGC        bool
 	ParallelCaching bool
-	Pool            *worker.Pool
+	Pool            *worker2.Engine
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
+func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -133,7 +133,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 			return err
 		}
 
-		err = worker.SuspendWaitGroup(ctx, genDeps)
+		err = worker2.WaitDep(ctx, genDeps)
 		if err != nil {
 			return err
 		}

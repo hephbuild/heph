@@ -59,22 +59,19 @@ func schedulerInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) e
 	Finalizers.RegisterWithErr(func(err error) {
 		bs.Finalizers.Run(err)
 
-		if !bs.Scheduler.Pool.IsDone() {
+		// TODO
+		//if !bs.Scheduler.Pool.IsDone() {
+		if false {
 			log.Tracef("Waiting for all pool items to finish")
 			select {
-			case <-bs.Scheduler.Pool.Done():
+			case <-bs.Scheduler.Pool.Wait():
 			case <-time.After(time.Second):
 				log.Infof("Waiting for background jobs to finish...")
-				<-bs.Scheduler.Pool.Done()
+				<-bs.Scheduler.Pool.Wait()
 			}
 			log.Tracef("All pool items finished")
 
-			bs.Scheduler.Pool.Stop(nil)
-
-			err := bs.Scheduler.Pool.Err()
-			if err != nil {
-				log.Error(err)
-			}
+			bs.Scheduler.Pool.Stop()
 		}
 
 		if bs.Summary != nil {
@@ -108,7 +105,7 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 	Finalizers.RegisterWithErr(func(err error) {
 		bs.Finalizers.Run(err)
 
-		bs.Pool.Stop(err)
+		bs.Pool.Stop()
 	})
 
 	return bs, nil

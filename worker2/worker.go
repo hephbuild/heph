@@ -10,14 +10,27 @@ type Worker struct {
 	ctx    context.Context
 	status status.Statuser
 	exec   *Execution
+	queue  func()
 }
 
 func (w *Worker) Status(status status.Statuser) {
 	w.status = status
 }
 
+func (w *Worker) GetStatus() status.Statuser {
+	s := w.status
+	if s == nil {
+		s = status.String("")
+	}
+	return s
+}
+
 func (w *Worker) Interactive() bool {
 	return true
+}
+
+func (w *Worker) Execution() *Execution {
+	return w.exec
 }
 
 func (w *Worker) Run() {
@@ -39,7 +52,7 @@ func (w *Worker) Run() {
 					Error:     ctx.Err(),
 				}
 			case <-w.exec.resumeCh:
-				w.exec.eventsCh <- EventReady{Execution: w.exec}
+				w.queue()
 			}
 		}()
 	} else {

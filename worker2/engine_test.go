@@ -2,16 +2,21 @@ package worker2
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/status"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"runtime"
 	"testing"
+	"time"
 )
 
 // Number of actions to be processed during a stress test
 const StressN = 100000
+
+// TODO: figure out
+var ErrSkipped = errors.New("skipped")
 
 func TestExecSimple(t *testing.T) {
 	t.Parallel()
@@ -32,7 +37,7 @@ func TestExecSimple(t *testing.T) {
 
 	e.Schedule(a)
 
-	e.Wait()
+	<-e.Wait()
 	<-a.Wait()
 
 	assert.True(t, didRun)
@@ -50,7 +55,7 @@ func TestExecSerial(t *testing.T) {
 		i := i
 		expected = append(expected, i)
 		a := &Action{
-			ID: fmt.Sprint(i),
+			Name: fmt.Sprint(i),
 			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				values = append(values, i)
 				return nil
@@ -71,6 +76,31 @@ func TestExecSerial(t *testing.T) {
 	<-serial.Wait()
 
 	assert.EqualValues(t, expected, values)
+}
+
+func TestDependOnImplicitlyScheduledGroupExecSimple(t *testing.T) {
+	t.Parallel()
+
+	g1 := &Group{}
+
+	a1 := &Action{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			fmt.Println("Running  1")
+			return nil
+		},
+	}
+
+	g1.AddDep(a1)
+
+	e := NewEngine()
+
+	go e.Run()
+	defer e.Stop()
+
+	e.Schedule(a1)
+
+	<-g1.Wait()
+	<-e.Wait()
 }
 
 func TestStatus(t *testing.T) {
@@ -137,7 +167,7 @@ func TestExecHook(t *testing.T) {
 
 	e.Schedule(a)
 
-	e.Wait()
+	<-e.Wait()
 	close(ch)
 
 	events := make([]string, 0)
@@ -145,7 +175,7 @@ func TestExecHook(t *testing.T) {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
 
-	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 	v, _ := (<-outputCh).Get()
 	assert.Equal(t, int(1), v)
 }
@@ -175,14 +205,14 @@ func TestExecError(t *testing.T) {
 func TestExecErrorSkip(t *testing.T) {
 	t.Parallel()
 	a1 := &Action{
-		ID: "a1",
+		Name: "a1",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return fmt.Errorf("beep bop")
 		},
 	}
 
 	a2 := &Action{
-		ID:   "a2",
+		Name: "a2",
 		Deps: NewDeps(a1),
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return nil
@@ -190,7 +220,7 @@ func TestExecErrorSkip(t *testing.T) {
 	}
 
 	a3 := &Action{
-		ID:   "a3",
+		Name: "a3",
 		Deps: NewDeps(a2),
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return nil
@@ -219,7 +249,7 @@ func TestExecErrorSkip(t *testing.T) {
 func TestExecErrorSkipStress(t *testing.T) {
 	t.Parallel()
 	a1 := &Action{
-		ID: "a1",
+		Name: "a1",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return fmt.Errorf("beep bop")
 		},
@@ -233,7 +263,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 	for i := 0; i < StressN/100; i++ {
 		a2 := &Action{
-			ID:        fmt.Sprintf("2-%v", i),
+			Name:      fmt.Sprintf("2-%v", i),
 			Deps:      NewDeps(a1),
 			Scheduler: scheduler,
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
@@ -245,7 +275,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 
 		for j := 0; j < 100; j++ {
 			a3 := &Action{
-				ID:        fmt.Sprintf("3-%v", j),
+				Name:      fmt.Sprintf("3-%v", j),
 				Deps:      NewDeps(a2),
 				Scheduler: scheduler,
 				Do: func(ctx context.Context, ds InStore, os OutStore) error {
@@ -402,7 +432,6 @@ func TestExecGroup(t *testing.T) {
 
 func TestExecStress(t *testing.T) {
 	t.Parallel()
-	tracker := &RunningTracker{}
 	scheduler := NewLimitScheduler(runtime.NumCPU())
 
 	g := &Group{Deps: NewDeps()}
@@ -412,7 +441,7 @@ func TestExecStress(t *testing.T) {
 	for i := 0; i < n; i++ {
 		i := i
 		a := &Action{
-			Scheduler: tracker.Scheduler(scheduler),
+			Scheduler: scheduler,
 			Deps:      NewDeps(),
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				os.Set(NewValue(i))
@@ -558,12 +587,41 @@ func TestSuspend(t *testing.T) {
 	assert.Equal(t, "end_wait", <-logCh)
 	assert.Equal(t, "leave", <-logCh)
 
-	e.Wait()
+	<-e.Wait()
 	close(eventCh)
 
 	events := make([]string, 0)
 	for event := range eventCh {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
-	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+}
+
+func TestSuspendLimit(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	e.SetDefaultScheduler(NewLimitScheduler(1))
+
+	g := &Group{}
+
+	for i := 0; i < 100; i++ {
+		a := &Action{
+			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+				Wait(ctx, func() {
+					time.Sleep(time.Second)
+				})
+				return nil
+			},
+		}
+		g.AddDep(a)
+
+		e.Schedule(a)
+	}
+
+	go e.Run()
+	defer e.Stop()
+
+	<-g.Wait()
+	<-e.Wait()
 }

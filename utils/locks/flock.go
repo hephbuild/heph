@@ -8,7 +8,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"golang.org/x/sys/unix"
 	"os"
 	"strconv"
@@ -153,7 +153,7 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 			lockCh <- flock.Flock(f, ro, true)
 		}()
 
-		err := worker.SuspendE(ctx, func() error {
+		err := worker2.WaitE(ctx, func() error {
 			select {
 			case err := <-lockCh:
 				return err

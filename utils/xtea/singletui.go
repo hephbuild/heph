@@ -28,6 +28,8 @@ func SingleflightTry() bool {
 }
 
 func SingleflightDone() {
-	//tuiStack = nil
+	if debugSingleflight {
+		tuiStack = nil
+	}
 	tuim.Unlock()
 }
