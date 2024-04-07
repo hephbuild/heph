@@ -240,10 +240,19 @@ func (g *Group) LinkDeps() {
 }
 
 func (g *Group) GetDepsObj() *Deps {
-	if g.Deps == nil {
-		g.Deps = NewDeps()
+	if g.Deps != nil {
+		return g.Deps
 	}
-	g.Deps.setOwner(g)
+
+	g.m.Lock()
+	defer g.m.Unlock()
+
+	if g.Deps == nil {
+		d := NewDeps()
+		d.setOwner(g)
+		g.Deps = d
+	}
+
 	return g.Deps
 }
 
