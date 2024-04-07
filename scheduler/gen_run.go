@@ -41,17 +41,16 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 
 	ctx, span := e.Observability.SpanGenPass(ctx)
 
-	j1 := &worker2.Action{
+	j1 := worker2.NewAction(worker2.ActionConfig{
 		Name:  "schedule gen pipeline",
 		Ctx:   ctx,
 		Hooks: []worker2.Hook{ge.tracker.Hook()},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			return ge.ScheduleGeneratedPipeline(ctx, genTargets)
 		},
-	}
-	ge.tracker.Register(j1)
+	})
 
-	j := &worker2.Action{
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name: "finalize gen",
 		Ctx:  ctx,
 		Hooks: []worker2.Hook{
@@ -62,13 +61,13 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 				},
 			}.Hook(),
 		},
-		Deps: worker2.NewDeps(j1, ge.tracker.Group()),
+		Deps: []worker2.Dep{j1, ge.tracker.Group()},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			status.Emit(ctx, status.String("Finalizing gen..."))
 
 			return nil
 		},
-	}
+	})
 
 	return j, nil
 }
@@ -102,11 +101,11 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 		e.scheduleRunGenerated(ctx, target, sdeps.Get(target.Addr), deps, newTargets)
 	}
 
-	e.Pool.Schedule(&worker2.Action{
+	e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
 		Name:  "ScheduleGeneratedPipeline " + e.Name,
 		Ctx:   ctx,
 		Hooks: []worker2.Hook{e.tracker.Hook()},
-		Deps:  worker2.NewDeps(deps),
+		Deps:  []worker2.Dep{deps},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated %v...", e.Name)))
 
@@ -125,22 +124,22 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 			return nil
 		},
-	})
+	}))
 
 	return nil
 }
 
 func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps worker2.Dep, deps *worker2.Group, targets *graph.Targets) {
-	j := &worker2.Action{
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name: "rungen_" + target.Addr,
-		Deps: worker2.NewDeps(runDeps),
+		Deps: []worker2.Dep{runDeps},
 		Ctx:  ctx,
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			ltarget := e.LocalCache.Metas.Find(target)
 
 			return e.scheduleRunGeneratedFiles(ctx, ltarget, deps, targets)
 		},
-	}
+	})
 	deps.AddDep(j)
 }
 
@@ -171,7 +170,7 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 	for i, files := range chunks {
 		files := files
 
-		j := &worker2.Action{
+		j := worker2.NewAction(worker2.ActionConfig{
 			Name:  fmt.Sprintf("rungen %v chunk %v", target.Addr, i),
 			Ctx:   ctx,
 			Hooks: []worker2.Hook{e.tracker.Hook()},
@@ -238,8 +237,7 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 
 				return nil
 			},
-		}
-		e.tracker.Register(j)
+		})
 		deps.AddDep(j)
 	}
 

@@ -17,9 +17,9 @@ import (
 )
 
 func (e *schedulerv2) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps worker2.Dep) (worker2.Dep, error) {
-	j := &worker2.Action{
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name: rr.Target.Addr,
-		Deps: worker2.NewDeps(deps),
+		Deps: []worker2.Dep{deps},
 		Ctx:  ctx,
 		Hooks: []worker2.Hook{
 			e.tracker.Hook(),
@@ -35,8 +35,7 @@ func (e *schedulerv2) ScheduleTargetRun(ctx context.Context, rr targetrun.Reques
 
 			return nil
 		},
-	}
-	e.tracker.Register(j)
+	})
 
 	return j, nil
 }
@@ -69,7 +68,6 @@ func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetru
 
 		toAssess:     toAssess,
 		outputs:      outputs,
-		done:         &maps.Map[string, *worker2.Sem]{},
 		deps:         &WaitGroupMap{},
 		pullMetaDeps: &WaitGroupMap{},
 
@@ -103,7 +101,6 @@ type schedulerv2 struct {
 	rrTargets              *graph.Targets
 	toAssess               *graph.Targets
 	outputs                *maps.Map[string, *sets.Set[string, string]]
-	done                   *maps.Map[string, *worker2.Sem]
 	deps                   *WaitGroupMap
 	pullMetaDeps           *WaitGroupMap
 	targetSchedLock        *maps.KMutex
@@ -111,84 +108,7 @@ type schedulerv2 struct {
 	getCacheOrRunSchedJobs *maps.Map[getCacheOrRunRequest, worker2.Dep]
 }
 
-func (s *schedulerv2) ggg(d worker2.Dep, target *graph.Target, ch chan struct{}) worker2.Dep {
-	return d
-	//children, _ := s.Graph.DAG().GetChildren(target)
-	//for _, child := range children {
-	//	wg := s.done.Get(child.Addr)
-	//	if wg == nil {
-	//		return nil
-	//	}
-	//
-	//	wg.DoneSem()
-	//}
-	//
-	//return d
-	//return &worker2.Action{
-	//	Deps: worker2.NewDeps(d),
-	//	Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-	//		children, err := s.Graph.DAG().GetChildren(target)
-	//		if err != nil {
-	//			return err
-	//		}
-	//		for _, child := range children {
-	//			a := s.done.Get(child.Addr)
-	//			if a == nil {
-	//				continue
-	//			}
-	//			a.DoneSem()
-	//		}
-	//
-	//		return nil
-	//	},
-	//}
-	//return &worker2.Action{
-	//	Deps: worker2.NewDeps(d),
-	//	Hooks: []worker2.Hook{
-	//		worker2.StageHook{
-	//			OnEnd: func(dep worker2.Dep) context.Context {
-	//				children, _ := s.Graph.DAG().GetChildren(target)
-	//				for _, child := range children {
-	//					wg := s.done.Get(child.Addr)
-	//					if wg == nil {
-	//						return nil
-	//					}
-	//
-	//					wg.DoneSem()
-	//				}
-	//				return nil
-	//			},
-	//		}.Hook(),
-	//	},
-	//	Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-	//		return nil
-	//	},
-	//}
-}
 func (s *schedulerv2) schedule() error {
-	//var sems []chan struct{}
-	//for _, target := range s.toAssess.Slice() {
-	//	ch := make(chan struct{})
-	//	sems = append(sems, ch)
-	//
-	//	a := &worker2.Action{
-	//		Ctx: s.sctx,
-	//		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-	//			return worker2.WaitChan(ctx, ch)
-	//		},
-	//	}
-	//
-	//	s.pullMetaDeps.Get(target.Addr).AddDep(a)
-	//}
-
-	//for _, target := range s.toAssess.Slice() {
-	//	sem := worker2.NewSemDep()
-	//	sem.AddSem(1)
-	//
-	//	s.done.Set(target.Addr, sem)
-	//	s.deps.Get(target.Addr).AddDep(sem)
-	//}
-
 	for _, target := range s.toAssess.Slice() {
 		targetDeps := s.deps.Get(target.Addr)
 
@@ -217,20 +137,11 @@ func (s *schedulerv2) schedule() error {
 			pmdeps.AddDep(s.pullMetaDeps.Get(parent.Addr))
 		}
 
-		//doneCh := make(chan struct{})
-		//
-		//targetDeps.AddDep(&worker2.Action{
-		//	Ctx: s.sctx,
-		//	Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-		//		return worker2.WaitChan(ctx, doneCh)
-		//	},
-		//})
-
 		isSkip := ads.Contains(s.skip, target.Addr)
 
-		pj := &worker2.Action{
+		pj := worker2.NewAction(worker2.ActionConfig{
 			Name:  "pull_meta " + target.Addr,
-			Deps:  worker2.NewDeps(pmdeps),
+			Deps:  []worker2.Dep{pmdeps},
 			Ctx:   s.sctx,
 			Hooks: []worker2.Hook{s.tracker.Hook()},
 			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
@@ -241,7 +152,7 @@ func (s *schedulerv2) schedule() error {
 					if err != nil {
 						return err
 					}
-					targetDeps.AddDep(s.ggg(d, target, nil))
+					targetDeps.AddDep(d)
 					return nil
 				}
 
@@ -255,11 +166,11 @@ func (s *schedulerv2) schedule() error {
 				if err != nil {
 					return err
 				}
-				targetDeps.AddDep(s.ggg(g, target, nil))
+				targetDeps.AddDep(g)
 				return nil
 			},
-		}
-		s.tracker.Register(pj)
+		})
+		s.Pool.Schedule(pj)
 		targetDeps.AddDep(pj)
 
 		children, err := s.Graph.DAG().GetChildren(target)
@@ -271,14 +182,6 @@ func (s *schedulerv2) schedule() error {
 			s.pullMetaDeps.Get(child.Addr).AddDep(pj)
 		}
 	}
-
-	for _, dep := range s.deps.List() {
-		s.Pool.Schedule(dep)
-	}
-
-	//for _, ch := range sems {
-	//	close(ch)
-	//}
 
 	return nil
 }
@@ -303,11 +206,11 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.
 	}
 
 	// TODO: add an observability span: OnPullOrGetCache
-	j := &worker2.Action{
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name:  "cache get " + target.Addr,
 		Ctx:   ctx,
 		Hooks: []worker2.Hook{s.tracker.Hook()},
-		Deps:  worker2.NewDeps(deps),
+		Deps:  []worker2.Dep{deps},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			cached, err := s.pullOrGetCacheAndPost(ctx, target, outputs, withRestoreCache, false, uncompress)
 			if err != nil {
@@ -320,8 +223,7 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.
 
 			return nil
 		},
-	}
-	s.tracker.Register(j)
+	})
 
 	return j, nil
 }
@@ -394,10 +296,10 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 	}
 
 	group := &worker2.Group{}
-	j := &worker2.Action{
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name:  "get cache or run once " + target.Addr,
 		Ctx:   ctx,
-		Deps:  worker2.NewDeps(deps),
+		Deps:  []worker2.Dep{deps},
 		Hooks: []worker2.Hook{s.tracker.Hook()},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			if target.Cache.Enabled && allowCached {
@@ -428,8 +330,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 
 			return nil
 		},
-	}
-	s.tracker.Register(j)
+	})
 	group.AddDep(j)
 
 	s.getCacheOrRunSchedJobs.Set(k, group)

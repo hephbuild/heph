@@ -190,10 +190,10 @@ func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *grap
 }
 
 func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker2.Group, tracker *worker2.RunningTracker) worker2.Dep {
-	return e.Pool.Schedule(&worker2.Action{
+	return e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
 		Name:  fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
 		Hooks: []worker2.Hook{tracker.Hook()},
-		Deps:  worker2.NewDeps(deps),
+		Deps:  []worker2.Dep{deps},
 		Ctx:   ctx,
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			exists, err := e.LocalCache.ArtifactExists(ctx, target, artifact)
@@ -216,5 +216,5 @@ func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, targ
 
 			return nil
 		},
-	})
+	}))
 }

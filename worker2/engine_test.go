@@ -22,13 +22,13 @@ func TestExecSimple(t *testing.T) {
 	t.Parallel()
 
 	didRun := false
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			didRun = true
 			fmt.Println("Running  1")
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -54,13 +54,13 @@ func TestExecSerial(t *testing.T) {
 	for i := 0; i < n; i++ {
 		i := i
 		expected = append(expected, i)
-		a := &Action{
+		a := NewAction(ActionConfig{
 			Name: fmt.Sprint(i),
 			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				values = append(values, i)
 				return nil
 			},
-		}
+		})
 		deps = append(deps, a)
 	}
 
@@ -83,12 +83,12 @@ func TestDependOnImplicitlyScheduledGroupExecSimple(t *testing.T) {
 
 	g1 := &Group{}
 
-	a1 := &Action{
+	a1 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running  1")
 			return nil
 		},
-	}
+	})
 
 	g1.AddDep(a1)
 
@@ -108,14 +108,14 @@ func TestStatus(t *testing.T) {
 
 	emittedCh := make(chan struct{})
 	resumeCh := make(chan struct{})
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			status.Emit(ctx, status.String("hello"))
 			close(emittedCh)
 			<-resumeCh
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -145,7 +145,7 @@ func TestExecHook(t *testing.T) {
 	t.Parallel()
 
 	ch := make(chan Event, 1000)
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Hooks: []Hook{
 			func(event Event) {
 				ch <- event
@@ -156,7 +156,7 @@ func TestExecHook(t *testing.T) {
 			os.Set(NewValue(1))
 			return nil
 		},
-	}
+	})
 
 	outputCh := a.OutputCh()
 
@@ -182,11 +182,11 @@ func TestExecHook(t *testing.T) {
 
 func TestExecError(t *testing.T) {
 	t.Parallel()
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return fmt.Errorf("beep bop")
 		},
-	}
+	})
 
 	errCh := a.ErrorCh()
 
@@ -204,28 +204,28 @@ func TestExecError(t *testing.T) {
 
 func TestExecErrorSkip(t *testing.T) {
 	t.Parallel()
-	a1 := &Action{
+	a1 := NewAction(ActionConfig{
 		Name: "a1",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return fmt.Errorf("beep bop")
 		},
-	}
+	})
 
-	a2 := &Action{
+	a2 := NewAction(ActionConfig{
 		Name: "a2",
-		Deps: NewDeps(a1),
+		Deps: []Dep{a1},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return nil
 		},
-	}
+	})
 
-	a3 := &Action{
+	a3 := NewAction(ActionConfig{
 		Name: "a3",
-		Deps: NewDeps(a2),
+		Deps: []Dep{a2},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return nil
 		},
-	}
+	})
 
 	err1Ch := a1.ErrorCh()
 	err2Ch := a2.ErrorCh()
@@ -248,12 +248,12 @@ func TestExecErrorSkip(t *testing.T) {
 
 func TestExecErrorSkipStress(t *testing.T) {
 	t.Parallel()
-	a1 := &Action{
+	a1 := NewAction(ActionConfig{
 		Name: "a1",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			return fmt.Errorf("beep bop")
 		},
-	}
+	})
 
 	g := &Group{}
 
@@ -262,26 +262,26 @@ func TestExecErrorSkipStress(t *testing.T) {
 	var errChs []<-chan error
 
 	for i := 0; i < StressN/100; i++ {
-		a2 := &Action{
+		a2 := NewAction(ActionConfig{
 			Name:      fmt.Sprintf("2-%v", i),
-			Deps:      NewDeps(a1),
+			Deps:      []Dep{a1},
 			Scheduler: scheduler,
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				return nil
 			},
-		}
+		})
 
 		errChs = append(errChs, a2.ErrorCh())
 
 		for j := 0; j < 100; j++ {
-			a3 := &Action{
+			a3 := NewAction(ActionConfig{
 				Name:      fmt.Sprintf("3-%v", j),
-				Deps:      NewDeps(a2),
+				Deps:      []Dep{a2},
 				Scheduler: scheduler,
 				Do: func(ctx context.Context, ds InStore, os OutStore) error {
 					return nil
 				},
-			}
+			})
 			g.AddDep(a3)
 
 			errChs = append(errChs, a3.ErrorCh())
@@ -308,13 +308,13 @@ func TestExecCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Ctx: ctx,
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			<-ctx.Done()
 			return ctx.Err()
 		},
-	}
+	})
 
 	errCh := a.ErrorCh()
 
@@ -336,30 +336,30 @@ func TestExecCancel(t *testing.T) {
 
 func TestExecDeps(t *testing.T) {
 	t.Parallel()
-	a1_1 := &Action{
+	a1_1 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
 
 			os.Set(NewValue(1))
 			return nil
 		},
-	}
-	a1_2 := &Action{
+	})
+	a1_2 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 2")
 
 			os.Set(NewValue("hello, world"))
 			return nil
 		},
-	}
+	})
 
 	receivedValue := ""
 
-	a2 := &Action{
-		Deps: NewDeps(
+	a2 := NewAction(ActionConfig{
+		Deps: []Dep{
 			Named{Name: "v1", Dep: a1_1},
 			Named{Name: "v2", Dep: a1_2},
-		),
+		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			v1 := ds.Get("v1")
 			v2 := ds.Get("v2")
@@ -369,7 +369,7 @@ func TestExecDeps(t *testing.T) {
 			receivedValue = fmt.Sprintf("%v %v", v1, v2)
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -385,22 +385,22 @@ func TestExecDeps(t *testing.T) {
 
 func TestExecGroup(t *testing.T) {
 	t.Parallel()
-	a1_1 := &Action{
+	a1_1 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
 
 			os.Set(NewValue(1))
 			return nil
 		},
-	}
-	a1_2 := &Action{
+	})
+	a1_2 := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 2")
 
 			os.Set(NewValue("hello, world"))
 			return nil
 		},
-	}
+	})
 
 	g := &Group{
 		Deps: NewDeps(
@@ -410,13 +410,13 @@ func TestExecGroup(t *testing.T) {
 	}
 
 	var received any
-	a := &Action{
-		Deps: NewDeps(Named{Name: "v", Dep: g}),
+	a := NewAction(ActionConfig{
+		Deps: []Dep{Named{Name: "v", Dep: g}},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			received = ds.Get("v")
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -440,26 +440,25 @@ func TestExecStress(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		i := i
-		a := &Action{
+		a := NewAction(ActionConfig{
 			Scheduler: scheduler,
-			Deps:      NewDeps(),
 			Do: func(ctx context.Context, ds InStore, os OutStore) error {
 				os.Set(NewValue(i))
 				return nil
 			},
-		}
+		})
 
 		g.AddDep(Named{Name: fmt.Sprint(i), Dep: a})
 	}
 
 	var received any
-	a := &Action{
-		Deps: NewDeps(Named{Name: "v", Dep: g}),
+	a := NewAction(ActionConfig{
+		Deps: []Dep{Named{Name: "v", Dep: g}},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			received = ds.Get("v")
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -493,39 +492,39 @@ func TestExecProducerConsumer(t *testing.T) {
 
 	n := 10000
 
-	producer := &Action{
+	producer := NewAction(ActionConfig{
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running producer")
 
 			for i := 0; i < n; i++ {
 				i := i
 
-				a := &Action{
+				a := NewAction(ActionConfig{
 					Do: func(ctx context.Context, ds InStore, os OutStore) error {
 						//fmt.Println("Running inner", i)
 						os.Set(NewValue(i))
 						return nil
 					},
-				}
+				})
 
 				g.AddDep(Named{Name: fmt.Sprint(i), Dep: a})
 			}
 			return nil
 		},
-	}
+	})
 
 	g.AddDep(producer)
 
 	var received any
-	consumer := &Action{
-		Deps: NewDeps(producer, Named{Name: "v", Dep: g}),
+	consumer := NewAction(ActionConfig{
+		Deps: []Dep{producer, Named{Name: "v", Dep: g}},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running consumer")
 
 			received = ds.Get("v")
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -554,7 +553,7 @@ func TestSuspend(t *testing.T) {
 	resumeCh := make(chan struct{})
 	resumeAckCh := make(chan struct{})
 	eventCh := make(chan Event, 1000)
-	a := &Action{
+	a := NewAction(ActionConfig{
 		Hooks: []Hook{
 			func(event Event) {
 				eventCh <- event
@@ -571,7 +570,7 @@ func TestSuspend(t *testing.T) {
 			log("leave")
 			return nil
 		},
-	}
+	})
 
 	e := NewEngine()
 
@@ -606,14 +605,14 @@ func TestSuspendLimit(t *testing.T) {
 	g := &Group{}
 
 	for i := 0; i < 100; i++ {
-		a := &Action{
+		a := NewAction(ActionConfig{
 			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				Wait(ctx, func() {
 					time.Sleep(time.Second)
 				})
 				return nil
 			},
-		}
+		})
 		g.AddDep(a)
 
 		e.Schedule(a)

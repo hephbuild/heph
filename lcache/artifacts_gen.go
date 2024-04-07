@@ -212,10 +212,10 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 		shouldCompress := artifact.Compressible() && compress
 
-		j := e.Pool.Schedule(&worker2.Action{
-			Name: fmt.Sprintf("store %v|%v", target.Addr, artifact.Name()),
+		j := e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
 			Ctx:  ctx,
-			Deps: worker2.NewDeps(deps[artifact.Name()]),
+			Name: fmt.Sprintf("store %v|%v", target.Addr, artifact.Name()),
+			Deps: []worker2.Dep{deps[artifact.Name()]},
 			Hooks: []worker2.Hook{
 				worker2.StageHook{
 					OnEnd: func(worker2.Dep) context.Context {
@@ -243,7 +243,8 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 				return nil
 			},
-		})
+		}))
+
 		allDeps.AddDep(j)
 	}
 

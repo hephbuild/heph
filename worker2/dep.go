@@ -3,6 +3,7 @@ package worker2
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type Dep interface {
@@ -17,6 +18,9 @@ type Dep interface {
 	SetCtx(ctx context.Context)
 	GetErr() error
 	GetState() ExecState
+	GetScheduledAt() time.Time
+	GetStartedAt() time.Time
+	GetQueuedAt() time.Time
 
 	setExecution(*Execution)
 	getExecution() *Execution
@@ -101,69 +105,106 @@ func (a *baseDep) GetState() ExecState {
 	return exec.State
 }
 
-type Action struct {
-	baseDep
+func (a *baseDep) GetScheduledAt() time.Time {
+	exec := a.execution
+	if exec == nil {
+		return time.Time{}
+	}
+
+	return exec.ScheduledAt
+}
+
+func (a *baseDep) GetStartedAt() time.Time {
+	exec := a.execution
+	if exec == nil {
+		return time.Time{}
+	}
+
+	return exec.StartedAt
+}
+
+func (a *baseDep) GetQueuedAt() time.Time {
+	exec := a.execution
+	if exec == nil {
+		return time.Time{}
+	}
+
+	return exec.QueuedAt
+}
+
+type ActionConfig struct {
 	Ctx       context.Context
 	Name      string
-	Deps      *Deps
+	Deps      []Dep
 	Hooks     []Hook
 	Scheduler Scheduler
 	Requests  map[string]int
 	Do        func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
+type Action struct {
+	baseDep
+	ctx       context.Context
+	name      string
+	deps      *Deps
+	hooks     []Hook
+	scheduler Scheduler
+	requests  map[string]int
+	do        func(ctx context.Context, ins InStore, outs OutStore) error
+}
+
 func (a *Action) GetScheduler() Scheduler {
-	return a.Scheduler
+	return a.scheduler
 }
 
 func (a *Action) GetRequest() map[string]int {
-	return a.Requests
+	return a.requests
 }
 
 func (a *Action) GetName() string {
-	return a.Name
+	return a.name
 }
 
 func (a *Action) GetCtx() context.Context {
-	if ctx := a.Ctx; ctx != nil {
+	if ctx := a.ctx; ctx != nil {
 		return ctx
 	}
 	return context.Background()
 }
 
 func (a *Action) SetCtx(ctx context.Context) {
-	a.Ctx = ctx
+	a.ctx = ctx
 }
 
 func (a *Action) OutputCh() <-chan Value {
 	h, ch := OutputHook()
-	a.Hooks = append(a.Hooks, h)
+	a.hooks = append(a.hooks, h)
 	return ch
 }
 
 func (a *Action) ErrorCh() <-chan error {
 	h, ch := ErrorHook()
-	a.Hooks = append(a.Hooks, h)
+	a.hooks = append(a.hooks, h)
 	return ch
 }
 
 func (a *Action) GetHooks() []Hook {
-	return a.Hooks
+	return a.hooks
 }
 
 func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
-	if a.Do == nil {
+	if a.do == nil {
 		return nil
 	}
-	return a.Do(ctx, ins, outs)
+	return a.do(ctx, ins, outs)
 }
 
 func (a *Action) GetDepsObj() *Deps {
-	if a.Deps == nil {
-		a.Deps = NewDeps()
+	if a.deps == nil {
+		a.deps = NewDeps()
 	}
-	a.Deps.setOwner(a)
-	return a.Deps
+	a.deps.setOwner(a)
+	return a.deps
 }
 
 func (a *Action) AddDep(deps ...Dep) {
@@ -269,7 +310,7 @@ func Serial(deps []Dep) Dep {
 
 func NewChanDep[T any](ch chan T) Dep {
 	return &Action{
-		Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+		do: func(ctx context.Context, ins InStore, outs OutStore) error {
 			return WaitChan(ctx, ch)
 		},
 	}
@@ -279,7 +320,7 @@ func NewSemDep() *Sem {
 	wg := &sync.WaitGroup{}
 	return &Sem{
 		Dep: &Action{
-			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
+			do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				Wait(ctx, func() {
 					wg.Wait()
 				})
