@@ -25,6 +25,10 @@ type Stats struct {
 func CollectStats(a Dep) Stats {
 	s := Stats{}
 	a.DeepDo(func(dep Dep) {
+		if _, ok := dep.(*Group); ok {
+			return
+		}
+
 		atomic.AddUint64(&s.All, 1)
 
 		j := dep.getExecution()
