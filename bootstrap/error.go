@@ -42,8 +42,7 @@ func printErrTargetFailed(err error) bool {
 }
 
 func PrintHumanError(err error) {
-	rootErrs := worker2.CollectRootErrors(err)
-	errs := multierr.Errors(rootErrs)
+	errs := worker2.CollectRootErrors(err)
 	skippedCount := 0
 	skipSpacing := true
 
@@ -58,18 +57,19 @@ func PrintHumanError(err error) {
 	for _, err := range errs {
 		if printErrTargetFailed(err) {
 			// Printed !
+			continue
+		}
+
+		var jerr worker2.Error
+		if errors.As(err, &jerr) && jerr.Skipped() {
+			skippedCount++
+			skipSpacing = true
+			log.Debugf("skipped: %v", jerr)
 		} else {
-			var jerr worker2.Error
-			if errors.As(err, &jerr) && jerr.Skipped() {
-				skippedCount++
+			for _, err := range multierr.Errors(err) {
 				skipSpacing = true
-				log.Debugf("skipped: %v", jerr)
-			} else {
-				for _, err := range multierr.Errors(err) {
-					skipSpacing = true
-					separate()
-					log.Error(err)
-				}
+				separate()
+				log.Error(err)
 			}
 		}
 	}

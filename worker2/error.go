@@ -39,7 +39,7 @@ func CollectUniqueErrors(inErrs []error) []error {
 	return errs
 }
 
-func CollectRootErrors(err error) error {
+func CollectRootErrors(err error) []error {
 	errs := make([]error, 0)
 
 	for _, err := range multierr.Errors(err) {
@@ -51,7 +51,7 @@ func CollectRootErrors(err error) error {
 		}
 	}
 
-	return multierr.Combine(CollectUniqueErrors(errs)...)
+	return CollectUniqueErrors(errs)
 }
 
 func (e Error) Root() error {
@@ -59,13 +59,17 @@ func (e Error) Root() error {
 		return e.root
 	}
 
+	if !e.Skipped() {
+		return e
+	}
+
 	var roots []error
 	for _, err := range multierr.Errors(e.Err) {
 		var jerr Error
 		if errors.As(err, &jerr) {
-			if jerr.Skipped() {
-				roots = append(roots, jerr.Root())
-			}
+			roots = append(roots, jerr.Root())
+		} else {
+			roots = append(roots, err)
 		}
 	}
 
