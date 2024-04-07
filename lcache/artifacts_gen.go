@@ -135,7 +135,7 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Target
 // For hashing to work properly:
 //   - each hash must be preceded by its tar
 //   - support_files must be first then the other artifacts
-func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []ArtifactWithProducer) (map[string]*worker2.Group, map[string]*worker2.Sem) {
+func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *graph.Target, artsp []ArtifactWithProducer) (map[string]*worker2.Group, map[string]*worker2.Sem) {
 	arts := target.Artifacts
 
 	deps := map[string]*worker2.Group{}
@@ -146,7 +146,7 @@ func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []A
 
 	signals := map[string]*worker2.Sem{}
 	for _, artifact := range artsp {
-		wg := worker2.NewSemDep()
+		wg := worker2.NewSemDep(ctx)
 		wg.AddSem(1)
 		signals[artifact.Name()] = wg
 	}
@@ -205,7 +205,7 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 	allDeps := &worker2.Group{}
 
-	deps, signals := e.createDepsGenArtifacts(target, arts)
+	deps, signals := e.createDepsGenArtifacts(ctx, target, arts)
 
 	for _, artifact := range arts {
 		artifact := artifact

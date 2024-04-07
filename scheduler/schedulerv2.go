@@ -242,15 +242,6 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *gr
 		return nil, err
 	}
 
-	// TODO: figure out if thats really needed...
-	//children, err := s.Graph.DAG().GetChildren(target.Target)
-	//if err != nil {
-	//	return nil, err
-	//}
-	//
-	//for _, child := range children {
-	//	s.deps.Get(child.Addr).AddDep(j)
-	//}
 	s.targetSchedJobs.Set(target.Addr, j)
 
 	return j, nil
