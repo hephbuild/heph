@@ -35,6 +35,7 @@ func (e *schedulerv2) ScheduleTargetRun(ctx context.Context, rr targetrun.Reques
 
 			return nil
 		},
+		Requests: rr.Target.Requests,
 	})
 
 	return j, nil

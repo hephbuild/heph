@@ -31,6 +31,7 @@ require (
 	github.com/muesli/reflow v0.3.0
 	github.com/muesli/termenv v0.15.2
 	github.com/olekukonko/tablewriter v0.0.5
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
 	github.com/shirou/gopsutil/v3 v3.23.10
 	github.com/spf13/cobra v1.7.0
 	github.com/spf13/pflag v1.0.5

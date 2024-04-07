@@ -112,3 +112,22 @@ target(
         },
     },
 )
+
+reqdeps = []
+for i in range(0, 3):
+    t = target(
+        name = "req{}".format(i),
+        run = "sleep 2",
+        cache = False,
+        requests = {
+            "cpu": heph.num_cpu()
+        }
+    )
+    reqdeps.append(t)
+
+target(
+    name = "req",
+    run = "echo ran",
+    deps = reqdeps,
+    cache = False,
+)

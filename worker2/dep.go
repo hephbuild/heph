@@ -26,7 +26,7 @@ type Dep interface {
 	getExecution() *Execution
 	getMutex() sync.Locker
 	GetScheduler() Scheduler
-	GetRequest() map[string]int
+	GetRequest() map[string]float64
 }
 
 type baseDep struct {
@@ -138,7 +138,7 @@ type ActionConfig struct {
 	Deps      []Dep
 	Hooks     []Hook
 	Scheduler Scheduler
-	Requests  map[string]int
+	Requests  map[string]float64
 	Do        func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
@@ -149,7 +149,7 @@ type Action struct {
 	deps      *Deps
 	hooks     []Hook
 	scheduler Scheduler
-	requests  map[string]int
+	requests  map[string]float64
 	do        func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
@@ -157,7 +157,7 @@ func (a *Action) GetScheduler() Scheduler {
 	return a.scheduler
 }
 
-func (a *Action) GetRequest() map[string]int {
+func (a *Action) GetRequest() map[string]float64 {
 	return a.requests
 }
 
@@ -255,7 +255,7 @@ func (g *Group) DeepDo(f func(Dep)) {
 	deepDo(g, f)
 }
 
-func (g *Group) GetRequest() map[string]int {
+func (g *Group) GetRequest() map[string]float64 {
 	return nil
 }
 

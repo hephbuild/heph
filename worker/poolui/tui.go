@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/utils/xtime"
@@ -72,9 +73,20 @@ func (m *Model) updateMsg(final bool) UpdateMessage {
 
 	s := worker2.CollectStats(m.deps)
 	return UpdateMessage{
-		stats:   s,
-		workers: m.pool.GetWorkers(),
-		final:   final,
+		stats: s,
+		workers: ads.Filter(m.pool.GetWorkers(), func(worker *worker2.Worker) bool {
+			exec := worker.Execution()
+			if exec == nil {
+				return false
+			}
+
+			if _, ok := exec.Dep.(*worker2.Group); ok {
+				return false
+			}
+
+			return true
+		}),
+		final: final,
 	}
 }
 

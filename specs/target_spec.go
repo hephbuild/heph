@@ -135,6 +135,7 @@ type Target struct {
 	Timeout             time.Duration
 	GenDepsMeta         bool
 	Annotations         map[string]interface{}
+	Requests            map[string]float64
 }
 
 func (t Target) MarshalJSON() ([]byte, error) {

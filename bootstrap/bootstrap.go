@@ -24,8 +24,10 @@ import (
 	"github.com/hephbuild/heph/upgrade"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/worker2"
+	"github.com/pbnjay/memory"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -140,6 +142,15 @@ type Bootstrap struct {
 	PlatformProviders []platform.PlatformProvider
 }
 
+func DefaultScheduler() *worker2.ResourceScheduler {
+	return worker2.NewResourceScheduler(map[string]float64{
+		"cpu": float64(runtime.NumCPU()),
+		"mem": float64(memory.TotalMemory()),
+	}, map[string]float64{
+		"cpu": float64(1),
+	})
+}
+
 func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	bs := Bootstrap{}
 
@@ -183,7 +194,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	pool := opts.Pool
 	if pool == nil {
 		pool = worker2.NewEngine()
-		pool.SetDefaultScheduler(worker2.NewLimitScheduler(opts.Workers))
+		pool.SetDefaultScheduler(DefaultScheduler())
 		go pool.Run()
 	}
 	bs.Pool = pool
