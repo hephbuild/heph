@@ -106,7 +106,7 @@ func logUI(name string, deps worker2.Dep, pool *worker2.Engine) error {
 			if c >= 5 {
 				c = 1
 				printWorkersStatus()
-				printWhatItsWaitingOn(deps, "")
+				//printWhatItsWaitingOn(deps, "")
 			}
 			c++
 			continue

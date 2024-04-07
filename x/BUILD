@@ -47,7 +47,8 @@ done
 waitfail = target(
     name = "wait-fail",
     run = """
-    sleep 5
+    echo will fail...
+    sleep 1
     exit 1
     """,
     cache = False,
