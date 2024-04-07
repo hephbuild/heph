@@ -12,15 +12,11 @@ func s(s string) string {
 }
 
 func TestLink(t *testing.T) {
-	d1 := &Action{name: "1", deps: NewDeps()}
-	d2 := &Action{name: "2", deps: NewDeps(d1)}
+	d1 := NewAction(ActionConfig{Name: "1"})
+	d2 := NewAction(ActionConfig{Name: "2", Deps: []Dep{d1}})
 
-	d3 := &Action{name: "3", deps: NewDeps()}
-	d4 := &Action{name: "4", deps: NewDeps(d3)}
-
-	for _, d := range []*Action{d1, d2, d3, d4} {
-		d.LinkDeps()
-	}
+	d3 := NewAction(ActionConfig{Name: "3"})
+	d4 := NewAction(ActionConfig{Name: "4", Deps: []Dep{d3}})
 
 	assertDetached := func() {
 		assert.Equal(t, s(`
@@ -98,9 +94,9 @@ func TestLink(t *testing.T) {
 }
 
 func TestCycle1(t *testing.T) {
-	d1 := &Action{name: "1", deps: NewDeps()}
-	d2 := &Action{name: "2", deps: NewDeps(d1)}
-	d3 := &Action{name: "3", deps: NewDeps(d2)}
+	d1 := NewAction(ActionConfig{Name: "1"})
+	d2 := NewAction(ActionConfig{Name: "2", Deps: []Dep{d1}})
+	d3 := NewAction(ActionConfig{Name: "3", Deps: []Dep{d2}})
 
 	assert.PanicsWithValue(t, "cycle", func() {
 		d2.AddDep(d3)
@@ -108,11 +104,11 @@ func TestCycle1(t *testing.T) {
 }
 
 func TestCycle2(t *testing.T) {
-	d1 := &Action{name: "1", deps: NewDeps( /* d4 */ )}
-	d2 := &Action{name: "2", deps: NewDeps(d1)}
+	d1 := NewAction(ActionConfig{Name: "1", Deps: []Dep{ /* d4 */ }})
+	d2 := NewAction(ActionConfig{Name: "2", Deps: []Dep{d1}})
 
-	d3 := &Action{name: "3", deps: NewDeps()}
-	d4 := &Action{name: "4", deps: NewDeps(d3)}
+	d3 := NewAction(ActionConfig{Name: "3"})
+	d4 := NewAction(ActionConfig{Name: "4", Deps: []Dep{d3}})
 
 	d1.AddDep(d4)
 
@@ -122,23 +118,19 @@ func TestCycle2(t *testing.T) {
 }
 
 func TestRemoveStress(t *testing.T) {
-	root := &Action{name: "root", deps: NewDeps()}
-	root.LinkDeps()
+	root := NewAction(ActionConfig{Name: "root", Deps: []Dep{}})
 
 	for i := 0; i < 1000; i++ {
-		d := &Action{name: fmt.Sprint(i)}
-		d.LinkDeps()
+		d := NewAction(ActionConfig{Name: fmt.Sprint(i)})
 		root.AddDep(d)
 
 		for j := 0; j < 1000; j++ {
-			d1 := &Action{name: fmt.Sprintf("%v-%v", i, j)}
-			d1.LinkDeps()
+			d1 := NewAction(ActionConfig{Name: fmt.Sprintf("%v-%v", i, j)})
 			d.AddDep(d1)
 		}
 	}
 
-	group := &Action{name: "group", deps: NewDeps(root)}
-	group.LinkDeps()
+	group := NewAction(ActionConfig{Name: "group", Deps: []Dep{root}})
 
 	group.GetDepsObj().Remove(root)
 }

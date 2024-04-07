@@ -5,8 +5,8 @@ type EventDeclared struct {
 }
 
 func NewAction(cfg ActionConfig) *Action {
-	a := &Action{}
-	_ = a.GetDepsObj()
+	a := &Action{deps: NewDeps()}
+	a.deps.setOwner(a)
 
 	a.name = cfg.Name
 	a.ctx = cfg.Ctx
