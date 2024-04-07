@@ -285,7 +285,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 			Ctx:   ctx,
 			Hooks: []worker2.Hook{tracker.Hook()},
 			// We need to make sure to wait for the lock to be released before proceeding
-			Deps: []worker2.Dep{worker2.NewChanDep(completedCh)},
+			Deps: []worker2.Dep{worker2.NewChanDep(ctx, completedCh)},
 			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 				locked, err := rtarget.SandboxLock.TryLock(ctx)
 				if err != nil {

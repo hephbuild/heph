@@ -14,7 +14,6 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker2"
 	"path/filepath"
-	"runtime"
 	"time"
 )
 
@@ -165,74 +164,68 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 
 	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
-	chunks := ads.Chunk(files, runtime.NumCPU())
+	opts := hbuiltin.Bootstrap(hbuiltin.Opts{
+		Pkgs:   e.Packages,
+		Root:   e.Root,
+		Config: e.Config,
+		RegisterTarget: func(spec specs.Target) error {
+			for _, entry := range matchers {
+				addrMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+					return specs.IsAddrMatcher(m)
+				})
 
-	for i, files := range chunks {
-		files := files
+				addrMatch := ads.Some(addrMatchers, func(m specs.Matcher) bool {
+					return m.Match(spec)
+				})
 
+				if !addrMatch {
+					return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
+				}
+
+				labelMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+					return specs.IsLabelMatcher(m)
+				})
+
+				for _, label := range spec.Labels {
+					labelMatch := ads.Some(labelMatchers, func(m specs.Matcher) bool {
+						return m.(specs.StringMatcher).MatchString(label)
+					})
+
+					if !labelMatch {
+						return fmt.Errorf("label `%v` doest match any gen pattern of %v: %v", label, entry.addr, entry.matchers)
+					}
+				}
+			}
+
+			spec.GenSources = []string{target.Addr}
+
+			t, err := e.Graph.Register(spec)
+			if err != nil {
+				return err
+			}
+
+			targets.Add(t)
+			return nil
+		},
+	})
+
+	for _, file := range files {
 		j := worker2.NewAction(worker2.ActionConfig{
-			Name:  fmt.Sprintf("rungen %v chunk %v", target.Addr, i),
+			Name:  fmt.Sprintf("rungen %v file %v", target.Addr, file.RelRoot()),
 			Ctx:   ctx,
 			Hooks: []worker2.Hook{e.tracker.Hook()},
 			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-				opts := hbuiltin.Bootstrap(hbuiltin.Opts{
-					Pkgs:   e.Packages,
-					Root:   e.Root,
-					Config: e.Config,
-					RegisterTarget: func(spec specs.Target) error {
-						for _, entry := range matchers {
-							addrMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
-								return specs.IsAddrMatcher(m)
-							})
+				status.Emit(ctx, status.String(fmt.Sprintf("Running %v", file.RelRoot())))
 
-							addrMatch := ads.Some(addrMatchers, func(m specs.Matcher) bool {
-								return m.Match(spec)
-							})
-
-							if !addrMatch {
-								return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
-							}
-
-							labelMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
-								return specs.IsLabelMatcher(m)
-							})
-
-							for _, label := range spec.Labels {
-								labelMatch := ads.Some(labelMatchers, func(m specs.Matcher) bool {
-									return m.(specs.StringMatcher).MatchString(label)
-								})
-
-								if !labelMatch {
-									return fmt.Errorf("label `%v` doest match any gen pattern of %v: %v", label, entry.addr, entry.matchers)
-								}
-							}
-						}
-
-						spec.GenSources = []string{target.Addr}
-
-						t, err := e.Graph.Register(spec)
-						if err != nil {
-							return err
-						}
-
-						targets.Add(t)
-						return nil
-					},
+				ppath := filepath.Dir(file.RelRoot())
+				pkg := e.Packages.GetOrCreate(packages.Package{
+					Path: ppath,
+					Root: xfs.NewPath(e.Root.Root.Abs(), ppath),
 				})
 
-				for _, file := range files {
-					status.Emit(ctx, status.String(fmt.Sprintf("Running %v", file.RelRoot())))
-
-					ppath := filepath.Dir(file.RelRoot())
-					pkg := e.Packages.GetOrCreate(packages.Package{
-						Path: ppath,
-						Root: xfs.NewPath(e.Root.Root.Abs(), ppath),
-					})
-
-					err := e.BuildFilesState.RunBuildFile(pkg, file.Abs(), opts)
-					if err != nil {
-						return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
-					}
+				err := e.BuildFilesState.RunBuildFile(pkg, file.Abs(), opts)
+				if err != nil {
+					return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
 				}
 
 				return nil

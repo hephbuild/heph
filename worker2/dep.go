@@ -308,25 +308,27 @@ func Serial(deps []Dep) Dep {
 	return out
 }
 
-func NewChanDep[T any](ch chan T) Dep {
-	return &Action{
-		do: func(ctx context.Context, ins InStore, outs OutStore) error {
+func NewChanDep[T any](ctx context.Context, ch chan T) Dep {
+	return NewAction(ActionConfig{
+		Ctx: ctx,
+		Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 			return WaitChan(ctx, ch)
 		},
-	}
+	})
 }
 
-func NewSemDep() *Sem {
+func NewSemDep(ctx context.Context) *Sem {
 	wg := &sync.WaitGroup{}
 	return &Sem{
-		Dep: &Action{
-			do: func(ctx context.Context, ins InStore, outs OutStore) error {
+		Dep: NewAction(ActionConfig{
+			Ctx: ctx,
+			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				Wait(ctx, func() {
 					wg.Wait()
 				})
 				return nil
 			},
-		},
+		}),
 		wg: wg,
 	}
 }
