@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xtypes"
 	"strings"
 	"sync"
 )
@@ -96,7 +97,6 @@ func (d *Deps) flattenNamed(deps []Dep) []Dep {
 	}
 	return fdeps
 }
-
 func (d *Deps) Add(deps ...Dep) {
 	d.m.Lock()
 	defer d.m.Unlock()
@@ -106,7 +106,7 @@ func (d *Deps) Add(deps ...Dep) {
 	}
 
 	for _, dep := range deps {
-		if dep == nil {
+		if xtypes.IsNil(dep) {
 			continue
 		}
 		if !d.has(dep) {

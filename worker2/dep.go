@@ -200,10 +200,6 @@ func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 }
 
 func (a *Action) GetDepsObj() *Deps {
-	if a.deps == nil {
-		a.deps = NewDeps()
-	}
-	a.deps.setOwner(a)
 	return a.deps
 }
 
@@ -213,12 +209,6 @@ func (a *Action) AddDep(deps ...Dep) {
 
 func (a *Action) DeepDo(f func(Dep)) {
 	deepDo(a, f)
-}
-
-func (a *Action) LinkDeps() {
-	for _, dep := range a.GetDepsObj().TransitiveDependencies() {
-		_ = dep.GetDepsObj()
-	}
 }
 
 type GroupConfig struct {
@@ -238,17 +228,7 @@ func (g *Group) GetName() string {
 	return g.name
 }
 
-func (g *Group) LinkDeps() {
-	for _, dep := range g.GetDepsObj().TransitiveDependencies() {
-		_ = dep.GetDepsObj()
-	}
-}
-
 func (g *Group) GetDepsObj() *Deps {
-	if g.deps == nil {
-		g.deps = NewDeps()
-	}
-	g.deps.setOwner(g)
 	return g.deps
 }
 

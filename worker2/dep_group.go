@@ -5,8 +5,8 @@ func NewGroup(deps ...Dep) *Group {
 }
 
 func NewGroupWith(cfg GroupConfig) *Group {
-	g := &Group{}
-	_ = g.GetDepsObj()
+	g := &Group{deps: NewDeps()}
+	g.deps.setOwner(g)
 
 	g.name = cfg.Name
 	g.AddDep(cfg.Deps...)
