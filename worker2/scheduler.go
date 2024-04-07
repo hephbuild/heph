@@ -1,8 +1,10 @@
 package worker2
 
 import (
-	"golang.org/x/exp/slices"
+	"fmt"
+	"maps"
 	"sync"
+	"time"
 )
 
 type Scheduler interface {
@@ -10,9 +12,7 @@ type Scheduler interface {
 	Done(Dep)
 }
 
-type UnlimitedScheduler struct {
-	ch chan struct{}
-}
+type UnlimitedScheduler struct{}
 
 func (ls UnlimitedScheduler) Schedule(d Dep, ins InStore) error {
 	return nil
@@ -43,51 +43,102 @@ func (ls *LimitScheduler) Done(d Dep) {
 	<-ls.ch
 }
 
-type RunningTracker struct {
-	deps []Dep
-	m    sync.RWMutex
-}
+func NewResourceScheduler(limits map[string]int) *ResourceScheduler {
+	inuse := map[string]int{}
+	for k := range limits {
+		inuse[k] = 0
+	}
 
-func (t *RunningTracker) Deps() []Dep {
-	t.m.RLock()
-	defer t.m.RUnlock()
-
-	return t.deps[:]
-}
-
-func (t *RunningTracker) Scheduler(s Scheduler) Scheduler {
-	return trackerScheduler{
-		t: t,
-		s: s,
+	return &ResourceScheduler{
+		signal:   make(chan struct{}, 1),
+		limits:   limits,
+		inuse:    inuse,
+		sessions: map[Dep]map[string]int{},
 	}
 }
 
-type trackerScheduler struct {
-	t *RunningTracker
-	s Scheduler
+type ResourceScheduler struct {
+	m        sync.Mutex
+	signal   chan struct{}
+	limits   map[string]int
+	inuse    map[string]int
+	sessions map[Dep]map[string]int
 }
 
-func (t trackerScheduler) Schedule(d Dep, ins InStore) error {
-	err := t.s.Schedule(d, ins)
-	if err != nil {
-		return err
+func (ls *ResourceScheduler) next() {
+	select {
+	case ls.signal <- struct{}{}:
+	default:
+	}
+}
+
+func (ls *ResourceScheduler) trySchedule(d Dep, request map[string]int) bool {
+	ls.m.Lock()
+	defer ls.m.Unlock()
+
+	for k, v := range request {
+		if ls.inuse[k]+v > ls.limits[k] {
+			return false
+		}
 	}
 
-	t.t.m.Lock()
-	defer t.t.m.Unlock()
+	for k, v := range request {
+		ls.inuse[k] += v
+	}
 
-	t.t.deps = append(t.t.deps, d)
+	ls.sessions[d] = maps.Clone(request)
 
-	return nil
+	return true
 }
 
-func (t trackerScheduler) Done(d Dep) {
-	t.t.m.Lock()
-	defer t.t.m.Unlock()
+func (ls *ResourceScheduler) Schedule(d Dep, ins InStore) error {
+	request := d.GetRequest()
 
-	t.t.deps = slices.DeleteFunc(t.t.deps, func(dep Dep) bool {
-		return dep == d
-	})
+	if len(request) == 0 {
+		return nil
+	}
 
-	t.s.Done(d)
+	for k, rv := range request {
+		lv, ok := ls.limits[k]
+		if !ok {
+			return fmt.Errorf("unknown resource: %v", k)
+		}
+
+		if rv > lv {
+			return fmt.Errorf("requesting more resource than available, request %v got %v", rv, lv)
+		}
+	}
+
+	// immediately try to schedule
+	retry := time.After(0)
+
+	for {
+		select {
+		case <-d.GetCtx().Done():
+			return d.GetCtx().Err()
+		case <-retry:
+		case <-ls.signal:
+		}
+
+		success := ls.trySchedule(d, request)
+		if success {
+			return nil
+		}
+		retry = time.After(100 * time.Millisecond)
+	}
+}
+
+func (ls *ResourceScheduler) Done(d Dep) {
+	ls.m.Lock()
+	defer ls.m.Unlock()
+
+	s := ls.sessions[d]
+
+	for k, v := range s {
+		ls.inuse[k] -= v
+	}
+
+	delete(ls.sessions, d)
+
+	ls.next()
 }

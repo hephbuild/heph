@@ -23,7 +23,7 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/upgrade"
 	"github.com/hephbuild/heph/utils/finalizers"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,7 +64,7 @@ type BootOpts struct {
 	Summary               bool
 	JaegerEndpoint        string
 	DisableCloudTelemetry bool
-	Pool                  *worker.Pool
+	Pool                  *worker2.Engine
 
 	PostBootBase func(bs BaseBootstrap) error
 
@@ -133,7 +133,7 @@ type Bootstrap struct {
 	Observability     *observability.Observability
 	Cloud             Cloud
 	Summary           *obsummary.Summary
-	Pool              *worker.Pool
+	Pool              *worker2.Engine
 	Packages          *packages.Registry
 	BuildFiles        *buildfiles.State
 	Graph             *graph.State
@@ -182,7 +182,9 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 
 	pool := opts.Pool
 	if pool == nil {
-		pool = worker.NewPool(opts.Workers)
+		pool = worker2.NewEngine()
+		pool.SetDefaultScheduler(worker2.NewLimitScheduler(opts.Workers))
+		go pool.Run()
 	}
 	bs.Pool = pool
 

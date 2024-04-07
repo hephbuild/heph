@@ -8,8 +8,6 @@ import (
 	"sync"
 )
 
-type DepHook = func(dep Dep)
-
 func NewDeps(deps ...Dep) *Deps {
 	return newDeps(deps)
 }
@@ -36,9 +34,6 @@ type Deps struct {
 }
 
 func (d *Deps) setOwner(dep Dep) {
-	d.m.Lock()
-	defer d.m.Unlock()
-
 	if d.owner != nil && d.owner != dep {
 		panic("deps owner is already set")
 	}
@@ -58,7 +53,7 @@ func (d *Deps) Freeze() {
 	}
 
 	for _, dep := range d.deps.Slice() {
-		if !dep.IsFrozen() {
+		if !dep.GetDepsObj().IsFrozen() {
 			panic("attempting to freeze while all deps aren't frozen")
 		}
 	}
@@ -87,6 +82,13 @@ func (d *Deps) TransitiveDependencies() []Dep {
 	return d.transitiveDeps.Slice()
 }
 
+func (d *Deps) TransitiveDependees() []*Deps {
+	d.m.RLock()
+	defer d.m.RUnlock()
+
+	return d.transitiveDependees.Slice()
+}
+
 func (d *Deps) flattenNamed(deps []Dep) []Dep {
 	fdeps := ads.Copy(deps)
 	for i, tdep := range deps {
@@ -100,12 +102,18 @@ func (d *Deps) Add(deps ...Dep) {
 	defer d.m.Unlock()
 
 	if d.frozen {
-		d.m.Unlock()
-		panic("deps is frozen")
+		panic("add: deps is frozen")
 	}
 
 	for _, dep := range deps {
+		if dep == nil {
+			continue
+		}
 		if !d.has(dep) {
+			if dep.GetDepsObj().transitiveDeps.Has(d.owner) {
+				panic("cycle")
+			}
+
 			d.deps.Add(dep)
 			d.transitiveDeps.Add(dep)
 			d.transitiveDeps.AddAll(d.flattenNamed(dep.GetDepsObj().transitiveDeps.Slice()))
@@ -117,21 +125,74 @@ func (d *Deps) Add(deps ...Dep) {
 		}
 
 		{
-			dep := dep.GetDepsObj()
+			depObj := dep.GetDepsObj()
 
-			if !dep.hasDependee(d) {
-				dep.dependees.Add(d)
+			if !depObj.hasDependee(d) {
+				depObj.dependees.Add(d)
 
-				for _, dep := range dep.transitiveDeps.Slice() {
-					dep.GetDepsObj().transitiveDependees.AddAll(d.transitiveDependees.Slice())
-					dep.GetDepsObj().transitiveDependees.Add(d)
+				for _, dep := range depObj.transitiveDeps.Slice() {
+					depObj := dep.GetDepsObj()
+					depObj.transitiveDependees.AddAll(d.transitiveDependees.Slice())
+					depObj.transitiveDependees.Add(d)
 				}
 
-				dep.transitiveDependees.AddAll(d.transitiveDependees.Slice())
-				dep.transitiveDependees.Add(d)
+				depObj.transitiveDependees.AddAll(d.transitiveDependees.Slice())
+				depObj.transitiveDependees.Add(d)
 			}
 		}
 	}
+}
+
+// Remove is quite a cold path, expected to be used only to track currently running actions
+func (d *Deps) Remove(dep Dep) {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	if d.frozen {
+		panic("remove: deps is frozen")
+	}
+
+	if d.has(dep) {
+		d.deps.Remove(dep)
+		d.transitiveDeps = d.computeTransitiveDeps()
+
+		for _, dependee := range d.transitiveDependees.Slice() {
+			dependee.m.Lock()
+			dependee.transitiveDeps = dependee.computeTransitiveDeps()
+			dependee.m.Unlock()
+		}
+	}
+
+	depObj := dep.GetDepsObj()
+
+	if depObj.hasDependee(d) {
+		depObj.m.Lock()
+		depObj.dependees.Remove(d)
+		depObj.transitiveDependees = depObj.computeTransitiveDependees()
+
+		for _, dep := range depObj.transitiveDeps.Slice() {
+			dep.GetDepsObj().transitiveDependees = dep.GetDepsObj().computeTransitiveDependees()
+		}
+		depObj.m.Unlock()
+	}
+}
+
+func (d *Deps) computeTransitiveDeps() *sets.Set[Dep, Dep] {
+	s := sets.NewIdentitySet[Dep](0)
+	for _, dep := range d.deps.Slice() {
+		s.Add(dep)
+		s.AddAll(d.flattenNamed(dep.GetDepsObj().transitiveDeps.Slice()))
+	}
+	return s
+}
+
+func (d *Deps) computeTransitiveDependees() *sets.Set[*Deps, *Deps] {
+	s := sets.NewIdentitySet[*Deps](0)
+	for _, dep := range d.dependees.Slice() {
+		s.Add(dep)
+		s.AddAll(dep.transitiveDependees.Slice())
+	}
+	return s
 }
 
 func (d *Deps) has(dep Dep) bool {
@@ -144,21 +205,17 @@ func (d *Deps) hasDependee(dep *Deps) bool {
 
 func (d *Deps) DebugString() string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%v:\n", d.owner.GetID())
-	deps := ads.Map(d.deps.Slice(), func(d Dep) string {
-		return d.GetID()
-	})
-	tdeps := ads.Map(d.transitiveDeps.Slice(), func(d Dep) string {
-		return d.GetID()
-	})
+	fmt.Fprintf(&sb, "%v:\n", d.owner.GetName())
+	deps := ads.Map(d.deps.Slice(), Dep.GetName)
+	tdeps := ads.Map(d.transitiveDeps.Slice(), Dep.GetName)
 	fmt.Fprintf(&sb, "  deps: %v\n", deps)
 	fmt.Fprintf(&sb, "  tdeps: %v\n", tdeps)
 
 	depdees := ads.Map(d.dependees.Slice(), func(d *Deps) string {
-		return d.owner.GetID()
+		return d.owner.GetName()
 	})
 	tdepdees := ads.Map(d.transitiveDependees.Slice(), func(d *Deps) string {
-		return d.owner.GetID()
+		return d.owner.GetName()
 	})
 	fmt.Fprintf(&sb, "  depdees: %v\n", depdees)
 	fmt.Fprintf(&sb, "  tdepdees: %v\n", tdepdees)

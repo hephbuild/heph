@@ -1,14 +1,15 @@
 package worker2
 
+import "time"
+
 type Event any
 
 type WithExecution interface {
 	getExecution() *Execution
 }
 
-type EventTryExecuteOne struct{}
-
 type EventCompleted struct {
+	At        time.Time
 	Execution *Execution
 	Output    Value
 	Error     error
@@ -19,6 +20,7 @@ func (e EventCompleted) getExecution() *Execution {
 }
 
 type EventScheduled struct {
+	At        time.Time
 	Execution *Execution
 }
 
@@ -26,7 +28,17 @@ func (e EventScheduled) getExecution() *Execution {
 	return e.Execution
 }
 
+type EventQueued struct {
+	At        time.Time
+	Execution *Execution
+}
+
+func (e EventQueued) getExecution() *Execution {
+	return e.Execution
+}
+
 type EventStarted struct {
+	At        time.Time
 	Execution *Execution
 }
 
@@ -35,7 +47,9 @@ func (e EventStarted) getExecution() *Execution {
 }
 
 type EventSkipped struct {
+	At        time.Time
 	Execution *Execution
+	Error     error
 }
 
 func (e EventSkipped) getExecution() *Execution {
@@ -43,6 +57,7 @@ func (e EventSkipped) getExecution() *Execution {
 }
 
 type EventReady struct {
+	At        time.Time
 	Execution *Execution
 }
 
@@ -51,6 +66,7 @@ func (e EventReady) getExecution() *Execution {
 }
 
 type EventSuspended struct {
+	At        time.Time
 	Execution *Execution
 }
 

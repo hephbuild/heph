@@ -2,13 +2,13 @@ package poolwait
 
 import (
 	"context"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 )
 
 type keyFgWaitGroup struct{}
 
-func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *worker.WaitGroup) {
-	deps := &worker.WaitGroup{}
+func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *worker2.Sem) {
+	deps := worker2.NewSemDep()
 	ctx = context.WithValue(ctx, keyFgWaitGroup{}, deps)
 
 	return ctx, deps
@@ -16,27 +16,19 @@ func ContextWithForegroundWaitGroup(ctx context.Context) (context.Context, *work
 
 // GCWaitGroup allows to depend on other Job/Worker without keeping them in memory, allowing GC to work
 type GCWaitGroup struct {
-	Deps *worker.WaitGroup
+	Deps *worker2.Group
 }
 
-func (wwg *GCWaitGroup) Add(j *worker.Job) {
-	wwg.Deps.Add(j)
+func (wwg *GCWaitGroup) AddDep(j worker2.Dep) {
+	wwg.Deps.AddDep(j)
 	go func() {
 		<-j.Wait()
-		wwg.Deps.Remove(j)
-	}()
-}
-
-func (wwg *GCWaitGroup) AddChild(wg *worker.WaitGroup) {
-	wwg.Deps.AddChild(wg)
-	go func() {
-		<-wg.Done()
-		wwg.Deps.RemoveChild(wg)
+		wwg.Deps.Deps.Remove(j)
 	}()
 }
 
 func ForegroundWaitGroup(ctx context.Context) *GCWaitGroup {
-	if deps, ok := ctx.Value(keyFgWaitGroup{}).(*worker.WaitGroup); ok {
+	if deps, ok := ctx.Value(keyFgWaitGroup{}).(*worker2.Group); ok {
 		return &GCWaitGroup{Deps: deps}
 	}
 
