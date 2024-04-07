@@ -14,6 +14,7 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"github.com/hephbuild/heph/utils/xsync"
+	"github.com/pbnjay/memory"
 	starlarkjson "go.starlark.net/lib/json"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
@@ -79,6 +80,8 @@ func predeclared_functions() starlark.StringDict {
 				"param":        starlark.NewBuiltin("heph.param", param),
 				"cache":        starlark.NewBuiltin("heph.cache", starlarkstruct.Make),
 				"target_spec":  starlark.NewBuiltin("heph.target_spec", starlarkstruct.Make),
+				"num_cpu":      starlark.NewBuiltin("heph.num_cpu", num_cpu),
+				"total_memory": starlark.NewBuiltin("heph.total_memory", total_memory),
 				//"normalize_target_name": starlark.NewBuiltin("heph.normalize_target_name", normalize_target_name),
 				//"normalize_pkg_name":    starlark.NewBuiltin("heph.normalize_target_name", normalize_pkg_name),
 				"pkg": &starlarkstruct.Module{
@@ -180,6 +183,7 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 		"timeout?", &sargs.Timeout,
 		"gen_deps_meta?", &sargs.GenDepsMeta,
 		"annotations?", &sargs.Annotations,
+		"requests?", &sargs.Requests,
 	); err != nil {
 		if sargs.Name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetAddr(sargs.Name), err)
@@ -389,6 +393,14 @@ func param(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, k
 	cfg := getOpts(thread).Config
 
 	return starlark.String(cfg.Params[name]), nil
+}
+
+func num_cpu(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.MakeInt(runtime.NumCPU()), nil
+}
+
+func total_memory(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
+	return starlark.MakeUint64(memory.TotalMemory()), nil
 }
 
 func path_base(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {

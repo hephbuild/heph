@@ -43,8 +43,8 @@ func (ls *LimitScheduler) Done(d Dep) {
 	<-ls.ch
 }
 
-func NewResourceScheduler(limits map[string]int) *ResourceScheduler {
-	inuse := map[string]int{}
+func NewResourceScheduler(limits map[string]float64, def map[string]float64) *ResourceScheduler {
+	inuse := map[string]float64{}
 	for k := range limits {
 		inuse[k] = 0
 	}
@@ -53,16 +53,18 @@ func NewResourceScheduler(limits map[string]int) *ResourceScheduler {
 		signal:   make(chan struct{}, 1),
 		limits:   limits,
 		inuse:    inuse,
-		sessions: map[Dep]map[string]int{},
+		sessions: map[Dep]map[string]float64{},
+		def:      def,
 	}
 }
 
 type ResourceScheduler struct {
 	m        sync.Mutex
 	signal   chan struct{}
-	limits   map[string]int
-	inuse    map[string]int
-	sessions map[Dep]map[string]int
+	limits   map[string]float64
+	inuse    map[string]float64
+	sessions map[Dep]map[string]float64
+	def      map[string]float64
 }
 
 func (ls *ResourceScheduler) next() {
@@ -72,7 +74,7 @@ func (ls *ResourceScheduler) next() {
 	}
 }
 
-func (ls *ResourceScheduler) trySchedule(d Dep, request map[string]int) bool {
+func (ls *ResourceScheduler) trySchedule(d Dep, request map[string]float64) bool {
 	ls.m.Lock()
 	defer ls.m.Unlock()
 
@@ -93,6 +95,10 @@ func (ls *ResourceScheduler) trySchedule(d Dep, request map[string]int) bool {
 
 func (ls *ResourceScheduler) Schedule(d Dep, ins InStore) error {
 	request := d.GetRequest()
+
+	if request == nil {
+		request = ls.def
+	}
 
 	if len(request) == 0 {
 		return nil

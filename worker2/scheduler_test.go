@@ -10,13 +10,13 @@ import (
 )
 
 func TestResourceScheduler(t *testing.T) {
-	s := NewResourceScheduler(map[string]int{
+	s := NewResourceScheduler(map[string]float64{
 		"cpu":    1000,
 		"memory": 4000,
-	})
+	}, nil)
 
 	d1 := NewAction(ActionConfig{
-		Requests: map[string]int{
+		Requests: map[string]float64{
 			"cpu": 100,
 		},
 	})
@@ -24,7 +24,7 @@ func TestResourceScheduler(t *testing.T) {
 	require.NoError(t, err)
 
 	d2 := NewAction(ActionConfig{
-		Requests: map[string]int{
+		Requests: map[string]float64{
 			"cpu": 100,
 		},
 	})
@@ -34,7 +34,7 @@ func TestResourceScheduler(t *testing.T) {
 	ctx, _ := context.WithTimeout(context.Background(), time.Second)
 	d3 := NewAction(ActionConfig{
 		Ctx: ctx,
-		Requests: map[string]int{
+		Requests: map[string]float64{
 			"cpu": 1000,
 		},
 	})
@@ -45,7 +45,7 @@ func TestResourceScheduler(t *testing.T) {
 	s.Done(d2)
 
 	d4 := NewAction(ActionConfig{
-		Requests: map[string]int{
+		Requests: map[string]float64{
 			"cpu": 1000,
 		},
 	})
@@ -54,9 +54,9 @@ func TestResourceScheduler(t *testing.T) {
 }
 
 func TestStressResourceScheduler(t *testing.T) {
-	s := NewResourceScheduler(map[string]int{
+	s := NewResourceScheduler(map[string]float64{
 		"cpu": 1000,
-	})
+	}, nil)
 
 	var wg sync.WaitGroup
 
@@ -64,8 +64,8 @@ func TestStressResourceScheduler(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			d := NewAction(ActionConfig{
-				Requests: map[string]int{
-					"cpu": rand.Intn(200),
+				Requests: map[string]float64{
+					"cpu": float64(rand.Intn(200)),
 				},
 			})
 			err := s.Schedule(d, nil)
