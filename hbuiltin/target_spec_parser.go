@@ -196,8 +196,8 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	}
 
 	t.Requests = map[string]float64{
-		"cpu": 1,
-		"mem": 100000000, // 1M
+		"cpu":    1,
+		"memory": 100000000, // 1M
 	}
 	for _, item := range args.Requests.Items() {
 		v, err := requestFromArg(item.Value)
