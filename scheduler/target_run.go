@@ -86,7 +86,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 
 	if len(writeableCaches) > 0 {
 		for _, cache := range writeableCaches {
-			_ = e.scheduleStoreExternalCache(ctx, rtarget.Target, cache, tracker)
+			_ = e.scheduleStoreExternalCache(ctx, rtarget.Target, cache, []*worker2.RunningTracker{tracker, e.BackgroundTracker})
 		}
 	}
 

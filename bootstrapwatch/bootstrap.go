@@ -89,7 +89,7 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 	}
 
 	pool := worker2.NewEngine()
-	pool.SetDefaultScheduler(bootstrap.DefaultScheduler())
+	pool.SetDefaultScheduler(bootstrap.DefaultScheduler(bootopts.Workers))
 	go pool.Run()
 	bootopts.Pool = pool
 

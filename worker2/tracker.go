@@ -31,6 +31,8 @@ func (t *RunningTracker) Hook() Hook {
 
 	return func(event Event) {
 		switch event := event.(type) {
+		case EventDeclared:
+			t.group.AddDep(event.Dep)
 		case EventScheduled:
 			t.group.AddDep(event.Execution.Dep)
 		case EventStarted:
