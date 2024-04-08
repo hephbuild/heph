@@ -143,8 +143,8 @@ type Bootstrap struct {
 
 func DefaultScheduler(cpu int) *worker2.ResourceScheduler {
 	return worker2.NewResourceScheduler(map[string]float64{
-		"cpu": float64(cpu),
-		"mem": float64(memory.TotalMemory()),
+		"cpu":    float64(cpu),
+		"memory": float64(memory.TotalMemory()),
 	}, map[string]float64{
 		"cpu": float64(1),
 	})
