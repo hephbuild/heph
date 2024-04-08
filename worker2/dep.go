@@ -24,7 +24,7 @@ type Dep interface {
 
 	setExecution(*Execution)
 	getExecution() *Execution
-	getMutex() sync.Locker
+	getMutex() *sync.RWMutex
 	GetScheduler() Scheduler
 	GetRequest() map[string]float64
 }
@@ -83,7 +83,7 @@ func (a *baseDep) Wait() <-chan struct{} {
 	return doneCh
 }
 
-func (a *baseDep) getMutex() sync.Locker {
+func (a *baseDep) getMutex() *sync.RWMutex {
 	return &a.m
 }
 

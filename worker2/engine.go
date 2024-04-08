@@ -312,8 +312,8 @@ func (e *Engine) Schedule(a Dep) Dep {
 func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 	dep = flattenNamed(dep)
 
+	m := dep.getMutex()
 	if lock {
-		m := dep.getMutex()
 		m.Lock()
 		defer m.Unlock()
 	}
@@ -322,15 +322,13 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 		return exec
 	}
 
-	// force deps registration
-	_ = dep.GetDepsObj()
-
 	exec := &Execution{
 		ID:          atomic.AddUint64(&e.execUid, 1),
 		Dep:         dep,
 		outStore:    &outStore{},
 		eventsCh:    e.eventsCh,
 		completedCh: make(chan struct{}),
+		m:           m,
 
 		// see field comments
 		errCh:  nil,
@@ -344,7 +342,7 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 			exec.c.L.Unlock()
 		})
 	}
-	exec.c = sync.NewCond(&exec.m)
+	exec.c = sync.NewCond(exec.m)
 	dep.setExecution(exec)
 
 	return exec

@@ -6,7 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/utils/xtime"
@@ -15,8 +15,14 @@ import (
 	"time"
 )
 
+type workerEntry struct {
+	status   status.Statuser
+	duration time.Duration
+	exec     *worker2.Execution
+}
+
 type UpdateMessage struct {
-	workers []*worker2.Worker
+	workers []workerEntry
 	stats   worker2.Stats
 	final   bool
 }
@@ -71,22 +77,38 @@ func (m *Model) updateMsg(final bool) UpdateMessage {
 		}
 	}
 
+	var workers []workerEntry
+	for _, w := range m.pool.GetWorkers() {
+		exec := w.Execution()
+		if exec == nil {
+			continue
+		}
+
+		if _, ok := exec.Dep.(*worker2.Group); ok {
+			continue
+		}
+
+		var duration time.Duration
+		if !exec.StartedAt.IsZero() {
+			duration = time.Since(exec.StartedAt)
+		}
+
+		if duration < 200*time.Millisecond {
+			continue
+		}
+
+		workers = append(workers, workerEntry{
+			status:   w.GetStatus(),
+			duration: duration,
+			exec:     exec,
+		})
+	}
+
 	s := worker2.CollectStats(m.deps)
 	return UpdateMessage{
-		stats: s,
-		workers: ads.Filter(m.pool.GetWorkers(), func(worker *worker2.Worker) bool {
-			exec := worker.Execution()
-			if exec == nil {
-				return false
-			}
-
-			if _, ok := exec.Dep.(*worker2.Group); ok {
-				return false
-			}
-
-			return true
-		}),
-		final: final,
+		stats:   s,
+		workers: workers,
+		final:   final,
 	}
 }
 
@@ -148,17 +170,14 @@ func (m *Model) View() string {
 	}
 
 	for _, w := range m.workers {
-		runtime := ""
-		if j := w.Execution(); j != nil {
-			runtime = fmt.Sprintf("=> [%5s]", xtime.FormatFixedWidthDuration(time.Since(j.StartedAt)))
+		runtime := fmt.Sprintf("=> [%5s]", xtime.FormatFixedWidthDuration(w.duration))
+
+		statusStr := w.status.String(log.Renderer())
+		if statusStr == "" {
+			statusStr = styleFaint.Render("=> Thinking...")
 		}
 
-		status := w.GetStatus().String(log.Renderer())
-		if status == "" {
-			status = styleFaint.Render("=|")
-		}
-
-		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), status))
+		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), statusStr))
 	}
 
 	return s.String()

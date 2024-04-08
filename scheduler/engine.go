@@ -21,20 +21,21 @@ import (
 )
 
 type Scheduler struct {
-	Cwd              string
-	Root             *hroot.State
-	Config           *config.Config
-	Observability    *observability.Observability
-	GetFlowID        func() string
-	LocalCache       *lcache.LocalCacheState
-	RemoteCache      *rcache.RemoteCache
-	RemoteCacheHints *rcache.HintStore
-	Packages         *packages.Registry
-	BuildFilesState  *buildfiles.State
-	Graph            *graph.State
-	Pool             *worker2.Engine
-	Finalizers       *finalizers.Finalizers
-	Runner           *targetrun.Runner
+	Cwd               string
+	Root              *hroot.State
+	Config            *config.Config
+	Observability     *observability.Observability
+	GetFlowID         func() string
+	LocalCache        *lcache.LocalCacheState
+	RemoteCache       *rcache.RemoteCache
+	RemoteCacheHints  *rcache.HintStore
+	Packages          *packages.Registry
+	BuildFilesState   *buildfiles.State
+	Graph             *graph.State
+	Pool              *worker2.Engine
+	BackgroundTracker *worker2.RunningTracker
+	Finalizers        *finalizers.Finalizers
+	Runner            *targetrun.Runner
 
 	toolsLock locks.Locker
 }

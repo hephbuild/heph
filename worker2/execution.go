@@ -63,7 +63,7 @@ type Execution struct {
 
 	errCh  chan error       // gets populated when exec is called
 	inputs map[string]Value // gets populated before marking as ready
-	m      sync.Mutex
+	m      *sync.RWMutex
 
 	suspendCh   chan struct{}
 	resumeCh    chan struct{}

@@ -27,7 +27,6 @@ import (
 	"github.com/pbnjay/memory"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -142,9 +141,9 @@ type Bootstrap struct {
 	PlatformProviders []platform.PlatformProvider
 }
 
-func DefaultScheduler() *worker2.ResourceScheduler {
+func DefaultScheduler(cpu int) *worker2.ResourceScheduler {
 	return worker2.NewResourceScheduler(map[string]float64{
-		"cpu": float64(runtime.NumCPU()),
+		"cpu": float64(cpu),
 		"mem": float64(memory.TotalMemory()),
 	}, map[string]float64{
 		"cpu": float64(1),
@@ -194,7 +193,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	pool := opts.Pool
 	if pool == nil {
 		pool = worker2.NewEngine()
-		pool.SetDefaultScheduler(DefaultScheduler())
+		pool.SetDefaultScheduler(DefaultScheduler(opts.Workers))
 		go pool.Run()
 	}
 	bs.Pool = pool
@@ -307,19 +306,20 @@ func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, err
 	}
 
 	e := scheduler.New(scheduler.Scheduler{
-		Cwd:             bs.Cwd,
-		Root:            bs.Root,
-		Config:          bs.Config,
-		Observability:   bs.Observability,
-		GetFlowID:       getFlowId,
-		LocalCache:      localCache,
-		RemoteCache:     remoteCache,
-		Packages:        bs.Packages,
-		BuildFilesState: bs.BuildFiles,
-		Graph:           bs.Graph,
-		Pool:            bs.Pool,
-		Finalizers:      fins,
-		Runner:          runner,
+		Cwd:               bs.Cwd,
+		Root:              bs.Root,
+		Config:            bs.Config,
+		Observability:     bs.Observability,
+		GetFlowID:         getFlowId,
+		LocalCache:        localCache,
+		RemoteCache:       remoteCache,
+		Packages:          bs.Packages,
+		BuildFilesState:   bs.BuildFiles,
+		Graph:             bs.Graph,
+		Pool:              bs.Pool,
+		BackgroundTracker: worker2.NewRunningTracker(),
+		Finalizers:        fins,
+		Runner:            runner,
 	})
 
 	bs.Finalizers.RegisterWithErr(func(err error) {

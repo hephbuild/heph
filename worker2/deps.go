@@ -55,7 +55,7 @@ func (d *Deps) Freeze() {
 
 	for _, dep := range d.deps.Slice() {
 		if !dep.GetDepsObj().IsFrozen() {
-			panic("attempting to freeze while all deps aren't frozen")
+			panic(fmt.Sprintf("attempting to freeze '%v' while all deps aren't frozen, '%v' isnt", d.owner.GetName(), dep.GetName()))
 		}
 	}
 
