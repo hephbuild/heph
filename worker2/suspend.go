@@ -60,3 +60,14 @@ func WaitChan[T any](ctx context.Context, ch <-chan T) error {
 		}
 	})
 }
+
+func WaitChanE[T error](ctx context.Context, ch <-chan T) error {
+	return WaitE(ctx, func() error {
+		select {
+		case err := <-ch:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}

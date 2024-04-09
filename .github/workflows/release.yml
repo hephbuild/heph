@@ -59,11 +59,11 @@ jobs:
           echo $VERSION
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Setup tmate session
-        if: ${{ failure() }}
-        run: |
-          curl -L https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz | tar -xJ --strip-components 1
-          ./tmate -F
+#      - name: Setup tmate session
+#        if: ${{ failure() }}
+#        run: |
+#          curl -L https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz | tar -xJ --strip-components 1
+#          ./tmate -F
 
   upload_gcs:
     name: Upload binaries

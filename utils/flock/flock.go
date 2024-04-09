@@ -1,7 +1,9 @@
 package flock
 
 import (
+	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
 )
@@ -57,4 +59,13 @@ func Flunlock(f *os.File) error {
 	}
 
 	return nil
+}
+
+func IsErrWouldBlock(err error) bool {
+	var errno unix.Errno
+	if ok := errors.As(err, &errno); ok && errno == unix.EWOULDBLOCK {
+		return true
+	}
+
+	return false
 }
