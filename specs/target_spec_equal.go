@@ -179,6 +179,14 @@ func (t Target) equalStruct(spec Target) bool {
 		return false
 	}
 
+	if !mapEqual(t.Annotations, t.Annotations) {
+		return false
+	}
+
+	if !mapEqual(t.Requests, t.Requests) {
+		return false
+	}
+
 	return true
 }
 

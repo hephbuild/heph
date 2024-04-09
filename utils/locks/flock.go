@@ -2,14 +2,12 @@ package locks
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	log "github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/flock"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker2"
-	"golang.org/x/sys/unix"
 	"os"
 	"strconv"
 	"sync"
@@ -63,8 +61,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	logger.Debugf("Attempting to acquire lock for %s...", f.Name())
 	err = flock.Flock(f, ro, false)
 	if err != nil {
-		var errno unix.Errno
-		if ok := errors.As(err, &errno); ok && errno == unix.EWOULDBLOCK {
+		if flock.IsErrWouldBlock(err) {
 			ok, err := onErr(f, ro)
 			if err != nil {
 				return false, fmt.Errorf("acquire lock for %s: %w", l.name, err)
@@ -153,14 +150,7 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 			lockCh <- flock.Flock(f, ro, true)
 		}()
 
-		err := worker2.WaitE(ctx, func() error {
-			select {
-			case err := <-lockCh:
-				return err
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
+		err := worker2.WaitChanE(ctx, lockCh)
 		if err != nil {
 			return false, err
 		}
