@@ -114,5 +114,9 @@ target(
     "Timeout": 0,
     "GenDepsMeta": false,
     "Annotations": {},
+    "Requests": {
+        "cpu": 1,
+        "memory": 100000000
+    },
     "Private": false
 }
