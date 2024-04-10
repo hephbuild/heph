@@ -10,7 +10,7 @@ import (
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 	"os"
 	"os/exec"
 )

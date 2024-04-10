@@ -18,7 +18,7 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 	"github.com/itchyny/gojq"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/slices"
