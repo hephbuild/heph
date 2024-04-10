@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")

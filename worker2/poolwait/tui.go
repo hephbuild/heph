@@ -3,8 +3,8 @@ package poolwait
 import (
 	"context"
 	"github.com/hephbuild/heph/utils/xtea"
-	"github.com/hephbuild/heph/worker/poolui"
 	"github.com/hephbuild/heph/worker2"
+	"github.com/hephbuild/heph/worker2/poolui"
 )
 
 func termUI(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engine) error {
