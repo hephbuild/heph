@@ -44,16 +44,8 @@ func (w *Worker) Run() {
 		w.exec.eventsCh <- EventSuspended{Execution: w.exec}
 
 		go func() {
-			select {
-			case <-ctx.Done():
-				w.exec.eventsCh <- EventCompleted{
-					Execution: w.exec,
-					Output:    w.exec.outStore.Get(),
-					Error:     ctx.Err(),
-				}
-			case <-w.exec.resumeCh:
-				w.queue()
-			}
+			<-w.exec.resumeCh
+			w.queue()
 		}()
 	} else {
 		w.exec.eventsCh <- EventCompleted{
