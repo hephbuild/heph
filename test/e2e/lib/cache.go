@@ -56,7 +56,7 @@ func ValidateCache(tgt string, outputs []string, fromRemote, compressed, uncompr
 	}
 	if len(outputs) > 0 {
 		expected = append(expected, "_output")
-		expected = append(expected, "_output_hash")
+		expected = append(expected, "_output_meta")
 	}
 	for _, output := range outputs {
 		expected = append(expected, "hash_out_"+output)
