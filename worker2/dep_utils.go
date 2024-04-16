@@ -22,40 +22,44 @@ type Stats struct {
 	Running   uint64
 }
 
-func CollectStats(a Dep) Stats {
+func (s *Stats) record(dep Dep) {
+	atomic.AddUint64(&s.All, 1)
+
+	j := dep.getExecution()
+	if j == nil {
+		return
+	}
+
+	if j.State.IsFinal() {
+		atomic.AddUint64(&s.Completed, 1)
+	}
+
+	switch j.State {
+	case ExecStateQueued:
+		atomic.AddUint64(&s.Waiting, 1)
+	case ExecStateSucceeded:
+		atomic.AddUint64(&s.Succeeded, 1)
+	case ExecStateFailed:
+		atomic.AddUint64(&s.Failed, 1)
+	case ExecStateSkipped:
+		atomic.AddUint64(&s.Skipped, 1)
+	case ExecStateSuspended:
+		atomic.AddUint64(&s.Suspended, 1)
+	case ExecStateRunning:
+		atomic.AddUint64(&s.Running, 1)
+	case ExecStateScheduled:
+		atomic.AddUint64(&s.Scheduled, 1)
+	}
+}
+
+func CollectStats(dep Dep) Stats {
 	s := Stats{}
-	a.DeepDo(func(dep Dep) {
+	dep.DeepDo(func(dep Dep) {
 		if _, ok := dep.(*Group); ok {
 			return
 		}
 
-		atomic.AddUint64(&s.All, 1)
-
-		j := dep.getExecution()
-		if j == nil {
-			return
-		}
-
-		if j.State.IsFinal() {
-			atomic.AddUint64(&s.Completed, 1)
-		}
-
-		switch j.State {
-		case ExecStateQueued:
-			atomic.AddUint64(&s.Waiting, 1)
-		case ExecStateSucceeded:
-			atomic.AddUint64(&s.Succeeded, 1)
-		case ExecStateFailed:
-			atomic.AddUint64(&s.Failed, 1)
-		case ExecStateSkipped:
-			atomic.AddUint64(&s.Skipped, 1)
-		case ExecStateSuspended:
-			atomic.AddUint64(&s.Suspended, 1)
-		case ExecStateRunning:
-			atomic.AddUint64(&s.Running, 1)
-		case ExecStateScheduled:
-			atomic.AddUint64(&s.Scheduled, 1)
-		}
+		s.record(dep)
 	})
 
 	return s

@@ -97,6 +97,7 @@ func (d *Deps) flattenNamed(deps []Dep) []Dep {
 	}
 	return fdeps
 }
+
 func (d *Deps) Add(deps ...Dep) {
 	d.m.Lock()
 	defer d.m.Unlock()

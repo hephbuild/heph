@@ -294,6 +294,10 @@ func (e *Engine) Wait() <-chan struct{} {
 func (e *Engine) executionForDep(dep Dep) *Execution {
 	dep = flattenNamed(dep)
 
+	if exec := dep.getExecution(); exec != nil {
+		return exec
+	}
+
 	return e.registerOne(dep, true)
 }
 

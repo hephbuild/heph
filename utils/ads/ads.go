@@ -57,6 +57,16 @@ func ContainsAny[T comparable](a []T, e []T) bool {
 	return false
 }
 
+func ContainsAll[T comparable](a []T, e []T) bool {
+	for _, ee := range e {
+		if !Contains(a, ee) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func Filter[S ~[]E, E any](a S, f func(E) bool) S {
 	o := a
 	alloc := false
