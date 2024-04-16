@@ -40,10 +40,6 @@ type Scheduler struct {
 	toolsLock locks.Locker
 }
 
-func (e *Scheduler) TrackScheduler() worker2.Scheduler {
-	return nil
-}
-
 func New(e Scheduler) *Scheduler {
 	e.toolsLock = locks.NewFlock("Tools", e.Root.Tmp.Join("tools.lock").Abs())
 	return &e

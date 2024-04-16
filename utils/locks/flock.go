@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func NewFlock(name, p string) RWLocker {
+func NewFlock(name, p string) *Flock {
 	if name == "" || log.Default().IsLevelEnabled(log.DebugLevel) {
 		name = p
 	}
