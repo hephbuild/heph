@@ -141,7 +141,7 @@ func Cancel(ctx context.Context) {
 func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	sc := newSoftCancelState()
@@ -160,13 +160,12 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 			}()
 			select {
 			case <-sigCh:
-			case <-time.After(5 * time.Second):
 			}
 			log.Warnf("Forcing cancellation...")
 			hardCanceled = true
 			sc.hardCancel()
 			select {
-			// Wait for soft cancel to all be unregistered, should be instant, unless something is stuck
+			// Wait for soft cancel to all be unregistered, should be fast, unless something is stuck
 			case <-sc.wait():
 				// Wait for graceful exit
 				<-time.After(2 * time.Second)
