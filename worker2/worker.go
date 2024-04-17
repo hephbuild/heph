@@ -40,11 +40,12 @@ func (w *Worker) Run() {
 	w.status = nil
 	w.exec.scheduler.Done(w.exec.Dep)
 
-	if errors.Is(err, ErrSuspended) {
+	var errSuspend ErrSuspended
+	if errors.As(err, &errSuspend) {
 		w.exec.eventsCh <- EventSuspended{Execution: w.exec}
 
 		go func() {
-			<-w.exec.resumeCh
+			<-errSuspend.Bag.WaitResume()
 			w.queue()
 		}()
 	} else {

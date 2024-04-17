@@ -27,6 +27,7 @@ type Dep interface {
 	getMutex() *sync.RWMutex
 	GetScheduler() Scheduler
 	GetRequest() map[string]float64
+	GetExecutionDebugString() string
 }
 
 type baseDep struct {
@@ -61,6 +62,15 @@ func (a *baseDep) getExecution() *Execution {
 	a.o.Do(a.init)
 
 	return a.execution
+}
+
+func (a *baseDep) GetExecutionDebugString() string {
+	exec := a.getExecution()
+	if exec == nil {
+		return ""
+	}
+
+	return exec.debugString
 }
 
 func (a *baseDep) Wait() <-chan struct{} {
