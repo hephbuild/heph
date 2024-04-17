@@ -11,6 +11,7 @@ import (
 	"github.com/hephbuild/heph/rcache"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/xdebug"
 	"github.com/hephbuild/heph/worker2"
 	"os"
 	"sync"
@@ -176,7 +177,7 @@ func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *grap
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
 
-	deps := worker2.NewGroup()
+	deps := worker2.NewNamedGroup(xdebug.Sprintf("%v: schedule store external cache", target.Name))
 	for _, artifact := range target.Artifacts.All() {
 		if artifact.Name() == inputHashArtifact.Name() {
 			continue

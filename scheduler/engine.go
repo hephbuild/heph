@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xdebug"
 	"github.com/hephbuild/heph/worker2"
 	"golang.org/x/exp/maps"
 	"sync"
@@ -69,7 +70,7 @@ func (wgm *WaitGroupMap) Get(s string) worker2.Dep {
 		wgm.m = map[string]worker2.Dep{}
 	}
 
-	wg := worker2.NewGroup()
+	wg := worker2.NewNamedGroup(xdebug.Sprintf("groupmap: get: %v", s))
 	wgm.m[s] = wg
 
 	return wg
