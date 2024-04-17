@@ -119,7 +119,6 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 				log.Error("watcher close:", err)
 			}
 			close(sigCh)
-			pool.Stop()
 		},
 	}
 

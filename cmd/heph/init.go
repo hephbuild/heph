@@ -70,8 +70,6 @@ func schedulerInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) e
 				<-gb.Wait()
 			}
 			log.Tracef("All pool items finished")
-
-			bs.Scheduler.Pool.Stop()
 		}
 
 		if bs.Summary != nil {
@@ -104,8 +102,6 @@ func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {
 
 	Finalizers.RegisterWithErr(func(err error) {
 		bs.Finalizers.Run(err)
-
-		bs.Pool.Stop()
 	})
 
 	return bs, nil
