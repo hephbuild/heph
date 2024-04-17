@@ -171,8 +171,8 @@ func (s *schedulerv2) schedule() error {
 				return nil
 			},
 		})
-		s.Pool.Schedule(pj)
 		targetDeps.AddDep(pj)
+		s.Pool.Schedule(pj)
 
 		children, err := s.Graph.DAG().GetChildren(target)
 		if err != nil {
