@@ -2,7 +2,6 @@ package worker2
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"runtime/debug"
 	"strconv"
@@ -65,8 +64,7 @@ type Execution struct {
 	inputs map[string]Value // gets populated before marking as ready
 	m      *sync.RWMutex
 
-	suspendCh   chan struct{}
-	resumeCh    chan struct{}
+	suspendCh   chan *SuspendBag
 	resumeAckCh chan struct{}
 
 	completedCh chan struct{}
@@ -74,6 +72,8 @@ type Execution struct {
 	ScheduledAt time.Time
 	StartedAt   time.Time
 	QueuedAt    time.Time
+
+	debugString string
 }
 
 func (e *Execution) String() string {
@@ -92,13 +92,19 @@ func (e *Execution) GetOutput() Value {
 	return e.outStore.Get()
 }
 
-var ErrSuspended = errors.New("suspended")
+type ErrSuspended struct {
+	Bag *SuspendBag
+}
+
+func (e ErrSuspended) Error() string {
+	return "suspended"
+}
 
 func (e *Execution) Run(ctx context.Context) error {
 	e.m.Lock()
 	if e.errCh == nil {
 		e.errCh = make(chan error)
-		e.suspendCh = make(chan struct{})
+		e.suspendCh = make(chan *SuspendBag)
 
 		if !e.StartedAt.IsZero() {
 			panic("double start detected")
@@ -111,15 +117,15 @@ func (e *Execution) Run(ctx context.Context) error {
 			e.errCh <- err
 		}()
 	} else {
-		e.resumeAckCh <- struct{}{}
+		e.ResumeAck()
 		e.State = ExecStateRunning
 	}
 	e.m.Unlock()
 
 	select {
-	case <-e.suspendCh:
+	case sb := <-e.WaitSuspend():
 		e.State = ExecStateSuspended
-		return ErrSuspended
+		return ErrSuspended{Bag: sb}
 	case err := <-e.errCh:
 		return err
 	}
@@ -155,31 +161,55 @@ func (e *Execution) safeExec(ctx context.Context, ins InStore) (err error) {
 	return e.Dep.Exec(ctx, ins, e.outStore)
 }
 
-func (e *Execution) Suspend() {
+type SuspendBag struct {
+	resumeCh    chan struct{}
+	resumeAckCh chan struct{}
+}
+
+func (e *Execution) Suspend() *SuspendBag {
 	e.m.Lock()
 	defer e.m.Unlock()
 
-	if e.resumeCh != nil {
+	// useful if debug poolwait is in use, commented for perf
+	//stack := debug.Stack()
+	//e.debugString = string(stack)
+
+	if e.State == ExecStateSuspended {
 		panic("attempting to suspend an already suspended execution")
 	}
 
-	e.suspendCh <- struct{}{}
-	e.resumeCh = make(chan struct{})
+	resumeCh := make(chan struct{})
 	e.resumeAckCh = make(chan struct{})
+	sb := &SuspendBag{
+		resumeCh:    resumeCh,
+		resumeAckCh: e.resumeAckCh,
+	}
+
+	e.suspendCh <- sb
+
+	return sb
 }
 
-func (e *Execution) Resume() <-chan struct{} {
-	e.m.Lock()
-	defer e.m.Unlock()
+func (e *SuspendBag) Resume() <-chan struct{} {
+	ackCh := e.resumeAckCh
 
-	if e.resumeAckCh == nil {
+	if ackCh == nil {
 		panic("attempting to resume an unsuspended execution")
 	}
 
-	ackCh := e.resumeAckCh
-
-	e.resumeCh <- struct{}{}
-	e.resumeCh = nil
+	close(e.resumeCh)
 
 	return ackCh
+}
+
+func (e *SuspendBag) WaitResume() <-chan struct{} {
+	return e.resumeCh
+}
+
+func (e *Execution) ResumeAck() {
+	close(e.resumeAckCh)
+}
+
+func (e *Execution) WaitSuspend() chan *SuspendBag {
+	return e.suspendCh
 }

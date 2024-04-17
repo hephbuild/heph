@@ -234,7 +234,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 			}
 
 			if cerr := ctx.Err(); cerr != nil {
-				if !errors.Is(cerr, err) {
+				if !errors.Is(err, cerr) {
 					err = fmt.Errorf("%w: %v", cerr, err)
 				}
 			}

@@ -414,6 +414,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		// Forward heph variables inside the sandbox
 		forward := []string{
 			"HEPH_PROFILES",
+			"HEPH_DEBUG_POOLWAIT",
 			"HEPH_FROM_PATH",
 			"HEPH_CLOUD_TOKEN",
 			hephprovider.EnvSrcRoot,

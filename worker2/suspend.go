@@ -28,9 +28,9 @@ func WaitE(ctx context.Context, f func() error) error {
 			return err
 		}
 	} else {
-		e.Suspend()
+		sb := e.Suspend()
 		err := f()
-		ack := e.Resume()
+		ack := sb.Resume()
 		<-ack
 		if err != nil {
 			return err

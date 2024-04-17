@@ -72,7 +72,6 @@ func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
 	exec.m.Lock()
 	exec.Err = err
 	exec.State = state
-	e.wg.Done()
 	close(exec.completedCh)
 	exec.m.Unlock()
 
@@ -81,6 +80,8 @@ func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
 
 		dexec.broadcast()
 	}
+
+	e.wg.Done()
 }
 
 func (e *Engine) runHooks(event Event, exec *Execution) {

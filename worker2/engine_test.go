@@ -8,6 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -642,6 +644,45 @@ func TestSuspend(t *testing.T) {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
 	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventSuspended", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+}
+
+func TestSuspendStress(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	e.SetDefaultScheduler(NewLimitScheduler(100))
+
+	var wg sync.WaitGroup
+	var done int64
+	for i := 0; i < StressN; i++ {
+		wg.Add(1)
+
+		a := NewAction(ActionConfig{
+			Do: func(ctx context.Context, ds InStore, os OutStore) error {
+				defer wg.Done()
+				defer atomic.AddInt64(&done, 1)
+
+				Wait(ctx, func() {
+					time.Sleep(time.Microsecond)
+				})
+				return nil
+			},
+		})
+		e.Schedule(a)
+	}
+
+	go e.Run()
+	defer e.Stop()
+
+	go func() {
+		for {
+			time.Sleep(time.Second)
+			t.Log(done)
+		}
+	}()
+
+	wg.Wait()
+	time.Sleep(time.Second) // todo figure out why things are trying to send events after the pool is stopped
 }
 
 func TestSuspendLimit(t *testing.T) {
