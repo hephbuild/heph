@@ -1,7 +1,11 @@
 package worker2
 
 func NewGroup(deps ...Dep) *Group {
-	return NewGroupWith(GroupConfig{Deps: deps})
+	return NewNamedGroup("", deps...)
+}
+
+func NewNamedGroup(name string, deps ...Dep) *Group {
+	return NewGroupWith(GroupConfig{Name: name, Deps: deps})
 }
 
 func NewGroupWith(cfg GroupConfig) *Group {

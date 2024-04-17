@@ -312,11 +312,12 @@ func NewChanDep[T any](ctx context.Context, ch chan T) Dep {
 	})
 }
 
-func NewSemDep(ctx context.Context) *Sem {
+func NewSemDep(ctx context.Context, name string) *Sem {
 	wg := &sync.WaitGroup{}
 	return &Sem{
 		Dep: NewAction(ActionConfig{
-			Ctx: ctx,
+			Ctx:  ctx,
+			Name: name,
 			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 				Wait(ctx, func() {
 					wg.Wait()

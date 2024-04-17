@@ -13,6 +13,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xdebug"
 	"github.com/hephbuild/heph/worker2"
 )
 
@@ -133,7 +134,7 @@ func (s *schedulerv2) schedule() error {
 			return err
 		}
 
-		pmdeps := worker2.NewGroup()
+		pmdeps := worker2.NewNamedGroup(xdebug.Sprintf("pmdeps %v", target.Name))
 		for _, parent := range parents {
 			pmdeps.AddDep(s.pullMetaDeps.Get(parent.Addr))
 		}
@@ -188,7 +189,7 @@ func (s *schedulerv2) schedule() error {
 }
 
 func (s *schedulerv2) parentTargetDeps(target specs.Specer) (worker2.Dep, error) {
-	deps := worker2.NewGroup()
+	deps := worker2.NewNamedGroup(xdebug.Sprintf("parent deps: %v", target.Spec().Name))
 	parents, err := s.Graph.DAG().GetParents(target)
 	if err != nil {
 		return nil, err
@@ -254,7 +255,7 @@ func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.S
 		return nil, err
 	}
 
-	runDeps := worker2.NewGroup()
+	runDeps := worker2.NewNamedGroup(xdebug.Sprintf("schedule target deps once: %v", target.Spec().Name))
 	for _, parent := range parents {
 		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
 		if err != nil {
@@ -287,7 +288,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 		return nil, err
 	}
 
-	group := worker2.NewGroup()
+	group := worker2.NewNamedGroup(xdebug.Sprintf("schedule target get cache or run once: %v", target.Spec().Name))
 	j := worker2.NewAction(worker2.ActionConfig{
 		Name:  "get cache or run once " + target.Addr,
 		Ctx:   ctx,
