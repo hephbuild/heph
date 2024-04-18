@@ -350,6 +350,10 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	status("Figuring out if anything changed...")
 	printEvents(events)
 
+	if bs.Scheduler.GitStatus != nil {
+		bs.Scheduler.GitStatus.Reset()
+	}
+
 	rrs, err := bootstrap.GenerateRRs(ctx, bs.Scheduler, s.matcher, s.targs, s.rropts, s.runopts.Plain, true)
 	if err != nil {
 		return err

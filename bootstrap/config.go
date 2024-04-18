@@ -16,6 +16,7 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg.CacheHistory = 3
 	cfg.Engine.GC = true
 	cfg.Engine.CacheHints = true
+	cfg.Engine.GitCacheHints = true
 	cfg.Engine.ParallelCaching = true
 	cfg.Engine.SmartGen = true
 	cfg.CacheOrder = config.CacheOrderLatency

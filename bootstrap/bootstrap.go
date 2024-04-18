@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/exprs"
+	"github.com/hephbuild/heph/gitstatus"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hbuiltin"
 	"github.com/hephbuild/heph/hroot"
@@ -321,6 +322,10 @@ func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, err
 		Finalizers:        fins,
 		Runner:            runner,
 	})
+
+	if bs.Config.Engine.GitCacheHints {
+		e.GitStatus = gitstatus.New(bs.Root.Root.Abs())
+	}
 
 	bs.Finalizers.RegisterWithErr(func(err error) {
 		fins.Run(err)
