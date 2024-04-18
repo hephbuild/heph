@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/hephbuild/heph/buildfiles"
 	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/gitstatus"
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
@@ -37,6 +38,7 @@ type Scheduler struct {
 	BackgroundTracker *worker2.RunningTracker
 	Finalizers        *finalizers.Finalizers
 	Runner            *targetrun.Runner
+	GitStatus         *gitstatus.GitStatus
 
 	toolsLock locks.Locker
 }

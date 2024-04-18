@@ -14,6 +14,7 @@ type FileConfig struct {
 	Engine struct {
 		GC              *bool `yaml:"gc"`
 		CacheHints      *bool `yaml:"cache_hints"`
+		GitCacheHints   *bool `yaml:"git_cache_hints"`
 		InstallTools    *bool `yaml:"install_tools"`
 		KeepSandbox     *bool `yaml:"keep_sandbox"`
 		ParallelCaching *bool `yaml:"parallel_caching"`
@@ -75,6 +76,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Engine.CacheHints != nil {
 		c.Engine.CacheHints = *fc.Engine.CacheHints
+	}
+
+	if fc.Engine.GitCacheHints != nil {
+		c.Engine.GitCacheHints = *fc.Engine.GitCacheHints
 	}
 
 	if fc.Engine.InstallTools != nil {
