@@ -2,9 +2,7 @@ package gitstatus
 
 import (
 	"context"
-	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
-	"golang.org/x/exp/slices"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -13,34 +11,33 @@ import (
 
 type GitStatus struct {
 	root string
-	m    sync.Mutex
+	o    sync.Once
 
-	dirty []string
+	dirty map[string]struct{}
 }
 
 func New(root string) *GitStatus {
 	return &GitStatus{root: root}
 }
 
-func (gs *GitStatus) diffIndexOnce(ctx context.Context) []string {
-	gs.m.Lock()
-	defer gs.m.Unlock()
+func (gs *GitStatus) diffIndexOnce(ctx context.Context) map[string]struct{} {
+	gs.o.Do(func() {
+		// If something went wrong, we can assume nothing is dirty
+		dirty, _ := gs.diffIndex(ctx)
 
-	if gs.dirty == nil {
-		gs.dirty = gs.diffIndex(ctx)
-		if gs.dirty == nil {
-			gs.dirty = []string{}
+		gs.dirty = make(map[string]struct{}, len(dirty))
+		for _, file := range dirty {
+			gs.dirty[file] = struct{}{}
 		}
-	}
+	})
 
-	return gs.dirty[:]
+	return gs.dirty
 }
 
-func (gs *GitStatus) diffIndex(ctx context.Context) []string {
+func (gs *GitStatus) diffIndex(ctx context.Context) ([]string, error) {
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
-		// git not found, assume nothing is dirty
-		return nil
+		return nil, err
 	}
 
 	cmd := exec.CommandContext(ctx, gitPath, "diff-index", "HEAD", "--name-only")
@@ -48,9 +45,7 @@ func (gs *GitStatus) diffIndex(ctx context.Context) []string {
 
 	b, err := cmd.Output()
 	if err != nil {
-		// something failed, assume nothing is dirty
-		log.Errorf("git: diff-index: %v", err)
-		return nil
+		return nil, err
 	}
 
 	lines := strings.Split(string(b), "\n")
@@ -60,18 +55,16 @@ func (gs *GitStatus) diffIndex(ctx context.Context) []string {
 
 	return ads.Map(lines, func(line string) string {
 		return filepath.Join(gs.root, line)
-	})
+	}), nil
 }
 
 func (gs *GitStatus) IsDirty(ctx context.Context, path string) bool {
 	dirty := gs.diffIndexOnce(ctx)
 
-	return slices.Contains(dirty, path)
+	_, ok := dirty[path]
+	return ok
 }
 
 func (gs *GitStatus) Reset() {
-	gs.m.Lock()
-	defer gs.m.Unlock()
-
-	gs.dirty = nil
+	gs.o = sync.Once{}
 }
