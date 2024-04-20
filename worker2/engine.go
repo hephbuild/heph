@@ -75,8 +75,8 @@ func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
 	close(exec.completedCh)
 	exec.m.Unlock()
 
-	for _, dep := range exec.Dep.GetDepsObj().Dependees() {
-		dexec := e.executionForDep(dep.owner)
+	for _, dep := range exec.Dep.GetNode().Dependees() {
+		dexec := e.executionForDep(dep)
 
 		dexec.broadcast()
 	}
@@ -105,7 +105,7 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 	defer exec.c.L.Unlock()
 
 	for {
-		depObj := exec.Dep.GetDepsObj()
+		depObj := exec.Dep.GetNode()
 
 		allDepsSucceeded := true
 		allDepsDone := true
@@ -168,14 +168,12 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 
 	exec.m.Lock()
 	ins := map[string]Value{}
-	for _, dep := range exec.Dep.GetDepsObj().Dependencies() {
-		if dep, ok := dep.(Named); ok {
-			exec := e.executionForDep(dep.Dep)
+	for name, dep := range exec.Dep.getNamed() {
+		exec := e.executionForDep(dep)
 
-			vv := exec.outStore.Get()
+		vv := exec.outStore.Get()
 
-			ins[dep.Name] = vv
-		}
+		ins[name] = vv
 	}
 	exec.inputs = ins
 	exec.State = ExecStateQueued
@@ -293,8 +291,6 @@ func (e *Engine) Wait() <-chan struct{} {
 }
 
 func (e *Engine) executionForDep(dep Dep) *Execution {
-	dep = flattenNamed(dep)
-
 	if exec := dep.getExecution(); exec != nil {
 		return exec
 	}
@@ -303,7 +299,7 @@ func (e *Engine) executionForDep(dep Dep) *Execution {
 }
 
 func (e *Engine) Schedule(a Dep) Dep {
-	deps := a.GetDepsObj().TransitiveDependencies()
+	deps := a.GetNode().TransitiveDependencies()
 
 	for _, dep := range deps {
 		_ = e.scheduleOne(dep)
@@ -315,8 +311,6 @@ func (e *Engine) Schedule(a Dep) Dep {
 }
 
 func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
-	dep = flattenNamed(dep)
-
 	m := dep.getMutex()
 	if lock {
 		m.Lock()

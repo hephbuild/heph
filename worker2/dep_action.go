@@ -5,13 +5,13 @@ type EventDeclared struct {
 }
 
 func NewAction(cfg ActionConfig) *Action {
-	a := &Action{deps: NewDeps()}
-	a.deps.setOwner(a)
+	a := &Action{baseDep: newBase()}
+	a.node = NewNode[Dep](cfg.Name, a)
 
 	a.name = cfg.Name
 	a.ctx = cfg.Ctx
 	a.name = cfg.Name
-	a.deps.Add(cfg.Deps...)
+	a.AddDep(cfg.Deps...)
 	a.hooks = cfg.Hooks
 	a.scheduler = cfg.Scheduler
 	a.requests = cfg.Requests

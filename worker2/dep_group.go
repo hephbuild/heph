@@ -9,8 +9,8 @@ func NewNamedGroup(name string, deps ...Dep) *Group {
 }
 
 func NewGroupWith(cfg GroupConfig) *Group {
-	g := &Group{deps: NewDeps()}
-	g.deps.setOwner(g)
+	g := &Group{baseDep: newBase()}
+	g.node = NewNode[Dep](cfg.Name, g)
 
 	g.name = cfg.Name
 	g.AddDep(cfg.Deps...)

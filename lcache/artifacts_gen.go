@@ -147,7 +147,7 @@ func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *gr
 
 	signals := map[string]*worker2.Sem{}
 	for _, artifact := range artsp {
-		wg := worker2.NewSemDep(ctx, fmt.Sprintf("%v: artifact signal: %v", target.Name, artifact.Name()))
+		wg := worker2.NewSemDep(ctx, xdebug.Sprintf("%v: artifact signal: %v", target.Name, artifact.Name()))
 		wg.AddSem(1)
 		signals[artifact.Name()] = wg
 	}
@@ -170,7 +170,7 @@ func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *gr
 
 	meta := []string{arts.InputHash.Name(), arts.Manifest.Name()}
 
-	allButMeta := worker2.NewNamedGroup("all but meta")
+	allButMeta := worker2.NewNamedGroup(xdebug.Sprintf("%v: all but meta", target.Addr))
 	for _, art := range artsp {
 		if !ads.Contains(meta, art.Name()) {
 			allButMeta.AddDep(signals[art.Name()])

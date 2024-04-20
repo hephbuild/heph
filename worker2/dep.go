@@ -9,7 +9,7 @@ import (
 type Dep interface {
 	GetName() string
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
-	GetDepsObj() *Deps
+	GetNode() *Node[Dep]
 	AddDep(...Dep)
 	GetHooks() []Hook
 	Wait() <-chan struct{}
@@ -24,15 +24,24 @@ type Dep interface {
 
 	setExecution(*Execution)
 	getExecution() *Execution
+	getNamed() map[string]Dep
 	getMutex() *sync.RWMutex
 	GetScheduler() Scheduler
 	GetRequest() map[string]float64
 	GetExecutionDebugString() string
 }
 
+func newBase() baseDep {
+	return baseDep{
+		named: map[string]Dep{},
+	}
+}
+
 type baseDep struct {
 	execution *Execution
 	m         sync.RWMutex
+	node      *Node[Dep]
+	named     map[string]Dep
 
 	executionPresentCh chan struct{}
 	o                  sync.Once
@@ -42,6 +51,27 @@ func (a *baseDep) init() {
 	if a.executionPresentCh == nil {
 		a.executionPresentCh = make(chan struct{})
 	}
+}
+
+func (a *baseDep) GetNode() *Node[Dep] {
+	return a.node
+}
+
+func (a *baseDep) AddDep(deps ...Dep) {
+	for _, dep := range deps {
+		if named, ok := dep.(Named); ok {
+			a.named[named.Name] = dep
+			dep = named.Dep
+		}
+		a.GetNode().AddDependency(dep.GetNode())
+	}
+}
+
+func (a *baseDep) getNamed() map[string]Dep {
+	if !a.GetNode().frozen {
+		panic("not frozen")
+	}
+	return a.named
 }
 
 func (a *baseDep) setExecution(e *Execution) {
@@ -156,7 +186,6 @@ type Action struct {
 	baseDep
 	ctx       context.Context
 	name      string
-	deps      *Deps
 	hooks     []Hook
 	scheduler Scheduler
 	requests  map[string]float64
@@ -209,14 +238,6 @@ func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	return a.do(ctx, ins, outs)
 }
 
-func (a *Action) GetDepsObj() *Deps {
-	return a.deps
-}
-
-func (a *Action) AddDep(deps ...Dep) {
-	a.GetDepsObj().Add(deps...)
-}
-
 func (a *Action) DeepDo(f func(Dep)) {
 	deepDo(a, f)
 }
@@ -229,17 +250,12 @@ type GroupConfig struct {
 type Group struct {
 	baseDep
 	name string
-	deps *Deps
 }
 
 func (g *Group) GetScheduler() Scheduler { return nil }
 
 func (g *Group) GetName() string {
 	return g.name
-}
-
-func (g *Group) GetDepsObj() *Deps {
-	return g.deps
 }
 
 func (g *Group) GetHooks() []Hook {
@@ -262,10 +278,6 @@ func (g *Group) GetCtx() context.Context {
 	return context.Background()
 }
 
-func (g *Group) AddDep(deps ...Dep) {
-	g.GetDepsObj().Add(deps...)
-}
-
 func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	e := executionFromContext(ctx)
 	outs.Set(MapValue(e.inputs))
@@ -275,16 +287,6 @@ func (g *Group) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 type Named struct {
 	Name string
 	Dep
-}
-
-func flattenNamed(dep Dep) Dep {
-	for {
-		if ndep, ok := dep.(Named); ok {
-			dep = ndep.Dep
-		} else {
-			return dep
-		}
-	}
 }
 
 func Serial(deps []Dep) Dep {
@@ -319,10 +321,10 @@ func NewSemDep(ctx context.Context, name string) *Sem {
 			Ctx:  ctx,
 			Name: name,
 			Do: func(ctx context.Context, ins InStore, outs OutStore) error {
-				Wait(ctx, func() {
+				return WaitE(ctx, func() error {
 					wg.Wait()
+					return ctx.Err()
 				})
-				return nil
 			},
 		}),
 		wg: wg,
