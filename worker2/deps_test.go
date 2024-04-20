@@ -25,7 +25,7 @@ func TestLink(t *testing.T) {
   tdeps: []
   depdees: [2]
   tdepdees: [2]
-`), d1.GetDepsObj().DebugString())
+`), d1.GetNode().DebugString())
 
 		assert.Equal(t, s(`
 2:
@@ -33,7 +33,7 @@ func TestLink(t *testing.T) {
   tdeps: [1]
   depdees: []
   tdepdees: []
-`), d2.GetDepsObj().DebugString())
+`), d2.GetNode().DebugString())
 
 		assert.Equal(t, s(`
 3:
@@ -41,7 +41,7 @@ func TestLink(t *testing.T) {
   tdeps: []
   depdees: [4]
   tdepdees: [4]
-`), d3.GetDepsObj().DebugString())
+`), d3.GetNode().DebugString())
 
 		assert.Equal(t, s(`
 4:
@@ -49,7 +49,7 @@ func TestLink(t *testing.T) {
   tdeps: [3]
   depdees: []
   tdepdees: []
-`), d4.GetDepsObj().DebugString())
+`), d4.GetNode().DebugString())
 	}
 
 	assertDetached()
@@ -62,7 +62,7 @@ func TestLink(t *testing.T) {
   tdeps: []
   depdees: [2]
   tdepdees: [2 4 3]
-`), d1.GetDepsObj().DebugString())
+`), d1.GetNode().DebugString())
 
 	assert.Equal(t, s(`
 2:
@@ -70,7 +70,7 @@ func TestLink(t *testing.T) {
   tdeps: [1]
   depdees: [3]
   tdepdees: [4 3]
-`), d2.GetDepsObj().DebugString())
+`), d2.GetNode().DebugString())
 
 	assert.Equal(t, s(`
 3:
@@ -78,7 +78,7 @@ func TestLink(t *testing.T) {
   tdeps: [2 1]
   depdees: [4]
   tdepdees: [4]
-`), d3.GetDepsObj().DebugString())
+`), d3.GetNode().DebugString())
 
 	assert.Equal(t, s(`
 4:
@@ -86,9 +86,9 @@ func TestLink(t *testing.T) {
   tdeps: [3 2 1]
   depdees: []
   tdepdees: []
-`), d4.GetDepsObj().DebugString())
+`), d4.GetNode().DebugString())
 
-	d3.GetDepsObj().Remove(d2)
+	d3.GetNode().RemoveDependency(d2.GetNode())
 
 	assertDetached()
 }
@@ -132,5 +132,5 @@ func TestRemoveStress(t *testing.T) {
 
 	group := NewAction(ActionConfig{Name: "group", Deps: []Dep{root}})
 
-	group.GetDepsObj().Remove(root)
+	group.GetNode().RemoveDependency(root.GetNode())
 }

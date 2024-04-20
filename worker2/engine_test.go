@@ -391,6 +391,7 @@ func TestExecCancel(t *testing.T) {
 func TestExecDeps(t *testing.T) {
 	t.Parallel()
 	a1_1 := NewAction(ActionConfig{
+		Name: "a1_1",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 1")
 
@@ -399,6 +400,7 @@ func TestExecDeps(t *testing.T) {
 		},
 	})
 	a1_2 := NewAction(ActionConfig{
+		Name: "a1_2",
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			fmt.Println("Running 2")
 
@@ -410,6 +412,7 @@ func TestExecDeps(t *testing.T) {
 	receivedValue := ""
 
 	a2 := NewAction(ActionConfig{
+		Name: "result",
 		Deps: []Dep{
 			Named{Name: "v1", Dep: a1_1},
 			Named{Name: "v2", Dep: a1_2},
@@ -517,7 +520,7 @@ func TestExecStress(t *testing.T) {
 	go e.Run()
 	defer e.Stop()
 
-	totalDeps := uint64(n + 2)
+	totalDeps := uint64(n + 1)
 
 	stats1 := CollectStats(a)
 	assert.Equal(t, Stats{All: totalDeps}, stats1)
@@ -611,13 +614,13 @@ func TestSuspend(t *testing.T) {
 		},
 		Do: func(ctx context.Context, ds InStore, os OutStore) error {
 			log("enter")
+			defer log("leave")
 			Wait(ctx, func() {
 				log("start_wait")
 				<-resumeCh
 				resumeAckCh <- struct{}{}
 				log("end_wait")
 			})
-			log("leave")
 			return nil
 		},
 	})
@@ -699,7 +702,6 @@ func TestSuspendLimit(t *testing.T) {
 				Wait(ctx, func() {
 					time.Sleep(time.Second)
 				})
-				return nil
 			},
 		})
 		g.AddDep(a)
