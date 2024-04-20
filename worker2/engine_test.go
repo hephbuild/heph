@@ -250,17 +250,17 @@ func TestExecErrorSkip(t *testing.T) {
 
 	assert.Equal(t, err1, errors.New("beep bop"))
 	assert.Equal(t, err2, Error{
-		ID:    2,
+		ID:    1,
 		Name:  "a1",
 		State: ExecStateFailed,
 		Err:   errors.New("beep bop"),
 	})
 	assert.Equal(t, err3, Error{
-		ID:    1,
+		ID:    2,
 		Name:  "a2",
 		State: ExecStateSkipped,
 		Err: Error{
-			ID:    2,
+			ID:    1,
 			Name:  "a1",
 			State: ExecStateFailed,
 			Err:   errors.New("beep bop"),
@@ -332,7 +332,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 		err := <-errCh
 
 		assert.Equal(t, err, Error{
-			ID:    3,
+			ID:    1,
 			Name:  "a1",
 			State: ExecStateFailed,
 			Err:   errors.New("beep bop"),
@@ -347,7 +347,7 @@ func TestExecErrorSkipStress(t *testing.T) {
 			Name:  c.d.GetName(),
 			State: ExecStateSkipped,
 			Err: Error{
-				ID:    3,
+				ID:    1,
 				Name:  "a1",
 				State: ExecStateFailed,
 				Err:   errors.New("beep bop"),
@@ -483,6 +483,31 @@ func TestExecGroup(t *testing.T) {
 	<-a.Wait()
 
 	assert.Equal(t, map[string]any{"v1": 1, "v2": "hello, world"}, received)
+}
+
+func TestExecStressDeep(t *testing.T) {
+	t.Parallel()
+	scheduler := NewLimitScheduler(runtime.NumCPU())
+
+	current := NewGroup()
+	for l := 0; l < 5000; l++ {
+		g := NewGroup()
+		for i := 0; i < 100; i++ {
+			g.AddDep(NewGroup())
+		}
+		current.AddDep(g)
+		current = g
+	}
+
+	e := NewEngine()
+	e.SetDefaultScheduler(scheduler)
+
+	go e.Run()
+	defer e.Stop()
+
+	e.Schedule(current)
+
+	<-current.Wait()
 }
 
 func TestExecStress(t *testing.T) {
@@ -702,6 +727,7 @@ func TestSuspendLimit(t *testing.T) {
 				Wait(ctx, func() {
 					time.Sleep(time.Second)
 				})
+				return nil
 			},
 		})
 		g.AddDep(a)

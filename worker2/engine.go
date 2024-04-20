@@ -5,6 +5,7 @@ import (
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/utils/ads"
 	"go.uber.org/multierr"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,7 +168,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	}
 
 	exec.m.Lock()
-	ins := map[string]Value{}
+	ins := make(map[string]Value, len(exec.Dep.getNamed()))
 	for name, dep := range exec.Dep.getNamed() {
 		exec := e.executionForDep(dep)
 
@@ -182,7 +183,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	if exec.scheduler == nil {
 		if _, ok := exec.Dep.(*Group); ok {
 			// TODO: change to properly use ResourceScheduler
-			exec.scheduler = UnlimitedScheduler{}
+			exec.scheduler = groupSchedulers
 		} else {
 			exec.scheduler = e.defaultScheduler
 		}
@@ -191,6 +192,8 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 
 	e.queue(exec)
 }
+
+var groupSchedulers = NewLimitScheduler(runtime.NumCPU())
 
 func (e *Engine) queue(exec *Execution) {
 	e.notifyQueued(exec)
@@ -299,10 +302,12 @@ func (e *Engine) executionForDep(dep Dep) *Execution {
 }
 
 func (e *Engine) Schedule(a Dep) Dep {
-	deps := a.GetNode().TransitiveDependencies()
+	if !a.GetScheduledAt().IsZero() {
+		return nil
+	}
 
-	for _, dep := range deps {
-		_ = e.scheduleOne(dep)
+	for _, dep := range a.GetNode().Dependencies() {
+		_ = e.Schedule(dep)
 	}
 
 	_ = e.scheduleOne(a)

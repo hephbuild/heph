@@ -10,15 +10,20 @@ import (
 )
 
 type Node[T any] struct {
-	V  T
-	ID string
+	V      T
+	ID     string
+	frozen bool
+	m      sync.Mutex
 
-	m                      sync.RWMutex
-	dependencies           *sets.Set[*Node[T], *Node[T]]
-	dependees              *sets.Set[*Node[T], *Node[T]]
-	transitiveDependencies *sets.Set[*Node[T], *Node[T]]
-	transitiveDependees    *sets.Set[*Node[T], *Node[T]]
-	frozen                 bool
+	mdependencies               sync.RWMutex
+	dependencies                *sets.Set[*Node[T], *Node[T]]
+	transitiveDependencies      *sets.Set[*Node[T], *Node[T]]
+	transitiveDependenciesDirty bool
+
+	mdependees               sync.RWMutex
+	dependees                *sets.Set[*Node[T], *Node[T]]
+	transitiveDependees      *sets.Set[*Node[T], *Node[T]]
+	transitiveDependeesDirty bool
 }
 
 func NewNode[T any](id string, v T) *Node[T] {
@@ -55,17 +60,15 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 	}
 
 	if !d.dependencies.Has(dep) {
-		if dep.transitiveDependencies.Has(d) {
+		if dep.HasTransitiveDependency(d) {
 			panic("cycle")
 		}
 
 		d.dependencies.Add(dep)
-		d.transitiveDependencies.Add(dep)
-		d.transitiveDependencies.AddAll(dep.transitiveDependencies.Slice())
+		d.transitiveDependenciesDirty = true
 
-		for _, dependee := range d.transitiveDependees.Slice() {
-			dependee.transitiveDependencies.Add(dep)
-			dependee.transitiveDependencies.AddAll(dep.transitiveDependencies.Slice())
+		for _, dependee := range d.TransitiveDependeesNodes() {
+			dependee.transitiveDependenciesDirty = true
 		}
 	}
 
@@ -73,13 +76,11 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 		if !dep.dependees.Has(d) {
 			dep.dependees.Add(d)
 
-			for _, dep := range dep.transitiveDependencies.Slice() {
-				dep.transitiveDependees.AddAll(d.transitiveDependees.Slice())
-				dep.transitiveDependees.Add(d)
+			for _, dep := range dep.TransitiveDependenciesNodes() {
+				dep.transitiveDependeesDirty = true
 			}
 
-			dep.transitiveDependees.AddAll(d.transitiveDependees.Slice())
-			dep.transitiveDependees.Add(d)
+			dep.transitiveDependeesDirty = true
 		}
 	}
 }
@@ -94,43 +95,49 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 
 	if d.dependencies.Has(dep) {
 		d.dependencies.Remove(dep)
-		d.transitiveDependencies = d.computeTransitiveDeps()
+		d.transitiveDependencies = nil
 
-		for _, dependee := range d.transitiveDependees.Slice() {
-			dependee.m.Lock()
-			dependee.transitiveDependencies = dependee.computeTransitiveDeps()
-			dependee.m.Unlock()
+		for _, dependee := range d.TransitiveDependeesNodes() {
+			dependee.mdependencies.Lock()
+			dependee.transitiveDependencies = nil
+			dependee.mdependencies.Unlock()
 		}
 	}
 
 	if dep.dependees.Has(d) {
-		dep.m.Lock()
+		dep.mdependees.Lock()
 		dep.dependees.Remove(d)
-		dep.transitiveDependees = dep.computeTransitiveDependees()
-		dep.m.Unlock()
+		dep.transitiveDependees = nil
+		dep.mdependees.Unlock()
 
-		for _, dep := range dep.transitiveDependencies.Slice() {
-			dep.m.Lock()
-			dep.transitiveDependees = dep.computeTransitiveDependees()
-			dep.m.Unlock()
+		for _, dep := range dep.TransitiveDependenciesNodes() {
+			dep.mdependees.Lock()
+			dep.transitiveDependees = nil
+			dep.mdependees.Unlock()
 		}
 	}
 }
 
-func (d *Node[T]) computeTransitiveDeps() *sets.Set[*Node[T], *Node[T]] {
-	s := sets.NewIdentitySet[*Node[T]](0)
+func (d *Node[T]) computeTransitiveDependencies(full bool) *sets.Set[*Node[T], *Node[T]] {
+	s := d.transitiveDependencies
+	if full {
+		s = sets.NewIdentitySet[*Node[T]](0)
+	}
 	for _, dep := range d.dependencies.Slice() {
 		s.Add(dep)
-		s.AddAll(dep.transitiveDependencies.Slice())
+		s.AddAll(dep.TransitiveDependenciesNodes())
 	}
 	return s
 }
 
-func (d *Node[T]) computeTransitiveDependees() *sets.Set[*Node[T], *Node[T]] {
-	s := sets.NewIdentitySet[*Node[T]](0)
+func (d *Node[T]) computeTransitiveDependees(full bool) *sets.Set[*Node[T], *Node[T]] {
+	s := d.transitiveDependees
+	if full {
+		s = sets.NewIdentitySet[*Node[T]](0)
+	}
 	for _, dep := range d.dependees.Slice() {
+		s.AddAll(dep.TransitiveDependeesNodes())
 		s.Add(dep)
-		s.AddAll(dep.transitiveDependees.Slice())
 	}
 	return s
 }
@@ -162,44 +169,85 @@ func (d *Node[T]) toV(nodes []*Node[T]) []T {
 	})
 }
 
-func (d *Node[T]) Dependencies() []T {
-	d.m.RLock()
-	defer d.m.RUnlock()
+func (d *Node[T]) DependenciesNodes() []*Node[T] {
+	d.mdependencies.RLock()
+	defer d.mdependencies.RUnlock()
 
-	return d.toV(d.dependencies.Slice())
+	return d.dependencies.Slice()
+}
+
+func (d *Node[T]) Dependencies() []T {
+	return d.toV(d.DependenciesNodes())
+}
+
+func (d *Node[T]) DependeesNodes() []*Node[T] {
+	d.mdependees.RLock()
+	defer d.mdependees.RUnlock()
+
+	return d.dependees.Slice()
 }
 
 func (d *Node[T]) Dependees() []T {
-	d.m.RLock()
-	defer d.m.RUnlock()
+	return d.toV(d.DependeesNodes())
+}
 
-	return d.toV(d.dependees.Slice())
+func (d *Node[T]) transitiveDependenciesSet() *sets.Set[*Node[T], *Node[T]] {
+	if d.transitiveDependencies == nil {
+		d.transitiveDependencies = d.computeTransitiveDependencies(true)
+	} else if d.transitiveDependenciesDirty {
+		d.transitiveDependencies = d.computeTransitiveDependencies(false)
+	}
+	d.transitiveDependenciesDirty = false
+
+	return d.transitiveDependencies
+}
+
+func (d *Node[T]) TransitiveDependenciesNodes() []*Node[T] {
+	d.mdependencies.Lock()
+	defer d.mdependencies.Unlock()
+
+	return d.transitiveDependenciesSet().Slice()
 }
 
 func (d *Node[T]) TransitiveDependencies() []T {
-	d.m.RLock()
-	defer d.m.RUnlock()
+	return d.toV(d.TransitiveDependenciesNodes())
+}
 
-	return d.toV(d.transitiveDependencies.Slice())
+func (d *Node[T]) HasTransitiveDependency(dep *Node[T]) bool {
+	d.mdependencies.Lock()
+	defer d.mdependencies.Unlock()
+
+	return d.transitiveDependenciesSet().Has(dep)
+}
+
+func (d *Node[T]) TransitiveDependeesNodes() []*Node[T] {
+	d.mdependees.Lock()
+	defer d.mdependees.Unlock()
+
+	if d.transitiveDependees == nil {
+		d.transitiveDependees = d.computeTransitiveDependees(true)
+	} else if d.transitiveDependeesDirty {
+		d.transitiveDependees = d.computeTransitiveDependees(false)
+	}
+	d.transitiveDependeesDirty = false
+
+	return d.transitiveDependees.Slice()
 }
 
 func (d *Node[T]) TransitiveDependees() []T {
-	d.m.RLock()
-	defer d.m.RUnlock()
-
-	return d.toV(d.transitiveDependees.Slice())
+	return d.toV(d.TransitiveDependeesNodes())
 }
 
 func (d *Node[T]) DebugString() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%v:\n", d.ID)
-	deps := ads.Map(d.dependencies.Slice(), (*Node[T]).GetID)
-	tdeps := ads.Map(d.transitiveDependencies.Slice(), (*Node[T]).GetID)
+	deps := ads.Map(d.DependenciesNodes(), (*Node[T]).GetID)
+	tdeps := ads.Map(d.TransitiveDependenciesNodes(), (*Node[T]).GetID)
 	fmt.Fprintf(&sb, "  deps: %v\n", deps)
 	fmt.Fprintf(&sb, "  tdeps: %v\n", tdeps)
 
-	depdees := ads.Map(d.dependees.Slice(), (*Node[T]).GetID)
-	tdepdees := ads.Map(d.transitiveDependees.Slice(), (*Node[T]).GetID)
+	depdees := ads.Map(d.DependeesNodes(), (*Node[T]).GetID)
+	tdepdees := ads.Map(d.TransitiveDependeesNodes(), (*Node[T]).GetID)
 	fmt.Fprintf(&sb, "  depdees: %v\n", depdees)
 	fmt.Fprintf(&sb, "  tdepdees: %v\n", tdepdees)
 
