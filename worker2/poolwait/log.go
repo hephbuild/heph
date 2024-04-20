@@ -21,7 +21,7 @@ func printWhatItsWaitingOn(dep worker2.Dep, indent string) {
 	}
 }
 
-func logUI(name string, deps worker2.Dep, pool *worker2.Engine) error {
+func logUI(name string, deps worker2.Dep, pool *worker2.Engine, interval time.Duration) error {
 	start := time.Now()
 	printProgress := func() {
 		s := worker2.CollectStats(deps)
@@ -95,7 +95,12 @@ func logUI(name string, deps worker2.Dep, pool *worker2.Engine) error {
 		}
 	}
 
-	t := time.NewTicker(time.Second)
+	if interval == 0 {
+		<-deps.Wait()
+		return nil
+	}
+
+	t := time.NewTicker(interval)
 	defer t.Stop()
 
 	c := 1

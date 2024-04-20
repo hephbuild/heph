@@ -379,7 +379,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	runDeps.AddDep(tdepsMap.All())
 	runDeps.AddDep(tracker.Group())
 
-	err = poolwait.Wait(ctx, "Change", bs.Pool, runDeps, s.runopts.Plain)
+	err = poolwait.Wait(ctx, "Change", bs.Pool, runDeps, s.runopts.Plain, bs.Config.ProgressInterval)
 	if err != nil {
 		return err
 	}
