@@ -45,7 +45,6 @@ func SetResetTerminal(p *tea.Program) {
 
 	resetTermFunc = func() {
 		_ = p.ReleaseTerminal()
-		_ = p.RestoreTerminal()
 	}
 }
 
