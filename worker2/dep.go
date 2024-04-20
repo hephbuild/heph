@@ -2,6 +2,7 @@ package worker2
 
 import (
 	"context"
+	"github.com/hephbuild/heph/utils/xtypes"
 	"sync"
 	"time"
 )
@@ -59,6 +60,9 @@ func (a *baseDep) GetNode() *Node[Dep] {
 
 func (a *baseDep) AddDep(deps ...Dep) {
 	for _, dep := range deps {
+		if xtypes.IsNil(dep) {
+			continue
+		}
 		if named, ok := dep.(Named); ok {
 			a.named[named.Name] = dep
 			dep = named.Dep

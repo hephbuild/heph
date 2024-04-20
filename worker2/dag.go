@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
-	"github.com/hephbuild/heph/utils/xtypes"
 	"strings"
 	"sync"
 )
@@ -55,10 +54,6 @@ func (d *Node[T]) AddDependency(deps ...*Node[T]) {
 }
 
 func (d *Node[T]) addDependency(dep *Node[T]) {
-	if xtypes.IsNil(dep) {
-		return
-	}
-
 	if !d.dependencies.Has(dep) {
 		if dep.HasTransitiveDependency(d) {
 			panic("cycle")

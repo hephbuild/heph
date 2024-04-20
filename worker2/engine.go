@@ -105,12 +105,13 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 	exec.c.L.Lock()
 	defer exec.c.L.Unlock()
 
+	var errs []error
 	for {
 		depObj := exec.Dep.GetNode()
 
 		allDepsSucceeded := true
 		allDepsDone := true
-		var errs []error
+		errs = errs[:0]
 		for _, dep := range depObj.Dependencies() {
 			depExec := e.scheduleOne(dep)
 
@@ -183,7 +184,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	if exec.scheduler == nil {
 		if _, ok := exec.Dep.(*Group); ok {
 			// TODO: change to properly use ResourceScheduler
-			exec.scheduler = groupSchedulers
+			exec.scheduler = groupScheduler
 		} else {
 			exec.scheduler = e.defaultScheduler
 		}
@@ -193,7 +194,7 @@ func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
 	e.queue(exec)
 }
 
-var groupSchedulers = NewLimitScheduler(runtime.NumCPU())
+var groupScheduler = NewLimitScheduler(runtime.NumCPU())
 
 func (e *Engine) queue(exec *Execution) {
 	e.notifyQueued(exec)
