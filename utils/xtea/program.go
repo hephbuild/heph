@@ -13,9 +13,11 @@ func RunModel(model tea.Model, opts ...tea.ProgramOption) error {
 
 func Run(p *tea.Program) error {
 	defer func() {
+		SetResetTerminal(nil)
 		log.SetDiversion(nil)
 	}()
 
+	SetResetTerminal(p)
 	_, err := p.Run()
 	return err
 }

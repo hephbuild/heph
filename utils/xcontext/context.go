@@ -5,6 +5,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xsync"
+	"github.com/hephbuild/heph/utils/xtea"
 	"os"
 	"os/signal"
 	"sync"
@@ -138,6 +139,8 @@ func Cancel(ctx context.Context) {
 	cancel()
 }
 
+const stuckTimeout = 5 * time.Second
+
 func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -168,12 +171,12 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 			// Wait for soft cancel to all be unregistered, should be fast, unless something is stuck
 			case <-sc.wait():
 				// Wait for graceful exit
-				<-time.After(2 * time.Second)
-			case <-time.After(2 * time.Second):
+				<-time.After(stuckTimeout)
+			case <-time.After(stuckTimeout):
 				// All soft cancel did not unregister, something is stuck...
 			}
 		} else {
-			<-time.After(2 * time.Second)
+			<-time.After(stuckTimeout)
 		}
 
 		log.Error("Something seems to be stuck, ctrl+c one more time to forcefully exit")
@@ -182,6 +185,7 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		if sig, ok := sig.(syscall.Signal); ok {
 			sigN = int(sig)
 		}
+		xtea.ResetTerminal()
 		os.Exit(128 + sigN)
 	}()
 
