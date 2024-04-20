@@ -8,6 +8,7 @@ import (
 	"gopkg.in/yaml.v3"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type BaseConfig struct {
@@ -21,11 +22,12 @@ const (
 )
 
 type Config struct {
-	BaseConfig   `yaml:",inline"`
-	Caches       map[string]Cache
-	CacheOrder   string `yaml:"cache_order"`
-	CacheHistory int    `yaml:"cache_history"`
-	Cloud        struct {
+	BaseConfig       `yaml:",inline"`
+	Caches           map[string]Cache
+	CacheOrder       string        `yaml:"cache_order"`
+	CacheHistory     int           `yaml:"cache_history"`
+	ProgressInterval time.Duration `yaml:"progress_interval"`
+	Cloud            struct {
 		URL     string `yaml:"url"`
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`

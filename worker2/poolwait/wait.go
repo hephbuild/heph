@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/worker2"
 	"os"
 	"strconv"
+	"time"
 )
 
 var debug bool
@@ -16,7 +17,7 @@ func init() {
 	debug, _ = strconv.ParseBool(os.Getenv("HEPH_DEBUG_POOLWAIT"))
 }
 
-func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.Dep, plain bool) error {
+func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.Dep, plain bool, interval time.Duration) error {
 	pool.Schedule(deps)
 
 	if debug {
@@ -40,7 +41,7 @@ func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.D
 			return fmt.Errorf("poolui: %w", err)
 		}
 	} else {
-		err := logUI(name, deps, pool)
+		err := logUI(name, deps, pool, interval)
 		if err != nil {
 			return fmt.Errorf("logpoolui: %w", err)
 		}

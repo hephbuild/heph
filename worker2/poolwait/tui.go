@@ -5,11 +5,12 @@ import (
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/worker2"
 	"github.com/hephbuild/heph/worker2/poolui"
+	"time"
 )
 
 func termUI(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engine) error {
 	if !xtea.SingleflightTry() {
-		return logUI(name, deps, pool)
+		return logUI(name, deps, pool, time.Second)
 	}
 
 	defer xtea.SingleflightDone()

@@ -1,13 +1,16 @@
 package config
 
+import "time"
+
 type Extras map[string]interface{}
 
 type FileConfig struct {
-	BaseConfig   `yaml:",inline"`
-	Caches       map[string]FileCache `yaml:"caches,omitempty"`
-	CacheOrder   string               `yaml:"cache_order"`
-	CacheHistory int                  `yaml:"cache_history"`
-	Cloud        struct {
+	BaseConfig       `yaml:",inline"`
+	Caches           map[string]FileCache `yaml:"caches,omitempty"`
+	CacheOrder       string               `yaml:"cache_order"`
+	CacheHistory     int                  `yaml:"cache_history"`
+	ProgressInterval *int                 `yaml:"progress_interval"`
+	Cloud            struct {
 		URL     string `yaml:"url"`
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`
@@ -84,6 +87,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Engine.InstallTools != nil {
 		c.Engine.InstallTools = *fc.Engine.InstallTools
+	}
+
+	if fc.ProgressInterval != nil {
+		c.ProgressInterval = time.Duration(*fc.ProgressInterval) * time.Second
 	}
 
 	if fc.CacheOrder != "" {
