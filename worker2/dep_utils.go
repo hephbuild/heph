@@ -4,7 +4,7 @@ import "sync/atomic"
 
 func deepDo(a Dep, f func(Dep)) {
 	f(a)
-	for _, dep := range a.GetNode().TransitiveDependencies() {
+	for _, dep := range a.GetNode().dependencies.TransitiveValues() {
 		f(dep)
 	}
 }
