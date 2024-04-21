@@ -194,7 +194,7 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 	}
 
 	if dep.Dependees.Has(d) {
-		dep.Dependees.Remove(dep)
+		dep.Dependees.Remove(d)
 
 		for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
 			dep.Dependees.MarkTransitiveInvalid()
