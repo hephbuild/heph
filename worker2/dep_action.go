@@ -6,7 +6,7 @@ type EventDeclared struct {
 
 func NewAction(cfg ActionConfig) *Action {
 	a := &Action{baseDep: newBase()}
-	a.node = NewNode[Dep](cfg.Name, a)
+	a.node = NewNode[Dep](cfg.Name, a, &a.m)
 
 	a.name = cfg.Name
 	a.ctx = cfg.Ctx
