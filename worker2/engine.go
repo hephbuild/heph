@@ -76,7 +76,7 @@ func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
 	close(exec.completedCh)
 	exec.m.Unlock()
 
-	for _, dep := range exec.Dep.GetNode().Dependees() {
+	for _, dep := range exec.Dep.GetNode().Dependees.Values() {
 		dexec := e.executionForDep(dep)
 
 		dexec.broadcast()
@@ -112,7 +112,7 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 		allDepsSucceeded := true
 		allDepsDone := true
 		errs = errs[:0]
-		for _, dep := range depObj.Dependencies() {
+		for _, dep := range depObj.Dependencies.Values() {
 			depExec := e.scheduleOne(dep)
 
 			depExec.m.Lock()
@@ -158,7 +158,7 @@ func (e *Engine) tryFreeze(depObj *Node[Dep]) bool {
 	depObj.m.Lock() // prevent any deps modification
 	defer depObj.m.Unlock()
 
-	for _, dep := range depObj.Dependencies() {
+	for _, dep := range depObj.Dependencies.Values() {
 		if dep.GetState() != ExecStateSucceeded {
 			return false
 		}
@@ -321,7 +321,7 @@ func (e *Engine) Schedule(a Dep) Dep {
 		return nil
 	}
 
-	for _, dep := range a.GetNode().Dependencies() {
+	for _, dep := range a.GetNode().Dependencies.Values() {
 		_ = e.Schedule(dep)
 	}
 
