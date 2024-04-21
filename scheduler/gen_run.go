@@ -18,7 +18,6 @@ import (
 )
 
 type runGenScheduler struct {
-	Name    string
 	tracker *worker2.RunningTracker
 	*Scheduler
 }
@@ -33,7 +32,6 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 	log.Debugf("Run gen pass")
 
 	ge := runGenScheduler{
-		Name:      "Main",
 		Scheduler: e,
 		tracker:   worker2.NewRunningTracker(),
 	}
@@ -87,7 +85,7 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 	start := time.Now()
 
-	status.Emit(ctx, status.String(fmt.Sprintf("Scheduling %v...", e.Name)))
+	status.Emit(ctx, status.String(fmt.Sprintf("Scheduling...")))
 
 	sdeps, _, err := e.ScheduleTargetsWithDeps(ctx, targets, true, nil)
 	if err != nil {
@@ -101,14 +99,14 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 	}
 
 	e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
-		Name:  "ScheduleGeneratedPipeline " + e.Name,
+		Name:  "ScheduleGeneratedPipeline Main",
 		Ctx:   ctx,
 		Hooks: []worker2.Hook{e.tracker.Hook()},
 		Deps:  []worker2.Dep{deps},
 		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
-			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated %v...", e.Name)))
+			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated...")))
 
-			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
+			log.Tracef("run generated got %v targets in %v", newTargets.Len(), time.Since(start))
 
 			genTargets := ads.Filter(newTargets.Slice(), func(target *graph.Target) bool {
 				return target.IsGen()
