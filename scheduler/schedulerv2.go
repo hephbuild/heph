@@ -288,7 +288,7 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 		return nil, err
 	}
 
-	group := worker2.NewNamedGroup(xdebug.Sprintf("schedule target get cache or run once: %v", target.Spec().Name))
+	group := worker2.NewNamedGroup(xdebug.Sprintf("schedule target get cache or run once: %v", target.Spec().Addr))
 	j := worker2.NewAction(worker2.ActionConfig{
 		Name:  "get cache or run once " + target.Addr,
 		Ctx:   ctx,
