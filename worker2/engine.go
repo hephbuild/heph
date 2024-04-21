@@ -144,14 +144,28 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 			}
 
 			if allDepsSucceeded {
-				depObj.Freeze()
-
-				return nil
+				if e.tryFreeze(depObj) {
+					return nil
+				}
 			}
 		}
 
 		exec.c.Wait()
 	}
+}
+
+func (e *Engine) tryFreeze(depObj *Node[Dep]) bool {
+	depObj.m.Lock() // prevent any deps modification
+	defer depObj.m.Unlock()
+
+	for _, dep := range depObj.Dependencies() {
+		if dep.GetState() != ExecStateSucceeded {
+			return false
+		}
+	}
+
+	depObj.Freeze()
+	return true
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
@@ -342,12 +356,19 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 	debounceBroadcast := debounce.New(time.Millisecond)
 	exec.broadcast = func() {
 		debounceBroadcast(func() {
+			debugger.SetLabels(func() []string {
+				return []string{
+					"where", "debounceBroadcast",
+				}
+			})
+
 			exec.c.L.Lock()
 			exec.c.Broadcast()
 			exec.c.L.Unlock()
 		})
 	}
 	exec.c = sync.NewCond(exec.m)
+	//exec.c = sync.NewCond(&exec.Dep.GetNode().m)
 	dep.setExecution(exec)
 
 	return exec
@@ -361,10 +382,10 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 	exec := e.registerOne(dep, false)
 
 	if exec.ScheduledAt.IsZero() {
+		e.wg.Add(1)
+
 		exec.ScheduledAt = time.Now()
 		exec.State = ExecStateScheduled
-
-		e.wg.Add(1)
 
 		e.runHooks(EventScheduled{Execution: exec}, exec)
 

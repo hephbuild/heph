@@ -3,6 +3,7 @@ package worker2
 import (
 	"context"
 	"fmt"
+	"github.com/dlsniper/debugger"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -132,6 +133,13 @@ func (e *Execution) Run(ctx context.Context) error {
 }
 
 func (e *Execution) run(ctx context.Context) error {
+	debugger.SetLabels(func() []string {
+		return []string{
+			"where", "Execution.run",
+			"dep_id", e.Dep.GetName(),
+		}
+	})
+
 	if g, ok := e.Dep.(*Group); ok {
 		return g.Exec(ctx, nil, e.outStore)
 	}
