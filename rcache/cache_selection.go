@@ -62,6 +62,10 @@ func (c orderCacheContainer) calculateLatency(ctx context.Context) (time.Duratio
 }
 
 func orderCaches(ctx context.Context, caches []CacheConfig) []CacheConfig {
+	caches = ads.Filter(caches, func(cc CacheConfig) bool {
+		return cc.Read || cc.Write
+	})
+
 	if len(caches) <= 1 {
 		return caches
 	}
