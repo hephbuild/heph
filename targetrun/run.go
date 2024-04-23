@@ -143,7 +143,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
 		execCtx := ctx
-		if target.Timeout > 0 {
+		if !rr.Shell && target.Timeout > 0 {
 			var cancel context.CancelFunc
 			execCtx, cancel = context.WithTimeout(ctx, target.Timeout)
 			defer cancel()
