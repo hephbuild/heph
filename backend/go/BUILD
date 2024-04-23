@@ -223,12 +223,8 @@ def go_mod(
         name = "_go_mod_gen",
         run = "godeps mod $SRC_CFG",
         out = "/**/BUILD",
-        deps = {
-            "cfg": godeps_cfg,
-        },
-        runtime_deps = {
-            "deps": godeps_deps,
-        },
+        deps = {"cfg": godeps_cfg},
+        runtime_deps = {"deps": godeps_deps},
         hash_deps = [imports, gomodsum],
         tools = godeps,
         env = {
