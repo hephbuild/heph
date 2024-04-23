@@ -208,6 +208,10 @@ func generate() []RenderUnit {
 		libPkg := libTarget(pkgs, pkg).Package
 		pkgCfg := Config.GetPkgCfg(pkg.ImportPath)
 
+		if strings.Contains(pkg.ImportPath, "notifications-delivery/cmd") {
+			fmt.Println("#############", pkg.ImportPath, pkg.Name, pkg.IsPartOfTree)
+		}
+
 		var lib *Lib
 		if pkg.IsPartOfTree {
 			if len(pkg.GoFiles) > 0 || len(pkg.SFiles) > 0 {
@@ -229,6 +233,10 @@ func generate() []RenderUnit {
 					t := libTarget(pkgs, pkgs.MustFind(p, pkg.Variant))
 
 					lib.Libs = append(lib.Libs, t.Full())
+				}
+
+				if strings.Contains(pkg.ImportPath, "notifications-delivery/cmd") {
+					fmt.Println("#############", "HAS LIB", lib)
 				}
 
 				units = append(units, RenderUnit{
@@ -295,7 +303,15 @@ func generate() []RenderUnit {
 		}
 
 		if lib != nil && pkg.Name == "main" {
+			if strings.Contains(pkg.ImportPath, "notifications-delivery/cmd") {
+				fmt.Println("#############", "ITS A MAIN")
+			}
+
 			for _, variant := range pkgCfg.UniqueLinkVariants(pkg.Variant) {
+				if strings.Contains(pkg.ImportPath, "notifications-delivery/cmd") {
+					fmt.Println("#############", variant.Name, variant.OS, variant.ARCH)
+				}
+
 				bin := &Bin{
 					TargetName:    targetName("go_bin#build", variant),
 					TargetPackage: lib.Target.Package,
