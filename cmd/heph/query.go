@@ -642,7 +642,7 @@ var revdepsCmd = &cobra.Command{
 				return fmt.Errorf("%v is outside repo", p)
 			}
 
-			children := bs.Graph.DAG().GetFileChildren([]string{rel}, bs.Graph.Targets().Slice())
+			children := bs.Graph.DAG().GetFileChildren([]string{p}, bs.Graph.Targets().Slice())
 			if err != nil {
 				return err
 			}

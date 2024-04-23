@@ -193,19 +193,33 @@ func (d *DAG) GetFileChildren(paths []string, universe []*Target) []*Target {
 	descendants := NewTargets(0)
 
 	for _, path := range paths {
-		for _, target := range universe {
-			for _, file := range target.HashDeps.Files {
-				if file.RelRoot() == path {
-					descendants.Add(target)
-					break
-				}
-			}
+		target := d.getFileChildren(path, universe)
+		if target != nil {
+			descendants.Add(target)
 		}
 	}
 
 	descendants.Sort()
 
 	return descendants.Slice()
+}
+
+func (d *DAG) getFileChildren(path string, universe []*Target) *Target {
+	for _, target := range universe {
+		for _, file := range target.Deps.All().Files {
+			if file.Abs() == path {
+				return target
+			}
+		}
+		for _, file := range target.HashDeps.Files {
+			if file.Abs() == path {
+				return target
+
+			}
+		}
+	}
+
+	return nil
 }
 
 func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
