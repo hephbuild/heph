@@ -12,63 +12,61 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"path/filepath"
 	"time"
 )
 
 type runGenScheduler struct {
-	Name string
-	deps *worker.WaitGroup
+	tracker *worker2.RunningTracker
 	*Scheduler
 }
 
-func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Target) (_ *worker.WaitGroup, rerr error) {
+func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Target) (_ worker2.Dep, rerr error) {
 	if len(genTargets) == 0 {
 		log.Debugf("No gen targets, skip gen pass")
 
-		return &worker.WaitGroup{}, nil
+		return worker2.NewNamedGroup("schedule gen pass: empty"), nil
 	}
-
-	ctx, span := e.Observability.SpanGenPass(ctx)
-	defer func() {
-		if rerr != nil {
-			span.EndError(rerr)
-		}
-	}()
 
 	log.Debugf("Run gen pass")
 
 	ge := runGenScheduler{
-		Name:      "Main",
 		Scheduler: e,
-		deps:      &worker.WaitGroup{},
+		tracker:   worker2.NewRunningTracker(),
 	}
 
-	err := ge.ScheduleGeneratedPipeline(ctx, genTargets)
-	if err != nil {
-		return nil, err
-	}
+	ctx, span := e.Observability.SpanGenPass(ctx)
 
-	j := e.Pool.Schedule(ctx, &worker.Job{
-		Name: "finalize gen",
-		Deps: ge.deps,
-		Hook: worker.StageHook{
-			OnEnd: func(job *worker.Job) context.Context {
-				span.EndError(job.Err())
-				return nil
-			},
+	j1 := worker2.NewAction(worker2.ActionConfig{
+		Name:  "schedule gen pipeline",
+		Ctx:   ctx,
+		Hooks: []worker2.Hook{ge.tracker.Hook()},
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
+			return ge.ScheduleGeneratedPipeline(ctx, genTargets)
 		},
-		Do: func(w *worker.Worker, ctx context.Context) error {
+	})
+
+	j := worker2.NewAction(worker2.ActionConfig{
+		Name: "finalize gen",
+		Ctx:  ctx,
+		Hooks: []worker2.Hook{
+			worker2.StageHook{
+				OnEnd: func(dep worker2.Dep) context.Context {
+					span.EndError(dep.GetErr())
+					return nil
+				},
+			}.Hook(),
+		},
+		Deps: []worker2.Dep{j1, ge.tracker.Group()},
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			status.Emit(ctx, status.String("Finalizing gen..."))
 
 			return nil
 		},
 	})
 
-	deps := worker.WaitGroupJob(j)
-
-	return deps, nil
+	return j, nil
 }
 
 func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets []*graph.Target) error {
@@ -78,6 +76,8 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 		}
 	}
 
+	status.Emit(ctx, status.String(fmt.Sprintf("Linking targets...")))
+
 	err := e.Graph.LinkTargets(ctx, false, targets, false)
 	if err != nil {
 		return fmt.Errorf("linking: %w", err)
@@ -85,24 +85,28 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 	start := time.Now()
 
-	sdeps, err := e.ScheduleTargetsWithDeps(ctx, targets, true, nil)
+	status.Emit(ctx, status.String(fmt.Sprintf("Scheduling...")))
+
+	sdeps, _, err := e.ScheduleTargetsWithDeps(ctx, targets, true, nil)
 	if err != nil {
 		return err
 	}
 
 	newTargets := graph.NewTargets(0)
-	deps := &worker.WaitGroup{}
+	deps := worker2.NewNamedGroup("schedule generated pipeline deps")
 	for _, target := range targets {
 		e.scheduleRunGenerated(ctx, target, sdeps.Get(target.Addr), deps, newTargets)
 	}
 
-	j := e.Pool.Schedule(ctx, &worker.Job{
-		Name: "ScheduleGeneratedPipeline " + e.Name,
-		Deps: deps,
-		Do: func(w *worker.Worker, ctx context.Context) error {
-			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated %v...", e.Name)))
+	e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
+		Name:  "ScheduleGeneratedPipeline Main",
+		Ctx:   ctx,
+		Hooks: []worker2.Hook{e.tracker.Hook()},
+		Deps:  []worker2.Dep{deps},
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
+			status.Emit(ctx, status.String(fmt.Sprintf("Finalizing generated...")))
 
-			log.Tracef("run generated %v got %v targets in %v", e.Name, newTargets.Len(), time.Since(start))
+			log.Tracef("run generated got %v targets in %v", newTargets.Len(), time.Since(start))
 
 			genTargets := ads.Filter(newTargets.Slice(), func(target *graph.Target) bool {
 				return target.IsGen()
@@ -117,23 +121,23 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 			return nil
 		},
-	})
-	e.deps.Add(j)
+	}))
 
 	return nil
 }
 
-func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps *worker.WaitGroup, deps *worker.WaitGroup, targets *graph.Targets) {
-	j := e.Pool.Schedule(ctx, &worker.Job{
+func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *graph.Target, runDeps worker2.Dep, deps *worker2.Group, targets *graph.Targets) {
+	j := worker2.NewAction(worker2.ActionConfig{
 		Name: "rungen_" + target.Addr,
-		Deps: runDeps,
-		Do: func(w *worker.Worker, ctx context.Context) error {
+		Deps: []worker2.Dep{runDeps},
+		Ctx:  ctx,
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			ltarget := e.LocalCache.Metas.Find(target)
 
 			return e.scheduleRunGeneratedFiles(ctx, ltarget, deps, targets)
 		},
 	})
-	deps.Add(j)
+	deps.AddDep(j)
 }
 
 type matchGen struct {
@@ -141,7 +145,7 @@ type matchGen struct {
 	matchers []specs.Matcher
 }
 
-func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker.WaitGroup, targets *graph.Targets) error {
+func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target *lcache.Target, deps *worker2.Group, targets *graph.Targets) error {
 	matchers := []matchGen{{
 		addr:     target.Addr,
 		matchers: target.Gen,
@@ -158,78 +162,75 @@ func (e *runGenScheduler) scheduleRunGeneratedFiles(ctx context.Context, target 
 
 	files := target.ActualOutFiles().All().WithRoot(target.OutExpansionRoot().Abs())
 
-	chunks := ads.Chunk(files, len(e.Pool.Workers))
-
-	for i, files := range chunks {
-		files := files
-
-		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("rungen %v chunk %v", target.Addr, i),
-			Do: func(w *worker.Worker, ctx context.Context) error {
-				opts := hbuiltin.Bootstrap(hbuiltin.Opts{
-					Pkgs:   e.Packages,
-					Root:   e.Root,
-					Config: e.Config,
-					RegisterTarget: func(spec specs.Target) error {
-						for _, entry := range matchers {
-							addrMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
-								return specs.IsAddrMatcher(m)
-							})
-
-							addrMatch := ads.Some(addrMatchers, func(m specs.Matcher) bool {
-								return m.Match(spec)
-							})
-
-							if !addrMatch {
-								return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
-							}
-
-							labelMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
-								return specs.IsLabelMatcher(m)
-							})
-
-							for _, label := range spec.Labels {
-								labelMatch := ads.Some(labelMatchers, func(m specs.Matcher) bool {
-									return m.(specs.StringMatcher).MatchString(label)
-								})
-
-								if !labelMatch {
-									return fmt.Errorf("label `%v` doest match any gen pattern of %v: %v", label, entry.addr, entry.matchers)
-								}
-							}
-						}
-
-						spec.GenSources = []string{target.Addr}
-
-						t, err := e.Graph.Register(spec)
-						if err != nil {
-							return err
-						}
-
-						targets.Add(t)
-						return nil
-					},
+	opts := hbuiltin.Bootstrap(hbuiltin.Opts{
+		Pkgs:   e.Packages,
+		Root:   e.Root,
+		Config: e.Config,
+		RegisterTarget: func(spec specs.Target) error {
+			for _, entry := range matchers {
+				addrMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+					return specs.IsAddrMatcher(m)
 				})
 
-				for _, file := range files {
-					status.Emit(ctx, status.String(fmt.Sprintf("Running %v", file.RelRoot())))
+				addrMatch := ads.Some(addrMatchers, func(m specs.Matcher) bool {
+					return m.Match(spec)
+				})
 
-					ppath := filepath.Dir(file.RelRoot())
-					pkg := e.Packages.GetOrCreate(packages.Package{
-						Path: ppath,
-						Root: xfs.NewPath(e.Root.Root.Abs(), ppath),
+				if !addrMatch {
+					return fmt.Errorf("%v doest match any gen pattern of %v: %v", spec.Addr, entry.addr, entry.matchers)
+				}
+
+				labelMatchers := ads.Filter(entry.matchers, func(m specs.Matcher) bool {
+					return specs.IsLabelMatcher(m)
+				})
+
+				for _, label := range spec.Labels {
+					labelMatch := ads.Some(labelMatchers, func(m specs.Matcher) bool {
+						return m.(specs.StringMatcher).MatchString(label)
 					})
 
-					err := e.BuildFilesState.RunBuildFile(pkg, file.Abs(), opts)
-					if err != nil {
-						return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
+					if !labelMatch {
+						return fmt.Errorf("label `%v` doest match any gen pattern of %v: %v", label, entry.addr, entry.matchers)
 					}
+				}
+			}
+
+			spec.GenSources = []string{target.Addr}
+
+			t, err := e.Graph.Register(spec)
+			if err != nil {
+				return err
+			}
+
+			targets.Add(t)
+			return nil
+		},
+	})
+
+	for _, file := range files {
+		file := file
+		j := worker2.NewAction(worker2.ActionConfig{
+			Name:  fmt.Sprintf("rungen %v file %v", target.Addr, file.RelRoot()),
+			Ctx:   ctx,
+			Hooks: []worker2.Hook{e.tracker.Hook()},
+			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
+				status.Emit(ctx, status.String(fmt.Sprintf("Running %v", file.RelRoot())))
+
+				ppath := filepath.Dir(file.RelRoot())
+				pkg := e.Packages.GetOrCreate(packages.Package{
+					Path: ppath,
+					Root: xfs.NewPath(e.Root.Root.Abs(), ppath),
+				})
+
+				err := e.BuildFilesState.RunBuildFile(pkg, file.Abs(), opts)
+				if err != nil {
+					return fmt.Errorf("runbuild %v: %w", file.Abs(), err)
 				}
 
 				return nil
 			},
 		})
-		deps.Add(j)
+		deps.AddDep(j)
 	}
 
 	return nil

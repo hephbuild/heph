@@ -11,6 +11,7 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xstarlark"
 	"go.starlark.net/starlark"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -194,6 +195,19 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		t.Annotations[item.Key] = utils.FromStarlark(item.Value)
 	}
 
+	t.Requests = map[string]float64{
+		"cpu":    1,
+		"memory": 100000000, // 1M
+	}
+	for _, item := range args.Requests.Items() {
+		v, err := requestFromArg(item.Value)
+		if err != nil {
+			return specs.Target{}, fmt.Errorf("request: %v: %w", item.Key, err)
+		}
+
+		t.Requests[item.Key] = v
+	}
+
 	if t.OutEnv == "" {
 		if t.OutInSandbox {
 			t.OutEnv = specs.FileEnvAbs
@@ -246,6 +260,53 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 	}
 
 	return t, nil
+}
+
+// https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/quantity/
+var units = map[string]float64{
+	"E": math.Pow(10, 18),
+	"P": math.Pow(10, 15),
+	"T": math.Pow(10, 12),
+	"G": math.Pow(10, 9),
+	"M": math.Pow(10, 6),
+	"k": math.Pow(10, 3),
+
+	"Ei": math.Pow(2, 60),
+	"Pi": math.Pow(2, 50),
+	"Ti": math.Pow(2, 40),
+	"Gi": math.Pow(2, 30),
+	"Mi": math.Pow(2, 20),
+	"Ki": math.Pow(2, 10),
+
+	"m": math.Pow(10, -3),
+}
+
+func requestFromArg(s starlark.Value) (float64, error) {
+	switch v := utils.FromStarlark(s).(type) {
+	case string:
+		mul := float64(1)
+		for u, uv := range units {
+			rest, ok := strings.CutSuffix(v, u)
+			if ok {
+				mul = uv
+				v = rest
+				break
+			}
+		}
+
+		vi, err := strconv.ParseFloat(v, 10)
+		if err != nil {
+			return 0, err
+		}
+
+		return vi * mul, nil
+	case int64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	default:
+		return 0, fmt.Errorf("unsupported type %T: %v", v, v)
+	}
 }
 
 func docFromArg(doc string) string {

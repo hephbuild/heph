@@ -15,8 +15,7 @@ import (
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,7 +40,7 @@ type RequestOpts struct {
 	PullCache     bool
 }
 
-func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*Target, error) {
+func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tracker *worker2.RunningTracker) (*Target, error) {
 	target := rr.Target
 
 	rtarget, err := e.runPrepare(ctx, rr.Target, rr)
@@ -144,7 +143,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 		sandbox.AddPathEnv(env, binDir, target.Sandbox && !hasPathInEnv)
 
 		execCtx := ctx
-		if target.Timeout > 0 {
+		if !rr.Shell && target.Timeout > 0 {
 			var cancel context.CancelFunc
 			execCtx, cancel = context.WithTimeout(ctx, target.Timeout)
 			defer cancel()
@@ -235,7 +234,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 			}
 
 			if cerr := ctx.Err(); cerr != nil {
-				if !errors.Is(cerr, err) {
+				if !errors.Is(err, cerr) {
 					err = fmt.Errorf("%w: %v", cerr, err)
 				}
 			}
@@ -281,11 +280,13 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 	}
 
 	if !e.Config.Engine.KeepSandbox {
-		j := e.Pool.Schedule(ctx, &worker.Job{
-			Name: fmt.Sprintf("clear sandbox %v", target.Addr),
+		e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
+			Name:  fmt.Sprintf("clear sandbox %v", target.Addr),
+			Ctx:   ctx,
+			Hooks: []worker2.Hook{tracker.Hook()},
 			// We need to make sure to wait for the lock to be released before proceeding
-			Deps: worker.WaitGroupChan(completedCh),
-			Do: func(w *worker.Worker, ctx context.Context) error {
+			Deps: []worker2.Dep{worker2.NewChanDep(ctx, completedCh)},
+			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 				locked, err := rtarget.SandboxLock.TryLock(ctx)
 				if err != nil {
 					return err
@@ -310,10 +311,7 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig) (*
 
 				return nil
 			},
-		})
-		if poolDeps := poolwait.ForegroundWaitGroup(ctx); poolDeps != nil {
-			poolDeps.Add(j)
-		}
+		}))
 	}
 
 	return rtarget, nil

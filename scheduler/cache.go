@@ -9,9 +9,12 @@ import (
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/rcache"
+	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/utils/mds"
+	"github.com/hephbuild/heph/utils/xdebug"
+	"github.com/hephbuild/heph/worker2"
 	"os"
 	"sync"
 )
@@ -69,6 +72,19 @@ func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, ou
 		return false, true, nil
 	}
 
+	if e.GitStatus != nil {
+		for _, file := range target.Deps.All().Files {
+			if e.GitStatus.IsDirty(ctx, file.Abs()) {
+				err = e.setCacheHintSkip(target, mds.Keys(e.Config.Caches))
+				if err != nil {
+					log.Error(fmt.Errorf("set cache hint: %w", err))
+				}
+				log.Tracef("%v: %v is dirty, skipping cache get", target.Addr, file.Abs())
+				return false, false, nil
+			}
+		}
+	}
+
 	orderedCaches, err := e.RemoteCache.OrderedCaches(ctx)
 	if err != nil {
 		return false, false, fmt.Errorf("orderedcaches: %w", err)
@@ -113,19 +129,34 @@ func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, ou
 			log.Warnf("%v cache %v: local cache is supposed to exist locally, but failed getLocalCache, this is not supposed to happen", target.Addr, cache.Name)
 		} else {
 			if e.Config.Engine.CacheHints {
-				children, err := e.Graph.DAG().GetDescendants(target.Target)
+				err = e.setCacheHintSkip(target, []string{cache.Name})
 				if err != nil {
-					log.Error(fmt.Errorf("descendants: %w", err))
-				}
-
-				for _, child := range children {
-					e.RemoteCache.Hints.Set(child.Addr, cache.Name, rcache.HintSkip{})
+					log.Error(fmt.Errorf("set cache hint: %w", err))
 				}
 			}
 		}
 	}
 
 	return false, false, nil
+}
+
+func (e *Scheduler) setCacheHintSkip(target specs.Specer, cacheNames []string) error {
+	for _, cacheName := range cacheNames {
+		e.RemoteCache.Hints.Set(target.Spec().Addr, cacheName, rcache.HintSkip{})
+	}
+
+	children, err := e.Graph.DAG().GetDescendants(target)
+	if err != nil {
+		return fmt.Errorf("descendants: %w", err)
+	}
+
+	for _, child := range children {
+		for _, cacheName := range cacheNames {
+			e.RemoteCache.Hints.Set(child.Addr, cacheName, rcache.HintSkip{})
+		}
+	}
+
+	return nil
 }
 
 func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target, outputs []string, onlyMeta bool, cache rcache.CacheConfig) (_ bool, rerr error) {
@@ -171,29 +202,36 @@ func (e *Scheduler) pullExternalCache(ctx context.Context, target *graph.Target,
 	return true, nil
 }
 
-func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache rcache.CacheConfig) *worker.Job {
+func (e *Scheduler) scheduleStoreExternalCache(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, trackers []*worker2.RunningTracker) worker2.Dep {
 	// input hash is used as a marker that everything went well,
 	// wait for everything else to be done before copying the input hash
 	inputHashArtifact := target.Artifacts.InputHash
 
-	deps := &worker.WaitGroup{}
+	deps := worker2.NewNamedGroup(xdebug.Sprintf("%v: schedule store external cache", target.Name))
 	for _, artifact := range target.Artifacts.All() {
 		if artifact.Name() == inputHashArtifact.Name() {
 			continue
 		}
 
-		j := e.scheduleStoreExternalCacheArtifact(ctx, target, cache, artifact, nil)
-		deps.Add(j)
+		j := e.scheduleStoreExternalCacheArtifact(ctx, target, cache, artifact, nil, trackers)
+		deps.AddDep(j)
 	}
 
-	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps)
+	return e.scheduleStoreExternalCacheArtifact(ctx, target, cache, inputHashArtifact, deps, trackers)
 }
 
-func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker.WaitGroup) *worker.Job {
-	return e.Pool.Schedule(ctx, &worker.Job{
-		Name: fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
-		Deps: deps,
-		Do: func(w *worker.Worker, ctx context.Context) error {
+func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, target *graph.Target, cache rcache.CacheConfig, artifact artifacts.Artifact, deps *worker2.Group, trackers []*worker2.RunningTracker) worker2.Dep {
+	var hooks []worker2.Hook
+	for _, tracker := range trackers {
+		hooks = append(hooks, tracker.Hook())
+	}
+
+	return e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
+		Name:  fmt.Sprintf("cache %v %v %v", target.Addr, cache.Name, artifact.Name()),
+		Hooks: hooks,
+		Deps:  []worker2.Dep{deps},
+		Ctx:   ctx,
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 			exists, err := e.LocalCache.ArtifactExists(ctx, target, artifact)
 			if err != nil {
 				return err
@@ -214,5 +252,5 @@ func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, targ
 
 			return nil
 		},
-	})
+	}))
 }

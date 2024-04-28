@@ -7,17 +7,17 @@ import (
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/locks"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2"
 )
 
-func (e *Scheduler) RunWithSpan(ctx context.Context, rr targetrun.Request, iocfg sandbox.IOConfig) (rerr error) {
+func (e *Scheduler) RunWithSpan(ctx context.Context, rr targetrun.Request, iocfg sandbox.IOConfig, tracker *worker2.RunningTracker) (rerr error) {
 	ctx, rspan := e.Observability.SpanRun(ctx, rr.Target)
 	defer rspan.EndError(rerr)
 
-	return e.Run(ctx, rr, iocfg)
+	return e.Run(ctx, rr, iocfg, tracker)
 }
 
-func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox.IOConfig) error {
+func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox.IOConfig, tracker *worker2.RunningTracker) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -55,7 +55,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 			return fmt.Errorf("args are not supported with cache")
 		}
 
-		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.OutWithSupport.Names(), false, true, false)
+		cached, err := e.pullOrGetCacheAndPost(ctx, target, target.Out.Names(), false, true, false)
 		if err != nil {
 			return err
 		}
@@ -74,7 +74,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 		rr.Compress = len(writeableCaches) > 0
 	}
 
-	rtarget, err := e.Runner.Run(ctx, rr, iocfg)
+	rtarget, err := e.Runner.Run(ctx, rr, iocfg, tracker)
 	if err != nil {
 		return targetrun.WrapTargetFailed(err, target)
 	}
@@ -86,11 +86,7 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 
 	if len(writeableCaches) > 0 {
 		for _, cache := range writeableCaches {
-			j := e.scheduleStoreExternalCache(ctx, rtarget.Target, cache)
-
-			if poolDeps := poolwait.ForegroundWaitGroup(ctx); poolDeps != nil {
-				poolDeps.Add(j)
-			}
+			_ = e.scheduleStoreExternalCache(ctx, rtarget.Target, cache, []*worker2.RunningTracker{tracker, e.BackgroundTracker})
 		}
 	}
 

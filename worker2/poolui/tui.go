@@ -6,22 +6,28 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/utils/xtime"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"strings"
 	"time"
 )
 
+type workerEntry struct {
+	status   status.Statuser
+	duration time.Duration
+	exec     *worker2.Execution
+}
+
 type UpdateMessage struct {
-	workers []*worker.Worker
-	stats   worker.WaitGroupStats
+	workers []workerEntry
+	stats   worker2.Stats
 	final   bool
 }
 
-func New(ctx context.Context, name string, deps *worker.WaitGroup, pool *worker.Pool, quitWhenDone bool) *Model {
+func New(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engine, quitWhenDone bool) *Model {
 	return &Model{
 		name:  name,
 		deps:  deps,
@@ -37,10 +43,10 @@ func New(ctx context.Context, name string, deps *worker.WaitGroup, pool *worker.
 
 type Model struct {
 	name         string
-	deps         *worker.WaitGroup
+	deps         worker2.Dep
 	start        time.Time
 	cancel       func()
-	pool         *worker.Pool
+	pool         *worker2.Engine
 	log          xtea.LogModel
 	quitWhenDone bool
 	UpdateMessage
@@ -63,36 +69,47 @@ func (m *Model) doUpdateMsgTicker() tea.Cmd {
 
 func (m *Model) updateMsg(final bool) UpdateMessage {
 	if !final {
-		final = m.deps.IsDone()
+		select {
+		case <-m.deps.Wait():
+			final = true
+		default:
+			final = false
+		}
 	}
 
-	s := m.deps.TransitiveCount()
-	return UpdateMessage{
-		stats:   s,
-		workers: m.pool.Workers,
-		final:   final,
-	}
-}
-
-func printJobsWaitStack(jobs []*worker.Job, d int) []string {
-	prefix := strings.Repeat("  ", d+1)
-
-	strs := make([]string, 0)
-	for _, j := range jobs {
-		if j.IsDone() {
+	var workers []workerEntry
+	for _, w := range m.pool.GetWorkers() {
+		exec := w.Execution()
+		if exec == nil {
 			continue
 		}
 
-		strs = append(strs, fmt.Sprintf("%v- %v (%v)", prefix, j.Name, j.State.String()))
-
-		deps := j.Deps.Jobs()
-		if len(deps) > 0 {
-			strs = append(strs, prefix+fmt.Sprintf("  deps: (%v)", len(deps)))
-			strs = append(strs, printJobsWaitStack(deps, d+1)...)
+		if _, ok := exec.Dep.(*worker2.Group); ok {
+			continue
 		}
+
+		var duration time.Duration
+		if !exec.StartedAt.IsZero() {
+			duration = time.Since(exec.StartedAt)
+		}
+
+		if duration < 200*time.Millisecond {
+			continue
+		}
+
+		workers = append(workers, workerEntry{
+			status:   w.GetStatus(),
+			duration: duration,
+			exec:     exec,
+		})
 	}
 
-	return strs
+	s := worker2.CollectStats(m.deps)
+	return UpdateMessage{
+		stats:   s,
+		workers: workers,
+		final:   final,
+	}
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -107,25 +124,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyBreak:
 			m.cancel()
 			return m, nil
-		case tea.KeyRunes:
-			switch msg.String() {
-			case "p":
-				jobs := m.pool.Jobs()
-
-				strs := make([]string, 0)
-				strs = append(strs, "Unfinished jobs:")
-				strs = append(strs, printJobsWaitStack(jobs, 0)...)
-				strs = append(strs, "Suspended jobs:")
-				strs = append(strs, ads.Map(
-					ads.Filter(jobs, func(job *worker.Job) bool {
-						return job.State == worker.StateSuspended
-					}), func(t *worker.Job) string {
-						return t.Name
-					},
-				)...)
-
-				return m, tea.Println(strings.Join(strs, "\n"))
-			}
 		}
 	case UpdateMessage:
 		m.UpdateMessage = msg
@@ -150,9 +148,9 @@ func (m *Model) View() string {
 	start := xtime.RoundDuration(time.Since(m.start), 1).String()
 
 	if m.final {
-		count := fmt.Sprint(m.stats.Done)
-		if m.stats.Done != m.stats.All {
-			count = fmt.Sprintf("%v/%v", m.stats.Done, m.stats.All)
+		count := fmt.Sprint(m.stats.Completed)
+		if m.stats.Completed != m.stats.All {
+			count = fmt.Sprintf("%v/%v", m.stats.Completed, m.stats.All)
 		}
 		extra := ""
 		if m.stats.Failed > 0 || m.stats.Skipped > 0 {
@@ -162,7 +160,7 @@ func (m *Model) View() string {
 	}
 
 	var s strings.Builder
-	s.WriteString(fmt.Sprintf("%v: %v/%v %v", m.name, m.stats.Done, m.stats.All, start))
+	s.WriteString(fmt.Sprintf("%v: %v/%v %v", m.name, m.stats.Completed, m.stats.All, start))
 	if m.stats.Suspended > 0 {
 		s.WriteString(fmt.Sprintf(" (%v suspended)", m.stats.Suspended))
 	}
@@ -172,17 +170,14 @@ func (m *Model) View() string {
 	}
 
 	for _, w := range m.workers {
-		runtime := ""
-		if j := w.CurrentJob; j != nil {
-			runtime = fmt.Sprintf("=> [%5s]", xtime.FormatFixedWidthDuration(time.Since(j.TimeStart)))
+		runtime := fmt.Sprintf("=> [%5s]", xtime.FormatFixedWidthDuration(w.duration))
+
+		statusStr := w.status.String(log.Renderer())
+		if statusStr == "" {
+			statusStr = styleFaint.Render("=> Thinking...")
 		}
 
-		status := w.GetStatus().String(log.Renderer())
-		if status == "" {
-			status = styleFaint.Render("=|")
-		}
-
-		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), status))
+		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), statusStr))
 	}
 
 	return s.String()

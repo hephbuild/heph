@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
@@ -23,13 +24,12 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
 	"github.com/hephbuild/heph/vfssimple"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"io"
 	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 )
 
@@ -43,12 +43,12 @@ type LocalCacheState struct {
 	Finalizers      *finalizers.Finalizers
 	EnableGC        bool
 	ParallelCaching bool
-	Pool            *worker.Pool
+	Pool            *worker2.Engine
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, pool *worker.Pool, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
+func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -133,7 +133,7 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 			return err
 		}
 
-		err = worker.SuspendWaitGroup(ctx, genDeps)
+		err = worker2.WaitDep(ctx, genDeps)
 		if err != nil {
 			return err
 		}
@@ -392,24 +392,36 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 	}
 
 	outDir := cacheDir.Join("_output")
+
+	// Legacy...
 	outDirHashPath := cacheDir.Join("_output_hash").Abs()
+	_ = os.Remove(outDirHashPath)
 
-	// TODO: This can be a problem, where 2 targets depends on the same target, but with different outputs,
-	// leading to the expand overriding each other
+	outDirMetaPath := cacheDir.Join("_output_meta").Abs()
 
-	outDirHash := "2|" + strings.Join(outputs, ",")
+	type OutDirMeta struct {
+		Version int
+		Outputs []string
+	}
+	version := 1
 
 	shouldExpand := false
+	shouldCleanExpand := false
 	if !xfs.PathExists(outDir.Abs()) {
 		shouldExpand = true
 	} else {
-		b, err := os.ReadFile(outDirHashPath)
+		b, err := os.ReadFile(outDirMetaPath)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return outDir, fmt.Errorf("outdirhash: %w", err)
+			return outDir, fmt.Errorf("get outdir meta: %w", err)
 		}
 
-		if len(b) > 0 && strings.TrimSpace(string(b)) != outDirHash {
+		var currentMeta OutDirMeta
+		_ = json.Unmarshal(b, &currentMeta)
+		if currentMeta.Version != version || !ads.ContainsAll(currentMeta.Outputs, outputs) {
 			shouldExpand = true
+		}
+		if currentMeta.Version != version {
+			shouldCleanExpand = true
 		}
 	}
 
@@ -419,18 +431,14 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 
 	if shouldExpand {
 		status.Emit(ctx, tgt.TargetStatus(target, "Expanding cache..."))
-		dir, err := e.cacheDir(target)
-		if err != nil {
-			return xfs.Path{}, err
-		}
-		tmpOutDir := dir.Join("_output_tmp").Abs()
-
-		err = os.RemoveAll(tmpOutDir)
-		if err != nil {
-			return outDir, err
+		if shouldCleanExpand {
+			err = os.RemoveAll(outDir.Abs())
+			if err != nil {
+				return outDir, err
+			}
 		}
 
-		err = os.MkdirAll(tmpOutDir, os.ModePerm)
+		err = os.MkdirAll(outDir.Abs(), os.ModePerm)
 		if err != nil {
 			return outDir, err
 		}
@@ -449,6 +457,7 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 			if err != nil {
 				return outDir, err
 			}
+			defer r.Close()
 
 			var progress func(written int64)
 			if manifest.Size > 0 {
@@ -464,30 +473,29 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 				return xfs.Path{}, err
 			}
 
-			err = tar.UntarContext(ctx, r, tmpOutDir, tar.UntarOptions{
+			err = tar.UntarContext(ctx, r, outDir.Abs(), tar.UntarOptions{
 				ListPath: tarPath,
 				Dedup:    untarDedup,
 				Progress: progress,
 			})
-			_ = r.Close()
 			if err != nil {
 				return outDir, fmt.Errorf("%v: untar: %w", name, err)
 			}
+
+			_ = r.Close()
 		}
 
-		err = os.RemoveAll(outDir.Abs())
+		b, err := json.Marshal(OutDirMeta{
+			Version: version,
+			Outputs: outputs,
+		})
 		if err != nil {
-			return outDir, err
+			return xfs.Path{}, err
 		}
 
-		err = os.Rename(tmpOutDir, outDir.Abs())
+		err = os.WriteFile(outDirMetaPath, b, os.ModePerm)
 		if err != nil {
-			return outDir, err
-		}
-
-		err = os.WriteFile(outDirHashPath, []byte(outDirHash), os.ModePerm)
-		if err != nil {
-			return outDir, fmt.Errorf("outdirhash: %w", err)
+			return outDir, fmt.Errorf("write outdir meta: %w", err)
 		}
 	}
 

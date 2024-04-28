@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
-	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 	"os"
 	"os/exec"
 )
@@ -37,6 +37,12 @@ func Run(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests, ru
 }
 
 func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests, runopts RunOpts, inlineSingle bool, mode string, iocfg sandbox.IOConfig) error {
+	debugger.SetLabels(func() []string {
+		return []string{
+			"where", "RunMode",
+		}
+	})
+
 	for i := range rrs {
 		rrs[i].Mode = mode
 	}
@@ -60,32 +66,19 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 		inlineRR = &rrs[0]
 	}
 
-	// fgDeps will include deps created inside the scheduled jobs to be waited for in the foreground
-	// The DoneSem() must be called after all the tdeps have finished
-	ctx, fgDeps := poolwait.ContextWithForegroundWaitGroup(ctx)
-	fgDeps.AddSem()
-
 	var skip []specs.Specer
 	if inlineRR != nil {
 		skip = []specs.Specer{inlineRR.Target}
 	}
-	tdepsMap, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
+	tdepsMap, tracker, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
 	if err != nil {
-		fgDeps.DoneSem()
 		return err
 	}
 
 	tdeps := tdepsMap.All()
-	go func() {
-		<-tdeps.Done()
-		fgDeps.DoneSem()
-	}()
+	tdeps.AddDep(tracker.Group())
 
-	runDeps := &worker.WaitGroup{}
-	runDeps.AddChild(tdeps)
-	runDeps.AddChild(fgDeps)
-
-	err = poolwait.Wait(ctx, "Run", e.Pool, runDeps, runopts.Plain)
+	err = poolwait.Wait(ctx, "Run", e.Pool, tdeps, runopts.Plain, e.Config.ProgressInterval)
 	if err != nil {
 		return err
 	}
@@ -119,7 +112,7 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 		iocfg.Stdout = os.Stderr
 	}
 
-	err = e.RunWithSpan(ctx, *inlineRR, iocfg)
+	err = e.RunWithSpan(ctx, *inlineRR, iocfg, nil)
 	if err != nil {
 		var eerr *exec.ExitError
 		if errors.As(err, &eerr) {

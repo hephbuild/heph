@@ -2,6 +2,7 @@ package xtea
 
 import (
 	"fmt"
+	tea "github.com/charmbracelet/bubbletea"
 	"runtime/debug"
 	"sync"
 )
@@ -28,6 +29,27 @@ func SingleflightTry() bool {
 }
 
 func SingleflightDone() {
-	//tuiStack = nil
+	if debugSingleflight {
+		tuiStack = nil
+	}
 	tuim.Unlock()
+}
+
+var resetTermFunc func()
+
+func SetResetTerminal(p *tea.Program) {
+	if p == nil {
+		resetTermFunc = nil
+		return
+	}
+
+	resetTermFunc = func() {
+		_ = p.ReleaseTerminal()
+	}
+}
+
+func ResetTerminal() {
+	if f := resetTermFunc; f != nil {
+		f()
+	}
 }

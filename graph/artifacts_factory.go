@@ -55,8 +55,17 @@ func (o *ArtifactRegistry) OutHash(name string) artifacts.Artifact {
 	return o.Out[name].Hash()
 }
 
+func (o *ArtifactRegistry) OutTar2(name string) (artifacts.Artifact, bool) {
+	out, ok := o.Out[name]
+	if !ok {
+		return nil, false
+	}
+	return out.Tar(), true
+}
+
 func (o *ArtifactRegistry) OutTar(name string) artifacts.Artifact {
-	return o.Out[name].Tar()
+	a, _ := o.OutTar2(name)
+	return a
 }
 
 func (e *State) newArtifactRegistry(target *Target) *ArtifactRegistry {

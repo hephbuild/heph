@@ -26,7 +26,7 @@ import (
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
-	"github.com/hephbuild/heph/worker"
+	"github.com/hephbuild/heph/worker2"
 	"io"
 	"os"
 	"path/filepath"
@@ -44,7 +44,7 @@ type Runner struct {
 	QueryFunctions    func(*graph.Target) map[string]exprs.Func
 	Cwd               string
 	Config            *config.Config
-	Pool              *worker.Pool
+	Pool              *worker2.Engine
 }
 
 type Target struct {
@@ -285,7 +285,10 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 					linkSrcRec.Add("", file.Abs(), file.RelRoot(), "")
 				}
 			} else {
-				art := dept.Artifacts.OutTar(dep.Output)
+				art, ok := dept.Artifacts.OutTar2(dep.Output)
+				if !ok {
+					return nil, fmt.Errorf("artifact %v|%v not found: %v", dept.Addr, dep.Output, dept.ActualOutFiles().Names())
+				}
 				p, stats, err := e.LocalCache.UncompressedPathFromArtifact(ctx, dept, art)
 				if err != nil {
 					return nil, err
@@ -411,6 +414,7 @@ func (e *Runner) runPrepare(ctx context.Context, target *graph.Target, rr Reques
 		// Forward heph variables inside the sandbox
 		forward := []string{
 			"HEPH_PROFILES",
+			"HEPH_DEBUG_POOLWAIT",
 			"HEPH_FROM_PATH",
 			"HEPH_CLOUD_TOKEN",
 			hephprovider.EnvSrcRoot,

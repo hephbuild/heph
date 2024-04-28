@@ -1,19 +1,23 @@
 package config
 
+import "time"
+
 type Extras map[string]interface{}
 
 type FileConfig struct {
-	BaseConfig   `yaml:",inline"`
-	Caches       map[string]FileCache `yaml:"caches,omitempty"`
-	CacheOrder   string               `yaml:"cache_order"`
-	CacheHistory int                  `yaml:"cache_history"`
-	Cloud        struct {
+	BaseConfig       `yaml:",inline"`
+	Caches           map[string]FileCache `yaml:"caches,omitempty"`
+	CacheOrder       string               `yaml:"cache_order"`
+	CacheHistory     int                  `yaml:"cache_history"`
+	ProgressInterval *int                 `yaml:"progress_interval"`
+	Cloud            struct {
 		URL     string `yaml:"url"`
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`
 	Engine struct {
 		GC              *bool `yaml:"gc"`
 		CacheHints      *bool `yaml:"cache_hints"`
+		GitCacheHints   *bool `yaml:"git_cache_hints"`
 		InstallTools    *bool `yaml:"install_tools"`
 		KeepSandbox     *bool `yaml:"keep_sandbox"`
 		ParallelCaching *bool `yaml:"parallel_caching"`
@@ -77,8 +81,16 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 		c.Engine.CacheHints = *fc.Engine.CacheHints
 	}
 
+	if fc.Engine.GitCacheHints != nil {
+		c.Engine.GitCacheHints = *fc.Engine.GitCacheHints
+	}
+
 	if fc.Engine.InstallTools != nil {
 		c.Engine.InstallTools = *fc.Engine.InstallTools
+	}
+
+	if fc.ProgressInterval != nil {
+		c.ProgressInterval = time.Duration(*fc.ProgressInterval) * time.Second
 	}
 
 	if fc.CacheOrder != "" {

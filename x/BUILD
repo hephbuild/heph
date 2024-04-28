@@ -47,7 +47,8 @@ done
 waitfail = target(
     name = "wait-fail",
     run = """
-    sleep 5
+    echo will fail...
+    sleep 1
     exit 1
     """,
     cache = False,
@@ -111,4 +112,23 @@ target(
             },
         },
     },
+)
+
+reqdeps = []
+for i in range(0, 3):
+    t = target(
+        name = "req{}".format(i),
+        run = "sleep 2",
+        cache = False,
+        requests = {
+            "cpu": heph.num_cpu()
+        }
+    )
+    reqdeps.append(t)
+
+target(
+    name = "req",
+    run = "echo ran",
+    deps = reqdeps,
+    cache = False,
 )

@@ -533,7 +533,7 @@ func (f *formatter) formatExpr(w Writer, expr syntax.Expr) error {
 		case syntax.INT:
 			w.WriteString(strconv.FormatInt(expr.Value.(int64), 10))
 		case syntax.FLOAT:
-			w.WriteString(strconv.FormatFloat(expr.Value.(float64), 'f', 0, 64))
+			w.WriteString(strconv.FormatFloat(expr.Value.(float64), 'f', -1, 64))
 		default:
 			return fmt.Errorf("unhandled Literal token: %v", expr.Token)
 		}

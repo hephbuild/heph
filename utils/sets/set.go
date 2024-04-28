@@ -1,7 +1,7 @@
 package sets
 
 import (
-	"github.com/hephbuild/heph/utils/ads"
+	"slices"
 	"sync"
 )
 
@@ -71,14 +71,18 @@ func (ts *Set[K, T]) GetKey(k K) T {
 
 func (ts *Set[K, T]) has(t T) bool {
 	k := ts.f(t)
-	_, ok := ts.m[k]
+	return ts.hask(k)
+}
 
+func (ts *Set[K, T]) hask(k K) bool {
+	_, ok := ts.m[k]
 	return ok
 }
 
 func (ts *Set[K, T]) add(t T) bool {
 	k := ts.f(t)
-	if ts.has(t) {
+
+	if ts.hask(k) {
 		return false
 	}
 
@@ -125,14 +129,21 @@ func (ts *Set[K, T]) Copy() *Set[K, T] {
 }
 
 func (ts *Set[K, T]) Pop(i int) T {
+	v := ts.a[i]
+
+	ts.Remove(v)
+
+	return v
+}
+
+func (ts *Set[K, T]) Remove(v T) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	v := ts.a[i]
+	k := ts.f(v)
 
-	ts.a = ads.Filter(ts.a, func(t T) bool {
-		return ts.f(t) != ts.f(v)
+	delete(ts.m, k)
+	ts.a = slices.DeleteFunc(ts.a, func(t T) bool {
+		return ts.f(t) == k
 	})
-
-	return v
 }

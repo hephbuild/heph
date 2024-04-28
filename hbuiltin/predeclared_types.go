@@ -41,6 +41,7 @@ type TargetArgs struct {
 	Timeout             string
 	GenDepsMeta         bool
 	Annotations         xstarlark.Distruct
+	Requests            xstarlark.Distruct
 }
 
 type TargetArgsTransitive struct {

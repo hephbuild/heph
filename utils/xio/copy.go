@@ -18,15 +18,13 @@ func CopyBuffer(dst io.Writer, src io.Reader, buf []byte, f func(written int64))
 	w := io.MultiWriter(dst, t)
 
 	written, err := io.CopyBuffer(w, src, buf)
-
-	if written == 0 {
-		_, err := w.Write([]byte{})
-		if err != nil {
-			return written, err
-		}
+	if err != nil {
+		return written, err
 	}
 
-	f(written)
+	if written == 0 {
+		_, _ = w.Write([]byte{})
+	}
 
-	return written, err
+	return written, nil
 }

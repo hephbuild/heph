@@ -14,11 +14,11 @@ import (
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/locks"
+	"github.com/hephbuild/heph/utils/xdebug"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xio"
 	"github.com/hephbuild/heph/utils/xmath"
-	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2"
 	"io"
 	"math"
 	"math/rand"
@@ -136,23 +136,23 @@ func (e *LocalCacheState) LockArtifacts(ctx context.Context, target graph.Target
 // For hashing to work properly:
 //   - each hash must be preceded by its tar
 //   - support_files must be first then the other artifacts
-func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []ArtifactWithProducer) (map[string]*worker.WaitGroup, map[string]*worker.WaitGroup) {
+func (e *LocalCacheState) createDepsGenArtifacts(ctx context.Context, target *graph.Target, artsp []ArtifactWithProducer) (map[string]*worker2.Group, map[string]*worker2.Sem) {
 	arts := target.Artifacts
 
-	deps := map[string]*worker.WaitGroup{}
+	deps := map[string]*worker2.Group{}
 	for _, artifact := range artsp {
-		wg := &worker.WaitGroup{}
+		wg := worker2.NewNamedGroup(xdebug.Sprintf("%v: artifact deps: %v", target.Name, artifact.Name()))
 		deps[artifact.Name()] = wg
 	}
 
-	signals := map[string]*worker.WaitGroup{}
+	signals := map[string]*worker2.Sem{}
 	for _, artifact := range artsp {
-		wg := &worker.WaitGroup{}
-		wg.AddSem()
+		wg := worker2.NewSemDep(ctx, xdebug.Sprintf("%v: artifact signal: %v", target.Name, artifact.Name()))
+		wg.AddSem(1)
 		signals[artifact.Name()] = wg
 	}
 
-	var support *worker.WaitGroup
+	var support worker2.Dep
 	if target.HasSupportFiles {
 		support = signals[arts.OutHash(specs.SupportFilesOutput).Name()]
 	}
@@ -161,30 +161,30 @@ func (e *LocalCacheState) createDepsGenArtifacts(target *graph.Target, artsp []A
 		tname := arts.OutTar(output).Name()
 		hname := arts.OutHash(output).Name()
 
-		deps[hname].AddChild(signals[tname])
+		deps[hname].AddDep(signals[tname])
 
 		if support != nil && output != specs.SupportFilesOutput {
-			deps[tname].AddChild(support)
+			deps[tname].AddDep(support)
 		}
 	}
 
 	meta := []string{arts.InputHash.Name(), arts.Manifest.Name()}
 
-	allButMeta := &worker.WaitGroup{}
+	allButMeta := worker2.NewNamedGroup(xdebug.Sprintf("%v: all but meta", target.Addr))
 	for _, art := range artsp {
 		if !ads.Contains(meta, art.Name()) {
-			allButMeta.AddChild(signals[art.Name()])
+			allButMeta.AddDep(signals[art.Name()])
 		}
 	}
 
 	for _, name := range meta {
-		deps[name].AddChild(allButMeta)
+		deps[name].AddDep(allButMeta)
 	}
 
 	return deps, signals
 }
 
-func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (_ *worker.WaitGroup, rerr error) {
+func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) (*worker2.Group, error) {
 	target := gtarget.GraphTarget()
 
 	dirp, err := e.cacheDir(target)
@@ -204,25 +204,28 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 		return nil, err
 	}
 
-	allDeps := &worker.WaitGroup{}
+	allDeps := worker2.NewNamedGroup("gen artifacts alldeps")
 
-	deps, signals := e.createDepsGenArtifacts(target, arts)
+	deps, signals := e.createDepsGenArtifacts(ctx, target, arts)
 
 	for _, artifact := range arts {
 		artifact := artifact
 
 		shouldCompress := artifact.Compressible() && compress
 
-		j := e.Pool.Schedule(ctx, &worker.Job{
+		j := e.Pool.Schedule(worker2.NewAction(worker2.ActionConfig{
+			Ctx:  ctx,
 			Name: fmt.Sprintf("store %v|%v", target.Addr, artifact.Name()),
-			Deps: deps[artifact.Name()],
-			Hook: worker.StageHook{
-				OnEnd: func(job *worker.Job) context.Context {
-					signals[artifact.Name()].DoneSem()
-					return nil
-				},
+			Deps: []worker2.Dep{deps[artifact.Name()]},
+			Hooks: []worker2.Hook{
+				worker2.StageHook{
+					OnEnd: func(worker2.Dep) context.Context {
+						signals[artifact.Name()].DoneSem()
+						return nil
+					},
+				}.Hook(),
 			},
-			Do: func(w *worker.Worker, ctx context.Context) error {
+			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
 				err := GenArtifact(ctx, dir, artifact, shouldCompress, func(percent float64) {
 					var s string
 					if target.Cache.Enabled {
@@ -241,13 +244,12 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 				return nil
 			},
-		})
-		allDeps.Add(j)
+		}))
+
+		allDeps.AddDep(j)
 	}
 
-	if fgDeps := poolwait.ForegroundWaitGroup(ctx); fgDeps != nil {
-		fgDeps.AddChild(allDeps)
-	}
+	e.Pool.Schedule(allDeps)
 
 	return allDeps, nil
 }

@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"os"
+	"time"
 )
 
 func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
@@ -16,6 +17,8 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg.CacheHistory = 3
 	cfg.Engine.GC = true
 	cfg.Engine.CacheHints = true
+	cfg.Engine.GitCacheHints = false
+	cfg.ProgressInterval = time.Second
 	cfg.Engine.ParallelCaching = true
 	cfg.Engine.SmartGen = true
 	cfg.CacheOrder = config.CacheOrderLatency

@@ -12,6 +12,7 @@ import (
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.starlark.net/starlark"
 	"io"
 	"io/fs"
 	"os"
@@ -163,6 +164,28 @@ func TestDocFromArgs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(strings.NewReplacer("\n", `\n`, " ", `\s`, "\t", `\t`).Replace(test.doc), func(t *testing.T) {
 			actual := docFromArg(test.doc)
+
+			assert.Equal(t, test.expected, actual)
+		})
+	}
+}
+
+func TestParseResource(t *testing.T) {
+	tests := []struct {
+		v        starlark.Value
+		expected float64
+	}{
+		{starlark.MakeInt(1), 1},
+		{starlark.Float(1.2), 1.2},
+		{starlark.String("1"), 1},
+		{starlark.String("100m"), 0.1},
+		{starlark.String("100k"), 100000},
+		{starlark.String("100Ki"), 102400},
+	}
+	for _, test := range tests {
+		t.Run(test.v.String(), func(t *testing.T) {
+			actual, err := requestFromArg(test.v)
+			require.NoError(t, err)
 
 			assert.Equal(t, test.expected, actual)
 		})

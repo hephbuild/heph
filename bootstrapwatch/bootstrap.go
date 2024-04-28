@@ -17,8 +17,8 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2"
+	"github.com/hephbuild/heph/worker2/poolwait"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -40,7 +40,7 @@ type State struct {
 	rropts   targetrun.RequestOpts
 	cbs      bootstrap.SchedulerBootstrap
 	cbbs     bootstrap.BaseBootstrap
-	pool     *worker.Pool
+	pool     *worker2.Engine
 	sigCh    chan sigEvent
 
 	triggeredHashed maps.Map[string, string]
@@ -88,7 +88,9 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 		return nil, err
 	}
 
-	pool := worker.NewPool(bootopts.Workers)
+	pool := worker2.NewEngine()
+	pool.SetDefaultScheduler(bootstrap.DefaultScheduler(bootopts.Workers))
+	go pool.Run()
 	bootopts.Pool = pool
 
 	bbs, err := bootstrap.BootBase(ctx, bootopts)
@@ -117,7 +119,6 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 				log.Error("watcher close:", err)
 			}
 			close(sigCh)
-			pool.Stop(nil)
 		},
 	}
 
@@ -349,6 +350,10 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	status("Figuring out if anything changed...")
 	printEvents(events)
 
+	if bs.Scheduler.GitStatus != nil {
+		bs.Scheduler.GitStatus.Reset()
+	}
+
 	rrs, err := bootstrap.GenerateRRs(ctx, bs.Scheduler, s.matcher, s.targs, s.rropts, s.runopts.Plain, true)
 	if err != nil {
 		return err
@@ -365,14 +370,16 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	}
 
 	// Run the rrs's deps, excluding the rrs's themselves
-	tdepsMap, err := bs.Scheduler.ScheduleTargetRRsWithDeps(ctx, rrs, specs.AsSpecers(rrs.Targets().Slice()))
+	tdepsMap, tracker, err := bs.Scheduler.ScheduleTargetRRsWithDeps(ctx, rrs, specs.AsSpecers(rrs.Targets().Slice()))
 	if err != nil {
 		return err
 	}
 
-	tdeps := tdepsMap.All()
+	runDeps := worker2.NewNamedGroup("trigger rundeps")
+	runDeps.AddDep(tdepsMap.All())
+	runDeps.AddDep(tracker.Group())
 
-	err = poolwait.Wait(ctx, "Change", bs.Pool, tdeps, s.runopts.Plain)
+	err = poolwait.Wait(ctx, "Change", bs.Pool, runDeps, s.runopts.Plain, bs.Config.ProgressInterval)
 	if err != nil {
 		return err
 	}

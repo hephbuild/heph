@@ -18,7 +18,7 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 	"github.com/itchyny/gojq"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/slices"
@@ -642,7 +642,7 @@ var revdepsCmd = &cobra.Command{
 				return fmt.Errorf("%v is outside repo", p)
 			}
 
-			children := bs.Graph.DAG().GetFileChildren([]string{rel}, bs.Graph.Targets().Slice())
+			children := bs.Graph.DAG().GetFileChildren([]string{p}, bs.Graph.Targets().Slice())
 			if err != nil {
 				return err
 			}
@@ -804,12 +804,12 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		tdeps, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, false, []specs.Specer{target})
+		tdeps, _, err := bs.Scheduler.ScheduleTargetsWithDeps(ctx, []*graph.Target{target}, false, []specs.Specer{target})
 		if err != nil {
 			return err
 		}
 
-		err = poolwait.Wait(ctx, "Run", bs.Scheduler.Pool, tdeps.All(), *plain)
+		err = poolwait.Wait(ctx, "Run", bs.Scheduler.Pool, tdeps.All(), *plain, bs.Config.ProgressInterval)
 		if err != nil {
 			return err
 		}

@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/targetrun"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
-	"github.com/hephbuild/heph/worker/poolwait"
+	"github.com/hephbuild/heph/worker2/poolwait"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")
@@ -125,7 +125,7 @@ func RunGen(ctx context.Context, e *scheduler.Scheduler, plain bool, filterFacto
 			return err
 		}
 
-		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain)
+		err = poolwait.Wait(ctx, fmt.Sprintf("Gen run %v", i), e.Pool, deps, plain, e.Config.ProgressInterval)
 		if err != nil {
 			return err
 		}

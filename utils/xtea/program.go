@@ -3,7 +3,6 @@ package xtea
 import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/xpanic"
 )
 
 func RunModel(model tea.Model, opts ...tea.ProgramOption) error {
@@ -14,12 +13,11 @@ func RunModel(model tea.Model, opts ...tea.ProgramOption) error {
 
 func Run(p *tea.Program) error {
 	defer func() {
+		SetResetTerminal(nil)
 		log.SetDiversion(nil)
-		_ = xpanic.Recover(func() error {
-			return p.ReleaseTerminal()
-		})
 	}()
 
+	SetResetTerminal(p)
 	_, err := p.Run()
 	return err
 }
