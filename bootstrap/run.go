@@ -78,7 +78,7 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 	tdeps := tdepsMap.All()
 	tdeps.AddDep(tracker.Group())
 
-	err = poolwait.Wait(ctx, "Run", e.Pool, tdeps, runopts.Plain, e.Config.ProgressInterval)
+	err = poolwait.Wait(ctx, "Run", e.Pool, tdeps, runopts.Plain, e.Config.ProgressInterval, e.Approver)
 	if err != nil {
 		return err
 	}

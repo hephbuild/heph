@@ -57,6 +57,7 @@ func specFromArgs(args TargetArgs, pkg *packages.Package) (specs.Target, error) 
 		OutEnv:      args.OutEnv,
 		HashFile:    args.HashFile,
 		GenDepsMeta: args.GenDepsMeta,
+		Dangerous:   args.Dangerous,
 	}
 
 	var err error

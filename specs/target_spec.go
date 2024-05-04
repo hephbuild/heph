@@ -136,6 +136,7 @@ type Target struct {
 	GenDepsMeta         bool
 	Annotations         map[string]interface{}
 	Requests            map[string]float64
+	Dangerous           bool
 }
 
 func (t Target) MarshalJSON() ([]byte, error) {

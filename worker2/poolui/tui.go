@@ -6,6 +6,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xtea"
@@ -27,8 +28,8 @@ type UpdateMessage struct {
 	final   bool
 }
 
-func New(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engine, quitWhenDone bool) *Model {
-	return &Model{
+func New(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engine, approver scheduler.Approver, quitWhenDone bool) *Model {
+	m := &Model{
 		name:  name,
 		deps:  deps,
 		pool:  pool,
@@ -39,25 +40,36 @@ func New(ctx context.Context, name string, deps worker2.Dep, pool *worker2.Engin
 		log:          xtea.NewLogModel(),
 		quitWhenDone: quitWhenDone,
 	}
+	if approver, ok := approver.(*Approver); ok {
+		m.approver = approver
+	}
+
+	return m
 }
 
 type Model struct {
-	name         string
-	deps         worker2.Dep
-	start        time.Time
-	cancel       func()
-	pool         *worker2.Engine
-	log          xtea.LogModel
-	quitWhenDone bool
+	name           string
+	deps           worker2.Dep
+	start          time.Time
+	cancel         func()
+	pool           *worker2.Engine
+	log            xtea.LogModel
+	quitWhenDone   bool
+	approver       *Approver
+	approveRequest *ApproveRequest
 	UpdateMessage
 }
 
 func (m *Model) Init() tea.Cmd {
 	m.log.Init()
 	m.UpdateMessage = m.updateMsg(false)
+	if m.approver != nil {
+		m.approver.SetConnected(true)
+	}
 	return tea.Batch(
 		m.log.Next,
 		m.doUpdateMsgTicker(),
+		m.doApproveMsg(),
 	)
 }
 
@@ -65,6 +77,18 @@ func (m *Model) doUpdateMsgTicker() tea.Cmd {
 	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
 		return m.updateMsg(false)
 	})
+}
+
+func (m *Model) doApproveMsg() tea.Cmd {
+	if m.approver == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		req := m.approver.Next()
+
+		return req
+	}
 }
 
 func (m *Model) updateMsg(final bool) UpdateMessage {
@@ -124,6 +148,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyBreak:
 			m.cancel()
 			return m, nil
+		case tea.KeyRunes:
+			switch msg.String() {
+			case "Y", "y":
+				if req := m.approveRequest; req != nil {
+					req.Respond(true)
+					m.approveRequest = nil
+					cmds = append(cmds, m.doApproveMsg())
+				}
+			case "N", "n":
+				if req := m.approveRequest; req != nil {
+					req.Respond(false)
+					m.approveRequest = nil
+					cmds = append(cmds, m.doApproveMsg())
+				}
+			}
 		}
 	case UpdateMessage:
 		m.UpdateMessage = msg
@@ -133,6 +172,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, m.doUpdateMsgTicker()
+	case ApproveRequest:
+		m.approveRequest = &msg
 	}
 
 	m.log, cmd = m.log.Update(msg)
@@ -180,9 +221,16 @@ func (m *Model) View() string {
 		s.WriteString(fmt.Sprintf("%v %v\n", styleWorkerStart.Render(runtime), statusStr))
 	}
 
+	if req := m.approveRequest; req != nil {
+		s.WriteString(fmt.Sprintf("\n%v needs your approval to run [Yy/Nn]", req.Target.Addr))
+	}
+
 	return s.String()
 }
 
 func (m *Model) Clean() {
+	if m.approver != nil {
+		m.approver.SetConnected(false)
+	}
 	m.log.Clean()
 }

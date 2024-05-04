@@ -184,6 +184,7 @@ func target(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, 
 		"gen_deps_meta?", &sargs.GenDepsMeta,
 		"annotations?", &sargs.Annotations,
 		"requests?", &sargs.Requests,
+		"dangerous?", &sargs.Dangerous,
 	); err != nil {
 		if sargs.Name != "" {
 			return nil, fmt.Errorf("%v: %w", pkg.TargetAddr(sargs.Name), err)

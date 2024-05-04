@@ -8,6 +8,7 @@ import (
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/utils/tuistatus"
+	"github.com/hephbuild/heph/worker2/poolui"
 	"os"
 	"strings"
 	"time"
@@ -51,7 +52,14 @@ func schedulerInit(ctx context.Context, postBoot func(bootstrap.BaseBootstrap) e
 	// This allows to block reading stdin right after a potential CheckAndUpgrade has run
 	opts.PostBootBase = postBoot
 
-	bs, err := bootstrap.BootWithScheduler(ctx, opts)
+	schedOpts := bootstrap.SchedulerOpts{
+		Approver: poolui.NewApprover(),
+	}
+	if autoApprove {
+		schedOpts.Approver = scheduler.StaticApprover{Value: true}
+	}
+
+	bs, err := bootstrap.BootWithScheduler(ctx, opts, schedOpts)
 	if err != nil {
 		return bs, err
 	}

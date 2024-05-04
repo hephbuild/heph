@@ -132,3 +132,20 @@ target(
     deps = reqdeps,
     cache = False,
 )
+
+dangerdeps = []
+for i in range(0, 3):
+    t = target(
+        name = "danger{}".format(i),
+        cache = False,
+        dangerous = True,
+    )
+    dangerdeps.append(t)
+
+target(
+    name = "danger",
+    run = "echo ran",
+    deps = dangerdeps,
+    cache = False,
+    dangerous = True,
+)

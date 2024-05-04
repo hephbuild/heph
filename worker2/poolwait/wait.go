@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/worker2"
 	"os"
@@ -17,7 +18,7 @@ func init() {
 	debug, _ = strconv.ParseBool(os.Getenv("HEPH_DEBUG_POOLWAIT"))
 }
 
-func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.Dep, plain bool, interval time.Duration) error {
+func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.Dep, plain bool, interval time.Duration, approver scheduler.Approver) error {
 	pool.Schedule(deps)
 
 	if debug {
@@ -36,7 +37,7 @@ func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.D
 	}()
 
 	if useTUI {
-		err := termUI(ctx, name, deps, pool)
+		err := termUI(ctx, name, deps, pool, approver)
 		if err != nil {
 			return fmt.Errorf("poolui: %w", err)
 		}

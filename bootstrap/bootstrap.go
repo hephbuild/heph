@@ -271,8 +271,16 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	return bs, nil
 }
 
-func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, error) {
+type SchedulerOpts struct {
+	Approver scheduler.Approver
+}
+
+func BootScheduler(ctx context.Context, bs Bootstrap, opts SchedulerOpts) (*scheduler.Scheduler, error) {
 	fins := &finalizers.Finalizers{}
+
+	if opts.Approver == nil {
+		opts.Approver = scheduler.StaticApprover{Value: false}
+	}
 
 	localCache, err := lcache.NewState(bs.Root, bs.Pool, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC, bs.Config.Engine.ParallelCaching)
 	if err != nil {
@@ -321,6 +329,7 @@ func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, err
 		BackgroundTracker: worker2.NewRunningTracker(),
 		Finalizers:        fins,
 		Runner:            runner,
+		Approver:          opts.Approver,
 	})
 
 	if bs.Config.Engine.GitCacheHints {
@@ -346,16 +355,16 @@ type SchedulerBootstrap struct {
 	Scheduler *scheduler.Scheduler
 }
 
-func BootWithScheduler(ctx context.Context, opts BootOpts) (SchedulerBootstrap, error) {
+func BootWithScheduler(ctx context.Context, bootOpts BootOpts, schedOpts SchedulerOpts) (SchedulerBootstrap, error) {
 	ebs := SchedulerBootstrap{}
 
-	bs, err := Boot(ctx, opts)
+	bs, err := Boot(ctx, bootOpts)
 	if err != nil {
 		return ebs, err
 	}
 	ebs.Bootstrap = bs
 
-	e, err := BootScheduler(ctx, bs)
+	e, err := BootScheduler(ctx, bs, schedOpts)
 	if err != nil {
 		return ebs, err
 	}

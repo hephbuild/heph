@@ -13,6 +13,7 @@ func executionFromContext(ctx context.Context) *Execution {
 	return e
 }
 
+// Wait suspends execution until the function returns
 func Wait(ctx context.Context, f func()) {
 	_ = WaitE(ctx, func() error {
 		f()
@@ -20,6 +21,7 @@ func Wait(ctx context.Context, f func()) {
 	})
 }
 
+// WaitE suspends execution until the function returns
 func WaitE(ctx context.Context, f func() error) error {
 	e := executionFromContext(ctx)
 	if e == nil {
@@ -39,17 +41,12 @@ func WaitE(ctx context.Context, f func() error) error {
 	return nil
 }
 
+// WaitDep suspends execution until Dep completes or the context gets canceled
 func WaitDep(ctx context.Context, dep Dep) error {
-	return WaitE(ctx, func() error {
-		select {
-		case <-dep.Wait():
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	})
+	return WaitChan(ctx, dep.Wait())
 }
 
+// WaitChan suspends execution until reading from the channel returns or the context gets canceled
 func WaitChan[T any](ctx context.Context, ch <-chan T) error {
 	return WaitE(ctx, func() error {
 		select {
@@ -61,11 +58,28 @@ func WaitChan[T any](ctx context.Context, ch <-chan T) error {
 	})
 }
 
-func WaitChanE[T error](ctx context.Context, ch <-chan T) error {
+// WaitChanReceive suspends execution until reading from the channel returns or the context gets canceled
+// Unlike WaitChan, it will return the value
+func WaitChanReceive[T any](ctx context.Context, ch <-chan T) (T, error) {
+	var out T
+	err := WaitE(ctx, func() error {
+		select {
+		case v := <-ch:
+			out = v
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	return out, err
+}
+
+// WaitChanSend suspends execution until sending to the channel succeeds or the context gets canceled
+func WaitChanSend[T any](ctx context.Context, ch chan<- T, v T) error {
 	return WaitE(ctx, func() error {
 		select {
-		case err := <-ch:
-			return err
+		case ch <- v:
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}

@@ -42,6 +42,7 @@ type TargetArgs struct {
 	GenDepsMeta         bool
 	Annotations         xstarlark.Distruct
 	Requests            xstarlark.Distruct
+	Dangerous           bool
 }
 
 type TargetArgsTransitive struct {

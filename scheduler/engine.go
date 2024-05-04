@@ -22,6 +22,18 @@ import (
 	"sync"
 )
 
+type Approver interface {
+	Approve(ctx context.Context, t specs.Target) bool
+}
+
+type StaticApprover struct {
+	Value bool
+}
+
+func (a StaticApprover) Approve(ctx context.Context, t specs.Target) bool {
+	return a.Value
+}
+
 type Scheduler struct {
 	Cwd               string
 	Root              *hroot.State
@@ -39,6 +51,7 @@ type Scheduler struct {
 	Finalizers        *finalizers.Finalizers
 	Runner            *targetrun.Runner
 	GitStatus         *gitstatus.GitStatus
+	Approver          Approver
 
 	toolsLock locks.Locker
 }

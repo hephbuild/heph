@@ -809,7 +809,7 @@ var hashinCmd = &cobra.Command{
 			return err
 		}
 
-		err = poolwait.Wait(ctx, "Run", bs.Scheduler.Pool, tdeps.All(), *plain, bs.Config.ProgressInterval)
+		err = poolwait.Wait(ctx, "Run", bs.Scheduler.Pool, tdeps.All(), *plain, bs.Config.ProgressInterval, bs.Scheduler.Approver)
 		if err != nil {
 			return err
 		}

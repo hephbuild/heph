@@ -24,6 +24,13 @@ func (e *Scheduler) Run(ctx context.Context, rr targetrun.Request, iocfg sandbox
 
 	target := rr.Target
 
+	if target.Dangerous {
+		approved := e.Approver.Approve(ctx, target.Spec())
+		if !approved {
+			return fmt.Errorf("dangerous target, pass --auto-approve to run")
+		}
+	}
+
 	done := log.TraceTiming("run " + target.Addr)
 	defer done()
 

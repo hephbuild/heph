@@ -43,6 +43,7 @@ var summary *bool
 var summaryGen *bool
 var jaegerEndpoint *string
 var check *bool
+var autoApprove bool
 
 func getRunOpts() bootstrap.RunOpts {
 	return bootstrap.RunOpts{
@@ -80,6 +81,7 @@ func init() {
 	alwaysOut = runCmd.Flags().Bool("always-out", false, "Ensure output will be present in cache")
 	runCmd.Flags().BoolVarP(&all, "all", "a", false, "Force run all")
 	runCmd.Flags().MarkHidden("all")
+	runCmd.Flags().BoolVar(&autoApprove, "auto-approve", false, "Auto-approve dangerous targets")
 
 	check = fmtCmd.Flags().Bool("check", false, "Only check formatting")
 

@@ -150,9 +150,12 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 			lockCh <- flock.Flock(f, ro, true)
 		}()
 
-		err := worker2.WaitChanE(ctx, lockCh)
+		lockErr, err := worker2.WaitChanReceive(ctx, lockCh)
 		if err != nil {
 			return false, err
+		}
+		if lockErr != nil {
+			return false, lockErr
 		}
 
 		return true, nil

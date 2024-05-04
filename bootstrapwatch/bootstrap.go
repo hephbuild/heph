@@ -324,7 +324,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 
 	usingBs := false
 	if bs.Scheduler == nil {
-		cbs, err := bootstrap.BootWithScheduler(ctx, s.bootopts)
+		cbs, err := bootstrap.BootWithScheduler(ctx, s.bootopts, bootstrap.SchedulerOpts{})
 		if err != nil {
 			return fmt.Errorf("boot: %w", err)
 		}
@@ -379,7 +379,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	runDeps.AddDep(tdepsMap.All())
 	runDeps.AddDep(tracker.Group())
 
-	err = poolwait.Wait(ctx, "Change", bs.Pool, runDeps, s.runopts.Plain, bs.Config.ProgressInterval)
+	err = poolwait.Wait(ctx, "Change", bs.Pool, runDeps, s.runopts.Plain, bs.Config.ProgressInterval, bs.Scheduler.Approver)
 	if err != nil {
 		return err
 	}
