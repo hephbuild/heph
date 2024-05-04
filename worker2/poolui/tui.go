@@ -78,12 +78,7 @@ func (m *Model) updateMsg(final bool) UpdateMessage {
 	}
 
 	var workers []workerEntry
-	for _, w := range m.pool.GetWorkers() {
-		exec := w.Execution()
-		if exec == nil {
-			continue
-		}
-
+	for _, exec := range m.pool.GetLiveExecutions() {
 		if _, ok := exec.Dep.(*worker2.Group); ok {
 			continue
 		}
@@ -98,7 +93,7 @@ func (m *Model) updateMsg(final bool) UpdateMessage {
 		}
 
 		workers = append(workers, workerEntry{
-			status:   w.GetStatus(),
+			status:   exec.GetStatus(),
 			duration: duration,
 			exec:     exec,
 		})

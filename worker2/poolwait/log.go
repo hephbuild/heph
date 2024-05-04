@@ -47,14 +47,14 @@ func logUI(name string, deps worker2.Dep, pool *worker2.Engine, interval time.Du
 
 	printWorkersStatus := func() {
 		statusm := map[string]struct{}{}
-		for _, job := range pool.GetWorkers() {
-			if job.Execution().State != worker2.ExecStateSuspended {
+		for _, exec := range pool.GetLiveExecutions() {
+			if exec.State != worker2.ExecStateSuspended {
 				continue
 			}
 
-			duration := time.Since(job.Execution().StartedAt)
+			duration := time.Since(exec.StartedAt)
 
-			status := job.GetStatus().String(log.Renderer())
+			status := exec.GetStatus().String(log.Renderer())
 			if status == "" {
 				status = "Suspended..."
 			}
@@ -71,20 +71,15 @@ func logUI(name string, deps worker2.Dep, pool *worker2.Engine, interval time.Du
 		if len(statusm) > 0 {
 			fmt.Fprintf(os.Stderr, "===\n")
 		}
-		for _, w := range pool.GetWorkers() {
-			j := w.Execution()
-			if j == nil {
-				continue
-			}
-
-			duration := time.Since(j.StartedAt)
+		for _, exec := range pool.GetLiveExecutions() {
+			duration := time.Since(exec.StartedAt)
 
 			if duration < 5*time.Second {
 				// Skip printing short jobs
 				continue
 			}
 
-			status := w.GetStatus().String(log.Renderer())
+			status := exec.GetStatus().String(log.Renderer())
 			if status == "" {
 				status = "Waiting..."
 			}

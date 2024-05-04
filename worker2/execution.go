@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/dlsniper/debugger"
+	"github.com/hephbuild/heph/status"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -74,6 +75,8 @@ type Execution struct {
 	StartedAt   time.Time
 	QueuedAt    time.Time
 
+	status status.Statuser
+
 	debugString string
 }
 
@@ -93,15 +96,7 @@ func (e *Execution) GetOutput() Value {
 	return e.outStore.Get()
 }
 
-type ErrSuspended struct {
-	Bag *SuspendBag
-}
-
-func (e ErrSuspended) Error() string {
-	return "suspended"
-}
-
-func (e *Execution) Run(ctx context.Context) error {
+func (e *Execution) Run() {
 	e.m.Lock()
 	if e.errCh == nil {
 		e.errCh = make(chan error)
@@ -114,6 +109,10 @@ func (e *Execution) Run(ctx context.Context) error {
 		e.StartedAt = time.Now()
 
 		go func() {
+			ctx := e.Dep.GetCtx()
+			ctx = contextWithExecution(ctx, e)
+			ctx = status.ContextWithHandler(ctx, e)
+
 			err := e.run(ctx)
 			e.errCh <- err
 		}()
@@ -125,10 +124,19 @@ func (e *Execution) Run(ctx context.Context) error {
 
 	select {
 	case sb := <-e.WaitSuspend():
+		e.scheduler.Done(e.Dep)
+
 		e.State = ExecStateSuspended
-		return ErrSuspended{Bag: sb}
+
+		e.eventsCh <- EventSuspended{Execution: e, Bag: sb}
 	case err := <-e.errCh:
-		return err
+		e.scheduler.Done(e.Dep)
+
+		e.eventsCh <- EventCompleted{
+			Execution: e,
+			Output:    e.outStore.Get(),
+			Error:     err,
+		}
 	}
 }
 
@@ -220,4 +228,20 @@ func (e *Execution) ResumeAck() {
 
 func (e *Execution) WaitSuspend() chan *SuspendBag {
 	return e.suspendCh
+}
+
+func (e *Execution) Status(status status.Statuser) {
+	e.status = status
+}
+
+func (e *Execution) GetStatus() status.Statuser {
+	s := e.status
+	if s == nil {
+		s = status.String("")
+	}
+	return s
+}
+
+func (e *Execution) Interactive() bool {
+	return true
 }

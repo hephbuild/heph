@@ -130,7 +130,7 @@ func TestStatus(t *testing.T) {
 	<-emittedCh
 
 	var emittedStatus status.Statuser
-	for _, worker := range e.GetWorkers() {
+	for _, worker := range e.GetLiveExecutions() {
 		emittedStatus = worker.status
 		if emittedStatus != nil {
 			break
@@ -664,7 +664,7 @@ func TestSuspend(t *testing.T) {
 	assert.Equal(t, "end_wait", <-logCh)
 	assert.Equal(t, "leave", <-logCh)
 
-	<-e.Wait()
+	<-a.Wait()
 	close(eventCh)
 
 	events := make([]string, 0)
@@ -702,15 +702,23 @@ func TestSuspendStress(t *testing.T) {
 	go e.Run()
 	defer e.Stop()
 
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
 	go func() {
 		for {
-			time.Sleep(time.Second)
-			t.Log(done)
+			select {
+			case <-doneCh:
+				return
+			case <-time.After(time.Second):
+			}
+
+			t.Log(atomic.LoadInt64(&done))
 		}
 	}()
 
 	wg.Wait()
-	time.Sleep(time.Second) // todo figure out why things are trying to send events after the pool is stopped
+	<-e.Wait()
 }
 
 func TestSuspendLimit(t *testing.T) {

@@ -68,6 +68,7 @@ func (e EventReady) getExecution() *Execution {
 type EventSuspended struct {
 	At        time.Time
 	Execution *Execution
+	Bag       *SuspendBag
 }
 
 func (e EventSuspended) getExecution() *Execution {

@@ -15,7 +15,7 @@ type Engine struct {
 	execUid          uint64
 	wg               sync.WaitGroup
 	defaultScheduler Scheduler
-	workers          []*Worker
+	liveExecs        []*Execution
 	m                sync.RWMutex
 	eventsCh         chan Event
 	hooks            []Hook
@@ -34,11 +34,11 @@ func (e *Engine) SetDefaultScheduler(s Scheduler) {
 	e.defaultScheduler = s
 }
 
-func (e *Engine) GetWorkers() []*Worker {
+func (e *Engine) GetLiveExecutions() []*Execution {
 	e.m.Lock()
 	defer e.m.Unlock()
 
-	return e.workers[:]
+	return e.liveExecs[:]
 }
 
 func (e *Engine) loop() {
@@ -62,6 +62,12 @@ func (e *Engine) handle(event Event) {
 			e.finalize(event.Execution, ExecStateSucceeded, nil)
 		}
 		e.runHooks(event, event.Execution)
+	case EventSuspended:
+		e.runHooks(event, event.Execution)
+		go func() {
+			<-event.Bag.WaitResume()
+			e.queue(event.Execution)
+		}()
 	default:
 		if event, ok := event.(WithExecution); ok {
 			defer e.runHooks(event, event.getExecution())
@@ -257,24 +263,15 @@ func (e *Engine) start(exec *Execution) {
 	e.m.Lock()
 	defer e.m.Unlock()
 
-	w := &Worker{
-		ctx:  exec.Dep.GetCtx(),
-		exec: exec,
-		queue: func() {
-			e.queue(exec)
-		},
-	}
-	e.workers = append(e.workers, w)
+	e.liveExecs = append(e.liveExecs, exec)
 
 	go func() {
-		w.Run()
+		exec.Run()
 
 		e.m.Lock()
 		defer e.m.Unlock()
 
-		e.workers = ads.Filter(e.workers, func(worker *Worker) bool {
-			return worker != w
-		})
+		e.liveExecs = ads.Remove(e.liveExecs, exec)
 	}()
 
 	e.runHooks(EventStarted{Execution: exec}, exec)
