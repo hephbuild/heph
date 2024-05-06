@@ -33,6 +33,7 @@ type Config struct {
 	} `yaml:"cloud"`
 	Engine struct {
 		GC              bool `yaml:"gc"`
+		CacheRW         bool `yaml:"cache_rw"`
 		CacheHints      bool `yaml:"cache_hints"`
 		GitCacheHints   bool `yaml:"git_cache_hints"`
 		InstallTools    bool `yaml:"install_tools"`

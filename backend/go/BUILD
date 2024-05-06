@@ -18,7 +18,7 @@ go_toolchain_gosh = group(
     deps = ["go.sh"],
 )
 
-def go_toolchain(name, version, architectures = []):
+def go_toolchain(name, version, architectures = [], runtime_env = {}, **kwargs):
     run = [
         "./$SRC_INSTALL '{}'".format(version),
         "mv $SRC_GO $OUT_GO",
@@ -52,7 +52,11 @@ def go_toolchain(name, version, architectures = []):
         },
         cache = heph.cache(history = 1),
         support_files = "go",
-        transitive = heph.target_spec(runtime_env = {"GO_OUTDIR": "$(outdir)"}),
+        runtime_env = {"GO_SHARED": "$(shared_stage_dir)"},
+        transitive = heph.target_spec(
+            runtime_env = runtime_env | {"GO_OUTDIR": "$(outdir)", "GO_SHARED": "$(shared_stage_dir)"},
+            **kwargs,
+        ),
     )
 
 godeps = target(
@@ -91,7 +95,7 @@ def go_install(name, pkg, version, bin_name):
         name = name,
         run = [
             "export GOBIN=$(pwd)/gobin",
-            "go install -modcacherw {}@{}".format(pkg, version),
+            "go install {}@{}".format(pkg, version),
         ],
         tools = [go],
         out = "gobin/" + bin_name,
@@ -301,7 +305,7 @@ def go_mod_download(name, path, version):
         name = name,
         run = [
             "echo module heph_ignore > go.mod", # stops go reading the main go.mod, and downloading all of those too
-            "go mod download -modcacherw -json {}@{} | tee mod.json".format(path, version),
+            "go mod download -json {}@{} | tee mod.json".format(path, version),
             "rm go.mod",
             """export MOD_DIR=$(cat mod.json | awk -F\\" '/"Dir": / { print $4 }') && cp -r "$MOD_DIR/." .""",
         ],

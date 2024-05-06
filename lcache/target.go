@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/utils/locks"
 	"github.com/hephbuild/heph/utils/maps"
 	"github.com/hephbuild/heph/utils/xfs"
+	"os"
 	"sync"
 	"time"
 )
@@ -30,6 +31,7 @@ type Target struct {
 	cacheHashOutputTargetMutex maps.KMutex
 	cacheHashOutput            *maps.Map[string, string]
 	cacheHashInputPathsModtime map[string]time.Time
+	sharedStageRoot            xfs.Path
 }
 
 func (t *Target) String() string {
@@ -70,4 +72,9 @@ func (t *Target) ActualRestoreCacheFiles() xfs.RelPaths {
 	}
 
 	return t.actualRestoreCacheFiles
+}
+
+func (t *Target) SharedStageRoot() xfs.Path {
+	_ = os.MkdirAll(t.sharedStageRoot.Abs(), os.ModePerm)
+	return t.sharedStageRoot
 }

@@ -2,7 +2,6 @@ package main
 
 import (
 	. "e2e/lib"
-	"os"
 	"path/filepath"
 )
 
@@ -10,7 +9,7 @@ import (
 // dependency B does trigger a rerun when the output of B is not the same
 func main() {
 	tmp := MustV(TempDir())
-	defer os.RemoveAll(tmp)
+	defer RemoveAll(tmp)
 
 	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))
 

@@ -44,11 +44,12 @@ type LocalCacheState struct {
 	EnableGC        bool
 	ParallelCaching bool
 	Pool            *worker2.Engine
+	CacheRW         bool
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
+func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching, cacheRw bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -64,6 +65,7 @@ func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, o
 		Finalizers:      finalizers,
 		EnableGC:        gc,
 		ParallelCaching: parallelCaching,
+		CacheRW:         cacheRw,
 		Pool:            pool,
 		Metas: NewTargetMetas(func(k targetMetaKey) *Target {
 			gtarget := targets.Find(k.addr)
@@ -80,6 +82,7 @@ func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, o
 				cacheHashOutput:            &maps.Map[string, string]{},
 				cacheHashInputPathsModtime: nil,
 				expandLock:                 locks.NewFlock(gtarget.Addr+" (expand)", lockPath(root, gtarget, "expand")),
+				sharedStageRoot:            root.Home.Join("shared_stage", gtarget.Package.Path, gtarget.Name),
 			}
 
 			ts := t.Spec()
@@ -402,6 +405,7 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 	type OutDirMeta struct {
 		Version int
 		Outputs []string
+		CacheRW bool
 	}
 	version := 1
 
@@ -416,11 +420,13 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		}
 
 		var currentMeta OutDirMeta
+		currentMeta.CacheRW = true // Legacy behavior
 		_ = json.Unmarshal(b, &currentMeta)
 		if currentMeta.Version != version || !ads.ContainsAll(currentMeta.Outputs, outputs) {
 			shouldExpand = true
-		}
-		if currentMeta.Version != version {
+		} else if currentMeta.Version != version {
+			shouldCleanExpand = true
+		} else if currentMeta.CacheRW != e.CacheRW {
 			shouldCleanExpand = true
 		}
 	}
@@ -442,6 +448,8 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		if err != nil {
 			return outDir, err
 		}
+
+		xfs.MakeDirsReadWrite(outDir.Abs())
 
 		untarDedup := sets.NewStringSet(0)
 
@@ -497,6 +505,10 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		if err != nil {
 			return outDir, fmt.Errorf("write outdir meta: %w", err)
 		}
+
+		if !e.CacheRW {
+			xfs.MakeDirsReadOnly(outDir.Abs())
+		}
 	}
 
 	e.Metas.Find(target).outExpansionRoot = outDir
@@ -536,8 +548,11 @@ func (e *LocalCacheState) Target(ctx context.Context, target graph.Targeter, o T
 }
 
 func (e *LocalCacheState) CleanTarget(target specs.Specer, async bool) error {
-	cacheDir := e.cacheDirForHash(target, "")
-	err := xfs.DeleteDir(cacheDir.Abs(), async)
+	cacheDir := e.cacheDirForHash(target, "").Abs()
+
+	xfs.MakeDirsReadWrite(cacheDir)
+
+	err := xfs.DeleteDir(cacheDir, async)
 	if err != nil {
 		return err
 	}

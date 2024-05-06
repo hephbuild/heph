@@ -56,7 +56,7 @@ def node_toolchain(name, version):
             "ARCH": get_arch(),
         },
         support_files = ["./node"],
-        transitive = heph.target_spec(runtime_env = {"NODE_OUTDIR": "$(outdir)"}),
+        transitive = heph.target_spec(runtime_env = {"NODE_OUTDIR": "$(outdir)", "NODE_SHARED": "$(shared_stage_dir)"}),
     )
 
 def yarn_toolchain(name, version, node):

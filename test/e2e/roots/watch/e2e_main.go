@@ -10,7 +10,7 @@ import (
 // This is a sanity test that watching a target works
 func main() {
 	tmp := MustV(TempDir())
-	defer os.RemoveAll(tmp)
+	defer RemoveAll(tmp)
 
 	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))
 

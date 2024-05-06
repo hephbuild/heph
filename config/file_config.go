@@ -16,6 +16,7 @@ type FileConfig struct {
 	} `yaml:"cloud"`
 	Engine struct {
 		GC              *bool `yaml:"gc"`
+		CacheRW         *bool `yaml:"cache_rw"`
 		CacheHints      *bool `yaml:"cache_hints"`
 		GitCacheHints   *bool `yaml:"git_cache_hints"`
 		InstallTools    *bool `yaml:"install_tools"`
@@ -75,6 +76,10 @@ func (fc FileConfig) ApplyTo(c Config) Config {
 
 	if fc.Engine.GC != nil {
 		c.Engine.GC = *fc.Engine.GC
+	}
+
+	if fc.Engine.CacheRW != nil {
+		c.Engine.CacheRW = *fc.Engine.CacheRW
 	}
 
 	if fc.Engine.CacheHints != nil {

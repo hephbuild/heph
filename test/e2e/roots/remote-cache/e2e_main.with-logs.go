@@ -3,15 +3,14 @@ package main
 import (
 	. "e2e/lib"
 	"fmt"
-	"os"
 )
 
 // This tests that running remote cache works
 func main() {
 	cache := MustV(TempDir())
-	defer os.RemoveAll(cache)
+	defer RemoveAll(cache)
 	tmp := MustV(TempDir())
-	defer os.RemoveAll(tmp)
+	defer RemoveAll(tmp)
 
 	Must(ReplaceFile(".hephconfig.local", "<URI>", "file://"+cache+"/"))
 	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))

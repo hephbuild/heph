@@ -14,7 +14,7 @@ func RmSandbox() error {
 		return err
 	}
 
-	return os.RemoveAll(filepath.Join(cache, "sandbox"))
+	return RemoveAll(filepath.Join(cache, "sandbox"))
 }
 
 func PrintConfig() error {

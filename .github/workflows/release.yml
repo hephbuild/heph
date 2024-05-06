@@ -175,4 +175,4 @@ jobs:
 
       - name: Cleanup .heph
         run: |
-          rm -rf .heph/cache/test
+          sudo rm -rf .heph/cache/test

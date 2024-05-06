@@ -3,15 +3,14 @@ package main
 import (
 	. "e2e/lib"
 	"fmt"
-	"os"
 	"path/filepath"
 )
 
 func Scenario(tgt string, outputs []string) {
 	cache := MustV(TempDir())
-	defer os.RemoveAll(cache)
+	defer RemoveAll(cache)
 	tmp := MustV(TempDir())
-	defer os.RemoveAll(tmp)
+	defer RemoveAll(tmp)
 
 	Must(ReplaceFile(".hephconfig.local", "<URI>", "file://"+cache+"/"))
 	Must(ReplaceFile(".hephconfig.local", "<TMP>", tmp))

@@ -65,6 +65,26 @@ func QueryFunctions(
 
 			return ltarget.OutExpansionRoot().Join(t.Package.Path).Abs(), nil
 		},
+		"shared_stage_dir": func(expr exprs.Expr) (string, error) {
+			t, err := getTarget(expr)
+			if err != nil {
+				return "", err
+			}
+
+			universe, err := g.DAG().GetParents(t.Target)
+			if err != nil {
+				return "", err
+			}
+			universe = append(universe, t)
+
+			ltarget := localCache.Metas.Find(t)
+
+			if !graph.Contains(universe, t.Addr) {
+				return "", fmt.Errorf("cannot get shared stage dir of %v", t.Addr)
+			}
+
+			return ltarget.SharedStageRoot().Abs(), nil
+		},
 		"hash_input": func(expr exprs.Expr) (string, error) {
 			t, err := getTarget(expr)
 			if err != nil {

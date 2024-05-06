@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/xfs"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -85,6 +86,8 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 		if !ok {
 			flog("Not part of graph or not cached, delete")
 			if !dryrun {
+				xfs.MakeDirsReadWrite(dir)
+
 				err := os.RemoveAll(dir)
 				if err != nil {
 					log.Error(err)
@@ -135,6 +138,8 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 		if len(entries) == 0 {
 			flog("Nothing left, delete")
 			if !dryrun {
+				xfs.MakeDirsReadWrite(dir)
+
 				err := os.RemoveAll(dir)
 				if err != nil {
 					log.Error(err)
@@ -180,6 +185,8 @@ func (e *LocalCacheState) runGc(targets []*graph.Target, targetDirs []string, fl
 			elog(entry, false)
 
 			if !dryrun {
+				xfs.MakeDirsReadWrite(entry.HashPath)
+
 				err := os.RemoveAll(entry.HashPath)
 				if err != nil {
 					log.Error(err)

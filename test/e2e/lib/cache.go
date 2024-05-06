@@ -14,7 +14,7 @@ func RmCache() error {
 		return err
 	}
 
-	return os.RemoveAll(cache)
+	return RemoveAll(cache)
 }
 
 func TargetCacheRoot(tgt string, elems ...string) (string, error) {

@@ -304,6 +304,9 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 				}()
 
 				status.Emit(ctx, tgt.TargetStatus(target, "Clearing sandbox..."))
+
+				xfs.MakeDirsReadWrite(rtarget.SandboxRoot.Abs())
+
 				err = xfs.DeleteDir(rtarget.SandboxRoot.Abs(), false)
 				if err != nil {
 					return fmt.Errorf("clear sandbox: %w", err)
