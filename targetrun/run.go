@@ -311,6 +311,10 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 
 				return nil
 			},
+			Requests: map[string]float64{
+				"cpu":   0.1,
+				"cdisk": 1,
+			},
 		}))
 	}
 

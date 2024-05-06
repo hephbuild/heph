@@ -34,21 +34,20 @@ import (
 )
 
 type LocalCacheState struct {
-	Location        *vfsos.Location
-	Path            xfs.Path
-	Targets         *graph.Targets
-	Metas           *TargetMetas[*Target]
-	Root            *hroot.State
-	Observability   *observability.Observability
-	Finalizers      *finalizers.Finalizers
-	EnableGC        bool
-	ParallelCaching bool
-	Pool            *worker2.Engine
+	Location      *vfsos.Location
+	Path          xfs.Path
+	Targets       *graph.Targets
+	Metas         *TargetMetas[*Target]
+	Root          *hroot.State
+	Observability *observability.Observability
+	Finalizers    *finalizers.Finalizers
+	EnableGC      bool
+	Pool          *worker2.Engine
 }
 
 const LatestDir = "latest"
 
-func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc, parallelCaching bool) (*LocalCacheState, error) {
+func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, obs *observability.Observability, finalizers *finalizers.Finalizers, gc bool) (*LocalCacheState, error) {
 	cachePath := root.Home.Join("cache")
 	loc, err := vfssimple.NewLocation("file://" + cachePath.Abs() + "/")
 	if err != nil {
@@ -56,15 +55,14 @@ func NewState(root *hroot.State, pool *worker2.Engine, targets *graph.Targets, o
 	}
 
 	s := &LocalCacheState{
-		Location:        loc.(*vfsos.Location),
-		Path:            cachePath,
-		Targets:         targets,
-		Root:            root,
-		Observability:   obs,
-		Finalizers:      finalizers,
-		EnableGC:        gc,
-		ParallelCaching: parallelCaching,
-		Pool:            pool,
+		Location:      loc.(*vfsos.Location),
+		Path:          cachePath,
+		Targets:       targets,
+		Root:          root,
+		Observability: obs,
+		Finalizers:    finalizers,
+		EnableGC:      gc,
+		Pool:          pool,
 		Metas: NewTargetMetas(func(k targetMetaKey) *Target {
 			gtarget := targets.Find(k.addr)
 
@@ -127,21 +125,14 @@ func (e *LocalCacheState) StoreCache(ctx context.Context, ttarget graph.Targeter
 	}
 	defer unlock()
 
-	if e.ParallelCaching {
-		genDeps, err := e.ScheduleGenArtifacts(ctx, target, arts, compress)
-		if err != nil {
-			return err
-		}
+	genDeps, err := e.ScheduleGenArtifacts(ctx, target, arts, compress)
+	if err != nil {
+		return err
+	}
 
-		err = worker2.WaitDep(ctx, genDeps)
-		if err != nil {
-			return err
-		}
-	} else {
-		err := e.GenArtifacts(ctx, target, arts, compress)
-		if err != nil {
-			return err
-		}
+	err = worker2.WaitDep(ctx, genDeps)
+	if err != nil {
+		return err
 	}
 
 	return nil

@@ -25,7 +25,7 @@ import (
 	"github.com/hephbuild/heph/upgrade"
 	"github.com/hephbuild/heph/utils/finalizers"
 	"github.com/hephbuild/heph/worker2"
-	"github.com/pbnjay/memory"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,16 +59,19 @@ func findRoot(cwd string) (string, error) {
 	return "", errors.New("root not found, are you running this command in the repo directory?")
 }
 
+type BootBaseOpts struct {
+	Profiles     []string
+	Params       map[string]string
+	PostBootBase func(bs BaseBootstrap) error
+}
+
 type BootOpts struct {
-	Profiles              []string
+	BootBaseOpts
 	Workers               int
-	Params                map[string]string
 	Summary               bool
 	JaegerEndpoint        string
 	DisableCloudTelemetry bool
 	Pool                  *worker2.Engine
-
-	PostBootBase func(bs BaseBootstrap) error
 
 	FlowID string
 }
@@ -79,7 +82,7 @@ type BaseBootstrap struct {
 	Config *config.Config
 }
 
-func BootBase(ctx context.Context, opts BootOpts) (BaseBootstrap, error) {
+func BootBase(ctx context.Context, opts BootBaseOpts) (BaseBootstrap, error) {
 	lipgloss.SetDefaultRenderer(log.Renderer())
 
 	bs := BaseBootstrap{}
@@ -142,11 +145,11 @@ type Bootstrap struct {
 	PlatformProviders []platform.PlatformProvider
 }
 
-func DefaultScheduler(cpu int) *worker2.ResourceScheduler {
-	return worker2.NewResourceScheduler(map[string]float64{
-		"cpu":    float64(cpu),
-		"memory": float64(memory.TotalMemory()),
-	}, map[string]float64{
+func DefaultScheduler(requests map[string]float64, cpu int) *worker2.ResourceScheduler {
+	requests = maps.Clone(requests)
+	requests["cpu"] = float64(cpu)
+
+	return worker2.NewResourceScheduler(requests, map[string]float64{
 		"cpu": float64(1),
 	})
 }
@@ -154,7 +157,7 @@ func DefaultScheduler(cpu int) *worker2.ResourceScheduler {
 func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	bs := Bootstrap{}
 
-	bbs, err := BootBase(ctx, opts)
+	bbs, err := BootBase(ctx, opts.BootBaseOpts)
 	if err != nil {
 		return bs, err
 	}
@@ -194,7 +197,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 	pool := opts.Pool
 	if pool == nil {
 		pool = worker2.NewEngine()
-		pool.SetDefaultScheduler(DefaultScheduler(opts.Workers))
+		pool.SetDefaultScheduler(DefaultScheduler(cfg.Engine.Resources, opts.Workers))
 		go pool.Run()
 	}
 	bs.Pool = pool
@@ -274,7 +277,7 @@ func Boot(ctx context.Context, opts BootOpts) (Bootstrap, error) {
 func BootScheduler(ctx context.Context, bs Bootstrap) (*scheduler.Scheduler, error) {
 	fins := &finalizers.Finalizers{}
 
-	localCache, err := lcache.NewState(bs.Root, bs.Pool, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC, bs.Config.Engine.ParallelCaching)
+	localCache, err := lcache.NewState(bs.Root, bs.Pool, bs.Graph.Targets(), bs.Observability, fins, bs.Config.Engine.GC)
 	if err != nil {
 		return nil, err
 	}

@@ -34,7 +34,7 @@ var watchCmd = &cobra.Command{
 			return err
 		}
 
-		bbs, err := bootstrap.BootBase(ctx, opts)
+		bbs, err := bootstrap.BootBase(ctx, opts.BootBaseOpts)
 		if err != nil {
 			return err
 		}

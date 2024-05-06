@@ -9,7 +9,9 @@ import (
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/worker2"
 	"github.com/hephbuild/heph/worker2/poolwait"
 	"os"
 	"os/exec"
@@ -70,15 +72,28 @@ func RunMode(ctx context.Context, e *scheduler.Scheduler, rrs targetrun.Requests
 	if inlineRR != nil {
 		skip = []specs.Specer{inlineRR.Target}
 	}
-	tdepsMap, tracker, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
-	if err != nil {
-		return err
-	}
 
-	tdeps := tdepsMap.All()
-	tdeps.AddDep(tracker.Group())
+	waitDeps := worker2.NewGroup()
 
-	err = poolwait.Wait(ctx, "Run", e.Pool, tdeps, runopts.Plain, e.Config.ProgressInterval)
+	schedule := worker2.NewAction(worker2.ActionConfig{
+		Ctx: ctx,
+		Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
+			status.Emit(ctx, status.String("Scheduling..."))
+
+			tdepsMap, tracker, err := e.ScheduleTargetRRsWithDeps(ctx, rrs, skip)
+			if err != nil {
+				return err
+			}
+
+			waitDeps.AddDep(tdepsMap.All())
+			waitDeps.AddDep(tracker.Group())
+
+			return nil
+		},
+	})
+	waitDeps.AddDep(schedule)
+
+	err := poolwait.Wait(ctx, "Run", e.Pool, waitDeps, runopts.Plain, e.Config.ProgressInterval)
 	if err != nil {
 		return err
 	}

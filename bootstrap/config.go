@@ -6,7 +6,9 @@ import (
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
+	"github.com/pbnjay/memory"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -21,6 +23,11 @@ func BuildConfig(root *hroot.State, profiles []string) (*config.Config, error) {
 	cfg.ProgressInterval = time.Second
 	cfg.Engine.ParallelCaching = true
 	cfg.Engine.SmartGen = true
+	cfg.Engine.Resources = map[string]float64{
+		"cpu":    float64(runtime.NumCPU()),
+		"memory": float64(memory.TotalMemory()),
+		"cdisk":  float64(runtime.NumCPU() * 5),
+	}
 	cfg.CacheOrder = config.CacheOrderLatency
 	cfg.BuildFiles.Patterns = []string{"**/{BUILD,*.BUILD}"}
 	cfg.Platforms = map[string]config.Platform{

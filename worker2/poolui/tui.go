@@ -88,7 +88,7 @@ func (m *Model) updateMsg(final bool) UpdateMessage {
 			duration = time.Since(exec.StartedAt)
 		}
 
-		if duration < 200*time.Millisecond {
+		if duration < 500*time.Millisecond {
 			continue
 		}
 

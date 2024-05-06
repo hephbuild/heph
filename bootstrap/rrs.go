@@ -8,15 +8,20 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/scheduler"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/worker2"
 	"github.com/hephbuild/heph/worker2/poolwait"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")
 
-func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []string, opts targetrun.RequestOpts, bailOutOnExpr bool) (targetrun.Requests, error) {
+func generateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, args []string, opts targetrun.RequestOpts, bailOutOnExpr, plain bool) (targetrun.Requests, error) {
+	g := e.Graph
+
 	targets, err := g.Targets().Filter(m)
 	if err != nil {
 		return nil, err
@@ -33,19 +38,38 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 		}
 	}
 
+	linkDeps := worker2.NewGroup()
+	for _, target := range targets.Slice() {
+		target := target
+		a := worker2.NewAction(worker2.ActionConfig{
+			Ctx:  ctx,
+			Name: "link " + target.Addr,
+			Do: func(ctx context.Context, ins worker2.InStore, outs worker2.OutStore) error {
+				status.Emit(ctx, tgt.TargetStatus(target, "Linking..."))
+				err := check(target)
+				if err != nil {
+					return err
+				}
+
+				err = g.LinkTarget(target, nil)
+				if err != nil {
+					return err
+				}
+
+				return nil
+			},
+		})
+		linkDeps.AddDep(a)
+	}
+
+	err = poolwait.Wait(ctx, "Link", e.Pool, linkDeps, plain, e.Config.ProgressInterval)
+	if err != nil {
+		return nil, err
+	}
+
 	rrs := make(targetrun.Requests, 0, targets.Len())
 	for _, target := range targets.Slice() {
 		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		err := check(target)
-		if err != nil {
-			return nil, err
-		}
-
-		err = g.LinkTarget(target, nil)
-		if err != nil {
 			return nil, err
 		}
 
@@ -197,7 +221,7 @@ func Query(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, plain, 
 func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, targs []string, opts targetrun.RequestOpts, plain, gen bool) (targetrun.Requests, error) {
 	if !e.Config.Engine.SmartGen {
 		if specs.IsMatcherExplicit(m) {
-			rrs, err := generateRRs(ctx, e.Graph, m, targs, opts, true)
+			rrs, err := generateRRs(ctx, e, m, targs, opts, true, plain)
 			if err != nil {
 				if !(errors.Is(err, errHasExprDep) || errors.Is(err, specs.TargetNotFoundErr{})) {
 					return nil, err
@@ -214,7 +238,7 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 	}
 
 	if !gen {
-		return generateRRs(ctx, e.Graph, m, targs, opts, false)
+		return generateRRs(ctx, e, m, targs, opts, false, plain)
 	}
 
 	err := RunGen(ctx, e, plain, func() (func(gent *graph.Target) bool, error) {
@@ -260,5 +284,5 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 		return nil, err
 	}
 
-	return generateRRs(ctx, e.Graph, m, targs, opts, false)
+	return generateRRs(ctx, e, m, targs, opts, false, plain)
 }

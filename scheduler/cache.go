@@ -252,5 +252,9 @@ func (e *Scheduler) scheduleStoreExternalCacheArtifact(ctx context.Context, targ
 
 			return nil
 		},
+		Requests: map[string]float64{
+			"cpu":   0.1,
+			"cdisk": 1,
+		},
 	}))
 }

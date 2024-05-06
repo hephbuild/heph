@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
+	"github.com/hephbuild/heph/worker2"
 	"math"
 	"os"
 	"path/filepath"
@@ -194,7 +195,9 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	//logPrefix := strings.Repeat("|", breadcrumb.Len()-1)
 
-	t.m.Lock()
+	worker2.Wait(context.Background(), func() {
+		t.m.Lock()
+	})
 	if t.AllTargetDeps == nil {
 		t.AllTargetDeps = NewTargets(0)
 	}

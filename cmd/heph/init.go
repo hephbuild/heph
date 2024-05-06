@@ -25,9 +25,11 @@ func bootstrapOptions() (bootstrap.BootOpts, error) {
 	}
 
 	return bootstrap.BootOpts{
-		Profiles:              *profiles,
+		BootBaseOpts: bootstrap.BootBaseOpts{
+			Profiles: *profiles,
+			Params:   paramsm,
+		},
 		Workers:               workers,
-		Params:                paramsm,
 		Summary:               *summary || *summaryGen,
 		JaegerEndpoint:        *jaegerEndpoint,
 		DisableCloudTelemetry: *noCloudTelemetry,
@@ -86,7 +88,7 @@ func bootstrapBase(ctx context.Context) (bootstrap.BaseBootstrap, error) {
 		return bootstrap.BaseBootstrap{}, err
 	}
 
-	return bootstrap.BootBase(ctx, opts)
+	return bootstrap.BootBase(ctx, opts.BootBaseOpts)
 }
 
 func bootstrapInit(ctx context.Context) (bootstrap.Bootstrap, error) {

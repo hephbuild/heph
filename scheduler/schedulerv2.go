@@ -171,6 +171,10 @@ func (s *schedulerv2) schedule() error {
 				targetDeps.AddDep(g)
 				return nil
 			},
+			Requests: map[string]float64{
+				"cpu":   0.1,
+				"cdisk": 1,
+			},
 		})
 		targetDeps.AddDep(pj)
 		s.Pool.Schedule(pj)
@@ -224,6 +228,10 @@ func (s *schedulerv2) ScheduleTargetCacheGet(ctx context.Context, target *graph.
 			}
 
 			return nil
+		},
+		Requests: map[string]float64{
+			"cpu":   0.1,
+			"cdisk": 1,
 		},
 	})
 
@@ -322,6 +330,9 @@ func (s *schedulerv2) ScheduleTargetGetCacheOrRunOnce(ctx context.Context, targe
 			group.AddDep(j)
 
 			return nil
+		},
+		Requests: map[string]float64{
+			"cpu": 0.1,
 		},
 	})
 	group.AddDep(j)

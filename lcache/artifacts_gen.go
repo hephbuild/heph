@@ -244,6 +244,10 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 				return nil
 			},
+			Requests: map[string]float64{
+				"cpu":   0.1,
+				"cdisk": 1,
+			},
 		}))
 
 		allDeps.AddDep(j)
@@ -252,52 +256,6 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 	e.Pool.Schedule(allDeps)
 
 	return allDeps, nil
-}
-
-// Deprecated: use ScheduleGenArtifacts instead
-func (e *LocalCacheState) GenArtifacts(ctx context.Context, gtarget graph.Targeter, arts []ArtifactWithProducer, compress bool) error {
-	target := gtarget.GraphTarget()
-
-	dirp, err := e.cacheDir(target)
-	if err != nil {
-		return err
-	}
-
-	dir := dirp.Abs()
-
-	err = os.RemoveAll(dir)
-	if err != nil {
-		return err
-	}
-
-	err = os.MkdirAll(dir, os.ModePerm)
-	if err != nil {
-		return err
-	}
-
-	for i, artifact := range arts {
-		shouldCompress := artifact.Compressible() && compress
-
-		err := GenArtifact(ctx, dir, artifact, shouldCompress, func(percent float64) {
-			var s string
-			if target.Cache.Enabled {
-				s = xmath.FormatPercent("Caching [P]...", percent)
-			} else if len(target.Artifacts.Out) > 0 {
-				s = xmath.FormatPercent("Storing [P]...", percent)
-			}
-
-			if s != "" {
-				status.EmitInteractive(ctx, tgt.TargetOutputStatus(target, artifact.Name(),
-					fmt.Sprintf("%v/%v %v", i+1, len(arts), s)),
-				)
-			}
-		})
-		if err != nil {
-			return fmt.Errorf("genartifact %v: %w", artifact.Name(), err)
-		}
-	}
-
-	return nil
 }
 
 type ArtifactGenContext struct {

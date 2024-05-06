@@ -315,6 +315,9 @@ func NewChanDep[T any](ctx context.Context, ch chan T) Dep {
 		Do: func(ctx context.Context, ins InStore, outs OutStore) error {
 			return WaitChan(ctx, ch)
 		},
+		Requests: map[string]float64{
+			"cpu": 0.01,
+		},
 	})
 }
 
@@ -329,6 +332,9 @@ func NewSemDep(ctx context.Context, name string) *Sem {
 					wg.Wait()
 					return ctx.Err()
 				})
+			},
+			Requests: map[string]float64{
+				"cpu": 0.01,
 			},
 		}),
 		wg: wg,

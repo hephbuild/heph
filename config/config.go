@@ -32,13 +32,13 @@ type Config struct {
 		Project string `yaml:"project"`
 	} `yaml:"cloud"`
 	Engine struct {
-		GC              bool `yaml:"gc"`
-		CacheHints      bool `yaml:"cache_hints"`
-		GitCacheHints   bool `yaml:"git_cache_hints"`
-		InstallTools    bool `yaml:"install_tools"`
-		KeepSandbox     bool `yaml:"keep_sandbox"`
-		ParallelCaching bool `yaml:"parallel_caching"`
-		SmartGen        bool `yaml:"smart_gen"`
+		GC            bool               `yaml:"gc"`
+		CacheHints    bool               `yaml:"cache_hints"`
+		GitCacheHints bool               `yaml:"git_cache_hints"`
+		InstallTools  bool               `yaml:"install_tools"`
+		KeepSandbox   bool               `yaml:"keep_sandbox"`
+		SmartGen      bool               `yaml:"smart_gen"`
+		Resources     map[string]float64 `yaml:"resources"`
 	} `yaml:"engine"`
 	Platforms  map[string]Platform `yaml:"platforms"`
 	BuildFiles struct {

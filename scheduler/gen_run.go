@@ -64,6 +64,9 @@ func (e *Scheduler) ScheduleGenPass(ctx context.Context, genTargets []*graph.Tar
 
 			return nil
 		},
+		Requests: map[string]float64{
+			"cpu": 0.01,
+		},
 	})
 
 	return j, nil
@@ -85,7 +88,7 @@ func (e *runGenScheduler) ScheduleGeneratedPipeline(ctx context.Context, targets
 
 	start := time.Now()
 
-	status.Emit(ctx, status.String(fmt.Sprintf("Scheduling...")))
+	status.Emit(ctx, status.String("Scheduling..."))
 
 	sdeps, _, err := e.ScheduleTargetsWithDeps(ctx, targets, true, nil)
 	if err != nil {
@@ -135,6 +138,10 @@ func (e *runGenScheduler) scheduleRunGenerated(ctx context.Context, target *grap
 			ltarget := e.LocalCache.Metas.Find(target)
 
 			return e.scheduleRunGeneratedFiles(ctx, ltarget, deps, targets)
+		},
+		Requests: map[string]float64{
+			"cpu":   1,
+			"cdisk": 1,
 		},
 	})
 	deps.AddDep(j)

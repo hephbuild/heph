@@ -88,15 +88,15 @@ func Boot(ctx context.Context, root *hroot.State, bootopts bootstrap.BootOpts, c
 		return nil, err
 	}
 
-	pool := worker2.NewEngine()
-	pool.SetDefaultScheduler(bootstrap.DefaultScheduler(bootopts.Workers))
-	go pool.Run()
-	bootopts.Pool = pool
-
-	bbs, err := bootstrap.BootBase(ctx, bootopts)
+	bbs, err := bootstrap.BootBase(ctx, bootopts.BootBaseOpts)
 	if err != nil {
 		return nil, err
 	}
+
+	pool := worker2.NewEngine()
+	pool.SetDefaultScheduler(bootstrap.DefaultScheduler(bbs.Config.Engine.Resources, bootopts.Workers))
+	go pool.Run()
+	bootopts.Pool = pool
 
 	sigCh := make(chan sigEvent)
 
