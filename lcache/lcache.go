@@ -407,7 +407,12 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		Outputs []string
 		CacheRW bool
 	}
-	version := 1
+
+	expectedMeta := OutDirMeta{
+		Version: 1,
+		Outputs: outputs,
+		CacheRW: e.CacheRW,
+	}
 
 	shouldExpand := false
 	shouldCleanExpand := false
@@ -422,11 +427,13 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		var currentMeta OutDirMeta
 		currentMeta.CacheRW = true // Legacy behavior
 		_ = json.Unmarshal(b, &currentMeta)
-		if currentMeta.Version != version || !ads.ContainsAll(currentMeta.Outputs, outputs) {
+		if currentMeta.Version != expectedMeta.Version || !ads.ContainsAll(currentMeta.Outputs, expectedMeta.Outputs) {
 			shouldExpand = true
-		} else if currentMeta.Version != version {
+		}
+
+		if currentMeta.Version != expectedMeta.Version {
 			shouldCleanExpand = true
-		} else if currentMeta.CacheRW != e.CacheRW {
+		} else if currentMeta.CacheRW != expectedMeta.CacheRW {
 			shouldCleanExpand = true
 		}
 	}
@@ -493,10 +500,7 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 			_ = r.Close()
 		}
 
-		b, err := json.Marshal(OutDirMeta{
-			Version: version,
-			Outputs: outputs,
-		})
+		b, err := json.Marshal(expectedMeta)
 		if err != nil {
 			return xfs.Path{}, err
 		}

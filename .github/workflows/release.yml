@@ -29,6 +29,11 @@ jobs:
           go-version: ~1.22
           cache-key-suffix: -build
 
+      - name: Configure golang
+        run: |
+          echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          echo "GOEXPERIMENT=rangefunc" >> $GITHUB_ENV
+
       - name: Cache
         uses: actions/cache@v3
         with:
@@ -133,6 +138,11 @@ jobs:
         with:
           go-version: ~1.22
           cache-key-suffix: -test
+
+      - name: Configure golang
+        run: |
+          echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          echo "GOEXPERIMENT=rangefunc" >> $GITHUB_ENV
 
       - uses: actions/download-artifact@v3
         with:

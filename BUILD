@@ -11,6 +11,9 @@ go_toolchain(
         "linux_amd64",
         "linux_arm64",
     ],
+    env = {
+        "GOEXPERIMENT": "rangefunc",
+    },
 )
 
 node = node_toolchain(
@@ -51,7 +54,7 @@ target(
     cache = False,
 )
 
-go_env_vars = ["GOROOT", "GOPATH", "HOME"]
+go_env_vars = ["GOROOT", "GOPATH", "HOME", "GOEXPERIMENT"]
 
 target(
     name = "test_go",

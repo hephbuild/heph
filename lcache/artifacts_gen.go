@@ -194,6 +194,8 @@ func (e *LocalCacheState) ScheduleGenArtifacts(ctx context.Context, gtarget grap
 
 	dir := dirp.Abs()
 
+	xfs.MakeDirsReadWrite(dir)
+
 	err = os.RemoveAll(dir)
 	if err != nil {
 		return nil, err

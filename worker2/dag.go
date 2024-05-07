@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
+	"iter"
 	"strings"
 	"sync"
 )
@@ -17,31 +18,35 @@ type nodesTransitive[T any] struct {
 	transitiveReverse bool
 }
 
-func (d *nodesTransitive[T]) Add(dep *Node[T]) {
-	d.m.Lock()
-	defer d.m.Unlock()
+func (d *nodesTransitive[T]) Add(dep *Node[T]) bool {
+	d.m.RLock()
+	defer d.m.RUnlock()
 
-	d.nodes.Add(dep)
-	d.transitiveDirty = true
+	if d.nodes.Add(dep) {
+		d.transitiveDirty = true
+		return true
+	}
+
+	return false
 }
 
 func (d *nodesTransitive[T]) MarkTransitiveDirty() {
-	d.m.Lock()
-	defer d.m.Unlock()
+	d.m.RLock()
+	defer d.m.RUnlock()
 
 	d.transitiveDirty = true
 }
 
 func (d *nodesTransitive[T]) MarkTransitiveInvalid() {
-	d.m.Lock()
-	defer d.m.Unlock()
+	d.m.RLock()
+	defer d.m.RUnlock()
 
 	d.transitiveNodes = nil
 }
 
 func (d *nodesTransitive[T]) Remove(dep *Node[T]) {
-	d.m.Lock()
-	defer d.m.Unlock()
+	d.m.RLock()
+	defer d.m.RUnlock()
 
 	d.nodes.Remove(dep)
 	d.transitiveNodes = nil
@@ -75,16 +80,20 @@ func (d *nodesTransitive[T]) TransitiveSet() *sets.Set[*Node[T], *Node[T]] {
 	return d.transitiveNodes
 }
 
-func (d *nodesTransitive[T]) TransitiveValues() []T {
-	return ads.Map(d.TransitiveSet().Slice(), func(t *Node[T]) T {
-		return t.V
-	})
+func (d *nodesTransitive[T]) TransitiveValues() iter.Seq2[int, T] {
+	return func(yield func(int, T) bool) {
+		for i, node := range d.TransitiveSet().Slice() {
+			yield(i, node.V)
+		}
+	}
 }
 
-func (d *nodesTransitive[T]) Values() []T {
-	return ads.Map(d.Set().Slice(), func(t *Node[T]) T {
-		return t.V
-	})
+func (d *nodesTransitive[T]) Values() iter.Seq2[int, T] {
+	return func(yield func(int, T) bool) {
+		for i, node := range d.Set().Slice() {
+			yield(i, node.V)
+		}
+	}
 }
 
 func (d *nodesTransitive[T]) computeTransitive(full bool) *sets.Set[*Node[T], *Node[T]] {
@@ -161,15 +170,13 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 			panic("cycle")
 		}
 
-		d.Dependencies.Add(dep)
-
-		for _, dependee := range d.Dependees.TransitiveSet().Slice() {
-			dependee.Dependencies.MarkTransitiveDirty()
+		if d.Dependencies.Add(dep) {
+			for _, dependee := range d.Dependees.TransitiveSet().Slice() {
+				dependee.Dependencies.MarkTransitiveDirty()
+			}
 		}
 
-		if !dep.Dependees.Has(d) {
-			dep.Dependees.Add(d)
-
+		if dep.Dependees.Add(d) {
 			for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
 				dep.Dependees.MarkTransitiveDirty()
 			}

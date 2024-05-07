@@ -11,7 +11,7 @@ import (
 )
 
 func printWhatItsWaitingOn(dep worker2.Dep, indent string) {
-	fmt.Println(indent, dep.GetName(), dep.GetState().String(), ":", len(dep.GetNode().Dependencies.Values()), "deps")
+	fmt.Println(indent, dep.GetName(), dep.GetState().String(), ":", dep.GetNode().Dependencies.Set().Len(), "deps")
 	for _, d := range dep.GetNode().Dependencies.Values() {
 		if d.GetState().IsFinal() {
 			return

@@ -1,11 +1,48 @@
 package worker2
 
-import "sync/atomic"
+import (
+	"github.com/hephbuild/heph/utils/xsync"
+	"golang.org/x/exp/maps"
+	"sync/atomic"
+)
 
-func deepDo(a Dep, f func(Dep)) {
+func deepDoPrecomputed(a Dep, f func(Dep)) {
 	f(a)
 	for _, dep := range a.GetNode().Dependencies.TransitiveValues() {
 		f(dep)
+	}
+}
+
+var deepDoMapPool = xsync.Pool[map[Dep]struct{}]{New: func() map[Dep]struct{} {
+	return map[Dep]struct{}{}
+}}
+
+func deepDo(a Dep, f func(Dep)) {
+	if false {
+		// This approach sounds good on paper, but in reality very CPU intensive since it requires
+		// read & write to the deps set at every change, at every level...
+		deepDoPrecomputed(a, f)
+	} else {
+		deepDoRecursive(a, f)
+	}
+}
+
+func deepDoRecursive(a Dep, f func(Dep)) {
+	m := deepDoMapPool.Get()
+	maps.Clear(m)
+	defer deepDoMapPool.Put(m)
+	deepDoRecursiveInner(a, f, m)
+}
+
+func deepDoRecursiveInner(a Dep, f func(Dep), m map[Dep]struct{}) {
+	if _, ok := m[a]; ok {
+		return
+	}
+	m[a] = struct{}{}
+
+	f(a)
+	for _, dep := range a.GetNode().Dependencies.Values() {
+		deepDoRecursiveInner(dep, f, m)
 	}
 }
 
