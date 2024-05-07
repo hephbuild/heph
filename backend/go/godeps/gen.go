@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -42,6 +43,9 @@ func libTarget(pkgs *Packages, pkg *Package) Target {
 		module := p.ActualModule()
 		h.Write([]byte(module.Path))
 		h.Write([]byte(module.Version))
+	}
+	if exp := os.Getenv("GOEXPERIMENT"); exp != "" {
+		h.Write([]byte(exp))
 	}
 	suffix := fmt.Sprintf("_%.7x", h.Sum(nil))
 
