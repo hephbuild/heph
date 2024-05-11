@@ -84,6 +84,8 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		log.Debugf("Make %v took %v", cfg.Dir, time.Since(start))
 	}()
 
+	xfs.MakeDirsReadWrite(cfg.Dir)
+
 	err := os.RemoveAll(cfg.Dir)
 	if err != nil {
 		return err

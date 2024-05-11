@@ -364,6 +364,30 @@ func (e *LocalCacheState) tarListPath(artifact artifacts.Artifact, target graph.
 	return dir.Join(artifact.Name() + ".list").Abs(), nil
 }
 
+type OutDirMeta struct {
+	Version int
+	Outputs []string
+	CacheRW bool
+}
+
+func (expectedMeta OutDirMeta) decide(currentMeta OutDirMeta) (expand bool, cleanExpand bool) {
+	if !ads.ContainsAll(currentMeta.Outputs, expectedMeta.Outputs) {
+		expand = true
+	}
+
+	if currentMeta.Version != expectedMeta.Version {
+		cleanExpand = true
+	} else if currentMeta.CacheRW != expectedMeta.CacheRW {
+		cleanExpand = true
+	}
+
+	if cleanExpand {
+		expand = true
+	}
+
+	return expand, cleanExpand
+}
+
 func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, outputs []string) (xfs.Path, error) {
 	target := ttarget.GraphTarget()
 
@@ -397,16 +421,9 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 	outDir := cacheDir.Join("_output")
 
 	// Legacy...
-	outDirHashPath := cacheDir.Join("_output_hash").Abs()
-	_ = os.Remove(outDirHashPath)
+	_ = os.Remove(cacheDir.Join("_output_hash").Abs())
 
 	outDirMetaPath := cacheDir.Join("_output_meta").Abs()
-
-	type OutDirMeta struct {
-		Version int
-		Outputs []string
-		CacheRW bool
-	}
 
 	expectedMeta := OutDirMeta{
 		Version: 1,
@@ -427,15 +444,8 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		var currentMeta OutDirMeta
 		currentMeta.CacheRW = true // Legacy behavior
 		_ = json.Unmarshal(b, &currentMeta)
-		if currentMeta.Version != expectedMeta.Version || !ads.ContainsAll(currentMeta.Outputs, expectedMeta.Outputs) {
-			shouldExpand = true
-		}
 
-		if currentMeta.Version != expectedMeta.Version {
-			shouldCleanExpand = true
-		} else if currentMeta.CacheRW != expectedMeta.CacheRW {
-			shouldCleanExpand = true
-		}
+		shouldExpand, shouldCleanExpand = expectedMeta.decide(currentMeta)
 	}
 
 	if len(outputs) == 0 {
@@ -443,6 +453,8 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 	}
 
 	if shouldExpand {
+		xfs.MakeDirsReadWrite(outDir.Abs())
+
 		status.Emit(ctx, tgt.TargetStatus(target, "Expanding cache..."))
 		if shouldCleanExpand {
 			err = os.RemoveAll(outDir.Abs())
@@ -455,8 +467,6 @@ func (e *LocalCacheState) Expand(ctx context.Context, ttarget graph.Targeter, ou
 		if err != nil {
 			return outDir, err
 		}
-
-		xfs.MakeDirsReadWrite(outDir.Abs())
 
 		untarDedup := sets.NewStringSet(0)
 

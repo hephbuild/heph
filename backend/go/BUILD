@@ -1,3 +1,5 @@
+backend_pkg = heph.pkg.addr()
+
 cfg = CONFIG["go_backend"]
 
 go = cfg["go"]
@@ -18,22 +20,43 @@ go_toolchain_gosh = group(
     deps = ["go.sh"],
 )
 
-def go_toolchain(name, version, architectures = [], runtime_env = {}, **kwargs):
+def go_std(os, arch, name = None):
+    if not name:
+        name = "_std_lib_{}_{}".format(os, arch)
+
+    xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s") + " 100000"
+
+    return target(
+        name = name,
+        pkg = backend_pkg,
+        tools = go,
+        run = [
+            'export LGOROOT=$(pwd)/goroot',
+            'rm -rf $LGOROOT',
+            'cp -r $(go env GOROOT) $LGOROOT',
+            'export GOROOT=$LGOROOT',
+            'chmod -R 777 $GOROOT',
+            'go install --trimpath std',
+            'go list std > list',
+            'cat list | {} -I[] echo "packagefile []=$OUT_PKG/[].a" | sort -u > $SANDBOX/$OUT_IMPORTCFG'.format(xargs),
+        ],
+        out_env = "rel_root",
+        env = {
+            'GOARCH': arch,
+            'GOOS': os,
+            'GODEBUG': 'installgoroot=all',
+        },
+        out = {
+            'pkg': 'goroot/pkg/{}_{}'.format(os, arch),
+            'importcfg': 'goroot/pkg/{}_{}.importcfg'.format(os, arch),
+        },
+    )
+
+def go_toolchain(name, version, runtime_env = {}, **kwargs):
     run = [
         "./$SRC_INSTALL '{}'".format(version),
         "mv $SRC_GO $OUT_GO",
-        "export GO_OUTDIR=$(pwd)",
-        "export GODEBUG='installgoroot=all'",
     ]
-
-    for arch in architectures:
-        (goos, _, goarch) = arch.partition("_")
-        run.append(
-            "(export GOOS={} && export GOARCH={} && ./$OUT_GO install --trimpath std)".format(
-                goos,
-                goarch,
-            ),
-        )
 
     return target(
         name = name,
@@ -52,7 +75,6 @@ def go_toolchain(name, version, architectures = [], runtime_env = {}, **kwargs):
         },
         cache = heph.cache(history = 1),
         support_files = "go",
-        runtime_env = {"GO_SHARED": "$(shared_stage_dir)"},
         transitive = heph.target_spec(
             runtime_env = runtime_env | {"GO_OUTDIR": "$(outdir)", "GO_SHARED": "$(shared_stage_dir)"},
             **kwargs,
@@ -85,10 +107,6 @@ generate_testmain = target(
         "ARCH": get_arch(),
     },
 )
-
-backend_dir = heph.pkg.dir()
-
-backend_pkg = heph.pkg.addr()
 
 def go_install(name, pkg, version, bin_name):
     return target(
@@ -182,10 +200,8 @@ def go_mod(
         env = goenv,
     )
 
-    (pkg, _, _) = heph.split(go)
-
     mod_pkgs_gen = [
-        "//" + pkg + ":_std_pkgs_*",
+        backend_pkg + ":_std_lib_*",
         "go_lib",
         "go_build_bin",
         "test",
@@ -276,9 +292,7 @@ def _go_gen_importcfg():
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s") + " 100000"
 
     return [
-        'cat "$SRC_STD" | {} -I[] echo "packagefile []=$GO_OUTDIR/go/pkg/${{GOOS}}_${{GOARCH}}/[].a" | sort -u > $SANDBOX/importconfig'.format(xargs),
-        'echo "" >> $SANDBOX/importconfig',
-        'find "$SANDBOX" -name "*.importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u >> $SANDBOX/importconfig'.format(xargs),
+        'find "$SANDBOX" -name "*.importcfg" | {} -I[] cat [] | sed -e "s:=:=$SANDBOX/:" | sort -u > $SANDBOX/importconfig'.format(xargs),
     ]
 
 def _go_compile_cmd(name, import_path, abi, complete, embed_cfg):
@@ -352,7 +366,7 @@ def go_library(
     if len(s_files) > 0:
         abi = target(
             name = pvt_name + "#abi",
-            deps = src_dep if src_dep else s_files,
+            deps = (src_dep if src_dep else s_files) + [go_std(os = os, arch = arch)],
             run = [
                 "eval $(go env)",
                 "touch $OUT_H", # the go Toolchain does this
@@ -391,7 +405,7 @@ def go_library(
                 deps = {
                     "lib": lib + "|a",
                     "hdr": lib + "|h",
-                    "_": src_dep if src_dep else s_file,
+                    "_": (src_dep if src_dep else s_file) + [go_std(os = os, arch = arch)],
                 },
                 run = [
                     "eval $(go env)",
@@ -473,7 +487,7 @@ def go_library(
         embed_cfg = None
 
     deps = deps | {
-        "std": _std_pkgs(os, arch),
+        "std": go_std(os = os, arch = arch),
         "embed": embed_cfg,
     }
 
@@ -495,21 +509,6 @@ def go_library(
         tools = [go],
         env = env,
         labels = ["go_lib"],
-    )
-
-def _std_pkgs(os, arch):
-    (pkg, _, _) = heph.split(go)
-
-    return target(
-        name = "_std_pkgs_{}_{}".format(os, arch),
-        pkg = "//" + pkg,
-        tools = [go],
-        run = "export CGO_ENABLED=1 && go list std > std_list",
-        out = "std_list",
-        env = {
-            "GOOS": os,
-            "GOARCH": arch,
-        },
     )
 
 def go_build_bin(
@@ -534,7 +533,7 @@ def go_build_bin(
     _deps = {
         "libs": libs,
         "main": main,
-        "std": _std_pkgs(os, arch),
+        "std": go_std(os, arch),
     }
 
     return target(

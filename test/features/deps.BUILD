@@ -7,8 +7,8 @@ e2e_test(
     name = "e2e_gen_deps",
     cmd = "heph q deps '{}'".format(bin),
     expect_output_contains = """
-//:_std_pkgs_OS_ARCH
 //:go
+//go_backend:_std_lib_OS_ARCH
 //test/go/mod-transitive-gen:_go_lib_
 """.replace("OS", get_os()).replace("ARCH", get_arch()).strip(),
 )
