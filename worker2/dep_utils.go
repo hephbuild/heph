@@ -6,6 +6,16 @@ import (
 	"sync/atomic"
 )
 
+func deepDo(a Dep, f func(Dep)) {
+	if a.GetNode().IsFrozen() {
+		// This approach sounds good on paper, but in reality very CPU intensive since it requires
+		// read & write to the deps set at every change, at every level...
+		deepDoPrecomputed(a, f)
+	} else {
+		deepDoRecursive(a, f)
+	}
+}
+
 func deepDoPrecomputed(a Dep, f func(Dep)) {
 	f(a)
 	for _, dep := range a.GetNode().Dependencies.TransitiveValues() {
@@ -17,32 +27,39 @@ var deepDoMapPool = xsync.Pool[map[Dep]struct{}]{New: func() map[Dep]struct{} {
 	return map[Dep]struct{}{}
 }}
 
-func deepDo(a Dep, f func(Dep)) {
-	if false {
-		// This approach sounds good on paper, but in reality very CPU intensive since it requires
-		// read & write to the deps set at every change, at every level...
-		deepDoPrecomputed(a, f)
-	} else {
-		deepDoRecursive(a, f)
-	}
-}
-
 func deepDoRecursive(a Dep, f func(Dep)) {
 	m := deepDoMapPool.Get()
-	maps.Clear(m)
-	defer deepDoMapPool.Put(m)
+	defer func() {
+		maps.Clear(m)
+		deepDoMapPool.Put(m)
+	}()
 	deepDoRecursiveInner(a, f, m)
 }
 
-func deepDoRecursiveInner(a Dep, f func(Dep), m map[Dep]struct{}) {
+func deepDoInner(a Dep, f func(Dep), m map[Dep]struct{}) bool {
 	if _, ok := m[a]; ok {
-		return
+		return false
 	}
 	m[a] = struct{}{}
 
 	f(a)
-	for _, dep := range a.GetNode().Dependencies.Values() {
-		deepDoRecursiveInner(dep, f, m)
+
+	return true
+}
+
+func deepDoRecursiveInner(a Dep, f func(Dep), m map[Dep]struct{}) {
+	if !deepDoInner(a, f, m) {
+		return
+	}
+
+	if a.GetNode().IsFrozen() {
+		for _, dep := range a.GetNode().Dependencies.TransitiveValues() {
+			deepDoInner(dep, f, m)
+		}
+	} else {
+		for _, dep := range a.GetNode().Dependencies.Values() {
+			deepDoRecursiveInner(dep, f, m)
+		}
 	}
 }
 

@@ -110,6 +110,9 @@ func (ts *Set[K, T]) Slice() []T {
 		return nil
 	}
 
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
 	return ts.a[:]
 }
 
@@ -117,6 +120,9 @@ func (ts *Set[K, T]) Len() int {
 	if ts == nil {
 		return 0
 	}
+
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
 
 	return len(ts.a)
 }
@@ -143,6 +149,7 @@ func (ts *Set[K, T]) Remove(v T) {
 	k := ts.f(v)
 
 	delete(ts.m, k)
+
 	ts.a = slices.DeleteFunc(ts.a, func(t T) bool {
 		return ts.f(t) == k
 	})
