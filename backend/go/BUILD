@@ -26,7 +26,7 @@ def go_std(os, arch, name = None):
 
     xargs = "xargs " + ("-S" if get_os() == "darwin" else "-s") + " 100000"
 
-    return target(
+    return '{mode=link}'+target(
         name = name,
         pkg = backend_pkg,
         tools = go,
