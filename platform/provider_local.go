@@ -45,7 +45,7 @@ func (p *localExecutor) Exec(ctx context.Context, o ExecOptions, execArgs []stri
 	}
 
 	sctx, hctx, cancel := xcontext.NewSoftCancel(ctx)
-	defer cancel()
+	defer cancel(nil)
 
 	cmd := sandbox.Exec(sandbox.ExecConfig{
 		Context:     hctx,

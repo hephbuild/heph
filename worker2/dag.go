@@ -83,7 +83,9 @@ func (d *nodesTransitive[T]) TransitiveSet() *sets.Set[*Node[T], *Node[T]] {
 func (d *nodesTransitive[T]) TransitiveValues() iter.Seq2[int, T] {
 	return func(yield func(int, T) bool) {
 		for i, node := range d.TransitiveSet().Slice() {
-			yield(i, node.V)
+			if !yield(i, node.V) {
+				break
+			}
 		}
 	}
 }
@@ -91,7 +93,9 @@ func (d *nodesTransitive[T]) TransitiveValues() iter.Seq2[int, T] {
 func (d *nodesTransitive[T]) Values() iter.Seq2[int, T] {
 	return func(yield func(int, T) bool) {
 		for i, node := range d.Set().Slice() {
-			yield(i, node.V)
+			if !yield(i, node.V) {
+				break
+			}
 		}
 	}
 }

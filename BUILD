@@ -79,9 +79,6 @@ deps = ["go.mod", "go.sum"] + glob(
 
 release = "release" in CONFIG["profiles"]
 
-def _gobuild(pkg, args):
-    return "go build -trimpath {} -ldflags='-s -w' -o $OUT {}".format(args, pkg)
-
 build_flags = ""
 if release:
     version = target(
@@ -101,10 +98,7 @@ for os in ["linux", "darwin"]:
             name = "build_{}_{}".format(os, arch),
             run = [
                 "go version",
-                _gobuild(
-                    "github.com/hephbuild/heph/cmd/heph",
-                    build_flags,
-                ),
+                "go build -o $OUT -trimpath -ldflags='-s -w' github.com/hephbuild/heph/cmd/heph",
             ],
             out = "heph_{}_{}".format(os, arch),
             deps = deps,
@@ -118,6 +112,24 @@ for os in ["linux", "darwin"]:
             pass_env = go_env_vars,
         )
         builds.append(t)
+
+        target(
+            name = "build_debug_{}_{}".format(os, arch),
+            run = [
+                "go version",
+                "go build -o $OUT -trimpath -gcflags='all=-N -l' github.com/hephbuild/heph/cmd/heph",
+            ],
+            out = "heph_debug_{}_{}".format(os, arch),
+            deps = deps,
+            env = {
+                "GOOS": os,
+                "GOARCH": arch,
+                "CGO_ENABLED": "0",
+            },
+            tools = ["go"],
+            labels = ["build-debug"],
+            pass_env = go_env_vars,
+        )
 
 target(
     name = "cp_builds",

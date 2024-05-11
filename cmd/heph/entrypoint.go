@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/utils/xcontext"
@@ -11,13 +12,18 @@ import (
 
 func execute() error {
 	ctx, cancel := xcontext.BootstrapSoftCancel()
-	defer cancel()
+	defer cancel(nil)
 
 	vfssimple.WithContext(ctx)
 
 	err := rootCmd.ExecuteContext(ctx)
 	postRun(err)
 	if err != nil {
+		// Handle ctrlc gracefuly
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
+
 		return err
 	}
 

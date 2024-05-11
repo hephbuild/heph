@@ -2,6 +2,7 @@ package xcontext
 
 import (
 	"context"
+	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/xsync"
@@ -22,9 +23,11 @@ func IsDone(ctx context.Context) bool {
 	}
 }
 
+type CancelFunc = context.CancelCauseFunc
+
 type entry struct {
-	softCancel context.CancelFunc
-	hardCancel context.CancelFunc
+	softCancel CancelFunc
+	hardCancel CancelFunc
 }
 
 type state struct {
@@ -42,9 +45,9 @@ func newSoftCancelState() *state {
 
 // New returns one context that will be canceled by soft cancel first, the second one will act as a force cancel
 // both inherit values from their parents
-func (a *state) New(parent context.Context) (context.Context, context.Context, func()) {
-	scctx, scancel := context.WithCancel(parent)
-	hcctx, hcancel := context.WithCancel(context.Background())
+func (a *state) New(parent context.Context) (context.Context, context.Context, CancelFunc) {
+	scctx, scancel := context.WithCancelCause(parent)
+	hcctx, hcancel := context.WithCancelCause(context.Background())
 
 	hctx := CancellableContext{
 		Parent: parent,
@@ -58,9 +61,9 @@ func (a *state) New(parent context.Context) (context.Context, context.Context, f
 
 	a.add(e)
 
-	return scctx, hctx, func() {
-		e.softCancel()
-		e.hardCancel()
+	return scctx, hctx, func(cause error) {
+		e.softCancel(cause)
+		e.hardCancel(cause)
 
 		a.remove(e)
 	}
@@ -95,7 +98,7 @@ func (a *state) has() bool {
 	return len(a.ctxs) > 0
 }
 
-func (a *state) hardCancel() bool {
+func (a *state) hardCancel(cause error) bool {
 	a.m.Lock()
 	defer a.m.Unlock()
 
@@ -104,7 +107,7 @@ func (a *state) hardCancel() bool {
 	}
 
 	for _, e := range a.ctxs {
-		e.hardCancel()
+		e.hardCancel(cause)
 	}
 
 	return true
@@ -113,7 +116,7 @@ func (a *state) hardCancel() bool {
 type keySoftCancelState struct{}
 
 // NewSoftCancel See softCancel.New
-func NewSoftCancel(parent context.Context) (context.Context, context.Context, context.CancelFunc) {
+func NewSoftCancel(parent context.Context) (context.Context, context.Context, CancelFunc) {
 	sc := parent.Value(keySoftCancelState{}).(*state)
 
 	return sc.New(parent)
@@ -140,9 +143,10 @@ func Cancel(ctx context.Context) {
 }
 
 const stuckTimeout = 5 * time.Second
+const forceTimeout = 1 * time.Second
 
-func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func BootstrapSoftCancel() (context.Context, CancelFunc) {
+	ctx, cancel := context.WithCancelCause(context.Background())
 
 	sigCh := make(chan os.Signal)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -150,23 +154,21 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 	sc := newSoftCancelState()
 
 	go func() {
-		<-sigCh
-		cancel()
+		sig := <-sigCh
+		cancel(fmt.Errorf(sig.String()))
 		if sc.has() {
 			hardCanceled := false
 			go func() {
-				<-time.After(200 * time.Millisecond)
+				<-time.After(forceTimeout)
 				if hardCanceled {
 					return
 				}
 				log.Warnf("Attempting to cancel... ctrl+c one more time to force")
 			}()
-			select {
-			case <-sigCh:
-			}
-			log.Warnf("Forcing cancellation...")
+			sig := <-sigCh
 			hardCanceled = true
-			sc.hardCancel()
+			log.Warnf("Forcing cancellation...")
+			sc.hardCancel(fmt.Errorf(sig.String()))
 			select {
 			// Wait for soft cancel to all be unregistered, should be fast, unless something is stuck
 			case <-sc.wait():
@@ -180,7 +182,7 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		}
 
 		log.Error("Something seems to be stuck, ctrl+c one more time to forcefully exit")
-		sig := <-sigCh
+		sig = <-sigCh
 		sigN := 0
 		if sig, ok := sig.(syscall.Signal); ok {
 			sigN = int(sig)
@@ -194,8 +196,8 @@ func BootstrapSoftCancel() (context.Context, context.CancelFunc) {
 		sigCh <- os.Interrupt
 	}))
 
-	return ctx, func() {
-		cancel()
-		sc.hardCancel()
+	return ctx, func(cause error) {
+		cancel(cause)
+		sc.hardCancel(cause)
 	}
 }

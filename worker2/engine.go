@@ -4,7 +4,6 @@ import (
 	"github.com/bep/debounce"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/utils/ads"
-	"go.uber.org/multierr"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -111,13 +110,10 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 	exec.c.L.Lock()
 	defer exec.c.L.Unlock()
 
-	var errs []error
 	for {
 		depObj := exec.Dep.GetNode()
 
-		allDepsSucceeded := true
 		allDepsDone := true
-		errs = errs[:0]
 		for _, dep := range depObj.Dependencies.Values() {
 			depExec := e.scheduleOne(dep)
 
@@ -129,30 +125,21 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 				allDepsDone = false
 			}
 
-			if state != ExecStateSucceeded {
-				allDepsSucceeded = false
-			}
-
 			switch state {
 			case ExecStateSkipped, ExecStateFailed:
-				errs = append(errs, Error{
+				// Prevent accumulating a million errors, fail early
+				return Error{
 					ID:    depExec.ID,
 					State: depExec.State,
 					Name:  depExec.Dep.GetName(),
 					Err:   depExec.Err,
-				})
+				}
 			}
 		}
 
 		if allDepsDone {
-			if len(errs) > 0 {
-				return multierr.Combine(errs...)
-			}
-
-			if allDepsSucceeded {
-				if e.tryFreeze(depObj) {
-					return nil
-				}
+			if e.tryFreeze(depObj) {
+				return nil
 			}
 		}
 
