@@ -98,7 +98,7 @@ for os in ["linux", "darwin"]:
             name = "build_{}_{}".format(os, arch),
             run = [
                 "go version",
-                "go build -o $OUT -trimpath -ldflags='-s -w' github.com/hephbuild/heph/cmd/heph",
+                "go build -o $OUT -trimpath -ldflags='-s -w' {} github.com/hephbuild/heph/cmd/heph".format(build_flags),
             ],
             out = "heph_{}_{}".format(os, arch),
             deps = deps,
@@ -117,7 +117,7 @@ for os in ["linux", "darwin"]:
             name = "build_debug_{}_{}".format(os, arch),
             run = [
                 "go version",
-                "go build -o $OUT -trimpath -gcflags='all=-N -l' github.com/hephbuild/heph/cmd/heph",
+                "go build -o $OUT -gcflags='all=-N -l' {} github.com/hephbuild/heph/cmd/heph".format(build_flags),
             ],
             out = "heph_debug_{}_{}".format(os, arch),
             deps = deps,
