@@ -233,12 +233,6 @@ func (e *Runner) Run(ctx context.Context, rr Request, iocfg sandbox.IOConfig, tr
 				return nil, nil
 			}
 
-			if cerr := ctx.Err(); cerr != nil {
-				if !errors.Is(err, cerr) {
-					err = fmt.Errorf("%w: %v", cerr, err)
-				}
-			}
-
 			err := fmt.Errorf("exec: %w", err)
 
 			if iocfg.Stdin == os.Stdin {

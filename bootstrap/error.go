@@ -5,72 +5,76 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/worker2"
 	"go.uber.org/multierr"
 	"io"
 	"os"
+	"sync"
 )
-
-func printErrTargetFailed(err error) bool {
-	var lerr targetrun.TargetFailed
-	if errors.As(err, &lerr) {
-		log.Errorf("%v failed: %v", lerr.Target.Addr, lerr.Err)
-
-		logFile := lerr.LogFile
-		if logFile != "" {
-			info, _ := os.Stat(logFile)
-			if info != nil && info.Size() > 0 {
-				fmt.Fprintln(log.Writer())
-				f, err := os.Open(logFile)
-				if err == nil {
-					_, _ = io.Copy(log.Writer(), f)
-					f.Close()
-					fmt.Fprintln(log.Writer())
-				}
-				log.Errorf("The log file can be found at %v", logFile)
-			}
-		}
-
-		for _, err := range multierr.Errors(lerr.Err) {
-			log.Error(err)
-		}
-
-		return true
-	}
-
-	return false
-}
 
 func PrintHumanError(err error) {
 	errs := worker2.CollectRootErrors(err)
 	skippedCount := 0
-	skipSpacing := true
 
-	separate := func() {
-		if skipSpacing {
-			skipSpacing = false
-		} else {
-			fmt.Fprintln(log.Writer())
+	var contextCanceledOnce sync.Once
+
+	logError := func(err error) {
+		var sigCause xcontext.SignalCause
+		if errors.As(err, &sigCause) {
+			contextCanceledOnce.Do(func() {
+				log.Error(sigCause)
+			})
+			return
 		}
+
+		log.Error(err)
 	}
 
 	for _, err := range errs {
-		if printErrTargetFailed(err) {
-			// Printed !
+		var terr targetrun.TargetFailed
+		if errors.As(err, &terr) {
+			var sigCause xcontext.SignalCause
+			if errors.As(err, &sigCause) {
+				contextCanceledOnce.Do(func() {
+					log.Error(sigCause)
+				})
+				return
+			}
+
+			log.Errorf("%v failed: %v", terr.Target.Addr, terr.Err)
+
+			logFile := terr.LogFile
+			if logFile != "" {
+				info, _ := os.Stat(logFile)
+				if info != nil && info.Size() > 0 {
+					fmt.Fprintln(log.Writer())
+					f, err := os.Open(logFile)
+					if err == nil {
+						_, _ = io.Copy(log.Writer(), f)
+						f.Close()
+						fmt.Fprintln(log.Writer())
+					}
+					log.Errorf("The log file can be found at %v", logFile)
+				}
+			}
+
+			for _, err := range multierr.Errors(terr.Err) {
+				logError(err)
+			}
+
 			continue
 		}
 
 		var jerr worker2.Error
 		if errors.As(err, &jerr) && jerr.Skipped() {
 			skippedCount++
-			skipSpacing = true
 			log.Debugf("skipped: %v", jerr)
-		} else {
-			for _, err := range multierr.Errors(err) {
-				skipSpacing = true
-				separate()
-				log.Error(err)
-			}
+			continue
+		}
+
+		for _, err := range multierr.Errors(err) {
+			logError(err)
 		}
 	}
 

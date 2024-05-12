@@ -76,6 +76,10 @@ func UncompressedPathFromArtifact(ctx context.Context, target graph.Targeter, ar
 			}
 
 			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return "", cerr
+				}
+
 				return "", fmt.Errorf("ungz: cp: %w", err)
 			}
 

@@ -2,6 +2,7 @@ package xcontext
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/ads"
@@ -43,11 +44,51 @@ func newSoftCancelState() *state {
 	return s
 }
 
+type causeErr struct {
+	err, cause error
+}
+
+func (c causeErr) Is(target error) bool {
+	return errors.Is(c.err, target) || errors.Is(c.cause, target)
+}
+
+func (c causeErr) As(target any) bool {
+	return errors.As(c.err, target) || errors.As(c.cause, target)
+}
+
+func (c causeErr) Error() string {
+	return c.cause.Error()
+}
+
+type causeCtx struct {
+	context.Context
+}
+
+func (c causeCtx) Err() error {
+	err := c.Context.Err()
+	if err == nil {
+		return nil
+	}
+
+	cause := context.Cause(c.Context)
+	if cause == nil || err == cause {
+		return err
+	}
+
+	return causeErr{err, cause}
+}
+
+func WithCancelCause(parent context.Context) (context.Context, CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+
+	return causeCtx{ctx}, cancel
+}
+
 // New returns one context that will be canceled by soft cancel first, the second one will act as a force cancel
 // both inherit values from their parents
 func (a *state) New(parent context.Context) (context.Context, context.Context, CancelFunc) {
-	scctx, scancel := context.WithCancelCause(parent)
-	hcctx, hcancel := context.WithCancelCause(context.Background())
+	scctx, scancel := WithCancelCause(parent)
+	hcctx, hcancel := WithCancelCause(context.Background())
 
 	hctx := CancellableContext{
 		Parent: parent,
@@ -145,8 +186,19 @@ func Cancel(ctx context.Context) {
 const stuckTimeout = 5 * time.Second
 const forceTimeout = 1 * time.Second
 
+type SignalCause struct {
+	sig os.Signal
+}
+
+func (s SignalCause) Error() string {
+	if s.sig == nil {
+		return "signal: !!missing!!"
+	}
+	return fmt.Sprintf("signal: %v", s.sig.String())
+}
+
 func BootstrapSoftCancel() (context.Context, CancelFunc) {
-	ctx, cancel := context.WithCancelCause(context.Background())
+	ctx, cancel := WithCancelCause(context.Background())
 
 	sigCh := make(chan os.Signal)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -155,7 +207,7 @@ func BootstrapSoftCancel() (context.Context, CancelFunc) {
 
 	go func() {
 		sig := <-sigCh
-		cancel(fmt.Errorf(sig.String()))
+		cancel(SignalCause{sig})
 		if sc.has() {
 			hardCanceled := false
 			go func() {
@@ -168,7 +220,7 @@ func BootstrapSoftCancel() (context.Context, CancelFunc) {
 			sig := <-sigCh
 			hardCanceled = true
 			log.Warnf("Forcing cancellation...")
-			sc.hardCancel(fmt.Errorf(sig.String()))
+			sc.hardCancel(SignalCause{sig})
 			select {
 			// Wait for soft cancel to all be unregistered, should be fast, unless something is stuck
 			case <-sc.wait():

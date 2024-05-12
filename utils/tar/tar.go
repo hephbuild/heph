@@ -160,11 +160,19 @@ func UntarPath(ctx context.Context, in, to string, o UntarOptions) (err error) {
 	return UntarContext(ctx, tarf, to, o)
 }
 
-func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) (err error) {
+func UntarContext(ctx context.Context, in io.ReadCloser, to string, o UntarOptions) error {
 	cancel := xio.ContextCloser(ctx, in)
 	defer cancel()
 
-	return Untar(in, to, o)
+	err := Untar(in, to, o)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return err
+	}
+
+	return nil
 }
 
 // See https://unix.stackexchange.com/a/557487
@@ -294,6 +302,10 @@ func UntarList(ctx context.Context, in io.ReadCloser, listPath string, progresss
 		return nil
 	})
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+
 		return nil, err
 	}
 
@@ -310,7 +322,16 @@ func WalkPath(ctx context.Context, path string, fs ...func(*tar.Header, *tar.Rea
 	cancel := xio.ContextCloser(ctx, tarf)
 	defer cancel()
 
-	return Walk(tarf, fs...)
+	err = Walk(tarf, fs...)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 func Walk(tarf io.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {

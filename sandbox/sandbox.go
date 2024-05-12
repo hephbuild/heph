@@ -282,15 +282,15 @@ func (c *Cmd) Run() error {
 	go c.watchSoftContext()
 
 	err := c.Cmd.Run()
-	if cerr := c.SoftContext.Err(); cerr != nil {
-		if err != nil {
-			err = fmt.Errorf("%v: %w", err, cerr)
-		} else {
-			err = cerr
+	if err != nil {
+		if cerr := c.SoftContext.Err(); cerr != nil {
+			return fmt.Errorf("%w: %w", cerr, err)
 		}
+
+		return err
 	}
 
-	return err
+	return nil
 }
 
 func Exec(cfg ExecConfig) *Cmd {

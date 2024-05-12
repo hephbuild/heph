@@ -375,6 +375,9 @@ func GenArtifact(ctx context.Context, dir string, a ArtifactWithProducer, compre
 			}
 			return nil
 		}
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		return err
 	}
 

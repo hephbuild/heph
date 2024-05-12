@@ -4,6 +4,10 @@ import (
 	"github.com/bep/debounce"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/utils/ads"
+	"github.com/hephbuild/heph/utils/sets"
+	"github.com/hephbuild/heph/utils/xcontext"
+	"github.com/hephbuild/heph/utils/xerrors"
+	"go.uber.org/multierr"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -117,29 +121,16 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 		for _, dep := range depObj.Dependencies.Values() {
 			depExec := e.scheduleOne(dep)
 
-			depExec.m.Lock()
 			state := depExec.State
-			depExec.m.Unlock()
 
 			if !state.IsFinal() {
 				allDepsDone = false
 			}
-
-			switch state {
-			case ExecStateSkipped, ExecStateFailed:
-				// Prevent accumulating a million errors, fail early
-				return Error{
-					ID:    depExec.ID,
-					State: depExec.State,
-					Name:  depExec.Dep.GetName(),
-					Err:   depExec.Err,
-				}
-			}
 		}
 
 		if allDepsDone {
-			if e.tryFreeze(depObj) {
-				return nil
+			if ok, err := e.tryFreeze(depObj); ok {
+				return err
 			}
 		}
 
@@ -147,18 +138,54 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 	}
 }
 
-func (e *Engine) tryFreeze(depObj *Node[Dep]) bool {
+func (e *Engine) tryFreeze(depObj *Node[Dep]) (bool, error) {
 	depObj.m.Lock() // prevent any deps modification
 	defer depObj.m.Unlock()
 
+	errs := sets.NewIdentitySet[error](0)
+
 	for _, dep := range depObj.Dependencies.Values() {
-		if dep.GetState() != ExecStateSucceeded {
-			return false
+		depExec := dep.getExecution()
+		if depExec == nil {
+			return false, nil
+		}
+
+		state := depExec.State
+
+		if !state.IsFinal() {
+			return false, nil
+		}
+
+		switch state {
+		case ExecStateSkipped:
+			errs.Add(depExec.Err)
+		case ExecStateFailed:
+			for _, err := range multierr.Errors(depExec.Err) {
+				if serr, ok := xerrors.As[xcontext.SignalCause](err); ok {
+					errs.Add(serr)
+				} else {
+					if jerr, ok := xerrors.As[Error](err); ok {
+						err = jerr.Root()
+					}
+
+					errs.Add(Error{
+						ID:    depExec.ID,
+						State: depExec.State,
+						Name:  depExec.Dep.GetName(),
+						Err:   err,
+					})
+				}
+			}
 		}
 	}
 
 	depObj.Freeze()
-	return true
+
+	if errs.Len() > 0 {
+		return true, multierr.Combine(errs.Slice()...)
+	}
+
+	return true, nil
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {

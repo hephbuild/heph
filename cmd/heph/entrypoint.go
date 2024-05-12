@@ -1,10 +1,9 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"github.com/hephbuild/heph/bootstrap"
 	"github.com/hephbuild/heph/utils/xcontext"
+	"github.com/hephbuild/heph/utils/xerrors"
 	"github.com/hephbuild/heph/utils/xrand"
 	"github.com/hephbuild/heph/vfssimple"
 	"os"
@@ -19,11 +18,6 @@ func execute() error {
 	err := rootCmd.ExecuteContext(ctx)
 	postRun(err)
 	if err != nil {
-		// Handle ctrlc gracefuly
-		if ctx.Err() != nil {
-			return context.Cause(ctx)
-		}
-
 		return err
 	}
 
@@ -35,8 +29,7 @@ func Execute() {
 
 	if err := execute(); err != nil {
 		exitCode := 1
-		var eerr bootstrap.ErrorWithExitCode
-		if errors.As(err, &eerr) {
+		if eerr, ok := xerrors.As[bootstrap.ErrorWithExitCode](err); ok {
 			exitCode = eerr.ExitCode
 			// This is required in case ErrorWithExitCode does not have an Err set, just an ExitCode
 			err = eerr.Err
