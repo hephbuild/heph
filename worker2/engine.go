@@ -157,23 +157,21 @@ func (e *Engine) tryFreeze(depObj *Node[Dep]) (bool, error) {
 		}
 
 		switch state {
-		case ExecStateSkipped:
-			errs.Add(depExec.Err)
-		case ExecStateFailed:
+		case ExecStateSkipped, ExecStateFailed:
 			for _, err := range multierr.Errors(depExec.Err) {
 				if serr, ok := xerrors.As[xcontext.SignalCause](err); ok {
 					errs.Add(serr)
 				} else {
 					if jerr, ok := xerrors.As[Error](err); ok {
-						err = jerr.Root()
+						errs.Add(jerr.Root())
+					} else {
+						errs.Add(Error{
+							ID:    depExec.ID,
+							State: depExec.State,
+							Name:  depExec.Dep.GetName(),
+							Err:   err,
+						})
 					}
-
-					errs.Add(Error{
-						ID:    depExec.ID,
-						State: depExec.State,
-						Name:  depExec.Dep.GetName(),
-						Err:   err,
-					})
 				}
 			}
 		}

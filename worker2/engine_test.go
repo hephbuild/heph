@@ -248,24 +248,19 @@ func TestExecErrorSkip(t *testing.T) {
 	err2 := <-err2Ch
 	err3 := <-err3Ch
 
-	assert.Equal(t, err1, errors.New("beep bop"))
-	assert.Equal(t, err2, Error{
+	assert.Equal(t, errors.New("beep bop"), err1)
+	assert.Equal(t, Error{
 		ID:    1,
 		Name:  "a1",
 		State: ExecStateFailed,
 		Err:   errors.New("beep bop"),
-	})
-	assert.Equal(t, err3, Error{
-		ID:    2,
-		Name:  "a2",
-		State: ExecStateSkipped,
-		Err: Error{
-			ID:    1,
-			Name:  "a1",
-			State: ExecStateFailed,
-			Err:   errors.New("beep bop"),
-		},
-	})
+	}, err2)
+	assert.Equal(t, Error{
+		ID:    1,
+		Name:  "a1",
+		State: ExecStateFailed,
+		Err:   errors.New("beep bop"),
+	}, err3)
 }
 
 func TestExecErrorSkipStress(t *testing.T) {
@@ -331,28 +326,23 @@ func TestExecErrorSkipStress(t *testing.T) {
 	for _, errCh := range errChs2 {
 		err := <-errCh
 
-		assert.Equal(t, err, Error{
+		assert.Equal(t, Error{
 			ID:    1,
 			Name:  "a1",
 			State: ExecStateFailed,
 			Err:   errors.New("beep bop"),
-		})
+		}, err)
 	}
 
 	for _, c := range errChs3 {
 		err := <-c.ch
 
-		assert.Equal(t, err, Error{
-			ID:    c.d.getExecution().ID,
-			Name:  c.d.GetName(),
-			State: ExecStateSkipped,
-			Err: Error{
-				ID:    1,
-				Name:  "a1",
-				State: ExecStateFailed,
-				Err:   errors.New("beep bop"),
-			},
-		})
+		require.Equal(t, Error{
+			ID:    1,
+			Name:  "a1",
+			State: ExecStateFailed,
+			Err:   errors.New("beep bop"),
+		}, err)
 	}
 }
 
@@ -385,7 +375,7 @@ func TestExecCancel(t *testing.T) {
 
 	err := <-errCh
 
-	assert.ErrorIs(t, err, context.Canceled)
+	assert.ErrorIs(t, context.Canceled, err)
 }
 
 func TestExecDeps(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/utils/xtea"
 	"github.com/hephbuild/heph/worker2"
+	"go.uber.org/multierr"
 	"os"
 	"strconv"
 	"time"
@@ -47,5 +48,7 @@ func Wait(ctx context.Context, name string, pool *worker2.Engine, deps worker2.D
 		}
 	}
 
-	return deps.GetErr()
+	err := deps.GetErr()
+
+	return multierr.Combine(worker2.CollectRootErrors(err)...)
 }

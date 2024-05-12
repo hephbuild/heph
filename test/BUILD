@@ -12,7 +12,7 @@ def e2e_test(
     cmd = "(" + cmd + ")"
 
     if expected_failure:
-        test_cmd = '%s | tee output && RC=$? || RC=$?; if [ $RC -eq 0 ]; then exit 1; fi; echo "Command exited with code $RC, as expected"; ' % cmd
+        test_cmd = '%s 2>&1 | tee output && RC=$? || RC=$?; if [ $RC -eq 0 ]; then exit 1; fi; echo "Command exited with code $RC, as expected"; ' % cmd
     else:
         test_cmd = "%s | tee output && RC=$? " % cmd
 

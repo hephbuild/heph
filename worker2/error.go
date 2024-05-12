@@ -1,7 +1,6 @@
 package worker2
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"go.uber.org/multierr"
@@ -27,11 +26,7 @@ func CollectUniqueErrors(inErrs []error) []error {
 	for _, err := range inErrs {
 		var jerr Error
 		if errors.As(err, &jerr) {
-			if errors.Is(err, context.Canceled) {
-				merrs[err] = struct{}{}
-			} else {
-				jerrs[jerr.ID] = jerr
-			}
+			jerrs[jerr.ID] = jerr
 		} else {
 			merrs[err] = struct{}{}
 		}
@@ -54,7 +49,7 @@ func CollectRootErrors(err error) []error {
 	for _, err := range multierr.Errors(err) {
 		var jerr Error
 		if errors.As(err, &jerr) {
-			errs = append(errs, jerr.Err)
+			errs = append(errs, jerr.Root())
 		} else {
 			errs = append(errs, err)
 		}
@@ -69,7 +64,7 @@ func (e *Error) Root() error {
 	}
 
 	if !e.Skipped() {
-		return e
+		return *e
 	}
 
 	var roots []error

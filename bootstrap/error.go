@@ -10,8 +10,15 @@ import (
 	"go.uber.org/multierr"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 )
+
+var skipPathLogFile bool
+
+func init() {
+	skipPathLogFile, _ = strconv.ParseBool(os.Getenv("HEPH_SKIP_PATH_LOG"))
+}
 
 func PrintHumanError(err error) {
 	errs := worker2.CollectRootErrors(err)
@@ -55,7 +62,9 @@ func PrintHumanError(err error) {
 						f.Close()
 						fmt.Fprintln(log.Writer())
 					}
-					log.Errorf("The log file can be found at %v", logFile)
+					if !skipPathLogFile {
+						log.Errorf("The log file can be found at %v", logFile)
+					}
 				}
 			}
 
