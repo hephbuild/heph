@@ -7,6 +7,7 @@ import (
 	"iter"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type nodesTransitive[T any] struct {
@@ -131,8 +132,8 @@ func newNodesTransitive[T any](transitiveGetter func(d *Node[T]) *nodesTransitiv
 type Node[T any] struct {
 	V      T
 	ID     string
-	frozen bool
-	m      sync.Mutex
+	frozen atomic.Bool
+	m      sync.RWMutex
 
 	Dependencies *nodesTransitive[T]
 	Dependees    *nodesTransitive[T]
@@ -159,7 +160,7 @@ func (d *Node[T]) AddDependency(deps ...*Node[T]) {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	if d.frozen {
+	if d.frozen.Load() {
 		panic("add: frozen")
 	}
 
@@ -192,7 +193,7 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	if d.frozen {
+	if d.IsFrozen() {
 		panic("remove: deps is frozen")
 	}
 
@@ -214,15 +215,12 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 }
 
 func (d *Node[T]) IsFrozen() bool {
-	d.m.Lock()
-	defer d.m.Unlock()
-
-	return d.frozen
+	return d.frozen.Load()
 }
 
 // Freeze assumes the lock is already held
 func (d *Node[T]) Freeze() {
-	if d.frozen {
+	if d.frozen.Load() {
 		return
 	}
 
@@ -232,7 +230,7 @@ func (d *Node[T]) Freeze() {
 		}
 	}
 
-	d.frozen = true
+	d.frozen.Store(true)
 }
 
 func (d *Node[T]) DebugString() string {

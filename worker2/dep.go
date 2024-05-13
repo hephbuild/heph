@@ -72,7 +72,7 @@ func (a *baseDep) AddDep(deps ...Dep) {
 }
 
 func (a *baseDep) getNamed() map[string]Dep {
-	if !a.GetNode().frozen {
+	if !a.GetNode().IsFrozen() {
 		panic("not frozen")
 	}
 	return a.named
