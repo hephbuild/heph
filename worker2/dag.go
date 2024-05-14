@@ -129,11 +129,24 @@ func newNodesTransitive[T any](transitiveGetter func(d *Node[T]) *nodesTransitiv
 	}
 }
 
+type DAGEvent interface {
+	dagEvent()
+}
+
+type DAGEventNewDep[T any] struct {
+	Node *Node[T]
+}
+
+func (d DAGEventNewDep[T]) dagEvent() {}
+
+type DAGHook func(DAGEvent)
+
 type Node[T any] struct {
 	V      T
 	ID     string
 	frozen atomic.Bool
-	m      sync.RWMutex
+	m      sync.Mutex
+	hooks  []DAGHook
 
 	Dependencies *nodesTransitive[T]
 	Dependees    *nodesTransitive[T]
@@ -154,6 +167,13 @@ func NewNode[T any](id string, v T) *Node[T] {
 
 func (d *Node[T]) GetID() string {
 	return d.ID
+}
+
+func (d *Node[T]) AddHook(hook DAGHook) {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	d.hooks = append(d.hooks, hook)
 }
 
 func (d *Node[T]) AddDependency(deps ...*Node[T]) {
@@ -179,11 +199,15 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 			for _, dependee := range d.Dependees.TransitiveSet().Slice() {
 				dependee.Dependencies.MarkTransitiveDirty()
 			}
-		}
 
-		if dep.Dependees.Add(d) {
-			for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
-				dep.Dependees.MarkTransitiveDirty()
+			if dep.Dependees.Add(d) {
+				for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
+					dep.Dependees.MarkTransitiveDirty()
+				}
+			}
+
+			for _, hook := range d.hooks {
+				hook(DAGEventNewDep[T]{Node: dep})
 			}
 		}
 	}

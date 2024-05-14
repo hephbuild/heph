@@ -56,15 +56,13 @@ func (e *Engine) handle(event Event) {
 		e.runHooks(event, event.Execution)
 		e.start(event.Execution)
 	case EventSkipped:
-		e.finalize(event.Execution, ExecStateSkipped, event.Error)
-		e.runHooks(event, event.Execution)
+		e.finalize(event, ExecStateSkipped, event.Error)
 	case EventCompleted:
 		if event.Error != nil {
-			e.finalize(event.Execution, ExecStateFailed, event.Error)
+			e.finalize(event, ExecStateFailed, event.Error)
 		} else {
-			e.finalize(event.Execution, ExecStateSucceeded, nil)
+			e.finalize(event, ExecStateSucceeded, nil)
 		}
-		e.runHooks(event, event.Execution)
 	case EventSuspended:
 		e.runHooks(event, event.Execution)
 		go func() {
@@ -72,16 +70,19 @@ func (e *Engine) handle(event Event) {
 			e.queue(event.Execution)
 		}()
 	default:
-		if event, ok := event.(WithExecution); ok {
-			defer e.runHooks(event, event.getExecution())
+		if event, ok := event.(EventWithExecution); ok {
+			e.runHooks(event, event.getExecution())
 		}
 	}
 }
 
-func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
+func (e *Engine) finalize(event EventWithExecution, state ExecState, err error) {
+	exec := event.getExecution()
+
 	exec.m.Lock()
 	exec.Err = err
 	exec.State = state
+	e.runHooksWithoutLock(event, exec)
 	close(exec.completedCh)
 	exec.m.Unlock()
 
@@ -95,19 +96,26 @@ func (e *Engine) finalize(exec *Execution, state ExecState, err error) {
 }
 
 func (e *Engine) runHooks(event Event, exec *Execution) {
+	exec.m.Lock()
+	defer exec.m.Unlock()
+
+	e.runHooksWithoutLock(event, exec)
+}
+
+func (e *Engine) runHooksWithoutLock(event Event, exec *Execution) {
 	for _, hook := range e.hooks {
-		if hook == nil {
-			continue
-		}
 		hook(event)
 	}
 
 	for _, hook := range exec.Dep.GetHooks() {
-		if hook == nil {
-			continue
-		}
 		hook(event)
 	}
+
+	if !event.Replayable() {
+		return
+	}
+
+	exec.events = append(exec.events, event)
 }
 
 func (e *Engine) waitForDeps(exec *Execution) error {
@@ -290,6 +298,9 @@ func (e *Engine) start(exec *Execution) {
 }
 
 func (e *Engine) RegisterHook(hook Hook) {
+	if hook == nil {
+		return
+	}
 	e.hooks = append(e.hooks, hook)
 }
 
@@ -357,6 +368,7 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 		eventsCh:    e.eventsCh,
 		completedCh: make(chan struct{}),
 		m:           m,
+		events:      make([]Event, 5),
 
 		// see field comments
 		errCh:  nil,
@@ -396,7 +408,7 @@ func (e *Engine) scheduleOne(dep Dep) *Execution {
 		exec.ScheduledAt = time.Now()
 		exec.State = ExecStateScheduled
 
-		e.runHooks(EventScheduled{Execution: exec}, exec)
+		e.runHooksWithoutLock(EventScheduled{Execution: exec}, exec)
 
 		go e.waitForDepsAndSchedule(exec)
 	}

@@ -183,6 +183,40 @@ func TestExecHook(t *testing.T) {
 	assert.Equal(t, int(1), v)
 }
 
+func TestExecHookAfterCompleted(t *testing.T) {
+	t.Parallel()
+
+	ch := make(chan Event, 1000)
+	a := NewAction(ActionConfig{
+		Do: func(ctx context.Context, ds InStore, os OutStore) error {
+			fmt.Println("Running 1")
+			return nil
+		},
+	})
+
+	e := NewEngine()
+
+	go e.Run()
+	defer e.Stop()
+
+	e.Schedule(a)
+
+	<-a.Wait()
+
+	a.AddHook(func(event Event) {
+		ch <- event
+	})
+
+	close(ch)
+
+	events := make([]string, 0)
+	for event := range ch {
+		events = append(events, fmt.Sprintf("%T", event))
+	}
+
+	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+}
+
 func TestExecError(t *testing.T) {
 	t.Parallel()
 	a := NewAction(ActionConfig{
@@ -546,6 +580,12 @@ func TestExecStress(t *testing.T) {
 
 	stats3 := CollectStats(a)
 	assert.Equal(t, Stats{All: totalDeps, Completed: totalDeps, Succeeded: totalDeps}, stats3)
+
+	sc := NewStatsCollector()
+	sc.Register(a)
+
+	stats3bis := sc.Collect()
+	assert.Equal(t, stats3, stats3bis)
 
 	expected := map[string]any{}
 	for i := 0; i < n; i++ {

@@ -59,6 +59,7 @@ type Execution struct {
 	eventsCh  chan Event
 	c         *sync.Cond
 	broadcast func()
+	events    []Event
 
 	scheduler Scheduler
 
@@ -72,8 +73,9 @@ type Execution struct {
 	completedCh chan struct{}
 
 	ScheduledAt time.Time
-	StartedAt   time.Time
 	QueuedAt    time.Time
+	StartedAt   time.Time
+	CompletedAt time.Time
 
 	status status.Statuser
 
@@ -115,6 +117,8 @@ func (e *Execution) Run() {
 
 			err := e.run(ctx)
 			e.errCh <- err
+
+			e.CompletedAt = time.Now()
 		}()
 	} else {
 		e.ResumeAck()
@@ -133,6 +137,7 @@ func (e *Execution) Run() {
 		e.scheduler.Done(e.Dep)
 
 		e.eventsCh <- EventCompleted{
+			At:        e.CompletedAt,
 			Execution: e,
 			Output:    e.outStore.Get(),
 			Error:     err,
@@ -226,7 +231,7 @@ func (e *Execution) ResumeAck() {
 	close(e.resumeAckCh)
 }
 
-func (e *Execution) WaitSuspend() chan *SuspendBag {
+func (e *Execution) WaitSuspend() <-chan *SuspendBag {
 	return e.suspendCh
 }
 

@@ -36,7 +36,7 @@ func ErrorHook() (Hook, <-chan error) {
 
 func LogHook() Hook {
 	return func(event Event) {
-		if event, ok := event.(WithExecution); ok {
+		if event, ok := event.(EventWithExecution); ok {
 			fmt.Printf("%v: %T %+v\n", event.getExecution().Dep.GetName(), event, event)
 		} else {
 			fmt.Printf("%T %+v\n", event, event)
@@ -54,21 +54,23 @@ type StageHook struct {
 
 func (h StageHook) Hook() Hook {
 	return func(event1 Event) {
-		event, ok := event1.(WithExecution)
+		event, ok := event1.(EventWithExecution)
 		if !ok {
 			return
 		}
 
-		ctx := h.run(event)
+		exec := event.getExecution()
+
+		ctx := h.run(exec)
 		if ctx != nil {
-			event.getExecution().Dep.SetCtx(ctx)
+			exec.Dep.SetCtx(ctx)
 		}
 	}
 }
 
-func (h StageHook) run(event WithExecution) context.Context {
-	state := event.getExecution().State
-	dep := event.getExecution().Dep
+func (h StageHook) run(exec *Execution) context.Context {
+	state := exec.State
+	dep := exec.Dep
 
 	switch state {
 	case ExecStateScheduled:

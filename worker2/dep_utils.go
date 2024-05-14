@@ -3,6 +3,7 @@ package worker2
 import (
 	"github.com/hephbuild/heph/utils/xsync"
 	"golang.org/x/exp/maps"
+	"sync"
 	"sync/atomic"
 )
 
@@ -77,6 +78,10 @@ type Stats struct {
 }
 
 func (s *Stats) record(dep Dep) {
+	if _, ok := dep.(*Group); ok {
+		return
+	}
+
 	atomic.AddUint64(&s.All, 1)
 
 	j := dep.getExecution()
@@ -106,15 +111,107 @@ func (s *Stats) record(dep Dep) {
 	}
 }
 
+// CollectStats can get quite expensive on large DAGs, prefer NewStatsCollector
 func CollectStats(dep Dep) Stats {
 	s := Stats{}
 	dep.DeepDo(func(dep Dep) {
-		if _, ok := dep.(*Group); ok {
-			return
-		}
-
 		s.record(dep)
 	})
 
 	return s
+}
+
+type StatsCollector struct {
+	completed, skipped, succeeded, failed atomic.Uint64
+
+	mu         sync.Mutex
+	depsm      map[Dep]struct{}
+	completedm map[uint64]struct{}
+}
+
+func NewStatsCollector() *StatsCollector {
+	return &StatsCollector{
+		depsm:      map[Dep]struct{}{},
+		completedm: map[uint64]struct{}{},
+	}
+}
+
+func (c *StatsCollector) Collect() Stats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	s := Stats{
+		All:       c.completed.Load(),
+		Completed: c.completed.Load(),
+		Skipped:   c.skipped.Load(),
+		Succeeded: c.succeeded.Load(),
+		Failed:    c.failed.Load(),
+	}
+	for dep := range c.depsm {
+		s.record(dep)
+	}
+
+	return s
+}
+
+func (c *StatsCollector) hook(event Event) {
+	switch event := event.(type) {
+	case EventNewDep:
+		c.Register(event.AddedDep)
+	case EventCompleted:
+		c.onCompleted(event.Execution.Dep)
+	case EventSkipped:
+		c.onCompleted(event.Execution.Dep)
+	}
+}
+
+func (c *StatsCollector) onCompleted(dep Dep) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	id := dep.getExecution().ID
+
+	if _, ok := c.completedm[id]; ok {
+		return
+	}
+	c.completedm[id] = struct{}{}
+	delete(c.depsm, dep)
+
+	if _, ok := dep.(*Group); ok {
+		return
+	}
+	c.completed.Add(1)
+
+	switch dep.GetState() {
+	case ExecStateSucceeded:
+		c.succeeded.Add(1)
+	case ExecStateFailed:
+		c.failed.Add(1)
+	case ExecStateSkipped:
+		c.skipped.Add(1)
+	}
+}
+
+func (c *StatsCollector) Register(dep Dep) {
+	c.mu.Lock()
+	if _, ok := c.depsm[dep]; ok {
+		c.mu.Unlock()
+		return
+	}
+
+	if exec := dep.getExecution(); exec != nil {
+		if _, ok := c.completedm[exec.ID]; ok {
+			c.mu.Unlock()
+			return
+		}
+	}
+
+	c.depsm[dep] = struct{}{}
+	c.mu.Unlock()
+
+	dep.AddHook(c.hook)
+
+	for _, dep := range dep.GetNode().Dependencies.Values() {
+		c.Register(dep)
+	}
 }

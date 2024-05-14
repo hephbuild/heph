@@ -13,6 +13,7 @@ type Dep interface {
 	GetNode() *Node[Dep]
 	AddDep(...Dep)
 	GetHooks() []Hook
+	AddHook(h Hook)
 	Wait() <-chan struct{}
 	DeepDo(f func(Dep))
 	GetCtx() context.Context
@@ -43,6 +44,7 @@ type baseDep struct {
 	m         sync.RWMutex
 	node      *Node[Dep]
 	named     map[string]Dep
+	hooks     []Hook
 
 	executionPresentCh chan struct{}
 	o                  sync.Once
@@ -176,6 +178,41 @@ func (a *baseDep) GetQueuedAt() time.Time {
 	return exec.QueuedAt
 }
 
+func (a *baseDep) AddHook(hook Hook) {
+	if hook == nil {
+		return
+	}
+
+	a.hooks = append(a.hooks, hook)
+
+	exec := a.getExecution()
+	if exec == nil {
+		return
+	}
+
+	hook(EventDeclared{Dep: exec.Dep})
+
+	for _, event := range exec.events {
+		hook(event)
+	}
+}
+
+func (a *baseDep) OutputCh() <-chan Value {
+	h, ch := OutputHook()
+	a.AddHook(h)
+	return ch
+}
+
+func (a *baseDep) ErrorCh() <-chan error {
+	h, ch := ErrorHook()
+	a.AddHook(h)
+	return ch
+}
+
+func (a *baseDep) GetHooks() []Hook {
+	return a.hooks[:]
+}
+
 type ActionConfig struct {
 	Ctx       context.Context
 	Name      string
@@ -190,7 +227,6 @@ type Action struct {
 	baseDep
 	ctx       context.Context
 	name      string
-	hooks     []Hook
 	scheduler Scheduler
 	requests  map[string]float64
 	do        func(ctx context.Context, ins InStore, outs OutStore) error
@@ -219,22 +255,6 @@ func (a *Action) SetCtx(ctx context.Context) {
 	a.ctx = ctx
 }
 
-func (a *Action) OutputCh() <-chan Value {
-	h, ch := OutputHook()
-	a.hooks = append(a.hooks, h)
-	return ch
-}
-
-func (a *Action) ErrorCh() <-chan error {
-	h, ch := ErrorHook()
-	a.hooks = append(a.hooks, h)
-	return ch
-}
-
-func (a *Action) GetHooks() []Hook {
-	return a.hooks
-}
-
 func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 	if a.do == nil {
 		return nil
@@ -260,10 +280,6 @@ func (g *Group) GetScheduler() Scheduler { return nil }
 
 func (g *Group) GetName() string {
 	return g.name
-}
-
-func (g *Group) GetHooks() []Hook {
-	return nil
 }
 
 func (g *Group) DeepDo(f func(Dep)) {

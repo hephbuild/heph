@@ -15,5 +15,14 @@ func NewGroupWith(cfg GroupConfig) *Group {
 	g.name = cfg.Name
 	g.AddDep(cfg.Deps...)
 
+	g.node.AddHook(func(event DAGEvent) {
+		switch event := event.(type) {
+		case DAGEventNewDep[Dep]:
+			for _, hook := range g.hooks {
+				hook(EventNewDep{Target: g, AddedDep: event.Node.V})
+			}
+		}
+	})
+
 	return g
 }

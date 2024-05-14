@@ -22,9 +22,12 @@ func printWhatItsWaitingOn(dep worker2.Dep, indent string) {
 }
 
 func logUI(name string, deps worker2.Dep, pool *worker2.Engine, interval time.Duration) error {
+	sc := worker2.NewStatsCollector()
+	sc.Register(deps)
+
 	start := time.Now()
 	printProgress := func() {
-		s := worker2.CollectStats(deps)
+		s := sc.Collect()
 
 		extra := ""
 		if s.Failed > 0 || s.Skipped > 0 || s.Suspended > 0 {
