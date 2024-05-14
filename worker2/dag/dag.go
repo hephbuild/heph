@@ -1,4 +1,4 @@
-package worker2
+package dag
 
 import (
 	"fmt"
@@ -129,24 +129,24 @@ func newNodesTransitive[T any](transitiveGetter func(d *Node[T]) *nodesTransitiv
 	}
 }
 
-type DAGEvent interface {
+type Event interface {
 	dagEvent()
 }
 
-type DAGEventNewDep[T any] struct {
+type EventNewDep[T any] struct {
 	Node *Node[T]
 }
 
-func (d DAGEventNewDep[T]) dagEvent() {}
+func (d EventNewDep[T]) dagEvent() {}
 
-type DAGHook func(DAGEvent)
+type Hook func(Event)
 
 type Node[T any] struct {
 	V      T
 	ID     string
 	frozen atomic.Bool
 	m      sync.Mutex
-	hooks  []DAGHook
+	hooks  []Hook
 
 	Dependencies *nodesTransitive[T]
 	Dependees    *nodesTransitive[T]
@@ -169,7 +169,7 @@ func (d *Node[T]) GetID() string {
 	return d.ID
 }
 
-func (d *Node[T]) AddHook(hook DAGHook) {
+func (d *Node[T]) AddHook(hook Hook) {
 	d.m.Lock()
 	defer d.m.Unlock()
 
@@ -207,7 +207,7 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 			}
 
 			for _, hook := range d.hooks {
-				hook(DAGEventNewDep[T]{Node: dep})
+				hook(EventNewDep[T]{Node: dep})
 			}
 		}
 	}
@@ -242,19 +242,27 @@ func (d *Node[T]) IsFrozen() bool {
 	return d.frozen.Load()
 }
 
-// Freeze assumes the lock is already held
-func (d *Node[T]) Freeze() {
+// Freeze will lock, and run valid across all dependencies, return false to prevent locking
+func (d *Node[T]) Freeze(valid func(*Node[T]) bool) bool {
+	d.m.Lock() // prevent any deps modification
+	defer d.m.Unlock()
+
 	if d.frozen.Load() {
-		return
+		return true
 	}
 
-	for _, dep := range d.Dependencies.nodes.Slice() {
+	for _, dep := range d.Dependencies.Set().Slice() {
 		if !dep.IsFrozen() {
 			panic(fmt.Sprintf("attempting to freeze '%v' while all deps aren't frozen, '%v' isnt", d.ID, dep.ID))
+		}
+
+		if !valid(dep) {
+			return false
 		}
 	}
 
 	d.frozen.Store(true)
+	return true
 }
 
 func (d *Node[T]) DebugString() string {

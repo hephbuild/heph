@@ -11,6 +11,14 @@ type EventWithExecution interface {
 	getExecution() *Execution
 }
 
+type EventDeclared struct {
+	Dep Dep
+}
+
+func (EventDeclared) Replayable() bool {
+	return true
+}
+
 type EventCompleted struct {
 	At        time.Time
 	Execution *Execution

@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xerrors"
+	"github.com/hephbuild/heph/worker2/dag"
 	"go.uber.org/multierr"
 	"runtime"
 	"sync"
@@ -146,22 +147,19 @@ func (e *Engine) waitForDeps(exec *Execution) error {
 	}
 }
 
-func (e *Engine) tryFreeze(depObj *Node[Dep]) (bool, error) {
-	depObj.m.Lock() // prevent any deps modification
-	defer depObj.m.Unlock()
-
+func (e *Engine) tryFreeze(depObj *dag.Node[Dep]) (bool, error) {
 	errs := sets.NewIdentitySet[error](0)
 
-	for _, dep := range depObj.Dependencies.Values() {
-		depExec := dep.getExecution()
+	frozen := depObj.Freeze(func(n *dag.Node[Dep]) bool {
+		depExec := n.V.getExecution()
 		if depExec == nil {
-			return false, nil
+			return false
 		}
 
 		state := depExec.State
 
 		if !state.IsFinal() {
-			return false, nil
+			return false
 		}
 
 		switch state {
@@ -183,15 +181,15 @@ func (e *Engine) tryFreeze(depObj *Node[Dep]) (bool, error) {
 				}
 			}
 		}
+
+		return true
+	})
+
+	if !frozen {
+		return false, nil
 	}
 
-	depObj.Freeze()
-
-	if errs.Len() > 0 {
-		return true, multierr.Combine(errs.Slice()...)
-	}
-
-	return true, nil
+	return true, multierr.Combine(errs.Slice()...)
 }
 
 func (e *Engine) waitForDepsAndSchedule(exec *Execution) {
@@ -368,7 +366,7 @@ func (e *Engine) registerOne(dep Dep, lock bool) *Execution {
 		eventsCh:    e.eventsCh,
 		completedCh: make(chan struct{}),
 		m:           m,
-		events:      make([]Event, 5),
+		events:      make([]Event, 0, 5),
 
 		// see field comments
 		errCh:  nil,

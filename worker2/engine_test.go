@@ -214,7 +214,7 @@ func TestExecHookAfterCompleted(t *testing.T) {
 		events = append(events, fmt.Sprintf("%T", event))
 	}
 
-	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventQueued", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
+	assert.EqualValues(t, []string{"worker2.EventDeclared", "worker2.EventScheduled", "worker2.EventReady", "worker2.EventStarted", "worker2.EventCompleted"}, events)
 }
 
 func TestExecError(t *testing.T) {

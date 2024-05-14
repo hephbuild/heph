@@ -1,16 +1,23 @@
 package worker2
 
-type EventDeclared struct {
-	Dep Dep
-}
+import (
+	"context"
+	"github.com/hephbuild/heph/worker2/dag"
+)
 
-func (EventDeclared) Replayable() bool {
-	return true
+type ActionConfig struct {
+	Ctx       context.Context
+	Name      string
+	Deps      []Dep
+	Hooks     []Hook
+	Scheduler Scheduler
+	Requests  map[string]float64
+	Do        func(ctx context.Context, ins InStore, outs OutStore) error
 }
 
 func NewAction(cfg ActionConfig) *Action {
 	a := &Action{baseDep: newBase()}
-	a.node = NewNode[Dep](cfg.Name, a)
+	a.node = dag.NewNode[Dep](cfg.Name, a)
 
 	a.name = cfg.Name
 	a.ctx = cfg.Ctx
@@ -30,9 +37,9 @@ func NewAction(cfg ActionConfig) *Action {
 		hook(EventDeclared{Dep: a})
 	}
 
-	a.node.AddHook(func(event DAGEvent) {
+	a.node.AddHook(func(event dag.Event) {
 		switch event := event.(type) {
-		case DAGEventNewDep[Dep]:
+		case dag.EventNewDep[Dep]:
 			for _, hook := range a.hooks {
 				hook(EventNewDep{Target: event.Node.V})
 			}

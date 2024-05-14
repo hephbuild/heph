@@ -3,6 +3,7 @@ package worker2
 import (
 	"context"
 	"github.com/hephbuild/heph/utils/xtypes"
+	"github.com/hephbuild/heph/worker2/dag"
 	"sync"
 	"time"
 )
@@ -10,7 +11,7 @@ import (
 type Dep interface {
 	GetName() string
 	Exec(ctx context.Context, ins InStore, outs OutStore) error
-	GetNode() *Node[Dep]
+	GetNode() *dag.Node[Dep]
 	AddDep(...Dep)
 	GetHooks() []Hook
 	AddHook(h Hook)
@@ -42,7 +43,7 @@ func newBase() baseDep {
 type baseDep struct {
 	execution *Execution
 	m         sync.RWMutex
-	node      *Node[Dep]
+	node      *dag.Node[Dep]
 	named     map[string]Dep
 	hooks     []Hook
 
@@ -56,7 +57,7 @@ func (a *baseDep) init() {
 	}
 }
 
-func (a *baseDep) GetNode() *Node[Dep] {
+func (a *baseDep) GetNode() *dag.Node[Dep] {
 	return a.node
 }
 
@@ -213,16 +214,6 @@ func (a *baseDep) GetHooks() []Hook {
 	return a.hooks[:]
 }
 
-type ActionConfig struct {
-	Ctx       context.Context
-	Name      string
-	Deps      []Dep
-	Hooks     []Hook
-	Scheduler Scheduler
-	Requests  map[string]float64
-	Do        func(ctx context.Context, ins InStore, outs OutStore) error
-}
-
 type Action struct {
 	baseDep
 	ctx       context.Context
@@ -264,11 +255,6 @@ func (a *Action) Exec(ctx context.Context, ins InStore, outs OutStore) error {
 
 func (a *Action) DeepDo(f func(Dep)) {
 	deepDo(a, f)
-}
-
-type GroupConfig struct {
-	Name string
-	Deps []Dep
 }
 
 type Group struct {
