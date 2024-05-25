@@ -3,6 +3,7 @@ package ads
 import (
 	"fmt"
 	"golang.org/x/exp/slices"
+	"iter"
 )
 
 func Map[T, O any](a []T, f func(T) O) []O {
@@ -302,4 +303,22 @@ func Reverse[S ~[]E, E any](a S) S {
 	r := Copy(a)
 	slices.Reverse(r)
 	return r
+}
+
+func From[T any](s iter.Seq[T]) []T {
+	var vs []T
+	for v := range s {
+		vs = append(vs, v)
+	}
+
+	return vs
+}
+
+func From2[K, V any](s iter.Seq2[K, V]) []V {
+	var vs []V
+	for _, v := range s {
+		vs = append(vs, v)
+	}
+
+	return vs
 }

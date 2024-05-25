@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/specs"
@@ -15,6 +14,7 @@ import (
 	"github.com/hephbuild/heph/utils/xcontext"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/utils/xmath"
+	dag2 "github.com/hephbuild/heph/worker2/dag"
 	"math"
 	"os"
 	"path/filepath"
@@ -56,6 +56,7 @@ func (e *State) Register(spec specs.Target) (*Target, error) {
 	t := &Target{
 		Target: spec,
 	}
+	t.Node = dag2.NewNode(t.Addr, t)
 
 	err = e.processTarget(t)
 	if err != nil {
@@ -399,10 +400,7 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 
 	t.Artifacts = e.newArtifactRegistry(t)
 
-	parents, err := e.DAG().GetParents(t)
-	if err != nil {
-		return err
-	}
+	parents := ads.From2(t.Node.Dependencies.Values())
 
 	t.AllTargetDeps.AddAll(parents)
 	t.AllTargetDeps.Sort()
@@ -411,18 +409,8 @@ func (e *State) LinkTarget(t *Target, breadcrumb *sets.StringSet) (rerr error) {
 }
 
 func (e *State) registerDag(t *Target) error {
-	_, err := e.dag.AddVertex(t)
-	if err != nil && !errors.As(err, &dag.VertexDuplicateError{}) {
-		return err
-	}
-
 	addEdge := func(src *Target, dst *Target) error {
-		ok, err := e.dag.IsEdge(src.Addr, dst.Addr)
-		if ok || err != nil {
-			return err
-		}
-
-		return e.dag.AddEdge(src.Addr, dst.Addr)
+		return dst.Node.AddDependency(src.Node)
 	}
 
 	for k, deps := range map[string]TargetDeps{"deps": t.Deps.All(), "runtime deps": t.RuntimeDeps.All(), "hash deps": t.HashDeps} {

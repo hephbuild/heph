@@ -11,20 +11,21 @@ import (
 )
 
 type nodesTransitive[T any] struct {
-	m                 sync.RWMutex
-	nodes             *sets.Set[*Node[T], *Node[T]]
-	transitiveNodes   *sets.Set[*Node[T], *Node[T]]
-	transitiveDirty   bool
-	transitiveGetter  func(d *Node[T]) *nodesTransitive[T]
-	transitiveReverse bool
+	m                    sync.RWMutex
+	nodes                *sets.Set[*Node[T], *Node[T]]
+	transitiveNodes      *sets.Set[*Node[T], *Node[T]]
+	transitiveIncomplete bool
+	transitiveUnordered  bool
+	transitiveGetter     func(d *Node[T]) *nodesTransitive[T]
+	transitiveReverse    bool
 }
 
-func (d *nodesTransitive[T]) Add(dep *Node[T]) bool {
+func (d *nodesTransitive[T]) add(dep *Node[T]) bool {
 	d.m.RLock()
 	defer d.m.RUnlock()
 
 	if d.nodes.Add(dep) {
-		d.transitiveDirty = true
+		d.transitiveIncomplete = true
 		return true
 	}
 
@@ -35,7 +36,7 @@ func (d *nodesTransitive[T]) MarkTransitiveDirty() {
 	d.m.RLock()
 	defer d.m.RUnlock()
 
-	d.transitiveDirty = true
+	d.transitiveIncomplete = true
 }
 
 func (d *nodesTransitive[T]) MarkTransitiveInvalid() {
@@ -45,7 +46,7 @@ func (d *nodesTransitive[T]) MarkTransitiveInvalid() {
 	d.transitiveNodes = nil
 }
 
-func (d *nodesTransitive[T]) Remove(dep *Node[T]) {
+func (d *nodesTransitive[T]) remove(dep *Node[T]) {
 	d.m.RLock()
 	defer d.m.RUnlock()
 
@@ -68,15 +69,25 @@ func (d *nodesTransitive[T]) Set() *sets.Set[*Node[T], *Node[T]] {
 }
 
 func (d *nodesTransitive[T]) TransitiveSet() *sets.Set[*Node[T], *Node[T]] {
+	return d.transitiveSet(false)
+}
+
+func (d *nodesTransitive[T]) OrderedTransitiveSet() *sets.Set[*Node[T], *Node[T]] {
+	return d.transitiveSet(true)
+}
+
+func (d *nodesTransitive[T]) transitiveSet(ordered bool) *sets.Set[*Node[T], *Node[T]] {
 	d.m.Lock()
 	defer d.m.Unlock()
 
-	if d.transitiveNodes == nil {
+	if d.transitiveNodes == nil || (ordered && d.transitiveUnordered) {
 		d.transitiveNodes = d.computeTransitive(true)
-	} else if d.transitiveDirty {
+		d.transitiveUnordered = false
+	} else if d.transitiveIncomplete {
 		d.transitiveNodes = d.computeTransitive(false)
+		d.transitiveUnordered = true
 	}
-	d.transitiveDirty = false
+	d.transitiveIncomplete = false
 
 	return d.transitiveNodes
 }
@@ -84,6 +95,16 @@ func (d *nodesTransitive[T]) TransitiveSet() *sets.Set[*Node[T], *Node[T]] {
 func (d *nodesTransitive[T]) TransitiveValues() iter.Seq2[int, T] {
 	return func(yield func(int, T) bool) {
 		for i, node := range d.TransitiveSet().Slice() {
+			if !yield(i, node.V) {
+				break
+			}
+		}
+	}
+}
+
+func (d *nodesTransitive[T]) OrderedTransitiveValues() iter.Seq2[int, T] {
+	return func(yield func(int, T) bool) {
+		for i, node := range d.OrderedTransitiveSet().Slice() {
 			if !yield(i, node.V) {
 				break
 			}
@@ -176,31 +197,36 @@ func (d *Node[T]) AddHook(hook Hook) {
 	d.hooks = append(d.hooks, hook)
 }
 
-func (d *Node[T]) AddDependency(deps ...*Node[T]) {
+func (d *Node[T]) AddDependency(deps ...*Node[T]) error {
 	d.m.Lock()
 	defer d.m.Unlock()
 
 	if d.frozen.Load() {
-		panic("add: frozen")
+		return fmt.Errorf("add: frozen")
 	}
 
 	for _, dep := range deps {
-		d.addDependency(dep)
+		err := d.addDependency(dep)
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
-func (d *Node[T]) addDependency(dep *Node[T]) {
+func (d *Node[T]) addDependency(dep *Node[T]) error {
 	if !d.Dependencies.Has(dep) {
 		if dep.Dependencies.TransitiveSet().Has(d) {
-			panic("cycle")
+			return fmt.Errorf("cycle")
 		}
 
-		if d.Dependencies.Add(dep) {
+		if d.Dependencies.add(dep) {
 			for _, dependee := range d.Dependees.TransitiveSet().Slice() {
 				dependee.Dependencies.MarkTransitiveDirty()
 			}
 
-			if dep.Dependees.Add(d) {
+			if dep.Dependees.add(d) {
 				for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
 					dep.Dependees.MarkTransitiveDirty()
 				}
@@ -211,6 +237,8 @@ func (d *Node[T]) addDependency(dep *Node[T]) {
 			}
 		}
 	}
+
+	return nil
 }
 
 func (d *Node[T]) RemoveDependency(dep *Node[T]) {
@@ -222,7 +250,7 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 	}
 
 	if d.Dependencies.Has(dep) {
-		d.Dependencies.Remove(dep)
+		d.Dependencies.remove(dep)
 
 		for _, dependee := range d.Dependees.TransitiveSet().Slice() {
 			dependee.Dependencies.MarkTransitiveInvalid()
@@ -230,7 +258,7 @@ func (d *Node[T]) RemoveDependency(dep *Node[T]) {
 	}
 
 	if dep.Dependees.Has(d) {
-		dep.Dependees.Remove(d)
+		dep.Dependees.remove(d)
 
 		for _, dep := range dep.Dependencies.TransitiveSet().Slice() {
 			dep.Dependees.MarkTransitiveInvalid()
@@ -256,7 +284,7 @@ func (d *Node[T]) Freeze(valid func(*Node[T]) bool) bool {
 			panic(fmt.Sprintf("attempting to freeze '%v' while all deps aren't frozen, '%v' isnt", d.ID, dep.ID))
 		}
 
-		if !valid(dep) {
+		if valid != nil && !valid(dep) {
 			return false
 		}
 	}

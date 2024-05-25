@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/specs"
+	"github.com/hephbuild/heph/utils/ads"
 )
 
 var utilFunctions = map[string]exprs.Func{
@@ -51,13 +52,10 @@ func QueryFunctions(
 				return "", err
 			}
 
-			universe, err := g.DAG().GetParents(t.Target)
-			if err != nil {
-				return "", err
-			}
-			universe = append(universe, t)
-
 			ltarget := localCache.Metas.Find(t)
+
+			universe := ads.From2(ltarget.Node.Dependencies.Values())
+			universe = append(universe, t)
 
 			if !graph.Contains(universe, t.Addr) {
 				return "", fmt.Errorf("cannot get outdir of %v", t.Addr)
@@ -71,13 +69,10 @@ func QueryFunctions(
 				return "", err
 			}
 
-			universe, err := g.DAG().GetParents(t.Target)
-			if err != nil {
-				return "", err
-			}
-			universe = append(universe, t)
-
 			ltarget := localCache.Metas.Find(t)
+
+			universe := ads.From2(ltarget.Node.Dependencies.Values())
+			universe = append(universe, t)
 
 			if !graph.Contains(universe, t.Addr) {
 				return "", fmt.Errorf("cannot get shared stage dir of %v", t.Addr)
@@ -91,10 +86,9 @@ func QueryFunctions(
 				return "", err
 			}
 
-			universe, err := g.DAG().GetParents(t.Target)
-			if err != nil {
-				return "", err
-			}
+			ltarget := g.Targets().FindT(t)
+
+			universe := ads.From2(ltarget.Node.Dependencies.Values())
 			universe = append(universe, t)
 
 			if !graph.Contains(universe, t.Addr) {
@@ -114,10 +108,7 @@ func QueryFunctions(
 				return "", specs.NewTargetNotFoundError(addr, g.Targets())
 			}
 
-			universe, err := g.DAG().GetParents(t)
-			if err != nil {
-				return "", err
-			}
+			universe := ads.From2(t.Node.Dependencies.Values())
 
 			if !graph.Contains(universe, t.Addr) {
 				return "", fmt.Errorf("cannot get output of %v", t.Addr)

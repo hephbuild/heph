@@ -8,7 +8,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/fsnotify/fsnotify"
 	"github.com/hephbuild/heph/bootstrap"
-	"github.com/hephbuild/heph/graph"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/sandbox"
@@ -360,11 +359,7 @@ func (s *State) trigger(ctx context.Context, events []fsEvent) error {
 	}
 
 	for _, rr := range rrs {
-		ancestors, err := bs.Graph.DAG().GetOrderedAncestors([]*graph.Target{rr.Target}, true)
-		if err != nil {
-			return err
-		}
-		for _, ancestor := range ancestors {
+		for _, ancestor := range rr.Target.Node.Dependencies.TransitiveValues() {
 			bs.Scheduler.LocalCache.ResetCacheHashInput(ancestor)
 		}
 	}
@@ -567,11 +562,7 @@ func (s *State) handleSig(ctx context.Context, e sigEvent) error {
 	}
 
 	for _, rr := range e.rrs {
-		ancestors, err := s.cbs.Graph.DAG().GetOrderedAncestors([]*graph.Target{rr.Target}, true)
-		if err != nil {
-			return err
-		}
-		for _, ancestor := range ancestors {
+		for _, ancestor := range rr.Target.Node.Dependencies.TransitiveValues() {
 			s.cbs.Scheduler.LocalCache.ResetCacheHashInput(ancestor)
 		}
 

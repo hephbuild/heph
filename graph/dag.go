@@ -1,3 +1,5 @@
+//go:build ignore
+
 package graph
 
 import (
@@ -10,7 +12,11 @@ import (
 )
 
 type DAG struct {
-	*dag.DAG
+	d *dag.DAG
+}
+
+func New(d *dag.DAG) *DAG {
+	return &DAG{d: d}
 }
 
 // returns parents first
@@ -49,7 +55,7 @@ func (d *DAG) GetOrderedAncestors(targets []*Target, includeRoot bool) ([]*Targe
 	return ancs, err
 }
 
-func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) (*Targets, *maps.Map[string, *sets.Set[string, string]], error) {
+func GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) (*Targets, *maps.Map[string, *sets.Set[string, string]], error) {
 	ancs := NewTargets(0)
 	ancsout := &maps.Map[string, *sets.Set[string, string]]{
 		Default: func(k string) *sets.Set[string, string] {
@@ -93,7 +99,7 @@ func (d *DAG) GetOrderedAncestorsWithOutput(targets *Targets, includeRoot bool) 
 	return ancs, ancsout, err
 }
 
-func (d *DAG) getOrderedAncestors(targets []*Target, includeRoot bool, f func(*Target)) error {
+func getOrderedAncestors(targets []*Target, includeRoot bool, f func(*Target)) error {
 	ancsm := map[string]struct{}{}
 
 	minDepth := 1
@@ -137,7 +143,7 @@ func (d *DAG) GetAncestors(target specs.Specer) ([]*Target, error) {
 }
 
 func (d *DAG) GetAncestorsOfAddr(addr string) ([]*Target, error) {
-	ancestors, err := d.DAG.GetAncestors(addr)
+	ancestors, err := d.d.GetAncestors(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +156,7 @@ func (d *DAG) GetDescendants(target specs.Specer) ([]*Target, error) {
 }
 
 func (d *DAG) GetDescendantsOfAddr(addr string) ([]*Target, error) {
-	ancestors, err := d.DAG.GetDescendants(addr)
+	ancestors, err := d.d.GetDescendants(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +165,7 @@ func (d *DAG) GetDescendantsOfAddr(addr string) ([]*Target, error) {
 }
 
 func (d *DAG) GetParents(target specs.Specer) ([]*Target, error) {
-	ancestors, err := d.DAG.GetParents(target.Spec().Addr)
+	ancestors, err := d.d.GetParents(target.Spec().Addr)
 	if err != nil {
 		return nil, err
 	}
@@ -168,13 +174,13 @@ func (d *DAG) GetParents(target specs.Specer) ([]*Target, error) {
 }
 
 func (d *DAG) GetVertices() []*Target {
-	vertices := d.DAG.GetVertices()
+	vertices := d.d.GetVertices()
 
 	return d.mapToArray(vertices)
 }
 
 func (d *DAG) GetChildren(target specs.Specer) ([]*Target, error) {
-	ancestors, err := d.DAG.GetChildren(target.Spec().Addr)
+	ancestors, err := d.d.GetChildren(target.Spec().Addr)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +189,7 @@ func (d *DAG) GetChildren(target specs.Specer) ([]*Target, error) {
 }
 
 func (d *DAG) GetLeaves() []*Target {
-	leaves := d.DAG.GetLeaves()
+	leaves := d.d.GetLeaves()
 
 	return d.mapToArray(leaves)
 }
@@ -234,6 +240,26 @@ func (d *DAG) mapToArray(m map[string]interface{}) []*Target {
 	})
 
 	return a
+}
+
+func (d *DAG) AddVertex(t *Target) (string, error) {
+	return d.d.AddVertex(t)
+}
+
+func (d *DAG) IsEdge(srcID, dstID string) (bool, error) {
+	return d.d.IsEdge(srcID, dstID)
+}
+
+func (d *DAG) AddEdge(srcID, dstID string) error {
+	return d.d.AddEdge(srcID, dstID)
+}
+
+func (d *DAG) GetAncestorsGraph(id string) (*dag.DAG, string, error) {
+	return d.d.GetAncestorsGraph(id)
+}
+
+func (d *DAG) GetDescendantsGraph(id string) (*dag.DAG, string, error) {
+	return d.d.GetDescendantsGraph(id)
 }
 
 type Walker func(target *Target)

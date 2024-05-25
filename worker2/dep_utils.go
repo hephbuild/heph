@@ -1,67 +1,28 @@
 package worker2
 
 import (
-	"github.com/hephbuild/heph/utils/xsync"
-	"golang.org/x/exp/maps"
+	"github.com/hephbuild/heph/worker2/dag"
 	"sync"
 	"sync/atomic"
 )
 
+type Node = *dag.Node[Dep]
+
+var deepDoMapPool = dag.NewPool[Node]()
+
 func deepDo(a Dep, f func(Dep)) {
-	if a.GetNode().IsFrozen() {
-		// This approach sounds good on paper, but in reality very CPU intensive since it requires
-		// read & write to the deps set at every change, at every level...
-		deepDoPrecomputed(a, f)
-	} else {
-		deepDoRecursive(a, f)
-	}
-}
-
-func deepDoPrecomputed(a Dep, f func(Dep)) {
-	f(a)
-	for _, dep := range a.GetNode().Dependencies.TransitiveValues() {
-		f(dep)
-	}
-}
-
-var deepDoMapPool = xsync.Pool[map[Dep]struct{}]{New: func() map[Dep]struct{} {
-	return map[Dep]struct{}{}
-}}
-
-func deepDoRecursive(a Dep, f func(Dep)) {
-	m := deepDoMapPool.Get()
-	defer func() {
-		maps.Clear(m)
-		deepDoMapPool.Put(m)
-	}()
-	deepDoRecursiveInner(a, f, m)
-}
-
-func deepDoInner(a Dep, f func(Dep), m map[Dep]struct{}) bool {
-	if _, ok := m[a]; ok {
-		return false
-	}
-	m[a] = struct{}{}
-
-	f(a)
-
-	return true
-}
-
-func deepDoRecursiveInner(a Dep, f func(Dep), m map[Dep]struct{}) {
-	if !deepDoInner(a, f, m) {
-		return
-	}
-
-	if a.GetNode().IsFrozen() {
-		for _, dep := range a.GetNode().Dependencies.TransitiveValues() {
-			deepDoInner(dep, f, m)
-		}
-	} else {
-		for _, dep := range a.GetNode().Dependencies.Values() {
-			deepDoRecursiveInner(dep, f, m)
-		}
-	}
+	dag.DeepDo(
+		dag.DeepDoOptions[Dep]{
+			Func: func(n *dag.Node[Dep]) {
+				f(n.V)
+			},
+			MemoizerFactory: func() (map[*dag.Node[Dep]]struct{}, func()) {
+				m, clean := deepDoMapPool.Get()
+				return m, clean
+			},
+		},
+		a.GetNode(),
+	)
 }
 
 type Stats struct {

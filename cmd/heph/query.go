@@ -10,12 +10,12 @@ import (
 	"github.com/hephbuild/heph/cmd/heph/searchui2"
 	"github.com/hephbuild/heph/exprs"
 	"github.com/hephbuild/heph/graph"
-	"github.com/hephbuild/heph/graphdot"
 	"github.com/hephbuild/heph/graphprint"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/packages"
 	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/targetrun"
+	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
 	"github.com/hephbuild/heph/worker2/poolwait"
@@ -43,8 +43,8 @@ var files bool
 func init() {
 	queryCmd.AddCommand(configCmd)
 	queryCmd.AddCommand(codegenCmd)
-	queryCmd.AddCommand(graphCmd)
-	queryCmd.AddCommand(graphDotCmd)
+	//queryCmd.AddCommand(graphCmd)
+	//queryCmd.AddCommand(graphDotCmd)
 	queryCmd.AddCommand(changesCmd)
 	queryCmd.AddCommand(targetCmd)
 	queryCmd.AddCommand(pkgsCmd)
@@ -329,92 +329,92 @@ var codegenCmd = &cobra.Command{
 	},
 }
 
-var graphCmd = &cobra.Command{
-	Use:               "graph <target>",
-	Short:             "Prints deps target graph",
-	Args:              cobra.ExactArgs(1),
-	ValidArgsFunction: ValidArgsFunctionTargets,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
+//var graphCmd = &cobra.Command{
+//	Use:               "graph <target>",
+//	Short:             "Prints deps target graph",
+//	Args:              cobra.ExactArgs(1),
+//	ValidArgsFunction: ValidArgsFunctionTargets,
+//	RunE: func(cmd *cobra.Command, args []string) error {
+//		ctx := cmd.Context()
+//
+//		bs, t, err := parseTargetFromArgs(ctx, args)
+//		if err != nil {
+//			return err
+//		}
+//
+//		err = linkAll(ctx, bs.Scheduler)
+//		if err != nil {
+//			return err
+//		}
+//
+//		id := t.Addr
+//
+//		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(id)
+//		if err != nil {
+//			return err
+//		}
+//
+//		desc, _, err := bs.Graph.DAG().GetDescendantsGraph(id)
+//		if err != nil {
+//			return err
+//		}
+//
+//		fmt.Println("Ancestors:")
+//		fmt.Print(ances.String())
+//		fmt.Println("Descendants:")
+//		fmt.Print(desc.String())
+//
+//		return nil
+//	},
+//}
 
-		bs, t, err := parseTargetFromArgs(ctx, args)
-		if err != nil {
-			return err
-		}
-
-		err = linkAll(ctx, bs.Scheduler)
-		if err != nil {
-			return err
-		}
-
-		id := t.Addr
-
-		ances, _, err := bs.Graph.DAG().GetAncestorsGraph(id)
-		if err != nil {
-			return err
-		}
-
-		desc, _, err := bs.Graph.DAG().GetDescendantsGraph(id)
-		if err != nil {
-			return err
-		}
-
-		fmt.Println("Ancestors:")
-		fmt.Print(ances.String())
-		fmt.Println("Descendants:")
-		fmt.Print(desc.String())
-
-		return nil
-	},
-}
-
-var graphDotCmd = &cobra.Command{
-	Use:               "graphdot [ancestors|descendants <target>]",
-	Short:             "Outputs graph dot",
-	Args:              cobra.ArbitraryArgs,
-	ValidArgsFunction: ValidArgsFunctionTargets,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx := cmd.Context()
-
-		bs, err := schedulerInit(ctx, nil)
-		if err != nil {
-			return err
-		}
-
-		err = linkAll(ctx, bs.Scheduler)
-		if err != nil {
-			return err
-		}
-
-		dag := bs.Graph.DAG()
-		if len(args) > 0 {
-			if len(args) < 2 {
-				return fmt.Errorf("requires two args")
-			}
-
-			switch args[0] {
-			case "ancestors":
-				gdag, _, err := dag.GetAncestorsGraph(args[1])
-				if err != nil {
-					return err
-				}
-				dag = &graph.DAG{DAG: gdag}
-			case "descendants":
-				gdag, _, err := dag.GetDescendantsGraph(args[1])
-				if err != nil {
-					return err
-				}
-				dag = &graph.DAG{DAG: gdag}
-			default:
-				return fmt.Errorf("must be one of ancestors, descendants")
-			}
-		}
-
-		graphdot.Print(dag, false)
-
-		return nil
-	},
-}
+//var graphDotCmd = &cobra.Command{
+//	Use:               "graphdot [ancestors|descendants <target>]",
+//	Short:             "Outputs graph dot",
+//	Args:              cobra.ArbitraryArgs,
+//	ValidArgsFunction: ValidArgsFunctionTargets,
+//	RunE: func(cmd *cobra.Command, args []string) error {
+//		ctx := cmd.Context()
+//
+//		bs, err := schedulerInit(ctx, nil)
+//		if err != nil {
+//			return err
+//		}
+//
+//		err = linkAll(ctx, bs.Scheduler)
+//		if err != nil {
+//			return err
+//		}
+//
+//		dag := bs.Graph.DAG()
+//		if len(args) > 0 {
+//			if len(args) < 2 {
+//				return fmt.Errorf("requires two args")
+//			}
+//
+//			switch args[0] {
+//			case "ancestors":
+//				gdag, _, err := dag.GetAncestorsGraph(args[1])
+//				if err != nil {
+//					return err
+//				}
+//				dag = graph.New(gdag)
+//			case "descendants":
+//				gdag, _, err := dag.GetDescendantsGraph(args[1])
+//				if err != nil {
+//					return err
+//				}
+//				dag = graph.New(gdag)
+//			default:
+//				return fmt.Errorf("must be one of ancestors, descendants")
+//			}
+//		}
+//
+//		graphdot.Print(dag, false)
+//
+//		return nil
+//	},
+//}
 
 var changesCmd = &cobra.Command{
 	Use:               "changes <since>",
@@ -534,7 +534,7 @@ var depsCmd = &cobra.Command{
 	Short: "Prints target dependencies",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		bs, target, err := parseTargetFromArgs(cmd.Context(), args)
+		_, target, err := parseTargetFromArgs(cmd.Context(), args)
 		if err != nil {
 			return err
 		}
@@ -546,14 +546,11 @@ var depsCmd = &cobra.Command{
 			return nil
 		}
 
-		fn := bs.Graph.DAG().GetParents
+		var ancs []*graph.Target
 		if transitive {
-			fn = bs.Graph.DAG().GetAncestors
-		}
-
-		ancs, err := fn(target.Target)
-		if err != nil {
-			return err
+			ancs = ads.From2(target.Node.Dependencies.TransitiveValues())
+		} else {
+			ancs = ads.From2(target.Node.Dependencies.Values())
 		}
 
 		deps := graph.NewTargetsFrom(ancs)
@@ -617,8 +614,8 @@ var revdepsCmd = &cobra.Command{
 			return err
 		}
 
-		var targets []specs.Specer
-		var fn func(target specs.Specer) ([]*graph.Target, error)
+		var targets []*graph.Target
+		var fn func(target graph.Targeter) ([]*graph.Target, error)
 
 		tp, err := specs.ParseTargetAddr("", args[0])
 		if err != nil { // It's probably a file
@@ -642,20 +639,19 @@ var revdepsCmd = &cobra.Command{
 				return fmt.Errorf("%v is outside repo", p)
 			}
 
-			children := bs.Graph.DAG().GetFileChildren([]string{p}, bs.Graph.Targets().Slice())
+			targets = graph.GetFileChildren([]string{p}, bs.Graph.Targets().Slice())
 			if err != nil {
 				return err
 			}
 
-			targets = specs.AsSpecers(children)
-			fn = func(target specs.Specer) ([]*graph.Target, error) {
+			fn = func(target graph.Targeter) ([]*graph.Target, error) {
 				return []*graph.Target{bs.Graph.Targets().FindT(target)}, nil
 			}
 			if transitive {
-				fn = func(target specs.Specer) ([]*graph.Target, error) {
-					desc, err := bs.Graph.DAG().GetDescendants(target)
+				fn = func(target graph.Targeter) ([]*graph.Target, error) {
+					desc := ads.From2(target.GraphTarget().Node.Dependees.TransitiveValues())
 					desc = append(desc, bs.Graph.Targets().FindT(target))
-					return desc, err
+					return desc, nil
 				}
 			}
 		} else {
@@ -664,10 +660,14 @@ var revdepsCmd = &cobra.Command{
 				return specs.NewTargetNotFoundError(tp.Full(), bs.Graph.Targets())
 			}
 
-			targets = []specs.Specer{target}
-			fn = bs.Graph.DAG().GetChildren
+			targets = []*graph.Target{target}
+			fn = func(target graph.Targeter) ([]*graph.Target, error) {
+				return ads.From2(target.GraphTarget().Node.Dependencies.Values()), nil
+			}
 			if transitive {
-				fn = bs.Graph.DAG().GetDescendants
+				fn = func(target graph.Targeter) ([]*graph.Target, error) {
+					return ads.From2(target.GraphTarget().Node.Dependencies.TransitiveValues()), nil
+				}
 			}
 		}
 

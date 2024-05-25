@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/graph"
+	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/observability"
 	"github.com/hephbuild/heph/sandbox"
 	"github.com/hephbuild/heph/specs"
@@ -15,6 +16,8 @@ import (
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xdebug"
 	"github.com/hephbuild/heph/worker2"
+	"slices"
+	"time"
 )
 
 func (e *schedulerv2) ScheduleTargetRun(ctx context.Context, rr targetrun.Request, deps worker2.Dep) (worker2.Dep, error) {
@@ -42,13 +45,67 @@ func (e *schedulerv2) ScheduleTargetRun(ctx context.Context, rr targetrun.Reques
 	return j, nil
 }
 
+func GetTransitiveDependenciesWithOutput(targets *graph.Targets) (*graph.Targets, *maps.Map[string, *sets.Set[string, string]]) {
+	ancs := graph.NewTargets(0)
+	ancsout := &maps.Map[string, *sets.Set[string, string]]{
+		Default: func(k string) *sets.Set[string, string] {
+			return sets.NewStringSet(0)
+		},
+	}
+
+	addOut := func(t *graph.Target, output string) {
+		if output == "" && !t.OutWithSupport.HasName(output) {
+			return
+		}
+
+		ancsout.Get(t.Addr).Add(output)
+	}
+
+	addAllOut := func(t *graph.Target) {
+		ancsout.Get(t.Addr).AddAll(t.OutWithSupport.Names())
+	}
+
+	maybeAddAllOuts := func(t *graph.Target, output string) {
+		if t.RestoreCache.Enabled || t.HasSupportFiles || t.Codegen != specs.CodegenNone || targets.Has(t) {
+			addAllOut(t)
+		} else {
+			addOut(t, output)
+		}
+	}
+
+	graph.DeepDoMany(targets.Slice(), func(target *graph.Target) {
+		for _, dep := range target.Deps.All().Targets {
+			maybeAddAllOuts(dep.Target, dep.Output)
+		}
+
+		for _, dep := range target.HashDeps.Targets {
+			maybeAddAllOuts(dep.Target, dep.Output)
+		}
+
+		for _, dep := range target.RuntimeDeps.All().Targets {
+			maybeAddAllOuts(dep.Target, dep.Output)
+		}
+
+		for _, tool := range target.Tools.Targets {
+			maybeAddAllOuts(tool.Target, tool.Output)
+		}
+
+		ancs.Add(target)
+	})
+
+	slices.Reverse(ancs.Slice())
+
+	return ancs, ancsout
+}
+
 func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetrun.Requests, skip []specs.Specer) (*WaitGroupMap, *worker2.RunningTracker, error) {
+	log.Info(time.Now(), "ScheduleTargetRRsWithDeps")
+
 	targetsSet := rrs.Targets()
 
-	toAssess, outputs, err := e.Graph.DAG().GetOrderedAncestorsWithOutput(targetsSet, true)
-	if err != nil {
-		return nil, nil, err
-	}
+	toAssess, outputs := GetTransitiveDependenciesWithOutput(targetsSet)
+
+	log.Info(time.Now(), "GetTransitiveDependenciesWithOutput done")
 
 	for _, target := range targetsSet.Slice() {
 		ss := sets.NewStringSet(len(target.OutWithSupport.All()))
@@ -78,10 +135,12 @@ func (e *Scheduler) ScheduleTargetRRsWithDeps(octx context.Context, rrs targetru
 		getCacheOrRunSchedJobs: &maps.Map[getCacheOrRunRequest, worker2.Dep]{},
 	}
 
-	err = sched.schedule()
+	err := sched.schedule()
 	if err != nil {
 		return nil, nil, err
 	}
+
+	log.Info(time.Now(), "ScheduleTargetRRsWithDeps schedule done")
 
 	return sched.deps, sched.tracker, nil
 }
@@ -114,12 +173,7 @@ func (s *schedulerv2) schedule() error {
 	for _, target := range s.toAssess.Slice() {
 		targetDeps := s.deps.Get(target.Addr)
 
-		parents, err := s.Graph.DAG().GetParents(target)
-		if err != nil {
-			return err
-		}
-
-		for _, parent := range parents {
+		for _, parent := range target.Node.Dependencies.Values() {
 			targetDeps.AddDep(s.deps.Get(parent.Addr))
 		}
 	}
@@ -129,13 +183,8 @@ func (s *schedulerv2) schedule() error {
 
 		targetDeps := s.deps.Get(target.Addr)
 
-		parents, err := s.Graph.DAG().GetParents(target)
-		if err != nil {
-			return err
-		}
-
 		pmdeps := worker2.NewNamedGroup(xdebug.Sprintf("pmdeps %v", target.Name))
-		for _, parent := range parents {
+		for _, parent := range target.Node.Dependencies.Values() {
 			pmdeps.AddDep(s.pullMetaDeps.Get(parent.Addr))
 		}
 
@@ -175,12 +224,7 @@ func (s *schedulerv2) schedule() error {
 		targetDeps.AddDep(pj)
 		s.Pool.Schedule(pj)
 
-		children, err := s.Graph.DAG().GetChildren(target)
-		if err != nil {
-			return err
-		}
-
-		for _, child := range children {
+		for _, child := range target.Node.Dependees.Values() {
 			s.pullMetaDeps.Get(child.Addr).AddDep(pj)
 		}
 	}
@@ -188,13 +232,12 @@ func (s *schedulerv2) schedule() error {
 	return nil
 }
 
-func (s *schedulerv2) parentTargetDeps(target specs.Specer) (worker2.Dep, error) {
-	deps := worker2.NewNamedGroup(xdebug.Sprintf("parent deps: %v", target.Spec().Name))
-	parents, err := s.Graph.DAG().GetParents(target)
-	if err != nil {
-		return nil, err
-	}
-	for _, parent := range parents {
+func (s *schedulerv2) parentTargetDeps(target1 graph.Targeter) (worker2.Dep, error) {
+	target := target1.GraphTarget()
+
+	deps := worker2.NewNamedGroup(xdebug.Sprintf("parent deps: %v", target.Name))
+
+	for _, parent := range target.Node.Dependencies.Values() {
 		deps.AddDep(s.deps.Get(parent.Addr))
 	}
 
@@ -249,14 +292,11 @@ func (s *schedulerv2) ScheduleTargetCacheGetOnce(ctx context.Context, target *gr
 	return j, nil
 }
 
-func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target specs.Specer) (worker2.Dep, error) {
-	parents, err := s.Graph.DAG().GetParents(target)
-	if err != nil {
-		return nil, err
-	}
+func (s *schedulerv2) ScheduleTargetDepsOnce(ctx context.Context, target1 graph.Targeter) (worker2.Dep, error) {
+	target := target1.GraphTarget()
 
 	runDeps := worker2.NewNamedGroup(xdebug.Sprintf("schedule target deps once: %v", target.Spec().Name))
-	for _, parent := range parents {
+	for _, parent := range target.Node.Dependencies.Values() {
 		j, err := s.ScheduleTargetGetCacheOrRunOnce(ctx, parent, true, true, true)
 		if err != nil {
 			return nil, err
@@ -352,12 +392,7 @@ func (s *schedulerv2) ScheduleTargetRunOnce(ctx context.Context, target *graph.T
 		return nil, err
 	}
 
-	children, err := s.Graph.DAG().GetChildren(target)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, child := range children {
+	for _, child := range target.Node.Dependees.Values() {
 		s.deps.Get(child.Addr).AddDep(j)
 	}
 	s.targetSchedJobs.Set(target.Addr, j)

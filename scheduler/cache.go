@@ -9,7 +9,6 @@ import (
 	"github.com/hephbuild/heph/lcache"
 	"github.com/hephbuild/heph/log/log"
 	"github.com/hephbuild/heph/rcache"
-	"github.com/hephbuild/heph/specs"
 	"github.com/hephbuild/heph/status"
 	"github.com/hephbuild/heph/tgt"
 	"github.com/hephbuild/heph/utils/mds"
@@ -140,17 +139,12 @@ func (e *Scheduler) pullOrGetCache(ctx context.Context, target *graph.Target, ou
 	return false, false, nil
 }
 
-func (e *Scheduler) setCacheHintSkip(target specs.Specer, cacheNames []string) error {
+func (e *Scheduler) setCacheHintSkip(target graph.Targeter, cacheNames []string) error {
 	for _, cacheName := range cacheNames {
 		e.RemoteCache.Hints.Set(target.Spec().Addr, cacheName, rcache.HintSkip{})
 	}
 
-	children, err := e.Graph.DAG().GetDescendants(target)
-	if err != nil {
-		return fmt.Errorf("descendants: %w", err)
-	}
-
-	for _, child := range children {
+	for _, child := range target.GraphTarget().Node.Dependees.TransitiveValues() {
 		for _, cacheName := range cacheNames {
 			e.RemoteCache.Hints.Set(child.Addr, cacheName, rcache.HintSkip{})
 		}

@@ -1,7 +1,6 @@
 package graph
 
 import (
-	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/config"
 	"github.com/hephbuild/heph/hroot"
 	"github.com/hephbuild/heph/utils/maps"
@@ -17,16 +16,11 @@ type State struct {
 	targets      *Targets
 	Tools        *Targets
 	codegenPaths map[string]*Target
-	dag          *DAG
 	labels       *sets.StringSet
 }
 
 func (e *State) CodegenPaths() map[string]*Target {
 	return e.codegenPaths
-}
-
-func (e *State) DAG() *DAG {
-	return e.dag
 }
 
 func (e *State) Targets() *Targets {
@@ -111,7 +105,6 @@ func NewState(root *hroot.State, cfg *config.Config) *State {
 		targets:      NewTargets(0),
 		Tools:        NewTargets(0),
 		codegenPaths: map[string]*Target{},
-		dag:          &DAG{dag.NewDAG()},
 		labels:       sets.NewStringSet(0),
 	}
 }

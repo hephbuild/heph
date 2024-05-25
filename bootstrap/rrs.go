@@ -12,6 +12,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker2/poolwait"
+	"time"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")
@@ -63,10 +64,7 @@ func generateRRs(ctx context.Context, g *graph.State, m specs.Matcher, args []st
 	}
 
 	if bailOutOnExpr {
-		ancs, err := g.DAG().GetOrderedAncestors(targets.Slice(), true)
-		if err != nil {
-			return nil, err
-		}
+		ancs := graph.TransitiveDependencies(targets.Slice())
 
 		for _, anc := range ancs {
 			err := check(anc)
@@ -259,6 +257,11 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 	if err != nil {
 		return nil, err
 	}
+
+	log.Info(time.Now(), "RunGen done")
+	defer func() {
+		log.Info(time.Now(), "generateRRs done")
+	}()
 
 	return generateRRs(ctx, e.Graph, m, targs, opts, false)
 }

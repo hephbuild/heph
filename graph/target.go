@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/utils/xfs"
+	"github.com/hephbuild/heph/worker2/dag"
 	"sync"
 )
 
@@ -14,6 +15,8 @@ type OutNamedPaths = tgt.NamedPaths[xfs.RelPaths, xfs.RelPath]
 
 type Target struct {
 	specs.Target
+
+	Node *dag.Node[*Target]
 
 	GenSources        []*Target       `json:"-"`
 	Tools             TargetTools     `json:"-"`
