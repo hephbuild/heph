@@ -73,7 +73,7 @@ func listImports() {
 			scanner := bufio.NewScanner(f)
 			for scanner.Scan() {
 				t := scanner.Text()
-				if strings.Contains(t, "go:build") || strings.Contains(t, "+build") {
+				if strings.HasPrefix(t, "//go:") || strings.Contains(t, "+build") {
 					fmt.Println("BUILDCONSTRAINT", t)
 				}
 			}
