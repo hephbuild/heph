@@ -155,6 +155,10 @@ var rootCmd = &cobra.Command{
 	Version:       utils.Version,
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	Args:          cobra.ArbitraryArgs,
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		return cmd.PersistentPreRunE(cmd, args)
+	},
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		lvl, err := log.ParseLevel(*logLevel)
 		if err != nil {
@@ -186,6 +190,39 @@ var rootCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		if len(args) > 0 {
+			verb := args[0]
+			arg := ""
+			if len(args) > 1 {
+				arg = args[1]
+			}
+
+			bs, err := schedulerInit(ctx, func(bootstrap.BaseBootstrap) error {
+				return bootstrap.BlockReadStdin(args)
+			})
+			if err != nil {
+				return err
+			}
+
+			rrs, err := bootstrap.GenerateRRsFromVerb(ctx, bs.Cwd, verb, arg, bs.Scheduler, getRROpts(), *plain, !*noGen)
+			if err != nil {
+				return err
+			}
+
+			for _, req := range rrs {
+				log.Info(req.Target.Addr, req.Args)
+			}
+
+			err = bootstrap.Run(ctx, bs.Scheduler, rrs, getRunOpts(), true)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		}
+
 		err := cmd.Help()
 		if err != nil {
 			return err

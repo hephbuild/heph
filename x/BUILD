@@ -2,7 +2,7 @@
 
 target(
     name = "noop",
-    run = "echo ran",
+    run = "echo $@; echo ran",
     cache = False,
 )
 
