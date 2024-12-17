@@ -207,10 +207,6 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 
 		target, err := os.Readlink(file.From)
 		if err == nil {
-			if !filepath.IsAbs(target) {
-				target = filepath.Join(filepath.Dir(file.From), target)
-			}
-
 			err = os.Symlink(target, to)
 			if err != nil {
 				return err
