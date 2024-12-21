@@ -19,6 +19,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSanity(t *testing.T) {
@@ -196,4 +197,87 @@ func TestPipeStdin(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello world", stdout.String())
+}
+
+type sleepReader struct {
+	d time.Duration
+}
+
+func (s sleepReader) Read(p []byte) (n int, err error) {
+	time.Sleep(s.d)
+
+	return 0, io.EOF
+}
+
+func TestPipeStdinLargeAndSlow(t *testing.T) {
+	ctx := context.Background()
+	sandboxPath, err := os.MkdirTemp("", "")
+	require.NoError(t, err)
+	defer os.RemoveAll(sandboxPath)
+
+	p := New()
+
+	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
+			p.PipesHandler().ServeHTTP(w, req)
+		} else {
+			rpcHandler.ServeHTTP(w, req)
+		}
+	}))
+	defer srv.Close()
+
+	pc := pluginv1connect.NewDriverClient(srv.Client(), srv.URL)
+
+	pipeIn, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+	require.NoError(t, err)
+	pipeOut, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+	require.NoError(t, err)
+
+	def, err := anypb.New(&shv1.Target{
+		Run: []string{"cat"},
+	})
+	require.NoError(t, err)
+
+	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.Path)
+	require.NoError(t, err)
+
+	expected := strings.Repeat("hello world", 10000)
+
+	go func() {
+		_, err := io.Copy(inw, io.MultiReader(strings.NewReader(expected), sleepReader{d: time.Second}, strings.NewReader(expected)))
+		if err != nil {
+			panic(err)
+		}
+		err = inw.Close()
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, pipeOut.Msg.Path)
+	require.NoError(t, err)
+
+	go func() {
+		_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+			Target: &pluginv1.TargetDef{
+				Ref: &pluginv1.TargetRef{
+					Package: "some/pkg",
+					Name:    "target",
+					Driver:  "sh",
+				},
+				Def: def,
+			},
+			SandboxPath: sandboxPath,
+			Pipes:       []string{pipeIn.Msg.Id, pipeOut.Msg.Id, ""},
+		}))
+		require.NoError(t, err)
+	}()
+
+	var stdout bytes.Buffer
+	_, err = io.Copy(&stdout, outr)
+	require.NoError(t, err)
+
+	assert.Equal(t, expected+expected, stdout.String())
 }
