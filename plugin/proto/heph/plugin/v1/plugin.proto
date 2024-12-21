@@ -1,0 +1,90 @@
+syntax = "proto3";
+package heph.plugin.v1;
+
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/descriptor.proto";
+
+message TargetRef {
+  string package = 1;
+  string name = 2;
+  string driver = 3;
+}
+
+message TargetDef {
+  TargetRef ref = 1;
+  google.protobuf.Any def = 2;
+}
+
+message TargetSpec {
+  TargetRef ref = 1;
+  map<string, google.protobuf.Value> config = 2;
+}
+
+message ListRequest {
+  string package = 1;
+  bool deep = 2;
+}
+
+message ListResponse {
+    TargetRef ref = 1;
+}
+
+message GetRequest {
+  TargetRef ref = 1;
+}
+
+message GetResponse {
+  TargetSpec spec = 1;
+}
+
+service Provider {
+  rpc List(ListRequest) returns (stream ListResponse) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
+}
+
+message ParseRequest {
+  TargetSpec spec = 1;
+}
+
+message ParseResponse {
+  TargetDef target = 1;
+}
+
+message RunRequest {
+  TargetDef target = 1;
+  string sandbox_path = 2;
+  repeated Artifact inputs = 3;
+}
+
+message Artifact {
+  enum WellKnown {
+    WELL_KNOWN_UNSPECIFIED = 0;
+    WELL_KNOWN_LOG = 1;
+  }
+
+  string group = 1;
+  string name = 2;
+  WellKnown well_known = 3;
+  string encoding = 4;
+  string uri = 5;
+}
+
+message RunResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message ConfigRequest {}
+
+message ConfigResponse {
+  string name = 1;
+  google.protobuf.DescriptorProto target_schema = 2;
+}
+
+service Driver {
+  rpc Config(ConfigRequest) returns (ConfigResponse) {}
+  rpc Parse(ParseRequest) returns (ParseResponse) {}
+  rpc Run(RunRequest) returns (RunResponse) {}
+}

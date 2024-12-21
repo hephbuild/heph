@@ -1,0 +1,4 @@
+syntax = "proto3";
+package heph.plugin.group.v1;
+
+message Target {}
