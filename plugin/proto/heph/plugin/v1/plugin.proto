@@ -57,6 +57,7 @@ message RunRequest {
   TargetDef target = 1;
   string sandbox_path = 2;
   repeated Artifact inputs = 3;
+  repeated string pipes = 4;
 }
 
 message Artifact {
@@ -83,8 +84,16 @@ message ConfigResponse {
   google.protobuf.DescriptorProto target_schema = 2;
 }
 
+message PipeRequest {}
+
+message PipeResponse {
+  string id = 1;
+  string path = 2;
+}
+
 service Driver {
   rpc Config(ConfigRequest) returns (ConfigResponse) {}
   rpc Parse(ParseRequest) returns (ParseResponse) {}
   rpc Run(RunRequest) returns (RunResponse) {}
+  rpc Pipe(PipeRequest) returns (PipeResponse) {}
 }

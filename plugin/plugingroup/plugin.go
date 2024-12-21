@@ -3,6 +3,7 @@ package plugingroup
 import (
 	"connectrpc.com/connect"
 	"context"
+	"errors"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	groupv1 "github.com/hephbuild/hephv2/plugin/plugingroup/gen/heph/plugin/group/v1"
@@ -11,6 +12,10 @@ import (
 )
 
 type Plugin struct {
+}
+
+func (p Plugin) Pipe(ctx context.Context, c *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
 }
 
 func (p Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
