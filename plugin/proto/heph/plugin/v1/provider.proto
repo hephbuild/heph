@@ -1,0 +1,29 @@
+syntax = "proto3";
+package heph.plugin.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/descriptor.proto";
+import "heph/plugin/v1/plugin.proto";
+
+message ListRequest {
+  string package = 1;
+  bool deep = 2;
+}
+
+message ListResponse {
+    TargetRef ref = 1;
+}
+
+message GetRequest {
+  TargetRef ref = 1;
+}
+
+message GetResponse {
+  TargetSpec spec = 1;
+}
+
+service Provider {
+  rpc List(ListRequest) returns (stream ListResponse) {}
+  rpc Get(GetRequest) returns (GetResponse) {}
+}

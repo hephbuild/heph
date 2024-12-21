@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 type PipesHandler struct {
@@ -99,4 +100,14 @@ func (p *Plugin) removePipe(id string) {
 	delete(p.pipes, id)
 
 	pipe.w.Close()
+
+	p.housekeepingPipes()
+}
+
+func (p *Plugin) housekeepingPipes() {
+	for k, v := range p.pipes {
+		if !v.busy.Load() && time.Now().After(v.exp) {
+			delete(p.pipes, k)
+		}
+	}
 }

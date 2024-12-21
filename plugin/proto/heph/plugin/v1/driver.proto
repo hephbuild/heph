@@ -1,0 +1,60 @@
+syntax = "proto3";
+package heph.plugin.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/descriptor.proto";
+import "heph/plugin/v1/plugin.proto";
+
+message ParseRequest {
+  TargetSpec spec = 1;
+}
+
+message ParseResponse {
+  TargetDef target = 1;
+}
+
+message RunRequest {
+  TargetDef target = 1;
+  string sandbox_path = 2;
+  repeated Artifact inputs = 3;
+  repeated string pipes = 4;
+}
+
+message Artifact {
+  enum WellKnown {
+    WELL_KNOWN_UNSPECIFIED = 0;
+    WELL_KNOWN_LOG = 1;
+  }
+
+  string group = 1;
+  string name = 2;
+  WellKnown well_known = 3;
+  string encoding = 4;
+  string uri = 5;
+}
+
+message RunResponse {
+  repeated Artifact artifacts = 1;
+}
+
+message ConfigRequest {}
+
+message ConfigResponse {
+  string name = 1;
+  google.protobuf.DescriptorProto target_schema = 2;
+}
+
+message PipeRequest {}
+
+message PipeResponse {
+  string id = 1;
+  string path = 2;
+}
+
+service Driver {
+  rpc Config(ConfigRequest) returns (ConfigResponse) {}
+  rpc Parse(ParseRequest) returns (ParseResponse) {}
+  rpc Run(RunRequest) returns (RunResponse) {}
+  rpc Pipe(PipeRequest) returns (PipeResponse) {}
+}
