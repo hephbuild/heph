@@ -7,6 +7,7 @@ require (
 	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/dlsniper/debugger v0.6.0
 	github.com/go-faker/faker/v4 v4.5.0
+	github.com/go-viper/mapstructure/v2 v2.2.1
 	github.com/google/uuid v1.4.0
 	github.com/hephbuild/heph v0.0.0-20240514172700-016edccca7cb
 	github.com/mattn/go-isatty v0.0.20

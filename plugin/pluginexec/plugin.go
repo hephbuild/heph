@@ -3,7 +3,6 @@ package pluginexec
 import (
 	"connectrpc.com/connect"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/dlsniper/debugger"
@@ -11,7 +10,6 @@ import (
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"io"
@@ -73,24 +71,20 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 }
 
 func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
-	m := map[string]json.RawMessage{}
-	for k, v := range req.Msg.Spec.Config {
-		b, err := protojson.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-		m[k] = b
-	}
-
-	b, err := json.Marshal(m)
+	targetSpec, err := Decode[Spec](req.Msg.Spec.Config)
 	if err != nil {
 		return nil, err
 	}
 
-	s := &shv1.Target{}
-	err = protojson.Unmarshal(b, s)
-	if err != nil {
-		return nil, err
+	s := &shv1.Target{
+		Run: targetSpec.Run,
+	}
+
+	for k, out := range targetSpec.Out {
+		s.Outputs = append(s.Outputs, &shv1.Target_Output{
+			Group: k,
+			Paths: out,
+		})
 	}
 
 	var collectOutputs []*pluginv1.TargetDef_CollectOutput
@@ -171,9 +165,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		env = append(env, envName("SRC", input.Group, input.Name, path))
 	}
 	for _, output := range t.Outputs {
-		path := output.Name // TODO: make it a path
+		path := strings.Join(output.Paths, " ") // TODO: make it a path
 
-		env = append(env, envName("OUT", output.Group, output.Name, path))
+		env = append(env, envName("OUT", output.Group, "", path))
 	}
 
 	var stdoutWriters, stderrWriters []io.Writer

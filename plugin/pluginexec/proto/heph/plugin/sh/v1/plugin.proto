@@ -4,10 +4,15 @@ package heph.plugin.sh.v1;
 message Target {
   message Output {
     string group = 1;
-    string name = 2;
-    repeated string paths = 3;
+    repeated string paths = 2;
+  }
+
+  message Dep {
+    repeated string files = 1;
+    repeated string targets = 2;
   }
 
   repeated string run = 1;
-  repeated Output outputs = 2;
+  map<string, Dep> deps = 2;
+  repeated Output outputs = 3;
 }

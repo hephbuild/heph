@@ -46,9 +46,7 @@ func TestSanity(t *testing.T) {
 				},
 				Config: map[string]*structpb.Value{
 					"run": newValueMust([]any{"sh", "-c", `echo hello > out`}),
-					"outputs": newValueMust([]any{map[string]any{
-						"paths": []any{"out"},
-					}}),
+					"out": newValueMust([]any{"out"}),
 				},
 			},
 		},
