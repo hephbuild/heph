@@ -1,4 +1,4 @@
-package locks
+package hlocks
 
 import "context"
 

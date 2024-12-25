@@ -1,13 +1,13 @@
-package locks
+package hlocks
 
 import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/log/liblog"
 	"github.com/hephbuild/heph/log/testlog"
+	"github.com/hephbuild/hephv2/hfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"hephv2/hfs"
 	"os"
 	"sync"
 	"sync/atomic"

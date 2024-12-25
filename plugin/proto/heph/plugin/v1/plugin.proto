@@ -10,9 +10,46 @@ message TargetRef {
   string driver = 3;
 }
 
+message TargetRefWithOutput {
+  string package = 1;
+  string name = 2;
+  string driver = 3;
+  optional string output = 4;
+}
+
 message TargetDef {
+  message Dep {
+    enum Mode {
+      MODE_UNSPECIFIED = 0; // deps will get expanded in sandbox
+      MODE_LINK = 1; // deps will get expanded in sandbox through hard links
+      MODE_NONE = 2; // deps will not get expanded
+    }
+
+    TargetRefWithOutput ref = 1;
+    Mode link = 3;
+  }
+
   TargetRef ref = 1;
   google.protobuf.Any def = 2;
+  repeated Dep deps = 3;
+  repeated string outputs = 4;
+  bool cache = 5;
+
+  message CollectOutput {
+    string group = 1;
+    repeated string paths = 2;
+  }
+
+  repeated CollectOutput collect_outputs = 6;
+
+  enum CodegenMode {
+    CODEGEN_MODE_UNSPECIFIED = 0;
+    CODEGEN_MODE_VCS_IGNORE = 1;
+    CODEGEN_MODE_COPY = 2;
+    CODEGEN_MODE_LINK = 3;
+  }
+
+  repeated CodegenMode codegen  = 7;
 }
 
 message TargetSpec {

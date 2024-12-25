@@ -11,6 +11,8 @@ type FileMode = fs.FileMode
 const ModePerm = fs.ModePerm
 const ModeDefault = 0770
 
+var ErrNotExist = fs.ErrNotExist
+
 type File interface {
 	io.ReadWriteCloser
 	Stat() (FileInfo, error)

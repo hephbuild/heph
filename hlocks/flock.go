@@ -1,4 +1,4 @@
-package locks
+package hlocks
 
 import (
 	"context"
@@ -14,19 +14,24 @@ import (
 	"time"
 )
 
-func NewFlock(fs hfs.OS, name, p string) *Flock {
+func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
 	if name == "" {
-		name = p
+		name = path
 	}
-	return &Flock{fs: fs, path: p, name: name}
+	return &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
+}
+
+func NewFlock(fs hfs.OS, name, path string) *Flock {
+	return NewFlock2(fs, name, path, true)
 }
 
 type Flock struct {
-	name string
-	m    sync.RWMutex
-	path string
-	f    *os.File
-	fs   hfs.OS
+	name        string
+	m           sync.RWMutex
+	path        string
+	f           *os.File
+	fs          hfs.OS
+	allowCreate bool
 }
 
 func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro bool) (bool, error)) (bool, error) {
@@ -46,7 +51,11 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 		return false, err
 	}
 
-	hf, err := l.fs.Open(l.path, fhow|os.O_CREATE, 0644)
+	if l.allowCreate {
+		fhow = fhow | os.O_CREATE
+	}
+
+	hf, err := l.fs.Open(l.path, fhow, 0644)
 	if err != nil {
 		return false, err
 	}
@@ -77,7 +86,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 	l.f = f
 
-	if !ro {
+	if !ro && l.allowCreate {
 		if err := f.Truncate(0); err == nil {
 			_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
 		}
@@ -115,8 +124,11 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 				default:
 				}
 
-				pidb, _ := hfs.ReadFile(l.fs, f.Name())
-				pidStr := string(pidb)
+				var pidStr string
+				if l.allowCreate {
+					pidb, _ := hfs.ReadFile(l.fs, f.Name())
+					pidStr = string(pidb)
+				}
 
 				if len(pidStr) > 0 {
 					pid, err := strconv.Atoi(pidStr)
@@ -178,8 +190,10 @@ func (l *Flock) Unlock() error {
 
 	f := l.f
 
-	// Try to wipe the pid if we have write perm
-	_ = f.Truncate(0)
+	if l.allowCreate {
+		// Try to wipe the pid if we have write perm
+		_ = f.Truncate(0)
+	}
 
 	err := flock.Funlock(f)
 	if err != nil {

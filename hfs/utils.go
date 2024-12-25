@@ -34,6 +34,20 @@ func ReadFile(fs FS, filename string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
+func WriteFile(fs FS, filename string, b []byte, mode FileMode) error {
+	f, err := Create(fs, filename)
+	if err != nil {
+		return err
+	}
+
+	_, err = f.Write(b)
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
+}
+
 func Create(fs FS, filename string) (File, error) {
 	err := CreateParentDir(fs, filename)
 	if err != nil {
@@ -54,8 +68,11 @@ func CreateParentDir(fs FS, path string) error {
 	return nil
 }
 
-func At[T FS](fs T, name string) T {
-	return fs.At(name).(T)
+func At[T FS](fs T, names ...string) T {
+	for _, name := range names {
+		fs = fs.At(name).(T)
+	}
+	return fs
 }
 
 type WalkDirFunc = iofs.WalkDirFunc

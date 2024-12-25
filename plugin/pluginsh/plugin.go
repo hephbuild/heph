@@ -87,13 +87,33 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, err
 	}
 
+	var collectOutputs []*pluginv1.TargetDef_CollectOutput
+	for _, output := range s.Outputs {
+		paths := output.Paths
+		for i, p := range paths {
+			paths[i] = filepath.Join("ws", p)
+		}
+		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
+			Group: output.Group,
+			Paths: paths,
+		})
+	}
+
 	target, err := anypb.New(s)
 	if err != nil {
 		return nil, err
 	}
 
 	return connect.NewResponse(&pluginv1.ParseResponse{
-		Target: &pluginv1.TargetDef{Def: target},
+		Target: &pluginv1.TargetDef{
+			Ref:            req.Msg.Spec.Ref,
+			Def:            target,
+			Deps:           nil,
+			Outputs:        nil,
+			Cache:          true,
+			CollectOutputs: collectOutputs,
+			Codegen:        nil,
+		},
 	}), nil
 }
 
@@ -209,9 +229,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	var artifacts []*pluginv1.Artifact
 	if stat.Size() > 0 {
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name:      "log.txt",
-			WellKnown: pluginv1.Artifact_WELL_KNOWN_LOG,
-			Uri:       "file://" + logFile.Name(),
+			Name: "log.txt",
+			Type: pluginv1.Artifact_TYPE_LOG,
+			Uri:  "file://" + logFile.Name(),
 		})
 	}
 

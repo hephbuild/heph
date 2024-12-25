@@ -22,15 +22,24 @@ message RunRequest {
 }
 
 message Artifact {
-  enum WellKnown {
-    WELL_KNOWN_UNSPECIFIED = 0;
-    WELL_KNOWN_LOG = 1;
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_OUTPUT = 1;
+    TYPE_LOG = 2;
+  }
+
+  enum Encoding {
+    ENCODING_UNSPECIFIED = 0;
+    ENCODING_NONE = 1;
+    ENCODING_TAR = 2;
+    ENCODING_TAR_GZ = 3;
+    ENCODING_BASE64 = 4;
   }
 
   string group = 1;
   string name = 2;
-  WellKnown well_known = 3;
-  string encoding = 4;
+  Type type = 3;
+  Encoding encoding = 4;
   string uri = 5;
 }
 

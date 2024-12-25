@@ -5,10 +5,17 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 func NewOS(root string) OS {
 	return OS{root: root}
+}
+
+func AsOs(fs FS) (OS, bool) {
+	osfs, ok := fs.(OS)
+
+	return osfs, ok
 }
 
 type OS struct {
@@ -19,6 +26,10 @@ var _ FS = (*OS)(nil)
 var _ FileReader = (*OS)(nil)
 
 func (osfs OS) join(name string) string {
+	if name == "" {
+		return osfs.root
+	}
+
 	if filepath.IsAbs(name) {
 		return name
 	}
@@ -66,6 +77,14 @@ func (osfs OS) Chown(name string, uid, gid int) error {
 
 func (osfs OS) Chmod(name string, mode os.FileMode) error {
 	return os.Chmod(osfs.join(name), mode)
+}
+
+func (osfs OS) Chtimes(name string, atime time.Time, mtime time.Time) error {
+	return os.Chtimes(osfs.join(name), atime, mtime)
+}
+
+func (osfs OS) Symlink(oldname, newname string) error {
+	return os.Symlink(oldname, osfs.join(newname))
 }
 
 func (osfs OS) Mkdir(name string, mode os.FileMode) error {
@@ -117,7 +136,14 @@ func (osfs OS) ReadFile(filename string) ([]byte, error) {
 	return os.ReadFile(osfs.join(filename))
 }
 
-func CloseEnsureROFD(hf File) error {
+func (osfs OS) Path(elems ...string) string {
+	args := []string{osfs.root}
+	args = append(args, elems...)
+
+	return filepath.Join(args...)
+}
+
+func (osfs OS) CloseEnsureROFD(hf File) error {
 	f := hf.(*os.File)
 
 	err := flock.Flock(f, false, true)
