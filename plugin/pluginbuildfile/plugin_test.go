@@ -4,33 +4,26 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/hfs/hfstest"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/hephv2/plugin/plugintest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestSanity(t *testing.T) {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "")
+
+	fs := hfstest.New(t)
+
+	err := hfs.WriteFile(fs, "BUILD", []byte(`target(name="hello", driver="sh", run=["hello"])`), os.ModePerm)
 	require.NoError(t, err)
-	defer os.RemoveAll(dir)
 
-	err = os.WriteFile(filepath.Join(dir, "BUILD"), []byte(`target(name="hello", driver="sh", run=["hello"])`), os.ModePerm)
-	require.NoError(t, err)
+	p := New(fs)
 
-	p := New(hfs.NewOS(dir))
-
-	_, h := pluginv1connect.NewProviderHandler(p)
-
-	srv := httptest.NewServer(h)
-	defer srv.Close()
-
-	pc := pluginv1connect.NewProviderClient(srv.Client(), srv.URL)
+	pc := plugintest.ProviderClient(t, p)
 
 	var ref *pluginv1.TargetRef
 	{

@@ -3,6 +3,7 @@ package hfs
 import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"io/fs"
 	"os"
 	"testing"
 )
@@ -51,7 +52,6 @@ func TestSanity(t *testing.T) {
 
 	fss := []FS{
 		NewOS(dir),
-		NewMem(),
 	}
 
 	files := doSame(t, fss, func(t *testing.T, fs FS) File {
@@ -100,6 +100,38 @@ func TestSanity(t *testing.T) {
 
 		return []any{b}
 	})
+
+	assertSame(t, files, func(t *testing.T, c container) []any {
+		info, err := c.fs.Stat("")
+		require.NoError(t, err)
+
+		require.True(t, info.IsDir())
+
+		return []any{info.IsDir()}
+	})
+
+	assertSame(t, files, func(t *testing.T, c container) []any {
+		info, err := c.fs.Stat("some")
+		require.NoError(t, err)
+
+		return []any{info.IsDir()}
+	})
+
+	assertSame(t, files, func(t *testing.T, c container) []any {
+		var paths []string
+		err := Walk(c.fs, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			paths = append(paths, path)
+
+			return nil
+		})
+		require.NoError(t, err)
+
+		return []any{paths}
+	})
 }
 
 func TestSanityAt(t *testing.T) {
@@ -109,7 +141,6 @@ func TestSanityAt(t *testing.T) {
 
 	fss := []FS{
 		At(NewOS(dir), "some/dir"),
-		At(NewMem(), "some/dir"),
 	}
 
 	files := doSame(t, fss, func(t *testing.T, fs FS) File {

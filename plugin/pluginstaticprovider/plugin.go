@@ -10,7 +10,6 @@ import (
 )
 
 type Target struct {
-	Ref  *pluginv1.TargetRef
 	Spec *pluginv1.TargetSpec
 }
 
@@ -28,18 +27,18 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 	for _, target := range p.targets {
 		if req.Msg.Package != "" {
 			if req.Msg.Deep {
-				if !strings.HasPrefix(target.Ref.Package, req.Msg.Package) {
+				if !strings.HasPrefix(target.Spec.Ref.Package, req.Msg.Package) {
 					continue
 				}
 			} else {
-				if target.Ref.Package != req.Msg.Package {
+				if target.Spec.Ref.Package != req.Msg.Package {
 					continue
 				}
 			}
 		}
 
 		err := res.Send(&pluginv1.ListResponse{
-			Ref: target.Ref,
+			Ref: target.Spec.Ref,
 		})
 		if err != nil {
 			return err
@@ -51,11 +50,9 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
 	for _, target := range p.targets {
-		if target.Ref.Package != req.Msg.Ref.Package || target.Ref.Name != req.Msg.Ref.Name {
+		if target.Spec.Ref.Package != req.Msg.Ref.Package || target.Spec.Ref.Name != req.Msg.Ref.Name {
 			continue
 		}
-
-		target.Spec.Ref = target.Ref
 
 		return connect.NewResponse(&pluginv1.GetResponse{
 			Spec: target.Spec,

@@ -5,6 +5,7 @@ import (
 	"context"
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/hfs/hfstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"path"
@@ -14,13 +15,18 @@ import (
 func TestSanity(t *testing.T) {
 	ctx := context.Background()
 
-	srcfs := hfs.NewMem()
+	srcfs := hfstest.New(t)
 
-	f, err := hfs.Create(srcfs, "file1")
-	require.NoError(t, err)
+	{
+		f, err := hfs.Create(srcfs, "file1")
+		require.NoError(t, err)
 
-	_, err = f.Write([]byte(`hello, world`))
-	require.NoError(t, err)
+		_, err = f.Write([]byte(`hello, world`))
+		require.NoError(t, err)
+
+		err = f.Close()
+		require.NoError(t, err)
+	}
 
 	var b bytes.Buffer
 
@@ -28,7 +34,13 @@ func TestSanity(t *testing.T) {
 		p := NewPacker(&b)
 		defer p.Close()
 
+		f, err := hfs.Open(srcfs, "file1")
+		require.NoError(t, err)
+
 		err = p.WriteFile(f, "some/file1")
+		require.NoError(t, err)
+
+		err = f.Close()
 		require.NoError(t, err)
 
 		err = p.Close()
@@ -36,9 +48,9 @@ func TestSanity(t *testing.T) {
 	}
 
 	{
-		dstfs := hfs.NewMem()
+		dstfs := hfstest.New(t)
 
-		err = Unpack(ctx, &b, dstfs)
+		err := Unpack(ctx, &b, dstfs)
 		require.NoError(t, err)
 
 		b, err := hfs.ReadFile(dstfs, "some/file1")
@@ -64,7 +76,7 @@ func fakePath() string {
 func TestMonkey(t *testing.T) {
 	ctx := context.Background()
 
-	srcfs := hfs.NewMem()
+	srcfs := hfstest.New(t)
 
 	var paths []string
 	pathscontent := map[string]string{}
@@ -101,7 +113,7 @@ func TestMonkey(t *testing.T) {
 	}
 
 	{
-		dstfs := hfs.NewMem()
+		dstfs := hfstest.New(t)
 
 		err := Unpack(ctx, &b, dstfs)
 		require.NoError(t, err)

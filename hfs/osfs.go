@@ -136,6 +136,10 @@ func (osfs OS) ReadFile(filename string) ([]byte, error) {
 	return os.ReadFile(osfs.join(filename))
 }
 
+func (osfs OS) ReadDir(name string) ([]DirEntry, error) {
+	return os.ReadDir(osfs.join(name))
+}
+
 func (osfs OS) Path(elems ...string) string {
 	args := []string{osfs.root}
 	args = append(args, elems...)

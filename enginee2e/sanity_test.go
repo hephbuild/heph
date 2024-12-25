@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/hephbuild/hephv2/engine"
 	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/hfs/hfstest"
 	"github.com/hephbuild/hephv2/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginsh"
@@ -38,12 +39,12 @@ func TestSanity(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Ref: &pluginv1.TargetRef{
-				Package: "some/package",
-				Name:    "sometarget",
-				Driver:  "sh",
-			},
 			Spec: &pluginv1.TargetSpec{
+				Ref: &pluginv1.TargetRef{
+					Package: "some/package",
+					Name:    "sometarget",
+					Driver:  "sh",
+				},
 				Config: map[string]*structpb.Value{
 					"run": newValueMust([]any{"sh", "-c", `echo hello > out`}),
 					"outputs": newValueMust([]any{map[string]any{
@@ -72,7 +73,7 @@ func TestSanity(t *testing.T) {
 
 	path := strings.TrimPrefix(res.Outputs[0].Uri, "file://")
 
-	fs2 := hfs.NewMem()
+	fs2 := hfstest.New(t)
 	err = htar.UnpackFromPath(ctx, path, fs2)
 	require.NoError(t, res.Err)
 

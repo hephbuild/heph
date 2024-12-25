@@ -81,11 +81,25 @@ type iofsAdapter struct {
 	fs FS
 }
 
+func (i iofsAdapter) ReadDir(name string) ([]iofs.DirEntry, error) {
+	return i.fs.ReadDir(name)
+}
+
+func (i iofsAdapter) Stat(name string) (iofs.FileInfo, error) {
+	return i.fs.Stat(name)
+}
+
 func (i iofsAdapter) Open(name string) (iofs.File, error) {
 	return Open(i.fs, name)
 }
 
-func ToIOFS(fs FS) iofs.FS {
+type StdFS interface {
+	iofs.FS
+	iofs.StatFS
+	iofs.ReadDirFS
+}
+
+func ToIOFS(fs FS) StdFS {
 	return iofsAdapter{fs: fs}
 }
 
