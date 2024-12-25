@@ -50,6 +50,7 @@ type Engine struct {
 
 	Providers     []pluginv1connect.ProviderClient
 	Drivers       []pluginv1connect.DriverClient
+	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
 	DriversByName map[string]pluginv1connect.DriverClient
 }
 

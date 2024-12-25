@@ -9,7 +9,6 @@ import (
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/hephbuild/hephv2/plugin/pluginstaticprovider"
-	"github.com/hephbuild/hephv2/plugin/plugintest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -55,16 +54,14 @@ func TestSanity(t *testing.T) {
 		},
 	})
 
-	staticproviderClient := plugintest.ProviderClient(t, staticprovider)
-
-	err = e.RegisterProvider(ctx, staticproviderClient)
+	_, err = e.RegisterProvider(ctx, staticprovider)
 	require.NoError(t, err)
 
 	execdriver := pluginexec.New()
-	err = e.RegisterDriver(ctx, execdriver)
+	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	ch := e.Result(ctx, "some/package", "sometarget", []string{""})
+	ch := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
 
 	res := <-ch
 	require.NoError(t, res.Err)

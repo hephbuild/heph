@@ -27,19 +27,25 @@ func (p PipesHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	return
 }
 
+type writerFlusher struct {
+	w  io.Writer
+	hf http.Flusher
+}
+
+func (w writerFlusher) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.hf.Flush()
+
+	return n, err
+}
+
 func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int, error) {
 	i := strings.Index(req.URL.Path, PipesHandlerPath)
 	if i < 0 {
 		return http.StatusBadRequest, fmt.Errorf("invalid path")
 	}
 
-	nameid := req.URL.Path[i+len(PipesHandlerPath)+1:]
-
-	name, id, _ := strings.Cut(nameid, "/")
-
-	if name != p.name {
-		return http.StatusBadRequest, fmt.Errorf("name did not match plugin: got %v, expected %v", name, p.name)
-	}
+	id := req.URL.Path[i+len(PipesHandlerPath)+1:]
 
 	pipe, ok := p.getPipe(id)
 	if !ok {
@@ -54,38 +60,17 @@ func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int,
 
 	rw.WriteHeader(http.StatusOK)
 
-	copyingCh := make(chan struct{})
-	flushingDoneCh := make(chan struct{})
-
-	waitFlusherDone := func() {
-		close(copyingCh)
-		<-flushingDoneCh
-	}
-
-	if flusher, ok := rw.(http.Flusher); ok {
-		go func() {
-			defer close(flushingDoneCh)
-
-			t := time.NewTicker(time.Millisecond)
-			defer t.Stop()
-
-			for {
-				select {
-				case <-req.Context().Done():
-					return
-				case <-copyingCh:
-					return
-				case <-t.C:
-					flusher.Flush()
-				}
-			}
-		}()
-	}
-
 	switch req.Method {
 	case http.MethodGet:
-		_, err := io.Copy(rw, pipe.r)
-		waitFlusherDone()
+		w := io.Writer(rw)
+		if flusher, ok := rw.(http.Flusher); ok {
+			w = writerFlusher{
+				w:  w,
+				hf: flusher,
+			}
+		}
+
+		_, err := io.Copy(w, pipe.r)
 		if err != nil {
 			return -1, fmt.Errorf("http -> pipe: %v", err)
 		}
@@ -94,14 +79,9 @@ func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int,
 		defer w.Close()
 
 		_, err := io.Copy(pipe.w, req.Body)
-		waitFlusherDone()
 		if err != nil {
 			return -1, fmt.Errorf("pipe -> http: %v", err)
 		}
-	}
-
-	if flusher, ok := rw.(http.Flusher); ok {
-		flusher.Flush()
 	}
 
 	p.removePipe(id)

@@ -44,7 +44,7 @@ type Plugin struct {
 }
 
 func (p *Plugin) PipesHandler() (string, http.Handler) {
-	return path.Join(PipesHandlerPath, p.name) + "/", PipesHandler{p}
+	return PipesHandlerPath + "/", PipesHandler{p}
 }
 
 func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {
@@ -58,7 +58,7 @@ func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeReq
 	p.pipes[id] = &pipe{exp: time.Now().Add(time.Minute), r: r, w: w}
 
 	return connect.NewResponse(&pluginv1.PipeResponse{
-		Path: path.Join(PipesHandlerPath, p.name, id),
+		Path: path.Join(PipesHandlerPath, id),
 		Id:   id,
 	}), nil
 }

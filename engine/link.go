@@ -6,31 +6,111 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/hephv2/hmaps"
+	"github.com/hephbuild/hephv2/plugin/c2"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"net"
+	"net/http"
 	"slices"
 )
 
-func (e *Engine) RegisterProvider(ctx context.Context, client pluginv1connect.ProviderClient) error {
-	e.Providers = append(e.Providers, client)
+type RegisterMuxFunc = func(mux *http.ServeMux)
 
-	return nil
+type PluginHandle struct {
+	HttpClient *http.Client
+	BaseURL    string
 }
 
-func (e *Engine) RegisterDriver(ctx context.Context, client pluginv1connect.DriverClient) error {
+func (e *Engine) RegisterPlugin(ctx context.Context, register RegisterMuxFunc) (PluginHandle, error) {
+	mux := http.NewServeMux()
+
+	register(mux)
+
+	l, err := net.Listen("tcp", "127.0.0.1:")
+	if err != nil {
+		return PluginHandle{}, err
+	}
+	// TODO: close listener
+
+	go func() {
+		if err := http.Serve(l, mux); err != nil {
+			panic(err)
+		}
+	}()
+
+	addr := "http://" + l.Addr().String()
+	httpClient := http.DefaultClient
+
+	ph := PluginHandle{HttpClient: httpClient, BaseURL: addr}
+
+	return ph, nil
+}
+
+type ProviderHandle struct {
+	PluginHandle
+	Client pluginv1connect.ProviderClient
+}
+
+func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {
+	path, h := pluginv1connect.NewProviderHandler(handler, connect.WithInterceptors(c2.NewInterceptor()))
+
+	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
+		mux.Handle(path, h)
+	})
+	if err != nil {
+		return ProviderHandle{}, err
+	}
+
+	client := pluginv1connect.NewProviderClient(pluginh.HttpClient, pluginh.BaseURL, connect.WithInterceptors(c2.NewInterceptor()))
+
+	e.Providers = append(e.Providers, client)
+
+	return ProviderHandle{
+		PluginHandle: pluginh,
+		Client:       client,
+	}, nil
+}
+
+type DriverHandle struct {
+	PluginHandle
+	Client pluginv1connect.DriverClient
+}
+
+func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.DriverHandler, register RegisterMuxFunc) (DriverHandle, error) {
+	path, h := pluginv1connect.NewDriverHandler(handler, connect.WithInterceptors(c2.NewInterceptor()))
+
+	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
+		mux.Handle(path, h)
+		if register != nil {
+			register(mux)
+		}
+	})
+	if err != nil {
+		return DriverHandle{}, err
+	}
+
+	client := pluginv1connect.NewDriverClient(pluginh.HttpClient, pluginh.BaseURL, connect.WithInterceptors(c2.NewInterceptor()))
+
 	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
 	if err != nil {
-		return err
+		return DriverHandle{}, err
 	}
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]pluginv1connect.DriverClient{}
 	}
+	if e.DriversHandle == nil {
+		e.DriversHandle = map[pluginv1connect.DriverClient]PluginHandle{}
+	}
 
-	e.DriversByName[res.Msg.Name] = client
 	e.Drivers = append(e.Drivers, client)
+	e.DriversByName[res.Msg.Name] = client
+	e.DriversHandle[client] = pluginh
 
-	return nil
+	return DriverHandle{
+		PluginHandle: pluginh,
+		Client:       client,
+	}, nil
 }
 
 func (e *Engine) GetSpec(ctx context.Context, pkg, name string) (*pluginv1.TargetSpec, error) {

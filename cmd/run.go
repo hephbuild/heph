@@ -1,16 +1,12 @@
 package cmd
 
 import (
-	"connectrpc.com/connect"
 	"fmt"
 	"github.com/hephbuild/hephv2/engine"
 	"github.com/hephbuild/hephv2/hfs"
-	"github.com/hephbuild/hephv2/plugin/c2"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/spf13/cobra"
-	"net"
 	"net/http"
 	"os"
 )
@@ -34,63 +30,31 @@ func init() {
 				return err
 			}
 
-			mux := http.NewServeMux()
-
-			for _, p := range []pluginv1connect.ProviderHandler{pluginbuildfile.New(hfs.NewOS(root))} {
-				path, h := pluginv1connect.NewProviderHandler(p, connect.WithInterceptors(c2.NewInterceptor()))
-
-				mux.Handle(path, h)
+			_, err = e.RegisterProvider(ctx, pluginbuildfile.New(hfs.NewOS(root)))
+			if err != nil {
+				return err
 			}
 
-			for _, p := range []*pluginexec.Plugin{ /*pluginexec.New(), pluginexec.NewSh(),*/ pluginexec.NewBash()} {
-				path, h := pluginv1connect.NewDriverHandler(p, connect.WithInterceptors(c2.NewInterceptor()))
-				mux.Handle(path, h)
-
-				path, h = p.PipesHandler()
-				mux.Handle(path, h)
-
-				err = e.RegisterDriver(ctx, p)
+			for _, p := range []*pluginexec.Plugin{pluginexec.New(), pluginexec.NewSh(), pluginexec.NewBash()} {
+				_, err := e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
+					path, h := p.PipesHandler()
+					mux.Handle(path, h)
+				})
 				if err != nil {
 					return err
 				}
 			}
 
-			readyCh := make(chan string)
-
-			go func() {
-				l, err := net.Listen("tcp", "127.0.0.1:")
-				if err != nil {
-					panic(err)
-				}
-
-				readyCh <- "http://" + l.Addr().String()
-				close(readyCh)
-
-				if err := http.Serve(l, mux); err != nil {
-					panic(err)
-				}
-			}()
-
-			addr := <-readyCh
-			httpClient := http.DefaultClient
-
-			ctx, err = c2.New(ctx, httpClient, addr)
-			if err != nil {
-				return err
-			}
-
-			err = e.RegisterProvider(ctx, pluginv1connect.NewProviderClient(httpClient, addr, connect.WithInterceptors(c2.NewInterceptor())))
-			if err != nil {
-				return err
-			}
+			//ctx, err = c2.New(ctx, httpClient, addr)
+			//if err != nil {
+			//	return err
+			//}
 
 			ch := e.Result(ctx, args[0], args[1], []string{engine.AllOutputs}, engine.ResultOptions{
 				ExecOptions: engine.ExecOptions{
-					HttpClient: httpClient,
-					BaseURL:    addr,
-					Stdin:      os.Stdin,
-					Stdout:     os.Stdout,
-					Stderr:     os.Stderr,
+					Stdin:  os.Stdin,
+					Stdout: os.Stdout,
+					Stderr: os.Stderr,
 				},
 			})
 

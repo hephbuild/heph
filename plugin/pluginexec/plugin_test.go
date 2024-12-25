@@ -247,10 +247,10 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.Path)
 	require.NoError(t, err)
 
-	expected := strings.Repeat("hello world", 10000)
+	input := strings.Repeat("hello world", 10000)
 
 	go func() {
-		_, err := io.Copy(inw, io.MultiReader(strings.NewReader(expected), sleepReader{d: time.Second}, strings.NewReader(expected)))
+		_, err := io.Copy(inw, io.MultiReader(strings.NewReader(input), sleepReader{d: time.Second}, strings.NewReader(input)))
 		if err != nil {
 			panic(err)
 		}
@@ -283,7 +283,11 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	_, err = io.Copy(&stdout, outr)
 	require.NoError(t, err)
 
-	assert.Equal(t, expected+expected, stdout.String())
+	actual := stdout.String()
+	expected := input + input
+
+	require.Equal(t, len(expected), len(actual))
+	assert.Equal(t, expected, actual)
 }
 
 func TestPipe404(t *testing.T) {
