@@ -1,5 +1,5 @@
 syntax = "proto3";
-package heph.plugin.sh.v1;
+package heph.plugin.exec.v1;
 
 message Target {
   message Output {

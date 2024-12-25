@@ -7,7 +7,7 @@ import (
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/hephv2/plugin/hpipe"
-	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
+	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -99,7 +99,7 @@ func TestPipeStdout(t *testing.T) {
 	res, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&shv1.Target{
+	def, err := anypb.New(&execv1.Target{
 		Run: []string{"echo", "hello"},
 	})
 	require.NoError(t, err)
@@ -157,7 +157,7 @@ func TestPipeStdin(t *testing.T) {
 	pipeOut, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&shv1.Target{
+	def, err := anypb.New(&execv1.Target{
 		Run: []string{"cat"},
 	})
 	require.NoError(t, err)
@@ -239,7 +239,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	pipeOut, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&shv1.Target{
+	def, err := anypb.New(&execv1.Target{
 		Run: []string{"cat"},
 	})
 	require.NoError(t, err)
@@ -317,7 +317,7 @@ func TestPipe404(t *testing.T) {
 	res, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&shv1.Target{
+	def, err := anypb.New(&execv1.Target{
 		Run: []string{"echo", "hello"},
 	})
 	require.NoError(t, err)

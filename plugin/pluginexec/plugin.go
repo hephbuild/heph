@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
-	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
+	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"io"
@@ -62,7 +62,7 @@ func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeReq
 }
 
 func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
-	desc := protodesc.ToDescriptorProto((&shv1.Target{}).ProtoReflect().Descriptor())
+	desc := protodesc.ToDescriptorProto((&execv1.Target{}).ProtoReflect().Descriptor())
 
 	return connect.NewResponse(&pluginv1.ConfigResponse{
 		Name:         p.name,
@@ -76,12 +76,12 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, err
 	}
 
-	s := &shv1.Target{
+	s := &execv1.Target{
 		Run: targetSpec.Run,
 	}
 
 	for k, out := range targetSpec.Out {
-		s.Outputs = append(s.Outputs, &shv1.Target_Output{
+		s.Outputs = append(s.Outputs, &execv1.Target_Output{
 			Group: k,
 			Paths: out,
 		})
@@ -143,7 +143,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		req.Msg.Pipes = append(req.Msg.Pipes, "")
 	}
 
-	var t shv1.Target
+	var t execv1.Target
 	err := req.Msg.Target.Def.UnmarshalTo(&t)
 	if err != nil {
 		return nil, err

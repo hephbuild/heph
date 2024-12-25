@@ -5,6 +5,9 @@ install-dev:
 	chmod +x /tmp/heph
 	mv /tmp/heph $(location)
 
+install-dev-build:
+	go build -o $(location)
+
 gen:
 	cd plugin && buf generate
 	cd plugin/pluginexec && buf generate
