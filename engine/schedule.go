@@ -7,13 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/hephv2/hfs"
 	"github.com/hephbuild/hephv2/hlocks"
 	"github.com/hephbuild/hephv2/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/hephv2/plugin/hpipe"
 	"github.com/zeebo/xxh3"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"io"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -28,11 +33,24 @@ func ExecuteResultErr(err error) chan *ExecuteResult {
 	return ch
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string) chan *ExecuteResult {
+type ExecOptions struct {
+	HttpClient *http.Client
+	BaseURL    string
+
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+type ResultOptions struct {
+	ExecOptions ExecOptions
+}
+
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
 	ch := make(chan *ExecuteResult)
 	go func() {
 		defer close(ch)
-		res, err := e.innerResult(ctx, pkg, name, outputs)
+		res, err := e.innerResult(ctx, pkg, name, outputs, options)
 		if err != nil {
 			ch <- &ExecuteResult{Err: err}
 			return
@@ -58,7 +76,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				outputs = nil
 			}
 
-			ch := e.Result(ctx, dep.Ref.Package, dep.Ref.Name, outputs)
+			ch := e.Result(ctx, dep.Ref.Package, dep.Ref.Name, outputs, ResultOptions{})
 
 			res := <-ch
 			results[i] = res
@@ -69,6 +87,8 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 
 	return results
 }
+
+const AllOutputs = "__all_outputs__"
 
 func (e *Engine) errFromDepsResults(results []*ExecuteResult, def *LightLinkedTarget) error {
 	var errs error
@@ -81,10 +101,14 @@ func (e *Engine) errFromDepsResults(results []*ExecuteResult, def *LightLinkedTa
 	return errs
 }
 
-func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []string) (*ExecuteResult, error) {
+func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
 	def, err := e.LightLink(ctx, pkg, name)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(outputs) == 1 && outputs[0] == AllOutputs {
+		outputs = def.Outputs
 	}
 
 	if def.Cache {
@@ -118,9 +142,9 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 			return res, nil
 		}
 
-		return e.ExecuteAndCache(ctx, def)
+		return e.ExecuteAndCache(ctx, def, options.ExecOptions)
 	} else {
-		return e.Execute(ctx, def)
+		return e.Execute(ctx, def, options.ExecOptions)
 	}
 }
 
@@ -296,7 +320,105 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 	return nil, false, nil
 }
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget) (*ExecuteResult, error) {
+func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient, options ExecOptions) ([]string, func() error, func(), error) {
+	pipes := []string{"", "", ""}
+	eg := &errgroup.Group{}
+
+	stdincancel := func() {}
+	var stdinErrCh chan error
+
+	wait := func() error {
+		err := eg.Wait()
+		// this is complicated...
+		// if the stdin connected was stdin, and we exec a command, stdin never closes, but the Read interface
+		// doesnt have a way to stop reading based on context cancelation, so this just hand until there is a write into stdin,
+		// which makes Read return only to realise that the writer is gone and error out with io: read/write on closed pipe
+		if false && stdinErrCh != nil {
+			err = errors.Join(err, <-stdinErrCh)
+		}
+
+		return err
+	}
+
+	if options.Stdin != nil {
+		stdinErrCh = make(chan error)
+
+		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+		if err != nil {
+			return nil, wait, stdincancel, err
+		}
+
+		pipes[0] = res.Msg.Id
+
+		ctx, cancel := context.WithCancel(ctx)
+		stdincancel = cancel
+
+		go func() {
+			defer cancel()
+
+			w, err := hpipe.Writer(ctx, options.HttpClient, options.BaseURL, res.Msg.Path)
+			if err != nil {
+				stdinErrCh <- err
+				return
+			}
+			defer w.Close()
+
+			_, err = io.Copy(w, options.Stdin)
+
+			stdinErrCh <- err
+		}()
+	}
+
+	if options.Stdout != nil {
+		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+		if err != nil {
+			return nil, wait, stdincancel, err
+		}
+
+		pipes[1] = res.Msg.Id
+
+		eg.Go(func() error {
+			r, err := hpipe.Reader(ctx, options.HttpClient, options.BaseURL, res.Msg.Path)
+			if err != nil {
+				return err
+			}
+
+			_, err = io.Copy(options.Stdout, r)
+
+			return err
+		})
+	}
+
+	if options.Stderr != nil {
+		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+		if err != nil {
+			return nil, wait, stdincancel, err
+		}
+
+		pipes[2] = res.Msg.Id
+
+		eg.Go(func() error {
+			r, err := hpipe.Reader(ctx, options.HttpClient, options.BaseURL, res.Msg.Path)
+			if err != nil {
+				return err
+			}
+
+			_, err = io.Copy(options.Stderr, r)
+
+			return err
+		})
+	}
+
+	return pipes, wait, stdincancel, nil
+}
+
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
+	debugger.SetLabels(func() []string {
+		return []string{
+			fmt.Sprintf("hephv2/engine: Execute %v %v", def.Ref.Package, def.Ref.Name), "",
+		}
+	})
+
 	results := e.depsResults(ctx, def, true)
 	err := e.errFromDepsResults(results, def)
 	if err != nil {
@@ -369,12 +491,21 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget) (*ExecuteR
 		}
 	}
 
+	pipes, pipesWait, pipeStdinCancel, err := e.pipes(ctx, driver, options)
+	if err != nil {
+		return nil, err
+	}
+
 	res, err := driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
 		Target:      def.TargetDef,
 		SandboxPath: sandboxfs.Path(),
 		Inputs:      inputArtifacts,
-		Pipes:       nil,
+		Pipes:       pipes,
 	}))
+	pipeStdinCancel()
+	if err = pipesWait(); err != nil {
+		fmt.Println("PIPESEG", err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -469,8 +600,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget) (*ExecuteR
 	}, nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, def)
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
+	res, err := e.Execute(ctx, def, options)
 	if err != nil {
 		return nil, err
 	}

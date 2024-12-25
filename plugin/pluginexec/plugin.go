@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/dlsniper/debugger"
 	"github.com/google/uuid"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -32,13 +33,18 @@ type pipe struct {
 	busy atomic.Bool
 }
 
+type RunToExecArgsFunc = func(run []string, termargs []string) []string
+
 type Plugin struct {
+	name          string
+	runToExecArgs RunToExecArgsFunc
+
 	pipes  map[string]*pipe
 	pipesm sync.RWMutex
 }
 
-func (p *Plugin) PipesHandler() http.Handler {
-	return PipesHandler{p}
+func (p *Plugin) PipesHandler() (string, http.Handler) {
+	return path.Join(PipesHandlerPath, p.name) + "/", PipesHandler{p}
 }
 
 func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {
@@ -52,7 +58,7 @@ func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeReq
 	p.pipes[id] = &pipe{exp: time.Now().Add(time.Minute), r: r, w: w}
 
 	return connect.NewResponse(&pluginv1.PipeResponse{
-		Path: path.Join(PipesHandlerPath, id),
+		Path: path.Join(PipesHandlerPath, p.name, id),
 		Id:   id,
 	}), nil
 }
@@ -61,7 +67,7 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 	desc := protodesc.ToDescriptorProto((&shv1.Target{}).ProtoReflect().Descriptor())
 
 	return connect.NewResponse(&pluginv1.ConfigResponse{
-		Name:         "exec",
+		Name:         p.name,
 		TargetSchema: desc,
 	}), nil
 }
@@ -133,6 +139,12 @@ func envName(prefix, group, name, value string) string {
 }
 
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
+	debugger.SetLabels(func() []string {
+		return []string{
+			fmt.Sprintf("hephv2/pluginexec %v: %v %v", p.name, req.Msg.Target.Ref.Package, req.Msg.Target.Ref.Name), "",
+		}
+	})
+
 	for len(req.Msg.Pipes) < 3 {
 		req.Msg.Pipes = append(req.Msg.Pipes, "")
 	}
@@ -194,7 +206,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, t.Run[0], t.Run[1:]...)
+	args := p.runToExecArgs(t.Run, nil)
+
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Env = env
 	cmd.Dir = workdir
 
@@ -204,7 +218,15 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		if !ok {
 			return nil, errors.New("pipe 0 not found")
 		}
-		cmd.Stdin = pipe.r
+		pw, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+
+		go func() {
+			_, _ = io.Copy(pw, pipe.r)
+			_ = pw.Close()
+		}()
 	}
 	cmd.Stdout = io.MultiWriter(stdoutWriters...)
 	cmd.Stderr = io.MultiWriter(stderrWriters...)
@@ -240,10 +262,90 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	}), nil
 }
 
-func New() *Plugin {
-	return &Plugin{
-		pipes: map[string]*pipe{},
+type Option func(*Plugin)
+
+func WithRunToExecArgs(f RunToExecArgsFunc) Option {
+	return func(plugin *Plugin) {
+		plugin.runToExecArgs = f
 	}
+}
+
+func WithName(name string) Option {
+	return func(plugin *Plugin) {
+		plugin.name = name
+	}
+}
+
+func New(options ...Option) *Plugin {
+	p := &Plugin{
+		pipes: map[string]*pipe{},
+		runToExecArgs: func(run []string, termargs []string) []string {
+			return append(run, termargs...)
+		},
+		name: "exec",
+	}
+
+	for _, opt := range options {
+		opt(p)
+	}
+
+	return p
+}
+
+func bashArgs(so, lo []string) []string {
+	// Bash also interprets a number of multi-character options. These options must appear on the command line
+	// before the single-character options to be recognized.
+	return append(
+		append([]string{"bash", "--noprofile"}, lo...),
+		append([]string{"-o", "pipefail"}, so...)...,
+	)
+}
+
+func NewBash(options ...Option) *Plugin {
+	options = append(options, WithRunToExecArgs(func(run []string, termargs []string) []string {
+		args := bashArgs(
+			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},
+			[]string{"--norc"},
+		)
+
+		if len(termargs) == 0 {
+			return args
+		} else {
+			// https://unix.stackexchange.com/a/144519
+			args = append(args, "bash")
+			args = append(args, termargs...)
+			return args
+		}
+	}), WithName("bash"))
+
+	return New(options...)
+}
+
+func shArgs(initfile string, so []string) []string {
+	base := []string{"sh"}
+	if initfile != "" {
+		base = []string{"env", "ENV=" + initfile, "sh"}
+	}
+	return append(base, so...)
+}
+
+func NewSh(options ...Option) *Plugin {
+	options = append(options, WithRunToExecArgs(func(run []string, termargs []string) []string {
+		args := shArgs(
+			"",
+			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},
+		)
+
+		if len(termargs) == 0 {
+			return args
+		} else {
+			// https://unix.stackexchange.com/a/144519
+			args = append(args, "sh")
+			args = append(args, termargs...)
+			return args
+		}
+	}), WithName("sh"))
+	return New(options...)
 }
 
 var _ pluginv1connect.DriverHandler = (*Plugin)(nil)

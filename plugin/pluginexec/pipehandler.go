@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -17,68 +16,97 @@ type PipesHandler struct {
 const PipesHandlerPath = pluginv1connect.DriverPipeProcedure + "Handler"
 
 func (p PipesHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	status, err := p.serveHTTP(rw, req)
+	if status > 0 {
+		rw.WriteHeader(status)
+	}
+	if err != nil {
+		rw.Write([]byte("\n"))
+		rw.Write([]byte(err.Error()))
+	}
+	return
+}
+
+func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int, error) {
 	i := strings.Index(req.URL.Path, PipesHandlerPath)
 	if i < 0 {
-		rw.WriteHeader(http.StatusBadRequest)
-		rw.Write([]byte("invalid path"))
-		return
+		return http.StatusBadRequest, fmt.Errorf("invalid path")
 	}
 
-	id := req.URL.Path[i+len(PipesHandlerPath)+1:]
+	nameid := req.URL.Path[i+len(PipesHandlerPath)+1:]
+
+	name, id, _ := strings.Cut(nameid, "/")
+
+	if name != p.name {
+		return http.StatusBadRequest, fmt.Errorf("name did not match plugin: got %v, expected %v", name, p.name)
+	}
 
 	pipe, ok := p.getPipe(id)
 	if !ok {
-		rw.WriteHeader(http.StatusBadRequest)
-		rw.Write([]byte(fmt.Sprintf("pipe not found: %v", id)))
-		return
+		return http.StatusBadRequest, fmt.Errorf("pipe not found: %v", id)
 	}
 
 	if pipe.busy.Swap(true) {
-		rw.WriteHeader(http.StatusBadRequest)
-		rw.Write([]byte("pipe is busy"))
-		return
+		return http.StatusBadRequest, fmt.Errorf("pipe is busy")
 	}
 
 	defer pipe.busy.Store(false)
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	ch := make(chan error, 2)
+	rw.WriteHeader(http.StatusOK)
 
-	go func() {
-		defer wg.Done()
+	copyingCh := make(chan struct{})
+	flushingDoneCh := make(chan struct{})
 
-		if req.Method != http.MethodGet {
-			return
-		}
+	waitFlusherDone := func() {
+		close(copyingCh)
+		<-flushingDoneCh
+	}
 
+	if flusher, ok := rw.(http.Flusher); ok {
+		go func() {
+			defer close(flushingDoneCh)
+
+			t := time.NewTicker(time.Millisecond)
+			defer t.Stop()
+
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-copyingCh:
+					return
+				case <-t.C:
+					flusher.Flush()
+				}
+			}
+		}()
+	}
+
+	switch req.Method {
+	case http.MethodGet:
 		_, err := io.Copy(rw, pipe.r)
+		waitFlusherDone()
 		if err != nil {
-			ch <- fmt.Errorf("http -> pipe: %v", err)
+			return -1, fmt.Errorf("http -> pipe: %v", err)
 		}
-	}()
-	go func() {
-		defer wg.Done()
-
-		if req.Method != http.MethodPost {
-			return
-		}
+	case http.MethodPost:
+		w := pipe.w
+		defer w.Close()
 
 		_, err := io.Copy(pipe.w, req.Body)
+		waitFlusherDone()
 		if err != nil {
-			ch <- fmt.Errorf("pipe -> http: %v", err)
+			return -1, fmt.Errorf("pipe -> http: %v", err)
 		}
-	}()
+	}
 
-	wg.Wait()
-	close(ch)
-
-	for err := range ch {
-		rw.Write([]byte("\n"))
-		rw.Write([]byte(fmt.Sprint(err)))
+	if flusher, ok := rw.(http.Flusher); ok {
+		flusher.Flush()
 	}
 
 	p.removePipe(id)
+
+	return -1, nil
 }
 
 func (p *Plugin) getPipe(id string) (*pipe, bool) {

@@ -5,6 +5,7 @@ go 1.23.0
 require (
 	connectrpc.com/connect v1.17.0
 	github.com/Code-Hex/go-generics-cache v1.5.1
+	github.com/dlsniper/debugger v0.6.0
 	github.com/go-faker/faker/v4 v4.5.0
 	github.com/google/uuid v1.4.0
 	github.com/hephbuild/heph v0.0.0-20240514172700-016edccca7cb
@@ -15,7 +16,6 @@ require (
 	github.com/viney-shih/go-lock v1.1.2
 	github.com/zeebo/xxh3 v1.0.2
 	go.starlark.net v0.0.0-20231101134539-556fd59b42f6
-	go.uber.org/multierr v1.11.0
 	golang.org/x/sync v0.7.0
 	golang.org/x/sys v0.24.0
 	google.golang.org/protobuf v1.34.2
@@ -43,6 +43,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20231006140011-7918f672742d // indirect
 	golang.org/x/text v0.16.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

@@ -21,6 +21,7 @@ func init() {
 var rootCmd = &cobra.Command{
 	Use:              "heph",
 	TraverseChildren: true,
+	SilenceUsage:     true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		if !debug {
 			levelVar.Set(slog.LevelInfo)
@@ -41,9 +42,9 @@ func Execute() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ctx = hio.ContextWithHandler(ctx, hio.NewDefaultHandler())
-	lh := hio.NewTermLogHandler(ctx, os.Stderr, &levelVar)
-	defer lh.Close()
+	//ctx = hio.ContextWithHandler(ctx, hio.NewDefaultHandler())
+	//lh := hio.NewTermLogHandler(ctx, os.Stderr, &levelVar)
+	//defer lh.Close()
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		hio.From(ctx).Err(err.Error())

@@ -68,7 +68,7 @@ func (e *Engine) GetDef(ctx context.Context, pkg, name string) (*pluginv1.Target
 
 	driver, ok := e.DriversByName[spec.Ref.Driver]
 	if !ok {
-		return nil, fmt.Errorf("driver doesnt exist: %s", spec.Ref.Driver)
+		return nil, fmt.Errorf("driver %q doesnt exist", spec.Ref.Driver)
 	}
 
 	res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{

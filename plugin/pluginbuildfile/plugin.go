@@ -202,6 +202,8 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 	if payload.Name == "" {
 		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("not found"))
 	}
+	ref := req.Msg.Ref
+	ref.Driver = payload.Driver
 
 	config := map[string]*structpb.Value{}
 	for k, v := range payload.Args {
@@ -217,7 +219,7 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
-			Ref:    req.Msg.Ref,
+			Ref:    ref,
 			Config: config,
 		},
 	}), nil

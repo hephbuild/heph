@@ -10,6 +10,7 @@ import (
 	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -84,8 +85,9 @@ func TestPipeStdout(t *testing.T) {
 	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
-			p.PipesHandler().ServeHTTP(w, req)
+		path, h := p.PipesHandler()
+		if strings.HasPrefix(req.URL.Path, path) {
+			h.ServeHTTP(w, req)
 		} else {
 			rpcHandler.ServeHTTP(w, req)
 		}
@@ -139,8 +141,9 @@ func TestPipeStdin(t *testing.T) {
 	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
-			p.PipesHandler().ServeHTTP(w, req)
+		path, h := p.PipesHandler()
+		if strings.HasPrefix(req.URL.Path, path) {
+			h.ServeHTTP(w, req)
 		} else {
 			rpcHandler.ServeHTTP(w, req)
 		}
@@ -220,8 +223,9 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
-			p.PipesHandler().ServeHTTP(w, req)
+		path, h := p.PipesHandler()
+		if strings.HasPrefix(req.URL.Path, path) {
+			h.ServeHTTP(w, req)
 		} else {
 			rpcHandler.ServeHTTP(w, req)
 		}
@@ -280,4 +284,68 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, expected+expected, stdout.String())
+}
+
+func TestPipe404(t *testing.T) {
+	t.Skip() // This is expected to block forever, since there is no functional reader
+
+	ctx := context.Background()
+	sandboxPath, err := os.MkdirTemp("", "")
+	require.NoError(t, err)
+	defer os.RemoveAll(sandboxPath)
+
+	p := New()
+
+	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("Not found :("))
+		} else {
+			rpcHandler.ServeHTTP(w, req)
+		}
+	}))
+	defer srv.Close()
+
+	pc := pluginv1connect.NewDriverClient(srv.Client(), srv.URL)
+
+	res, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+	require.NoError(t, err)
+
+	def, err := anypb.New(&shv1.Target{
+		Run: []string{"echo", "hello"},
+	})
+	require.NoError(t, err)
+
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.Path)
+	require.NoError(t, err)
+
+	var stdout bytes.Buffer
+
+	var eg errgroup.Group
+	eg.Go(func() error {
+		_, err = io.Copy(&stdout, outr)
+
+		return err
+	})
+
+	_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		Target: &pluginv1.TargetDef{
+			Ref: &pluginv1.TargetRef{
+				Package: "some/pkg",
+				Name:    "target",
+				Driver:  "exec",
+			},
+			Def: def,
+		},
+		SandboxPath: sandboxPath,
+		Pipes:       []string{"", res.Msg.Id, ""},
+	}))
+	require.NoError(t, err)
+
+	err = eg.Wait()
+	assert.ErrorContains(t, err, "status: 404 404 Not Found")
+
+	assert.Equal(t, "Not found :(", stdout.String())
 }

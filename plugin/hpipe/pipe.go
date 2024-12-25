@@ -2,6 +2,7 @@ package hpipe
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 )
@@ -27,6 +28,9 @@ func Reader(ctx context.Context, client *http.Client, baseUrl, path string) (Rea
 		}
 
 		_, err = io.Copy(w, res.Body)
+		if err == nil && res.StatusCode != http.StatusOK {
+			err = fmt.Errorf("status: %v %v", res.StatusCode, res.Status)
+		}
 		_ = w.CloseWithError(err)
 	}()
 
@@ -45,6 +49,7 @@ func Writer(ctx context.Context, client *http.Client, baseUrl, path string) (Wri
 	if err != nil {
 		return nil, err
 	}
+	req.ContentLength = -1
 
 	go func() {
 		res, err := client.Do(req)
