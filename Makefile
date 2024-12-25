@@ -7,5 +7,5 @@ install-dev:
 
 gen:
 	cd plugin && buf generate
-	cd plugin/pluginsh && buf generate
+	cd plugin/pluginexec && buf generate
 	cd plugin/plugingroup && buf generate

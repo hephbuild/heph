@@ -1,4 +1,4 @@
-package pluginsh
+package pluginexec
 
 import (
 	"connectrpc.com/connect"
@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
-	shv1 "github.com/hephbuild/hephv2/plugin/pluginsh/gen/heph/plugin/sh/v1"
+	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -61,7 +61,7 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 	desc := protodesc.ToDescriptorProto((&shv1.Target{}).ProtoReflect().Descriptor())
 
 	return connect.NewResponse(&pluginv1.ConfigResponse{
-		Name:         "sh",
+		Name:         "exec",
 		TargetSchema: desc,
 	}), nil
 }

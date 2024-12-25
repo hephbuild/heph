@@ -1,7 +1,7 @@
 version: v2
 modules:
   - path: plugin/proto
-  - path: plugin/pluginsh/proto
+  - path: plugin/pluginexec/proto
   - path: plugin/plugingroup/proto
 lint:
   use:

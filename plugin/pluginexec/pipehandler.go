@@ -1,4 +1,4 @@
-package pluginsh
+package pluginexec
 
 import (
 	"fmt"

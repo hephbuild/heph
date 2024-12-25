@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/hephv2/hfs/hfstest"
 	"github.com/hephbuild/hephv2/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/pluginsh"
+	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/hephbuild/hephv2/plugin/pluginstaticprovider"
 	"github.com/hephbuild/hephv2/plugin/plugintest"
 	"github.com/stretchr/testify/assert"
@@ -43,7 +43,7 @@ func TestSanity(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/package",
 					Name:    "sometarget",
-					Driver:  "sh",
+					Driver:  "exec",
 				},
 				Config: map[string]*structpb.Value{
 					"run": newValueMust([]any{"sh", "-c", `echo hello > out`}),
@@ -60,7 +60,7 @@ func TestSanity(t *testing.T) {
 	err = e.RegisterProvider(ctx, staticproviderClient)
 	require.NoError(t, err)
 
-	execdriver := pluginsh.New()
+	execdriver := pluginexec.New()
 	err = e.RegisterDriver(ctx, execdriver)
 	require.NoError(t, err)
 

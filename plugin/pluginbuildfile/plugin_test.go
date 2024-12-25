@@ -18,7 +18,7 @@ func TestSanity(t *testing.T) {
 
 	fs := hfstest.New(t)
 
-	err := hfs.WriteFile(fs, "BUILD", []byte(`target(name="hello", driver="sh", run=["hello"])`), os.ModePerm)
+	err := hfs.WriteFile(fs, "BUILD", []byte(`target(name="hello", driver="exec", run=["hello"])`), os.ModePerm)
 	require.NoError(t, err)
 
 	p := New(fs)
@@ -37,7 +37,7 @@ func TestSanity(t *testing.T) {
 		spec := res.Msg()
 		assert.Equal(t, "", spec.Ref.Package)
 		assert.Equal(t, "hello", spec.Ref.Name)
-		assert.Equal(t, "sh", spec.Ref.Driver)
+		assert.Equal(t, "exec", spec.Ref.Driver)
 
 		ref = spec.Ref
 	}

@@ -1,4 +1,4 @@
-package pluginsh
+package pluginexec
 
 import (
 	"bytes"
@@ -7,7 +7,7 @@ import (
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/hephv2/plugin/hpipe"
-	shv1 "github.com/hephbuild/hephv2/plugin/pluginsh/gen/heph/plugin/sh/v1"
+	shv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/sh/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -50,7 +50,7 @@ func TestSanity(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "sh",
+					Driver:  "exec",
 				},
 				Config: map[string]*structpb.Value{
 					"run": runArg,
@@ -111,7 +111,7 @@ func TestPipeStdout(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "sh",
+					Driver:  "exec",
 				},
 				Def: def,
 			},
@@ -182,7 +182,7 @@ func TestPipeStdin(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "sh",
+					Driver:  "exec",
 				},
 				Def: def,
 			},
@@ -265,7 +265,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "sh",
+					Driver:  "exec",
 				},
 				Def: def,
 			},
