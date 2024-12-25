@@ -354,7 +354,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		go func() {
 			defer cancel()
 
-			w, err := hpipe.Writer(ctx, driverHandle.HttpClient, driverHandle.BaseURL, res.Msg.Path)
+			w, err := hpipe.Writer(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
 			if err != nil {
 				stdinErrCh <- err
 				return
@@ -376,7 +376,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[1] = res.Msg.Id
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HttpClient, driverHandle.BaseURL, res.Msg.Path)
+			r, err := hpipe.Reader(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
 			if err != nil {
 				return err
 			}
@@ -396,7 +396,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[2] = res.Msg.Id
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HttpClient, driverHandle.BaseURL, res.Msg.Path)
+			r, err := hpipe.Reader(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
 			if err != nil {
 				return err
 			}
