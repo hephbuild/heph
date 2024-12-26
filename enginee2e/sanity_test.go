@@ -45,7 +45,7 @@ func TestSanity(t *testing.T) {
 					Driver:  "exec",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{"sh", "-c", `echo hello > out`}),
+					"run": newValueMust([]any{"sh", "-c", "-e", `echo hello > out`}),
 					"out": newValueMust([]any{"out"}),
 				},
 			},
