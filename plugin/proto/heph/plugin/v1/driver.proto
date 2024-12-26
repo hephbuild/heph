@@ -17,7 +17,7 @@ message ParseResponse {
 message RunRequest {
   TargetDef target = 1;
   string sandbox_path = 2;
-  repeated Artifact inputs = 3;
+  repeated ArtifactWithOrigin inputs = 3;
   repeated string pipes = 4;
 }
 
@@ -43,6 +43,11 @@ message Artifact {
   Type type = 3;
   Encoding encoding = 4;
   string uri = 5;
+}
+
+message ArtifactWithOrigin {
+  Artifact artifact = 1;
+  TargetDef.Dep dep = 2;
 }
 
 message RunResponse {

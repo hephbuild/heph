@@ -79,7 +79,8 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}
 
 	s := &execv1.Target{
-		Run: targetSpec.Run,
+		Run:  targetSpec.Run,
+		Deps: map[string]*execv1.Target_Dep{},
 	}
 
 	for k, out := range targetSpec.Out {
@@ -98,12 +99,13 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}
 
 	var deps []*pluginv1.TargetDef_Dep
-	for _, sdeps := range targetSpec.Deps {
+	for name, sdeps := range targetSpec.Deps {
+		var execDeps execv1.Target_Dep
 		for _, dep := range sdeps {
-			s := strings.ReplaceAll(dep, "//", "")
-			pkg, rest, ok := strings.Cut(s, ":")
+			str := strings.ReplaceAll(dep, "//", "")
+			pkg, rest, ok := strings.Cut(str, ":")
 			if !ok {
-				return nil, fmt.Errorf("invalid dep spec: %s", s)
+				return nil, fmt.Errorf("invalid dep spec: %s", str)
 			}
 			var name string
 			var output *string
@@ -122,7 +124,14 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 					Output:  output,
 				},
 			})
+
+			execDeps.Targets = append(execDeps.Targets, &execv1.Target_Dep_TargetRef{
+				Package: pkg,
+				Name:    name,
+				Output:  output,
+			})
 		}
+		s.Deps[name] = &execDeps
 	}
 
 	target, err := anypb.New(s)
@@ -143,19 +152,86 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}), nil
 }
 
-func envName(prefix, group, name, value string) string {
+func getEnvName(prefix, group, name string) string {
 	group = strings.ToUpper(group)
 	name = strings.ToUpper(name)
 
 	if group != "" && name != "" {
-		return fmt.Sprintf("%v_%v_%v=%v", prefix, group, name, value)
+		return fmt.Sprintf("%v_%v_%v", prefix, group, name)
 	} else if group != "" {
-		return fmt.Sprintf("%v_%v=%v", prefix, group, value)
+		return fmt.Sprintf("%v_%v", prefix, group)
 	} else if name != "" {
-		return fmt.Sprintf("%v_%v=%v", prefix, name, value)
+		return fmt.Sprintf("%v_%v", prefix, name)
 	} else {
-		return fmt.Sprintf("%v=%v", prefix, value)
+		return fmt.Sprintf("%v", prefix)
 	}
+}
+
+func getEnvEntry(prefix, group, name, value string) string {
+	return getEnvEntryWithName(getEnvName(prefix, group, name), value)
+}
+func getEnvEntryWithName(name, value string) string {
+	return name + "=" + value
+}
+
+func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, deps map[string]*execv1.Target_Dep) ([]string, error) {
+	getDep := func(t *pluginv1.TargetRefWithOutput) (string, bool) {
+		for name, dep := range deps {
+			for _, target := range dep.Targets {
+				if target.Name == t.Name && target.Package == t.Package {
+					return name, target.Output == nil
+				}
+			}
+		}
+
+		return "", false
+	}
+
+	m := map[string][]*pluginv1.Artifact{}
+	for _, input := range inputs {
+		if input.Artifact.Type != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
+			continue
+		}
+
+		depName, allOutput := getDep(input.Dep.Ref)
+
+		var outputName string
+		if allOutput {
+			outputName = input.Artifact.Group
+		}
+
+		envName := getEnvName("SRC", depName, outputName)
+
+		m[envName] = append(m[envName], input.Artifact)
+	}
+
+	var env []string
+	var sb strings.Builder
+	for name, artifacts := range m {
+		sb.Reset()
+
+		for _, input := range artifacts {
+			b, err := os.ReadFile(strings.ReplaceAll(input.Uri, "file://", ""))
+			if err != nil {
+				return nil, err
+			}
+
+			incomingValue := strings.ReplaceAll(string(b), "\n", " ")
+
+			if len(incomingValue) == 0 {
+				continue
+			}
+
+			if sb.Len() > 0 {
+				sb.WriteString(" ")
+			}
+			sb.WriteString(incomingValue)
+		}
+
+		env = append(env, getEnvEntryWithName(name, sb.String()))
+	}
+
+	return env, nil
 }
 
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
@@ -184,26 +260,17 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	env := []string{}
 
-	for _, input := range req.Msg.Inputs {
-		if input.Type != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
-			continue
-		}
-
-		b, err := os.ReadFile(strings.ReplaceAll(input.Uri, "file://", ""))
-		if err != nil {
-			return nil, err
-		}
-
-		value := strings.ReplaceAll(string(b), "\n", " ")
-
-		// TODO: expand based on encoding
-
-		env = append(env, envName("SRC", input.Group, "", value))
+	inputEnv, err := p.inputEnv(ctx, req.Msg.Inputs, t.Deps)
+	if err != nil {
+		return nil, err
 	}
-	for _, output := range t.Outputs {
-		path := strings.Join(output.Paths, " ") // TODO: make it a path
 
-		env = append(env, envName("OUT", output.Group, "", path))
+	env = append(env, inputEnv...)
+
+	for _, output := range t.Outputs {
+		paths := strings.Join(output.Paths, " ") // TODO: make it a path
+
+		env = append(env, getEnvEntry("OUT", output.Group, "", paths))
 	}
 
 	var stdoutWriters, stderrWriters []io.Writer

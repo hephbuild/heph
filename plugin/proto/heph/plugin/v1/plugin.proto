@@ -26,7 +26,7 @@ message TargetDef {
     }
 
     TargetRefWithOutput ref = 1;
-    Mode link = 3;
+    Mode link = 2;
   }
 
   TargetRef ref = 1;
@@ -49,7 +49,7 @@ message TargetDef {
     CODEGEN_MODE_LINK = 3;
   }
 
-  repeated CodegenMode codegen  = 7;
+  repeated CodegenMode codegen = 7;
 }
 
 message TargetSpec {

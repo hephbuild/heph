@@ -9,23 +9,29 @@ import (
 	"io"
 )
 
-func SetupSandbox(ctx context.Context, depResults []*ExecuteResult, fs hfs.FS) ([]*pluginv1.Artifact, error) {
-	var artifacts []*pluginv1.Artifact
+func SetupSandbox(ctx context.Context, depResults []*ExecuteResultWithOrigin, fs hfs.FS) ([]*pluginv1.ArtifactWithOrigin, error) {
+	var artifacts []*pluginv1.ArtifactWithOrigin
 
 	for _, depResult := range depResults {
-		for _, artifact := range depResult.Outputs {
-			if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
-				return nil, fmt.Errorf("unexpected artifact type: %s", artifact.Type)
+		for _, res := range depResult.Outputs {
+			if res.Type != pluginv1.Artifact_TYPE_OUTPUT {
+				return nil, fmt.Errorf("unexpected artifact type: %s", res.Type)
 			}
 
-			artifacts = append(artifacts, artifact.Artifact)
+			artifacts = append(artifacts, &pluginv1.ArtifactWithOrigin{
+				Artifact: res.Artifact,
+				Dep:      depResult.Origin,
+			})
 
-			listArtifact, err := SetupSandboxArtifact(ctx, artifact, fs)
+			listArtifact, err := SetupSandboxArtifact(ctx, res, fs)
 			if err != nil {
 				return nil, err
 			}
 
-			artifacts = append(artifacts, listArtifact)
+			artifacts = append(artifacts, &pluginv1.ArtifactWithOrigin{
+				Artifact: listArtifact,
+				Dep:      depResult.Origin,
+			})
 		}
 	}
 

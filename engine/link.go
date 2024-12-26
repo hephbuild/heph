@@ -102,6 +102,7 @@ func (e *Engine) linkInner(ctx context.Context, pkg, name string, memo *LinkMemo
 type LightLinkedTargetDep struct {
 	*pluginv1.TargetDef
 	Outputs []string
+	DefDep  *pluginv1.TargetDef_Dep
 }
 
 type LightLinkedTarget struct {
@@ -159,6 +160,7 @@ func (e *Engine) LightLink(ctx context.Context, pkg, name string) (*LightLinkedT
 				setOutputIndex(len(lt.Deps))
 			}
 			lt.Deps = append(lt.Deps, &LightLinkedTargetDep{
+				DefDep:    dep,
 				TargetDef: linkeddep,
 				Outputs:   outputs,
 			})

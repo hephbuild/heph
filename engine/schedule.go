@@ -61,9 +61,9 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 	return ch
 }
 
-func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool) []*ExecuteResult {
+func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool) []*ExecuteResultWithOrigin {
 	var wg sync.WaitGroup
-	results := make([]*ExecuteResult, len(def.Deps))
+	results := make([]*ExecuteResultWithOrigin, len(def.Deps))
 	wg.Add(len(def.Deps))
 
 	for i, dep := range def.Deps {
@@ -83,7 +83,10 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				return output.Type != pluginv1.Artifact_TYPE_OUTPUT
 			})
 
-			results[i] = res
+			results[i] = &ExecuteResultWithOrigin{
+				ExecuteResult: res,
+				Origin:        dep.DefDep,
+			}
 		}()
 	}
 
@@ -94,7 +97,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 
 const AllOutputs = "__all_outputs__"
 
-func (e *Engine) errFromDepsResults(results []*ExecuteResult, def *LightLinkedTarget) error {
+func (e *Engine) errFromDepsResults(results []*ExecuteResultWithOrigin, def *LightLinkedTarget) error {
 	var errs error
 	for i, result := range results {
 		if result.Err != nil {
@@ -152,7 +155,7 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 	}
 }
 
-func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResult) (string, error) {
+func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
 	h := xxh3.New()
 	b, err := proto.Marshal(def.Ref)
 	if err != nil {
@@ -175,6 +178,15 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
+		b, err = proto.Marshal(result.Origin.Ref)
+		if err != nil {
+			return "", err
+		}
+		_, err = h.Write(b)
+		if err != nil {
+			return "", err
+		}
+
 		for _, output := range result.Outputs {
 			_, err = h.WriteString(output.Hashout)
 			if err != nil {
@@ -197,6 +209,11 @@ type ExecuteResult struct {
 	Err     error
 	Hashin  string
 	Outputs []ExecuteResultOutput
+}
+
+type ExecuteResultWithOrigin struct {
+	*ExecuteResult
+	Origin *pluginv1.TargetDef_Dep
 }
 
 func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {

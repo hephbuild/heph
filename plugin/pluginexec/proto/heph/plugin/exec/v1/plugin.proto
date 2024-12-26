@@ -11,6 +11,7 @@ message Target {
     message TargetRef {
       string package = 1;
       string name = 2;
+      optional string output = 3;
     }
     repeated string files = 1;
     repeated TargetRef targets = 2;

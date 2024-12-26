@@ -50,11 +50,13 @@ func (p Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReques
 	var artifacts []*pluginv1.Artifact
 
 	for _, input := range req.Msg.Inputs {
+		artifact := input.Artifact
+
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name:     input.Name,
-			Group:    input.Group,
-			Encoding: input.Encoding,
-			Uri:      input.Uri,
+			Name:     artifact.Name,
+			Group:    artifact.Group,
+			Encoding: artifact.Encoding,
+			Uri:      artifact.Uri,
 		})
 	}
 

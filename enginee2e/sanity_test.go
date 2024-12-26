@@ -64,16 +64,16 @@ func TestSanity(t *testing.T) {
 	res := <-ch
 	require.NoError(t, res.Err)
 
-	require.Len(t, res.Outputs, 1)
+	require.Len(t, res.Outputs, 2)
 
 	path := strings.TrimPrefix(res.Outputs[0].Uri, "file://")
 
 	fs2 := hfstest.New(t)
 	err = htar.UnpackFromPath(ctx, path, fs2)
-	require.NoError(t, res.Err)
+	require.NoError(t, err)
 
-	b, err := hfs.ReadFile(fs2, "ws/out")
-	require.NoError(t, res.Err)
+	b, err := hfs.ReadFile(fs2, "out")
+	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))
 }

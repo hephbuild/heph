@@ -9,8 +9,8 @@ target(
     name = "result",
     run = [
         "env | grep SRC || true",
-        "echo $SRC", # will make it fail is its not defined
-        "echo $(cat $SRC) > $OUT",
+        "echo $SRC_D1", # will make it fail is its not defined
+        "echo $(cat $SRC_D1) > $OUT",
     ],
     driver = "bash",
     deps = {
