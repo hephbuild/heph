@@ -1,6 +1,7 @@
 package hfs
 
 import (
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -58,8 +59,9 @@ func Create(fs FS, filename string) (File, error) {
 }
 
 func CreateParentDir(fs FS, path string) error {
+	path = fs.Path(path)
 	if dir := filepath.Dir(path); dir != "." {
-		err := fs.MkdirAll(dir, ModePerm)
+		err := fs.At(dir).MkdirAll("", ModePerm)
 		if err != nil {
 			return err
 		}
@@ -105,4 +107,18 @@ func ToIOFS(fs FS) StdFS {
 
 func Walk(fs FS, walkFn WalkDirFunc) error {
 	return iofs.WalkDir(ToIOFS(fs), "", walkFn)
+}
+
+func Move(from, to FS) error {
+	fromos, ok := from.(OS)
+	if !ok {
+		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
+	}
+
+	toos, ok := to.(OS)
+	if !ok {
+		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
+	}
+
+	return os.Rename(fromos.Path(), toos.Path())
 }

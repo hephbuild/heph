@@ -32,4 +32,5 @@ type FS interface {
 	MkdirAll(name string, mode FileMode) error
 	ReadDir(name string) ([]DirEntry, error)
 	At(name string) FS
+	Path(names ...string) string
 }

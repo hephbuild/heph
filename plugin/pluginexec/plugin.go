@@ -13,11 +13,13 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -89,14 +91,38 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 
 	var collectOutputs []*pluginv1.TargetDef_CollectOutput
 	for _, output := range s.Outputs {
-		paths := output.Paths
-		for i, p := range paths {
-			paths[i] = filepath.Join("ws", p)
-		}
 		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
 			Group: output.Group,
-			Paths: paths,
+			Paths: output.Paths,
 		})
+	}
+
+	var deps []*pluginv1.TargetDef_Dep
+	for _, sdeps := range targetSpec.Deps {
+		for _, dep := range sdeps {
+			s := strings.ReplaceAll(dep, "//", "")
+			pkg, rest, ok := strings.Cut(s, ":")
+			if !ok {
+				return nil, fmt.Errorf("invalid dep spec: %s", s)
+			}
+			var name string
+			var output *string
+
+			if sname, soutput, ok := strings.Cut(rest, "|"); ok {
+				name = sname
+				output = &soutput
+			} else {
+				name = rest
+			}
+
+			deps = append(deps, &pluginv1.TargetDef_Dep{
+				Ref: &pluginv1.TargetRefWithOutput{
+					Package: pkg,
+					Name:    name,
+					Output:  output,
+				},
+			})
+		}
 	}
 
 	target, err := anypb.New(s)
@@ -108,8 +134,8 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		Target: &pluginv1.TargetDef{
 			Ref:            req.Msg.Spec.Ref,
 			Def:            target,
-			Deps:           nil,
-			Outputs:        nil,
+			Deps:           deps,
+			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
 			Cache:          true,
 			CollectOutputs: collectOutputs,
 			Codegen:        nil,
@@ -156,13 +182,23 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		return nil, err
 	}
 
-	var env []string
+	env := []string{}
 
 	for _, input := range req.Msg.Inputs {
-		// TODO: expand based on encoding
-		path := input.Name // TODO: make it a path
+		if input.Type != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
+			continue
+		}
 
-		env = append(env, envName("SRC", input.Group, input.Name, path))
+		b, err := os.ReadFile(strings.ReplaceAll(input.Uri, "file://", ""))
+		if err != nil {
+			return nil, err
+		}
+
+		value := strings.ReplaceAll(string(b), "\n", " ")
+
+		// TODO: expand based on encoding
+
+		env = append(env, envName("SRC", input.Group, "", value))
 	}
 	for _, output := range t.Outputs {
 		path := strings.Join(output.Paths, " ") // TODO: make it a path
@@ -229,7 +265,20 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	err = cmd.Run()
 	if err != nil {
-		return nil, err
+		cmderr := err
+
+		err = logFile.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		b, _ := os.ReadFile(logFile.Name())
+
+		if len(b) > 0 {
+			cmderr = errors.Join(cmderr, errors.New(string(b)))
+		}
+
+		return nil, cmderr
 	}
 
 	stat, err := logFile.Stat()

@@ -141,7 +141,7 @@ func (p *Plugin) builtinTarget(onTarget onTarget) BuiltinFunc {
 		}
 
 		// TODO: addr
-		return starlark.String(payload.Name), nil
+		return starlark.String("//" + pkg + ":" + payload.Name), nil
 	}
 }
 
@@ -192,8 +192,12 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
 	var payload OnTargetPayload
 	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, p OnTargetPayload) error {
-		payload = p
-		return nil // TODO: StopErr
+		if p.Package == req.Msg.Ref.Package && p.Name == req.Msg.Ref.Name {
+			payload = p
+			return nil // TODO: StopErr
+		}
+
+		return nil
 	})
 	if err != nil {
 		return nil, err

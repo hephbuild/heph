@@ -1,6 +1,9 @@
 package hlocks
 
-import "errors"
+import (
+	"errors"
+	"slices"
+)
 
 type Multi struct {
 	ls []func() error
@@ -16,7 +19,7 @@ func (m *Multi) Add(l func() error) {
 
 func (m *Multi) UnlockAll() error {
 	var errs error
-	for _, l := range m.ls {
+	for _, l := range slices.Backward(m.ls) {
 		err := l()
 		if err != nil {
 			errs = errors.Join(errs, err)

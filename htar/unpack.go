@@ -20,13 +20,32 @@ func UnpackFromPath(ctx context.Context, path string, to hfs.FS) error {
 	return Unpack(ctx, f, to)
 }
 
-func Unpack(ctx context.Context, r io.Reader, to hfs.FS) error {
+type Option func(c *config)
+
+func WithOnFile(onFile func(to string)) Option {
+	return func(c *config) {
+		c.onFile = onFile
+	}
+}
+
+type config struct {
+	onFile func(to string)
+}
+
+func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) error {
+	cfg := &config{
+		onFile: func(to string) {},
+	}
+	for _, option := range options {
+		option(cfg)
+	}
+
 	tr := tar.NewReader(r)
 
 	return Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
 		switch hdr.Typeflag {
 		case tar.TypeReg:
-			err := unpackFile(hdr, tr, to, false)
+			err := unpackFile(hdr, tr, to, false, cfg.onFile)
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
@@ -62,7 +81,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS) error {
 	})
 }
 
-func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool) error {
+func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func(to string)) error {
 	info, err := to.Lstat(hdr.Name)
 	if err != nil && !errors.Is(err, hfs.ErrNotExist) {
 		return err
@@ -72,6 +91,8 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool) error {
 		// The file is probably not changed... This should prevent an infinite loop of
 		// a file being codegen copy_noexclude & input to another target
 		if hdr.Size == info.Size() && hdr.ModTime == info.ModTime() {
+			onFile(info.Name())
+
 			return nil
 		}
 	}
@@ -86,6 +107,8 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool) error {
 		return err
 	}
 	defer f.Close()
+
+	defer onFile(f.Name())
 
 	_, err = io.CopyN(f, tr, hdr.Size)
 	if err != nil {

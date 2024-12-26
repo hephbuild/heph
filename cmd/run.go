@@ -65,11 +65,11 @@ func init() {
 			}
 
 			for _, output := range res.Outputs {
-				fmt.Println(output.Group)
-				fmt.Println("  ", output.Name)
-				fmt.Println("  ", output.Uri)
-				fmt.Println("  ", output.Type.String())
-				fmt.Println("  ", output.Encoding.String())
+				fmt.Println(output.Name)
+				fmt.Println("  group:    ", output.Group)
+				fmt.Println("  uri:      ", output.Uri)
+				fmt.Println("  type:     ", output.Type.String())
+				fmt.Println("  encoding: ", output.Encoding.String())
 			}
 
 			return nil

@@ -25,7 +25,9 @@ message Artifact {
   enum Type {
     TYPE_UNSPECIFIED = 0;
     TYPE_OUTPUT = 1;
-    TYPE_LOG = 2;
+    TYPE_OUTPUT_LIST_V1 = 2;
+    TYPE_LOG = 3;
+    TYPE_MANIFEST_V1 = 4;
   }
 
   enum Encoding {

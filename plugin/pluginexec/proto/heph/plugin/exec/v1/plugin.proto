@@ -8,8 +8,12 @@ message Target {
   }
 
   message Dep {
+    message TargetRef {
+      string package = 1;
+      string name = 2;
+    }
     repeated string files = 1;
-    repeated string targets = 2;
+    repeated TargetRef targets = 2;
   }
 
   repeated string run = 1;
