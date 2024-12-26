@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/hephv2/internal/flock"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/internal/hio"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -137,16 +137,16 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 					}
 
 					if os.Getpid() == pid {
-						hio.From(ctx).Debug(fmt.Sprintf("Another job locked %v, waiting...", l.name))
+						hlog.From(ctx).Debug(fmt.Sprintf("Another job locked %v, waiting...", l.name))
 					} else {
 						processDetails := getProcessDetails(pid)
 
-						hio.From(ctx).Debug(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name))
+						hlog.From(ctx).Debug(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name))
 					}
 
 					break
 				} else {
-					hio.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", l.name))
+					hlog.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", l.name))
 					time.Sleep(time.Second)
 				}
 			}

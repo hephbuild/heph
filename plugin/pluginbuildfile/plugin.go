@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hstarlark"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
@@ -161,7 +162,7 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 
 	thread := &starlark.Thread{
 		Print: func(thread *starlark.Thread, msg string) {
-			fmt.Println(msg)
+			hlog.From(ctx).Info(msg)
 		},
 	}
 	thread.SetLocal(ctxKey, ctx)

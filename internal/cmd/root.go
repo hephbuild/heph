@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"github.com/hephbuild/hephv2/internal/hio"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"log/slog"
@@ -42,12 +42,11 @@ func Execute() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	//ctx = hio.ContextWithHandler(ctx, hio.NewDefaultHandler())
-	//lh := hio.NewTermLogHandler(ctx, os.Stderr, &levelVar)
-	//defer lh.Close()
+	logger := hlog.NewStdoutLogger(&levelVar)
+	ctx = hlog.ContextWithLogger(ctx, logger)
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
-		hio.From(ctx).Err(err.Error())
+		logger.Error(err.Error())
 		os.Exit(1)
 	}
 }

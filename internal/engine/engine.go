@@ -1,8 +1,12 @@
 package engine
 
 import (
+	"connectrpc.com/connect"
+	"context"
 	"errors"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"os"
 	"path/filepath"
@@ -42,11 +46,20 @@ func Root() (string, error) {
 type Config struct {
 }
 
+type EngineHandle struct {
+	ServerHandle
+	Client interface {
+		corev1connect.LogServiceClient
+	}
+}
+
 type Engine struct {
 	Root    hfs.OS
 	Home    hfs.OS
 	Cache   hfs.OS
 	Sandbox hfs.OS
+
+	CoreHandle EngineHandle
 
 	Providers     []pluginv1connect.ProviderClient
 	Drivers       []pluginv1connect.DriverClient
@@ -54,16 +67,34 @@ type Engine struct {
 	DriversByName map[string]pluginv1connect.DriverClient
 }
 
-func New(root string, cfg Config) (*Engine, error) {
+func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	rootfs := hfs.NewOS(root)
 	homefs := hfs.At(rootfs, ".heph")
 	cachefs := hfs.At(homefs, "cache")
 	sandboxfs := hfs.At(homefs, "sandbox")
 
-	return &Engine{
+	e := &Engine{
 		Root:    rootfs,
 		Home:    homefs,
 		Cache:   cachefs,
 		Sandbox: sandboxfs,
-	}, nil
+	}
+
+	srvh, err := e.newServer()
+	if err != nil {
+		return nil, err
+	}
+
+	{
+		path, handler := corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx)))
+
+		srvh.Mux.Handle(path, handler)
+	}
+
+	e.CoreHandle = EngineHandle{
+		ServerHandle: srvh,
+		Client:       corev1connect.NewLogServiceClient(srvh.HttpClient(), srvh.BaseURL(), connect.WithInterceptors()),
+	}
+
+	return e, nil
 }

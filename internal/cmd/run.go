@@ -25,7 +25,7 @@ func init() {
 				return err
 			}
 
-			e, err := engine.New(root, engine.Config{})
+			e, err := engine.New(ctx, root, engine.Config{})
 			if err != nil {
 				return err
 			}
@@ -44,11 +44,6 @@ func init() {
 					return err
 				}
 			}
-
-			//ctx, err = c2.New(ctx, httpClient, addr)
-			//if err != nil {
-			//	return err
-			//}
 
 			ch := e.Result(ctx, args[0], args[1], []string{engine.AllOutputs}, engine.ResultOptions{
 				ExecOptions: engine.ExecOptions{

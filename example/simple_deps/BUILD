@@ -1,3 +1,5 @@
+print("in simple_deps")
+
 d1 = target(
     name = "d1",
     run = ["env | grep OUT", "echo hello > $OUT"],

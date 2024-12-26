@@ -17,6 +17,7 @@ require (
 	github.com/viney-shih/go-lock v1.1.2
 	github.com/zeebo/xxh3 v1.0.2
 	go.starlark.net v0.0.0-20231101134539-556fd59b42f6
+	golang.org/x/net v0.23.0
 	golang.org/x/sync v0.7.0
 	golang.org/x/sys v0.24.0
 	google.golang.org/protobuf v1.34.2

@@ -3,16 +3,22 @@ package engine
 import (
 	"connectrpc.com/connect"
 	"context"
-	"github.com/hephbuild/hephv2/plugin/c2"
+	"crypto/tls"
+	"github.com/hephbuild/hephv2/internal/hcore"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"net"
 	"net/http"
+	"time"
 )
 
 type ServerHandle struct {
 	Listener net.Listener
 	Mux      *http.ServeMux
+
+	client *http.Client
 }
 
 func (h ServerHandle) BaseURL() string {
@@ -20,7 +26,32 @@ func (h ServerHandle) BaseURL() string {
 }
 
 func (h ServerHandle) HttpClient() *http.Client {
-	return http.DefaultClient
+	return h.client
+}
+
+var httpClient2 = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+	Timeout: 0,
+}
+
+var httpClient = &http.Client{
+	Transport: &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			return net.Dial(network, addr)
+		},
+	},
 }
 
 func (e *Engine) newServer() (ServerHandle, error) {
@@ -33,15 +64,23 @@ func (e *Engine) newServer() (ServerHandle, error) {
 	mux := http.NewServeMux()
 
 	go func() {
-		if err := http.Serve(l, mux); err != nil {
+		h2s := &http2.Server{}
+		srv := &http.Server{Handler: h2c.NewHandler(mux, h2s)}
+
+		if err := srv.Serve(l); err != nil {
 			panic(err)
 		}
 	}()
 
-	return ServerHandle{
+	h := ServerHandle{
 		Listener: l,
 		Mux:      mux,
-	}, nil
+		client:   httpClient,
+	}
+
+	go h.client.Get(h.BaseURL()) // warmup the client
+
+	return h, nil
 }
 
 type RegisterMuxFunc = func(mux *http.ServeMux)
@@ -66,8 +105,28 @@ type ProviderHandle struct {
 	Client pluginv1connect.ProviderClient
 }
 
+type PluginInit struct {
+	CoreHandle EngineHandle
+}
+
+type PluginIniter interface {
+	PluginInit(context.Context, PluginInit) error
+}
+
+func (e *Engine) initPlugin(ctx context.Context, handler any) error {
+	if pi, ok := handler.(PluginIniter); ok {
+		err := pi.PluginInit(ctx, PluginInit{
+			CoreHandle: e.CoreHandle,
+		})
+
+		return err
+	}
+
+	return nil
+}
+
 func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {
-	path, h := pluginv1connect.NewProviderHandler(handler, connect.WithInterceptors(c2.NewInterceptor()))
+	path, h := pluginv1connect.NewProviderHandler(handler, connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.Client)))
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)
@@ -76,9 +135,14 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HttpClient(), pluginh.BaseURL(), connect.WithInterceptors(c2.NewInterceptor()))
+	client := pluginv1connect.NewProviderClient(pluginh.HttpClient(), pluginh.BaseURL())
 
 	e.Providers = append(e.Providers, client)
+
+	err = e.initPlugin(ctx, handler)
+	if err != nil {
+		return ProviderHandle{}, err
+	}
 
 	return ProviderHandle{
 		PluginHandle: pluginh,
@@ -92,7 +156,7 @@ type DriverHandle struct {
 }
 
 func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.DriverHandler, register RegisterMuxFunc) (DriverHandle, error) {
-	path, h := pluginv1connect.NewDriverHandler(handler, connect.WithInterceptors(c2.NewInterceptor()))
+	path, h := pluginv1connect.NewDriverHandler(handler, connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.Client)))
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)
@@ -104,7 +168,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HttpClient(), pluginh.BaseURL(), connect.WithInterceptors(c2.NewInterceptor()))
+	client := pluginv1connect.NewDriverClient(pluginh.HttpClient(), pluginh.BaseURL())
 
 	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
 	if err != nil {
@@ -121,6 +185,11 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 	e.Drivers = append(e.Drivers, client)
 	e.DriversByName[res.Msg.Name] = client
 	e.DriversHandle[client] = pluginh
+
+	err = e.initPlugin(ctx, handler)
+	if err != nil {
+		return DriverHandle{}, err
+	}
 
 	return DriverHandle{
 		PluginHandle: pluginh,

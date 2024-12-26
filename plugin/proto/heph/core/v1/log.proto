@@ -1,0 +1,21 @@
+syntax = "proto3";
+package heph.core.v1;
+
+message CreateRequest {
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    LEVEL_TRACE = 1;
+    LEVEL_INFO = 2;
+    LEVEL_WARN = 3;
+    LEVEL_ERROR = 4;
+  }
+
+  Level level = 1;
+  string message = 2;
+}
+
+message CreateResponse {}
+
+service LogService {
+  rpc Create(CreateRequest) returns (CreateResponse) {}
+}

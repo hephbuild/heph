@@ -3,7 +3,7 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/hio"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	golock "github.com/viney-shih/go-lock"
 )
 
@@ -26,7 +26,7 @@ func (m *mutex) Lock(ctx context.Context) error {
 		return nil
 	}
 
-	hio.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", m.name))
+	hlog.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", m.name))
 
 	m.m.TryLockWithContext(ctx)
 
@@ -49,7 +49,7 @@ func (m *mutex) RLock(ctx context.Context) error {
 		return nil
 	}
 
-	hio.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", m.name))
+	hlog.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", m.name))
 
 	m.m.RTryLockWithContext(ctx)
 

@@ -20,7 +20,7 @@ func TestEnv(t *testing.T) {
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 
-	e, err := engine.New(dir, engine.Config{})
+	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
