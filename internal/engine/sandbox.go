@@ -3,8 +3,8 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/hfs"
-	"github.com/hephbuild/hephv2/htar"
+	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"io"
 )

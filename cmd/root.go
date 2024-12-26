@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"github.com/hephbuild/hephv2/hio"
+	"github.com/hephbuild/hephv2/internal/hio"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"log/slog"

@@ -2,10 +2,10 @@ package enginee2e
 
 import (
 	"context"
-	"github.com/hephbuild/hephv2/engine"
-	"github.com/hephbuild/hephv2/hfs"
-	"github.com/hephbuild/hephv2/hfs/hfstest"
-	"github.com/hephbuild/hephv2/htar"
+	"github.com/hephbuild/hephv2/internal/engine"
+	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
+	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/hephbuild/hephv2/plugin/pluginstaticprovider"

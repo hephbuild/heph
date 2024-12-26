@@ -3,9 +3,9 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/flock"
-	"github.com/hephbuild/hephv2/hfs"
-	"github.com/hephbuild/hephv2/hio"
+	"github.com/hephbuild/hephv2/internal/flock"
+	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/internal/hio"
 	"os"
 	"path/filepath"
 	"strconv"

@@ -1,7 +1,7 @@
 package hfs
 
 import (
-	"github.com/hephbuild/hephv2/flock"
+	"github.com/hephbuild/hephv2/internal/flock"
 	"io/fs"
 	"os"
 	"path/filepath"

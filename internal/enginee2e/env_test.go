@@ -2,7 +2,7 @@ package enginee2e
 
 import (
 	"context"
-	"github.com/hephbuild/hephv2/engine"
+	"github.com/hephbuild/hephv2/internal/engine"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/hephbuild/hephv2/plugin/pluginstaticprovider"

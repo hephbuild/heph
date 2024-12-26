@@ -3,8 +3,8 @@ package pluginbuildfile
 import (
 	"connectrpc.com/connect"
 	"context"
-	"github.com/hephbuild/hephv2/hfs"
-	"github.com/hephbuild/hephv2/hfs/hfstest"
+	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/plugintest"
 	"github.com/stretchr/testify/assert"

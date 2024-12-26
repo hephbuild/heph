@@ -3,7 +3,7 @@ package htar
 import (
 	"archive/tar"
 	"fmt"
-	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/internal/hfs"
 	"io"
 	"os"
 	"path/filepath"

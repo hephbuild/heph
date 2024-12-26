@@ -1,4 +1,4 @@
-package xpanic
+package hpanic
 
 import (
 	"fmt"

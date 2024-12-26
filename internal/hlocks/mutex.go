@@ -3,7 +3,7 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/hio"
+	"github.com/hephbuild/hephv2/internal/hio"
 	golock "github.com/viney-shih/go-lock"
 )
 

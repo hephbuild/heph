@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/hephbuild/hephv2/engine"
-	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/internal/engine"
+	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/spf13/cobra"

@@ -2,7 +2,7 @@ package engine
 
 import (
 	"errors"
-	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"os"
 	"path/filepath"

@@ -5,7 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/hephv2/hmaps"
+	"github.com/hephbuild/hephv2/internal/hmaps"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"slices"
 )

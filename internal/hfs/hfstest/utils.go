@@ -1,7 +1,7 @@
 package hfstest
 
 import (
-	"github.com/hephbuild/hephv2/hfs"
+	"github.com/hephbuild/hephv2/internal/hfs"
 	"testing"
 )
 
