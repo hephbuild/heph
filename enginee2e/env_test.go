@@ -128,6 +128,59 @@ func TestEnv(t *testing.T) {
 				},
 			},
 		},
+
+		{
+			Spec: &pluginv1.TargetSpec{
+				Ref: &pluginv1.TargetRef{
+					Package: "",
+					Name:    "one_named_dep_no_out",
+					Driver:  "sh",
+				},
+				Config: map[string]*structpb.Value{
+					"run":  newValueMust([]any{`env | grep -v SRC`}),
+					"deps": newValueMust(map[string]any{"in1": "//:no_out"}),
+				},
+			},
+		},
+		{
+			Spec: &pluginv1.TargetSpec{
+				Ref: &pluginv1.TargetRef{
+					Package: "",
+					Name:    "one_named_dep_unamed_out",
+					Driver:  "sh",
+				},
+				Config: map[string]*structpb.Value{
+					"run":  newValueMust([]any{`echo $SRC_IN1`}),
+					"deps": newValueMust(map[string]any{"in1": "//:unamed_out"}),
+				},
+			},
+		},
+		{
+			Spec: &pluginv1.TargetSpec{
+				Ref: &pluginv1.TargetRef{
+					Package: "",
+					Name:    "one_named_dep_one_named_out_unspecified",
+					Driver:  "sh",
+				},
+				Config: map[string]*structpb.Value{
+					"run":  newValueMust([]any{`echo $SRC_IN1_OUT1`}),
+					"deps": newValueMust(map[string]any{"in1": "//:one_named_out"}),
+				},
+			},
+		},
+		{
+			Spec: &pluginv1.TargetSpec{
+				Ref: &pluginv1.TargetRef{
+					Package: "",
+					Name:    "one_named_dep_one_named_out_specified",
+					Driver:  "sh",
+				},
+				Config: map[string]*structpb.Value{
+					"run":  newValueMust([]any{`echo $SRC_IN1`}),
+					"deps": newValueMust(map[string]any{"in1": "//:one_named_out|out1"}),
+				},
+			},
+		},
 	})
 
 	_, err = e.RegisterProvider(ctx, staticprovider)
@@ -183,6 +236,11 @@ func TestEnv(t *testing.T) {
 			{"one_unamed_dep_unamed_out"},
 			{"one_unamed_dep_one_named_out_unspecified"},
 			{"one_unamed_dep_one_named_out_specified"},
+
+			{"one_named_dep_no_out"},
+			{"one_named_dep_unamed_out"},
+			{"one_named_dep_one_named_out_unspecified"},
+			{"one_named_dep_one_named_out_specified"},
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
