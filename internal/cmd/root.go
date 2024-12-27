@@ -2,15 +2,21 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 	"log/slog"
 	"os"
+	"runtime"
+	"runtime/pprof"
 )
 
 var plain bool
 var debug bool
+var cpuprofile string
+var cpuProfileFile *os.File
+var memprofile string
 
 var levelVar slog.LevelVar
 
@@ -27,7 +33,43 @@ var rootCmd = &cobra.Command{
 			levelVar.Set(slog.LevelInfo)
 		}
 
+		if cpuprofile != "" {
+			var err error
+			cpuProfileFile, err = os.Create(cpuprofile)
+			if err != nil {
+				return fmt.Errorf("could not create CPU profile: %w", err)
+			}
+			if err := pprof.StartCPUProfile(cpuProfileFile); err != nil {
+				return fmt.Errorf("could not start CPU profile: %w", err)
+			}
+		}
+
 		return nil
+	},
+	PersistentPostRun: func(cmd *cobra.Command, args []string) {
+		ctx := cmd.Context()
+
+		if cpuProfileFile != nil {
+			pprof.StopCPUProfile()
+			err := cpuProfileFile.Close()
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("could not close cpu profile: %v", err))
+				return
+			}
+		}
+
+		if memprofile != "" {
+			f, err := os.Create(memprofile)
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("could not create memory profile: %v", err))
+				return
+			}
+			defer f.Close()
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("could not write memory profile: %v", err))
+			}
+		}
 	},
 }
 
@@ -36,6 +78,9 @@ func init() {
 
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", !isTerm, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
+
+	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")
+	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
 }
 
 func Execute() {
