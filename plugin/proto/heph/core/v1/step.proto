@@ -1,6 +1,8 @@
 syntax = "proto3";
 package heph.core.v1;
 
+import "google/protobuf/timestamp.proto";
+
 message Step {
   enum Status {
     STATUS_UNSPECIFIED = 0;
@@ -12,6 +14,8 @@ message Step {
   string text = 3;
   Status status = 4;
   bool error = 5;
+  google.protobuf.Timestamp started_at = 6;
+  google.protobuf.Timestamp completed_at = 7;
 }
 
 message StepServiceCreateRequest {

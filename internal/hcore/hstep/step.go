@@ -3,9 +3,12 @@ package hstep
 import (
 	"connectrpc.com/connect"
 	"context"
+	"github.com/google/uuid"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"time"
 )
 
 type Step struct {
@@ -51,6 +54,7 @@ func (s *Step) Done() {
 
 	pbstep := s.getPbStep()
 	pbstep.Status = corev1.Step_STATUS_COMPLETED
+	pbstep.CompletedAt = timestamppb.New(time.Now())
 
 	s.pbstep = s.handleStep(s.ctx, pbstep)
 }
@@ -79,21 +83,46 @@ func ContextWithHandler(ctx context.Context, handler Handler) context.Context {
 func HandlerFromContext(ctx context.Context) Handler {
 	handler, ok := ctx.Value(ctxHandlerKey{}).(Handler)
 	if !ok {
-		handler = func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {
-			return pbstep
+		handler = func(ctx context.Context, step *corev1.Step) *corev1.Step {
+			return step
 		}
 	}
 
 	return handler
 }
 
+func ParentFromContext(ctx context.Context) (*corev1.Step, bool) {
+	parent, ok := ctx.Value(ctxStepKey{}).(*Step)
+	if !ok {
+		return nil, false
+	}
+
+	return parent.pbstep, true
+}
+
+func ContextWithParentId(ctx context.Context, parentId string) context.Context {
+	handler := HandlerFromContext(ctx)
+
+	step := &Step{
+		ctx:        context.WithoutCancel(ctx),
+		handleStep: handler,
+		pbstep: &corev1.Step{
+			Id: uuid.New().String(),
+		},
+	}
+
+	ctx = context.WithValue(ctx, ctxStepKey{}, step)
+
+	return ctx
+}
+
 func New(ctx context.Context, str string) (*Step, context.Context) {
 	handler := HandlerFromContext(ctx)
 
 	var parentId string
-	if parent, ok := ctx.Value(ctxStepKey{}).(*Step); ok {
-		if parent.pbstep != nil {
-			parentId = parent.pbstep.Id
+	if parent, ok := ParentFromContext(ctx); ok {
+		if parent != nil {
+			parentId = parent.Id
 		}
 	}
 
@@ -101,9 +130,11 @@ func New(ctx context.Context, str string) (*Step, context.Context) {
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
 		pbstep: &corev1.Step{
-			ParentId: parentId,
-			Text:     str,
-			Status:   corev1.Step_STATUS_RUNNING,
+			Id:        uuid.New().String(),
+			ParentId:  parentId,
+			Text:      str,
+			Status:    corev1.Step_STATUS_RUNNING,
+			StartedAt: timestamppb.New(time.Now()),
 		},
 	}
 

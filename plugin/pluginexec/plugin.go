@@ -74,7 +74,9 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 }
 
 func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
-	targetSpec, err := Decode[Spec](req.Msg.Spec.Config)
+	var targetSpec Spec
+	targetSpec.Cache = true
+	err := DecodeTo(req.Msg.Spec.Config, &targetSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +148,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			Def:            target,
 			Deps:           deps,
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
-			Cache:          true,
+			Cache:          targetSpec.Cache,
 			CollectOutputs: collectOutputs,
 			Codegen:        nil,
 		},

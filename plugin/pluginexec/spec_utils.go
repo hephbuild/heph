@@ -13,8 +13,13 @@ type MapstructureDecoder interface {
 
 func Decode[T any](from any) (T, error) {
 	var to T
+	err := DecodeTo(from, &to)
+	return to, err
+}
+
+func DecodeTo(from, to any) error {
 	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
-		Result: &to,
+		Result: to,
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(
 			mapstructure.DecodeHookFuncKind(func(_ reflect.Kind, _ reflect.Kind, v any) (any, error) {
 				if v, ok := v.(*structpb.Value); ok {
@@ -36,15 +41,15 @@ func Decode[T any](from any) (T, error) {
 		ErrorUnused: true,
 	})
 	if err != nil {
-		return to, err
+		return err
 	}
 
 	err = dec.Decode(from)
 	if err != nil {
-		return to, err
+		return err
 	}
 
-	return to, nil
+	return nil
 }
 
 func DecodeSlice[T any](v any) ([]T, error) {

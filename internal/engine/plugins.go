@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"github.com/hephbuild/hephv2/internal/hcore"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepconnect"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"golang.org/x/net/http2"
@@ -131,7 +132,10 @@ func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 }
 
 func (e *Engine) pluginInterceptor() connect.Option {
-	return connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient))
+	return connect.WithInterceptors(
+		hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient),
+		hstepconnect.Interceptor(),
+	)
 }
 
 func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {

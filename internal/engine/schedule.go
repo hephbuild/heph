@@ -9,6 +9,7 @@ import (
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/internal/hinstance"
 	"github.com/hephbuild/hephv2/internal/hlocks"
 	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
@@ -39,7 +40,8 @@ type ExecOptions struct {
 }
 
 type ResultOptions struct {
-	ExecOptions ExecOptions
+	ExecOptions             ExecOptions
+	ExecInteractiveCallback bool
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
@@ -200,6 +202,13 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		}
 	}
 
+	if !def.Cache {
+		_, err = h.WriteString(hinstance.UID)
+		if err != nil {
+			return "", err
+		}
+	}
+
 	hashin := hex.EncodeToString(h.Sum(nil))
 
 	return hashin, nil
@@ -211,9 +220,10 @@ type ExecuteResultOutput struct {
 }
 
 type ExecuteResult struct {
-	Err     error
-	Hashin  string
-	Outputs []ExecuteResultOutput
+	Err             error
+	Hashin          string
+	Outputs         []ExecuteResultOutput
+	ExecInteractive func(ExecOptions) <-chan *ExecuteResult
 }
 
 type ExecuteResultWithOrigin struct {
@@ -240,6 +250,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		// if the stdin connected was stdin, and we exec a command, stdin never closes, but the Read interface
 		// doesnt have a way to stop reading based on context cancellation, so this just hangs until there is a write into stdin,
 		// which makes Read return only to realise that the writer is gone and error out with io: read/write on closed pipe
+		// TODO: explore https://github.com/muesli/cancelreader
 		if false && stdinErrCh != nil {
 			err = errors.Join(err, <-stdinErrCh)
 		}

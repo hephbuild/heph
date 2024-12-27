@@ -63,11 +63,9 @@ func (l slogRpcHandler) WithGroup(name string) slog.Handler {
 }
 
 func NewRPCLogger(client corev1connect.LogServiceClient) *slog.Logger {
-	logger := slog.New(&slogRpcHandler{
+	return NewLogger(&slogRpcHandler{
 		innerSlogRpcHandler: &innerSlogRpcHandler{
 			client: client,
 		},
 	})
-
-	return logger
 }

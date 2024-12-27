@@ -12,7 +12,8 @@ type rpcHandler struct {
 }
 
 func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.StepServiceCreateRequest]) (*connect.Response[corev1.StepServiceCreateResponse], error) {
-	step := r.handler(ctx, req.Msg.Step)
+	step := req.Msg.Step
+	step = r.handler(ctx, step)
 
 	return connect.NewResponse(&corev1.StepServiceCreateResponse{Step: step}), nil
 }
