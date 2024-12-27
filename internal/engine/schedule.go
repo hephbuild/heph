@@ -227,6 +227,7 @@ type ExecuteResult struct {
 	Err             error
 	Hashin          string
 	Outputs         []ExecuteResultOutput
+	Executed        bool
 	ExecInteractive func(ExecOptions) <-chan *ExecuteResult
 }
 
@@ -519,8 +520,9 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	// TODO: cleanup sandbox
 
 	return &ExecuteResult{
-		Hashin:  hashin,
-		Outputs: execOutputs,
+		Hashin:   hashin,
+		Executed: true,
+		Outputs:  execOutputs,
 	}, nil
 }
 
@@ -530,9 +532,16 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, op
 		return nil, fmt.Errorf("execute: %v", err)
 	}
 
-	cachedArtifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Outputs)
-	if err != nil {
-		return nil, fmt.Errorf("cache locally: %v", err)
+	var cachedArtifacts []ExecuteResultOutput
+	if res.Executed {
+		artifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Outputs)
+		if err != nil {
+			return nil, fmt.Errorf("cache locally: %v", err)
+		}
+
+		cachedArtifacts = artifacts
+	} else {
+		cachedArtifacts = res.Outputs
 	}
 
 	return &ExecuteResult{

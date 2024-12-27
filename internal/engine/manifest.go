@@ -1,6 +1,9 @@
 package engine
 
-import pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+import (
+	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"time"
+)
 
 var ArtifactManifestName = "manifest.v1.json"
 
@@ -15,6 +18,7 @@ type ManifestArtifact struct {
 
 type Manifest struct {
 	Version   string
+	CreatedAt time.Time
 	Hashin    string
 	Artifacts []ManifestArtifact
 }

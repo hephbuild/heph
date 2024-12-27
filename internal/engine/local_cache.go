@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 )
 
 func parseUri(uri string) (string, string, error) {
@@ -128,8 +129,9 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	manifestfs := hfs.At(cachedir, ArtifactManifestName)
 
 	m := Manifest{
-		Version: "v1",
-		Hashin:  hashin,
+		Version:   "v1",
+		CreatedAt: time.Now(),
+		Hashin:    hashin,
 	}
 	for _, artifact := range cacheArtifacts {
 		m.Artifacts = append(m.Artifacts, ManifestArtifact{
@@ -152,15 +154,19 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	}
 
 	cacheArtifacts = append(cacheArtifacts, ExecuteResultOutput{
-		Artifact: &pluginv1.Artifact{
-			Name:     ArtifactManifestName,
-			Type:     pluginv1.Artifact_TYPE_MANIFEST_V1,
-			Encoding: pluginv1.Artifact_ENCODING_NONE,
-			Uri:      "file://" + manifestfs.Path(),
-		},
+		Artifact: manifestV1Artifact(cachedir),
 	})
 
 	return cacheArtifacts, nil
+}
+
+func manifestV1Artifact(fs hfs.OS) *pluginv1.Artifact {
+	return &pluginv1.Artifact{
+		Name:     ArtifactManifestName,
+		Type:     pluginv1.Artifact_TYPE_MANIFEST_V1,
+		Encoding: pluginv1.Artifact_ENCODING_NONE,
+		Uri:      "file://" + hfs.At(fs, ArtifactManifestName).Path(),
+	}
 }
 
 func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
@@ -235,6 +241,10 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 			},
 		})
 	}
+
+	execOutputs = append(execOutputs, ExecuteResultOutput{
+		Artifact: manifestV1Artifact(dirfs),
+	})
 
 	return &ExecuteResult{
 		Hashin:  manifest.Hashin,
