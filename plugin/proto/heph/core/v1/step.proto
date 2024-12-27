@@ -1,0 +1,27 @@
+syntax = "proto3";
+package heph.core.v1;
+
+message Step {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    STATUS_RUNNING = 1;
+    STATUS_COMPLETED = 2;
+  }
+  string id = 1;
+  string parent_id = 2;
+  string text = 3;
+  Status status = 4;
+  bool error = 5;
+}
+
+message StepServiceCreateRequest {
+  Step step = 1;
+}
+
+message StepServiceCreateResponse {
+  Step step = 1;
+}
+
+service StepService {
+  rpc Create(StepServiceCreateRequest) returns (StepServiceCreateResponse) {}
+}

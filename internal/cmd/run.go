@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"github.com/hephbuild/hephv2/internal/engine"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/spf13/cobra"
@@ -24,6 +28,12 @@ func init() {
 			if err != nil {
 				return err
 			}
+
+			ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {
+				hlog.From(ctx).Info(fmt.Sprintf("%v %v", pbstep.Text, pbstep.Status.String()))
+
+				return pbstep
+			})
 
 			e, err := engine.New(ctx, root, engine.Config{})
 			if err != nil {

@@ -54,7 +54,7 @@ var httpClient = &http.Client{
 	},
 }
 
-func (e *Engine) newServer() (ServerHandle, error) {
+func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:")
 	if err != nil {
 		return ServerHandle{}, err
@@ -65,7 +65,12 @@ func (e *Engine) newServer() (ServerHandle, error) {
 
 	go func() {
 		h2s := &http2.Server{}
-		srv := &http.Server{Handler: h2c.NewHandler(mux, h2s)}
+		srv := &http.Server{
+			Handler: h2c.NewHandler(mux, h2s),
+			BaseContext: func(listener net.Listener) context.Context {
+				return ctx
+			},
+		}
 
 		if err := srv.Serve(l); err != nil {
 			panic(err)
@@ -90,7 +95,7 @@ type PluginHandle struct {
 }
 
 func (e *Engine) RegisterPlugin(ctx context.Context, register RegisterMuxFunc) (PluginHandle, error) {
-	sh, err := e.newServer()
+	sh, err := e.newServer(ctx)
 	if err != nil {
 		return PluginHandle{}, err
 	}
@@ -125,8 +130,12 @@ func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 	return nil
 }
 
+func (e *Engine) pluginInterceptor() connect.Option {
+	return connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient))
+}
+
 func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {
-	path, h := pluginv1connect.NewProviderHandler(handler, connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.Client)))
+	path, h := pluginv1connect.NewProviderHandler(handler, e.pluginInterceptor())
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)
@@ -156,7 +165,7 @@ type DriverHandle struct {
 }
 
 func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.DriverHandler, register RegisterMuxFunc) (DriverHandle, error) {
-	path, h := pluginv1connect.NewDriverHandler(handler, connect.WithInterceptors(hcore.NewInterceptor(e.CoreHandle.Client)))
+	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor())
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)

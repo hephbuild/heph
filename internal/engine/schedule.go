@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/dlsniper/debugger"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hlocks"
 	"github.com/hephbuild/hephv2/internal/htar"
@@ -44,6 +45,9 @@ type ResultOptions struct {
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
 	ch := make(chan *ExecuteResult)
 	go func() {
+		step, ctx := hstep.New(ctx, fmt.Sprintf("//%v:%v", pkg, name))
+		defer step.Done()
+
 		defer close(ch)
 		res, err := e.innerResult(ctx, pkg, name, outputs, options)
 		if err != nil {
@@ -52,6 +56,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 		}
 
 		if res.Err != nil {
+			step.SetError()
 			res.Err = fmt.Errorf("%v:%v %w", pkg, name, res.Err)
 		}
 
@@ -378,7 +383,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	}
 
-	fmt.Printf("Executing %v:%v\n", def.Ref.Package, def.Ref.Name)
+	step, ctx := hstep.New(ctx, "Running...")
+	defer step.Done()
 
 	inputArtifacts, err := SetupSandbox(ctx, results, workdirfs)
 	if err != nil {

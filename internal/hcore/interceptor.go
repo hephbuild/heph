@@ -4,23 +4,30 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 )
 
-func NewInterceptor(logClient corev1connect.LogServiceClient) *Interceptor {
-	return &Interceptor{logClient: logClient}
+func NewInterceptor(
+	logClient corev1connect.LogServiceClient,
+	stepClient corev1connect.StepServiceClient,
+) *Interceptor {
+	return &Interceptor{
+		logClient:  logClient,
+		stepClient: stepClient,
+	}
 }
 
 var _ connect.Interceptor = (*Interceptor)(nil)
 
 type Interceptor struct {
-	logClient corev1connect.LogServiceClient
+	logClient  corev1connect.LogServiceClient
+	stepClient corev1connect.StepServiceClient
 }
 
 func (i Interceptor) handlerSide(ctx context.Context) context.Context {
-	logger := hlog.NewRPCLogger(i.logClient)
-
-	ctx = hlog.ContextWithLogger(ctx, logger)
+	ctx = hlog.ContextWithLogger(ctx, hlog.NewRPCLogger(i.logClient))
+	ctx = hstep.ContextWithRPCHandler(ctx, i.stepClient)
 
 	return ctx
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/dlsniper/debugger"
 	"github.com/google/uuid"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -240,6 +241,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 			fmt.Sprintf("hephv2/pluginexec %v: %v %v", p.name, req.Msg.Target.Ref.Package, req.Msg.Target.Ref.Name), "",
 		}
 	})
+
+	step, ctx := hstep.New(ctx, "Executing...")
+	defer step.Done()
 
 	for len(req.Msg.Pipes) < 3 {
 		req.Msg.Pipes = append(req.Msg.Pipes, "")

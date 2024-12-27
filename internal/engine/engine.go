@@ -1,10 +1,10 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -48,9 +48,8 @@ type Config struct {
 
 type EngineHandle struct {
 	ServerHandle
-	Client interface {
-		corev1connect.LogServiceClient
-	}
+	LogClient  corev1connect.LogServiceClient
+	StepClient corev1connect.StepServiceClient
 }
 
 type Engine struct {
@@ -80,7 +79,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		Sandbox: sandboxfs,
 	}
 
-	srvh, err := e.newServer()
+	srvh, err := e.newServer(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -91,9 +90,16 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		srvh.Mux.Handle(path, handler)
 	}
 
+	{
+		path, handler := corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)))
+
+		srvh.Mux.Handle(path, handler)
+	}
+
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
-		Client:       corev1connect.NewLogServiceClient(srvh.HttpClient(), srvh.BaseURL(), connect.WithInterceptors()),
+		LogClient:    corev1connect.NewLogServiceClient(srvh.HttpClient(), srvh.BaseURL()),
+		StepClient:   corev1connect.NewStepServiceClient(srvh.HttpClient(), srvh.BaseURL()),
 	}
 
 	return e, nil
