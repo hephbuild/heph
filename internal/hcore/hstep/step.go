@@ -59,6 +59,10 @@ func (s *Step) Done() {
 	s.pbstep = s.handleStep(s.ctx, pbstep)
 }
 
+func (s *Step) GetId() string {
+	return s.pbstep.Id
+}
+
 type ctxStepKey struct{}
 type ctxHandlerKey struct{}
 
@@ -91,13 +95,17 @@ func HandlerFromContext(ctx context.Context) Handler {
 	return handler
 }
 
-func ParentFromContext(ctx context.Context) (*corev1.Step, bool) {
+func From(ctx context.Context) *Step {
 	parent, ok := ctx.Value(ctxStepKey{}).(*Step)
 	if !ok {
-		return nil, false
+		return &Step{pbstep: &corev1.Step{}}
 	}
 
-	return parent.pbstep, true
+	return parent
+}
+
+func WithoutParent(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxStepKey{}, nil)
 }
 
 func ContextWithParentId(ctx context.Context, parentId string) context.Context {
@@ -107,7 +115,7 @@ func ContextWithParentId(ctx context.Context, parentId string) context.Context {
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
 		pbstep: &corev1.Step{
-			Id: uuid.New().String(),
+			Id: parentId,
 		},
 	}
 
@@ -120,10 +128,8 @@ func New(ctx context.Context, str string) (*Step, context.Context) {
 	handler := HandlerFromContext(ctx)
 
 	var parentId string
-	if parent, ok := ParentFromContext(ctx); ok {
-		if parent != nil {
-			parentId = parent.Id
-		}
+	if parent := From(ctx); parent.GetId() != "" {
+		parentId = parent.GetId()
 	}
 
 	step := &Step{

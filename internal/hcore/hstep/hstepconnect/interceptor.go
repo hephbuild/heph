@@ -12,9 +12,9 @@ func Interceptor() connect.Interceptor {
 	return connect.UnaryInterceptorFunc(func(next connect.UnaryFunc) connect.UnaryFunc {
 		return func(ctx context.Context, request connect.AnyRequest) (connect.AnyResponse, error) {
 			if request.Spec().IsClient {
-				step, ok := hstep.ParentFromContext(ctx)
-				if ok {
-					request.Header().Set(stepParentIdHeaderKey, step.Id)
+				step := hstep.From(ctx)
+				if step.GetId() != "" {
+					request.Header().Set(stepParentIdHeaderKey, step.GetId())
 				}
 			} else {
 				ctx = hstep.ContextWithParentId(ctx, request.Header().Get(stepParentIdHeaderKey))

@@ -47,6 +47,7 @@ type ResultOptions struct {
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
 	ch := make(chan *ExecuteResult)
 	go func() {
+		ctx = hstep.WithoutParent(ctx)
 		step, ctx := hstep.New(ctx, fmt.Sprintf("//%v:%v", pkg, name))
 		defer step.Done()
 
@@ -144,6 +145,9 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 		}
 
 		if ok {
+			step := hstep.From(ctx)
+			step.SetText(fmt.Sprintf("//%v:%v: cached", pkg, name))
+
 			return res, nil
 		}
 

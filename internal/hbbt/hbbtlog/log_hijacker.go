@@ -18,7 +18,6 @@ type Hijacker struct {
 type hijackerData struct {
 	mode atomic.Value
 	cond *sync.Cond
-	wg   sync.WaitGroup
 }
 
 func (h Hijacker) GetMode() LogHijackerMode {
@@ -44,8 +43,6 @@ func (h Hijacker) GetModeWait() LogHijackerMode {
 }
 
 func (h Hijacker) SetMode(mode LogHijackerMode) {
-	h.wg.Wait()
-
 	h.cond.L.Lock()
 	h.mode.Store(mode)
 	h.cond.L.Unlock()
@@ -73,23 +70,10 @@ func (h Hijacker) Handler(next hlog.HandleFunc, ctx context.Context, record slog
 	case LogHijackerModeDisabled:
 		return next(ctx, record)
 	case LogHijackerModeHijack:
-		h.wg.Add(1)
-		doneCh := h.Send(record.Clone())
-		go func() {
-			<-doneCh
-			defer h.wg.Done()
-		}()
+		h.Send(record.Clone())
 	}
 
 	return nil
-}
-
-func (h Hijacker) WaitAdd() {
-	h.wg.Add(1)
-}
-
-func (h Hijacker) WaitDone() {
-	h.wg.Done()
 }
 
 type LogHijackerMode int

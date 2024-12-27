@@ -148,7 +148,7 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HttpClient(), pluginh.BaseURL())
+	client := pluginv1connect.NewProviderClient(pluginh.HttpClient(), pluginh.BaseURL(), e.pluginInterceptor())
 
 	e.Providers = append(e.Providers, client)
 
@@ -181,7 +181,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HttpClient(), pluginh.BaseURL())
+	client := pluginv1connect.NewDriverClient(pluginh.HttpClient(), pluginh.BaseURL(), e.pluginInterceptor())
 
 	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
 	if err != nil {

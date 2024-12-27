@@ -38,12 +38,10 @@ func initialModel(ctx context.Context) Model {
 
 	ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
 		if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
-			m.log.WaitAdd()
 			select {
 			case m.stepCh <- step:
 			default:
 				hlog.From(ctx).Info(step.String())
-				m.log.WaitDone()
 			}
 		} else {
 			hlog.From(ctx).Info(step.String())
@@ -92,7 +90,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case *corev1.Step:
 		m.steps[msg.Id] = msg
 
-		m.log.WaitDone()
 		cmds = append(cmds, m.nextStep())
 	case resetStepsMsg:
 		m.steps = map[string]*corev1.Step{}
