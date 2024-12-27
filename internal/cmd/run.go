@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -53,6 +54,7 @@ func init() {
 
 				ch := e.Result(ctx, args[0], args[1], []string{engine.AllOutputs}, engine.ResultOptions{
 					ExecInteractiveCallback: true,
+					Shell:                   shell,
 				})
 
 				res := <-ch
@@ -62,9 +64,9 @@ func init() {
 				if res.ExecInteractive != nil {
 					outputs, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) ([]engine.ExecuteResultOutput, error) {
 						res := <-res.ExecInteractive(engine.ExecOptions{
-							Stdin:  stdin,
-							Stdout: stdout,
-							Stderr: stderr,
+							Stdin:  os.Stdin,
+							Stdout: os.Stdout,
+							Stderr: os.Stderr,
 						})
 
 						if res.Err != nil {

@@ -34,7 +34,7 @@ type pipe struct {
 	busy atomic.Bool
 }
 
-type RunToExecArgsFunc = func(run []string, termargs []string) []string
+type RunToExecArgsFunc = func(sandboxPath string, run []string, termargs []string) []string
 
 type Plugin struct {
 	name          string
@@ -309,7 +309,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		}
 	}
 
-	args := p.runToExecArgs(t.Run, nil)
+	args := p.runToExecArgs(req.Msg.SandboxPath, t.Run, nil)
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Env = env
@@ -395,7 +395,7 @@ func WithName(name string) Option {
 func New(options ...Option) *Plugin {
 	p := &Plugin{
 		pipes: map[string]*pipe{},
-		runToExecArgs: func(run []string, termargs []string) []string {
+		runToExecArgs: func(sandboxPath string, run []string, termargs []string) []string {
 			return append(run, termargs...)
 		},
 		name: "exec",
@@ -418,7 +418,7 @@ func bashArgs(so, lo []string) []string {
 }
 
 func NewBash(options ...Option) *Plugin {
-	options = append(options, WithRunToExecArgs(func(run []string, termargs []string) []string {
+	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
 		args := bashArgs(
 			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},
 			[]string{"--norc"},
@@ -437,6 +437,29 @@ func NewBash(options ...Option) *Plugin {
 	return New(options...)
 }
 
+func NewInteractiveBash(options ...Option) *Plugin {
+	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
+		content, err := RenderInitFile(strings.Join(run, "\n"))
+		if err != nil {
+			// TODO: log
+		}
+
+		initfilePath := filepath.Join(sandboxPath, "init.sh")
+
+		err = os.WriteFile(initfilePath, []byte(content), 0644)
+		if err != nil {
+			// TODO: log
+		}
+
+		return bashArgs(
+			nil,
+			[]string{"--rcfile", initfilePath},
+		)
+	}), WithName("bash"))
+
+	return New(options...)
+}
+
 func shArgs(initfile string, so []string) []string {
 	base := []string{"sh"}
 	if initfile != "" {
@@ -446,7 +469,7 @@ func shArgs(initfile string, so []string) []string {
 }
 
 func NewSh(options ...Option) *Plugin {
-	options = append(options, WithRunToExecArgs(func(run []string, termargs []string) []string {
+	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
 		args := shArgs(
 			"",
 			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},

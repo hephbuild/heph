@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtch"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 )
@@ -85,9 +86,11 @@ const (
 )
 
 func NewLogHijacker() Hijacker {
+	renderer := hlog.NewRenderer(os.Stderr)
+
 	h := Hijacker{
 		Model: hbbtch.New[slog.Record](func(record slog.Record) tea.Cmd {
-			return tea.Println(record.Message)
+			return tea.Println(hlog.FormatRecord(renderer, record))
 		}),
 		hijackerData: &hijackerData{
 			cond: sync.NewCond(&sync.Mutex{}),

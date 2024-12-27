@@ -2,15 +2,15 @@ package termui
 
 import (
 	"context"
-	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/internal/htime"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -41,10 +41,10 @@ func initialModel(ctx context.Context) Model {
 			select {
 			case m.stepCh <- step:
 			default:
-				hlog.From(ctx).Info(step.String())
+				hlog.From(ctx).Info(hstepfmt.Format(step, false))
 			}
 		} else {
-			hlog.From(ctx).Info(step.String())
+			hlog.From(ctx).Info(hstepfmt.Format(step, false))
 		}
 
 		return step
@@ -107,19 +107,9 @@ func printTree(children map[string][]*corev1.Step, indent, id string) string {
 
 	for _, step := range children[id] {
 		sb.WriteString(indent)
-		t := time.Since(step.StartedAt.AsTime())
-		status := " "
-		switch step.Status {
-		case corev1.Step_STATUS_RUNNING:
-			status = "R"
-		case corev1.Step_STATUS_COMPLETED:
-			status = "C"
-			t = step.CompletedAt.AsTime().Sub(step.StartedAt.AsTime())
-		}
-
-		sb.WriteString(fmt.Sprintf("%v %v %v", status, htime.FormatFixedWidthDuration(t), step.Text))
+		sb.WriteString(hstepfmt.Format(step, true))
 		sb.WriteString("\n")
-		sb.WriteString(printTree(children, "  "+indent, step.Id))
+		sb.WriteString(printTree(children, "└ "+indent, step.Id))
 	}
 
 	return sb.String()
@@ -143,7 +133,6 @@ func (m Model) buildStepsTree() string {
 func (m Model) View() string {
 	var sb strings.Builder
 
-	sb.WriteString("=== STEPS ===\n")
 	sb.WriteString(m.buildStepsTree())
 
 	return sb.String()
@@ -153,7 +142,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 	errCh := make(chan error, 1)
 	m := initialModel(ctx)
 
-	p := tea.NewProgram(m)
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr))
 	go func() {
 		errCh <- f(m.ctx, m, p.Send)
 		p.Send(tea.Quit())

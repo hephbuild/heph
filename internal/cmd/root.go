@@ -87,7 +87,7 @@ func Execute() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	logger := hlog.NewStdoutLogger(&levelVar)
+	logger := hlog.NewTextLogger(os.Stderr, &levelVar)
 	ctx = hlog.ContextWithLogger(ctx, logger)
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {

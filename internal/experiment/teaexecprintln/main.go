@@ -110,7 +110,7 @@ func (m model) View() string {
 func main() {
 	ctx := context.Background()
 
-	logger := hlog.NewStdoutLogger(slog.LevelDebug)
+	logger := hlog.NewTextLogger(os.Stderr, slog.LevelDebug)
 	ctx = hlog.ContextWithLogger(ctx, logger)
 
 	initialModel := model{

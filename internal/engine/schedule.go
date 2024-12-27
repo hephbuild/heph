@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/dlsniper/debugger"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hinstance"
@@ -37,14 +38,19 @@ type ExecOptions struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	ExecInteractiveCallback bool
 }
 
 type ResultOptions struct {
 	ExecOptions             ExecOptions
 	ExecInteractiveCallback bool
+	Shell                   bool
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
+	options.ExecOptions.ExecInteractiveCallback = options.ExecInteractiveCallback
+
 	ch := make(chan *ExecuteResult)
 	go func() {
 		ctx = hstep.WithoutParent(ctx)
@@ -242,7 +248,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 	return nil, false, nil
 }
 
-func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient, options ExecOptions) ([]string, func() error, func(), error) {
+func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient, options ExecOptions) ([]string, func() error, error) {
 	pipes := []string{"", "", ""}
 	eg := &errgroup.Group{}
 
@@ -250,6 +256,8 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	var stdinErrCh chan error
 
 	wait := func() error {
+		stdincancel()
+
 		err := eg.Wait()
 		// this is complicated...
 		// if the stdin connected was stdin, and we exec a command, stdin never closes, but the Read interface
@@ -270,7 +278,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 		if err != nil {
-			return nil, wait, stdincancel, err
+			return nil, wait, err
 		}
 
 		pipes[0] = res.Msg.Id
@@ -297,7 +305,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	if options.Stdout != nil {
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 		if err != nil {
-			return nil, wait, stdincancel, err
+			return nil, wait, err
 		}
 
 		pipes[1] = res.Msg.Id
@@ -317,7 +325,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	if options.Stderr != nil {
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 		if err != nil {
-			return nil, wait, stdincancel, err
+			return nil, wait, err
 		}
 
 		pipes[2] = res.Msg.Id
@@ -334,7 +342,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		})
 	}
 
-	return pipes, wait, stdincancel, nil
+	return pipes, wait, nil
 }
 
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
@@ -416,114 +424,139 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("modified while creating sandbox")
 	}
 
-	pipes, pipesWait, pipeStdinCancel, err := e.pipes(ctx, driver, options)
-	if err != nil {
-		return nil, fmt.Errorf("pipes: %w", err)
-	}
-
-	res, err := driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
-		Target:      def.TargetDef,
-		SandboxPath: sandboxfs.Path(),
-		Inputs:      inputArtifacts,
-		Pipes:       pipes,
-	}))
-	pipeStdinCancel()
-	if err := pipesWait(); err != nil {
-		fmt.Println("PIPESEG", err)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("run: %w", err)
-	}
-
-	cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
-	var execOutputs []ExecuteResultOutput
-
-	for _, output := range def.CollectOutputs {
-		tarname := output.Group + ".tar"
-		tarf, err := hfs.Create(cachefs, tarname)
+	doStuff := func(options ExecOptions) (*ExecuteResult, error) {
+		pipes, pipesWait, err := e.pipes(ctx, driver, options)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("pipes: %w", err)
 		}
-		defer tarf.Close()
 
-		tar := htar.NewPacker(tarf)
-		for _, path := range output.Paths {
-			// TODO: glob
+		res, err := driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+			Target:      def.TargetDef,
+			SandboxPath: sandboxfs.Path(),
+			Inputs:      inputArtifacts,
+			Pipes:       pipes,
+		}))
+		if err := pipesWait(); err != nil {
+			hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
+		}
+		if err != nil {
+			return nil, fmt.Errorf("run: %w", err)
+		}
 
-			f, err := hfs.Open(workdirfs, path)
+		cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
+		var execOutputs []ExecuteResultOutput
+
+		for _, output := range def.CollectOutputs {
+			tarname := output.Group + ".tar"
+			tarf, err := hfs.Create(cachefs, tarname)
 			if err != nil {
-				return nil, fmt.Errorf("collect: open: %w", err)
+				return nil, err
 			}
-			defer f.Close()
+			defer tarf.Close()
 
-			err = tar.WriteFile(f, path)
+			tar := htar.NewPacker(tarf)
+			for _, path := range output.Paths {
+				// TODO: glob
+
+				f, err := hfs.Open(workdirfs, path)
+				if err != nil {
+					return nil, fmt.Errorf("collect: open: %w", err)
+				}
+				defer f.Close()
+
+				err = tar.WriteFile(f, path)
+				if err != nil {
+					return nil, err
+				}
+
+				err = f.Close()
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			err = tarf.Close()
 			if err != nil {
 				return nil, err
 			}
 
-			err = f.Close()
+			tarf, err = hfs.Open(cachefs, tarname)
 			if err != nil {
 				return nil, err
 			}
+
+			h := xxh3.New()
+
+			_, err = io.Copy(h, tarf)
+			if err != nil {
+				return nil, err
+			}
+
+			hashout := hex.EncodeToString(h.Sum(nil))
+
+			execOutputs = append(execOutputs, ExecuteResultOutput{
+				Hashout: hashout,
+				Artifact: &pluginv1.Artifact{
+					Group:    output.Group,
+					Name:     tarname,
+					Type:     pluginv1.Artifact_TYPE_OUTPUT,
+					Encoding: pluginv1.Artifact_ENCODING_TAR,
+					Uri:      "file://" + tarf.Name(),
+				},
+			})
 		}
 
-		err = tarf.Close()
-		if err != nil {
-			return nil, err
+		for _, artifact := range res.Msg.Artifacts {
+			if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
+				continue
+			}
+
+			//panic("copy to cache not implemented yet")
+
+			// TODO: copy to cache
+			//hfs.Copy()
+			//
+			//artifact.Uri
+			//
+			//execOutputs = append(execOutputs, ExecuteResultOutput{
+			//	Name:    artifact.Group,
+			//	Hashout: "",
+			//	TarPath: "",
+			//})
 		}
 
-		tarf, err = hfs.Open(cachefs, tarname)
-		if err != nil {
-			return nil, err
-		}
+		// TODO: cleanup sandbox
 
-		h := xxh3.New()
+		return &ExecuteResult{
+			Hashin:   hashin,
+			Executed: true,
+			Outputs:  execOutputs,
+		}, nil
+	}
 
-		_, err = io.Copy(h, tarf)
-		if err != nil {
-			return nil, err
-		}
+	if options.ExecInteractiveCallback {
+		return &ExecuteResult{
+			Hashin:   hashin,
+			Executed: true,
+			ExecInteractive: func(options ExecOptions) <-chan *ExecuteResult {
+				ch := make(chan *ExecuteResult)
 
-		hashout := hex.EncodeToString(h.Sum(nil))
+				go func() {
+					res, err := doStuff(options)
+					if err != nil {
+						ch <- &ExecuteResult{Err: err}
+						return
+					}
 
-		execOutputs = append(execOutputs, ExecuteResultOutput{
-			Hashout: hashout,
-			Artifact: &pluginv1.Artifact{
-				Group:    output.Group,
-				Name:     tarname,
-				Type:     pluginv1.Artifact_TYPE_OUTPUT,
-				Encoding: pluginv1.Artifact_ENCODING_TAR,
-				Uri:      "file://" + tarf.Name(),
+					ch <- res
+				}()
+
+				return ch
 			},
-		})
+		}, nil
+	} else {
+		return doStuff(options)
 	}
-
-	for _, artifact := range res.Msg.Artifacts {
-		if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
-			continue
-		}
-
-		//panic("copy to cache not implemented yet")
-
-		// TODO: copy to cache
-		//hfs.Copy()
-		//
-		//artifact.Uri
-		//
-		//execOutputs = append(execOutputs, ExecuteResultOutput{
-		//	Name:    artifact.Group,
-		//	Hashout: "",
-		//	TarPath: "",
-		//})
-	}
-
-	// TODO: cleanup sandbox
-
-	return &ExecuteResult{
-		Hashin:   hashin,
-		Executed: true,
-		Outputs:  execOutputs,
-	}, nil
 }
 
 func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
