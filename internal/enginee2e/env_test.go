@@ -204,7 +204,6 @@ func TestEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				_ = e.Cache.RemoveAll("")
 				ch := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{})
 
 				res := <-ch
@@ -245,7 +244,6 @@ func TestEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				_ = e.Cache.RemoveAll("")
 				ch := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{})
 
 				res := <-ch

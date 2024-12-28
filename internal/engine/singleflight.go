@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/hephbuild/hephv2/internal/hproto"
 	"slices"
-	"strings"
 	"sync"
 )
 
@@ -68,7 +67,10 @@ func (h *singleflightResultHandle) send(result *ExecuteResult) {
 func (s *singleflightResult) getHandle(ctx context.Context, pkg string, name string, outputs []string) (*singleflightResultHandle, bool) {
 	outputs = slices.Clone(outputs)
 	slices.Sort(outputs)
-	key := fmt.Sprintf("%s %s %s", pkg, name, strings.Join(outputs, ":"))
+	if len(outputs) == 0 {
+		outputs = nil
+	}
+	key := fmt.Sprintf("%s %s %#v", pkg, name, outputs)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

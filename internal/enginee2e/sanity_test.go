@@ -3,9 +3,9 @@ package enginee2e
 import (
 	"context"
 	"github.com/hephbuild/hephv2/internal/engine"
+	"github.com/hephbuild/hephv2/internal/hartifact"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
-	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/hephbuild/hephv2/plugin/pluginstaticprovider"
@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
 	"os"
-	"strings"
 	"testing"
 )
 
@@ -66,10 +65,8 @@ func TestSanity(t *testing.T) {
 
 	require.Len(t, res.Outputs, 2)
 
-	path := strings.TrimPrefix(res.Outputs[0].Uri, "file://")
-
 	fs2 := hfstest.New(t)
-	err = htar.UnpackFromPath(ctx, path, fs2)
+	err = hartifact.Unpack(ctx, res.Outputs[0].Artifact, fs2)
 	require.NoError(t, err)
 
 	b, err := hfs.ReadFile(fs2, "out")
