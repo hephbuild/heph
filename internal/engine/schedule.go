@@ -21,7 +21,6 @@ import (
 	"google.golang.org/protobuf/proto"
 	"io"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 )
@@ -42,75 +41,6 @@ type ResultOptions struct {
 	Singleflight *Singleflight
 }
 
-type Singleflight struct {
-	mu sync.Mutex
-	m  map[string]*SingleflightHandle
-}
-
-type SingleflightHandle struct {
-	mu  sync.Mutex
-	res *ExecuteResult
-	chs []chan *ExecuteResult
-}
-
-func (h *SingleflightHandle) newCh() <-chan *ExecuteResult {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	ch := make(chan *ExecuteResult, 1)
-	if h.res != nil {
-		ch <- h.res
-		return ch
-	}
-
-	h.chs = append(h.chs, ch)
-
-	return ch
-}
-
-func (h *SingleflightHandle) send(result *ExecuteResult) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.res = result
-	for _, ch := range h.chs {
-		ch <- h.res
-		close(ch)
-	}
-
-	h.chs = nil
-}
-
-func (s *Singleflight) getHandle(ctx context.Context, pkg string, name string, outputs []string) (*SingleflightHandle, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	outputs = slices.Clone(outputs)
-	slices.Sort(outputs)
-	key := fmt.Sprintf("%s %s %s", pkg, name, strings.Join(outputs, ":"))
-
-	isNew := false
-
-	if s.m == nil {
-		s.m = make(map[string]*SingleflightHandle)
-	}
-
-	h, ok := s.m[key]
-	if !ok {
-		isNew = true
-		h = &SingleflightHandle{}
-	}
-	s.m[key] = h
-
-	return h, isNew
-}
-
-func (s *Singleflight) Register(ctx context.Context, pkg string, name string, outputs []string) (<-chan *ExecuteResult, func(result *ExecuteResult), bool) {
-	h, isNew := s.getHandle(ctx, pkg, name, outputs)
-
-	return h.newCh(), h.send, isNew
-}
-
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteResult {
 	if options.Singleflight == nil {
 		options.Singleflight = &Singleflight{}
@@ -120,7 +50,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 
 	ctx = hstep.WithoutParent(ctx)
 
-	ch, send, isNew := options.Singleflight.Register(ctx, pkg, name, outputs)
+	ch, send, isNew := options.Singleflight.Result(ctx, pkg, name, outputs)
 	if !isNew {
 		return ch
 	}
