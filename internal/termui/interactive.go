@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
+	"github.com/hephbuild/hephv2/internal/hpanic"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"maps"
 	"os"
@@ -31,25 +32,25 @@ func initialModel(ctx context.Context) Model {
 	steps := map[string]*corev1.Step{}
 	m := Model{
 		log:    hbbtlog.NewLogHijacker(),
-		stepCh: make(chan *corev1.Step, 100),
+		stepCh: make(chan *corev1.Step),
 		steps:  steps,
 	}
 
 	ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
 
-	ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
-		if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
-			select {
-			case m.stepCh <- step:
-			default:
-				hlog.From(ctx).Info(hstepfmt.Format(step, false))
-			}
-		} else {
-			hlog.From(ctx).Info(hstepfmt.Format(step, false))
-		}
-
-		return step
-	})
+	//ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
+	//	if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
+	//		select {
+	//		case m.stepCh <- step:
+	//			//default:
+	//			//	hlog.From(ctx).Info(hstepfmt.Format(step, false))
+	//		}
+	//	} else {
+	//		hlog.From(ctx).Info(hstepfmt.Format(step, false))
+	//	}
+	//
+	//	return step
+	//})
 
 	ctx, m.Exec = hbbtexec.New(ctx, m.log)
 
@@ -159,7 +160,21 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr))
 	go func() {
-		errCh <- f(m.ctx, m, p.Send)
+		m.ctx = hstep.ContextWithHandler(m.ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
+			if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
+				p.Send(step)
+			} else {
+				hlog.From(ctx).Info(hstepfmt.Format(step, false))
+			}
+
+			return step
+		})
+
+		err := hpanic.Recover(func() error {
+			return f(m.ctx, m, p.Send)
+		})
+
+		errCh <- err
 		p.Send(tea.Quit())
 	}()
 

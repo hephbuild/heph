@@ -4,20 +4,18 @@ import (
 	"context"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"github.com/stretchr/testify/assert"
-	"strconv"
-	"sync/atomic"
+	"slices"
 	"testing"
 )
 
 func TestSanity(t *testing.T) {
 	ctx := context.Background()
 
-	var i atomic.Int32
 	var steps []*corev1.Step
-
 	ctx = ContextWithHandler(ctx, func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {
-		if pbstep.Id == "" {
-			pbstep.Id = strconv.Itoa(int(i.Add(1)))
+		if !slices.ContainsFunc(steps, func(s *corev1.Step) bool {
+			return s.Id == pbstep.Id
+		}) {
 			steps = append(steps, pbstep)
 		}
 

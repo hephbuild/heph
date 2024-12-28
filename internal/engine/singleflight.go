@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/hephv2/internal/hproto"
 	"slices"
 	"strings"
 	"sync"
@@ -23,13 +24,24 @@ type singleflightResultHandle struct {
 	chs []chan *ExecuteResult
 }
 
+func (h *singleflightResultHandle) getRes() *ExecuteResult {
+	res := *h.res
+	res.Outputs = slices.Clone(res.Outputs)
+
+	for i, output := range res.Outputs {
+		res.Outputs[i].Artifact = hproto.Clone(output.Artifact)
+	}
+
+	return &res
+}
+
 func (h *singleflightResultHandle) newCh() <-chan *ExecuteResult {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	ch := make(chan *ExecuteResult, 1)
 	if h.res != nil {
-		ch <- h.res
+		ch <- h.getRes()
 		return ch
 	}
 
@@ -43,8 +55,10 @@ func (h *singleflightResultHandle) send(result *ExecuteResult) {
 	defer h.mu.Unlock()
 
 	h.res = result
+	h.res = h.getRes() // make a copy
+
 	for _, ch := range h.chs {
-		ch <- h.res
+		ch <- h.getRes()
 		close(ch)
 	}
 
@@ -52,12 +66,12 @@ func (h *singleflightResultHandle) send(result *ExecuteResult) {
 }
 
 func (s *singleflightResult) getHandle(ctx context.Context, pkg string, name string, outputs []string) (*singleflightResultHandle, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	outputs = slices.Clone(outputs)
 	slices.Sort(outputs)
 	key := fmt.Sprintf("%s %s %s", pkg, name, strings.Join(outputs, ":"))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if s.m == nil {
 		s.m = make(map[string]*singleflightResultHandle)

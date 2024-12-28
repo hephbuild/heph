@@ -17,8 +17,9 @@ import (
 )
 
 type Plugin struct {
-	repoRoot hfs.FS
-	cache    Cache
+	repoRoot    hfs.FS
+	cacheget    CacheGet
+	cacherunpkg CacheRunpkg
 }
 
 func New(fs hfs.FS) *Plugin {
@@ -27,7 +28,7 @@ func New(fs hfs.FS) *Plugin {
 	}
 }
 
-type onTarget = func(ctx context.Context, payload OnTargetPayload) error
+type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
 	err := hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
@@ -62,16 +63,13 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 	return nil
 }
 
-func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTarget) (starlark.StringDict, error) {
-	res, err := p.runPkgInner(ctx, pkg, onTarget)
-	if err != nil {
-		return nil, err
-	}
-
-	return res, nil
+func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, pkg, onTarget, func(onTarget onTargetFunc) (starlark.StringDict, error) {
+		return p.runPkgInner(ctx, pkg, onTarget)
+	})
 }
 
-func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTarget) (starlark.StringDict, error) {
+func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetFunc) (starlark.StringDict, error) {
 	fs := hfs.At(p.repoRoot, pkg)
 	// TODO: parametrize
 	f, err := hfs.Open(fs, "BUILD")
@@ -97,7 +95,7 @@ type OnTargetPayload struct {
 
 type BuiltinFunc = func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error)
 
-func (p *Plugin) builtinTarget(onTarget onTarget) BuiltinFunc {
+func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 	return func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		ctx := thread.Local(ctxKey).(context.Context)
 		pkg := thread.Local(packageKey).(string)
@@ -150,7 +148,7 @@ const (
 	packageKey = "__pkg"
 )
 
-func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTarget) (starlark.StringDict, error) {
+func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc) (starlark.StringDict, error) {
 	universe := starlark.StringDict{
 		"target": starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
 	}
@@ -197,7 +195,7 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 }
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	spec, err := p.cache.Singleflight(ctx, req.Msg.Ref, func() (*pluginv1.TargetSpec, error) {
+	spec, err := p.cacheget.Singleflight(ctx, req.Msg.Ref, func() (*pluginv1.TargetSpec, error) {
 		return p.getInner(ctx, req)
 	})
 	if err != nil {
@@ -210,10 +208,6 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 }
 
 func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
-	if spec, ok := p.cache.Get(ctx, req.Msg.Ref); ok {
-		return spec, nil
-	}
-
 	var payload OnTargetPayload
 	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, p OnTargetPayload) error {
 		if p.Package == req.Msg.Ref.Package && p.Name == req.Msg.Ref.Name {
@@ -250,8 +244,6 @@ func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.Get
 		Ref:    ref,
 		Config: config,
 	}
-
-	p.cache.Set(ctx, req.Msg.Ref, spec)
 
 	return spec, nil
 }

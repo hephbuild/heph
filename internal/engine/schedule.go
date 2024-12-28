@@ -61,6 +61,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 
 		res, err := e.innerResult(ctx, pkg, name, outputs, options)
 		if err != nil {
+			step.SetError()
 			send(&ExecuteResult{Err: fmt.Errorf("%v:%v %w", pkg, name, err)})
 			return
 		}
@@ -170,6 +171,15 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 		outputs = def.Outputs
 	}
 
+	var targetfolder string
+	if def.Cache {
+		targetfolder = "__" + def.Ref.Name
+	} else {
+		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
+	}
+
+	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "result.lock")
+
 	if def.Cache {
 		res, ok, err := e.ResultFromCache(ctx, def, outputs, options.Singleflight)
 		if err != nil {
@@ -179,15 +189,6 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 		if ok {
 			return res, nil
 		}
-
-		var targetfolder string
-		if def.Cache {
-			targetfolder = "__" + def.Ref.Name
-		} else {
-			targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
-		}
-
-		l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "result.lock")
 
 		err = l.Lock(ctx)
 		if err != nil {
@@ -203,6 +204,18 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 
 		return e.ExecuteAndCache(ctx, def, options.ExecOptions, options.Singleflight)
 	} else {
+		err = l.Lock(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			err := l.Unlock()
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("failed unlocking: %v", err))
+			}
+		}()
+
 		return e.Execute(ctx, def, options.ExecOptions, options.Singleflight)
 	}
 }

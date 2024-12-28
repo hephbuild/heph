@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hmaps"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"slices"
@@ -38,6 +39,10 @@ func (e *Engine) GetDefFromRef(ctx context.Context, ref Refish) (*pluginv1.Targe
 }
 
 func (e *Engine) GetDef(ctx context.Context, pkg, name string) (*pluginv1.TargetDef, error) {
+	// put back when we have custom ids
+	//step, ctx := hstep.New(ctx, "Getting definition...")
+	//defer step.Done()
+
 	spec, err := e.GetSpec(ctx, pkg, name)
 	if err != nil {
 		return nil, err
@@ -111,6 +116,9 @@ type LightLinkedTarget struct {
 }
 
 func (e *Engine) LightLink(ctx context.Context, pkg, name string) (*LightLinkedTarget, error) {
+	step, ctx := hstep.New(ctx, "Linking...")
+	defer step.Done()
+
 	def, err := e.GetDef(ctx, pkg, name)
 	if err != nil {
 		return nil, err
