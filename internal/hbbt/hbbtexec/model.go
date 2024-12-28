@@ -1,11 +1,9 @@
 package hbbtexec
 
 import (
-	"context"
 	"errors"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"io"
 )
 
@@ -46,7 +44,7 @@ type execCmdWrapper struct {
 }
 
 func (e *execCmdWrapper) Run() error {
-	// 4. pause the logs, since bbt will take control of the term again
+	// 3. pause the logs, since bbt will take control of the term again
 	//defer e.w.Write([]byte("\n"))
 	defer e.hijacker.SetMode(hbbtlog.LogHijackerModeWait)
 
@@ -54,7 +52,7 @@ func (e *execCmdWrapper) Run() error {
 }
 
 func (e *execCmdWrapper) SetStdin(r io.Reader) {
-	// 3. resume the logs, but without hijacking since bbt doesnt control the term anymore
+	// 2. resume the logs, but without hijacking since bbt doesnt control the term anymore
 	e.hijacker.SetMode(hbbtlog.LogHijackerModeDisabled)
 
 	e.c.SetStdin(r)
@@ -129,7 +127,7 @@ func Run[T any](m Model, send func(tea.Msg), f ExecFunc[T]) (T, error) {
 
 func (m Model) Exec(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
 	return func() tea.Msg {
-		// 2. before starting, pause the logs
+		// 1. before starting, pause the logs
 		m.hijacker.SetMode(hbbtlog.LogHijackerModeWait)
 
 		cc := &execCmdWrapper{
@@ -138,7 +136,7 @@ func (m Model) Exec(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
 		}
 
 		return tea.Exec(cc, func(err error) tea.Msg {
-			// 5. resume the logs, but since bbt controls the term, send them to bbt
+			// 4. resume the logs, but since bbt controls the term, send them to bbt
 			m.hijacker.SetMode(hbbtlog.LogHijackerModeHijack)
 
 			var cmd tea.Msg
@@ -151,13 +149,13 @@ func (m Model) Exec(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
 	}
 }
 
-func New(ctx context.Context, hijacker hbbtlog.Hijacker) (context.Context, Model) {
-	// 1. set the hijacker in ctx
-	ctx = hlog.NewContextWithHijacker(ctx, hijacker.Handler)
-
+// New creates an exec controller, hijacker must be set in context:
+//
+//	ctx = hlog.NewContextWithHijacker(ctx, hijacker.Handler)
+func New(hijacker hbbtlog.Hijacker) Model {
 	m := Model{
 		hijacker: hijacker,
 	}
 
-	return ctx, m
+	return m
 }

@@ -19,7 +19,6 @@ import (
 
 type execCmd struct {
 	w   io.Writer
-	log hbbtlog.Hijacker
 	ctx context.Context
 }
 
@@ -72,9 +71,6 @@ type model struct {
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		m.log.Init(),
-		m.exec.Exec(&execCmd{ctx: m.ctx, log: m.log}, func(err error) tea.Msg {
-			return tea.Quit()
-		}),
 		tickEvery(),
 	)
 }
@@ -117,9 +113,21 @@ func main() {
 		ctx: ctx,
 		log: hbbtlog.NewLogHijacker(),
 	}
-	initialModel.ctx, initialModel.exec = hbbtexec.New(initialModel.ctx, initialModel.log)
+	ctx = hlog.NewContextWithHijacker(ctx, initialModel.log.Handler)
+	initialModel.ctx = ctx
+	initialModel.exec = hbbtexec.New(initialModel.log)
 
-	if _, err := tea.NewProgram(initialModel).Run(); err != nil {
+	p := tea.NewProgram(initialModel)
+
+	go func() {
+		p.Send(
+			initialModel.exec.Exec(&execCmd{ctx: ctx}, func(err error) tea.Msg {
+				return tea.Quit()
+			}),
+		)
+	}()
+
+	if _, err := p.Run(); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
 	}

@@ -19,8 +19,6 @@ import (
 )
 
 type Model struct {
-	ctx context.Context
-
 	log  hbbtlog.Hijacker
 	Exec hbbtexec.Model
 
@@ -28,33 +26,14 @@ type Model struct {
 	steps  map[string]*corev1.Step
 }
 
-func initialModel(ctx context.Context) Model {
+func initialModel() Model {
 	steps := map[string]*corev1.Step{}
 	m := Model{
 		log:    hbbtlog.NewLogHijacker(),
 		stepCh: make(chan *corev1.Step),
 		steps:  steps,
 	}
-
-	ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
-
-	//ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
-	//	if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
-	//		select {
-	//		case m.stepCh <- step:
-	//			//default:
-	//			//	hlog.From(ctx).Info(hstepfmt.Format(step, false))
-	//		}
-	//	} else {
-	//		hlog.From(ctx).Info(hstepfmt.Format(step, false))
-	//	}
-	//
-	//	return step
-	//})
-
-	ctx, m.Exec = hbbtexec.New(ctx, m.log)
-
-	m.ctx = ctx
+	m.Exec = hbbtexec.New(m.log)
 
 	return m
 }
@@ -156,11 +135,14 @@ func (m Model) View() string {
 
 func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, send func(tea.Msg)) error) error {
 	errCh := make(chan error, 1)
-	m := initialModel(ctx)
+	m := initialModel()
 
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr))
 	go func() {
-		m.ctx = hstep.ContextWithHandler(m.ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
+		ctx := ctx
+		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
+
+		ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
 			if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
 				p.Send(step)
 			} else {
@@ -171,7 +153,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 		})
 
 		err := hpanic.Recover(func() error {
-			return f(m.ctx, m, p.Send)
+			return f(ctx, m, p.Send)
 		})
 
 		errCh <- err
