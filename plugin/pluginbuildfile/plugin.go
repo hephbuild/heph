@@ -18,6 +18,7 @@ import (
 
 type Plugin struct {
 	repoRoot hfs.FS
+	cache    Cache
 }
 
 func New(fs hfs.FS) *Plugin {
@@ -196,6 +197,23 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 }
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
+	spec, err := p.cache.Singleflight(ctx, req.Msg.Ref, func() (*pluginv1.TargetSpec, error) {
+		return p.getInner(ctx, req)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return connect.NewResponse(&pluginv1.GetResponse{
+		Spec: spec,
+	}), nil
+}
+
+func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
+	if spec, ok := p.cache.Get(ctx, req.Msg.Ref); ok {
+		return spec, nil
+	}
+
 	var payload OnTargetPayload
 	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, p OnTargetPayload) error {
 		if p.Package == req.Msg.Ref.Package && p.Name == req.Msg.Ref.Name {
@@ -228,12 +246,14 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		config[k] = pv
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref:    ref,
-			Config: config,
-		},
-	}), nil
+	spec := &pluginv1.TargetSpec{
+		Ref:    ref,
+		Config: config,
+	}
+
+	p.cache.Set(ctx, req.Msg.Ref, spec)
+
+	return spec, nil
 }
 
 var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
