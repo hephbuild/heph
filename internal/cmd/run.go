@@ -53,8 +53,20 @@ func init() {
 				}
 
 				ch := e.Result(ctx, args[0], args[1], []string{engine.AllOutputs}, engine.ResultOptions{
-					ExecInteractiveCallback: true,
-					Shell:                   shell,
+					InteractiveExec: func(run func(engine.ExecOptions)) error {
+						_, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) (struct{}, error) {
+							run(engine.ExecOptions{
+								Stdin:  os.Stdin,
+								Stdout: os.Stdout,
+								Stderr: os.Stderr,
+							})
+
+							return struct{}{}, nil
+						})
+
+						return err
+					},
+					Shell: shell,
 				})
 
 				res := <-ch
@@ -64,27 +76,6 @@ func init() {
 				}
 
 				outputs := res.Outputs
-
-				if res.ExecInteractive != nil {
-					outputs, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) ([]engine.ExecuteResultOutput, error) {
-						res := <-res.ExecInteractive(engine.ExecOptions{
-							Stdin:  os.Stdin,
-							Stdout: os.Stdout,
-							Stderr: os.Stderr,
-						})
-
-						if res.Err != nil {
-							return nil, res.Err
-						}
-
-						return res.Outputs, nil
-					})
-					if err != nil {
-						return err
-					}
-				}
-
-				send(termui.ResetSteps())
 
 				// TODO how to render res natively without exec
 				_, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) (*engine.ExecuteResult, error) {

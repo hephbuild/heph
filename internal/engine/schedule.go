@@ -30,13 +30,13 @@ type ExecOptions struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	ExecInteractiveCallback bool
+	interactiveExec func(run func(ExecOptions)) error
 }
 
 type ResultOptions struct {
-	ExecOptions             ExecOptions
-	ExecInteractiveCallback bool
-	Shell                   bool
+	ExecOptions     ExecOptions
+	InteractiveExec func(run func(ExecOptions)) error
+	Shell           bool
 
 	Singleflight *Singleflight
 }
@@ -46,7 +46,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 		options.Singleflight = &Singleflight{}
 	}
 
-	options.ExecOptions.ExecInteractiveCallback = options.ExecInteractiveCallback
+	options.ExecOptions.interactiveExec = options.InteractiveExec
 
 	ctx = hstep.WithoutParent(ctx)
 
@@ -278,11 +278,10 @@ type ExecuteResultOutput struct {
 }
 
 type ExecuteResult struct {
-	Err             error
-	Hashin          string
-	Outputs         []ExecuteResultOutput
-	Executed        bool
-	ExecInteractive func(ExecOptions) <-chan *ExecuteResult
+	Err      error
+	Hashin   string
+	Outputs  []ExecuteResultOutput
+	Executed bool
 }
 
 type ExecuteResultWithOrigin struct {
@@ -459,13 +458,23 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("modified while creating sandbox")
 	}
 
-	doStuff := func(options ExecOptions) (*ExecuteResult, error) {
+	if options.interactiveExec == nil {
+		options.interactiveExec = func(run func(ExecOptions)) error {
+			run(options)
+			return nil
+		}
+	}
+
+	var runRes *connect.Response[pluginv1.RunResponse]
+	var runErr error
+	err = options.interactiveExec(func(options ExecOptions) {
 		pipes, pipesWait, err := e.pipes(ctx, driver, options)
 		if err != nil {
-			return nil, fmt.Errorf("pipes: %w", err)
+			runErr = err
+			return
 		}
 
-		res, err := driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
 			Target:      def.TargetDef,
 			SandboxPath: sandboxfs.Path(),
 			Inputs:      inputArtifacts,
@@ -474,124 +483,101 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		if err := pipesWait(); err != nil {
 			hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
 		}
+	})
+	err = errors.Join(err, runErr)
+	if err != nil {
+		return nil, fmt.Errorf("run: %w", err)
+	}
+
+	cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
+	var execOutputs []ExecuteResultOutput
+
+	for _, output := range def.CollectOutputs {
+		tarname := output.Group + ".tar"
+		tarf, err := hfs.Create(cachefs, tarname)
 		if err != nil {
-			return nil, fmt.Errorf("run: %w", err)
+			return nil, err
+		}
+		defer tarf.Close()
+
+		tar := htar.NewPacker(tarf)
+		for _, path := range output.Paths {
+			// TODO: glob
+
+			f, err := hfs.Open(workdirfs, path)
+			if err != nil {
+				return nil, fmt.Errorf("collect: open: %w", err)
+			}
+			defer f.Close()
+
+			err = tar.WriteFile(f, path)
+			if err != nil {
+				return nil, err
+			}
+
+			err = f.Close()
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
-		var execOutputs []ExecuteResultOutput
-
-		for _, output := range def.CollectOutputs {
-			tarname := output.Group + ".tar"
-			tarf, err := hfs.Create(cachefs, tarname)
-			if err != nil {
-				return nil, err
-			}
-			defer tarf.Close()
-
-			tar := htar.NewPacker(tarf)
-			for _, path := range output.Paths {
-				// TODO: glob
-
-				f, err := hfs.Open(workdirfs, path)
-				if err != nil {
-					return nil, fmt.Errorf("collect: open: %w", err)
-				}
-				defer f.Close()
-
-				err = tar.WriteFile(f, path)
-				if err != nil {
-					return nil, err
-				}
-
-				err = f.Close()
-				if err != nil {
-					return nil, err
-				}
-			}
-
-			err = tarf.Close()
-			if err != nil {
-				return nil, err
-			}
-
-			tarf, err = hfs.Open(cachefs, tarname)
-			if err != nil {
-				return nil, err
-			}
-
-			h := xxh3.New()
-
-			_, err = io.Copy(h, tarf)
-			if err != nil {
-				return nil, err
-			}
-
-			hashout := hex.EncodeToString(h.Sum(nil))
-
-			execOutputs = append(execOutputs, ExecuteResultOutput{
-				Hashout: hashout,
-				Artifact: &pluginv1.Artifact{
-					Group:    output.Group,
-					Name:     tarname,
-					Type:     pluginv1.Artifact_TYPE_OUTPUT,
-					Encoding: pluginv1.Artifact_ENCODING_TAR,
-					Uri:      "file://" + tarf.Name(),
-				},
-			})
+		err = tarf.Close()
+		if err != nil {
+			return nil, err
 		}
 
-		for _, artifact := range res.Msg.Artifacts {
-			if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
-				continue
-			}
-
-			//panic("copy to cache not implemented yet")
-
-			// TODO: copy to cache
-			//hfs.Copy()
-			//
-			//artifact.Uri
-			//
-			//execOutputs = append(execOutputs, ExecuteResultOutput{
-			//	Name:    artifact.Group,
-			//	Hashout: "",
-			//	TarPath: "",
-			//})
+		tarf, err = hfs.Open(cachefs, tarname)
+		if err != nil {
+			return nil, err
 		}
 
-		// TODO: cleanup sandbox
+		h := xxh3.New()
 
-		return &ExecuteResult{
-			Hashin:   hashin,
-			Executed: true,
-			Outputs:  execOutputs,
-		}, nil
-	}
+		_, err = io.Copy(h, tarf)
+		if err != nil {
+			return nil, err
+		}
 
-	if options.ExecInteractiveCallback {
-		return &ExecuteResult{
-			Hashin:   hashin,
-			Executed: true,
-			ExecInteractive: func(options ExecOptions) <-chan *ExecuteResult {
-				ch := make(chan *ExecuteResult)
+		hashout := hex.EncodeToString(h.Sum(nil))
 
-				go func() {
-					res, err := doStuff(options)
-					if err != nil {
-						ch <- &ExecuteResult{Err: err}
-						return
-					}
-
-					ch <- res
-				}()
-
-				return ch
+		execOutputs = append(execOutputs, ExecuteResultOutput{
+			Hashout: hashout,
+			Artifact: &pluginv1.Artifact{
+				Group:    output.Group,
+				Name:     tarname,
+				Type:     pluginv1.Artifact_TYPE_OUTPUT,
+				Encoding: pluginv1.Artifact_ENCODING_TAR,
+				Uri:      "file://" + tarf.Name(),
 			},
-		}, nil
-	} else {
-		return doStuff(options)
+		})
 	}
+
+	for _, artifact := range runRes.Msg.Artifacts {
+		if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
+			continue
+		}
+
+		//panic("copy to cache not implemented yet")
+
+		// TODO: copy to cache
+		//hfs.Copy()
+		//
+		//artifact.Uri
+		//
+		//execOutputs = append(execOutputs, ExecuteResultOutput{
+		//	Name:    artifact.Group,
+		//	Hashout: "",
+		//	TarPath: "",
+		//})
+	}
+
+	// TODO: cleanup sandbox
+
+	return &ExecuteResult{
+		Hashin:   hashin,
+		Executed: true,
+		Outputs:  execOutputs,
+	}, nil
 }
 
 func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {

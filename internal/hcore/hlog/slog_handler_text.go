@@ -4,7 +4,6 @@ import (
 	"context"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/hephv2/internal/hlipgloss"
-	"github.com/muesli/termenv"
 	"io"
 	"log/slog"
 	"strings"
@@ -65,7 +64,7 @@ type Renderer struct {
 }
 
 func NewRenderer(w io.Writer) Renderer {
-	r := lipgloss.NewRenderer(w, hlipgloss.EnvForceTTY(), termenv.WithColorCache(true))
+	r := hlipgloss.NewRenderer(w)
 
 	lvlStyles := map[slog.Level]lipgloss.Style{}
 	for lvl, color := range levelColors {

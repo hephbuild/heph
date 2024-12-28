@@ -19,7 +19,7 @@ def genDeps(n, prefix, deep):
         t = target(
             name = "{}{}".format(prefix, i),
             run = [
-                "sleep 0.1",
+                "sleep 0.5",
                 "echo running {} {}".format(prefix, i),
                 "echo hello > $OUT",
             ],

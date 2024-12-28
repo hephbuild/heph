@@ -1,7 +1,9 @@
 package hlipgloss
 
 import (
+	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
+	"io"
 	"os"
 	"strconv"
 )
@@ -18,4 +20,8 @@ func EnvForceTTY() termenv.OutputOption {
 	}
 
 	return func(output *termenv.Output) {}
+}
+
+func NewRenderer(w io.Writer) *lipgloss.Renderer {
+	return lipgloss.NewRenderer(w, EnvForceTTY(), termenv.WithColorCache(true))
 }

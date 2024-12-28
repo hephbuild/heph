@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"sync"
 )
 
 var plain bool
@@ -19,6 +20,10 @@ var cpuProfileFile *os.File
 var memprofile string
 
 var levelVar slog.LevelVar
+
+var isTerm = sync.OnceValue(func() bool {
+	return isatty.IsTerminal(os.Stderr.Fd())
+})
 
 func init() {
 	levelVar.Set(slog.LevelDebug)
@@ -75,9 +80,7 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
-	isTerm := isatty.IsTerminal(os.Stderr.Fd())
-
-	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", !isTerm, "disable terminal UI")
+	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
 
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")

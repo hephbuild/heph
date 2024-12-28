@@ -3,12 +3,14 @@ package termui
 import (
 	"context"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/tree"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
+	"github.com/hephbuild/hephv2/internal/hlipgloss"
 	"github.com/hephbuild/hephv2/internal/hpanic"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"maps"
@@ -19,8 +21,12 @@ import (
 )
 
 type Model struct {
-	log  hbbtlog.Hijacker
-	Exec hbbtexec.Model
+	log      hbbtlog.Hijacker
+	Exec     hbbtexec.Model
+	renderer *lipgloss.Renderer
+
+	width  int
+	height int
 
 	stepCh chan *corev1.Step
 	steps  map[string]*corev1.Step
@@ -29,9 +35,10 @@ type Model struct {
 func initialModel() Model {
 	steps := map[string]*corev1.Step{}
 	m := Model{
-		log:    hbbtlog.NewLogHijacker(),
-		stepCh: make(chan *corev1.Step),
-		steps:  steps,
+		log:      hbbtlog.NewLogHijacker(),
+		stepCh:   make(chan *corev1.Step),
+		steps:    steps,
+		renderer: hlipgloss.NewRenderer(os.Stderr),
 	}
 	m.Exec = hbbtexec.New(m.log)
 
@@ -56,14 +63,6 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.log.Init(), m.nextStep(), m.nextTick())
 }
 
-func ResetSteps() tea.Cmd {
-	return func() tea.Msg {
-		return resetStepsMsg{}
-	}
-}
-
-type resetStepsMsg struct{}
-
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
@@ -71,15 +70,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case *corev1.Step:
 		m.steps[msg.Id] = msg
 
-		if msg.Status == corev1.Step_STATUS_COMPLETED && msg.ParentId != "" {
+		if msg.Status == corev1.Step_STATUS_COMPLETED {
+			if msg.ParentId == "" {
+				cmds = append(cmds, tea.Println(hstepfmt.Format(m.renderer, msg, false)))
+			}
+
 			delete(m.steps, msg.Id)
 		}
 
 		cmds = append(cmds, m.nextStep())
-	case resetStepsMsg:
-		m.steps = map[string]*corev1.Step{}
 	case tickMsg:
 		cmds = append(cmds, m.nextTick())
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
 	}
 
 	cmds, m.log = ChildUpdate(cmds, msg, m.log)
@@ -87,11 +91,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func printTree(children map[string][]*corev1.Step, root string, id string) *tree.Tree {
+func (m Model) printTree(children map[string][]*corev1.Step, root string, id string) *tree.Tree {
 	t := tree.Root(root)
 
 	for _, step := range children[id] {
-		t = t.Child(printTree(children, hstepfmt.Format(step, true), step.Id))
+		t = t.Child(m.printTree(children, hstepfmt.Format(m.renderer, step, true), step.Id))
 	}
 
 	return t
@@ -109,7 +113,7 @@ func (m Model) buildStepsTree() string {
 		})
 	}
 
-	t := printTree(children, "", "").
+	t := m.printTree(children, "", "").
 		Enumerator(func(children tree.Children, index int) string {
 			if children.Length()-1 == index {
 				return "╰─"
@@ -126,7 +130,15 @@ func (m Model) buildStepsTree() string {
 			return "│ "
 		})
 
-	return t.String() + "\n"
+	s := t.String()
+	if m.height > 0 {
+		s = lipgloss.NewStyle().MaxHeight(m.height).Render(s)
+	}
+	if len(s) > 0 {
+		s += "\n"
+	}
+
+	return s
 }
 
 func (m Model) View() string {
@@ -150,7 +162,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 			if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
 				p.Send(step)
 			} else {
-				hlog.From(ctx).Info(hstepfmt.Format(step, false))
+				hlog.From(ctx).Info(hstepfmt.Format(m.renderer, step, false))
 			}
 
 			return step
