@@ -3,6 +3,7 @@ package termui
 import (
 	"context"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss/tree"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
@@ -102,17 +103,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func printTree(children map[string][]*corev1.Step, indent, id string) string {
-	var sb strings.Builder
+func printTree(children map[string][]*corev1.Step, root string, id string) *tree.Tree {
+	t := tree.Root(root)
 
 	for _, step := range children[id] {
-		sb.WriteString(indent)
-		sb.WriteString(hstepfmt.Format(step, true))
-		sb.WriteString("\n")
-		sb.WriteString(printTree(children, "└ "+indent, step.Id))
+		t = t.Child(printTree(children, hstepfmt.Format(step, true), step.Id))
 	}
 
-	return sb.String()
+	return t
 }
 
 func (m Model) buildStepsTree() string {
@@ -127,7 +125,24 @@ func (m Model) buildStepsTree() string {
 		})
 	}
 
-	return printTree(children, "", "")
+	t := printTree(children, "", "").
+		Enumerator(func(children tree.Children, index int) string {
+			if children.Length()-1 == index {
+				return "╰─"
+			}
+			if index == 0 {
+				return "╭─"
+			}
+			return "├─"
+		}).
+		Indenter(func(children tree.Children, index int) string {
+			if children.Length()-1 == index {
+				return "  "
+			}
+			return "│ "
+		})
+
+	return t.String() + "\n"
 }
 
 func (m Model) View() string {
