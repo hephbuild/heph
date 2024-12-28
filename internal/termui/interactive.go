@@ -71,6 +71,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case *corev1.Step:
 		m.steps[msg.Id] = msg
 
+		if msg.Status == corev1.Step_STATUS_COMPLETED && msg.ParentId != "" {
+			delete(m.steps, msg.Id)
+		}
+
 		cmds = append(cmds, m.nextStep())
 	case resetStepsMsg:
 		m.steps = map[string]*corev1.Step{}
