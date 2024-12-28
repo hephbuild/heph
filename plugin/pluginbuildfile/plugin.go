@@ -12,14 +12,12 @@ import (
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
-	"golang.org/x/sync/singleflight"
 	"google.golang.org/protobuf/types/known/structpb"
 	iofs "io/fs"
 )
 
 type Plugin struct {
 	repoRoot hfs.FS
-	sf       singleflight.Group
 }
 
 func New(fs hfs.FS) *Plugin {
@@ -64,16 +62,12 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 }
 
 func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTarget) (starlark.StringDict, error) {
-	res, err, _ := p.sf.Do(pkg, func() (interface{}, error) {
-		res, err := p.runPkgInner(ctx, pkg, onTarget)
-		if err != nil {
-			return nil, err
-		}
+	res, err := p.runPkgInner(ctx, pkg, onTarget)
+	if err != nil {
+		return nil, err
+	}
 
-		return res, nil
-	})
-
-	return res.(starlark.StringDict), err
+	return res, nil
 }
 
 func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTarget) (starlark.StringDict, error) {
@@ -136,6 +130,10 @@ func (p *Plugin) builtinTarget(onTarget onTarget) BuiltinFunc {
 			return nil, err
 		}
 
+		if payload.Name == "" {
+			return nil, fmt.Errorf("missing name")
+		}
+
 		err := onTarget(ctx, payload)
 		if err != nil {
 			return nil, err
@@ -182,7 +180,14 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 }
 
 func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark.StringDict) (*starlark.Program, error) {
-	_, prog, err := starlark.SourceProgramOptions(&syntax.FileOptions{}, file.Name(), file, universe.Has)
+	opts := &syntax.FileOptions{
+		While:             false,
+		TopLevelControl:   true,
+		GlobalReassign:    false,
+		LoadBindsGlobally: false,
+		Recursion:         true,
+	}
+	_, prog, err := starlark.SourceProgramOptions(opts, file.Name(), file, universe.Has)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +212,7 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 	if payload.Name == "" {
 		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("not found"))
 	}
+
 	ref := req.Msg.Ref
 	ref.Driver = payload.Driver
 

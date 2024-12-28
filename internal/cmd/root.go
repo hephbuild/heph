@@ -28,6 +28,7 @@ var rootCmd = &cobra.Command{
 	Use:              "heph",
 	TraverseChildren: true,
 	SilenceUsage:     true,
+	SilenceErrors:    true,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		if !debug {
 			levelVar.Set(slog.LevelInfo)

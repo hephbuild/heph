@@ -133,6 +133,7 @@ func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 
 func (e *Engine) pluginInterceptor() connect.Option {
 	return connect.WithInterceptors(
+		hcore.NewRecoveryInterceptor(),
 		hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient),
 		hstepconnect.Interceptor(),
 	)

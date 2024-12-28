@@ -59,6 +59,10 @@ func init() {
 
 				res := <-ch
 
+				if res.Err != nil {
+					return res.Err
+				}
+
 				outputs := res.Outputs
 
 				if res.ExecInteractive != nil {

@@ -19,6 +19,9 @@ func Format(step *corev1.Step, interactive bool) string {
 		}
 	case corev1.Step_STATUS_COMPLETED:
 		status = "✔"
+		if step.Error {
+			status = "✘"
+		}
 		t = step.CompletedAt.AsTime().Sub(step.StartedAt.AsTime())
 	}
 

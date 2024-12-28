@@ -3,10 +3,33 @@ package hcore
 import (
 	"connectrpc.com/connect"
 	"context"
+	"fmt"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 )
+
+func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {
+	return func(next connect.UnaryFunc) connect.UnaryFunc {
+		return func(
+			ctx context.Context,
+			req connect.AnyRequest,
+		) (response connect.AnyResponse, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					response = nil
+					if e, ok := r.(error); ok {
+						err = connect.NewError(connect.CodeInternal, e)
+					} else {
+						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%v", r))
+					}
+				}
+			}()
+
+			return next(ctx, req)
+		}
+	}
+}
 
 func NewInterceptor(
 	logClient corev1connect.LogServiceClient,

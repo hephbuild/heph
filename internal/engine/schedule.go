@@ -21,18 +21,10 @@ import (
 	"google.golang.org/protobuf/proto"
 	"io"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
-
-func ExecuteResultErr(err error) chan *ExecuteResult {
-	ch := make(chan *ExecuteResult)
-	go func() {
-		ch <- &ExecuteResult{Err: err}
-		close(ch)
-	}()
-	return ch
-}
 
 type ExecOptions struct {
 	Stdin  io.Reader
@@ -46,21 +38,100 @@ type ResultOptions struct {
 	ExecOptions             ExecOptions
 	ExecInteractiveCallback bool
 	Shell                   bool
+
+	Singleflight *Singleflight
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) chan *ExecuteResult {
+type Singleflight struct {
+	mu sync.Mutex
+	m  map[string]*SingleflightHandle
+}
+
+type SingleflightHandle struct {
+	mu  sync.Mutex
+	res *ExecuteResult
+	chs []chan *ExecuteResult
+}
+
+func (h *SingleflightHandle) newCh() <-chan *ExecuteResult {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	ch := make(chan *ExecuteResult, 1)
+	if h.res != nil {
+		ch <- h.res
+		return ch
+	}
+
+	h.chs = append(h.chs, ch)
+
+	return ch
+}
+
+func (h *SingleflightHandle) send(result *ExecuteResult) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.res = result
+	for _, ch := range h.chs {
+		ch <- h.res
+		close(ch)
+	}
+
+	h.chs = nil
+}
+
+func (s *Singleflight) getHandle(ctx context.Context, pkg string, name string, outputs []string) (*SingleflightHandle, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	outputs = slices.Clone(outputs)
+	slices.Sort(outputs)
+	key := fmt.Sprintf("%s %s %s", pkg, name, strings.Join(outputs, ":"))
+
+	isNew := false
+
+	if s.m == nil {
+		s.m = make(map[string]*SingleflightHandle)
+	}
+
+	h, ok := s.m[key]
+	if !ok {
+		isNew = true
+		h = &SingleflightHandle{}
+	}
+	s.m[key] = h
+
+	return h, isNew
+}
+
+func (s *Singleflight) Register(ctx context.Context, pkg string, name string, outputs []string) (<-chan *ExecuteResult, func(result *ExecuteResult), bool) {
+	h, isNew := s.getHandle(ctx, pkg, name, outputs)
+
+	return h.newCh(), h.send, isNew
+}
+
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+	if options.Singleflight == nil {
+		options.Singleflight = &Singleflight{}
+	}
+
 	options.ExecOptions.ExecInteractiveCallback = options.ExecInteractiveCallback
 
-	ch := make(chan *ExecuteResult)
+	ctx = hstep.WithoutParent(ctx)
+
+	ch, send, isNew := options.Singleflight.Register(ctx, pkg, name, outputs)
+	if !isNew {
+		return ch
+	}
+
 	go func() {
-		ctx = hstep.WithoutParent(ctx)
 		step, ctx := hstep.New(ctx, fmt.Sprintf("//%v:%v", pkg, name))
 		defer step.Done()
 
-		defer close(ch)
 		res, err := e.innerResult(ctx, pkg, name, outputs, options)
 		if err != nil {
-			ch <- &ExecuteResult{Err: fmt.Errorf("%v:%v %w", pkg, name, err)}
+			send(&ExecuteResult{Err: fmt.Errorf("%v:%v %w", pkg, name, err)})
 			return
 		}
 
@@ -69,13 +140,13 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 			res.Err = fmt.Errorf("%v:%v %w", pkg, name, res.Err)
 		}
 
-		ch <- res
+		send(res)
 	}()
 
 	return ch
 }
 
-func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool) []*ExecuteResultWithOrigin {
+func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool, sf *Singleflight) []*ExecuteResultWithOrigin {
 	var wg sync.WaitGroup
 	results := make([]*ExecuteResultWithOrigin, len(def.Deps))
 	wg.Add(len(def.Deps))
@@ -89,7 +160,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				outputs = nil
 			}
 
-			ch := e.Result(ctx, dep.Ref.Package, dep.Ref.Name, outputs, ResultOptions{})
+			ch := e.Result(ctx, dep.Ref.Package, dep.Ref.Name, outputs, ResultOptions{Singleflight: sf})
 
 			res := <-ch
 
@@ -122,6 +193,43 @@ func (e *Engine) errFromDepsResults(results []*ExecuteResultWithOrigin, def *Lig
 	return errs
 }
 
+func (e *Engine) ResultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, sf *Singleflight) (*ExecuteResult, bool, error) {
+	// Get hashout from all deps
+	results := e.depsResults(ctx, def, false, sf)
+	err := e.errFromDepsResults(results, def)
+	if err != nil {
+		return nil, false, fmt.Errorf("result deps: %w", err)
+	}
+
+	hashin, err := e.hashin(ctx, def, results)
+	if err != nil {
+		return nil, false, fmt.Errorf("hashin: %w", err)
+	}
+
+	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
+	if err != nil {
+		return nil, false, fmt.Errorf("result from local cache: %w", err)
+	}
+
+	if ok {
+		step := hstep.From(ctx)
+		step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.Package, def.Ref.Name))
+
+		return res, true, nil
+	}
+
+	res, ok, err = e.ResultFromRemoteCache(ctx, def, outputs, hashin)
+	if err != nil {
+		return nil, false, fmt.Errorf("result from remote cache: %w", err)
+	}
+
+	if ok {
+		return res, true, nil
+	}
+
+	return nil, false, nil
+}
+
 func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
 	def, err := e.LightLink(ctx, pkg, name)
 	if err != nil {
@@ -133,42 +241,39 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 	}
 
 	if def.Cache {
-		// Get hashout from all deps
-		results := e.depsResults(ctx, def, false)
-		err = e.errFromDepsResults(results, def)
+		res, ok, err := e.ResultFromCache(ctx, def, outputs, options.Singleflight)
 		if err != nil {
-			return nil, fmt.Errorf("result deps: %w", err)
-		}
-
-		hashin, err := e.hashin(ctx, def, results)
-		if err != nil {
-			return nil, fmt.Errorf("hashin: %w", err)
-		}
-
-		res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
-		if err != nil {
-			return nil, fmt.Errorf("result from local cache: %w", err)
-		}
-
-		if ok {
-			step := hstep.From(ctx)
-			step.SetText(fmt.Sprintf("//%v:%v: cached", pkg, name))
-
-			return res, nil
-		}
-
-		res, ok, err = e.ResultFromRemoteCache(ctx, def, outputs, hashin)
-		if err != nil {
-			return nil, fmt.Errorf("result from remote cache: %w", err)
+			return nil, err
 		}
 
 		if ok {
 			return res, nil
 		}
 
-		return e.ExecuteAndCache(ctx, def, options.ExecOptions)
+		var targetfolder string
+		if def.Cache {
+			targetfolder = "__" + def.Ref.Name
+		} else {
+			targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
+		}
+
+		l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "result.lock")
+
+		err = l.Lock(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		defer func() {
+			err := l.Unlock()
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("failed unlocking: %v", err))
+			}
+		}()
+
+		return e.ExecuteAndCache(ctx, def, options.ExecOptions, options.Singleflight)
 	} else {
-		return e.Execute(ctx, def, options.ExecOptions)
+		return e.Execute(ctx, def, options.ExecOptions, options.Singleflight)
 	}
 }
 
@@ -345,14 +450,14 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	return pipes, wait, nil
 }
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("hephv2/engine: Execute %v %v", def.Ref.Package, def.Ref.Name), "",
 		}
 	})
 
-	results := e.depsResults(ctx, def, true)
+	results := e.depsResults(ctx, def, true, sf)
 	err := e.errFromDepsResults(results, def)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
@@ -368,27 +473,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		targetfolder = "__" + def.Ref.Name
 	} else {
 		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
-	}
-
-	sandboxfs := hfs.At(e.Sandbox, def.Ref.Package, targetfolder)
-	workdirfs := sandboxfs.At("ws") // TODO: remove the ws from here
-
-	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "exec.lock")
-
-	err = l.Lock(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		err := l.Unlock()
-		if err != nil {
-			// TODO: log
-		}
-	}()
-
-	err = sandboxfs.RemoveAll("")
-	if err != nil {
-		return nil, err
 	}
 
 	hashin, err := e.hashin(ctx, def, results)
@@ -409,6 +493,14 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	step, ctx := hstep.New(ctx, "Running...")
 	defer step.Done()
+
+	sandboxfs := hfs.At(e.Sandbox, def.Ref.Package, targetfolder)
+	workdirfs := sandboxfs.At("ws") // TODO: remove the ws from here
+
+	err = sandboxfs.RemoveAll("")
+	if err != nil {
+		return nil, err
+	}
 
 	inputArtifacts, err := SetupSandbox(ctx, results, workdirfs)
 	if err != nil {
@@ -559,8 +651,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, def, options)
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
+	res, err := e.Execute(ctx, def, options, sf)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %v", err)
 	}
