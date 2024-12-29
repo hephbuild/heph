@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/hephv2/internal/hartifact"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hlocks"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
@@ -154,7 +155,7 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
 	if err != nil {
 		if err := multi.UnlockAll(); err != nil {
-			// TODO: log
+			hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
 		}
 
 		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
