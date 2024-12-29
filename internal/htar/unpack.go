@@ -33,11 +33,12 @@ type config struct {
 }
 
 func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) error {
-	cfg := &config{
-		onFile: func(to string) {},
-	}
+	cfg := &config{}
 	for _, option := range options {
 		option(cfg)
+	}
+	if cfg.onFile == nil {
+		cfg.onFile = func(to string) {}
 	}
 
 	tr := tar.NewReader(r)
