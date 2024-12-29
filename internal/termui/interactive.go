@@ -33,11 +33,10 @@ type Model struct {
 }
 
 func initialModel() Model {
-	steps := map[string]*corev1.Step{}
 	m := Model{
 		log:      hbbtlog.NewLogHijacker(),
 		stepCh:   make(chan *corev1.Step),
-		steps:    steps,
+		steps:    map[string]*corev1.Step{},
 		renderer: hlipgloss.NewRenderer(os.Stderr),
 	}
 	m.Exec = hbbtexec.New(m.log)
@@ -63,6 +62,8 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(m.log.Init(), m.nextStep(), m.nextTick())
 }
 
+type routineExitedMsg struct{}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
@@ -84,6 +85,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case routineExitedMsg:
+		cmds = append(cmds, tea.Quit)
 	}
 
 	cmds, m.log = ChildUpdate(cmds, msg, m.log)
@@ -153,7 +156,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 	errCh := make(chan error, 1)
 	m := initialModel()
 
-	p := tea.NewProgram(m, tea.WithOutput(os.Stderr))
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 	go func() {
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
@@ -173,7 +176,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 		})
 
 		errCh <- err
-		p.Send(tea.Quit())
+		p.Send(routineExitedMsg{})
 	}()
 
 	_, err := p.Run()

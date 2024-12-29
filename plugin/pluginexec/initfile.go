@@ -3,7 +3,6 @@ package pluginexec
 import (
 	"bytes"
 	_ "embed"
-	"strings"
 	"text/template"
 )
 
@@ -23,8 +22,7 @@ func init() {
 func RenderInitFile(cmds string) (string, error) {
 	var buf bytes.Buffer
 	err := initfiletpl.Execute(&buf, map[string]string{
-		"Cmds":    cmds,
-		"CmdsStr": strings.ReplaceAll(cmds, "'", `'\''`),
+		"Cmds": cmds,
 	})
 	if err != nil {
 		return "", err

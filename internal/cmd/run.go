@@ -11,10 +11,8 @@ import (
 	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/spf13/cobra"
-	"io"
 	"net/http"
 	"os"
-	"time"
 )
 
 func init() {
@@ -42,7 +40,7 @@ func init() {
 					return err
 				}
 
-				for _, p := range []*pluginexec.Plugin{pluginexec.New(), pluginexec.NewSh(), pluginexec.NewBash()} {
+				for _, p := range []*pluginexec.Plugin{pluginexec.New(), pluginexec.NewSh(), pluginexec.NewBash(), pluginexec.NewInteractiveBash()} {
 					_, err := e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
 						path, h := p.PipesHandler()
 						mux.Handle(path, h)
@@ -53,10 +51,17 @@ func init() {
 				}
 
 				ch := e.Result(ctx, args[0], args[1], []string{engine.AllOutputs}, engine.ResultOptions{
-					InteractiveExec: func(run func(engine.ExecOptions)) error {
-						_, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) (struct{}, error) {
-							run(engine.ExecOptions{
-								Stdin:  os.Stdin,
+					InteractiveExec: func(iargs engine.InteractiveExecOptions) error {
+						_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
+							if iargs.Pty {
+								err = args.MakeRaw()
+								if err != nil {
+									return struct{}{}, err
+								}
+							}
+
+							iargs.Run(engine.ExecOptions{
+								Stdin:  args.Stdin,
 								Stdout: os.Stdout,
 								Stderr: os.Stderr,
 							})
@@ -78,13 +83,13 @@ func init() {
 				outputs := res.Outputs
 
 				// TODO how to render res natively without exec
-				_, err = hbbtexec.Run(m.Exec, send, func(stdin io.Reader, stdout, stderr io.Writer) (*engine.ExecuteResult, error) {
+				_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (*engine.ExecuteResult, error) {
 					for _, output := range outputs {
-						fmt.Fprintln(stdout, output.Name)
-						fmt.Fprintln(stdout, "  group:    ", output.Group)
-						fmt.Fprintln(stdout, "  uri:      ", output.Uri)
-						fmt.Fprintln(stdout, "  type:     ", output.Type.String())
-						fmt.Fprintln(stdout, "  encoding: ", output.Encoding.String())
+						fmt.Println(output.Name)
+						fmt.Println("  group:    ", output.Group)
+						fmt.Println("  uri:      ", output.Uri)
+						fmt.Println("  type:     ", output.Type.String())
+						fmt.Println("  encoding: ", output.Encoding.String())
 					}
 
 					return res, nil
@@ -92,8 +97,6 @@ func init() {
 				if err != nil {
 					return err
 				}
-
-				time.Sleep(time.Millisecond)
 
 				return nil
 			})

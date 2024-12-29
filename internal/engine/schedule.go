@@ -4,6 +4,7 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/dlsniper/debugger"
@@ -12,6 +13,7 @@ import (
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hinstance"
 	"github.com/hephbuild/hephv2/internal/hlocks"
+	"github.com/hephbuild/hephv2/internal/hpty"
 	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -20,6 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 	"io"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -30,12 +33,18 @@ type ExecOptions struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	interactiveExec func(run func(ExecOptions)) error
+	interactiveExec func(InteractiveExecOptions) error
+	shell           bool
+}
+
+type InteractiveExecOptions struct {
+	Run func(ExecOptions)
+	Pty bool
 }
 
 type ResultOptions struct {
 	ExecOptions     ExecOptions
-	InteractiveExec func(run func(ExecOptions)) error
+	InteractiveExec func(InteractiveExecOptions) error
 	Shell           bool
 
 	Singleflight *Singleflight
@@ -47,6 +56,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 	}
 
 	options.ExecOptions.interactiveExec = options.InteractiveExec
+	options.ExecOptions.shell = options.Shell
 
 	ctx = hstep.WithoutParent(ctx)
 
@@ -165,6 +175,10 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 	def, err := e.LightLink(ctx, pkg, name)
 	if err != nil {
 		return nil, err
+	}
+
+	if options.Shell {
+		def.Cache = false
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {
@@ -296,14 +310,16 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 }
 
 func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient, options ExecOptions) ([]string, func() error, error) {
-	pipes := []string{"", "", ""}
+	pipes := []string{"", "", "", "", ""}
 	eg := &errgroup.Group{}
 
-	stdincancel := func() {}
+	var cancels []func()
 	var stdinErrCh chan error
 
 	wait := func() error {
-		stdincancel()
+		for _, cancel := range cancels {
+			cancel()
+		}
 
 		err := eg.Wait()
 		// this is complicated...
@@ -331,7 +347,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[0] = res.Msg.Id
 
 		ctx, cancel := context.WithCancel(ctx)
-		stdincancel = cancel
+		cancels = append(cancels, cancel)
 
 		go func() {
 			defer cancel()
@@ -389,6 +405,38 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		})
 	}
 
+	if stdin, ok := options.Stdin.(*os.File); ok {
+		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
+		if err != nil {
+			return nil, wait, err
+		}
+
+		pipes[3] = res.Msg.Id
+
+		ch, clean := hpty.WinSizeChan(ctx, stdin)
+		cancels = append(cancels, clean)
+
+		go func() {
+			w, err := hpipe.Writer(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
+				return
+			}
+			defer w.Close()
+
+			for size := range ch {
+				b, err := json.Marshal(size)
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("failed to marshal size: %v", err))
+					continue
+				}
+
+				_, _ = w.Write(b)
+				_, _ = w.Write([]byte("\n"))
+			}
+		}()
+	}
+
 	return pipes, wait, nil
 }
 
@@ -408,6 +456,15 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	driver, ok := e.DriversByName[def.Ref.Driver]
 	if !ok {
 		return nil, fmt.Errorf("driver not found: %v", def.Ref.Driver)
+	}
+
+	if options.shell {
+		// TODO: make the original driver declare the shell config
+		driver, ok = e.DriversByName[def.Ref.Driver+"@shell"]
+		if !ok {
+			return nil, fmt.Errorf("shell driver not found: %v", def.Ref.Driver)
+		}
+		def.Pty = true
 	}
 
 	var targetfolder string
@@ -462,34 +519,44 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if options.interactiveExec == nil {
-		options.interactiveExec = func(run func(ExecOptions)) error {
-			run(options)
+		options.interactiveExec = func(args InteractiveExecOptions) error {
+			args.Run(options)
 			return nil
 		}
 	}
 
 	var runRes *connect.Response[pluginv1.RunResponse]
 	var runErr error
-	err = options.interactiveExec(func(options ExecOptions) {
-		pipes, pipesWait, err := e.pipes(ctx, driver, options)
-		if err != nil {
-			runErr = err
-			return
-		}
+	err = options.interactiveExec(InteractiveExecOptions{
+		Run: func(options ExecOptions) {
+			pipes, pipesWait, err := e.pipes(ctx, driver, options)
+			if err != nil {
+				runErr = err
+				return
+			}
 
-		runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
-			Target:      def.TargetDef,
-			SandboxPath: sandboxfs.Path(),
-			Inputs:      inputArtifacts,
-			Pipes:       pipes,
-		}))
-		if err := pipesWait(); err != nil {
-			hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
-		}
+			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+				Target:      def.TargetDef,
+				SandboxPath: sandboxfs.Path(),
+				Inputs:      inputArtifacts,
+				Pipes:       pipes,
+			}))
+			if err := pipesWait(); err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
+			}
+		},
+		Pty: def.Pty,
 	})
 	err = errors.Join(err, runErr)
 	if err != nil {
 		return nil, fmt.Errorf("run: %w", err)
+	}
+
+	if options.shell {
+		return &ExecuteResult{
+			Hashin:   hashin,
+			Executed: true,
+		}, nil
 	}
 
 	cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)

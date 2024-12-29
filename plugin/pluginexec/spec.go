@@ -55,4 +55,5 @@ type Spec struct {
 	Deps  SpecDeps    `mapstructure:"deps"`
 	Out   SpecOutputs `mapstructure:"out"`
 	Cache bool        `mapstructure:"cache"`
+	Pty   bool        `mapstructure:"pty"`
 }

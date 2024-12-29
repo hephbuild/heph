@@ -9,6 +9,8 @@ require (
 	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0
+	github.com/charmbracelet/x/term v0.2.1
+	github.com/creack/pty v1.1.20
 	github.com/dlsniper/debugger v0.6.0
 	github.com/go-faker/faker/v4 v4.5.0
 	github.com/go-viper/mapstructure/v2 v2.2.1
@@ -31,7 +33,6 @@ require (
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/charmbracelet/x/ansi v0.6.0 // indirect
-	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect

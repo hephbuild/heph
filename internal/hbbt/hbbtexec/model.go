@@ -2,23 +2,64 @@ package hbbtexec
 
 import (
 	"errors"
+	"fmt"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
 	"io"
+	"sync"
 )
 
-type ExecFunc[T any] func(stdin io.Reader, stdout, stderr io.Writer) (T, error)
+type ExecFunc[T any] func(args RunArgs) (T, error)
 
-type execCmdFunc func(stdin io.Reader, stdout, stderr io.Writer) error
+type execCmdFunc func(args RunArgs) error
 
 type execCmd struct {
 	f              execCmdFunc
 	stdin          io.Reader
 	stdout, stderr io.Writer
+
+	restore func()
+}
+
+func (e *execCmd) makeRaw() error {
+	if f, ok := e.stdin.(term.File); ok && term.IsTerminal(f.Fd()) {
+		previousState, err := term.MakeRaw(f.Fd())
+		if err != nil {
+			return fmt.Errorf("error entering raw mode: %w", err)
+		}
+		e.restore = func() {
+			err := term.Restore(f.Fd(), previousState)
+			if err != nil {
+				//fmt.Println("RESTORE", err)
+				// TODO: log
+			}
+		}
+	}
+
+	return nil
+}
+
+type RunArgs struct {
+	Stdin          io.Reader
+	Stdout, Stderr io.Writer
+	MakeRaw        func() error
 }
 
 func (e *execCmd) Run() error {
-	return e.f(e.stdin, e.stdout, e.stderr)
+	defer func() {
+		if e.restore != nil {
+			e.restore()
+			e.restore = nil
+		}
+	}()
+
+	return e.f(RunArgs{
+		MakeRaw: sync.OnceValue(e.makeRaw),
+		Stdin:   e.stdin,
+		Stdout:  e.stdout,
+		Stderr:  e.stderr,
+	})
 }
 
 func (e *execCmd) SetStdin(r io.Reader) {
@@ -98,8 +139,8 @@ func Run[T any](m Model, send func(tea.Msg), f ExecFunc[T]) (T, error) {
 	resCh := make(chan container, 1)
 	returnedCh := make(chan error, 1)
 
-	cmd := m.Exec(NewExecFunc(func(stdin io.Reader, stdout, stderr io.Writer) error {
-		v, err := f(stdin, stdout, stderr)
+	cmd := m.Exec(NewExecFunc(func(args RunArgs) error {
+		v, err := f(args)
 
 		resCh <- container{v: v, err: err}
 

@@ -1,13 +1,19 @@
 package pluginexec
 
 import (
+	"bufio"
 	"connectrpc.com/connect"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	ptylib "github.com/creack/pty"
 	"github.com/dlsniper/debugger"
 	"github.com/google/uuid"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
+	"github.com/hephbuild/hephv2/internal/hio"
+	"github.com/hephbuild/hephv2/internal/hpty"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -152,6 +158,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			Cache:          targetSpec.Cache,
 			CollectOutputs: collectOutputs,
 			Codegen:        nil,
+			Pty:            targetSpec.Pty,
 		},
 	}), nil
 }
@@ -248,7 +255,12 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	step, ctx := hstep.New(ctx, "Executing...")
 	defer step.Done()
 
-	for len(req.Msg.Pipes) < 3 {
+	const pipeStdin = 0
+	const pipeStdout = 1
+	const pipeStderr = 2
+	const pipeTermSize = 3
+
+	for len(req.Msg.Pipes) < 4 {
 		req.Msg.Pipes = append(req.Msg.Pipes, "")
 	}
 
@@ -258,6 +270,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		return nil, err
 	}
 
+	pty := req.Msg.Target.Pty
 	workdir := filepath.Join(req.Msg.SandboxPath, "ws")
 
 	err = os.MkdirAll(workdir, 0755)
@@ -280,6 +293,10 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		env = append(env, getEnvEntry("OUT", output.Group, "", paths))
 	}
 
+	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.Run))
+	args := p.runToExecArgs(req.Msg.SandboxPath, t.Run, nil)
+	hlog.From(ctx).Debug(fmt.Sprintf("args: %#v", args))
+
 	var stdoutWriters, stderrWriters []io.Writer
 
 	logFile, err := os.Create(filepath.Join(req.Msg.SandboxPath, "log.txt"))
@@ -291,16 +308,22 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	stdoutWriters = append(stdoutWriters, logFile)
 	stderrWriters = append(stderrWriters, logFile)
 
-	for i, id := range req.Msg.Pipes[1:3] {
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Env = env
+	cmd.Dir = workdir
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // this creates a new process group, same as Setpgid
+	}
+
+	for i, id := range []string{req.Msg.Pipes[pipeStdout], req.Msg.Pipes[pipeStderr]} {
 		if id == "" {
 			continue
 		}
 
 		pipe, ok := p.getPipe(id)
 		if !ok {
-			return nil, errors.New("pipe 0 not found")
+			return nil, errors.New("pipe not found")
 		}
-
 		defer p.removePipe(id)
 
 		if i == 0 {
@@ -310,46 +333,91 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		}
 	}
 
-	args := p.runToExecArgs(req.Msg.SandboxPath, t.Run, nil)
+	cmd.Stdout = hio.MultiWriter(stdoutWriters...)
+	cmd.Stderr = hio.MultiWriter(stderrWriters...)
 
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Env = env
-	cmd.Dir = workdir
-
-	// TODO: pty
-	if id := req.Msg.Pipes[0]; id != "" {
+	if id := req.Msg.Pipes[pipeStdin]; id != "" {
 		pipe, ok := p.getPipe(id)
 		if !ok {
-			return nil, errors.New("pipe 0 not found")
+			return nil, errors.New("pipe stdin not found")
 		}
-		pw, err := cmd.StdinPipe()
+		defer p.removePipe(id)
+
+		// Stdin must be a file, otherwise exec.Run() will wait for that Reader to close before exiting
+		if pty {
+			cmd.Stdin = pipe.r
+		} else {
+			pw, err := cmd.StdinPipe()
+			if err != nil {
+				return nil, err
+			}
+
+			go func() {
+				_, _ = io.Copy(pw, pipe.r)
+				_ = pw.Close()
+			}()
+		}
+	}
+
+	if pty {
+		var sizeChan chan *ptylib.Winsize
+		if id := req.Msg.Pipes[pipeTermSize]; id != "" {
+			sizeChan = make(chan *ptylib.Winsize)
+			defer close(sizeChan)
+
+			pipe, ok := p.getPipe(id)
+			if !ok {
+				return nil, errors.New("pipe term size not found")
+			}
+			defer p.removePipe(id)
+
+			scanner := bufio.NewScanner(pipe.r)
+			go func() {
+				for scanner.Scan() {
+					var size ptylib.Winsize
+					err := json.Unmarshal(scanner.Bytes(), &size)
+					if err != nil {
+						hlog.From(ctx).Warn(fmt.Sprintf("invalid size: %v", scanner.Text()))
+						continue
+					}
+
+					sizeChan <- &size
+				}
+				if err := scanner.Err(); err != nil {
+					hlog.From(ctx).Warn(fmt.Sprintf("pipe signal: %v", err))
+				}
+			}()
+		}
+
+		pty, err := hpty.Create(ctx, cmd.Stdin, cmd.Stdout, sizeChan)
 		if err != nil {
 			return nil, err
 		}
+		defer pty.Close()
 
-		go func() {
-			_, _ = io.Copy(pw, pipe.r)
-			_ = pw.Close()
-		}()
+		// if its a file, it will wait for it to close before exiting
+		cmd.Stdin = pty
+		cmd.Stdout = pty
+		cmd.Stderr = pty
+
+		cmd.SysProcAttr.Setctty = true
 	}
-	cmd.Stdout = io.MultiWriter(stdoutWriters...)
-	cmd.Stderr = io.MultiWriter(stderrWriters...)
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	err = cmd.Run()
 	if err != nil {
 		cmderr := err
 
-		err = logFile.Close()
-		if err != nil {
-			return nil, err
-		}
+		if !pty {
+			err = logFile.Close()
+			if err != nil {
+				return nil, err
+			}
 
-		b, _ := os.ReadFile(logFile.Name())
+			b, _ := os.ReadFile(logFile.Name())
 
-		if len(b) > 0 {
-			cmderr = errors.Join(cmderr, errors.New(string(b)))
+			if len(b) > 0 {
+				cmderr = errors.Join(cmderr, errors.New(string(b)))
+			}
 		}
 
 		return nil, cmderr
@@ -368,9 +436,10 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	var artifacts []*pluginv1.Artifact
 	if stat.Size() > 0 {
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name: "log.txt",
-			Type: pluginv1.Artifact_TYPE_LOG,
-			Uri:  "file://" + logFile.Name(),
+			Name:     "log.txt",
+			Type:     pluginv1.Artifact_TYPE_LOG,
+			Encoding: pluginv1.Artifact_ENCODING_NONE,
+			Uri:      "file://" + logFile.Name(),
 		})
 	}
 
@@ -456,7 +525,7 @@ func NewInteractiveBash(options ...Option) *Plugin {
 			nil,
 			[]string{"--rcfile", initfilePath},
 		)
-	}), WithName("bash"))
+	}), WithName("bash@shell"))
 
 	return New(options...)
 }

@@ -50,6 +50,7 @@ message TargetDef {
   }
 
   repeated CodegenMode codegen = 7;
+  bool pty = 8;
 }
 
 message TargetSpec {

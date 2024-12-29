@@ -42,7 +42,7 @@ func (t textHandler) Handle(ctx context.Context, record slog.Record) error {
 	if err != nil {
 		return err
 	}
-	_, err = t.w.Write([]byte("\n"))
+	_, err = t.w.Write([]byte("\r\n"))
 	if err != nil {
 		return err
 	}
