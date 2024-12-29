@@ -1,12 +1,12 @@
 package hfs
 
 import (
-	"github.com/hephbuild/heph/utils/xrand"
 	"github.com/hephbuild/hephv2/internal/hinstance"
+	"github.com/hephbuild/hephv2/internal/hrand"
 )
 
 func processUniquePath(p string) string {
-	return p + "_tmp_" + hinstance.UID + "_" + xrand.RandStr(7)
+	return p + "_tmp_" + hinstance.UID + "_" + hrand.Str(7)
 }
 
 type AtomicFile struct {

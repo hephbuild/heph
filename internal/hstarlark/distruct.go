@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hephbuild/heph/utils/ads"
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
 )
@@ -21,9 +20,11 @@ type StringItem struct {
 type StringItems []StringItem
 
 func (s StringItems) Tuples() []starlark.Tuple {
-	return ads.Map(s, func(t StringItem) starlark.Tuple {
-		return starlark.Tuple{starlark.String(t.Key), t.Value}
-	})
+	ts := make([]starlark.Tuple, 0, len(s))
+	for _, item := range s {
+		ts = append(ts, starlark.Tuple{starlark.String(item.Key), item.Value})
+	}
+	return ts
 }
 
 type structkv struct {
@@ -33,13 +34,16 @@ type structkv struct {
 
 func (s *structkv) Items() StringItems {
 	if s.items == nil {
-		s.items = ads.Map(s.s.AttrNames(), func(name string) StringItem {
+		items := make(StringItems, 0, len(s.items))
+		for _, name := range s.s.AttrNames() {
 			v, err := s.s.Attr(name)
 			if err != nil {
 				panic(err)
 			}
-			return StringItem{name, v}
-		})
+			items = append(items, StringItem{name, v})
+		}
+
+		s.items = items
 	}
 
 	return s.items
@@ -52,12 +56,15 @@ type dictkv struct {
 
 func (s *dictkv) Items() StringItems {
 	if s.items == nil {
-		s.items = ads.Map(s.dict.Items(), func(item starlark.Tuple) StringItem {
+		items := make(StringItems, 0, len(s.items))
+		for _, item := range s.dict.Items() {
 			k := item[0].(starlark.String) //nolint:errcheck
 			v := item[1]
 
-			return StringItem{k.GoString(), v}
-		})
+			items = append(items, StringItem{k.GoString(), v})
+		}
+
+		s.items = items
 	}
 
 	return s.items

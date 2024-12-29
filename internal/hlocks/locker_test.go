@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hephbuild/heph/log/liblog"
-	"github.com/hephbuild/heph/log/testlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog/hlogtest"
 
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/stretchr/testify/assert"
@@ -124,8 +124,8 @@ func testLocker(t *testing.T, factory func() Locker) {
 	var wg sync.WaitGroup
 	var n int32
 
-	logger := testlog.NewLogger(t)
-	ctx := liblog.ContextWith(context.Background(), logger)
+	logger := hlogtest.NewLogger(t)
+	ctx := hlog.ContextWithLogger(context.Background(), logger)
 
 	do := func() {
 		defer wg.Done()
@@ -167,8 +167,8 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 
 	ch := make(chan struct{})
 
-	logger := testlog.NewLogger(t)
-	ctx := liblog.ContextWith(context.Background(), logger)
+	logger := hlogtest.NewLogger(t)
+	ctx := hlog.ContextWithLogger(context.Background(), logger)
 
 	go func() {
 		l := factory()
@@ -210,8 +210,8 @@ func testLockerTry(t *testing.T, factory func() Locker) {
 	l1 := factory()
 	l2 := factory()
 
-	logger := testlog.NewLogger(t)
-	ctx := liblog.ContextWith(context.Background(), logger)
+	logger := hlogtest.NewLogger(t)
+	ctx := hlog.ContextWithLogger(context.Background(), logger)
 
 	err := l1.Lock(ctx)
 	require.NoError(t, err)
@@ -233,8 +233,8 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	l2 := factory()
 	l3 := factory()
 
-	logger := testlog.NewLogger(t)
-	ctx := liblog.ContextWith(context.Background(), logger)
+	logger := hlogtest.NewLogger(t)
+	ctx := hlog.ContextWithLogger(context.Background(), logger)
 
 	// 2 RLock
 	err := l1.RLock(ctx)
