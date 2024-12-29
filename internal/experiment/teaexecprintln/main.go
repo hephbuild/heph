@@ -10,9 +10,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 )
 
 // When exec is running, its blocking the event loop

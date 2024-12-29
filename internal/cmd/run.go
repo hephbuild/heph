@@ -9,12 +9,12 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/hephv2/internal/engine"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/internal/termui"
-	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
-	"github.com/hephbuild/hephv2/plugin/pluginexec"
+	"github.com/hephbuild/heph/internal/engine"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/termui"
+	"github.com/hephbuild/heph/plugin/pluginbuildfile"
+	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/spf13/cobra"
 )
 

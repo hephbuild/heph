@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"connectrpc.com/connect"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 type Target struct {

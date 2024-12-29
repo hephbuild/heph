@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hfs"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {

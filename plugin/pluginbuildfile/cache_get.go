@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/hephbuild/hephv2/internal/hsingleflight"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hsingleflight"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 type CacheGet struct {

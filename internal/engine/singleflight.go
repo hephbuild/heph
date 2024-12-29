@@ -6,7 +6,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/hephbuild/hephv2/internal/hproto"
+	"github.com/hephbuild/heph/internal/hproto"
 )
 
 type Singleflight struct {

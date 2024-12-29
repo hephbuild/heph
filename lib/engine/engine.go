@@ -1,6 +1,6 @@
 package engine
 
-import "github.com/hephbuild/hephv2/internal/engine"
+import "github.com/hephbuild/heph/internal/engine"
 
 type PluginInit = engine.PluginInit
 type PluginIniter = engine.PluginIniter

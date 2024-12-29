@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 type PipesHandler struct {

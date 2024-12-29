@@ -8,7 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/term"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 )
 
 type ExecFunc[T any] func(args RunArgs) (T, error)

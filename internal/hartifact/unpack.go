@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/internal/htar"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/htar"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 type unpackConfig struct {

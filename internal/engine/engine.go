@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 func Root() (string, error) {

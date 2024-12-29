@@ -9,14 +9,14 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
-	"github.com/hephbuild/hephv2/internal/hlipgloss"
-	"github.com/hephbuild/hephv2/internal/hpanic"
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hcore/hstep/hstepfmt"
+	"github.com/hephbuild/heph/internal/hlipgloss"
+	"github.com/hephbuild/heph/internal/hpanic"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
 type Model struct {

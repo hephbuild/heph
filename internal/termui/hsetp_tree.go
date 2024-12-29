@@ -7,8 +7,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/tree"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+	"github.com/hephbuild/heph/internal/hcore/hstep/hstepfmt"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
 func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*corev1.Step, root string, id string) *tree.Tree {

@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
 )
 
 const stepParentIDHeaderKey = "heph-step-parent-id"

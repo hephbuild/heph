@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"github.com/stretchr/testify/assert"
 )
 

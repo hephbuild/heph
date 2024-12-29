@@ -10,7 +10,7 @@ import (
 
 	"github.com/charmbracelet/x/term"
 	ptylib "github.com/creack/pty"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 )
 
 func WinSizeChan(ctx context.Context, f *os.File) (chan *ptylib.Winsize, func()) {

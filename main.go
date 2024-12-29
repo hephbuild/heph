@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/hephbuild/hephv2/internal/cmd"
+	"github.com/hephbuild/heph/internal/cmd"
 )
 
 func main() {

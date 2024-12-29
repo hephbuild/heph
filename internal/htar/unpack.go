@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 func UnpackFromPath(ctx context.Context, path string, to hfs.FS) error {

@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hephbuild/hephv2/internal/htime"
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+	"github.com/hephbuild/heph/internal/htime"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
 var runningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))

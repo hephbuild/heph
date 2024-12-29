@@ -9,7 +9,7 @@ import (
 	"runtime/pprof"
 	"sync"
 
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
 )

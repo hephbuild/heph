@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog/hlogtest"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog/hlogtest"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

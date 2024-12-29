@@ -6,9 +6,9 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
+	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 

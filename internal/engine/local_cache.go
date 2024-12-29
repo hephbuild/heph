@@ -10,11 +10,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/hephbuild/hephv2/internal/hartifact"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/internal/hlocks"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hlocks"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/proto"
 )

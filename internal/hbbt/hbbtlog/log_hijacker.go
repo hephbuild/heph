@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtch"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtch"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 )
 
 type Hijacker struct {

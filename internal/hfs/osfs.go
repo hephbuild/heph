@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hephbuild/hephv2/internal/flock"
+	"github.com/hephbuild/heph/internal/flock"
 )
 
 func NewOS(root string) OS {

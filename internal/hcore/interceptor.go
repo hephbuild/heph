@@ -5,9 +5,9 @@ import (
 	"fmt"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
 )
 
 func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {

@@ -1,8 +1,8 @@
 package hfs
 
 import (
-	"github.com/hephbuild/hephv2/internal/hinstance"
-	"github.com/hephbuild/hephv2/internal/hrand"
+	"github.com/hephbuild/heph/internal/hinstance"
+	"github.com/hephbuild/heph/internal/hrand"
 )
 
 func processUniquePath(p string) string {

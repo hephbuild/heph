@@ -3,7 +3,7 @@ package engine
 import (
 	"time"
 
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 var ArtifactManifestName = "manifest.v1.json"

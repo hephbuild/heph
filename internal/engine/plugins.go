@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/hephv2/internal/hcore"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepconnect"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/heph/internal/hcore"
+	"github.com/hephbuild/heph/internal/hcore/hstep/hstepconnect"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )

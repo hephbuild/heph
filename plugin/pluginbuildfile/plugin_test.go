@@ -6,10 +6,10 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/plugintest"
+	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hfs/hfstest"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/plugintest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

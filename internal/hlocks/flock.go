@@ -10,9 +10,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hephbuild/hephv2/internal/flock"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/heph/internal/flock"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {

@@ -7,9 +7,9 @@ import (
 	"slices"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/internal/hmaps"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hmaps"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 func (e *Engine) GetSpec(ctx context.Context, pkg, name string) (*pluginv1.TargetSpec, error) {

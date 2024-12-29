@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 )
 
 func NewLogger(t testing.TB) hlog.Logger {

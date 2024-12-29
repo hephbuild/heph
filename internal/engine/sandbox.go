@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/hephbuild/hephv2/internal/hartifact"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hfs"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 func SetupSandbox(ctx context.Context, depResults []*ExecuteResultWithOrigin, fs hfs.FS) ([]*pluginv1.ArtifactWithOrigin, error) {

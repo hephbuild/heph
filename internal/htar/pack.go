@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 type Packer struct {

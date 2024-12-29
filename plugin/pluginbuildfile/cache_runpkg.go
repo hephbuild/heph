@@ -3,7 +3,7 @@ package pluginbuildfile
 import (
 	"context"
 
-	"github.com/hephbuild/hephv2/internal/hsingleflight"
+	"github.com/hephbuild/heph/internal/hsingleflight"
 	"go.starlark.net/starlark"
 )
 

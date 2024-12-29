@@ -3,7 +3,7 @@ package hfstest
 import (
 	"testing"
 
-	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 func New(t *testing.T) hfs.FS {

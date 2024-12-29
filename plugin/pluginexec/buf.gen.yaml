@@ -4,7 +4,7 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/hephbuild/hephv2/plugin/pluginexec/gen
+      value: github.com/hephbuild/heph/plugin/pluginexec/gen
 plugins:
   - remote: buf.build/protocolbuffers/go
     out: gen

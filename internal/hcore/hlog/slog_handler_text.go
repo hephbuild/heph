@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/hephbuild/hephv2/internal/hlipgloss"
+	"github.com/hephbuild/heph/internal/hlipgloss"
 )
 
 var levelColors = map[slog.Level]lipgloss.TerminalColor{
