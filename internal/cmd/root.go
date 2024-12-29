@@ -9,6 +9,8 @@ import (
 	"runtime/pprof"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/hversion"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -35,6 +37,7 @@ var rootCmd = &cobra.Command{
 	TraverseChildren: true,
 	SilenceUsage:     true,
 	SilenceErrors:    true,
+	Version:          hversion.Version,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		if !debug {
 			levelVar.Set(slog.LevelInfo)

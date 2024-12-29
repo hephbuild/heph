@@ -14,7 +14,17 @@ jobs:
         os: [linux, darwin]
         arch: [arm64, amd64]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        run: |
+          VERSION=$(.github/workflows/version.sh)
+          echo "$VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
       - name: Set up Go
         uses: actions/setup-go@v4
@@ -45,4 +55,6 @@ jobs:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
-        run: go build -ldflags "-s -w" -o heph_${{ matrix.os }}_${{ matrix.arch }}
+          HEPH_VERSION: ${{steps.version.outputs.version}}
+        run: |
+          go build -ldflags "-s -w -X internal/hversion.Version=$HEPH_VERSION" -o heph_$HEPH_VERSION_${{ matrix.os }}_${{ matrix.arch }}
