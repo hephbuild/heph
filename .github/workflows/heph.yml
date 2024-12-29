@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [ "master", "v1" ]
+  pull_request:
+    branches: [ "master", "v1" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, darwin]
+        arch: [arm64, amd64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'
+          cache: 'true'
+
+      - name: Get buf
+        run: |
+          BIN="/usr/local/bin"
+          VERSION="1.48.0"
+          curl -sSL "https://github.com/bufbuild/buf/releases/download/v${VERSION}/buf-$(uname -s)-$(uname -m)" -o "${BIN}/buf"
+          chmod +x "${BIN}/buf"
+
+      - name: Gen
+        run: make gen
+
+      - name: Test
+        run: go test -v ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.62
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: go build -ldflags "-s -w" -o heph_${{ matrix.os }}_${{ matrix.arch }}
