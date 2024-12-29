@@ -429,6 +429,9 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 
 		if ok {
+			step := hstep.From(ctx)
+			step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.Package, def.Ref.Name))
+
 			return res, nil
 		}
 	}
@@ -571,7 +574,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		//})
 	}
 
-	// TODO: cleanup sandbox
+	err = sandboxfs.RemoveAll("")
+	if err != nil {
+		return nil, err
+	}
 
 	return &ExecuteResult{
 		Hashin:   hashin,

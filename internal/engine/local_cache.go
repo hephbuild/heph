@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/hephv2/internal/hartifact"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hlocks"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
@@ -13,18 +14,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"io"
 	"os"
-	"strings"
 	"time"
 )
-
-func parseUri(uri string) (string, string, error) {
-	scheme, rest, ok := strings.Cut(uri, "://")
-	if !ok {
-		return "", "", fmt.Errorf("invalid URI: %s", uri)
-	}
-
-	return scheme, rest, nil
-}
 
 func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (string, error) {
 	h := xxh3.New()
@@ -39,27 +30,15 @@ func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (stri
 		return "", err
 	}
 
-	scheme, rest, err := parseUri(artifact.Uri)
+	r, err := hartifact.Reader(ctx, artifact)
 	if err != nil {
 		return "", err
 	}
+	defer r.Close()
 
-	switch scheme {
-	case "file":
-		fromfs := hfs.NewOS(rest)
-
-		f, err := hfs.Open(fromfs, "")
-		if err != nil {
-			return "", err
-		}
-		defer f.Close()
-
-		_, err = io.Copy(h, f)
-		if err != nil {
-			return "", err
-		}
-	default:
-		return "", fmt.Errorf("unsupprted scheme: %s", scheme)
+	_, err = io.Copy(h, r)
+	if err != nil {
+		return "", err
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -73,7 +52,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	cacheArtifacts := make([]ExecuteResultOutput, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
-		scheme, rest, err := parseUri(artifact.Uri)
+		scheme, rest, err := hartifact.ParseUri(artifact.Uri)
 		if err != nil {
 			return nil, err
 		}
