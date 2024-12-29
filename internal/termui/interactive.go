@@ -4,7 +4,6 @@ import (
 	"context"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/lipgloss/tree"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
@@ -15,7 +14,6 @@ import (
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"maps"
 	"os"
-	"slices"
 	"strings"
 	"time"
 )
@@ -94,60 +92,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m Model) printTree(children map[string][]*corev1.Step, root string, id string) *tree.Tree {
-	t := tree.Root(root)
-
-	for _, step := range children[id] {
-		t = t.Child(m.printTree(children, hstepfmt.Format(m.renderer, step, true), step.Id))
-	}
-
-	return t
-}
-
-func (m Model) buildStepsTree() string {
-	children := map[string][]*corev1.Step{}
-	for v := range maps.Values(m.steps) {
-		children[v.ParentId] = append(children[v.ParentId], v)
-	}
-
-	for v := range maps.Values(children) {
-		slices.SortFunc(v, func(a, b *corev1.Step) int {
-			return a.StartedAt.AsTime().Compare(b.StartedAt.AsTime())
-		})
-	}
-
-	t := m.printTree(children, "", "").
-		Enumerator(func(children tree.Children, index int) string {
-			if children.Length()-1 == index {
-				return "╰─"
-			}
-			if index == 0 {
-				return "╭─"
-			}
-			return "├─"
-		}).
-		Indenter(func(children tree.Children, index int) string {
-			if children.Length()-1 == index {
-				return "  "
-			}
-			return "│ "
-		})
-
-	s := t.String()
-	if m.height > 0 {
-		s = lipgloss.NewStyle().MaxHeight(m.height).Render(s)
-	}
-	if len(s) > 0 {
-		s += "\n"
-	}
-
-	return s
-}
-
 func (m Model) View() string {
 	var sb strings.Builder
 
-	sb.WriteString(m.buildStepsTree())
+	stepsTree := buildStepsTree(m.renderer, maps.Values(m.steps))
+	if m.height > 0 {
+		stepsTree = lipgloss.NewStyle().MaxHeight(m.height).Render(stepsTree)
+	}
+
+	sb.WriteString(stepsTree)
 
 	return sb.String()
 }
