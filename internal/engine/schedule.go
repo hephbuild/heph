@@ -449,7 +449,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("hephv2/engine: Execute %v %v", def.Ref.GetPackage(), def.Ref.GetName()), "",
+			fmt.Sprintf("heph/engine: Execute %v %v", def.Ref.GetPackage(), def.Ref.GetName()), "",
 		}
 	})
 

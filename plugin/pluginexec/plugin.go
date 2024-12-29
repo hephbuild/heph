@@ -254,7 +254,7 @@ func (p *Plugin) inputEnv(
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("hephv2/pluginexec %v: %v %v", p.name, req.Msg.GetTarget().GetRef().GetPackage(), req.Msg.GetTarget().GetRef().GetName()), "",
+			fmt.Sprintf("heph/pluginexec %v: %v %v", p.name, req.Msg.GetTarget().GetRef().GetPackage(), req.Msg.GetTarget().GetRef().GetName()), "",
 		}
 	})
 
