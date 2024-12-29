@@ -35,6 +35,7 @@ type ExecOptions struct {
 
 	interactiveExec func(InteractiveExecOptions) error
 	shell           bool
+	force           bool
 }
 
 type InteractiveExecOptions struct {
@@ -46,6 +47,7 @@ type ResultOptions struct {
 	ExecOptions     ExecOptions
 	InteractiveExec func(InteractiveExecOptions) error
 	Shell           bool
+	Force           bool
 
 	Singleflight *Singleflight
 }
@@ -57,6 +59,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 
 	options.ExecOptions.interactiveExec = options.InteractiveExec
 	options.ExecOptions.shell = options.Shell
+	options.ExecOptions.force = options.Force
 
 	ctx = hstep.WithoutParent(ctx)
 
@@ -195,13 +198,15 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "result.lock")
 
 	if def.Cache {
-		res, ok, err := e.ResultFromCache(ctx, def, outputs, options.Singleflight)
-		if err != nil {
-			return nil, err
-		}
+		if !options.Force {
+			res, ok, err := e.ResultFromCache(ctx, def, outputs, options.Singleflight)
+			if err != nil {
+				return nil, err
+			}
 
-		if ok {
-			return res, nil
+			if ok {
+				return res, nil
+			}
 		}
 
 		err = l.Lock(ctx)
@@ -479,7 +484,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("hashin1: %w", err)
 	}
 
-	if def.Cache {
+	if def.Cache && !options.force {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			return nil, err

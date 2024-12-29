@@ -17,6 +17,7 @@ import (
 
 func init() {
 	var shell bool
+	var force bool
 
 	var runCmd = &cobra.Command{
 		Use:  "run",
@@ -72,6 +73,7 @@ func init() {
 						return err
 					},
 					Shell: shell,
+					Force: force,
 				})
 
 				res := <-ch
@@ -109,6 +111,7 @@ func init() {
 	}
 
 	runCmd.Flags().BoolVarP(&shell, "shell", "", false, "shell into target")
+	runCmd.Flags().BoolVarP(&force, "force", "", false, "force running")
 
 	rootCmd.AddCommand(runCmd)
 }
