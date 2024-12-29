@@ -1,14 +1,15 @@
 package hstep
 
 import (
-	"connectrpc.com/connect"
 	"context"
+	"time"
+
+	"connectrpc.com/connect"
 	"github.com/google/uuid"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"time"
 )
 
 type Step struct {
@@ -59,8 +60,8 @@ func (s *Step) Done() {
 	s.pbstep = s.handleStep(s.ctx, pbstep)
 }
 
-func (s *Step) GetId() string {
-	return s.pbstep.Id
+func (s *Step) GetID() string {
+	return s.pbstep.GetId()
 }
 
 type ctxStepKey struct{}
@@ -76,7 +77,7 @@ func ContextWithRPCHandler(ctx context.Context, client corev1connect.StepService
 			return pbstep
 		}
 
-		return res.Msg.Step
+		return res.Msg.GetStep()
 	})
 }
 
@@ -108,14 +109,14 @@ func WithoutParent(ctx context.Context) context.Context {
 	return context.WithValue(ctx, ctxStepKey{}, nil)
 }
 
-func ContextWithParentId(ctx context.Context, parentId string) context.Context {
+func ContextWithParentID(ctx context.Context, parentID string) context.Context {
 	handler := HandlerFromContext(ctx)
 
 	step := &Step{
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
 		pbstep: &corev1.Step{
-			Id: parentId,
+			Id: parentID,
 		},
 	}
 
@@ -127,9 +128,9 @@ func ContextWithParentId(ctx context.Context, parentId string) context.Context {
 func New(ctx context.Context, str string) (*Step, context.Context) {
 	handler := HandlerFromContext(ctx)
 
-	var parentId string
-	if parent := From(ctx); parent.GetId() != "" {
-		parentId = parent.GetId()
+	var parentID string
+	if parent := From(ctx); parent.GetID() != "" {
+		parentID = parent.GetID()
 	}
 
 	step := &Step{
@@ -137,7 +138,7 @@ func New(ctx context.Context, str string) (*Step, context.Context) {
 		handleStep: handler,
 		pbstep: &corev1.Step{
 			Id:        uuid.New().String(),
-			ParentId:  parentId,
+			ParentId:  parentID,
 			Text:      str,
 			Status:    corev1.Step_STATUS_RUNNING,
 			StartedAt: timestamppb.New(time.Now()),

@@ -1,11 +1,12 @@
 package termui
 
 import (
+	"strings"
+	"testing"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/tree"
 	"github.com/stretchr/testify/assert"
-	"strings"
-	"testing"
 )
 
 func TestRenderStepTree(t *testing.T) {

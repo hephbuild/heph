@@ -1,9 +1,10 @@
 package hstep
 
 import (
-	"connectrpc.com/connect"
 	"context"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+
+	"connectrpc.com/connect"
+	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 )
 
@@ -12,7 +13,7 @@ type rpcHandler struct {
 }
 
 func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.StepServiceCreateRequest]) (*connect.Response[corev1.StepServiceCreateResponse], error) {
-	step := req.Msg.Step
+	step := req.Msg.GetStep()
 	step = r.handler(ctx, step)
 
 	return connect.NewResponse(&corev1.StepServiceCreateResponse{Step: step}), nil

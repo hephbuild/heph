@@ -1,11 +1,12 @@
 package hlipgloss
 
 import (
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
 	"io"
 	"os"
 	"strconv"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 var forcetty bool

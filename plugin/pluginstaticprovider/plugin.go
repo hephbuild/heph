@@ -1,12 +1,13 @@
 package pluginstaticprovider
 
 import (
-	"connectrpc.com/connect"
 	"context"
-	"fmt"
+	"errors"
+	"strings"
+
+	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
-	"strings"
 )
 
 type Target struct {
@@ -25,20 +26,20 @@ func New(targets []Target) *Plugin {
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
 	for _, target := range p.targets {
-		if req.Msg.Package != "" {
-			if req.Msg.Deep {
-				if !strings.HasPrefix(target.Spec.Ref.Package, req.Msg.Package) {
+		if req.Msg.GetPackage() != "" {
+			if req.Msg.GetDeep() {
+				if !strings.HasPrefix(target.Spec.GetRef().GetPackage(), req.Msg.GetPackage()) {
 					continue
 				}
 			} else {
-				if target.Spec.Ref.Package != req.Msg.Package {
+				if target.Spec.GetRef().GetPackage() != req.Msg.GetPackage() {
 					continue
 				}
 			}
 		}
 
 		err := res.Send(&pluginv1.ListResponse{
-			Ref: target.Spec.Ref,
+			Ref: target.Spec.GetRef(),
 		})
 		if err != nil {
 			return err
@@ -50,7 +51,7 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
 	for _, target := range p.targets {
-		if target.Spec.Ref.Package != req.Msg.Ref.Package || target.Spec.Ref.Name != req.Msg.Ref.Name {
+		if target.Spec.GetRef().GetPackage() != req.Msg.GetRef().GetPackage() || target.Spec.GetRef().GetName() != req.Msg.GetRef().GetName() {
 			continue
 		}
 
@@ -59,8 +60,7 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}), nil
 	}
 
-	return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("not found"))
-
+	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 }
 
 var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)

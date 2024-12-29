@@ -3,11 +3,12 @@ package hbbtexec
 import (
 	"errors"
 	"fmt"
+	"io"
+	"sync"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/term"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
-	"io"
-	"sync"
 )
 
 type ExecFunc[T any] func(args RunArgs) (T, error)
@@ -30,8 +31,8 @@ func (e *execCmd) makeRaw() error {
 		}
 		e.restore = func() {
 			err := term.Restore(f.Fd(), previousState)
-			if err != nil {
-				//fmt.Println("RESTORE", err)
+			if err != nil { //nolint:staticcheck
+				// fmt.Println("RESTORE", err)
 				// TODO: log
 			}
 		}
@@ -86,7 +87,7 @@ type execCmdWrapper struct {
 
 func (e *execCmdWrapper) Run() error {
 	// 3. pause the logs, since bbt will take control of the term again
-	//defer e.w.Write([]byte("\n"))
+	// defer e.w.Write([]byte("\n"))
 	defer e.hijacker.SetMode(hbbtlog.LogHijackerModeWait)
 
 	return e.c.Run()

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"os"
+
 	"github.com/hephbuild/hephv2/internal/cmd"
 )
 
 func main() {
-	cmd.Execute()
+	code := cmd.Execute()
+
+	os.Exit(code)
 }

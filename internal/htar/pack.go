@@ -3,10 +3,11 @@ package htar
 import (
 	"archive/tar"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/hfs"
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/hephbuild/hephv2/internal/hfs"
 )
 
 type Packer struct {
@@ -48,7 +49,7 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 		return err
 	}
 
-	if !info.Mode().IsRegular() { //nothing more to do for non-regular
+	if !info.Mode().IsRegular() { // nothing more to do for non-regular
 		return nil
 	}
 

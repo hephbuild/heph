@@ -3,10 +3,11 @@ package hartifact
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/htar"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"io"
 )
 
 type unpackConfig struct {
@@ -33,9 +34,9 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	}
 	defer r.Close()
 
-	switch artifact.Encoding {
+	switch artifact.GetEncoding() {
 	case pluginv1.Artifact_ENCODING_NONE:
-		f, err := hfs.Create(fs, artifact.Name)
+		f, err := hfs.Create(fs, artifact.GetName())
 		if err != nil {
 			return err
 		}
@@ -50,8 +51,10 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return err
 		}
+	case pluginv1.Artifact_ENCODING_BASE64, pluginv1.Artifact_ENCODING_TAR_GZ, pluginv1.Artifact_ENCODING_UNSPECIFIED:
+		fallthrough
 	default:
-		return fmt.Errorf("unsupported encoding %s", artifact.Encoding)
+		return fmt.Errorf("unsupported encoding %s", artifact.GetEncoding())
 	}
 
 	return nil

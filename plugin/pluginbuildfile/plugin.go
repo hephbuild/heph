@@ -1,10 +1,12 @@
 package pluginbuildfile
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hstarlark"
@@ -13,7 +15,6 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 	"google.golang.org/protobuf/types/known/structpb"
-	iofs "io/fs"
 )
 
 type Plugin struct {
@@ -93,17 +94,27 @@ type OnTargetPayload struct {
 	Args    map[string]starlark.Value
 }
 
-type BuiltinFunc = func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error)
+type BuiltinFunc = func(
+	thread *starlark.Thread,
+	fn *starlark.Builtin,
+	args starlark.Tuple,
+	kwargs []starlark.Tuple,
+) (starlark.Value, error)
 
 func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
-	return func(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		ctx := thread.Local(ctxKey).(context.Context)
-		pkg := thread.Local(packageKey).(string)
+	return func(
+		thread *starlark.Thread,
+		fn *starlark.Builtin,
+		args starlark.Tuple,
+		kwargs []starlark.Tuple,
+	) (starlark.Value, error) {
+		ctx := thread.Local(ctxKey).(context.Context) //nolint:errcheck
+		pkg := thread.Local(packageKey).(string)      //nolint:errcheck
 
 		var fkwargs []starlark.Tuple
 		var otherkwargs = map[string]starlark.Value{}
 		for _, item := range kwargs {
-			name, arg := item[0].(starlark.String), item[1]
+			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
 
 			switch name {
 			case "name", "driver":
@@ -130,7 +141,7 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 		}
 
 		if payload.Name == "" {
-			return nil, fmt.Errorf("missing name")
+			return nil, errors.New("missing name")
 		}
 
 		err := onTarget(ctx, payload)
@@ -195,7 +206,7 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 }
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	spec, err := p.cacheget.Singleflight(ctx, req.Msg.Ref, func() (*pluginv1.TargetSpec, error) {
+	spec, err := p.cacheget.Singleflight(ctx, req.Msg.GetRef(), func() (*pluginv1.TargetSpec, error) {
 		return p.getInner(ctx, req)
 	})
 	if err != nil {
@@ -209,8 +220,8 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
 	var payload OnTargetPayload
-	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, p OnTargetPayload) error {
-		if p.Package == req.Msg.Ref.Package && p.Name == req.Msg.Ref.Name {
+	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
+		if p.Package == req.Msg.GetRef().GetPackage() && p.Name == req.Msg.GetRef().GetName() {
 			payload = p
 			return nil // TODO: StopErr
 		}
@@ -222,10 +233,10 @@ func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.Get
 	}
 
 	if payload.Name == "" {
-		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("not found"))
+		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
 
-	ref := req.Msg.Ref
+	ref := req.Msg.GetRef()
 	ref.Driver = payload.Driver
 
 	config := map[string]*structpb.Value{}

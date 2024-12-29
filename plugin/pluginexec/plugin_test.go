@@ -2,8 +2,16 @@ package pluginexec
 
 import (
 	"bytes"
-	"connectrpc.com/connect"
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/hephv2/plugin/hpipe"
@@ -14,13 +22,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"strings"
-	"testing"
-	"time"
 )
 
 func TestSanity(t *testing.T) {
@@ -35,10 +36,10 @@ func TestSanity(t *testing.T) {
 		res, err := p.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
 		require.NoError(t, err)
 
-		b, err := protojson.Marshal(res.Msg.TargetSchema)
+		b, err := protojson.Marshal(res.Msg.GetTargetSchema())
 		require.NoError(t, err)
 		require.NotEmpty(t, b)
-		//require.JSONEq(t, `{"name":"Target", "field":[{"name":"run", "number":1, "label":"LABEL_REPEATED", "type":"TYPE_STRING", "jsonName":"run"}]}`, string(b))
+		// require.JSONEq(t, `{"name":"Target", "field":[{"name":"run", "number":1, "label":"LABEL_REPEATED", "type":"TYPE_STRING", "jsonName":"run"}]}`, string(b))
 	}
 
 	var def *pluginv1.TargetDef
@@ -60,7 +61,7 @@ func TestSanity(t *testing.T) {
 		}))
 		require.NoError(t, err)
 
-		def = res.Msg.Target
+		def = res.Msg.GetTarget()
 	}
 
 	{
@@ -70,7 +71,7 @@ func TestSanity(t *testing.T) {
 		}))
 		require.NoError(t, err)
 
-		assert.Len(t, res.Msg.Artifacts, 1)
+		assert.Len(t, res.Msg.GetArtifacts(), 1)
 	}
 }
 
@@ -104,7 +105,7 @@ func TestPipeStdout(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.Path)
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.GetPath())
 	require.NoError(t, err)
 
 	go func() {
@@ -118,9 +119,11 @@ func TestPipeStdout(t *testing.T) {
 				Def: def,
 			},
 			SandboxPath: sandboxPath,
-			Pipes:       []string{"", res.Msg.Id, ""},
+			Pipes:       []string{"", res.Msg.GetId(), ""},
 		}))
-		require.NoError(t, err)
+		if err != nil {
+			panic(err)
+		}
 	}()
 
 	var stdout bytes.Buffer
@@ -162,7 +165,7 @@ func TestPipeStdin(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.Path)
+	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.GetPath())
 	require.NoError(t, err)
 
 	go func() {
@@ -176,7 +179,7 @@ func TestPipeStdin(t *testing.T) {
 		}
 	}()
 
-	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, pipeOut.Msg.Path)
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, pipeOut.Msg.GetPath())
 	require.NoError(t, err)
 
 	go func() {
@@ -190,9 +193,11 @@ func TestPipeStdin(t *testing.T) {
 				Def: def,
 			},
 			SandboxPath: sandboxPath,
-			Pipes:       []string{pipeIn.Msg.Id, pipeOut.Msg.Id, ""},
+			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 		}))
-		require.NoError(t, err)
+		if err != nil {
+			panic(err)
+		}
 	}()
 
 	var stdout bytes.Buffer
@@ -206,7 +211,7 @@ type sleepReader struct {
 	d time.Duration
 }
 
-func (s sleepReader) Read(p []byte) (n int, err error) {
+func (s sleepReader) Read(p []byte) (int, error) {
 	time.Sleep(s.d)
 
 	return 0, io.EOF
@@ -244,7 +249,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.Path)
+	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.GetPath())
 	require.NoError(t, err)
 
 	input := strings.Repeat("hello world", 10000)
@@ -260,7 +265,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 		}
 	}()
 
-	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, pipeOut.Msg.Path)
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, pipeOut.Msg.GetPath())
 	require.NoError(t, err)
 
 	go func() {
@@ -274,9 +279,11 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 				Def: def,
 			},
 			SandboxPath: sandboxPath,
-			Pipes:       []string{pipeIn.Msg.Id, pipeOut.Msg.Id, ""},
+			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 		}))
-		require.NoError(t, err)
+		if err != nil {
+			panic(err)
+		}
 	}()
 
 	var stdout bytes.Buffer
@@ -322,7 +329,7 @@ func TestPipe404(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.Path)
+	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.GetPath())
 	require.NoError(t, err)
 
 	var stdout bytes.Buffer
@@ -344,12 +351,12 @@ func TestPipe404(t *testing.T) {
 			Def: def,
 		},
 		SandboxPath: sandboxPath,
-		Pipes:       []string{"", res.Msg.Id, ""},
+		Pipes:       []string{"", res.Msg.GetId(), ""},
 	}))
 	require.NoError(t, err)
 
 	err = eg.Wait()
-	assert.ErrorContains(t, err, "status: 404 404 Not Found")
+	require.ErrorContains(t, err, "status: 404 404 Not Found")
 
 	assert.Equal(t, "Not found :(", stdout.String())
 }

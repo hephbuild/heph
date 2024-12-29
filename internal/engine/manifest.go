@@ -1,8 +1,9 @@
 package engine
 
 import (
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"time"
+
+	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 )
 
 var ArtifactManifestName = "manifest.v1.json"

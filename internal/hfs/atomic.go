@@ -1,12 +1,12 @@
 package hfs
 
 import (
-	"github.com/hephbuild/heph/utils/instance"
 	"github.com/hephbuild/heph/utils/xrand"
+	"github.com/hephbuild/hephv2/internal/hinstance"
 )
 
 func processUniquePath(p string) string {
-	return p + "_tmp_" + instance.UID + "_" + xrand.RandStr(7)
+	return p + "_tmp_" + hinstance.UID + "_" + xrand.RandStr(7)
 }
 
 type AtomicFile struct {
@@ -17,7 +17,7 @@ type AtomicFile struct {
 }
 
 func (f *AtomicFile) Close() error {
-	defer f.fs.Remove(f.tmpname)
+	defer f.fs.Remove(f.tmpname) //nolint:errcheck
 
 	err := f.File.Close()
 	if err != nil {

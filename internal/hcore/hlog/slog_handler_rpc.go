@@ -1,29 +1,30 @@
 package hlog
 
 import (
-	"connectrpc.com/connect"
 	"context"
-	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 	"log/slog"
 	"sync"
+
+	"connectrpc.com/connect"
+	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
+	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 )
 
-type slogRpcHandler struct {
-	*innerSlogRpcHandler
+type slogRPCHandler struct {
+	*innerSlogRPCHandler
 	attrs []slog.Attr
 }
 
-type innerSlogRpcHandler struct {
+type innerSlogRPCHandler struct {
 	m      sync.Mutex
 	client corev1connect.LogServiceClient
 }
 
-func (l slogRpcHandler) Enabled(ctx context.Context, level slog.Level) bool {
+func (l slogRPCHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return true
 }
 
-func (l slogRpcHandler) Handle(ctx context.Context, record slog.Record) error {
+func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 	l.m.Lock()
 	defer l.m.Unlock()
 
@@ -52,19 +53,19 @@ func (l slogRpcHandler) Handle(ctx context.Context, record slog.Record) error {
 	return nil
 }
 
-func (l slogRpcHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+func (l slogRPCHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	l.attrs = append(l.attrs, attrs...)
 
 	return l
 }
 
-func (l slogRpcHandler) WithGroup(name string) slog.Handler {
+func (l slogRPCHandler) WithGroup(name string) slog.Handler {
 	return l
 }
 
 func NewRPCLogger(client corev1connect.LogServiceClient) *slog.Logger {
-	return NewLogger(&slogRpcHandler{
-		innerSlogRpcHandler: &innerSlogRpcHandler{
+	return NewLogger(&slogRPCHandler{
+		innerSlogRPCHandler: &innerSlogRPCHandler{
 			client: client,
 		},
 	})

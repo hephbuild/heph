@@ -1,16 +1,17 @@
 package pluginbuildfile
 
 import (
-	"connectrpc.com/connect"
 	"context"
+	"os"
+	"testing"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/plugintest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"os"
-	"testing"
 )
 
 func TestSanity(t *testing.T) {
@@ -35,11 +36,11 @@ func TestSanity(t *testing.T) {
 
 		require.True(t, res.Receive())
 		spec := res.Msg()
-		assert.Equal(t, "", spec.Ref.Package)
-		assert.Equal(t, "hello", spec.Ref.Name)
-		assert.Equal(t, "exec", spec.Ref.Driver)
+		assert.Equal(t, "", spec.GetRef().GetPackage())
+		assert.Equal(t, "hello", spec.GetRef().GetName())
+		assert.Equal(t, "exec", spec.GetRef().GetDriver())
 
-		ref = spec.Ref
+		ref = spec.GetRef()
 	}
 
 	{
@@ -48,6 +49,6 @@ func TestSanity(t *testing.T) {
 		}))
 		require.NoError(t, err)
 
-		assert.Equal(t, []any{"hello"}, res.Msg.Spec.Config["run"].GetListValue().AsSlice())
+		assert.Equal(t, []any{"hello"}, res.Msg.GetSpec().GetConfig()["run"].GetListValue().AsSlice())
 	}
 }

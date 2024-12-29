@@ -3,16 +3,18 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/log/liblog"
-	"github.com/hephbuild/heph/log/testlog"
-	"github.com/hephbuild/hephv2/internal/hfs"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hephbuild/heph/log/liblog"
+	"github.com/hephbuild/heph/log/testlog"
+
+	"github.com/hephbuild/hephv2/internal/hfs"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func newfs(t testing.TB) hfs.OS {
@@ -151,7 +153,7 @@ func testLocker(t *testing.T, factory func() Locker) {
 		}
 	}
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		wg.Add(1)
 		go do()
 	}
@@ -199,7 +201,7 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 	l := factory()
 
 	err := l.Lock(ctx)
-	assert.ErrorContains(t, err, "context deadline exceeded")
+	require.ErrorContains(t, err, "context deadline exceeded")
 
 	time.Sleep(time.Second)
 }
@@ -245,7 +247,7 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	ok, err := l3.TryLock(ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, false, ok)
+	assert.False(t, ok)
 
 	// Unlock one of them
 	err = l1.RUnlock()
@@ -254,7 +256,7 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	ok, err = l3.TryLock(ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, false, ok)
+	assert.False(t, ok)
 
 	// Unlock the second
 	err = l2.RUnlock()
@@ -264,13 +266,13 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	ok, err = l3.TryLock(ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, true, ok)
+	assert.True(t, ok)
 
 	// Try to RLock after Lock
 	ok, err = l1.TryRLock(ctx)
 	require.NoError(t, err)
 
-	assert.Equal(t, false, ok)
+	assert.False(t, ok)
 }
 
 func TestFlockConcurrent(t *testing.T) {
@@ -316,7 +318,7 @@ func TestFlockConcurrent(t *testing.T) {
 		for _, lock := range locks {
 			err := lock.Unlock()
 			if err != nil {
-				// TODO
+				return err
 			}
 		}
 

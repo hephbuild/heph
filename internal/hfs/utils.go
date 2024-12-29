@@ -72,7 +72,7 @@ func CreateParentDir(fs FS, path string) error {
 
 func At[T FS](fs T, names ...string) T {
 	for _, name := range names {
-		fs = fs.At(name).(T)
+		fs = fs.At(name).(T) //nolint:errcheck
 	}
 	return fs
 }

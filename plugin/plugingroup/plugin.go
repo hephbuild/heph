@@ -1,9 +1,10 @@
 package plugingroup
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
+
+	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	groupv1 "github.com/hephbuild/hephv2/plugin/plugingroup/gen/heph/plugin/group/v1"
@@ -42,21 +43,20 @@ func (p Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRe
 
 func (p Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	var t groupv1.Target
-	err := req.Msg.Target.Def.UnmarshalTo(&t)
+	err := req.Msg.GetTarget().GetDef().UnmarshalTo(&t)
 	if err != nil {
 		return nil, err
 	}
 
-	var artifacts []*pluginv1.Artifact
-
-	for _, input := range req.Msg.Inputs {
-		artifact := input.Artifact
+	artifacts := make([]*pluginv1.Artifact, 0, len(req.Msg.GetInputs()))
+	for _, input := range req.Msg.GetInputs() {
+		artifact := input.GetArtifact()
 
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name:     artifact.Name,
-			Group:    artifact.Group,
-			Encoding: artifact.Encoding,
-			Uri:      artifact.Uri,
+			Name:     artifact.GetName(),
+			Group:    artifact.GetGroup(),
+			Encoding: artifact.GetEncoding(),
+			Uri:      artifact.GetUri(),
 		})
 	}
 

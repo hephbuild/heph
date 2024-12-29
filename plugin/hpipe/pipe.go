@@ -12,8 +12,8 @@ type ReaderCloser interface {
 	io.Closer
 }
 
-func Reader(ctx context.Context, client *http.Client, baseUrl, path string) (ReaderCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseUrl+path, nil)
+func Reader(ctx context.Context, client *http.Client, baseURL, path string) (ReaderCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -26,6 +26,7 @@ func Reader(ctx context.Context, client *http.Client, baseUrl, path string) (Rea
 			_ = w.CloseWithError(err)
 			return
 		}
+		defer res.Body.Close()
 
 		_, err = io.Copy(w, res.Body)
 		if err == nil && res.StatusCode != http.StatusOK {
@@ -42,10 +43,10 @@ type WriterCloser interface {
 	io.Closer
 }
 
-func Writer(ctx context.Context, client *http.Client, baseUrl, path string) (WriterCloser, error) {
+func Writer(ctx context.Context, client *http.Client, baseURL, path string) (WriterCloser, error) {
 	r, w := io.Pipe()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseUrl+path, r)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, r)
 	if err != nil {
 		return nil, err
 	}

@@ -1,9 +1,10 @@
 package hcore
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
@@ -11,7 +12,7 @@ import (
 
 func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {
 	return func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(
+		return func( //nolint:nonamedreturns
 			ctx context.Context,
 			req connect.AnyRequest,
 		) (response connect.AnyResponse, err error) {

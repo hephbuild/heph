@@ -1,20 +1,21 @@
 package termui
 
 import (
+	"iter"
+	"maps"
+	"slices"
+
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/tree"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepfmt"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
-	"iter"
-	"maps"
-	"slices"
 )
 
 func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*corev1.Step, root string, id string) *tree.Tree {
 	t := tree.Root(root)
 
 	for _, step := range children[id] {
-		t = t.Child(buildStepsTreeInner(renderer, children, hstepfmt.Format(renderer, step, true), step.Id))
+		t = t.Child(buildStepsTreeInner(renderer, children, hstepfmt.Format(renderer, step, true), step.GetId()))
 	}
 
 	return t
@@ -23,12 +24,12 @@ func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*cor
 func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) string {
 	children := map[string][]*corev1.Step{}
 	for v := range steps {
-		children[v.ParentId] = append(children[v.ParentId], v)
+		children[v.GetParentId()] = append(children[v.GetParentId()], v)
 	}
 
 	for v := range maps.Values(children) {
 		slices.SortFunc(v, func(a, b *corev1.Step) int {
-			return a.StartedAt.AsTime().Compare(b.StartedAt.AsTime())
+			return a.GetStartedAt().AsTime().Compare(b.GetStartedAt().AsTime())
 		})
 	}
 

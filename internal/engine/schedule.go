@@ -1,12 +1,18 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"slices"
+	"sync"
+	"time"
+
+	"connectrpc.com/connect"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
@@ -21,11 +27,6 @@ import (
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
-	"io"
-	"os"
-	"slices"
-	"sync"
-	"time"
 )
 
 type ExecOptions struct {
@@ -104,7 +105,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				outputs = nil
 			}
 
-			ch := e.Result(ctx, dep.Ref.Package, dep.Ref.Name, outputs, ResultOptions{Singleflight: sf})
+			ch := e.Result(ctx, dep.Ref.GetPackage(), dep.Ref.GetName(), outputs, ResultOptions{Singleflight: sf})
 
 			res := <-ch
 
@@ -157,7 +158,7 @@ func (e *Engine) ResultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 
 	if ok {
 		step := hstep.From(ctx)
-		step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.Package, def.Ref.Name))
+		step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.GetPackage(), def.Ref.GetName()))
 
 		return res, true, nil
 	}
@@ -190,12 +191,12 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 
 	var targetfolder string
 	if def.Cache {
-		targetfolder = "__" + def.Ref.Name
+		targetfolder = "__" + def.Ref.GetName()
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.GetName(), time.Now().UnixNano())
 	}
 
-	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.Package, targetfolder), "", "result.lock")
+	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.GetPackage(), targetfolder), "", "result.lock")
 
 	if def.Cache {
 		if !options.Force {
@@ -262,7 +263,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		b, err = proto.Marshal(result.Origin.Ref)
+		b, err = proto.Marshal(result.Origin.GetRef())
 		if err != nil {
 			return "", err
 		}
@@ -349,7 +350,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 			return nil, wait, err
 		}
 
-		pipes[0] = res.Msg.Id
+		pipes[0] = res.Msg.GetId()
 
 		ctx, cancel := context.WithCancel(ctx)
 		cancels = append(cancels, cancel)
@@ -357,7 +358,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		go func() {
 			defer cancel()
 
-			w, err := hpipe.Writer(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				stdinErrCh <- err
 				return
@@ -376,10 +377,10 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 			return nil, wait, err
 		}
 
-		pipes[1] = res.Msg.Id
+		pipes[1] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -396,10 +397,10 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 			return nil, wait, err
 		}
 
-		pipes[2] = res.Msg.Id
+		pipes[2] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -416,13 +417,13 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 			return nil, wait, err
 		}
 
-		pipes[3] = res.Msg.Id
+		pipes[3] = res.Msg.GetId()
 
 		ch, clean := hpty.WinSizeChan(ctx, stdin)
 		cancels = append(cancels, clean)
 
 		go func() {
-			w, err := hpipe.Writer(ctx, driverHandle.HttpClient(), driverHandle.BaseURL(), res.Msg.Path)
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
 				return
@@ -448,7 +449,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("hephv2/engine: Execute %v %v", def.Ref.Package, def.Ref.Name), "",
+			fmt.Sprintf("hephv2/engine: Execute %v %v", def.Ref.GetPackage(), def.Ref.GetName()), "",
 		}
 	})
 
@@ -458,25 +459,25 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
 
-	driver, ok := e.DriversByName[def.Ref.Driver]
+	driver, ok := e.DriversByName[def.Ref.GetDriver()]
 	if !ok {
-		return nil, fmt.Errorf("driver not found: %v", def.Ref.Driver)
+		return nil, fmt.Errorf("driver not found: %v", def.Ref.GetDriver())
 	}
 
 	if options.shell {
 		// TODO: make the original driver declare the shell config
-		driver, ok = e.DriversByName[def.Ref.Driver+"@shell"]
+		driver, ok = e.DriversByName[def.Ref.GetDriver()+"@shell"]
 		if !ok {
-			return nil, fmt.Errorf("shell driver not found: %v", def.Ref.Driver)
+			return nil, fmt.Errorf("shell driver not found: %v", def.Ref.GetDriver())
 		}
 		def.Pty = true
 	}
 
 	var targetfolder string
 	if def.Cache {
-		targetfolder = "__" + def.Ref.Name
+		targetfolder = "__" + def.Ref.GetName()
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.Name, time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.GetName(), time.Now().UnixNano())
 	}
 
 	hashin, err := e.hashin(ctx, def, results)
@@ -492,7 +493,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 		if ok {
 			step := hstep.From(ctx)
-			step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.Package, def.Ref.Name))
+			step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.GetPackage(), def.Ref.GetName()))
 
 			return res, nil
 		}
@@ -501,7 +502,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	step, ctx := hstep.New(ctx, "Running...")
 	defer step.Done()
 
-	sandboxfs := hfs.At(e.Sandbox, def.Ref.Package, targetfolder)
+	sandboxfs := hfs.At(e.Sandbox, def.Ref.GetPackage(), targetfolder)
 	workdirfs := sandboxfs.At("ws") // TODO: remove the ws from here
 
 	err = sandboxfs.RemoveAll("")
@@ -520,7 +521,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if hashin != hashin2 {
-		return nil, fmt.Errorf("modified while creating sandbox")
+		return nil, errors.New("modified while creating sandbox")
 	}
 
 	if options.interactiveExec == nil {
@@ -564,11 +565,11 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}, nil
 	}
 
-	cachefs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
-	var execOutputs []ExecuteResultOutput
+	cachefs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
+	execOutputs := make([]ExecuteResultOutput, 0, len(def.CollectOutputs))
 
 	for _, output := range def.CollectOutputs {
-		tarname := output.Group + ".tar"
+		tarname := output.GetGroup() + ".tar"
 		tarf, err := hfs.Create(cachefs, tarname)
 		if err != nil {
 			return nil, err
@@ -576,7 +577,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		defer tarf.Close()
 
 		tar := htar.NewPacker(tarf)
-		for _, path := range output.Paths {
+		for _, path := range output.GetPaths() {
 			// TODO: glob
 
 			f, err := hfs.Open(workdirfs, path)
@@ -618,7 +619,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		execOutputs = append(execOutputs, ExecuteResultOutput{
 			Hashout: hashout,
 			Artifact: &pluginv1.Artifact{
-				Group:    output.Group,
+				Group:    output.GetGroup(),
 				Name:     tarname,
 				Type:     pluginv1.Artifact_TYPE_OUTPUT,
 				Encoding: pluginv1.Artifact_ENCODING_TAR,
@@ -627,23 +628,23 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		})
 	}
 
-	for _, artifact := range runRes.Msg.Artifacts {
-		if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
+	for _, artifact := range runRes.Msg.GetArtifacts() {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}
 
-		//panic("copy to cache not implemented yet")
+		// panic("copy to cache not implemented yet")
 
 		// TODO: copy to cache
-		//hfs.Copy()
+		// hfs.Copy()
 		//
-		//artifact.Uri
+		// artifact.Uri
 		//
-		//execOutputs = append(execOutputs, ExecuteResultOutput{
+		// execOutputs = append(execOutputs, ExecuteResultOutput{
 		//	Name:    artifact.Group,
 		//	Hashout: "",
 		//	TarPath: "",
-		//})
+		// })
 	}
 
 	err = sandboxfs.RemoveAll("")
@@ -661,14 +662,14 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
 	res, err := e.Execute(ctx, def, options, sf)
 	if err != nil {
-		return nil, fmt.Errorf("execute: %v", err)
+		return nil, fmt.Errorf("execute: %w", err)
 	}
 
 	var cachedArtifacts []ExecuteResultOutput
 	if res.Executed {
 		artifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Outputs)
 		if err != nil {
-			return nil, fmt.Errorf("cache locally: %v", err)
+			return nil, fmt.Errorf("cache locally: %w", err)
 		}
 
 		cachedArtifacts = artifacts

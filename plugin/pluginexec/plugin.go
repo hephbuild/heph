@@ -2,23 +2,10 @@ package pluginexec
 
 import (
 	"bufio"
-	"connectrpc.com/connect"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	ptylib "github.com/creack/pty"
-	"github.com/dlsniper/debugger"
-	"github.com/google/uuid"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hstep"
-	"github.com/hephbuild/hephv2/internal/hio"
-	"github.com/hephbuild/hephv2/internal/hpty"
-	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
-	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
-	"google.golang.org/protobuf/reflect/protodesc"
-	"google.golang.org/protobuf/types/known/anypb"
 	"io"
 	"maps"
 	"net/http"
@@ -32,6 +19,20 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"connectrpc.com/connect"
+	ptylib "github.com/creack/pty"
+	"github.com/dlsniper/debugger"
+	"github.com/google/uuid"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hstep"
+	"github.com/hephbuild/hephv2/internal/hio"
+	"github.com/hephbuild/hephv2/internal/hpty"
+	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
+	execv1 "github.com/hephbuild/hephv2/plugin/pluginexec/gen/heph/plugin/exec/v1"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 type pipe struct {
@@ -83,7 +84,7 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
 	var targetSpec Spec
 	targetSpec.Cache = true
-	err := DecodeTo(req.Msg.Spec.Config, &targetSpec)
+	err := DecodeTo(req.Msg.GetSpec().GetConfig(), &targetSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -100,11 +101,11 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		})
 	}
 
-	var collectOutputs []*pluginv1.TargetDef_CollectOutput
-	for _, output := range s.Outputs {
+	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(s.GetOutputs()))
+	for _, output := range s.GetOutputs() {
 		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
-			Group: output.Group,
-			Paths: output.Paths,
+			Group: output.GetGroup(),
+			Paths: output.GetPaths(),
 		})
 	}
 
@@ -151,7 +152,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 
 	return connect.NewResponse(&pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
-			Ref:            req.Msg.Spec.Ref,
+			Ref:            req.Msg.GetSpec().GetRef(),
 			Def:            target,
 			Deps:           deps,
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
@@ -167,14 +168,15 @@ func getEnvName(prefix, group, name string) string {
 	group = strings.ToUpper(group)
 	name = strings.ToUpper(name)
 
-	if group != "" && name != "" {
+	switch {
+	case group != "" && name != "":
 		return fmt.Sprintf("%v_%v_%v", prefix, group, name)
-	} else if group != "" {
+	case group != "":
 		return fmt.Sprintf("%v_%v", prefix, group)
-	} else if name != "" {
+	case name != "":
 		return fmt.Sprintf("%v_%v", prefix, name)
-	} else {
-		return fmt.Sprintf("%v", prefix)
+	default:
+		return prefix
 	}
 }
 
@@ -185,11 +187,15 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, deps map[string]*execv1.Target_Dep) ([]string, error) {
+func (p *Plugin) inputEnv(
+	ctx context.Context,
+	inputs []*pluginv1.ArtifactWithOrigin,
+	deps map[string]*execv1.Target_Dep,
+) ([]string, error) {
 	getDep := func(t *pluginv1.TargetRefWithOutput) (string, bool) {
 		for name, dep := range deps {
-			for _, target := range dep.Targets {
-				if target.Name == t.Name && target.Package == t.Package {
+			for _, target := range dep.GetTargets() {
+				if target.GetName() == t.GetName() && target.GetPackage() == t.GetPackage() {
 					return name, target.Output == nil
 				}
 			}
@@ -200,29 +206,29 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 
 	m := map[string][]*pluginv1.Artifact{}
 	for _, input := range inputs {
-		if input.Artifact.Type != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
+		if input.GetArtifact().GetType() != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
 			continue
 		}
 
-		depName, allOutput := getDep(input.Dep.Ref)
+		depName, allOutput := getDep(input.GetDep().GetRef())
 
 		var outputName string
 		if allOutput {
-			outputName = input.Artifact.Group
+			outputName = input.GetArtifact().GetGroup()
 		}
 
 		envName := getEnvName("SRC", depName, outputName)
 
-		m[envName] = append(m[envName], input.Artifact)
+		m[envName] = append(m[envName], input.GetArtifact())
 	}
 
-	var env []string
+	env := make([]string, 0, len(m))
 	var sb strings.Builder
 	for name, artifacts := range m {
 		sb.Reset()
 
 		for _, input := range artifacts {
-			b, err := os.ReadFile(strings.ReplaceAll(input.Uri, "file://", ""))
+			b, err := os.ReadFile(strings.ReplaceAll(input.GetUri(), "file://", ""))
 			if err != nil {
 				return nil, err
 			}
@@ -248,7 +254,7 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("hephv2/pluginexec %v: %v %v", p.name, req.Msg.Target.Ref.Package, req.Msg.Target.Ref.Name), "",
+			fmt.Sprintf("hephv2/pluginexec %v: %v %v", p.name, req.Msg.GetTarget().GetRef().GetPackage(), req.Msg.GetTarget().GetRef().GetName()), "",
 		}
 	})
 
@@ -260,18 +266,18 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	const pipeStderr = 2
 	const pipeTermSize = 3
 
-	for len(req.Msg.Pipes) < 4 {
+	for len(req.Msg.GetPipes()) < 4 {
 		req.Msg.Pipes = append(req.Msg.Pipes, "")
 	}
 
 	var t execv1.Target
-	err := req.Msg.Target.Def.UnmarshalTo(&t)
+	err := req.Msg.GetTarget().GetDef().UnmarshalTo(&t)
 	if err != nil {
 		return nil, err
 	}
 
-	pty := req.Msg.Target.Pty
-	workdir := filepath.Join(req.Msg.SandboxPath, "ws")
+	pty := req.Msg.GetTarget().GetPty()
+	workdir := filepath.Join(req.Msg.GetSandboxPath(), "ws")
 
 	err = os.MkdirAll(workdir, 0755)
 	if err != nil {
@@ -280,26 +286,26 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	env := []string{}
 
-	inputEnv, err := p.inputEnv(ctx, req.Msg.Inputs, t.Deps)
+	inputEnv, err := p.inputEnv(ctx, req.Msg.GetInputs(), t.GetDeps())
 	if err != nil {
 		return nil, err
 	}
 
 	env = append(env, inputEnv...)
 
-	for _, output := range t.Outputs {
-		paths := strings.Join(output.Paths, " ") // TODO: make it a path
+	for _, output := range t.GetOutputs() {
+		paths := strings.Join(output.GetPaths(), " ") // TODO: make it a path
 
-		env = append(env, getEnvEntry("OUT", output.Group, "", paths))
+		env = append(env, getEnvEntry("OUT", output.GetGroup(), "", paths))
 	}
 
-	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.Run))
-	args := p.runToExecArgs(req.Msg.SandboxPath, t.Run, nil)
+	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.GetRun()))
+	args := p.runToExecArgs(req.Msg.GetSandboxPath(), t.GetRun(), nil)
 	hlog.From(ctx).Debug(fmt.Sprintf("args: %#v", args))
 
 	var stdoutWriters, stderrWriters []io.Writer
 
-	logFile, err := os.Create(filepath.Join(req.Msg.SandboxPath, "log.txt"))
+	logFile, err := os.Create(filepath.Join(req.Msg.GetSandboxPath(), "log.txt"))
 	if err != nil {
 		return nil, err
 	}
@@ -308,14 +314,14 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	stdoutWriters = append(stdoutWriters, logFile)
 	stderrWriters = append(stderrWriters, logFile)
 
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
 	cmd.Dir = workdir
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // this creates a new process group, same as Setpgid
 	}
 
-	for i, id := range []string{req.Msg.Pipes[pipeStdout], req.Msg.Pipes[pipeStderr]} {
+	for i, id := range []string{req.Msg.GetPipes()[pipeStdout], req.Msg.GetPipes()[pipeStderr]} {
 		if id == "" {
 			continue
 		}
@@ -336,7 +342,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	cmd.Stdout = hio.MultiWriter(stdoutWriters...)
 	cmd.Stderr = hio.MultiWriter(stderrWriters...)
 
-	if id := req.Msg.Pipes[pipeStdin]; id != "" {
+	if id := req.Msg.GetPipes()[pipeStdin]; id != "" {
 		pipe, ok := p.getPipe(id)
 		if !ok {
 			return nil, errors.New("pipe stdin not found")
@@ -361,7 +367,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	if pty {
 		var sizeChan chan *ptylib.Winsize
-		if id := req.Msg.Pipes[pipeTermSize]; id != "" {
+		if id := req.Msg.GetPipes()[pipeTermSize]; id != "" {
 			sizeChan = make(chan *ptylib.Winsize)
 			defer close(sizeChan)
 
@@ -510,14 +516,14 @@ func NewBash(options ...Option) *Plugin {
 func NewInteractiveBash(options ...Option) *Plugin {
 	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
 		content, err := RenderInitFile(strings.Join(run, "\n"))
-		if err != nil {
+		if err != nil { //nolint:staticcheck
 			// TODO: log
 		}
 
 		initfilePath := filepath.Join(sandboxPath, "init.sh")
 
-		err = os.WriteFile(initfilePath, []byte(content), 0644)
-		if err != nil {
+		err = os.WriteFile(initfilePath, []byte(content), 0644) //nolint:gosec
+		if err != nil {                                         //nolint:staticcheck
 			// TODO: log
 		}
 

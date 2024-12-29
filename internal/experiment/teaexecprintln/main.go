@@ -3,15 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/hephv2/internal/hbbt/hbbtlog"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 )
 
 // When exec is running, its blocking the event loop
@@ -37,7 +38,6 @@ func (e *execCmd) Run() error {
 		e.w.Write([]byte("signal: " + s.String() + "\n"))
 		return nil
 	case <-time.After(time.Second):
-
 	}
 
 	return nil

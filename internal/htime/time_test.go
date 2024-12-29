@@ -2,9 +2,10 @@ package htime
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestFormatFixedWidthDuration(t *testing.T) {

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+
 	"github.com/hephbuild/hephv2/internal/hartifact"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
@@ -45,8 +46,8 @@ func SetupSandboxArtifact(ctx context.Context, artifact ExecuteResultOutput, fs 
 	defer listf.Close()
 
 	err = hartifact.Unpack(ctx, artifact.Artifact, fs, hartifact.WithOnFile(func(to string) {
-		listf.Write([]byte(to))
-		listf.Write([]byte("\n"))
+		_, _ = listf.Write([]byte(to))
+		_, _ = listf.Write([]byte("\n"))
 	}))
 	if err != nil {
 		return nil, err

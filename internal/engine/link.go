@@ -1,14 +1,15 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hmaps"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
-	"slices"
 )
 
 func (e *Engine) GetSpec(ctx context.Context, pkg, name string) (*pluginv1.TargetSpec, error) {
@@ -20,10 +21,14 @@ func (e *Engine) GetSpec(ctx context.Context, pkg, name string) (*pluginv1.Targe
 			},
 		}))
 		if err != nil {
+			if connect.CodeOf(err) == connect.CodeNotFound {
+				continue
+			}
+
 			return nil, err
 		}
 
-		return res.Msg.Spec, nil
+		return res.Msg.GetSpec(), nil
 	}
 
 	return nil, errors.New("target not found")
@@ -40,17 +45,17 @@ func (e *Engine) GetDefFromRef(ctx context.Context, ref Refish) (*pluginv1.Targe
 
 func (e *Engine) GetDef(ctx context.Context, pkg, name string) (*pluginv1.TargetDef, error) {
 	// put back when we have custom ids
-	//step, ctx := hstep.New(ctx, "Getting definition...")
-	//defer step.Done()
+	// step, ctx := hstep.New(ctx, "Getting definition...")
+	// defer step.Done()
 
 	spec, err := e.GetSpec(ctx, pkg, name)
 	if err != nil {
 		return nil, err
 	}
 
-	driver, ok := e.DriversByName[spec.Ref.Driver]
+	driver, ok := e.DriversByName[spec.GetRef().GetDriver()]
 	if !ok {
-		return nil, fmt.Errorf("driver %q doesnt exist", spec.Ref.Driver)
+		return nil, fmt.Errorf("driver %q doesnt exist", spec.GetRef().GetDriver())
 	}
 
 	res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
@@ -60,7 +65,7 @@ func (e *Engine) GetDef(ctx context.Context, pkg, name string) (*pluginv1.Target
 		return nil, err
 	}
 
-	return res.Msg.Target, nil
+	return res.Msg.GetTarget(), nil
 }
 
 type LinkedTarget struct {
@@ -92,8 +97,8 @@ func (e *Engine) linkInner(ctx context.Context, pkg, name string, memo *LinkMemo
 
 	memo.m[pkg+name] = lt
 
-	for _, dep := range def.Deps {
-		linkedDep, err := e.linkInner(ctx, dep.Ref.Package, dep.Ref.Name, memo)
+	for _, dep := range def.GetDeps() {
+		linkedDep, err := e.linkInner(ctx, dep.GetRef().GetPackage(), dep.GetRef().GetName(), memo)
 		if err != nil {
 			return nil, err
 		}
@@ -130,8 +135,8 @@ func (e *Engine) LightLink(ctx context.Context, pkg, name string) (*LightLinkedT
 
 	dedupOutputs := map[string]int{}
 
-	for _, dep := range def.Deps {
-		getOutputIndex, setOutputIndex := hmaps.GetSet(dedupOutputs, dep.Ref.String())
+	for _, dep := range def.GetDeps() {
+		getOutputIndex, setOutputIndex := hmaps.GetSet(dedupOutputs, dep.GetRef().String())
 
 		i, ok := getOutputIndex()
 
@@ -139,7 +144,7 @@ func (e *Engine) LightLink(ctx context.Context, pkg, name string) (*LightLinkedT
 			continue
 		}
 
-		linkeddep, err := e.GetDefFromRef(ctx, dep.Ref)
+		linkeddep, err := e.GetDefFromRef(ctx, dep.GetRef())
 		if err != nil {
 			return nil, err
 		}
@@ -152,9 +157,9 @@ func (e *Engine) LightLink(ctx context.Context, pkg, name string) (*LightLinkedT
 		if dep.Ref.Output == nil {
 			allset = true
 
-			outputs = linkeddep.Outputs
+			outputs = linkeddep.GetOutputs()
 		} else {
-			outputs = append(outputs, *dep.Ref.Output)
+			outputs = append(outputs, dep.GetRef().GetOutput())
 			slices.Sort(outputs)
 			outputs = slices.Compact(outputs)
 		}

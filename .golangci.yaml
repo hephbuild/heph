@@ -3,10 +3,12 @@ run:
   # Default: 1m
   timeout: 3m
 
-
 # This file contains only configs which differ from defaults.
 # All possible options can be found here https://github.com/golangci/golangci-lint/blob/master/.golangci.reference.yml
 linters-settings:
+  lll:
+    line-length: 170
+
   cyclop:
     # The maximal code complexity to report.
     # Default: 10
@@ -122,37 +124,17 @@ linters-settings:
     # Default: []
     disable:
       - fieldalignment # too strict
-    # Settings per analyzer.
-    settings:
-      shadow:
-        # Whether to be strict about shadowing; can be noisy.
-        # Default: false
-        strict: true
+      - shadow # too many false positives
+
+  revive:
+    rules:
+      - name: unused-parameter
+        disabled: true
 
   inamedparam:
     # Skips check for interface methods with only a single parameter.
     # Default: false
     skip-single-param: true
-
-  mnd:
-    # List of function patterns to exclude from analysis.
-    # Values always ignored: `time.Date`,
-    # `strconv.FormatInt`, `strconv.FormatUint`, `strconv.FormatFloat`,
-    # `strconv.ParseInt`, `strconv.ParseUint`, `strconv.ParseFloat`.
-    # Default: []
-    ignored-functions:
-      - args.Error
-      - flag.Arg
-      - flag.Duration.*
-      - flag.Float.*
-      - flag.Int.*
-      - flag.Uint.*
-      - os.Chmod
-      - os.Mkdir.*
-      - os.OpenFile
-      - os.WriteFile
-      - prometheus.ExponentialBuckets.*
-      - prometheus.LinearBuckets
 
   nakedret:
     # Make an issue if func has more lines of code than this setting, and it has naked returns.
@@ -162,10 +144,10 @@ linters-settings:
   nolintlint:
     # Exclude following linters from requiring an explanation.
     # Default: []
-    allow-no-explanation: [ funlen, gocognit, lll ]
+    # allow-no-explanation: [ funlen, gocognit, lll, errcheck, gocritic, exhaustive ]
     # Enable to require an explanation of nonzero length after each nolint directive.
     # Default: false
-    require-explanation: true
+    require-explanation: false
     # Enable to require nolint directives to mention the specific linter being suppressed.
     # Default: false
     require-specific: true
@@ -211,7 +193,9 @@ linters-settings:
     # Otherwise, only methods that take `*testing.T`, `*testing.B`, and `testing.TB` as arguments are checked.
     # Default: false
     all: true
-
+  gomoddirectives:
+    replace-allow-list:
+      - github.com/charmbracelet/bubbletea
 
 linters:
   disable-all: true
@@ -231,7 +215,6 @@ linters:
     - bodyclose # checks whether HTTP response body is closed successfully
     - canonicalheader # checks whether net/http.Header uses canonical header
     - copyloopvar # detects places where loop variables are copied (Go 1.22+)
-    - cyclop # checks function and package cyclomatic complexity
     - dupl # tool for code clone detection
     - durationcheck # checks for two durations multiplied together
     - errname # checks that sentinel errors are prefixed with the Err and error types are suffixed with the Error
@@ -239,15 +222,10 @@ linters:
     - exhaustive # checks exhaustiveness of enum switch statements
     - fatcontext # detects nested contexts in loops
     - forbidigo # forbids identifiers
-    - funlen # tool for detection of long functions
     - gocheckcompilerdirectives # validates go compiler directive comments (//go:)
-    - gochecknoglobals # checks that no global variables exist
-    - gochecknoinits # checks that no init functions are present in Go code
     - gochecksumtype # checks exhaustiveness on Go "sum types"
-    - gocognit # computes and checks the cognitive complexity of functions
     - goconst # finds repeated strings that could be replaced by a constant
     - gocritic # provides diagnostics that check for bugs, performance and style issues
-    - gocyclo # computes and checks the cyclomatic complexity of functions
     - godot # checks if comments end in a period
     - goimports # in addition to fixing imports, goimports also formats your code in the same style as gofmt
     - gomoddirectives # manages the use of 'replace', 'retract', and 'excludes' directives in go.mod
@@ -260,10 +238,8 @@ linters:
     - loggercheck # checks key value pairs for common logger libraries (kitlog,klog,logr,zap)
     - makezero # finds slice declarations with non-zero initial length
     - mirror # reports wrong mirror patterns of bytes/strings usage
-    - mnd # detects magic numbers
     - musttag # enforces field tags in (un)marshaled structs
     - nakedret # finds naked returns in functions greater than a specified function length
-    - nestif # reports deeply nested if statements
     - nilerr # finds the code that returns nil even if it checks that the error is not nil
     - nilnil # checks that there is no simultaneous return of nil error and an invalid value
     - noctx # finds sending http request without context.Context
@@ -278,20 +254,18 @@ linters:
     - recvcheck # checks for receiver type consistency
     - revive # fast, configurable, extensible, flexible, and beautiful linter for Go, drop-in replacement of golint
     - rowserrcheck # checks whether Err of rows is checked successfully
-    - sloglint # ensure consistent code style when using log/slog
     - spancheck # checks for mistakes with OpenTelemetry/Census spans
     - sqlclosecheck # checks that sql.Rows and sql.Stmt are closed
     - stylecheck # is a replacement for golint
     - tenv # detects using os.Setenv instead of t.Setenv since Go1.17
     - testableexamples # checks if examples are testable (have an expected output)
     - testifylint # checks usage of github.com/stretchr/testify
-    - testpackage # makes you use a separate _test package
     - tparallel # detects inappropriate usage of t.Parallel() method in your Go test codes
     - unconvert # removes unnecessary type conversions
-    - unparam # reports unused function parameters
     - usestdlibvars # detects the possibility to use variables/constants from the Go standard library
     - wastedassign # finds wasted assignment statements
     - whitespace # detects leading and trailing whitespace
+    - prealloc # finds slice declarations that could potentially be preallocated
 
     ## you may want to enable
     #- decorder # checks declaration order and count of types, constants, variables and functions
@@ -303,13 +277,23 @@ linters:
     #- inamedparam # [great idea, but too strict, need to ignore a lot of cases by default] reports interfaces with unnamed method parameters
     #- interfacebloat # checks the number of methods inside an interface
     #- ireturn # accept interfaces, return concrete types
-    #- prealloc # [premature optimization, but can be used in some cases] finds slice declarations that could potentially be preallocated
     #- tagalign # checks that struct tags are well aligned
     #- varnamelen # [great idea, but too many false positives] checks that the length of a variable's name matches its scope
     #- wrapcheck # checks that errors returned from external packages are wrapped
     #- zerologlint # detects the wrong usage of zerolog that a user forgets to dispatch zerolog.Event
 
     ## disabled
+    #- mnd # detects magic numbers
+    #- unparam [too many false positives with ctx] # reports unused function parameters
+    #- nestif # reports deeply nested if statements
+    #- gocognit # computes and checks the cognitive complexity of functions
+    #- gochecknoglobals # checks that no global variables exist
+    #- sloglint # ensure consistent code style when using log/slog
+    #- testpackage # makes you use a separate _test package
+    #- gocyclo # computes and checks the cyclomatic complexity of functions
+    #- cyclop # checks function and package cyclomatic complexity
+    #- funlen # tool for detection of long functions
+    #- gochecknoinits # checks that no init functions are present in Go code
     #- containedctx # detects struct contained context.Context field
     #- contextcheck # [too many false positives] checks the function whether use a non-inherited context
     #- depguard # [replaced by gomodguard] checks if package imports are in a list of acceptable packages
@@ -334,6 +318,9 @@ linters:
 
 
 issues:
+  exclude-dirs:
+    - internal/experiment
+
   # Maximum count of issues with the same text.
   # Set to 0 to disable.
   # Default: 3
@@ -354,3 +341,4 @@ issues:
         - gosec
         - noctx
         - wrapcheck
+        - prealloc

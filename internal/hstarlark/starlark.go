@@ -2,10 +2,10 @@ package hstarlark
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/utils/xstarlark"
+	"reflect"
+
 	"go.starlark.net/starlark"
 	"go.starlark.net/starlarkstruct"
-	"reflect"
 )
 
 func FromStarlark(v starlark.Value) interface{} {
@@ -22,7 +22,7 @@ func FromStarlark(v starlark.Value) interface{} {
 	case starlark.Float:
 		return float64(v)
 	case *starlarkstruct.Struct:
-		d, err := xstarlark.UnpackDistruct(v)
+		d, err := UnpackDistruct(v)
 		if err != nil {
 			panic(err)
 		}
@@ -33,7 +33,7 @@ func FromStarlark(v starlark.Value) interface{} {
 		}
 		return data
 	case *starlark.Dict:
-		d, err := xstarlark.UnpackDistruct(v)
+		d, err := UnpackDistruct(v)
 		if err == nil {
 			data := make(map[string]interface{}, len(d.Items()))
 			for _, e := range d.Items() {
@@ -90,16 +90,16 @@ func FromGo(v interface{}) starlark.Value {
 		return starlark.Float(v)
 	default:
 		rv := reflect.ValueOf(v)
-		switch rv.Kind() {
+		switch rv.Kind() { //nolint:exhaustive
 		case reflect.Map:
 			dict := &starlark.Dict{}
 
 			it := rv.MapRange()
 			for it.Next() {
-				k := it.Key().Interface()
-				v := it.Value().Interface()
+				mk := it.Key().Interface()
+				mv := it.Value().Interface()
 
-				err := dict.SetKey(FromGo(k), FromGo(v))
+				err := dict.SetKey(FromGo(mk), FromGo(mv))
 				if err != nil {
 					panic(err)
 				}
@@ -108,7 +108,7 @@ func FromGo(v interface{}) starlark.Value {
 			return dict
 		case reflect.Slice, reflect.Array:
 			list := &starlark.List{}
-			for i := 0; i < rv.Len(); i++ {
+			for i := range rv.Len() {
 				err := list.Append(FromGo(rv.Index(i).Interface()))
 				if err != nil {
 					panic(err)

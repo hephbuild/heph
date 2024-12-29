@@ -1,11 +1,12 @@
 package hfs
 
 import (
-	"github.com/hephbuild/hephv2/internal/flock"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/hephbuild/hephv2/internal/flock"
 )
 
 func NewOS(root string) OS {
@@ -123,7 +124,7 @@ func (osfs OS) MakeDirsReadWrite(dir string) {
 	// Module cache has 0555 directories; make them writable in order to remove content.
 	_ = filepath.WalkDir(osfs.join(dir), func(path string, info fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // ignore errors walking in file system
+			return nil //nolint:nilerr // ignore errors walking in file system
 		}
 		if info.IsDir() {
 			_ = os.Chmod(path, 0777)
@@ -148,7 +149,10 @@ func (osfs OS) Path(elems ...string) string {
 }
 
 func (osfs OS) CloseEnsureROFD(hf File) error {
-	f := hf.(*os.File)
+	f, ok := hf.(*os.File)
+	if !ok {
+		return hf.Close()
+	}
 
 	err := flock.Flock(f, false, true)
 	if err != nil {

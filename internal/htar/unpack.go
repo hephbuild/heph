@@ -5,9 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/hfs"
 	"io"
 	"os"
+
+	"github.com/hephbuild/hephv2/internal/hfs"
 )
 
 func UnpackFromPath(ctx context.Context, path string, to hfs.FS) error {
@@ -52,7 +53,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 			}
 
 		case tar.TypeDir:
-			err := to.MkdirAll(hdr.Name, hfs.FileMode(hdr.Mode))
+			err := to.MkdirAll(hdr.Name, hfs.FileMode(hdr.Mode)) //nolint:gosec
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
@@ -117,20 +118,20 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 	}
 
 	if osto, ok := hfs.AsOs(to); ok {
-		err := osto.CloseEnsureROFD(f)
+		err = osto.CloseEnsureROFD(f)
 		if err != nil {
 			return err
 		}
 	} else {
-		err := f.Close()
+		err = f.Close()
 		if err != nil {
 			return err
 		}
 	}
 
-	mode := os.FileMode(hdr.Mode)
+	mode := os.FileMode(hdr.Mode) //nolint:gosec
 	if ro {
-		mode = mode &^ 0222
+		mode &^= 0222
 	}
 
 	if osto, ok := hfs.AsOs(to); ok {
@@ -152,7 +153,7 @@ func Walk(tr *tar.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break // End of archive
 			}
 

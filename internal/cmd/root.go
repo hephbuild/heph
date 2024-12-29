@@ -3,14 +3,15 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/mattn/go-isatty"
-	"github.com/spf13/cobra"
 	"log/slog"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"sync"
+
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/mattn/go-isatty"
+	"github.com/spf13/cobra"
 )
 
 var plain bool
@@ -87,7 +88,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
 }
 
-func Execute() {
+func Execute() int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -96,6 +97,8 @@ func Execute() {
 
 	if err := rootCmd.ExecuteContext(ctx); err != nil {
 		logger.Error(err.Error())
-		os.Exit(1)
+		return 1
 	}
+
+	return 0
 }

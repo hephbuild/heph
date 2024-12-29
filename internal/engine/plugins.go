@@ -1,18 +1,19 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"crypto/tls"
+	"net"
+	"net/http"
+	"time"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/hephv2/internal/hcore"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep/hstepconnect"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
-	"net"
-	"net/http"
-	"time"
 )
 
 type ServerHandle struct {
@@ -26,24 +27,8 @@ func (h ServerHandle) BaseURL() string {
 	return "http://" + h.Listener.Addr().String()
 }
 
-func (h ServerHandle) HttpClient() *http.Client {
+func (h ServerHandle) HTTPClient() *http.Client {
 	return h.client
-}
-
-var httpClient2 = &http.Client{
-	Transport: &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
-	Timeout: 0,
 }
 
 var httpClient = &http.Client{
@@ -71,6 +56,7 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 			BaseContext: func(listener net.Listener) context.Context {
 				return ctx
 			},
+			ReadHeaderTimeout: 5 * time.Second,
 		}
 
 		if err := srv.Serve(l); err != nil {
@@ -84,7 +70,8 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 		client:   httpClient,
 	}
 
-	go h.client.Get(h.BaseURL()) // warmup the client
+	// warmup the client
+	go h.client.Get(h.BaseURL()) //nolint:errcheck,noctx
 
 	return h, nil
 }
@@ -149,7 +136,7 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HttpClient(), pluginh.BaseURL(), e.pluginInterceptor())
+	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor())
 
 	e.Providers = append(e.Providers, client)
 
@@ -182,7 +169,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HttpClient(), pluginh.BaseURL(), e.pluginInterceptor())
+	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor())
 
 	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
 	if err != nil {
@@ -197,7 +184,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 	}
 
 	e.Drivers = append(e.Drivers, client)
-	e.DriversByName[res.Msg.Name] = client
+	e.DriversByName[res.Msg.GetName()] = client
 	e.DriversHandle[client] = pluginh
 
 	err = e.initPlugin(ctx, handler)

@@ -1,8 +1,9 @@
 package hsingleflight
 
 import (
-	"golang.org/x/sync/singleflight"
 	"sync"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type Group[T any] singleflight.Group

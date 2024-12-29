@@ -2,13 +2,14 @@ package hbbtlog
 
 import (
 	"context"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/hephbuild/hephv2/internal/hbbt/hbbtch"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"log/slog"
 	"os"
 	"sync"
 	"sync/atomic"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/hephbuild/hephv2/internal/hbbt/hbbtch"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 )
 
 type Hijacker struct {
@@ -22,7 +23,7 @@ type hijackerData struct {
 }
 
 func (h Hijacker) GetMode() LogHijackerMode {
-	return h.mode.Load().(LogHijackerMode)
+	return h.mode.Load().(LogHijackerMode) //nolint:errcheck
 }
 
 func (h Hijacker) GetModeWait() LogHijackerMode {
@@ -68,6 +69,8 @@ func (h Hijacker) Handler(next hlog.HandleFunc, ctx context.Context, record slog
 	mode := h.GetModeWait()
 
 	switch mode {
+	case LogHijackerModeWait:
+		// will not happen
 	case LogHijackerModeDisabled:
 		return next(ctx, record)
 	case LogHijackerModeHijack:

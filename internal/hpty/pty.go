@@ -3,13 +3,14 @@ package hpty
 import (
 	"context"
 	"fmt"
-	"github.com/charmbracelet/x/term"
-	ptylib "github.com/creack/pty"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"io"
 	"os"
 	"os/signal"
 	"syscall"
+
+	"github.com/charmbracelet/x/term"
+	ptylib "github.com/creack/pty"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 )
 
 func WinSizeChan(ctx context.Context, f *os.File) (chan *ptylib.Winsize, func()) {

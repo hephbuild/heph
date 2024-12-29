@@ -3,14 +3,15 @@ package engine
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hcore/hstep"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/core/v1/corev1connect"
 	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 func Root() (string, error) {
@@ -98,8 +99,8 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
-		LogClient:    corev1connect.NewLogServiceClient(srvh.HttpClient(), srvh.BaseURL()),
-		StepClient:   corev1connect.NewStepServiceClient(srvh.HttpClient(), srvh.BaseURL()),
+		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
+		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
 	}
 
 	return e, nil

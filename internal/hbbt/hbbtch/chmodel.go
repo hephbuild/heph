@@ -22,7 +22,7 @@ func (m Model[T]) Init() tea.Cmd {
 }
 
 func (m Model[T]) Update(msg tea.Msg) (Model[T], tea.Cmd) {
-	switch msg := msg.(type) {
+	switch msg := msg.(type) { //nolint:gocritic
 	case container[T]:
 		cmd := m.onMsg(msg.v)
 		return m, tea.Batch(cmd, m.next())

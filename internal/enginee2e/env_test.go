@@ -2,6 +2,9 @@ package enginee2e
 
 import (
 	"context"
+	"os"
+	"testing"
+
 	"github.com/hephbuild/hephv2/internal/engine"
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
@@ -9,8 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
-	"os"
-	"testing"
 )
 
 func TestEnv(t *testing.T) {

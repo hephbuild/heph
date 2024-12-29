@@ -3,9 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/hproto"
 	"slices"
 	"sync"
+
+	"github.com/hephbuild/hephv2/internal/hproto"
 )
 
 type Singleflight struct {

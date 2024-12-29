@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"time"
+
 	"github.com/hephbuild/hephv2/internal/hartifact"
 	"github.com/hephbuild/hephv2/internal/hcore/hlog"
 	"github.com/hephbuild/hephv2/internal/hfs"
@@ -13,9 +17,6 @@ import (
 	pluginv1 "github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/proto"
-	"io"
-	"os"
-	"time"
 )
 
 func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (string, error) {
@@ -48,12 +49,12 @@ func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (stri
 func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultOutput) ([]ExecuteResultOutput, error) {
 	// TODO: locks
 
-	cachedir := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
+	cachedir := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
 
 	cacheArtifacts := make([]ExecuteResultOutput, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
-		scheme, rest, err := hartifact.ParseUri(artifact.Uri)
+		scheme, rest, err := hartifact.ParseURI(artifact.Uri)
 		if err != nil {
 			return nil, err
 		}
@@ -64,6 +65,8 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			prefix = "out_"
 		case pluginv1.Artifact_TYPE_LOG:
 			prefix = "log_"
+		case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:
+			fallthrough
 		default:
 			return nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
 		}
@@ -123,7 +126,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		})
 	}
 
-	b, err := json.Marshal(m)
+	b, err := json.Marshal(m) //nolint:musttag
 	if err != nil {
 		return nil, err
 	}
@@ -169,8 +172,14 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 	return res, ok, nil
 }
 
-func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, locks *hlocks.Multi) (*ExecuteResult, bool, error) {
-	dirfs := hfs.At(e.Cache, def.Ref.Package, "__"+def.Ref.Name, hashin)
+func (e *Engine) resultFromLocalCacheInner(
+	ctx context.Context,
+	def *LightLinkedTarget,
+	outputs []string,
+	hashin string,
+	locks *hlocks.Multi,
+) (*ExecuteResult, bool, error) {
+	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
 
 	{
 		l := hlocks.NewFlock2(dirfs, "", ArtifactManifestName, false)
@@ -187,7 +196,7 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 	}
 
 	var manifest Manifest
-	err = json.Unmarshal(mainfestb, &manifest)
+	err = json.Unmarshal(mainfestb, &manifest) //nolint:musttag
 	if err != nil {
 		return nil, false, err
 	}

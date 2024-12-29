@@ -1,11 +1,12 @@
 package hfs
 
 import (
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"io/fs"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func assertSame(t *testing.T, fss []container, f func(*testing.T, container) []any) {

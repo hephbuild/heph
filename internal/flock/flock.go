@@ -3,9 +3,10 @@ package flock
 import (
 	"errors"
 	"fmt"
-	"golang.org/x/sys/unix"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func fileDoFd(f *os.File, fun func(fd uintptr) error) error {
@@ -15,7 +16,7 @@ func fileDoFd(f *os.File, fun func(fd uintptr) error) error {
 	}
 
 	var rerr error
-	werr := rawConn.Write(func(fd uintptr) (done bool) {
+	werr := rawConn.Write(func(fd uintptr) bool {
 		rerr = fun(fd)
 		return true
 	})
@@ -50,12 +51,12 @@ func Funlock(f *os.File) error {
 		return syscall.Flock(int(fd), syscall.LOCK_UN)
 	})
 	if err != nil {
-		return fmt.Errorf("release lock for %s: %s", f.Name(), err)
+		return fmt.Errorf("release lock for %s: %w", f.Name(), err)
 	}
 
 	err = f.Close()
 	if err != nil {
-		return fmt.Errorf("close lock file %s: %s", f.Name(), err)
+		return fmt.Errorf("close lock file %s: %w", f.Name(), err)
 	}
 
 	return nil

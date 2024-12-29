@@ -1,8 +1,9 @@
 package hfstest
 
 import (
-	"github.com/hephbuild/hephv2/internal/hfs"
 	"testing"
+
+	"github.com/hephbuild/hephv2/internal/hfs"
 )
 
 func New(t *testing.T) hfs.FS {

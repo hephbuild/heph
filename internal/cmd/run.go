@@ -1,8 +1,13 @@
+//nolint:forbidigo
 package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"os"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/hephv2/internal/engine"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
@@ -11,8 +16,6 @@ import (
 	"github.com/hephbuild/hephv2/plugin/pluginbuildfile"
 	"github.com/hephbuild/hephv2/plugin/pluginexec"
 	"github.com/spf13/cobra"
-	"net/http"
-	"os"
 )
 
 func init() {
@@ -24,6 +27,10 @@ func init() {
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
+
+			if plain || !isTerm() {
+				return errors.New("must run in a term for now")
+			}
 
 			err := termui.NewInteractive(ctx, func(ctx context.Context, m termui.Model, send func(tea.Msg)) error {
 				root, err := engine.Root()
@@ -41,8 +48,15 @@ func init() {
 					return err
 				}
 
-				for _, p := range []*pluginexec.Plugin{pluginexec.New(), pluginexec.NewSh(), pluginexec.NewBash(), pluginexec.NewInteractiveBash()} {
-					_, err := e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
+				providers := []*pluginexec.Plugin{
+					pluginexec.New(),
+					pluginexec.NewSh(),
+					pluginexec.NewBash(),
+					pluginexec.NewInteractiveBash(),
+				}
+
+				for _, p := range providers {
+					_, err = e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
 						path, h := p.PipesHandler()
 						mux.Handle(path, h)
 					})

@@ -3,13 +3,14 @@ package htar
 import (
 	"bytes"
 	"context"
+	"path"
+	"testing"
+
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/hephv2/internal/hfs"
 	"github.com/hephbuild/hephv2/internal/hfs/hfstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"path"
-	"testing"
 )
 
 func TestSanity(t *testing.T) {

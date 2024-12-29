@@ -2,9 +2,10 @@ package pluginexec
 
 import (
 	"fmt"
+	"reflect"
+
 	"github.com/go-viper/mapstructure/v2"
 	"google.golang.org/protobuf/types/known/structpb"
-	"reflect"
 )
 
 type MapstructureDecoder interface {
@@ -60,7 +61,7 @@ func DecodeSlice[T any](v any) ([]T, error) {
 	}
 
 	if vas, err := Decode[[]any](v); err == nil {
-		out := make([]T, len(vas))
+		out := make([]T, 0, len(vas))
 
 		for i, va := range vas {
 			v, err := Decode[T](va)

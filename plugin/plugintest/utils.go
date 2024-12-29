@@ -1,9 +1,10 @@
 package plugintest
 
 import (
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 func ProviderClient(t *testing.T, p pluginv1connect.ProviderHandler) pluginv1connect.ProviderClient {

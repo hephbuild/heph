@@ -3,11 +3,12 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	cache "github.com/Code-Hex/go-generics-cache"
-	"github.com/shirou/gopsutil/v3/process"
 	"strconv"
 	"sync"
 	"time"
+
+	cache "github.com/Code-Hex/go-generics-cache"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 var processDetails = cache.New[int, func() string]()
@@ -27,7 +28,7 @@ func computeProcessDetails(pid int) func() string {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
 
-		p, _ := process.NewProcessWithContext(ctx, int32(pid))
+		p, _ := process.NewProcessWithContext(ctx, int32(pid)) //nolint:gosec
 		if p != nil {
 			cmdLine, _ := p.CmdlineWithContext(ctx)
 			if len(cmdLine) > 0 {

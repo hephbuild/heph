@@ -2,11 +2,12 @@ package hlog
 
 import (
 	"context"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/hephbuild/hephv2/internal/hlipgloss"
 	"io"
 	"log/slog"
 	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/hephbuild/hephv2/internal/hlipgloss"
 )
 
 var levelColors = map[slog.Level]lipgloss.TerminalColor{

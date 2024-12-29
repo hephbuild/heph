@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-func ParseUri(uri string) (string, string, error) {
+func ParseURI(uri string) (string, string, error) {
 	scheme, rest, ok := strings.Cut(uri, "://")
 	if !ok {
 		return "", "", fmt.Errorf("invalid URI: %s", uri)

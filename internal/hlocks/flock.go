@@ -3,15 +3,16 @@ package hlocks
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/hephv2/internal/flock"
-	"github.com/hephbuild/hephv2/internal/hcore/hlog"
-	"github.com/hephbuild/hephv2/internal/hfs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/hephbuild/hephv2/internal/flock"
+	"github.com/hephbuild/hephv2/internal/hcore/hlog"
+	"github.com/hephbuild/hephv2/internal/hfs"
 )
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
@@ -52,7 +53,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}
 
 	if l.allowCreate {
-		fhow = fhow | os.O_CREATE
+		fhow |= os.O_CREATE
 	}
 
 	hf, err := l.fs.Open(l.path, fhow, 0644)
@@ -60,7 +61,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 		return false, err
 	}
 
-	f := hf.(*os.File)
+	f := hf.(*os.File) //nolint:errcheck
 
 	defer func() {
 		if f != l.f {
@@ -69,7 +70,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}()
 
 	err = flock.Flock(f, ro, false)
-	if err != nil {
+	if err != nil { //nolint:nestif
 		if flock.IsErrWouldBlock(err) {
 			ok, err := onErr(f, ro)
 			if err != nil {

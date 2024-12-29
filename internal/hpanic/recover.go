@@ -25,7 +25,7 @@ func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 	}
 
 	defer func() {
-		if rerr := recover(); rerr != nil {
+		if rerr := recover(); rerr != nil { //nolint:nestif
 			if o.wrap != nil {
 				err = o.wrap(rerr)
 			} else {
@@ -35,7 +35,6 @@ func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 					err = fmt.Errorf("%v", rerr)
 				}
 			}
-
 		}
 	}()
 

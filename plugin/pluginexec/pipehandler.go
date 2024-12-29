@@ -1,12 +1,14 @@
 package pluginexec
 
 import (
+	"errors"
 	"fmt"
-	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hephbuild/hephv2/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 type PipesHandler struct {
@@ -21,10 +23,9 @@ func (p PipesHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(status)
 	}
 	if err != nil {
-		rw.Write([]byte("\n"))
-		rw.Write([]byte(err.Error()))
+		_, _ = rw.Write([]byte("\n"))
+		_, _ = rw.Write([]byte(err.Error()))
 	}
-	return
 }
 
 type writerFlusher struct {
@@ -42,7 +43,7 @@ func (w writerFlusher) Write(p []byte) (int, error) {
 func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int, error) {
 	i := strings.Index(req.URL.Path, PipesHandlerPath)
 	if i < 0 {
-		return http.StatusBadRequest, fmt.Errorf("invalid path")
+		return http.StatusBadRequest, errors.New("invalid path")
 	}
 
 	id := req.URL.Path[i+len(PipesHandlerPath)+1:]
@@ -53,7 +54,7 @@ func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int,
 	}
 
 	if pipe.busy.Swap(true) {
-		return http.StatusBadRequest, fmt.Errorf("pipe is busy")
+		return http.StatusBadRequest, errors.New("pipe is busy")
 	}
 
 	defer pipe.busy.Store(false)
@@ -72,15 +73,17 @@ func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int,
 
 		_, err := io.Copy(w, pipe.r)
 		if err != nil {
-			return -1, fmt.Errorf("http -> pipe: %v", err)
+			return -1, fmt.Errorf("http -> pipe: %w", err)
 		}
 	case http.MethodPost:
 		w := pipe.w
-		defer w.Close()
+		defer func() {
+			_ = w.Close()
+		}()
 
 		_, err := io.Copy(pipe.w, req.Body)
 		if err != nil {
-			return -1, fmt.Errorf("pipe -> http: %v", err)
+			return -1, fmt.Errorf("pipe -> http: %w", err)
 		}
 	}
 
@@ -107,7 +110,7 @@ func (p *Plugin) removePipe(id string) {
 
 	delete(p.pipes, id)
 
-	pipe.w.Close()
+	_ = pipe.w.Close()
 
 	p.housekeepingPipes()
 }

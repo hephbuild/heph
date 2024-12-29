@@ -2,6 +2,11 @@ package termui
 
 import (
 	"context"
+	"maps"
+	"os"
+	"strings"
+	"time"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/hephbuild/hephv2/internal/hbbt/hbbtexec"
@@ -12,10 +17,6 @@ import (
 	"github.com/hephbuild/hephv2/internal/hlipgloss"
 	"github.com/hephbuild/hephv2/internal/hpanic"
 	corev1 "github.com/hephbuild/hephv2/plugin/gen/heph/core/v1"
-	"maps"
-	"os"
-	"strings"
-	"time"
 )
 
 type Model struct {
@@ -67,14 +68,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case *corev1.Step:
-		m.steps[msg.Id] = msg
+		m.steps[msg.GetId()] = msg
 
-		if msg.Status == corev1.Step_STATUS_COMPLETED {
-			if msg.ParentId == "" {
+		if msg.GetStatus() == corev1.Step_STATUS_COMPLETED {
+			if msg.GetParentId() == "" {
 				cmds = append(cmds, tea.Println(hstepfmt.Format(m.renderer, msg, false)))
 			}
 
-			delete(m.steps, msg.Id)
+			delete(m.steps, msg.GetId())
 		}
 
 		cmds = append(cmds, m.nextStep())

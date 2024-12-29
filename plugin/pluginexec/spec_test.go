@@ -2,8 +2,9 @@ package pluginexec
 
 import (
 	"encoding/json"
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func decoder[T any]() func(any) (any, error) {
