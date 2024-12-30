@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -73,7 +74,7 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 		step, ctx := hstep.New(ctx, fmt.Sprintf("//%v:%v", pkg, name))
 		defer step.Done()
 
-		res, err := e.innerResult(ctx, pkg, name, outputs, options)
+		res, err := e.innerResultWithSideEffects(ctx, pkg, name, outputs, options)
 		if err != nil {
 			step.SetError()
 			send(&ExecuteResult{Err: fmt.Errorf("%v:%v %w", pkg, name, err)})
@@ -109,7 +110,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 
 			res := <-ch
 
-			res.Outputs = slices.DeleteFunc(res.Outputs, func(output ExecuteResultOutput) bool {
+			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
 				return output.Type != pluginv1.Artifact_TYPE_OUTPUT
 			})
 
@@ -173,6 +174,20 @@ func (e *Engine) ResultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	}
 
 	return nil, false, nil
+}
+
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
+	res, err := e.innerResult(ctx, pkg, name, outputs, options)
+	if err != nil {
+		return nil, err
+	}
+
+	err = e.codegenTree(ctx, res.Def, res.Artifacts)
+	if err != nil {
+		return nil, fmt.Errorf("codegen tree: %w", err)
+	}
+
+	return res, nil
 }
 
 func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
@@ -272,7 +287,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 			return "", err
 		}
 
-		for _, output := range result.Outputs {
+		for _, output := range result.Artifacts {
 			_, err = h.WriteString(output.Hashout)
 			if err != nil {
 				return "", err
@@ -292,16 +307,17 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 	return hashin, nil
 }
 
-type ExecuteResultOutput struct {
+type ExecuteResultArtifact struct {
 	Hashout string
 	*pluginv1.Artifact
 }
 
 type ExecuteResult struct {
-	Err      error
-	Hashin   string
-	Outputs  []ExecuteResultOutput
-	Executed bool
+	Def       *LightLinkedTarget
+	Executed  bool
+	Err       error
+	Hashin    string
+	Artifacts []ExecuteResultArtifact
 }
 
 type ExecuteResultWithOrigin struct {
@@ -503,14 +519,15 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	defer step.Done()
 
 	sandboxfs := hfs.At(e.Sandbox, def.Ref.GetPackage(), targetfolder)
-	workdirfs := sandboxfs.At("ws") // TODO: remove the ws from here
+	workdirfs := hfs.At(sandboxfs, "ws") // TODO: remove the ws from here
+	cwdfs := hfs.At(workdirfs, def.Ref.GetPackage())
 
 	err = sandboxfs.RemoveAll("")
 	if err != nil {
 		return nil, err
 	}
 
-	inputArtifacts, err := SetupSandbox(ctx, results, workdirfs)
+	inputArtifacts, err := SetupSandbox(ctx, def, results, workdirfs, cwdfs)
 	if err != nil {
 		return nil, fmt.Errorf("setup sandbox: %w", err)
 	}
@@ -560,13 +577,14 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	if options.shell {
 		return &ExecuteResult{
+			Def:      def,
 			Hashin:   hashin,
 			Executed: true,
 		}, nil
 	}
 
 	cachefs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
-	execOutputs := make([]ExecuteResultOutput, 0, len(def.CollectOutputs))
+	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.CollectOutputs))
 
 	for _, output := range def.CollectOutputs {
 		tarname := output.GetGroup() + ".tar"
@@ -578,22 +596,22 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 		tar := htar.NewPacker(tarf)
 		for _, path := range output.GetPaths() {
-			// TODO: glob
+			err := hfs.Glob(ctx, cwdfs, path, nil, func(path string, d hfs.DirEntry) error {
+				f, err := hfs.Open(cwdfs, path)
+				if err != nil {
+					return err
+				}
+				defer f.Close()
 
-			f, err := hfs.Open(workdirfs, path)
-			if err != nil {
-				return nil, fmt.Errorf("collect: open: %w", err)
-			}
-			defer f.Close()
+				err = tar.WriteFile(f, filepath.Join(def.Ref.GetPackage(), path))
+				if err != nil {
+					return err
+				}
 
-			err = tar.WriteFile(f, path)
+				return nil
+			})
 			if err != nil {
-				return nil, err
-			}
-
-			err = f.Close()
-			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("collect: %v: %w", path, err)
 			}
 		}
 
@@ -616,7 +634,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 		hashout := hex.EncodeToString(h.Sum(nil))
 
-		execOutputs = append(execOutputs, ExecuteResultOutput{
+		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
 			Hashout: hashout,
 			Artifact: &pluginv1.Artifact{
 				Group:    output.GetGroup(),
@@ -653,9 +671,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	return &ExecuteResult{
-		Hashin:   hashin,
-		Executed: true,
-		Outputs:  execOutputs,
+		Hashin:    hashin,
+		Def:       def,
+		Executed:  true,
+		Artifacts: execArtifacts,
 	}, nil
 }
 
@@ -665,21 +684,22 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, op
 		return nil, fmt.Errorf("execute: %w", err)
 	}
 
-	var cachedArtifacts []ExecuteResultOutput
+	var cachedArtifacts []ExecuteResultArtifact
 	if res.Executed {
-		artifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Outputs)
+		artifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Artifacts)
 		if err != nil {
 			return nil, fmt.Errorf("cache locally: %w", err)
 		}
 
 		cachedArtifacts = artifacts
 	} else {
-		cachedArtifacts = res.Outputs
+		cachedArtifacts = res.Artifacts
 	}
 
 	return &ExecuteResult{
-		Hashin:  res.Hashin,
-		Outputs: cachedArtifacts,
+		Def:       def,
+		Hashin:    res.Hashin,
+		Artifacts: cachedArtifacts,
 	}, nil
 }
 

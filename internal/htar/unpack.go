@@ -29,8 +29,15 @@ func WithOnFile(onFile func(to string)) Option {
 	}
 }
 
+func WithFilter(filter func(from string) bool) Option {
+	return func(c *config) {
+		c.filter = filter
+	}
+}
+
 type config struct {
 	onFile func(to string)
+	filter func(from string) bool
 }
 
 func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) error {
@@ -41,10 +48,19 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 	if cfg.onFile == nil {
 		cfg.onFile = func(to string) {}
 	}
+	if cfg.filter == nil {
+		cfg.filter = func(from string) bool {
+			return true
+		}
+	}
 
 	tr := tar.NewReader(r)
 
 	return Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
+		if !cfg.filter(hdr.Name) {
+			return nil
+		}
+
 		switch hdr.Typeflag {
 		case tar.TypeReg:
 			err := unpackFile(hdr, tr, to, false, cfg.onFile)

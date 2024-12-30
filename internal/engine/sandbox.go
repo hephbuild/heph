@@ -3,17 +3,28 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func SetupSandbox(ctx context.Context, depResults []*ExecuteResultWithOrigin, fs hfs.FS) ([]*pluginv1.ArtifactWithOrigin, error) {
+func SetupSandbox(ctx context.Context, def *LightLinkedTarget, depResults []*ExecuteResultWithOrigin, workdirfs, cwdfs hfs.FS) ([]*pluginv1.ArtifactWithOrigin, error) {
+	err := workdirfs.MkdirAll(def.Ref.GetPackage(), hfs.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
+	err = cwdfs.MkdirAll("", os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
 	var artifacts []*pluginv1.ArtifactWithOrigin
 
 	for _, depResult := range depResults {
-		for _, res := range depResult.Outputs {
+		for _, res := range depResult.Artifacts {
 			if res.Type != pluginv1.Artifact_TYPE_OUTPUT {
 				return nil, fmt.Errorf("unexpected artifact type: %s", res.Type)
 			}
@@ -23,7 +34,7 @@ func SetupSandbox(ctx context.Context, depResults []*ExecuteResultWithOrigin, fs
 				Dep:      depResult.Origin,
 			})
 
-			listArtifact, err := SetupSandboxArtifact(ctx, res, fs)
+			listArtifact, err := SetupSandboxArtifact(ctx, res, workdirfs)
 			if err != nil {
 				return nil, err
 			}
@@ -35,10 +46,19 @@ func SetupSandbox(ctx context.Context, depResults []*ExecuteResultWithOrigin, fs
 		}
 	}
 
+	for _, output := range def.CollectOutputs {
+		for _, path := range output.GetPaths() {
+			err := hfs.CreateParentDir(cwdfs, path)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return artifacts, nil
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact ExecuteResultOutput, fs hfs.FS) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact ExecuteResultArtifact, fs hfs.FS) (*pluginv1.Artifact, error) {
 	listf, err := hfs.Create(fs, artifact.Hashout+".list")
 	if err != nil {
 		return nil, err

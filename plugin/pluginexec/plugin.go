@@ -94,11 +94,13 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		Deps: map[string]*execv1.Target_Dep{},
 	}
 
+	var allOutputPaths []string
 	for k, out := range targetSpec.Out {
 		s.Outputs = append(s.Outputs, &execv1.Target_Output{
 			Group: k,
 			Paths: out,
 		})
+		allOutputPaths = append(allOutputPaths, out...)
 	}
 
 	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(s.GetOutputs()))
@@ -150,6 +152,24 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, err
 	}
 
+	var codegenTree *pluginv1.TargetDef_CodegenTree
+	switch targetSpec.Codegen {
+	case "":
+		// no codegen
+	case "copy":
+		codegenTree = &pluginv1.TargetDef_CodegenTree{
+			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY,
+			Paths: allOutputPaths,
+		}
+	case "link":
+		codegenTree = &pluginv1.TargetDef_CodegenTree{
+			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK,
+			Paths: allOutputPaths,
+		}
+	default:
+		return nil, fmt.Errorf("invalid codegen mode: %s", targetSpec.Codegen)
+	}
+
 	return connect.NewResponse(&pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
 			Ref:            req.Msg.GetSpec().GetRef(),
@@ -158,7 +178,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
 			Cache:          targetSpec.Cache,
 			CollectOutputs: collectOutputs,
-			Codegen:        nil,
+			CodegenTree:    codegenTree,
 			Pty:            targetSpec.Pty,
 		},
 	}), nil
@@ -278,8 +298,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	pty := req.Msg.GetTarget().GetPty()
 	workdir := filepath.Join(req.Msg.GetSandboxPath(), "ws")
+	cwd := filepath.Join(workdir, req.Msg.GetTarget().GetRef().GetPackage())
 
-	err = os.MkdirAll(workdir, 0755)
+	err = os.MkdirAll(cwd, 0755)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +337,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
-	cmd.Dir = workdir
+	cmd.Dir = cwd
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // this creates a new process group, same as Setpgid
 	}

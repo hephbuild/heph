@@ -21,7 +21,7 @@ func TestRenderStepTree(t *testing.T) {
 		{
 			tree: tree.Root("").Child(tree.Root("root1")),
 			expected: `
-▢  root1
+◯─ root1
 				`,
 		},
 		{
@@ -66,7 +66,7 @@ func TestRenderStepTree(t *testing.T) {
 					tree.Root("root1").Child("child1"),
 				),
 			expected: `
-▢  root1
+◯─ root1
    ╰─ child1
 `,
 		},

@@ -12,6 +12,7 @@ import (
 
 type unpackConfig struct {
 	onFile func(to string)
+	filter func(from string) bool
 }
 
 type UnpackOption func(*unpackConfig)
@@ -22,10 +23,24 @@ func WithOnFile(onFile func(to string)) UnpackOption {
 	}
 }
 
+func WithFilter(filter func(from string) bool) UnpackOption {
+	return func(config *unpackConfig) {
+		config.filter = filter
+	}
+}
+
 func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options ...UnpackOption) error {
 	var cfg unpackConfig
 	for _, option := range options {
 		option(&cfg)
+	}
+	if cfg.onFile == nil {
+		cfg.onFile = func(to string) {}
+	}
+	if cfg.filter == nil {
+		cfg.filter = func(from string) bool {
+			return true
+		}
 	}
 
 	r, err := Reader(ctx, artifact)
@@ -36,6 +51,10 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 
 	switch artifact.GetEncoding() {
 	case pluginv1.Artifact_ENCODING_NONE:
+		if !cfg.filter(artifact.GetName()) {
+			return nil
+		}
+
 		f, err := hfs.Create(fs, artifact.GetName())
 		if err != nil {
 			return err
@@ -47,7 +66,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 			return err
 		}
 	case pluginv1.Artifact_ENCODING_TAR:
-		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile))
+		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return err
 		}

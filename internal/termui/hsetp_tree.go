@@ -50,7 +50,7 @@ func renderStepsTree(renderer *lipgloss.Renderer, t *tree.Tree) string {
 
 			if rootNode == children.At(index) {
 				if children.Length() == 1 && index == 0 {
-					return "▢ "
+					return "◯─"
 				} else {
 					return "╭─"
 				}

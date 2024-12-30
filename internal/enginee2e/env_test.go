@@ -210,11 +210,11 @@ func TestEnv(t *testing.T) {
 				res := <-ch
 				require.NoError(t, res.Err)
 
-				require.Len(t, res.Outputs, len(test.expected)+1)
+				require.Len(t, res.Artifacts, len(test.expected)+1)
 
 				for _, name := range test.expected {
 					found := false
-					for _, output := range res.Outputs {
+					for _, output := range res.Artifacts {
 						if output.Group == name {
 							found = true
 							break

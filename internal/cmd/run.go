@@ -96,7 +96,7 @@ func init() {
 					return res.Err
 				}
 
-				outputs := res.Outputs
+				outputs := res.Artifacts
 
 				// TODO how to render res natively without exec
 				_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (*engine.ExecuteResult, error) {

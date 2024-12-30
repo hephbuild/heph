@@ -64,13 +64,13 @@ func TestSanity(t *testing.T) {
 	res := <-ch
 	require.NoError(t, res.Err)
 
-	require.Len(t, res.Outputs, 2)
+	require.Len(t, res.Artifacts, 2)
 
 	fs2 := hfstest.New(t)
-	err = hartifact.Unpack(ctx, res.Outputs[0].Artifact, fs2)
+	err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs2)
 	require.NoError(t, err)
 
-	b, err := hfs.ReadFile(fs2, "out")
+	b, err := hfs.ReadFile(fs2, "some/package/out")
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))

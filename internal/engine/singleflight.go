@@ -26,10 +26,10 @@ type singleflightResultHandle struct {
 
 func (h *singleflightResultHandle) getRes() *ExecuteResult {
 	res := *h.res
-	res.Outputs = slices.Clone(res.Outputs)
+	res.Artifacts = slices.Clone(res.Artifacts)
 
-	for i, output := range res.Outputs {
-		res.Outputs[i].Artifact = hproto.Clone(output.Artifact)
+	for i, output := range res.Artifacts {
+		res.Artifacts[i].Artifact = hproto.Clone(output.Artifact)
 	}
 
 	return &res

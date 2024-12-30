@@ -46,12 +46,12 @@ func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (stri
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultOutput) ([]ExecuteResultOutput, error) {
+func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultArtifact) ([]ExecuteResultArtifact, error) {
 	// TODO: locks
 
 	cachedir := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
 
-	cacheArtifacts := make([]ExecuteResultOutput, 0, len(sandboxArtifacts))
+	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
 		scheme, rest, err := hartifact.ParseURI(artifact.Uri)
@@ -103,7 +103,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			}
 		}
 
-		cacheArtifacts = append(cacheArtifacts, ExecuteResultOutput{
+		cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
 			Hashout:  hashout,
 			Artifact: cachedArtifact,
 		})
@@ -136,7 +136,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		return nil, err
 	}
 
-	cacheArtifacts = append(cacheArtifacts, ExecuteResultOutput{
+	cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
 		Artifact: manifestV1Artifact(cachedir),
 	})
 
@@ -217,9 +217,9 @@ func (e *Engine) resultFromLocalCacheInner(
 		locks.Add(l.RUnlock)
 	}
 
-	execOutputs := make([]ExecuteResultOutput, 0, len(artifacts))
+	execArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		execOutputs = append(execOutputs, ExecuteResultOutput{
+		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
 			Hashout: artifact.Hashout,
 			Artifact: &pluginv1.Artifact{
 				Group:    artifact.Group,
@@ -231,12 +231,13 @@ func (e *Engine) resultFromLocalCacheInner(
 		})
 	}
 
-	execOutputs = append(execOutputs, ExecuteResultOutput{
+	execArtifacts = append(execArtifacts, ExecuteResultArtifact{
 		Artifact: manifestV1Artifact(dirfs),
 	})
 
 	return &ExecuteResult{
-		Hashin:  manifest.Hashin,
-		Outputs: execOutputs,
+		Def:       def,
+		Hashin:    manifest.Hashin,
+		Artifacts: execArtifacts,
 	}, true, nil
 }

@@ -68,7 +68,7 @@ func TestDepsCache(t *testing.T) {
 
 	assertOut := func(res *engine.ExecuteResult) {
 		fs := hfstest.New(t)
-		err = hartifact.Unpack(ctx, res.Outputs[0].Artifact, fs)
+		err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs)
 		require.NoError(t, res.Err)
 
 		b, err := hfs.ReadFile(fs, "out_parent")

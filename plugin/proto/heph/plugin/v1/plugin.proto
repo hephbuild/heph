@@ -42,14 +42,19 @@ message TargetDef {
 
   repeated CollectOutput collect_outputs = 6;
 
-  enum CodegenMode {
-    CODEGEN_MODE_UNSPECIFIED = 0;
-    CODEGEN_MODE_VCS_IGNORE = 1;
-    CODEGEN_MODE_COPY = 2;
-    CODEGEN_MODE_LINK = 3;
+  message CodegenTree {
+    enum Mode {
+      CODEGEN_MODE_UNSPECIFIED = 0;
+      CODEGEN_MODE_COPY = 2;
+      CODEGEN_MODE_LINK = 3;
+    }
+
+    Mode mode = 1;
+    repeated string paths = 2;
   }
 
-  repeated CodegenMode codegen = 7;
+  CodegenTree codegen_tree = 7;
+
   bool pty = 8;
 }
 
