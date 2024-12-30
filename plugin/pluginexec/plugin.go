@@ -78,6 +78,11 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 	return connect.NewResponse(&pluginv1.ConfigResponse{
 		Name:         p.name,
 		TargetSchema: desc,
+		IgnoreFromHash: []string{
+			"runtime_deps",
+			"runtime_env",
+			"runtime_pass_env",
+		},
 	}), nil
 }
 
@@ -90,8 +95,14 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}
 
 	s := &execv1.Target{
-		Run:  targetSpec.Run,
-		Deps: map[string]*execv1.Target_Dep{},
+		Run:            targetSpec.Run,
+		Deps:           map[string]*execv1.Target_Dep{},
+		HashDeps:       map[string]*execv1.Target_Dep{},
+		RuntimeDeps:    map[string]*execv1.Target_Dep{},
+		Env:            targetSpec.Env,
+		RuntimeEnv:     targetSpec.RuntimeEnv,
+		PassEnv:        targetSpec.PassEnv,
+		RuntimePassEnv: targetSpec.RuntimePassEnv,
 	}
 
 	var allOutputPaths []string

@@ -14,7 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func TestEnv(t *testing.T) {
+func TestSrcOutEnv(t *testing.T) {
 	ctx := context.Background()
 
 	dir, err := os.MkdirTemp("", "")

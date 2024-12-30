@@ -3,11 +3,9 @@ package engine
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/hephbuild/heph/internal/hartifact"
@@ -109,15 +107,13 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		})
 	}
 
-	manifestfs := hfs.At(cachedir, ArtifactManifestName)
-
-	m := Manifest{
+	m := hartifact.Manifest{
 		Version:   "v1",
 		CreatedAt: time.Now(),
 		Hashin:    hashin,
 	}
 	for _, artifact := range cacheArtifacts {
-		m.Artifacts = append(m.Artifacts, ManifestArtifact{
+		m.Artifacts = append(m.Artifacts, hartifact.ManifestArtifact{
 			Hashout:  artifact.Hashout,
 			Group:    artifact.Group,
 			Name:     artifact.Name,
@@ -126,30 +122,16 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		})
 	}
 
-	b, err := json.Marshal(m) //nolint:musttag
-	if err != nil {
-		return nil, err
-	}
-
-	err = hfs.WriteFile(manifestfs, "", b, os.ModePerm)
+	manifestArtifact, err := hartifact.NewManifestArtifact(cachedir, m)
 	if err != nil {
 		return nil, err
 	}
 
 	cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
-		Artifact: manifestV1Artifact(cachedir),
+		Artifact: manifestArtifact,
 	})
 
 	return cacheArtifacts, nil
-}
-
-func manifestV1Artifact(fs hfs.OS) *pluginv1.Artifact {
-	return &pluginv1.Artifact{
-		Name:     ArtifactManifestName,
-		Type:     pluginv1.Artifact_TYPE_MANIFEST_V1,
-		Encoding: pluginv1.Artifact_ENCODING_NONE,
-		Uri:      "file://" + hfs.At(fs, ArtifactManifestName).Path(),
-	}
 }
 
 func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
@@ -182,7 +164,7 @@ func (e *Engine) resultFromLocalCacheInner(
 	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
 
 	{
-		l := hlocks.NewFlock2(dirfs, "", ArtifactManifestName, false)
+		l := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName, false)
 		err := l.RLock(ctx)
 		if err != nil {
 			return nil, false, err
@@ -190,18 +172,12 @@ func (e *Engine) resultFromLocalCacheInner(
 		locks.Add(l.RUnlock)
 	}
 
-	mainfestb, err := hfs.ReadFile(dirfs, ArtifactManifestName)
+	manifest, err := hartifact.ManifestFromFS(dirfs)
 	if err != nil {
 		return nil, false, err
 	}
 
-	var manifest Manifest
-	err = json.Unmarshal(mainfestb, &manifest) //nolint:musttag
-	if err != nil {
-		return nil, false, err
-	}
-
-	var artifacts []ManifestArtifact
+	var artifacts []hartifact.ManifestArtifact
 	for _, output := range outputs {
 		outputArtifacts := manifest.GetArtifacts(output)
 
@@ -231,8 +207,13 @@ func (e *Engine) resultFromLocalCacheInner(
 		})
 	}
 
+	manifestArtifact, err := hartifact.NewManifestArtifact(dirfs, manifest)
+	if err != nil {
+		return nil, false, err
+	}
+
 	execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-		Artifact: manifestV1Artifact(dirfs),
+		Artifact: manifestArtifact,
 	})
 
 	return &ExecuteResult{

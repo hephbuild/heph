@@ -2,7 +2,6 @@ syntax = "proto3";
 package heph.plugin.v1;
 
 import "google/protobuf/struct.proto";
-import "google/protobuf/any.proto";
 import "google/protobuf/descriptor.proto";
 import "heph/plugin/v1/plugin.proto";
 
@@ -59,6 +58,7 @@ message ConfigRequest {}
 message ConfigResponse {
   string name = 1;
   google.protobuf.DescriptorProto target_schema = 2;
+  repeated string ignore_from_hash = 9;
 }
 
 message PipeRequest {}

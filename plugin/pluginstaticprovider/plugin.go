@@ -15,17 +15,25 @@ type Target struct {
 }
 
 type Plugin struct {
-	targets []Target
+	f func() []Target
 }
 
 func New(targets []Target) *Plugin {
 	return &Plugin{
-		targets: targets,
+		func() []Target {
+			return targets
+		},
+	}
+}
+
+func NewFunc(f func() []Target) *Plugin {
+	return &Plugin{
+		f: f,
 	}
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-	for _, target := range p.targets {
+	for _, target := range p.f() {
 		if req.Msg.GetPackage() != "" {
 			if req.Msg.GetDeep() {
 				if !strings.HasPrefix(target.Spec.GetRef().GetPackage(), req.Msg.GetPackage()) {
@@ -50,7 +58,7 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 }
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	for _, target := range p.targets {
+	for _, target := range p.f() {
 		if target.Spec.GetRef().GetPackage() != req.Msg.GetRef().GetPackage() || target.Spec.GetRef().GetName() != req.Msg.GetRef().GetName() {
 			continue
 		}

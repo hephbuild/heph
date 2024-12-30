@@ -1,0 +1,14 @@
+version: v2
+clean: true
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/hephbuild/heph/internal/hproto/internal/gen
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: internal/gen
+    opt: paths=source_relative
+inputs:
+  - directory: internal/proto
+

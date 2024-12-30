@@ -12,3 +12,4 @@ gen:
 	cd plugin && buf generate
 	cd plugin/pluginexec && buf generate
 	cd plugin/plugingroup && buf generate
+	cd internal/hproto && buf generate

@@ -182,10 +182,14 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 	if e.DriversHandle == nil {
 		e.DriversHandle = map[pluginv1connect.DriverClient]PluginHandle{}
 	}
+	if e.DriversConfig == nil {
+		e.DriversConfig = map[string]*pluginv1.ConfigResponse{}
+	}
 
 	e.Drivers = append(e.Drivers, client)
 	e.DriversByName[res.Msg.GetName()] = client
 	e.DriversHandle[client] = pluginh
+	e.DriversConfig[res.Msg.GetName()] = res.Msg
 
 	err = e.initPlugin(ctx, handler)
 	if err != nil {

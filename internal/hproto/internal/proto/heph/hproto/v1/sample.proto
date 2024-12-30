@@ -1,0 +1,14 @@
+syntax = "proto3";
+package heph.hproto.v1;
+
+message Sample {
+  message Nested {
+    repeated string included = 1;
+    repeated string excluded = 2;
+  }
+
+  repeated string included = 1;
+  repeated string excluded = 2;
+  Nested nested = 3;
+  repeated Nested repeated_nested = 4;
+}

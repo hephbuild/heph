@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -65,6 +67,7 @@ type Engine struct {
 	Drivers       []pluginv1connect.DriverClient
 	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
 	DriversByName map[string]pluginv1connect.DriverClient
+	DriversConfig map[string]*pluginv1.ConfigResponse
 }
 
 func New(ctx context.Context, root string, cfg Config) (*Engine, error) {

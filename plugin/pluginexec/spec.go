@@ -51,10 +51,16 @@ func (s *SpecOutputs) MapstructureDecode(v any) error {
 }
 
 type Spec struct {
-	Run     SpecStrings `mapstructure:"run"`
-	Deps    SpecDeps    `mapstructure:"deps"`
-	Out     SpecOutputs `mapstructure:"out"`
-	Cache   bool        `mapstructure:"cache"`
-	Pty     bool        `mapstructure:"pty"`
-	Codegen string      `mapstructure:"codegen"`
+	Run            SpecStrings       `mapstructure:"run"`
+	Deps           SpecDeps          `mapstructure:"deps"`
+	HashDeps       SpecDeps          `mapstructure:"hash_deps"`
+	RuntimeDeps    SpecDeps          `mapstructure:"runtime_deps"`
+	Out            SpecOutputs       `mapstructure:"out"`
+	Cache          bool              `mapstructure:"cache"`
+	Pty            bool              `mapstructure:"pty"`
+	Codegen        string            `mapstructure:"codegen"`
+	Env            map[string]string `mapstructure:"env"`
+	RuntimeEnv     map[string]string `mapstructure:"runtime_env"`
+	PassEnv        []string          `mapstructure:"pass_env"`
+	RuntimePassEnv []string          `mapstructure:"runtime_pass_env"`
 }

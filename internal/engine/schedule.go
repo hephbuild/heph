@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hproto"
+
 	"connectrpc.com/connect"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -266,8 +268,15 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		return "", err
 	}
 
-	// TODO support fieldmask of things to include in hashin
-	b, err = proto.Marshal(def.Def)
+	defHash := def.Def
+	if ignoreFromHash := e.DriversConfig[def.Ref.GetDriver()].GetIgnoreFromHash(); len(ignoreFromHash) > 0 {
+		defHash, err = hproto.RemoveMasked(defHash, ignoreFromHash)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	b, err = proto.Marshal(defHash)
 	if err != nil {
 		return "", err
 	}
