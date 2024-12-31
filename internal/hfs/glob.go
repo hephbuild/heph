@@ -90,7 +90,6 @@ func Glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWa
 }
 
 func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc) error {
-	walkfs := fs
 	prefix := ""
 
 	i := indexMeta(pattern)
@@ -106,43 +105,68 @@ func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWa
 
 		if info.IsDir() {
 			prefix = pattern
-			walkfs = At(fs, pattern)
 			pattern = "**/*"
 		}
+	} else {
+		prefix = unescapeMeta(pattern[:i])
+		pattern = pattern[i:]
+	}
+
+	walkfs := fs
+	if prefix != "" {
+		walkfs = At(fs, prefix)
+	}
+
+	if pattern == "**/*" {
+		return globAll(ctx, walkfs, prefix, ignore, fn)
 	}
 
 	return doublestar.GlobWalk(ToIOFS(walkfs), pattern, func(path string, d iofs.DirEntry) error {
-		if err := ctx.Err(); err != nil {
+		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
+	})
+}
+
+func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return iofs.WalkDir(ToIOFS(fs), "", func(path string, d DirEntry, err error) error {
+		if err != nil {
 			return err
 		}
 
-		if d.IsDir() {
-			skip, err := PathMatchAny(path, ignore...)
-			if err != nil {
-				return err
-			}
+		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
+	})
+}
 
-			if skip {
-				return filepath.SkipDir
-			}
-			// Only match files
-			return nil
-		}
+func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntry, fn GlobWalkFunc) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
+	if d.IsDir() {
 		skip, err := PathMatchAny(path, ignore...)
 		if err != nil {
 			return err
 		}
 
 		if skip {
-			return nil
+			return filepath.SkipDir
 		}
-
-		err = fn(filepath.Join(prefix, path), d)
-		if err != nil {
-			return err
-		}
-
+		// Only match files
 		return nil
-	})
+	}
+
+	skip, err := PathMatchAny(path, ignore...)
+	if err != nil {
+		return err
+	}
+
+	if skip {
+		return nil
+	}
+
+	err = fn(path, d)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

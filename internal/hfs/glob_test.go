@@ -3,6 +3,7 @@ package hfs_test
 import (
 	"context"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hfs"
@@ -32,6 +33,7 @@ func collector() (hfs.GlobWalkFunc, func() []string) {
 
 			return nil
 		}, func() []string {
+			slices.Sort(matches)
 			return matches
 		}
 }
@@ -50,8 +52,8 @@ func TestGlobNoPattern(t *testing.T) {
 
 	assert.EqualValues(t, []string{
 		"file1",
-		"some/file2",
 		"some/deep/file3",
+		"some/file2",
 	}, get())
 }
 
@@ -69,8 +71,8 @@ func TestGlobAllPattern(t *testing.T) {
 
 	assert.EqualValues(t, []string{
 		"file1",
-		"some/file2",
 		"some/deep/file3",
+		"some/file2",
 	}, get())
 }
 
@@ -121,7 +123,7 @@ func TestGlobNoPatternSecondLevel(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.EqualValues(t, []string{
-		"some/file2",
 		"some/deep/file3",
+		"some/file2",
 	}, get())
 }
