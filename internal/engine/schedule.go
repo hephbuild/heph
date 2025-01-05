@@ -113,7 +113,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 			res := <-ch
 
 			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
-				return output.Type != pluginv1.Artifact_TYPE_OUTPUT
+				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT
 			})
 
 			results[i] = &ExecuteResultWithOrigin{
