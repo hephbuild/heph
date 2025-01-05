@@ -8,6 +8,8 @@ import (
 	"io"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hmaps"
+
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -44,10 +46,24 @@ func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (stri
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
+	if len(ref.GetArgs()) == 0 {
+		return "__" + ref.GetName()
+	}
+
+	h := xxh3.New()
+	for k, v := range hmaps.Sorted(ref.GetArgs()) {
+		_, _ = h.WriteString(k)
+		_, _ = h.WriteString(v)
+	}
+
+	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
+}
+
 func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultArtifact) ([]ExecuteResultArtifact, error) {
 	// TODO: locks
 
-	cachedir := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
+	cachedir := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
 
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
@@ -161,7 +177,7 @@ func (e *Engine) resultFromLocalCacheInner(
 	hashin string,
 	locks *hlocks.Multi,
 ) (*ExecuteResult, bool, error) {
-	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
+	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
 
 	{
 		l := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName, false)

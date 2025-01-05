@@ -6,6 +6,13 @@ import "google/protobuf/any.proto";
 import "google/protobuf/descriptor.proto";
 import "heph/plugin/v1/plugin.proto";
 
+message ProviderConfigRequest {
+}
+
+message ProviderConfigResponse {
+  string name = 1;
+}
+
 message ListRequest {
   string package = 1;
   bool deep = 2;
@@ -17,13 +24,29 @@ message ListResponse {
 
 message GetRequest {
   TargetRef ref = 1;
+  repeated ProviderState states = 2;
 }
 
 message GetResponse {
   TargetSpec spec = 1;
 }
 
+message ProbeRequest {
+  string package = 1;
+}
+
+message ProviderState {
+  string provider = 1;
+  map<string, google.protobuf.Value> state = 2;
+}
+
+message ProbeResponse {
+  repeated ProviderState states = 1;
+}
+
 service Provider {
+  rpc Config(ProviderConfigRequest) returns (ProviderConfigResponse) {}
   rpc List(ListRequest) returns (stream ListResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {}
 }

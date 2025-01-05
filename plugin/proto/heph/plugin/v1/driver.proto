@@ -4,6 +4,7 @@ package heph.plugin.v1;
 import "google/protobuf/struct.proto";
 import "google/protobuf/descriptor.proto";
 import "heph/plugin/v1/plugin.proto";
+import "google/protobuf/any.proto";
 
 message ParseRequest {
   TargetSpec spec = 1;
@@ -11,6 +12,11 @@ message ParseRequest {
 
 message ParseResponse {
   TargetDef target = 1;
+}
+
+message ArtifactWithOrigin {
+  Artifact artifact = 1;
+  google.protobuf.Any meta = 2;
 }
 
 message RunRequest {
@@ -42,11 +48,6 @@ message Artifact {
   Type type = 3;
   Encoding encoding = 4;
   string uri = 5;
-}
-
-message ArtifactWithOrigin {
-  Artifact artifact = 1;
-  TargetDef.Dep dep = 2;
 }
 
 message RunResponse {

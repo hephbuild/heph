@@ -7,10 +7,11 @@ message Target {
     repeated string paths = 2;
   }
 
-  message Dep {
+  message Deps {
     message TargetRef {
       string package = 1;
       string name = 2;
+      map<string, string> args = 4;
       optional string output = 3;
     }
     repeated string files = 1;
@@ -18,9 +19,10 @@ message Target {
   }
 
   repeated string run = 1;
-  map<string, Dep> deps = 2;
-  map<string, Dep> hash_deps = 3;
-  map<string, Dep> runtime_deps = 4;
+  map<string, Deps> deps = 2;
+  map<string, Deps> hash_deps = 3;
+  map<string, Deps> runtime_deps = 4;
+  repeated Deps.TargetRef tools = 10;
   repeated Output outputs = 5;
   map<string, string> env = 6;
   map<string, string> runtime_env = 7;

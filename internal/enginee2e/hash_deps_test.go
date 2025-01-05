@@ -2,9 +2,10 @@ package enginee2e
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hartifact"
@@ -18,9 +19,7 @@ import (
 func TestHashDeps(t *testing.T) {
 	ctx := context.Background()
 
-	dir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
@@ -35,8 +34,8 @@ func TestHashDeps(t *testing.T) {
 						Driver:  "sh",
 					},
 					Config: map[string]*structpb.Value{
-						"run": newValueMust([]any{`echo hello > out`}),
-						"out": newValueMust([]any{"out"}),
+						"run": hstructpb.NewStringsValue([]string{`echo hello > out`}),
+						"out": hstructpb.NewStringsValue([]string{"out"}),
 						"runtime_env": newValueMust(map[string]any{
 							"VAR1": time.Now().String(),
 						}),

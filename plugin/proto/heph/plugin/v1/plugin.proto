@@ -9,13 +9,15 @@ message TargetRef {
   string package = 1;
   string name = 2;
   string driver = 3;
+  map<string, string> args = 4;
 }
 
 message TargetRefWithOutput {
   string package = 1;
   string name = 2;
   string driver = 3;
-  optional string output = 4;
+  map<string, string> args = 4;
+  optional string output = 5;
 }
 
 message TargetDef {
@@ -28,6 +30,7 @@ message TargetDef {
 
     TargetRefWithOutput ref = 1;
     Mode link = 2;
+    google.protobuf.Any meta = 3;
   }
 
   TargetRef ref = 1;

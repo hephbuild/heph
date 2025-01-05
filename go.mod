@@ -7,6 +7,8 @@ replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea 
 require (
 	connectrpc.com/connect v1.17.0
 	github.com/Code-Hex/go-generics-cache v1.5.1
+	github.com/alecthomas/participle v0.7.1
+	github.com/alecthomas/participle/v2 v2.1.1
 	github.com/bmatcuk/doublestar/v4 v4.7.1
 	github.com/charmbracelet/bubbletea v1.2.4
 	github.com/charmbracelet/lipgloss v1.0.0

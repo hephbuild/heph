@@ -138,7 +138,15 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 
 	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor())
 
-	e.Providers = append(e.Providers, client)
+	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ProviderConfigRequest{}))
+	if err != nil {
+		return ProviderHandle{}, err
+	}
+
+	e.Providers = append(e.Providers, Provider{
+		Name:           res.Msg.GetName(),
+		ProviderClient: client,
+	})
 
 	err = e.initPlugin(ctx, handler)
 	if err != nil {

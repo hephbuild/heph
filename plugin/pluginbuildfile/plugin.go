@@ -23,13 +23,56 @@ type Plugin struct {
 	cacherunpkg CacheRunpkg
 }
 
+var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
+
+const Name = "buildfile"
+
 func New(fs hfs.FS) *Plugin {
 	return &Plugin{
 		repoRoot: fs,
 	}
 }
 
-type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
+func (p *Plugin) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
+	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
+		Name: Name,
+	}), nil
+}
+
+func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
+	var states []*pluginv1.ProviderState
+	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, c.Msg.GetPackage()).Path(), nil, func(ctx context.Context, payload OnProviderStatePayload) error {
+		if payload.Provider == Name {
+			return nil
+		}
+
+		state := map[string]*structpb.Value{}
+		for k, v := range payload.Args {
+			v := hstarlark.FromStarlark(v)
+
+			pv, err := structpb.NewValue(v)
+			if err != nil {
+				return err
+			}
+
+			state[k] = pv
+		}
+
+		states = append(states, &pluginv1.ProviderState{
+			Provider: payload.Provider,
+			State:    state,
+		})
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return connect.NewResponse(&pluginv1.ProbeResponse{
+		States: states,
+	}), nil
+}
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
 	err := hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
@@ -50,7 +93,7 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 				},
 			})
 			return err
-		})
+		}, nil)
 		if err != nil {
 			return err
 		}
@@ -64,13 +107,13 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 	return nil
 }
 
-func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc) (starlark.StringDict, error) {
-	return p.cacherunpkg.Singleflight(ctx, pkg, onTarget, func(onTarget onTargetFunc) (starlark.StringDict, error) {
-		return p.runPkgInner(ctx, pkg, onTarget)
+func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, pkg, onTarget, onProviderState, func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+		return p.runPkgInner(ctx, pkg, onTarget, onProviderState)
 	})
 }
 
-func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetFunc) (starlark.StringDict, error) {
+func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
 	fs := hfs.At(p.repoRoot, pkg)
 	// TODO: parametrize
 	f, err := hfs.Open(fs, "BUILD")
@@ -79,7 +122,7 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetF
 	}
 	defer f.Close()
 
-	res, err := p.runFile(ctx, pkg, f, onTarget)
+	res, err := p.runFile(ctx, pkg, f, onTarget, onProviderState)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +136,8 @@ type OnTargetPayload struct {
 	Driver  string
 	Args    map[string]starlark.Value
 }
+
+type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
 
 type BuiltinFunc = func(
 	thread *starlark.Thread,
@@ -154,14 +199,80 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 	}
 }
 
+type OnProviderStatePayload struct {
+	Package  string
+	Provider string
+	Args     map[string]starlark.Value
+}
+
+type onProviderStateFunc = func(ctx context.Context, payload OnProviderStatePayload) error
+
+func (p *Plugin) builtinProviderState(onState onProviderStateFunc) BuiltinFunc {
+	return func(
+		thread *starlark.Thread,
+		fn *starlark.Builtin,
+		args starlark.Tuple,
+		kwargs []starlark.Tuple,
+	) (starlark.Value, error) {
+		ctx := thread.Local(ctxKey).(context.Context) //nolint:errcheck
+		pkg := thread.Local(packageKey).(string)      //nolint:errcheck
+
+		var fkwargs []starlark.Tuple
+		var otherkwargs = map[string]starlark.Value{}
+		for _, item := range kwargs {
+			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
+
+			switch name {
+			case "provider":
+				fkwargs = append(fkwargs, item)
+			default:
+				otherkwargs[string(name)] = arg
+			}
+		}
+
+		payload := OnProviderStatePayload{
+			Package: pkg,
+			Args:    otherkwargs,
+		}
+		if err := starlark.UnpackArgs(
+			"provider_state", args, fkwargs,
+			"provider?", &payload.Provider,
+		); err != nil {
+			return nil, err
+		}
+
+		if payload.Provider == "" {
+			return nil, errors.New("missing provider")
+		}
+
+		err := onState(ctx, payload)
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
+	}
+}
+
 const (
-	ctxKey     = "__ctx"
-	packageKey = "__pkg"
+	ctxKey     = "__heph_ctx"
+	packageKey = "__heph_pkg"
 )
 
-func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc) (starlark.StringDict, error) {
+func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+	if onTarget == nil {
+		onTarget = func(ctx context.Context, payload OnTargetPayload) error {
+			return nil
+		}
+	}
+	if onProviderState == nil {
+		onProviderState = func(ctx context.Context, payload OnProviderStatePayload) error {
+			return nil
+		}
+	}
 	universe := starlark.StringDict{
-		"target": starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
+		"target":         starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
+		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState(onProviderState)),
 	}
 	prog, err := p.buildFile(ctx, file, universe)
 	if err != nil {
@@ -227,7 +338,7 @@ func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.Get
 		}
 
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -258,5 +369,3 @@ func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.Get
 
 	return spec, nil
 }
-
-var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)

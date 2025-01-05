@@ -208,9 +208,9 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 
 	var targetfolder string
 	if def.Cache {
-		targetfolder = "__" + def.Ref.GetName()
+		targetfolder = e.targetDirName(def.Ref)
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.GetName(), time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.Ref), time.Now().UnixNano())
 	}
 
 	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.GetPackage(), targetfolder), "", "result.lock")
@@ -499,10 +499,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	var targetfolder string
-	if def.Cache {
-		targetfolder = "__" + def.Ref.GetName()
+	if def.Cache || options.shell {
+		targetfolder = e.targetDirName(def.Ref)
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", def.Ref.GetName(), time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.Ref), time.Now().UnixNano())
 	}
 
 	hashin, err := e.hashin(ctx, def, results)
@@ -536,20 +536,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, err
 	}
 
-	inputArtifacts, err := SetupSandbox(ctx, def, results, workdirfs, cwdfs)
-	if err != nil {
-		return nil, fmt.Errorf("setup sandbox: %w", err)
-	}
-
-	hashin2, err := e.hashin(ctx, def, results)
-	if err != nil {
-		return nil, fmt.Errorf("hashin2: %w", err)
-	}
-
-	if hashin != hashin2 {
-		return nil, errors.New("modified while creating sandbox")
-	}
-
 	if options.interactiveExec == nil {
 		options.interactiveExec = func(args InteractiveExecOptions) error {
 			args.Run(options)
@@ -567,10 +553,20 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 				return
 			}
 
+			var inputs []*pluginv1.ArtifactWithOrigin
+			for _, result := range results {
+				for _, artifact := range result.Artifacts {
+					inputs = append(inputs, &pluginv1.ArtifactWithOrigin{
+						Artifact: artifact.Artifact,
+						Meta:     result.Origin.GetMeta(),
+					})
+				}
+			}
+
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
 				Target:      def.TargetDef,
 				SandboxPath: sandboxfs.Path(),
-				Inputs:      inputArtifacts,
+				Inputs:      inputs,
 				Pipes:       pipes,
 			}))
 			if err := pipesWait(); err != nil {
@@ -584,6 +580,15 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("run: %w", err)
 	}
 
+	hashin2, err := e.hashin(ctx, def, results)
+	if err != nil {
+		return nil, fmt.Errorf("hashin2: %w", err)
+	}
+
+	if hashin != hashin2 {
+		return nil, errors.New("modified during execution")
+	}
+
 	if options.shell {
 		return &ExecuteResult{
 			Def:      def,
@@ -592,7 +597,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}, nil
 	}
 
-	cachefs := hfs.At(e.Cache, def.Ref.GetPackage(), "__"+def.Ref.GetName(), hashin)
+	cachefs := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
 	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.CollectOutputs))
 
 	for _, output := range def.CollectOutputs {

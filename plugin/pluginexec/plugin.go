@@ -20,6 +20,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hfs"
+
+	"github.com/hephbuild/heph/plugin/tref"
+
 	"connectrpc.com/connect"
 	ptylib "github.com/creack/pty"
 	"github.com/dlsniper/debugger"
@@ -94,11 +98,11 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, err
 	}
 
-	s := &execv1.Target{
+	target := &execv1.Target{
 		Run:            targetSpec.Run,
-		Deps:           map[string]*execv1.Target_Dep{},
-		HashDeps:       map[string]*execv1.Target_Dep{},
-		RuntimeDeps:    map[string]*execv1.Target_Dep{},
+		Deps:           map[string]*execv1.Target_Deps{},
+		HashDeps:       map[string]*execv1.Target_Deps{},
+		RuntimeDeps:    map[string]*execv1.Target_Deps{},
 		Env:            targetSpec.Env,
 		RuntimeEnv:     targetSpec.RuntimeEnv,
 		PassEnv:        targetSpec.PassEnv,
@@ -107,15 +111,15 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 
 	var allOutputPaths []string
 	for k, out := range targetSpec.Out {
-		s.Outputs = append(s.Outputs, &execv1.Target_Output{
+		target.Outputs = append(target.Outputs, &execv1.Target_Output{
 			Group: k,
 			Paths: out,
 		})
 		allOutputPaths = append(allOutputPaths, out...)
 	}
 
-	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(s.GetOutputs()))
-	for _, output := range s.GetOutputs() {
+	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))
+	for _, output := range target.GetOutputs() {
 		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
 			Group: output.GetGroup(),
 			Paths: output.GetPaths(),
@@ -123,42 +127,63 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}
 
 	var deps []*pluginv1.TargetDef_Dep
-	for name, sdeps := range targetSpec.Deps {
-		var execDeps execv1.Target_Dep
+	for name, sdeps := range targetSpec.Deps.Merge(targetSpec.HashDeps, targetSpec.RuntimeDeps) {
+		var execDeps execv1.Target_Deps
 		for _, dep := range sdeps {
-			str := strings.ReplaceAll(dep, "//", "")
-			pkg, rest, ok := strings.Cut(str, ":")
-			if !ok {
-				return nil, fmt.Errorf("invalid dep spec: %s", str)
+			sref, err := tref.ParseWithOut(dep)
+			if err != nil {
+				return nil, err
 			}
-			var name string
-			var output *string
 
-			if sname, soutput, ok := strings.Cut(rest, "|"); ok {
-				name = sname
-				output = &soutput
-			} else {
-				name = rest
+			ref := &execv1.Target_Deps_TargetRef{
+				Package: sref.GetPackage(),
+				Name:    sref.GetName(),
+				Output:  sref.Output, //nolint:protogetter
+			}
+
+			meta, err := anypb.New(ref)
+			if err != nil {
+				return nil, err
 			}
 
 			deps = append(deps, &pluginv1.TargetDef_Dep{
-				Ref: &pluginv1.TargetRefWithOutput{
-					Package: pkg,
-					Name:    name,
-					Output:  output,
-				},
+				Ref:  sref,
+				Meta: meta,
 			})
 
-			execDeps.Targets = append(execDeps.Targets, &execv1.Target_Dep_TargetRef{
-				Package: pkg,
-				Name:    name,
-				Output:  output,
-			})
+			execDeps.Targets = append(execDeps.Targets, ref)
 		}
-		s.Deps[name] = &execDeps
+		target.Deps[name] = &execDeps
 	}
 
-	target, err := anypb.New(s)
+	for _, tools := range targetSpec.Tools {
+		for _, tool := range tools {
+			sref, err := tref.ParseWithOut(tool)
+			if err != nil {
+				return nil, err
+			}
+
+			ref := &execv1.Target_Deps_TargetRef{
+				Package: sref.GetPackage(),
+				Name:    sref.GetName(),
+				Args:    sref.GetArgs(),
+				Output:  sref.Output, //nolint:protogetter
+			}
+
+			meta, err := anypb.New(ref)
+			if err != nil {
+				return nil, err
+			}
+
+			deps = append(deps, &pluginv1.TargetDef_Dep{
+				Ref:  sref,
+				Meta: meta,
+			})
+			target.Tools = append(target.Tools, ref)
+		}
+	}
+
+	targetAny, err := anypb.New(target)
 	if err != nil {
 		return nil, err
 	}
@@ -184,7 +209,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	return connect.NewResponse(&pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
 			Ref:            req.Msg.GetSpec().GetRef(),
-			Def:            target,
+			Def:            targetAny,
 			Deps:           deps,
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
 			Cache:          targetSpec.Cache,
@@ -221,9 +246,9 @@ func getEnvEntryWithName(name, value string) string {
 func (p *Plugin) inputEnv(
 	ctx context.Context,
 	inputs []*pluginv1.ArtifactWithOrigin,
-	deps map[string]*execv1.Target_Dep,
+	deps map[string]*execv1.Target_Deps,
 ) ([]string, error) {
-	getDep := func(t *pluginv1.TargetRefWithOutput) (string, bool) {
+	getDep := func(t *execv1.Target_Deps_TargetRef) (string, bool) {
 		for name, dep := range deps {
 			for _, target := range dep.GetTargets() {
 				if target.GetName() == t.GetName() && target.GetPackage() == t.GetPackage() {
@@ -241,7 +266,13 @@ func (p *Plugin) inputEnv(
 			continue
 		}
 
-		depName, allOutput := getDep(input.GetDep().GetRef())
+		ref := &execv1.Target_Deps_TargetRef{}
+		err := input.GetMeta().UnmarshalTo(ref)
+		if err != nil {
+			return nil, err
+		}
+
+		depName, allOutput := getDep(ref)
 
 		var outputName string
 		if allOutput {
@@ -301,29 +332,32 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		req.Msg.Pipes = append(req.Msg.Pipes, "")
 	}
 
-	var t execv1.Target
-	err := req.Msg.GetTarget().GetDef().UnmarshalTo(&t)
+	t := &execv1.Target{}
+	err := req.Msg.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {
 		return nil, err
 	}
 
 	pty := req.Msg.GetTarget().GetPty()
-	workdir := filepath.Join(req.Msg.GetSandboxPath(), "ws")
-	cwd := filepath.Join(workdir, req.Msg.GetTarget().GetRef().GetPackage())
+	sandboxfs := hfs.NewOS(req.Msg.GetSandboxPath())
+	workfs := hfs.At(sandboxfs, "ws")
+	binfs := hfs.At(sandboxfs, "bin")
+	cwdfs := hfs.At(workfs, req.Msg.GetTarget().GetRef().GetPackage())
 
-	err = os.MkdirAll(cwd, 0755)
+	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs)
 	if err != nil {
 		return nil, err
 	}
 
 	env := []string{}
 
-	inputEnv, err := p.inputEnv(ctx, req.Msg.GetInputs(), t.GetDeps())
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, t.GetDeps())
 	if err != nil {
 		return nil, err
 	}
 
 	env = append(env, inputEnv...)
+	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin", binfs.Path()))
 
 	for _, output := range t.GetOutputs() {
 		paths := strings.Join(output.GetPaths(), " ") // TODO: make it a path
@@ -348,7 +382,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
-	cmd.Dir = cwd
+	cmd.Dir = cwdfs.Path()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // this creates a new process group, same as Setpgid
 	}
@@ -443,6 +477,8 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	err = cmd.Run()
 	if err != nil {
+		step.SetError()
+
 		cmderr := err
 
 		if !pty {

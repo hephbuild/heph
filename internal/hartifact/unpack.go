@@ -60,6 +60,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 			return err
 		}
 		defer f.Close()
+		defer cfg.onFile(f.Name())
 
 		_, err = io.Copy(f, r)
 		if err != nil {

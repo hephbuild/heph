@@ -18,7 +18,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func TestDepsCache(t *testing.T) {
+func TestSanityTool(t *testing.T) {
 	ctx := context.Background()
 
 	dir := t.TempDir()
@@ -30,27 +30,34 @@ func TestDepsCache(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "child",
+					Package: "tools",
+					Name:    "mytool",
 					Driver:  "bash",
 				},
 				Config: map[string]*structpb.Value{
-					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
-					"out": hstructpb.NewStringsValue([]string{"out_child"}),
+					"run": hstructpb.NewStringsValue([]string{
+						`echo '#!/usr/bin/env bash' > $OUT`,
+						`echo 'echo hello' > $OUT`,
+						`chmod +x $OUT`,
+					}),
+					"out": hstructpb.NewStringsValue([]string{"screw"}),
 				},
 			},
 		},
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "parent",
+					Package: "some/package",
+					Name:    "sometarget",
 					Driver:  "bash",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  hstructpb.NewStringsValue([]string{`echo $(cat $SRC) > $OUT`}),
-					"deps": hstructpb.NewStringsValue([]string{"//:child"}),
-					"out":  hstructpb.NewStringsValue([]string{"out_parent"}),
+					"run": hstructpb.NewStringsValue([]string{
+						`which screw || echo 'screw bin not found'`,
+						`screw > out`,
+					}),
+					"out":   hstructpb.NewStringsValue([]string{"out"}),
+					"tools": hstructpb.NewStringsValue([]string{"//tools:mytool"}),
 				},
 			},
 		},
@@ -66,32 +73,19 @@ func TestDepsCache(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	assertOut := func(res *engine.ExecuteResult) {
-		fs := hfstest.New(t)
-		err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs)
-		require.NoError(t, res.Err)
+	ch := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
 
-		b, err := hfs.ReadFile(fs, "out_parent")
-		require.NoError(t, err)
+	res := <-ch
+	require.NoError(t, res.Err)
 
-		assert.Equal(t, "hello\n", string(b))
-	}
+	require.Len(t, res.Artifacts, 2)
 
-	{ // This will run all
-		ch := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
+	fs2 := hfstest.New(t)
+	err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs2)
+	require.NoError(t, err)
 
-		res := <-ch
-		require.NoError(t, res.Err)
+	b, err := hfs.ReadFile(fs2, "some/package/out")
+	require.NoError(t, err)
 
-		assertOut(res)
-	}
-
-	{ // this should reuse cache from deps
-		ch := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
-
-		res := <-ch
-		require.NoError(t, res.Err)
-
-		assertOut(res)
-	}
+	assert.Equal(t, "hello\n", string(b))
 }

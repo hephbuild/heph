@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
+
+	"golang.org/x/sync/errgroup"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
@@ -13,12 +16,44 @@ import (
 )
 
 func (e *Engine) GetSpec(ctx context.Context, pkg, name string) (*pluginv1.TargetSpec, error) {
+	var eg errgroup.Group
+
+	var states []*pluginv1.ProviderState
+
+	segments := strings.Split(pkg, "/")
+	segments = slices.Insert(segments, 0, "")
+	for i := range segments {
+		for _, p := range e.Providers {
+			res, err := p.Probe(ctx, connect.NewRequest(&pluginv1.ProbeRequest{
+				Package: strings.Join(segments[:i], "/"),
+			}))
+			if err != nil {
+				return nil, err
+			}
+
+			states = append(states, res.Msg.GetStates()...)
+		}
+	}
+
+	err := eg.Wait()
+	if err != nil {
+		return nil, err
+	}
+
 	for _, p := range e.Providers {
+		var providerStates []*pluginv1.ProviderState
+		for _, state := range states {
+			if state.GetProvider() == p.Name {
+				providerStates = append(providerStates, state)
+			}
+		}
+
 		res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
 			Ref: &pluginv1.TargetRef{
 				Package: pkg,
 				Name:    name,
 			},
+			States: providerStates,
 		}))
 		if err != nil {
 			if connect.CodeOf(err) == connect.CodeNotFound {

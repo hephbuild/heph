@@ -2,8 +2,9 @@ package enginee2e
 
 import (
 	"context"
-	"os"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -17,9 +18,7 @@ import (
 func TestSrcOutEnv(t *testing.T) {
 	ctx := context.Background()
 
-	dir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
@@ -33,7 +32,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{`echo hello`}),
+					"run": hstructpb.NewStringsValue([]string{`echo hello`}),
 				},
 			},
 		},
@@ -45,8 +44,8 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{`echo hello > $OUT`}),
-					"out": newValueMust([]any{"out"}),
+					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
+					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
 			},
 		},
@@ -58,7 +57,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{`echo hello > $OUT_OUT1`}),
+					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`}),
 					"out": newValueMust(map[string]any{"out1": "out"}),
 				},
 			},
@@ -71,7 +70,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{`echo hello > $OUT_OUT1`, `echo world > $OUT_OUT2`}),
+					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`, `echo world > $OUT_OUT2`}),
 					"out": newValueMust(map[string]any{"out1": "out1", "out2": "out1"}),
 				},
 			},
@@ -85,8 +84,8 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`env | grep -v SRC`}),
-					"deps": newValueMust([]any{"//:no_out"}),
+					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
+					"deps": hstructpb.NewStringsValue([]string{"//:no_out"}),
 				},
 			},
 		},
@@ -98,8 +97,8 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC`}),
-					"deps": newValueMust([]any{"//:unamed_out"}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
+					"deps": hstructpb.NewStringsValue([]string{"//:unamed_out"}),
 				},
 			},
 		},
@@ -111,8 +110,8 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC_OUT1`}),
-					"deps": newValueMust([]any{"//:one_named_out"}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_OUT1`}),
+					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out"}),
 				},
 			},
 		},
@@ -124,8 +123,8 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC`}),
-					"deps": newValueMust([]any{"//:one_named_out|out1"}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
+					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out|out1"}),
 				},
 			},
 		},
@@ -138,7 +137,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`env | grep -v SRC`}),
+					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
 					"deps": newValueMust(map[string]any{"in1": "//:no_out"}),
 				},
 			},
@@ -151,7 +150,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC_IN1`}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:unamed_out"}),
 				},
 			},
@@ -164,7 +163,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC_IN1_OUT1`}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1_OUT1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out"}),
 				},
 			},
@@ -177,7 +176,7 @@ func TestSrcOutEnv(t *testing.T) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"run":  newValueMust([]any{`echo $SRC_IN1`}),
+					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out|out1"}),
 				},
 			},

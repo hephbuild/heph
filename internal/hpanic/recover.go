@@ -2,7 +2,19 @@ package hpanic
 
 import (
 	"fmt"
+	"runtime"
 )
+
+type Error struct {
+	Err   error
+	Stack string
+}
+
+func (e Error) Error() string {
+	return fmt.Sprintf("%v\n%s", e.Err, e.Stack)
+}
+
+func (e Error) Unwrap() error { return e.Err }
 
 type Option interface {
 	do(*options)
@@ -34,6 +46,13 @@ func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 				} else {
 					err = fmt.Errorf("%v", rerr)
 				}
+			}
+
+			buf := make([]byte, 512)
+			runtime.Stack(buf, false)
+			err = Error{
+				Err:   err,
+				Stack: string(buf),
 			}
 		}
 	}()

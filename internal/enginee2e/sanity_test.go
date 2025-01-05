@@ -2,8 +2,9 @@ package enginee2e
 
 import (
 	"context"
-	"os"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hartifact"
@@ -29,9 +30,7 @@ func newValueMust(v any) *structpb.Value {
 func TestSanity(t *testing.T) {
 	ctx := context.Background()
 
-	dir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
@@ -45,8 +44,8 @@ func TestSanity(t *testing.T) {
 					Driver:  "exec",
 				},
 				Config: map[string]*structpb.Value{
-					"run": newValueMust([]any{"sh", "-c", "-e", `echo hello > out`}),
-					"out": newValueMust([]any{"out"}),
+					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > out`}),
+					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
 			},
 		},

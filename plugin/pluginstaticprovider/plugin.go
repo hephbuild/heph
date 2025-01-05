@@ -5,17 +5,30 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
+
 	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 type Target struct {
 	Spec *pluginv1.TargetSpec
 }
 
+var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
+
 type Plugin struct {
 	f func() []Target
+}
+
+func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
+	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
+		Name: "static",
+	}), nil
+}
+
+func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
+	return connect.NewResponse(&pluginv1.ProbeResponse{}), nil
 }
 
 func New(targets []Target) *Plugin {
@@ -70,5 +83,3 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 }
-
-var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)

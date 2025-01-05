@@ -15,6 +15,10 @@ func Clone[T proto.Message](m T) T {
 	return proto.Clone(m).(T) //nolint:errcheck
 }
 
+func Equal[T proto.Message](a, b T) bool {
+	return proto.Equal(a, b)
+}
+
 func protoPathValueToDotPath(p protopath.Values) string {
 	segments := make([]string, 0, len(p.Path))
 	for _, step := range p.Path {

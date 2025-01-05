@@ -3,6 +3,7 @@ package hcore
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -19,10 +20,13 @@ func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {
 			defer func() {
 				if r := recover(); r != nil {
 					response = nil
+					buf := make([]byte, 2048)
+					runtime.Stack(buf, false)
+
 					if e, ok := r.(error); ok {
-						err = connect.NewError(connect.CodeInternal, e)
+						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%w: %v", e, string(buf)))
 					} else {
-						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%v", r))
+						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%v: %s", r, string(buf)))
 					}
 				}
 			}()

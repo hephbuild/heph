@@ -63,11 +63,16 @@ type Engine struct {
 
 	CoreHandle EngineHandle
 
-	Providers     []pluginv1connect.ProviderClient
+	Providers     []Provider
 	Drivers       []pluginv1connect.DriverClient
 	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
 	DriversByName map[string]pluginv1connect.DriverClient
 	DriversConfig map[string]*pluginv1.ConfigResponse
+}
+
+type Provider struct {
+	Name string
+	pluginv1connect.ProviderClient
 }
 
 func New(ctx context.Context, root string, cfg Config) (*Engine, error) {

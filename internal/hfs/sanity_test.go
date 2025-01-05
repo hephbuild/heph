@@ -47,9 +47,7 @@ func doSame(t *testing.T, fss []FS, f func(*testing.T, FS) File) []container {
 }
 
 func TestSanity(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	fss := []FS{
 		NewOS(dir),
@@ -75,7 +73,7 @@ func TestSanity(t *testing.T) {
 	})
 
 	assertSame(t, files, func(t *testing.T, c container) []any {
-		err = c.f.Close()
+		err := c.f.Close()
 		require.NoError(t, err)
 
 		return nil
@@ -136,9 +134,7 @@ func TestSanity(t *testing.T) {
 }
 
 func TestSanityAt(t *testing.T) {
-	dir, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	fss := []FS{
 		At(NewOS(dir), "some/dir"),
