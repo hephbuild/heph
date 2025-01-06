@@ -1,6 +1,8 @@
 syntax = "proto3";
 package heph.plugin.exec.v1;
 
+import "heph/plugin/v1/plugin.proto";
+
 message Target {
   message Output {
     string group = 1;
@@ -8,21 +10,15 @@ message Target {
   }
 
   message Deps {
-    message TargetRef {
-      string package = 1;
-      string name = 2;
-      map<string, string> args = 4;
-      optional string output = 3;
-    }
     repeated string files = 1;
-    repeated TargetRef targets = 2;
+    repeated heph.plugin.v1.TargetRefWithOutput targets = 2;
   }
 
   repeated string run = 1;
   map<string, Deps> deps = 2;
   map<string, Deps> hash_deps = 3;
   map<string, Deps> runtime_deps = 4;
-  repeated Deps.TargetRef tools = 10;
+  repeated heph.plugin.v1.TargetRefWithOutput tools = 10;
   repeated Output outputs = 5;
   map<string, string> env = 6;
   map<string, string> runtime_env = 7;

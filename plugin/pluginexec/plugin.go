@@ -117,15 +117,9 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	for name, sdeps := range targetSpec.Deps.Merge(targetSpec.HashDeps, targetSpec.RuntimeDeps) {
 		var execDeps execv1.Target_Deps
 		for _, dep := range sdeps {
-			sref, err := tref.ParseWithOut(dep)
+			ref, err := tref.ParseWithOut(dep)
 			if err != nil {
 				return nil, err
-			}
-
-			ref := &execv1.Target_Deps_TargetRef{
-				Package: sref.GetPackage(),
-				Name:    sref.GetName(),
-				Output:  sref.Output, //nolint:protogetter
 			}
 
 			meta, err := anypb.New(ref)
@@ -134,7 +128,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			}
 
 			deps = append(deps, &pluginv1.TargetDef_Dep{
-				Ref:  sref,
+				Ref:  ref,
 				Meta: meta,
 			})
 
@@ -145,16 +139,9 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 
 	for _, tools := range targetSpec.Tools {
 		for _, tool := range tools {
-			sref, err := tref.ParseWithOut(tool)
+			ref, err := tref.ParseWithOut(tool)
 			if err != nil {
 				return nil, err
-			}
-
-			ref := &execv1.Target_Deps_TargetRef{
-				Package: sref.GetPackage(),
-				Name:    sref.GetName(),
-				Args:    sref.GetArgs(),
-				Output:  sref.Output, //nolint:protogetter
 			}
 
 			meta, err := anypb.New(ref)
@@ -163,7 +150,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			}
 
 			deps = append(deps, &pluginv1.TargetDef_Dep{
-				Ref:  sref,
+				Ref:  ref,
 				Meta: meta,
 			})
 			target.Tools = append(target.Tools, ref)

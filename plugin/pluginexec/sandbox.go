@@ -74,14 +74,14 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 	return listArtifacts, nil
 }
 
-func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *execv1.Target_Deps_TargetRef) iter.Seq[*pluginv1.ArtifactWithOrigin] {
+func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *pluginv1.TargetRefWithOutput) iter.Seq[*pluginv1.ArtifactWithOrigin] {
 	return func(yield func(origin *pluginv1.ArtifactWithOrigin) bool) {
 		for _, input := range inputs {
 			if input.GetArtifact().GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 				continue
 			}
 
-			aref := &execv1.Target_Deps_TargetRef{}
+			aref := &pluginv1.TargetRefWithOutput{}
 			err := input.GetMeta().UnmarshalTo(aref)
 			if err != nil {
 				continue

@@ -262,7 +262,7 @@ func (p *Plugin) inputEnv(
 	inputs []*pluginv1.ArtifactWithOrigin,
 	deps map[string]*execv1.Target_Deps,
 ) ([]string, error) {
-	getDep := func(t *execv1.Target_Deps_TargetRef) (string, bool) {
+	getDep := func(t *pluginv1.TargetRefWithOutput) (string, bool) {
 		for name, dep := range deps {
 			for _, target := range dep.GetTargets() {
 				if target.GetName() == t.GetName() && target.GetPackage() == t.GetPackage() {
@@ -280,7 +280,7 @@ func (p *Plugin) inputEnv(
 			continue
 		}
 
-		ref := &execv1.Target_Deps_TargetRef{}
+		ref := &pluginv1.TargetRefWithOutput{}
 		err := input.GetMeta().UnmarshalTo(ref)
 		if err != nil {
 			return nil, err
