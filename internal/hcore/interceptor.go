@@ -2,36 +2,22 @@ package hcore
 
 import (
 	"context"
-	"fmt"
-	"runtime"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hpanic"
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
 )
 
 func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {
 	return func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func( //nolint:nonamedreturns
-			ctx context.Context,
-			req connect.AnyRequest,
-		) (response connect.AnyResponse, err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					response = nil
-					buf := make([]byte, 2048)
-					runtime.Stack(buf, false)
-
-					if e, ok := r.(error); ok {
-						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%w: %v", e, string(buf)))
-					} else {
-						err = connect.NewError(connect.CodeInternal, fmt.Errorf("%v: %s", r, string(buf)))
-					}
-				}
-			}()
-
-			return next(ctx, req)
+		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+			return hpanic.RecoverV(func() (connect.AnyResponse, error) {
+				return next(ctx, req)
+			}, hpanic.Wrap(func(err error) error {
+				return connect.NewError(connect.CodeInternal, err)
+			}))
 		}
 	}
 }

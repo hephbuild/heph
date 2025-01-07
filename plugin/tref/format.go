@@ -14,6 +14,7 @@ type RefOut = pluginv1.TargetRefWithOutput
 
 var _ Refable = (*Ref)(nil)
 var _ Refable = (*RefOut)(nil)
+var _ RefableOut = (*RefOut)(nil)
 
 type Refable interface {
 	GetArgs() map[string]string

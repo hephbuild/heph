@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package heph.core.v1;
+import "heph/plugin/v1/driver.proto";
+import "heph/plugin/v1/plugin.proto";
+
+message ResultRequest {
+  oneof of {
+    heph.plugin.v1.TargetRef ref = 1;
+    heph.plugin.v1.TargetSpec spec = 2;
+    heph.plugin.v1.TargetDef def = 3;
+  }
+}
+
+message ResultResponse {
+  repeated heph.plugin.v1.Artifact artifacts = 1;
+}
+
+service ResultService {
+  rpc Get(ResultRequest) returns (ResultResponse) {}
+}

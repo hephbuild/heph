@@ -51,8 +51,9 @@ type Config struct {
 
 type EngineHandle struct {
 	ServerHandle
-	LogClient  corev1connect.LogServiceClient
-	StepClient corev1connect.StepServiceClient
+	LogClient    corev1connect.LogServiceClient
+	StepClient   corev1connect.StepServiceClient
+	ResultClient corev1connect.ResultServiceClient
 }
 
 type Engine struct {
@@ -105,10 +106,17 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		srvh.Mux.Handle(path, handler)
 	}
 
+	{
+		path, handler := corev1connect.NewResultServiceHandler(e.Handler())
+
+		srvh.Mux.Handle(path, handler)
+	}
+
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
 		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
 		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
+		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
 	}
 
 	return e, nil

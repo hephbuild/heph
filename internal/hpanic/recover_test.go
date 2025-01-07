@@ -28,8 +28,8 @@ func TestRecoverOutOfBound(t *testing.T) {
 func TestRecoverWrap(t *testing.T) {
 	err := Recover(func() error {
 		panic("blah")
-	}, Wrap(func(err any) error {
-		return fmt.Errorf("error: %v", err)
+	}, Wrap(func(err error) error {
+		return fmt.Errorf("error: %w", err)
 	}))
-	assert.ErrorContains(t, err, "error: blah")
+	assert.ErrorContains(t, err, "error: Panic: blah")
 }

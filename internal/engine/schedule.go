@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/plugin/tref"
+
 	"github.com/hephbuild/heph/internal/hproto"
 
 	"connectrpc.com/connect"
@@ -57,6 +59,20 @@ type ResultOptions struct {
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options)
+}
+
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+	return e.result(ctx, DefContainer{Ref: ref}, outputs, options)
+}
+func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+	return e.result(ctx, DefContainer{Def: def}, outputs, options)
+}
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+	return e.result(ctx, DefContainer{Spec: spec}, outputs, options)
+}
+
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteResult {
 	if options.Singleflight == nil {
 		options.Singleflight = &Singleflight{}
 	}
@@ -67,25 +83,25 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 
 	ctx = hstep.WithoutParent(ctx)
 
-	ch, send, isNew := options.Singleflight.Result(ctx, pkg, name, outputs)
+	ch, send, isNew := options.Singleflight.Result(ctx, c.GetRef(), outputs)
 	if !isNew {
 		return ch
 	}
 
 	go func() {
-		step, ctx := hstep.New(ctx, fmt.Sprintf("//%v:%v", pkg, name))
+		step, ctx := hstep.New(ctx, tref.Format(c.GetRef()))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, pkg, name, outputs, options)
+		res, err := e.innerResultWithSideEffects(ctx, c, outputs, options)
 		if err != nil {
 			step.SetError()
-			send(&ExecuteResult{Err: fmt.Errorf("%v:%v %w", pkg, name, err)})
+			send(&ExecuteResult{Err: fmt.Errorf("%v %w", tref.Format(c.GetRef()), err)})
 			return
 		}
 
 		if res.Err != nil {
 			step.SetError()
-			res.Err = fmt.Errorf("%v:%v %w", pkg, name, res.Err)
+			res.Err = fmt.Errorf("%v %w", tref.Format(c.GetRef()), res.Err)
 		}
 
 		send(res)
@@ -108,7 +124,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				outputs = nil
 			}
 
-			ch := e.Result(ctx, dep.Ref.GetPackage(), dep.Ref.GetName(), outputs, ResultOptions{Singleflight: sf})
+			ch := e.ResultFromRef(ctx, dep.Ref, outputs, ResultOptions{Singleflight: sf})
 
 			res := <-ch
 
@@ -141,7 +157,7 @@ func (e *Engine) errFromDepsResults(results []*ExecuteResultWithOrigin, def *Lig
 	return errs
 }
 
-func (e *Engine) ResultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, sf *Singleflight) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, sf *Singleflight) (*ExecuteResult, bool, error) {
 	// Get hashout from all deps
 	results := e.depsResults(ctx, def, false, sf)
 	err := e.errFromDepsResults(results, def)
@@ -178,8 +194,8 @@ func (e *Engine) ResultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
-	res, err := e.innerResult(ctx, pkg, name, outputs, options)
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) (*ExecuteResult, error) {
+	res, err := e.innerResult(ctx, c, outputs, options)
 	if err != nil {
 		return nil, err
 	}
@@ -192,8 +208,8 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, pkg, name strin
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) (*ExecuteResult, error) {
-	def, err := e.LightLink(ctx, pkg, name)
+func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) (*ExecuteResult, error) {
+	def, err := e.LightLink(ctx, c)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +233,7 @@ func (e *Engine) innerResult(ctx context.Context, pkg, name string, outputs []st
 
 	if def.Cache {
 		if !options.Force {
-			res, ok, err := e.ResultFromCache(ctx, def, outputs, options.Singleflight)
+			res, ok, err := e.resultFromCache(ctx, def, outputs, options.Singleflight)
 			if err != nil {
 				return nil, err
 			}

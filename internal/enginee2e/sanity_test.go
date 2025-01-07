@@ -8,8 +8,6 @@ import (
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hartifact"
-	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/hfs/hfstest"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginstaticprovider"
@@ -65,11 +63,7 @@ func TestSanity(t *testing.T) {
 
 	require.Len(t, res.Artifacts, 2)
 
-	fs2 := hfstest.New(t)
-	err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs2)
-	require.NoError(t, err)
-
-	b, err := hfs.ReadFile(fs2, "some/package/out")
+	b, err := hartifact.ReadAll(ctx, res.Artifacts[0].Artifact, "some/package/out")
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))

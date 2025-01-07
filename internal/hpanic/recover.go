@@ -11,7 +11,7 @@ type Error struct {
 }
 
 func (e Error) Error() string {
-	return fmt.Sprintf("%v\n%s", e.Err, e.Stack)
+	return fmt.Sprintf("Panic: %v\n%s", e.Err, e.Stack)
 }
 
 func (e Error) Unwrap() error { return e.Err }
@@ -27,7 +27,7 @@ func (f optionFunc) do(o *options) {
 }
 
 type options struct {
-	wrap func(err any) error
+	wrap func(err error) error
 }
 
 func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
@@ -37,22 +37,22 @@ func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 	}
 
 	defer func() {
-		if rerr := recover(); rerr != nil { //nolint:nestif
-			if o.wrap != nil {
-				err = o.wrap(rerr)
+		if rerr := recover(); rerr != nil {
+			if rerrr, ok := rerr.(error); ok {
+				err = rerrr
 			} else {
-				if rerrr, ok := rerr.(error); ok {
-					err = rerrr
-				} else {
-					err = fmt.Errorf("%v", rerr)
-				}
+				err = fmt.Errorf("%v", rerr)
 			}
 
-			buf := make([]byte, 512)
-			runtime.Stack(buf, false)
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
 			err = Error{
 				Err:   err,
-				Stack: string(buf),
+				Stack: string(buf[:n]),
+			}
+
+			if o.wrap != nil {
+				err = o.wrap(err)
 			}
 		}
 	}()
@@ -68,7 +68,7 @@ func Recover(f func() error, opts ...Option) error {
 	return err
 }
 
-func Wrap(f func(err any) error) Option {
+func Wrap(f func(err error) error) Option {
 	return optionFunc(func(o *options) {
 		o.wrap = f
 	})

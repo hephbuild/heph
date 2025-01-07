@@ -6,6 +6,9 @@ import (
 	"slices"
 	"sync"
 
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/tref"
+
 	"github.com/hephbuild/heph/internal/hproto"
 )
 
@@ -65,13 +68,13 @@ func (h *singleflightResultHandle) send(result *ExecuteResult) {
 	h.chs = nil
 }
 
-func (s *singleflightResult) getHandle(ctx context.Context, pkg string, name string, outputs []string) (*singleflightResultHandle, bool) {
+func (s *singleflightResult) getHandle(ctx context.Context, ref *pluginv1.TargetRef, outputs []string) (*singleflightResultHandle, bool) {
 	outputs = slices.Clone(outputs)
 	slices.Sort(outputs)
 	if len(outputs) == 0 {
 		outputs = nil
 	}
-	key := fmt.Sprintf("%s %s %#v", pkg, name, outputs)
+	key := fmt.Sprintf("%s %#v", tref.Format(ref), outputs)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -91,8 +94,8 @@ func (s *singleflightResult) getHandle(ctx context.Context, pkg string, name str
 	return h, isNew
 }
 
-func (s *Singleflight) Result(ctx context.Context, pkg string, name string, outputs []string) (<-chan *ExecuteResult, func(result *ExecuteResult), bool) {
-	h, isNew := s.result.getHandle(ctx, pkg, name, outputs)
+func (s *Singleflight) Result(ctx context.Context, ref *pluginv1.TargetRef, outputs []string) (<-chan *ExecuteResult, func(result *ExecuteResult), bool) {
+	h, isNew := s.result.getHandle(ctx, ref, outputs)
 
 	return h.newCh(), h.send, isNew
 }

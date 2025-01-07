@@ -40,6 +40,30 @@ type config struct {
 	filter func(from string) bool
 }
 
+func FileReader(ctx context.Context, r io.Reader, path string) (io.Reader, error) {
+	tr := tar.NewReader(r)
+
+	var fileReader io.Reader
+	err := Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
+		if hdr.Name != path {
+			return nil
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeReg:
+			fileReader = r
+			return ErrStopWalk
+		default:
+			return fmt.Errorf("is not a file, is %v: %s", hdr.Typeflag, hdr.Name)
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return fileReader, nil
+}
+
 func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) error {
 	cfg := &config{}
 	for _, option := range options {
@@ -165,6 +189,8 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 	return nil
 }
 
+var ErrStopWalk = errors.New("stop walk")
+
 func Walk(tr *tar.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
 	for {
 		hdr, err := tr.Next()
@@ -179,6 +205,10 @@ func Walk(tr *tar.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
 		for _, f := range fs {
 			err = f(hdr, tr)
 			if err != nil {
+				if errors.Is(err, ErrStopWalk) {
+					return nil
+				}
+
 				return err
 			}
 		}
