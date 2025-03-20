@@ -3,7 +3,7 @@ load("//test", "e2e_test")
 e2e_test(
     name = "sanity_go_version",
     cmd = "heph run //test/go:version",
-    expect_output_contains = "go version go1.22.2",
+    expect_output_contains = "go version go1.24.1",
 )
 
 e2e_test(
