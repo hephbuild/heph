@@ -4,7 +4,7 @@ load("//backend/node", "yarn_toolchain")
 
 go_toolchain(
     name = "go",
-    version = "1.22.2",
+    version = "1.24.1",
     env = {
         "GOEXPERIMENT": "rangefunc",
     },
