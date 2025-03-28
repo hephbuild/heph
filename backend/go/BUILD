@@ -245,7 +245,7 @@ def go_mod(
         out = "/**/BUILD",
         deps = {"cfg": godeps_cfg},
         runtime_deps = {"deps": godeps_deps},
-        hash_deps = [imports, gomodsum],
+        hash_deps = [imports, mod_pkg_modsums],
         tools = godeps,
         env = {
             "GOOS": get_os(),
