@@ -2,6 +2,7 @@ package pluginsmartprovidertest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -39,6 +40,10 @@ func (p *Provider) Config(ctx context.Context, req *connect.Request[pluginv1.Pro
 	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
 		Name: ProviderName,
 	}), nil
+}
+
+func (p *Provider) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
 }
 
 func (p *Provider) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], stream *connect.ServerStream[pluginv1.ListResponse]) error {

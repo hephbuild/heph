@@ -2,6 +2,7 @@ package hlog
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
@@ -29,17 +30,34 @@ func (t textHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= t.leveler.Level()
 }
 
-func FormatRecord(r Renderer, record slog.Record) string {
+func FormatRecord(r Renderer, attrs []slog.Attr, record slog.Record) string {
 	var sb strings.Builder
 	sb.WriteString(r.lvlStyles[record.Level].Render(record.Level.String()))
 	sb.WriteString(" ")
 	sb.WriteString(record.Message)
 
+	renderAttr := func(attr slog.Attr) {
+		sb.WriteString(" ")
+		sb.WriteString(attr.Key)
+		sb.WriteString("=")
+		sb.WriteString(strings.ReplaceAll(fmt.Sprint(attr.Value.Any()), "\n", `\n`))
+	}
+
+	for _, attr := range attrs {
+		renderAttr(attr)
+	}
+
+	record.Attrs(func(attr slog.Attr) bool {
+		renderAttr(attr)
+
+		return true
+	})
+
 	return sb.String()
 }
 
 func (t textHandler) Handle(ctx context.Context, record slog.Record) error {
-	_, err := t.w.Write([]byte(FormatRecord(t.renderer, record)))
+	_, err := t.w.Write([]byte(FormatRecord(t.renderer, t.attrs, record)))
 	if err != nil {
 		return err
 	}

@@ -23,11 +23,11 @@ type singleflightResult struct {
 
 type singleflightResultHandle struct {
 	mu  sync.Mutex
-	res *ExecuteResult
-	chs []chan *ExecuteResult
+	res *ExecuteChResult
+	chs []chan *ExecuteChResult
 }
 
-func (h *singleflightResultHandle) getRes() *ExecuteResult {
+func (h *singleflightResultHandle) getRes() *ExecuteChResult {
 	res := *h.res
 	res.Artifacts = slices.Clone(res.Artifacts)
 
@@ -38,11 +38,11 @@ func (h *singleflightResultHandle) getRes() *ExecuteResult {
 	return &res
 }
 
-func (h *singleflightResultHandle) newCh() <-chan *ExecuteResult {
+func (h *singleflightResultHandle) newCh() <-chan *ExecuteChResult {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	ch := make(chan *ExecuteResult, 1)
+	ch := make(chan *ExecuteChResult, 1)
 	if h.res != nil {
 		ch <- h.getRes()
 		return ch
@@ -53,7 +53,7 @@ func (h *singleflightResultHandle) newCh() <-chan *ExecuteResult {
 	return ch
 }
 
-func (h *singleflightResultHandle) send(result *ExecuteResult) {
+func (h *singleflightResultHandle) send(result *ExecuteChResult) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -94,7 +94,7 @@ func (s *singleflightResult) getHandle(ctx context.Context, ref *pluginv1.Target
 	return h, isNew
 }
 
-func (s *Singleflight) Result(ctx context.Context, ref *pluginv1.TargetRef, outputs []string) (<-chan *ExecuteResult, func(result *ExecuteResult), bool) {
+func (s *Singleflight) Result(ctx context.Context, ref *pluginv1.TargetRef, outputs []string) (<-chan *ExecuteChResult, func(result *ExecuteChResult), bool) {
 	h, isNew := s.result.getHandle(ctx, ref, outputs)
 
 	return h.newCh(), h.send, isNew

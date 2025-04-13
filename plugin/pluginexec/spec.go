@@ -75,4 +75,5 @@ type Spec struct {
 	RuntimeEnv     map[string]string `mapstructure:"runtime_env"`
 	PassEnv        []string          `mapstructure:"pass_env"`
 	RuntimePassEnv []string          `mapstructure:"runtime_pass_env"`
+	InTree         bool              `mapstructure:"in_tree"`
 }

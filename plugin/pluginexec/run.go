@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 
@@ -28,7 +30,7 @@ import (
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("heph/pluginexec %v: %v %v", p.name, req.Msg.GetTarget().GetRef().GetPackage(), req.Msg.GetTarget().GetRef().GetName()), "",
+			fmt.Sprintf("heph/pluginexec %v: %v", p.name, tref.Format(req.Msg.GetTarget().GetRef())), "",
 		}
 	})
 
@@ -55,13 +57,17 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	workfs := hfs.At(sandboxfs, "ws")
 	binfs := hfs.At(sandboxfs, "bin")
 	cwdfs := hfs.At(workfs, req.Msg.GetTarget().GetRef().GetPackage())
+	outfs := cwdfs
+	if t.Context == execv1.Target_Tree {
+		cwdfs = hfs.At(hfs.NewOS(req.Msg.GetTreeRootPath()), req.Msg.GetTarget().GetRef().GetPackage())
+	}
 
-	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs)
+	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.Context != execv1.Target_Tree)
 	if err != nil {
 		return nil, err
 	}
 
-	env := []string{}
+	env := make([]string, 0)
 
 	inputEnv, err := p.inputEnv(ctx, listArtifacts, t.GetDeps())
 	if err != nil {
@@ -69,12 +75,31 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	}
 
 	env = append(env, inputEnv...)
-	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin", binfs.Path()))
+	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin", binfs.Path())) // TODO: remove /opt/homebrew/bin
+
+	for key, value := range t.Env {
+		env = append(env, fmt.Sprintf("%v=%v", key, value))
+	}
+	for key, value := range t.RuntimeEnv {
+		env = append(env, fmt.Sprintf("%v=%v", key, value))
+	}
+	for _, name := range t.RuntimePassEnv {
+		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
+	}
+	for _, name := range t.PassEnv {
+		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
+	}
+	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))        // TODO: figure it out
+	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.Msg.TreeRootPath)) // TODO: figure it out
 
 	for _, output := range t.GetOutputs() {
-		paths := strings.Join(output.GetPaths(), " ") // TODO: make it a path
+		paths := slices.Clone(output.Paths)
+		for i, path := range paths {
+			paths[i] = outfs.Path(path)
+		}
+		pathsStr := strings.Join(paths, " ")
 
-		env = append(env, getEnvEntry("OUT", output.GetGroup(), "", paths))
+		env = append(env, getEnvEntry("OUT", output.GetGroup(), "", pathsStr))
 	}
 
 	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.GetRun()))
@@ -262,18 +287,6 @@ func (p *Plugin) inputEnv(
 	inputs []*pluginv1.ArtifactWithOrigin,
 	deps map[string]*execv1.Target_Deps,
 ) ([]string, error) {
-	getDep := func(t *pluginv1.TargetRefWithOutput) (string, bool) {
-		for name, dep := range deps {
-			for _, target := range dep.GetTargets() {
-				if target.GetName() == t.GetName() && target.GetPackage() == t.GetPackage() {
-					return name, target.Output == nil
-				}
-			}
-		}
-
-		return "", false
-	}
-
 	m := map[string][]*pluginv1.Artifact{}
 	for _, input := range inputs {
 		if input.GetArtifact().GetType() != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
@@ -286,16 +299,22 @@ func (p *Plugin) inputEnv(
 			return nil, err
 		}
 
-		depName, allOutput := getDep(ref)
+		for depName, dep := range deps {
+			for _, target := range dep.GetTargets() {
+				if tref.Equal(tref.WithoutOut(target), tref.WithoutOut(ref)) {
+					allOutput := target.Output == nil
 
-		var outputName string
-		if allOutput {
-			outputName = input.GetArtifact().GetGroup()
+					var outputName string
+					if allOutput {
+						outputName = input.GetArtifact().GetGroup()
+					}
+
+					envName := getEnvName("SRC", depName, outputName)
+
+					m[envName] = append(m[envName], input.GetArtifact())
+				}
+			}
 		}
-
-		envName := getEnvName("SRC", depName, outputName)
-
-		m[envName] = append(m[envName], input.GetArtifact())
 	}
 
 	env := make([]string, 0, len(m))

@@ -2,6 +2,7 @@ package pluginexec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -85,6 +86,12 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, err
 	}
 
+	if targetSpec.InTree {
+		if targetSpec.Cache {
+			return nil, errors.New("incompatible: cache & in_tree")
+		}
+	}
+
 	target := &execv1.Target{
 		Run:            targetSpec.Run,
 		Deps:           map[string]*execv1.Target_Deps{},
@@ -94,6 +101,11 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		RuntimeEnv:     targetSpec.RuntimeEnv,
 		PassEnv:        targetSpec.PassEnv,
 		RuntimePassEnv: targetSpec.RuntimePassEnv,
+		Context:        execv1.Target_SoftSandbox,
+	}
+
+	if targetSpec.InTree {
+		target.Context = execv1.Target_Tree
 	}
 
 	var allOutputPaths []string
@@ -104,6 +116,14 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		})
 		allOutputPaths = append(allOutputPaths, out...)
 	}
+
+	for _, output := range target.Outputs {
+		slices.SortFunc(output.Paths, strings.Compare)
+	}
+
+	slices.SortFunc(target.Outputs, func(a, b *execv1.Target_Output) int {
+		return strings.Compare(a.Group, b.Group)
+	})
 
 	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))
 	for _, output := range target.GetOutputs() {
@@ -116,10 +136,10 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	var deps []*pluginv1.TargetDef_Dep
 	for name, sdeps := range targetSpec.Deps.Merge(targetSpec.HashDeps, targetSpec.RuntimeDeps) {
 		var execDeps execv1.Target_Deps
-		for _, dep := range sdeps {
+		for i, dep := range sdeps {
 			ref, err := tref.ParseWithOut(dep)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("dep[%v][%d]: %q: %w", name, i, dep, err)
 			}
 
 			meta, err := anypb.New(ref)
@@ -138,10 +158,10 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 	}
 
 	for _, tools := range targetSpec.Tools {
-		for _, tool := range tools {
+		for i, tool := range tools {
 			ref, err := tref.ParseWithOut(tool)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("tool[%d]: %q: %w", i, tool, err)
 			}
 
 			meta, err := anypb.New(ref)

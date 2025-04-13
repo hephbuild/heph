@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hsingleflight"
+	"github.com/hephbuild/heph/plugin/tref"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -19,7 +21,106 @@ type SpecContainer struct {
 	Spec *pluginv1.TargetSpec
 }
 
-func (e *Engine) GetSpec(ctx context.Context, c SpecContainer) (*pluginv1.TargetSpec, error) {
+func (c SpecContainer) GetRef() *pluginv1.TargetRef {
+	if c.Spec != nil {
+		return c.Spec.GetRef()
+	}
+	if c.Ref != nil {
+		return c.Ref
+	}
+
+	panic("ref or spec must be specified")
+}
+
+func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache, p Provider) (*pluginv1.TargetSpec, error) {
+	// TODO: caching must be smarter, probably package-based ?
+	specs, err, _ := rc.memSpecs.Do(tref.Format(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
+		strm, err := p.GetSpecs(ctx, connect.NewRequest(&pluginv1.GetSpecsRequest{
+			Ref:    c.Ref,
+			States: states,
+		}))
+		if err != nil {
+			return nil, err
+		}
+
+		var specs []*pluginv1.TargetSpec
+		for strm.Receive() {
+			switch res := strm.Msg().Of.(type) {
+			case *pluginv1.GetSpecsResponse_Spec:
+				if !tref.Equal(res.Spec.Ref, c.GetRef()) {
+					rc.memRef.Set(tref.Format(res.Spec.Ref), res.Spec, nil)
+				}
+
+				specs = append(specs, res.Spec)
+			}
+		}
+		if err = strm.Err(); err != nil {
+			if connect.CodeOf(err) == connect.CodeUnimplemented {
+				return nil, nil
+			}
+
+			return nil, err
+		}
+
+		return specs, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, spec := range specs {
+		if tref.Equal(spec.GetRef(), c.GetRef()) {
+			return spec, nil
+		}
+	}
+
+	res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
+		Ref:    c.GetRef(),
+		States: states,
+	}))
+	if err != nil {
+		return nil, err
+	}
+
+	return res.Msg.GetSpec(), nil
+}
+
+func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache) (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rc.memRef.Do(tref.Format(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+		for _, p := range e.Providers {
+			var providerStates []*pluginv1.ProviderState
+			for _, state := range states {
+				if state.GetProvider() == p.Name {
+					providerStates = append(providerStates, state)
+				}
+			}
+
+			spec, err := e.resolveProvider(ctx, providerStates, c, rc, p)
+			if err != nil {
+				if connect.CodeOf(err) == connect.CodeNotFound {
+					continue
+				}
+
+				return nil, err
+			}
+	
+			if spec == nil {
+				return nil, fmt.Errorf("invalid nil spec: %v", tref.Format(c.GetRef()))
+			}
+
+			return spec, nil
+		}
+
+		return nil, errors.New("target not found")
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolve spec: %v: %w", tref.Format(c.GetRef()), err)
+	}
+
+	return spec, nil
+}
+
+func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rc *ResolveCache) (*pluginv1.TargetSpec, error) {
 	if c.Spec != nil {
 		return c.Spec, nil
 	}
@@ -52,30 +153,7 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer) (*pluginv1.Target
 
 	// TODO: errgroup to parallelize probing
 
-	for _, p := range e.Providers {
-		var providerStates []*pluginv1.ProviderState
-		for _, state := range states {
-			if state.GetProvider() == p.Name {
-				providerStates = append(providerStates, state)
-			}
-		}
-
-		res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
-			Ref:    c.Ref,
-			States: providerStates,
-		}))
-		if err != nil {
-			if connect.CodeOf(err) == connect.CodeNotFound {
-				continue
-			}
-
-			return nil, err
-		}
-
-		return res.Msg.GetSpec(), nil
-	}
-
-	return nil, errors.New("target not found")
+	return e.ResolveSpec(ctx, states, c, rc)
 }
 
 type Refish interface {
@@ -103,7 +181,12 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref, spec or def must be specified")
 }
 
-func (e *Engine) GetDef(ctx context.Context, c DefContainer) (*pluginv1.TargetDef, error) {
+type ResolveCache struct {
+	memSpecs hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
+	memRef   hsingleflight.GroupMem[*pluginv1.TargetSpec]
+}
+
+func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (*pluginv1.TargetDef, error) {
 	// put back when we have custom ids
 	// step, ctx := hstep.New(ctx, "Getting definition...")
 	// defer step.Done()
@@ -115,7 +198,7 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer) (*pluginv1.TargetDe
 	spec, err := e.GetSpec(ctx, SpecContainer{
 		Ref:  c.Ref,
 		Spec: c.Spec,
-	})
+	}, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -164,7 +247,9 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 	step, ctx := hstep.New(ctx, "Linking...")
 	defer step.Done()
 
-	def, err := e.GetDef(ctx, c)
+	rc := &ResolveCache{}
+
+	def, err := e.GetDef(ctx, c, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +261,9 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 	dedupOutputs := map[string]int{}
 
 	for _, dep := range def.GetDeps() {
-		getOutputIndex, setOutputIndex := hmaps.GetSet(dedupOutputs, dep.GetRef().String())
+		ref := dep.GetRef()
+
+		getOutputIndex, setOutputIndex := hmaps.GetSet(dedupOutputs, ref.String())
 
 		i, ok := getOutputIndex()
 
@@ -184,7 +271,7 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 			continue
 		}
 
-		linkeddep, err := e.GetDef(ctx, DefContainer{Ref: refWithOutputToRef(dep.GetRef())})
+		linkeddep, err := e.GetDef(ctx, DefContainer{Ref: refWithOutputToRef(ref)}, rc)
 		if err != nil {
 			return nil, err
 		}
@@ -194,12 +281,12 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 		if ok {
 			outputs = lt.Deps[i].Outputs
 		}
-		if dep.Ref.Output == nil {
+		if ref.Output == nil {
 			allset = true
 
 			outputs = linkeddep.GetOutputs()
 		} else {
-			outputs = append(outputs, dep.GetRef().GetOutput())
+			outputs = append(outputs, ref.GetOutput())
 			slices.Sort(outputs)
 			outputs = slices.Compact(outputs)
 		}
@@ -219,6 +306,11 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 			})
 		}
 	}
+
+	slices.SortFunc(lt.Deps, func(a, b *LightLinkedTargetDep) int {
+		return tref.CompareOut(a.DefDep.Ref, a.DefDep.Ref)
+
+	})
 
 	return lt, nil
 }

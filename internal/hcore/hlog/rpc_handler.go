@@ -2,6 +2,7 @@ package hlog
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"connectrpc.com/connect"
@@ -14,19 +15,40 @@ type rpcHandler struct {
 }
 
 func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.CreateRequest]) (*connect.Response[corev1.CreateResponse], error) {
+	logger := r.logger
+	if len(req.Msg.Attrs) > 0 {
+		var attrs []any
+		for _, attr := range req.Msg.Attrs {
+			switch value := attr.Value.(type) {
+			case *corev1.CreateRequest_Attr_ValueStr:
+				attrs = append(attrs, slog.String(attr.Key, value.ValueStr))
+			case *corev1.CreateRequest_Attr_ValueBool:
+				attrs = append(attrs, slog.Bool(attr.Key, value.ValueBool))
+			case *corev1.CreateRequest_Attr_ValueInt:
+				attrs = append(attrs, slog.Int64(attr.Key, value.ValueInt))
+			case *corev1.CreateRequest_Attr_ValueFloat:
+				attrs = append(attrs, slog.Float64(attr.Key, value.ValueFloat))
+			default:
+				attrs = append(attrs, slog.String(attr.Key, fmt.Sprintf("%#v", attr.Value)))
+			}
+		}
+
+		logger = logger.With(attrs...)
+	}
+
 	switch req.Msg.GetLevel() {
 	case corev1.CreateRequest_LEVEL_TRACE:
-		r.logger.Debug(req.Msg.GetMessage())
+		logger.Debug(req.Msg.GetMessage())
 	case corev1.CreateRequest_LEVEL_INFO:
-		r.logger.Info(req.Msg.GetMessage())
+		logger.Info(req.Msg.GetMessage())
 	case corev1.CreateRequest_LEVEL_WARN:
-		r.logger.Warn(req.Msg.GetMessage())
+		logger.Warn(req.Msg.GetMessage())
 	case corev1.CreateRequest_LEVEL_ERROR:
-		r.logger.Error(req.Msg.GetMessage())
+		logger.Error(req.Msg.GetMessage())
 	case corev1.CreateRequest_LEVEL_UNSPECIFIED:
 		fallthrough
 	default:
-		r.logger.Info(req.Msg.GetMessage())
+		logger.Info(req.Msg.GetMessage())
 	}
 
 	return connect.NewResponse(&corev1.CreateResponse{}), nil

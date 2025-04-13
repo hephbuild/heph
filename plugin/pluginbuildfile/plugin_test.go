@@ -35,12 +35,12 @@ func TestSanity(t *testing.T) {
 		require.NoError(t, err)
 
 		require.True(t, res.Receive())
-		spec := res.Msg()
-		assert.Equal(t, "", spec.GetRef().GetPackage())
-		assert.Equal(t, "hello", spec.GetRef().GetName())
-		assert.Equal(t, "exec", spec.GetRef().GetDriver())
-
+		spec := res.Msg().GetSpec()
 		ref = spec.GetRef()
+
+		assert.Equal(t, "", ref.GetPackage())
+		assert.Equal(t, "hello", ref.GetName())
+		assert.Equal(t, "exec", ref.GetDriver())
 	}
 
 	{

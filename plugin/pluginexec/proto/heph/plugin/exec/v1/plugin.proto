@@ -24,4 +24,11 @@ message Target {
   map<string, string> runtime_env = 7;
   repeated string pass_env = 8;
   repeated string runtime_pass_env = 9;
+
+  enum Context {
+    Unspecified = 0;
+    Tree = 1;
+    SoftSandbox = 2;
+  }
+  Context context = 11;
 }

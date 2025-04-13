@@ -110,7 +110,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 	errCh := make(chan error, 1)
 	m := initialModel()
 
-	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin), tea.WithoutSignalHandler())
 	go func() {
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)

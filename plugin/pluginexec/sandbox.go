@@ -2,14 +2,15 @@ package pluginexec
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/zeebo/xxh3"
 	"iter"
 	"maps"
 	"os"
 	"path/filepath"
-
-	"github.com/hephbuild/heph/internal/hproto"
 
 	"github.com/hephbuild/heph/internal/hiter"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -19,7 +20,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.ArtifactWithOrigin, workfs, binfs, cwdfs hfs.OS) ([]*pluginv1.ArtifactWithOrigin, error) {
+func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.ArtifactWithOrigin, workfs, binfs, cwdfs, outfs hfs.OS, setupWd bool) ([]*pluginv1.ArtifactWithOrigin, error) {
 	err := workfs.MkdirAll("", os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -30,27 +31,29 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 		return nil, err
 	}
 
-	err = cwdfs.MkdirAll("", os.ModePerm)
-	if err != nil {
-		return nil, err
-	}
-
 	var listArtifacts []*pluginv1.ArtifactWithOrigin
-	for _, dep := range hiter.Concat2(maps.All(t.GetDeps()), maps.All(t.GetRuntimeDeps())) {
-		for _, target := range dep.GetTargets() {
-			for artifact := range ArtifactsForDep(results, target) {
-				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs)
-				if err != nil {
-					return nil, err
-				}
-				listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
-					Artifact: listArtifact,
-					Meta:     artifact.GetMeta(),
-				})
-			}
+	if setupWd {
+		err = cwdfs.MkdirAll("", os.ModePerm)
+		if err != nil {
+			return nil, err
 		}
 
-		// TODO: files
+		for _, dep := range hiter.Concat2(maps.All(t.GetDeps()), maps.All(t.GetRuntimeDeps())) {
+			for _, target := range dep.GetTargets() {
+				for artifact := range ArtifactsForDep(results, target) {
+					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs)
+					if err != nil {
+						return nil, err
+					}
+					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
+						Artifact: listArtifact,
+						Meta:     artifact.GetMeta(),
+					})
+				}
+			}
+
+			// TODO: files
+		}
 	}
 
 	for _, tool := range t.GetTools() {
@@ -64,7 +67,7 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 
 	for _, output := range t.GetOutputs() {
 		for _, path := range output.GetPaths() {
-			err := hfs.CreateParentDir(cwdfs, path)
+			err := hfs.CreateParentDir(outfs, path)
 			if err != nil {
 				return nil, err
 			}
@@ -87,7 +90,7 @@ func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *pluginv1.Target
 				continue
 			}
 
-			if !hproto.Equal(aref, ref) {
+			if !tref.Equal(tref.WithoutOut(aref), tref.WithoutOut(ref)) {
 				continue
 			}
 
@@ -99,7 +102,10 @@ func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *pluginv1.Target
 }
 
 func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) (*pluginv1.Artifact, error) {
-	listf, err := hfs.Create(fs, artifact.GetName()+".list")
+	h := xxh3.New()
+	_, _ = h.WriteString(artifact.Uri)
+
+	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
 		return nil, err
 	}

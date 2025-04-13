@@ -59,6 +59,10 @@ func (g *GroupMem[T]) set(key string, v T, err error) {
 	g.m[key] = groupMemEntry[T]{v: v, err: err}
 }
 
+func (g *GroupMem[T]) Set(key string, v T, err error) {
+	g.set(key, v, err)
+}
+
 func (g *GroupMem[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 	v, err, ok := g.get(key)
 	if ok {

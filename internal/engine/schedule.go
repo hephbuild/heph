@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,7 +33,6 @@ import (
 	"github.com/hephbuild/heph/plugin/hpipe"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/protobuf/proto"
 )
 
 type ExecOptions struct {
@@ -58,21 +59,21 @@ type ResultOptions struct {
 	Singleflight *Singleflight
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options)
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	return e.result(ctx, DefContainer{Ref: ref}, outputs, options)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	return e.result(ctx, DefContainer{Def: def}, outputs, options)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	return e.result(ctx, DefContainer{Spec: spec}, outputs, options)
 }
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteResult {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	if options.Singleflight == nil {
 		options.Singleflight = &Singleflight{}
 	}
@@ -89,22 +90,23 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 	}
 
 	go func() {
+		debugger.SetLabels(func() []string {
+			return []string{
+				fmt.Sprintf("result: %v", tref.Format(c.GetRef())), "",
+			}
+		})
+
 		step, ctx := hstep.New(ctx, tref.Format(c.GetRef()))
 		defer step.Done()
 
 		res, err := e.innerResultWithSideEffects(ctx, c, outputs, options)
 		if err != nil {
 			step.SetError()
-			send(&ExecuteResult{Err: fmt.Errorf("%v %w", tref.Format(c.GetRef()), err)})
+			send(&ExecuteChResult{Err: fmt.Errorf("%v %w", tref.Format(c.GetRef()), err)})
 			return
 		}
 
-		if res.Err != nil {
-			step.SetError()
-			res.Err = fmt.Errorf("%v %w", tref.Format(c.GetRef()), res.Err)
-		}
-
-		send(res)
+		send(res.ToChResult())
 	}()
 
 	return ch
@@ -133,8 +135,8 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 			})
 
 			results[i] = &ExecuteResultWithOrigin{
-				ExecuteResult: res,
-				Origin:        dep.DefDep,
+				ExecuteChResult: res,
+				Origin:          dep.DefDep,
 			}
 		}()
 	}
@@ -150,7 +152,7 @@ func (e *Engine) errFromDepsResults(results []*ExecuteResultWithOrigin, def *Lig
 	var errs error
 	for i, result := range results {
 		if result.Err != nil {
-			errs = errors.Join(errs, fmt.Errorf("%v: %w", def.Deps[i].Ref, result.Err))
+			errs = errors.Join(errs, fmt.Errorf("%v: %w", tref.Format(def.Deps[i].Ref), result.Err))
 		}
 	}
 
@@ -177,7 +179,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 
 	if ok {
 		step := hstep.From(ctx)
-		step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.GetPackage(), def.Ref.GetName()))
+		step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.Ref)))
 
 		return res, true, nil
 	}
@@ -211,7 +213,7 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer,
 func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) (*ExecuteResult, error) {
 	def, err := e.LightLink(ctx, c)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("link: %w", err)
 	}
 
 	if options.Shell {
@@ -274,12 +276,13 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
+	//h := newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
 	h := xxh3.New()
-	b, err := proto.Marshal(def.Ref)
-	if err != nil {
-		return "", err
+	writeProto := func(v proto.Message) error {
+		return stableProtoHashEncode(h, v)
 	}
-	_, err = h.Write(b)
+
+	err := writeProto(def.Ref)
 	if err != nil {
 		return "", err
 	}
@@ -292,22 +295,14 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		}
 	}
 
-	b, err = proto.Marshal(defHash)
-	if err != nil {
-		return "", err
-	}
-	_, err = h.Write(b)
+	err = writeProto(defHash)
 	if err != nil {
 		return "", err
 	}
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		b, err = proto.Marshal(result.Origin.GetRef())
-		if err != nil {
-			return "", err
-		}
-		_, err = h.Write(b)
+		err = writeProto(result.Origin.GetRef())
 		if err != nil {
 			return "", err
 		}
@@ -337,16 +332,34 @@ type ExecuteResultArtifact struct {
 	*pluginv1.Artifact
 }
 
+type ExecuteChResult struct {
+	Err error
+	ExecuteResult
+}
+
 type ExecuteResult struct {
 	Def       *LightLinkedTarget
 	Executed  bool
-	Err       error
 	Hashin    string
 	Artifacts []ExecuteResultArtifact
 }
 
+func (r ExecuteResult) Sorted() *ExecuteResult {
+	slices.SortFunc(r.Artifacts, func(a, b ExecuteResultArtifact) int {
+		return strings.Compare(a.Hashout, b.Hashout)
+	})
+
+	return &r
+}
+
+func (r ExecuteResult) ToChResult() *ExecuteChResult {
+	return &ExecuteChResult{
+		ExecuteResult: r,
+	}
+}
+
 type ExecuteResultWithOrigin struct {
-	*ExecuteResult
+	*ExecuteChResult
 	Origin *pluginv1.TargetDef_Dep
 }
 
@@ -490,7 +503,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("heph/engine: Execute %v %v", def.Ref.GetPackage(), def.Ref.GetName()), "",
+			fmt.Sprintf("heph/engine: Execute %v", tref.Format(def.Ref)), "",
 		}
 	})
 
@@ -506,10 +519,11 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if options.shell {
+		shellDriver := def.Ref.GetDriver() + "@shell"
 		// TODO: make the original driver declare the shell config
-		driver, ok = e.DriversByName[def.Ref.GetDriver()+"@shell"]
+		driver, ok = e.DriversByName[shellDriver]
 		if !ok {
-			return nil, fmt.Errorf("shell driver not found: %v", def.Ref.GetDriver())
+			return nil, fmt.Errorf("shell driver not found: %v", shellDriver)
 		}
 		def.Pty = true
 	}
@@ -534,7 +548,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 		if ok {
 			step := hstep.From(ctx)
-			step.SetText(fmt.Sprintf("//%v:%v: cached", def.Ref.GetPackage(), def.Ref.GetName()))
+			step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.Ref)))
 
 			return res, nil
 		}
@@ -580,10 +594,11 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			}
 
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
-				Target:      def.TargetDef,
-				SandboxPath: sandboxfs.Path(),
-				Inputs:      inputs,
-				Pipes:       pipes,
+				Target:       def.TargetDef,
+				SandboxPath:  sandboxfs.Path(),
+				TreeRootPath: e.Root.Path(),
+				Inputs:       inputs,
+				Pipes:        pipes,
 			}))
 			if err := pipesWait(); err != nil {
 				hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
@@ -700,12 +715,12 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, err
 	}
 
-	return &ExecuteResult{
+	return ExecuteResult{
 		Hashin:    hashin,
 		Def:       def,
 		Executed:  true,
 		Artifacts: execArtifacts,
-	}, nil
+	}.Sorted(), nil
 }
 
 func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
@@ -726,11 +741,11 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, op
 		cachedArtifacts = res.Artifacts
 	}
 
-	return &ExecuteResult{
+	return ExecuteResult{
 		Def:       def,
 		Hashin:    res.Hashin,
 		Artifacts: cachedArtifacts,
-	}, nil
+	}.Sorted(), nil
 }
 
 /*

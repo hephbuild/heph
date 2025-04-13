@@ -1,12 +1,10 @@
 package pluginbuildfile
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
-	iofs "io/fs"
-
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
@@ -15,6 +13,7 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 	"google.golang.org/protobuf/types/known/structpb"
+	iofs "io/fs"
 )
 
 type Plugin struct {
@@ -59,6 +58,7 @@ func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeReq
 		}
 
 		states = append(states, &pluginv1.ProviderState{
+			Package:  payload.Package,
 			Provider: payload.Provider,
 			State:    state,
 		})
@@ -74,7 +74,52 @@ func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeReq
 	}), nil
 }
 
+func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
+	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, payload OnTargetPayload) error {
+		spec, err := p.toTargetSpec(ctx, payload)
+		if err != nil {
+			return err
+		}
+
+		err = res.Send(&pluginv1.GetSpecsResponse{
+			Of: &pluginv1.GetSpecsResponse_Spec{
+				Spec: spec,
+			},
+		})
+
+		return err
+	}, nil)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
+	if !req.Msg.Deep {
+		_, err := p.runPkg(ctx, req.Msg.Package, func(ctx context.Context, payload OnTargetPayload) error {
+			spec, err := p.toTargetSpec(ctx, payload)
+			if err != nil {
+				return err
+			}
+
+			err = res.Send(&pluginv1.ListResponse{
+				Of: &pluginv1.ListResponse_Spec{
+					Spec: spec,
+				},
+			})
+
+			return err
+		}, nil)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
+	// TODO: hfs.At(p.repoRoot, req.Msg.Package)
 	err := hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -85,13 +130,17 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 		}
 
 		_, err = p.runPkg(ctx, path, func(ctx context.Context, payload OnTargetPayload) error {
-			err := res.Send(&pluginv1.ListResponse{
-				Ref: &pluginv1.TargetRef{
-					Package: payload.Package,
-					Name:    payload.Name,
-					Driver:  payload.Driver,
+			spec, err := p.toTargetSpec(ctx, payload)
+			if err != nil {
+				return err
+			}
+
+			err = res.Send(&pluginv1.ListResponse{
+				Of: &pluginv1.ListResponse_Spec{
+					Spec: spec,
 				},
 			})
+
 			return err
 		}, nil)
 		if err != nil {
@@ -118,6 +167,10 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetF
 	// TODO: parametrize
 	f, err := hfs.Open(fs, "BUILD")
 	if err != nil {
+		if errors.Is(err, hfs.ErrNotExist) {
+			return starlark.StringDict{}, nil
+		}
+
 		return nil, err
 	}
 	defer f.Close()
@@ -250,7 +303,7 @@ func (p *Plugin) builtinProviderState(onState onProviderStateFunc) BuiltinFunc {
 			return nil, err
 		}
 
-		return nil, nil
+		return starlark.None, nil
 	}
 }
 
@@ -329,26 +382,10 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 	}), nil
 }
 
-func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
-	var payload OnTargetPayload
-	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
-		if p.Package == req.Msg.GetRef().GetPackage() && p.Name == req.Msg.GetRef().GetName() {
-			payload = p
-			return nil // TODO: StopErr
-		}
-
-		return nil
-	}, nil)
-	if err != nil {
-		return nil, err
-	}
-
+func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
 	if payload.Name == "" {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
-
-	ref := req.Msg.GetRef()
-	ref.Driver = payload.Driver
 
 	config := map[string]*structpb.Value{}
 	for k, v := range payload.Args {
@@ -363,9 +400,30 @@ func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.Get
 	}
 
 	spec := &pluginv1.TargetSpec{
-		Ref:    ref,
+		Ref: &pluginv1.TargetRef{
+			Package: payload.Package,
+			Name:    payload.Name,
+			Driver:  payload.Driver,
+		},
 		Config: config,
 	}
 
 	return spec, nil
+}
+
+func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
+	var payload OnTargetPayload
+	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
+		if p.Package == req.Msg.GetRef().GetPackage() && p.Name == req.Msg.GetRef().GetName() {
+			payload = p
+			return nil // TODO: StopErr
+		}
+
+		return nil
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.toTargetSpec(ctx, payload)
 }

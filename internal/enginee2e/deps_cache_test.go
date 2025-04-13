@@ -66,7 +66,7 @@ func TestDepsCache(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	assertOut := func(res *engine.ExecuteResult) {
+	assertOut := func(res *engine.ExecuteChResult) {
 		fs := hfstest.New(t)
 		err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs)
 		require.NoError(t, res.Err)

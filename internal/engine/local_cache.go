@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
+	"google.golang.org/protobuf/proto"
 	"io"
 	"time"
 
@@ -16,18 +18,15 @@ import (
 	"github.com/hephbuild/heph/internal/hlocks"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
-	"google.golang.org/protobuf/proto"
 )
 
 func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (string, error) {
 	h := xxh3.New()
-
-	b, err := proto.Marshal(artifact)
-	if err != nil {
-		return "", err
+	writeProto := func(v proto.Message) error {
+		return stableProtoHashEncode(h, v)
 	}
 
-	_, err = h.Write(b)
+	err := writeProto(artifact)
 	if err != nil {
 		return "", err
 	}
@@ -125,6 +124,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 
 	m := hartifact.Manifest{
 		Version:   "v1",
+		Target:    tref.Format(def.Ref),
 		CreatedAt: time.Now(),
 		Hashin:    hashin,
 	}
@@ -232,9 +232,9 @@ func (e *Engine) resultFromLocalCacheInner(
 		Artifact: manifestArtifact,
 	})
 
-	return &ExecuteResult{
+	return ExecuteResult{
 		Def:       def,
 		Hashin:    manifest.Hashin,
 		Artifacts: execArtifacts,
-	}, true, nil
+	}.Sorted(), true, nil
 }

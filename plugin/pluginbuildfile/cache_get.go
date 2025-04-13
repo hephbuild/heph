@@ -2,7 +2,7 @@ package pluginbuildfile
 
 import (
 	"context"
-	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
 
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -13,7 +13,7 @@ type CacheGet struct {
 }
 
 func (c *CacheGet) key(ref *pluginv1.TargetRef) string {
-	return fmt.Sprintf("%s:%s", ref.GetPackage(), ref.GetName())
+	return tref.Format(ref)
 }
 
 func (c *CacheGet) Singleflight(ctx context.Context, ref *pluginv1.TargetRef, f func() (*pluginv1.TargetSpec, error)) (*pluginv1.TargetSpec, error) {

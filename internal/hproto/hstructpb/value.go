@@ -23,3 +23,14 @@ func NewMapStringStringValue(m map[string]string) *structpb.Value {
 		Fields: values,
 	})
 }
+
+func NewMapStringStringsValue(m map[string][]string) *structpb.Value {
+	values := map[string]*structpb.Value{}
+	for k, v := range m {
+		values[k] = NewStringsValue(v)
+	}
+
+	return structpb.NewStructValue(&structpb.Struct{
+		Fields: values,
+	})
+}

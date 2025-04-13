@@ -25,6 +25,7 @@ type ManifestArtifact struct {
 
 type Manifest struct {
 	Version   string
+	Target    string
 	CreatedAt time.Time
 	Hashin    string
 	Artifacts []ManifestArtifact

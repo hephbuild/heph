@@ -1,6 +1,7 @@
 package hartifact
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
@@ -21,7 +22,9 @@ func subpathReader(ctx context.Context, artifact *pluginv1.Artifact, r io.ReadCl
 	case pluginv1.Artifact_ENCODING_NONE:
 		return r, nil
 	case pluginv1.Artifact_ENCODING_TAR:
-		f, err := htar.FileReader(ctx, r, path)
+		f, err := htar.FileReader(ctx, r, func(hdr *tar.Header) bool {
+			return hdr.Name == path
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -67,4 +70,21 @@ func ReadAll(ctx context.Context, a *pluginv1.Artifact, path string) ([]byte, er
 	defer r.Close()
 
 	return io.ReadAll(r)
+}
+
+func TarFileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
+	r, err := Reader(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+
+	tr, err := htar.FileReader(ctx, r, func(hdr *tar.Header) bool {
+		return true
+	})
+	if err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+
+	return hio.NewReadCloser(tr, r), nil
 }

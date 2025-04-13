@@ -40,12 +40,14 @@ type config struct {
 	filter func(from string) bool
 }
 
-func FileReader(ctx context.Context, r io.Reader, path string) (io.Reader, error) {
+type Matcher = func(hdr *tar.Header) bool
+
+func FileReader(ctx context.Context, r io.Reader, match Matcher) (io.Reader, error) {
 	tr := tar.NewReader(r)
 
 	var fileReader io.Reader
 	err := Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
-		if hdr.Name != path {
+		if !match(hdr) {
 			return nil
 		}
 

@@ -19,7 +19,7 @@ type resultServiceHandler struct {
 }
 
 func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[corev1.ResultRequest]) (*connect.Response[corev1.ResultResponse], error) {
-	var ch <-chan *ExecuteResult
+	var ch <-chan *ExecuteChResult
 	switch kind := req.Msg.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
 		ch = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{})
@@ -43,5 +43,6 @@ func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[core
 
 	return connect.NewResponse(&corev1.ResultResponse{
 		Artifacts: artifacts,
+		Def:       res.Def.TargetDef,
 	}), nil
 }

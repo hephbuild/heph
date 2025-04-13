@@ -12,21 +12,21 @@ import (
 
 type Ref struct {
 	SS    string `@SS`
-	Pkg   string `@RootIdent?`
+	Pkg   string `@PackageIdent?`
 	Colon string `@Colon`
-	Name  string `@RootIdent`
+	Name  string `@NameIdent`
 	Args  []Arg  `(At (@@ Comma?)*)?`
 }
 
 type RefWithOut struct {
 	Ref
-	Out *string `((Pipe|ParamsPipe) @RootIdent)?`
+	Out *string `((Pipe|ParamsPipe) @NameIdent)?`
 }
 
 type Arg struct {
 	Key   string   `@Ident`
 	Eq    string   `@Eq`
-	Value ArgValue `@@`
+	Value ArgValue `@@?`
 }
 
 type ArgValue struct {
@@ -37,10 +37,13 @@ type ArgValue struct {
 var def = lexer.MustStateful(lexer.Rules{
 	"Root": {
 		{`SS`, `//`, nil},
-		{`Colon`, `:`, nil},
+		{`Colon`, `:`, lexer.Push("Name")},
+		{`PackageIdent`, `[^:]+`, nil},
+	},
+	"Name": {
 		{`Pipe`, `\|`, nil},
-		{`RootIdent`, `[^: @|]+`, nil},
 		{`At`, `@`, lexer.Push("Params")},
+		{`NameIdent`, `[^ @|]+`, nil},
 	},
 	"Params": {
 		{"Ident", `[^, =|"]+`, nil},

@@ -22,6 +22,7 @@ message ArtifactWithOrigin {
 message RunRequest {
   TargetDef target = 1;
   string sandbox_path = 2;
+  string tree_root_path = 5;
   repeated ArtifactWithOrigin inputs = 3;
   repeated string pipes = 4;
 }

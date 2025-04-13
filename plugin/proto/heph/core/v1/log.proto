@@ -10,8 +10,19 @@ message CreateRequest {
     LEVEL_ERROR = 4;
   }
 
+  message Attr {
+    string key = 1;
+    oneof value {
+      string value_str = 2;
+      bool value_bool = 3;
+      int64 value_int = 4;
+      double value_float = 5;
+    }
+  }
+
   Level level = 1;
   string message = 2;
+  repeated Attr attrs = 3;
 }
 
 message CreateResponse {}

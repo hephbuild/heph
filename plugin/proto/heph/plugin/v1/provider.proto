@@ -19,7 +19,22 @@ message ListRequest {
 }
 
 message ListResponse {
-    TargetRef ref = 1;
+    oneof of {
+      TargetRef ref = 1;
+      TargetSpec spec = 2;
+    }
+}
+
+message GetSpecsRequest {
+  TargetRef ref = 1;
+  repeated ProviderState states = 2;
+}
+
+message GetSpecsResponse {
+    oneof of {
+      TargetRef ref = 1;
+      TargetSpec spec = 2;
+    }
 }
 
 message GetRequest {
@@ -36,8 +51,9 @@ message ProbeRequest {
 }
 
 message ProviderState {
-  string provider = 1;
-  map<string, google.protobuf.Value> state = 2;
+  string package = 1;
+  string provider = 2;
+  map<string, google.protobuf.Value> state = 3;
 }
 
 message ProbeResponse {
@@ -48,5 +64,6 @@ service Provider {
   rpc Config(ProviderConfigRequest) returns (ProviderConfigResponse) {}
   rpc List(ListRequest) returns (stream ListResponse) {}
   rpc Get(GetRequest) returns (GetResponse) {}
+  rpc GetSpecs(GetSpecsRequest) returns (stream GetSpecsResponse) {}
   rpc Probe(ProbeRequest) returns (ProbeResponse) {}
 }
