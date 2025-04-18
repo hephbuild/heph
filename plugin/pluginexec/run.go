@@ -117,6 +117,10 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	stdoutWriters = append(stdoutWriters, logFile)
 	stderrWriters = append(stderrWriters, logFile)
 
+	if !hfs.Exists(cwdfs, "") {
+		return nil, fmt.Errorf("cwd not found: %v", cwdfs.Path())
+	}
+
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
 	cmd.Dir = cwdfs.Path()

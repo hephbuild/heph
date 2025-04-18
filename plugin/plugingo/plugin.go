@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hinstance"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/engine"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"google.golang.org/protobuf/types/known/structpb"
+	"strconv"
 	"strings"
 )
 
@@ -49,10 +51,12 @@ var _ engine.PluginIniter = (*Plugin)(nil)
 
 type Plugin struct {
 	resultClient engine.EngineHandle
+	root         string
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
 	p.resultClient = init.CoreHandle
+	p.root = init.Root
 
 	return nil
 }
@@ -136,7 +140,16 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 }
 
-func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, find bool, imp string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+	var extra string
+	if deps {
+		extra += " -deps"
+	}
+
+	if find {
+		extra += " -find"
+	}
+
 	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
@@ -144,7 +157,10 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors) ([]*plugi
 					Package: pkg,
 					Name:    "_golist",
 					Driver:  "sh",
-					Args:    f.Args(),
+					Args: hmaps.Concat(f.Args(), map[string]string{
+						"deps": strconv.FormatBool(deps),
+						"find": strconv.FormatBool(find),
+					}),
 				},
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -155,7 +171,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors) ([]*plugi
 						"HEPH_HASH":   hinstance.Hash(),
 					}),
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
-					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q . > $OUT", f.Tags)),
+					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v %v > $OUT", f.Tags, extra, imp)),
 					"out":              structpb.NewStringValue("golist.json"),
 					"in_tree":          structpb.NewBoolValue(true),
 					"cache":            structpb.NewBoolValue(false),

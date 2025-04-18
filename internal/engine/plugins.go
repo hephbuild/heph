@@ -100,6 +100,7 @@ type ProviderHandle struct {
 
 type PluginInit struct {
 	CoreHandle EngineHandle
+	Root       string
 }
 
 type PluginIniter interface {
@@ -110,6 +111,7 @@ func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 	if pi, ok := handler.(PluginIniter); ok {
 		err := pi.PluginInit(ctx, PluginInit{
 			CoreHandle: e.CoreHandle,
+			Root:       e.Root.Path(),
 		})
 
 		return err

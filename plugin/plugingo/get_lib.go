@@ -7,32 +7,53 @@ import (
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
 	"path"
-	"path/filepath"
-	"slices"
 )
 
 func (p *Plugin) packageLib(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
 	return p.packageLibInner(ctx, goPkg, factors)
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
-	stdList, err := p.resultStdList(ctx, factors)
-	if err != nil {
-		return nil, fmt.Errorf("get stdlib list: %w", err)
-	}
+func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, error) {
+	return imp, nil
+}
 
+func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
 	}
+	imports := make([]Package, len(goPkg.Imports))
+	var g errgroup.Group
 	for i, imp := range goPkg.Imports {
-		isStd := slices.ContainsFunc(stdList, func(p Package) bool {
-			return p.ImportPath == imp
-		})
+		g.Go(func() error {
+			impGoPkg, err := p.goFindPkg(ctx, goPkg.HephPackage, imp, factors)
+			if err != nil {
+				return err
+			}
 
-		if isStd {
+			imports[i] = impGoPkg
+
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	for i, imp := range goPkg.Imports {
+		impGoPkg := imports[i]
+
+		if impGoPkg.IsStd {
+			if impGoPkg.ImportPath == "unsafe" {
+				// ignore pseudo package
+				continue
+			}
+
 			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
 				Package: path.Join("@heph/go/std", imp),
 				Name:    "build_lib",
@@ -40,7 +61,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 			}, "a"))}
 		} else {
 			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-				Package: imp,
+				Package: impGoPkg.HephPackage,
 				Name:    "build_lib",
 				Args:    factors.Args(),
 			}, "a"))}
@@ -63,12 +84,15 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 	}
 
 	for _, file := range goPkg.GoFiles {
-		deps["src"] = append(deps["src"], "//"+filepath.Join("@heph/file", goPkg.HephPackage, file)+":content")
+		deps["src"] = append(deps["src"], tref.Format(&pluginv1.TargetRef{
+			Package: path.Join("@heph/file", goPkg.HephPackage, file),
+			Name:    ":content",
+		}))
 	}
 
 	importPath := goPkg.ImportPath
-	if goPkg.Name == "main" {
-		importPath = "main"
+	if goPkg.IsCommand() {
+		importPath = MainPackage
 	}
 
 	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, importPath, extra))

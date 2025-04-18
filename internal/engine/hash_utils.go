@@ -52,6 +52,7 @@ func (h hashWithDebug) Write(p []byte) (int, error) {
 	return h.Hasher.Write(p)
 }
 
+// TODO: this is pretty damn inefficient, but at least its stable
 func stableProtoHashEncode(w io.Writer, v proto.Message) error {
 	b, err := protojson.Marshal(v)
 	if err != nil {

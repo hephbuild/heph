@@ -5,6 +5,8 @@ import (
 	"time"
 )
 
+const MainPackage = "main"
+
 type Module struct {
 	Path       string       // module path
 	Query      string       // version query corresponding to this version
@@ -34,6 +36,7 @@ type ModuleError struct {
 type Package struct {
 	build.Package
 	HephPackage string
+	IsStd       bool
 }
 
 func (p Package) IsMain() bool {
