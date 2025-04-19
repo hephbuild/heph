@@ -8,7 +8,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path"
 	"path/filepath"
 )
 
@@ -23,28 +22,20 @@ func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors)
 		`echo > importconfig`,
 	}
 	for i, goPkg := range goPkgs {
-		if goPkg.IsStd {
-			if goPkg.ImportPath == "unsafe" {
-				// ignore pseudo package
-				continue
-			}
-
-			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-				Package: path.Join("@heph/go/std", goPkg.ImportPath),
-				Name:    "build_lib",
-				Args:    factors.Args(),
-			}, "a"))}
-		} else {
-			if goPkg.IsCommand() {
-				continue
-			}
-
-			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-				Package: goPkg.HephPackage,
-				Name:    "build_lib",
-				Args:    factors.Args(),
-			}, "a"))}
+		if goPkg.IsCommand() {
+			continue
 		}
+
+		if goPkg.ImportPath == "unsafe" {
+			// ignore pseudo package
+			continue
+		}
+
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
+			Package: goPkg.HephPackage,
+			Name:    "build_lib",
+			Args:    factors.Args(),
+		}, "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
 	}
@@ -55,7 +46,7 @@ func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors)
 		Args:    factors.Args(),
 	}, "a"))}
 
-	run = append(run, fmt.Sprintf(`go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`))
+	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{

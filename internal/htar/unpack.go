@@ -63,6 +63,10 @@ func FileReader(ctx context.Context, r io.Reader, match Matcher) (io.Reader, err
 		return nil, err
 	}
 
+	if fileReader == nil {
+		return nil, fmt.Errorf("file not found")
+	}
+
 	return fileReader, nil
 }
 

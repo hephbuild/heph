@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"io"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -91,6 +92,13 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 			goPkg.IsStd = slices.ContainsFunc(stdList, func(p Package) bool {
 				return p.ImportPath == goPkg.ImportPath
 			})
+			if goPkg.IsStd {
+				goPkg.HephPackage = path.Join("@heph/go/std", goPkg.ImportPath)
+			}
+
+			if !goPkg.IsStd {
+				return nil, fmt.Errorf("package cannot resolve: %#v", goPkg)
+			}
 		}
 
 		goPkgs[i] = goPkg
@@ -140,6 +148,13 @@ func (p *Plugin) goFindPkg(ctx context.Context, pkg, imp string, factors Factors
 		goPkg.IsStd = slices.ContainsFunc(stdList, func(p Package) bool {
 			return p.ImportPath == goPkg.ImportPath
 		})
+		if goPkg.IsStd {
+			goPkg.HephPackage = path.Join("@heph/go/std", goPkg.ImportPath)
+		}
+
+		if !goPkg.IsStd {
+			return Package{}, fmt.Errorf("package cannot resolve: %#v", goPkg)
+		}
 	}
 
 	return goPkg, nil

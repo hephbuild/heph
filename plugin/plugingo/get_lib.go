@@ -48,24 +48,16 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 	for i, imp := range goPkg.Imports {
 		impGoPkg := imports[i]
 
-		if impGoPkg.IsStd {
-			if impGoPkg.ImportPath == "unsafe" {
-				// ignore pseudo package
-				continue
-			}
-
-			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-				Package: path.Join("@heph/go/std", imp),
-				Name:    "build_lib",
-				Args:    factors.Args(),
-			}, "a"))}
-		} else {
-			deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-				Package: impGoPkg.HephPackage,
-				Name:    "build_lib",
-				Args:    factors.Args(),
-			}, "a"))}
+		if impGoPkg.ImportPath == "unsafe" {
+			// ignore pseudo package
+			continue
 		}
+
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
+			Package: impGoPkg.HephPackage,
+			Name:    "build_lib",
+			Args:    factors.Args(),
+		}, "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, imp, i))
 	}
