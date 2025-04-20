@@ -152,6 +152,9 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 }
 
 func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
+	ctx, span := tracer.Start(ctx, "ResultFromLocalCache")
+	defer span.End()
+
 	multi := hlocks.NewMulti()
 
 	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)

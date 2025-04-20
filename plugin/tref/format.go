@@ -2,9 +2,8 @@ package tref
 
 import (
 	"fmt"
-	"strings"
-
 	"github.com/hephbuild/heph/internal/hmaps"
+	"strings"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
@@ -28,32 +27,39 @@ type RefableOut interface {
 }
 
 func Format(ref Refable) string {
-	var argsSuffix strings.Builder
+	var sb strings.Builder
+	sb.WriteString("//")
+	sb.WriteString(ref.GetPackage())
+	sb.WriteString(":")
+	sb.WriteString(ref.GetName())
+
 	if len(ref.GetArgs()) > 0 {
-		argsSuffix.WriteString("@")
+		sb.WriteString("@")
+		first := true
 		for k, v := range hmaps.Sorted(ref.GetArgs()) {
-			if argsSuffix.String() != "@" {
-				argsSuffix.WriteString(",")
+			if !first {
+				sb.WriteString(",")
+			} else {
+				first = false
 			}
 
-			argsSuffix.WriteString(k)
-			argsSuffix.WriteString("=")
+			sb.WriteString(k)
+			sb.WriteString("=")
 			if strings.ContainsAny(v, ` ,"'`) {
-				argsSuffix.WriteString(fmt.Sprintf("%q", v))
+				sb.WriteString(fmt.Sprintf("%q", v))
 			} else {
-				argsSuffix.WriteString(v)
+				sb.WriteString(v)
 			}
 		}
 	}
-
-	v := fmt.Sprintf("//%s:%s%s", ref.GetPackage(), ref.GetName(), argsSuffix.String())
 
 	if ref, ok := ref.(RefableOut); ok {
 		out := ref.GetOutput()
 		if out != "" {
-			v += "|" + out
+			sb.WriteString("|")
+			sb.WriteString(out)
 		}
 	}
 
-	return v
+	return sb.String()
 }

@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
@@ -142,7 +145,7 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rc *ResolveCache)
 		return nil, errors.New("spec or ref must be specified")
 	}
 
-	states, err := e.ProbeSegments(ctx, c, pkg)
+	states, err := e.ProbeSegments(ctx, c, pkg, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +153,9 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rc *ResolveCache)
 	return e.ResolveSpec(ctx, states, c, rc)
 }
 
-func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string) ([]*pluginv1.ProviderState, error) {
+func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string, rc *ResolveCache) ([]*pluginv1.ProviderState, error) {
+	return nil, nil
+
 	ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
@@ -163,15 +168,24 @@ func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string)
 		segments = slices.Insert(segments, 0, "")
 	}
 	for i := range segments {
-		for _, p := range e.Providers {
-			res, err := p.Probe(ctx, connect.NewRequest(&pluginv1.ProbeRequest{
-				Package: strings.Join(segments[:i], string(filepath.Separator)),
-			}))
+		probePkg := path.Join(segments[:i]...)
+
+		for ip, p := range e.Providers {
+			probeStates, err, _ := rc.memProbe.Do(fmt.Sprintf("%v %v", ip, probePkg), func() ([]*pluginv1.ProviderState, error) {
+				res, err := p.Probe(ctx, connect.NewRequest(&pluginv1.ProbeRequest{
+					Package: probePkg,
+				}))
+				if err != nil {
+					return nil, err
+				}
+
+				return res.Msg.States, nil
+			})
 			if err != nil {
 				return nil, err
 			}
 
-			states = append(states, res.Msg.GetStates()...)
+			states = append(states, probeStates...)
 		}
 	}
 
@@ -206,6 +220,21 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 type ResolveCache struct {
 	memSpecs hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
 	memRef   hsingleflight.GroupMem[*pluginv1.TargetSpec]
+	memProbe hsingleflight.GroupMem[[]*pluginv1.ProviderState]
+
+	correlationId  string
+	correlationIdm sync.Mutex
+}
+
+func (c *ResolveCache) GetCorrelationId() string {
+	c.correlationIdm.Lock()
+	defer c.correlationIdm.Unlock()
+
+	if c.correlationId == "" {
+		c.correlationId = uuid.New().String()
+	}
+
+	return c.correlationId
 }
 
 func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (*pluginv1.TargetDef, error) {
@@ -260,13 +289,15 @@ type LightLinkedTarget struct {
 }
 
 func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTarget, error) {
+	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+
 	ctx, span := tracer.Start(ctx, "LightLink", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
 	step, ctx := hstep.New(ctx, "Linking...")
 	defer step.Done()
 
-	rc := &ResolveCache{}
+	rc := GlobalResolveCache
 
 	def, err := e.GetDef(ctx, c, rc)
 	if err != nil {

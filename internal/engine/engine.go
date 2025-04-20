@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/internal/hcore"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,10 +63,11 @@ type EngineHandle struct {
 }
 
 type Engine struct {
-	Root    hfs.OS
-	Home    hfs.OS
-	Cache   hfs.OS
-	Sandbox hfs.OS
+	Root     hfs.OS
+	Home     hfs.OS
+	Cache    hfs.OS
+	Sandbox  hfs.OS
+	RootSpan trace.Span
 
 	CoreHandle EngineHandle
 
@@ -88,10 +90,11 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	sandboxfs := hfs.At(homefs, "sandbox")
 
 	e := &Engine{
-		Root:    rootfs,
-		Home:    homefs,
-		Cache:   cachefs,
-		Sandbox: sandboxfs,
+		Root:     rootfs,
+		Home:     homefs,
+		Cache:    cachefs,
+		Sandbox:  sandboxfs,
+		RootSpan: trace.SpanFromContext(ctx),
 	}
 
 	connectInterceptor, err := otelconnect.NewInterceptor(

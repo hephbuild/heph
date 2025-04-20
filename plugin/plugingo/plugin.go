@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
+	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -151,6 +155,23 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, fin
 		extra += " -find"
 	}
 
+	entries, err := os.ReadDir(filepath.Join(p.root, pkg))
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+
+		files = append(files, tref.Format(&pluginv1.TargetRef{
+			Package: path.Join("@heph/file", pkg, e.Name()),
+			Name:    "content",
+		}))
+	}
+
 	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
@@ -175,9 +196,9 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, fin
 					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v %v > $OUT", f.Tags, extra, imp)),
 					"out":              structpb.NewStringValue("golist.json"),
 					"in_tree":          structpb.NewBoolValue(true),
-					"cache":            structpb.NewBoolValue(false),
+					"cache":            structpb.NewBoolValue(true),
+					"hash_deps":        hstructpb.NewStringsValue(files),
 					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
-					// TODO: cache based on go.mod
 				},
 			},
 		},

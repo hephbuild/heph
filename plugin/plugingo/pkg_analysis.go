@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/internal/hslices"
+	"golang.org/x/sync/errgroup"
 	"path"
 	"path/filepath"
 	"slices"
@@ -51,61 +53,94 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 		return nil, fmt.Errorf("get stdlib list: %w", err)
 	}
 
-	artifacts, _, err := p.goListPkg(ctx, pkg, factors, true, false, ".")
-	if err != nil {
-		return nil, fmt.Errorf("go list: %w", err)
+	seen := hmaps.Sync[string, Package]{}
+
+	var g errgroup.Group
+
+	var doTheMagicForStdPackage func(pkg string) error
+	doTheMagicForStdPackage = func(imp string) error {
+		if _, ok := seen.GetOk(imp); ok {
+			return nil
+		}
+
+		goPkg, isStd := hslices.Find(stdList, func(p Package) bool {
+			return p.ImportPath == imp
+		})
+
+		seen.Set(imp, goPkg)
+
+		if !isStd {
+			return fmt.Errorf("not std, not supposed to happen")
+		}
+
+		for _, imp := range goPkg.Imports {
+			err := doTheMagicForStdPackage(imp)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
 	}
 
-	outputArtifacts := hartifact.FindOutputs(artifacts, "")
+	var doTheMagicForHephPackage func(pkg string) error
+	doTheMagicForHephPackage = func(pkg string) error {
+		goPkg, err := p.goListPkgResult(ctx, pkg, factors)
+		if err != nil {
+			return fmt.Errorf("go list: %w", err)
+		}
 
-	if len(outputArtifacts) == 0 {
-		return nil, connect.NewError(connect.CodeInternal, errors.New("golist: no output found"))
+		goPkg.HephPackage = pkg
+
+		seen.Set(goPkg.ImportPath, goPkg)
+
+		for _, imp := range goPkg.Imports {
+			if _, ok := seen.GetOk(imp); ok {
+				continue
+			}
+
+			isStd := slices.ContainsFunc(stdList, func(p Package) bool {
+				return p.ImportPath == imp
+			})
+
+			if isStd {
+				g.Go(func() error {
+					return doTheMagicForStdPackage(imp)
+				})
+			} else {
+				hephPkg := strings.ReplaceAll(imp, "mod-simple", "go/mod-simple")
+
+				if seen.SetOk(imp, Package{}) {
+					g.Go(func() error {
+						return doTheMagicForHephPackage(hephPkg)
+					})
+				}
+			}
+		}
+
+		return nil
 	}
 
-	outputArtifact := outputArtifacts[0]
+	g.Go(func() error {
+		return doTheMagicForHephPackage(pkg)
+	})
 
-	f, err := hartifact.TarFileReader(ctx, outputArtifact)
+	err = g.Wait()
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
-	var goPkgs []Package
-
-	dec := json.NewDecoder(f)
-	for {
-		var goPkg Package
-		err := dec.Decode(&goPkg)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		goPkgs = append(goPkgs, goPkg)
-	}
-
-	for i, goPkg := range goPkgs {
-		if rest, ok := strings.CutPrefix(goPkg.Dir, p.root); ok {
-			goPkg.HephPackage = strings.TrimLeft(rest, string(filepath.Separator))
-		} else {
-			goPkg.IsStd = slices.ContainsFunc(stdList, func(p Package) bool {
-				return p.ImportPath == goPkg.ImportPath
-			})
-			if goPkg.IsStd {
-				goPkg.HephPackage = path.Join("@heph/go/std", goPkg.ImportPath)
-			}
-
-			if !goPkg.IsStd {
-				return nil, fmt.Errorf("package cannot resolve: %#v", goPkg)
-			}
-		}
-
-		goPkgs[i] = goPkg
-	}
+	goPkgs := slices.Collect(seen.Values())
 
 	slices.SortFunc(goPkgs, func(a, b Package) int {
+		if a.HephPackage == pkg {
+			return -1
+		}
+
+		if b.HephPackage == pkg {
+			return 1
+		}
+
 		return strings.Compare(a.ImportPath, b.ImportPath)
 	})
 

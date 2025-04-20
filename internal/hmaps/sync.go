@@ -1,6 +1,10 @@
 package hmaps
 
-import "sync"
+import (
+	"iter"
+	"maps"
+	"sync"
+)
 
 type Sync[K comparable, V any] struct {
 	m  map[K]V
@@ -31,4 +35,26 @@ func (m *Sync[K, V]) Set(k K, v V) {
 	}
 
 	m.m[k] = v
+}
+
+func (m *Sync[K, V]) SetOk(k K, v V) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.m == nil {
+		m.m = map[K]V{}
+	}
+
+	_, ok := m.m[k]
+	if ok {
+		return false
+	}
+
+	m.m[k] = v
+
+	return true
+}
+
+func (m *Sync[K, V]) Values() iter.Seq[V] {
+	return maps.Values(m.m)
 }

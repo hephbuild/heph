@@ -2,7 +2,6 @@ package pluginexec
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -88,7 +87,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 
 	if targetSpec.InTree {
 		if targetSpec.Cache {
-			return nil, errors.New("incompatible: cache & in_tree")
+			//return nil, errors.New("incompatible: cache & in_tree")
 		}
 	}
 

@@ -61,35 +61,35 @@ type ResultOptions struct {
 	Singleflight *Singleflight
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) *ExecuteChResult {
-	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options)
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) *ExecuteChResult {
+	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rc)
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) *ExecuteChResult {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rc *ResolveCache) *ExecuteChResult {
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Ref: ref}, outputs, options)
+	return e.result(ctx, DefContainer{Ref: ref}, outputs, options, rc)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) *ExecuteChResult {
+func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) *ExecuteChResult {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Def: def}, outputs, options)
+	return e.result(ctx, DefContainer{Def: def}, outputs, options, rc)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) *ExecuteChResult {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) *ExecuteChResult {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: spec}, outputs, options)
+	return e.result(ctx, DefContainer{Spec: spec}, outputs, options, rc)
 }
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) *ExecuteChResult {
-	ch := e.resultInner(ctx, c, outputs, options)
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) *ExecuteChResult {
+	ch := e.resultInner(ctx, c, outputs, options, rc)
 
 	return <-ch
 }
-func (e *Engine) resultInner(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) resultInner(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) <-chan *ExecuteChResult {
 	if options.Singleflight == nil {
 		options.Singleflight = &Singleflight{}
 	}
@@ -115,7 +115,7 @@ func (e *Engine) resultInner(ctx context.Context, c DefContainer, outputs []stri
 		step, ctx := hstep.New(ctx, tref.Format(c.GetRef()))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, c, outputs, options)
+		res, err := e.innerResultWithSideEffects(ctx, c, outputs, options, rc)
 		if err != nil {
 			step.SetError()
 			send(&ExecuteChResult{Err: fmt.Errorf("%v: %w", tref.Format(c.GetRef()), err)})
@@ -128,7 +128,7 @@ func (e *Engine) resultInner(ctx context.Context, c DefContainer, outputs []stri
 	return ch
 }
 
-func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool, sf *Singleflight) []*ExecuteResultWithOrigin {
+func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool, sf *Singleflight, rc *ResolveCache) []*ExecuteResultWithOrigin {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
@@ -142,7 +142,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				outputs = nil
 			}
 
-			res := e.ResultFromRef(ctx, dep.Ref, outputs, ResultOptions{Singleflight: sf})
+			res := e.ResultFromRef(ctx, dep.Ref, outputs, ResultOptions{Singleflight: sf}, rc)
 
 			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
 				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT
@@ -175,9 +175,9 @@ func (e *Engine) errFromDepsResults(results []*ExecuteResultWithOrigin, def *Lig
 	return errs
 }
 
-func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, sf *Singleflight) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, sf *Singleflight, rc *ResolveCache) (*ExecuteResult, bool, error) {
 	// Get hashout from all deps
-	results := e.depsResults(ctx, def, false, sf)
+	results := e.depsResults(ctx, def, false, sf, rc)
 	err := e.errFromDepsResults(results, def)
 	if err != nil {
 		return nil, false, fmt.Errorf("result deps: %w", err)
@@ -212,8 +212,8 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) (*ExecuteResult, error) {
-	res, err := e.innerResult(ctx, c, outputs, options)
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+	res, err := e.innerResult(ctx, c, outputs, options, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +226,7 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer,
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) (*ExecuteResult, error) {
+func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	def, err := e.LightLink(ctx, c)
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -251,7 +251,7 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 
 	if def.Cache {
 		if !options.Force {
-			res, ok, err := e.resultFromCache(ctx, def, outputs, options.Singleflight)
+			res, ok, err := e.resultFromCache(ctx, def, outputs, options.Singleflight, rc)
 			if err != nil {
 				return nil, err
 			}
@@ -273,7 +273,7 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 			}
 		}()
 
-		return e.ExecuteAndCache(ctx, def, options.ExecOptions, options.Singleflight)
+		return e.ExecuteAndCache(ctx, def, options.ExecOptions, options.Singleflight, rc)
 	} else {
 		err = l.Lock(ctx)
 		if err != nil {
@@ -287,7 +287,7 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 			}
 		}()
 
-		return e.Execute(ctx, def, options.ExecOptions, options.Singleflight)
+		return e.Execute(ctx, def, options.ExecOptions, options.Singleflight, rc)
 	}
 }
 
@@ -380,6 +380,9 @@ type ExecuteResultWithOrigin struct {
 }
 
 func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
+	ctx, span := tracer.Start(ctx, "ResultFromRemoteCache")
+	defer span.End()
+
 	// TODO
 
 	return nil, false, nil
@@ -428,7 +431,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		go func() {
 			defer cancel()
 
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				stdinErrCh <- err
 				return
@@ -450,7 +453,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[1] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -470,7 +473,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[2] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -493,7 +496,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		cancels = append(cancels, clean)
 
 		go func() {
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClient(), driverHandle.BaseURL(), res.Msg.GetPath())
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
 			if err != nil {
 				hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
 				return
@@ -516,14 +519,17 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	return pipes, wait, nil
 }
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight, rc *ResolveCache) (*ExecuteResult, error) {
+	ctx, span := tracer.Start(ctx, "Execute")
+	defer span.End()
+
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("heph/engine: Execute %v", tref.Format(def.Ref)), "",
 		}
 	})
 
-	results := e.depsResults(ctx, def, true, sf)
+	results := e.depsResults(ctx, def, true, sf, rc)
 	err := e.errFromDepsResults(results, def)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
@@ -739,8 +745,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, def, options, sf)
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, sf *Singleflight, rc *ResolveCache) (*ExecuteResult, error) {
+	res, err := e.Execute(ctx, def, options, sf, rc)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)
 	}

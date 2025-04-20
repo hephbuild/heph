@@ -116,7 +116,7 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
 
 		ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
-			if m.log.GetModeWait() == hbbtlog.LogHijackerModeHijack {
+			if m.log.GetMode() == hbbtlog.LogHijackerModeHijack {
 				p.Send(step)
 			} else {
 				hlog.From(ctx).Info(hstepfmt.Format(m.renderer, step, false))

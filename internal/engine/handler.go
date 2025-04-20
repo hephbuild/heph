@@ -22,15 +22,19 @@ type resultServiceHandler struct {
 
 var tracer = otel.Tracer("heph/engine")
 
+var GlobalResolveCache = &ResolveCache{}
+
 func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[corev1.ResultRequest]) (*connect.Response[corev1.ResultResponse], error) {
+	rc := GlobalResolveCache
+
 	var res *ExecuteChResult
 	switch kind := req.Msg.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
-		res = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{})
+		res = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{}, rc)
 	case *corev1.ResultRequest_Def:
-		res = r.ResultFromDef(ctx, kind.Def, []string{AllOutputs}, ResultOptions{})
+		res = r.ResultFromDef(ctx, kind.Def, []string{AllOutputs}, ResultOptions{}, rc)
 	case *corev1.ResultRequest_Spec:
-		res = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{})
+		res = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rc)
 	default:
 		return nil, fmt.Errorf("unexpected message type: %T", kind)
 	}

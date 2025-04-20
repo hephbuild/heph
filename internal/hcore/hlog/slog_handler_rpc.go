@@ -97,10 +97,14 @@ func (l slogRPCHandler) WithGroup(name string) slog.Handler {
 	return l
 }
 
-func NewRPCLogger(client corev1connect.LogServiceClient) *slog.Logger {
-	return NewLogger(&slogRPCHandler{
+func NewRCPHandler(client corev1connect.LogServiceClient) slog.Handler {
+	return &slogRPCHandler{
 		innerSlogRPCHandler: &innerSlogRPCHandler{
 			client: client,
 		},
-	})
+	}
+}
+
+func NewRPCLogger(client corev1connect.LogServiceClient) *slog.Logger {
+	return NewLogger(NewRCPHandler(client))
 }

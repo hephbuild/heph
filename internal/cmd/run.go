@@ -20,6 +20,7 @@ import (
 	"github.com/hephbuild/heph/plugin/plugingo"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func init() {
@@ -85,6 +86,9 @@ func init() {
 				for _, p := range drivers {
 					_, err = e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
 						path, h := p.PipesHandler()
+
+						h = otelhttp.NewHandler(h, "Pipe")
+
 						mux.Handle(path, h)
 					})
 					if err != nil {
@@ -117,7 +121,7 @@ func init() {
 					},
 					Shell: shell,
 					Force: force,
-				})
+				}, engine.GlobalResolveCache)
 
 				if res.Err != nil {
 					return res.Err

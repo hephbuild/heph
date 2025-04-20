@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"net"
 	"net/http"
@@ -24,8 +25,6 @@ import (
 type ServerHandle struct {
 	Listener net.Listener
 	Mux      *http.ServeMux
-
-	client *http.Client
 }
 
 func (h ServerHandle) BaseURL() string {
@@ -33,7 +32,11 @@ func (h ServerHandle) BaseURL() string {
 }
 
 func (h ServerHandle) HTTPClient() *http.Client {
-	return h.client
+	return httpClient
+}
+
+func (h ServerHandle) HTTPClientWithOtel() *http.Client {
+	return httpClientWithOtel
 }
 
 var httpClient = &http.Client{
@@ -43,6 +46,10 @@ var httpClient = &http.Client{
 			return net.Dial(network, addr)
 		},
 	},
+}
+
+var httpClientWithOtel = &http.Client{
+	Transport: otelhttp.NewTransport(httpClient.Transport),
 }
 
 func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
@@ -75,11 +82,10 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 	h := ServerHandle{
 		Listener: l,
 		Mux:      mux,
-		client:   httpClient,
 	}
 
 	// warmup the client
-	go h.client.Get(h.BaseURL()) //nolint:errcheck,noctx
+	go h.HTTPClient().Get(h.BaseURL()) //nolint:errcheck,noctx
 
 	return h, nil
 }

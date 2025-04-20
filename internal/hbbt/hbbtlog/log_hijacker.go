@@ -22,17 +22,17 @@ type hijackerData struct {
 	cond *sync.Cond
 }
 
-func (h Hijacker) GetMode() LogHijackerMode {
+func (h Hijacker) getMode() LogHijackerMode {
 	return h.mode.Load().(LogHijackerMode) //nolint:errcheck
 }
 
-func (h Hijacker) GetModeWait() LogHijackerMode {
-	mode := h.GetMode()
+func (h Hijacker) GetMode() LogHijackerMode {
+	mode := h.getMode()
 
 	if mode == LogHijackerModeWait {
 		h.cond.L.Lock()
 		for {
-			mode = h.GetMode()
+			mode = h.getMode()
 			if mode != LogHijackerModeWait {
 				break
 			}
@@ -66,7 +66,7 @@ func (h Hijacker) Update(msg tea.Msg) (Hijacker, tea.Cmd) {
 }
 
 func (h Hijacker) Handler(next hlog.HandleFunc, ctx context.Context, attrs []slog.Attr, record slog.Record) error {
-	mode := h.GetModeWait()
+	mode := h.GetMode()
 
 	switch mode {
 	case LogHijackerModeWait:
