@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/plugin/tref"
 	"io"
 	"os"
 	"os/exec"
@@ -14,6 +13,9 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+
+	"github.com/hephbuild/heph/plugin/tref"
+	"go.opentelemetry.io/otel"
 
 	"connectrpc.com/connect"
 	ptylib "github.com/creack/pty"
@@ -26,6 +28,8 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 )
+
+var tracer = otel.Tracer("heph/pluginexec")
 
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
@@ -58,11 +62,11 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	binfs := hfs.At(sandboxfs, "bin")
 	cwdfs := hfs.At(workfs, req.Msg.GetTarget().GetRef().GetPackage())
 	outfs := cwdfs
-	if t.Context == execv1.Target_Tree {
+	if t.GetContext() == execv1.Target_Tree {
 		cwdfs = hfs.At(hfs.NewOS(req.Msg.GetTreeRootPath()), req.Msg.GetTarget().GetRef().GetPackage())
 	}
 
-	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.Context != execv1.Target_Tree)
+	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
 	if err != nil {
 		return nil, err
 	}
@@ -77,23 +81,23 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	env = append(env, inputEnv...)
 	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin", binfs.Path())) // TODO: remove /opt/homebrew/bin
 
-	for key, value := range t.Env {
+	for key, value := range t.GetEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
-	for key, value := range t.RuntimeEnv {
+	for key, value := range t.GetRuntimeEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
-	for _, name := range t.RuntimePassEnv {
+	for _, name := range t.GetRuntimePassEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
 	}
-	for _, name := range t.PassEnv {
+	for _, name := range t.GetPassEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
 	}
-	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))        // TODO: figure it out
-	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.Msg.TreeRootPath)) // TODO: figure it out
+	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))             // TODO: figure it out
+	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.Msg.GetTreeRootPath())) // TODO: figure it out
 
 	for _, output := range t.GetOutputs() {
-		paths := slices.Clone(output.Paths)
+		paths := slices.Clone(output.GetPaths())
 		for i, path := range paths {
 			paths[i] = outfs.Path(path)
 		}

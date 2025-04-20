@@ -5,12 +5,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/zeebo/xxh3"
 	"iter"
 	"maps"
 	"os"
 	"path/filepath"
+
+	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/zeebo/xxh3"
 
 	"github.com/hephbuild/heph/internal/hiter"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -21,6 +22,9 @@ import (
 )
 
 func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.ArtifactWithOrigin, workfs, binfs, cwdfs, outfs hfs.OS, setupWd bool) ([]*pluginv1.ArtifactWithOrigin, error) {
+	ctx, span := tracer.Start(ctx, "SetupSandbox")
+	defer span.End()
+
 	err := workfs.MkdirAll("", os.ModePerm)
 	if err != nil {
 		return nil, err
@@ -102,8 +106,11 @@ func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *pluginv1.Target
 }
 
 func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) (*pluginv1.Artifact, error) {
+	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
+	defer span.End()
+
 	h := xxh3.New()
-	_, _ = h.WriteString(artifact.Uri)
+	_, _ = h.WriteString(artifact.GetUri())
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
@@ -134,6 +141,9 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 }
 
 func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) error {
+	ctx, span := tracer.Start(ctx, "SetupSandboxBinArtifact")
+	defer span.End()
+
 	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		return err

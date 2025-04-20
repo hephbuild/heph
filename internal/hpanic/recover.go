@@ -30,6 +30,24 @@ type options struct {
 	wrap func(err error) error
 }
 
+func RecoverHandler(rerr any) error {
+	var err error
+	if rerrr, ok := rerr.(error); ok {
+		err = rerrr
+	} else {
+		err = fmt.Errorf("%v", rerr)
+	}
+
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	err = Error{
+		Err:   err,
+		Stack: string(buf[:n]),
+	}
+
+	return err
+}
+
 func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 	o := options{}
 	for _, opt := range opts {
@@ -38,18 +56,7 @@ func RecoverV[T any](f func() (T, error), opts ...Option) (_ T, err error) {
 
 	defer func() {
 		if rerr := recover(); rerr != nil {
-			if rerrr, ok := rerr.(error); ok {
-				err = rerrr
-			} else {
-				err = fmt.Errorf("%v", rerr)
-			}
-
-			buf := make([]byte, 4096)
-			n := runtime.Stack(buf, false)
-			err = Error{
-				Err:   err,
-				Stack: string(buf[:n]),
-			}
+			err = RecoverHandler(rerr)
 
 			if o.wrap != nil {
 				err = o.wrap(err)

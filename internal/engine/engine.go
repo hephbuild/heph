@@ -3,10 +3,15 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/hcore"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -89,34 +94,49 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		Sandbox: sandboxfs,
 	}
 
+	connectInterceptor, err := otelconnect.NewInterceptor(
+		otelconnect.WithTrustRemote(),
+		otelconnect.WithAttributeFilter(func(spec connect.Spec, value attribute.KeyValue) bool {
+			if value.Key == semconv.NetPeerPortKey {
+				return false
+			}
+			if value.Key == semconv.NetPeerNameKey {
+				return false
+			}
+			return true
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	interceptors := []connect.Interceptor{
+		connectInterceptor,
+	}
+
 	srvh, err := e.newServer(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	{
-		path, handler := corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx)))
-
-		srvh.Mux.Handle(path, handler)
+	handlerOpts := []connect.HandlerOption{
+		connect.WithInterceptors(interceptors...),
+		hcore.WithRecovery(),
 	}
 
-	{
-		path, handler := corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)))
+	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
+	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
+	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.Handler(), handlerOpts...))
 
-		srvh.Mux.Handle(path, handler)
-	}
-
-	{
-		path, handler := corev1connect.NewResultServiceHandler(e.Handler())
-
-		srvh.Mux.Handle(path, handler)
+	clientOpts := []connect.ClientOption{
+		connect.WithInterceptors(interceptors...),
 	}
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
 		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
-		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
-		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
+		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.BaseURL(), clientOpts...),
+		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.BaseURL(), clientOpts...),
 	}
 
 	return e, nil

@@ -1,10 +1,13 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -13,8 +16,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"google.golang.org/protobuf/types/known/structpb"
-	"strconv"
-	"strings"
 )
 
 type Factors struct {
@@ -80,8 +81,8 @@ func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.Get
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-	//artifacts, ref, err := p.goListPkg(ctx, req.Msg.Package, Factors{}) // for all factors
-	//hlog.From(ctx).With(slog.Any("artifacts", artifacts), slog.Any("ref", ref), slog.Any("err", err)).Warn("LIST")
+	// artifacts, ref, err := p.goListPkg(ctx, req.Msg.Package, Factors{}) // for all factors
+	// hlog.From(ctx).With(slog.Any("artifacts", artifacts), slog.Any("ref", ref), slog.Any("err", err)).Warn("LIST")
 
 	return nil
 }
@@ -98,13 +99,13 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		factors.GOARCH = "amd64"
 	}
 
-	if strings.HasPrefix(req.Msg.GetRef().Package, "@heph/go") {
-		if req.Msg.GetRef().Package == "@heph/go/std" && req.Msg.GetRef().Name == "install" {
+	if strings.HasPrefix(req.Msg.GetRef().GetPackage(), "@heph/go") {
+		if req.Msg.GetRef().GetPackage() == "@heph/go/std" && req.Msg.GetRef().GetName() == "install" {
 			return p.stdInstall(ctx, factors)
 		}
 
-		if req.Msg.GetRef().Name == "build_lib" {
-			goImport := strings.TrimPrefix(req.Msg.GetRef().Package, "@heph/go/std/")
+		if req.Msg.GetRef().GetName() == "build_lib" {
+			goImport := strings.TrimPrefix(req.Msg.GetRef().GetPackage(), "@heph/go/std/")
 
 			return p.stdLibBuild(ctx, factors, goImport)
 		}
@@ -112,29 +113,29 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
 
-	switch req.Msg.GetRef().Name {
+	switch req.Msg.GetRef().GetName() {
 	case "build":
-		goPkg, err := p.goListPkgResult(ctx, req.Msg.Ref.Package, factors)
+		goPkg, err := p.goListPkgResult(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
 		return p.packageBin(ctx, goPkg, factors)
 	case "build_lib":
-		goPkg, err := p.goListPkgResult(ctx, req.Msg.Ref.Package, factors)
+		goPkg, err := p.goListPkgResult(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
 		return p.packageLib(ctx, goPkg, factors)
 	case "build_lib#asm":
-		//return p.packageLibAsm(ctx, goPkg, factors)
+		// return p.packageLibAsm(ctx, goPkg, factors)
 	case "build_lib#abi":
-		//return p.packageLibAbi(ctx, goPkg, factors)
+		// return p.packageLibAbi(ctx, goPkg, factors)
 	case "build_lib#pure":
-		//return p.packageLibAsmPure(ctx, goPkg, factors)
+		// return p.packageLibAsmPure(ctx, goPkg, factors)
 	case "build_lib#embed":
-		//return p.packageLibEmbed(ctx, goPkg, factors)
+		// return p.packageLibEmbed(ctx, goPkg, factors)
 	}
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
@@ -175,7 +176,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, fin
 					"out":              structpb.NewStringValue("golist.json"),
 					"in_tree":          structpb.NewBoolValue(true),
 					"cache":            structpb.NewBoolValue(false),
-					//"tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
+					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 					// TODO: cache based on go.mod
 				},
 			},
@@ -185,5 +186,5 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, fin
 		return nil, nil, err
 	}
 
-	return res.Msg.GetArtifacts(), res.Msg.Def.Ref, nil
+	return res.Msg.GetArtifacts(), res.Msg.GetDef().GetRef(), nil
 }

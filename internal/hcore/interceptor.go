@@ -2,6 +2,7 @@ package hcore
 
 import (
 	"context"
+	"net/http"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -10,16 +11,10 @@ import (
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
 )
 
-func NewRecoveryInterceptor() connect.UnaryInterceptorFunc {
-	return func(next connect.UnaryFunc) connect.UnaryFunc {
-		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
-			return hpanic.RecoverV(func() (connect.AnyResponse, error) {
-				return next(ctx, req)
-			}, hpanic.Wrap(func(err error) error {
-				return connect.NewError(connect.CodeInternal, err)
-			}))
-		}
-	}
+func WithRecovery() connect.HandlerOption {
+	return connect.WithRecover(func(ctx context.Context, spec connect.Spec, header http.Header, a any) error {
+		return connect.NewError(connect.CodeInternal, hpanic.RecoverHandler(a))
+	})
 }
 
 func NewInterceptor(
@@ -57,11 +52,7 @@ func (i Interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 }
 
 func (i Interceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
-	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
-		conn := next(ctx, spec)
-
-		return conn
-	}
+	return next
 }
 
 func (i Interceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {

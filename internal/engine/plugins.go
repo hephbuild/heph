@@ -3,11 +3,16 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"net"
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/internal/hcore/hstep/hstepconnect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -54,6 +59,9 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 		srv := &http.Server{
 			Handler: h2c.NewHandler(mux, h2s),
 			BaseContext: func(listener net.Listener) context.Context {
+				// to prevent inheriting from the root span, make a new noop span
+				ctx := trace.ContextWithSpan(ctx, trace.SpanFromContext(context.Background()))
+
 				return ctx
 			},
 			ReadHeaderTimeout: 5 * time.Second,
@@ -120,35 +128,91 @@ func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 	return nil
 }
 
-func (e *Engine) pluginInterceptor() connect.Option {
+type pluginSpanDecorator struct {
+	pluginType, pluginName string
+}
+
+func (f pluginSpanDecorator) decorate(ctx context.Context) {
+	span := trace.SpanFromContext(ctx)
+	span.SetAttributes(attribute.String("heph.plugin.type", f.pluginType))
+	span.SetAttributes(attribute.String("heph.plugin.name", f.pluginName))
+}
+
+func (f pluginSpanDecorator) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		f.decorate(ctx)
+
+		return next(ctx, req)
+	}
+}
+
+func (f pluginSpanDecorator) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		f.decorate(ctx)
+
+		return next(ctx, spec)
+	}
+}
+
+func (f pluginSpanDecorator) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		f.decorate(ctx)
+
+		return next(ctx, conn)
+	}
+}
+
+func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option {
+	connectInterceptor, err := otelconnect.NewInterceptor(
+		otelconnect.WithTrustRemote(),
+		otelconnect.WithAttributeFilter(func(spec connect.Spec, value attribute.KeyValue) bool {
+			if value.Key == semconv.NetPeerPortKey {
+				return false
+			}
+			if value.Key == semconv.NetPeerNameKey {
+				return false
+			}
+			return true
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+
 	return connect.WithInterceptors(
-		hcore.NewRecoveryInterceptor(),
+		connectInterceptor,
+		pluginSpanDecorator{
+			pluginType: pluginType,
+			pluginName: pluginName,
+		},
 		hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient),
 		hstepconnect.Interceptor(),
 	)
 }
 
 func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {
-	path, h := pluginv1connect.NewProviderHandler(handler, e.pluginInterceptor())
+	res, err := handler.Config(ctx, connect.NewRequest(&pluginv1.ProviderConfigRequest{}))
+	if err != nil {
+		return ProviderHandle{}, err
+	}
+
+	pluginName := res.Msg.GetName()
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
-		mux.Handle(path, h)
+		mux.Handle(pluginv1connect.NewProviderHandler(handler, hcore.WithRecovery(), e.pluginInterceptor("provider", pluginName)))
 	})
 	if err != nil {
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor())
+	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor("provider", pluginName))
 
-	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ProviderConfigRequest{}))
-	if err != nil {
-		return ProviderHandle{}, err
-	}
-
-	e.Providers = append(e.Providers, Provider{
-		Name:           res.Msg.GetName(),
+	provider := Provider{
+		Name:           pluginName,
 		ProviderClient: client,
-	})
+	}
+
+	e.Providers = append(e.Providers, provider)
 
 	err = e.initPlugin(ctx, handler)
 	if err != nil {
@@ -167,7 +231,14 @@ type DriverHandle struct {
 }
 
 func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.DriverHandler, register RegisterMuxFunc) (DriverHandle, error) {
-	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor())
+	res, err := handler.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
+	if err != nil {
+		return DriverHandle{}, err
+	}
+
+	pluginName := res.Msg.GetName()
+
+	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName))
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)
@@ -179,12 +250,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor())
-
-	res, err := client.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
-	if err != nil {
-		return DriverHandle{}, err
-	}
+	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor("driver", pluginName))
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]pluginv1connect.DriverClient{}
@@ -197,9 +263,9 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 	}
 
 	e.Drivers = append(e.Drivers, client)
-	e.DriversByName[res.Msg.GetName()] = client
+	e.DriversByName[pluginName] = client
 	e.DriversHandle[client] = pluginh
-	e.DriversConfig[res.Msg.GetName()] = res.Msg
+	e.DriversConfig[pluginName] = res.Msg
 
 	err = e.initPlugin(ctx, handler)
 	if err != nil {

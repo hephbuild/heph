@@ -29,9 +29,7 @@ func TestSmartProviderPlugin(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	ch := e.Result(ctx, "", "do", []string{engine.AllOutputs}, engine.ResultOptions{})
-
-	res := <-ch
+	res := e.Result(ctx, "", "do", []string{engine.AllOutputs}, engine.ResultOptions{})
 	require.NoError(t, res.Err)
 
 	require.Len(t, res.Artifacts, 2)

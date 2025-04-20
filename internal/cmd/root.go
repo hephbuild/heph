@@ -7,9 +7,14 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/hephbuild/heph/internal/hversion"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
@@ -19,7 +24,6 @@ import (
 var plain bool
 var debug bool
 var cpuprofile string
-var cpuProfileFile *os.File
 var memprofile string
 
 var levelVar slog.LevelVar
@@ -32,6 +36,21 @@ func init() {
 	levelVar.Set(slog.LevelDebug)
 }
 
+var tracer = otel.Tracer("heph")
+
+var onFinalize []func()
+
+func registerFinalize(f func()) {
+	onFinalize = append(onFinalize, f)
+}
+
+func runFinalize() {
+	for _, f := range slices.Backward(onFinalize) {
+		f()
+	}
+	onFinalize = nil
+}
+
 var rootCmd = &cobra.Command{
 	Use:              "heph",
 	TraverseChildren: true,
@@ -39,47 +58,81 @@ var rootCmd = &cobra.Command{
 	SilenceErrors:    true,
 	Version:          hversion.Version,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		defer func() {
+			cmd.SetContext(ctx)
+		}()
+
 		if !debug {
 			levelVar.Set(slog.LevelInfo)
 		}
 
-		if cpuprofile != "" {
+		if true {
 			var err error
-			cpuProfileFile, err = os.Create(cpuprofile)
+			otelShutdown, err := setupOTelSDK(ctx)
+			if err != nil {
+				return err
+			}
+			registerFinalize(func() {
+				err := otelShutdown(context.WithoutCancel(ctx))
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("otel: %v", err))
+				}
+			})
+		}
+
+		spanArgs := []string{"heph"}
+		spanArgs = append(spanArgs, os.Args[1:]...)
+
+		ctx, rootSpan := tracer.Start(ctx, strings.Join(spanArgs, " "), trace.WithAttributes(attribute.StringSlice("heph.args", spanArgs)))
+		registerFinalize(func() {
+			rootSpan.End()
+		})
+
+		{
+			spanCtx := rootSpan.SpanContext()
+			if spanCtx.HasTraceID() {
+				traceID := spanCtx.TraceID().String()
+
+				hlog.From(ctx).Info("Trace ID: " + traceID)
+			}
+		}
+
+		if cpuprofile != "" {
+			cpuProfileFile, err := os.Create(cpuprofile)
 			if err != nil {
 				return fmt.Errorf("could not create CPU profile: %w", err)
 			}
 			if err := pprof.StartCPUProfile(cpuProfileFile); err != nil {
 				return fmt.Errorf("could not start CPU profile: %w", err)
 			}
-		}
 
-		return nil
-	},
-	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		ctx := cmd.Context()
-
-		if cpuProfileFile != nil {
-			pprof.StopCPUProfile()
-			err := cpuProfileFile.Close()
-			if err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("could not close cpu profile: %v", err))
-				return
-			}
+			registerFinalize(func() {
+				pprof.StopCPUProfile()
+				err := cpuProfileFile.Close()
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("could not close cpu profile: %v", err))
+				}
+			})
 		}
 
 		if memprofile != "" {
-			f, err := os.Create(memprofile)
-			if err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("could not create memory profile: %v", err))
-				return
-			}
-			defer f.Close()
-			runtime.GC() // get up-to-date statistics
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("could not write memory profile: %v", err))
-			}
+			registerFinalize(func() {
+				f, err := os.Create(memprofile)
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("could not create memory profile: %v", err))
+					return
+				}
+
+				defer f.Close()
+				runtime.GC() // get up-to-date statistics
+				if err := pprof.WriteHeapProfile(f); err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("could not write memory profile: %v", err))
+				}
+			})
 		}
+
+		return nil
 	},
 }
 
@@ -94,6 +147,8 @@ func init() {
 func Execute() int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	defer runFinalize()
 
 	logger := hlog.NewTextLogger(os.Stderr, &levelVar)
 	ctx = hlog.ContextWithLogger(ctx, logger)

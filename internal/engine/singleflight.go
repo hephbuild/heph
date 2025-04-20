@@ -64,7 +64,6 @@ func (h *singleflightResultHandle) send(result *ExecuteChResult) {
 		ch <- h.getRes()
 		close(ch)
 	}
-
 	h.chs = nil
 }
 

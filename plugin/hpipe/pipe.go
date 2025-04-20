@@ -3,6 +3,7 @@ package hpipe
 import (
 	"context"
 	"fmt"
+	"go.opentelemetry.io/otel"
 	"io"
 	"net/http"
 )
@@ -13,14 +14,20 @@ type ReaderCloser interface {
 }
 
 func Reader(ctx context.Context, client *http.Client, baseURL, path string) (ReaderCloser, error) {
+	ctx, span := tracer.Start(ctx, "Reader")
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
+		span.End()
+
 		return nil, err
 	}
 
 	r, w := io.Pipe()
 
 	go func() {
+		defer span.End()
+
 		res, err := client.Do(req)
 		if err != nil {
 			_ = w.CloseWithError(err)
@@ -43,16 +50,24 @@ type WriterCloser interface {
 	io.Closer
 }
 
+var tracer = otel.Tracer("heph/hpipe")
+
 func Writer(ctx context.Context, client *http.Client, baseURL, path string) (WriterCloser, error) {
+	ctx, span := tracer.Start(ctx, "Writer")
+
 	r, w := io.Pipe()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+path, r)
 	if err != nil {
+		span.End()
+
 		return nil, err
 	}
 	req.ContentLength = -1
 
 	go func() {
+		defer span.End()
+
 		res, err := client.Do(req)
 		if err != nil {
 			_ = w.CloseWithError(err)

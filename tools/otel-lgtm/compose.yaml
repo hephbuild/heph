@@ -1,0 +1,13 @@
+services:
+  otel-lgtm:
+    environment:
+      ENABLE_LOGS_TEMPO: "true"
+    volumes:
+      - data:/data
+    build: .
+    ports:
+      - "3000:3000"
+      - "4317:4317"
+      - "4318:4318"
+volumes:
+  data:

@@ -5,6 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
@@ -16,9 +20,6 @@ import (
 	"github.com/hephbuild/heph/plugin/plugingo"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
-	"net/http"
-	"os"
-	"os/signal"
 )
 
 func init() {
@@ -41,17 +42,8 @@ func init() {
 				return errors.New("must run in a term for now")
 			}
 
-			c := make(chan os.Signal, 1)
-			signal.Notify(c, os.Interrupt)
-			defer signal.Stop(c)
-
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-
-			go func() {
-				<-c
-				cancel()
-			}()
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+			defer stop()
 
 			err = termui.NewInteractive(ctx, func(ctx context.Context, m termui.Model, send func(tea.Msg)) error {
 				root, err := engine.Root()
@@ -78,8 +70,8 @@ func init() {
 				if err != nil {
 					return err
 				}
-				//_, err = e.RegisterDriver(ctx, pluginfs.NewDriver())
-				//if err != nil {
+				// _, err = e.RegisterDriver(ctx, pluginfs.NewDriver())
+				// if err != nil {
 				//	return err
 				//}
 
@@ -100,18 +92,20 @@ func init() {
 					}
 				}
 
-				ch := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
-					InteractiveExec: func(iargs engine.InteractiveExecOptions) error {
-						_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
+				res := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
+					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
+						_, err := hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
 							if iargs.Pty {
-								err = args.MakeRaw()
+								err := args.MakeRaw()
 								if err != nil {
 									return struct{}{}, err
 								}
 							}
 
-							iargs.Run(engine.ExecOptions{
-								Stdin:  args.Stdin,
+							iargs.Run(ctx, engine.ExecOptions{
+								Stdin: args.Stdin,
+								// bbt has its output set to stderr, to prevent the CLI from outputting on stderr too,
+								// we rely on os-provided stdout/stderr directly
 								Stdout: os.Stdout,
 								Stderr: os.Stderr,
 							})
@@ -125,8 +119,6 @@ func init() {
 					Force: force,
 				})
 
-				res := <-ch
-
 				if res.Err != nil {
 					return res.Err
 				}
@@ -134,7 +126,7 @@ func init() {
 				outputs := res.Artifacts
 
 				// TODO how to render res natively without exec
-				_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (*engine.ExecuteChResult, error) {
+				_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
 					for _, output := range outputs {
 						fmt.Println(output.Name)
 						fmt.Println("  group:    ", output.Group)
@@ -143,7 +135,7 @@ func init() {
 						fmt.Println("  encoding: ", output.Encoding.String())
 					}
 
-					return res, nil
+					return struct{}{}, nil
 				})
 				if err != nil {
 					return err

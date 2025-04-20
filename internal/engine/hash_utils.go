@@ -2,14 +2,15 @@ package engine
 
 import (
 	"encoding/json"
-	"github.com/hephbuild/heph/internal/hinstance"
-	"github.com/zeebo/xxh3"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 	"io"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hinstance"
+	"github.com/zeebo/xxh3"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // Useful for figuring out why hash isnt deterministic

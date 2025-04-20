@@ -6,14 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"google.golang.org/protobuf/proto"
 	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/hephbuild/heph/plugin/tref"
 
@@ -40,40 +42,54 @@ type ExecOptions struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	interactiveExec func(InteractiveExecOptions) error
+	interactiveExec func(context.Context, InteractiveExecOptions) error
 	shell           bool
 	force           bool
 }
 
 type InteractiveExecOptions struct {
-	Run func(ExecOptions)
+	Run func(context.Context, ExecOptions)
 	Pty bool
 }
 
 type ResultOptions struct {
 	ExecOptions     ExecOptions
-	InteractiveExec func(InteractiveExecOptions) error
+	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           bool
 	Force           bool
 
 	Singleflight *Singleflight
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions) *ExecuteChResult {
 	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options)
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions) *ExecuteChResult {
+	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
+	defer span.End()
+
 	return e.result(ctx, DefContainer{Ref: ref}, outputs, options)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions) *ExecuteChResult {
+	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+	defer span.End()
+
 	return e.result(ctx, DefContainer{Def: def}, outputs, options)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions) *ExecuteChResult {
+	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
+	defer span.End()
+
 	return e.result(ctx, DefContainer{Spec: spec}, outputs, options)
 }
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) *ExecuteChResult {
+	ch := e.resultInner(ctx, c, outputs, options)
+
+	return <-ch
+}
+func (e *Engine) resultInner(ctx context.Context, c DefContainer, outputs []string, options ResultOptions) <-chan *ExecuteChResult {
 	if options.Singleflight == nil {
 		options.Singleflight = &Singleflight{}
 	}
@@ -102,7 +118,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		res, err := e.innerResultWithSideEffects(ctx, c, outputs, options)
 		if err != nil {
 			step.SetError()
-			send(&ExecuteChResult{Err: fmt.Errorf("%v %w", tref.Format(c.GetRef()), err)})
+			send(&ExecuteChResult{Err: fmt.Errorf("%v: %w", tref.Format(c.GetRef()), err)})
 			return
 		}
 
@@ -113,22 +129,20 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 }
 
 func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool, sf *Singleflight) []*ExecuteResultWithOrigin {
-	var wg sync.WaitGroup
+	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+	defer span.End()
+
+	var g errgroup.Group
 	results := make([]*ExecuteResultWithOrigin, len(def.Deps))
-	wg.Add(len(def.Deps))
 
 	for i, dep := range def.Deps {
-		go func() {
-			defer wg.Done()
-
+		g.Go(func() error {
 			outputs := dep.Outputs
 			if !withOutputs {
 				outputs = nil
 			}
 
-			ch := e.ResultFromRef(ctx, dep.Ref, outputs, ResultOptions{Singleflight: sf})
-
-			res := <-ch
+			res := e.ResultFromRef(ctx, dep.Ref, outputs, ResultOptions{Singleflight: sf})
 
 			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
 				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT
@@ -138,10 +152,12 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 				ExecuteChResult: res,
 				Origin:          dep.DefDep,
 			}
-		}()
+
+			return nil
+		})
 	}
 
-	wg.Wait()
+	_ = g.Wait()
 
 	return results
 }
@@ -276,7 +292,7 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
-	//h := newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
+	// h := newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
 	h := xxh3.New()
 	writeProto := func(v proto.Message) error {
 		return stableProtoHashEncode(h, v)
@@ -567,16 +583,16 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if options.interactiveExec == nil {
-		options.interactiveExec = func(args InteractiveExecOptions) error {
-			args.Run(options)
+		options.interactiveExec = func(ctx context.Context, args InteractiveExecOptions) error {
+			args.Run(ctx, options)
 			return nil
 		}
 	}
 
 	var runRes *connect.Response[pluginv1.RunResponse]
 	var runErr error
-	err = options.interactiveExec(InteractiveExecOptions{
-		Run: func(options ExecOptions) {
+	err = options.interactiveExec(ctx, InteractiveExecOptions{
+		Run: func(ctx context.Context, options ExecOptions) {
 			pipes, pipesWait, err := e.pipes(ctx, driver, options)
 			if err != nil {
 				runErr = err

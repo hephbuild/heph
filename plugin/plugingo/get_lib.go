@@ -1,15 +1,16 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
+	"path"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path"
 )
 
 func (p *Plugin) packageLib(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
@@ -63,7 +64,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 	}
 
 	var extra string
-	//if abi != "" { // if (asm pure)
+	// if abi != "" { // if (asm pure)
 	//	extra += " -symabis $SRC_ABI -asmhdr $SRC_ABI_H"
 	//}
 
@@ -114,7 +115,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 	}), nil
 }
 
-//func (p *Plugin) packageLibPure(ctx context.Context, goPkg Package) (*connect.Response[pluginv1.GetResponse], error) {
+// func (p *Plugin) packageLibPure(ctx context.Context, goPkg Package) (*connect.Response[pluginv1.GetResponse], error) {
 //	goPkg.SFiles = nil
 //
 //	return p.packageLib(ctx, goPkg)

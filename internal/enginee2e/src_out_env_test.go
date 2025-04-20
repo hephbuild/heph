@@ -204,9 +204,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				ch := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{})
-
-				res := <-ch
+				res := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{})
 				require.NoError(t, res.Err)
 
 				require.Len(t, res.Artifacts, len(test.expected)+1)
@@ -244,9 +242,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				ch := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{})
-
-				res := <-ch
+				res := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{})
 				require.NoError(t, res.Err)
 			})
 		}

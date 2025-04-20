@@ -1,10 +1,13 @@
 package pluginbuildfile
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/otel"
+	iofs "io/fs"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
@@ -13,7 +16,6 @@ import (
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 	"google.golang.org/protobuf/types/known/structpb"
-	iofs "io/fs"
 )
 
 type Plugin struct {
@@ -74,8 +76,10 @@ func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeReq
 	}), nil
 }
 
+var tracer = otel.Tracer("heph/pluginbuildfile")
+
 func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
-	_, err := p.runPkg(ctx, req.Msg.Ref.Package, func(ctx context.Context, payload OnTargetPayload) error {
+	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
 		spec, err := p.toTargetSpec(ctx, payload)
 		if err != nil {
 			return err
@@ -97,8 +101,8 @@ func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.Get
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-	if !req.Msg.Deep {
-		_, err := p.runPkg(ctx, req.Msg.Package, func(ctx context.Context, payload OnTargetPayload) error {
+	if !req.Msg.GetDeep() {
+		_, err := p.runPkg(ctx, req.Msg.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
 			spec, err := p.toTargetSpec(ctx, payload)
 			if err != nil {
 				return err

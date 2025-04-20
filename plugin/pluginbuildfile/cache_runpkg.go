@@ -37,7 +37,7 @@ func (c *CacheRunpkg) Singleflight(
 		}
 
 		var providerStates []OnProviderStatePayload
-		onProviderState = func(ctx context.Context, payload OnProviderStatePayload) error {
+		onProviderState := func(ctx context.Context, payload OnProviderStatePayload) error {
 			providerStates = append(providerStates, payload)
 
 			return nil

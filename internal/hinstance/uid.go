@@ -3,10 +3,11 @@ package hinstance
 import (
 	"encoding/hex"
 	"fmt"
-	"github.com/zeebo/xxh3"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/zeebo/xxh3"
 )
 
 func gen() string {

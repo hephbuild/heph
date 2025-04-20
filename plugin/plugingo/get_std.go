@@ -1,18 +1,19 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"path"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"io"
-	"path"
 )
 
 func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package, error) {
@@ -30,7 +31,7 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package,
 		return nil, err
 	}
 
-	outputs := hartifact.FindOutputs(res.Msg.Artifacts, "list")
+	outputs := hartifact.FindOutputs(res.Msg.GetArtifacts(), "list")
 
 	if len(outputs) == 0 {
 		return nil, fmt.Errorf("no install artifact found")

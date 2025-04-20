@@ -1,10 +1,11 @@
 package tref
 
 import (
+	"strings"
+
 	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/proto"
-	"strings"
 )
 
 func Equal(a, b *pluginv1.TargetRef) bool {
@@ -15,20 +16,20 @@ func Equal(a, b *pluginv1.TargetRef) bool {
 }
 
 func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
-	if v := strings.Compare(a.Package, b.Package); v != 0 {
+	if v := strings.Compare(a.GetPackage(), b.GetPackage()); v != 0 {
 		return v
 	}
 
-	if v := strings.Compare(a.Name, b.Name); v != 0 {
+	if v := strings.Compare(a.GetName(), b.GetName()); v != 0 {
 		return v
 	}
 
-	if v := len(a.Args) - len(b.Args); v != 0 {
+	if v := len(a.GetArgs()) - len(b.GetArgs()); v != 0 {
 		return v
 	}
 
-	for k, av := range a.Args {
-		bv, ok := b.Args[k]
+	for k, av := range a.GetArgs() {
+		bv, ok := b.GetArgs()[k]
 		if !ok {
 			return 1
 		}
@@ -39,7 +40,7 @@ func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
 	}
 
 	if a.Output != nil && b.Output != nil {
-		if v := strings.Compare(*a.Output, *b.Output); v != 0 {
+		if v := strings.Compare(a.GetOutput(), b.GetOutput()); v != 0 {
 			return v
 		}
 	} else {
@@ -55,7 +56,7 @@ func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
 }
 
 func WithDriver(ref *pluginv1.TargetRef, driver string) *pluginv1.TargetRef {
-	if ref.Driver == driver {
+	if ref.GetDriver() == driver {
 		return ref
 	}
 
@@ -65,7 +66,7 @@ func WithDriver(ref *pluginv1.TargetRef, driver string) *pluginv1.TargetRef {
 }
 
 func WithName(ref *pluginv1.TargetRef, name string) *pluginv1.TargetRef {
-	if ref.Name == name {
+	if ref.GetName() == name {
 		return ref
 	}
 
@@ -75,7 +76,7 @@ func WithName(ref *pluginv1.TargetRef, name string) *pluginv1.TargetRef {
 }
 
 func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
-	if ref.Args != nil && ref.Args[key] == value {
+	if ref.Args != nil && ref.GetArgs()[key] == value {
 		return ref
 	}
 
@@ -89,19 +90,19 @@ func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
 
 func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutput {
 	return &pluginv1.TargetRefWithOutput{
-		Package: ref.Package,
-		Name:    ref.Name,
-		Driver:  ref.Driver,
-		Args:    ref.Args,
+		Package: ref.GetPackage(),
+		Name:    ref.GetName(),
+		Driver:  ref.GetDriver(),
+		Args:    ref.GetArgs(),
 		Output:  &output,
 	}
 }
 
 func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
 	return &pluginv1.TargetRef{
-		Package: ref.Package,
-		Name:    ref.Name,
-		Driver:  ref.Driver,
-		Args:    ref.Args,
+		Package: ref.GetPackage(),
+		Name:    ref.GetName(),
+		Driver:  ref.GetDriver(),
+		Args:    ref.GetArgs(),
 	}
 }

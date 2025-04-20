@@ -117,12 +117,12 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		allOutputPaths = append(allOutputPaths, out...)
 	}
 
-	for _, output := range target.Outputs {
-		slices.SortFunc(output.Paths, strings.Compare)
+	for _, output := range target.GetOutputs() {
+		slices.SortFunc(output.GetPaths(), strings.Compare)
 	}
 
-	slices.SortFunc(target.Outputs, func(a, b *execv1.Target_Output) int {
-		return strings.Compare(a.Group, b.Group)
+	slices.SortFunc(target.GetOutputs(), func(a, b *execv1.Target_Output) int {
+		return strings.Compare(a.GetGroup(), b.GetGroup())
 	})
 
 	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))

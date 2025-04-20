@@ -1,17 +1,18 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hartifact"
 	"io"
 	"path"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"connectrpc.com/connect"
+	"github.com/hephbuild/heph/internal/hartifact"
 )
 
 func (p *Plugin) goListPkgResult(ctx context.Context, pkg string, factors Factors) (Package, error) {

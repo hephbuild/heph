@@ -1,17 +1,18 @@
 package pluginfs
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strings"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path/filepath"
-	"strings"
 )
 
 var _ pluginv1connect.ProviderHandler = (*Provider)(nil)
@@ -50,14 +51,14 @@ func (p *Provider) List(ctx context.Context, req *connect.Request[pluginv1.ListR
 }
 
 func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	rest, ok := strings.CutPrefix(req.Msg.GetRef().Package, "@heph/file/")
+	rest, ok := strings.CutPrefix(req.Msg.GetRef().GetPackage(), "@heph/file/")
 	if !ok {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
-			Ref: tref.WithDriver(req.Msg.Ref, "sh"),
+			Ref: tref.WithDriver(req.Msg.GetRef(), "sh"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v $OUT", rest)),
 				"out": structpb.NewStringValue(filepath.Base(rest)),

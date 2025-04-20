@@ -53,9 +53,7 @@ func TestHashDeps(t *testing.T) {
 
 	var at time.Time
 	{
-		ch := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-
-		res := <-ch
+		res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
 		require.NoError(t, res.Err)
 
 		require.Len(t, res.Artifacts, 2)
@@ -67,9 +65,7 @@ func TestHashDeps(t *testing.T) {
 	}
 
 	{
-		ch := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-
-		res := <-ch
+		res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
 		require.NoError(t, res.Err)
 
 		require.Len(t, res.Artifacts, 2)

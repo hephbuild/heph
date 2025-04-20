@@ -56,9 +56,7 @@ func TestSanity(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	ch := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-
-	res := <-ch
+	res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
 	require.NoError(t, res.Err)
 
 	require.Len(t, res.Artifacts, 2)

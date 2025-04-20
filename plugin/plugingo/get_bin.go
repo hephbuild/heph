@@ -1,14 +1,15 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
+	"path/filepath"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path/filepath"
 )
 
 func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {

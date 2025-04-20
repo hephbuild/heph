@@ -5,10 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/plugin/tref"
-	"google.golang.org/protobuf/proto"
 	"io"
 	"time"
+
+	"github.com/hephbuild/heph/plugin/tref"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/hephbuild/heph/internal/hmaps"
 

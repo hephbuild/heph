@@ -16,20 +16,20 @@ type rpcHandler struct {
 
 func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.CreateRequest]) (*connect.Response[corev1.CreateResponse], error) {
 	logger := r.logger
-	if len(req.Msg.Attrs) > 0 {
+	if len(req.Msg.GetAttrs()) > 0 {
 		var attrs []any
-		for _, attr := range req.Msg.Attrs {
-			switch value := attr.Value.(type) {
+		for _, attr := range req.Msg.GetAttrs() {
+			switch value := attr.GetValue().(type) {
 			case *corev1.CreateRequest_Attr_ValueStr:
-				attrs = append(attrs, slog.String(attr.Key, value.ValueStr))
+				attrs = append(attrs, slog.String(attr.GetKey(), value.ValueStr))
 			case *corev1.CreateRequest_Attr_ValueBool:
-				attrs = append(attrs, slog.Bool(attr.Key, value.ValueBool))
+				attrs = append(attrs, slog.Bool(attr.GetKey(), value.ValueBool))
 			case *corev1.CreateRequest_Attr_ValueInt:
-				attrs = append(attrs, slog.Int64(attr.Key, value.ValueInt))
+				attrs = append(attrs, slog.Int64(attr.GetKey(), value.ValueInt))
 			case *corev1.CreateRequest_Attr_ValueFloat:
-				attrs = append(attrs, slog.Float64(attr.Key, value.ValueFloat))
+				attrs = append(attrs, slog.Float64(attr.GetKey(), value.ValueFloat))
 			default:
-				attrs = append(attrs, slog.String(attr.Key, fmt.Sprintf("%#v", attr.Value)))
+				attrs = append(attrs, slog.String(attr.GetKey(), fmt.Sprintf("%#v", attr.GetValue())))
 			}
 		}
 

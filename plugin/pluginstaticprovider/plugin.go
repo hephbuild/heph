@@ -3,8 +3,9 @@ package pluginstaticprovider
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/plugin/tref"
 	"strings"
+
+	"github.com/hephbuild/heph/plugin/tref"
 
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 

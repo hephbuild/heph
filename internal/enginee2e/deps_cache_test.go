@@ -78,18 +78,14 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // This will run all
-		ch := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
-
-		res := <-ch
+		res := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
 		require.NoError(t, res.Err)
 
 		assertOut(res)
 	}
 
 	{ // this should reuse cache from deps
-		ch := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
-
-		res := <-ch
+		res := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
 		require.NoError(t, res.Err)
 
 		assertOut(res)
