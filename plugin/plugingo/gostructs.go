@@ -27,6 +27,8 @@ type Module struct {
 	GoModSum   string       // checksum for go.mod (as in go.sum)
 	Origin     any          // provenance of module
 	Reuse      bool         // reuse of old module info is safe
+
+	HephPackage string
 }
 
 type ModuleError struct {

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"os"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -27,6 +28,10 @@ import (
 // If it does not return an error, make sure to call shutdown for proper cleanup.
 func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, err error) {
 	otel.SetLogger(logr.FromSlogHandler(hlog.From(ctx).Handler()))
+
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		return func(ctx context.Context) error { return nil }, err
+	}
 
 	var shutdownFuncs []func(context.Context) error
 

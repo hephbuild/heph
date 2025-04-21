@@ -58,3 +58,11 @@ func (m *Sync[K, V]) SetOk(k K, v V) bool {
 func (m *Sync[K, V]) Values() iter.Seq[V] {
 	return maps.Values(m.m)
 }
+
+func (m *Sync[K, V]) Keys() iter.Seq[K] {
+	return maps.Keys(m.m)
+}
+
+func (m *Sync[K, V]) Range() iter.Seq2[K, V] {
+	return maps.All(m.m)
+}
