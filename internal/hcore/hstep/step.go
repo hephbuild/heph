@@ -2,6 +2,7 @@ package hstep
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -70,14 +71,43 @@ type ctxHandlerKey struct{}
 type Handler func(ctx context.Context, pbstep *corev1.Step) *corev1.Step
 
 func ContextWithRPCHandler(ctx context.Context, client corev1connect.StepServiceClient) context.Context {
-	return ContextWithHandler(ctx, func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {
-		res, err := client.Create(ctx, connect.NewRequest(&corev1.StepServiceCreateRequest{Step: pbstep}))
-		if err != nil {
-			hlog.From(ctx).Error(err.Error())
-			return pbstep
+	ch := make(chan *corev1.Step, 1000)
+	var running atomic.Bool
+
+	startRoutine := func() {
+		if running.Swap(true) {
+			return
 		}
 
-		return res.Msg.GetStep()
+		ctx := context.WithoutCancel(ctx)
+		t := time.NewTimer(time.Second)
+		defer t.Stop()
+
+		go func() {
+			defer running.Store(false)
+
+			for {
+				t.Reset(time.Second)
+
+				select {
+				case <-t.C:
+					return
+				case step := <-ch:
+					_, err := client.Create(ctx, connect.NewRequest(&corev1.StepServiceCreateRequest{Step: step}))
+					if err != nil {
+						hlog.From(ctx).Error(err.Error())
+					}
+				}
+			}
+		}()
+	}
+
+	return ContextWithHandler(ctx, func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {
+		startRoutine()
+
+		ch <- pbstep
+
+		return pbstep
 	})
 }
 
