@@ -1,17 +1,10 @@
 package plugingo
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/plugin/tref"
-	"os"
-	"path"
-	"path/filepath"
-	"strconv"
-	"strings"
-
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -19,7 +12,11 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
+	"os"
+	"path/filepath"
+	"strconv"
 )
 
 type Factors struct {
@@ -91,7 +88,13 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 	return nil
 }
 
+const ThirdpartyPrefix = "@heph/go/thirdparty"
+
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
+	if tref.HasPackagePrefix(req.Msg.GetRef().GetPackage(), "@heph/file") {
+		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+	}
+
 	factors := FactorsFromArgs(req.Msg.GetRef().GetArgs())
 	if factors.GoVersion == "" {
 		factors.GoVersion = "1.24"
@@ -103,14 +106,25 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		factors.GOARCH = "amd64"
 	}
 
-	if strings.HasPrefix(req.Msg.GetRef().GetPackage(), "@heph/go") {
-		if req.Msg.GetRef().GetPackage() == "@heph/go/std" && req.Msg.GetRef().GetName() == "install" {
+	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.Msg.GetRef().GetPackage()); ok && basePkg == "" && len(req.Msg.Ref.Args) == 0 {
+		switch req.Msg.GetRef().GetName() {
+		case "download":
+			if modPkgPath != "" {
+				return nil, fmt.Errorf("modpath is unsupported on download")
+			}
+
+			return p.goModDownload(ctx, req.Msg.GetRef().GetPackage(), modPath, version)
+		case "content":
+			return p.goModContent(ctx, modPath, version, modPkgPath)
+		}
+	}
+
+	if goImport, ok := tref.CutPackagePrefix(req.Msg.GetRef().GetPackage(), "@heph/go/std"); ok {
+		if goImport == "" && req.Msg.GetRef().GetName() == "install" {
 			return p.stdInstall(ctx, factors)
 		}
 
 		if req.Msg.GetRef().GetName() == "build_lib" {
-			goImport := strings.TrimPrefix(req.Msg.GetRef().GetPackage(), "@heph/go/std/")
-
 			return p.stdLibBuild(ctx, factors, goImport)
 		}
 
@@ -119,19 +133,41 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 	switch req.Msg.GetRef().GetName() {
 	case "build":
-		goPkg, err := p.goListPkgResult(ctx, req.Msg.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
-		return p.packageBin(ctx, goPkg, factors)
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
+	case "content":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.goModContentIn(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors)
 	case "build_lib":
-		goPkg, err := p.goListPkgResult(ctx, req.Msg.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
-		return p.packageLib(ctx, goPkg, factors)
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors)
 	case "build_lib#asm":
 		// return p.packageLibAsm(ctx, goPkg, factors)
 	case "build_lib#abi":
@@ -167,7 +203,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, deps, fin
 		}
 
 		files = append(files, tref.Format(&pluginv1.TargetRef{
-			Package: path.Join("@heph/file", pkg, e.Name()),
+			Package: tref.JoinPackage("@heph/file", pkg, e.Name()),
 			Name:    "content",
 		}))
 	}

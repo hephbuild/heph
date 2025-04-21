@@ -37,8 +37,11 @@ type ModuleError struct {
 
 type Package struct {
 	build.Package
-	HephPackage string
-	IsStd       bool
+	Module           *Module
+	HephPackage      string
+	HephBuildPackage string
+	IsStd            bool
+	Is3rdParty       bool
 }
 
 func (p Package) IsMain() bool {
@@ -49,4 +52,11 @@ func (p Package) HasTest() bool {
 }
 func (p Package) HasXTest() bool {
 	return len(p.XTestGoFiles) > 0
+}
+func (p Package) GetHephBuildPackage() string {
+	if p.HephBuildPackage != "" {
+		return p.HephBuildPackage
+	}
+
+	return p.HephPackage
 }

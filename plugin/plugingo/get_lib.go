@@ -1,11 +1,9 @@
 package plugingo
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"fmt"
-	"path"
-
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -13,21 +11,21 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func (p *Plugin) packageLib(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
-	return p.packageLibInner(ctx, goPkg, factors)
+func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+	return p.packageLibInner(ctx, basePkg, goPkg, factors)
 }
 
 func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, error) {
 	return imp, nil
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
 	}
 	imports := make([]Package, len(goPkg.Imports))
-	c := p.newGetGoPackageCache(ctx, goPkg.HephPackage, factors)
+	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
 	var g errgroup.Group
 	for i, imp := range goPkg.Imports {
@@ -57,7 +55,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 		}
 
 		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: impGoPkg.HephPackage,
+			Package: impGoPkg.GetHephBuildPackage(),
 			Name:    "build_lib",
 			Args:    factors.Args(),
 		}, "a"))}
@@ -78,11 +76,19 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 		extra += " -complete"
 	}
 
-	for _, file := range goPkg.GoFiles {
+	if goPkg.Is3rdParty {
 		deps["src"] = append(deps["src"], tref.Format(&pluginv1.TargetRef{
-			Package: path.Join("@heph/file", goPkg.HephPackage, file),
-			Name:    ":content",
+			Package: goPkg.GetHephBuildPackage(),
+			Name:    "content",
+			Args:    factors.Args(),
 		}))
+	} else {
+		for _, file := range goPkg.GoFiles {
+			deps["src"] = append(deps["src"], tref.Format(&pluginv1.TargetRef{
+				Package: tref.JoinPackage("@heph/file", goPkg.HephPackage, file),
+				Name:    "content",
+			}))
+		}
 	}
 
 	importPath := goPkg.ImportPath
@@ -95,7 +101,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.HephPackage,
+				Package: goPkg.GetHephBuildPackage(),
 				Name:    "build_lib",
 				Driver:  "bash",
 				Args:    factors.Args(),

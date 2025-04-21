@@ -542,7 +542,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	if options.shell {
 		shellDriver := def.Ref.GetDriver() + "@shell"
-		// TODO: make the original driver declare the shell config
+		shellDriver = "bash@shell" // TODO: make the original driver declare the shell config
 		driver, ok = e.DriversByName[shellDriver]
 		if !ok {
 			return nil, fmt.Errorf("shell driver not found: %v", shellDriver)

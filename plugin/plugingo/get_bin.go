@@ -12,8 +12,10 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
-	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg.HephPackage, factors)
+func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+	c := p.newGetGoPackageCache(ctx, basePkg, factors)
+
+	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg.HephPackage, factors, c)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +35,7 @@ func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors)
 		}
 
 		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: goPkg.HephPackage,
+			Package: goPkg.GetHephBuildPackage(),
 			Name:    "build_lib",
 			Args:    factors.Args(),
 		}, "a"))}
@@ -42,7 +44,7 @@ func (p *Plugin) packageBin(ctx context.Context, goPkg Package, factors Factors)
 	}
 
 	deps["main"] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-		Package: goPkg.HephPackage,
+		Package: goPkg.GetHephBuildPackage(),
 		Name:    "build_lib",
 		Args:    factors.Args(),
 	}, "a"))}

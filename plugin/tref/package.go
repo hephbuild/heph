@@ -2,7 +2,9 @@ package tref
 
 import (
 	"fmt"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -35,5 +37,33 @@ func SplitPackage(s string) []string {
 }
 
 func JoinPackage(s ...string) string {
+	s = slices.DeleteFunc(s, func(s string) bool {
+		return s == ""
+	})
 	return strings.Join(s, "/")
+}
+
+func DirPackage(s string) string {
+	return path.Dir(s)
+}
+
+func HasPackagePrefix(pkg, prefix string) bool {
+	return pkg == prefix || strings.HasPrefix(pkg, prefix+"/")
+}
+
+func CutPackagePrefix(pkg, prefix string) (string, bool) {
+	if pkg == prefix {
+		return "", true
+	}
+
+	return strings.CutPrefix(pkg, prefix+"/")
+}
+
+func CutPackage(pkg, prefix string) (string, string, bool) {
+	before, after, found := strings.Cut(pkg, prefix)
+
+	before = strings.TrimSuffix(before, "/")
+	after = strings.TrimPrefix(after, "/")
+
+	return before, after, found
 }

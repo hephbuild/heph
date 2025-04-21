@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -25,8 +26,8 @@ import (
 	"github.com/hephbuild/heph/internal/hartifact"
 )
 
-func (p *Plugin) goListPkgResult(ctx context.Context, pkg string, factors Factors) (Package, error) {
-	artifacts, _, err := p.goListPkg(ctx, pkg, factors, false, false, ".")
+func (p *Plugin) goListPkgResult(ctx context.Context, pkg, imp string, factors Factors) (Package, error) {
+	artifacts, _, err := p.goListPkg(ctx, pkg, factors, false, false, imp)
 	if err != nil {
 		return Package{}, fmt.Errorf("go list: %w", err)
 	}
@@ -46,11 +47,28 @@ func (p *Plugin) goListPkgResult(ctx context.Context, pkg string, factors Factor
 	defer f.Close()
 
 	var goPkg Package
-	err = json.NewDecoder(f).Decode(&goPkg.Package)
+	err = json.NewDecoder(f).Decode(&goPkg)
 	if err != nil {
 		return Package{}, err
 	}
-	goPkg.HephPackage = pkg
+
+	relPkg, err := tref.DirToPackage(goPkg.Dir, p.root)
+	if err != nil {
+		goPkg.Is3rdParty = true
+
+		if goPkg.Module == nil {
+			return Package{}, fmt.Errorf("%v: not in a module", imp)
+		}
+
+		modPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
+		modPath = strings.TrimPrefix(modPath, "/")
+
+		goPkg.HephPackage = ThirdpartyBuildPackage(pkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+		goPkg.HephBuildPackage = ThirdpartyBuildPackage(pkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+		fmt.Print()
+	} else {
+		goPkg.HephPackage = relPkg
+	}
 
 	return goPkg, nil
 }
@@ -58,6 +76,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, pkg string, factors Factor
 type GetGoPackageCache struct {
 	stdListRes func() ([]Package, error)
 	modulesRes func() ([]Module, error)
+	basePkg    string
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors) *GetGoPackageCache {
@@ -70,12 +89,37 @@ func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, facto
 	})
 
 	return &GetGoPackageCache{
+		basePkg:    basePkg,
 		stdListRes: stdListRes,
 		modulesRes: modulesRes,
 	}
 }
 
+func ParseThirdpartyPackage(pkg string) (string, string, string, string, bool) {
+	if basePkg, rest, ok := tref.CutPackage(pkg, ThirdpartyPrefix); ok {
+		modPath, rest, _ := strings.Cut(rest, "@")
+		version, modPkgPath, _ := strings.Cut(rest, "/")
+
+		return basePkg, modPath, version, modPkgPath, true
+	}
+
+	return "", "", "", "", false
+}
+
 func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, factors Factors) (Package, error) {
+	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(pkg); ok {
+		goPkg, err := p.goListPkgResult(ctx, basePkg, path.Join(modPath, modPkgPath), factors)
+		if err != nil {
+			return Package{}, fmt.Errorf("thirdparty: %w", err)
+		}
+
+		if goPkg.Module.Version != version {
+			return Package{}, fmt.Errorf("version mismatch %v %v", goPkg.Module.Version, version)
+		}
+
+		return goPkg, nil
+	}
+
 	stdList, err := p.resultStdList(ctx, factors)
 	if err != nil {
 		return Package{}, err
@@ -88,9 +132,9 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return stdPkg, nil
 	}
 
-	goPkg, err := p.goListPkgResult(ctx, pkg, factors)
+	goPkg, err := p.goListPkgResult(ctx, pkg, ".", factors)
 	if err != nil {
-		return Package{}, err
+		return Package{}, fmt.Errorf("in tree: %w", err)
 	}
 
 	return goPkg, nil
@@ -123,39 +167,34 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 	}
 
 	if hephPkg == "" {
-		// TODO thirdparty
-		return Package{}, fmt.Errorf("%v: no module found", imp)
+		// Attempt to download 3rdparty package
+		goPkg, err := p.goListPkgResult(ctx, c.basePkg, imp, factors)
+		if err != nil {
+			return Package{}, err
+		}
+
+		return goPkg, nil
 	}
 
 	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors)
 }
 
-func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Factors) ([]Package, error) {
+func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
 	seen := hmaps.Sync[string, struct{}]{}
 	pkgsm := hmaps.Sync[string, Package]{}
 
 	var g errgroup.Group
 
-	stdListRes := hsync.Go2(func() ([]Package, error) {
-		return p.resultStdList(ctx, factors)
-	})
-
-	modulesRes := hsync.Go2(func() ([]Module, error) {
-		return p.goModules(ctx, pkg)
-	})
-
 	g.Go(func() error {
-		_, _ = stdListRes() // warmup
+		_, _ = c.stdListRes() // warmup
 
 		return nil
 	})
 	g.Go(func() error {
-		_, _ = modulesRes() // warmup
+		_, _ = c.modulesRes() // warmup
 
 		return nil
 	})
-
-	c := p.newGetGoPackageCache(ctx, pkg, factors)
 
 	var doTheMagicForImportPath func(imp string) error
 	doTheMagicForImportPath = func(imp string) error {
@@ -236,11 +275,10 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 	return goPkgs, nil
 }
 
-func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
+func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string, error) {
 	pkgParts := tref.SplitPackage(pkg)
 
 	var gomod, gowork string
-	var gomodPkg string
 
 	for {
 		pkg := tref.JoinPackage(pkgParts...)
@@ -251,7 +289,6 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 			_, err := os.Stat(filepath.Join(pkgDir, "go.mod"))
 			if err == nil {
 				gomod = tref.JoinPackage(pkg, "go.mod")
-				gomodPkg = pkg
 			}
 		}
 
@@ -273,8 +310,17 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 		pkgParts = pkgParts[:len(pkgParts)-1]
 	}
 
-	if gomod == "" || gomodPkg == "" {
-		return nil, fmt.Errorf("no module for %v", pkg)
+	if gomod == "" {
+		return "", "", fmt.Errorf("%v is not in a go module", pkg)
+	}
+
+	return gomod, gowork, nil
+}
+
+func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
+	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
+	if err != nil {
+		return nil, err
 	}
 
 	files := []string{
@@ -294,7 +340,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: gomodPkg,
+					Package: tref.DirPackage(gomod),
 					Name:    "_gomod",
 					Driver:  "sh",
 				},
