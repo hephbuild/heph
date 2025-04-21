@@ -55,6 +55,81 @@ func (p *Plugin) goListPkgResult(ctx context.Context, pkg string, factors Factor
 	return goPkg, nil
 }
 
+type GetGoPackageCache struct {
+	stdListRes func() ([]Package, error)
+	modulesRes func() ([]Module, error)
+}
+
+func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors) *GetGoPackageCache {
+	stdListRes := hsync.Go2(func() ([]Package, error) {
+		return p.resultStdList(ctx, factors)
+	})
+
+	modulesRes := hsync.Go2(func() ([]Module, error) {
+		return p.goModules(ctx, basePkg)
+	})
+
+	return &GetGoPackageCache{
+		stdListRes: stdListRes,
+		modulesRes: modulesRes,
+	}
+}
+
+func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, factors Factors) (Package, error) {
+	stdList, err := p.resultStdList(ctx, factors)
+	if err != nil {
+		return Package{}, err
+	}
+
+	stdPkg, isStd := hslices.Find(stdList, func(p Package) bool {
+		return p.HephPackage == pkg
+	})
+	if isStd {
+		return stdPkg, nil
+	}
+
+	goPkg, err := p.goListPkgResult(ctx, pkg, factors)
+	if err != nil {
+		return Package{}, err
+	}
+
+	return goPkg, nil
+}
+
+func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (Package, error) {
+	stdList, err := c.stdListRes()
+	if err != nil {
+		return Package{}, err
+	}
+
+	stdPkg, isStd := hslices.Find(stdList, func(p Package) bool {
+		return p.ImportPath == imp
+	})
+	if isStd {
+		return stdPkg, nil
+	}
+
+	modules, err := c.modulesRes()
+	if err != nil {
+		return Package{}, fmt.Errorf("get modules list: %w", err)
+	}
+
+	var hephPkg string
+	for _, module := range modules {
+		if rest, ok := strings.CutPrefix(imp, module.Path); ok {
+			hephPkg = tref.JoinPackage(module.HephPackage, strings.TrimLeft(rest, "/"))
+			break
+		}
+	}
+
+	if hephPkg == "" {
+		// TODO thirdparty
+		return Package{}, fmt.Errorf("%v: no module found", imp)
+	}
+
+	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors)
+}
+
 func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Factors) ([]Package, error) {
 	seen := hmaps.Sync[string, struct{}]{}
 	pkgsm := hmaps.Sync[string, Package]{}
@@ -80,51 +155,21 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 		return nil
 	})
 
-	var doTheMagicForStdPackage func(pkg string) error
-	doTheMagicForStdPackage = func(imp string) error {
+	c := p.newGetGoPackageCache(ctx, pkg, factors)
+
+	var doTheMagicForImportPath func(imp string) error
+	doTheMagicForImportPath = func(imp string) error {
 		if !seen.SetOk(imp, struct{}{}) {
 			return nil
 		}
 
-		stdList, err := stdListRes()
+		goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
 		if err != nil {
-			return fmt.Errorf("get stdlib list: %w", err)
-		}
-
-		goPkg, isStd := hslices.Find(stdList, func(p Package) bool {
-			return p.ImportPath == imp
-		})
-
-		pkgsm.Set(goPkg.ImportPath, goPkg)
-
-		if !isStd {
-			return fmt.Errorf("not std, not supposed to happen")
-		}
-
-		for _, imp := range goPkg.Imports {
-			err := doTheMagicForStdPackage(imp)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	}
-
-	var doTheMagicForHephPackage func(pkg string) error
-	doTheMagicForHephPackage = func(pkg string) error {
-		goPkg, err := p.goListPkgResult(ctx, pkg, factors)
-		if err != nil {
-			return fmt.Errorf("go list: %w", err)
+			return fmt.Errorf("get pkg: %w", err)
 		}
 
 		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
 			return nil
-		}
-
-		stdList, err := stdListRes()
-		if err != nil {
-			return fmt.Errorf("get stdlib list: %w", err)
 		}
 
 		for _, imp := range goPkg.Imports {
@@ -132,38 +177,34 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 				continue
 			}
 
-			isStd := slices.ContainsFunc(stdList, func(p Package) bool {
-				return p.ImportPath == imp
+			g.Go(func() error {
+				return doTheMagicForImportPath(imp)
 			})
+		}
 
-			if isStd {
-				g.Go(func() error {
-					return doTheMagicForStdPackage(imp)
-				})
-			} else {
-				if seen.SetOk(imp, struct{}{}) {
-					modules, err := modulesRes()
-					if err != nil {
-						return fmt.Errorf("get modules list: %w", err)
-					}
+		return nil
+	}
 
-					var hephPkg string
-					for _, module := range modules {
-						if rest, ok := strings.CutPrefix(imp, module.Path); ok {
-							hephPkg = tref.JoinPackage(module.HephPackage, strings.TrimLeft(rest, "/"))
-							break
-						}
-					}
+	var doTheMagicForHephPackage func(pkg string) error
+	doTheMagicForHephPackage = func(pkg string) error {
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
+		if err != nil {
+			return fmt.Errorf("get pkg: %w", err)
+		}
 
-					if hephPkg == "" {
-						return fmt.Errorf("no module found")
-					}
+		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
+			return nil
+		}
+		seen.Set(goPkg.ImportPath, struct{}{})
 
-					g.Go(func() error {
-						return doTheMagicForHephPackage(hephPkg)
-					})
-				}
+		for _, imp := range goPkg.Imports {
+			if _, ok := seen.GetOk(imp); ok {
+				continue
 			}
+
+			g.Go(func() error {
+				return doTheMagicForImportPath(imp)
+			})
 		}
 
 		return nil
