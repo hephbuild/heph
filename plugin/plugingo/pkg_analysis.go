@@ -236,52 +236,6 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 	return goPkgs, nil
 }
 
-func (p *Plugin) goFindPkg(ctx context.Context, pkg, imp string, factors Factors) (Package, error) {
-	stdList, err := p.resultStdList(ctx, factors)
-	if err != nil {
-		return Package{}, fmt.Errorf("get stdlib list: %w", err)
-	}
-
-	artifacts, _, err := p.goListPkg(ctx, pkg, factors, false, true, imp)
-	if err != nil {
-		return Package{}, fmt.Errorf("go list: %w", err)
-	}
-
-	outputArtifacts := hartifact.FindOutputs(artifacts, "")
-
-	if len(outputArtifacts) == 0 {
-		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no output found"))
-	}
-
-	outputArtifact := outputArtifacts[0]
-
-	f, err := hartifact.TarFileReader(ctx, outputArtifact)
-	if err != nil {
-		return Package{}, err
-	}
-	defer f.Close()
-
-	var goPkg Package
-	err = json.NewDecoder(f).Decode(&goPkg.Package)
-	if err != nil {
-		return Package{}, err
-	}
-
-	stdPkg, ok := hslices.Find(stdList, func(p Package) bool {
-		return p.ImportPath == goPkg.ImportPath
-	})
-	if ok {
-		goPkg = stdPkg
-	} else {
-		goPkg.HephPackage, err = tref.DirToPackage(goPkg.Dir, p.root)
-		if err != nil {
-			return Package{}, err
-		}
-	}
-
-	return goPkg, nil
-}
-
 func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 	pkgParts := tref.SplitPackage(pkg)
 
@@ -316,7 +270,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 			break
 		}
 
-		pkgParts = pkgParts[:len(pkgParts)-2]
+		pkgParts = pkgParts[:len(pkgParts)-1]
 	}
 
 	if gomod == "" || gomodPkg == "" {

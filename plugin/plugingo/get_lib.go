@@ -27,10 +27,12 @@ func (p *Plugin) packageLibInner(ctx context.Context, goPkg Package, factors Fac
 		`echo > importconfig`,
 	}
 	imports := make([]Package, len(goPkg.Imports))
+	c := p.newGetGoPackageCache(ctx, goPkg.HephPackage, factors)
+
 	var g errgroup.Group
 	for i, imp := range goPkg.Imports {
 		g.Go(func() error {
-			impGoPkg, err := p.goFindPkg(ctx, goPkg.HephPackage, imp, factors)
+			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
 			if err != nil {
 				return err
 			}
