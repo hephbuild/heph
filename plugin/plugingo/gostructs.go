@@ -38,6 +38,7 @@ type ModuleError struct {
 type Package struct {
 	build.Package
 	Module           *Module
+	Deps             []string
 	HephPackage      string
 	HephBuildPackage string
 	IsStd            bool

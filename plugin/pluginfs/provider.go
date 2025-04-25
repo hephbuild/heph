@@ -1,13 +1,10 @@
 package pluginfs
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
-	"strings"
-
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -51,7 +48,7 @@ func (p *Provider) List(ctx context.Context, req *connect.Request[pluginv1.ListR
 }
 
 func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	rest, ok := strings.CutPrefix(req.Msg.GetRef().GetPackage(), "@heph/file/")
+	rest, ok := tref.CutPackagePrefix(req.Msg.GetRef().GetPackage(), "@heph/file")
 	if !ok {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
@@ -61,7 +58,7 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 			Ref: tref.WithDriver(req.Msg.GetRef(), "sh"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v $OUT", rest)),
-				"out": structpb.NewStringValue(filepath.Base(rest)),
+				"out": structpb.NewStringValue("."),
 			},
 		},
 	}), nil

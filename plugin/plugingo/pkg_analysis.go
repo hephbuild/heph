@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/hsync"
-	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
@@ -26,8 +25,8 @@ import (
 	"github.com/hephbuild/heph/internal/hartifact"
 )
 
-func (p *Plugin) goListPkgResult(ctx context.Context, pkg, imp string, factors Factors) (Package, error) {
-	artifacts, _, err := p.goListPkg(ctx, pkg, factors, false, false, imp)
+func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors) (Package, error) {
+	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp)
 	if err != nil {
 		return Package{}, fmt.Errorf("go list: %w", err)
 	}
@@ -63,8 +62,8 @@ func (p *Plugin) goListPkgResult(ctx context.Context, pkg, imp string, factors F
 		modPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
 		modPath = strings.TrimPrefix(modPath, "/")
 
-		goPkg.HephPackage = ThirdpartyBuildPackage(pkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
-		goPkg.HephBuildPackage = ThirdpartyBuildPackage(pkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+		goPkg.HephPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+		goPkg.HephBuildPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
 		fmt.Print()
 	} else {
 		goPkg.HephPackage = relPkg
@@ -108,7 +107,7 @@ func ParseThirdpartyPackage(pkg string) (string, string, string, string, bool) {
 
 func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, factors Factors) (Package, error) {
 	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(pkg); ok {
-		goPkg, err := p.goListPkgResult(ctx, basePkg, path.Join(modPath, modPkgPath), factors)
+		goPkg, err := p.goListPkgResult(ctx, basePkg, basePkg, path.Join(modPath, modPkgPath), factors)
 		if err != nil {
 			return Package{}, fmt.Errorf("thirdparty: %w", err)
 		}
@@ -118,6 +117,11 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		}
 
 		return goPkg, nil
+	}
+
+	gomod, _, err := p.getGoModGoWork(ctx, pkg)
+	if err != nil {
+		return Package{}, err
 	}
 
 	stdList, err := p.resultStdList(ctx, factors)
@@ -132,7 +136,7 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return stdPkg, nil
 	}
 
-	goPkg, err := p.goListPkgResult(ctx, pkg, ".", factors)
+	goPkg, err := p.goListPkgResult(ctx, tref.DirPackage(gomod), pkg, ".", factors)
 	if err != nil {
 		return Package{}, fmt.Errorf("in tree: %w", err)
 	}
@@ -168,7 +172,7 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 
 	if hephPkg == "" {
 		// Attempt to download 3rdparty package
-		goPkg, err := p.goListPkgResult(ctx, c.basePkg, imp, factors)
+		goPkg, err := p.goListPkgResult(ctx, c.basePkg, c.basePkg, imp, factors)
 		if err != nil {
 			return Package{}, err
 		}
@@ -180,7 +184,38 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 }
 
 func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
-	seen := hmaps.Sync[string, struct{}]{}
+	goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
+	if err != nil {
+		return nil, fmt.Errorf("get pkg: %w", err)
+	}
+
+	goPkgs := make([]Package, len(goPkg.Deps))
+	var g errgroup.Group
+
+	for i, imp := range goPkg.Deps {
+		g.Go(func() error {
+			goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
+			if err != nil {
+				return fmt.Errorf("get pkg: %w", err)
+			}
+
+			goPkgs[i] = goPkg
+
+			return nil
+		})
+	}
+
+	err = g.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	return goPkgs, nil
+}
+
+func (p *Plugin) goListDepsPkgResult2(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
+	seenImp := hmaps.Sync[string, struct{}]{}
+	seenPkg := hmaps.Sync[string, struct{}]{}
 	pkgsm := hmaps.Sync[string, Package]{}
 
 	var g errgroup.Group
@@ -198,7 +233,7 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 
 	var doTheMagicForImportPath func(imp string) error
 	doTheMagicForImportPath = func(imp string) error {
-		if !seen.SetOk(imp, struct{}{}) {
+		if !seenImp.SetOk(imp, struct{}{}) {
 			return nil
 		}
 
@@ -207,12 +242,16 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 			return fmt.Errorf("get pkg: %w", err)
 		}
 
+		if !seenPkg.SetOk(goPkg.HephPackage, struct{}{}) {
+			return nil
+		}
+
 		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
 			return nil
 		}
 
 		for _, imp := range goPkg.Imports {
-			if _, ok := seen.GetOk(imp); ok {
+			if _, ok := seenImp.GetOk(imp); ok {
 				continue
 			}
 
@@ -226,18 +265,25 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 
 	var doTheMagicForHephPackage func(pkg string) error
 	doTheMagicForHephPackage = func(pkg string) error {
+		if !seenPkg.SetOk(pkg, struct{}{}) {
+			return nil
+		}
+
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
 		if err != nil {
 			return fmt.Errorf("get pkg: %w", err)
 		}
 
+		if !seenImp.SetOk(goPkg.ImportPath, struct{}{}) {
+			return nil
+		}
+
 		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
 			return nil
 		}
-		seen.Set(goPkg.ImportPath, struct{}{})
 
 		for _, imp := range goPkg.Imports {
-			if _, ok := seen.GetOk(imp); ok {
+			if _, ok := seenImp.GetOk(imp); ok {
 				continue
 			}
 
@@ -345,9 +391,6 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 					Driver:  "sh",
 				},
 				Config: map[string]*structpb.Value{
-					"env": hstructpb.NewMapStringStringValue(map[string]string{
-						"HEPH_HASH": hinstance.Hash(),
-					}),
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 					"run":              structpb.NewStringValue("go list -m -json > $OUT"),
 					"out":              structpb.NewStringValue("golist_mod.json"),

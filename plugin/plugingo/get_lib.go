@@ -64,17 +64,22 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 	}
 
 	var extra string
-	// if abi != "" { // if (asm pure)
-	//	extra += " -symabis $SRC_ABI -asmhdr $SRC_ABI_H"
-	//}
 
 	if len(goPkg.EmbedPatterns) > 0 {
+		deps["embed"] = append(deps["embed"], tref.Format(&pluginv1.TargetRef{
+			Package: goPkg.GetHephBuildPackage(),
+			Name:    "embedcfg",
+			Args:    factors.Args(),
+		}))
+
 		extra += " -embedcfg $SRC_EMBED"
 	}
 
-	if true { // if !(asm pure)
-		extra += " -complete"
-	}
+	// if abi != "" { // if (asm pure)
+	//	extra += " -symabis $SRC_ABI -asmhdr $SRC_ABI_H"
+	//} else {
+	extra += " -complete"
+	//}
 
 	if goPkg.Is3rdParty {
 		deps["src"] = append(deps["src"], tref.Format(&pluginv1.TargetRef{
@@ -83,6 +88,10 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 			Args:    factors.Args(),
 		}))
 	} else {
+		if len(goPkg.GoFiles) == 0 {
+			return nil, fmt.Errorf("empty go file")
+		}
+
 		for _, file := range goPkg.GoFiles {
 			deps["src"] = append(deps["src"], tref.Format(&pluginv1.TargetRef{
 				Package: tref.JoinPackage("@heph/file", goPkg.HephPackage, file),

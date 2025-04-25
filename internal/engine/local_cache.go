@@ -187,14 +187,14 @@ func (e *Engine) resultFromLocalCacheInner(
 		l := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName, false)
 		err := l.RLock(ctx)
 		if err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("flock manifest: %w", err)
 		}
 		locks.Add(l.RUnlock)
 	}
 
 	manifest, err := hartifact.ManifestFromFS(dirfs)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("ManifestFromFS: %w", err)
 	}
 
 	var artifacts []hartifact.ManifestArtifact
@@ -208,7 +208,7 @@ func (e *Engine) resultFromLocalCacheInner(
 		l := hlocks.NewFlock2(dirfs, "", artifact.Name, false)
 		err := l.RLock(ctx)
 		if err != nil {
-			return nil, false, err
+			return nil, false, fmt.Errorf("flock artifact: %w", err)
 		}
 		locks.Add(l.RUnlock)
 	}
@@ -229,7 +229,7 @@ func (e *Engine) resultFromLocalCacheInner(
 
 	manifestArtifact, err := hartifact.NewManifestArtifact(dirfs, manifest)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("NewManifestArtifact: %w", err)
 	}
 
 	execArtifacts = append(execArtifacts, ExecuteResultArtifact{

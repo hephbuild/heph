@@ -3,23 +3,33 @@ package hlocks
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/flock"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hfs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/hephbuild/heph/internal/flock"
-	"github.com/hephbuild/heph/internal/hcore/hlog"
-	"github.com/hephbuild/heph/internal/hfs"
+	"weak"
 )
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
 	if name == "" {
 		name = path
 	}
-	return &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
+	l := &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
+	runtime.AddCleanup(l, func(lp weak.Pointer[Flock]) {
+		if lp := lp.Value(); lp != nil {
+			if f := l.f; f != nil {
+				panic(fmt.Sprintf("Flock is being freed, but underlying lock is stil held: %v", f.Name()))
+			}
+		}
+	}, weak.Make(l))
+
+	return l
 }
 
 func NewFlock(fs hfs.OS, name, path string) *Flock {
@@ -47,12 +57,12 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 		defer l.m.Unlock()
 	}
 
-	err := l.fs.MkdirAll(filepath.Dir(l.path), hfs.ModePerm)
-	if err != nil {
-		return false, err
-	}
-
 	if l.allowCreate {
+		err := l.fs.MkdirAll(filepath.Dir(l.path), hfs.ModePerm)
+		if err != nil {
+			return false, err
+		}
+
 		fhow |= os.O_CREATE
 	}
 
