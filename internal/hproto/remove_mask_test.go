@@ -1,6 +1,7 @@
 package hproto
 
 import (
+	"github.com/hephbuild/heph/internal/hmaps"
 	"testing"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -24,7 +25,7 @@ func TestRemoveMasked(t *testing.T) {
 		}},
 	}
 
-	m2, err := RemoveMasked(m, []string{"excluded", "nested.excluded", "repeated_nested.excluded"})
+	m2, err := RemoveMasked(m, hmaps.Keyed([]string{"excluded", "nested.excluded", "repeated_nested.excluded"}))
 	require.NoError(t, err)
 
 	b, err := protojson.Marshal(m2)
@@ -35,6 +36,6 @@ func TestRemoveMasked(t *testing.T) {
 func TestRemoveNil(t *testing.T) {
 	m := &hprotov1.Sample{}
 
-	_, err := RemoveMasked(m, []string{"excluded", "nested.excluded", "repeated_nested.excluded"})
+	_, err := RemoveMasked(m, hmaps.Keyed([]string{"excluded", "nested.excluded", "repeated_nested.excluded"}))
 	require.NoError(t, err)
 }

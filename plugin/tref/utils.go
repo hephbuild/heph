@@ -88,6 +88,16 @@ func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
 	return ref
 }
 
+func WithArgs(ref *pluginv1.TargetRef, m map[string]string) *pluginv1.TargetRef {
+	if len(m) == 0 && len(ref.Args) == 0 {
+		return ref
+	}
+
+	ref = hproto.Clone(ref)
+	ref.Args = m
+	return ref
+}
+
 func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutput {
 	return &pluginv1.TargetRefWithOutput{
 		Package: ref.GetPackage(),

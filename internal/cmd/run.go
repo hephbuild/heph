@@ -34,7 +34,22 @@ func init() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			ref, err := tref.Parse(args[0])
+			cwd, err := engine.Cwd()
+			if err != nil {
+				return err
+			}
+
+			root, err := engine.Root()
+			if err != nil {
+				return err
+			}
+
+			cwp, err := tref.DirToPackage(cwd, root)
+			if err != nil {
+				return err
+			}
+
+			ref, err := tref.ParseInPackage(args[0], cwp)
 			if err != nil {
 				return err
 			}
@@ -47,11 +62,6 @@ func init() {
 			defer stop()
 
 			err = termui.NewInteractive(ctx, func(ctx context.Context, m termui.Model, send func(tea.Msg)) error {
-				root, err := engine.Root()
-				if err != nil {
-					return err
-				}
-
 				e, err := engine.New(ctx, root, engine.Config{})
 				if err != nil {
 					return err

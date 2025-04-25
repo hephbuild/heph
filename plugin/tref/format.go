@@ -2,10 +2,14 @@ package tref
 
 import (
 	"fmt"
+	cache "github.com/Code-Hex/go-generics-cache"
+	"github.com/Code-Hex/go-generics-cache/policy/lfu"
 	"github.com/hephbuild/heph/internal/hmaps"
-	"strings"
-
+	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/zeebo/xxh3"
+	"strings"
+	"sync"
 )
 
 type Ref = pluginv1.TargetRef
@@ -26,7 +30,24 @@ type RefableOut interface {
 	GetOutput() string
 }
 
+var m = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
+
 func Format(ref Refable) string {
+	if refh, ok := ref.(hproto.Hashable); ok {
+		h := xxh3.New()
+		refh.HashPB(h, nil)
+
+		sum := h.Sum64()
+
+		f, _ := m.GetOrSet(sum, sync.OnceValue(func() string { return format(ref) }))
+
+		return f()
+	}
+
+	return format(ref)
+}
+
+func format(ref Refable) string {
 	var sb strings.Builder
 	sb.WriteString("//")
 	sb.WriteString(ref.GetPackage())

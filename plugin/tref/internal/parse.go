@@ -91,7 +91,11 @@ func LexDebug(s string, out bool) {
 	fmt.Println(buf.String())
 }
 
-func Parse(s string) (*Ref, error) {
+func Parse(s, pkg string, optPkg bool) (*Ref, error) {
+	if optPkg && strings.HasPrefix(s, ":") {
+		s = "//" + pkg + s
+	}
+
 	return parser.ParseString("", s)
 }
 

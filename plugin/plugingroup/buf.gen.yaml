@@ -9,5 +9,10 @@ plugins:
   - remote: buf.build/protocolbuffers/go
     out: gen
     opt: paths=source_relative
+  - local: ["go", "run", "github.com/cerbos/protoc-gen-go-hashpb"]
+    out: gen
+    opt:
+      - paths=source_relative
+      - hashpb_out=.
 inputs:
   - directory: proto

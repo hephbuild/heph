@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,8 +19,6 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/hephbuild/heph/plugin/tref"
-
-	"github.com/hephbuild/heph/internal/hproto"
 
 	"connectrpc.com/connect"
 	"github.com/dlsniper/debugger"
@@ -213,6 +212,12 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 }
 
 func (e *Engine) innerResultWithSideEffects(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+	//if len(outputs) == 0 {
+	//	outputs = nil
+	//}
+	//res, err, _ := rc.memRun.Do(tref.Format(c.GetRef())+fmt.Sprint(outputs), func() (*ExecuteResult, error) {
+	//	return e.innerResult(ctx, c, outputs, options, rc)
+	//})
 	res, err := e.innerResult(ctx, c, outputs, options, rc)
 	if err != nil {
 		return nil, err
@@ -294,31 +299,25 @@ func (e *Engine) innerResult(ctx context.Context, c DefContainer, outputs []stri
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
 	// h := newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
 	h := xxh3.New()
-	writeProto := func(v proto.Message) error {
-		return stableProtoHashEncode(h, v)
+	writeProto := func(v proto.Message, ignore map[string]struct{}) error {
+		return stableProtoHashEncode(h, v, ignore)
 	}
 
-	err := writeProto(def.Ref)
+	err := writeProto(def.Ref, nil)
 	if err != nil {
 		return "", err
 	}
 
-	defHash := def.Def
-	if ignoreFromHash := e.DriversConfig[def.Ref.GetDriver()].GetIgnoreFromHash(); len(ignoreFromHash) > 0 {
-		defHash, err = hproto.RemoveMasked(defHash, ignoreFromHash)
-		if err != nil {
-			return "", err
-		}
-	}
+	ignoreFromHash := e.DriversConfig[def.Ref.GetDriver()].GetIgnoreFromHash()
 
-	err = writeProto(defHash)
+	err = writeProto(def.Def, hmaps.Keyed(ignoreFromHash))
 	if err != nil {
 		return "", err
 	}
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		err = writeProto(result.Origin.GetRef())
+		err = writeProto(result.Origin.GetRef(), nil)
 		if err != nil {
 			return "", err
 		}

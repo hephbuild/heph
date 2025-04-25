@@ -38,6 +38,12 @@ func (m *Sync[K, V]) Set(k K, v V) {
 }
 
 func (m *Sync[K, V]) SetOk(k K, v V) bool {
+	_, ok := m.SetOkV(k, v)
+
+	return ok
+}
+
+func (m *Sync[K, V]) SetOkV(k K, v V) (V, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -45,14 +51,20 @@ func (m *Sync[K, V]) SetOk(k K, v V) bool {
 		m.m = map[K]V{}
 	}
 
-	_, ok := m.m[k]
-	if ok {
-		return false
+	if v, ok := m.m[k]; ok {
+		return v, false
 	}
 
 	m.m[k] = v
 
-	return true
+	return v, true
+}
+
+func (m *Sync[K, V]) Delete(k K) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	delete(m.m, k)
 }
 
 func (m *Sync[K, V]) Values() iter.Seq[V] {

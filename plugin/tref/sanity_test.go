@@ -33,6 +33,27 @@ func TestSanity(t *testing.T) {
 	}
 }
 
+func TestSanityInPackage(t *testing.T) {
+	tests := []struct {
+		ref      string
+		expected string
+	}{
+		{"//:name", "//:name"},
+		{":name", "//some/pkg:name"},
+	}
+	for _, test := range tests {
+		t.Run(test.ref, func(t *testing.T) {
+			internal.LexDebug(test.ref, false)
+
+			actual, err := ParseInPackage(test.ref, "some/pkg")
+			require.NoError(t, err)
+
+			fmted := Format(actual)
+			require.Equal(t, test.expected, fmted)
+		})
+	}
+}
+
 func TestSanityOut(t *testing.T) {
 	tests := []struct {
 		ref string

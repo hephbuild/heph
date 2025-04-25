@@ -2,7 +2,7 @@ package hproto
 
 import (
 	"fmt"
-	"slices"
+	"hash"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
@@ -10,6 +10,11 @@ import (
 	"google.golang.org/protobuf/reflect/protorange"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
+
+// match https://github.com/cerbos/protoc-gen-go-hashpb/blob/db0168880c5d9ad459ff3be9157f7f4eac77412c/internal/generator/generator_test.go#L24
+type Hashable interface {
+	HashPB(hash.Hash, map[string]struct{})
+}
 
 func Clone[T proto.Message](m T) T {
 	return proto.Clone(m).(T) //nolint:errcheck
@@ -31,11 +36,11 @@ func protoPathValueToDotPath(p protopath.Values) string {
 	return strings.Join(segments, ".")
 }
 
-func RemoveMasked[T proto.Message](m T, paths []string) (T, error) {
+func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	m = Clone(m)
 
 	err := protorange.Range(m.ProtoReflect(), func(p protopath.Values) error {
-		if !slices.Contains(paths, protoPathValueToDotPath(p)) {
+		if _, ok := paths[protoPathValueToDotPath(p)]; !ok {
 			return nil
 		}
 

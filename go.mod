@@ -2,6 +2,8 @@ module github.com/hephbuild/heph
 
 go 1.23.0
 
+tool github.com/cerbos/protoc-gen-go-hashpb
+
 replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20241227212548-ff79c9f0edc9
 
 require (
@@ -47,6 +49,7 @@ require (
 require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
+	github.com/cerbos/protoc-gen-go-hashpb v0.3.7 // indirect
 	github.com/charmbracelet/x/ansi v0.6.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect

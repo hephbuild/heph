@@ -22,18 +22,27 @@ import (
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
-func Root() (string, error) {
-	var err error
+func Cwd() (string, error) {
 	cwd := os.Getenv("HEPH_CWD")
 
 	if cwd == "" {
+		var err error
 		cwd, err = os.Getwd()
 		if err != nil {
 			return "", err
 		}
 	}
 
-	cwd, err = filepath.Abs(cwd)
+	cwd, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+
+	return cwd, nil
+}
+
+func Root() (string, error) {
+	cwd, err := Cwd()
 	if err != nil {
 		return "", err
 	}

@@ -24,7 +24,7 @@ import (
 func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (string, error) {
 	h := xxh3.New()
 	writeProto := func(v proto.Message) error {
-		return stableProtoHashEncode(h, v)
+		return stableProtoHashEncode(h, v, nil)
 	}
 
 	err := writeProto(artifact)

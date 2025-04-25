@@ -18,6 +18,8 @@ github.com/bmatcuk/doublestar/v4 v4.7.1 h1:fdDeAqgT47acgwd9bd9HxJRDmc9UAmPpc+2m0
 github.com/bmatcuk/doublestar/v4 v4.7.1/go.mod h1:xBQ8jztBU6kakFMg+8WGxn0c6z1fTSPVIjEY1Wr7jzc=
 github.com/cenkalti/backoff/v4 v4.3.0 h1:MyRJ/UdXutAwSAT+s3wNd7MfTIcy71VQueUuFK343L8=
 github.com/cenkalti/backoff/v4 v4.3.0/go.mod h1:Y3VNntkOUPxTVeUxJ/G5vcM//AlwfmyYozVcomhLiZE=
+github.com/cerbos/protoc-gen-go-hashpb v0.3.7 h1:8d77DeoO7YdYxkzi0YfDaPLHKTbLxHVzroQ/dhVjn9Q=
+github.com/cerbos/protoc-gen-go-hashpb v0.3.7/go.mod h1:3jSMwjx4jeOHvtSs/Kgh9Q1Whc6eziTLbeZoU++lvLY=
 github.com/charmbracelet/lipgloss v1.0.0 h1:O7VkGDvqEdGi93X+DeqsQ7PKHDgtQfF8j8/O2qFMQNg=
 github.com/charmbracelet/lipgloss v1.0.0/go.mod h1:U5fy9Z+C38obMs+T+tJqst9VGzlOYGj4ri9reL3qUlo=
 github.com/charmbracelet/x/ansi v0.6.0 h1:qOznutrb93gx9oMiGf7caF7bqqubh6YIM0SWKyA08pA=

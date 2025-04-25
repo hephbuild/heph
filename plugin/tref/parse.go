@@ -20,8 +20,16 @@ func argsToProto(args []internal.Arg) map[string]string {
 	return margs
 }
 
+func ParseInPackage(s, pkg string) (*pluginv1.TargetRef, error) {
+	return parse(s, pkg, true)
+}
+
 func Parse(s string) (*pluginv1.TargetRef, error) {
-	res, err := internal.Parse(s)
+	return parse(s, "", false)
+}
+
+func parse(s, pkg string, optPkg bool) (*pluginv1.TargetRef, error) {
+	res, err := internal.Parse(s, pkg, optPkg)
 	if err != nil {
 		return nil, err
 	}

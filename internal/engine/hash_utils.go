@@ -2,7 +2,8 @@ package engine
 
 import (
 	"encoding/json"
-	"io"
+	"github.com/hephbuild/heph/internal/hproto"
+	"hash"
 	"os"
 	"path/filepath"
 	"time"
@@ -54,7 +55,18 @@ func (h hashWithDebug) Write(p []byte) (int, error) {
 }
 
 // TODO: this is pretty damn inefficient, but at least its stable
-func stableProtoHashEncode(w io.Writer, v proto.Message) error {
+func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struct{}) error {
+	if v, ok := v.(hproto.Hashable); ok {
+		v.HashPB(w, ignore)
+
+		return nil
+	}
+
+	v, err := hproto.RemoveMasked(v, ignore)
+	if err != nil {
+		return err
+	}
+
 	b, err := protojson.Marshal(v)
 	if err != nil {
 		return err

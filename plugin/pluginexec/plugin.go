@@ -64,15 +64,16 @@ func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeReq
 }
 
 func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
-	desc := protodesc.ToDescriptorProto((&execv1.Target{}).ProtoReflect().Descriptor())
+	desc := (&execv1.Target{}).ProtoReflect().Descriptor()
+	pdesc := protodesc.ToDescriptorProto(desc)
 
 	return connect.NewResponse(&pluginv1.ConfigResponse{
 		Name:         p.name,
-		TargetSchema: desc,
+		TargetSchema: pdesc,
 		IgnoreFromHash: []string{
-			"runtime_deps",
-			"runtime_env",
-			"runtime_pass_env",
+			string(desc.FullName()) + ".runtime_deps",
+			string(desc.FullName()) + ".runtime_env",
+			string(desc.FullName()) + ".runtime_pass_env",
 		},
 	}), nil
 }
