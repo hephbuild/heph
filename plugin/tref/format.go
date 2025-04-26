@@ -32,6 +32,14 @@ type RefableOut interface {
 
 var m = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
 
+func FormatFile(pkg string, file string) string {
+	return Format(&pluginv1.TargetRef{
+		Package: JoinPackage("@heph/file", pkg),
+		Name:    "content",
+		Args:    map[string]string{"f": file},
+	})
+}
+
 func Format(ref Refable) string {
 	if refh, ok := ref.(hproto.Hashable); ok {
 		h := xxh3.New()

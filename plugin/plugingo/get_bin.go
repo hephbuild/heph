@@ -61,9 +61,10 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 			},
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        factors.GOOS,
-					"GOARCH":      factors.GOARCH,
-					"CGO_ENABLED": "0",
+					"GOOS":               factors.GOOS,
+					"GOARCH":             factors.GOARCH,
+					"CGO_ENABLED":        "0",
+					"GO_EXTLINK_ENABLED": "0",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run":              hstructpb.NewStringsValue(run),

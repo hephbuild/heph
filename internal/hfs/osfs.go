@@ -52,8 +52,24 @@ func (osfs OS) Stat(name string) (FileInfo, error) {
 	return os.Stat(osfs.join(name))
 }
 
+type wrapOsInfo struct {
+	os.FileInfo
+	name string
+}
+
+// os.FileInfo.Name() returns the base name of the file, while os.File.Name() returns the full path.
+func (i wrapOsInfo) Name() string {
+	return i.name
+}
+
 func (osfs OS) Lstat(name string) (FileInfo, error) {
-	return os.Lstat(osfs.join(name))
+	path := osfs.join(name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapOsInfo{FileInfo: info, name: path}, err
 }
 
 func (osfs OS) Open(name string, flag int, perm FileMode) (File, error) {

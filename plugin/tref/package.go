@@ -47,6 +47,10 @@ func DirPackage(s string) string {
 	return path.Dir(s)
 }
 
+func BasePackage(s string) string {
+	return path.Base(s)
+}
+
 func HasPackagePrefix(pkg, prefix string) bool {
 	return pkg == prefix || strings.HasPrefix(pkg, prefix+"/")
 }

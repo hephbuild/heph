@@ -61,3 +61,11 @@ func (p Package) GetHephBuildPackage() string {
 
 	return p.HephPackage
 }
+
+func (p Package) GetBuildImportPath() string {
+	if p.IsCommand() {
+		return MainPackage
+	} else {
+		return p.ImportPath
+	}
+}

@@ -12,8 +12,7 @@ func (g *Group[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 	sf := (*singleflight.Group)(g)
 
 	vi, err, shared := sf.Do(key, func() (interface{}, error) {
-		v, err := do()
-		return v, err
+		return do()
 	})
 
 	var v T

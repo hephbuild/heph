@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"io"
 	"os"
 	"os/exec"
@@ -66,6 +67,10 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		cwdfs = hfs.At(hfs.NewOS(req.Msg.GetTreeRootPath()), req.Msg.GetTarget().GetRef().GetPackage())
 	}
 
+	if tref.Format(req.Msg.Target.Ref) == "//go/mod-asm2/@heph/go/thirdparty/google.golang.org/grpc@v1.57.0/internal/grpclog:build_lib@arch=amd64,os=linux" {
+		fmt.Print()
+	}
+
 	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
 	if err != nil {
 		return nil, err
@@ -73,7 +78,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, t.GetDeps())
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()))
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +129,8 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	if !hfs.Exists(cwdfs, "") {
 		return nil, fmt.Errorf("cwd not found: %v", cwdfs.Path())
 	}
+
+	env = append(env, "SHELLOPTS=")
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
@@ -309,22 +316,31 @@ func (p *Plugin) inputEnv(
 
 		for depName, dep := range deps {
 			for _, target := range dep.GetTargets() {
-				if tref.Equal(tref.WithoutOut(target), tref.WithoutOut(ref)) {
-					allOutput := target.Output == nil
-
-					var outputName string
-					if allOutput {
-						outputName = input.GetArtifact().GetGroup()
-					}
-
-					envName := getEnvName("SRC", depName, outputName)
-
-					m[envName] = append(m[envName], input.GetArtifact())
+				if !tref.Equal(tref.WithoutOut(target), tref.WithoutOut(ref)) {
+					continue
 				}
+
+				allOutput := target.Output == nil
+
+				if !allOutput {
+					if input.GetArtifact().GetGroup() != target.GetOutput() {
+						continue
+					}
+				}
+
+				var outputName string
+				if allOutput {
+					outputName = input.GetArtifact().GetGroup()
+				}
+
+				envName := getEnvName("SRC", depName, outputName)
+
+				m[envName] = append(m[envName], input.GetArtifact())
 			}
 		}
 	}
 
+	seenFiles := map[string]struct{}{}
 	env := make([]string, 0, len(m))
 	var sb strings.Builder
 	for name, artifacts := range m {
@@ -336,16 +352,22 @@ func (p *Plugin) inputEnv(
 				return nil, err
 			}
 
-			incomingValue := strings.ReplaceAll(string(b), "\n", " ")
+			lines := strings.Split(string(b), "\n")
+			for _, line := range lines {
+				if line == "" {
+					continue
+				}
 
-			if len(incomingValue) == 0 {
-				continue
-			}
+				if _, ok := seenFiles[line]; ok {
+					continue
+				}
+				seenFiles[line] = struct{}{}
 
-			if sb.Len() > 0 {
-				sb.WriteString(" ")
+				if sb.Len() > 0 {
+					sb.WriteString(" ")
+				}
+				sb.WriteString(line)
 			}
-			sb.WriteString(incomingValue)
 		}
 
 		env = append(env, getEnvEntryWithName(name, sb.String()))

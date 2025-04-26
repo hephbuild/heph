@@ -370,16 +370,10 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 	}
 
 	files := []string{
-		tref.Format(&pluginv1.TargetRef{
-			Package: tref.JoinPackage("@heph/file", gomod),
-			Name:    "content",
-		}),
+		tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)),
 	}
 	if gowork != "" {
-		files = append(files, tref.Format(&pluginv1.TargetRef{
-			Package: tref.JoinPackage("@heph/file", gowork),
-			Name:    "content",
-		}))
+		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gowork)))
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{

@@ -66,10 +66,10 @@ func TestDepsCache(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	assertOut := func(res *engine.ExecuteChResult) {
+	assertOut := func(res *engine.ExecuteResult) {
 		fs := hfstest.New(t)
 		err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs)
-		require.NoError(t, res.Err)
+		require.NoError(t, err)
 
 		b, err := hfs.ReadFile(fs, "out_parent")
 		require.NoError(t, err)
@@ -78,15 +78,15 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // This will run all
-		res := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
-		require.NoError(t, res.Err)
+		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
 
 		assertOut(res)
 	}
 
 	{ // this should reuse cache from deps
-		res := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{})
-		require.NoError(t, res.Err)
+		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
 
 		assertOut(res)
 	}

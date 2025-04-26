@@ -106,7 +106,7 @@ func init() {
 					}
 				}
 
-				res := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
+				res, err := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
 					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
 						_, err := hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
 							if iargs.Pty {
@@ -132,9 +132,8 @@ func init() {
 					Shell: shell,
 					Force: force,
 				}, engine.GlobalResolveCache)
-
-				if res.Err != nil {
-					return res.Err
+				if err != nil {
+					return err
 				}
 
 				outputs := res.Artifacts

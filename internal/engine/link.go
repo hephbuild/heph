@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"path"
 	"path/filepath"
 	"slices"
@@ -39,8 +40,10 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 }
 
 func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache, p Provider) (*pluginv1.TargetSpec, error) {
+	providerKey := p.Name
+
 	// TODO: caching must be smarter, probably package-based ?
-	specs, err, _ := rc.memSpecs.Do(tref.Format(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
+	specs, err, _ := rc.memSpecs.Do(providerKey+tref.Format(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
 		strm, err := p.GetSpecs(ctx, connect.NewRequest(&pluginv1.GetSpecsRequest{
 			Ref:    c.Ref,
 			States: states,
@@ -54,6 +57,8 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 		for strm.Receive() {
 			switch res := strm.Msg().GetOf().(type) {
 			case *pluginv1.GetSpecsResponse_Spec:
+				// TODO: what do we do if the spec.ref is different from the request ?
+
 				if !tref.Equal(res.Spec.GetRef(), c.GetRef()) {
 					rc.memRef.Set(tref.Format(res.Spec.GetRef()), res.Spec, nil)
 				}
@@ -81,15 +86,25 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 		}
 	}
 
-	res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
-		Ref:    c.GetRef(),
-		States: states,
-	}))
+	spec, err, _ := rc.memSpecGet.Do(providerKey+tref.Format(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+		res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
+			Ref:    c.GetRef(),
+			States: states,
+		}))
+		if err != nil {
+			return nil, err
+		}
+
+		return res.Msg.GetSpec(), nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	return res.Msg.GetSpec(), nil
+	// TODO: what do we do if the spec.ref is different from the request ?
+
+	return spec, nil
+
 }
 
 func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache) (*pluginv1.TargetSpec, error) {
@@ -125,6 +140,10 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 	})
 	if err != nil {
 		return nil, fmt.Errorf("resolve spec: %v: %w", tref.Format(c.GetRef()), err)
+	}
+
+	if !tref.Equal(spec.Ref, c.GetRef()) {
+		hlog.From(ctx).Warn(fmt.Sprintf("%v resolved as %v", tref.Format(c.GetRef()), tref.Format(spec.Ref)))
 	}
 
 	return spec, nil
@@ -218,9 +237,16 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 }
 
 type ResolveCache struct {
-	memSpecs hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
-	memRef   hsingleflight.GroupMem[*pluginv1.TargetSpec]
-	memProbe hsingleflight.GroupMem[[]*pluginv1.ProviderState]
+	memSpecs   hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
+	memSpecGet hsingleflight.GroupMem[*pluginv1.TargetSpec]
+	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]
+	memProbe   hsingleflight.GroupMem[[]*pluginv1.ProviderState]
+
+	memResult     hsingleflight.GroupMem[*ExecuteResult]
+	memLink       hsingleflight.GroupMem[*LightLinkedTarget]
+	memLocalCache hsingleflight.GroupMem[*ExecuteResult]
+	memExecute    hsingleflight.GroupMem[*ExecuteResult]
+	memDef        hsingleflight.GroupMem[*pluginv1.TargetDef]
 
 	correlationId  string
 	correlationIdm sync.Mutex
@@ -249,27 +275,31 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 		return c.Def, nil
 	}
 
-	spec, err := e.GetSpec(ctx, SpecContainer{
-		Ref:  c.Ref,
-		Spec: c.Spec,
-	}, rc)
-	if err != nil {
-		return nil, err
-	}
+	res, err, _ := rc.memDef.Do(tref.Format(c.GetRef()), func() (*pluginv1.TargetDef, error) {
+		spec, err := e.GetSpec(ctx, SpecContainer{
+			Ref:  c.Ref,
+			Spec: c.Spec,
+		}, rc)
+		if err != nil {
+			return nil, err
+		}
 
-	driver, ok := e.DriversByName[spec.GetRef().GetDriver()]
-	if !ok {
-		return nil, fmt.Errorf("driver %q doesnt exist", spec.GetRef().GetDriver())
-	}
+		driver, ok := e.DriversByName[spec.GetRef().GetDriver()]
+		if !ok {
+			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetRef().GetDriver())
+		}
 
-	res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
-		Spec: spec,
-	}))
-	if err != nil {
-		return nil, err
-	}
+		res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
+			Spec: spec,
+		}))
+		if err != nil {
+			return nil, err
+		}
 
-	return res.Msg.GetTarget(), nil
+		return res.Msg.GetTarget(), nil
+	})
+
+	return res, err
 }
 
 type LinkedTarget struct {
@@ -294,7 +324,7 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 	ctx, span := tracer.Start(ctx, "LightLink", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
-	step, ctx := hstep.New(ctx, "Linking...")
+	step, ctx := hstep.New(ctx, fmt.Sprintf("Linking %v...", tref.Format(c.GetRef())))
 	defer step.Done()
 
 	rc := GlobalResolveCache
@@ -350,6 +380,12 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 		}
 
 		linkedDep := depRefs.Get(tref.Format(tref.WithoutOut(ref)))
+
+		if dep.Ref.Output != nil {
+			if !slices.Contains(linkedDep.Outputs, dep.Ref.GetOutput()) {
+				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.Format(dep.Ref), dep.Ref.GetOutput())
+			}
+		}
 
 		var outputs []string
 		var allset bool

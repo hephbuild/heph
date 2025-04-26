@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/hephbuild/heph/plugin/tref"
@@ -151,36 +152,46 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	return cacheArtifacts, nil
 }
 
-func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
+func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
+	if len(outputs) == 0 {
+		outputs = nil
+	}
+	outputs = slices.Clone(outputs)
+	slices.Sort(outputs)
+	return tref.Format(ref) + fmt.Sprint(outputs)
+}
+
+func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rc *ResolveCache) (*ExecuteResult, bool, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromLocalCache")
 	defer span.End()
 
-	multi := hlocks.NewMulti()
+	res, err, _ := rc.memLocalCache.Do(keyRefOutputs(def.GetRef(), outputs)+hashin, func() (*ExecuteResult, error) {
+		multi := hlocks.NewMulti()
 
-	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
+		res, _, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
+		if err != nil {
+			if err := multi.UnlockAll(); err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
+			}
+
+			// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
+			if errors.Is(err, hfs.ErrNotExist) {
+				return nil, nil
+			}
+
+			return nil, err
+		}
+
+		return res, nil
+	})
 	if err != nil {
-		if err := multi.UnlockAll(); err != nil {
-			hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
-		}
-
-		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
-		if errors.Is(err, hfs.ErrNotExist) {
-			return nil, false, nil
-		}
-
 		return nil, false, err
 	}
 
-	return res, ok, nil
+	return res, res != nil, nil
 }
 
-func (e *Engine) resultFromLocalCacheInner(
-	ctx context.Context,
-	def *LightLinkedTarget,
-	outputs []string,
-	hashin string,
-	locks *hlocks.Multi,
-) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, locks *hlocks.Multi) (*ExecuteResult, bool, error) {
 	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
 
 	{

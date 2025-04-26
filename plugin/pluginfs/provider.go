@@ -53,11 +53,16 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
 
+	f := req.Msg.Ref.Args["f"]
+	if f == "" {
+		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("missing f argument"))
+	}
+
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: tref.WithDriver(req.Msg.GetRef(), "sh"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v $OUT", rest)),
+				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v/%v $OUT", rest, f)),
 				"out": structpb.NewStringValue("."),
 			},
 		},

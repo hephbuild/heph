@@ -27,20 +27,26 @@ var GlobalResolveCache = &ResolveCache{}
 func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[corev1.ResultRequest]) (*connect.Response[corev1.ResultResponse], error) {
 	rc := GlobalResolveCache
 
-	var res *ExecuteChResult
+	var res *ExecuteResult
+	var err error
 	switch kind := req.Msg.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
-		res = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{}, rc)
+		res, err = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{}, rc)
+		if err != nil {
+			return nil, err
+		}
 	case *corev1.ResultRequest_Def:
-		res = r.ResultFromDef(ctx, kind.Def, []string{AllOutputs}, ResultOptions{}, rc)
+		res, err = r.ResultFromDef(ctx, kind.Def, []string{AllOutputs}, ResultOptions{}, rc)
+		if err != nil {
+			return nil, err
+		}
 	case *corev1.ResultRequest_Spec:
-		res = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rc)
+		res, err = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rc)
+		if err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("unexpected message type: %T", kind)
-	}
-
-	if res.Err != nil {
-		return nil, res.Err
 	}
 
 	artifacts := make([]*pluginv1.Artifact, 0, len(res.Artifacts))

@@ -1,6 +1,8 @@
 module github.com/hephbuild/heph
 
-go 1.23.0
+go 1.24
+
+toolchain go1.24.2
 
 tool github.com/cerbos/protoc-gen-go-hashpb
 
@@ -23,6 +25,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-isatty v0.0.20
 	github.com/muesli/termenv v0.15.2
+	github.com/puzpuzpuz/xsync/v4 v4.0.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.10.0

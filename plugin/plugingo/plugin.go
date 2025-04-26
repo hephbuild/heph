@@ -103,7 +103,7 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		factors.GOARCH = "amd64"
 	}
 
-	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.Msg.GetRef().GetPackage()); ok && basePkg == "" && len(req.Msg.Ref.Args) == 0 {
+	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.Msg.GetRef().GetPackage()); ok && basePkg == "" {
 		switch req.Msg.GetRef().GetName() {
 		case "download":
 			if modPkgPath != "" {
@@ -112,7 +112,7 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 			return p.goModDownload(ctx, req.Msg.GetRef().GetPackage(), modPath, version)
 		case "content":
-			return p.goModContent(ctx, modPath, version, modPkgPath)
+			return p.goModContent(ctx, modPath, version, modPkgPath, req.Msg.GetRef().GetPackage(), req.Msg.GetRef().Args["f"])
 		}
 	}
 
@@ -141,18 +141,18 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}
 
 		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
-	case "content":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
-		if err != nil {
-			return nil, err
-		}
-
-		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
-		if err != nil {
-			return nil, err
-		}
-
-		return p.goModContentIn(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors)
+	//case "content":
+	//	goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//
+	//	gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//
+	//	return p.goModContentIn(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors, req.Msg.GetRef().Args["f"])
 	case "embedcfg":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -178,13 +178,31 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors)
 	case "build_lib#asm":
-		// return p.packageLibAsm(ctx, goPkg, factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageLibAsm(ctx, goPkg, factors, req.Msg.GetRef().Args["file"])
 	case "build_lib#abi":
-		// return p.packageLibAbi(ctx, goPkg, factors)
-	case "build_lib#pure":
-		// return p.packageLibAsmPure(ctx, goPkg, factors)
-	case "build_lib#embed":
-		// return p.packageLibEmbed(ctx, goPkg, factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageLibAbi(ctx, goPkg, factors)
+	case "build_lib#incomplete":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors)
 	}
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
@@ -201,11 +219,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 		if e.IsDir() {
 			continue
 		}
-
-		files = append(files, tref.Format(&pluginv1.TargetRef{
-			Package: tref.JoinPackage("@heph/file", pkg, e.Name()),
-			Name:    "content",
-		}))
+		files = append(files, tref.FormatFile(pkg, e.Name()))
 	}
 
 	var args map[string]string
