@@ -153,7 +153,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 		return nil, fmt.Errorf("empty go file")
 	}
 
-	deps["src"] = append(deps["src"], getFiles(factors, goPkg, goPkg.GoFiles)...)
+	deps["src"] = append(deps["src"], getFiles(goPkg, goPkg.GoFiles)...)
 
 	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, goPkg.GetBuildImportPath(), extra))
 
@@ -192,7 +192,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 	}), nil
 }
 
-func getFiles(factors Factors, goPkg Package, files []string) []string {
+func getFiles(goPkg Package, files []string) []string {
 	goPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
 	goPath = strings.TrimPrefix(goPath, "/")
 
@@ -220,7 +220,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 
 	deps := map[string][]string{}
 	for k, files := range map[string][]string{"": goPkg.SFiles, "hdr": goPkg.HFiles} {
-		deps[k] = append(deps[k], getFiles(factors, goPkg, files)...)
+		deps[k] = append(deps[k], getFiles(goPkg, files)...)
 	}
 
 	return connect.NewResponse(&pluginv1.GetResponse{
@@ -294,7 +294,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Facto
 						Name:    "build_lib#incomplete",
 						Args:    factors.Args(),
 					}, "h"))},
-					"asm": getFiles(factors, goPkg, []string{asmFile}),
+					"asm": getFiles(goPkg, []string{asmFile}),
 				}),
 			},
 		},

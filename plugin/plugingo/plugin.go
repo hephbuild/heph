@@ -141,18 +141,6 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}
 
 		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
-	//case "content":
-	//	goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//
-	//	gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//
-	//	return p.goModContentIn(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors, req.Msg.GetRef().Args["f"])
 	case "embedcfg":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {

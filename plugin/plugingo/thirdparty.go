@@ -4,7 +4,6 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -82,46 +81,6 @@ func (p *Plugin) goModContent(ctx context.Context, goMod, version, modPath, curr
 			})),
 			"run": hstructpb.NewStringsValue(run),
 			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
-		},
-	}}), nil
-}
-
-func (p *Plugin) goModContentIn(ctx context.Context, basePkg, currentPkg string, goPkg Package, factors Factors, file string) (*connect.Response[pluginv1.GetResponse], error) {
-	basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(currentPkg)
-	if !ok {
-		return nil, fmt.Errorf("invalid package")
-	}
-
-	var allFiles []string
-	args := factors.Args()
-	if file != "" {
-		allFiles = append(allFiles, file)
-		args = hmaps.Concat(args, map[string]string{"f": file})
-	} else {
-		allFiles = append(allFiles, goPkg.GoFiles...)
-		allFiles = append(allFiles, goPkg.SFiles...)
-	}
-
-	run := []string{}
-	for _, file := range allFiles {
-		run = append(run, fmt.Sprintf("mv $WORKDIR/%v/%v .", ThirdpartyContentPackage(modPath, version, modPkgPath), file))
-	}
-
-	return connect.NewResponse(&pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
-			Package: currentPkg,
-			Name:    "content",
-			Driver:  "sh",
-			Args:    args,
-		},
-		Config: map[string]*structpb.Value{
-			"out":   structpb.NewStringValue("."),
-			"cache": structpb.NewBoolValue(true),
-			"run":   hstructpb.NewStringsValue(run),
-			"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-				Package: ThirdpartyContentPackage(modPath, version, modPkgPath),
-				Name:    "content",
-			})),
 		},
 	}}), nil
 }
