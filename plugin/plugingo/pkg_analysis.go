@@ -271,8 +271,8 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 				Ref: &pluginv1.TargetRef{
 					Package: tref.DirPackage(gomod),
 					Name:    "_gomod",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 					"run":              structpb.NewStringValue("go list -m -json > $OUT"),

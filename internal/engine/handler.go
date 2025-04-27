@@ -35,11 +35,6 @@ func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[core
 		if err != nil {
 			return nil, err
 		}
-	case *corev1.ResultRequest_Def:
-		res, err = r.ResultFromDef(ctx, kind.Def, []string{AllOutputs}, ResultOptions{}, rc)
-		if err != nil {
-			return nil, err
-		}
 	case *corev1.ResultRequest_Spec:
 		res, err = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rc)
 		if err != nil {
@@ -56,6 +51,6 @@ func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[core
 
 	return connect.NewResponse(&corev1.ResultResponse{
 		Artifacts: artifacts,
-		Def:       res.Def.TargetDef,
+		Def:       res.Def.TargetDef.TargetDef,
 	}), nil
 }

@@ -8,7 +8,6 @@ message ResultRequest {
   oneof of {
     heph.plugin.v1.TargetRef ref = 1;
     heph.plugin.v1.TargetSpec spec = 2;
-    heph.plugin.v1.TargetDef def = 3;
   }
 }
 

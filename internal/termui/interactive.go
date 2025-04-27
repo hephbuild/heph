@@ -2,6 +2,7 @@ package termui
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"os"
 	"strings"
@@ -96,6 +97,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var sb strings.Builder
 
+	sb.WriteString(fmt.Sprintf("%v\n", len(m.steps)))
 	stepsTree := buildStepsTree(m.renderer, maps.Values(m.steps))
 	if m.height > 0 {
 		stepsTree = lipgloss.NewStyle().MaxHeight(m.height / 2).Render(stepsTree)

@@ -64,7 +64,7 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultArtifact) ([]ExecuteResultArtifact, error) {
 	// TODO: locks
 
-	cachedir := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
+	cachedir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
@@ -126,7 +126,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 
 	m := hartifact.Manifest{
 		Version:   "v1",
-		Target:    tref.Format(def.Ref),
+		Target:    tref.Format(def.GetRef()),
 		CreatedAt: time.Now(),
 		Hashin:    hashin,
 	}
@@ -192,7 +192,7 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 }
 
 func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, locks *hlocks.Multi) (*ExecuteResult, bool, error) {
-	dirfs := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
+	dirfs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
 	{
 		l := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName, false)

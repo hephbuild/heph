@@ -60,7 +60,8 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
-			Ref: tref.WithDriver(req.Msg.GetRef(), "sh"),
+			Ref:    req.Msg.GetRef(),
+			Driver: "sh",
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v/%v $OUT", rest, f)),
 				"out": structpb.NewStringValue("."),

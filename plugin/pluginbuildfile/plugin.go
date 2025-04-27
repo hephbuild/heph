@@ -407,8 +407,8 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		Ref: &pluginv1.TargetRef{
 			Package: payload.Package,
 			Name:    payload.Name,
-			Driver:  payload.Driver,
 		},
+		Driver: payload.Driver,
 		Config: config,
 	}
 

@@ -38,7 +38,7 @@ func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, output
 func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
 	codegenPaths := make([]string, 0, len(outputs))
 	for _, path := range def.CodegenTree.GetPaths() {
-		codegenPaths = append(codegenPaths, filepath.Join(def.Ref.GetPackage(), path))
+		codegenPaths = append(codegenPaths, filepath.Join(def.GetRef().GetPackage(), path))
 	}
 
 	isUnderCodegenPath := func(p string) bool {

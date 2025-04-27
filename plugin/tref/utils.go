@@ -9,9 +9,6 @@ import (
 )
 
 func Equal(a, b *pluginv1.TargetRef) bool {
-	a = WithDriver(a, "")
-	b = WithDriver(b, "")
-
 	return proto.Equal(a, b)
 }
 
@@ -55,16 +52,6 @@ func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
 	return 0
 }
 
-func WithDriver(ref *pluginv1.TargetRef, driver string) *pluginv1.TargetRef {
-	if ref.GetDriver() == driver {
-		return ref
-	}
-
-	ref = hproto.Clone(ref)
-	ref.Driver = driver
-	return ref
-}
-
 func WithName(ref *pluginv1.TargetRef, name string) *pluginv1.TargetRef {
 	if ref.GetName() == name {
 		return ref
@@ -102,7 +89,6 @@ func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutp
 	return &pluginv1.TargetRefWithOutput{
 		Package: ref.GetPackage(),
 		Name:    ref.GetName(),
-		Driver:  ref.GetDriver(),
 		Args:    ref.GetArgs(),
 		Output:  &output,
 	}
@@ -112,7 +98,6 @@ func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
 	return &pluginv1.TargetRef{
 		Package: ref.GetPackage(),
 		Name:    ref.GetName(),
-		Driver:  ref.GetDriver(),
 		Args:    ref.GetArgs(),
 	}
 }

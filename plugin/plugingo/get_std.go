@@ -22,7 +22,6 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package,
 			Ref: &pluginv1.TargetRef{
 				Package: "@heph/go/std",
 				Name:    "install",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
 		},
@@ -71,9 +70,9 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*connect.Resp
 			Ref: &pluginv1.TargetRef{
 				Package: "@heph/go/std",
 				Name:    "install",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,
@@ -106,9 +105,9 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 			Ref: &pluginv1.TargetRef{
 				Package: path.Join("@heph/go/std", goImport),
 				Name:    "build_lib",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":   factors.GOOS,

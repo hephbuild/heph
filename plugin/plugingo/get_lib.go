@@ -40,9 +40,9 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 				Ref: &pluginv1.TargetRef{
 					Package: goPkg.GetHephBuildPackage(),
 					Name:    "build_lib",
-					Driver:  "bash",
 					Args:    factors.Args(),
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
 						"GOOS":        factors.GOOS,
@@ -174,9 +174,9 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
 				Name:    name,
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,
@@ -228,9 +228,9 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
 				Name:    "build_lib#abi",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,
@@ -267,9 +267,9 @@ func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Facto
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
 				Name:    "build_lib#asm",
-				Driver:  "bash",
 				Args:    hmaps.Concat(factors.Args(), map[string]string{"file": asmFile}),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,

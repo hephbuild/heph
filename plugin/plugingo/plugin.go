@@ -223,9 +223,9 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 				Ref: &pluginv1.TargetRef{
 					Package: pkg,
 					Name:    "_golist",
-					Driver:  "sh",
 					Args:    args,
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
 						"GODEBUG":     "installgoroot=all",

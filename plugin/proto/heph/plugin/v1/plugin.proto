@@ -8,7 +8,6 @@ import "google/protobuf/field_mask.proto";
 message TargetRef {
   string package = 1;
   string name = 2;
-  string driver = 3;
   map<string, string> args = 4;
 }
 
@@ -64,5 +63,6 @@ message TargetDef {
 
 message TargetSpec {
   TargetRef ref = 1;
-  map<string, google.protobuf.Value> config = 2;
+  string driver = 2;
+  map<string, google.protobuf.Value> config = 3;
 }

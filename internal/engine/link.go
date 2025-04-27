@@ -247,7 +247,7 @@ type ResolveCache struct {
 	memLink       hsingleflight.GroupMem[*LightLinkedTarget]
 	memLocalCache hsingleflight.GroupMem[*ExecuteResult]
 	memExecute    hsingleflight.GroupMem[*ExecuteResult]
-	memDef        hsingleflight.GroupMem[*pluginv1.TargetDef]
+	memDef        hsingleflight.GroupMem[*TargetDef]
 
 	correlationId  string
 	correlationIdm sync.Mutex
@@ -264,7 +264,16 @@ func (c *ResolveCache) GetCorrelationId() string {
 	return c.correlationId
 }
 
-func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (*pluginv1.TargetDef, error) {
+type TargetDef struct {
+	*pluginv1.TargetDef
+	*pluginv1.TargetSpec
+}
+
+func (t TargetDef) GetRef() *pluginv1.TargetRef {
+	return t.TargetSpec.GetRef()
+}
+
+func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (*TargetDef, error) {
 	ctx, span := tracer.Start(ctx, "GetDef", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
@@ -272,11 +281,14 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 	// step, ctx := hstep.New(ctx, "Getting definition...")
 	// defer step.Done()
 
-	if c.Def != nil {
-		return c.Def, nil
+	if c.Def != nil && c.Spec != nil {
+		return &TargetDef{
+			TargetDef:  c.Def,
+			TargetSpec: c.Spec,
+		}, nil
 	}
 
-	res, err, _ := rc.memDef.Do(tref.Format(c.GetRef()), func() (*pluginv1.TargetDef, error) {
+	res, err, _ := rc.memDef.Do(tref.Format(c.GetRef()), func() (*TargetDef, error) {
 		spec, err := e.GetSpec(ctx, SpecContainer{
 			Ref:  c.Ref,
 			Spec: c.Spec,
@@ -285,9 +297,9 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 			return nil, err
 		}
 
-		driver, ok := e.DriversByName[spec.GetRef().GetDriver()]
+		driver, ok := e.DriversByName[spec.GetDriver()]
 		if !ok {
-			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetRef().GetDriver())
+			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetDriver())
 		}
 
 		res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
@@ -297,7 +309,10 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 			return nil, err
 		}
 
-		return res.Msg.GetTarget(), nil
+		return &TargetDef{
+			TargetDef:  res.Msg.GetTarget(),
+			TargetSpec: spec,
+		}, nil
 	})
 
 	return res, err
@@ -309,13 +324,13 @@ type LinkedTarget struct {
 }
 
 type LightLinkedTargetDep struct {
-	*pluginv1.TargetDef
+	*TargetDef
 	Outputs []string
 	DefDep  *pluginv1.TargetDef_Dep
 }
 
 type LightLinkedTarget struct {
-	*pluginv1.TargetDef
+	*TargetDef
 	Deps []*LightLinkedTargetDep
 }
 
@@ -341,7 +356,7 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 
 	dedupOutputs := map[string]int{}
 
-	depRefs := xsync.NewMap[string, *pluginv1.TargetDef]()
+	depRefs := xsync.NewMap[string, *TargetDef]()
 	var g errgroup.Group
 	for _, dep := range def.GetDeps() {
 		depRef := tref.WithoutOut(dep.GetRef())

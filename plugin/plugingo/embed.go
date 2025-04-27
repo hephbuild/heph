@@ -68,9 +68,9 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
 				Name:    "embedcfg",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q > $OUT", string(b))),
 				"out": structpb.NewStringValue("embedcfg.json"),

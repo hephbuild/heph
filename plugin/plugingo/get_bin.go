@@ -56,9 +56,9 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.HephPackage,
 				Name:    "build",
-				Driver:  "bash",
 				Args:    factors.Args(),
 			},
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":               factors.GOOS,

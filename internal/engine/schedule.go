@@ -73,11 +73,11 @@ func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, out
 
 	return e.result(ctx, DefContainer{Ref: ref}, outputs, options, rc)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *pluginv1.TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Def: def}, outputs, options, rc)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, options, rc)
 }
 func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
@@ -104,7 +104,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		return nil, fmt.Errorf("link: %w", err)
 	}
 
-	ref := def.Ref
+	ref := def.GetRef()
 
 	if outputs == nil || len(outputs) == 1 && outputs[0] == AllOutputs {
 		outputs = def.Outputs
@@ -208,7 +208,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 
 	if ok {
 		step := hstep.From(ctx)
-		step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.Ref)))
+		step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.GetRef())))
 
 		return res, true, nil
 	}
@@ -246,12 +246,12 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 
 	var targetfolder string
 	if def.Cache {
-		targetfolder = e.targetDirName(def.Ref)
+		targetfolder = e.targetDirName(def.GetRef())
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.Ref), time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
 	}
 
-	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.Ref.GetPackage(), targetfolder), "", "result.lock")
+	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.GetRef().GetPackage(), targetfolder), "", "result.lock")
 
 	if def.Cache {
 		if !options.Force {
@@ -309,7 +309,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		io.StringWriter
 	}
 	if false {
-		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.GetRef()), "//"))
 	} else {
 		h = xxh3.New()
 	}
@@ -317,12 +317,12 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		return stableProtoHashEncode(h, v, ignore)
 	}
 
-	err := writeProto(def.Ref, nil)
+	err := writeProto(def.GetRef(), nil)
 	if err != nil {
 		return "", err
 	}
 
-	ignoreFromHash := e.DriversConfig[def.Ref.GetDriver()].GetIgnoreFromHash()
+	ignoreFromHash := e.DriversConfig[def.GetDriver()].GetIgnoreFromHash()
 
 	err = writeProto(def.Def, hmaps.Keyed(ignoreFromHash))
 	if err != nil {
@@ -535,7 +535,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("heph/engine: Execute %v", tref.Format(def.Ref)), "",
+			fmt.Sprintf("heph/engine: Execute %v", tref.Format(def.GetRef())), "",
 		}
 	})
 
@@ -544,13 +544,13 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
 
-	driver, ok := e.DriversByName[def.Ref.GetDriver()]
+	driver, ok := e.DriversByName[def.TargetSpec.GetDriver()]
 	if !ok {
-		return nil, fmt.Errorf("driver not found: %v", def.Ref.GetDriver())
+		return nil, fmt.Errorf("driver not found: %v", def.TargetSpec.GetDriver())
 	}
 
 	if options.shell {
-		shellDriver := def.Ref.GetDriver() + "@shell"
+		shellDriver := def.TargetSpec.GetDriver() + "@shell"
 		shellDriver = "bash@shell" // TODO: make the original driver declare the shell config
 		driver, ok = e.DriversByName[shellDriver]
 		if !ok {
@@ -561,9 +561,9 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	var targetfolder string
 	if def.Cache || options.shell {
-		targetfolder = e.targetDirName(def.Ref)
+		targetfolder = e.targetDirName(def.GetRef())
 	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.Ref), time.Now().UnixNano())
+		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
 	}
 
 	hashin, err := e.hashin(ctx, def, results)
@@ -579,7 +579,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 		if ok {
 			step := hstep.From(ctx)
-			step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.Ref)))
+			step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.GetRef())))
 
 			return res, nil
 		}
@@ -588,9 +588,9 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	step, ctx := hstep.New(ctx, "Running...")
 	defer step.Done()
 
-	sandboxfs := hfs.At(e.Sandbox, def.Ref.GetPackage(), targetfolder)
+	sandboxfs := hfs.At(e.Sandbox, def.GetRef().GetPackage(), targetfolder)
 	workdirfs := hfs.At(sandboxfs, "ws") // TODO: remove the ws from here
-	cwdfs := hfs.At(workdirfs, def.Ref.GetPackage())
+	cwdfs := hfs.At(workdirfs, def.GetRef().GetPackage())
 
 	err = sandboxfs.RemoveAll("")
 	if err != nil {
@@ -625,7 +625,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			}
 
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
-				Target:       def.TargetDef,
+				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  sandboxfs.Path(),
 				TreeRootPath: e.Root.Path(),
 				Inputs:       inputs,
@@ -659,7 +659,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}, nil
 	}
 
-	cachefs := hfs.At(e.Cache, def.Ref.GetPackage(), e.targetDirName(def.Ref), hashin)
+	cachefs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.CollectOutputs))
 
 	for _, output := range def.CollectOutputs {
@@ -682,7 +682,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 				found = true
 
-				err = tar.WriteFile(f, filepath.Join(def.Ref.GetPackage(), path))
+				err = tar.WriteFile(f, filepath.Join(def.GetRef().GetPackage(), path))
 				if err != nil {
 					return err
 				}

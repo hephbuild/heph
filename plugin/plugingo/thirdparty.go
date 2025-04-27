@@ -24,8 +24,8 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		Ref: &pluginv1.TargetRef{
 			Package: pkg,
 			Name:    "download",
-			Driver:  "sh",
 		},
+		Driver: "sh",
 		Config: map[string]*structpb.Value{
 			"env": hstructpb.NewMapStringStringValue(map[string]string{
 				"CGO_ENABLED": "0",
@@ -69,9 +69,9 @@ func (p *Plugin) goModContent(ctx context.Context, goMod, version, modPath, curr
 		Ref: &pluginv1.TargetRef{
 			Package: ThirdpartyContentPackage(goMod, version, modPath),
 			Name:    "content",
-			Driver:  "sh",
 			Args:    args,
 		},
+		Driver: "sh",
 		Config: map[string]*structpb.Value{
 			"out":   structpb.NewStringValue("."),
 			"cache": structpb.NewBoolValue(true),
