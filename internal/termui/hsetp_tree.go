@@ -24,6 +24,10 @@ func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*cor
 func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) string {
 	children := map[string][]*corev1.Step{}
 	for v := range steps {
+		if v.GetParentId() == "" && len(children[""]) > 100 {
+			continue
+		}
+
 		children[v.GetParentId()] = append(children[v.GetParentId()], v)
 	}
 

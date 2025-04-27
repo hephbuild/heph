@@ -3,14 +3,18 @@ package engine
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
+	"fmt"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
+	"go.opentelemetry.io/otel/trace"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"time"
-
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
@@ -25,10 +29,11 @@ import (
 type ServerHandle struct {
 	Listener net.Listener
 	Mux      *http.ServeMux
+	BaseURL  string
 }
 
-func (h ServerHandle) BaseURL() string {
-	return "http://" + h.Listener.Addr().String()
+func (h ServerHandle) GetBaseURL() string {
+	return h.BaseURL
 }
 
 func (h ServerHandle) HTTPClient() *http.Client {
@@ -43,6 +48,22 @@ var httpClient = &http.Client{
 	Transport: &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
+			if rest, ok := strings.CutPrefix(addr, "unix"); ok {
+				b64host, _, err := net.SplitHostPort(rest)
+				if err != nil {
+					return nil, err
+				}
+
+				host, err := base64.URLEncoding.DecodeString(b64host)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %q", err, rest)
+				}
+
+				addr = string(host)
+
+				return net.Dial("unix", addr)
+			}
+
 			return net.Dial(network, addr)
 		},
 	},
@@ -52,8 +73,41 @@ var httpClientWithOtel = &http.Client{
 	Transport: otelhttp.NewTransport(httpClient.Transport),
 }
 
+func (e *Engine) newListener(ctx context.Context) (net.Listener, string, error) {
+	if true {
+		dir := e.Home.At("socks")
+		err := dir.MkdirAll("", os.ModePerm)
+		if err != nil {
+			return nil, "", err
+		}
+
+		path := dir.At(fmt.Sprintf("%v_%v", os.Getpid(), uuid.New().String())).Path()
+
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			return nil, "", err
+		}
+		go func() {
+			<-ctx.Done()
+			//_ = l.Close()
+			_ = os.Remove(path)
+		}()
+
+		b64Path := base64.URLEncoding.EncodeToString([]byte(path))
+
+		return l, "http://unix" + b64Path, nil
+	} else {
+		l, err := net.Listen("tcp", "127.0.0.1:")
+		if err != nil {
+			return nil, "", err
+		}
+
+		return l, "http://" + l.Addr().String(), nil
+	}
+}
+
 func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:")
+	l, baseUrl, err := e.newListener(ctx)
 	if err != nil {
 		return ServerHandle{}, err
 	}
@@ -62,7 +116,9 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 	mux := http.NewServeMux()
 
 	go func() {
-		h2s := &http2.Server{}
+		h2s := &http2.Server{
+			MaxReadFrameSize: 1024 * 256,
+		}
 		srv := &http.Server{
 			Handler: h2c.NewHandler(mux, h2s),
 			BaseContext: func(listener net.Listener) context.Context {
@@ -82,10 +138,11 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 	h := ServerHandle{
 		Listener: l,
 		Mux:      mux,
+		BaseURL:  baseUrl,
 	}
 
 	// warmup the client
-	go h.HTTPClient().Get(h.BaseURL()) //nolint:errcheck,noctx
+	go h.HTTPClient().Get(h.GetBaseURL()) //nolint:errcheck,noctx
 
 	return h, nil
 }
@@ -211,7 +268,7 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor("provider", pluginName))
+	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("provider", pluginName))
 
 	provider := Provider{
 		Name:           pluginName,
@@ -256,7 +313,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.BaseURL(), e.pluginInterceptor("driver", pluginName))
+	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName))
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]pluginv1connect.DriverClient{}

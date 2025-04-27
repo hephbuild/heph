@@ -71,7 +71,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.steps[msg.GetId()] = msg
 
 		if msg.GetStatus() == corev1.Step_STATUS_COMPLETED {
-			if msg.GetParentId() == "" {
+			if msg.GetParentId() == "" && msg.Error {
 				cmds = append(cmds, tea.Println(hstepfmt.Format(m.renderer, msg, false)))
 			}
 
@@ -98,7 +98,7 @@ func (m Model) View() string {
 
 	stepsTree := buildStepsTree(m.renderer, maps.Values(m.steps))
 	if m.height > 0 {
-		stepsTree = lipgloss.NewStyle().MaxHeight(m.height).Render(stepsTree)
+		stepsTree = lipgloss.NewStyle().MaxHeight(m.height / 2).Render(stepsTree)
 	}
 
 	sb.WriteString(stepsTree)

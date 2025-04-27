@@ -67,10 +67,6 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		cwdfs = hfs.At(hfs.NewOS(req.Msg.GetTreeRootPath()), req.Msg.GetTarget().GetRef().GetPackage())
 	}
 
-	if tref.Format(req.Msg.Target.Ref) == "//go/mod-asm2/@heph/go/thirdparty/google.golang.org/grpc@v1.57.0/internal/grpclog:build_lib@arch=amd64,os=linux" {
-		fmt.Print()
-	}
-
 	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
 	if err != nil {
 		return nil, err

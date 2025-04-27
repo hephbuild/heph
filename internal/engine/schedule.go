@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -133,11 +134,10 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		res, err := e.innerResultWithSideEffects(ctx, def, outputs, options, rc)
 		if err != nil {
 			step.SetError()
-			return nil, fmt.Errorf("%v: %w", tref.Format(c.GetRef()), err)
+			return nil, fmt.Errorf("%v: %w", tref.Format(ref), err)
 		}
 
 		return res, nil
-
 	})
 
 	return res, err
@@ -179,6 +179,10 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 	if err != nil {
 		return nil, err
 	}
+
+	slices.SortFunc(results, func(a, b *ExecuteResultWithOrigin) int {
+		return strings.Compare(a.Hashin, b.Hashin)
+	})
 
 	return results, nil
 }
@@ -300,8 +304,15 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
-	// h := newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
-	h := xxh3.New()
+	var h interface {
+		hash.Hash
+		io.StringWriter
+	}
+	if false {
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.Ref), "//"))
+	} else {
+		h = xxh3.New()
+	}
 	writeProto := func(v proto.Message, ignore map[string]struct{}) error {
 		return stableProtoHashEncode(h, v, ignore)
 	}
@@ -422,7 +433,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		go func() {
 			defer cancel()
 
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
 			if err != nil {
 				stdinErrCh <- err
 				return
@@ -444,7 +455,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[1] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -464,7 +475,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		pipes[2] = res.Msg.GetId()
 
 		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
+			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
 			if err != nil {
 				return err
 			}
@@ -487,7 +498,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		cancels = append(cancels, clean)
 
 		go func() {
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.BaseURL(), res.Msg.GetPath())
+			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
 			if err != nil {
 				hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
 				return
@@ -601,10 +612,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			if err != nil {
 				runErr = err
 				return
-			}
-
-			if tref.Format(def.Ref) == "//go/mod-simple/hello:build_lib@arch=amd64,os=linux" {
-				fmt.Print()
 			}
 
 			var inputs []*pluginv1.ArtifactWithOrigin

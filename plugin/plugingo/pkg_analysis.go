@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/hsync"
-	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
@@ -18,7 +17,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -64,7 +62,6 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 		goPkg.HephPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
 		goPkg.HephBuildPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
-		fmt.Print()
 	} else {
 		goPkg.HephPackage = relPkg
 	}
@@ -209,114 +206,6 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, pkg string, factors Fa
 	if err != nil {
 		return nil, err
 	}
-
-	return goPkgs, nil
-}
-
-func (p *Plugin) goListDepsPkgResult2(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
-	seenImp := hmaps.Sync[string, struct{}]{}
-	seenPkg := hmaps.Sync[string, struct{}]{}
-	pkgsm := hmaps.Sync[string, Package]{}
-
-	var g errgroup.Group
-
-	g.Go(func() error {
-		_, _ = c.stdListRes() // warmup
-
-		return nil
-	})
-	g.Go(func() error {
-		_, _ = c.modulesRes() // warmup
-
-		return nil
-	})
-
-	var doTheMagicForImportPath func(imp string) error
-	doTheMagicForImportPath = func(imp string) error {
-		if !seenImp.SetOk(imp, struct{}{}) {
-			return nil
-		}
-
-		goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
-		if err != nil {
-			return fmt.Errorf("get pkg: %w", err)
-		}
-
-		if !seenPkg.SetOk(goPkg.HephPackage, struct{}{}) {
-			return nil
-		}
-
-		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
-			return nil
-		}
-
-		for _, imp := range goPkg.Imports {
-			if _, ok := seenImp.GetOk(imp); ok {
-				continue
-			}
-
-			g.Go(func() error {
-				return doTheMagicForImportPath(imp)
-			})
-		}
-
-		return nil
-	}
-
-	var doTheMagicForHephPackage func(pkg string) error
-	doTheMagicForHephPackage = func(pkg string) error {
-		if !seenPkg.SetOk(pkg, struct{}{}) {
-			return nil
-		}
-
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
-		if err != nil {
-			return fmt.Errorf("get pkg: %w", err)
-		}
-
-		if !seenImp.SetOk(goPkg.ImportPath, struct{}{}) {
-			return nil
-		}
-
-		if !pkgsm.SetOk(goPkg.ImportPath, goPkg) {
-			return nil
-		}
-
-		for _, imp := range goPkg.Imports {
-			if _, ok := seenImp.GetOk(imp); ok {
-				continue
-			}
-
-			g.Go(func() error {
-				return doTheMagicForImportPath(imp)
-			})
-		}
-
-		return nil
-	}
-
-	g.Go(func() error {
-		return doTheMagicForHephPackage(pkg)
-	})
-
-	err := g.Wait()
-	if err != nil {
-		return nil, err
-	}
-
-	goPkgs := slices.Collect(pkgsm.Values())
-
-	slices.SortFunc(goPkgs, func(a, b Package) int {
-		if a.HephPackage == pkg {
-			return -1
-		}
-
-		if b.HephPackage == pkg {
-			return 1
-		}
-
-		return strings.Compare(a.ImportPath, b.ImportPath)
-	})
 
 	return goPkgs, nil
 }

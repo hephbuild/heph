@@ -146,9 +146,9 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
-		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.BaseURL()),
-		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.BaseURL(), clientOpts...),
-		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.BaseURL(), clientOpts...),
+		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
+		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
 	}
 
 	return e, nil

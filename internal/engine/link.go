@@ -18,6 +18,7 @@ import (
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/puzpuzpuz/xsync/v4"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -340,17 +341,17 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 
 	dedupOutputs := map[string]int{}
 
-	depRefs := hmaps.Sync[string, *pluginv1.TargetDef]{}
+	depRefs := xsync.NewMap[string, *pluginv1.TargetDef]()
 	var g errgroup.Group
 	for _, dep := range def.GetDeps() {
 		depRef := tref.WithoutOut(dep.GetRef())
 		refStr := tref.Format(depRef)
 
-		if _, ok := depRefs.GetOk(refStr); ok {
+		if _, ok := depRefs.Load(refStr); ok {
 			continue
 		}
 
-		depRefs.Set(refStr, nil)
+		depRefs.Store(refStr, nil)
 
 		g.Go(func() error {
 			linkedDep, err := e.GetDef(ctx, DefContainer{Ref: depRef}, rc)
@@ -358,7 +359,7 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 				return err
 			}
 
-			depRefs.Set(refStr, linkedDep)
+			depRefs.Store(refStr, linkedDep)
 
 			return nil
 		})
@@ -379,7 +380,7 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 			continue
 		}
 
-		linkedDep := depRefs.Get(tref.Format(tref.WithoutOut(ref)))
+		linkedDep, _ := depRefs.Load(tref.Format(tref.WithoutOut(ref)))
 
 		if dep.Ref.Output != nil {
 			if !slices.Contains(linkedDep.Outputs, dep.Ref.GetOutput()) {
