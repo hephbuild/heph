@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -106,10 +107,9 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 
 	ref := def.GetRef()
 
-	if outputs == nil || len(outputs) == 1 && outputs[0] == AllOutputs {
+	if len(outputs) == 1 && outputs[0] == AllOutputs {
 		outputs = def.Outputs
 	}
-	outputs = def.Outputs // TODO: figure out how to properly select outputs
 
 	res, err, _ := rc.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResult, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
@@ -120,6 +120,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		options.ExecOptions.shell = options.Shell
 		options.ExecOptions.force = options.Force
 
+		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 		ctx = hstep.WithoutParent(ctx)
 
 		debugger.SetLabels(func() []string {
@@ -139,18 +140,21 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 
 		return res, nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
-	return res, err
+	return res.Clone(), nil
 }
 
-func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOutputs bool, rc *ResolveCache) ([]*ExecuteResultWithOrigin, error) {
-	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache) ([]*ExecuteResultWithOrigin, error) {
+	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
 	var g errgroup.Group
-	results := make([]*ExecuteResultWithOrigin, len(def.Deps))
+	results := make([]*ExecuteResultWithOrigin, len(t.Inputs))
 
-	for i, dep := range def.Deps {
+	for i, dep := range t.Inputs {
 		g.Go(func() error {
 			outputs := dep.Outputs
 			if !withOutputs {
@@ -168,7 +172,7 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 
 			results[i] = &ExecuteResultWithOrigin{
 				ExecuteResult: res,
-				Origin:        dep.DefDep,
+				InputOrigin:   dep.Origin,
 			}
 
 			return nil
@@ -181,6 +185,10 @@ func (e *Engine) depsResults(ctx context.Context, def *LightLinkedTarget, withOu
 	}
 
 	slices.SortFunc(results, func(a, b *ExecuteResultWithOrigin) int {
+		if v := tref.Compare(a.Def.GetRef(), b.Def.GetRef()); v != 0 {
+			return v
+		}
+
 		return strings.Compare(a.Hashin, b.Hashin)
 	})
 
@@ -201,7 +209,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 		return nil, false, fmt.Errorf("hashin: %w", err)
 	}
 
-	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin, rc)
+	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from local cache: %w", err)
 	}
@@ -226,7 +234,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 }
 
 func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
-	res, err := e.innerResult(ctx, def, outputs, options, rc)
+	res, err := e.innerResult(ctx, def, options, outputs, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -236,10 +244,14 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 		return nil, fmt.Errorf("codegen tree: %w", err)
 	}
 
+	res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+		return !slices.Contains(outputs, artifact.Group)
+	})
+
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (*ExecuteResult, error) {
 	if options.Shell {
 		def.Cache = false
 	}
@@ -280,8 +292,11 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 
 			return e.ExecuteAndCache(ctx, def, options.ExecOptions, rc)
 		})
+		if err != nil {
+			return nil, err
+		}
 
-		return res, err
+		return res.Clone(), nil
 	} else {
 		res, err, _ := rc.memExecute.Do(tref.Format(def.GetRef()), func() (*ExecuteResult, error) {
 			err := l.Lock(ctx)
@@ -298,8 +313,11 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 
 			return e.Execute(ctx, def, options.ExecOptions, rc)
 		})
+		if err != nil {
+			return nil, err
+		}
 
-		return res, err
+		return res.Clone(), nil
 	}
 }
 
@@ -331,7 +349,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		err = writeProto(result.Origin.GetRef(), nil)
+		_, err = h.WriteString(result.InputOrigin.Id)
 		if err != nil {
 			return "", err
 		}
@@ -376,9 +394,18 @@ func (r ExecuteResult) Sorted() *ExecuteResult {
 	return &r
 }
 
+func (r ExecuteResult) Clone() *ExecuteResult {
+	return &ExecuteResult{
+		Def:       r.Def.Clone(),
+		Executed:  r.Executed,
+		Hashin:    r.Hashin,
+		Artifacts: slices.Clone(r.Artifacts),
+	}
+}
+
 type ExecuteResultWithOrigin struct {
 	*ExecuteResult
-	Origin *pluginv1.TargetDef_Dep
+	InputOrigin *pluginv1.TargetDef_InputOrigin
 }
 
 func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rc *ResolveCache) (*ExecuteResult, bool, error) {
@@ -521,15 +548,9 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	return pipes, wait, nil
 }
 
-var sem = semaphore.NewWeighted(10)
+var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
 
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, rc *ResolveCache) (*ExecuteResult, error) {
-	err := sem.Acquire(ctx, 1)
-	if err != nil {
-		return nil, err
-	}
-	defer sem.Release(1)
-
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
@@ -572,7 +593,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if def.Cache && !options.force {
-		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin, rc)
+		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			return nil, err
 		}
@@ -584,6 +605,12 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			return res, nil
 		}
 	}
+
+	err = sem.Acquire(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer sem.Release(1)
 
 	step, ctx := hstep.New(ctx, "Running...")
 	defer step.Done()
@@ -604,6 +631,16 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	}
 
+	var inputs []*pluginv1.ArtifactWithOrigin
+	for _, result := range results {
+		for _, artifact := range result.Artifacts {
+			inputs = append(inputs, &pluginv1.ArtifactWithOrigin{
+				Artifact: artifact.Artifact,
+				Origin:   result.InputOrigin,
+			})
+		}
+	}
+
 	var runRes *connect.Response[pluginv1.RunResponse]
 	var runErr error
 	err = options.interactiveExec(ctx, InteractiveExecOptions{
@@ -612,16 +649,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			if err != nil {
 				runErr = err
 				return
-			}
-
-			var inputs []*pluginv1.ArtifactWithOrigin
-			for _, result := range results {
-				for _, artifact := range result.Artifacts {
-					inputs = append(inputs, &pluginv1.ArtifactWithOrigin{
-						Artifact: artifact.Artifact,
-						Meta:     result.Origin.GetMeta(),
-					})
-				}
 			}
 
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{

@@ -13,6 +13,27 @@ func Equal(a, b *pluginv1.TargetRef) bool {
 }
 
 func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
+	if v := Compare(WithoutOut(a), WithoutOut(b)); v != 0 {
+		return v
+	}
+
+	if a.Output != nil && b.Output != nil {
+		if v := strings.Compare(a.GetOutput(), b.GetOutput()); v != 0 {
+			return v
+		}
+	} else {
+		if a.Output == nil {
+			return 1
+		}
+		if b.Output == nil {
+			return -1
+		}
+	}
+
+	return 0
+}
+
+func Compare(a, b *pluginv1.TargetRef) int {
 	if v := strings.Compare(a.GetPackage(), b.GetPackage()); v != 0 {
 		return v
 	}
@@ -33,19 +54,6 @@ func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
 
 		if v := strings.Compare(av, bv); v != 0 {
 			return v
-		}
-	}
-
-	if a.Output != nil && b.Output != nil {
-		if v := strings.Compare(a.GetOutput(), b.GetOutput()); v != 0 {
-			return v
-		}
-	} else {
-		if a.Output == nil {
-			return 1
-		}
-		if b.Output == nil {
-			return -1
 		}
 	}
 

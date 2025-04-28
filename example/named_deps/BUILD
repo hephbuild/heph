@@ -29,8 +29,8 @@ target(
     run = [
         'echo a: $SRC_A',
         'echo b: $SRC_B',
-        'echo o1', 'cat $SRC_A',
-        'echo o2', 'cat $SRC_B',
+        'echo expect o1', 'cat $SRC_A',
+        'echo expect o2', 'cat $SRC_B',
     ],
     driver = "bash",
     cache = False,

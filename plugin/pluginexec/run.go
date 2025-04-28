@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hmaps"
 	"io"
 	"os"
 	"os/exec"
@@ -35,7 +34,7 @@ var tracer = otel.Tracer("heph/pluginexec")
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("heph/pluginexec %v: %v", p.name, tref.Format(req.Msg.GetTarget().GetRef())), "",
+			fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.Msg.GetTarget().GetRef())), "",
 		}
 	})
 
@@ -74,7 +73,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()))
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, t)
 	if err != nil {
 		return nil, err
 	}
@@ -293,62 +292,63 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin) inputEnv(
-	ctx context.Context,
-	inputs []*pluginv1.ArtifactWithOrigin,
-	deps map[string]*execv1.Target_Deps,
-) ([]string, error) {
-	m := map[string][]*pluginv1.Artifact{}
-	for _, input := range inputs {
-		if input.GetArtifact().GetType() != pluginv1.Artifact_TYPE_OUTPUT_LIST_V1 {
-			continue
+func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps {
+	nd := map[string]*execv1.Target_Deps{}
+	for _, deps := range ds {
+		for k, v := range deps {
+			if _, ok := nd[k]; !ok {
+				nd[k] = &execv1.Target_Deps{}
+			}
+
+			nd[k].Targets = append(nd[k].Targets, v.Targets...)
+			nd[k].Files = append(nd[k].Files, v.Files...)
 		}
+	}
 
-		ref := &pluginv1.TargetRefWithOutput{}
-		err := input.GetMeta().UnmarshalTo(ref)
-		if err != nil {
-			return nil, err
-		}
+	return nd
+}
 
-		for depName, dep := range deps {
-			for _, target := range dep.GetTargets() {
-				if !tref.Equal(tref.WithoutOut(target), tref.WithoutOut(ref)) {
-					continue
-				}
+func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
+	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
-				allOutput := target.Output == nil
+	for name, deps := range Merge(t.Deps, t.RuntimeDeps) {
+		for _, dep := range deps.Targets {
+			id := dep.Id
 
-				if !allOutput {
-					if input.GetArtifact().GetGroup() != target.GetOutput() {
-						continue
-					}
-				}
+			allOutput := dep.Ref.Output == nil
 
+			for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
 				var outputName string
 				if allOutput {
-					outputName = input.GetArtifact().GetGroup()
+					outputName = artifact.Artifact.Group
 				}
 
-				envName := getEnvName("SRC", depName, outputName)
+				envName := getEnvName("SRC", name, outputName)
 
-				m[envName] = append(m[envName], input.GetArtifact())
+				m[envName] = append(m[envName], artifact)
 			}
 		}
 	}
 
-	seenFiles := map[string]struct{}{}
 	env := make([]string, 0, len(m))
 	var sb strings.Builder
 	for name, artifacts := range m {
+		seenFiles := map[string]struct{}{}
 		sb.Reset()
 
+		slices.SortFunc(artifacts, func(a, b *pluginv1.ArtifactWithOrigin) int {
+			return strings.Compare(a.Artifact.Uri, b.Artifact.Uri)
+		})
+
 		for _, input := range artifacts {
-			b, err := os.ReadFile(strings.ReplaceAll(input.GetUri(), "file://", ""))
+			b, err := os.ReadFile(strings.ReplaceAll(input.Artifact.GetUri(), "file://", ""))
 			if err != nil {
 				return nil, err
 			}
 
 			lines := strings.Split(string(b), "\n")
+			slices.Sort(lines)
+
 			for _, line := range lines {
 				if line == "" {
 					continue
@@ -368,6 +368,8 @@ func (p *Plugin) inputEnv(
 
 		env = append(env, getEnvEntryWithName(name, sb.String()))
 	}
+
+	slices.Sort(env)
 
 	return env, nil
 }

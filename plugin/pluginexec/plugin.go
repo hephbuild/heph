@@ -3,6 +3,7 @@ package pluginexec
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"io"
 	"maps"
 	"net/http"
@@ -78,6 +79,10 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 	}), nil
 }
 
+func depId(prop string, group string, i int) string {
+	return fmt.Sprintf("%q %q %v", prop, group, i)
+}
+
 func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
 	var targetSpec Spec
 	targetSpec.Cache = true
@@ -133,10 +138,10 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		})
 	}
 
-	var deps []*pluginv1.TargetDef_Dep
-	for name, sdeps := range targetSpec.Deps.Merge(targetSpec.HashDeps, targetSpec.RuntimeDeps) {
+	var inputs []*pluginv1.TargetDef_Input
+	for name, deps := range hmaps.Sorted(targetSpec.Deps.Merge(targetSpec.HashDeps, targetSpec.RuntimeDeps)) {
 		var execDeps execv1.Target_Deps
-		for i, dep := range sdeps {
+		for i, dep := range deps {
 			ref, err := tref.ParseWithOut(dep)
 			if err != nil {
 				return nil, fmt.Errorf("dep[%v][%d]: %q: %w", name, i, dep, err)
@@ -147,12 +152,19 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 				return nil, err
 			}
 
-			deps = append(deps, &pluginv1.TargetDef_Dep{
-				Ref:  ref,
-				Meta: meta,
+			id := depId("deps", name, i)
+			inputs = append(inputs, &pluginv1.TargetDef_Input{
+				Ref: ref,
+				Origin: &pluginv1.TargetDef_InputOrigin{
+					Meta: meta,
+					Id:   id,
+				},
 			})
 
-			execDeps.Targets = append(execDeps.Targets, ref)
+			execDeps.Targets = append(execDeps.Targets, &execv1.Target_InputRef{
+				Ref: ref,
+				Id:  id,
+			})
 		}
 		target.Deps[name] = &execDeps
 	}
@@ -169,11 +181,18 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 				return nil, err
 			}
 
-			deps = append(deps, &pluginv1.TargetDef_Dep{
-				Ref:  ref,
-				Meta: meta,
+			id := depId("tools", "", i)
+			inputs = append(inputs, &pluginv1.TargetDef_Input{
+				Ref: ref,
+				Origin: &pluginv1.TargetDef_InputOrigin{
+					Meta: meta,
+					Id:   id,
+				},
 			})
-			target.Tools = append(target.Tools, ref)
+			target.Tools = append(target.Tools, &execv1.Target_InputRef{
+				Ref: ref,
+				Id:  id,
+			})
 		}
 	}
 
@@ -204,7 +223,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		Target: &pluginv1.TargetDef{
 			Ref:            req.Msg.GetSpec().GetRef(),
 			Def:            targetAny,
-			Deps:           deps,
+			Inputs:         inputs,
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
 			Cache:          targetSpec.Cache,
 			CollectOutputs: collectOutputs,

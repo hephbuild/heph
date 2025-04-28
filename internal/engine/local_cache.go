@@ -12,8 +12,6 @@ import (
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/hephbuild/heph/internal/hmaps"
-
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -53,10 +51,7 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 	}
 
 	h := xxh3.New()
-	for k, v := range hmaps.Sorted(ref.GetArgs()) {
-		_, _ = h.WriteString(k)
-		_, _ = h.WriteString(v)
-	}
+	ref.HashPB(h, nil)
 
 	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
 }
@@ -155,40 +150,35 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
 	if len(outputs) == 0 {
 		outputs = nil
+	} else {
+		outputs = slices.Clone(outputs)
+		slices.Sort(outputs)
 	}
-	outputs = slices.Clone(outputs)
-	slices.Sort(outputs)
-	return tref.Format(ref) + fmt.Sprint(outputs)
+
+	return tref.Format(ref) + fmt.Sprintf("%#v", outputs)
 }
 
-func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rc *ResolveCache) (*ExecuteResult, bool, error) {
+func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromLocalCache")
 	defer span.End()
 
-	res, err, _ := rc.memLocalCache.Do(keyRefOutputs(def.GetRef(), outputs)+hashin, func() (*ExecuteResult, error) {
-		multi := hlocks.NewMulti()
+	multi := hlocks.NewMulti()
 
-		res, _, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
-		if err != nil {
-			if err := multi.UnlockAll(); err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
-			}
-
-			// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
-			if errors.Is(err, hfs.ErrNotExist) {
-				return nil, nil
-			}
-
-			return nil, err
+	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
+	if err != nil {
+		if err := multi.UnlockAll(); err != nil {
+			hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
 		}
 
-		return res, nil
-	})
-	if err != nil {
+		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
+		if errors.Is(err, hfs.ErrNotExist) {
+			return nil, false, nil
+		}
+
 		return nil, false, err
 	}
 
-	return res, res != nil, nil
+	return res, ok, nil
 }
 
 func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, locks *hlocks.Multi) (*ExecuteResult, bool, error) {

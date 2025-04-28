@@ -16,7 +16,7 @@ message ParseResponse {
 
 message ArtifactWithOrigin {
   Artifact artifact = 1;
-  google.protobuf.Any meta = 2;
+  TargetDef.InputOrigin origin = 2;
 }
 
 message RunRequest {

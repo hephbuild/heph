@@ -5,15 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"iter"
-	"maps"
 	"os"
 	"path/filepath"
 
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 
-	"github.com/hephbuild/heph/internal/hiter"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 
 	"github.com/hephbuild/heph/internal/hartifact"
@@ -42,16 +41,18 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 			return nil, err
 		}
 
-		for _, dep := range hiter.Concat2(maps.All(t.GetDeps()), maps.All(t.GetRuntimeDeps())) {
+		for _, dep := range hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()) {
 			for _, target := range dep.GetTargets() {
-				for artifact := range ArtifactsForDep(results, target) {
+				for artifact := range ArtifactsForId(results, target.Id, pluginv1.Artifact_TYPE_OUTPUT) {
 					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs)
 					if err != nil {
 						return nil, err
 					}
 					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
 						Artifact: listArtifact,
-						Meta:     artifact.GetMeta(),
+						Origin: &pluginv1.TargetDef_InputOrigin{
+							Id: target.Id,
+						},
 					})
 				}
 			}
@@ -61,10 +62,10 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 	}
 
 	for _, tool := range t.GetTools() {
-		for artifact := range ArtifactsForDep(results, tool) {
+		for artifact := range ArtifactsForId(results, tool.Id, pluginv1.Artifact_TYPE_OUTPUT) {
 			err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
-				return nil, fmt.Errorf("%v: %w", artifact.GetMeta(), err)
+				return nil, fmt.Errorf("%v: %w", tref.Format(tool.Ref), err)
 			}
 		}
 	}
@@ -81,20 +82,14 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 	return listArtifacts, nil
 }
 
-func ArtifactsForDep(inputs []*pluginv1.ArtifactWithOrigin, ref *pluginv1.TargetRefWithOutput) iter.Seq[*pluginv1.ArtifactWithOrigin] {
+func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ pluginv1.Artifact_Type) iter.Seq[*pluginv1.ArtifactWithOrigin] {
 	return func(yield func(origin *pluginv1.ArtifactWithOrigin) bool) {
 		for _, input := range inputs {
-			if input.GetArtifact().GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+			if input.GetArtifact().GetType() != typ {
 				continue
 			}
 
-			aref := &pluginv1.TargetRefWithOutput{}
-			err := input.GetMeta().UnmarshalTo(aref)
-			if err != nil {
-				continue
-			}
-
-			if !tref.Equal(tref.WithoutOut(aref), tref.WithoutOut(ref)) {
+			if input.Origin.Id != id {
 				continue
 			}
 

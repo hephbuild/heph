@@ -20,7 +20,12 @@ message TargetRefWithOutput {
 }
 
 message TargetDef {
-  message Dep {
+  message InputOrigin {
+    google.protobuf.Any meta = 2;
+    string id = 3;
+  }
+
+  message Input {
     enum Mode {
       MODE_UNSPECIFIED = 0; // deps will get expanded in sandbox
       MODE_LINK = 1; // deps will get expanded in sandbox through hard links
@@ -29,12 +34,12 @@ message TargetDef {
 
     TargetRefWithOutput ref = 1;
     Mode link = 2;
-    google.protobuf.Any meta = 3;
+    InputOrigin origin = 3;
   }
 
   TargetRef ref = 1;
   google.protobuf.Any def = 2;
-  repeated Dep deps = 3;
+  repeated Input inputs = 3;
   repeated string outputs = 4;
   bool cache = 5;
 

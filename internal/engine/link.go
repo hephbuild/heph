@@ -14,7 +14,6 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
-	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -243,11 +242,11 @@ type ResolveCache struct {
 	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]
 	memProbe   hsingleflight.GroupMem[[]*pluginv1.ProviderState]
 
-	memResult     hsingleflight.GroupMem[*ExecuteResult]
-	memLink       hsingleflight.GroupMem[*LightLinkedTarget]
-	memLocalCache hsingleflight.GroupMem[*ExecuteResult]
-	memExecute    hsingleflight.GroupMem[*ExecuteResult]
-	memDef        hsingleflight.GroupMem[*TargetDef]
+	memLink hsingleflight.GroupMem[*LightLinkedTarget]
+	memDef  hsingleflight.GroupMem[*TargetDef]
+
+	memResult  hsingleflight.GroupMem[*ExecuteResult]
+	memExecute hsingleflight.GroupMem[*ExecuteResult]
 
 	correlationId  string
 	correlationIdm sync.Mutex
@@ -309,8 +308,14 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 			return nil, err
 		}
 
+		def := res.Msg.GetTarget()
+
+		if !tref.Equal(def.Ref, spec.Ref) {
+			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.Ref), tref.Format(spec.Ref))
+		}
+
 		return &TargetDef{
-			TargetDef:  res.Msg.GetTarget(),
+			TargetDef:  def,
 			TargetSpec: spec,
 		}, nil
 	})
@@ -323,19 +328,27 @@ type LinkedTarget struct {
 	Deps []*LinkedTarget
 }
 
-type LightLinkedTargetDep struct {
+type LightLinkedTargetInput struct {
 	*TargetDef
+	Origin  *pluginv1.TargetDef_InputOrigin
 	Outputs []string
-	DefDep  *pluginv1.TargetDef_Dep
 }
 
 type LightLinkedTarget struct {
 	*TargetDef
-	Deps []*LightLinkedTargetDep
+	Inputs []*LightLinkedTargetInput
+}
+
+func (t LightLinkedTarget) Clone() *LightLinkedTarget {
+	return &LightLinkedTarget{
+		TargetDef: t.TargetDef,
+		Inputs:    slices.Clone(t.Inputs),
+	}
 }
 
 func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+	ctx = hstep.WithoutParent(ctx)
 
 	ctx, span := tracer.Start(ctx, "LightLink", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
@@ -354,12 +367,10 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 		TargetDef: def,
 	}
 
-	dedupOutputs := map[string]int{}
-
 	depRefs := xsync.NewMap[string, *TargetDef]()
 	var g errgroup.Group
-	for _, dep := range def.GetDeps() {
-		depRef := tref.WithoutOut(dep.GetRef())
+	for _, input := range def.GetInputs() {
+		depRef := tref.WithoutOut(input.GetRef())
 		refStr := tref.Format(depRef)
 
 		if _, ok := depRefs.Load(refStr); ok {
@@ -384,58 +395,37 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 		return nil, err
 	}
 
-	for _, dep := range def.GetDeps() {
-		ref := dep.GetRef()
+	for _, input := range def.GetInputs() {
+		ref := input.GetRef()
 
-		getOutputIndex, setOutputIndex := hmaps.GetSet(dedupOutputs, ref.String())
-
-		i, ok := getOutputIndex()
-
-		if i == -1 {
-			continue
+		linkedDep, ok := depRefs.Load(tref.Format(tref.WithoutOut(ref)))
+		if !ok {
+			return nil, fmt.Errorf("%v doesnt have a dependency %q", tref.Format(ref), tref.Format(tref.WithoutOut(ref)))
 		}
 
-		linkedDep, _ := depRefs.Load(tref.Format(tref.WithoutOut(ref)))
+		outputs := linkedDep.Outputs
 
-		if dep.Ref.Output != nil {
-			if !slices.Contains(linkedDep.Outputs, dep.Ref.GetOutput()) {
-				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.Format(dep.Ref), dep.Ref.GetOutput())
+		if ref.Output != nil {
+			if !slices.Contains(linkedDep.Outputs, ref.GetOutput()) {
+				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.Format(ref), ref.GetOutput())
 			}
+
+			outputs = []string{ref.GetOutput()}
 		}
 
-		var outputs []string
-		var allset bool
-		if ok {
-			outputs = lt.Deps[i].Outputs
-		}
-		if ref.Output == nil {
-			allset = true
-
-			outputs = linkedDep.GetOutputs()
-		} else {
-			outputs = append(outputs, ref.GetOutput())
-			slices.Sort(outputs)
-			outputs = slices.Compact(outputs)
-		}
-
-		if ok {
-			lt.Deps[i].Outputs = outputs
-		} else {
-			if allset {
-				setOutputIndex(-1)
-			} else {
-				setOutputIndex(len(lt.Deps))
-			}
-			lt.Deps = append(lt.Deps, &LightLinkedTargetDep{
-				DefDep:    dep,
-				TargetDef: linkedDep,
-				Outputs:   outputs,
-			})
-		}
+		lt.Inputs = append(lt.Inputs, &LightLinkedTargetInput{
+			TargetDef: linkedDep,
+			Outputs:   outputs,
+			Origin:    input.Origin,
+		})
 	}
 
-	slices.SortFunc(lt.Deps, func(a, b *LightLinkedTargetDep) int {
-		return tref.CompareOut(a.DefDep.GetRef(), a.DefDep.GetRef())
+	slices.SortFunc(lt.Inputs, func(a, b *LightLinkedTargetInput) int {
+		if v := tref.Compare(a.TargetDef.GetRef(), a.TargetDef.GetRef()); v != 0 {
+			return v
+		}
+
+		return strings.Compare(a.Origin.Id, a.Origin.Id)
 	})
 
 	return lt, nil
