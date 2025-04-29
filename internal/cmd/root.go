@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
@@ -25,6 +26,7 @@ var plain bool
 var debug bool
 var cpuprofile string
 var memprofile string
+var goroutineprofile string
 
 var levelVar slog.LevelVar
 
@@ -132,6 +134,43 @@ var rootCmd = &cobra.Command{
 			})
 		}
 
+		if goroutineprofile != "" {
+			goroutineFile, err := os.Create(goroutineprofile)
+			if err != nil {
+				return fmt.Errorf("could not create goroutine profile: %w", err)
+			}
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+						_, _ = goroutineFile.WriteString("\n####################\n")
+
+						err := pprof.Lookup("goroutine").WriteTo(goroutineFile, 2)
+						if err != nil {
+							hlog.From(ctx).Error(fmt.Sprintf("could not write goroutine profile: %v", err))
+						}
+						continue
+					}
+				}
+			}()
+
+			registerFinalize(func() {
+				wg.Wait()
+
+				err := goroutineFile.Close()
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("could not close goroutine profile: %v", err))
+				}
+			})
+		}
+
 		return nil
 	},
 }
@@ -142,6 +181,7 @@ func init() {
 
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")
 	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
+	rootCmd.PersistentFlags().StringVar(&goroutineprofile, "goroutineprofile", "", "Goroutine Profile file")
 }
 
 func Execute() int {

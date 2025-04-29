@@ -6,6 +6,7 @@ import (
 	"maps"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,6 +21,8 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
+type stepsUpdateMsg map[string]*corev1.Step
+
 type Model struct {
 	log      hbbtlog.Hijacker
 	Exec     hbbtexec.Model
@@ -28,26 +31,18 @@ type Model struct {
 	width  int
 	height int
 
-	stepCh chan *corev1.Step
-	steps  map[string]*corev1.Step
+	steps map[string]*corev1.Step
 }
 
 func initialModel() Model {
 	m := Model{
 		log:      hbbtlog.NewLogHijacker(),
-		stepCh:   make(chan *corev1.Step),
 		steps:    map[string]*corev1.Step{},
 		renderer: hlipgloss.NewRenderer(os.Stderr),
 	}
 	m.Exec = hbbtexec.New(m.log)
 
 	return m
-}
-
-func (m Model) nextStep() tea.Cmd {
-	return func() tea.Msg {
-		return <-m.stepCh
-	}
 }
 
 type tickMsg struct{}
@@ -59,7 +54,7 @@ func (m Model) nextTick() tea.Cmd {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(m.log.Init(), m.nextStep(), m.nextTick())
+	return tea.Batch(m.log.Init(), m.nextTick())
 }
 
 type routineExitedMsg struct{}
@@ -68,18 +63,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
-	case *corev1.Step:
-		m.steps[msg.GetId()] = msg
-
-		if msg.GetStatus() == corev1.Step_STATUS_COMPLETED {
-			if msg.GetParentId() == "" && msg.Error {
-				cmds = append(cmds, tea.Println(hstepfmt.Format(m.renderer, msg, false)))
-			}
-
-			delete(m.steps, msg.GetId())
-		}
-
-		cmds = append(cmds, m.nextStep())
+	case stepsUpdateMsg:
+		m.steps = msg
 	case tickMsg:
 		cmds = append(cmds, m.nextTick())
 	case tea.WindowSizeMsg:
@@ -108,6 +93,45 @@ func (m Model) View() string {
 	return sb.String()
 }
 
+func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Renderer) (func(*corev1.Step), func()) {
+	stepsCh := make(chan *corev1.Step)
+	steps := map[string]*corev1.Step{}
+	var stepsm sync.Mutex
+
+	go func() {
+		for step := range stepsCh {
+			stepsm.Lock()
+			steps[step.GetId()] = step
+
+			if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
+				if step.GetParentId() == "" && step.Error {
+					hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
+				}
+
+				delete(steps, step.GetId())
+			}
+			stepsm.Unlock()
+		}
+	}()
+
+	t := time.NewTicker(20 * time.Millisecond)
+	go func() {
+		for range t.C {
+			stepsm.Lock()
+			steps := maps.Clone(steps)
+			p.Send(stepsUpdateMsg(steps))
+			stepsm.Unlock()
+		}
+	}()
+
+	return func(step *corev1.Step) {
+			stepsCh <- step
+		}, func() {
+			t.Stop()
+			close(stepsCh)
+		}
+}
+
 func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, send func(tea.Msg)) error) error {
 	errCh := make(chan error, 1)
 	m := initialModel()
@@ -117,9 +141,12 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
 
+		sendStep, cancelStepStore := NewStepsStore(ctx, p, m.renderer)
+		defer cancelStepStore()
+
 		ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
 			if m.log.GetMode() == hbbtlog.LogHijackerModeHijack {
-				p.Send(step)
+				sendStep(step)
 			} else {
 				hlog.From(ctx).Info(hstepfmt.Format(m.renderer, step, false))
 			}

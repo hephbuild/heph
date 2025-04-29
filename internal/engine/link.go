@@ -17,7 +17,6 @@ import (
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/puzpuzpuz/xsync/v4"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -365,27 +364,38 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 
 	lt := &LightLinkedTarget{
 		TargetDef: def,
+		Inputs:    make([]*LightLinkedTargetInput, len(def.GetInputs())),
 	}
 
-	depRefs := xsync.NewMap[string, *TargetDef]()
+	var sf hsingleflight.GroupMem[*TargetDef]
 	var g errgroup.Group
-	for _, input := range def.GetInputs() {
+	for i, input := range def.GetInputs() {
 		depRef := tref.WithoutOut(input.GetRef())
 		refStr := tref.Format(depRef)
 
-		if _, ok := depRefs.Load(refStr); ok {
-			continue
-		}
-
-		depRefs.Store(refStr, nil)
-
 		g.Go(func() error {
-			linkedDep, err := e.GetDef(ctx, DefContainer{Ref: depRef}, rc)
+			linkedDep, err, _ := sf.Do(refStr, func() (*TargetDef, error) {
+				return e.GetDef(ctx, DefContainer{Ref: depRef}, rc)
+			})
 			if err != nil {
 				return err
 			}
 
-			depRefs.Store(refStr, linkedDep)
+			outputs := linkedDep.Outputs
+
+			if input.GetRef().Output != nil {
+				if !slices.Contains(linkedDep.Outputs, input.GetRef().GetOutput()) {
+					return fmt.Errorf("%v doesnt have a named output %q", tref.Format(input.GetRef()), input.GetRef().GetOutput())
+				}
+
+				outputs = []string{input.GetRef().GetOutput()}
+			}
+
+			lt.Inputs[i] = &LightLinkedTargetInput{
+				TargetDef: linkedDep,
+				Outputs:   outputs,
+				Origin:    input.Origin,
+			}
 
 			return nil
 		})
@@ -393,31 +403,6 @@ func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTar
 
 	if err := g.Wait(); err != nil {
 		return nil, err
-	}
-
-	for _, input := range def.GetInputs() {
-		ref := input.GetRef()
-
-		linkedDep, ok := depRefs.Load(tref.Format(tref.WithoutOut(ref)))
-		if !ok {
-			return nil, fmt.Errorf("%v doesnt have a dependency %q", tref.Format(ref), tref.Format(tref.WithoutOut(ref)))
-		}
-
-		outputs := linkedDep.Outputs
-
-		if ref.Output != nil {
-			if !slices.Contains(linkedDep.Outputs, ref.GetOutput()) {
-				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.Format(ref), ref.GetOutput())
-			}
-
-			outputs = []string{ref.GetOutput()}
-		}
-
-		lt.Inputs = append(lt.Inputs, &LightLinkedTargetInput{
-			TargetDef: linkedDep,
-			Outputs:   outputs,
-			Origin:    input.Origin,
-		})
 	}
 
 	slices.SortFunc(lt.Inputs, func(a, b *LightLinkedTargetInput) int {
