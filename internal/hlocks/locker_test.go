@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+
+	runtime.GC()
+	fmt.Println("Giving the opportunity for the cleanup to run...")
+	time.Sleep(5 * time.Second)
+	os.Exit(code)
+}
 
 func newfs(t testing.TB) hfs.OS {
 	t.Helper()

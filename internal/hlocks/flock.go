@@ -30,7 +30,9 @@ func NewFlock(fs hfs.OS, name, path string) *Flock {
 
 type Flock struct {
 	name        string
-	m           sync.RWMutex
+	rc          int          // count of read locks, allows multiple rlock on this instance
+	opm         sync.RWMutex // op mutex, protects this instances against races with with itself
+	lm          sync.RWMutex // lock mutex, protects this instances specifically against lock races
 	path        string
 	f           *os.File
 	cleanup     runtime.Cleanup
@@ -39,15 +41,21 @@ type Flock struct {
 }
 
 func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro bool) (bool, error)) (bool, error) {
+	l.lm.Lock()
+	defer l.lm.Unlock()
+
 	fhow := syscall.O_RDWR
 	if ro {
 		fhow = syscall.O_RDONLY
 
-		l.m.RLock()
-		defer l.m.RUnlock()
-	} else {
-		l.m.Lock()
-		defer l.m.Unlock()
+		l.opm.Lock()
+		if l.rc > 0 {
+			l.rc++
+			l.opm.Unlock()
+
+			return true, nil
+		}
+		l.opm.Unlock()
 	}
 
 	if l.allowCreate {
@@ -66,32 +74,42 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 	f := hf.(*os.File) //nolint:errcheck
 
-	defer func() {
-		if f != l.f {
-			_ = f.Close()
-		}
-	}()
-
 	err = flock.Flock(f, ro, false)
 	if err != nil { //nolint:nestif
 		if flock.IsErrWouldBlock(err) {
 			ok, err := onErr(f, ro)
 			if err != nil {
+				_ = f.Close()
+
 				return false, fmt.Errorf("acquire lock for %s: %w", l.name, err)
 			}
 
 			if !ok {
+				_ = f.Close()
+
 				return false, nil
 			}
 		} else {
+			_ = f.Close()
+
 			return false, err
 		}
 	}
 
-	l.f = f
-	l.cleanup = runtime.AddCleanup(l, func(f *os.File) {
-		panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v", f.Name()))
-	}, f)
+	l.opm.Lock()
+	defer l.opm.Unlock()
+
+	if l.rc == 0 {
+		l.cleanup.Stop()
+		l.cleanup = runtime.AddCleanup(l, func(f *os.File) {
+			panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v", f.Name()))
+		}, f)
+		l.f = f
+	}
+
+	if ro {
+		l.rc++
+	}
 
 	if !ro && l.allowCreate {
 		if err := f.Truncate(0); err == nil {
@@ -104,18 +122,12 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 func (l *Flock) lock(ctx context.Context, ro bool) error {
 	_, err := l.tryLock(ctx, ro, func(f *os.File, ro bool) (bool, error) {
-		if ro {
-			l.m.RUnlock()
-			defer l.m.RLock()
-		} else {
-			l.m.Unlock()
-			defer l.m.Lock()
-		}
-
 		doneCh := make(chan struct{})
-		defer close(doneCh)
+		logDoneCh := make(chan struct{})
 
 		go func() {
+			defer close(logDoneCh)
+
 			select {
 			case <-doneCh:
 				// don't log
@@ -127,7 +139,7 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 			for {
 				select {
 				case <-doneCh:
-					break
+					return
 				default:
 				}
 
@@ -144,20 +156,31 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 					}
 
 					if os.Getpid() == pid {
-						hlog.From(ctx).Debug(fmt.Sprintf("Another job locked %v, waiting...", l.name))
+						hlog.From(ctx).Debug(fmt.Sprintf("Another routine locked %v, waiting...", l.name))
 					} else {
 						processDetails := getProcessDetails(pid)
 
 						hlog.From(ctx).Debug(fmt.Sprintf("Process %v locked %v, waiting...", processDetails, l.name))
 					}
 
-					break
+					return
 				} else {
 					hlog.From(ctx).Debug(fmt.Sprintf("Another process locked %v, waiting...", l.name))
-					time.Sleep(time.Second)
+
+					select {
+					case <-doneCh:
+						return
+					case <-time.After(time.Second):
+					}
 				}
 			}
 		}()
+
+		defer func() {
+			// wait for goroutine to go away
+			<-logDoneCh
+		}()
+		defer close(doneCh)
 
 		lockCh := make(chan error, 1)
 
@@ -192,8 +215,12 @@ func (l *Flock) Lock(ctx context.Context) error {
 }
 
 func (l *Flock) Unlock() error {
-	l.m.Lock()
-	defer l.m.Unlock()
+	return l.unlock(false)
+}
+
+func (l *Flock) unlock(ro bool) error {
+	l.opm.Lock()
+	defer l.opm.Unlock()
 
 	f := l.f
 
@@ -206,14 +233,22 @@ func (l *Flock) Unlock() error {
 		_ = f.Truncate(0)
 	}
 
+	if ro {
+		l.rc--
+
+		if l.rc > 0 { // some other goroutine holds an RLock on this instance, dont release the file yet
+			return nil
+		}
+	}
+
 	err := flock.Funlock(f)
 	if err != nil {
 		return err
 	}
 
 	l.cleanup.Stop()
-	l.cleanup = runtime.Cleanup{}
 	l.f = nil
+	l.rc = 0
 
 	return nil
 }
@@ -229,7 +264,7 @@ func (l *Flock) RLock(ctx context.Context) error {
 }
 
 func (l *Flock) RUnlock() error {
-	return l.Unlock()
+	return l.unlock(true)
 }
 
 func (l *Flock) Clean() error {
