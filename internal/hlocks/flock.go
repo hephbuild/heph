@@ -13,7 +13,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"weak"
 )
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
@@ -21,13 +20,6 @@ func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
 		name = path
 	}
 	l := &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
-	runtime.AddCleanup(l, func(lp weak.Pointer[Flock]) {
-		if lp := lp.Value(); lp != nil {
-			if f := l.f; f != nil {
-				panic(fmt.Sprintf("Flock is being freed, but underlying lock is stil held: %v", f.Name()))
-			}
-		}
-	}, weak.Make(l))
 
 	return l
 }
@@ -41,6 +33,7 @@ type Flock struct {
 	m           sync.RWMutex
 	path        string
 	f           *os.File
+	cleanup     runtime.Cleanup
 	fs          hfs.OS
 	allowCreate bool
 }
@@ -96,6 +89,9 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}
 
 	l.f = f
+	l.cleanup = runtime.AddCleanup(l, func(f *os.File) {
+		panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v", f.Name()))
+	}, f)
 
 	if !ro && l.allowCreate {
 		if err := f.Truncate(0); err == nil {
@@ -201,6 +197,10 @@ func (l *Flock) Unlock() error {
 
 	f := l.f
 
+	if f == nil {
+		return fmt.Errorf("attempting to release lock when not held ")
+	}
+
 	if l.allowCreate {
 		// Try to wipe the pid if we have write perm
 		_ = f.Truncate(0)
@@ -211,6 +211,8 @@ func (l *Flock) Unlock() error {
 		return err
 	}
 
+	l.cleanup.Stop()
+	l.cleanup = runtime.Cleanup{}
 	l.f = nil
 
 	return nil

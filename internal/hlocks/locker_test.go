@@ -88,7 +88,7 @@ func TestFlockRLock(t *testing.T) {
 
 	testRLockTry(t, func() RWLocker {
 		return NewFlock(fs, "lock", t.Name()+".lock")
-	})
+	}, false)
 }
 
 func TestMutex(t *testing.T) {
@@ -117,7 +117,7 @@ func TestMutexRLock(t *testing.T) {
 
 	testRLockTry(t, func() RWLocker {
 		return l
-	})
+	}, true)
 }
 
 func testLocker(t *testing.T, factory func() Locker) {
@@ -179,6 +179,13 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 		}
 		// hold lock
 		ch <- struct{}{}
+
+		t.Cleanup(func() {
+			err := l.Unlock()
+			if err != nil {
+				panic(err)
+			}
+		})
 	}()
 
 	<-ch
@@ -226,9 +233,10 @@ func testLockerTry(t *testing.T, factory func() Locker) {
 	ok, err = l2.TryLock(ctx)
 	require.NoError(t, err)
 	assert.True(t, ok)
+	defer l2.Unlock()
 }
 
-func testRLockTry(t *testing.T, factory func() RWLocker) {
+func testRLockTry(t *testing.T, factory func() RWLocker, shared bool) {
 	l1 := factory()
 	l2 := factory()
 	l3 := factory()
@@ -239,9 +247,15 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	// 2 RLock
 	err := l1.RLock(ctx)
 	require.NoError(t, err)
+	if !shared {
+		defer l1.RUnlock()
+	}
 
 	err = l2.RLock(ctx)
 	require.NoError(t, err)
+	if !shared {
+		defer l2.RUnlock()
+	}
 
 	// Try to Lock
 	ok, err := l3.TryLock(ctx)
@@ -265,6 +279,7 @@ func testRLockTry(t *testing.T, factory func() RWLocker) {
 	// Try to Lock after all are unlocked
 	ok, err = l3.TryLock(ctx)
 	require.NoError(t, err)
+	defer l3.Unlock()
 
 	assert.True(t, ok)
 

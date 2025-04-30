@@ -12,7 +12,7 @@ func BenchmarkFlock(b *testing.B) {
 
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := l.Lock(context.Background())
 		if err != nil {
 			panic(err)
@@ -29,7 +29,7 @@ func BenchmarkMutex(b *testing.B) {
 
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err := l.Lock(context.Background())
 		if err != nil {
 			panic(err)
