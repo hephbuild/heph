@@ -3,7 +3,10 @@ package hlocks
 import (
 	"context"
 	"errors"
+	"go.opentelemetry.io/otel"
 )
+
+var tmutexTracer = otel.Tracer("heph/internal/hlocks/tmutex")
 
 func NewT(outer Locker, inner RWLocker) *TMutex {
 	return &TMutex{
@@ -27,10 +30,16 @@ type TMutex struct {
 }
 
 func (tm *TMutex) TryRLock(ctx context.Context) (bool, error) {
+	ctx, span := tmutexTracer.Start(ctx, "TryRLock")
+	defer span.End()
+
 	return tm.inner.TryRLock(ctx)
 }
 
 func (tm *TMutex) TryLock(ctx context.Context) (bool, error) {
+	ctx, span := tmutexTracer.Start(ctx, "TryLock")
+	defer span.End()
+
 	ok, err := tm.outer.TryLock(ctx)
 	if !ok || err != nil {
 		return false, err
@@ -56,6 +65,9 @@ func (tm *TMutex) Clean() error {
 }
 
 func (tm *TMutex) RLock2Lock(ctx context.Context) error {
+	ctx, span := tmutexTracer.Start(ctx, "RLock2Lock")
+	defer span.End()
+
 	err := tm.outer.Lock(ctx)
 	if err != nil {
 		return err
@@ -73,6 +85,9 @@ func (tm *TMutex) RLock2Lock(ctx context.Context) error {
 }
 
 func (tm *TMutex) Lock2RLock(ctx context.Context) error {
+	ctx, span := tmutexTracer.Start(ctx, "Lock2RLock")
+	defer span.End()
+
 	err := tm.inner.Unlock()
 	if err != nil {
 		return err
@@ -90,6 +105,9 @@ func (tm *TMutex) Lock2RLock(ctx context.Context) error {
 }
 
 func (tm *TMutex) RLock(ctx context.Context) error {
+	ctx, span := tmutexTracer.Start(ctx, "RLock")
+	defer span.End()
+
 	return tm.inner.RLock(ctx)
 }
 
@@ -98,6 +116,9 @@ func (tm *TMutex) RUnlock() error {
 }
 
 func (tm *TMutex) Lock(ctx context.Context) error {
+	ctx, span := tmutexTracer.Start(ctx, "Lock")
+	defer span.End()
+
 	// The outer lock must be acquired first, and then the inner lock acquired
 	// second. This ensures that only one writelock has access to the inner
 	// lock at a time.

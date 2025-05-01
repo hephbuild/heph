@@ -1,6 +1,8 @@
 package hsingleflight
 
 import (
+	"fmt"
+	"github.com/dlsniper/debugger"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
@@ -11,7 +13,22 @@ type Group[T any] singleflight.Group
 func (g *Group[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 	sf := (*singleflight.Group)(g)
 
-	vi, err, shared := sf.Do(key, func() (interface{}, error) {
+	debugger.SetLabels(func() []string {
+		return []string{
+			fmt.Sprintf("do: outer: %v", key), "",
+		}
+	})
+
+	var computed bool
+	vi, err, _ := sf.Do(key, func() (interface{}, error) {
+		debugger.SetLabels(func() []string {
+			return []string{
+				fmt.Sprintf("do: inner: %v", key), "",
+			}
+		})
+
+		computed = true
+
 		return do()
 	})
 
@@ -20,7 +37,7 @@ func (g *Group[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 		v = vv
 	}
 
-	return v, err, shared
+	return v, err, computed
 }
 
 type GroupMem[T any] struct {
@@ -68,11 +85,14 @@ func (g *GroupMem[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 		return v, err, false
 	}
 
-	return g.g.Do(key, func() (T, error) {
+	var computed bool
+	v, err, _ = g.g.Do(key, func() (T, error) {
 		v, err, ok := g.get(key)
 		if ok {
 			return v, err
 		}
+
+		computed = true
 
 		v, err = do()
 
@@ -80,4 +100,6 @@ func (g *GroupMem[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 
 		return v, err
 	})
+
+	return v, err, computed
 }

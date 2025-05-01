@@ -32,7 +32,6 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hinstance"
-	"github.com/hephbuild/heph/internal/hlocks"
 	"github.com/hephbuild/heph/internal/hpty"
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -65,22 +64,27 @@ type ResultOptions struct {
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
-	return e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rc)
+	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rc)
+	if err != nil {
+		return nil, err
+	}
+
+	return res.ExecuteResult, nil
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
 	return e.result(ctx, DefContainer{Ref: ref}, outputs, options, rc)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
 	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, options, rc)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
@@ -97,7 +101,13 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+	debugger.SetLabels(func() []string {
+		return []string{
+			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
+		}
+	})
+
 	def, err, _ := rc.memLink.Do(tref.Format(c.GetRef()), func() (*LightLinkedTarget, error) {
 		return e.LightLink(ctx, c)
 	})
@@ -111,7 +121,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		outputs = def.Outputs
 	}
 
-	res, err, _ := rc.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResult, error) {
+	res, err, computed := rc.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResultLocks, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
@@ -122,12 +132,6 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 
 		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 		ctx = hstep.WithoutParent(ctx)
-
-		debugger.SetLabels(func() []string {
-			return []string{
-				fmt.Sprintf("result: %v", tref.Format(ref)), "",
-			}
-		})
 
 		step, ctx := hstep.New(ctx, tref.Format(ref))
 		defer step.Done()
@@ -144,15 +148,42 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		return nil, err
 	}
 
-	return res.Clone(), nil
+	if !computed {
+		res = res.Clone()
+
+		err := res.Locks.RLock(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("lock: %w", err)
+		}
+
+		//e.ResultFromLocalCache(ctx, def, outputs, res.Hashin)
+
+		// TODO: recheck if things are in cache, and if not, clear memResult and call it again
+	} else {
+		res = res.CloneWithoutLocks()
+	}
+
+	return res, nil
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache) ([]*ExecuteResultWithOrigin, error) {
+type DepsResults []*ExecuteResultWithOrigin
+
+func (r DepsResults) Unlock(ctx context.Context) {
+	for _, res := range r {
+		if res == nil {
+			continue
+		}
+
+		res.Unlock(ctx)
+	}
+}
+
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
 	var g errgroup.Group
-	results := make([]*ExecuteResultWithOrigin, len(t.Inputs))
+	results := make(DepsResults, len(t.Inputs))
 
 	for i, dep := range t.Inputs {
 		g.Go(func() error {
@@ -171,8 +202,8 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 			})
 
 			results[i] = &ExecuteResultWithOrigin{
-				ExecuteResult: res,
-				InputOrigin:   dep.Origin,
+				ExecuteResultLocks: res,
+				InputOrigin:        dep.Origin,
 			}
 
 			return nil
@@ -181,6 +212,8 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 
 	err := g.Wait()
 	if err != nil {
+		results.Unlock(ctx)
+
 		return nil, err
 	}
 
@@ -197,18 +230,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 
 const AllOutputs = "__all_outputs__"
 
-func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, rc *ResolveCache) (*ExecuteResult, bool, error) {
-	// Get hashout from all deps
-	results, err := e.depsResults(ctx, def, false, rc)
-	if err != nil {
-		return nil, false, fmt.Errorf("result deps: %w", err)
-	}
-
-	hashin, err := e.hashin(ctx, def, results)
-	if err != nil {
-		return nil, false, fmt.Errorf("hashin: %w", err)
-	}
-
+func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, rc *ResolveCache, hashin string) (*ExecuteResult, bool, error) {
 	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from local cache: %w", err)
@@ -233,15 +255,113 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	res, err := e.innerResult(ctx, def, options, outputs, rc)
 	if err != nil {
 		return nil, err
 	}
 
+	// TODO: move after execute
 	err = e.codegenTree(ctx, res.Def, res.Artifacts)
 	if err != nil {
 		return nil, fmt.Errorf("codegen tree: %w", err)
+	}
+
+	return res, nil
+}
+
+func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (_ *ExecuteResultLocks, rerr error) {
+	results, err := e.depsResults(ctx, def, false, rc)
+	if err != nil {
+		return nil, fmt.Errorf("result deps: %w", err)
+	}
+	unlockDepsResults := sync.OnceFunc(func() {
+		results.Unlock(ctx)
+	})
+	defer unlockDepsResults()
+
+	hashin, err := e.hashin(ctx, def, results)
+	if err != nil {
+		return nil, fmt.Errorf("hashin: %w", err)
+	}
+
+	unlockDepsResults()
+
+	getCache := def.Cache && !options.Shell && !options.Force
+	storeCache := def.Cache && !options.Shell
+
+	if getCache {
+		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, true)
+		if err != nil {
+			return nil, fmt.Errorf("lock cache: %w", err)
+		}
+
+		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
+		if err != nil {
+			return nil, err
+		}
+
+		if ok {
+			return &ExecuteResultLocks{
+				ExecuteResult: res,
+				Locks:         locks,
+			}, nil
+		}
+
+		err = locks.Unlock()
+		if err != nil {
+			hlog.From(ctx).Error(fmt.Sprintf("%v: failed to unlock result locks: %v", tref.Format(def.GetRef()), err))
+		}
+	}
+
+	res, err, computed := rc.memExecute.Do(tref.Format(def.GetRef()), func() (*ExecuteResultLocks, error) {
+		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, false)
+		if err != nil {
+			return nil, fmt.Errorf("lock cache: %w", err)
+		}
+
+		var res *ExecuteResult
+		if storeCache {
+			res, err = e.ExecuteAndCache(ctx, def, options.ExecOptions, rc)
+			if err != nil {
+				err = errors.Join(err, locks.Unlock())
+
+				return nil, err
+			}
+		} else {
+			res, err = e.Execute(ctx, def, options.ExecOptions, rc)
+			if err != nil {
+				err = errors.Join(err, locks.Unlock())
+
+				return nil, err
+			}
+		}
+
+		err = locks.Lock2RLock(ctx)
+		if err != nil {
+			err = errors.Join(err, locks.Unlock())
+
+			return nil, err
+		}
+
+		return &ExecuteResultLocks{
+			ExecuteResult: res,
+			Locks:         locks,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if !computed {
+		res = res.Clone()
+
+		err := res.Locks.RLock(ctx)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		res = res.CloneWithoutLocks()
 	}
 
 	res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
@@ -249,76 +369,7 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 	})
 
 	return res, nil
-}
 
-func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (*ExecuteResult, error) {
-	if options.Shell {
-		def.Cache = false
-	}
-
-	var targetfolder string
-	if def.Cache {
-		targetfolder = e.targetDirName(def.GetRef())
-	} else {
-		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
-	}
-
-	l := hlocks.NewFlock(hfs.At(e.Home, "locks", def.GetRef().GetPackage(), targetfolder), "", "result.lock")
-
-	if def.Cache {
-		if !options.Force {
-			res, ok, err := e.resultFromCache(ctx, def, outputs, rc)
-			if err != nil {
-				return nil, err
-			}
-
-			if ok {
-				return res, nil
-			}
-		}
-
-		res, err, _ := rc.memExecute.Do(tref.Format(def.GetRef()), func() (*ExecuteResult, error) {
-			err := l.Lock(ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			defer func() {
-				err := l.Unlock()
-				if err != nil {
-					hlog.From(ctx).Error(fmt.Sprintf("failed unlocking: %v", err))
-				}
-			}()
-
-			return e.ExecuteAndCache(ctx, def, options.ExecOptions, rc)
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		return res.Clone(), nil
-	} else {
-		res, err, _ := rc.memExecute.Do(tref.Format(def.GetRef()), func() (*ExecuteResult, error) {
-			err := l.Lock(ctx)
-			if err != nil {
-				return nil, err
-			}
-
-			defer func() {
-				err := l.Unlock()
-				if err != nil {
-					hlog.From(ctx).Error(fmt.Sprintf("failed unlocking: %v", err))
-				}
-			}()
-
-			return e.Execute(ctx, def, options.ExecOptions, rc)
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		return res.Clone(), nil
-	}
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
@@ -386,6 +437,36 @@ type ExecuteResult struct {
 	Artifacts []ExecuteResultArtifact
 }
 
+type ExecuteResultLocks struct {
+	*ExecuteResult
+	Locks *CacheLocks
+}
+
+func (r *ExecuteResultLocks) Clone() *ExecuteResultLocks {
+	return &ExecuteResultLocks{
+		ExecuteResult: r.ExecuteResult.Clone(),
+		Locks:         r.Locks.Clone(),
+	}
+}
+
+func (r *ExecuteResultLocks) CloneWithoutLocks() *ExecuteResultLocks {
+	return &ExecuteResultLocks{
+		ExecuteResult: r.ExecuteResult.Clone(),
+		Locks:         r.Locks,
+	}
+}
+
+func (r *ExecuteResultLocks) Unlock(ctx context.Context) {
+	if r == nil {
+		return
+	}
+
+	err := r.Locks.Unlock()
+	if err != nil {
+		hlog.From(ctx).Error(fmt.Sprintf("%v: failed to unlock result locks: %v", tref.Format(r.Def.GetRef()), err))
+	}
+}
+
 func (r ExecuteResult) Sorted() *ExecuteResult {
 	slices.SortFunc(r.Artifacts, func(a, b ExecuteResultArtifact) int {
 		return strings.Compare(a.Hashout, b.Hashout)
@@ -404,7 +485,7 @@ func (r ExecuteResult) Clone() *ExecuteResult {
 }
 
 type ExecuteResultWithOrigin struct {
-	*ExecuteResult
+	*ExecuteResultLocks
 	InputOrigin *pluginv1.TargetDef_InputOrigin
 }
 
@@ -564,6 +645,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
+	defer results.Unlock(ctx)
 
 	driver, ok := e.DriversByName[def.TargetSpec.GetDriver()]
 	if !ok {
@@ -812,26 +894,3 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, op
 		Artifacts: cachedArtifacts,
 	}.Sorted(), nil
 }
-
-/*
-0. get the hashout from deps
-	-> recursive call on transitive deps
-1. hash the deps => hashin
-2. check if hashin has data present for the requested outputs:
-	a. yes
-		-> return that
-	b. no
-		-> go to 3.
-3. check if hashin has data present in any cache
-	a. yes
-		-> attempt to pull them all
-			i. success
-				-> return that
-			ii. failure
-				-> go to 4.
-	b. no
-		-> go to 4.
-4. get the result from deps
-	-> recursive call to routine
-5. execute
-*/

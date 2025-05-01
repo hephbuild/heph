@@ -244,8 +244,8 @@ type ResolveCache struct {
 	memLink hsingleflight.GroupMem[*LightLinkedTarget]
 	memDef  hsingleflight.GroupMem[*TargetDef]
 
-	memResult  hsingleflight.GroupMem[*ExecuteResult]
-	memExecute hsingleflight.GroupMem[*ExecuteResult]
+	memResult  hsingleflight.GroupMem[*ExecuteResultLocks]
+	memExecute hsingleflight.GroupMem[*ExecuteResultLocks]
 
 	correlationId  string
 	correlationIdm sync.Mutex

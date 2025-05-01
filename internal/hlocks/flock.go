@@ -17,7 +17,7 @@ import (
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
 	if name == "" {
-		name = path
+		name = fs.Path(path)
 	}
 	l := &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
 
@@ -100,9 +100,17 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	defer l.opm.Unlock()
 
 	if l.rc == 0 {
+		var stack string
+		if true {
+			buf := make([]byte, 4096)
+			n := runtime.Stack(buf, false)
+
+			stack = "\n" + string(buf[:n])
+		}
+
 		l.cleanup.Stop()
 		l.cleanup = runtime.AddCleanup(l, func(f *os.File) {
-			panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v", f.Name()))
+			panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v%v", f.Name(), stack))
 		}, f)
 		l.f = f
 	}

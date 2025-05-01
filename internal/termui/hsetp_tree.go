@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/tree"
@@ -34,11 +35,15 @@ func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) s
 
 	for v := range maps.Values(children) {
 		slices.SortFunc(v, func(a, b *corev1.Step) int {
-			if v := a.GetStartedAt().AsTime().Compare(b.GetStartedAt().AsTime()); v != 0 {
+			if v := a.GetStartedAt().AsTime().Truncate(1000 * time.Millisecond).Compare(b.GetStartedAt().AsTime().Truncate(1000 * time.Millisecond)); v != 0 {
 				return 0
 			}
 
-			return strings.Compare(a.Id, b.Id)
+			if v := strings.Compare(a.Id, b.Id); v != 0 {
+				return v
+			}
+
+			return strings.Compare(a.Text, b.Text)
 		})
 	}
 

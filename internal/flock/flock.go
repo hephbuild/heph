@@ -16,9 +16,8 @@ func fileDoFd(f *os.File, fun func(fd uintptr) error) error {
 	}
 
 	var rerr error
-	werr := rawConn.Write(func(fd uintptr) bool {
+	werr := rawConn.Control(func(fd uintptr) {
 		rerr = fun(fd)
-		return true
 	})
 	if werr != nil {
 		return werr

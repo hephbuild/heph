@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-
 	"go.opentelemetry.io/otel"
 
 	"connectrpc.com/connect"
@@ -27,7 +26,7 @@ var GlobalResolveCache = &ResolveCache{}
 func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[corev1.ResultRequest]) (*connect.Response[corev1.ResultResponse], error) {
 	rc := GlobalResolveCache
 
-	var res *ExecuteResult
+	var res *ExecuteResultLocks
 	var err error
 	switch kind := req.Msg.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
@@ -43,6 +42,8 @@ func (r resultServiceHandler) Get(ctx context.Context, req *connect.Request[core
 	default:
 		return nil, fmt.Errorf("unexpected message type: %T", kind)
 	}
+	// TODO: this is in the wrong place, the caller should be responsible for releasing the locks
+	defer res.Unlock(ctx)
 
 	artifacts := make([]*pluginv1.Artifact, 0, len(res.Artifacts))
 	for _, artifact := range res.Artifacts {

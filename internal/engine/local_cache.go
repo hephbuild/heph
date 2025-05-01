@@ -13,9 +13,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/hephbuild/heph/internal/hartifact"
-	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/hlocks"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 )
@@ -57,8 +55,6 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 }
 
 func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultArtifact) ([]ExecuteResultArtifact, error) {
-	// TODO: locks
-
 	cachedir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
@@ -162,13 +158,8 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 	ctx, span := tracer.Start(ctx, "ResultFromLocalCache")
 	defer span.End()
 
-	multi := hlocks.NewMulti()
-
-	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin, multi)
+	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin)
 	if err != nil {
-		if err := multi.UnlockAll(); err != nil {
-			hlog.From(ctx).Error(fmt.Sprintf("failed to unlock: %v", err))
-		}
 
 		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
 		if errors.Is(err, hfs.ErrNotExist) {
@@ -181,17 +172,8 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 	return res, ok, nil
 }
 
-func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, locks *hlocks.Multi) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
 	dirfs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-
-	{
-		l := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName, false)
-		err := l.RLock(ctx)
-		if err != nil {
-			return nil, false, fmt.Errorf("flock manifest: %w", err)
-		}
-		locks.Add(l.RUnlock)
-	}
 
 	manifest, err := hartifact.ManifestFromFS(dirfs)
 	if err != nil {
@@ -203,15 +185,6 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 		outputArtifacts := manifest.GetArtifacts(output)
 
 		artifacts = append(artifacts, outputArtifacts...)
-	}
-
-	for _, artifact := range artifacts {
-		l := hlocks.NewFlock2(dirfs, "", artifact.Name, false)
-		err := l.RLock(ctx)
-		if err != nil {
-			return nil, false, fmt.Errorf("flock artifact: %w", err)
-		}
-		locks.Add(l.RUnlock)
 	}
 
 	execArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))

@@ -135,6 +135,7 @@ func init() {
 				if err != nil {
 					return err
 				}
+				defer res.Unlock(ctx)
 
 				outputs := res.Artifacts
 
