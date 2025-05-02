@@ -49,6 +49,7 @@ message Artifact {
   Type type = 3;
   Encoding encoding = 4;
   string uri = 5;
+  string package = 6;
 }
 
 message RunResponse {

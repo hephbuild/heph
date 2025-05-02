@@ -1,0 +1,23 @@
+version: v2
+clean: true
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      path: heph/plugin/fs
+      value: github.com/hephbuild/heph/plugin/pluginfs/gen
+    - file_option: go_package_prefix
+      path: heph/plugin
+      value: github.com/hephbuild/heph/plugin/gen
+
+plugins:
+  - remote: buf.build/protocolbuffers/go
+    out: gen
+    opt: paths=source_relative
+  - local: ["go", "run", "github.com/cerbos/protoc-gen-go-hashpb"]
+    out: gen
+    opt:
+      - paths=source_relative
+      - hashpb_out=.
+inputs:
+  - directory: proto

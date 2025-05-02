@@ -2,6 +2,7 @@ package pluginexec
 
 import (
 	"encoding/json"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -9,7 +10,7 @@ import (
 
 func decoder[T any]() func(any) (any, error) {
 	return func(v any) (any, error) {
-		v, err := Decode[T](v)
+		v, err := hstructpb.Decode[T](v)
 		return v, err
 	}
 }

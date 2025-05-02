@@ -1,16 +1,19 @@
 package pluginexec
 
-import "fmt"
+import (
+	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+)
 
 type SpecStrings []string
 
 func (s *SpecStrings) MapstructureDecode(v any) error {
-	if v, err := Decode[string](v); err == nil {
+	if v, err := hstructpb.Decode[string](v); err == nil {
 		*s = []string{v}
 		return nil
 	}
 
-	if v, err := DecodeSlice[string](v); err == nil {
+	if v, err := hstructpb.DecodeSlice[string](v); err == nil {
 		*s = v
 		return nil
 	}
@@ -21,12 +24,12 @@ func (s *SpecStrings) MapstructureDecode(v any) error {
 type SpecDeps map[string]SpecStrings //nolint:recvcheck
 
 func (s *SpecDeps) MapstructureDecode(v any) error {
-	if v, err := Decode[SpecStrings](v); err == nil {
+	if v, err := hstructpb.Decode[SpecStrings](v); err == nil {
 		*s = map[string]SpecStrings{"": v}
 		return nil
 	}
 
-	if v, err := Decode[map[string]SpecStrings](v); err == nil {
+	if v, err := hstructpb.Decode[map[string]SpecStrings](v); err == nil {
 		*s = v
 		return nil
 	}
@@ -48,12 +51,12 @@ func (s SpecDeps) Merge(ds ...SpecDeps) SpecDeps {
 type SpecOutputs map[string]SpecStrings
 
 func (s *SpecOutputs) MapstructureDecode(v any) error {
-	if v, err := Decode[SpecStrings](v); err == nil {
+	if v, err := hstructpb.Decode[SpecStrings](v); err == nil {
 		*s = map[string]SpecStrings{"": v}
 		return nil
 	}
 
-	if v, err := Decode[map[string]SpecStrings](v); err == nil {
+	if v, err := hstructpb.Decode[map[string]SpecStrings](v); err == nil {
 		*s = v
 		return nil
 	}

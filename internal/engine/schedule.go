@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -529,107 +530,114 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 		stdinErrCh = make(chan error)
 
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil {
+		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
 			return nil, wait, err
 		}
 
-		pipes[0] = res.Msg.GetId()
+		if res != nil && res.Msg.GetId() != "" {
+			pipes[0] = res.Msg.GetId()
 
-		ctx, cancel := context.WithCancel(ctx)
-		cancels = append(cancels, cancel)
+			ctx, cancel := context.WithCancel(ctx)
+			cancels = append(cancels, cancel)
 
-		go func() {
-			defer cancel()
+			go func() {
+				defer cancel()
 
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
-			if err != nil {
+				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				if err != nil {
+					stdinErrCh <- err
+					return
+				}
+				defer w.Close()
+
+				_, err = io.Copy(w, options.Stdin)
+
 				stdinErrCh <- err
-				return
-			}
-			defer w.Close()
-
-			_, err = io.Copy(w, options.Stdin)
-
-			stdinErrCh <- err
-		}()
+			}()
+		}
 	}
 
 	if options.Stdout != nil {
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil {
+		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
 			return nil, wait, err
 		}
 
-		pipes[1] = res.Msg.GetId()
+		if res != nil && res.Msg.GetId() != "" {
+			pipes[1] = res.Msg.GetId()
 
-		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
-			if err != nil {
+			eg.Go(func() error {
+				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				if err != nil {
+					return err
+				}
+
+				_, err = io.Copy(options.Stdout, r)
+
 				return err
-			}
-
-			_, err = io.Copy(options.Stdout, r)
-
-			return err
-		})
+			})
+		}
 	}
 
 	if options.Stderr != nil {
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil {
+		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
 			return nil, wait, err
 		}
 
-		pipes[2] = res.Msg.GetId()
+		if res != nil && res.Msg.GetId() != "" {
+			pipes[2] = res.Msg.GetId()
 
-		eg.Go(func() error {
-			r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
-			if err != nil {
+			eg.Go(func() error {
+				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				if err != nil {
+					return err
+				}
+
+				_, err = io.Copy(options.Stderr, r)
+
 				return err
-			}
-
-			_, err = io.Copy(options.Stderr, r)
-
-			return err
-		})
+			})
+		}
 	}
 
 	if stdin, ok := options.Stdin.(*os.File); ok {
 		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil {
+		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
 			return nil, wait, err
 		}
+		if res != nil && res.Msg.GetId() != "" {
+			pipes[3] = res.Msg.GetId()
 
-		pipes[3] = res.Msg.GetId()
+			ch, clean := hpty.WinSizeChan(ctx, stdin)
+			cancels = append(cancels, clean)
 
-		ch, clean := hpty.WinSizeChan(ctx, stdin)
-		cancels = append(cancels, clean)
-
-		go func() {
-			w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
-			if err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
-				return
-			}
-			defer w.Close()
-
-			for size := range ch {
-				b, err := json.Marshal(size)
+			go func() {
+				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
 				if err != nil {
-					hlog.From(ctx).Error(fmt.Sprintf("failed to marshal size: %v", err))
-					continue
+					hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
+					return
 				}
+				defer w.Close()
 
-				_, _ = w.Write(b)
-				_, _ = w.Write([]byte("\n"))
-			}
-		}()
+				for size := range ch {
+					b, err := json.Marshal(size)
+					if err != nil {
+						hlog.From(ctx).Error(fmt.Sprintf("failed to marshal size: %v", err))
+						continue
+					}
+
+					_, _ = w.Write(b)
+					_, _ = w.Write([]byte("\n"))
+				}
+			}()
+		}
 	}
 
 	return pipes, wait, nil
 }
 
-var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
+var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
 func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "Execute")
@@ -842,6 +850,24 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}
+
+		r, err := hartifact.Reader(ctx, artifact)
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+
+		h := xxh3.New()
+		_, err = io.Copy(h, r)
+		if err != nil {
+			return nil, err
+		}
+		r.Close()
+
+		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+			Hashout:  hex.EncodeToString(h.Sum(nil)),
+			Artifact: artifact,
+		})
 
 		// panic("copy to cache not implemented yet")
 

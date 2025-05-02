@@ -81,10 +81,11 @@ func init() {
 				if err != nil {
 					return err
 				}
-				// _, err = e.RegisterDriver(ctx, pluginfs.NewDriver())
-				// if err != nil {
-				//	return err
-				//}
+
+				_, err = e.RegisterDriver(ctx, pluginfs.NewDriver(), nil)
+				if err != nil {
+					return err
+				}
 
 				drivers := []*pluginexec.Plugin{
 					pluginexec.New(),

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/hephbuild/heph/plugin/tref"
@@ -85,9 +86,16 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			fromfs := hfs.NewOS(rest)
 			tofs := hfs.At(cachedir, name)
 
-			err = hfs.Move(fromfs, tofs)
-			if err != nil {
-				return nil, err
+			if strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
+				err = hfs.Move(fromfs, tofs)
+				if err != nil {
+					return nil, fmt.Errorf("move: %w", err)
+				}
+			} else {
+				err = hfs.Copy(fromfs, tofs)
+				if err != nil {
+					return nil, fmt.Errorf("copy: %w", err)
+				}
 			}
 
 			cachedArtifact = &pluginv1.Artifact{

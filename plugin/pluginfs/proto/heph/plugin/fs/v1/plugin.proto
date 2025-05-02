@@ -1,0 +1,9 @@
+syntax = "proto3";
+package heph.plugin.fs.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message Target {
+  string file = 1;
+  google.protobuf.Timestamp modified_at = 2;
+}

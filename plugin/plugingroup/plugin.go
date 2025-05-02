@@ -58,6 +58,7 @@ func (p Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReques
 			Encoding: artifact.GetEncoding(),
 			Uri:      artifact.GetUri(),
 			Type:     artifact.GetType(),
+			Package:  artifact.Package,
 		})
 	}
 

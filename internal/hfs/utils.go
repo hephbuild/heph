@@ -122,3 +122,38 @@ func Move(from, to FS) error {
 
 	return os.Rename(fromos.Path(), toos.Path())
 }
+
+func Copy(from, to FS) error {
+	fromi, err := from.Stat("")
+	if err != nil {
+		return err
+	}
+
+	if fromi.IsDir() {
+		return fmt.Errorf("unsupported codepath")
+	}
+
+	fromf, err := Open(from, "")
+	if err != nil {
+		return err
+	}
+	defer fromf.Close()
+
+	//toi, err := to.Stat("")
+	//if err != nil {
+	//	return err
+	//}
+
+	tof, err := Create(to, "")
+	if err != nil {
+		return err
+	}
+	defer tof.Close()
+
+	_, err = io.Copy(tof, fromf)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}

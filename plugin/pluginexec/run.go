@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/sync/semaphore"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -31,6 +33,8 @@ import (
 
 var tracer = otel.Tracer("heph/pluginexec")
 
+var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
+
 func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
 	debugger.SetLabels(func() []string {
 		return []string{
@@ -40,6 +44,12 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	step, ctx := hstep.New(ctx, "Executing...")
 	defer step.Done()
+
+	err := sem.Acquire(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer sem.Release(1)
 
 	const pipeStdin = 0
 	const pipeStdout = 1
@@ -51,7 +61,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	}
 
 	t := &execv1.Target{}
-	err := req.Msg.GetTarget().GetDef().UnmarshalTo(t)
+	err = req.Msg.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {
 		return nil, err
 	}

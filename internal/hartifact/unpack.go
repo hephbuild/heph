@@ -49,6 +49,8 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	}
 	defer r.Close()
 
+	fs = hfs.At(fs, artifact.Package)
+
 	switch artifact.GetEncoding() {
 	case pluginv1.Artifact_ENCODING_NONE:
 		if !cfg.filter(artifact.GetName()) {

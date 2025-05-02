@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"io"
 	"maps"
 	"net/http"
@@ -86,7 +87,7 @@ func depId(prop string, group string, i int) string {
 func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
 	var targetSpec Spec
 	targetSpec.Cache = true
-	err := DecodeTo(req.Msg.GetSpec().GetConfig(), &targetSpec)
+	err := hstructpb.DecodeTo(req.Msg.GetSpec().GetConfig(), &targetSpec)
 	if err != nil {
 		return nil, err
 	}

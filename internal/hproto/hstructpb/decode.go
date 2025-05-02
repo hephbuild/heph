@@ -1,4 +1,4 @@
-package pluginexec
+package hstructpb
 
 import (
 	"fmt"

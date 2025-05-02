@@ -52,7 +52,6 @@ func TestSanity(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "exec",
 				},
 				Config: map[string]*structpb.Value{
 					"run": runArg,
@@ -114,7 +113,6 @@ func TestPipeStdout(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "exec",
 				},
 				Def: def,
 			},
@@ -188,7 +186,6 @@ func TestPipeStdin(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "exec",
 				},
 				Def: def,
 			},
@@ -274,7 +271,6 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
 					Name:    "target",
-					Driver:  "exec",
 				},
 				Def: def,
 			},
@@ -346,7 +342,6 @@ func TestPipe404(t *testing.T) {
 			Ref: &pluginv1.TargetRef{
 				Package: "some/pkg",
 				Name:    "target",
-				Driver:  "exec",
 			},
 			Def: def,
 		},

@@ -4,12 +4,12 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
-	"fmt"
 	"github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
+	"path/filepath"
 )
 
 var _ pluginv1connect.ProviderHandler = (*Provider)(nil)
@@ -61,10 +61,9 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref:    req.Msg.GetRef(),
-			Driver: "sh",
+			Driver: "fs_driver",
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue(fmt.Sprintf("cp $ROOTDIR/%v/%v $OUT", rest, f)),
-				"out": structpb.NewStringValue("."),
+				"file": structpb.NewStringValue(filepath.Join(rest, f)),
 			},
 		},
 	}), nil
