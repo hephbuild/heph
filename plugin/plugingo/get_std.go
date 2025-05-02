@@ -17,6 +17,14 @@ import (
 )
 
 func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package, error) {
+	res, err, _ := p.resultStdListMem.Do(fmt.Sprintf("%#v", factors), func() ([]Package, error) {
+		return p.resultStdListInner(ctx, factors)
+	})
+
+	return res, err
+}
+
+func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Package, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Ref{
 			Ref: &pluginv1.TargetRef{

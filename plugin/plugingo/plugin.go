@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/lib/engine"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -49,8 +50,9 @@ var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
 var _ engine.PluginIniter = (*Plugin)(nil)
 
 type Plugin struct {
-	resultClient engine.EngineHandle
-	root         string
+	resultClient     engine.EngineHandle
+	root             string
+	resultStdListMem hsingleflight.GroupMem[[]Package]
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {

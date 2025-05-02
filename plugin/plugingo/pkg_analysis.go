@@ -76,17 +76,15 @@ type GetGoPackageCache struct {
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors) *GetGoPackageCache {
-	stdListRes := hsync.Go2(func() ([]Package, error) {
-		return p.resultStdList(ctx, factors)
-	})
-
 	modulesRes := hsync.Go2(func() ([]Module, error) {
 		return p.goModules(ctx, basePkg)
 	})
 
 	return &GetGoPackageCache{
-		basePkg:    basePkg,
-		stdListRes: stdListRes,
+		basePkg: basePkg,
+		stdListRes: func() ([]Package, error) {
+			return p.resultStdList(ctx, factors)
+		},
 		modulesRes: modulesRes,
 	}
 }
