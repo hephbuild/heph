@@ -44,7 +44,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	l.lm.Lock()
 	defer l.lm.Unlock()
 
-	fhow := syscall.O_RDWR
+	fhow := syscall.O_RDWR | syscall.O_TRUNC
 	if ro {
 		fhow = syscall.O_RDONLY
 
@@ -101,7 +101,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 	if l.rc == 0 {
 		var stack string
-		if true {
+		if false {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 
@@ -120,9 +120,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}
 
 	if !ro && l.allowCreate {
-		if err := f.Truncate(0); err == nil {
-			_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
-		}
+		_, _ = f.WriteAt([]byte(strconv.Itoa(os.Getpid())), 0)
 	}
 
 	return true, nil

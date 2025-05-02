@@ -117,7 +117,8 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 
 	go func() {
 		h2s := &http2.Server{
-			MaxReadFrameSize: 1024 * 256,
+			MaxReadFrameSize:     1 << 20,
+			MaxConcurrentStreams: 500,
 		}
 		srv := &http.Server{
 			Handler: h2c.NewHandler(mux, h2s),
