@@ -44,7 +44,12 @@ func JoinPackage(s ...string) string {
 }
 
 func DirPackage(s string) string {
-	return path.Dir(s)
+	p := path.Dir(s)
+	if p == "." {
+		p = ""
+	}
+
+	return p
 }
 
 func BasePackage(s string) string {

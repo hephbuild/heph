@@ -9,6 +9,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	fsv1 "github.com/hephbuild/heph/plugin/pluginfs/gen/heph/plugin/fs/v1"
+	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -92,7 +93,7 @@ func (p *Driver) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 				Type:     pluginv1.Artifact_TYPE_OUTPUT,
 				Encoding: pluginv1.Artifact_ENCODING_NONE,
 				Uri:      "file://" + filepath.Join(p.resultClient.Root, t.File),
-				Package:  filepath.Dir(t.File),
+				Package:  tref.DirPackage(t.File),
 			},
 		},
 	}), nil
