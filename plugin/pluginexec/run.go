@@ -89,7 +89,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	}
 
 	env = append(env, inputEnv...)
-	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin", binfs.Path())) // TODO: remove /opt/homebrew/bin
+	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin:/usr/local/go/bin", binfs.Path())) // TODO: remove /opt/homebrew/bin
 
 	for key, value := range t.GetEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))

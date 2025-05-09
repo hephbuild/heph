@@ -65,6 +65,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Pac
 
 		goPkg.HephPackage = path.Join("@heph/go/std", goPkg.ImportPath)
 		goPkg.IsStd = true
+		goPkg.Factors = factors
 
 		packages = append(packages, goPkg)
 	}

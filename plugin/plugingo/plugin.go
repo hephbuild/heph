@@ -15,6 +15,8 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 )
 
 type Factors struct {
@@ -99,10 +101,10 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		factors.GoVersion = "1.24"
 	}
 	if factors.GOOS == "" {
-		factors.GOOS = "linux"
+		factors.GOOS = runtime.GOOS
 	}
 	if factors.GOARCH == "" {
-		factors.GOARCH = "amd64"
+		factors.GOARCH = runtime.GOARCH
 	}
 
 	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.Msg.GetRef().GetPackage()); ok && basePkg == "" {
@@ -143,6 +145,8 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}
 
 		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
+	case "test":
+		return p.runTest(ctx, req.Msg.GetRef().GetPackage(), factors)
 	case "embedcfg":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -167,6 +171,54 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}
 
 		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors)
+	case "build_test":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors)
+	case "build_test_lib":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		x, err := strconv.ParseBool(req.Msg.GetRef().Args["x"])
+		if err != nil {
+			return nil, fmt.Errorf("parse x: %w", err)
+		}
+
+		return p.packageTestLib(ctx, tref.DirPackage(gomod), goPkg, factors, x)
+	case "testmain":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		return p.generateTestMain(ctx, goPkg, factors)
+	case "build_testmain_lib":
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
+		if err != nil {
+			return nil, err
+		}
+
+		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors)
 	case "build_lib#asm":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {

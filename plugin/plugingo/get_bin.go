@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -15,47 +16,53 @@ import (
 func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
-	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg.HephPackage, factors, c)
+	goPkg, err := p.getGoPackageFromHephPackage(ctx, goPkg.HephPackage, factors)
+	if err != nil {
+		return nil, fmt.Errorf("get pkg: %w", err)
+	}
+
+	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg, factors, c)
 	if err != nil {
 		return nil, err
 	}
+	goPkgs = slices.DeleteFunc(goPkgs, func(p Package) bool {
+		return p.IsCommand()
+	})
 
+	mainRef := tref.Format(tref.WithOut(&pluginv1.TargetRef{
+		Package: goPkg.GetHephBuildPackage(),
+		Name:    "build_lib",
+		Args:    factors.Args(),
+	}, "a"))
+
+	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
+}
+
+func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []Package) (*connect.Response[pluginv1.GetResponse], error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
 	}
 	for i, goPkg := range goPkgs {
-		if goPkg.IsCommand() {
-			continue
-		}
-
 		if goPkg.ImportPath == "unsafe" {
 			// ignore pseudo package
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
-			Name:    "build_lib",
-			Args:    factors.Args(),
-		}, "a"))}
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(), "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
 	}
 
-	deps["main"] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_lib",
-		Args:    factors.Args(),
-	}, "a"))}
+	deps["main"] = []string{mainRef}
 
 	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.HephPackage,
-				Name:    "build",
+				Package: goPkg.GetHephBuildPackage(),
+				Name:    targetName,
 				Args:    factors.Args(),
 			},
 			Driver: "bash",

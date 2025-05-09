@@ -682,7 +682,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("hashin1: %w", err)
 	}
 
-	if def.Cache && !options.force {
+	if def.Cache && !options.force && !options.shell {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			return nil, err

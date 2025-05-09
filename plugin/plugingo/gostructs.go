@@ -1,6 +1,7 @@
 package plugingo
 
 import (
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go/build"
 	"time"
 )
@@ -37,17 +38,16 @@ type ModuleError struct {
 
 type Package struct {
 	build.Package
+	Factors          Factors
 	Module           *Module
-	Deps             []string
+	Deps             []string // Thats an std field
 	HephPackage      string
 	HephBuildPackage string
 	IsStd            bool
 	Is3rdParty       bool
+	LibTargetRef     *pluginv1.TargetRef
 }
 
-func (p Package) IsMain() bool {
-	return p.Name == "main"
-}
 func (p Package) HasTest() bool {
 	return len(p.TestGoFiles) > 0
 }
@@ -67,5 +67,17 @@ func (p Package) GetBuildImportPath() string {
 		return MainPackage
 	} else {
 		return p.ImportPath
+	}
+}
+
+func (p Package) GetBuildLibTargetRef() *pluginv1.TargetRef {
+	if p.LibTargetRef != nil {
+		return p.LibTargetRef
+	}
+
+	return &pluginv1.TargetRef{
+		Package: p.GetHephBuildPackage(),
+		Name:    "build_lib",
+		Args:    p.Factors.Args(),
 	}
 }

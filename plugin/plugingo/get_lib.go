@@ -8,7 +8,6 @@ import (
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
 	"slices"
 	"strings"
@@ -82,33 +81,38 @@ func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, e
 }
 
 func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Package, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
-	deps := map[string][]string{}
-	run := []string{
-		`echo > importconfig`,
+	return p.packageLibInner2(ctx, "build_lib", nil, goPkg.Name, basePkg, LibPackage{
+		Imports:       goPkg.Imports,
+		EmbedPatterns: goPkg.EmbedPatterns,
+		GoFiles:       goPkg.GoFiles,
+		GoPkg:         goPkg,
+		ImportPath:    goPkg.ImportPath,
+	}, factors, incomplete)
+}
+
+type LibPackage struct {
+	Imports       []string
+	EmbedPatterns []string
+	GoFiles       []string
+
+	GoPkg      Package
+	ImportPath string
+}
+
+func (p *Plugin) packageLibInner2(ctx context.Context, targetName string, extraArgs map[string]string, outName, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+	if len(goPkg.GoFiles) == 0 {
+		return nil, fmt.Errorf("empty go file")
 	}
-	imports := make([]Package, len(goPkg.Imports))
+
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
-	var g errgroup.Group
-	for i, imp := range goPkg.Imports {
-		g.Go(func() error {
-			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
-			if err != nil {
-				return err
-			}
-
-			imports[i] = impGoPkg
-
-			return nil
-		})
-	}
-
-	err := g.Wait()
+	imports, err := p.goImportsToGoPkgs(ctx, goPkg.Imports, factors, c)
 	if err != nil {
 		return nil, err
 	}
 
-	for i, imp := range goPkg.Imports {
+	importsm := map[string]string{}
+	for i := range goPkg.Imports {
 		impGoPkg := imports[i]
 
 		if impGoPkg.ImportPath == "unsafe" {
@@ -116,20 +120,49 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: impGoPkg.GetHephBuildPackage(),
-			Name:    "build_lib",
-			Args:    factors.Args(),
-		}, "a"))}
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(), "a"))
+	}
 
-		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, imp, i))
+	return p.packageLibInner3(
+		ctx,
+		targetName,
+		outName,
+		extraArgs,
+		goPkg.GoPkg.GetHephBuildPackage(),
+		goPkg.ImportPath,
+		importsm,
+		getFiles(goPkg.GoPkg, goPkg.GoFiles),
+		len(goPkg.EmbedPatterns) > 0,
+		factors,
+		incomplete,
+	)
+}
+
+func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName string, extraArgs map[string]string, buildPkg, buildImportPath string, imports map[string]string, srcRefs []string, embedCfg bool, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+	deps := map[string][]string{}
+	run := []string{
+		`echo > importconfig`,
+	}
+
+	var i int
+	for importPath, depRef := range hmaps.Sorted(imports) {
+		i++
+
+		if importPath == "unsafe" {
+			// ignore pseudo package
+			continue
+		}
+
+		deps[fmt.Sprintf("lib%v", i)] = []string{depRef}
+
+		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, importPath, i))
 	}
 
 	var extra string
 
-	if len(goPkg.EmbedPatterns) > 0 {
+	if embedCfg {
 		deps["embed"] = append(deps["embed"], tref.Format(&pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
+			Package: buildPkg,
 			Name:    "embedcfg",
 			Args:    factors.Args(),
 		}))
@@ -141,7 +174,7 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 		extra += " -symabis $SRC_ABI_ABI -asmhdr $SRC_ABI_H"
 
 		deps["abi"] = append(deps["abi"], tref.Format(&pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
+			Package: buildPkg,
 			Name:    "build_lib#abi",
 			Args:    factors.Args(),
 		}))
@@ -149,21 +182,17 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 		extra += " -complete"
 	}
 
-	if len(goPkg.GoFiles) == 0 {
-		return nil, fmt.Errorf("empty go file")
-	}
+	deps["src"] = srcRefs
 
-	deps["src"] = append(deps["src"], getFiles(goPkg, goPkg.GoFiles)...)
+	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, buildImportPath, extra))
 
-	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, goPkg.GetBuildImportPath(), extra))
-
-	name := "build_lib"
+	name := targetName
 	if incomplete {
-		name = "build_lib#incomplete"
+		name += "#incomplete"
 	}
 
 	out := map[string]string{
-		"a": goPkg.Name + ".a",
+		"a": outName + ".a",
 	}
 	if incomplete {
 		out["h"] = "go_asm.h"
@@ -172,9 +201,9 @@ func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Pack
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
+				Package: buildPkg,
 				Name:    name,
-				Args:    factors.Args(),
+				Args:    hmaps.Concat(factors.Args(), extraArgs),
 			},
 			Driver: "bash",
 			Config: map[string]*structpb.Value{
