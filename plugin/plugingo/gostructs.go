@@ -1,6 +1,7 @@
 package plugingo
 
 import (
+	"github.com/hephbuild/heph/internal/hmaps"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go/build"
 	"time"
@@ -62,22 +63,27 @@ func (p Package) GetHephBuildPackage() string {
 	return p.HephPackage
 }
 
-func (p Package) GetBuildImportPath() string {
-	if p.IsCommand() {
+func (p Package) GetBuildImportPath(main bool) string {
+	if main && p.IsCommand() {
 		return MainPackage
 	} else {
 		return p.ImportPath
 	}
 }
 
-func (p Package) GetBuildLibTargetRef() *pluginv1.TargetRef {
+func (p Package) GetBuildLibTargetRef(main bool) *pluginv1.TargetRef {
 	if p.LibTargetRef != nil {
 		return p.LibTargetRef
+	}
+
+	args := p.Factors.Args()
+	if main {
+		args = hmaps.Concat(args, map[string]string{"main": "true"})
 	}
 
 	return &pluginv1.TargetRef{
 		Package: p.GetHephBuildPackage(),
 		Name:    "build_lib",
-		Args:    p.Factors.Args(),
+		Args:    args,
 	}
 }

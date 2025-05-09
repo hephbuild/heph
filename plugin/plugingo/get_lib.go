@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
 	if len(goPkg.SFiles) > 0 {
 		deps := map[string][]string{}
 
@@ -36,11 +36,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 
 		return connect.NewResponse(&pluginv1.GetResponse{
 			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: goPkg.GetHephBuildPackage(),
-					Name:    "build_lib",
-					Args:    factors.Args(),
-				},
+				Ref:    goPkg.GetBuildLibTargetRef(main),
 				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -69,24 +65,31 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 		}), nil
 	}
 
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, false)
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, false, main)
 }
 
-func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, true)
+func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, true, main)
 }
 
 func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, error) {
 	return imp, nil
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Package, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
-	return p.packageLibInner2(ctx, "build_lib", nil, goPkg.Name, basePkg, LibPackage{
+func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Package, factors Factors, incomplete, main bool) (*connect.Response[pluginv1.GetResponse], error) {
+	var extraArgs map[string]string
+	if main {
+		extraArgs = map[string]string{
+			"main": "true",
+		}
+	}
+
+	return p.packageLibInner2(ctx, "build_lib", extraArgs, goPkg.Name, basePkg, LibPackage{
 		Imports:       goPkg.Imports,
 		EmbedPatterns: goPkg.EmbedPatterns,
 		GoFiles:       goPkg.GoFiles,
 		GoPkg:         goPkg,
-		ImportPath:    goPkg.ImportPath,
+		ImportPath:    goPkg.GetBuildImportPath(main),
 	}, factors, incomplete)
 }
 
@@ -120,7 +123,7 @@ func (p *Plugin) packageLibInner2(ctx context.Context, targetName string, extraA
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(), "a"))
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(false), "a"))
 	}
 
 	return p.packageLibInner3(
@@ -242,7 +245,7 @@ func getFiles(goPkg Package, files []string) []string {
 	return out
 }
 
-func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
 	if len(goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
@@ -270,7 +273,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch $OUT_H",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.GetBuildImportPath()),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.GetBuildImportPath(main)),
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"abi": goPkg.Name + ".abi",
@@ -282,7 +285,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 	}), nil
 }
 
-func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Factors, asmFile string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Factors, asmFile string, main bool) (*connect.Response[pluginv1.GetResponse], error) {
 	if len(goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
@@ -309,7 +312,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Facto
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch go_asm.h",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.GetBuildImportPath()),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.GetBuildImportPath(main)),
 				}),
 				"out": structpb.NewStringValue(strings.ReplaceAll(asmFile, ".s", ".o")),
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{

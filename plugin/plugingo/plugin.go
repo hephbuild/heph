@@ -91,6 +91,14 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 
 const ThirdpartyPrefix = "@heph/go/thirdparty"
 
+func isMain(ref *pluginv1.TargetRef) (bool, error) {
+	if v := ref.Args["main"]; v != "" {
+		return strconv.ParseBool(v)
+	}
+
+	return false, nil
+}
+
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
 	if tref.HasPackagePrefix(req.Msg.GetRef().GetPackage(), "@heph/file") {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
@@ -170,7 +178,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors)
+		main, err := isMain(req.Msg.GetRef())
+		if err != nil {
+			return nil, fmt.Errorf("parse main: %w", err)
+		}
+
+		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, main)
 	case "build_test":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -225,14 +238,24 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		return p.packageLibAsm(ctx, goPkg, factors, req.Msg.GetRef().Args["file"])
+		main, err := isMain(req.Msg.GetRef())
+		if err != nil {
+			return nil, fmt.Errorf("parse main: %w", err)
+		}
+
+		return p.packageLibAsm(ctx, goPkg, factors, req.Msg.GetRef().Args["file"], main)
 	case "build_lib#abi":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
-		return p.packageLibAbi(ctx, goPkg, factors)
+		main, err := isMain(req.Msg.GetRef())
+		if err != nil {
+			return nil, fmt.Errorf("parse main: %w", err)
+		}
+
+		return p.packageLibAbi(ctx, goPkg, factors, main)
 	case "build_lib#incomplete":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -244,7 +267,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors)
+		main, err := isMain(req.Msg.GetRef())
+		if err != nil {
+			return nil, fmt.Errorf("parse main: %w", err)
+		}
+
+		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, main)
 	}
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))

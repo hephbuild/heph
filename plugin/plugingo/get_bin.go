@@ -29,11 +29,7 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 		return p.IsCommand()
 	})
 
-	mainRef := tref.Format(tref.WithOut(&pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_lib",
-		Args:    factors.Args(),
-	}, "a"))
+	mainRef := tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(true), "a"))
 
 	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
 }
@@ -49,7 +45,7 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(), "a"))}
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(false), "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
 	}

@@ -61,9 +61,9 @@ func (p *Plugin) packageTestLib(ctx context.Context, basePkg string, goPkg Packa
 	}
 
 	return p.packageLibInner2(ctx, "build_test_lib", map[string]string{"x": "false"}, goPkg.Name, basePkg, LibPackage{
-		Imports:       goPkg.TestImports,
-		EmbedPatterns: goPkg.TestEmbedPatterns,
-		GoFiles:       goPkg.TestGoFiles,
+		Imports:       append(goPkg.Imports, goPkg.TestImports...),
+		EmbedPatterns: append(goPkg.EmbedPatterns, goPkg.TestEmbedPatterns...),
+		GoFiles:       append(goPkg.GoFiles, goPkg.TestGoFiles...),
 		ImportPath:    goPkg.ImportPath,
 		GoPkg:         goPkg,
 	}, factors, false)
@@ -119,7 +119,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, goPkg Package,
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(), "a"))
+		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(false), "a"))
 	}
 
 	if len(goPkg.XTestGoFiles) > 0 {
@@ -128,7 +128,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, goPkg Package,
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(), "a"))
+		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(false), "a"))
 	}
 
 	if len(importsm) == 0 {
@@ -153,16 +153,16 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, goPkg Package,
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(), "a"))
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(false), "a"))
 	}
 
 	return p.packageLibInner3(
 		ctx,
-		goPkg.GetBuildLibTargetRef().Name,
+		goPkg.GetBuildLibTargetRef(false).Name,
 		"testmain_"+goPkg.Name,
 		nil,
-		goPkg.GetBuildLibTargetRef().Package,
-		goPkg.GetBuildImportPath(),
+		goPkg.GetBuildLibTargetRef(false).Package,
+		MainPackage,
 		importsm,
 		[]string{tref.Format(&pluginv1.TargetRef{
 			Package: goPkg.GetHephBuildPackage(),
