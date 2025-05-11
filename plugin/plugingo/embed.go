@@ -39,7 +39,22 @@ func relglob(dir, pattern string) ([]string, error) {
 	return ret, err
 }
 
-func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+	var patterns []string
+	args := factors.Args()
+	switch mode {
+	case ModeNormal:
+		patterns = goPkg.EmbedPatterns
+	case ModeTest:
+		patterns = append(goPkg.TestEmbedPatterns, goPkg.EmbedPatterns...)
+	case ModeXTest:
+		patterns = goPkg.XTestEmbedPatterns
+	}
+
+	if mode != "" {
+		args["mode"] = mode
+	}
+
 	// TODO: move out of linking
 
 	cfg := &Cfg{
@@ -47,7 +62,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 		Files:    map[string]string{},
 	}
 
-	for _, pattern := range goPkg.EmbedPatterns {
+	for _, pattern := range patterns {
 		paths, err := relglob(goPkg.Dir, pattern)
 		if err != nil {
 			return nil, err
@@ -68,7 +83,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
 				Name:    "embedcfg",
-				Args:    factors.Args(),
+				Args:    args,
 			},
 			Driver: "bash",
 			Config: map[string]*structpb.Value{

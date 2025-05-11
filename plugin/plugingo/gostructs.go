@@ -71,14 +71,14 @@ func (p Package) GetBuildImportPath(main bool) string {
 	}
 }
 
-func (p Package) GetBuildLibTargetRef(main bool) *pluginv1.TargetRef {
+func (p Package) GetBuildLibTargetRef(mode string) *pluginv1.TargetRef {
 	if p.LibTargetRef != nil {
 		return p.LibTargetRef
 	}
 
 	args := p.Factors.Args()
-	if main {
-		args = hmaps.Concat(args, map[string]string{"main": "true"})
+	if mode != "" {
+		args = hmaps.Concat(args, map[string]string{"mode": mode})
 	}
 
 	return &pluginv1.TargetRef{

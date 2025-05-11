@@ -137,6 +137,11 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	env = append(env, "SHELLOPTS=")
 
+	env, err = FilterLongEnv(env, args)
+	if err != nil {
+		return nil, err
+	}
+
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
 	cmd.Dir = cwdfs.Path()

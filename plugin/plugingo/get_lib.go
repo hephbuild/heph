@@ -13,22 +13,27 @@ import (
 	"strings"
 )
 
-func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
-	if len(goPkg.SFiles) > 0 {
+func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	if mode != ModeXTest && len(goPkg.GoPkg.SFiles) > 0 {
 		deps := map[string][]string{}
 
 		deps["lib"] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
+			Package: goPkg.GoPkg.GetHephBuildPackage(),
 			Name:    "build_pure_lib",
-			Args:    factors.Args(),
+			Args:    goPkg.LibTargetRef.Args,
 		}, "a"))}
 
 		var asmDeps []string
-		for _, file := range goPkg.SFiles {
+		for _, file := range goPkg.GoPkg.SFiles {
 			asmDeps = append(asmDeps, tref.Format(&pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
+				Package: goPkg.LibTargetRef.Package,
 				Name:    "build_lib#asm",
-				Args: hmaps.Concat(factors.Args(), map[string]string{
+				Args: hmaps.Concat(goPkg.LibTargetRef.Args, map[string]string{
 					"file": file,
 				}),
 			}))
@@ -36,7 +41,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 
 		return connect.NewResponse(&pluginv1.GetResponse{
 			Spec: &pluginv1.TargetSpec{
-				Ref:    goPkg.GetBuildLibTargetRef(main),
+				Ref:    goPkg.GoPkg.LibTargetRef,
 				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -54,9 +59,9 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 					}),
 					"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
 						"lib": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
-							Package: goPkg.GetHephBuildPackage(),
+							Package: goPkg.LibTargetRef.Package,
 							Name:    "build_lib#incomplete",
-							Args:    factors.Args(),
+							Args:    goPkg.LibTargetRef.Args,
 						}, "a"))},
 						"asm": asmDeps,
 					}),
@@ -65,44 +70,23 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, goPkg Package, 
 		}), nil
 	}
 
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, false, main)
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, false)
 }
 
-func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, true, main)
+func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, true)
 }
 
 func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, error) {
 	return imp, nil
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg Package, factors Factors, incomplete, main bool) (*connect.Response[pluginv1.GetResponse], error) {
-	var extraArgs map[string]string
-	if main {
-		extraArgs = map[string]string{
-			"main": "true",
-		}
-	}
-
-	return p.packageLibInner2(ctx, "build_lib", extraArgs, goPkg.Name, basePkg, LibPackage{
-		Imports:       goPkg.Imports,
-		EmbedPatterns: goPkg.EmbedPatterns,
-		GoFiles:       goPkg.GoFiles,
-		GoPkg:         goPkg,
-		ImportPath:    goPkg.GetBuildImportPath(main),
-	}, factors, incomplete)
-}
-
-type LibPackage struct {
-	Imports       []string
-	EmbedPatterns []string
-	GoFiles       []string
-
-	GoPkg      Package
-	ImportPath string
-}
-
-func (p *Plugin) packageLibInner2(ctx context.Context, targetName string, extraArgs map[string]string, outName, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
 	if len(goPkg.GoFiles) == 0 {
 		return nil, fmt.Errorf("empty go file")
 	}
@@ -115,33 +99,86 @@ func (p *Plugin) packageLibInner2(ctx context.Context, targetName string, extraA
 	}
 
 	importsm := map[string]string{}
-	for i := range goPkg.Imports {
-		impGoPkg := imports[i]
-
+	for _, impGoPkg := range imports {
 		if impGoPkg.ImportPath == "unsafe" {
 			// ignore pseudo package
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(false), "a"))
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 	}
 
 	return p.packageLibInner3(
 		ctx,
-		targetName,
-		outName,
-		extraArgs,
-		goPkg.GoPkg.GetHephBuildPackage(),
-		goPkg.ImportPath,
+		"build_lib",
+		goPkg,
 		importsm,
 		getFiles(goPkg.GoPkg, goPkg.GoFiles),
-		len(goPkg.EmbedPatterns) > 0,
 		factors,
 		incomplete,
 	)
 }
 
-func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName string, extraArgs map[string]string, buildPkg, buildImportPath string, imports map[string]string, srcRefs []string, embedCfg bool, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+type LibPackage struct {
+	Mode string
+
+	Imports       []string
+	EmbedPatterns []string
+	GoFiles       []string
+
+	GoPkg        Package
+	ImportPath   string
+	Name         string
+	LibTargetRef *pluginv1.TargetRef
+}
+
+func (p *Plugin) libGoPkg(ctx context.Context, goPkg Package, mode string) (LibPackage, error) {
+	switch mode {
+	case ModeNormal:
+		return LibPackage{
+			Mode:          ModeNormal,
+			Imports:       goPkg.Imports,
+			EmbedPatterns: goPkg.EmbedPatterns,
+			GoFiles:       goPkg.GoFiles,
+			ImportPath:    goPkg.GetBuildImportPath(true),
+			Name:          goPkg.Name,
+			GoPkg:         goPkg,
+			LibTargetRef:  goPkg.GetBuildLibTargetRef(ModeNormal),
+		}, nil
+	case ModeTest:
+		return LibPackage{
+			Mode:          ModeTest,
+			Imports:       append(goPkg.Imports, goPkg.TestImports...),
+			EmbedPatterns: append(goPkg.EmbedPatterns, goPkg.TestEmbedPatterns...),
+			GoFiles:       append(goPkg.GoFiles, goPkg.TestGoFiles...),
+			ImportPath:    goPkg.GetBuildImportPath(false),
+			Name:          goPkg.Name,
+			GoPkg:         goPkg,
+			LibTargetRef:  goPkg.GetBuildLibTargetRef(ModeTest),
+		}, nil
+	case ModeXTest:
+		return LibPackage{
+			Mode:          ModeXTest,
+			Imports:       goPkg.XTestImports,
+			EmbedPatterns: goPkg.XTestEmbedPatterns,
+			GoFiles:       goPkg.XTestGoFiles,
+			ImportPath:    goPkg.GetBuildImportPath(false) + "_test",
+			Name:          goPkg.Name + "_test",
+			GoPkg:         goPkg,
+			LibTargetRef:  goPkg.GetBuildLibTargetRef(ModeXTest),
+		}, nil
+	default:
+		return LibPackage{}, fmt.Errorf("unknown mode %q", mode)
+	}
+}
+
+const (
+	ModeNormal = ""
+	ModeTest   = "test"
+	ModeXTest  = "xtest"
+)
+
+func (p *Plugin) packageLibInner3(ctx context.Context, name string, goPkg LibPackage, imports map[string]string, srcRefs []string, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
@@ -163,11 +200,11 @@ func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName strin
 
 	var extra string
 
-	if embedCfg {
+	if len(goPkg.EmbedPatterns) > 0 {
 		deps["embed"] = append(deps["embed"], tref.Format(&pluginv1.TargetRef{
-			Package: buildPkg,
+			Package: goPkg.LibTargetRef.Package,
 			Name:    "embedcfg",
-			Args:    factors.Args(),
+			Args:    goPkg.LibTargetRef.Args,
 		}))
 
 		extra += " -embedcfg $SRC_EMBED"
@@ -177,9 +214,9 @@ func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName strin
 		extra += " -symabis $SRC_ABI_ABI -asmhdr $SRC_ABI_H"
 
 		deps["abi"] = append(deps["abi"], tref.Format(&pluginv1.TargetRef{
-			Package: buildPkg,
+			Package: goPkg.LibTargetRef.Package,
 			Name:    "build_lib#abi",
-			Args:    factors.Args(),
+			Args:    goPkg.LibTargetRef.Args,
 		}))
 	} else {
 		extra += " -complete"
@@ -187,15 +224,19 @@ func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName strin
 
 	deps["src"] = srcRefs
 
-	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, buildImportPath, extra))
+	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, goPkg.ImportPath, extra))
 
-	name := targetName
+	outFile := goPkg.Name + ".a"
+	if goPkg.Mode != "" {
+		outFile = goPkg.Name + "_" + goPkg.Mode + ".a"
+	}
 	if incomplete {
 		name += "#incomplete"
+		outFile = "inc_" + outFile
 	}
 
 	out := map[string]string{
-		"a": outName + ".a",
+		"a": outFile,
 	}
 	if incomplete {
 		out["h"] = "go_asm.h"
@@ -204,9 +245,9 @@ func (p *Plugin) packageLibInner3(ctx context.Context, targetName, outName strin
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: buildPkg,
+				Package: goPkg.LibTargetRef.Package,
 				Name:    name,
-				Args:    hmaps.Concat(factors.Args(), extraArgs),
+				Args:    goPkg.LibTargetRef.Args,
 			},
 			Driver: "bash",
 			Config: map[string]*structpb.Value{
@@ -245,22 +286,32 @@ func getFiles(goPkg Package, files []string) []string {
 	return out
 }
 
-func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Factors, main bool) (*connect.Response[pluginv1.GetResponse], error) {
-	if len(goPkg.SFiles) == 0 {
+func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+	if len(_goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
 
+	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
+	if err != nil {
+		return nil, err
+	}
+
 	deps := map[string][]string{}
-	for k, files := range map[string][]string{"": goPkg.SFiles, "hdr": goPkg.HFiles} {
-		deps[k] = append(deps[k], getFiles(goPkg, files)...)
+	for k, files := range map[string][]string{"": goPkg.GoPkg.SFiles, "hdr": goPkg.GoPkg.HFiles} {
+		deps[k] = append(deps[k], getFiles(goPkg.GoPkg, files)...)
+	}
+
+	args := factors.Args()
+	if goPkg.Mode != ModeNormal {
+		args["mode"] = goPkg.Mode
 	}
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
+				Package: goPkg.GoPkg.GetHephBuildPackage(),
 				Name:    "build_lib#abi",
-				Args:    factors.Args(),
+				Args:    args,
 			},
 			Driver: "bash",
 			Config: map[string]*structpb.Value{
@@ -273,7 +324,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch $OUT_H",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.GetBuildImportPath(main)),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.ImportPath),
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"abi": goPkg.Name + ".abi",
@@ -285,21 +336,26 @@ func (p *Plugin) packageLibAbi(ctx context.Context, goPkg Package, factors Facto
 	}), nil
 }
 
-func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Factors, asmFile string, main bool) (*connect.Response[pluginv1.GetResponse], error) {
-	if len(goPkg.SFiles) == 0 {
+func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Factors, asmFile string, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+	if len(_goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
 
-	if !slices.Contains(goPkg.SFiles, asmFile) {
+	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	if !slices.Contains(goPkg.GoPkg.SFiles, asmFile) {
 		return nil, fmt.Errorf(asmFile + " not found")
 	}
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
+				Package: goPkg.LibTargetRef.Package,
 				Name:    "build_lib#asm",
-				Args:    hmaps.Concat(factors.Args(), map[string]string{"file": asmFile}),
+				Args:    hmaps.Concat(goPkg.LibTargetRef.Args, map[string]string{"file": asmFile}),
 			},
 			Driver: "bash",
 			Config: map[string]*structpb.Value{
@@ -312,21 +368,21 @@ func (p *Plugin) packageLibAsm(ctx context.Context, goPkg Package, factors Facto
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch go_asm.h",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.GetBuildImportPath(main)),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.ImportPath),
 				}),
 				"out": structpb.NewStringValue(strings.ReplaceAll(asmFile, ".s", ".o")),
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
 					"lib": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
+						Package: goPkg.LibTargetRef.Package,
 						Name:    "build_lib#incomplete",
-						Args:    factors.Args(),
+						Args:    goPkg.LibTargetRef.Args,
 					}, "a"))},
 					"hdr": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
+						Package: goPkg.LibTargetRef.Package,
 						Name:    "build_lib#incomplete",
-						Args:    factors.Args(),
+						Args:    goPkg.LibTargetRef.Args,
 					}, "h"))},
-					"asm": getFiles(goPkg, []string{asmFile}),
+					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
 				}),
 			},
 		},

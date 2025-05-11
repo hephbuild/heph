@@ -1,16 +1,14 @@
 package plugingo
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"fmt"
-	"path/filepath"
-	"slices"
-
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
+	"path/filepath"
 )
 
 func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
@@ -25,16 +23,16 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 	if err != nil {
 		return nil, err
 	}
-	goPkgs = slices.DeleteFunc(goPkgs, func(p Package) bool {
-		return p.IsCommand()
-	})
+	//goPkgs = slices.DeleteFunc(goPkgs, func(p LibPackage) bool {
+	//	return p.GoPkg.IsCommand()
+	//})
 
-	mainRef := tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(true), "a"))
+	mainRef := tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 
 	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
 }
 
-func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []Package) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []LibPackage) (*connect.Response[pluginv1.GetResponse], error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
@@ -45,7 +43,11 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(false), "a"))}
+		if tref.Format(goPkg.LibTargetRef) == "//:" {
+			fmt.Println()
+		}
+
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.LibTargetRef, "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
 	}

@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 )
 
 type Factors struct {
@@ -91,12 +90,8 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 
 const ThirdpartyPrefix = "@heph/go/thirdparty"
 
-func isMain(ref *pluginv1.TargetRef) (bool, error) {
-	if v := ref.Args["main"]; v != "" {
-		return strconv.ParseBool(v)
-	}
-
-	return false, nil
+func getMode(ref *pluginv1.TargetRef) (string, error) {
+	return ref.Args["mode"], nil
 }
 
 func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
@@ -166,7 +161,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		return p.embedCfg(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors)
+		mode, err := getMode(req.Msg.GetRef())
+		if err != nil {
+			return nil, fmt.Errorf("parse mode: %w", err)
+		}
+
+		return p.embedCfg(ctx, tref.DirPackage(gomod), req.Msg.GetRef().GetPackage(), goPkg, factors, mode)
 	case "build_lib":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -178,12 +178,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		main, err := isMain(req.Msg.GetRef())
+		mode, err := getMode(req.Msg.GetRef())
 		if err != nil {
-			return nil, fmt.Errorf("parse main: %w", err)
+			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, main)
+		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode)
 	case "build_test":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -196,23 +196,6 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 		}
 
 		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors)
-	case "build_test_lib":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
-		if err != nil {
-			return nil, err
-		}
-
-		gomod, _, err := p.getGoModGoWork(ctx, req.Msg.GetRef().GetPackage())
-		if err != nil {
-			return nil, err
-		}
-
-		x, err := strconv.ParseBool(req.Msg.GetRef().Args["x"])
-		if err != nil {
-			return nil, fmt.Errorf("parse x: %w", err)
-		}
-
-		return p.packageTestLib(ctx, tref.DirPackage(gomod), goPkg, factors, x)
 	case "testmain":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -238,24 +221,24 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		main, err := isMain(req.Msg.GetRef())
+		mode, err := getMode(req.Msg.GetRef())
 		if err != nil {
-			return nil, fmt.Errorf("parse main: %w", err)
+			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibAsm(ctx, goPkg, factors, req.Msg.GetRef().Args["file"], main)
+		return p.packageLibAsm(ctx, goPkg, factors, req.Msg.GetRef().Args["file"], mode)
 	case "build_lib#abi":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
 			return nil, err
 		}
 
-		main, err := isMain(req.Msg.GetRef())
+		mode, err := getMode(req.Msg.GetRef())
 		if err != nil {
-			return nil, fmt.Errorf("parse main: %w", err)
+			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibAbi(ctx, goPkg, factors, main)
+		return p.packageLibAbi(ctx, goPkg, factors, mode)
 	case "build_lib#incomplete":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -267,12 +250,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			return nil, err
 		}
 
-		main, err := isMain(req.Msg.GetRef())
+		mode, err := getMode(req.Msg.GetRef())
 		if err != nil {
-			return nil, fmt.Errorf("parse main: %w", err)
+			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, main)
+		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode)
 	}
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))

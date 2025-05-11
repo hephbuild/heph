@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/hsync"
-	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
@@ -19,7 +18,6 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -144,16 +142,16 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 	return goPkg, nil
 }
 
-func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (Package, error) {
+func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (LibPackage, error) {
 	goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
 	if err != nil {
-		return Package{}, err
+		return LibPackage{}, err
 	}
 
 	//hasTest := len(goPkg.TestGoFiles) > 0
 	//hasXTest := len(goPkg.XTestGoFiles) > 0
 
-	goPkg.ImportPath = "testmain_" + goPkg.ImportPath
+	goPkg.ImportPath = goPkg.ImportPath + "_testmain"
 	goPkg.Name = MainPackage
 	goPkg.EmbedPatterns = nil
 	goPkg.EmbedPatternPos = nil
@@ -194,7 +192,7 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 
 	deps, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c)
 	if err != nil {
-		return Package{}, err
+		return LibPackage{}, err
 	}
 
 	goPkg.Deps = nil
@@ -202,26 +200,18 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 		goPkg.Deps = append(goPkg.Deps, dep.ImportPath)
 	}
 
-	return goPkg, nil
-}
-
-func (p *Plugin) getGoTestPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache, xtest bool) (Package, error) {
-	goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
-	if err != nil {
-		return Package{}, err
-	}
-
-	if xtest {
-		goPkg.ImportPath = goPkg.ImportPath + "_test"
-	}
-
-	goPkg.LibTargetRef = &pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_test_lib",
-		Args:    hmaps.Concat(factors.Args(), map[string]string{"x": strconv.FormatBool(xtest)}),
-	}
-
-	return goPkg, nil
+	return LibPackage{
+		Mode:       ModeNormal,
+		Imports:    goPkg.Imports,
+		GoPkg:      goPkg,
+		ImportPath: MainPackage,
+		Name:       MainPackage,
+		LibTargetRef: &pluginv1.TargetRef{
+			Package: goPkg.GetHephBuildPackage(),
+			Name:    "build_testmain_lib",
+			Args:    factors.Args(),
+		},
+	}, nil
 }
 
 func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (Package, error) {
@@ -263,8 +253,8 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors)
 }
 
-func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors Factors, c *GetGoPackageCache) ([]Package, error) {
-	goPkgs := make([]Package, len(goPkg.Deps))
+func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors Factors, c *GetGoPackageCache) ([]LibPackage, error) {
+	goPkgs := make([]LibPackage, len(goPkg.Deps))
 	var g errgroup.Group
 
 	for i, imp := range goPkg.Deps {
@@ -274,7 +264,12 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors
 				return fmt.Errorf("get pkg: %w", err)
 			}
 
-			goPkgs[i] = goPkg
+			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeNormal)
+			if err != nil {
+				return fmt.Errorf("get lib pkg: %w", err)
+			}
+
+			goPkgs[i] = libGoPkg
 
 			return nil
 		})
@@ -288,7 +283,7 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors
 	return goPkgs, nil
 }
 
-func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache, extraImports []string) ([]Package, error) {
+func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache, extraImports []string) ([]LibPackage, error) {
 	goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
 	if err != nil {
 		return nil, fmt.Errorf("get pkg: %w", err)
@@ -299,32 +294,37 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 	imports = append(imports, goPkg.XTestImports...)
 	imports = append(imports, extraImports...)
 
-	goPkgs := make([]Package, 0)
+	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
 	var g errgroup.Group
 
-	g.Go(func() error {
-		goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
-		if err != nil {
-			return fmt.Errorf("get test pkg: %w", err)
-		}
-
-		goPkgsm.Lock()
-		goPkgs = append(goPkgs, goPkg)
-		goPkgsm.Unlock()
-
-		return nil
-	})
+	//g.Go(func() error {
+	//	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+	//	if err != nil {
+	//		return fmt.Errorf("get test pkg: %w", err)
+	//	}
+	//
+	//	goPkgsm.Lock()
+	//	goPkgs = append(goPkgs, goPkg)
+	//	goPkgsm.Unlock()
+	//
+	//	return nil
+	//})
 
 	g.Go(func() error {
 		if len(goPkg.TestGoFiles) > 0 {
-			goPkg, err := p.getGoTestPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, false)
+			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
 			if err != nil {
-				return fmt.Errorf("get test pkg: %w", err)
+				return err
+			}
+
+			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
+			if err != nil {
+				return err
 			}
 
 			goPkgsm.Lock()
-			goPkgs = append(goPkgs, goPkg)
+			goPkgs = append(goPkgs, libGoPkg)
 			goPkgsm.Unlock()
 		}
 
@@ -333,13 +333,18 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 	g.Go(func() error {
 		if len(goPkg.XTestGoFiles) > 0 {
-			goPkg, err := p.getGoTestPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, true)
+			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
 			if err != nil {
-				return fmt.Errorf("get test pkg: %w", err)
+				return err
+			}
+
+			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeXTest)
+			if err != nil {
+				return err
 			}
 
 			goPkgsm.Lock()
-			goPkgs = append(goPkgs, goPkg)
+			goPkgs = append(goPkgs, libGoPkg)
 			goPkgsm.Unlock()
 		}
 
@@ -364,11 +369,11 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 		return nil, err
 	}
 
-	slices.SortFunc(goPkgs, func(a, b Package) int {
+	slices.SortFunc(goPkgs, func(a, b LibPackage) int {
 		return strings.Compare(a.ImportPath, b.ImportPath)
 	})
 
-	goPkgs = hslices.UniqBy(goPkgs, func(item Package) string {
+	goPkgs = hslices.UniqBy(goPkgs, func(item LibPackage) string {
 		return item.ImportPath
 	})
 
@@ -400,8 +405,8 @@ func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factor
 	return goPkgs, nil
 }
 
-func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
-	goPkgs := make([]Package, 0)
+func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache) ([]LibPackage, error) {
+	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
 	var g errgroup.Group
 
@@ -425,8 +430,13 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 				return nil
 			})
 
+			libImpGoPkg, err := p.libGoPkg(ctx, impGoPkg, ModeNormal)
+			if err != nil {
+				return err
+			}
+
 			goPkgsm.Lock()
-			goPkgs = append(goPkgs, impGoPkg)
+			goPkgs = append(goPkgs, libImpGoPkg)
 			goPkgsm.Unlock()
 
 			return nil
@@ -438,11 +448,11 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 		return nil, err
 	}
 
-	slices.SortFunc(goPkgs, func(a, b Package) int {
+	slices.SortFunc(goPkgs, func(a, b LibPackage) int {
 		return strings.Compare(a.ImportPath, b.ImportPath)
 	})
 
-	goPkgs = hslices.UniqBy(goPkgs, func(item Package) string {
+	goPkgs = hslices.UniqBy(goPkgs, func(item LibPackage) string {
 		return item.ImportPath
 	})
 

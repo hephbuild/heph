@@ -40,33 +40,14 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 		return nil, err
 	}
 
-	mainRef := tref.Format(tref.WithOut(&pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_testmain_lib",
-		Args:    factors.Args(),
-	}, "a"))
-
-	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs)
-}
-
-func (p *Plugin) packageTestLib(ctx context.Context, basePkg string, goPkg Package, factors Factors, xtest bool) (*connect.Response[pluginv1.GetResponse], error) {
-	if xtest {
-		return p.packageLibInner2(ctx, "build_test_lib", map[string]string{"x": "true"}, goPkg.Name+"_xtest", basePkg, LibPackage{
-			Imports:       goPkg.XTestImports,
-			EmbedPatterns: goPkg.XTestEmbedPatterns,
-			GoFiles:       goPkg.XTestGoFiles,
-			ImportPath:    goPkg.ImportPath + "_test",
-			GoPkg:         goPkg,
-		}, factors, false)
+	libGoPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+	if err != nil {
+		return nil, err
 	}
 
-	return p.packageLibInner2(ctx, "build_test_lib", map[string]string{"x": "false"}, goPkg.Name, basePkg, LibPackage{
-		Imports:       append(goPkg.Imports, goPkg.TestImports...),
-		EmbedPatterns: append(goPkg.EmbedPatterns, goPkg.TestEmbedPatterns...),
-		GoFiles:       append(goPkg.GoFiles, goPkg.TestGoFiles...),
-		ImportPath:    goPkg.ImportPath,
-		GoPkg:         goPkg,
-	}, factors, false)
+	mainRef := tref.Format(tref.WithOut(libGoPkg.LibTargetRef, "a"))
+
+	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs)
 }
 
 func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
@@ -108,34 +89,34 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 var testmainImports = []string{"os", "reflect", "testing", "testing/internal/testdeps"}
 
-func (p *Plugin) testMainLib(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
 	importsm := map[string]string{}
 
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
-	if len(goPkg.TestGoFiles) > 0 {
-		testGoPkg, err := p.getGoTestPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, false)
+	if len(_goPkg.TestGoFiles) > 0 {
+		testGoPkg, err := p.libGoPkg(ctx, _goPkg, ModeTest)
 		if err != nil {
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(false), "a"))
+		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.LibTargetRef, "a"))
 	}
 
-	if len(goPkg.XTestGoFiles) > 0 {
-		testGoPkg, err := p.getGoTestPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, true)
+	if len(_goPkg.XTestGoFiles) > 0 {
+		testGoPkg, err := p.libGoPkg(ctx, _goPkg, ModeXTest)
 		if err != nil {
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.GetBuildLibTargetRef(false), "a"))
+		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.LibTargetRef, "a"))
 	}
 
 	if len(importsm) == 0 {
 		return nil, fmt.Errorf("this package has no tests")
 	}
 
-	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, _goPkg.ImportPath, factors, c)
 	if err != nil {
 		return nil, err
 	}
@@ -145,31 +126,25 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, goPkg Package,
 		return nil, err
 	}
 
-	for i := range goPkg.Imports {
-		impGoPkg := imports[i]
-
+	for _, impGoPkg := range imports {
 		if impGoPkg.ImportPath == "unsafe" {
 			// ignore pseudo package
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(false), "a"))
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 	}
 
 	return p.packageLibInner3(
 		ctx,
-		goPkg.GetBuildLibTargetRef(false).Name,
-		"testmain_"+goPkg.Name,
-		nil,
-		goPkg.GetBuildLibTargetRef(false).Package,
-		MainPackage,
+		"build_testmain_lib",
+		goPkg,
 		importsm,
 		[]string{tref.Format(&pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
+			Package: goPkg.GoPkg.GetHephBuildPackage(),
 			Name:    "testmain",
 			Args:    factors.Args(),
 		})},
-		false,
 		factors,
 		false,
 	)
