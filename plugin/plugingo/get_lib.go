@@ -20,14 +20,6 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 	}
 
 	if mode != ModeXTest && len(goPkg.GoPkg.SFiles) > 0 {
-		deps := map[string][]string{}
-
-		deps["lib"] = []string{tref.Format(tref.WithOut(&pluginv1.TargetRef{
-			Package: goPkg.GoPkg.GetHephBuildPackage(),
-			Name:    "build_pure_lib",
-			Args:    goPkg.LibTargetRef.Args,
-		}, "a"))}
-
 		var asmDeps []string
 		for _, file := range goPkg.GoPkg.SFiles {
 			asmDeps = append(asmDeps, tref.Format(&pluginv1.TargetRef{
@@ -41,7 +33,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 
 		return connect.NewResponse(&pluginv1.GetResponse{
 			Spec: &pluginv1.TargetSpec{
-				Ref:    goPkg.GoPkg.LibTargetRef,
+				Ref:    goPkg.LibTargetRef,
 				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -53,6 +45,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 					"run": hstructpb.NewStringsValue([]string{
 						// This appends to $SRC_LIB, so name of input & output need to be the same.
 						`go tool pack r "$SRC_LIB" $SRC_ASM`,
+						`mv $SRC_LIB $OUT_A`,
 					}),
 					"out": hstructpb.NewMapStringStringValue(map[string]string{
 						"a": goPkg.Name + ".a",
