@@ -5,22 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/termui"
-	"github.com/hephbuild/heph/plugin/pluginbuildfile"
-	"github.com/hephbuild/heph/plugin/pluginexec"
-	"github.com/hephbuild/heph/plugin/pluginfs"
-	"github.com/hephbuild/heph/plugin/plugingo"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func init() {
@@ -34,6 +26,9 @@ func init() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
+			ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+			defer stop()
+
 			cwd, err := engine.Cwd()
 			if err != nil {
 				return err
@@ -44,12 +39,7 @@ func init() {
 				return err
 			}
 
-			cwp, err := tref.DirToPackage(cwd, root)
-			if err != nil {
-				return err
-			}
-
-			ref, err := tref.ParseInPackage(args[0], cwp)
+			ref, err := parseTargetRef(args[0], cwd, root)
 			if err != nil {
 				return err
 			}
@@ -58,53 +48,10 @@ func init() {
 				return errors.New("must run in a term for now")
 			}
 
-			ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
-			defer stop()
-
 			err = termui.NewInteractive(ctx, func(ctx context.Context, m termui.Model, send func(tea.Msg)) error {
-				e, err := engine.New(ctx, root, engine.Config{})
+				e, err := newEngine(ctx, root)
 				if err != nil {
 					return err
-				}
-
-				_, err = e.RegisterProvider(ctx, pluginbuildfile.New(hfs.NewOS(root)))
-				if err != nil {
-					return err
-				}
-
-				_, err = e.RegisterProvider(ctx, plugingo.New())
-				if err != nil {
-					return err
-				}
-
-				_, err = e.RegisterProvider(ctx, pluginfs.NewProvider())
-				if err != nil {
-					return err
-				}
-
-				_, err = e.RegisterDriver(ctx, pluginfs.NewDriver(), nil)
-				if err != nil {
-					return err
-				}
-
-				drivers := []*pluginexec.Plugin{
-					pluginexec.New(),
-					pluginexec.NewSh(),
-					pluginexec.NewBash(),
-					pluginexec.NewInteractiveBash(),
-				}
-
-				for _, p := range drivers {
-					_, err = e.RegisterDriver(ctx, p, func(mux *http.ServeMux) {
-						path, h := p.PipesHandler()
-
-						h = otelhttp.NewHandler(h, "Pipe")
-
-						mux.Handle(path, h)
-					})
-					if err != nil {
-						return err
-					}
 				}
 
 				res, err := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
