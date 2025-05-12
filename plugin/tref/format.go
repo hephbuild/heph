@@ -28,6 +28,7 @@ type Refable interface {
 type RefableOut interface {
 	Refable
 	GetOutput() string
+	GetFilters() []string
 }
 
 var m = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
@@ -87,6 +88,19 @@ func format(ref Refable) string {
 		if out != "" {
 			sb.WriteString("|")
 			sb.WriteString(out)
+		}
+
+		if len(ref.GetFilters()) > 0 {
+			sb.WriteString(" filters=")
+			first := true
+			for _, f := range ref.GetFilters() {
+				if !first {
+					sb.WriteString(",")
+				} else {
+					first = false
+				}
+				sb.WriteString(f)
+			}
 		}
 	}
 

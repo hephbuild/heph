@@ -101,7 +101,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 	if l.rc == 0 {
 		var stack string
-		if false {
+		if true {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 

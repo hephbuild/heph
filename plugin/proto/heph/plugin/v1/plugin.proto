@@ -17,6 +17,7 @@ message TargetRefWithOutput {
   string driver = 3;
   map<string, string> args = 4;
   optional string output = 5;
+  repeated string filters = 6;
 }
 
 message TargetDef {

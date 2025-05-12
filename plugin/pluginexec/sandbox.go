@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/zeebo/xxh3"
 	"iter"
 	"os"
 	"path/filepath"
-
-	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/zeebo/xxh3"
+	"slices"
 
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 
@@ -44,7 +44,7 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 		for _, dep := range hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()) {
 			for _, target := range dep.GetTargets() {
 				for artifact := range ArtifactsForId(results, target.Id, pluginv1.Artifact_TYPE_OUTPUT) {
-					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs)
+					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.Ref.Filters)
 					if err != nil {
 						return nil, err
 					}
@@ -100,7 +100,7 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 	}
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, filters []string) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
@@ -116,6 +116,12 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	err = hartifact.Unpack(ctx, artifact, fs, hartifact.WithOnFile(func(to string) {
 		_, _ = listf.Write([]byte(to))
 		_, _ = listf.Write([]byte("\n"))
+	}), hartifact.WithFilter(func(from string) bool {
+		if len(filters) == 0 {
+			return true
+		}
+
+		return slices.Contains(filters, from)
 	}))
 	if err != nil {
 		return nil, err

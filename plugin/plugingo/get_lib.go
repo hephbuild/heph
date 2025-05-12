@@ -9,6 +9,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
+	"path"
 	"slices"
 	"strings"
 )
@@ -264,13 +265,19 @@ func getFiles(goPkg Package, files []string) []string {
 
 	var out []string
 	if goPkg.Is3rdParty {
-		for _, file := range files {
-			out = append(out, tref.Format(&pluginv1.TargetRef{
-				Package: ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, goPath),
-				Name:    "content",
-				Args:    map[string]string{"f": file},
-			}))
+		if len(files) == 0 {
+			return nil
 		}
+
+		var filters []string
+		for _, file := range files {
+			filters = append(filters, path.Join(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), goPath, file))
+		}
+
+		out = append(out, tref.Format(tref.WithFilters(tref.WithOut(&pluginv1.TargetRef{
+			Package: ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""),
+			Name:    "download",
+		}, ""), filters)))
 	} else {
 		for _, file := range files {
 			out = append(out, tref.FormatFile(goPkg.HephPackage, file))

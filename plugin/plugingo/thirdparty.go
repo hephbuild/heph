@@ -8,7 +8,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"strings"
 )
 
 func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) (*connect.Response[pluginv1.GetResponse], error) {
@@ -46,41 +45,4 @@ func ThirdpartyContentPackage(goMod, version, goPath string) string {
 
 func ThirdpartyBuildPackage(basePkg, goMod, version, goPath string) string {
 	return tref.JoinPackage(basePkg, ThirdpartyPrefix, goMod+"@"+version, goPath)
-}
-
-func (p *Plugin) goModContent(ctx context.Context, goMod, version, modPath, currentPkg, file string) (*connect.Response[pluginv1.GetResponse], error) {
-	var args map[string]string
-	if file != "" {
-		args = map[string]string{"f": file}
-	}
-	run := []string{
-		"cd $WORKDIR",
-		"mv $WORKDIR/@heph $WORKDIR/@heph.tmp",
-		"mkdir -p $OUT",
-	}
-	if file != "" {
-		run = append(run, fmt.Sprintf("mv $WORKDIR/%v/%v $OUT", strings.ReplaceAll(currentPkg, "@heph", "@heph.tmp"), file))
-	} else {
-		run = append(run, "rm -r $OUT")
-		run = append(run, fmt.Sprintf("mv $WORKDIR/%v $OUT", strings.ReplaceAll(currentPkg, "@heph", "@heph.tmp")))
-	}
-
-	return connect.NewResponse(&pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
-			Package: ThirdpartyContentPackage(goMod, version, modPath),
-			Name:    "content",
-			Args:    args,
-		},
-		Driver: "sh",
-		Config: map[string]*structpb.Value{
-			"out":   structpb.NewStringValue("."),
-			"cache": structpb.NewBoolValue(true),
-			"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-				Package: ThirdpartyContentPackage(goMod, version, ""),
-				Name:    "download",
-			})),
-			"run": hstructpb.NewStringsValue(run),
-			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
-		},
-	}}), nil
 }

@@ -42,7 +42,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 	providerKey := p.Name
 
 	// TODO: caching must be smarter, probably package-based ?
-	specs, err, _ := rc.memSpecs.Do(providerKey+tref.Format(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
+	specs, err, _ := rc.memSpecs.Do(providerKey+refKey(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
 		strm, err := p.GetSpecs(ctx, connect.NewRequest(&pluginv1.GetSpecsRequest{
 			Ref:    c.Ref,
 			States: states,
@@ -59,7 +59,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 				// TODO: what do we do if the spec.ref is different from the request ?
 
 				if !tref.Equal(res.Spec.GetRef(), c.GetRef()) {
-					rc.memRef.Set(tref.Format(res.Spec.GetRef()), res.Spec, nil)
+					rc.memRef.Set(refKey(res.Spec.GetRef()), res.Spec, nil)
 				}
 
 				specs = append(specs, res.Spec)
@@ -85,7 +85,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 		}
 	}
 
-	spec, err, _ := rc.memSpecGet.Do(providerKey+tref.Format(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rc.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
 			Ref:    c.GetRef(),
 			States: states,
@@ -110,7 +110,7 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 	ctx, span := tracer.Start(ctx, "ResolveSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
-	spec, err, _ := rc.memRef.Do(tref.Format(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rc.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		for _, p := range e.Providers {
 			var providerStates []*pluginv1.ProviderState
 			for _, state := range states {
@@ -267,6 +267,10 @@ type TargetDef struct {
 	*pluginv1.TargetSpec
 }
 
+func refKey(ref *pluginv1.TargetRef) string {
+	return tref.Format(ref)
+}
+
 func (t TargetDef) GetRef() *pluginv1.TargetRef {
 	return t.TargetSpec.GetRef()
 }
@@ -286,7 +290,7 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 		}, nil
 	}
 
-	res, err, _ := rc.memDef.Do(tref.Format(c.GetRef()), func() (*TargetDef, error) {
+	res, err, _ := rc.memDef.Do(refKey(c.GetRef()), func() (*TargetDef, error) {
 		spec, err := e.GetSpec(ctx, SpecContainer{
 			Ref:  c.Ref,
 			Spec: c.Spec,

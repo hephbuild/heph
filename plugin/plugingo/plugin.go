@@ -118,8 +118,6 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 			}
 
 			return p.goModDownload(ctx, req.Msg.GetRef().GetPackage(), modPath, version)
-		case "content":
-			return p.goModContent(ctx, modPath, version, modPkgPath, req.Msg.GetRef().GetPackage(), req.Msg.GetRef().Args["f"])
 		}
 	}
 

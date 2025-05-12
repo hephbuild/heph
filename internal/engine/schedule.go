@@ -109,7 +109,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		}
 	})
 
-	def, err, _ := rc.memLink.Do(tref.Format(c.GetRef()), func() (*LightLinkedTarget, error) {
+	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
 		return e.LightLink(ctx, c)
 	})
 	if err != nil {
@@ -315,7 +315,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		}
 	}
 
-	res, err, computed := rc.memExecute.Do(tref.Format(def.GetRef()), func() (*ExecuteResultLocks, error) {
+	res, err, computed := rc.memExecute.Do(refKey(def.GetRef()), func() (*ExecuteResultLocks, error) {
 		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, false)
 		if err != nil {
 			return nil, fmt.Errorf("lock cache: %w", err)

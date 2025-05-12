@@ -20,7 +20,8 @@ type Ref struct {
 
 type RefWithOut struct {
 	Ref
-	Out *string `((Pipe|ParamsPipe) @NameIdent)?`
+	Out     *string `((Pipe|ParamsPipe) @NameIdent)?`
+	Filters string  `("filters" OptEq (@OptValue|@OptIdent))?`
 }
 
 type Arg struct {
@@ -44,6 +45,7 @@ var def = lexer.MustStateful(lexer.Rules{
 		{`Pipe`, `\|`, nil},
 		{`At`, `@`, lexer.Push("Params")},
 		{`NameIdent`, `[^ @|]+`, nil},
+		{"NameEOR", ` `, lexer.Push("Opts")},
 	},
 	"Params": {
 		{"Ident", `[^, =|"]+`, nil},
@@ -51,15 +53,21 @@ var def = lexer.MustStateful(lexer.Rules{
 		{"Eq", `=`, nil},
 		{"Comma", `,`, nil},
 		{"ParamsPipe", `\|`, lexer.Pop()},
+		{"ParamsEOR", ` `, lexer.Push("Opts")},
 	},
 	"ParamString": {
 		{"StrValue", `(\\"|[^"])+`, nil},
 		{"StrEnd", `"`, lexer.Pop()},
 	},
+	"Opts": {
+		{`OptIdent`, `[^ =]+`, nil},
+		{`OptEq`, `=`, nil},
+		{"OptValue", `[^ ]+`, nil},
+	},
 })
 
 var parser = participle.MustBuild[Ref](participle.Lexer(def))
-var parserWithOut = participle.MustBuild[RefWithOut](participle.Lexer(def))
+var parserWithOut = participle.MustBuild[RefWithOut](participle.Lexer(def), participle.Elide("NameEOR", "ParamsEOR"))
 
 func LexDebug(s string, out bool) {
 	var parser interface {

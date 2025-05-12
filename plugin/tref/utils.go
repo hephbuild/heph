@@ -94,12 +94,24 @@ func WithArgs(ref *pluginv1.TargetRef, m map[string]string) *pluginv1.TargetRef 
 }
 
 func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutput {
+	var outputp *string
+	if output != "" {
+		outputp = &output
+	}
+
 	return &pluginv1.TargetRefWithOutput{
 		Package: ref.GetPackage(),
 		Name:    ref.GetName(),
 		Args:    ref.GetArgs(),
-		Output:  &output,
+		Output:  outputp,
 	}
+}
+
+func WithFilters(ref *pluginv1.TargetRefWithOutput, filters []string) *pluginv1.TargetRefWithOutput {
+	ref = hproto.Clone(ref)
+	ref.Filters = filters
+
+	return ref
 }
 
 func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {

@@ -47,10 +47,16 @@ func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
 		return nil, err
 	}
 
+	var filters []string
+	if res.Filters != "" {
+		filters = strings.Split(res.Filters, ",")
+	}
+
 	return &pluginv1.TargetRefWithOutput{
 		Package: res.Pkg,
 		Name:    res.Name,
 		Output:  res.Out,
 		Args:    argsToProto(res.Args),
+		Filters: filters,
 	}, nil
 }

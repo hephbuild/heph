@@ -62,6 +62,10 @@ func (s *Step) Done() {
 }
 
 func (s *Step) GetID() string {
+	if s.pbstep == nil {
+		return ""
+	}
+
 	return s.pbstep.GetId()
 }
 
@@ -129,7 +133,7 @@ func HandlerFromContext(ctx context.Context) Handler {
 func From(ctx context.Context) *Step {
 	parent, ok := ctx.Value(ctxStepKey{}).(*Step)
 	if !ok {
-		return &Step{pbstep: &corev1.Step{}}
+		return &Step{}
 	}
 
 	return parent

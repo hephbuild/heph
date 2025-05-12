@@ -159,7 +159,7 @@ func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
 		slices.Sort(outputs)
 	}
 
-	return tref.Format(ref) + fmt.Sprintf("%#v", outputs)
+	return refKey(ref) + fmt.Sprintf("%#v", outputs)
 }
 
 func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
