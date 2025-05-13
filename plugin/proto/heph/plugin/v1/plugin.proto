@@ -14,10 +14,9 @@ message TargetRef {
 message TargetRefWithOutput {
   string package = 1;
   string name = 2;
-  string driver = 3;
-  map<string, string> args = 4;
-  optional string output = 5;
-  repeated string filters = 6;
+  map<string, string> args = 3;
+  optional string output = 4;
+  repeated string filters = 5;
 }
 
 message TargetDef {
