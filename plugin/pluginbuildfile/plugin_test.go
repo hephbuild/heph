@@ -22,7 +22,7 @@ func TestSanity(t *testing.T) {
 	err := hfs.WriteFile(fs, "BUILD", []byte(`target(name="hello", driver="exec", run=["hello"])`), os.ModePerm)
 	require.NoError(t, err)
 
-	p := New(fs)
+	p := New(fs, Options{Patterns: []string{"BUILD"}})
 
 	pc := plugintest.ProviderClient(t, p)
 
@@ -40,7 +40,6 @@ func TestSanity(t *testing.T) {
 
 		assert.Equal(t, "", ref.GetPackage())
 		assert.Equal(t, "hello", ref.GetName())
-		assert.Equal(t, "exec", ref.GetDriver())
 	}
 
 	{

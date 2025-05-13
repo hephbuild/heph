@@ -22,6 +22,7 @@ require (
 	github.com/go-faker/faker/v4 v4.5.0
 	github.com/go-logr/logr v1.4.2
 	github.com/go-viper/mapstructure/v2 v2.2.1
+	github.com/goccy/go-yaml v1.17.1
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-isatty v0.0.20
 	github.com/muesli/termenv v0.15.2

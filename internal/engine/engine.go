@@ -41,6 +41,8 @@ func Cwd() (string, error) {
 	return cwd, nil
 }
 
+const ConfigFileName = ".hephconfig2"
+
 func Root() (string, error) {
 	cwd, err := Cwd()
 	if err != nil {
@@ -51,7 +53,7 @@ func Root() (string, error) {
 	for len(parts) > 0 {
 		p := string(filepath.Separator) + filepath.Join(parts...)
 
-		if _, err := os.Stat(filepath.Join(p, ".hephconfig")); err == nil {
+		if _, err := os.Stat(filepath.Join(p, ConfigFileName)); err == nil {
 			return p, nil
 		}
 
@@ -59,9 +61,6 @@ func Root() (string, error) {
 	}
 
 	return "", errors.New("root not found, are you running this command in the repo directory?")
-}
-
-type Config struct {
 }
 
 type EngineHandle struct {

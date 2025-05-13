@@ -18,7 +18,12 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+type Options struct {
+	Patterns []string
+}
+
 type Plugin struct {
+	Options
 	repoRoot    hfs.FS
 	cacheget    CacheGet
 	cacherunpkg CacheRunpkg
@@ -28,8 +33,9 @@ var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
 
 const Name = "buildfile"
 
-func New(fs hfs.FS) *Plugin {
+func New(fs hfs.FS, cfg Options) *Plugin {
 	return &Plugin{
+		Options:  cfg,
 		repoRoot: fs,
 	}
 }

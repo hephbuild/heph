@@ -63,13 +63,15 @@ func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
 	return nil
 }
 
+const Name = "go"
+
 func New() *Plugin {
 	return &Plugin{}
 }
 
 func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
 	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
-		Name: "go",
+		Name: Name,
 	}), nil
 }
 

@@ -248,13 +248,15 @@ func WithName(name string) Option {
 	}
 }
 
+const NameExec = "exec"
+
 func New(options ...Option) *Plugin {
 	p := &Plugin{
 		pipes: map[string]*pipe{},
 		runToExecArgs: func(sandboxPath string, run []string, termargs []string) []string {
 			return append(run, termargs...)
 		},
-		name: "exec",
+		name: NameExec,
 	}
 
 	for _, opt := range options {
@@ -273,6 +275,8 @@ func bashArgs(so, lo []string) []string {
 	)
 }
 
+const NameBash = "bash"
+
 func NewBash(options ...Option) *Plugin {
 	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
 		args := bashArgs(
@@ -288,10 +292,12 @@ func NewBash(options ...Option) *Plugin {
 			args = append(args, termargs...)
 			return args
 		}
-	}), WithName("bash"))
+	}), WithName(NameBash))
 
 	return New(options...)
 }
+
+const NameBashShell = "bash@shell"
 
 func NewInteractiveBash(options ...Option) *Plugin {
 	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
@@ -311,7 +317,7 @@ func NewInteractiveBash(options ...Option) *Plugin {
 			nil,
 			[]string{"--rcfile", initfilePath},
 		)
-	}), WithName("bash@shell"))
+	}), WithName(NameBashShell))
 
 	return New(options...)
 }
@@ -323,6 +329,8 @@ func shArgs(initfile string, so []string) []string {
 	}
 	return append(base, so...)
 }
+
+const NameSh = "sh"
 
 func NewSh(options ...Option) *Plugin {
 	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
@@ -339,7 +347,7 @@ func NewSh(options ...Option) *Plugin {
 			args = append(args, termargs...)
 			return args
 		}
-	}), WithName("sh"))
+	}), WithName(NameSh))
 	return New(options...)
 }
 

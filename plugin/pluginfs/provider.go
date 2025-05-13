@@ -29,9 +29,11 @@ func NewProvider() *Provider {
 	return &Provider{}
 }
 
+const Name = "fs"
+
 func (p *Provider) Config(ctx context.Context, c *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
 	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
-		Name: "fs",
+		Name: Name,
 	}), nil
 }
 
