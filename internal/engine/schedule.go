@@ -110,7 +110,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 	})
 
 	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.LightLink(ctx, c)
+		return e.DeepLink(ctx, c)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)

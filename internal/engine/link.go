@@ -349,7 +349,7 @@ func (t LightLinkedTarget) Clone() *LightLinkedTarget {
 	}
 }
 
-func (e *Engine) LightLink(ctx context.Context, c DefContainer) (*LightLinkedTarget, error) {
+func (e *Engine) DeepLink(ctx context.Context, c DefContainer) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
 

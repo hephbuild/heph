@@ -51,7 +51,7 @@ func init() {
 					return err
 				}
 
-				def, err := e.LightLink(ctx, engine.DefContainer{Ref: ref})
+				def, err := e.DeepLink(ctx, engine.DefContainer{Ref: ref})
 				if err != nil {
 					return err
 				}
