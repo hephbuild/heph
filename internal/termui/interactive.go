@@ -132,7 +132,9 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 		}
 }
 
-func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, send func(tea.Msg)) error) error {
+type RunFunc = func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error
+
+func NewInteractive(ctx context.Context, f RunFunc) error {
 	errCh := make(chan error, 1)
 	m := initialModel()
 
@@ -155,7 +157,9 @@ func NewInteractive(ctx context.Context, f func(ctx context.Context, m Model, se
 		})
 
 		err := hpanic.Recover(func() error {
-			return f(ctx, m, p.Send)
+			return f(ctx, func(f hbbtexec.ExecFunc) error {
+				return hbbtexec.Run(m.Exec, p.Send, f)
+			})
 		})
 
 		errCh <- err

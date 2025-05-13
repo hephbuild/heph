@@ -7,6 +7,7 @@ import (
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/termui"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
@@ -192,4 +193,12 @@ func newEngine(ctx context.Context, root string) (*engine.Engine, error) {
 	}
 
 	return e, nil
+}
+
+func newTermui(ctx context.Context, f termui.RunFunc) error {
+	if !plain && isTerm() {
+		return termui.NewInteractive(ctx, f)
+	} else {
+		return termui.NewNonInteractive(ctx, f)
+	}
 }

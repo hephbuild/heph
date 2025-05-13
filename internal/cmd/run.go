@@ -3,15 +3,12 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/heph/internal/termui"
 	"github.com/spf13/cobra"
 )
 
@@ -44,11 +41,7 @@ func init() {
 				return err
 			}
 
-			if plain || !isTerm() {
-				return errors.New("must run in a term for now")
-			}
-
-			err = termui.NewInteractive(ctx, func(ctx context.Context, m termui.Model, send func(tea.Msg)) error {
+			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
 				e, err := newEngine(ctx, root)
 				if err != nil {
 					return err
@@ -56,23 +49,21 @@ func init() {
 
 				res, err := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
 					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
-						_, err := hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
+						err := execFunc(func(args hbbtexec.RunArgs) error {
 							if iargs.Pty {
 								err := args.MakeRaw()
 								if err != nil {
-									return struct{}{}, err
+									return err
 								}
 							}
 
 							iargs.Run(ctx, engine.ExecOptions{
-								Stdin: args.Stdin,
-								// bbt has its output set to stderr, to prevent the CLI from outputting on stderr too,
-								// we rely on os-provided stdout/stderr directly
-								Stdout: os.Stdout,
-								Stderr: os.Stderr,
+								Stdin:  args.Stdin,
+								Stdout: args.Stdout,
+								Stderr: args.Stderr,
 							})
 
-							return struct{}{}, nil
+							return nil
 						})
 
 						return err
@@ -88,7 +79,7 @@ func init() {
 				outputs := res.Artifacts
 
 				// TODO how to render res natively without exec
-				_, err = hbbtexec.Run(m.Exec, send, func(args hbbtexec.RunArgs) (struct{}, error) {
+				err = execFunc(func(args hbbtexec.RunArgs) error {
 					for _, output := range outputs {
 						fmt.Println(output.Name)
 						fmt.Println("  group:    ", output.Group)
@@ -97,13 +88,14 @@ func init() {
 						fmt.Println("  encoding: ", output.Encoding.String())
 					}
 
-					return struct{}{}, nil
+					return nil
 				})
 				if err != nil {
 					return err
 				}
 
 				return nil
+
 			})
 			if err != nil {
 				return err

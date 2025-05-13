@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -11,7 +12,7 @@ import (
 	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 )
 
-type ExecFunc[T any] func(args RunArgs) (T, error)
+type ExecFunc func(args RunArgs) error
 
 type execCmdFunc func(args RunArgs) error
 
@@ -23,22 +24,29 @@ type execCmd struct {
 	restore func()
 }
 
-func (e *execCmd) makeRaw() error {
-	if f, ok := e.stdin.(term.File); ok && term.IsTerminal(f.Fd()) {
+func MakeRaw(r io.Reader) (func(), error) {
+	if f, ok := r.(term.File); ok && term.IsTerminal(f.Fd()) {
 		previousState, err := term.MakeRaw(f.Fd())
 		if err != nil {
-			return fmt.Errorf("error entering raw mode: %w", err)
+			return nil, fmt.Errorf("error entering raw mode: %w", err)
 		}
-		e.restore = func() {
+		return func() {
 			err := term.Restore(f.Fd(), previousState)
 			if err != nil { //nolint:staticcheck
 				// fmt.Println("RESTORE", err)
 				// TODO: log
 			}
-		}
+		}, nil
 	}
 
-	return nil
+	return func() {}, nil
+}
+
+func (e *execCmd) makeRaw() error {
+	var err error
+	e.restore, err = MakeRaw(e.stdin)
+
+	return err
 }
 
 type RunArgs struct {
@@ -101,12 +109,14 @@ func (e *execCmdWrapper) SetStdin(r io.Reader) {
 }
 
 func (e *execCmdWrapper) SetStdout(w io.Writer) {
-	e.c.SetStdout(w)
+	// bbt has its output set to stderr, to prevent the CLI from outputting on stderr too,
+	// we rely on os-provided stdout/stderr directly
+	e.c.SetStdout(os.Stdout)
 	e.w = w
 }
 
 func (e *execCmdWrapper) SetStderr(w io.Writer) {
-	e.c.SetStderr(w)
+	e.c.SetStderr(os.Stderr)
 }
 
 type Model struct {
@@ -131,9 +141,8 @@ func (r runError) Unwrap() error {
 	return r.err
 }
 
-func Run[T any](m Model, send func(tea.Msg), f ExecFunc[T]) (T, error) {
+func Run(m Model, send func(tea.Msg), f ExecFunc) error {
 	type container struct {
-		v   T
 		err error
 	}
 
@@ -141,9 +150,9 @@ func Run[T any](m Model, send func(tea.Msg), f ExecFunc[T]) (T, error) {
 	returnedCh := make(chan error, 1)
 
 	cmd := m.Exec(NewExecFunc(func(args RunArgs) error {
-		v, err := f(args)
+		err := f(args)
 
-		resCh <- container{v: v, err: err}
+		resCh <- container{err: err}
 
 		if err != nil {
 			return runError{err: err}
@@ -164,7 +173,7 @@ func Run[T any](m Model, send func(tea.Msg), f ExecFunc[T]) (T, error) {
 	res := <-resCh
 	returnErr := <-returnedCh
 
-	return res.v, errors.Join(res.err, returnErr)
+	return errors.Join(res.err, returnErr)
 }
 
 func (m Model) Exec(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
