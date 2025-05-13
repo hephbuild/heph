@@ -6,16 +6,14 @@ toolchain go1.24.2
 
 tool github.com/cerbos/protoc-gen-go-hashpb
 
-replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20241227212548-ff79c9f0edc9
-
 require (
 	connectrpc.com/connect v1.17.0
 	connectrpc.com/otelconnect v0.7.2
 	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/alecthomas/participle/v2 v2.1.1
 	github.com/bmatcuk/doublestar/v4 v4.7.1
-	github.com/charmbracelet/bubbletea v1.2.4
-	github.com/charmbracelet/lipgloss v1.0.0
+	github.com/charmbracelet/bubbletea v1.3.6-0.20250513162750-78ed49b060c8
+	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/term v0.2.1
 	github.com/creack/pty v1.1.20
 	github.com/dlsniper/debugger v0.6.0
@@ -25,7 +23,7 @@ require (
 	github.com/goccy/go-yaml v1.17.1
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-isatty v0.0.20
-	github.com/muesli/termenv v0.15.2
+	github.com/muesli/termenv v0.16.0
 	github.com/shirou/gopsutil/v3 v3.24.5
 	github.com/spf13/cobra v1.8.1
 	github.com/stretchr/testify v1.10.0
@@ -45,8 +43,8 @@ require (
 	go.opentelemetry.io/otel/trace v1.35.0
 	go.starlark.net v0.0.0-20241226192728-8dfa5b98479f
 	golang.org/x/net v0.39.0
-	golang.org/x/sync v0.13.0
-	golang.org/x/sys v0.32.0
+	golang.org/x/sync v0.14.0
+	golang.org/x/sys v0.33.0
 	google.golang.org/protobuf v1.36.6
 )
 
@@ -54,7 +52,9 @@ require (
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cerbos/protoc-gen-go-hashpb v0.4.0 // indirect
-	github.com/charmbracelet/x/ansi v0.6.0 // indirect
+	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
+	github.com/charmbracelet/x/ansi v0.9.2 // indirect
+	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -76,6 +76,7 @@ require (
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/tklauser/go-sysconf v0.3.14 // indirect
 	github.com/tklauser/numcpus v0.9.0 // indirect
+	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.1.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.5.0 // indirect
