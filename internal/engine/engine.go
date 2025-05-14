@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
@@ -44,6 +45,10 @@ func Cwd() (string, error) {
 const ConfigFileName = ".hephconfig2"
 
 func Root() (string, error) {
+	return getRoot()
+}
+
+var getRoot = sync.OnceValues(func() (string, error) {
 	cwd, err := Cwd()
 	if err != nil {
 		return "", err
@@ -61,7 +66,7 @@ func Root() (string, error) {
 	}
 
 	return "", errors.New("root not found, are you running this command in the repo directory?")
-}
+})
 
 type EngineHandle struct {
 	ServerHandle

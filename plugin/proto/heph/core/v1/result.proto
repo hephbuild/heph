@@ -3,6 +3,7 @@ syntax = "proto3";
 package heph.core.v1;
 import "heph/plugin/v1/driver.proto";
 import "heph/plugin/v1/plugin.proto";
+import "heph/plugin/v1/tref.proto";
 
 message ResultRequest {
   oneof of {

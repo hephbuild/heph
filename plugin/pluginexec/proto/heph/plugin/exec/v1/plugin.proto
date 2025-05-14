@@ -1,7 +1,7 @@
 syntax = "proto3";
 package heph.plugin.exec.v1;
 
-import "heph/plugin/v1/plugin.proto";
+import "heph/plugin/v1/tref.proto";
 
 message Target {
   message Output {

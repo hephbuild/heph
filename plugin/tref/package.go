@@ -10,7 +10,7 @@ import (
 
 func DirToPackage(dir, hephroot string) (string, error) {
 	if !filepath.IsAbs(dir) {
-		return "", fmt.Errorf("dir must be abs")
+		return "", fmt.Errorf("dir must be abs: %v", dir)
 	}
 
 	if !filepath.IsAbs(hephroot) {
@@ -57,7 +57,7 @@ func BasePackage(s string) string {
 }
 
 func HasPackagePrefix(pkg, prefix string) bool {
-	return pkg == prefix || strings.HasPrefix(pkg, prefix+"/")
+	return prefix == "" || pkg == prefix || strings.HasPrefix(pkg, prefix+"/")
 }
 
 func CutPackagePrefix(pkg, prefix string) (string, bool) {
