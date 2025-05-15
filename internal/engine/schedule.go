@@ -48,10 +48,12 @@ type ExecOptions struct {
 	Stderr io.Writer
 }
 
-type ExecInnerOptions struct {
-	interactiveExec func(context.Context, InteractiveExecOptions) error
-	shell           *pluginv1.TargetRef
-	force           bool
+type ExecuteOptions struct {
+	ResultOptions ResultOptions
+
+	shell       bool
+	force       bool
+	interactive bool
 }
 
 type InteractiveExecOptions struct {
@@ -62,7 +64,7 @@ type InteractiveExecOptions struct {
 type ResultOptions struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
-	Force           bool
+	Force           *pluginv1.TargetRef
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
@@ -289,7 +291,8 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 	unlockDepsResults()
 
 	shouldShell := tref.Equal(options.Shell, def.GetRef())
-	getCache := def.Cache && !shouldShell && !options.Force
+	shouldForce := tref.Equal(options.Force, def.GetRef())
+	getCache := def.Cache && !shouldShell && !shouldForce
 	storeCache := def.Cache && !shouldShell
 
 	if getCache {
@@ -322,10 +325,12 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 
-		execOptions := ExecInnerOptions{
-			interactiveExec: options.InteractiveExec,
-			shell:           options.Shell,
-			force:           options.Force,
+		execOptions := ExecuteOptions{
+			ResultOptions: options,
+
+			shell:       tref.Equal(options.Shell, def.GetRef()),
+			force:       tref.Equal(options.Force, def.GetRef()),
+			interactive: tref.Equal(options.Force, def.GetRef()) || tref.Equal(options.Shell, def.GetRef()),
 		}
 
 		var res *ExecuteResult
@@ -646,7 +651,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecInnerOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
@@ -656,10 +661,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	})
 
-	results, err := e.depsResults(ctx, def, true, rc, ResultOptions{
-		InteractiveExec: options.interactiveExec,
-		Shell:           options.shell,
-	})
+	results, err := e.depsResults(ctx, def, true, rc, options.ResultOptions)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -670,9 +672,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("driver not found: %v", def.TargetSpec.GetDriver())
 	}
 
-	shouldShell := tref.Equal(options.shell, def.GetRef())
-
-	if shouldShell {
+	if options.shell {
 		shellDriver := def.TargetSpec.GetDriver() + "@shell"
 		shellDriver = "bash@shell" // TODO: make the original driver declare the shell config
 		driver, ok = e.DriversByName[shellDriver]
@@ -683,7 +683,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	var targetfolder string
-	if def.Cache || shouldShell {
+	if def.Cache || options.shell {
 		targetfolder = e.targetDirName(def.GetRef())
 	} else {
 		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
@@ -694,7 +694,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("hashin1: %w", err)
 	}
 
-	if def.Cache && !options.force && !shouldShell {
+	if def.Cache && !options.force && !options.shell {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			return nil, err
@@ -731,8 +731,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil
 	}
 
-	if shouldShell {
-		execWrapper = options.interactiveExec
+	if options.interactive {
+		execWrapper = options.ResultOptions.InteractiveExec
 		if execWrapper == nil {
 			return nil, errors.New("shell requires interactiveExec not supported")
 		}
@@ -785,7 +785,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, errors.New("modified during execution")
 	}
 
-	if shouldShell {
+	if options.shell {
 		return &ExecuteResult{
 			Def:      def,
 			Hashin:   hashin,
@@ -913,7 +913,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecInnerOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	res, err := e.Execute(ctx, def, options, rc)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)

@@ -49,7 +49,7 @@ func init() {
 					return err
 				}
 
-				var shellTarget *pluginv1.TargetRef
+				var shellTarget, forceTarget *pluginv1.TargetRef
 				if shell.bool {
 					if shell.str != "" {
 						shellTarget, err = tref.Parse(shell.str)
@@ -63,6 +63,10 @@ func init() {
 					}
 				}
 
+				if force {
+					forceTarget = ref
+				}
+
 				res, err := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
 					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
 						return execFunc(func(args hbbtexec.RunArgs) error {
@@ -72,8 +76,6 @@ func init() {
 									return err
 								}
 							}
-
-							panic("A")
 
 							iargs.Run(ctx, engine.ExecOptions{
 								Stdin:  args.Stdin,
@@ -85,7 +87,7 @@ func init() {
 						})
 					},
 					Shell: shellTarget,
-					Force: force,
+					Force: forceTarget,
 				}, engine.GlobalResolveCache)
 				if err != nil {
 					return err
