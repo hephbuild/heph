@@ -11,11 +11,16 @@ import (
 	"path/filepath"
 )
 
-func (p *Plugin) runTest(ctx context.Context, pkg string, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+	labels := []string{"test", "go-test"}
+	if goPkg.IsStd || goPkg.Is3rdParty {
+		labels = nil
+	}
+
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: pkg,
+				Package: goPkg.GetHephBuildPackage(),
 				Name:    "test",
 				Args:    factors.Args(),
 			},
@@ -23,11 +28,12 @@ func (p *Plugin) runTest(ctx context.Context, pkg string, factors Factors) (*con
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue("$SRC"),
 				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-					Package: pkg,
+					Package: goPkg.GetHephBuildPackage(),
 					Name:    "build_test",
 					Args:    factors.Args(),
 				})),
 			},
+			Labels: labels,
 		},
 	}), nil
 }
@@ -37,7 +43,7 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 
 	goPkgs, err := p.goListTestDepsPkgResult(ctx, goPkg.GetHephBuildPackage(), factors, c, testmainImports)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("go list testdeps: %w", err)
 	}
 
 	libGoPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)

@@ -298,19 +298,6 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 	var goPkgsm sync.Mutex
 	var g errgroup.Group
 
-	//g.Go(func() error {
-	//	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
-	//	if err != nil {
-	//		return fmt.Errorf("get test pkg: %w", err)
-	//	}
-	//
-	//	goPkgsm.Lock()
-	//	goPkgs = append(goPkgs, goPkg)
-	//	goPkgsm.Unlock()
-	//
-	//	return nil
-	//})
-
 	g.Go(func() error {
 		if len(goPkg.TestGoFiles) > 0 {
 			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
@@ -414,13 +401,13 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 		g.Go(func() error {
 			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
 			if err != nil {
-				return fmt.Errorf("get pkg: %w", err)
+				return fmt.Errorf("get pkg: %v: %w", imp, err)
 			}
 
 			g.Go(func() error {
 				depPkgs, err := p.goListDepsPkgResult(ctx, impGoPkg, factors, c)
 				if err != nil {
-					return fmt.Errorf("get deps: %w", err)
+					return fmt.Errorf("get deps: %v: %w", impGoPkg, err)
 				}
 
 				goPkgsm.Lock()
@@ -459,6 +446,8 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 	return goPkgs, nil
 }
 
+var errNotInGoModule = errors.New("not in go module")
+
 func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string, error) {
 	pkgParts := tref.SplitPackage(pkg)
 
@@ -495,7 +484,7 @@ func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string
 	}
 
 	if gomod == "" {
-		return "", "", fmt.Errorf("%v is not in a go module", pkg)
+		return "", "", fmt.Errorf("%v: %w", pkg, errNotInGoModule)
 	}
 
 	return gomod, gowork, nil

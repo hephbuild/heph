@@ -241,6 +241,8 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	if err != nil {
 		step.SetError()
 
+		//err = fmt.Errorf("%v: %w", args, err)
+
 		cmderr := err
 
 		if !pty {

@@ -141,6 +141,9 @@ func (r runError) Unwrap() error {
 	return r.err
 }
 
+type StartMsg struct{}
+type EndMsg struct{}
+
 func Run(m Model, send func(tea.Msg), f ExecFunc) error {
 	type container struct {
 		err error
@@ -186,17 +189,32 @@ func (m Model) Exec(c tea.ExecCommand, fn tea.ExecCallback) tea.Cmd {
 			hijacker: m.hijacker,
 		}
 
-		return tea.Exec(cc, func(err error) tea.Msg {
-			// 4. resume the logs, but since bbt controls the term, send them to bbt
-			m.hijacker.SetMode(hbbtlog.LogHijackerModeHijack)
+		return tea.Sequence(
+			func() tea.Msg {
+				return StartMsg{}
+			},
+			tea.Exec(cc, func(err error) tea.Msg {
+				// 4. resume the logs, but since bbt controls the term, send them to bbt
+				m.hijacker.SetMode(hbbtlog.LogHijackerModeHijack)
 
-			var cmd tea.Msg
-			if fn != nil {
-				cmd = fn(err)
-			}
+				var cmd tea.Cmd
+				if fn != nil {
+					msg := fn(err)
+					if msg != nil {
+						cmd = func() tea.Msg {
+							return msg
+						}
+					}
+				}
 
-			return cmd
-		})()
+				return tea.Sequence(
+					func() tea.Msg {
+						return EndMsg{}
+					},
+					cmd,
+				)()
+			}),
+		)()
 	}
 }
 

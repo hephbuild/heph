@@ -4,6 +4,8 @@ package cmd
 import (
 	"context"
 	"fmt"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/tref"
 	"os"
 	"os/signal"
 
@@ -13,7 +15,7 @@ import (
 )
 
 func init() {
-	var shell bool
+	var shell boolStr
 	var force bool
 
 	var runCmd = &cobra.Command{
@@ -47,15 +49,31 @@ func init() {
 					return err
 				}
 
+				var shellTarget *pluginv1.TargetRef
+				if shell.bool {
+					if shell.str != "" {
+						shellTarget, err = tref.Parse(shell.str)
+						if err != nil {
+							return fmt.Errorf("shell flag: %w", err)
+						}
+					}
+
+					if shellTarget == nil {
+						shellTarget = ref
+					}
+				}
+
 				res, err := e.ResultFromRef(ctx, ref, []string{engine.AllOutputs}, engine.ResultOptions{
 					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
-						err := execFunc(func(args hbbtexec.RunArgs) error {
+						return execFunc(func(args hbbtexec.RunArgs) error {
 							if iargs.Pty {
 								err := args.MakeRaw()
 								if err != nil {
 									return err
 								}
 							}
+
+							panic("A")
 
 							iargs.Run(ctx, engine.ExecOptions{
 								Stdin:  args.Stdin,
@@ -65,10 +83,8 @@ func init() {
 
 							return nil
 						})
-
-						return err
 					},
-					Shell: shell,
+					Shell: shellTarget,
 					Force: force,
 				}, engine.GlobalResolveCache)
 				if err != nil {
@@ -105,7 +121,7 @@ func init() {
 		},
 	}
 
-	runCmd.Flags().BoolVarP(&shell, "shell", "", false, "shell into target")
+	runCmd.Flags().AddFlag(NewBoolStrFlag(&shell, "shell", "", "shell into target"))
 	runCmd.Flags().BoolVarP(&force, "force", "", false, "force running")
 
 	rootCmd.AddCommand(runCmd)

@@ -3,14 +3,11 @@ package cmd
 
 import (
 	"fmt"
+	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/tmatch"
+	"github.com/spf13/cobra"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"slices"
-
-	"github.com/hephbuild/heph/internal/engine"
-	"github.com/spf13/cobra"
 )
 
 func init() {
@@ -44,17 +41,7 @@ func init() {
 				return err
 			}
 
-			packages := tmatch.Packages(root, pkgMatcher, func(path string) bool {
-				if path == e.Home.Path() {
-					return false
-				}
-
-				if slices.Contains([]string{"node_modules", "dist"}, filepath.Base(path)) {
-					return false
-				}
-
-				return true
-			})
+			packages := e.Packages(ctx, pkgMatcher)
 
 			for pkg, err := range packages {
 				if err != nil {

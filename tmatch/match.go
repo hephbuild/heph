@@ -9,6 +9,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -163,7 +164,69 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	}
 }
 
+func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
+	switch item := m.Item.(type) {
+	case *pluginv1.TargetMatcher_Ref:
+		return boolToResult(tref.Equal(item.Ref, spec.Ref))
+	case *pluginv1.TargetMatcher_Package:
+		return boolToResult(item.Package == spec.Ref.Package)
+	case *pluginv1.TargetMatcher_PackagePrefix:
+		return boolToResult(tref.HasPackagePrefix(spec.Ref.Package, item.PackagePrefix))
+	case *pluginv1.TargetMatcher_Label:
+		return boolToResult(slices.Contains(spec.Labels, item.Label))
+	case *pluginv1.TargetMatcher_Or:
+		out := MatchNo
+		for _, matcher := range item.Or.Items {
+			switch MatchSpec(spec, matcher) {
+			case MatchYes:
+				out = MatchYes
+			case MatchNo:
+				// dont touch
+			case MatchShrug:
+				return MatchShrug
+			default:
+				panic("unhandled result")
+			}
+		}
+
+		return out
+	case *pluginv1.TargetMatcher_And:
+		out := MatchYes
+		for _, matcher := range item.And.Items {
+			switch MatchSpec(spec, matcher) {
+			case MatchYes:
+				// dont touch
+			case MatchNo:
+				return MatchNo
+			case MatchShrug:
+				out = MatchShrug
+			default:
+				panic("unhandled result")
+			}
+		}
+
+		return out
+	case *pluginv1.TargetMatcher_Not:
+		switch MatchSpec(spec, item.Not) {
+		case MatchYes:
+			return MatchNo
+		case MatchNo:
+			return MatchYes
+		case MatchShrug:
+			return MatchShrug
+		default:
+			panic("unhandled result")
+		}
+	default:
+		panic("unhandled target matcher type")
+	}
+}
+
 func extractRoot(root string, m *pluginv1.TargetMatcher) string {
+	if m == nil {
+		return root
+	}
+
 	switch item := m.Item.(type) {
 	case *pluginv1.TargetMatcher_Ref:
 		return filepath.Join(root, tref.ToOSPath(item.Ref.GetPackage()))

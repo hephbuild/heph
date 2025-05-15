@@ -46,9 +46,11 @@ type ExecOptions struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+}
 
+type ExecInnerOptions struct {
 	interactiveExec func(context.Context, InteractiveExecOptions) error
-	shell           bool
+	shell           *pluginv1.TargetRef
 	force           bool
 }
 
@@ -58,9 +60,8 @@ type InteractiveExecOptions struct {
 }
 
 type ResultOptions struct {
-	ExecOptions     ExecOptions
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
-	Shell           bool
+	Shell           *pluginv1.TargetRef
 	Force           bool
 }
 
@@ -110,7 +111,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 	})
 
 	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.DeepLink(ctx, c)
+		return e.Link(ctx, c)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -126,10 +127,6 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
-
-		options.ExecOptions.interactiveExec = options.InteractiveExec
-		options.ExecOptions.shell = options.Shell
-		options.ExecOptions.force = options.Force
 
 		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 		ctx = hstep.WithoutParent(ctx)
@@ -179,7 +176,7 @@ func (r DepsResults) Unlock(ctx context.Context) {
 	}
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache) (DepsResults, error) {
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache, options ResultOptions) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -193,7 +190,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 				outputs = nil
 			}
 
-			res, err := e.ResultFromDef(ctx, dep.TargetDef, outputs, ResultOptions{}, rc)
+			res, err := e.ResultFromDef(ctx, dep.TargetDef, outputs, options, rc)
 			if err != nil {
 				return err
 			}
@@ -272,7 +269,10 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 }
 
 func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (_ *ExecuteResultLocks, rerr error) {
-	results, err := e.depsResults(ctx, def, false, rc)
+	results, err := e.depsResults(ctx, def, false, rc, ResultOptions{
+		InteractiveExec: options.InteractiveExec,
+		Shell:           options.Shell,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("result deps: %w", err)
 	}
@@ -288,8 +288,9 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 
 	unlockDepsResults()
 
-	getCache := def.Cache && !options.Shell && !options.Force
-	storeCache := def.Cache && !options.Shell
+	shouldShell := tref.Equal(options.Shell, def.GetRef())
+	getCache := def.Cache && !shouldShell && !options.Force
+	storeCache := def.Cache && !shouldShell
 
 	if getCache {
 		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, true)
@@ -321,16 +322,22 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 
+		execOptions := ExecInnerOptions{
+			interactiveExec: options.InteractiveExec,
+			shell:           options.Shell,
+			force:           options.Force,
+		}
+
 		var res *ExecuteResult
 		if storeCache {
-			res, err = e.ExecuteAndCache(ctx, def, options.ExecOptions, rc)
+			res, err = e.ExecuteAndCache(ctx, def, execOptions, rc)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
 				return nil, err
 			}
 		} else {
-			res, err = e.Execute(ctx, def, options.ExecOptions, rc)
+			res, err = e.Execute(ctx, def, execOptions, rc)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
@@ -639,7 +646,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecInnerOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
@@ -649,7 +656,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	})
 
-	results, err := e.depsResults(ctx, def, true, rc)
+	results, err := e.depsResults(ctx, def, true, rc, ResultOptions{
+		InteractiveExec: options.interactiveExec,
+		Shell:           options.shell,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -660,7 +670,9 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("driver not found: %v", def.TargetSpec.GetDriver())
 	}
 
-	if options.shell {
+	shouldShell := tref.Equal(options.shell, def.GetRef())
+
+	if shouldShell {
 		shellDriver := def.TargetSpec.GetDriver() + "@shell"
 		shellDriver = "bash@shell" // TODO: make the original driver declare the shell config
 		driver, ok = e.DriversByName[shellDriver]
@@ -671,7 +683,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	var targetfolder string
-	if def.Cache || options.shell {
+	if def.Cache || shouldShell {
 		targetfolder = e.targetDirName(def.GetRef())
 	} else {
 		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
@@ -682,7 +694,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, fmt.Errorf("hashin1: %w", err)
 	}
 
-	if def.Cache && !options.force && !options.shell {
+	if def.Cache && !options.force && !shouldShell {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			return nil, err
@@ -714,10 +726,15 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, err
 	}
 
-	if options.interactiveExec == nil {
-		options.interactiveExec = func(ctx context.Context, args InteractiveExecOptions) error {
-			args.Run(ctx, options)
-			return nil
+	execWrapper := func(ctx context.Context, args InteractiveExecOptions) error {
+		args.Run(ctx, ExecOptions{})
+		return nil
+	}
+
+	if shouldShell {
+		execWrapper = options.interactiveExec
+		if execWrapper == nil {
+			return nil, errors.New("shell requires interactiveExec not supported")
 		}
 	}
 
@@ -733,7 +750,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 
 	var runRes *connect.Response[pluginv1.RunResponse]
 	var runErr error
-	err = options.interactiveExec(ctx, InteractiveExecOptions{
+	err = execWrapper(ctx, InteractiveExecOptions{
 		Run: func(ctx context.Context, options ExecOptions) {
 			pipes, pipesWait, err := e.pipes(ctx, driver, options)
 			if err != nil {
@@ -768,7 +785,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		return nil, errors.New("modified during execution")
 	}
 
-	if options.shell {
+	if shouldShell {
 		return &ExecuteResult{
 			Def:      def,
 			Hashin:   hashin,
@@ -896,7 +913,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecInnerOptions, rc *ResolveCache) (*ExecuteResult, error) {
 	res, err := e.Execute(ctx, def, options, rc)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)

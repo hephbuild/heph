@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/go-viper/mapstructure/v2"
 	"go.opentelemetry.io/otel"
 	iofs "io/fs"
 
@@ -392,11 +393,28 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 	}), nil
 }
 
+func parseLabels(v any) ([]string, error) {
+	var labels []string
+	err := mapstructure.Decode(v, &labels)
+	if err == nil {
+		return labels, nil
+	}
+
+	var label string
+	err = mapstructure.Decode(v, &label)
+	if err == nil {
+		return []string{label}, nil
+	}
+
+	return nil, fmt.Errorf("expected string or []string, got %T", v)
+}
+
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
 	if payload.Name == "" {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
 
+	var labels []string
 	config := map[string]*structpb.Value{}
 	for k, v := range payload.Args {
 		v := hstarlark.FromStarlark(v)
@@ -407,6 +425,13 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		}
 
 		config[k] = pv
+
+		if k == "labels" {
+			labels, err = parseLabels(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid labels: %w", err)
+			}
+		}
 	}
 
 	spec := &pluginv1.TargetSpec{
@@ -416,6 +441,7 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		},
 		Driver: payload.Driver,
 		Config: config,
+		Labels: labels,
 	}
 
 	return spec, nil

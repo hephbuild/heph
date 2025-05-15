@@ -31,7 +31,8 @@ type Model struct {
 	width  int
 	height int
 
-	steps map[string]*corev1.Step
+	steps          map[string]*corev1.Step
+	pauseRendering bool
 }
 
 func initialModel() Model {
@@ -70,8 +71,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case hbbtexec.StartMsg:
+		m.pauseRendering = true
+	case hbbtexec.EndMsg:
+		m.pauseRendering = false
 	case routineExitedMsg:
 		cmds = append(cmds, tea.Quit)
+	case tea.QuitMsg:
+		m.pauseRendering = true
 	}
 
 	cmds, m.log = ChildUpdate(cmds, msg, m.log)
@@ -80,6 +87,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	if m.pauseRendering {
+		return ""
+	}
+
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("%v\n", len(m.steps)))
@@ -104,9 +115,9 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 			steps[step.GetId()] = step
 
 			if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
-				if step.GetParentId() == "" && step.Error {
-					hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
-				}
+				//if step.GetParentId() == "" && step.Error {
+				//	hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
+				//}
 
 				delete(steps, step.GetId())
 			}
@@ -156,8 +167,14 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 			return step
 		})
 
+		var mu sync.Mutex
 		err := hpanic.Recover(func() error {
 			return f(ctx, func(f hbbtexec.ExecFunc) error {
+				if !mu.TryLock() {
+					return fmt.Errorf("two concurrent interractive exec detected")
+				}
+				defer mu.Unlock()
+
 				return hbbtexec.Run(m.Exec, p.Send, f)
 			})
 		})

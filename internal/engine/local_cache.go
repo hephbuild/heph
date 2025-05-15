@@ -86,7 +86,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			fromfs := hfs.NewOS(rest)
 			tofs := hfs.At(cachedir, name)
 
-			if strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
+			if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
 				err = hfs.Move(fromfs, tofs)
 				if err != nil {
 					return nil, fmt.Errorf("move: %w", err)

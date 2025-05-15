@@ -13,11 +13,15 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
-func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*corev1.Step, root string, id string) *tree.Tree {
+func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*corev1.Step, root string, id string, depth int) *tree.Tree {
+	if depth > 5 {
+		return tree.Root(root + " max depth exceeded")
+	}
+
 	t := tree.Root(root)
 
 	for _, step := range children[id] {
-		t = t.Child(buildStepsTreeInner(renderer, children, hstepfmt.Format(renderer, step, true), step.GetId()))
+		t = t.Child(buildStepsTreeInner(renderer, children, hstepfmt.Format(renderer, step, true), step.GetId(), depth+1))
 	}
 
 	return t
@@ -47,7 +51,7 @@ func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) s
 		})
 	}
 
-	t := buildStepsTreeInner(renderer, children, "", "")
+	t := buildStepsTreeInner(renderer, children, "", "", 0)
 	s := renderStepsTree(renderer, t)
 
 	return s

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/lib/engine"
@@ -16,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 type Factors struct {
@@ -84,8 +86,70 @@ func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.Get
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-	// artifacts, ref, err := p.goListPkg(ctx, req.Msg.Package, Factors{}) // for all factors
-	// hlog.From(ctx).With(slog.Any("artifacts", artifacts), slog.Any("ref", ref), slog.Any("err", err)).Warn("LIST")
+	// TODO: factors matrix
+	for _, factors := range []Factors{{
+		GoVersion: "1.24",
+		GOOS:      runtime.GOOS,
+		GOARCH:    runtime.GOARCH,
+	}} {
+		if _, ok := tref.CutPackagePrefix(req.Msg.GetPackage(), "@heph/go/std"); ok {
+			// TODO: std
+
+			return nil
+		}
+
+		if tref.HasPackagePrefix(req.Msg.GetPackage(), "@heph/go/thirdparty") {
+			// TODO
+
+			return nil
+		}
+
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.Package, factors)
+		if err != nil {
+			if errors.Is(err, errNotInGoModule) {
+				return nil
+			}
+
+			if strings.Contains(err.Error(), "no Go files") {
+				return nil
+			}
+
+			return err
+		}
+
+		err = res.Send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
+			Ref: goPkg.GetBuildLibTargetRef(ModeNormal),
+		}})
+		if err != nil {
+			return err
+		}
+
+		if goPkg.IsCommand() {
+			err = res.Send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
+				Ref: &pluginv1.TargetRef{
+					Package: goPkg.GetHephBuildPackage(),
+					Name:    "build",
+					Args:    factors.Args(),
+				},
+			}})
+			if err != nil {
+				return err
+			}
+		}
+
+		if !goPkg.Is3rdParty && !goPkg.IsStd && (len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0) {
+			err = res.Send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
+				Ref: &pluginv1.TargetRef{
+					Package: goPkg.GetHephBuildPackage(),
+					Name:    "test",
+					Args:    factors.Args(),
+				},
+			}})
+			if err != nil {
+				return err
+			}
+		}
+	}
 
 	return nil
 }
@@ -96,10 +160,16 @@ func getMode(ref *pluginv1.TargetRef) (string, error) {
 	return ref.Args["mode"], nil
 }
 
-func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (_ *connect.Response[pluginv1.GetResponse], rerr error) {
 	if tref.HasPackagePrefix(req.Msg.GetRef().GetPackage(), "@heph/file") {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
 	}
+
+	defer func() {
+		if rerr != nil {
+			rerr = connect.NewError(connect.CodeInternal, rerr)
+		}
+	}()
 
 	factors := FactorsFromArgs(req.Msg.GetRef().GetArgs())
 	if factors.GoVersion == "" {
@@ -149,7 +219,12 @@ func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetReque
 
 		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
 	case "test":
-		return p.runTest(ctx, req.Msg.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
+		if err != nil {
+			return nil, err
+		}
+
+		return p.runTest(ctx, goPkg, factors)
 	case "embedcfg":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Msg.GetRef().GetPackage(), factors)
 		if err != nil {
@@ -274,26 +349,27 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 		}
 		files = append(files, tref.FormatFile(pkg, e.Name()))
 	}
-
-	var args map[string]string
+	
+	args := f.Args()
 	if imp != "." {
-		args = map[string]string{
+		args = hmaps.Concat(args, map[string]string{
 			"import": imp,
-		}
+		})
+	}
+
+	listRef := &pluginv1.TargetRef{
+		Package: pkg,
+		Name:    "_golist",
+		Args:    args,
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "_golist",
-					Args:    args,
-				},
+				Ref:    listRef,
 				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
-						"GODEBUG":     "installgoroot=all",
 						"GOOS":        f.GOOS,
 						"GOARCH":      f.GOARCH,
 						"CGO_ENABLED": "0",
@@ -310,7 +386,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 		},
 	}))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)
 	}
 
 	return res.Msg.GetArtifacts(), res.Msg.GetDef().GetRef(), nil
