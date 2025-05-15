@@ -2,6 +2,7 @@ package termui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -24,9 +25,10 @@ import (
 type stepsUpdateMsg map[string]*corev1.Step
 
 type Model struct {
-	log      hbbtlog.Hijacker
-	Exec     hbbtexec.Model
-	renderer *lipgloss.Renderer
+	log           hbbtlog.Hijacker
+	Exec          hbbtexec.Model
+	renderer      *lipgloss.Renderer
+	cancelRoutine context.CancelCauseFunc
 
 	width  int
 	height int
@@ -35,11 +37,12 @@ type Model struct {
 	pauseRendering bool
 }
 
-func initialModel() Model {
+func initialModel(cancelRoutine context.CancelCauseFunc) Model {
 	m := Model{
-		log:      hbbtlog.NewLogHijacker(),
-		steps:    map[string]*corev1.Step{},
-		renderer: hlipgloss.NewRenderer(os.Stderr),
+		log:           hbbtlog.NewLogHijacker(),
+		steps:         map[string]*corev1.Step{},
+		renderer:      hlipgloss.NewRenderer(os.Stderr),
+		cancelRoutine: cancelRoutine,
 	}
 	m.Exec = hbbtexec.New(m.log)
 
@@ -79,6 +82,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tea.Quit)
 	case tea.QuitMsg:
 		m.pauseRendering = true
+	case tea.InterruptMsg:
+		m.cancelRoutine(errors.New("ctrl+c"))
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			m.cancelRoutine(errors.New("ctrl+c"))
+		}
 	}
 
 	cmds, m.log = ChildUpdate(cmds, msg, m.log)
@@ -147,9 +157,13 @@ type RunFunc = func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) erro
 
 func NewInteractive(ctx context.Context, f RunFunc) error {
 	errCh := make(chan error, 1)
-	m := initialModel()
 
-	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin), tea.WithoutSignalHandler())
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+
+	m := initialModel(cancel)
+
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 	go func() {
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)

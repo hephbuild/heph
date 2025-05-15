@@ -76,10 +76,6 @@ func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPk
 	return p.packageLibInner(ctx, basePkg, goPkg, factors, true)
 }
 
-func (p *Plugin) importPathToPackage(ctx context.Context, imp string) (string, error) {
-	return imp, nil
-}
-
 func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
 	if len(goPkg.GoFiles) == 0 {
 		return nil, fmt.Errorf("empty go file")

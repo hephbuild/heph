@@ -86,6 +86,11 @@ func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.Get
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
+
+	if _, ok := tref.CutPackagePrefix(req.Msg.GetPackage(), "@heph/file"); ok {
+		return nil
+	}
+
 	// TODO: factors matrix
 	for _, factors := range []Factors{{
 		GoVersion: "1.24",
@@ -349,7 +354,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 		}
 		files = append(files, tref.FormatFile(pkg, e.Name()))
 	}
-	
+
 	args := f.Args()
 	if imp != "." {
 		args = hmaps.Concat(args, map[string]string{

@@ -2,6 +2,7 @@ package hstep
 
 import (
 	"context"
+	"github.com/hephbuild/heph/internal/hproto"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +25,7 @@ func (s *Step) getPbStep() *corev1.Step {
 		return &corev1.Step{}
 	}
 
-	return s.pbstep
+	return hproto.Clone(s.pbstep)
 }
 
 func (s *Step) SetText(text string) {

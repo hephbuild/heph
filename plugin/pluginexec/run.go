@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/plugin/tref"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/semaphore"
 	"io"
 	"os"
@@ -15,9 +17,6 @@ import (
 	"slices"
 	"strings"
 	"syscall"
-
-	"github.com/hephbuild/heph/plugin/tref"
-	"go.opentelemetry.io/otel"
 
 	"connectrpc.com/connect"
 	ptylib "github.com/creack/pty"
@@ -142,6 +141,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		return nil, err
 	}
 
+	// TODO: make Run a stream to be able to cancel from outside
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
 	cmd.Dir = cwdfs.Path()

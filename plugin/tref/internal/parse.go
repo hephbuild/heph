@@ -99,8 +99,12 @@ func LexDebug(s string, out bool) {
 	fmt.Println(buf.String())
 }
 
+func IsRelative(s string) bool {
+	return strings.HasPrefix(s, ":")
+}
+
 func Parse(s, pkg string, optPkg bool) (*Ref, error) {
-	if optPkg && strings.HasPrefix(s, ":") {
+	if optPkg && IsRelative(s) {
 		s = "//" + pkg + s
 	}
 

@@ -11,11 +11,19 @@ import (
 	"os/signal"
 )
 
-// heph r :deploy          run //some:deploy
-// heph r deploy           run all deploy targets         <= should this be possible ? kinda risky
-// heph r deploy //...     run all deploy targets
-// heph r deploy ./...     run all test target under cwd
-// heph r deploy ./foo/... run all test target under foo
+// heph r :lint          run //some:lint (assuming pwd = some)
+// heph r :lint .        run //some:lint (assuming pwd = some)
+// heph r //other:lint   run //other:lint
+// heph r lint //...     run all lint targets
+
+// heph r lint ./...     run all test target under cwd
+// heph r lint ./foo/... run all test target under foo
+// heph r lint .
+
+// heph r //:lint
+
+// heph r -e 'lint && //some/**/*'
+// heph r -e 'test || (k8s-validate && !k8s-validate-prod)'
 
 var queryCmd = func() *cobra.Command {
 	return &cobra.Command{

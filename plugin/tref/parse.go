@@ -24,6 +24,10 @@ func ParseInPackage(s, pkg string) (*pluginv1.TargetRef, error) {
 	return parse(s, pkg, true)
 }
 
+func IsRelative(s string) bool {
+	return internal.IsRelative(s)
+}
+
 func Parse(s string) (*pluginv1.TargetRef, error) {
 	return parse(s, "", false)
 }
