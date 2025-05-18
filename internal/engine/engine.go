@@ -1,9 +1,13 @@
 package engine
 
 import (
+	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	"context"
 	"errors"
 	"github.com/hephbuild/heph/internal/hcore"
+	"github.com/hephbuild/heph/internal/hsoftcontext"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
@@ -11,10 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-
-	"connectrpc.com/connect"
-	"connectrpc.com/otelconnect"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
@@ -70,9 +70,10 @@ var getRoot = sync.OnceValues(func() (string, error) {
 
 type EngineHandle struct {
 	ServerHandle
-	LogClient    corev1connect.LogServiceClient
-	StepClient   corev1connect.StepServiceClient
-	ResultClient corev1connect.ResultServiceClient
+	LogClient     corev1connect.LogServiceClient
+	StepClient    corev1connect.StepServiceClient
+	ResultClient  corev1connect.ResultServiceClient
+	ControlClient corev1connect.ControlServiceClient
 }
 
 type Engine struct {
@@ -89,6 +90,8 @@ type Engine struct {
 	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
 	DriversByName map[string]pluginv1connect.DriverClient
 	DriversConfig map[string]*pluginv1.ConfigResponse
+
+	SoftCancel *hsoftcontext.Handler
 }
 
 type Provider struct {
@@ -103,14 +106,15 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	sandboxfs := hfs.At(homefs, "sandbox")
 
 	e := &Engine{
-		Root:     rootfs,
-		Home:     homefs,
-		Cache:    cachefs,
-		Sandbox:  sandboxfs,
-		RootSpan: trace.SpanFromContext(ctx),
+		Root:       rootfs,
+		Home:       homefs,
+		Cache:      cachefs,
+		Sandbox:    sandboxfs,
+		RootSpan:   trace.SpanFromContext(ctx),
+		SoftCancel: hsoftcontext.NewHandler(),
 	}
 
-	connectInterceptor, err := otelconnect.NewInterceptor(
+	otelInterceptor, err := otelconnect.NewInterceptor(
 		otelconnect.WithTrustRemote(),
 		otelconnect.WithAttributeFilter(func(spec connect.Spec, value attribute.KeyValue) bool {
 			if value.Key == semconv.NetPeerPortKey {
@@ -127,7 +131,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	}
 
 	interceptors := []connect.Interceptor{
-		connectInterceptor,
+		otelInterceptor,
 	}
 
 	srvh, err := e.newServer(ctx)
@@ -140,19 +144,23 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		hcore.WithRecovery(),
 	}
 
-	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
-	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
-	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), handlerOpts...))
-
 	clientOpts := []connect.ClientOption{
 		connect.WithInterceptors(interceptors...),
 	}
 
+	srvh.Mux.Handle(corev1connect.NewControlServiceHandler(e.SoftCancel, handlerOpts...))
+	controlClient := corev1connect.NewControlServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...)
+
+	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
+	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
+	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), append(handlerOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...))
+
 	e.CoreHandle = EngineHandle{
-		ServerHandle: srvh,
-		LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
-		StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-		ResultClient: corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+		ServerHandle:  srvh,
+		LogClient:     corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
+		StepClient:    corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+		ResultClient:  corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), append(clientOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...),
+		ControlClient: controlClient,
 	}
 
 	return e, nil

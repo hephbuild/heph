@@ -753,7 +753,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	var runErr error
 	err = execWrapper(ctx, InteractiveExecOptions{
 		Run: func(ctx context.Context, options ExecOptions) {
-			pipes, pipesWait, err := e.pipes(ctx, driver, options)
+			pctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+			defer cancel()
+
+			pipes, pipesWait, err := e.pipes(pctx, driver, options)
 			if err != nil {
 				runErr = err
 				return

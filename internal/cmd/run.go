@@ -4,13 +4,10 @@ package cmd
 import (
 	"context"
 	"fmt"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
-	"os"
-	"os/signal"
-
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
 )
 
@@ -25,7 +22,7 @@ func init() {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+			ctx, stop := newSignalNotifyContext(ctx)
 			defer stop()
 
 			cwd, err := engine.Cwd()

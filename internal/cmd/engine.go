@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/hephbuild/heph/internal/engine"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/termui"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -196,9 +198,18 @@ func newEngine(ctx context.Context, root string) (*engine.Engine, error) {
 }
 
 func newTermui(ctx context.Context, f termui.RunFunc) error {
+	wrappedF := func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
+		go func() {
+			<-ctx.Done()
+			hlog.From(ctx).Warn("interrupt, gracefully stopping...")
+		}()
+
+		return f(ctx, execFunc)
+	}
+
 	if !plain && isTerm() {
-		return termui.NewInteractive(ctx, f)
+		return termui.NewInteractive(ctx, wrappedF)
 	} else {
-		return termui.NewNonInteractive(ctx, f)
+		return termui.NewNonInteractive(ctx, wrappedF)
 	}
 }

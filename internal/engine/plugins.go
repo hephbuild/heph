@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -44,11 +45,13 @@ func (h ServerHandle) HTTPClientWithOtel() *http.Client {
 	return httpClientWithOtel
 }
 
+const unixPathPrefix = "unix_"
+
 var httpClient = &http.Client{
 	Transport: &http2.Transport{
 		AllowHTTP: true,
 		DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error) {
-			if rest, ok := strings.CutPrefix(addr, "unix"); ok {
+			if rest, ok := strings.CutPrefix(addr, unixPathPrefix); ok {
 				b64host, _, err := net.SplitHostPort(rest)
 				if err != nil {
 					return nil, err
@@ -74,7 +77,7 @@ var httpClientWithOtel = &http.Client{
 }
 
 func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(), error) {
-	if true {
+	if false {
 		dir := e.Home.At("socks")
 		err := dir.MkdirAll("", os.ModePerm)
 		if err != nil {
@@ -94,7 +97,7 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 
 		b64Path := base64.URLEncoding.EncodeToString([]byte(path))
 
-		return l, "http://unix" + b64Path, cleanup, nil
+		return l, "http://" + unixPathPrefix + b64Path, cleanup, nil
 	} else {
 		l, err := net.Listen("tcp", "127.0.0.1:")
 		if err != nil {
@@ -122,7 +125,7 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 			Handler: h2c.NewHandler(mux, h2s),
 			BaseContext: func(listener net.Listener) context.Context {
 				// to prevent inheriting from the root span, make a new noop span
-				ctx := trace.ContextWithSpan(ctx, trace.SpanFromContext(context.Background()))
+				ctx := trace.ContextWithSpan(context.WithoutCancel(ctx), trace.SpanFromContext(context.Background()))
 
 				return ctx
 			},
@@ -226,7 +229,7 @@ func (f pluginSpanDecorator) WrapStreamingHandler(next connect.StreamingHandlerF
 }
 
 func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option {
-	connectInterceptor, err := otelconnect.NewInterceptor(
+	otelInterceptor, err := otelconnect.NewInterceptor(
 		otelconnect.WithTrustRemote(),
 		otelconnect.WithAttributeFilter(func(spec connect.Spec, value attribute.KeyValue) bool {
 			if value.Key == semconv.NetPeerPortKey {
@@ -243,13 +246,14 @@ func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option
 	}
 
 	return connect.WithInterceptors(
-		connectInterceptor,
+		otelInterceptor,
 		pluginSpanDecorator{
 			pluginType: pluginType,
 			pluginName: pluginName,
 		},
 		hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient),
 		hstepconnect.Interceptor(),
+		hsoftcontext.Interceptor(e.CoreHandle.ControlClient),
 	)
 }
 

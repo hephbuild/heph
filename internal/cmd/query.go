@@ -7,8 +7,6 @@ import (
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
-	"os"
-	"os/signal"
 )
 
 // heph r :lint          run //some:lint (assuming pwd = some)
@@ -33,7 +31,7 @@ var queryCmd = func() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+			ctx, stop := newSignalNotifyContext(ctx)
 			defer stop()
 
 			cwd, err := engine.Cwd()

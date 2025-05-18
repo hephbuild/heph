@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"maps"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -158,10 +160,18 @@ type RunFunc = func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) erro
 func NewInteractive(ctx context.Context, f RunFunc) error {
 	errCh := make(chan error, 1)
 
-	ctx, cancel := context.WithCancelCause(ctx)
+	ctx, cancel := hsoftcontext.WithCancel(ctx)
 	defer cancel(nil)
 
-	m := initialModel(cancel)
+	var currentlyInteractive atomic.Bool
+
+	m := initialModel(func(cause error) {
+		if currentlyInteractive.Load() {
+			return
+		}
+
+		cancel(cause)
+	})
 
 	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
 	go func() {
@@ -188,6 +198,9 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 					return fmt.Errorf("two concurrent interractive exec detected")
 				}
 				defer mu.Unlock()
+
+				currentlyInteractive.Store(true)
+				defer currentlyInteractive.Store(false)
 
 				return hbbtexec.Run(m.Exec, p.Send, f)
 			})

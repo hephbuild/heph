@@ -1,0 +1,27 @@
+syntax = "proto3";
+package heph.core.v1;
+
+message ContextDoneRequest {
+  string id = 1;
+}
+message ContextDoneResponse {
+  string err = 1;
+}
+
+message NewContextRequest {
+  message Cancel {
+    string cause = 1;
+  }
+
+  oneof msg {
+    Cancel cancel = 1;
+  }
+}
+message NewContextResponse {
+  string id = 1;
+}
+
+service ControlService {
+  rpc NewContext(stream NewContextRequest) returns (stream NewContextResponse) {}
+  rpc ContextDone(ContextDoneRequest) returns (stream ContextDoneResponse) {}
+}

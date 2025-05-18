@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"connectrpc.com/connect"
 	ptylib "github.com/creack/pty"
@@ -141,12 +142,20 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		return nil, err
 	}
 
-	// TODO: make Run a stream to be able to cancel from outside
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...) //nolint:gosec
 	cmd.Env = env
 	cmd.Dir = cwdfs.Path()
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true, // this creates a new process group, same as Setpgid
+	}
+	cmd.WaitDelay = 5 * time.Second // TODO: parameterize this
+	cmd.Cancel = func() error {
+		p := cmd.Process
+		if p == nil {
+			return nil
+		}
+
+		return p.Signal(os.Interrupt)
 	}
 
 	for i, id := range []string{req.Msg.GetPipes()[pipeStdout], req.Msg.GetPipes()[pipeStderr]} {
@@ -243,9 +252,13 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 		//err = fmt.Errorf("%v: %w", args, err)
 
+		if cerr := ctx.Err(); cerr != nil {
+			err = fmt.Errorf("%w: %w", cerr, err)
+		}
+
 		cmderr := err
 
-		if !pty {
+		if !pty { // TODO: if not interactive
 			err = logFile.Close()
 			if err != nil {
 				return nil, err
