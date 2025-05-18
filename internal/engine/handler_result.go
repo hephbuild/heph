@@ -11,7 +11,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func (e *Engine) Handler() corev1connect.ResultServiceHandler {
+func (e *Engine) ResultHandler() corev1connect.ResultServiceHandler {
 	return &resultServiceHandler{Engine: e}
 }
 

@@ -73,49 +73,47 @@ var httpClientWithOtel = &http.Client{
 	Transport: otelhttp.NewTransport(httpClient.Transport),
 }
 
-func (e *Engine) newListener(ctx context.Context) (net.Listener, string, error) {
+func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(), error) {
 	if true {
 		dir := e.Home.At("socks")
 		err := dir.MkdirAll("", os.ModePerm)
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 
 		path := dir.At(fmt.Sprintf("%v_%v", os.Getpid(), uuid.New().String())).Path()
 
 		l, err := net.Listen("unix", path)
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
-		go func() {
-			<-ctx.Done()
-			//_ = l.Close()
+		cleanup := func() {
+			_ = l.Close()
 			_ = os.Remove(path)
-		}()
+		}
 
 		b64Path := base64.URLEncoding.EncodeToString([]byte(path))
 
-		return l, "http://unix" + b64Path, nil
+		return l, "http://unix" + b64Path, cleanup, nil
 	} else {
 		l, err := net.Listen("tcp", "127.0.0.1:")
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 
-		return l, "http://" + l.Addr().String(), nil
+		return l, "http://" + l.Addr().String(), func() {}, nil
 	}
 }
 
 func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
-	l, baseUrl, err := e.newListener(ctx)
+	l, baseUrl, cleanup, err := e.newListener(ctx)
 	if err != nil {
 		return ServerHandle{}, err
 	}
-	// TODO: close listener
-
 	mux := http.NewServeMux()
 
 	go func() {
+		defer cleanup()
 		h2s := &http2.Server{
 			MaxReadFrameSize:     1 << 20,
 			MaxConcurrentStreams: 500,
@@ -136,6 +134,7 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 		}
 	}()
 
+	// TODO: call a clean srv.Shutdown() before exiting the bin
 	h := ServerHandle{
 		Listener: l,
 		Mux:      mux,

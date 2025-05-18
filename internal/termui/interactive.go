@@ -85,8 +85,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.InterruptMsg:
 		m.cancelRoutine(errors.New("ctrl+c"))
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c":
+		switch msg.Type {
+		case tea.KeyBreak:
 			m.cancelRoutine(errors.New("ctrl+c"))
 		}
 	}

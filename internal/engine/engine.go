@@ -142,7 +142,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
 	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
-	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.Handler(), handlerOpts...))
+	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), handlerOpts...))
 
 	clientOpts := []connect.ClientOption{
 		connect.WithInterceptors(interceptors...),

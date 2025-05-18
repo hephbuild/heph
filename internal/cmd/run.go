@@ -86,8 +86,9 @@ func init() {
 							return nil
 						})
 					},
-					Shell: shellTarget,
-					Force: forceTarget,
+					Shell:       shellTarget,
+					Force:       forceTarget,
+					Interactive: ref,
 				}, engine.GlobalResolveCache)
 				if err != nil {
 					return err

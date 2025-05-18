@@ -65,6 +65,7 @@ type ResultOptions struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
 	Force           *pluginv1.TargetRef
+	Interactive     *pluginv1.TargetRef
 }
 
 func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
@@ -330,7 +331,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 
 			shell:       tref.Equal(options.Shell, def.GetRef()),
 			force:       tref.Equal(options.Force, def.GetRef()),
-			interactive: tref.Equal(options.Force, def.GetRef()) || tref.Equal(options.Shell, def.GetRef()),
+			interactive: tref.Equal(options.Force, def.GetRef()) || tref.Equal(options.Shell, def.GetRef()) || tref.Equal(options.Interactive, def.GetRef()),
 		}
 
 		var res *ExecuteResult
@@ -757,7 +758,13 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 				runErr = err
 				return
 			}
+			defer func() {
+				if err := pipesWait(); err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
+				}
+			}()
 
+			// TODO switch around, or add capabilities array
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
 				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  sandboxfs.Path(),
@@ -765,9 +772,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 				Inputs:       inputs,
 				Pipes:        pipes,
 			}))
-			if err := pipesWait(); err != nil {
-				hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
-			}
 		},
 		Pty: def.Pty,
 	})

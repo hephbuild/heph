@@ -89,7 +89,7 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) ite
 			for _, provider := range e.Providers {
 				for spec, err := range e.listDeep(ctx, provider, pkg, seenPkg) {
 					if err != nil {
-						hlog.From(ctx).Error("error listing deep", "provider", provider.Name, "spec", spec, "err", err)
+						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
 						continue
 					}
 
