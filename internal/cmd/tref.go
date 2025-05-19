@@ -5,6 +5,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/hephbuild/heph/tmatch"
+	"github.com/spf13/cobra"
 )
 
 func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
@@ -19,6 +20,10 @@ func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
 	}
 
 	return ref, nil
+}
+
+func cobraArgs() cobra.PositionalArgs {
+	return cobra.RangeArgs(1, 2)
 }
 
 func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {

@@ -27,7 +27,7 @@ var queryCmd = func() *cobra.Command {
 	return &cobra.Command{
 		Use:     "query",
 		Aliases: []string{"q"},
-		Args:    cobra.RangeArgs(1, 2),
+		Args:    cobraArgs(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
