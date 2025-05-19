@@ -113,7 +113,10 @@ func (m Model) View() string {
 
 	sb.WriteString(stepsTree)
 
-	return sb.String()
+	return lipgloss.NewStyle().
+		MaxWidth(m.width - 1). // not sure why -1 is needed
+		MaxHeight(m.height).
+		Render(sb.String())
 }
 
 func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Renderer) (func(*corev1.Step), func()) {
@@ -142,6 +145,9 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 		for range t.C {
 			stepsm.Lock()
 			steps := maps.Clone(steps)
+			maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
+				return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
+			})
 			p.Send(stepsUpdateMsg(steps))
 			stepsm.Unlock()
 		}

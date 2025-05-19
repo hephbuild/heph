@@ -50,7 +50,7 @@ func (e *Engine) listDeep(ctx context.Context, p Provider, pkg string, seen map[
 				ref = res.Msg().GetSpec().Ref
 			}
 
-			def, err := e.Link(ctx, DefContainer{Ref: ref})
+			def, err := e.GetDef(ctx, DefContainer{Ref: ref}, GlobalResolveCache)
 			if err != nil {
 				yield(nil, err)
 				return
