@@ -27,7 +27,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) listDeep(ctx context.Context, p Provider, pkg string, seen map[string]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
+func (e *Engine) queryListProvider(ctx context.Context, p Provider, pkg string, seen map[string]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
 	key := p.Name + " " + pkg
 	if _, ok := seen[key]; ok {
 		return func(yield func(*pluginv1.TargetSpec, error) bool) {}
@@ -54,14 +54,6 @@ func (e *Engine) listDeep(ctx context.Context, p Provider, pkg string, seen map[
 			if !yield(def.TargetSpec, nil) {
 				return
 			}
-
-			for _, input := range def.Inputs {
-				for spec, err := range e.listDeep(ctx, p, input.GetRef().GetPackage(), seen) {
-					if !yield(spec, err) {
-						return
-					}
-				}
-			}
 		}
 		if res.Err() != nil {
 			yield(nil, res.Err())
@@ -82,7 +74,7 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) ite
 			}
 
 			for _, provider := range e.Providers {
-				for spec, err := range e.listDeep(ctx, provider, pkg, seenPkg) {
+				for spec, err := range e.queryListProvider(ctx, provider, pkg, seenPkg) {
 					if err != nil {
 						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
 						continue
