@@ -45,12 +45,7 @@ func (e *Engine) listDeep(ctx context.Context, p Provider, pkg string, seen map[
 		defer res.Close()
 
 		for res.Receive() {
-			ref := res.Msg().GetRef()
-			if ref == nil {
-				ref = res.Msg().GetSpec().Ref
-			}
-
-			def, err := e.GetDef(ctx, DefContainer{Ref: ref}, GlobalResolveCache)
+			def, err := e.GetDef(ctx, DefContainer{Ref: res.Msg().GetRef(), Spec: res.Msg().GetSpec()}, GlobalResolveCache)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -61,8 +56,8 @@ func (e *Engine) listDeep(ctx context.Context, p Provider, pkg string, seen map[
 			}
 
 			for _, input := range def.Inputs {
-				for ref, err := range e.listDeep(ctx, p, input.GetRef().GetPackage(), seen) {
-					if !yield(ref, err) {
+				for spec, err := range e.listDeep(ctx, p, input.GetRef().GetPackage(), seen) {
+					if !yield(spec, err) {
 						return
 					}
 				}
