@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/hephbuild/heph/tmatch"
@@ -12,7 +13,12 @@ func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
 		return nil, err
 	}
 
-	return tref.ParseInPackage(s, cwp)
+	ref, err := tref.ParseInPackage(s, cwp)
+	if err != nil {
+		return nil, fmt.Errorf("target: %w", err)
+	}
+
+	return ref, nil
 }
 
 func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {
@@ -30,7 +36,7 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 	case 2:
 		pkgMatcher, err := tmatch.ParsePackageMatcher(args[1], cwd, root)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("package: %w", err)
 		}
 
 		matchers := []*pluginv1.TargetMatcher{

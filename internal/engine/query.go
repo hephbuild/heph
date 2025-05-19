@@ -13,7 +13,7 @@ import (
 )
 
 func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
-	return tmatch.Packages(e.Root.Path(), matcher, func(path string) bool {
+	return tmatch.Packages(ctx, e.Root.Path(), matcher, func(path string) bool {
 		if path == e.Home.Path() {
 			return false
 		}
@@ -104,7 +104,7 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) ite
 						continue
 					}
 
-					if !yield(ref, err) {
+					if !yield(ref, nil) {
 						return
 					}
 				}

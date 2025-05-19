@@ -39,9 +39,7 @@ func init() {
 				return err
 			}
 
-			packages := e.Packages(ctx, pkgMatcher)
-
-			for pkg, err := range packages {
+			for pkg, err := range e.Packages(ctx, pkgMatcher) {
 				if err != nil {
 					return err
 				}

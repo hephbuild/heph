@@ -1,6 +1,7 @@
 package tmatch
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -13,7 +14,7 @@ import (
 	"strings"
 )
 
-func Packages(root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {
+func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {
 	if filter == nil {
 		filter = func(path string) bool {
 			return true
@@ -26,6 +27,10 @@ func Packages(root string, m *pluginv1.TargetMatcher, filter func(path string) b
 		err := fs.WalkDir(os.DirFS(walkRoot), ".", func(path string, d fs.DirEntry, err error) error {
 			if d == nil || !d.IsDir() {
 				return nil
+			}
+
+			if err := ctx.Err(); err != nil {
+				return err
 			}
 
 			path = filepath.Join(walkRoot, path)

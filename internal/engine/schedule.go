@@ -96,6 +96,49 @@ func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, 
 	return e.result(ctx, DefContainer{Spec: spec}, outputs, options, rc)
 }
 
+func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, options ResultOptions, rc *ResolveCache) ([]*ExecuteResultLocks, error) {
+	var out []*ExecuteResultLocks
+	var outm sync.Mutex
+
+	var matched bool
+	var g errgroup.Group
+	for ref, err := range e.Query(ctx, matcher) {
+		if err != nil {
+			return nil, err
+		}
+
+		matched = true
+
+		g.Go(func() error {
+			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, options, rc)
+			if err != nil {
+				return err
+			}
+
+			outm.Lock()
+			out = append(out, res)
+			outm.Unlock()
+
+			return nil
+		})
+	}
+
+	if !matched {
+		return nil, errors.New("did not match any target")
+	}
+
+	err := g.Wait()
+	if err != nil {
+		for _, locks := range out {
+			locks.Unlock(ctx)
+		}
+
+		return nil, err
+	}
+
+	return out, nil
+}
+
 var meter = otel.Meter("heph_engine")
 
 var resultCounter = sync.OnceValue(func() metric.Int64Counter {

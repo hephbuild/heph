@@ -23,7 +23,7 @@ import (
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
-func Cwd() (string, error) {
+var getCwd = sync.OnceValues(func() (string, error) {
 	cwd := os.Getenv("HEPH_CWD")
 
 	if cwd == "" {
@@ -40,6 +40,10 @@ func Cwd() (string, error) {
 	}
 
 	return cwd, nil
+})
+
+func Cwd() (string, error) {
+	return getCwd()
 }
 
 const ConfigFileName = ".hephconfig2"
