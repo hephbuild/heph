@@ -257,6 +257,9 @@ func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option
 	)
 }
 
+var connectCompressOption = connect.WithCompression("gzip", nil, nil)
+var connectAcceptCompressOption = connect.WithAcceptCompression("gzip", nil, nil)
+
 func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.ProviderHandler) (ProviderHandle, error) {
 	res, err := handler.Config(ctx, connect.NewRequest(&pluginv1.ProviderConfigRequest{}))
 	if err != nil {
@@ -266,13 +269,13 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 	pluginName := res.Msg.GetName()
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
-		mux.Handle(pluginv1connect.NewProviderHandler(handler, hcore.WithRecovery(), e.pluginInterceptor("provider", pluginName)))
+		mux.Handle(pluginv1connect.NewProviderHandler(handler, hcore.WithRecovery(), e.pluginInterceptor("provider", pluginName), connectCompressOption))
 	})
 	if err != nil {
 		return ProviderHandle{}, err
 	}
 
-	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("provider", pluginName))
+	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("provider", pluginName), connectAcceptCompressOption)
 
 	provider := Provider{
 		Name:           pluginName,
@@ -305,7 +308,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 
 	pluginName := res.Msg.GetName()
 
-	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName))
+	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName), connectCompressOption)
 
 	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 		mux.Handle(path, h)
@@ -317,7 +320,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName))
+	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]pluginv1connect.DriverClient{}

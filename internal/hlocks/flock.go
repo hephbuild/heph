@@ -40,6 +40,12 @@ type Flock struct {
 	allowCreate bool
 }
 
+var enableStack = sync.OnceValue(func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("HEPH_FLOCK_STACK"))
+
+	return v
+})
+
 func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro bool) (bool, error)) (bool, error) {
 	l.lm.Lock()
 	defer l.lm.Unlock()
@@ -101,7 +107,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 	if l.rc == 0 {
 		var stack string
-		if true {
+		if enableStack() {
 			buf := make([]byte, 4096)
 			n := runtime.Stack(buf, false)
 

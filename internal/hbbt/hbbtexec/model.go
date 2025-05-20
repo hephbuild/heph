@@ -3,13 +3,12 @@ package hbbtexec
 import (
 	"errors"
 	"fmt"
-	"io"
-	"os"
-	"sync"
-
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/term"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
+	"io"
+	"os"
+	"sync"
 )
 
 type ExecFunc func(args RunArgs) error
@@ -150,7 +149,7 @@ func Run(m Model, send func(tea.Msg), f ExecFunc) error {
 	}
 
 	resCh := make(chan container, 1)
-	returnedCh := make(chan error, 1)
+	errCh := make(chan error, 1)
 
 	cmd := m.Exec(NewExecFunc(func(args RunArgs) error {
 		err := f(args)
@@ -164,9 +163,9 @@ func Run(m Model, send func(tea.Msg), f ExecFunc) error {
 		return nil
 	}), func(err error) tea.Msg {
 		if errors.Is(err, runError{}) {
-			returnedCh <- nil
+			errCh <- nil
 		} else { // This should be a RestoreTerminal error
-			returnedCh <- err
+			errCh <- err
 		}
 
 		return nil
@@ -174,7 +173,7 @@ func Run(m Model, send func(tea.Msg), f ExecFunc) error {
 	go send(cmd())
 
 	res := <-resCh
-	returnErr := <-returnedCh
+	returnErr := <-errCh
 
 	return errors.Join(res.err, returnErr)
 }

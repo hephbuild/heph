@@ -86,7 +86,6 @@ func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.Get
 }
 
 func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-
 	if _, ok := tref.CutPackagePrefix(req.Msg.GetPackage(), "@heph/file"); ok {
 		return nil
 	}
@@ -122,11 +121,13 @@ func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListReq
 			return err
 		}
 
-		err = res.Send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
-			Ref: goPkg.GetBuildLibTargetRef(ModeNormal),
-		}})
-		if err != nil {
-			return err
+		if len(goPkg.GoFiles) > 0 {
+			err = res.Send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
+				Ref: goPkg.GetBuildLibTargetRef(ModeNormal),
+			}})
+			if err != nil {
+				return err
+			}
 		}
 
 		if goPkg.IsCommand() {

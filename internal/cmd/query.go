@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
+	"slices"
+	"sync"
+	"time"
 )
 
 // heph r :lint          run //some:lint (assuming pwd = some)
@@ -55,8 +59,10 @@ var queryCmd = func() *cobra.Command {
 					return err
 				}
 
-				refs := e.Query(ctx, matcher)
-				for ref, err := range refs {
+				queue, done := renderResults(ctx, execFunc)
+				defer done()
+
+				for ref, err := range e.Query(ctx, matcher) {
 					if err != nil {
 						return err
 					}
@@ -65,15 +71,7 @@ var queryCmd = func() *cobra.Command {
 						return err
 					}
 
-					// TODO: batch write
-					err := execFunc(func(args hbbtexec.RunArgs) error {
-						fmt.Println(tref.Format(ref))
-
-						return nil
-					})
-					if err != nil {
-						return err
-					}
+					queue(tref.Format(ref))
 				}
 
 				return nil
@@ -86,6 +84,66 @@ var queryCmd = func() *cobra.Command {
 		},
 	}
 }()
+
+func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func(s string), func()) {
+	var m sync.Mutex
+	ss := make([]string, 0, 100)
+	t := time.NewTicker(20 * time.Millisecond)
+
+	renderRefs := func() {
+		m.Lock()
+		if len(ss) == 0 {
+			m.Unlock()
+
+			return
+		}
+		pss := slices.Clone(ss)
+		ss = ss[:0]
+		m.Unlock()
+
+		err := execFunc(func(args hbbtexec.RunArgs) error {
+			for _, s := range pss {
+				fmt.Fprintln(args.Stdout, s)
+			}
+
+			return nil
+		})
+		if err != nil {
+			hlog.From(ctx).Error(fmt.Sprintf("exec: %v", err))
+		}
+	}
+
+	closeCh := make(chan struct{})
+	bgDoneCh := make(chan struct{})
+	go func() {
+		defer close(bgDoneCh)
+		for {
+			select {
+			case <-closeCh:
+				renderRefs()
+				return
+			default:
+				select {
+				case <-closeCh:
+					renderRefs()
+					return
+				case <-t.C:
+					renderRefs()
+				}
+			}
+		}
+	}()
+
+	return func(s string) {
+			m.Lock()
+			ss = append(ss, s)
+			m.Unlock()
+		}, func() {
+			t.Stop()
+			close(closeCh)
+			<-bgDoneCh
+		}
+}
 
 func init() {
 	rootCmd.AddCommand(queryCmd)

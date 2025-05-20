@@ -3,13 +3,17 @@ package engine
 import (
 	"connectrpc.com/connect"
 	"context"
+	"errors"
+	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/hephbuild/heph/tmatch"
+	"golang.org/x/sync/semaphore"
 	"iter"
 	"path/filepath"
 	"slices"
+	"sync"
 )
 
 func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
@@ -62,7 +66,7 @@ func (e *Engine) queryListProvider(ctx context.Context, p Provider, pkg string, 
 	}
 }
 
-func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
 		seenPkg := map[string]struct{}{}
 		seenRef := map[string]struct{}{}
@@ -97,5 +101,157 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) ite
 				}
 			}
 		}
+	}
+}
+
+type queryState struct {
+	*Engine
+	seenPkg *cache.Cache[string, struct{}]
+	seenRef *cache.Cache[string, struct{}]
+	ch      chan queryStateRes
+	wg      sync.WaitGroup
+	listSem *semaphore.Weighted
+}
+
+type queryStateRes struct {
+	spec *pluginv1.TargetSpec
+	err  error
+}
+
+func (e *queryState) sendSpec(ctx context.Context, spec *pluginv1.TargetSpec) {
+	select {
+	case <-ctx.Done():
+	case e.ch <- queryStateRes{spec: spec}:
+	}
+}
+
+func (e *queryState) sendErr(ctx context.Context, err error) {
+	select {
+	case <-ctx.Done():
+	case e.ch <- queryStateRes{err: err}:
+	}
+}
+
+func (e *queryState) queryPackage(ctx context.Context, pkg string) {
+	if _, loaded := e.seenPkg.GetOrSet(pkg, struct{}{}); loaded {
+		return
+	}
+
+	for _, provider := range e.Providers {
+		e.wg.Add(1)
+
+		go func() {
+			defer e.wg.Done()
+
+			e.queryListProvider(ctx, provider, pkg)
+		}()
+	}
+}
+
+func (e *queryState) queryListProvider(ctx context.Context, p Provider, pkg string) {
+	err := e.listSem.Acquire(ctx, 1)
+	if err != nil {
+		e.sendErr(ctx, err)
+		return
+	}
+	defer e.listSem.Release(1)
+
+	res, err := p.List(ctx, connect.NewRequest(&pluginv1.ListRequest{
+		Package: pkg,
+	}))
+	if err != nil {
+		e.sendErr(ctx, err)
+		return
+	}
+	defer res.Close()
+
+	for res.Receive() {
+		e.handleRefSpec(ctx, res.Msg().GetRef(), res.Msg().GetSpec())
+	}
+	if err := res.Err(); err != nil {
+		e.sendErr(ctx, err)
+		return
+	}
+}
+
+func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef, spec *pluginv1.TargetSpec) {
+	if _, loaded := e.seenRef.GetOrSet(tref.Format(ref), struct{}{}); loaded {
+		return
+	}
+
+	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, GlobalResolveCache)
+	if err != nil {
+		e.sendErr(ctx, err)
+		return
+	}
+
+	e.sendSpec(ctx, def.TargetSpec)
+
+	for _, input := range def.Inputs {
+		e.handleRefSpec(ctx, tref.WithoutOut(input.Ref), nil)
+	}
+}
+
+func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+	return func(yield func(*pluginv1.TargetRef, error) bool) {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		for pkg, err := range e.Packages(ctx, matcher) {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			e.queryPackage(ctx, pkg)
+		}
+
+		go func() {
+			e.wg.Wait()
+			cancel()
+			close(e.ch)
+		}()
+
+		seenRef := map[string]struct{}{}
+
+		for res := range e.ch {
+			if res.err != nil {
+				if !errors.Is(res.err, context.Canceled) {
+					hlog.From(ctx).Error("failed query", "err", res.err)
+				}
+				continue
+			}
+
+			spec := res.spec
+			ref := spec.Ref
+
+			if _, ok := seenRef[tref.Format(ref)]; ok {
+				continue
+			}
+			seenRef[tref.Format(ref)] = struct{}{}
+
+			if tmatch.MatchSpec(spec, matcher) != tmatch.MatchYes {
+				continue
+			}
+
+			if !yield(ref, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+	if true {
+		state := &queryState{
+			Engine:  e,
+			ch:      make(chan queryStateRes, 1000),
+			seenPkg: cache.New[string, struct{}](),
+			seenRef: cache.New[string, struct{}](),
+			listSem: semaphore.NewWeighted(100),
+		}
+		return state.query2(ctx, matcher)
+	} else {
+		return e.query1(ctx, matcher)
 	}
 }
