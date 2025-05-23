@@ -62,12 +62,14 @@ func TestSanityOut(t *testing.T) {
 		{"//:name"},
 		{"//:name|out"},
 		{"//some:name|out"},
+		{"//some:name@key=value"},
 		{"//some:name@key=value|out"},
 		{"//some:name@key1=value1,key2=value2|out"},
 		{"//some:name@key1=|out"},
 		{"//some:name@@key1=value|out"},
 		{"//some:name@@key1=value|out filters=foo"},
 		{"//some:name@@key1=value|out filters=foo,bar"},
+		{"//some:target filters=a,@b"},
 	}
 	for _, test := range tests {
 		t.Run(test.ref, func(t *testing.T) {

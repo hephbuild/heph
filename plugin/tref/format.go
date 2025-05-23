@@ -4,6 +4,7 @@ import (
 	"fmt"
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lfu"
+	"github.com/hephbuild/heph/hsync"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -31,8 +32,6 @@ type RefableOut interface {
 	GetFilters() []string
 }
 
-var m = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
-
 func FormatFile(pkg string, file string) string {
 	return Format(&pluginv1.TargetRef{
 		Package: JoinPackage("@heph/file", pkg),
@@ -41,14 +40,21 @@ func FormatFile(pkg string, file string) string {
 	})
 }
 
+var formatCache = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
+
+var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
+
 func Format(ref Refable) string {
 	if refh, ok := ref.(hproto.Hashable); ok {
-		h := xxh3.New()
+		h := formatHashPool.Get()
+		defer formatHashPool.Put(h)
+		h.Reset()
+
 		refh.HashPB(h, nil)
 
 		sum := h.Sum64()
 
-		f, _ := m.GetOrSet(sum, sync.OnceValue(func() string { return format(ref) }))
+		f, _ := formatCache.GetOrSet(sum, sync.OnceValue(func() string { return format(ref) }))
 
 		return f()
 	}

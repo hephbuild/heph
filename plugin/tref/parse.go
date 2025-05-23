@@ -46,8 +46,13 @@ func parse(s, pkg string, optPkg bool) (*pluginv1.TargetRef, error) {
 }
 
 func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
-	res, err := internal.ParseWithOut(s)
+	res, err := internal.FastParseWithOut(s, "", false)
 	if err != nil {
+		_, err2 := internal.ParseWithOut(s) // this one gives better err messages
+		if err2 != nil {
+			return nil, err2
+		}
+
 		return nil, err
 	}
 
@@ -60,7 +65,7 @@ func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
 		Package: res.Pkg,
 		Name:    res.Name,
 		Output:  res.Out,
-		Args:    argsToProto(res.Args),
+		Args:    res.Args,
 		Filters: filters,
 	}, nil
 }
