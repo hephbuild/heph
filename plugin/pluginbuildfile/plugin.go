@@ -8,7 +8,6 @@ import (
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	iofs "io/fs"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
@@ -403,7 +402,7 @@ func parseLabels(v any) ([]string, error) {
 
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
 	if payload.Name == "" {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+		return nil, engine2.ErrNotFound
 	}
 
 	var labels []string

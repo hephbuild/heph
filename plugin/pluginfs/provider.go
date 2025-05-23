@@ -42,7 +42,7 @@ func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*plugin
 }
 
 func (p *Provider) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
+	return nil, engine2.ErrNotImplemented
 }
 
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -54,7 +54,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	rest, ok := tref.CutPackagePrefix(req.GetRef().GetPackage(), "@heph/file")
 	if !ok {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+		return nil, engine2.ErrNotFound
 	}
 
 	f := req.Ref.Args["f"]

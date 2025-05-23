@@ -3,6 +3,7 @@ package engine
 import (
 	"connectrpc.com/connect"
 	"context"
+	"errors"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
@@ -25,10 +26,21 @@ type providerConnectClient struct {
 	client pluginv1connect.ProviderClient
 }
 
+func (p providerConnectClient) handleErr(ctx context.Context, err error) error {
+	if connect.CodeOf(err) == connect.CodeUnimplemented {
+		return ErrNotImplemented
+	}
+	if connect.CodeOf(err) == connect.CodeNotFound {
+		return ErrNotFound
+	}
+
+	return err
+}
+
 func (p providerConnectClient) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	res, err := p.client.Config(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return res.Msg, nil
@@ -37,7 +49,7 @@ func (p providerConnectClient) Config(ctx context.Context, req *pluginv1.Provide
 func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListRequest) (HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	res, err := p.client.List(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return connectServerStream(res), nil
@@ -46,7 +58,7 @@ func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListReque
 func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	res, err := p.client.Get(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return res.Msg, nil
@@ -55,7 +67,7 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 func (p providerConnectClient) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
 	res, err := p.client.GetSpecs(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return connectServerStream(res), nil
@@ -64,7 +76,7 @@ func (p providerConnectClient) GetSpecs(ctx context.Context, req *pluginv1.GetSp
 func (p providerConnectClient) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	res, err := p.client.Probe(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return res.Msg, nil
@@ -78,10 +90,21 @@ type providerConnectHandler struct {
 	handler Provider
 }
 
+func (p providerConnectHandler) handleErr(ctx context.Context, err error) error {
+	if errors.Is(err, ErrNotImplemented) {
+		return connect.NewError(connect.CodeUnimplemented, err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		return connect.NewError(connect.CodeNotFound, err)
+	}
+
+	return err
+}
+
 func (p providerConnectHandler) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
 	res, err := p.handler.Config(ctx, req.Msg)
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return connect.NewResponse(res), nil
@@ -90,7 +113,7 @@ func (p providerConnectHandler) Config(ctx context.Context, req *connect.Request
 func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
 	strm, err := p.handler.List(ctx, req.Msg)
 	if err != nil {
-		return err
+		return p.handleErr(ctx, err)
 	}
 	defer strm.CloseReceive()
 
@@ -111,7 +134,7 @@ func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[p
 func (p providerConnectHandler) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
 	res, err := p.handler.Get(ctx, req.Msg)
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return connect.NewResponse(res), nil
@@ -120,7 +143,7 @@ func (p providerConnectHandler) Get(ctx context.Context, req *connect.Request[pl
 func (p providerConnectHandler) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
 	strm, err := p.handler.GetSpecs(ctx, req.Msg)
 	if err != nil {
-		return err
+		return p.handleErr(ctx, err)
 	}
 	defer strm.CloseReceive()
 
@@ -138,7 +161,7 @@ func (p providerConnectHandler) GetSpecs(ctx context.Context, req *connect.Reque
 func (p providerConnectHandler) Probe(ctx context.Context, req *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
 	res, err := p.handler.Probe(ctx, req.Msg)
 	if err != nil {
-		return nil, err
+		return nil, p.handleErr(ctx, err)
 	}
 
 	return connect.NewResponse(res), nil

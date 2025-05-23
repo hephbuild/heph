@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	"path"
 	"path/filepath"
 	"slices"
@@ -48,6 +49,10 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 			States: states,
 		})
 		if err != nil {
+			if errors.Is(err, engine2.ErrNotImplemented) {
+				return nil, nil
+			}
+
 			return nil, err
 		}
 		defer strm.CloseReceive()
@@ -66,10 +71,6 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 			}
 		}
 		if err := strm.Err(); err != nil {
-			if connect.CodeOf(err) == connect.CodeUnimplemented {
-				return nil, nil
-			}
-
 			return nil, err
 		}
 
@@ -121,7 +122,7 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 
 			spec, err := e.resolveProvider(ctx, providerStates, c, rc, p)
 			if err != nil {
-				if connect.CodeOf(err) == connect.CodeNotFound {
+				if errors.Is(err, engine2.ErrNotFound) {
 					continue
 				}
 

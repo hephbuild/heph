@@ -5,6 +5,9 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+var ErrNotImplemented = errors.New("not implemented")
+var ErrNotFound = errors.New("not found")
+
 type HandlerStreamSend[T any] interface {
 	Send(T) error
 	CloseSend(err error) error

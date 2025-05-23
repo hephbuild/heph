@@ -169,8 +169,7 @@ func (e *Engine) RegisterPlugin(ctx context.Context, register RegisterMuxFunc) (
 }
 
 type ProviderHandle struct {
-	PluginHandle
-	Client pluginv1connect.ProviderClient
+	Client engine2.Provider
 }
 
 type PluginInit = engine2.PluginInit
@@ -257,27 +256,16 @@ var connectCompressOption = connect.WithCompression("gzip", nil, nil)
 var connectAcceptCompressOption = connect.WithAcceptCompression("gzip", nil, nil)
 
 func (e *Engine) RegisterProvider(ctx context.Context, provider engine2.Provider) (ProviderHandle, error) {
-	handler := engine2.NewProviderConnectHandler(provider)
-
-	res, err := handler.Config(ctx, connect.NewRequest(&pluginv1.ProviderConfigRequest{}))
+	res, err := provider.Config(ctx, &pluginv1.ProviderConfigRequest{})
 	if err != nil {
 		return ProviderHandle{}, err
 	}
 
-	pluginName := res.Msg.GetName()
-
-	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
-		mux.Handle(pluginv1connect.NewProviderHandler(handler, hcore.WithRecovery(), e.pluginInterceptor("provider", pluginName), connectCompressOption))
-	})
-	if err != nil {
-		return ProviderHandle{}, err
-	}
-
-	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("provider", pluginName), connectAcceptCompressOption)
+	pluginName := res.GetName()
 
 	provider2 := EngineProvider{
 		Name:     pluginName,
-		Provider: engine2.NewProviderConnectClient(client),
+		Provider: provider,
 	}
 
 	e.Providers = append(e.Providers, provider2)
@@ -288,8 +276,7 @@ func (e *Engine) RegisterProvider(ctx context.Context, provider engine2.Provider
 	}
 
 	return ProviderHandle{
-		PluginHandle: pluginh,
-		Client:       client,
+		Client: provider,
 	}, nil
 }
 

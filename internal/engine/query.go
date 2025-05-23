@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -160,7 +161,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 		Package: pkg,
 	})
 	if err != nil {
-		e.sendErr(ctx, err)
+		e.sendErr(ctx, fmt.Errorf("%v list: %w", p.Name, err))
 		return
 	}
 	defer res.CloseReceive()
@@ -170,7 +171,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 		e.handleRefSpec(ctx, msg.GetRef(), msg.GetSpec())
 	}
 	if err := res.Err(); err != nil {
-		e.sendErr(ctx, err)
+		e.sendErr(ctx, fmt.Errorf("%v list: %w", p.Name, err))
 		return
 	}
 }
@@ -182,7 +183,7 @@ func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef,
 
 	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, GlobalResolveCache)
 	if err != nil {
-		e.sendErr(ctx, err)
+		e.sendErr(ctx, fmt.Errorf("get def: %w", err))
 		return
 	}
 

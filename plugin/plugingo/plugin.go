@@ -82,7 +82,7 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 }
 
 func (p *Plugin) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
+	return nil, engine2.ErrNotImplemented
 }
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -171,7 +171,7 @@ func getMode(ref *pluginv1.TargetRef) (string, error) {
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1.GetResponse, rerr error) {
 	if tref.HasPackagePrefix(req.GetRef().GetPackage(), "@heph/file") {
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+		return nil, engine2.ErrNotFound
 	}
 
 	defer func() {
@@ -211,7 +211,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return p.stdLibBuild(ctx, factors, goImport)
 		}
 
-		return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+		return nil, engine2.ErrNotFound
 	}
 
 	switch req.GetRef().GetName() {
@@ -342,7 +342,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode)
 	}
 
-	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+	return nil, engine2.ErrNotFound
 }
 
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
