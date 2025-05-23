@@ -18,7 +18,6 @@ import (
 	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
-	"github.com/hephbuild/heph/internal/hcore/hstep/hstepfmt"
 	"github.com/hephbuild/heph/internal/hlipgloss"
 	"github.com/hephbuild/heph/internal/hpanic"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
@@ -190,8 +189,6 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 		ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
 			if m.log.GetMode() == hbbtlog.LogHijackerModeHijack {
 				sendStep(step)
-			} else {
-				hlog.From(ctx).Info(hstepfmt.Format(m.renderer, step, false))
 			}
 
 			return step

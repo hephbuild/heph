@@ -7,7 +7,6 @@ import (
 	"io"
 	"path"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
@@ -25,7 +24,7 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package,
 }
 
 func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Package, error) {
-	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
+	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Ref{
 			Ref: &pluginv1.TargetRef{
 				Package: "@heph/go/std",
@@ -33,12 +32,12 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Pac
 				Args:    factors.Args(),
 			},
 		},
-	}))
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	outputs := hartifact.FindOutputs(res.Msg.GetArtifacts(), "list")
+	outputs := hartifact.FindOutputs(res.GetArtifacts(), "list")
 
 	if len(outputs) == 0 {
 		return nil, fmt.Errorf("no install artifact found")

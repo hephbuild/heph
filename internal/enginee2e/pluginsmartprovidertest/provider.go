@@ -12,7 +12,8 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
+	engine2 "github.com/hephbuild/heph/lib/engine"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
@@ -27,11 +28,11 @@ func New() *Provider {
 }
 
 type Provider struct {
-	resultClient corev1connect.ResultServiceClient
+	resultClient engine2.EngineHandle
 }
 
 func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error {
-	p.resultClient = init.CoreHandle.ResultClient
+	p.resultClient = init.CoreHandle
 
 	return nil
 }
@@ -51,13 +52,12 @@ func (p *Provider) List(ctx context.Context, req *connect.Request[pluginv1.ListR
 }
 
 func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	res, err := p.resultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
+	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
 					Package: "some/package",
 					Name:    "think",
-					Driver:  "bash",
 				},
 				Config: map[string]*structpb.Value{
 					"out": structpb.NewStringValue("out"),
@@ -65,19 +65,17 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 				},
 			},
 		},
-	}))
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	artifacts := hartifact.FindOutputs(res.Msg.GetArtifacts(), "")
+	artifacts := hartifact.FindOutputs(res.GetArtifacts(), "")
 
 	b, err := hartifact.ReadAll(ctx, artifacts[0], "some/package/out")
 	if err != nil {
 		return nil, err
 	}
-
-	req.Msg.Ref.Driver = "bash"
 
 	return connect.NewResponse(&pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{

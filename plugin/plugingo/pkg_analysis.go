@@ -503,7 +503,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gowork)))
 	}
 
-	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
+	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
@@ -522,12 +522,12 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 				},
 			},
 		},
-	}))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("gomod: %w", err)
 	}
 
-	outputArtifacts := hartifact.FindOutputs(res.Msg.GetArtifacts(), "")
+	outputArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "")
 
 	if len(outputArtifacts) == 0 {
 		return nil, connect.NewError(connect.CodeInternal, errors.New("gomodules: no output found"))

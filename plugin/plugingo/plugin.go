@@ -372,7 +372,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 		Args:    args,
 	}
 
-	res, err := p.resultClient.ResultClient.Get(ctx, connect.NewRequest(&corev1.ResultRequest{
+	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref:    listRef,
@@ -393,10 +393,10 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 				},
 			},
 		},
-	}))
+	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)
 	}
 
-	return res.Msg.GetArtifacts(), res.Msg.GetDef().GetRef(), nil
+	return res.GetArtifacts(), res.GetDef().GetRef(), nil
 }

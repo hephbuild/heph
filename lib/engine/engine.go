@@ -17,6 +17,6 @@ type PluginIniter interface {
 type EngineHandle struct {
 	LogClient     corev1connect.LogServiceClient
 	StepClient    corev1connect.StepServiceClient
-	ResultClient  corev1connect.ResultServiceClient
+	ResultClient  Resulter
 	ControlClient corev1connect.ControlServiceClient
 }

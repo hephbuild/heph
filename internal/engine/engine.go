@@ -162,7 +162,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		EngineHandle: engine2.EngineHandle{
 			LogClient:     corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
 			StepClient:    corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-			ResultClient:  corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), append(clientOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...),
+			ResultClient:  e.Resulter(),
 			ControlClient: controlClient,
 		},
 	}
