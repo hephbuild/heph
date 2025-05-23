@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
@@ -64,7 +65,7 @@ type InteractiveExecOptions struct {
 type ResultOptions struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
-	Force           *pluginv1.TargetRef
+	Force           *pluginv1.TargetMatcher
 	Interactive     *pluginv1.TargetRef
 }
 
@@ -104,6 +105,10 @@ func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.Target
 	var g errgroup.Group
 	for ref, err := range e.Query(ctx, matcher) {
 		if err != nil {
+			for _, locks := range out {
+				locks.Unlock(ctx)
+			}
+
 			return nil, err
 		}
 
@@ -335,7 +340,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 	unlockDepsResults()
 
 	shouldShell := tref.Equal(options.Shell, def.GetRef())
-	shouldForce := tref.Equal(options.Force, def.GetRef())
+	shouldForce := tmatch.MatchSpec(def.TargetSpec, options.Force) == tmatch.MatchYes
 	getCache := def.Cache && !shouldShell && !shouldForce
 	storeCache := def.Cache && !shouldShell
 
@@ -372,9 +377,9 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		execOptions := ExecuteOptions{
 			ResultOptions: options,
 
-			shell:       tref.Equal(options.Shell, def.GetRef()),
-			force:       tref.Equal(options.Force, def.GetRef()),
-			interactive: tref.Equal(options.Force, def.GetRef()) || tref.Equal(options.Shell, def.GetRef()) || tref.Equal(options.Interactive, def.GetRef()),
+			shell:       shouldShell,
+			force:       shouldForce,
+			interactive: tref.Equal(options.Shell, def.GetRef()) || tref.Equal(options.Interactive, def.GetRef()),
 		}
 
 		var res *ExecuteResult
@@ -426,7 +431,6 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 	})
 
 	return res, nil
-
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
@@ -778,7 +782,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	if options.interactive {
 		execWrapper = options.ResultOptions.InteractiveExec
 		if execWrapper == nil {
-			return nil, errors.New("shell requires interactiveExec not supported")
+			return nil, errors.New("interactive mode requires interactiveExec")
 		}
 	}
 
@@ -810,7 +814,6 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 				}
 			}()
 
-			// TODO switch around, or add capabilities array
 			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
 				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  sandboxfs.Path(),

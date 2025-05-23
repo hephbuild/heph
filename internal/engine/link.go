@@ -318,6 +318,12 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.Ref), tref.Format(spec.Ref))
 		}
 
+		for _, output := range def.CollectOutputs {
+			if !slices.Contains(def.Outputs, output.Group) {
+				def.Outputs = append(def.Outputs, output.Group)
+			}
+		}
+
 		return &TargetDef{
 			TargetDef:  def,
 			TargetSpec: spec,
@@ -354,7 +360,7 @@ func (e *Engine) Link(ctx context.Context, c DefContainer) (*LightLinkedTarget, 
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
 
-	ctx, span := tracer.Start(ctx, "LightLink", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
+	ctx, span := tracer.Start(ctx, "Link", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
 	step, ctx := hstep.New(ctx, fmt.Sprintf("Linking %v...", tref.Format(c.GetRef())))

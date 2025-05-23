@@ -170,6 +170,10 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 }
 
 func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
+	if m == nil {
+		return MatchNo
+	}
+
 	switch item := m.Item.(type) {
 	case *pluginv1.TargetMatcher_Ref:
 		return boolToResult(tref.Equal(item.Ref, spec.Ref))
