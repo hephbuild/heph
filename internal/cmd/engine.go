@@ -108,7 +108,7 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 		return plugingo.New()
 	},
 	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler {
-		return pluginfs.NewProvider()
+		return engine2.NewProviderConnectHandler(pluginfs.NewProvider())
 	},
 }
 
