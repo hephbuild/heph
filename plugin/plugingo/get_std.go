@@ -2,8 +2,8 @@ package plugingo
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"io"
 	"path"
 

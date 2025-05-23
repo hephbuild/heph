@@ -2,9 +2,9 @@ package plugingo
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/goccy/go-json"
 	"github.com/hephbuild/heph/hsync"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"

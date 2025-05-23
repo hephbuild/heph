@@ -119,44 +119,56 @@ func (m Model) View() string {
 }
 
 func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Renderer) (func(*corev1.Step), func()) {
+	doCtx, cancel := context.WithCancel(context.Background())
+
 	stepsCh := make(chan *corev1.Step)
 	steps := map[string]*corev1.Step{}
 	var stepsm sync.Mutex
 
 	go func() {
-		for step := range stepsCh {
-			stepsm.Lock()
-			steps[step.GetId()] = step
+		for {
+			select {
+			case step := <-stepsCh:
+				stepsm.Lock()
+				steps[step.GetId()] = step
 
-			if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
-				//if step.GetParentId() == "" && step.Error {
-				//	hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
-				//}
+				if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
+					//if step.GetParentId() == "" && step.Error {
+					//	hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
+					//}
 
-				delete(steps, step.GetId())
+					delete(steps, step.GetId())
+				}
+				stepsm.Unlock()
+			case <-doCtx.Done():
+				return
 			}
-			stepsm.Unlock()
 		}
 	}()
 
 	t := time.NewTicker(20 * time.Millisecond)
 	go func() {
-		for range t.C {
-			stepsm.Lock()
-			steps := maps.Clone(steps)
-			maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
-				return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
-			})
-			p.Send(stepsUpdateMsg(steps))
-			stepsm.Unlock()
+		for {
+			select {
+			case <-doCtx.Done():
+				return
+			case <-t.C:
+				stepsm.Lock()
+				steps := maps.Clone(steps)
+				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
+					return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
+				})
+				p.Send(stepsUpdateMsg(steps))
+				stepsm.Unlock()
+			}
 		}
 	}()
 
 	return func(step *corev1.Step) {
 			stepsCh <- step
 		}, func() {
+			cancel()
 			t.Stop()
-			close(stepsCh)
 		}
 }
 

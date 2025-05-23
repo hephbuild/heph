@@ -2,8 +2,8 @@ package plugingo
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 	"io/fs"
