@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -74,10 +75,7 @@ var getRoot = sync.OnceValues(func() (string, error) {
 
 type EngineHandle struct {
 	ServerHandle
-	LogClient     corev1connect.LogServiceClient
-	StepClient    corev1connect.StepServiceClient
-	ResultClient  corev1connect.ResultServiceClient
-	ControlClient corev1connect.ControlServiceClient
+	engine2.EngineHandle
 }
 
 type Engine struct {
@@ -89,7 +87,7 @@ type Engine struct {
 
 	CoreHandle EngineHandle
 
-	Providers     []Provider
+	Providers     []EngineProvider
 	Drivers       []pluginv1connect.DriverClient
 	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
 	DriversByName map[string]pluginv1connect.DriverClient
@@ -98,9 +96,9 @@ type Engine struct {
 	SoftCancel *hsoftcontext.Handler
 }
 
-type Provider struct {
+type EngineProvider struct {
 	Name string
-	pluginv1connect.ProviderClient
+	engine2.Provider
 }
 
 func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
@@ -160,11 +158,13 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), append(handlerOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...))
 
 	e.CoreHandle = EngineHandle{
-		ServerHandle:  srvh,
-		LogClient:     corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
-		StepClient:    corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-		ResultClient:  corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), append(clientOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...),
-		ControlClient: controlClient,
+		ServerHandle: srvh,
+		EngineHandle: engine2.EngineHandle{
+			LogClient:     corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
+			StepClient:    corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+			ResultClient:  corev1connect.NewResultServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), append(clientOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...),
+			ControlClient: controlClient,
+		},
 	}
 
 	return e, nil

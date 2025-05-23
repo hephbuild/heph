@@ -10,6 +10,7 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/termui"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
@@ -101,7 +102,7 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 			panic(err)
 		}
 
-		return pluginbuildfile.New(hfs.NewOS(root), cfg)
+		return engine2.NewProviderConnectHandler(pluginbuildfile.New(hfs.NewOS(root), cfg))
 	},
 	plugingo.Name: func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler {
 		return plugingo.New()

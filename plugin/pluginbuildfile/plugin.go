@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/go-viper/mapstructure/v2"
-	"go.opentelemetry.io/otel"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	iofs "io/fs"
 
 	"connectrpc.com/connect"
@@ -13,7 +13,6 @@ import (
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -30,7 +29,7 @@ type Plugin struct {
 	cacherunpkg CacheRunpkg
 }
 
-var _ pluginv1connect.ProviderHandler = (*Plugin)(nil)
+var _ engine2.Provider = (*Plugin)(nil)
 
 const Name = "buildfile"
 
@@ -41,15 +40,15 @@ func New(fs hfs.FS, cfg Options) *Plugin {
 	}
 }
 
-func (p *Plugin) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
-	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
+func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
+	return &pluginv1.ProviderConfigResponse{
 		Name: Name,
-	}), nil
+	}, nil
 }
 
-func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
+func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	var states []*pluginv1.ProviderState
-	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, c.Msg.GetPackage()).Path(), nil, func(ctx context.Context, payload OnProviderStatePayload) error {
+	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, req.GetPackage()).Path(), nil, func(ctx context.Context, payload OnProviderStatePayload) error {
 		if payload.Provider == Name {
 			return nil
 		}
@@ -78,93 +77,86 @@ func (p *Plugin) Probe(ctx context.Context, c *connect.Request[pluginv1.ProbeReq
 		return nil, err
 	}
 
-	return connect.NewResponse(&pluginv1.ProbeResponse{
+	return &pluginv1.ProbeResponse{
 		States: states,
+	}, nil
+}
+
+func (p *Plugin) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
+	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.GetSpecsResponse) error) error {
+		_, err := p.runPkg(ctx, req.GetRef().GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
+			spec, err := p.toTargetSpec(ctx, payload)
+			if err != nil {
+				return err
+			}
+
+			err = send(&pluginv1.GetSpecsResponse{
+				Of: &pluginv1.GetSpecsResponse_Spec{
+					Spec: spec,
+				},
+			})
+
+			return err
+		}, nil)
+
+		return err
 	}), nil
 }
 
-var tracer = otel.Tracer("heph/pluginbuildfile")
+func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 
-func (p *Plugin) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
-	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
-		spec, err := p.toTargetSpec(ctx, payload)
-		if err != nil {
+		if !req.GetDeep() {
+			_, err := p.runPkg(ctx, req.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
+				spec, err := p.toTargetSpec(ctx, payload)
+				if err != nil {
+					return err
+				}
+
+				err = send(&pluginv1.ListResponse{
+					Of: &pluginv1.ListResponse_Spec{
+						Spec: spec,
+					},
+				})
+
+				return err
+			}, nil)
+
 			return err
 		}
 
-		err = res.Send(&pluginv1.GetSpecsResponse{
-			Of: &pluginv1.GetSpecsResponse_Spec{
-				Spec: spec,
-			},
-		})
-
-		return err
-	}, nil)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (p *Plugin) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
-	if !req.Msg.GetDeep() {
-		_, err := p.runPkg(ctx, req.Msg.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
-			spec, err := p.toTargetSpec(ctx, payload)
+		// TODO: hfs.At(p.repoRoot, req.Package)
+		return hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 
-			err = res.Send(&pluginv1.ListResponse{
-				Of: &pluginv1.ListResponse_Spec{
-					Spec: spec,
-				},
-			})
+			if !info.IsDir() {
+				return nil
+			}
 
-			return err
-		}, nil)
-		if err != nil {
-			return err
-		}
+			_, err = p.runPkg(ctx, path, func(ctx context.Context, payload OnTargetPayload) error {
+				spec, err := p.toTargetSpec(ctx, payload)
+				if err != nil {
+					return err
+				}
 
-		return nil
-	}
+				err = send(&pluginv1.ListResponse{
+					Of: &pluginv1.ListResponse_Spec{
+						Spec: spec,
+					},
+				})
 
-	// TODO: hfs.At(p.repoRoot, req.Msg.Package)
-	err := hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
+				return err
+			}, nil)
+			if err != nil {
+				return err
+			}
 
-		if !info.IsDir() {
 			return nil
-		}
+		})
+	}), nil
 
-		_, err = p.runPkg(ctx, path, func(ctx context.Context, payload OnTargetPayload) error {
-			spec, err := p.toTargetSpec(ctx, payload)
-			if err != nil {
-				return err
-			}
-
-			err = res.Send(&pluginv1.ListResponse{
-				Of: &pluginv1.ListResponse_Spec{
-					Spec: spec,
-				},
-			})
-
-			return err
-		}, nil)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
@@ -380,17 +372,17 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 	return prog, nil
 }
 
-func (p *Plugin) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	spec, err := p.cacheget.Singleflight(ctx, req.Msg.GetRef(), func() (*pluginv1.TargetSpec, error) {
+func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
+	spec, err := p.cacheget.Singleflight(ctx, req.GetRef(), func() (*pluginv1.TargetSpec, error) {
 		return p.getInner(ctx, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: spec,
-	}), nil
+	}, nil
 }
 
 func parseLabels(v any) ([]string, error) {
@@ -447,10 +439,10 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 	return spec, nil
 }
 
-func (p *Plugin) getInner(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*pluginv1.TargetSpec, error) {
+func (p *Plugin) getInner(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.TargetSpec, error) {
 	var payload OnTargetPayload
-	_, err := p.runPkg(ctx, req.Msg.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
-		if p.Package == req.Msg.GetRef().GetPackage() && p.Name == req.Msg.GetRef().GetName() {
+	_, err := p.runPkg(ctx, req.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
+		if p.Package == req.GetRef().GetPackage() && p.Name == req.GetRef().GetName() {
 			payload = p
 			return nil // TODO: StopErr
 		}

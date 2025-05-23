@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	cache "github.com/Code-Hex/go-generics-cache"
@@ -31,7 +30,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) queryListProvider(ctx context.Context, p Provider, pkg string, seen map[string]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
+func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[string]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
 	key := p.Name + " " + pkg
 	if _, ok := seen[key]; ok {
 		return func(yield func(*pluginv1.TargetSpec, error) bool) {}
@@ -39,17 +38,18 @@ func (e *Engine) queryListProvider(ctx context.Context, p Provider, pkg string, 
 	seen[key] = struct{}{}
 
 	return func(yield func(*pluginv1.TargetSpec, error) bool) {
-		res, err := p.List(ctx, connect.NewRequest(&pluginv1.ListRequest{
+		res, err := p.List(ctx, &pluginv1.ListRequest{
 			Package: pkg,
-		}))
+		})
 		if err != nil {
 			yield(nil, err)
 			return
 		}
-		defer res.Close()
+		defer res.CloseReceive()
 
 		for res.Receive() {
-			def, err := e.GetDef(ctx, DefContainer{Ref: res.Msg().GetRef(), Spec: res.Msg().GetSpec()}, GlobalResolveCache)
+			msg := res.Msg()
+			def, err := e.GetDef(ctx, DefContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()}, GlobalResolveCache)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -148,7 +148,7 @@ func (e *queryState) queryPackage(ctx context.Context, pkg string) {
 	}
 }
 
-func (e *queryState) queryListProvider(ctx context.Context, p Provider, pkg string) {
+func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pkg string) {
 	err := e.listSem.Acquire(ctx, 1)
 	if err != nil {
 		e.sendErr(ctx, err)
@@ -156,17 +156,18 @@ func (e *queryState) queryListProvider(ctx context.Context, p Provider, pkg stri
 	}
 	defer e.listSem.Release(1)
 
-	res, err := p.List(ctx, connect.NewRequest(&pluginv1.ListRequest{
+	res, err := p.List(ctx, &pluginv1.ListRequest{
 		Package: pkg,
-	}))
+	})
 	if err != nil {
 		e.sendErr(ctx, err)
 		return
 	}
-	defer res.Close()
+	defer res.CloseReceive()
 
 	for res.Receive() {
-		e.handleRefSpec(ctx, res.Msg().GetRef(), res.Msg().GetSpec())
+		msg := res.Msg()
+		e.handleRefSpec(ctx, msg.GetRef(), msg.GetSpec())
 	}
 	if err := res.Err(); err != nil {
 		e.sendErr(ctx, err)

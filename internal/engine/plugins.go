@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
@@ -172,19 +173,14 @@ type ProviderHandle struct {
 	Client pluginv1connect.ProviderClient
 }
 
-type PluginInit struct {
-	CoreHandle EngineHandle
-	Root       string
-}
+type PluginInit = engine2.PluginInit
 
-type PluginIniter interface {
-	PluginInit(context.Context, PluginInit) error
-}
+type PluginIniter = engine2.PluginIniter
 
 func (e *Engine) initPlugin(ctx context.Context, handler any) error {
 	if pi, ok := handler.(PluginIniter); ok {
 		err := pi.PluginInit(ctx, PluginInit{
-			CoreHandle: e.CoreHandle,
+			CoreHandle: e.CoreHandle.EngineHandle,
 			Root:       e.Root.Path(),
 		})
 
@@ -277,9 +273,9 @@ func (e *Engine) RegisterProvider(ctx context.Context, handler pluginv1connect.P
 
 	client := pluginv1connect.NewProviderClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("provider", pluginName), connectAcceptCompressOption)
 
-	provider := Provider{
-		Name:           pluginName,
-		ProviderClient: client,
+	provider := EngineProvider{
+		Name:     pluginName,
+		Provider: engine2.NewProviderConnectClient(client),
 	}
 
 	e.Providers = append(e.Providers, provider)

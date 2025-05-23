@@ -38,19 +38,19 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref or spec must be specified")
 }
 
-func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache, p Provider) (*pluginv1.TargetSpec, error) {
+func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache, p EngineProvider) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
 	// TODO: caching must be smarter, probably package-based ?
 	specs, err, _ := rc.memSpecs.Do(providerKey+refKey(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
-		strm, err := p.GetSpecs(ctx, connect.NewRequest(&pluginv1.GetSpecsRequest{
+		strm, err := p.GetSpecs(ctx, &pluginv1.GetSpecsRequest{
 			Ref:    c.Ref,
 			States: states,
-		}))
+		})
 		if err != nil {
 			return nil, err
 		}
-		defer strm.Close()
+		defer strm.CloseReceive()
 
 		var specs []*pluginv1.TargetSpec
 		for strm.Receive() {
@@ -65,7 +65,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 				specs = append(specs, res.Spec)
 			}
 		}
-		if err = strm.Err(); err != nil {
+		if err := strm.Err(); err != nil {
 			if connect.CodeOf(err) == connect.CodeUnimplemented {
 				return nil, nil
 			}
@@ -86,15 +86,15 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 	}
 
 	spec, err, _ := rc.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
-		res, err := p.Get(ctx, connect.NewRequest(&pluginv1.GetRequest{
+		res, err := p.Get(ctx, &pluginv1.GetRequest{
 			Ref:    c.GetRef(),
 			States: states,
-		}))
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		return res.Msg.GetSpec(), nil
+		return res.GetSpec(), nil
 	})
 	if err != nil {
 		return nil, err
@@ -190,14 +190,14 @@ func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string,
 
 		for ip, p := range e.Providers {
 			probeStates, err, _ := rc.memProbe.Do(fmt.Sprintf("%v %v", ip, probePkg), func() ([]*pluginv1.ProviderState, error) {
-				res, err := p.Probe(ctx, connect.NewRequest(&pluginv1.ProbeRequest{
+				res, err := p.Probe(ctx, &pluginv1.ProbeRequest{
 					Package: probePkg,
-				}))
+				})
 				if err != nil {
 					return nil, err
 				}
 
-				return res.Msg.States, nil
+				return res.States, nil
 			})
 			if err != nil {
 				return nil, err
