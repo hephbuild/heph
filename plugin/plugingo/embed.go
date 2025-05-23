@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -39,7 +38,7 @@ func relglob(dir, pattern string) ([]string, error) {
 	return ret, err
 }
 
-func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
 	var patterns []string
 	args := factors.Args()
 	switch mode {
@@ -78,7 +77,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 		return nil, err
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
@@ -91,5 +90,5 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 				"out": structpb.NewStringValue("embedcfg.json"),
 			},
 		},
-	}), nil
+	}, nil
 }

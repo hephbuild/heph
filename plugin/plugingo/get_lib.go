@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -14,7 +13,7 @@ import (
 	"strings"
 )
 
-func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
 	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
 	if err != nil {
 		return nil, err
@@ -32,7 +31,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 			}))
 		}
 
-		return connect.NewResponse(&pluginv1.GetResponse{
+		return &pluginv1.GetResponse{
 			Spec: &pluginv1.TargetSpec{
 				Ref:    goPkg.LibTargetRef,
 				Driver: "bash",
@@ -61,13 +60,13 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 					}),
 				},
 			},
-		}), nil
+		}, nil
 	}
 
 	return p.packageLibInner(ctx, basePkg, goPkg, factors, false)
 }
 
-func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
 	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
 	if err != nil {
 		return nil, err
@@ -76,7 +75,7 @@ func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPk
 	return p.packageLibInner(ctx, basePkg, goPkg, factors, true)
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*pluginv1.GetResponse, error) {
 	if len(goPkg.GoFiles) == 0 {
 		return nil, fmt.Errorf("empty go file")
 	}
@@ -168,7 +167,7 @@ const (
 	ModeXTest  = "xtest"
 )
 
-func (p *Plugin) packageLibInner3(ctx context.Context, name string, goPkg LibPackage, imports map[string]string, srcRefs []string, factors Factors, incomplete bool) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibInner3(ctx context.Context, name string, goPkg LibPackage, imports map[string]string, srcRefs []string, factors Factors, incomplete bool) (*pluginv1.GetResponse, error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
@@ -232,7 +231,7 @@ func (p *Plugin) packageLibInner3(ctx context.Context, name string, goPkg LibPac
 		out["h"] = "go_asm.h"
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.LibTargetRef.Package,
@@ -252,7 +251,7 @@ func (p *Plugin) packageLibInner3(ctx context.Context, name string, goPkg LibPac
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
 			},
 		},
-	}), nil
+	}, nil
 }
 
 func getFiles(goPkg Package, files []string) []string {
@@ -282,7 +281,7 @@ func getFiles(goPkg Package, files []string) []string {
 	return out
 }
 
-func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Factors, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
 	if len(_goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
@@ -302,7 +301,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 		args["mode"] = goPkg.Mode
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GoPkg.GetHephBuildPackage(),
@@ -329,10 +328,10 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 				"deps": hstructpb.NewMapStringStringsValue(deps),
 			},
 		},
-	}), nil
+	}, nil
 }
 
-func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Factors, asmFile string, mode string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Factors, asmFile string, mode string) (*pluginv1.GetResponse, error) {
 	if len(_goPkg.SFiles) == 0 {
 		return nil, fmt.Errorf("no s files in package")
 	}
@@ -346,7 +345,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 		return nil, fmt.Errorf(asmFile + " not found")
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.LibTargetRef.Package,
@@ -382,5 +381,5 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 				}),
 			},
 		},
-	}), nil
+	}, nil
 }

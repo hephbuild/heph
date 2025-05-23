@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -11,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
 	goPkg, err := p.getGoPackageFromHephPackage(ctx, goPkg.HephPackage, factors)
@@ -32,7 +31,7 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
 }
 
-func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []LibPackage) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []LibPackage) (*pluginv1.GetResponse, error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
@@ -56,7 +55,7 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 
 	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
@@ -78,5 +77,5 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 			},
 			Labels: []string{"go-build"},
 		},
-	}), nil
+	}, nil
 }

@@ -94,21 +94,21 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	return cfg, nil
 }
 
-var nameToProvider = map[string]func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler{
-	pluginbuildfile.Name: func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler {
+var nameToProvider = map[string]func(ctx context.Context, root string, options map[string]any) engine2.Provider{
+	pluginbuildfile.Name: func(ctx context.Context, root string, options map[string]any) engine2.Provider {
 		var cfg pluginbuildfile.Options
 		err := mapstructure.Decode(options, &cfg)
 		if err != nil {
 			panic(err)
 		}
 
-		return engine2.NewProviderConnectHandler(pluginbuildfile.New(hfs.NewOS(root), cfg))
+		return pluginbuildfile.New(hfs.NewOS(root), cfg)
 	},
-	plugingo.Name: func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler {
+	plugingo.Name: func(ctx context.Context, root string, options map[string]any) engine2.Provider {
 		return plugingo.New()
 	},
-	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) pluginv1connect.ProviderHandler {
-		return engine2.NewProviderConnectHandler(pluginfs.NewProvider())
+	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) engine2.Provider {
+		return pluginfs.NewProvider()
 	},
 }
 

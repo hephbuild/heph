@@ -73,8 +73,8 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Pac
 	return packages, nil
 }
 
-func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
-	return connect.NewResponse(&pluginv1.GetResponse{
+func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.GetResponse, error) {
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: "@heph/go/std",
@@ -105,11 +105,11 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*connect.Resp
 				}),
 			},
 		},
-	}), nil
+	}, nil
 }
 
-func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport string) (*connect.Response[pluginv1.GetResponse], error) {
-	return connect.NewResponse(&pluginv1.GetResponse{
+func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport string) (*pluginv1.GetResponse, error) {
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: path.Join("@heph/go/std", goImport),
@@ -135,5 +135,5 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				}),
 			},
 		},
-	}), nil
+	}, nil
 }

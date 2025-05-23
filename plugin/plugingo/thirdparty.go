@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -10,7 +9,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) (*pluginv1.GetResponse, error) {
 	run := []string{
 		"echo module heph_ignore > go.mod", // stops go from reading the main go.mod, and downloading all of those too
 		fmt.Sprintf("go mod download -modcacherw -json %v@%v | tee mod.json", goMod, version),
@@ -19,7 +18,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		`cp -r "$MOD_DIR/." .`,
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
+	return &pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
 		Ref: &pluginv1.TargetRef{
 			Package: pkg,
 			Name:    "download",
@@ -36,7 +35,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 			"cache":            structpb.NewBoolValue(true),
 			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 		},
-	}}), nil
+	}}, nil
 }
 
 func ThirdpartyContentPackage(goMod, version, goPath string) string {

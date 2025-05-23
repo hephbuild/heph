@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -11,13 +10,13 @@ import (
 	"path/filepath"
 )
 
-func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
 	labels := []string{"test", "go-test"}
 	if goPkg.IsStd || goPkg.Is3rdParty {
 		labels = nil
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
@@ -35,10 +34,10 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 			},
 			Labels: labels,
 		},
-	}), nil
+	}, nil
 }
 
-func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
 
 	goPkgs, err := p.goListTestDepsPkgResult(ctx, goPkg.GetHephBuildPackage(), factors, c, testmainImports)
@@ -56,7 +55,7 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs)
 }
 
-func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
 	var absFiles []string
 	for _, file := range goPkg.TestGoFiles {
 		absFiles = append(absFiles, "_test:"+filepath.Join(goPkg.Dir, file))
@@ -77,7 +76,7 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 	testmain := base64.StdEncoding.EncodeToString(testmainb)
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
 				Package: goPkg.GetHephBuildPackage(),
@@ -90,12 +89,12 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 				"out": structpb.NewStringValue("testmain.go"),
 			},
 		},
-	}), nil
+	}, nil
 }
 
 var testmainImports = []string{"os", "reflect", "testing", "testing/internal/testdeps"}
 
-func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
 	importsm := map[string]string{}
 
 	c := p.newGetGoPackageCache(ctx, basePkg, factors)
