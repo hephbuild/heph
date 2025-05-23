@@ -13,7 +13,6 @@ import (
 	"strings"
 	"sync"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -305,14 +304,14 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetDriver())
 		}
 
-		res, err := driver.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
+		res, err := driver.Parse(ctx, &pluginv1.ParseRequest{
 			Spec: spec,
-		}))
+		})
 		if err != nil {
 			return nil, err
 		}
 
-		def := res.Msg.GetTarget()
+		def := res.GetTarget()
 
 		if !tref.Equal(def.Ref, spec.Ref) {
 			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.Ref), tref.Format(spec.Ref))

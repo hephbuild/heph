@@ -21,7 +21,6 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
 var getCwd = sync.OnceValues(func() (string, error) {
@@ -88,9 +87,9 @@ type Engine struct {
 	CoreHandle EngineHandle
 
 	Providers     []EngineProvider
-	Drivers       []pluginv1connect.DriverClient
-	DriversHandle map[pluginv1connect.DriverClient]PluginHandle
-	DriversByName map[string]pluginv1connect.DriverClient
+	Drivers       []engine2.Driver
+	DriversHandle map[engine2.Driver]PluginHandle
+	DriversByName map[string]engine2.Driver
 	DriversConfig map[string]*pluginv1.ConfigResponse
 
 	SoftCancel *hsoftcontext.Handler

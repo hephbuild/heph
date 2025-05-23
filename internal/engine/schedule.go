@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hmaps"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -28,7 +29,6 @@ import (
 
 	"github.com/hephbuild/heph/plugin/tref"
 
-	"connectrpc.com/connect"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
@@ -37,7 +37,6 @@ import (
 	"github.com/hephbuild/heph/internal/hpty"
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/hpipe"
 	"github.com/zeebo/xxh3"
 	"golang.org/x/sync/errgroup"
@@ -559,7 +558,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 	return nil, false, nil
 }
 
-func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient, options ExecOptions) ([]string, func() error, error) {
+func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
 	eg := &errgroup.Group{}
 
@@ -589,13 +588,13 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	if options.Stdin != nil {
 		stdinErrCh = make(chan error)
 
-		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
-		if res != nil && res.Msg.GetId() != "" {
-			pipes[0] = res.Msg.GetId()
+		if res != nil && res.GetId() != "" {
+			pipes[0] = res.GetId()
 
 			ctx, cancel := context.WithCancel(ctx)
 			cancels = append(cancels, cancel)
@@ -603,7 +602,7 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 			go func() {
 				defer cancel()
 
-				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.GetPath())
 				if err != nil {
 					stdinErrCh <- err
 					return
@@ -618,16 +617,16 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	}
 
 	if options.Stdout != nil {
-		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
-		if res != nil && res.Msg.GetId() != "" {
-			pipes[1] = res.Msg.GetId()
+		if res != nil && res.GetId() != "" {
+			pipes[1] = res.GetId()
 
 			eg.Go(func() error {
-				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.GetPath())
 				if err != nil {
 					return err
 				}
@@ -640,16 +639,16 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	}
 
 	if options.Stderr != nil {
-		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
-		if res != nil && res.Msg.GetId() != "" {
-			pipes[2] = res.Msg.GetId()
+		if res != nil && res.GetId() != "" {
+			pipes[2] = res.GetId()
 
 			eg.Go(func() error {
-				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				r, err := hpipe.Reader(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.GetPath())
 				if err != nil {
 					return err
 				}
@@ -662,18 +661,18 @@ func (e *Engine) pipes(ctx context.Context, driver pluginv1connect.DriverClient,
 	}
 
 	if stdin, ok := options.Stdin.(*os.File); ok {
-		res, err := driver.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
-		if err != nil && connect.CodeOf(err) != connect.CodeUnimplemented {
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
-		if res != nil && res.Msg.GetId() != "" {
-			pipes[3] = res.Msg.GetId()
+		if res != nil && res.GetId() != "" {
+			pipes[3] = res.GetId()
 
 			ch, clean := hpty.WinSizeChan(ctx, stdin)
 			cancels = append(cancels, clean)
 
 			go func() {
-				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.Msg.GetPath())
+				w, err := hpipe.Writer(ctx, driverHandle.HTTPClientWithOtel(), driverHandle.GetBaseURL(), res.GetPath())
 				if err != nil {
 					hlog.From(ctx).Error(fmt.Sprintf("failed to get pipe: %v", err))
 					return
@@ -796,7 +795,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	}
 
-	var runRes *connect.Response[pluginv1.RunResponse]
+	var runRes *pluginv1.RunResponse
 	var runErr error
 	err = execWrapper(ctx, InteractiveExecOptions{
 		Run: func(ctx context.Context, options ExecOptions) {
@@ -814,13 +813,13 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 				}
 			}()
 
-			runRes, runErr = driver.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+			runRes, runErr = driver.Run(ctx, &pluginv1.RunRequest{
 				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  sandboxfs.Path(),
 				TreeRootPath: e.Root.Path(),
 				Inputs:       inputs,
 				Pipes:        pipes,
-			}))
+			})
 		},
 		Pty: def.Pty,
 	})
@@ -916,7 +915,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		})
 	}
 
-	for _, artifact := range runRes.Msg.GetArtifacts() {
+	for _, artifact := range runRes.GetArtifacts() {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}

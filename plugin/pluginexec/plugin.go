@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	"io"
 	"maps"
 	"net/http"
@@ -19,10 +20,8 @@ import (
 
 	"github.com/hephbuild/heph/plugin/tref"
 
-	"connectrpc.com/connect"
 	"github.com/google/uuid"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -49,7 +48,7 @@ func (p *Plugin) PipesHandler() (string, http.Handler) {
 	return PipesHandlerPath + "/", PipesHandler{p}
 }
 
-func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {
+func (p *Plugin) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
 	p.pipesm.Lock()
 	defer p.pipesm.Unlock()
 
@@ -59,17 +58,17 @@ func (p *Plugin) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeReq
 
 	p.pipes[id] = &pipe{exp: time.Now().Add(time.Minute), r: r, w: w}
 
-	return connect.NewResponse(&pluginv1.PipeResponse{
+	return &pluginv1.PipeResponse{
 		Path: path.Join(PipesHandlerPath, id),
 		Id:   id,
-	}), nil
+	}, nil
 }
 
-func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
+func (p *Plugin) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	desc := (&execv1.Target{}).ProtoReflect().Descriptor()
 	pdesc := protodesc.ToDescriptorProto(desc)
 
-	return connect.NewResponse(&pluginv1.ConfigResponse{
+	return &pluginv1.ConfigResponse{
 		Name:         p.name,
 		TargetSchema: pdesc,
 		IgnoreFromHash: []string{
@@ -77,17 +76,17 @@ func (p *Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigR
 			string(desc.FullName()) + ".runtime_env",
 			string(desc.FullName()) + ".runtime_pass_env",
 		},
-	}), nil
+	}, nil
 }
 
 func depId(prop string, group string, i int) string {
 	return fmt.Sprintf("%q %q %v", prop, group, i)
 }
 
-func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
+func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
 	var targetSpec Spec
 	targetSpec.Cache = true
-	err := hstructpb.DecodeTo(req.Msg.GetSpec().GetConfig(), &targetSpec)
+	err := hstructpb.DecodeTo(req.GetSpec().GetConfig(), &targetSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -220,9 +219,9 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 		return nil, fmt.Errorf("invalid codegen mode: %s", targetSpec.Codegen)
 	}
 
-	return connect.NewResponse(&pluginv1.ParseResponse{
+	return &pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
-			Ref:            req.Msg.GetSpec().GetRef(),
+			Ref:            req.GetSpec().GetRef(),
 			Def:            targetAny,
 			Inputs:         inputs,
 			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
@@ -231,7 +230,7 @@ func (p *Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseR
 			CodegenTree:    codegenTree,
 			Pty:            targetSpec.Pty,
 		},
-	}), nil
+	}, nil
 }
 
 type Option func(*Plugin)
@@ -351,4 +350,4 @@ func NewSh(options ...Option) *Plugin {
 	return New(options...)
 }
 
-var _ pluginv1connect.DriverHandler = (*Plugin)(nil)
+var _ engine2.Driver = (*Plugin)(nil)

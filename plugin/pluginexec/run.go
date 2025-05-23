@@ -19,7 +19,6 @@ import (
 	"syscall"
 	"time"
 
-	"connectrpc.com/connect"
 	ptylib "github.com/creack/pty"
 	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -35,10 +34,10 @@ var tracer = otel.Tracer("heph/pluginexec")
 
 var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
 
-func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
+func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
-			fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.Msg.GetTarget().GetRef())), "",
+			fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.GetTarget().GetRef())), "",
 		}
 	})
 
@@ -56,27 +55,27 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	const pipeStderr = 2
 	const pipeTermSize = 3
 
-	for len(req.Msg.GetPipes()) < 4 {
-		req.Msg.Pipes = append(req.Msg.Pipes, "")
+	for len(req.GetPipes()) < 4 {
+		req.Pipes = append(req.Pipes, "")
 	}
 
 	t := &execv1.Target{}
-	err = req.Msg.GetTarget().GetDef().UnmarshalTo(t)
+	err = req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {
 		return nil, err
 	}
 
-	pty := req.Msg.GetTarget().GetPty()
-	sandboxfs := hfs.NewOS(req.Msg.GetSandboxPath())
+	pty := req.GetTarget().GetPty()
+	sandboxfs := hfs.NewOS(req.GetSandboxPath())
 	workfs := hfs.At(sandboxfs, "ws")
 	binfs := hfs.At(sandboxfs, "bin")
-	cwdfs := hfs.At(workfs, req.Msg.GetTarget().GetRef().GetPackage())
+	cwdfs := hfs.At(workfs, req.GetTarget().GetRef().GetPackage())
 	outfs := cwdfs
 	if t.GetContext() == execv1.Target_Tree {
-		cwdfs = hfs.At(hfs.NewOS(req.Msg.GetTreeRootPath()), req.Msg.GetTarget().GetRef().GetPackage())
+		cwdfs = hfs.At(hfs.NewOS(req.GetTreeRootPath()), req.GetTarget().GetRef().GetPackage())
 	}
 
-	listArtifacts, err := SetupSandbox(ctx, t, req.Msg.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
+	listArtifacts, err := SetupSandbox(ctx, t, req.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
 	if err != nil {
 		return nil, err
 	}
@@ -103,8 +102,8 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	for _, name := range t.GetPassEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
 	}
-	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))             // TODO: figure it out
-	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.Msg.GetTreeRootPath())) // TODO: figure it out
+	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))         // TODO: figure it out
+	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.GetTreeRootPath())) // TODO: figure it out
 
 	for _, output := range t.GetOutputs() {
 		paths := slices.Clone(output.GetPaths())
@@ -117,12 +116,12 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	}
 
 	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.GetRun()))
-	args := p.runToExecArgs(req.Msg.GetSandboxPath(), t.GetRun(), nil)
+	args := p.runToExecArgs(req.GetSandboxPath(), t.GetRun(), nil)
 	hlog.From(ctx).Debug(fmt.Sprintf("args: %#v", args))
 
 	var stdoutWriters, stderrWriters []io.Writer
 
-	logFile, err := os.Create(filepath.Join(req.Msg.GetSandboxPath(), "log.txt"))
+	logFile, err := os.Create(filepath.Join(req.GetSandboxPath(), "log.txt"))
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +157,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		return p.Signal(os.Interrupt)
 	}
 
-	for i, id := range []string{req.Msg.GetPipes()[pipeStdout], req.Msg.GetPipes()[pipeStderr]} {
+	for i, id := range []string{req.GetPipes()[pipeStdout], req.GetPipes()[pipeStderr]} {
 		if id == "" {
 			continue
 		}
@@ -179,7 +178,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 	cmd.Stdout = hio.MultiWriter(stdoutWriters...)
 	cmd.Stderr = hio.MultiWriter(stderrWriters...)
 
-	if id := req.Msg.GetPipes()[pipeStdin]; id != "" {
+	if id := req.GetPipes()[pipeStdin]; id != "" {
 		pipe, ok := p.getPipe(id)
 		if !ok {
 			return nil, errors.New("pipe stdin not found")
@@ -204,7 +203,7 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 
 	if pty {
 		var sizeChan chan *ptylib.Winsize
-		if id := req.Msg.GetPipes()[pipeTermSize]; id != "" {
+		if id := req.GetPipes()[pipeTermSize]; id != "" {
 			sizeChan = make(chan *ptylib.Winsize)
 			defer close(sizeChan)
 
@@ -294,9 +293,9 @@ func (p *Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunReque
 		})
 	}
 
-	return connect.NewResponse(&pluginv1.RunResponse{
+	return &pluginv1.RunResponse{
 		Artifacts: artifacts,
-	}), nil
+	}, nil
 }
 
 func getEnvName(prefix, group, name string) string {

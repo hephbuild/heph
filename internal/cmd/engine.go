@@ -11,7 +11,6 @@ import (
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/termui"
 	engine2 "github.com/hephbuild/heph/lib/engine"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginfs"
@@ -112,7 +111,7 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 	},
 }
 
-func pluginExecFactory(d *pluginexec.Plugin) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+func pluginExecFactory(d *pluginexec.Plugin) (engine2.Driver, func(mux *http.ServeMux)) {
 	return d, func(mux *http.ServeMux) {
 		path, h := d.PipesHandler()
 
@@ -122,26 +121,26 @@ func pluginExecFactory(d *pluginexec.Plugin) (pluginv1connect.DriverHandler, fun
 	}
 }
 
-var nameToDriver = map[string]func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)){
-	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+var nameToDriver = map[string]func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)){
+	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		return pluginfs.NewDriver(), nil
 	},
-	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		d := pluginexec.New()
 
 		return pluginExecFactory(d)
 	},
-	pluginexec.NameSh: func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+	pluginexec.NameSh: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		d := pluginexec.NewSh()
 
 		return pluginExecFactory(d)
 	},
-	pluginexec.NameBash: func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+	pluginexec.NameBash: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		d := pluginexec.NewBash()
 
 		return pluginExecFactory(d)
 	},
-	pluginexec.NameBashShell: func(ctx context.Context, root string, options map[string]any) (pluginv1connect.DriverHandler, func(mux *http.ServeMux)) {
+	pluginexec.NameBashShell: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		d := pluginexec.NewInteractiveBash()
 
 		return pluginExecFactory(d)

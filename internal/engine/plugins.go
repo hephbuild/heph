@@ -282,16 +282,18 @@ func (e *Engine) RegisterProvider(ctx context.Context, provider engine2.Provider
 
 type DriverHandle struct {
 	PluginHandle
-	Client pluginv1connect.DriverClient
+	Client engine2.Driver
 }
 
-func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.DriverHandler, register RegisterMuxFunc) (DriverHandle, error) {
-	res, err := handler.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
+func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, register RegisterMuxFunc) (DriverHandle, error) {
+	res, err := driver.Config(ctx, &pluginv1.ConfigRequest{})
 	if err != nil {
 		return DriverHandle{}, err
 	}
 
-	pluginName := res.Msg.GetName()
+	pluginName := res.GetName()
+
+	handler := engine2.NewDriverConnectHandler(driver)
 
 	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName), connectCompressOption)
 
@@ -305,13 +307,14 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 		return DriverHandle{}, err
 	}
 
-	client := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
+	cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
+	client := engine2.NewDriverConnectClient(cclient)
 
 	if e.DriversByName == nil {
-		e.DriversByName = map[string]pluginv1connect.DriverClient{}
+		e.DriversByName = map[string]engine2.Driver{}
 	}
 	if e.DriversHandle == nil {
-		e.DriversHandle = map[pluginv1connect.DriverClient]PluginHandle{}
+		e.DriversHandle = map[engine2.Driver]PluginHandle{}
 	}
 	if e.DriversConfig == nil {
 		e.DriversConfig = map[string]*pluginv1.ConfigResponse{}
@@ -320,7 +323,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, handler pluginv1connect.Dri
 	e.Drivers = append(e.Drivers, client)
 	e.DriversByName[pluginName] = client
 	e.DriversHandle[client] = pluginh
-	e.DriversConfig[pluginName] = res.Msg
+	e.DriversConfig[pluginName] = res
 
 	err = e.initPlugin(ctx, handler)
 	if err != nil {
