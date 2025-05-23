@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"maps"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,7 +24,7 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
-type stepsUpdateMsg map[string]*corev1.Step
+type stepsUpdateMsg []*corev1.Step
 
 type Model struct {
 	log           hbbtlog.Hijacker
@@ -34,14 +35,13 @@ type Model struct {
 	width  int
 	height int
 
-	steps          map[string]*corev1.Step
+	steps          stepsUpdateMsg
 	pauseRendering bool
 }
 
 func initialModel(cancelRoutine context.CancelCauseFunc) Model {
 	m := Model{
 		log:           hbbtlog.NewLogHijacker(),
-		steps:         map[string]*corev1.Step{},
 		renderer:      hlipgloss.NewRenderer(os.Stderr),
 		cancelRoutine: cancelRoutine,
 	}
@@ -105,7 +105,7 @@ func (m Model) View() string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("%v\n", len(m.steps)))
-	stepsTree := buildStepsTree(m.renderer, maps.Values(m.steps))
+	stepsTree := buildStepsTree(m.renderer, m.steps)
 	if m.height > 0 {
 		stepsTree = lipgloss.NewStyle().MaxHeight(m.height / 2).Render(stepsTree)
 	}
@@ -155,11 +155,12 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 			case <-t.C:
 				stepsm.Lock()
 				steps := maps.Clone(steps)
+				stepsm.Unlock()
 				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
 					return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
 				})
-				p.Send(stepsUpdateMsg(steps))
-				stepsm.Unlock()
+				stepsa := slices.Collect(maps.Values(steps))
+				p.Send(stepsUpdateMsg(stepsa))
 			}
 		}
 	}()

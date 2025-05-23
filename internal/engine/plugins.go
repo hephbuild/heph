@@ -325,7 +325,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, regi
 	e.DriversHandle[client] = pluginh
 	e.DriversConfig[pluginName] = res
 
-	err = e.initPlugin(ctx, handler)
+	err = e.initPlugin(ctx, driver)
 	if err != nil {
 		return DriverHandle{}, err
 	}

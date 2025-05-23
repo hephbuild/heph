@@ -1,7 +1,6 @@
 package termui
 
 import (
-	"iter"
 	"maps"
 	"slices"
 	"strings"
@@ -27,9 +26,9 @@ func buildStepsTreeInner(renderer *lipgloss.Renderer, children map[string][]*cor
 	return t
 }
 
-func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) string {
+func buildStepsTree(renderer *lipgloss.Renderer, steps []*corev1.Step) string {
 	children := map[string][]*corev1.Step{}
-	for v := range steps {
+	for _, v := range steps {
 		if v.GetParentId() == "" && len(children[""]) > 100 {
 			continue
 		}
@@ -39,8 +38,8 @@ func buildStepsTree(renderer *lipgloss.Renderer, steps iter.Seq[*corev1.Step]) s
 
 	for v := range maps.Values(children) {
 		slices.SortFunc(v, func(a, b *corev1.Step) int {
-			if v := a.GetStartedAt().AsTime().Truncate(1000 * time.Millisecond).Compare(b.GetStartedAt().AsTime().Truncate(1000 * time.Millisecond)); v != 0 {
-				return 0
+			if v := a.GetStartedAt().AsTime().Truncate(time.Second).Compare(b.GetStartedAt().AsTime().Truncate(time.Second)); v != 0 {
+				return v
 			}
 
 			if v := strings.Compare(a.Id, b.Id); v != 0 {
