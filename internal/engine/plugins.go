@@ -256,6 +256,11 @@ var connectCompressOption = connect.WithCompression("gzip", nil, nil)
 var connectAcceptCompressOption = connect.WithAcceptCompression("gzip", nil, nil)
 
 func (e *Engine) RegisterProvider(ctx context.Context, provider engine2.Provider) (ProviderHandle, error) {
+	err := e.initPlugin(ctx, provider)
+	if err != nil {
+		return ProviderHandle{}, err
+	}
+
 	res, err := provider.Config(ctx, &pluginv1.ProviderConfigRequest{})
 	if err != nil {
 		return ProviderHandle{}, err
@@ -270,11 +275,6 @@ func (e *Engine) RegisterProvider(ctx context.Context, provider engine2.Provider
 
 	e.Providers = append(e.Providers, provider2)
 
-	err = e.initPlugin(ctx, provider)
-	if err != nil {
-		return ProviderHandle{}, err
-	}
-
 	return ProviderHandle{
 		Client: provider,
 	}, nil
@@ -286,6 +286,11 @@ type DriverHandle struct {
 }
 
 func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, register RegisterMuxFunc) (DriverHandle, error) {
+	err := e.initPlugin(ctx, driver)
+	if err != nil {
+		return DriverHandle{}, err
+	}
+
 	res, err := driver.Config(ctx, &pluginv1.ConfigRequest{})
 	if err != nil {
 		return DriverHandle{}, err
@@ -324,11 +329,6 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, regi
 	e.DriversByName[pluginName] = client
 	e.DriversHandle[client] = pluginh
 	e.DriversConfig[pluginName] = res
-
-	err = e.initPlugin(ctx, driver)
-	if err != nil {
-		return DriverHandle{}, err
-	}
 
 	return DriverHandle{
 		PluginHandle: pluginh,
