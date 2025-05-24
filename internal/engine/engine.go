@@ -91,6 +91,7 @@ type Engine struct {
 	DriversHandle map[engine2.Driver]PluginHandle
 	DriversByName map[string]engine2.Driver
 	DriversConfig map[string]*pluginv1.ConfigResponse
+	Caches        []CacheHandle
 
 	SoftCancel *hsoftcontext.Handler
 }

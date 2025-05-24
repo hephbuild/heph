@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"github.com/hephbuild/heph/internal/hproto"
 	"hash"
@@ -79,4 +80,12 @@ func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struc
 	}
 
 	return json.NewEncoder(w).Encode(a)
+}
+
+func (h hashWithDebug) Sum(b []byte) []byte {
+	sum := h.Hasher.Sum(b)
+
+	_, _ = h.WriteString("SUM: " + hex.EncodeToString(sum))
+
+	return sum
 }

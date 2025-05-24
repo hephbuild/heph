@@ -85,16 +85,12 @@ func depId(prop string, group string, i int) string {
 
 func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
 	var targetSpec Spec
-	targetSpec.Cache = true
+	targetSpec.Cache.Remote = true
+	targetSpec.Cache.Local = true
+
 	err := hstructpb.DecodeTo(req.GetSpec().GetConfig(), &targetSpec)
 	if err != nil {
 		return nil, err
-	}
-
-	if targetSpec.InTree {
-		if targetSpec.Cache {
-			//return nil, errors.New("incompatible: cache & in_tree")
-		}
 	}
 
 	target := &execv1.Target{
@@ -221,14 +217,15 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	return &pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
-			Ref:            req.GetSpec().GetRef(),
-			Def:            targetAny,
-			Inputs:         inputs,
-			Outputs:        slices.Collect(maps.Keys(targetSpec.Out)),
-			Cache:          targetSpec.Cache,
-			CollectOutputs: collectOutputs,
-			CodegenTree:    codegenTree,
-			Pty:            targetSpec.Pty,
+			Ref:                req.GetSpec().GetRef(),
+			Def:                targetAny,
+			Inputs:             inputs,
+			Outputs:            slices.Collect(maps.Keys(targetSpec.Out)),
+			Cache:              targetSpec.Cache.Local,
+			DisableRemoteCache: !targetSpec.Cache.Remote,
+			CollectOutputs:     collectOutputs,
+			CodegenTree:        codegenTree,
+			Pty:                targetSpec.Pty,
 		},
 	}, nil
 }

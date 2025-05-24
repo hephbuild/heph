@@ -516,7 +516,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 					"run":              structpb.NewStringValue("go list -m -json > $OUT"),
 					"out":              structpb.NewStringValue("golist_mod.json"),
 					"in_tree":          structpb.NewBoolValue(true),
-					"cache":            structpb.NewBoolValue(true),
+					"cache":            structpb.NewStringValue("local"),
 					"hash_deps":        hstructpb.NewStringsValue(files),
 					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 				},

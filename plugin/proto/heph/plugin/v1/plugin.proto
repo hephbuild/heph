@@ -29,6 +29,7 @@ message TargetDef {
   repeated Input inputs = 3;
   repeated string outputs = 4;
   bool cache = 5;
+  bool disable_remote_cache = 9;
 
   message CollectOutput {
     string group = 1;

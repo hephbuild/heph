@@ -2,6 +2,7 @@ package enginee2e
 
 import (
 	"context"
+	"github.com/go-faker/faker/v4"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -33,14 +34,16 @@ func TestSanity(t *testing.T) {
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
 
+	pkg := faker.UUIDDigit()
+
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/package",
+					Package: pkg,
 					Name:    "sometarget",
-					Driver:  "exec",
 				},
+				Driver: "exec",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > out`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
@@ -56,12 +59,13 @@ func TestSanity(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-	require.NoError(t, res.Err)
+	res, err := e.Result(ctx, pkg, "sometarget", []string{""}, engine.ResultOptions{}, &engine.ResolveCache{})
+	require.NoError(t, err)
+	defer res.Unlock(ctx)
 
 	require.Len(t, res.Artifacts, 2)
 
-	b, err := hartifact.ReadAll(ctx, res.Artifacts[0].Artifact, "some/package/out")
+	b, err := hartifact.ReadAll(ctx, res.FindOutputs("")[0].Artifact, pkg+"/out")
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))

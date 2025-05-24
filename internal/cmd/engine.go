@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/remotecache"
 	"github.com/hephbuild/heph/internal/termui"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
@@ -147,6 +148,26 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 	},
 }
 
+var nameToCache = map[string]func(ctx context.Context, options map[string]any) (engine2.Cache, error){
+	remotecache.DriverNameGCS: func(ctx context.Context, options map[string]any) (engine2.Cache, error) {
+		return remotecache.NewGCS(ctx, fmt.Sprint(options["bucket"]))
+	},
+	remotecache.DriverNameExec: func(ctx context.Context, options map[string]any) (engine2.Cache, error) {
+		var optionss struct {
+			Args []string `mapstructure:"args"`
+		}
+		err := mapstructure.Decode(options, &optionss)
+		if err != nil {
+			return nil, err
+		}
+
+		return remotecache.NewExec(optionss.Args)
+	},
+	remotecache.DriverNameSh: func(ctx context.Context, options map[string]any) (engine2.Cache, error) {
+		return remotecache.NewSh(fmt.Sprint(options["cmd"]))
+	},
+}
+
 func newEngine(ctx context.Context, root string) (*engine.Engine, error) {
 	cfg, err := parseConfig(ctx, root)
 	if err != nil {
@@ -156,6 +177,27 @@ func newEngine(ctx context.Context, root string) (*engine.Engine, error) {
 	e, err := engine.New(ctx, root, cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	for _, cache := range cfg.Caches {
+		if !cache.Read && !cache.Write {
+			continue
+		}
+
+		factory, ok := nameToCache[cache.Driver]
+		if !ok {
+			return nil, fmt.Errorf("unknown cache driver %s: %q", cache.Name, cache.Driver)
+		}
+
+		c, err := factory(ctx, cache.Options)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = e.RegisterCache(cache.Name, c, cache.Read, cache.Write)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for _, plugin := range cfg.Providers {

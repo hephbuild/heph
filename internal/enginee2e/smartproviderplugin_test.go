@@ -29,12 +29,13 @@ func TestSmartProviderPlugin(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res := e.Result(ctx, "", "do", []string{engine.AllOutputs}, engine.ResultOptions{})
-	require.NoError(t, res.Err)
+	res, err := e.Result(ctx, "", "do", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+	require.NoError(t, err)
+	defer res.Unlock(ctx)
 
 	require.Len(t, res.Artifacts, 2)
 
-	b, err := hartifact.ReadAll(ctx, res.Artifacts[0].Artifact, "out")
+	b, err := hartifact.ReadAll(ctx, res.FindOutputs("")[0].Artifact, "out")
 	require.NoError(t, err)
 
 	assert.Equal(t, "parent: hello\n\n", string(b))

@@ -2,7 +2,6 @@ package pluginsmartprovidertest
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -11,15 +10,13 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"connectrpc.com/connect"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
-var _ pluginv1connect.ProviderHandler = (*Provider)(nil)
-var _ engine.PluginIniter = (*Provider)(nil)
+var _ engine2.Provider = (*Provider)(nil)
+var _ engine2.PluginIniter = (*Provider)(nil)
 
 const ProviderName = "smart_provider_test"
 
@@ -37,21 +34,23 @@ func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error
 	return nil
 }
 
-func (p *Provider) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
-	return connect.NewResponse(&pluginv1.ProviderConfigResponse{
+func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
+	return &pluginv1.ProviderConfigResponse{
 		Name: ProviderName,
+	}, nil
+}
+
+func (p *Provider) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
+	return nil, engine2.ErrNotImplemented
+}
+
+func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+		return nil
 	}), nil
 }
 
-func (p *Provider) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
-	return connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
-}
-
-func (p *Provider) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], stream *connect.ServerStream[pluginv1.ListResponse]) error {
-	return nil
-}
-
-func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
+func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
@@ -59,6 +58,7 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 					Package: "some/package",
 					Name:    "think",
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"out": structpb.NewStringValue("out"),
 					"run": structpb.NewStringValue(`echo hello > $OUT`),
@@ -77,17 +77,18 @@ func (p *Provider) Get(ctx context.Context, req *connect.Request[pluginv1.GetReq
 		return nil, err
 	}
 
-	return connect.NewResponse(&pluginv1.GetResponse{
+	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
-			Ref: req.Msg.GetRef(),
+			Ref:    req.GetRef(),
+			Driver: "bash",
 			Config: map[string]*structpb.Value{
 				"out": structpb.NewStringValue("out"),
 				"run": structpb.NewStringValue(fmt.Sprintf(`echo 'parent: %s' > $OUT`, b)),
 			},
 		},
-	}), nil
+	}, nil
 }
 
-func (p *Provider) Probe(ctx context.Context, req *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
-	return connect.NewResponse(&pluginv1.ProbeResponse{}), nil
+func (p *Provider) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
+	return &pluginv1.ProbeResponse{}, nil
 }

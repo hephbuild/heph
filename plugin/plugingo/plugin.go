@@ -387,7 +387,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),
 					"out":              structpb.NewStringValue("golist.json"),
 					"in_tree":          structpb.NewBoolValue(true),
-					"cache":            structpb.NewBoolValue(true),
+					"cache":            structpb.NewStringValue("local"),
 					"hash_deps":        hstructpb.NewStringsValue(files),
 					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 				},

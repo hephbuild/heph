@@ -29,8 +29,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "no_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello`}),
 				},
@@ -41,8 +41,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "unamed_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
@@ -54,8 +54,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_named_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`}),
 					"out": newValueMust(map[string]any{"out1": "out"}),
@@ -67,8 +67,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "two_named_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`, `echo world > $OUT_OUT2`}),
 					"out": newValueMust(map[string]any{"out1": "out1", "out2": "out1"}),
@@ -81,8 +81,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_unamed_dep_no_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:no_out"}),
@@ -94,8 +94,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_unamed_dep_unamed_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:unamed_out"}),
@@ -107,8 +107,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_unamed_dep_one_named_out_unspecified",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_OUT1`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out"}),
@@ -120,8 +120,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_unamed_dep_one_named_out_specified",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out|out1"}),
@@ -134,8 +134,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_named_dep_no_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
 					"deps": newValueMust(map[string]any{"in1": "//:no_out"}),
@@ -147,8 +147,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_named_dep_unamed_out",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:unamed_out"}),
@@ -160,8 +160,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_named_dep_one_named_out_unspecified",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1_OUT1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out"}),
@@ -173,8 +173,8 @@ func TestSrcOutEnv(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "one_named_dep_one_named_out_specified",
-					Driver:  "sh",
 				},
+				Driver: "sh",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out|out1"}),
@@ -204,21 +204,19 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{})
-				require.NoError(t, res.Err)
+				res, err := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+				require.NoError(t, err)
+				defer res.Unlock(ctx)
 
 				require.Len(t, res.Artifacts, len(test.expected)+1)
 
-				for _, name := range test.expected {
-					found := false
-					for _, output := range res.Artifacts {
-						if output.Group == name {
-							found = true
-							break
-						}
-					}
+				manifest := res.FindManifest()
+				assert.NotEmpty(t, manifest.Artifact)
 
-					if !found {
+				for _, name := range test.expected {
+					outputArtifacts := res.FindOutputs(name)
+
+					if len(outputArtifacts) != 1 {
 						assert.Failf(t, "output not found", "output %v not found", name)
 					}
 				}
@@ -242,8 +240,9 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{})
-				require.NoError(t, res.Err)
+				res, err := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{}, &engine.ResolveCache{})
+				require.NoError(t, err)
+				defer res.Unlock(ctx)
 			})
 		}
 	}

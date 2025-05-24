@@ -10,6 +10,7 @@ type YAMLConfig struct {
 	Version   *string              `yaml:"version"`
 	Providers []YAMLConfigProvider `yaml:"providers"`
 	Drivers   []YAMLConfigDriver   `yaml:"drivers"`
+	Caches    []YAMLConfigCache    `yaml:"caches"`
 }
 
 type YAMLConfigProvider struct {
@@ -24,6 +25,14 @@ type YAMLConfigPlugin struct {
 	Name    string         `yaml:"name"`
 	Enabled *bool          `yaml:"enabled"`
 	Options map[string]any `yaml:"options,omitempty"`
+}
+
+type YAMLConfigCache struct {
+	Name    string         `yaml:"name"`
+	Driver  string         `yaml:"driver"`
+	Read    *bool          `yaml:"read"`
+	Write   *bool          `yaml:"write"`
+	Options map[string]any `yaml:"options"`
 }
 
 func ParseYAMLConfig(filepath string) (YAMLConfig, error) {
@@ -44,6 +53,37 @@ func ParseYAMLConfig(filepath string) (YAMLConfig, error) {
 func ApplyYAMLConfig(cfg Config, inc YAMLConfig) (Config, error) {
 	if inc.Version != nil {
 		cfg.Version = *inc.Version
+	}
+
+	for _, incc := range inc.Caches {
+		i := slices.IndexFunc(cfg.Caches, func(p ConfigCache) bool {
+			return p.Name == incc.Name
+		})
+
+		if i < 0 {
+			cfg.Caches = append(cfg.Caches, ConfigCache{
+				Name:   incc.Name,
+				Driver: incc.Driver,
+			})
+			i = len(cfg.Caches) - 1
+		}
+
+		cc := cfg.Caches[i]
+		if incc.Read != nil {
+			cc.Read = *incc.Read
+		}
+		if incc.Write != nil {
+			cc.Write = *incc.Write
+		}
+		if incc.Options != nil {
+			if cc.Options == nil {
+				cc.Options = make(map[string]any)
+			}
+			for k, v := range incc.Options {
+				cc.Options[k] = v
+			}
+		}
+		cfg.Caches[i] = cc
 	}
 
 	for _, incp := range inc.Providers {

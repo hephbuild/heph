@@ -31,8 +31,8 @@ func TestHashDeps(t *testing.T) {
 					Ref: &pluginv1.TargetRef{
 						Package: "some/package",
 						Name:    "sometarget",
-						Driver:  "sh",
 					},
+					Driver: "sh",
 					Config: map[string]*structpb.Value{
 						"run": hstructpb.NewStringsValue([]string{`echo hello > out`}),
 						"out": hstructpb.NewStringsValue([]string{"out"}),
@@ -53,26 +53,30 @@ func TestHashDeps(t *testing.T) {
 
 	var at time.Time
 	{
-		res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-		require.NoError(t, res.Err)
+		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
+		defer res.Unlock(ctx)
 
 		require.Len(t, res.Artifacts, 2)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, res.Artifacts[1].Artifact)
+		m, err := hartifact.ManifestFromArtifact(ctx, res.FindManifest().Artifact)
 		require.NoError(t, err)
 
 		at = m.CreatedAt
+		res.Unlock(ctx)
 	}
 
 	{
-		res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-		require.NoError(t, res.Err)
+		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
+		defer res.Unlock(ctx)
 
 		require.Len(t, res.Artifacts, 2)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, res.Artifacts[1].Artifact)
+		m, err := hartifact.ManifestFromArtifact(ctx, res.FindManifest().Artifact)
 		require.NoError(t, err)
 
 		require.Equal(t, at, m.CreatedAt)
+		res.Unlock(ctx)
 	}
 }

@@ -32,8 +32,8 @@ func TestSanityTool(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "tools",
 					Name:    "mytool",
-					Driver:  "bash",
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`echo '#!/usr/bin/env bash' > $OUT`,
@@ -49,8 +49,8 @@ func TestSanityTool(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "some/package",
 					Name:    "sometarget",
-					Driver:  "bash",
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`which screw || echo 'screw bin not found'`,
@@ -73,13 +73,14 @@ func TestSanityTool(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{})
-	require.NoError(t, res.Err)
+	res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{}, &engine.ResolveCache{})
+	require.NoError(t, err)
+	defer res.Unlock(ctx)
 
 	require.Len(t, res.Artifacts, 2)
 
 	fs2 := hfstest.New(t)
-	err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs2)
+	err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs2)
 	require.NoError(t, err)
 
 	b, err := hfs.ReadFile(fs2, "some/package/out")

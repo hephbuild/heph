@@ -31,7 +31,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[string]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
+func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[string]struct{}, rc *ResolveCache) iter.Seq2[*pluginv1.TargetSpec, error] {
 	key := p.Name + " " + pkg
 	if _, ok := seen[key]; ok {
 		return func(yield func(*pluginv1.TargetSpec, error) bool) {}
@@ -50,7 +50,7 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 
 		for res.Receive() {
 			msg := res.Msg()
-			def, err := e.GetDef(ctx, DefContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()}, GlobalResolveCache)
+			def, err := e.GetDef(ctx, DefContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()}, rc)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -67,7 +67,7 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 	}
 }
 
-func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rc *ResolveCache) iter.Seq2[*pluginv1.TargetRef, error] {
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
 		seenPkg := map[string]struct{}{}
 		seenRef := map[string]struct{}{}
@@ -79,7 +79,7 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher) it
 			}
 
 			for _, provider := range e.Providers {
-				for spec, err := range e.queryListProvider(ctx, provider, pkg, seenPkg) {
+				for spec, err := range e.queryListProvider(ctx, provider, pkg, seenPkg, rc) {
 					if err != nil {
 						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
 						continue
@@ -243,7 +243,7 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 	}
 }
 
-func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rc *ResolveCache) iter.Seq2[*pluginv1.TargetRef, error] {
 	if true {
 		state := &queryState{
 			Engine:  e,
@@ -254,6 +254,6 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher) ite
 		}
 		return state.query2(ctx, matcher)
 	} else {
-		return e.query1(ctx, matcher)
+		return e.query1(ctx, matcher, rc)
 	}
 }

@@ -64,6 +64,35 @@ func (s *SpecOutputs) MapstructureDecode(v any) error {
 	return fmt.Errorf("expected string, []string, map[string]string or map[string][]string, got %T", v)
 }
 
+type SpecCache struct {
+	Local  bool
+	Remote bool
+}
+
+func (s *SpecCache) MapstructureDecode(v any) error {
+	if v, err := hstructpb.Decode[bool](v); err == nil {
+		*s = SpecCache{
+			Local:  v,
+			Remote: v,
+		}
+		return nil
+	}
+
+	if v, err := hstructpb.Decode[string](v); err == nil {
+		if v == "local" {
+			*s = SpecCache{
+				Local:  true,
+				Remote: false,
+			}
+			return nil
+		} else {
+			return fmt.Errorf("invalid value: %q", v)
+		}
+	}
+
+	return fmt.Errorf(`invalid value: must be bool or "local"`)
+}
+
 type Spec struct {
 	Run            SpecStrings       `mapstructure:"run"`
 	Deps           SpecDeps          `mapstructure:"deps"`
@@ -71,7 +100,7 @@ type Spec struct {
 	HashDeps       SpecDeps          `mapstructure:"hash_deps"`
 	RuntimeDeps    SpecDeps          `mapstructure:"runtime_deps"`
 	Out            SpecOutputs       `mapstructure:"out"`
-	Cache          bool              `mapstructure:"cache"`
+	Cache          SpecCache         `mapstructure:"cache"`
 	Pty            bool              `mapstructure:"pty"`
 	Codegen        string            `mapstructure:"codegen"`
 	Env            map[string]string `mapstructure:"env"`

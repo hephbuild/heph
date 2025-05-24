@@ -21,6 +21,7 @@ type ManifestArtifact struct {
 	Name     string
 	Type     pluginv1.Artifact_Type
 	Encoding pluginv1.Artifact_Encoding
+	Package  string
 }
 
 type Manifest struct {
@@ -70,7 +71,7 @@ func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, 
 	}
 	defer r.Close()
 
-	return openManifest(r)
+	return DecodeManifest(r)
 }
 
 func ManifestFromFS(fs hfs.FS) (Manifest, error) {
@@ -80,10 +81,10 @@ func ManifestFromFS(fs hfs.FS) (Manifest, error) {
 	}
 	defer f.Close()
 
-	return openManifest(f)
+	return DecodeManifest(f)
 }
 
-func openManifest(r io.Reader) (Manifest, error) {
+func DecodeManifest(r io.Reader) (Manifest, error) {
 	var manifest Manifest
 	err := json.NewDecoder(r).Decode(&manifest) //nolint:musttag
 	if err != nil {

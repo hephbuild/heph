@@ -32,8 +32,8 @@ func TestDepsCache(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "child",
-					Driver:  "bash",
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out_child"}),
@@ -45,8 +45,8 @@ func TestDepsCache(t *testing.T) {
 				Ref: &pluginv1.TargetRef{
 					Package: "",
 					Name:    "parent",
-					Driver:  "bash",
 				},
+				Driver: "bash",
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $(cat $SRC) > $OUT`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:child"}),
@@ -66,9 +66,9 @@ func TestDepsCache(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	assertOut := func(res *engine.ExecuteResult) {
+	assertOut := func(res *engine.ExecuteResultLocks) {
 		fs := hfstest.New(t)
-		err = hartifact.Unpack(ctx, res.Artifacts[0].Artifact, fs)
+		err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs)
 		require.NoError(t, err)
 
 		b, err := hfs.ReadFile(fs, "out_parent")
@@ -80,14 +80,18 @@ func TestDepsCache(t *testing.T) {
 	{ // This will run all
 		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
 		require.NoError(t, err)
+		defer res.Unlock(ctx)
 
 		assertOut(res)
+		res.Unlock(ctx)
 	}
 
 	{ // this should reuse cache from deps
 		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
 		require.NoError(t, err)
+		defer res.Unlock(ctx)
 
 		assertOut(res)
+		res.Unlock(ctx)
 	}
 }

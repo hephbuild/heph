@@ -68,13 +68,13 @@ type ResultOptions struct {
 	Interactive     *pluginv1.TargetRef
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rc)
 	if err != nil {
 		return nil, err
 	}
 
-	return res.ExecuteResult, nil
+	return res, nil
 }
 
 func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
@@ -102,7 +102,7 @@ func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.Target
 
 	var matched bool
 	var g errgroup.Group
-	for ref, err := range e.Query(ctx, matcher) {
+	for ref, err := range e.Query(ctx, matcher, rc) {
 		if err != nil {
 			for _, locks := range out {
 				locks.Unlock(ctx)
@@ -236,9 +236,9 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 	for i, dep := range t.Inputs {
 		g.Go(func() error {
 			outputs := dep.Outputs
-			if !withOutputs {
-				outputs = nil
-			}
+			//if !withOutputs { // TODO: we still need to fetch the output for the hashin to be correct, but we should not pull artifacts from remote cache (e.MetaFromDef)
+			//	outputs = nil
+			//}
 
 			res, err := e.ResultFromDef(ctx, dep.TargetDef, outputs, options, rc)
 			if err != nil {
@@ -349,6 +349,9 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 
+		refstr := tref.Format(def.GetRef())
+		_ = refstr
+
 		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
 		if err != nil {
 			return nil, err
@@ -426,6 +429,10 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 	}
 
 	res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+		if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+			return false
+		}
+
 		return !slices.Contains(outputs, artifact.Group)
 	})
 
@@ -527,6 +534,34 @@ func (r *ExecuteResultLocks) Unlock(ctx context.Context) {
 	}
 }
 
+func (r *ExecuteResultLocks) FindManifest() ExecuteResultArtifact {
+	for _, artifact := range r.Artifacts {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
+			continue
+		}
+
+		return artifact
+	}
+
+	return ExecuteResultArtifact{}
+}
+
+func (r *ExecuteResultLocks) FindOutputs(group string) []ExecuteResultArtifact {
+	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+	for _, artifact := range r.Artifacts {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+			continue
+		}
+		if artifact.Group != group {
+			continue
+		}
+
+		res = append(res, artifact)
+	}
+
+	return res
+}
+
 func (r ExecuteResult) Sorted() *ExecuteResult {
 	slices.SortFunc(r.Artifacts, func(a, b ExecuteResultArtifact) int {
 		return strings.Compare(a.Hashout, b.Hashout)
@@ -547,15 +582,6 @@ func (r ExecuteResult) Clone() *ExecuteResult {
 type ExecuteResultWithOrigin struct {
 	*ExecuteResultLocks
 	InputOrigin *pluginv1.TargetDef_InputOrigin
-}
-
-func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rc *ResolveCache) (*ExecuteResult, bool, error) {
-	ctx, span := tracer.Start(ctx, "ResultFromRemoteCache")
-	defer span.End()
-
-	// TODO
-
-	return nil, false, nil
 }
 
 func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions) ([]string, func() error, error) {
@@ -973,12 +999,15 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, op
 
 	var cachedArtifacts []ExecuteResultArtifact
 	if res.Executed {
-		artifacts, err := e.CacheLocally(ctx, def, res.Hashin, res.Artifacts)
+		artifacts, manifest, err := e.CacheLocally(ctx, def, res.Hashin, res.Artifacts)
 		if err != nil {
 			return nil, fmt.Errorf("cache locally: %w", err)
 		}
 
 		cachedArtifacts = artifacts
+
+		// TODO: move this to a background execution model , so that local build can proceed, while this is uploading in the background
+		e.CacheRemotely(ctx, def, res.Hashin, manifest, cachedArtifacts)
 	} else {
 		cachedArtifacts = res.Artifacts
 	}
