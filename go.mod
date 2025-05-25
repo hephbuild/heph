@@ -6,6 +6,8 @@ toolchain go1.24.2
 
 tool github.com/cerbos/protoc-gen-go-hashpb
 
+tool capnproto.org/go/capnp/v3/capnpc-go
+
 require (
 	cloud.google.com/go/storage v1.54.0
 	connectrpc.com/connect v1.17.0
@@ -52,6 +54,7 @@ require (
 )
 
 require (
+	capnproto.org/go/capnp/v3 v3.1.0-alpha.1 // indirect
 	cel.dev/expr v0.20.0 // indirect
 	cloud.google.com/go v0.121.0 // indirect
 	cloud.google.com/go/auth v0.16.1 // indirect
@@ -70,6 +73,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.9.2 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/cncf/xds/go v0.0.0-20250121191232-2f005788dc42 // indirect
+	github.com/colega/zeropool v0.0.0-20230505084239-6fb4a4f75381 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.2.1 // indirect
