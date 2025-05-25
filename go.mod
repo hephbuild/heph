@@ -9,6 +9,7 @@ tool github.com/cerbos/protoc-gen-go-hashpb
 tool capnproto.org/go/capnp/v3/capnpc-go
 
 require (
+	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
 	cloud.google.com/go/storage v1.54.0
 	connectrpc.com/connect v1.17.0
 	connectrpc.com/otelconnect v0.7.2
@@ -26,6 +27,7 @@ require (
 	github.com/goccy/go-json v0.10.5
 	github.com/goccy/go-yaml v1.17.1
 	github.com/google/uuid v1.6.0
+	github.com/hanwen/go-fuse/v2 v2.7.2
 	github.com/mattn/go-isatty v0.0.20
 	github.com/muesli/termenv v0.16.0
 	github.com/shirou/gopsutil/v3 v3.24.5
@@ -54,7 +56,6 @@ require (
 )
 
 require (
-	capnproto.org/go/capnp/v3 v3.1.0-alpha.1 // indirect
 	cel.dev/expr v0.20.0 // indirect
 	cloud.google.com/go v0.121.0 // indirect
 	cloud.google.com/go/auth v0.16.1 // indirect
