@@ -3,6 +3,7 @@ location = ~/.local/bin/heph2
 install-dev:
 	sed "s|<HEPH_SRC_ROOT>|$(shell pwd)|g" < internal/scripts/dev.sh > /tmp/heph
 	chmod +x /tmp/heph
+	mkdir -p $$(dirname $(location))
 	mv /tmp/heph $(location)
 
 install-dev-build:

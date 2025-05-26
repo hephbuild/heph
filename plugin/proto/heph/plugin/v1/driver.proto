@@ -36,20 +36,25 @@ message Artifact {
     TYPE_MANIFEST_V1 = 4;
   }
 
-  enum Encoding {
-    ENCODING_UNSPECIFIED = 0;
-    ENCODING_NONE = 1;
-    ENCODING_TAR = 2;
-    ENCODING_TAR_GZ = 3;
-    ENCODING_BASE64 = 4;
+  message ContentRaw {
+    bytes data = 1;
+    string path = 2;
+  }
+
+  message ContentFile {
+    string source_path = 1;
+    string out_path = 2;
   }
 
   string group = 1;
   string name = 2;
   Type type = 3;
-  Encoding encoding = 4;
-  string uri = 5;
-  string package = 6;
+  oneof content {
+    ContentFile file = 4;
+    ContentRaw raw = 5;
+    string tar_path = 6;
+    string targz_path = 7;
+  }
 }
 
 message RunResponse {

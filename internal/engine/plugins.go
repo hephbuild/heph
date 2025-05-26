@@ -6,12 +6,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -131,6 +133,7 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 				return ctx
 			},
 			ReadHeaderTimeout: 5 * time.Second,
+			ErrorLog:          slog.NewLogLogger(hlog.From(ctx).Handler(), slog.LevelError),
 		}
 
 		if err := srv.Serve(l); err != nil {

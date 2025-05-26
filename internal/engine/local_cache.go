@@ -61,11 +61,6 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
-		scheme, rest, err := hartifact.ParseURI(artifact.Uri)
-		if err != nil {
-			return nil, nil, err
-		}
-
 		var prefix string
 		switch artifact.Type {
 		case pluginv1.Artifact_TYPE_OUTPUT:
@@ -78,15 +73,38 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
 		}
 
-		var cachedArtifact *pluginv1.Artifact
+		name := prefix + artifact.Name
+		fromPath, err := hartifact.Path(artifact.Artifact)
+		if err != nil {
+			return nil, nil, err
+		}
 
-		switch scheme {
-		case "file":
-			name := prefix + artifact.Name
-			fromfs := hfs.NewOS(rest)
-			tofs := hfs.At(cachedir, name)
+		tofs := hfs.At(cachedir, name)
+
+		if fromPath == "" {
+			r, err := hartifact.FileReader(ctx, artifact.Artifact)
+			if err != nil {
+				return nil, nil, err
+			}
+			defer r.Close()
+
+			f, err := hfs.Create(tofs, "")
+			if err != nil {
+				return nil, nil, err
+			}
+			defer f.Close()
+
+			_, err = io.Copy(f, r)
+			if err != nil {
+				return nil, nil, err
+			}
+			_ = r.Close()
+			_ = f.Close()
+		} else {
+			fromfs := hfs.NewOS(fromPath)
 
 			if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
+				// TODO: there was a bug here where when a target was running in tree, it would move things out from tree
 				err = hfs.Move(fromfs, tofs)
 				if err != nil {
 					return nil, nil, fmt.Errorf("move: %w", err)
@@ -97,20 +115,16 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 					return nil, nil, fmt.Errorf("copy: %w", err)
 				}
 			}
+		}
 
-			cachedArtifact = &pluginv1.Artifact{
-				Group:    artifact.Group,
-				Name:     name,
-				Type:     artifact.Type,
-				Encoding: artifact.Encoding,
-				Uri:      "file://" + tofs.Path(),
-			}
-		default:
-			return nil, nil, fmt.Errorf("unsupported scheme: %q", scheme)
+		cachedArtifact, err := hartifact.Relocated(artifact.Artifact, tofs.Path())
+		if err != nil {
+			return nil, nil, fmt.Errorf("relocated: %w", err)
 		}
 
 		hashout := artifact.Hashout
 		if hashout == "" && artifact.Type == pluginv1.Artifact_TYPE_OUTPUT {
+			var err error
 			hashout, err = e.hashout(ctx, cachedArtifact)
 			if err != nil {
 				return nil, nil, err
@@ -130,14 +144,12 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		Hashin:    hashin,
 	}
 	for _, artifact := range cacheArtifacts {
-		m.Artifacts = append(m.Artifacts, hartifact.ManifestArtifact{
-			Hashout:  artifact.Hashout,
-			Group:    artifact.Group,
-			Name:     artifact.Name,
-			Type:     artifact.Type,
-			Encoding: artifact.Encoding,
-			Package:  artifact.Package,
-		})
+		martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		m.Artifacts = append(m.Artifacts, martifact)
 	}
 
 	manifestArtifact, err := hartifact.NewManifestArtifact(cachedir, m)
@@ -205,15 +217,14 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 			return nil, false, nil
 		}
 
+		partifact, err := hartifact.ManifestArtifactToProto(artifact, dirfs.Path(artifact.Name))
+		if err != nil {
+			return nil, false, fmt.Errorf("ManifestArtifactToProto: %w", err)
+		}
+
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Hashout: artifact.Hashout,
-			Artifact: &pluginv1.Artifact{
-				Group:    artifact.Group,
-				Name:     artifact.Name,
-				Type:     artifact.Type,
-				Encoding: artifact.Encoding,
-				Uri:      "file://" + dirfs.Path(artifact.Name),
-			},
+			Hashout:  artifact.Hashout,
+			Artifact: partifact,
 		})
 	}
 

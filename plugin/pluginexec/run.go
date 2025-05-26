@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/plugin/tref"
 	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/semaphore"
@@ -286,10 +288,12 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	var artifacts []*pluginv1.Artifact
 	if stat.Size() > 0 {
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name:     "log.txt",
-			Type:     pluginv1.Artifact_TYPE_LOG,
-			Encoding: pluginv1.Artifact_ENCODING_NONE,
-			Uri:      "file://" + logFile.Name(),
+			Name: "log.txt",
+			Type: pluginv1.Artifact_TYPE_LOG,
+			Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
+				SourcePath: logFile.Name(),
+				OutPath:    "log.txt",
+			}},
 		})
 	}
 
@@ -366,22 +370,36 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 		sb.Reset()
 
 		slices.SortFunc(artifacts, func(a, b *pluginv1.ArtifactWithOrigin) int {
-			return strings.Compare(a.Artifact.Uri, b.Artifact.Uri)
+			if v := strings.Compare(a.Origin.Id, b.Origin.Id); v != 0 {
+				return v
+			}
+
+			if v := strings.Compare(a.Artifact.Group, a.Artifact.Group); v != 0 {
+				return v
+			}
+
+			if v := strings.Compare(a.Artifact.Name, a.Artifact.Name); v != 0 {
+				return v
+			}
+
+			if v := hproto.Compare(a, b); v != 0 {
+				return v
+			}
+
+			return 0
 		})
 
 		for _, input := range artifacts {
-			b, err := os.ReadFile(strings.ReplaceAll(input.Artifact.GetUri(), "file://", ""))
+			r, err := hartifact.FileReader(ctx, input.Artifact)
 			if err != nil {
 				return nil, err
 			}
+			defer r.Close()
 
-			lines := strings.Split(string(b), "\n")
-			slices.Sort(lines)
+			sc := bufio.NewScanner(r)
 
-			for _, line := range lines {
-				if line == "" {
-					continue
-				}
+			for sc.Scan() {
+				line := sc.Text()
 
 				if _, ok := seenFiles[line]; ok {
 					continue
@@ -393,6 +411,8 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 				}
 				sb.WriteString(line)
 			}
+
+			_ = r.Close()
 		}
 
 		env = append(env, getEnvEntryWithName(name, sb.String()))

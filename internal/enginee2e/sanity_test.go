@@ -3,6 +3,7 @@ package enginee2e
 import (
 	"context"
 	"github.com/go-faker/faker/v4"
+	"io"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -65,7 +66,11 @@ func TestSanity(t *testing.T) {
 
 	require.Len(t, res.Artifacts, 2)
 
-	b, err := hartifact.ReadAll(ctx, res.FindOutputs("")[0].Artifact, pkg+"/out")
+	r, err := hartifact.FileReader(ctx, res.FindOutputs("")[0].Artifact)
+	require.NoError(t, err)
+	defer r.Close()
+
+	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))

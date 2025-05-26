@@ -3,6 +3,7 @@ package hartifact
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"time"
@@ -14,14 +15,49 @@ import (
 
 var ManifestName = "manifest.v1.json"
 
+type ManifestArtifactType pluginv1.Artifact_Type
+
+func (b ManifestArtifactType) MarshalJSON() ([]byte, error) {
+	v, ok := pluginv1.Artifact_Type_name[int32(b)]
+	if !ok {
+		return nil, fmt.Errorf("unknown artifact type %v", b)
+	}
+
+	return json.Marshal(v)
+}
+
+func (b *ManifestArtifactType) UnmarshalJSON(data []byte) error {
+	var vs string
+	if err := json.Unmarshal(data, &vs); err != nil {
+		return err
+	}
+
+	v, ok := pluginv1.Artifact_Type_value[vs]
+	if !ok {
+		return fmt.Errorf("unknown artifact type %q", vs)
+	}
+
+	*b = ManifestArtifactType(v)
+
+	return nil
+}
+
+type ManifestArtifactContentType string
+
+const (
+	ManifestArtifactContentTypeFile  ManifestArtifactContentType = "file"
+	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "tar"
+	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "targz"
+)
+
 type ManifestArtifact struct {
 	Hashout string
 
-	Group    string
-	Name     string
-	Type     pluginv1.Artifact_Type
-	Encoding pluginv1.Artifact_Encoding
-	Package  string
+	Group       string
+	Name        string
+	Type        ManifestArtifactType
+	ContentType ManifestArtifactContentType
+	Package     string
 }
 
 type Manifest struct {
@@ -57,15 +93,19 @@ func NewManifestArtifact(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
 	}
 
 	return &pluginv1.Artifact{
-		Name:     ManifestName,
-		Type:     pluginv1.Artifact_TYPE_MANIFEST_V1,
-		Encoding: pluginv1.Artifact_ENCODING_NONE,
-		Uri:      "file://" + hfs.At(fs, ManifestName).Path(),
+		Name: ManifestName,
+		Type: pluginv1.Artifact_TYPE_MANIFEST_V1,
+		Content: &pluginv1.Artifact_File{
+			File: &pluginv1.Artifact_ContentFile{
+				SourcePath: fs.Path(ManifestName),
+				OutPath:    ManifestName,
+			},
+		},
 	}, nil
 }
 
 func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, error) {
-	r, err := Reader(ctx, a)
+	r, err := FileReader(ctx, a)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -92,4 +132,61 @@ func DecodeManifest(r io.Reader) (Manifest, error) {
 	}
 
 	return manifest, nil
+}
+
+func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, error) {
+	switch a.Content.(type) {
+	case *pluginv1.Artifact_File:
+		return ManifestArtifactContentTypeFile, nil
+	case *pluginv1.Artifact_Raw:
+		return "", fmt.Errorf("no content type for raw")
+	case *pluginv1.Artifact_TargzPath:
+		return ManifestArtifactContentTypeTarGz, nil
+	case *pluginv1.Artifact_TarPath:
+		return ManifestArtifactContentTypeTar, nil
+	default:
+		return "", fmt.Errorf("unsupported content %T", a.Content)
+	}
+}
+
+func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (ManifestArtifact, error) {
+	contentType, err := ManifestContentType(artifact)
+	if err != nil {
+		return ManifestArtifact{}, err
+	}
+
+	return ManifestArtifact{
+		Hashout:     hashout,
+		Group:       artifact.Group,
+		Name:        artifact.Name,
+		Type:        ManifestArtifactType(artifact.Type),
+		ContentType: contentType,
+	}, nil
+}
+
+func ManifestArtifactToProto(artifact ManifestArtifact, path string) (*pluginv1.Artifact, error) {
+	partifact := &pluginv1.Artifact{
+		Group: artifact.Group,
+		Name:  artifact.Name,
+		Type:  pluginv1.Artifact_Type(artifact.Type),
+	}
+
+	switch artifact.ContentType {
+	case ManifestArtifactContentTypeFile:
+		partifact.Content = &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
+			SourcePath: path,
+		}}
+	case ManifestArtifactContentTypeTar:
+		partifact.Content = &pluginv1.Artifact_TarPath{
+			TarPath: path,
+		}
+	case ManifestArtifactContentTypeTarGz:
+		partifact.Content = &pluginv1.Artifact_TargzPath{
+			TargzPath: path,
+		}
+	default:
+		return nil, fmt.Errorf("unsupported content type %q", artifact.ContentType)
+	}
+
+	return partifact, nil
 }

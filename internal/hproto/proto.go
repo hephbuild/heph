@@ -2,6 +2,7 @@ package hproto
 
 import (
 	"fmt"
+	"github.com/zeebo/xxh3"
 	"hash"
 	"strings"
 
@@ -69,4 +70,22 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	})
 
 	return m, err
+}
+
+func Compare(a, b Hashable) int {
+	ha := xxh3.New()
+	a.HashPB(ha, nil)
+
+	hb := xxh3.New()
+	b.HashPB(hb, nil)
+
+	diff := hb.Sum64() - ha.Sum64()
+
+	if diff < 0 {
+		return -1
+	} else if diff > 0 {
+		return 1
+	} else {
+		return 0
+	}
 }

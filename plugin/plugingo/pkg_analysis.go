@@ -39,7 +39,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 	outputArtifact := outputArtifacts[0]
 
-	f, err := hartifact.TarFileReader(ctx, outputArtifact)
+	f, err := hartifact.FileReader(ctx, outputArtifact)
 	if err != nil {
 		return Package{}, err
 	}
@@ -535,7 +535,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 
 	outputArtifact := outputArtifacts[0]
 
-	f, err := hartifact.TarFileReader(ctx, outputArtifact)
+	f, err := hartifact.FileReader(ctx, outputArtifact)
 	if err != nil {
 		return nil, err
 	}

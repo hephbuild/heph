@@ -43,7 +43,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Pac
 		return nil, fmt.Errorf("no install artifact found")
 	}
 
-	f, err := hartifact.TarFileReader(ctx, outputs[0])
+	f, err := hartifact.FileReader(ctx, outputs[0])
 	if err != nil {
 		return nil, err
 	}

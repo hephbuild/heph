@@ -3,10 +3,10 @@ package hartifact
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htar"
 	"io"
 
 	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
@@ -49,15 +49,13 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	}
 	defer r.Close()
 
-	fs = hfs.At(fs, artifact.Package)
-
-	switch artifact.GetEncoding() {
-	case pluginv1.Artifact_ENCODING_NONE:
+	switch content := artifact.Content.(type) {
+	case *pluginv1.Artifact_File:
 		if !cfg.filter(artifact.GetName()) {
 			return nil
 		}
 
-		f, err := hfs.Create(fs, artifact.GetName())
+		f, err := hfs.Create(fs, content.File.OutPath)
 		if err != nil {
 			return err
 		}
@@ -68,15 +66,26 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return err
 		}
-	case pluginv1.Artifact_ENCODING_TAR:
+	case *pluginv1.Artifact_Raw:
+		f, err := hfs.Create(fs, content.Raw.Path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		defer cfg.onFile(f.Name())
+
+		_, err = io.Copy(f, r)
+		if err != nil {
+			return err
+		}
+	case *pluginv1.Artifact_TarPath:
 		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return err
 		}
-	case pluginv1.Artifact_ENCODING_BASE64, pluginv1.Artifact_ENCODING_TAR_GZ, pluginv1.Artifact_ENCODING_UNSPECIFIED:
-		fallthrough
+	//case *pluginv1.Artifact_TargzPath:
 	default:
-		return fmt.Errorf("unsupported encoding %s", artifact.GetEncoding())
+		return fmt.Errorf("unsupported encoding %T", artifact.Content)
 	}
 
 	return nil

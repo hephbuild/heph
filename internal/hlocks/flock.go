@@ -116,7 +116,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 
 		l.cleanup.Stop()
 		l.cleanup = runtime.AddCleanup(l, func(f *os.File) {
-			panic(fmt.Sprintf("Flock file is being freed, but lock is stil held: %v%v", f.Name(), stack))
+			panic(fmt.Sprintf("Flock file is being freed, but lock is stil held, enable stack with HEPH_FLOCK_STACK: %v%v", f.Name(), stack))
 		}, f)
 		l.f = f
 	}

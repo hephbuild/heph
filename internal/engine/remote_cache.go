@@ -19,7 +19,6 @@ import (
 	"io"
 	"log/slog"
 	"path"
-	"strings"
 	"sync"
 )
 
@@ -131,20 +130,31 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 		}
 
 		if ok {
+			localArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
 			for _, artifact := range artifacts {
-				err = hfs.Move(tmpCacheDir.At(artifact.Name), cacheDir.At(artifact.Name))
+				to := cacheDir.At(artifact.Name)
+
+				err = hfs.Move(tmpCacheDir.At(artifact.Name), to)
 				if err != nil {
 					return nil, false, err
 				}
 
-				artifact.Uri = strings.ReplaceAll(artifact.Uri, tmpCacheDir.Path(), cacheDir.Path())
+				rartifact, err := hartifact.Relocated(artifact.Artifact, to.Path())
+				if err != nil {
+					return nil, false, err
+				}
+
+				localArtifacts = append(localArtifacts, ExecuteResultArtifact{
+					Hashout:  artifact.Hashout,
+					Artifact: rartifact,
+				})
 			}
 
 			return ExecuteResult{
 				Def:       def,
 				Executed:  false,
 				Hashin:    hashin,
-				Artifacts: artifacts,
+				Artifacts: localArtifacts,
 			}.Sorted(), true, nil
 		}
 
@@ -202,7 +212,7 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 	remoteArtifacts := make([]hartifact.ManifestArtifact, 0, len(outputs))
 	for _, output := range outputs {
 		artifact, ok := hslices.Find(manifest.Artifacts, func(artifact hartifact.ManifestArtifact) bool {
-			if artifact.Type != pluginv1.Artifact_TYPE_OUTPUT {
+			if artifact.Type != hartifact.ManifestArtifactType(pluginv1.Artifact_TYPE_OUTPUT) {
 				return false
 			}
 
@@ -235,20 +245,6 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 				return err
 			}
 
-			localArtifactsm.Lock()
-			localArtifacts = append(localArtifacts, ExecuteResultArtifact{
-				Hashout: artifact.Hashout,
-				Artifact: &pluginv1.Artifact{
-					Group:    artifact.Group,
-					Name:     artifact.Name,
-					Type:     pluginv1.Artifact_TYPE_OUTPUT,
-					Encoding: artifact.Encoding,
-					Uri:      "file://" + tofs.Path(),
-					Package:  artifact.Package,
-				},
-			})
-			localArtifactsm.Unlock()
-
 			f, err := hfs.Create(tofs, "")
 			if err != nil {
 				return err
@@ -259,6 +255,19 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 			if err != nil {
 				return err
 			}
+			_ = f.Close()
+
+			lartifact, err := hartifact.ManifestArtifactToProto(artifact, tofs.Path())
+			if err != nil {
+				return err
+			}
+
+			localArtifactsm.Lock()
+			localArtifacts = append(localArtifacts, ExecuteResultArtifact{
+				Hashout:  artifact.Hashout,
+				Artifact: lartifact,
+			})
+			localArtifactsm.Unlock()
 
 			return nil
 		})

@@ -109,9 +109,8 @@ func init() {
 						for _, output := range res[0].Artifacts {
 							fmt.Println(output.Name)
 							fmt.Println("  group:    ", output.Group)
-							fmt.Println("  uri:      ", output.Uri)
+							fmt.Println("  content:  ", output.Content)
 							fmt.Println("  type:     ", output.Type.String())
-							fmt.Println("  encoding: ", output.Encoding.String())
 						}
 					} else {
 						fmt.Println("matched", len(res))

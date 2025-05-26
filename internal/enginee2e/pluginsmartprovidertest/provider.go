@@ -3,6 +3,7 @@ package pluginsmartprovidertest
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/hephbuild/heph/internal/engine"
 
@@ -72,7 +73,13 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 
 	artifacts := hartifact.FindOutputs(res.GetArtifacts(), "")
 
-	b, err := hartifact.ReadAll(ctx, artifacts[0], "some/package/out")
+	r, err := hartifact.FileReader(ctx, artifacts[0])
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	b, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}

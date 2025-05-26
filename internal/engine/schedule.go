@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hmaps"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/tmatch"
@@ -354,6 +353,8 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 
 		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
 		if err != nil {
+			err = errors.Join(err, locks.Unlock())
+
 			return nil, err
 		}
 
@@ -932,11 +933,12 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
 			Hashout: hashout,
 			Artifact: &pluginv1.Artifact{
-				Group:    output.GetGroup(),
-				Name:     tarname,
-				Type:     pluginv1.Artifact_TYPE_OUTPUT,
-				Encoding: pluginv1.Artifact_ENCODING_TAR,
-				Uri:      "file://" + tarf.Name(),
+				Group: output.GetGroup(),
+				Name:  tarname,
+				Type:  pluginv1.Artifact_TYPE_OUTPUT,
+				Content: &pluginv1.Artifact_TarPath{
+					TarPath: tarf.Name(),
+				},
 			},
 		})
 	}
@@ -946,21 +948,13 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			continue
 		}
 
-		r, err := hartifact.Reader(ctx, artifact)
+		hashout, err := e.hashout(ctx, artifact)
 		if err != nil {
 			return nil, err
 		}
-		defer r.Close()
-
-		h := xxh3.New()
-		_, err = io.Copy(h, r)
-		if err != nil {
-			return nil, err
-		}
-		r.Close()
 
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Hashout:  hex.EncodeToString(h.Sum(nil)),
+			Hashout:  hashout,
 			Artifact: artifact,
 		})
 

@@ -105,7 +105,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	defer span.End()
 
 	h := xxh3.New()
-	_, _ = h.WriteString(artifact.GetUri())
+	artifact.HashPB(h, nil)
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
@@ -133,11 +133,12 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	}
 
 	return &pluginv1.Artifact{
-		Group:    artifact.GetGroup(),
-		Name:     artifact.GetName() + ".list",
-		Type:     pluginv1.Artifact_TYPE_OUTPUT_LIST_V1,
-		Encoding: pluginv1.Artifact_ENCODING_NONE,
-		Uri:      "file://" + listf.Name(),
+		Group: artifact.GetGroup(),
+		Name:  artifact.GetName() + ".list",
+		Type:  pluginv1.Artifact_TYPE_OUTPUT_LIST_V1,
+		Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
+			SourcePath: listf.Name(),
+		}},
 	}, nil
 }
 

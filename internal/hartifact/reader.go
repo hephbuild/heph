@@ -2,89 +2,57 @@ package hartifact
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/htar"
 
-	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func subpathReader(ctx context.Context, artifact *pluginv1.Artifact, r io.ReadCloser, path string) (io.ReadCloser, error) {
-	if path == "" {
-		return r, nil
+// Reader gives a raw io.Reader of an artifact, useful for things like hashing
+func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
+	switch content := a.Content.(type) {
+	case *pluginv1.Artifact_File:
+		return os.Open(content.File.SourcePath)
+	case *pluginv1.Artifact_Raw:
+		return io.NopCloser(bytes.NewReader(content.Raw.Data)), nil
+	case *pluginv1.Artifact_TargzPath:
+		return os.Open(content.TargzPath)
+	case *pluginv1.Artifact_TarPath:
+		return os.Open(content.TarPath)
+	default:
+		return nil, fmt.Errorf("unsupported encoding %T", a.Content)
 	}
+}
 
-	switch artifact.GetEncoding() {
-	case pluginv1.Artifact_ENCODING_NONE:
-		return r, nil
-	case pluginv1.Artifact_ENCODING_TAR:
-		f, err := htar.FileReader(ctx, r, func(hdr *tar.Header) bool {
-			return hdr.Name == path
+// FileReader Assumes the output has a single file, and provides a reader for it (no matter the packaging)
+func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
+	switch content := a.Content.(type) {
+	case *pluginv1.Artifact_File:
+		return os.Open(content.File.SourcePath)
+	case *pluginv1.Artifact_Raw:
+		return io.NopCloser(bytes.NewReader(content.Raw.Data)), nil
+	case *pluginv1.Artifact_TarPath:
+		r, err := Reader(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+
+		tr, err := htar.FileReader(ctx, r, func(hdr *tar.Header) bool {
+			return true
 		})
 		if err != nil {
 			return nil, err
 		}
 
-		return hio.NewReadCloser(f, r), nil
-	case pluginv1.Artifact_ENCODING_BASE64, pluginv1.Artifact_ENCODING_TAR_GZ, pluginv1.Artifact_ENCODING_UNSPECIFIED:
-		fallthrough
+		return hio.NewReadCloser(tr, r), nil
+	//case *pluginv1.Artifact_TargzPath:
 	default:
-		return nil, fmt.Errorf("unsupported encoding %s", artifact.GetEncoding())
+		return nil, fmt.Errorf("unsupported encoding %T", a.Content)
 	}
-}
-
-func SubpathReader(ctx context.Context, a *pluginv1.Artifact, path string) (io.ReadCloser, error) {
-	scheme, rest, err := ParseURI(a.GetUri())
-	if err != nil {
-		return nil, err
-	}
-
-	switch scheme {
-	case "file":
-		fromfs := hfs.NewOS(rest)
-
-		f, err := hfs.Open(fromfs, "")
-		if err != nil {
-			return nil, err
-		}
-
-		return subpathReader(ctx, a, f, path)
-	default:
-		return nil, fmt.Errorf("unsupported scheme: %s", scheme)
-	}
-}
-
-func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	return SubpathReader(ctx, a, "")
-}
-
-func ReadAll(ctx context.Context, a *pluginv1.Artifact, path string) ([]byte, error) {
-	r, err := SubpathReader(ctx, a, path)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	return io.ReadAll(r)
-}
-
-func TarFileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	r, err := Reader(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-
-	tr, err := htar.FileReader(ctx, r, func(hdr *tar.Header) bool {
-		return true
-	})
-	if err != nil {
-		_ = r.Close()
-		return nil, err
-	}
-
-	return hio.NewReadCloser(tr, r), nil
 }
