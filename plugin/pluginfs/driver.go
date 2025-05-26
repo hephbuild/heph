@@ -67,10 +67,11 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	return &pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
-			Ref:     req.GetSpec().GetRef(),
-			Def:     targetAny,
-			Outputs: []string{""},
-			Cache:   true,
+			Ref:                req.GetSpec().GetRef(),
+			Def:                targetAny,
+			Outputs:            []string{""},
+			Cache:              true,
+			DisableRemoteCache: true,
 		},
 	}, nil
 }
