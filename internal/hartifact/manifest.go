@@ -45,7 +45,6 @@ func (b *ManifestArtifactType) UnmarshalJSON(data []byte) error {
 type ManifestArtifactContentType string
 
 const (
-	ManifestArtifactContentTypeFile  ManifestArtifactContentType = "file"
 	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "tar"
 	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "targz"
 )
@@ -145,17 +144,16 @@ func DecodeManifest(r io.Reader) (Manifest, error) {
 
 func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, error) {
 	switch a.Content.(type) {
-	case *pluginv1.Artifact_File:
-		return ManifestArtifactContentTypeFile, nil
-	case *pluginv1.Artifact_Raw:
-		return "", fmt.Errorf("no content type for raw")
 	case *pluginv1.Artifact_TargzPath:
 		return ManifestArtifactContentTypeTarGz, nil
 	case *pluginv1.Artifact_TarPath:
 		return ManifestArtifactContentTypeTar, nil
+	case *pluginv1.Artifact_File:
+	case *pluginv1.Artifact_Raw:
 	default:
-		return "", fmt.Errorf("unsupported content %T", a.Content)
 	}
+
+	return "", fmt.Errorf("unsupported content %T", a.Content)
 }
 
 func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (ManifestArtifact, error) {
@@ -181,10 +179,6 @@ func ManifestArtifactToProto(artifact ManifestArtifact, path string) (*pluginv1.
 	}
 
 	switch artifact.ContentType {
-	case ManifestArtifactContentTypeFile:
-		partifact.Content = &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-			SourcePath: path,
-		}}
 	case ManifestArtifactContentTypeTar:
 		partifact.Content = &pluginv1.Artifact_TarPath{
 			TarPath: path,

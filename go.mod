@@ -8,6 +8,8 @@ tool github.com/cerbos/protoc-gen-go-hashpb
 
 tool capnproto.org/go/capnp/v3/capnpc-go
 
+replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20250529082417-38d0d515cbfb
+
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
 	cloud.google.com/go/storage v1.54.0

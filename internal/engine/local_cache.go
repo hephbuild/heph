@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htar"
 	"hash"
 	"io"
 	"slices"
@@ -69,6 +70,41 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
+		if content, ok := artifact.Artifact.Content.(*pluginv1.Artifact_File); ok {
+			artifact.Name += ".tar"
+			tarf, err := hfs.Create(cachedir, artifact.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+			defer tarf.Close()
+			p := htar.NewPacker(tarf)
+
+			sourcefs := hfs.NewOS(content.File.SourcePath)
+
+			f, err := hfs.Open(sourcefs, "")
+			if err != nil {
+				return nil, nil, err
+			}
+			defer f.Close()
+
+			err = p.WriteFile(f, content.File.OutPath)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			_ = f.Close()
+			_ = tarf.Close()
+
+			artifact.Artifact.Content = &pluginv1.Artifact_TarPath{
+				TarPath: tarf.Name(),
+			}
+		}
+
+		fromPath, err := hartifact.Path(artifact.Artifact)
+		if err != nil {
+			return nil, nil, err
+		}
+
 		var prefix string
 		switch artifact.Type {
 		case pluginv1.Artifact_TYPE_OUTPUT:
@@ -79,11 +115,6 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			fallthrough
 		default:
 			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
-		}
-
-		fromPath, err := hartifact.Path(artifact.Artifact)
-		if err != nil {
-			return nil, nil, err
 		}
 
 		artifact.Name = prefix + artifact.Name

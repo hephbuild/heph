@@ -57,7 +57,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 
 		f, err := hfs.Create(fs, content.File.OutPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("file: create: %w", err)
 		}
 		defer f.Close()
 		defer cfg.onFile(f.Name())
@@ -69,7 +69,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	case *pluginv1.Artifact_Raw:
 		f, err := hfs.Create(fs, content.Raw.Path)
 		if err != nil {
-			return err
+			return fmt.Errorf("raw: create: %w", err)
 		}
 		defer f.Close()
 		defer cfg.onFile(f.Name())
@@ -81,7 +81,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	case *pluginv1.Artifact_TarPath:
 		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
-			return err
+			return fmt.Errorf("tar: %w", err)
 		}
 	//case *pluginv1.Artifact_TargzPath:
 	default:

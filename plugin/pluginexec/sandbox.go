@@ -46,7 +46,7 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 				for artifact := range ArtifactsForId(results, target.Id, pluginv1.Artifact_TYPE_OUTPUT) {
 					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.Ref.Filters)
 					if err != nil {
-						return nil, fmt.Errorf("setup artifact: %w", err)
+						return nil, fmt.Errorf("setup artifact: %v: %w", target.Id, err)
 					}
 					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
 						Artifact: listArtifact,
@@ -109,7 +109,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create list file: %w", err)
 	}
 	defer listf.Close()
 
@@ -124,7 +124,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 		return slices.Contains(filters, from)
 	}))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unpack: %w", err)
 	}
 
 	err = listf.Close()

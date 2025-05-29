@@ -24,7 +24,10 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
-type stepsUpdateMsg []*corev1.Step
+type stepsUpdateMsg struct {
+	steps []*corev1.Step
+	total int
+}
 
 type Model struct {
 	log           hbbtlog.Hijacker
@@ -35,7 +38,7 @@ type Model struct {
 	width  int
 	height int
 
-	steps          stepsUpdateMsg
+	stepsState     stepsUpdateMsg
 	pauseRendering bool
 }
 
@@ -69,7 +72,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case stepsUpdateMsg:
-		m.steps = msg
+		m.stepsState = msg
 	case tickMsg:
 		cmds = append(cmds, m.nextTick())
 	case tea.WindowSizeMsg:
@@ -104,17 +107,14 @@ func (m Model) View() string {
 
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("%v\n", len(m.steps)))
-	stepsTree := buildStepsTree(m.renderer, m.steps)
-	if m.height > 0 {
-		stepsTree = lipgloss.NewStyle().MaxHeight(m.height / 2).Render(stepsTree)
-	}
+	sb.WriteString(fmt.Sprintf("%v\n", m.stepsState.total))
+	stepsTree := buildStepsTree(m.renderer, m.stepsState.steps)
 
 	sb.WriteString(stepsTree)
 
 	return lipgloss.NewStyle().
 		MaxWidth(m.width - 1). // not sure why -1 is needed
-		MaxHeight(m.height).
+		MaxHeight(m.height / 2).
 		Render(sb.String())
 }
 
@@ -156,11 +156,15 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 				stepsm.Lock()
 				steps := maps.Clone(steps)
 				stepsm.Unlock()
+				total := len(steps)
 				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
 					return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
 				})
 				stepsa := slices.Collect(maps.Values(steps))
-				p.Send(stepsUpdateMsg(stepsa))
+				p.Send(stepsUpdateMsg{
+					steps: stepsa,
+					total: total,
+				})
 			}
 		}
 	}()
