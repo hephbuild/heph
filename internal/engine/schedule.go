@@ -16,6 +16,7 @@ import (
 	"golang.org/x/sync/semaphore"
 	"hash"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -493,9 +494,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 
 		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
 		if err != nil {
-			err = errors.Join(err, locks.Unlock())
-
-			return nil, err
+			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
 
 		if ok {
@@ -934,7 +933,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	if def.Cache && !options.force && !options.shell {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
-			return nil, err
+			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
 
 		if ok {

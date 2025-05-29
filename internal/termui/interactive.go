@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
+	"github.com/hephbuild/heph/internal/htime"
 	"maps"
 	"os"
 	"slices"
@@ -24,9 +25,18 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
+// We want our own QuitMsg so that we can do a graceful shotdown of the UI
+type QuitMsg struct{}
+
+func Quit() tea.Msg {
+	return QuitMsg{}
+}
+
 type stepsUpdateMsg struct {
-	steps []*corev1.Step
-	total int
+	steps     []*corev1.Step
+	stepsc    int
+	total     uint64
+	completed uint64
 }
 
 type Model struct {
@@ -34,12 +44,14 @@ type Model struct {
 	Exec          hbbtexec.Model
 	renderer      *lipgloss.Renderer
 	cancelRoutine context.CancelCauseFunc
+	startedAt     time.Time
 
 	width  int
 	height int
 
 	stepsState     stepsUpdateMsg
 	pauseRendering bool
+	finalRendering bool
 }
 
 func initialModel(cancelRoutine context.CancelCauseFunc) Model {
@@ -47,6 +59,7 @@ func initialModel(cancelRoutine context.CancelCauseFunc) Model {
 		log:           hbbtlog.NewLogHijacker(),
 		renderer:      hlipgloss.NewRenderer(os.Stderr),
 		cancelRoutine: cancelRoutine,
+		startedAt:     time.Now(),
 	}
 	m.Exec = hbbtexec.New(m.log)
 
@@ -83,9 +96,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case hbbtexec.EndMsg:
 		m.pauseRendering = false
 	case routineExitedMsg:
+		cmds = append(cmds, Quit)
+	case QuitMsg:
+		m.pauseRendering = false
+		m.finalRendering = true
 		cmds = append(cmds, tea.Quit)
-	case tea.QuitMsg:
-		m.pauseRendering = true
 	case tea.InterruptMsg:
 		m.cancelRoutine(errors.New("ctrl+c"))
 	case tea.KeyMsg:
@@ -107,13 +122,22 @@ func (m Model) View() string {
 
 	var sb strings.Builder
 
-	sb.WriteString(fmt.Sprintf("%v\n", m.stepsState.total))
-	stepsTree := buildStepsTree(m.renderer, m.stepsState.steps)
+	sb.WriteString(fmt.Sprintf(
+		"Total jobs: %-6d Completed jobs: %-6d Total time: %v\n",
+		m.stepsState.total, m.stepsState.completed,
+		htime.FormatFixedWidthDuration(time.Since(m.startedAt)),
+	))
 
-	sb.WriteString(stepsTree)
+	if !m.finalRendering {
+		sb.WriteString(strings.Repeat("-", m.width))
+		sb.WriteString("\n")
+
+		stepsTree := buildStepsTree(m.renderer, m.stepsState.steps)
+		sb.WriteString(stepsTree)
+	}
 
 	return lipgloss.NewStyle().
-		MaxWidth(m.width - 1). // not sure why -1 is needed
+		MaxWidth(m.width).
 		MaxHeight(m.height / 2).
 		Render(sb.String())
 }
@@ -124,12 +148,19 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 	stepsCh := make(chan *corev1.Step)
 	steps := map[string]*corev1.Step{}
 	var stepsm sync.Mutex
+	var total uint64
+	var completed uint64
 
 	go func() {
 		for {
 			select {
 			case step := <-stepsCh:
 				stepsm.Lock()
+				_, ok := steps[step.GetId()]
+				if !ok {
+					total++
+				}
+
 				steps[step.GetId()] = step
 
 				if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
@@ -138,6 +169,7 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 					//}
 
 					delete(steps, step.GetId())
+					completed++
 				}
 				stepsm.Unlock()
 			case <-doCtx.Done():
@@ -156,14 +188,16 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 				stepsm.Lock()
 				steps := maps.Clone(steps)
 				stepsm.Unlock()
-				total := len(steps)
+				stepsc := len(steps)
 				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
 					return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
 				})
 				stepsa := slices.Collect(maps.Values(steps))
 				p.Send(stepsUpdateMsg{
-					steps: stepsa,
-					total: total,
+					steps:     stepsa,
+					stepsc:    stepsc,
+					total:     total,
+					completed: completed,
 				})
 			}
 		}

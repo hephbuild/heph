@@ -45,8 +45,8 @@ func (b *ManifestArtifactType) UnmarshalJSON(data []byte) error {
 type ManifestArtifactContentType string
 
 const (
-	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "tar"
-	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "targz"
+	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "application/x-tar"
+	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "application/x-gtar"
 )
 
 type ManifestArtifact struct {
