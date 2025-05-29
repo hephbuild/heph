@@ -81,7 +81,7 @@ func (m Manifest) GetArtifacts(output string) []ManifestArtifact {
 	return a
 }
 
-func NewManifestArtifact(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
+func WriteManifest(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
 	b, err := json.Marshal(m) //nolint:musttag
 	if err != nil {
 		return nil, err
@@ -92,6 +92,10 @@ func NewManifestArtifact(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
 		return nil, err
 	}
 
+	return newManifestArtifact(fs), nil
+}
+
+func newManifestArtifact(fs hfs.FS) *pluginv1.Artifact {
 	return &pluginv1.Artifact{
 		Name: ManifestName,
 		Type: pluginv1.Artifact_TYPE_MANIFEST_V1,
@@ -101,7 +105,7 @@ func NewManifestArtifact(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
 				OutPath:    ManifestName,
 			},
 		},
-	}, nil
+	}
 }
 
 func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, error) {
@@ -114,14 +118,19 @@ func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, 
 	return DecodeManifest(r)
 }
 
-func ManifestFromFS(fs hfs.FS) (Manifest, error) {
+func ManifestFromFS(fs hfs.FS) (Manifest, *pluginv1.Artifact, error) {
 	f, err := hfs.Open(fs, ManifestName)
 	if err != nil {
-		return Manifest{}, err
+		return Manifest{}, nil, err
 	}
 	defer f.Close()
 
-	return DecodeManifest(f)
+	m, err := DecodeManifest(f)
+	if err != nil {
+		return Manifest{}, nil, err
+	}
+
+	return m, newManifestArtifact(fs), nil
 }
 
 func DecodeManifest(r io.Reader) (Manifest, error) {

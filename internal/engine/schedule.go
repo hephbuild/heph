@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hmaps"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/tmatch"
@@ -18,6 +20,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +35,6 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hpty"
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -80,19 +82,25 @@ func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, out
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Ref: ref}, outputs, options, rc)
+	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, options, rc)
 }
 func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, options, rc)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, options, rc)
+}
+func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+	ctx, span := tracer.Start(ctx, "ResultFromDefWithManifest", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+	defer span.End()
+
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, options, rc)
 }
 func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: spec}, outputs, options, rc)
+	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, options, rc)
 }
 
 func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, options ResultOptions, rc *ResolveCache) ([]*ExecuteResultLocks, error) {
@@ -142,6 +150,70 @@ func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.Target
 	return out, nil
 }
 
+type Meta struct {
+	Hashin string
+}
+
+func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, options ResultOptions, rc *ResolveCache) (*Meta, error) {
+	ctx, span := tracer.Start(ctx, "MetaFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+	defer span.End()
+
+	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rc)
+}
+
+func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (*Meta, error) {
+	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.Link(ctx, c)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("link: %w", err)
+	}
+
+	manifests, err := e.depsManifests(ctx, def, rc, options)
+	if err != nil {
+		return nil, fmt.Errorf("deps manifests: %w", err)
+	}
+
+	hashin, err := e.hashin2(ctx, def, manifests)
+	if err != nil {
+		return nil, fmt.Errorf("hashin: %w", err)
+	}
+
+	return &Meta{
+		Hashin: hashin,
+	}, nil
+}
+
+func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rc *ResolveCache, options ResultOptions) (hartifact.Manifest, error) {
+	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rc)
+}
+
+func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (hartifact.Manifest, error) {
+	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.Link(ctx, c)
+	})
+	if err != nil {
+		return hartifact.Manifest{}, fmt.Errorf("link: %w", err)
+	}
+
+	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, options, rc)
+	if err != nil {
+		return hartifact.Manifest{}, fmt.Errorf("result from def: %w", err)
+	}
+	defer res.Unlock(ctx)
+
+	artifact := res.FindManifest()
+
+	manifest, err := hartifact.ManifestFromArtifact(ctx, artifact.Artifact)
+	if err != nil {
+		hlog.From(ctx).Error(fmt.Sprintf("%v: failed to read manifest: %v", tref.Format(c.GetRef()), err))
+
+		return hartifact.Manifest{}, nil
+	}
+
+	return manifest, nil
+}
+
 var meter = otel.Meter("heph_engine")
 
 var resultCounter = sync.OnceValue(func() metric.Int64Counter {
@@ -152,7 +224,7 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
@@ -168,7 +240,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 
 	ref := def.GetRef()
 
-	if len(outputs) == 1 && outputs[0] == AllOutputs {
+	if len(outputs) == 1 && outputs[0] == AllOutputs || !def.Cache {
 		outputs = def.Outputs
 	}
 
@@ -210,6 +282,16 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		res = res.CloneWithoutLocks()
 	}
 
+	if !withManifest {
+		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+				return false
+			}
+
+			return !slices.Contains(outputs, artifact.Group)
+		})
+	}
+
 	return res, nil
 }
 
@@ -225,21 +307,29 @@ func (r DepsResults) Unlock(ctx context.Context) {
 	}
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutputs bool, rc *ResolveCache, options ResultOptions) (DepsResults, error) {
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rc *ResolveCache, options ResultOptions) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
+	if len(t.Inputs) == 0 {
+		return nil, nil
+	}
+
+	inputs := slices.Clone(t.Inputs)
+	slices.SortFunc(inputs, func(a, b *LightLinkedTargetInput) int {
+		if v := tref.Compare(a.GetRef(), b.GetRef()); v != 0 {
+			return v
+		}
+
+		return strings.Compare(a.Origin.Id, b.Origin.Id)
+	})
+
 	var g errgroup.Group
-	results := make(DepsResults, len(t.Inputs))
+	results := make(DepsResults, len(inputs))
 
-	for i, dep := range t.Inputs {
+	for i, dep := range inputs {
 		g.Go(func() error {
-			outputs := dep.Outputs
-			//if !withOutputs { // TODO: we still need to fetch the output for the hashin to be correct, but we should not pull artifacts from remote cache (e.MetaFromDef)
-			//	outputs = nil
-			//}
-
-			res, err := e.ResultFromDef(ctx, dep.TargetDef, outputs, options, rc)
+			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, options, rc)
 			if err != nil {
 				return err
 			}
@@ -264,13 +354,81 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, withOutp
 		return nil, err
 	}
 
-	slices.SortFunc(results, func(a, b *ExecuteResultWithOrigin) int {
-		if v := tref.Compare(a.Def.GetRef(), b.Def.GetRef()); v != 0 {
+	return results, nil
+}
+
+type DepMeta struct {
+	Hashin    string
+	Origin    *pluginv1.TargetDef_InputOrigin
+	Artifacts []DepMetaArtifact
+}
+
+type DepMetaArtifact struct {
+	Hashout string
+}
+
+func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rc *ResolveCache, options ResultOptions) ([]DepMeta, error) {
+	ctx, span := tracer.Start(ctx, "depsManifests", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
+	defer span.End()
+
+	if len(t.Inputs) == 0 {
+		return nil, nil
+	}
+
+	inputs := slices.Clone(t.Inputs)
+	slices.SortFunc(inputs, func(a, b *LightLinkedTargetInput) int {
+		if v := tref.Compare(a.GetRef(), b.GetRef()); v != 0 {
 			return v
 		}
 
-		return strings.Compare(a.Hashin, b.Hashin)
+		return strings.Compare(a.Origin.Id, b.Origin.Id)
 	})
+
+	var g errgroup.Group
+	results := make([]DepMeta, len(inputs))
+
+	for i, dep := range inputs {
+		g.Go(func() error {
+			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rc, options)
+			if err != nil {
+				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
+			}
+
+			artifacts := make([]DepMetaArtifact, 0)
+			for _, output := range dep.Outputs {
+				for _, artifact := range res.Artifacts {
+					if pluginv1.Artifact_Type(artifact.Type) != pluginv1.Artifact_TYPE_OUTPUT {
+						continue
+					}
+
+					if artifact.Group != output {
+						continue
+					}
+
+					artifacts = append(artifacts, DepMetaArtifact{
+						Hashout: artifact.Hashout,
+					})
+				}
+			}
+
+			slices.SortFunc(artifacts, func(a, b DepMetaArtifact) int {
+				return strings.Compare(a.Hashout, b.Hashout)
+			})
+
+			results[i] = DepMeta{
+				Hashin:    res.Hashin,
+				Origin:    dep.Origin,
+				Artifacts: artifacts,
+			}
+
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	if err != nil {
+		return nil, err
+	}
 
 	return results, nil
 }
@@ -284,9 +442,6 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	}
 
 	if ok {
-		step := hstep.From(ctx)
-		step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.GetRef())))
-
 		return res, true, nil
 	}
 
@@ -318,24 +473,12 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 }
 
 func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (_ *ExecuteResultLocks, rerr error) {
-	results, err := e.depsResults(ctx, def, false, rc, ResultOptions{
-		InteractiveExec: options.InteractiveExec,
-		Shell:           options.Shell,
-	})
+	meta, err := e.MetaFromDef(ctx, def.TargetDef, options, rc)
 	if err != nil {
-		return nil, fmt.Errorf("result deps: %w", err)
-	}
-	unlockDepsResults := sync.OnceFunc(func() {
-		results.Unlock(ctx)
-	})
-	defer unlockDepsResults()
-
-	hashin, err := e.hashin(ctx, def, results)
-	if err != nil {
-		return nil, fmt.Errorf("hashin: %w", err)
+		return nil, fmt.Errorf("meta: %w", err)
 	}
 
-	unlockDepsResults()
+	hashin := meta.Hashin
 
 	shouldShell := tref.Equal(options.Shell, def.GetRef())
 	shouldForce := tmatch.MatchSpec(def.TargetSpec, options.Force) == tmatch.MatchYes
@@ -347,9 +490,6 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		if err != nil {
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
-
-		refstr := tref.Format(def.GetRef())
-		_ = refstr
 
 		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
 		if err != nil {
@@ -429,23 +569,21 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		res = res.CloneWithoutLocks()
 	}
 
-	res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
-		if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
-			return false
-		}
-
-		return !slices.Contains(outputs, artifact.Group)
-	})
-
 	return res, nil
 }
 
-func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
+var enableHashDebug = sync.OnceValue(func() bool {
+	v, _ := strconv.ParseBool(os.Getenv("HEPH_HASH_DEBUG"))
+
+	return v
+})
+
+func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []DepMeta) (string, error) {
 	var h interface {
 		hash.Hash
 		io.StringWriter
 	}
-	if false {
+	if enableHashDebug() {
 		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.GetRef()), "//"))
 	} else {
 		h = xxh3.New()
@@ -468,7 +606,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		_, err = h.WriteString(result.InputOrigin.Id)
+		_, err = h.WriteString(result.Origin.Id)
 		if err != nil {
 			return "", err
 		}
@@ -493,6 +631,31 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 	return hashin, nil
 }
 
+func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
+	var metas []DepMeta
+
+	for _, result := range results {
+		var artifacts []DepMetaArtifact
+		for _, artifact := range result.Artifacts {
+			artifacts = append(artifacts, DepMetaArtifact{
+				Hashout: artifact.Hashout,
+			})
+		}
+
+		slices.SortFunc(artifacts, func(a, b DepMetaArtifact) int {
+			return strings.Compare(a.Hashout, b.Hashout)
+		})
+
+		metas = append(metas, DepMeta{
+			Hashin:    result.Hashin,
+			Origin:    result.InputOrigin,
+			Artifacts: artifacts,
+		})
+	}
+
+	return e.hashin2(ctx, def, metas)
+}
+
 type ExecuteResultArtifact struct {
 	Hashout string
 	*pluginv1.Artifact
@@ -503,6 +666,34 @@ type ExecuteResult struct {
 	Executed  bool
 	Hashin    string
 	Artifacts []ExecuteResultArtifact
+}
+
+func (r ExecuteResult) FindManifest() ExecuteResultArtifact {
+	for _, artifact := range r.Artifacts {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
+			continue
+		}
+
+		return artifact
+	}
+
+	return ExecuteResultArtifact{}
+}
+
+func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
+	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+	for _, artifact := range r.Artifacts {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+			continue
+		}
+		if artifact.Group != group {
+			continue
+		}
+
+		res = append(res, artifact)
+	}
+
+	return res
 }
 
 type ExecuteResultLocks struct {
@@ -533,34 +724,6 @@ func (r *ExecuteResultLocks) Unlock(ctx context.Context) {
 	if err != nil {
 		hlog.From(ctx).Error(fmt.Sprintf("%v: failed to unlock result locks: %v", tref.Format(r.Def.GetRef()), err))
 	}
-}
-
-func (r *ExecuteResultLocks) FindManifest() ExecuteResultArtifact {
-	for _, artifact := range r.Artifacts {
-		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
-			continue
-		}
-
-		return artifact
-	}
-
-	return ExecuteResultArtifact{}
-}
-
-func (r *ExecuteResultLocks) FindOutputs(group string) []ExecuteResultArtifact {
-	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
-	for _, artifact := range r.Artifacts {
-		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
-			continue
-		}
-		if artifact.Group != group {
-			continue
-		}
-
-		res = append(res, artifact)
-	}
-
-	return res
 }
 
 func (r ExecuteResult) Sorted() *ExecuteResult {
@@ -735,7 +898,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	})
 
-	results, err := e.depsResults(ctx, def, true, rc, options.ResultOptions)
+	results, err := e.depsResults(ctx, def, rc, options.ResultOptions)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -916,22 +1079,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			return nil, err
 		}
 
-		tarf, err = hfs.Open(cachefs, tarname)
-		if err != nil {
-			return nil, err
-		}
-
-		h := xxh3.New()
-
-		_, err = io.Copy(h, tarf)
-		if err != nil {
-			return nil, err
-		}
-
-		hashout := hex.EncodeToString(h.Sum(nil))
-
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Hashout: hashout,
 			Artifact: &pluginv1.Artifact{
 				Group: output.GetGroup(),
 				Name:  tarname,
@@ -948,13 +1096,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			continue
 		}
 
-		hashout, err := e.hashout(ctx, artifact)
-		if err != nil {
-			return nil, err
-		}
-
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Hashout:  hashout,
 			Artifact: artifact,
 		})
 

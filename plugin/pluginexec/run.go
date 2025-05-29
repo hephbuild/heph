@@ -79,7 +79,7 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 
 	listArtifacts, err := SetupSandbox(ctx, t, req.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("setup sandbox: %w", err)
 	}
 
 	env := make([]string, 0)

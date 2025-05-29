@@ -12,12 +12,12 @@ import (
 	"github.com/hephbuild/heph/internal/hslices"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	"io"
 	"log/slog"
+	"os"
 	"path"
 	"sync"
 )
@@ -88,8 +88,6 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context, ref *pluginv1.TargetRef
 
 func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rc *ResolveCache) (*ExecuteResult, bool, error) {
 	ref := def.GetRef()
-	refstr := tref.Format(ref)
-	_ = refstr
 
 	if def.DisableRemoteCache {
 		return nil, false, nil
@@ -99,7 +97,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 	for _, cache := range e.Caches {
 		if cache.Read {
 			hasReadCache = true
-			continue
+			break
 		}
 	}
 
@@ -119,6 +117,11 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 		}
 
 		tmpCacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef())+"_tmp_"+hinstance.UID+"_"+hrand.Str(7), hashin)
+		err := tmpCacheDir.MkdirAll("", os.ModePerm)
+		if err != nil {
+			return nil, false, err
+		}
+
 		defer tmpCacheDir.RemoveAll("")
 
 		cacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
@@ -281,7 +284,7 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 		return nil, false, err
 	}
 
-	manifestArtifact, err := hartifact.NewManifestArtifact(cachedir, manifest)
+	manifestArtifact, err := hartifact.WriteManifest(cachedir, manifest)
 	if err != nil {
 		return nil, false, err
 	}

@@ -5,40 +5,48 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/hephbuild/heph/plugin/tref"
-	"google.golang.org/protobuf/proto"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 )
 
-func (e *Engine) hashout(ctx context.Context, artifact *pluginv1.Artifact) (string, error) {
-	h := xxh3.New()
-	writeProto := func(v proto.Message) error {
-		return stableProtoHashEncode(h, v, nil)
+func (e *Engine) hashout(ctx context.Context, ref *pluginv1.TargetRef, artifact *pluginv1.Artifact) (string, error) {
+	var h interface {
+		hash.Hash
+		io.StringWriter
+	}
+	if enableHashDebug() {
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(ref), "//")+"_hashout_"+artifact.Name)
+	} else {
+		h = xxh3.New()
 	}
 
-	err := writeProto(artifact)
-	if err != nil {
-		return "", err
-	}
+	_, _ = h.WriteString(artifact.Group)
+	_, _ = h.WriteString(artifact.Name)
+	_, _ = h.WriteString(strconv.Itoa(int(artifact.Type)))
 
-	r, err := hartifact.Reader(ctx, artifact)
-	if err != nil {
-		return "", err
-	}
-	defer r.Close()
+	for file, err := range hartifact.FilesReader(ctx, artifact) {
+		if err != nil {
+			return "", err
+		}
 
-	_, err = io.Copy(h, r)
-	if err != nil {
-		return "", err
+		_, _ = h.WriteString(file.Path)
+
+		_, err = io.Copy(h, file)
+		if err != nil {
+			return "", err
+		}
+
+		_ = file.Close()
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
@@ -73,13 +81,13 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
 		}
 
-		name := prefix + artifact.Name
 		fromPath, err := hartifact.Path(artifact.Artifact)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		tofs := hfs.At(cachedir, name)
+		artifact.Name = prefix + artifact.Name
+		tofs := hfs.At(cachedir, artifact.Name)
 
 		if fromPath == "" {
 			r, err := hartifact.FileReader(ctx, artifact.Artifact)
@@ -98,6 +106,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			if err != nil {
 				return nil, nil, err
 			}
+
 			_ = r.Close()
 			_ = f.Close()
 		} else {
@@ -125,7 +134,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		hashout := artifact.Hashout
 		if hashout == "" && artifact.Type == pluginv1.Artifact_TYPE_OUTPUT {
 			var err error
-			hashout, err = e.hashout(ctx, cachedArtifact)
+			hashout, err = e.hashout(ctx, def.GetRef(), cachedArtifact)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -152,7 +161,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		m.Artifacts = append(m.Artifacts, martifact)
 	}
 
-	manifestArtifact, err := hartifact.NewManifestArtifact(cachedir, m)
+	manifestArtifact, err := hartifact.WriteManifest(cachedir, m)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -194,12 +203,9 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 }
 
 func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
-	refstr := tref.Format(def.GetRef())
-	_ = refstr
-
 	dirfs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
-	manifest, err := hartifact.ManifestFromFS(dirfs)
+	manifest, manifestArtifact, err := hartifact.ManifestFromFS(dirfs)
 	if err != nil {
 		return nil, false, fmt.Errorf("ManifestFromFS: %w", err)
 	}
@@ -226,11 +232,6 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 			Hashout:  artifact.Hashout,
 			Artifact: partifact,
 		})
-	}
-
-	manifestArtifact, err := hartifact.NewManifestArtifact(dirfs, manifest)
-	if err != nil {
-		return nil, false, fmt.Errorf("NewManifestArtifact: %w", err)
 	}
 
 	execArtifacts = append(execArtifacts, ExecuteResultArtifact{

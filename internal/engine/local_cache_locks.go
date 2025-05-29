@@ -44,6 +44,12 @@ func (c *CacheLocks) lock(ctx context.Context, ro bool) error {
 
 	if len(c.unlocks) < len(c.ms) {
 		c.unlocks = hslices.GrowLen(c.unlocks, len(c.ms)-len(c.unlocks))
+
+		for i, l := range c.unlocks {
+			if l == nil {
+				c.unlocks[i] = func() error { return nil }
+			}
+		}
 	}
 
 	for i, m := range c.ms {

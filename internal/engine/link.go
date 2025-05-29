@@ -381,10 +381,9 @@ func (e *Engine) Link(ctx context.Context, c DefContainer) (*LightLinkedTarget, 
 	var g errgroup.Group
 	for i, input := range def.GetInputs() {
 		depRef := tref.WithoutOut(input.GetRef())
-		refStr := tref.Format(depRef)
 
 		g.Go(func() error {
-			linkedDep, err, _ := sf.Do(refStr, func() (*TargetDef, error) {
+			linkedDep, err, _ := sf.Do(refKey(depRef), func() (*TargetDef, error) {
 				return e.GetDef(ctx, DefContainer{Ref: depRef}, rc)
 			})
 			if err != nil {

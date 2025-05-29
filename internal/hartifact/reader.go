@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"iter"
 	"os"
 
 	"github.com/hephbuild/heph/internal/hio"
@@ -54,5 +55,79 @@ func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error
 	//case *pluginv1.Artifact_TargzPath:
 	default:
 		return nil, fmt.Errorf("unsupported encoding %T", a.Content)
+	}
+}
+
+type File struct {
+	io.ReadCloser
+	Path string
+}
+
+// FilesReader provides a reader for each file it (no matter the packaging)
+func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, error] {
+	return func(yield func(*File, error) bool) {
+		switch content := a.Content.(type) {
+		case *pluginv1.Artifact_File:
+			f, err := os.Open(content.File.SourcePath)
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+				return
+			}
+
+			if !yield(&File{
+				ReadCloser: f,
+				Path:       content.File.OutPath,
+			}, nil) {
+				return
+			}
+		case *pluginv1.Artifact_Raw:
+			f := io.NopCloser(bytes.NewReader(content.Raw.Data))
+
+			if !yield(&File{
+				ReadCloser: f,
+				Path:       content.Raw.Path,
+			}, nil) {
+				return
+			}
+		case *pluginv1.Artifact_TarPath:
+			r, err := Reader(ctx, a)
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+				return
+			}
+			defer r.Close()
+
+			tr := tar.NewReader(r)
+
+			err = htar.Walk(tr, func(header *tar.Header, reader *tar.Reader) error {
+				if header.Typeflag != tar.TypeReg {
+					return nil
+				}
+
+				if !yield(&File{
+					ReadCloser: io.NopCloser(reader),
+					Path:       header.Name,
+				}, nil) {
+					return htar.ErrStopWalk
+				}
+
+				return nil
+			})
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+				return
+			}
+		//case *pluginv1.Artifact_TargzPath:
+		default:
+			if !yield(nil, fmt.Errorf("unsupported encoding %T", a.Content)) {
+				return
+			}
+		}
 	}
 }

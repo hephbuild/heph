@@ -132,6 +132,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"a": goImport + ".a",
 				}),
+				"cache": structpb.NewStringValue("local"),
 			},
 		},
 	}, nil

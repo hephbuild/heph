@@ -244,7 +244,7 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 }
 
 func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rc *ResolveCache) iter.Seq2[*pluginv1.TargetRef, error] {
-	if true {
+	if false {
 		state := &queryState{
 			Engine:  e,
 			ch:      make(chan queryStateRes, 1000),

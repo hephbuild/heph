@@ -3,16 +3,17 @@ package engine
 import (
 	"encoding/hex"
 	"encoding/json"
-	"github.com/hephbuild/heph/internal/hproto"
-	"hash"
-	"os"
-	"path/filepath"
-	"time"
-
+	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hinstance"
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+	"hash"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
 )
 
 // Useful for figuring out why hash isnt deterministic
@@ -22,8 +23,14 @@ type hashWithDebug struct {
 	path string
 }
 
+var debugCounter = cache.New[string, *atomic.Int32]()
+
 func newHashWithDebug(w *xxh3.Hasher, name string) hashWithDebug {
-	path := filepath.Join("/tmp/hashdebug", hinstance.UID, name, time.Now().Format(time.StampNano)+".txt")
+	c, _ := debugCounter.GetOrSet(name, &atomic.Int32{})
+	id := c.Add(1)
+
+	path := filepath.Join("/tmp/hashdebug", hinstance.UID, name, strconv.Itoa(int(id))+".txt")
+
 	return hashWithDebug{Hasher: w, path: path}
 }
 
@@ -55,7 +62,14 @@ func (h hashWithDebug) Write(p []byte) (int, error) {
 	return h.Hasher.Write(p)
 }
 
-// TODO: this is pretty damn inefficient, but at least its stable
+func (h hashWithDebug) Sum(b []byte) []byte {
+	sum := h.Hasher.Sum(b)
+
+	_, _ = h.WriteString("SUM: " + hex.EncodeToString(sum))
+
+	return sum
+}
+
 func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struct{}) error {
 	if v, ok := v.(hproto.Hashable); ok {
 		v.HashPB(w, ignore)
@@ -63,6 +77,7 @@ func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struc
 		return nil
 	}
 
+	// this is pretty damn inefficient, but at least its stable
 	v, err := hproto.RemoveMasked(v, ignore)
 	if err != nil {
 		return err
@@ -80,12 +95,4 @@ func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struc
 	}
 
 	return json.NewEncoder(w).Encode(a)
-}
-
-func (h hashWithDebug) Sum(b []byte) []byte {
-	sum := h.Hasher.Sum(b)
-
-	_, _ = h.WriteString("SUM: " + hex.EncodeToString(sum))
-
-	return sum
 }

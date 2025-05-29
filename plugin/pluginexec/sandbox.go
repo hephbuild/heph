@@ -46,7 +46,7 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 				for artifact := range ArtifactsForId(results, target.Id, pluginv1.Artifact_TYPE_OUTPUT) {
 					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.Ref.Filters)
 					if err != nil {
-						return nil, err
+						return nil, fmt.Errorf("setup artifact: %w", err)
 					}
 					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
 						Artifact: listArtifact,
