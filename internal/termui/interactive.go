@@ -37,6 +37,7 @@ type stepsUpdateMsg struct {
 	stepsc    int
 	total     uint64
 	completed uint64
+	failed    uint64
 }
 
 type Model struct {
@@ -122,9 +123,15 @@ func (m Model) View() string {
 
 	var sb strings.Builder
 
+	var failed string
+	if m.stepsState.failed > 0 {
+		failed = fmt.Sprintf(" Failed: %-6d", m.stepsState.failed)
+	}
+
 	sb.WriteString(fmt.Sprintf(
-		"Total jobs: %-6d Completed jobs: %-6d Total time: %v\n",
+		"Total jobs: %-6d Completed jobs: %-6d%v Total time: %v\n",
 		m.stepsState.total, m.stepsState.completed,
+		failed,
 		htime.FormatFixedWidthDuration(time.Since(m.startedAt)),
 	))
 
@@ -150,6 +157,7 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 	var stepsm sync.Mutex
 	var total uint64
 	var completed uint64
+	var failed uint64
 
 	go func() {
 		for {
@@ -168,8 +176,11 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 					//	hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
 					//}
 
-					delete(steps, step.GetId())
 					completed++
+					if step.GetError() {
+						failed++
+					}
+					delete(steps, step.GetId())
 				}
 				stepsm.Unlock()
 			case <-doCtx.Done():
@@ -198,6 +209,7 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 					stepsc:    stepsc,
 					total:     total,
 					completed: completed,
+					failed:    failed,
 				})
 			}
 		}
