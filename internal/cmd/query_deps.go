@@ -41,7 +41,9 @@ func init() {
 					return err
 				}
 
-				def, err := e.Link(ctx, engine.DefContainer{Ref: ref})
+				rc := engine.GlobalResolveCache
+
+				def, err := e.Link(ctx, engine.DefContainer{Ref: ref}, rc)
 				if err != nil {
 					return err
 				}

@@ -125,7 +125,7 @@ func (m Model) View() string {
 
 	var failed string
 	if m.stepsState.failed > 0 {
-		failed = fmt.Sprintf(" Failed: %-6d", m.stepsState.failed)
+		failed = fmt.Sprintf(" Failed jobs: %-6d", m.stepsState.failed)
 	}
 
 	sb.WriteString(fmt.Sprintf(

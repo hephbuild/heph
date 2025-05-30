@@ -112,6 +112,7 @@ type queryState struct {
 	ch      chan queryStateRes
 	wg      sync.WaitGroup
 	listSem *semaphore.Weighted
+	rc      *ResolveCache
 }
 
 type queryStateRes struct {
@@ -181,7 +182,7 @@ func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef,
 		return
 	}
 
-	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, GlobalResolveCache)
+	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, e.rc)
 	if err != nil {
 		e.sendErr(ctx, fmt.Errorf("get def: %w", err))
 		return
@@ -247,6 +248,7 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rc 
 	if false {
 		state := &queryState{
 			Engine:  e,
+			rc:      rc,
 			ch:      make(chan queryStateRes, 1000),
 			seenPkg: cache.New[string, struct{}](),
 			seenRef: cache.New[string, struct{}](),

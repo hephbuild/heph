@@ -355,7 +355,7 @@ func (t LightLinkedTarget) Clone() *LightLinkedTarget {
 	}
 }
 
-func (e *Engine) Link(ctx context.Context, c DefContainer) (*LightLinkedTarget, error) {
+func (e *Engine) Link(ctx context.Context, c DefContainer, rc *ResolveCache) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
 
@@ -364,8 +364,6 @@ func (e *Engine) Link(ctx context.Context, c DefContainer) (*LightLinkedTarget, 
 
 	step, ctx := hstep.New(ctx, fmt.Sprintf("Linking %v...", tref.Format(c.GetRef())))
 	defer step.Done()
-
-	rc := GlobalResolveCache
 
 	def, err := e.GetDef(ctx, c, rc)
 	if err != nil {

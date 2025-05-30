@@ -41,6 +41,8 @@ func init() {
 				return err
 			}
 
+			rc := engine.GlobalResolveCache
+
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
 				e, err := newEngine(ctx, root)
 				if err != nil {
@@ -93,7 +95,7 @@ func init() {
 					resultOpts.Force = matcher
 				}
 
-				res, err := e.ResultFromMatcher(ctx, matcher, resultOpts, engine.GlobalResolveCache)
+				res, err := e.ResultFromMatcher(ctx, matcher, resultOpts, rc)
 				if err != nil {
 					return err
 				}

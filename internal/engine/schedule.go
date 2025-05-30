@@ -164,7 +164,7 @@ func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, options Result
 
 func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (*Meta, error) {
 	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c)
+		return e.Link(ctx, c, rc)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -191,7 +191,7 @@ func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rc *Resolv
 
 func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (hartifact.Manifest, error) {
 	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c)
+		return e.Link(ctx, c, rc)
 	})
 	if err != nil {
 		return hartifact.Manifest{}, fmt.Errorf("link: %w", err)
@@ -233,7 +233,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 	})
 
 	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c)
+		return e.Link(ctx, c, rc)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
