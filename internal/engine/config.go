@@ -2,6 +2,7 @@ package engine
 
 type Config struct {
 	Version   string
+	HomeDir   string
 	Providers []ConfigProvider
 	Drivers   []ConfigDriver
 	Caches    []ConfigCache

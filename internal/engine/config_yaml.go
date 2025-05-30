@@ -11,6 +11,7 @@ type YAMLConfig struct {
 	Providers []YAMLConfigProvider `yaml:"providers"`
 	Drivers   []YAMLConfigDriver   `yaml:"drivers"`
 	Caches    []YAMLConfigCache    `yaml:"caches"`
+	HomeDir   *string              `yaml:"homeDir"`
 }
 
 type YAMLConfigProvider struct {
@@ -53,6 +54,10 @@ func ParseYAMLConfig(filepath string) (YAMLConfig, error) {
 func ApplyYAMLConfig(cfg Config, inc YAMLConfig) (Config, error) {
 	if inc.Version != nil {
 		cfg.Version = *inc.Version
+	}
+
+	if inc.HomeDir != nil {
+		cfg.HomeDir = *inc.HomeDir
 	}
 
 	for _, incc := range inc.Caches {

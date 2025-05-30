@@ -28,12 +28,7 @@ func Relocated(artifact *pluginv1.Artifact, to string) (*pluginv1.Artifact, erro
 	case *pluginv1.Artifact_File:
 		content.File.SourcePath = to
 	case *pluginv1.Artifact_Raw:
-		artifact.Content = &pluginv1.Artifact_File{
-			File: &pluginv1.Artifact_ContentFile{
-				SourcePath: to,
-				OutPath:    content.Raw.Path,
-			},
-		}
+		return nil, fmt.Errorf("unsupported content %T", artifact.Content)
 	case *pluginv1.Artifact_TargzPath:
 		content.TargzPath = to
 	case *pluginv1.Artifact_TarPath:

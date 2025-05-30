@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -8,6 +10,7 @@ import (
 	"github.com/hephbuild/heph/internal/htar"
 	"hash"
 	"io"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -99,10 +102,39 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 				TarPath: tarf.Name(),
 			}
 		}
+		if content, ok := artifact.Artifact.Content.(*pluginv1.Artifact_Raw); ok {
+			artifact.Name += ".tar"
+			tarf, err := hfs.Create(cachedir, artifact.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+			defer tarf.Close()
+			p := htar.NewPacker(tarf)
+
+			err = p.Write(bytes.NewReader(content.Raw.Data), &tar.Header{
+				Typeflag: tar.TypeReg,
+				Name:     content.Raw.Path,
+				Size:     int64(len(content.Raw.Data)),
+				Mode:     int64(os.ModePerm),
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+
+			_ = tarf.Close()
+
+			artifact.Artifact.Content = &pluginv1.Artifact_TarPath{
+				TarPath: tarf.Name(),
+			}
+		}
 
 		fromPath, err := hartifact.Path(artifact.Artifact)
 		if err != nil {
 			return nil, nil, err
+		}
+
+		if fromPath == "" {
+			return nil, nil, fmt.Errorf("artifact %s has no path", artifact.Name)
 		}
 
 		var prefix string
@@ -118,42 +150,19 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 		}
 
 		artifact.Name = prefix + artifact.Name
+		fromfs := hfs.NewOS(fromPath)
 		tofs := hfs.At(cachedir, artifact.Name)
 
-		if fromPath == "" {
-			r, err := hartifact.FileReader(ctx, artifact.Artifact)
+		if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
+			// TODO: there was a bug here where when a target was running in tree, it would move things out from tree
+			err = hfs.Move(fromfs, tofs)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("move: %w", err)
 			}
-			defer r.Close()
-
-			f, err := hfs.Create(tofs, "")
-			if err != nil {
-				return nil, nil, err
-			}
-			defer f.Close()
-
-			_, err = io.Copy(f, r)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			_ = r.Close()
-			_ = f.Close()
 		} else {
-			fromfs := hfs.NewOS(fromPath)
-
-			if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
-				// TODO: there was a bug here where when a target was running in tree, it would move things out from tree
-				err = hfs.Move(fromfs, tofs)
-				if err != nil {
-					return nil, nil, fmt.Errorf("move: %w", err)
-				}
-			} else {
-				err = hfs.Copy(fromfs, tofs)
-				if err != nil {
-					return nil, nil, fmt.Errorf("copy: %w", err)
-				}
+			err = hfs.Copy(fromfs, tofs)
+			if err != nil {
+				return nil, nil, fmt.Errorf("copy: %w", err)
 			}
 		}
 

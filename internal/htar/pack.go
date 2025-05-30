@@ -60,6 +60,18 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 	return nil
 }
 
+func (p *Packer) Write(r io.Reader, hdr *tar.Header) error {
+	if err := p.tw.WriteHeader(hdr); err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(p.tw, r); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (p *Packer) Close() error {
 	return p.tw.Close()
 }

@@ -102,8 +102,12 @@ type EngineProvider struct {
 }
 
 func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
+	if cfg.HomeDir == "" {
+		cfg.HomeDir = ".heph"
+	}
+
 	rootfs := hfs.NewOS(root)
-	homefs := hfs.At(rootfs, ".heph")
+	homefs := hfs.At(rootfs, cfg.HomeDir)
 	cachefs := hfs.At(homefs, "cache")
 	sandboxfs := hfs.At(homefs, "sandbox")
 

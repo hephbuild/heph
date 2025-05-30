@@ -1,7 +1,13 @@
 package enginee2e
 
 import (
+	"bytes"
 	"context"
+	engine2 "github.com/hephbuild/heph/lib/engine"
+	"go.uber.org/mock/gomock"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -88,6 +94,147 @@ func TestDepsCache(t *testing.T) {
 
 	{ // this should reuse cache from deps
 		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
+		defer res.Unlock(ctx)
+
+		assertOut(res)
+		res.Unlock(ctx)
+	}
+}
+
+func TestDepsCache2(t *testing.T) {
+	ctx := context.Background()
+	c := gomock.NewController(t)
+
+	dir := t.TempDir()
+
+	e, err := engine.New(ctx, dir, engine.Config{})
+	require.NoError(t, err)
+
+	provider := engine2.NewMockProvider(c)
+
+	provider.EXPECT().
+		Config(gomock.Any(), gomock.Any()).
+		Return(&pluginv1.ProviderConfigResponse{Name: "test_provider"}, nil).AnyTimes()
+
+	provider.EXPECT().
+		GetSpecs(gomock.Any(), gomock.Any()).
+		Return(nil, engine2.ErrNotImplemented).AnyTimes()
+
+	provider.EXPECT().
+		Get(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, request *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
+			return &pluginv1.GetResponse{
+				Spec: &pluginv1.TargetSpec{
+					Ref:    &pluginv1.TargetRef{Package: "", Name: "child"},
+					Driver: "test_driver",
+				},
+			}, nil
+		}).Times(1)
+
+	_, err = e.RegisterProvider(ctx, provider)
+	require.NoError(t, err)
+
+	driver := engine2.NewMockDriver(c)
+
+	driver.EXPECT().
+		Config(gomock.Any(), gomock.Any()).
+		Return(&pluginv1.ConfigResponse{Name: "test_driver"}, nil).AnyTimes()
+
+	driver.EXPECT().
+		Parse(gomock.Any(), gomock.Any()).
+		Return(&pluginv1.ParseResponse{
+			Target: &pluginv1.TargetDef{
+				Ref:     &pluginv1.TargetRef{Package: "", Name: "child"},
+				Inputs:  nil,
+				Outputs: []string{""},
+				Cache:   true,
+			},
+		}, nil).Times(1)
+
+	driver.EXPECT().
+		Run(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+			return &pluginv1.RunResponse{
+				Artifacts: []*pluginv1.Artifact{
+					{
+						Group: "",
+						Name:  "out",
+						Type:  pluginv1.Artifact_TYPE_OUTPUT,
+						Content: &pluginv1.Artifact_Raw{
+							Raw: &pluginv1.Artifact_ContentRaw{
+								Data: []byte("hello"),
+								Path: "out.txt",
+							},
+						},
+					},
+				},
+			}, nil
+		}).Times(1)
+
+	_, err = e.RegisterDriver(ctx, driver, nil)
+	require.NoError(t, err)
+
+	cache := engine2.NewMockCache(c)
+
+	cache.EXPECT().
+		Get(gomock.Any(), "__child/a758f2d4b1f498ef/manifest.v1.json").
+		Return(nil, engine2.ErrNotFound).Times(1)
+
+	for _, key := range []string{"__child/a758f2d4b1f498ef/manifest.v1.json", "__child/a758f2d4b1f498ef/out_out.tar"} {
+		cache.EXPECT().
+			Store(gomock.Any(), key, gomock.Any()).
+			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {
+				b, err := io.ReadAll(reader)
+				if err != nil {
+					return err
+				}
+
+				cache.EXPECT().
+					Get(gomock.Any(), key).
+					Return(io.NopCloser(bytes.NewReader(b)), nil).Times(1)
+
+				return nil
+			}).Times(1)
+	}
+
+	_, err = e.RegisterCache("test", cache, true, true)
+	require.NoError(t, err)
+
+	assertOut := func(res *engine.ExecuteResultLocks) {
+		fs := hfstest.New(t)
+		err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs)
+		require.NoError(t, err)
+
+		b, err := hfs.ReadFile(fs, "out.txt")
+		require.NoError(t, err)
+
+		assert.Equal(t, "hello", string(b))
+	}
+
+	{ // This will run all
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
+		defer res.Unlock(ctx)
+
+		assertOut(res)
+		res.Unlock(ctx)
+	}
+
+	{ // this should reuse cache from deps
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+		require.NoError(t, err)
+		defer res.Unlock(ctx)
+
+		assertOut(res)
+		res.Unlock(ctx)
+	}
+
+	err = os.RemoveAll(filepath.Join(dir, ".heph"))
+	require.NoError(t, err)
+
+	{ // this should reuse cache from deps
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
