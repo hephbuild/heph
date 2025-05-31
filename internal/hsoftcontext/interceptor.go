@@ -121,7 +121,11 @@ func (i interceptor) handlerSide(ctx context.Context, id string) (context.Contex
 }
 
 var ignores = map[string]struct{}{
-	pluginv1connect.DriverRunProcedure: {},
+	pluginv1connect.DriverRunProcedure:    {},
+	pluginv1connect.DriverParseProcedure:  {},
+	pluginv1connect.DriverPipeProcedure:   {},
+	pluginv1connect.DriverConfigProcedure: {},
+	pluginv1connect.ProviderGetProcedure:  {},
 }
 
 const header = "x-heph-context-boundary-id"

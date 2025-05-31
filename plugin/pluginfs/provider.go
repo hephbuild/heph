@@ -41,10 +41,6 @@ func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*plugin
 	return &pluginv1.ProbeResponse{}, nil
 }
 
-func (p *Provider) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return nil, engine2.ErrNotImplemented
-}
-
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		return nil

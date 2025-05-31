@@ -42,10 +42,6 @@ func NewFunc(f func() []Target) *Plugin {
 	}
 }
 
-func (p *Plugin) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return nil, engine.ErrNotImplemented
-}
-
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		for _, target := range p.f() {

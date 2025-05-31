@@ -81,27 +81,6 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 	}, nil
 }
 
-func (p *Plugin) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.GetSpecsResponse) error) error {
-		_, err := p.runPkg(ctx, req.GetRef().GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
-			spec, err := p.toTargetSpec(ctx, payload)
-			if err != nil {
-				return err
-			}
-
-			err = send(&pluginv1.GetSpecsResponse{
-				Of: &pluginv1.GetSpecsResponse_Spec{
-					Spec: spec,
-				},
-			})
-
-			return err
-		}, nil)
-
-		return err
-	}), nil
-}
-
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 

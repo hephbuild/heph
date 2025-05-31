@@ -27,17 +27,11 @@ message ListResponse {
     }
 }
 
-message GetSpecsRequest {
-  string request_id = 1;
-  TargetRef ref = 2;
-  repeated ProviderState states = 3;
-}
-
-message GetSpecsResponse {
-    oneof of {
-      TargetRef ref = 1;
-      TargetSpec spec = 2;
-    }
+message GetContainer {
+  oneof msg {
+    GetRequest start = 1;
+    bool cancel = 2;
+  }
 }
 
 message GetRequest {
@@ -68,7 +62,6 @@ message ProbeResponse {
 service Provider {
   rpc Config(ProviderConfigRequest) returns (ProviderConfigResponse) {}
   rpc List(ListRequest) returns (stream ListResponse) {}
-  rpc Get(GetRequest) returns (GetResponse) {}
-  rpc GetSpecs(GetSpecsRequest) returns (stream GetSpecsResponse) {}
+  rpc Get(stream GetContainer) returns (stream GetResponse) {}
   rpc Probe(ProbeRequest) returns (ProbeResponse) {}
 }

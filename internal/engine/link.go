@@ -38,51 +38,6 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState, p EngineProvider) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
-	// TODO: caching must be smarter, probably package-based ?
-	specs, err, _ := rs.memSpecs.Do(providerKey+refKey(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
-		strm, err := p.GetSpecs(ctx, &pluginv1.GetSpecsRequest{
-			RequestId: rs.ID,
-			Ref:       c.Ref,
-			States:    states,
-		})
-		if err != nil {
-			if errors.Is(err, engine2.ErrNotImplemented) {
-				return nil, nil
-			}
-
-			return nil, err
-		}
-		defer strm.CloseReceive()
-
-		var specs []*pluginv1.TargetSpec
-		for strm.Receive() {
-			switch res := strm.Msg().GetOf().(type) {
-			case *pluginv1.GetSpecsResponse_Spec:
-				// TODO: what do we do if the spec.ref is different from the request ?
-
-				if !tref.Equal(res.Spec.GetRef(), c.GetRef()) {
-					rs.memRef.Set(refKey(res.Spec.GetRef()), res.Spec, nil)
-				}
-
-				specs = append(specs, res.Spec)
-			}
-		}
-		if err := strm.Err(); err != nil {
-			return nil, err
-		}
-
-		return specs, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	for _, spec := range specs {
-		if tref.Equal(spec.GetRef(), c.GetRef()) {
-			return spec, nil
-		}
-	}
-
 	spec, err, _ := rs.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		res, err := p.Get(ctx, &pluginv1.GetRequest{
 			RequestId: rs.ID,
@@ -238,7 +193,6 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 type RequestState struct {
 	ID string
 
-	memSpecs   hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
 	memSpecGet hsingleflight.GroupMem[*pluginv1.TargetSpec]
 	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]
 	memProbe   hsingleflight.GroupMem[[]*pluginv1.ProviderState]

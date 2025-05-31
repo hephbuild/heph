@@ -107,10 +107,6 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 	return &pluginv1.ProbeResponse{}, nil
 }
 
-func (p *Plugin) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (engine2.HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	return nil, engine2.ErrNotImplemented
-}
-
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		if _, ok := tref.CutPackagePrefix(req.GetPackage(), "@heph/file"); ok {

@@ -4,6 +4,7 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
@@ -12,7 +13,6 @@ type Provider interface {
 	Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error)
 	List(ctx context.Context, req *pluginv1.ListRequest) (HandlerStreamReceive[*pluginv1.ListResponse], error)
 	Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error)
-	GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (HandlerStreamReceive[*pluginv1.GetSpecsResponse], error)
 	Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error)
 }
 
@@ -56,21 +56,36 @@ func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListReque
 }
 
 func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	res, err := p.client.Get(ctx, connect.NewRequest(req))
+	hardCtx, cancelHardCtx := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHardCtx()
+
+	strm := p.client.Get(hardCtx)
+	defer strm.CloseResponse()
+	defer strm.CloseRequest()
+
+	go func() {
+		select {
+		case <-hardCtx.Done():
+			return
+		case <-ctx.Done():
+			err := strm.Send(&pluginv1.GetContainer{Msg: &pluginv1.GetContainer_Cancel{Cancel: true}})
+			if err != nil {
+				hlog.From(ctx).Error("failed to send cancel message", "err", err)
+			}
+		}
+	}()
+
+	err := strm.Send(&pluginv1.GetContainer{Msg: &pluginv1.GetContainer_Start{Start: req}})
 	if err != nil {
 		return nil, p.handleErr(ctx, err)
 	}
 
-	return res.Msg, nil
-}
-
-func (p providerConnectClient) GetSpecs(ctx context.Context, req *pluginv1.GetSpecsRequest) (HandlerStreamReceive[*pluginv1.GetSpecsResponse], error) {
-	res, err := p.client.GetSpecs(ctx, connect.NewRequest(req))
+	res, err := strm.Receive()
 	if err != nil {
 		return nil, p.handleErr(ctx, err)
 	}
 
-	return connectServerStream(res), nil
+	return res, nil
 }
 
 func (p providerConnectClient) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -131,31 +146,49 @@ func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[p
 	return nil
 }
 
-func (p providerConnectHandler) Get(ctx context.Context, req *connect.Request[pluginv1.GetRequest]) (*connect.Response[pluginv1.GetResponse], error) {
-	res, err := p.handler.Get(ctx, req.Msg)
-	if err != nil {
-		return nil, p.handleErr(ctx, err)
-	}
+func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStream[pluginv1.GetContainer, pluginv1.GetResponse]) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	return connect.NewResponse(res), nil
-}
+	startCh := make(chan *pluginv1.GetRequest, 1)
+	errCh := make(chan error, 1)
 
-func (p providerConnectHandler) GetSpecs(ctx context.Context, req *connect.Request[pluginv1.GetSpecsRequest], res *connect.ServerStream[pluginv1.GetSpecsResponse]) error {
-	strm, err := p.handler.GetSpecs(ctx, req.Msg)
-	if err != nil {
-		return p.handleErr(ctx, err)
-	}
-	defer strm.CloseReceive()
+	go func() {
+		defer cancel()
 
-	for strm.Receive() {
-		msg := strm.Msg()
-		err := res.Send(msg)
+		for {
+			msg, err := strm.Receive()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			switch msg := msg.Msg.(type) {
+			case *pluginv1.GetContainer_Start:
+				startCh <- msg.Start
+				close(startCh)
+			case *pluginv1.GetContainer_Cancel:
+				cancel()
+			}
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case startMsg := <-startCh:
+		res, err := p.handler.Get(ctx, startMsg)
+		if err != nil {
+			return p.handleErr(ctx, err)
+		}
+
+		err = strm.Send(res)
 		if err != nil {
 			return err
 		}
-	}
 
-	return nil
+		return nil
+	}
 }
 
 func (p providerConnectHandler) Probe(ctx context.Context, req *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
