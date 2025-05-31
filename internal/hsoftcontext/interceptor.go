@@ -7,6 +7,7 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
+	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	"sync/atomic"
 )
 
@@ -119,10 +120,18 @@ func (i interceptor) handlerSide(ctx context.Context, id string) (context.Contex
 	}, nil
 }
 
+var ignores = map[string]struct{}{
+	pluginv1connect.DriverRunProcedure: {},
+}
+
 const header = "x-heph-context-boundary-id"
 
 func (i interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		if _, ok := ignores[req.Spec().Procedure]; ok {
+			return next(ctx, req)
+		}
+
 		if req.Spec().IsClient {
 			id, nctx, cancel, err := i.clientSide(ctx)
 			if err != nil {
@@ -146,6 +155,10 @@ func (i interceptor) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
 
 func (i interceptor) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
 	return func(ctx context.Context, spec connect.Spec) connect.StreamingClientConn {
+		if _, ok := ignores[spec.Procedure]; ok {
+			return next(ctx, spec)
+		}
+
 		id, ctx, cancel, err := i.clientSide(ctx)
 		if err != nil {
 			hlog.From(ctx).Error("streaming client side", "error", err)
@@ -165,6 +178,10 @@ func (i interceptor) WrapStreamingClient(next connect.StreamingClientFunc) conne
 
 func (i interceptor) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
 	return func(ctx context.Context, conn connect.StreamingHandlerConn) error {
+		if _, ok := ignores[conn.Spec().Procedure]; ok {
+			return next(ctx, conn)
+		}
+
 		ctx, cancel, err := i.handlerSide(ctx, conn.RequestHeader().Get(header))
 		if err != nil {
 			return err

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/goccy/go-json"
-	"github.com/hephbuild/heph/hsync"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
@@ -72,21 +71,38 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 }
 
 type GetGoPackageCache struct {
-	stdListRes func() ([]Package, error)
+	stdListRes func() (map[string]Package, error)
 	modulesRes func() ([]Module, error)
 	basePkg    string
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors, requestId string) *GetGoPackageCache {
-	modulesRes := hsync.Go2(func() ([]Module, error) {
+	stdListRes, _ := p.stdCache.GetOrSet(stdCacheKey{
+		RequestId: requestId,
+		Factors:   factors,
+	}, sync.OnceValues(func() (map[string]Package, error) {
+		stdList, err := p.resultStdList(ctx, factors, requestId)
+		if err != nil {
+			return nil, err
+		}
+
+		stdListMap := make(map[string]Package, len(stdList))
+		for _, stdPkg := range stdList {
+			stdListMap[stdPkg.ImportPath] = stdPkg
+		}
+		return stdListMap, nil
+	}))
+
+	modulesRes, _ := p.moduleCache.GetOrSet(moduleCacheKey{
+		RequestId: requestId,
+		Factors:   factors,
+	}, sync.OnceValues(func() ([]Module, error) {
 		return p.goModules(ctx, basePkg, requestId)
-	})
+	}))
 
 	c := &GetGoPackageCache{
-		basePkg: basePkg,
-		stdListRes: func() ([]Package, error) {
-			return p.resultStdList(ctx, factors, requestId)
-		},
+		basePkg:    basePkg,
+		stdListRes: stdListRes,
 		modulesRes: modulesRes,
 	}
 
@@ -227,9 +243,7 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 		return Package{}, err
 	}
 
-	stdPkg, isStd := hslices.Find(stdList, func(p Package) bool {
-		return p.ImportPath == imp
-	})
+	stdPkg, isStd := stdList[imp]
 	if isStd {
 		return stdPkg, nil
 	}

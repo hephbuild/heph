@@ -60,12 +60,24 @@ type packageCacheKey struct {
 	BasePkg   string
 }
 
+type stdCacheKey struct {
+	RequestId string
+	Factors   Factors
+}
+
+type moduleCacheKey struct {
+	RequestId string
+	Factors   Factors
+}
+
 type Plugin struct {
 	resultClient     engine.EngineHandle
 	root             string
 	resultStdListMem hsingleflight.GroupMem[[]Package]
 
 	packageCache *cache.Cache[packageCacheKey, *GetGoPackageCache]
+	moduleCache  *cache.Cache[moduleCacheKey, func() ([]Module, error)]
+	stdCache     *cache.Cache[stdCacheKey, func() (map[string]Package, error)]
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
@@ -80,6 +92,8 @@ const Name = "go"
 func New() *Plugin {
 	return &Plugin{
 		packageCache: cache.New(cache.AsLRU[packageCacheKey, *GetGoPackageCache](lru.WithCapacity(10000))),
+		stdCache:     cache.New[stdCacheKey, func() (map[string]Package, error)](),
+		moduleCache:  cache.New[moduleCacheKey, func() ([]Module, error)](),
 	}
 }
 

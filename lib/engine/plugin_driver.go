@@ -4,6 +4,7 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
@@ -45,13 +46,36 @@ func (p driverConnectClient) Parse(ctx context.Context, req *pluginv1.ParseReque
 }
 
 func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
-	res, err := p.client.Run(ctx, connect.NewRequest(req))
+	hardCtx, cancelHardCtx := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelHardCtx()
+
+	strm := p.client.Run(hardCtx)
+	defer strm.CloseResponse()
+	defer strm.CloseRequest()
+
+	go func() {
+		select {
+		case <-hardCtx.Done():
+			return
+		case <-ctx.Done():
+			err := strm.Send(&pluginv1.RunContainer{Msg: &pluginv1.RunContainer_Cancel{Cancel: true}})
+			if err != nil {
+				hlog.From(ctx).Error("failed to send cancel message", "err", err)
+			}
+		}
+	}()
+
+	err := strm.Send(&pluginv1.RunContainer{Msg: &pluginv1.RunContainer_Start{Start: req}})
 	if err != nil {
 		return nil, p.handleErr(ctx, err)
 	}
 
-	return res.Msg, nil
+	res, err := strm.Receive()
+	if err != nil {
+		return nil, p.handleErr(ctx, err)
+	}
 
+	return res, nil
 }
 
 func (p driverConnectClient) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
@@ -100,13 +124,49 @@ func (p driverConnectHandler) Parse(ctx context.Context, req *connect.Request[pl
 	return connect.NewResponse(res), nil
 }
 
-func (p driverConnectHandler) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
-	res, err := p.handler.Run(ctx, req.Msg)
-	if err != nil {
-		return nil, p.handleErr(ctx, err)
-	}
+func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[pluginv1.RunContainer, pluginv1.RunResponse]) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	return connect.NewResponse(res), nil
+	startCh := make(chan *pluginv1.RunRequest, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer cancel()
+
+		for {
+			msg, err := strm.Receive()
+			if err != nil {
+				errCh <- err
+				return
+			}
+
+			switch msg := msg.Msg.(type) {
+			case *pluginv1.RunContainer_Start:
+				startCh <- msg.Start
+				close(startCh)
+			case *pluginv1.RunContainer_Cancel:
+				cancel()
+			}
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case startMsg := <-startCh:
+		res, err := p.handler.Run(ctx, startMsg)
+		if err != nil {
+			return p.handleErr(ctx, err)
+		}
+
+		err = strm.Send(res)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
 }
 
 func (p driverConnectHandler) Pipe(ctx context.Context, req *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {

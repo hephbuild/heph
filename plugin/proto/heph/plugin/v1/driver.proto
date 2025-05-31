@@ -29,6 +29,13 @@ message RunRequest {
   repeated string pipes = 6;
 }
 
+message RunContainer {
+  oneof msg {
+    RunRequest start = 1;
+    bool cancel = 2;
+  }
+}
+
 message Artifact {
   enum Type {
     TYPE_UNSPECIFIED = 0;
@@ -83,6 +90,6 @@ message PipeResponse {
 service Driver {
   rpc Config(ConfigRequest) returns (ConfigResponse) {}
   rpc Parse(ParseRequest) returns (ParseResponse) {}
-  rpc Run(RunRequest) returns (RunResponse) {}
+  rpc Run(stream RunContainer) returns (stream RunResponse) {}
   rpc Pipe(PipeRequest) returns (PipeResponse) {}
 }
