@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	cache "github.com/Code-Hex/go-generics-cache"
+	"github.com/Code-Hex/go-generics-cache/policy/lru"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
@@ -52,10 +54,18 @@ func FactorsFromArgs(args map[string]string) Factors {
 var _ engine2.Provider = (*Plugin)(nil)
 var _ engine2.PluginIniter = (*Plugin)(nil)
 
+type packageCacheKey struct {
+	RequestId string
+	Factors   Factors
+	BasePkg   string
+}
+
 type Plugin struct {
 	resultClient     engine.EngineHandle
 	root             string
 	resultStdListMem hsingleflight.GroupMem[[]Package]
+
+	packageCache *cache.Cache[packageCacheKey, *GetGoPackageCache]
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
@@ -68,7 +78,9 @@ func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
 const Name = "go"
 
 func New() *Plugin {
-	return &Plugin{}
+	return &Plugin{
+		packageCache: cache.New(cache.AsLRU[packageCacheKey, *GetGoPackageCache](lru.WithCapacity(10000))),
+	}
 }
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
@@ -109,7 +121,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.H
 				return nil
 			}
 
-			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Package, factors)
+			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Package, factors, req.RequestId)
 			if err != nil {
 				if errors.Is(err, errNotInGoModule) {
 					return nil
@@ -216,7 +228,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 	switch req.GetRef().GetName() {
 	case "build":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -226,16 +238,16 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors)
+		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
 	case "test":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
 
 		return p.runTest(ctx, goPkg, factors)
 	case "embedcfg":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -252,7 +264,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 		return p.embedCfg(ctx, tref.DirPackage(gomod), req.GetRef().GetPackage(), goPkg, factors, mode)
 	case "build_lib":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -267,9 +279,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode)
+		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.RequestId)
 	case "build_test":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -279,16 +291,16 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors)
+		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
 	case "testmain":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
 
 		return p.generateTestMain(ctx, goPkg, factors)
 	case "build_testmain_lib":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -298,9 +310,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors)
+		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
 	case "build_lib#asm":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +324,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 		return p.packageLibAsm(ctx, goPkg, factors, req.GetRef().Args["file"], mode)
 	case "build_lib#abi":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -324,7 +336,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 		return p.packageLibAbi(ctx, goPkg, factors, mode)
 	case "build_lib#incomplete":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
 		if err != nil {
 			return nil, err
 		}
@@ -339,13 +351,13 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode)
+		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.RequestId)
 	}
 
 	return nil, engine2.ErrNotFound
 }
 
-func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
 	entries, err := os.ReadDir(filepath.Join(p.root, pkg))
 	if err != nil {
 		return nil, nil, err
@@ -373,6 +385,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp strin
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
+		RequestId: requestId,
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref:    listRef,

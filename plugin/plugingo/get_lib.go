@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
+func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode, requestId string) (*pluginv1.GetResponse, error) {
 	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
 	if err != nil {
 		return nil, err
@@ -63,26 +63,26 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 		}, nil
 	}
 
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, false)
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, false, requestId)
 }
 
-func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode string) (*pluginv1.GetResponse, error) {
+func (p *Plugin) packageLibIncomplete(ctx context.Context, basePkg string, _goPkg Package, factors Factors, mode, requestId string) (*pluginv1.GetResponse, error) {
 	goPkg, err := p.libGoPkg(ctx, _goPkg, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	return p.packageLibInner(ctx, basePkg, goPkg, factors, true)
+	return p.packageLibInner(ctx, basePkg, goPkg, factors, true, requestId)
 }
 
-func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool) (*pluginv1.GetResponse, error) {
+func (p *Plugin) packageLibInner(ctx context.Context, basePkg string, goPkg LibPackage, factors Factors, incomplete bool, requestId string) (*pluginv1.GetResponse, error) {
 	if len(goPkg.GoFiles) == 0 {
 		return nil, fmt.Errorf("empty go file")
 	}
 
-	c := p.newGetGoPackageCache(ctx, basePkg, factors)
+	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
 
-	imports, err := p.goImportsToGoPkgs(ctx, goPkg.Imports, factors, c)
+	imports, err := p.goImportsToGoPkgs(ctx, goPkg.Imports, factors, c, requestId)
 	if err != nil {
 		return nil, err
 	}

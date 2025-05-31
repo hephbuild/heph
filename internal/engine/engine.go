@@ -5,6 +5,9 @@ import (
 	"connectrpc.com/otelconnect"
 	"context"
 	"errors"
+	"fmt"
+	cache "github.com/Code-Hex/go-generics-cache"
+	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	engine2 "github.com/hephbuild/heph/lib/engine"
@@ -94,6 +97,8 @@ type Engine struct {
 	Caches        []CacheHandle
 
 	SoftCancel *hsoftcontext.Handler
+
+	requestState *cache.Cache[string, *RequestState]
 }
 
 type EngineProvider struct {
@@ -112,12 +117,13 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	sandboxfs := hfs.At(homefs, "sandbox")
 
 	e := &Engine{
-		Root:       rootfs,
-		Home:       homefs,
-		Cache:      cachefs,
-		Sandbox:    sandboxfs,
-		RootSpan:   trace.SpanFromContext(ctx),
-		SoftCancel: hsoftcontext.NewHandler(),
+		Root:         rootfs,
+		Home:         homefs,
+		Cache:        cachefs,
+		Sandbox:      sandboxfs,
+		RootSpan:     trace.SpanFromContext(ctx),
+		SoftCancel:   hsoftcontext.NewHandler(),
+		requestState: cache.New[string, *RequestState](),
 	}
 
 	otelInterceptor, err := otelconnect.NewInterceptor(
@@ -172,4 +178,27 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	}
 
 	return e, nil
+}
+
+func (e *Engine) NewRequestState() (*RequestState, func()) {
+	id := uuid.New().String()
+
+	s := &RequestState{
+		ID: id,
+	}
+
+	e.requestState.Set(id, s)
+
+	return s, func() {
+		e.requestState.Delete(id)
+	}
+}
+
+func (e *Engine) GetRequestState(id string) (*RequestState, error) {
+	s, ok := e.requestState.Get(id)
+	if !ok {
+		return nil, fmt.Errorf("request state not found for id %q", id)
+	}
+
+	return s, nil
 }

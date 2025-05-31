@@ -15,8 +15,9 @@ message ProviderConfigResponse {
 }
 
 message ListRequest {
-  string package = 1;
-  bool deep = 2;
+  string request_id = 1;
+  string package = 2;
+  bool deep = 3;
 }
 
 message ListResponse {
@@ -27,8 +28,9 @@ message ListResponse {
 }
 
 message GetSpecsRequest {
-  TargetRef ref = 1;
-  repeated ProviderState states = 2;
+  string request_id = 1;
+  TargetRef ref = 2;
+  repeated ProviderState states = 3;
 }
 
 message GetSpecsResponse {
@@ -39,8 +41,9 @@ message GetSpecsResponse {
 }
 
 message GetRequest {
-  TargetRef ref = 1;
-  repeated ProviderState states = 2;
+  string request_id = 1;
+  TargetRef ref = 2;
+  repeated ProviderState states = 3;
 }
 
 message GetResponse {
@@ -48,7 +51,8 @@ message GetResponse {
 }
 
 message ProbeRequest {
-  string package = 1;
+  string request_id = 1;
+  string package = 2;
 }
 
 message ProviderState {

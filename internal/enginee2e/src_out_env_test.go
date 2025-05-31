@@ -204,7 +204,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.ResolveCache{})
+				res, err := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 
@@ -240,7 +240,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{}, &engine.ResolveCache{})
+				res, err := e.Result(ctx, "", test.target, []string{}, engine.ResultOptions{}, &engine.RequestState{})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 			})

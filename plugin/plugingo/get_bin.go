@@ -10,15 +10,15 @@ import (
 	"path/filepath"
 )
 
-func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
-	c := p.newGetGoPackageCache(ctx, basePkg, factors)
+func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
+	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
 
-	goPkg, err := p.getGoPackageFromHephPackage(ctx, goPkg.HephPackage, factors)
+	goPkg, err := p.getGoPackageFromHephPackage(ctx, goPkg.HephPackage, factors, requestId)
 	if err != nil {
 		return nil, fmt.Errorf("get pkg: %w", err)
 	}
 
-	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg, factors, c)
+	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg, factors, c, requestId)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 		}
 
 		if tref.Format(goPkg.LibTargetRef) == "//:" {
-			fmt.Println()
+			return nil, fmt.Errorf("invalid target ref found for %v", goPkg.ImportPath)
 		}
 
 		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.LibTargetRef, "a"))}

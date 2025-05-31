@@ -41,9 +41,10 @@ func init() {
 					return err
 				}
 
-				rc := engine.GlobalResolveCache
+				rs, cleanRs := e.NewRequestState()
+				defer cleanRs()
 
-				def, err := e.Link(ctx, engine.DefContainer{Ref: ref}, rc)
+				def, err := e.Link(ctx, engine.DefContainer{Ref: ref}, rs)
 				if err != nil {
 					return err
 				}

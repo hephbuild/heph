@@ -70,8 +70,8 @@ type ResultOptions struct {
 	Interactive     *pluginv1.TargetRef
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rc)
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -79,38 +79,38 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 	return res, nil
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, options, rc)
+	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, options, rs)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, options, rc)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, options, rs)
 }
-func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDefWithManifest", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, options, rc)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, options, rs)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, options, rc)
+	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, options, rs)
 }
 
-func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, options ResultOptions, rc *ResolveCache) ([]*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, options ResultOptions, rs *RequestState) ([]*ExecuteResultLocks, error) {
 	var out []*ExecuteResultLocks
 	var outm sync.Mutex
 
 	var matched bool
 	var g errgroup.Group
-	for ref, err := range e.Query(ctx, matcher, rc) {
+	for ref, err := range e.Query(ctx, matcher, rs) {
 		if err != nil {
 			for _, locks := range out {
 				locks.Unlock(ctx)
@@ -122,7 +122,7 @@ func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.Target
 		matched = true
 
 		g.Go(func() error {
-			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, options, rc)
+			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, options, rs)
 			if err != nil {
 				return err
 			}
@@ -155,22 +155,22 @@ type Meta struct {
 	Hashin string
 }
 
-func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, options ResultOptions, rc *ResolveCache) (*Meta, error) {
+func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, options ResultOptions, rs *RequestState) (*Meta, error) {
 	ctx, span := tracer.Start(ctx, "MetaFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rc)
+	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rs)
 }
 
-func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (*Meta, error) {
-	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rc)
+func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions, rs *RequestState) (*Meta, error) {
+	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.Link(ctx, c, rs)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
 	}
 
-	manifests, err := e.depsManifests(ctx, def, rc, options)
+	manifests, err := e.depsManifests(ctx, def, rs, options)
 	if err != nil {
 		return nil, fmt.Errorf("deps manifests: %w", err)
 	}
@@ -185,19 +185,19 @@ func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions
 	}, nil
 }
 
-func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rc *ResolveCache, options ResultOptions) (hartifact.Manifest, error) {
-	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rc)
+func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rs *RequestState, options ResultOptions) (hartifact.Manifest, error) {
+	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rs)
 }
 
-func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOptions, rc *ResolveCache) (hartifact.Manifest, error) {
-	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rc)
+func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOptions, rs *RequestState) (hartifact.Manifest, error) {
+	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.Link(ctx, c, rs)
 	})
 	if err != nil {
 		return hartifact.Manifest{}, fmt.Errorf("link: %w", err)
 	}
 
-	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, options, rc)
+	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, options, rs)
 	if err != nil {
 		return hartifact.Manifest{}, fmt.Errorf("result from def: %w", err)
 	}
@@ -225,15 +225,15 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
 		}
 	})
 
-	def, err, _ := rc.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rc)
+	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.Link(ctx, c, rs)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
@@ -245,7 +245,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 		outputs = def.Outputs
 	}
 
-	res, err, computed := rc.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResultLocks, error) {
+	res, err, computed := rs.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResultLocks, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
@@ -256,7 +256,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 		step, ctx := hstep.New(ctx, tref.Format(ref))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, def, outputs, options, rc)
+		res, err := e.innerResultWithSideEffects(ctx, def, outputs, options, rs)
 		if err != nil {
 			step.SetError()
 			return nil, fmt.Errorf("%v: %w", tref.Format(ref), err)
@@ -308,7 +308,7 @@ func (r DepsResults) Unlock(ctx context.Context) {
 	}
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rc *ResolveCache, options ResultOptions) (DepsResults, error) {
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *RequestState, options ResultOptions) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -330,7 +330,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rc *Reso
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, options, rc)
+			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, options, rs)
 			if err != nil {
 				return err
 			}
@@ -368,7 +368,7 @@ type DepMetaArtifact struct {
 	Hashout string
 }
 
-func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rc *ResolveCache, options ResultOptions) ([]DepMeta, error) {
+func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *RequestState, options ResultOptions) ([]DepMeta, error) {
 	ctx, span := tracer.Start(ctx, "depsManifests", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -390,7 +390,7 @@ func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rc *Re
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rc, options)
+			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rs, options)
 			if err != nil {
 				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
 			}
@@ -436,7 +436,7 @@ func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rc *Re
 
 const AllOutputs = "__all_outputs__"
 
-func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, rc *ResolveCache, hashin string) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState, hashin string) (*ExecuteResult, bool, error) {
 	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from local cache: %w", err)
@@ -446,7 +446,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 		return res, true, nil
 	}
 
-	res, ok, err = e.ResultFromRemoteCache(ctx, def, outputs, hashin, rc)
+	res, ok, err = e.ResultFromRemoteCache(ctx, def, outputs, hashin, rs)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from remote cache: %w", err)
 	}
@@ -458,8 +458,8 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rc *ResolveCache) (*ExecuteResultLocks, error) {
-	res, err := e.innerResult(ctx, def, options, outputs, rc)
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+	res, err := e.innerResult(ctx, def, options, outputs, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -473,8 +473,8 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rc *ResolveCache) (_ *ExecuteResultLocks, rerr error) {
-	meta, err := e.MetaFromDef(ctx, def.TargetDef, options, rc)
+func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rs *RequestState) (_ *ExecuteResultLocks, rerr error) {
+	meta, err := e.MetaFromDef(ctx, def.TargetDef, options, rs)
 	if err != nil {
 		return nil, fmt.Errorf("meta: %w", err)
 	}
@@ -492,7 +492,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 
-		res, ok, err := e.resultFromCache(ctx, def, outputs, rc, hashin)
+		res, ok, err := e.resultFromCache(ctx, def, outputs, rs, hashin)
 		if err != nil {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
@@ -510,7 +510,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		}
 	}
 
-	res, err, computed := rc.memExecute.Do(refKey(def.GetRef()), func() (*ExecuteResultLocks, error) {
+	res, err, computed := rs.memExecute.Do(refKey(def.GetRef()), func() (*ExecuteResultLocks, error) {
 		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, false)
 		if err != nil {
 			return nil, fmt.Errorf("lock cache: %w", err)
@@ -526,14 +526,14 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 
 		var res *ExecuteResult
 		if storeCache {
-			res, err = e.ExecuteAndCache(ctx, def, execOptions, rc)
+			res, err = e.ExecuteAndCache(ctx, def, execOptions, rs)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
 				return nil, err
 			}
 		} else {
-			res, err = e.Execute(ctx, def, execOptions, rc)
+			res, err = e.Execute(ctx, def, execOptions, rs)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
@@ -747,7 +747,7 @@ type ExecuteResultWithOrigin struct {
 	InputOrigin *pluginv1.TargetDef_InputOrigin
 }
 
-func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions) ([]string, func() error, error) {
+func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions, rs *RequestState) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
 	eg := &errgroup.Group{}
 
@@ -777,7 +777,9 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 	if options.Stdin != nil {
 		stdinErrCh = make(chan error)
 
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+			RequestId: rs.ID,
+		})
 		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -806,7 +808,9 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 	}
 
 	if options.Stdout != nil {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+			RequestId: rs.ID,
+		})
 		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -828,7 +832,9 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 	}
 
 	if options.Stderr != nil {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+			RequestId: rs.ID,
+		})
 		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -850,7 +856,9 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 	}
 
 	if stdin, ok := options.Stdin.(*os.File); ok {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{})
+		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+			RequestId: rs.ID,
+		})
 		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -887,7 +895,7 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rc *ResolveCache) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rs *RequestState) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
@@ -897,7 +905,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	})
 
-	results, err := e.depsResults(ctx, def, rc, options.ResultOptions)
+	results, err := e.depsResults(ctx, def, rs, options.ResultOptions)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -991,7 +999,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			pctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 			defer cancel()
 
-			pipes, pipesWait, err := e.pipes(pctx, driver, options)
+			pipes, pipesWait, err := e.pipes(pctx, driver, options, rs)
 			if err != nil {
 				runErr = err
 				return
@@ -1003,6 +1011,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			}()
 
 			runRes, runErr = driver.Run(ctx, &pluginv1.RunRequest{
+				RequestId:    rs.ID,
 				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  sandboxfs.Path(),
 				TreeRootPath: e.Root.Path(),
@@ -1126,8 +1135,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rc *ResolveCache) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, def, options, rc)
+func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rs *RequestState) (*ExecuteResult, error) {
+	res, err := e.Execute(ctx, def, options, rs)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)
 	}

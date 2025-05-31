@@ -4,22 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
-	engine2 "github.com/hephbuild/heph/lib/engine"
-	"path"
-	"path/filepath"
-	"slices"
-	"strings"
-	"sync"
-
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hsingleflight"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"path"
+	"path/filepath"
+	"slices"
+	"strings"
 )
 
 type SpecContainer struct {
@@ -38,14 +35,15 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref or spec must be specified")
 }
 
-func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache, p EngineProvider) (*pluginv1.TargetSpec, error) {
+func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState, p EngineProvider) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
 	// TODO: caching must be smarter, probably package-based ?
-	specs, err, _ := rc.memSpecs.Do(providerKey+refKey(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
+	specs, err, _ := rs.memSpecs.Do(providerKey+refKey(c.GetRef()), func() ([]*pluginv1.TargetSpec, error) {
 		strm, err := p.GetSpecs(ctx, &pluginv1.GetSpecsRequest{
-			Ref:    c.Ref,
-			States: states,
+			RequestId: rs.ID,
+			Ref:       c.Ref,
+			States:    states,
 		})
 		if err != nil {
 			if errors.Is(err, engine2.ErrNotImplemented) {
@@ -63,7 +61,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 				// TODO: what do we do if the spec.ref is different from the request ?
 
 				if !tref.Equal(res.Spec.GetRef(), c.GetRef()) {
-					rc.memRef.Set(refKey(res.Spec.GetRef()), res.Spec, nil)
+					rs.memRef.Set(refKey(res.Spec.GetRef()), res.Spec, nil)
 				}
 
 				specs = append(specs, res.Spec)
@@ -85,10 +83,11 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 		}
 	}
 
-	spec, err, _ := rc.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rs.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		res, err := p.Get(ctx, &pluginv1.GetRequest{
-			Ref:    c.GetRef(),
-			States: states,
+			RequestId: rs.ID,
+			Ref:       c.GetRef(),
+			States:    states,
 		})
 		if err != nil {
 			return nil, err
@@ -106,11 +105,11 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 
 }
 
-func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rc *ResolveCache) (*pluginv1.TargetSpec, error) {
+func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState) (*pluginv1.TargetSpec, error) {
 	ctx, span := tracer.Start(ctx, "ResolveSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
-	spec, err, _ := rc.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rs.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		for _, p := range e.Providers {
 			var providerStates []*pluginv1.ProviderState
 			for _, state := range states {
@@ -119,7 +118,7 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 				}
 			}
 
-			spec, err := e.resolveProvider(ctx, providerStates, c, rc, p)
+			spec, err := e.resolveProvider(ctx, providerStates, c, rs, p)
 			if err != nil {
 				if errors.Is(err, engine2.ErrNotFound) {
 					continue
@@ -148,7 +147,7 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 	return spec, nil
 }
 
-func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rc *ResolveCache) (*pluginv1.TargetSpec, error) {
+func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rs *RequestState) (*pluginv1.TargetSpec, error) {
 	ctx, span := tracer.Start(ctx, "GetSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
@@ -163,15 +162,15 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rc *ResolveCache)
 		return nil, errors.New("spec or ref must be specified")
 	}
 
-	states, err := e.ProbeSegments(ctx, c, pkg, rc)
+	states, err := e.ProbeSegments(ctx, c, pkg, rs)
 	if err != nil {
 		return nil, err
 	}
 
-	return e.ResolveSpec(ctx, states, c, rc)
+	return e.ResolveSpec(ctx, states, c, rs)
 }
 
-func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string, rc *ResolveCache) ([]*pluginv1.ProviderState, error) {
+func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string, rs *RequestState) ([]*pluginv1.ProviderState, error) {
 	return nil, nil
 
 	ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
@@ -189,9 +188,10 @@ func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string,
 		probePkg := path.Join(segments[:i]...)
 
 		for ip, p := range e.Providers {
-			probeStates, err, _ := rc.memProbe.Do(fmt.Sprintf("%v %v", ip, probePkg), func() ([]*pluginv1.ProviderState, error) {
+			probeStates, err, _ := rs.memProbe.Do(fmt.Sprintf("%v %v", ip, probePkg), func() ([]*pluginv1.ProviderState, error) {
 				res, err := p.Probe(ctx, &pluginv1.ProbeRequest{
-					Package: probePkg,
+					RequestId: rs.ID,
+					Package:   probePkg,
 				})
 				if err != nil {
 					return nil, err
@@ -235,7 +235,9 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref, spec or def must be specified")
 }
 
-type ResolveCache struct {
+type RequestState struct {
+	ID string
+
 	memSpecs   hsingleflight.GroupMem[[]*pluginv1.TargetSpec]
 	memSpecGet hsingleflight.GroupMem[*pluginv1.TargetSpec]
 	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]
@@ -246,20 +248,6 @@ type ResolveCache struct {
 
 	memResult  hsingleflight.GroupMem[*ExecuteResultLocks]
 	memExecute hsingleflight.GroupMem[*ExecuteResultLocks]
-
-	correlationId  string
-	correlationIdm sync.Mutex
-}
-
-func (c *ResolveCache) GetCorrelationId() string {
-	c.correlationIdm.Lock()
-	defer c.correlationIdm.Unlock()
-
-	if c.correlationId == "" {
-		c.correlationId = uuid.New().String()
-	}
-
-	return c.correlationId
 }
 
 type TargetDef struct {
@@ -275,7 +263,7 @@ func (t TargetDef) GetRef() *pluginv1.TargetRef {
 	return t.TargetSpec.GetRef()
 }
 
-func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (*TargetDef, error) {
+func (e *Engine) GetDef(ctx context.Context, c DefContainer, rs *RequestState) (*TargetDef, error) {
 	ctx, span := tracer.Start(ctx, "GetDef", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
@@ -290,11 +278,11 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 		}, nil
 	}
 
-	res, err, _ := rc.memDef.Do(refKey(c.GetRef()), func() (*TargetDef, error) {
+	res, err, _ := rs.memDef.Do(refKey(c.GetRef()), func() (*TargetDef, error) {
 		spec, err := e.GetSpec(ctx, SpecContainer{
 			Ref:  c.Ref,
 			Spec: c.Spec,
-		}, rc)
+		}, rs)
 		if err != nil {
 			return nil, err
 		}
@@ -305,7 +293,8 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rc *ResolveCache) (
 		}
 
 		res, err := driver.Parse(ctx, &pluginv1.ParseRequest{
-			Spec: spec,
+			RequestId: rs.ID,
+			Spec:      spec,
 		})
 		if err != nil {
 			return nil, err
@@ -355,7 +344,7 @@ func (t LightLinkedTarget) Clone() *LightLinkedTarget {
 	}
 }
 
-func (e *Engine) Link(ctx context.Context, c DefContainer, rc *ResolveCache) (*LightLinkedTarget, error) {
+func (e *Engine) Link(ctx context.Context, c DefContainer, rs *RequestState) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
 
@@ -365,7 +354,7 @@ func (e *Engine) Link(ctx context.Context, c DefContainer, rc *ResolveCache) (*L
 	step, ctx := hstep.New(ctx, fmt.Sprintf("Linking %v...", tref.Format(c.GetRef())))
 	defer step.Done()
 
-	def, err := e.GetDef(ctx, c, rc)
+	def, err := e.GetDef(ctx, c, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +371,7 @@ func (e *Engine) Link(ctx context.Context, c DefContainer, rc *ResolveCache) (*L
 
 		g.Go(func() error {
 			linkedDep, err, _ := sf.Do(refKey(depRef), func() (*TargetDef, error) {
-				return e.GetDef(ctx, DefContainer{Ref: depRef}, rc)
+				return e.GetDef(ctx, DefContainer{Ref: depRef}, rs)
 			})
 			if err != nil {
 				return err

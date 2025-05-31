@@ -15,16 +15,17 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func (p *Plugin) resultStdList(ctx context.Context, factors Factors) ([]Package, error) {
+func (p *Plugin) resultStdList(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
 	res, err, _ := p.resultStdListMem.Do(fmt.Sprintf("%#v", factors), func() ([]Package, error) {
-		return p.resultStdListInner(ctx, factors)
+		return p.resultStdListInner(ctx, factors, requestId)
 	})
 
 	return res, err
 }
 
-func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors) ([]Package, error) {
+func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
+		RequestId: requestId,
 		Of: &corev1.ResultRequest_Ref{
 			Ref: &pluginv1.TargetRef{
 				Package: "@heph/go/std",

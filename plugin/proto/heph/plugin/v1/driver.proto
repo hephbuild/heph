@@ -7,7 +7,8 @@ import "heph/plugin/v1/plugin.proto";
 import "google/protobuf/any.proto";
 
 message ParseRequest {
-  TargetSpec spec = 1;
+  string request_id = 1;
+  TargetSpec spec = 2;
 }
 
 message ParseResponse {
@@ -20,11 +21,12 @@ message ArtifactWithOrigin {
 }
 
 message RunRequest {
-  TargetDef target = 1;
-  string sandbox_path = 2;
-  string tree_root_path = 5;
-  repeated ArtifactWithOrigin inputs = 3;
-  repeated string pipes = 4;
+  string request_id = 1;
+  TargetDef target = 2;
+  string sandbox_path = 3;
+  string tree_root_path = 4;
+  repeated ArtifactWithOrigin inputs = 5;
+  repeated string pipes = 6;
 }
 
 message Artifact {
@@ -69,7 +71,9 @@ message ConfigResponse {
   repeated string ignore_from_hash = 9;
 }
 
-message PipeRequest {}
+message PipeRequest {
+  string request_id = 1;
+}
 
 message PipeResponse {
   string id = 1;

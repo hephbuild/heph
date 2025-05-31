@@ -60,7 +60,7 @@ func TestSanity(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, pkg, "sometarget", []string{""}, engine.ResultOptions{}, &engine.ResolveCache{})
+	res, err := e.Result(ctx, pkg, "sometarget", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

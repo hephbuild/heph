@@ -6,9 +6,10 @@ import "heph/plugin/v1/plugin.proto";
 import "heph/plugin/v1/tref.proto";
 
 message ResultRequest {
+  string request_id = 1;
   oneof of {
-    heph.plugin.v1.TargetRef ref = 1;
-    heph.plugin.v1.TargetSpec spec = 2;
+    heph.plugin.v1.TargetRef ref = 2;
+    heph.plugin.v1.TargetSpec spec = 3;
   }
 }
 

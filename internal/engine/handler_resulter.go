@@ -19,21 +19,21 @@ type resulterHandler struct {
 
 var tracer = otel.Tracer("heph/engine")
 
-var GlobalResolveCache = &ResolveCache{}
-
 func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*corev1.ResultResponse, error) {
-	rc := GlobalResolveCache
+	rs, err := r.GetRequestState(req.RequestId)
+	if err != nil {
+		return nil, err
+	}
 
 	var res *ExecuteResultLocks
-	var err error
 	switch kind := req.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
-		res, err = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{}, rc)
+		res, err = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, ResultOptions{}, rs)
 		if err != nil {
 			return nil, err
 		}
 	case *corev1.ResultRequest_Spec:
-		res, err = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rc)
+		res, err = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, ResultOptions{}, rs)
 		if err != nil {
 			return nil, err
 		}

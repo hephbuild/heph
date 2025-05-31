@@ -37,15 +37,15 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 	}, nil
 }
 
-func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
-	c := p.newGetGoPackageCache(ctx, basePkg, factors)
+func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
+	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
 
-	goPkgs, err := p.goListTestDepsPkgResult(ctx, goPkg.GetHephBuildPackage(), factors, c, testmainImports)
+	goPkgs, err := p.goListTestDepsPkgResult(ctx, goPkg.GetHephBuildPackage(), factors, c, testmainImports, requestId)
 	if err != nil {
 		return nil, fmt.Errorf("go list testdeps: %w", err)
 	}
 
-	libGoPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+	libGoPkg, err := p.getGoTestmainPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, requestId)
 	if err != nil {
 		return nil, err
 	}
@@ -94,10 +94,10 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 var testmainImports = []string{"os", "reflect", "testing", "testing/internal/testdeps"}
 
-func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
+func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
 	importsm := map[string]string{}
 
-	c := p.newGetGoPackageCache(ctx, basePkg, factors)
+	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
 
 	if len(_goPkg.TestGoFiles) > 0 {
 		testGoPkg, err := p.libGoPkg(ctx, _goPkg, ModeTest)
@@ -121,12 +121,12 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 		return nil, fmt.Errorf("this package has no tests")
 	}
 
-	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, _goPkg.ImportPath, factors, c)
+	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, _goPkg.ImportPath, factors, c, requestId)
 	if err != nil {
 		return nil, err
 	}
 
-	imports, err := p.goImportsToGoPkgs(ctx, goPkg.Imports, factors, c)
+	imports, err := p.goImportsToGoPkgs(ctx, goPkg.Imports, factors, c, requestId)
 	if err != nil {
 		return nil, err
 	}

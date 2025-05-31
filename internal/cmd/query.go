@@ -53,18 +53,19 @@ var queryCmd = func() *cobra.Command {
 				return err
 			}
 
-			rc := engine.GlobalResolveCache
-
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
 				e, err := newEngine(ctx, root)
 				if err != nil {
 					return err
 				}
 
-				queue, done := renderResults(ctx, execFunc)
-				defer done()
+				rs, cleanRs := e.NewRequestState()
+				defer cleanRs()
 
-				for ref, err := range e.Query(ctx, matcher, rc) {
+				queue, flushResults := renderResults(ctx, execFunc)
+				defer flushResults()
+
+				for ref, err := range e.Query(ctx, matcher, rs) {
 					if err != nil {
 						return err
 					}

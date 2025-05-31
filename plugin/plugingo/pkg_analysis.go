@@ -1,11 +1,13 @@
 package plugingo
 
 import (
+	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
 	"github.com/goccy/go-json"
 	"github.com/hephbuild/heph/hsync"
+	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
@@ -20,13 +22,10 @@ import (
 	"slices"
 	"strings"
 	"sync"
-
-	"connectrpc.com/connect"
-	"github.com/hephbuild/heph/internal/hartifact"
 )
 
-func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors) (Package, error) {
-	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp)
+func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors, requestId string) (Package, error) {
+	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp, requestId)
 	if err != nil {
 		return Package{}, fmt.Errorf("go list: %w", err)
 	}
@@ -78,18 +77,26 @@ type GetGoPackageCache struct {
 	basePkg    string
 }
 
-func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors) *GetGoPackageCache {
+func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors, requestId string) *GetGoPackageCache {
 	modulesRes := hsync.Go2(func() ([]Module, error) {
-		return p.goModules(ctx, basePkg)
+		return p.goModules(ctx, basePkg, requestId)
 	})
 
-	return &GetGoPackageCache{
+	c := &GetGoPackageCache{
 		basePkg: basePkg,
 		stdListRes: func() ([]Package, error) {
-			return p.resultStdList(ctx, factors)
+			return p.resultStdList(ctx, factors, requestId)
 		},
 		modulesRes: modulesRes,
 	}
+
+	c, _ = p.packageCache.GetOrSet(packageCacheKey{
+		RequestId: requestId,
+		Factors:   factors,
+		BasePkg:   basePkg,
+	}, c)
+
+	return c
 }
 
 func ParseThirdpartyPackage(pkg string) (string, string, string, string, bool) {
@@ -103,9 +110,9 @@ func ParseThirdpartyPackage(pkg string) (string, string, string, string, bool) {
 	return "", "", "", "", false
 }
 
-func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, factors Factors) (Package, error) {
+func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, factors Factors, requestId string) (Package, error) {
 	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(pkg); ok {
-		goPkg, err := p.goListPkgResult(ctx, basePkg, basePkg, path.Join(modPath, modPkgPath), factors)
+		goPkg, err := p.goListPkgResult(ctx, basePkg, basePkg, path.Join(modPath, modPkgPath), factors, requestId)
 		if err != nil {
 			return Package{}, fmt.Errorf("thirdparty: %w", err)
 		}
@@ -122,7 +129,7 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return Package{}, err
 	}
 
-	stdList, err := p.resultStdList(ctx, factors)
+	stdList, err := p.resultStdList(ctx, factors, requestId)
 	if err != nil {
 		return Package{}, err
 	}
@@ -134,7 +141,7 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return stdPkg, nil
 	}
 
-	goPkg, err := p.goListPkgResult(ctx, tref.DirPackage(gomod), pkg, ".", factors)
+	goPkg, err := p.goListPkgResult(ctx, tref.DirPackage(gomod), pkg, ".", factors, requestId)
 	if err != nil {
 		return Package{}, fmt.Errorf("in tree: %w", err)
 	}
@@ -142,8 +149,8 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 	return goPkg, nil
 }
 
-func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (LibPackage, error) {
-	goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
+func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache, requestId string) (LibPackage, error) {
+	goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 	if err != nil {
 		return LibPackage{}, err
 	}
@@ -190,7 +197,7 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	//	goPkg.Imports = append(goPkg.Imports, xxx)
 	//}
 
-	deps, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c)
+	deps, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c, requestId)
 	if err != nil {
 		return LibPackage{}, err
 	}
@@ -214,7 +221,7 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	}, nil
 }
 
-func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache) (Package, error) {
+func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache, requestId string) (Package, error) {
 	stdList, err := c.stdListRes()
 	if err != nil {
 		return Package{}, err
@@ -242,7 +249,7 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 
 	if hephPkg == "" {
 		// Attempt to download 3rdparty package
-		goPkg, err := p.goListPkgResult(ctx, c.basePkg, c.basePkg, imp, factors)
+		goPkg, err := p.goListPkgResult(ctx, c.basePkg, c.basePkg, imp, factors, requestId)
 		if err != nil {
 			return Package{}, err
 		}
@@ -250,16 +257,16 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 		return goPkg, nil
 	}
 
-	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors)
+	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors, requestId)
 }
 
-func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors Factors, c *GetGoPackageCache) ([]LibPackage, error) {
+func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors Factors, c *GetGoPackageCache, requestId string) ([]LibPackage, error) {
 	goPkgs := make([]LibPackage, len(goPkg.Deps))
 	var g errgroup.Group
 
 	for i, imp := range goPkg.Deps {
 		g.Go(func() error {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
+			goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
 				return fmt.Errorf("get pkg: %w", err)
 			}
@@ -283,8 +290,8 @@ func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors
 	return goPkgs, nil
 }
 
-func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache, extraImports []string) ([]LibPackage, error) {
-	goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors)
+func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache, extraImports []string, requestId string) ([]LibPackage, error) {
+	goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors, requestId)
 	if err != nil {
 		return nil, fmt.Errorf("get pkg: %w", err)
 	}
@@ -300,7 +307,7 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 	g.Go(func() error {
 		if len(goPkg.TestGoFiles) > 0 {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, requestId)
 			if err != nil {
 				return err
 			}
@@ -320,7 +327,7 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 	g.Go(func() error {
 		if len(goPkg.XTestGoFiles) > 0 {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c)
+			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, requestId)
 			if err != nil {
 				return err
 			}
@@ -339,7 +346,7 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 	})
 
 	g.Go(func() error {
-		res, err := p.goImportsToDeps(ctx, imports, factors, c)
+		res, err := p.goImportsToDeps(ctx, imports, factors, c, requestId)
 		if err != nil {
 			return fmt.Errorf("get deps: %w", err)
 		}
@@ -367,13 +374,13 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 	return goPkgs, nil
 }
 
-func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache) ([]Package, error) {
+func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string) ([]Package, error) {
 	goPkgs := make([]Package, len(imports))
 	var g errgroup.Group
 
 	for i, imp := range imports {
 		g.Go(func() error {
-			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
+			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
 				return fmt.Errorf("get pkg: %w", err)
 			}
@@ -392,20 +399,20 @@ func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factor
 	return goPkgs, nil
 }
 
-func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache) ([]LibPackage, error) {
+func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string) ([]LibPackage, error) {
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
 	var g errgroup.Group
 
 	for _, imp := range imports {
 		g.Go(func() error {
-			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c)
+			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
 				return fmt.Errorf("get pkg: %v: %w", imp, err)
 			}
 
 			g.Go(func() error {
-				depPkgs, err := p.goListDepsPkgResult(ctx, impGoPkg, factors, c)
+				depPkgs, err := p.goListDepsPkgResult(ctx, impGoPkg, factors, c, requestId)
 				if err != nil {
 					return fmt.Errorf("get deps: %v: %w", impGoPkg, err)
 				}
@@ -490,7 +497,7 @@ func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string
 	return gomod, gowork, nil
 }
 
-func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
+func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module, error) {
 	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
 		return nil, err
@@ -504,6 +511,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg string) ([]Module, error) {
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
+		RequestId: requestId,
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
