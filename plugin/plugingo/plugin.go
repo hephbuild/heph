@@ -68,6 +68,7 @@ type stdCacheKey struct {
 type moduleCacheKey struct {
 	RequestId string
 	Factors   Factors
+	BasePkg   string
 }
 
 type Plugin struct {

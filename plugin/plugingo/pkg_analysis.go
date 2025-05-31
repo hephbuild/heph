@@ -96,6 +96,7 @@ func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, facto
 	modulesRes, _ := p.moduleCache.GetOrSet(moduleCacheKey{
 		RequestId: requestId,
 		Factors:   factors,
+		BasePkg:   basePkg,
 	}, sync.OnceValues(func() ([]Module, error) {
 		return p.goModules(ctx, basePkg, requestId)
 	}))
