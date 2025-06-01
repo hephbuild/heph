@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/hephbuild/heph/tmatch"
+	sync_map "github.com/zolstein/sync-map"
 	"golang.org/x/sync/semaphore"
 	"iter"
 	"path/filepath"
@@ -108,8 +108,8 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 
 type queryState struct {
 	*Engine
-	seenPkg *cache.Cache[string, struct{}]
-	seenRef *cache.Cache[string, struct{}]
+	seenPkg sync_map.Map[string, struct{}]
+	seenRef sync_map.Map[string, struct{}]
 	ch      chan queryStateRes
 	wg      sync.WaitGroup
 	listSem *semaphore.Weighted
@@ -136,7 +136,7 @@ func (e *queryState) sendErr(ctx context.Context, err error) {
 }
 
 func (e *queryState) queryPackage(ctx context.Context, pkg string) {
-	if _, loaded := e.seenPkg.GetOrSet(pkg, struct{}{}); loaded {
+	if _, loaded := e.seenPkg.LoadOrStore(pkg, struct{}{}); loaded {
 		return
 	}
 
@@ -180,7 +180,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 }
 
 func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef, spec *pluginv1.TargetSpec) {
-	if _, loaded := e.seenRef.GetOrSet(tref.Format(ref), struct{}{}); loaded {
+	if _, loaded := e.seenRef.LoadOrStore(tref.Format(ref), struct{}{}); loaded {
 		return
 	}
 
@@ -252,8 +252,6 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rs 
 			Engine:  e,
 			rs:      rs,
 			ch:      make(chan queryStateRes, 1000),
-			seenPkg: cache.New[string, struct{}](),
-			seenRef: cache.New[string, struct{}](),
 			listSem: semaphore.NewWeighted(100),
 		}
 		return state.query2(ctx, matcher)

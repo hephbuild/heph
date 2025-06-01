@@ -8,12 +8,14 @@ type Pool[T any] struct {
 	once sync.Once
 }
 
+func (p *Pool[T]) init() {
+	p.p.New = func() any {
+		return p.New()
+	}
+}
+
 func (p *Pool[T]) Get() T {
-	p.once.Do(func() {
-		p.p.New = func() any {
-			return p.New()
-		}
-	})
+	p.once.Do(p.init)
 
 	return p.p.Get().(T)
 }

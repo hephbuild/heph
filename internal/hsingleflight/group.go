@@ -3,6 +3,7 @@ package hsingleflight
 import (
 	"fmt"
 	"github.com/dlsniper/debugger"
+	sync_map "github.com/zolstein/sync-map"
 	"sync"
 
 	"golang.org/x/sync/singleflight"
@@ -41,65 +42,19 @@ func (g *Group[T]) Do(key string, do func() (T, error)) (T, error, bool) {
 }
 
 type GroupMem[T any] struct {
-	g  Group[T]
-	mu sync.RWMutex
-	m  map[string]groupMemEntry[T]
-}
-
-type groupMemEntry[T any] struct {
-	v   T
-	err error
-}
-
-func (g *GroupMem[T]) get(key string) (T, error, bool) {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
-
-	e, ok := g.m[key]
-	if !ok {
-		var zero T
-		return zero, nil, false
-	}
-
-	return e.v, e.err, true
-}
-
-func (g *GroupMem[T]) set(key string, v T, err error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	if g.m == nil {
-		g.m = make(map[string]groupMemEntry[T])
-	}
-
-	g.m[key] = groupMemEntry[T]{v: v, err: err}
+	c sync_map.Map[string, func() (T, error)]
+	o sync.Once
 }
 
 func (g *GroupMem[T]) Set(key string, v T, err error) {
-	g.set(key, v, err)
+	g.c.LoadOrStore(key, sync.OnceValues(func() (T, error) {
+		return v, err
+	}))
 }
 
 func (g *GroupMem[T]) Do(key string, do func() (T, error)) (T, error, bool) {
-	v, err, ok := g.get(key)
-	if ok {
-		return v, err, false
-	}
+	f, loaded := g.c.LoadOrStore(key, sync.OnceValues(do))
+	v, err := f()
 
-	var computed bool
-	v, err, _ = g.g.Do(key, func() (T, error) {
-		v, err, ok := g.get(key)
-		if ok {
-			return v, err
-		}
-
-		computed = true
-
-		v, err = do()
-
-		g.set(key, v, err)
-
-		return v, err
-	})
-
-	return v, err, computed
+	return v, err, !loaded
 }

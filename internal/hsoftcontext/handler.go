@@ -5,15 +5,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
+	sync_map "github.com/zolstein/sync-map"
 	"io"
 )
 
 type Handler struct {
-	ctxs *cache.Cache[string, *ctxContainer]
+	ctxs sync_map.Map[string, *ctxContainer]
 }
 
 func (e *Handler) NewContext(ctx context.Context, strm *connect.BidiStream[corev1.NewContextRequest, corev1.NewContextResponse]) error {
@@ -23,7 +23,7 @@ func (e *Handler) NewContext(ctx context.Context, strm *connect.BidiStream[corev
 	c := &ctxContainer{
 		ctx: ictx,
 	}
-	e.ctxs.Set(id, c)
+	e.ctxs.Store(id, c)
 
 	defer func() {
 		icancel(errors.New("cleanup"))
@@ -62,7 +62,7 @@ func (e *Handler) NewContext(ctx context.Context, strm *connect.BidiStream[corev
 }
 
 func (e *Handler) ContextDone(ctx context.Context, req *connect.Request[corev1.ContextDoneRequest], res *connect.ServerStream[corev1.ContextDoneResponse]) error {
-	c, ok := e.ctxs.Get(req.Msg.Id)
+	c, ok := e.ctxs.Load(req.Msg.Id)
 	if !ok {
 		return fmt.Errorf("unknown request id: %q", req.Msg.Id)
 	}
@@ -91,5 +91,5 @@ type ctxContainer struct {
 }
 
 func NewHandler() *Handler {
-	return &Handler{ctxs: cache.New[string, *ctxContainer]()}
+	return &Handler{}
 }

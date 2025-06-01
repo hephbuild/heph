@@ -6,12 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	sync_map "github.com/zolstein/sync-map"
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
@@ -98,7 +98,7 @@ type Engine struct {
 
 	SoftCancel *hsoftcontext.Handler
 
-	requestState *cache.Cache[string, *RequestState]
+	requestState sync_map.Map[string, *RequestState]
 }
 
 type EngineProvider struct {
@@ -117,13 +117,12 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	sandboxfs := hfs.At(homefs, "sandbox")
 
 	e := &Engine{
-		Root:         rootfs,
-		Home:         homefs,
-		Cache:        cachefs,
-		Sandbox:      sandboxfs,
-		RootSpan:     trace.SpanFromContext(ctx),
-		SoftCancel:   hsoftcontext.NewHandler(),
-		requestState: cache.New[string, *RequestState](),
+		Root:       rootfs,
+		Home:       homefs,
+		Cache:      cachefs,
+		Sandbox:    sandboxfs,
+		RootSpan:   trace.SpanFromContext(ctx),
+		SoftCancel: hsoftcontext.NewHandler(),
 	}
 
 	otelInterceptor, err := otelconnect.NewInterceptor(
@@ -187,7 +186,7 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 		ID: id,
 	}
 
-	e.requestState.Set(id, s)
+	e.requestState.Store(id, s)
 
 	return s, func() {
 		e.requestState.Delete(id)
@@ -195,7 +194,7 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 }
 
 func (e *Engine) GetRequestState(id string) (*RequestState, error) {
-	s, ok := e.requestState.Get(id)
+	s, ok := e.requestState.Load(id)
 	if !ok {
 		return nil, fmt.Errorf("request state not found for id %q", id)
 	}

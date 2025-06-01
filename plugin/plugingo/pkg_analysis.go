@@ -77,7 +77,7 @@ type GetGoPackageCache struct {
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors, requestId string) *GetGoPackageCache {
-	stdListRes, _ := p.stdCache.GetOrSet(stdCacheKey{
+	stdListRes, _ := p.stdCache.LoadOrStore(stdCacheKey{
 		RequestId: requestId,
 		Factors:   factors,
 	}, sync.OnceValues(func() (map[string]Package, error) {
@@ -93,7 +93,7 @@ func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, facto
 		return stdListMap, nil
 	}))
 
-	modulesRes, _ := p.moduleCache.GetOrSet(moduleCacheKey{
+	modulesRes, _ := p.moduleCache.LoadOrStore(moduleCacheKey{
 		RequestId: requestId,
 		Factors:   factors,
 		BasePkg:   basePkg,
