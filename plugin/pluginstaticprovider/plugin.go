@@ -46,14 +46,8 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine.Ha
 	return engine.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		for _, target := range p.f() {
 			if req.GetPackage() != "" {
-				if req.GetDeep() {
-					if !tref.HasPackagePrefix(target.Spec.GetRef().GetPackage(), req.GetPackage()) {
-						continue
-					}
-				} else {
-					if target.Spec.GetRef().GetPackage() != req.GetPackage() {
-						continue
-					}
+				if target.Spec.GetRef().GetPackage() != req.GetPackage() {
+					continue
 				}
 			}
 

@@ -31,8 +31,11 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[string]struct{}, rs *RequestState) iter.Seq2[*pluginv1.TargetSpec, error] {
-	key := p.Name + " " + pkg
+func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[seenPkgKey]struct{}, rs *RequestState) iter.Seq2[*pluginv1.TargetSpec, error] {
+	key := seenPkgKey{
+		pname: p.Name,
+		pkg:   pkg,
+	}
 	if _, ok := seen[key]; ok {
 		return func(yield func(*pluginv1.TargetSpec, error) bool) {}
 	}
@@ -68,9 +71,14 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 	}
 }
 
+type seenPkgKey struct {
+	pname string
+	pkg   string
+}
+
 func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) iter.Seq2[*pluginv1.TargetRef, error] {
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
-		seenPkg := map[string]struct{}{}
+		seenPkg := map[seenPkgKey]struct{}{}
 		seenRef := map[string]struct{}{}
 
 		for pkg, err := range e.Packages(ctx, matcher) {
@@ -87,11 +95,12 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 					}
 
 					ref := spec.Ref
+					refstr := tref.Format(ref)
 
-					if _, ok := seenRef[tref.Format(ref)]; ok {
+					if _, ok := seenRef[refstr]; ok {
 						continue
 					}
-					seenRef[tref.Format(ref)] = struct{}{}
+					seenRef[refstr] = struct{}{}
 
 					if tmatch.MatchSpec(spec, matcher) != tmatch.MatchYes {
 						continue
@@ -247,6 +256,13 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 }
 
 func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) iter.Seq2[*pluginv1.TargetRef, error] {
+	if matcher, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
+		return func(yield func(*pluginv1.TargetRef, error) bool) {
+			spec, err := e.GetSpec(ctx, SpecContainer{Ref: matcher.Ref}, rs)
+			yield(spec.Ref, err)
+		}
+	}
+
 	if false {
 		state := &queryState{
 			Engine:  e,

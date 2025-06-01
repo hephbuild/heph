@@ -53,7 +53,7 @@ func TestHashDeps(t *testing.T) {
 
 	var at time.Time
 	{
-		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -67,7 +67,7 @@ func TestHashDeps(t *testing.T) {
 	}
 
 	{
-		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 

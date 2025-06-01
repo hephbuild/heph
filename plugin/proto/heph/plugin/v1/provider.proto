@@ -17,7 +17,6 @@ message ProviderConfigResponse {
 message ListRequest {
   string request_id = 1;
   string package = 2;
-  bool deep = 3;
 }
 
 message ListResponse {

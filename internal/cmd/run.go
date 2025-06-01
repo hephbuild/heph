@@ -36,11 +36,6 @@ func init() {
 				return err
 			}
 
-			matcher, err := parseMatcher(args, cwd, root)
-			if err != nil {
-				return err
-			}
-
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
 				e, err := newEngine(ctx, root)
 				if err != nil {
@@ -50,53 +45,52 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				resultOpts := engine.ResultOptions{
-					InteractiveExec: func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
-						return execFunc(func(args hbbtexec.RunArgs) error {
-							if iargs.Pty {
-								err := args.MakeRaw()
-								if err != nil {
-									return err
-								}
+				rs.InteractiveExec = func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
+					return execFunc(func(args hbbtexec.RunArgs) error {
+						if iargs.Pty {
+							err := args.MakeRaw()
+							if err != nil {
+								return err
 							}
+						}
 
-							iargs.Run(ctx, engine.ExecOptions{
-								Stdin:  args.Stdin,
-								Stdout: args.Stdout,
-								Stderr: args.Stderr,
-							})
-
-							return nil
+						iargs.Run(ctx, engine.ExecOptions{
+							Stdin:  args.Stdin,
+							Stdout: args.Stdout,
+							Stderr: args.Stderr,
 						})
-					},
+
+						return nil
+					})
 				}
 
-				if refm, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
-					resultOpts.Interactive = refm.Ref
-				}
-
-				if shell.bool {
-					if shell.str != "" {
-						resultOpts.Shell, err = tref.Parse(shell.str)
-						if err != nil {
-							return fmt.Errorf("shell flag: %w", err)
-						}
+				if shell.bool && shell.str != "" {
+					rs.Shell, err = tref.Parse(shell.str)
+					if err != nil {
+						return fmt.Errorf("shell flag: %w", err)
 					}
+				}
 
-					if resultOpts.Shell == nil {
-						if refm, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
-							resultOpts.Shell = refm.Ref
-						} else {
-							return errors.New("shell only supports a single target, specify --shell=//some:target")
-						}
+				matcher, matcherRef, err := parseMatcherResolve(ctx, e, rs, args, cwd, root)
+				if err != nil {
+					return err
+				}
+
+				rs.Interactive = matcherRef
+
+				if shell.bool && rs.Shell == nil {
+					if matcherRef != nil {
+						rs.Shell = matcherRef
+					} else {
+						return errors.New("shell only supports a single target, specify --shell=//some:target")
 					}
 				}
 
 				if force {
-					resultOpts.Force = matcher
+					rs.Force = matcher
 				}
 
-				res, err := e.ResultFromMatcher(ctx, matcher, resultOpts, rs)
+				res, err := e.ResultsFromMatcher(ctx, matcher, rs)
 				if err != nil {
 					return err
 				}

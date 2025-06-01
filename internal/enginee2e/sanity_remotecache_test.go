@@ -121,7 +121,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		require.NoError(t, err)
 
 		{
-			res, err := e.Result(ctx, pkg, "t1", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
+			res, err := e.Result(ctx, pkg, "t1", []string{""}, &engine.RequestState{})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
@@ -137,7 +137,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		}
 
 		{
-			res, err := e.Result(ctx, pkg, "t2", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
+			res, err := e.Result(ctx, pkg, "t2", []string{""}, &engine.RequestState{})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
@@ -153,7 +153,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		}
 
 		{
-			res, err := e.Result(ctx, pkg, "t3", []string{""}, engine.ResultOptions{}, &engine.RequestState{})
+			res, err := e.Result(ctx, pkg, "t3", []string{""}, &engine.RequestState{})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 

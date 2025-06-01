@@ -5,12 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"github.com/go-viper/mapstructure/v2"
-	engine2 "github.com/hephbuild/heph/lib/engine"
-	iofs "io/fs"
-
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
+	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -83,58 +81,23 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-
-		if !req.GetDeep() {
-			_, err := p.runPkg(ctx, req.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
-				spec, err := p.toTargetSpec(ctx, payload)
-				if err != nil {
-					return err
-				}
-
-				err = send(&pluginv1.ListResponse{
-					Of: &pluginv1.ListResponse_Spec{
-						Spec: spec,
-					},
-				})
-
+		_, err := p.runPkg(ctx, req.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
+			spec, err := p.toTargetSpec(ctx, payload)
+			if err != nil {
 				return err
-			}, nil)
+			}
+
+			err = send(&pluginv1.ListResponse{
+				Of: &pluginv1.ListResponse_Spec{
+					Spec: spec,
+				},
+			})
 
 			return err
-		}
+		}, nil)
 
-		// TODO: hfs.At(p.repoRoot, req.Package)
-		return hfs.Walk(p.repoRoot, func(path string, info iofs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if !info.IsDir() {
-				return nil
-			}
-
-			_, err = p.runPkg(ctx, path, func(ctx context.Context, payload OnTargetPayload) error {
-				spec, err := p.toTargetSpec(ctx, payload)
-				if err != nil {
-					return err
-				}
-
-				err = send(&pluginv1.ListResponse{
-					Of: &pluginv1.ListResponse_Spec{
-						Spec: spec,
-					},
-				})
-
-				return err
-			}, nil)
-			if err != nil {
-				return err
-			}
-
-			return nil
-		})
+		return err
 	}), nil
-
 }
 
 func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {

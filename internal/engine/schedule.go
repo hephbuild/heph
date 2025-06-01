@@ -51,8 +51,6 @@ type ExecOptions struct {
 }
 
 type ExecuteOptions struct {
-	ResultOptions ResultOptions
-
 	shell       bool
 	force       bool
 	interactive bool
@@ -63,15 +61,8 @@ type InteractiveExecOptions struct {
 	Pty bool
 }
 
-type ResultOptions struct {
-	InteractiveExec func(context.Context, InteractiveExecOptions) error
-	Shell           *pluginv1.TargetRef
-	Force           *pluginv1.TargetMatcher
-	Interactive     *pluginv1.TargetRef
-}
-
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, options, rs)
+func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
+	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -79,32 +70,32 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 	return res, nil
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, options, rs)
+	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, rs)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, options, rs)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, rs)
 }
-func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDefWithManifest", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, options, rs)
+	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, rs)
 }
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, options, rs)
+	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, rs)
 }
 
-func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, options ResultOptions, rs *RequestState) ([]*ExecuteResultLocks, error) {
+func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) ([]*ExecuteResultLocks, error) {
 	var out []*ExecuteResultLocks
 	var outm sync.Mutex
 
@@ -122,7 +113,7 @@ func (e *Engine) ResultFromMatcher(ctx context.Context, matcher *pluginv1.Target
 		matched = true
 
 		g.Go(func() error {
-			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, options, rs)
+			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, rs)
 			if err != nil {
 				return err
 			}
@@ -155,14 +146,14 @@ type Meta struct {
 	Hashin string
 }
 
-func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, options ResultOptions, rs *RequestState) (*Meta, error) {
+func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, rs *RequestState) (*Meta, error) {
 	ctx, span := tracer.Start(ctx, "MetaFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rs)
+	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, rs)
 }
 
-func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions, rs *RequestState) (*Meta, error) {
+func (e *Engine) meta(ctx context.Context, c DefContainer, rs *RequestState) (*Meta, error) {
 	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
 		return e.Link(ctx, c, rs)
 	})
@@ -170,7 +161,7 @@ func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions
 		return nil, fmt.Errorf("link: %w", err)
 	}
 
-	manifests, err := e.depsManifests(ctx, def, rs, options)
+	manifests, err := e.depsManifests(ctx, def, rs)
 	if err != nil {
 		return nil, fmt.Errorf("deps manifests: %w", err)
 	}
@@ -185,11 +176,11 @@ func (e *Engine) meta(ctx context.Context, c DefContainer, options ResultOptions
 	}, nil
 }
 
-func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rs *RequestState, options ResultOptions) (hartifact.Manifest, error) {
-	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, options, rs)
+func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rs *RequestState) (hartifact.Manifest, error) {
+	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, rs)
 }
 
-func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOptions, rs *RequestState) (hartifact.Manifest, error) {
+func (e *Engine) manifest(ctx context.Context, c DefContainer, rs *RequestState) (hartifact.Manifest, error) {
 	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
 		return e.Link(ctx, c, rs)
 	})
@@ -197,7 +188,7 @@ func (e *Engine) manifest(ctx context.Context, c DefContainer, options ResultOpt
 		return hartifact.Manifest{}, fmt.Errorf("link: %w", err)
 	}
 
-	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, options, rs)
+	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, rs)
 	if err != nil {
 		return hartifact.Manifest{}, fmt.Errorf("result from def: %w", err)
 	}
@@ -225,7 +216,7 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, rs *RequestState) (*ExecuteResultLocks, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
@@ -256,7 +247,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 		step, ctx := hstep.New(ctx, tref.Format(ref))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, def, outputs, options, rs)
+		res, err := e.innerResultWithSideEffects(ctx, def, outputs, rs)
 		if err != nil {
 			step.SetError()
 			return nil, fmt.Errorf("%v: %w", tref.Format(ref), err)
@@ -308,7 +299,7 @@ func (r DepsResults) Unlock(ctx context.Context) {
 	}
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *RequestState, options ResultOptions) (DepsResults, error) {
+func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *RequestState) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -330,7 +321,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *Requ
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, options, rs)
+			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, rs)
 			if err != nil {
 				return err
 			}
@@ -368,7 +359,7 @@ type DepMetaArtifact struct {
 	Hashout string
 }
 
-func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *RequestState, options ResultOptions) ([]DepMeta, error) {
+func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *RequestState) ([]DepMeta, error) {
 	ctx, span := tracer.Start(ctx, "depsManifests", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -390,7 +381,7 @@ func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *Re
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rs, options)
+			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rs)
 			if err != nil {
 				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
 			}
@@ -458,8 +449,8 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, options ResultOptions, rs *RequestState) (*ExecuteResultLocks, error) {
-	res, err := e.innerResult(ctx, def, options, outputs, rs)
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
+	res, err := e.innerResult(ctx, def, outputs, rs)
 	if err != nil {
 		return nil, err
 	}
@@ -473,16 +464,16 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, options ResultOptions, outputs []string, rs *RequestState) (_ *ExecuteResultLocks, rerr error) {
-	meta, err := e.MetaFromDef(ctx, def.TargetDef, options, rs)
+func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState) (_ *ExecuteResultLocks, rerr error) {
+	meta, err := e.MetaFromDef(ctx, def.TargetDef, rs)
 	if err != nil {
 		return nil, fmt.Errorf("meta: %w", err)
 	}
 
 	hashin := meta.Hashin
 
-	shouldShell := tref.Equal(options.Shell, def.GetRef())
-	shouldForce := tmatch.MatchSpec(def.TargetSpec, options.Force) == tmatch.MatchYes
+	shouldShell := tref.Equal(rs.Shell, def.GetRef())
+	shouldForce := tmatch.MatchSpec(def.TargetSpec, rs.Force) == tmatch.MatchYes
 	getCache := def.Cache && !shouldShell && !shouldForce
 	storeCache := def.Cache && !shouldShell
 
@@ -517,11 +508,9 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, option
 		}
 
 		execOptions := ExecuteOptions{
-			ResultOptions: options,
-
 			shell:       shouldShell,
 			force:       shouldForce,
-			interactive: tref.Equal(options.Shell, def.GetRef()) || tref.Equal(options.Interactive, def.GetRef()),
+			interactive: tref.Equal(rs.Shell, def.GetRef()) || tref.Equal(rs.Interactive, def.GetRef()),
 		}
 
 		var res *ExecuteResult
@@ -905,7 +894,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 		}
 	})
 
-	results, err := e.depsResults(ctx, def, rs, options.ResultOptions)
+	results, err := e.depsResults(ctx, def, rs)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -976,7 +965,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}
 
 	if options.interactive {
-		execWrapper = options.ResultOptions.InteractiveExec
+		execWrapper = rs.InteractiveExec
 		if execWrapper == nil {
 			return nil, errors.New("interactive mode requires interactiveExec")
 		}

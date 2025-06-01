@@ -84,7 +84,7 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -93,7 +93,7 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -213,7 +213,7 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -222,7 +222,7 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -234,7 +234,7 @@ func TestDepsCache2(t *testing.T) {
 	require.NoError(t, err)
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, engine.ResultOptions{}, &engine.RequestState{})
+		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 

@@ -191,7 +191,11 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 }
 
 type RequestState struct {
-	ID string
+	ID              string
+	InteractiveExec func(context.Context, InteractiveExecOptions) error
+	Shell           *pluginv1.TargetRef
+	Force           *pluginv1.TargetMatcher
+	Interactive     *pluginv1.TargetRef
 
 	memSpecGet hsingleflight.GroupMem[*pluginv1.TargetSpec]
 	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]

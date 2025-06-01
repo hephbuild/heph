@@ -177,6 +177,17 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.H
 				if err != nil {
 					return err
 				}
+
+				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
+					Ref: &pluginv1.TargetRef{
+						Package: goPkg.GetHephBuildPackage(),
+						Name:    "build_test",
+						Args:    factors.Args(),
+					},
+				}})
+				if err != nil {
+					return err
+				}
 			}
 		}
 
