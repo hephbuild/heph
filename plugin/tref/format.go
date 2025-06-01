@@ -44,15 +44,19 @@ var formatCache = cache.New[uint64, func() string](cache.AsLFU[uint64, func() st
 
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
 
+func sumRef(ref hproto.Hashable) uint64 {
+	h := formatHashPool.Get()
+	defer formatHashPool.Put(h)
+	h.Reset()
+
+	ref.HashPB(h, nil)
+
+	return h.Sum64()
+}
+
 func Format(ref Refable) string {
 	if refh, ok := ref.(hproto.Hashable); ok {
-		h := formatHashPool.Get()
-		defer formatHashPool.Put(h)
-		h.Reset()
-
-		refh.HashPB(h, nil)
-
-		sum := h.Sum64()
+		sum := sumRef(refh)
 
 		f, _ := formatCache.GetOrSet(sum, sync.OnceValue(func() string { return format(ref) }))
 
