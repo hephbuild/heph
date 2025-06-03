@@ -14,7 +14,7 @@ type CacheGet struct {
 }
 
 func (c *CacheGet) key(ref *pluginv1.TargetRef) string {
-	return tref.Format(ref)
+	return tref.Format(tref.FromProto(ref))
 }
 
 func (c *CacheGet) Singleflight(ctx context.Context, ref *pluginv1.TargetRef, f func() (*pluginv1.TargetSpec, error)) (*pluginv1.TargetSpec, error) {

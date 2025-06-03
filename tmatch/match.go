@@ -176,7 +176,7 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 
 	switch item := m.Item.(type) {
 	case *pluginv1.TargetMatcher_Ref:
-		return boolToResult(tref.Equal(item.Ref, spec.Ref))
+		return boolToResult(tref.Equal(tref.FromProto(item.Ref), tref.FromProto(spec.Ref)))
 	case *pluginv1.TargetMatcher_Package:
 		return boolToResult(item.Package == spec.Ref.Package)
 	case *pluginv1.TargetMatcher_PackagePrefix:
