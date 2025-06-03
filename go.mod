@@ -4,8 +4,6 @@ go 1.24
 
 toolchain go1.24.2
 
-replace github.com/cerbos/protoc-gen-go-hashpb => github.com/raphaelvigee/protoc-gen-go-hashpb v0.0.0-20250603101841-ba76dbe78c78
-
 tool github.com/cerbos/protoc-gen-go-hashpb
 
 tool capnproto.org/go/capnp/v3/capnpc-go
@@ -76,7 +74,7 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.51.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cerbos/protoc-gen-go-hashpb v0.4.0 // indirect
+	github.com/cerbos/protoc-gen-go-hashpb v0.4.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
 	github.com/charmbracelet/x/ansi v0.9.2 // indirect
