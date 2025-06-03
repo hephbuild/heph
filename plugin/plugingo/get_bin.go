@@ -18,13 +18,10 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 		return nil, fmt.Errorf("get pkg: %w", err)
 	}
 
-	goPkgs, err := p.goListDepsPkgResult(ctx, goPkg, factors, c, requestId)
+	goPkgs, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c, requestId, nil)
 	if err != nil {
 		return nil, err
 	}
-	//goPkgs = slices.DeleteFunc(goPkgs, func(p LibPackage) bool {
-	//	return p.GoPkg.IsCommand()
-	//})
 
 	mainRef := tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 

@@ -41,7 +41,6 @@ type Package struct {
 	build.Package
 	Factors          Factors
 	Module           *Module
-	Deps             []string // Thats an std field
 	HephPackage      string
 	HephBuildPackage string
 	IsStd            bool

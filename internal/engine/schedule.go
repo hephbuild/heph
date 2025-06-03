@@ -250,6 +250,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 		res, err := e.innerResultWithSideEffects(ctx, def, outputs, rs)
 		if err != nil {
 			step.SetError()
+
 			return nil, fmt.Errorf("%v: %w", tref.Format(ref), err)
 		}
 

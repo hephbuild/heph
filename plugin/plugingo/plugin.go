@@ -72,14 +72,19 @@ type moduleCacheKey struct {
 	BasePkg   string
 }
 
+type goModGoWorkCache struct {
+	gomod, gowork string
+}
+
 type Plugin struct {
 	resultClient     engine.EngineHandle
 	root             string
 	resultStdListMem hsingleflight.GroupMem[[]Package]
 
-	packageCache *cache.Cache[packageCacheKey, *GetGoPackageCache]
-	moduleCache  sync_map.Map[moduleCacheKey, func() ([]Module, error)]
-	stdCache     sync_map.Map[stdCacheKey, func() (map[string]Package, error)]
+	packageCache     *cache.Cache[packageCacheKey, *GetGoPackageCache]
+	moduleCache      sync_map.Map[moduleCacheKey, func() ([]Module, error)]
+	stdCache         sync_map.Map[stdCacheKey, func() (map[string]Package, error)]
+	goModGoWorkCache sync_map.Map[string, func() (goModGoWorkCache, error)]
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
@@ -379,21 +384,42 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 }
 
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
-	entries, err := os.ReadDir(filepath.Join(p.root, pkg))
+	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var files []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		files = append(files, tref.FormatFile(pkg, e.Name()))
+	if gomod != "" {
+		files = append(files, tref.FormatFile(tref.DirPackage(gomod), "go.mod"))
+	}
+	if gowork != "" {
+		files = append(files, tref.FormatFile(tref.DirPackage(gowork), "go.mod"))
 	}
 
 	args := f.Args()
-	if imp != "." {
+	if imp == "." {
+		entries, err := os.ReadDir(filepath.Join(p.root, pkg))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		var hasGoFile bool
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			files = append(files, tref.FormatFile(pkg, e.Name()))
+
+			if !hasGoFile && strings.HasSuffix(e.Name(), ".go") {
+				hasGoFile = true
+			}
+		}
+
+		if !hasGoFile {
+			return nil, nil, fmt.Errorf("no Go files")
+		}
+	} else {
 		args = hmaps.Concat(args, map[string]string{
 			"import": imp,
 		})

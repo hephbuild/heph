@@ -12,6 +12,7 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
+	sync_map "github.com/zolstein/sync-map"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
 	"io"
@@ -146,19 +147,22 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return Package{}, err
 	}
 
-	stdList, err := p.resultStdList(ctx, factors, requestId)
+	basePkg := tref.DirPackage(gomod)
+
+	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
+
+	stdList, err := c.stdListRes()
 	if err != nil {
 		return Package{}, err
 	}
 
-	stdPkg, isStd := hslices.Find(stdList, func(p Package) bool {
-		return p.HephPackage == pkg
-	})
-	if isStd {
-		return stdPkg, nil
+	for _, p := range stdList {
+		if p.HephPackage == pkg {
+			return p, nil
+		}
 	}
 
-	goPkg, err := p.goListPkgResult(ctx, tref.DirPackage(gomod), pkg, ".", factors, requestId)
+	goPkg, err := p.goListPkgResult(ctx, basePkg, pkg, ".", factors, requestId)
 	if err != nil {
 		return Package{}, fmt.Errorf("in tree: %w", err)
 	}
@@ -214,16 +218,6 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	//	goPkg.Imports = append(goPkg.Imports, xxx)
 	//}
 
-	deps, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c, requestId)
-	if err != nil {
-		return LibPackage{}, err
-	}
-
-	goPkg.Deps = nil
-	for _, dep := range deps {
-		goPkg.Deps = append(goPkg.Deps, dep.ImportPath)
-	}
-
 	return LibPackage{
 		Mode:       ModeNormal,
 		Imports:    goPkg.Imports,
@@ -244,8 +238,7 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 		return Package{}, err
 	}
 
-	stdPkg, isStd := stdList[imp]
-	if isStd {
+	if stdPkg, isStd := stdList[imp]; isStd {
 		return stdPkg, nil
 	}
 
@@ -275,36 +268,6 @@ func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, fac
 	return p.getGoPackageFromHephPackage(ctx, hephPkg, factors, requestId)
 }
 
-func (p *Plugin) goListDepsPkgResult(ctx context.Context, goPkg Package, factors Factors, c *GetGoPackageCache, requestId string) ([]LibPackage, error) {
-	goPkgs := make([]LibPackage, len(goPkg.Deps))
-	var g errgroup.Group
-
-	for i, imp := range goPkg.Deps {
-		g.Go(func() error {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
-			if err != nil {
-				return fmt.Errorf("get pkg: %w", err)
-			}
-
-			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeNormal)
-			if err != nil {
-				return fmt.Errorf("get lib pkg: %w", err)
-			}
-
-			goPkgs[i] = libGoPkg
-
-			return nil
-		})
-	}
-
-	err := g.Wait()
-	if err != nil {
-		return nil, err
-	}
-
-	return goPkgs, nil
-}
-
 func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factors Factors, c *GetGoPackageCache, extraImports []string, requestId string) ([]LibPackage, error) {
 	goPkg, err := p.getGoPackageFromHephPackage(ctx, pkg, factors, requestId)
 	if err != nil {
@@ -322,46 +285,49 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 	g.Go(func() error {
 		if len(goPkg.TestGoFiles) > 0 {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, requestId)
-			if err != nil {
-				return err
-			}
+			g.Go(func() error {
+				libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
+				if err != nil {
+					return err
+				}
 
-			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
-			if err != nil {
-				return err
-			}
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, libGoPkg)
+				goPkgsm.Unlock()
 
-			goPkgsm.Lock()
-			goPkgs = append(goPkgs, libGoPkg)
-			goPkgsm.Unlock()
+				res, err := p.goImportsToDeps(ctx, libGoPkg.Imports, factors, c, requestId, nil)
+				if err != nil {
+					return fmt.Errorf("get deps: %w", err)
+				}
+
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, res...)
+				goPkgsm.Unlock()
+
+				return nil
+			})
 		}
 
-		return nil
-	})
-
-	g.Go(func() error {
 		if len(goPkg.XTestGoFiles) > 0 {
-			goPkg, err := p.getGoPackageFromImportPath(ctx, goPkg.ImportPath, factors, c, requestId)
-			if err != nil {
-				return err
-			}
+			g.Go(func() error {
+				libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeXTest)
+				if err != nil {
+					return err
+				}
 
-			libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeXTest)
-			if err != nil {
-				return err
-			}
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, libGoPkg)
+				goPkgsm.Unlock()
 
-			goPkgsm.Lock()
-			goPkgs = append(goPkgs, libGoPkg)
-			goPkgsm.Unlock()
+				return nil
+			})
 		}
 
 		return nil
 	})
 
 	g.Go(func() error {
-		res, err := p.goImportsToDeps(ctx, imports, factors, c, requestId)
+		res, err := p.goImportsToDeps(ctx, imports, factors, c, requestId, nil)
 		if err != nil {
 			return fmt.Errorf("get deps: %w", err)
 		}
@@ -414,12 +380,20 @@ func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factor
 	return goPkgs, nil
 }
 
-func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string) ([]LibPackage, error) {
+func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string, seen *sync_map.Map[string, struct{}]) ([]LibPackage, error) {
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
 	var g errgroup.Group
 
+	if seen == nil {
+		seen = &sync_map.Map[string, struct{}]{}
+	}
+
 	for _, imp := range imports {
+		if _, loaded := seen.LoadOrStore(imp, struct{}{}); loaded {
+			continue
+		}
+
 		g.Go(func() error {
 			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
@@ -427,7 +401,7 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 			}
 
 			g.Go(func() error {
-				depPkgs, err := p.goListDepsPkgResult(ctx, impGoPkg, factors, c, requestId)
+				depPkgs, err := p.goImportsToDeps(ctx, impGoPkg.Imports, factors, c, requestId, seen)
 				if err != nil {
 					return fmt.Errorf("get deps: %v: %w", impGoPkg, err)
 				}
@@ -471,6 +445,27 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 var errNotInGoModule = errors.New("not in go module")
 
 func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string, error) {
+	f, _ := p.goModGoWorkCache.LoadOrStore(pkg, sync.OnceValues(func() (goModGoWorkCache, error) {
+		gomod, gowork, err := p.getGoModGoWorkInner(ctx, pkg)
+		if err != nil {
+			return goModGoWorkCache{}, err
+		}
+
+		return goModGoWorkCache{
+			gomod:  gomod,
+			gowork: gowork,
+		}, nil
+	}))
+
+	res, err := f()
+	if err != nil {
+		return "", "", err
+	}
+
+	return res.gomod, res.gowork, nil
+}
+
+func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (string, string, error) {
 	pkgParts := tref.SplitPackage(pkg)
 
 	var gomod, gowork string

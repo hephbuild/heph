@@ -38,6 +38,10 @@ func protoPathValueToDotPath(p protopath.Values) string {
 }
 
 func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
+	if len(paths) == 0 {
+		return m, nil
+	}
+
 	m = Clone(m)
 
 	err := protorange.Range(m.ProtoReflect(), func(p protopath.Values) error {
