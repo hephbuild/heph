@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
-	"github.com/hephbuild/heph/internal/hmaps"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
@@ -577,18 +576,20 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 	} else {
 		h = xxh3.New()
 	}
-	writeProto := func(v proto.Message, ignore map[string]struct{}) error {
-		return stableProtoHashEncode(h, v, ignore)
+	writeProto := func(v proto.Message) error {
+		return stableProtoHashEncode(h, v)
 	}
 
-	err := writeProto(def.GetRef(), nil)
+	err := writeProto(def.GetRef())
 	if err != nil {
 		return "", err
 	}
 
-	ignoreFromHash := e.DriversConfig[def.GetDriver()].GetIgnoreFromHash()
+	if len(def.Hash) == 0 {
+		return "", fmt.Errorf("hash is empty")
+	}
 
-	err = writeProto(def.Def, hmaps.Keyed(ignoreFromHash))
+	_, err = h.Write(def.Hash)
 	if err != nil {
 		return "", err
 	}

@@ -70,19 +70,14 @@ func (h hashWithDebug) Sum(b []byte) []byte {
 	return sum
 }
 
-func stableProtoHashEncode(w hash.Hash, v proto.Message, ignore map[string]struct{}) error {
+func stableProtoHashEncode(w hash.Hash, v proto.Message) error {
 	if v, ok := v.(hproto.Hashable); ok {
-		v.HashPB(w, ignore)
+		v.HashPB(w, nil)
 
 		return nil
 	}
 
 	// this is pretty damn inefficient, but at least its stable
-	v, err := hproto.RemoveMasked(v, ignore)
-	if err != nil {
-		return err
-	}
-
 	b, err := protojson.Marshal(v)
 	if err != nil {
 		return err

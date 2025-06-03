@@ -75,7 +75,6 @@ message ConfigRequest {}
 message ConfigResponse {
   string name = 1;
   google.protobuf.DescriptorProto target_schema = 2;
-  repeated string ignore_from_hash = 9;
 }
 
 message PipeRequest {

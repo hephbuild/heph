@@ -52,6 +52,7 @@ message TargetDef {
   CodegenTree codegen_tree = 7;
 
   bool pty = 8;
+  bytes hash = 10;
 }
 
 message TargetSpec {

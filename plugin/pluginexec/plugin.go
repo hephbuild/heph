@@ -6,6 +6,7 @@ import (
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/zeebo/xxh3"
 	"io"
 	"maps"
 	"net/http"
@@ -71,11 +72,6 @@ func (p *Plugin) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*plugin
 	return &pluginv1.ConfigResponse{
 		Name:         p.name,
 		TargetSchema: pdesc,
-		IgnoreFromHash: []string{
-			string(desc.FullName()) + ".runtime_deps",
-			string(desc.FullName()) + ".runtime_env",
-			string(desc.FullName()) + ".runtime_pass_env",
-		},
 	}, nil
 }
 
@@ -192,6 +188,14 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		}
 	}
 
+	hash := xxh3.New()
+	desc := target.ProtoReflect().Descriptor()
+	target.HashPB(hash, map[string]struct{}{
+		string(desc.FullName()) + ".runtime_deps":     {},
+		string(desc.FullName()) + ".runtime_env":      {},
+		string(desc.FullName()) + ".runtime_pass_env": {},
+	})
+
 	targetAny, err := anypb.New(target)
 	if err != nil {
 		return nil, err
@@ -226,6 +230,7 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			CollectOutputs:     collectOutputs,
 			CodegenTree:        codegenTree,
 			Pty:                targetSpec.Pty,
+			Hash:               hash.Sum(nil),
 		},
 	}, nil
 }

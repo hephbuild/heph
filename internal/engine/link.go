@@ -10,6 +10,7 @@ import (
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
@@ -268,6 +269,13 @@ func (e *Engine) GetDef(ctx context.Context, c DefContainer, rs *RequestState) (
 			if !slices.Contains(def.Outputs, output.Group) {
 				def.Outputs = append(def.Outputs, output.Group)
 			}
+		}
+
+		if len(def.Hash) == 0 {
+			h := xxh3.New()
+			def.HashPB(h, nil)
+
+			def.Hash = h.Sum(nil)
 		}
 
 		return &TargetDef{
