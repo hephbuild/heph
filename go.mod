@@ -4,6 +4,8 @@ go 1.24
 
 toolchain go1.24.2
 
+replace github.com/cerbos/protoc-gen-go-hashpb => github.com/raphaelvigee/protoc-gen-go-hashpb v0.0.0-20250603101841-ba76dbe78c78
+
 tool github.com/cerbos/protoc-gen-go-hashpb
 
 tool capnproto.org/go/capnp/v3/capnpc-go
