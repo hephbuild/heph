@@ -39,10 +39,6 @@ func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg P
 			continue
 		}
 
-		if tref.Format(goPkg.LibTargetRef) == "//:" {
-			return nil, fmt.Errorf("invalid target ref found for %v", goPkg.ImportPath)
-		}
-
 		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.LibTargetRef, "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
