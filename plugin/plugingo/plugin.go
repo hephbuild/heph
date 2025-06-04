@@ -118,6 +118,15 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.H
 			return nil
 		}
 
+		_, _, err := p.getGoModGoWork(ctx, req.Package)
+		if err != nil {
+			if errors.Is(err, errNotInGoModule) {
+				return nil
+			}
+
+			return err
+		}
+
 		// TODO: factors matrix
 		for _, factors := range []Factors{{
 			GoVersion: "1.24",
@@ -138,10 +147,6 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.H
 
 			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Package, factors, req.RequestId)
 			if err != nil {
-				if errors.Is(err, errNotInGoModule) {
-					return nil
-				}
-
 				if strings.Contains(err.Error(), "no Go files") {
 					return nil
 				}
