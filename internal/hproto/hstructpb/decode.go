@@ -19,6 +19,15 @@ func Decode[T any](from any) (T, error) {
 }
 
 func DecodeTo(from, to any) error {
+	if to, ok := to.(MapstructureDecoder); ok {
+		err := to.MapstructureDecode(from)
+		if err != nil {
+			return err
+		}
+
+		return nil
+	}
+
 	dec, err := mapstructure.NewDecoder(&mapstructure.DecoderConfig{
 		Result: to,
 		DecodeHook: mapstructure.ComposeDecodeHookFunc(

@@ -3,22 +3,34 @@ package pluginexec
 import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	"reflect"
 )
 
 type SpecStrings []string
 
 func (s *SpecStrings) MapstructureDecode(v any) error {
-	if v, err := hstructpb.Decode[string](v); err == nil {
-		*s = []string{v}
-		return nil
-	}
+	rv := reflect.ValueOf(v)
 
-	if v, err := hstructpb.DecodeSlice[string](v); err == nil {
-		*s = v
+	switch rv.Kind() {
+	case reflect.String:
+		*s = []string{rv.Interface().(string)}
 		return nil
-	}
+	case reflect.Slice, reflect.Array:
+		values := make([]string, 0, rv.Len())
+		for i := 0; i < rv.Len(); i++ {
+			elem := rv.Index(i)
 
-	return fmt.Errorf("expected string or []string, got %T", v)
+			if v, ok := elem.Interface().(string); ok {
+				values = append(values, v)
+			} else {
+				return fmt.Errorf("expected string, got %v", elem.Type())
+			}
+		}
+		*s = values
+		return nil
+	default:
+		return fmt.Errorf("expected string or []string, got %T", v)
+	}
 }
 
 type SpecDeps map[string]SpecStrings //nolint:recvcheck
