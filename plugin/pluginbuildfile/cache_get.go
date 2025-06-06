@@ -10,7 +10,7 @@ import (
 )
 
 type CacheGet struct {
-	sf hsingleflight.GroupMem[*pluginv1.TargetSpec]
+	sf hsingleflight.GroupMem[string, *pluginv1.TargetSpec]
 }
 
 func (c *CacheGet) key(ref *pluginv1.TargetRef) string {

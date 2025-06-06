@@ -315,8 +315,9 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, regi
 		return DriverHandle{}, err
 	}
 
-	cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
-	client := engine2.NewDriverConnectClient(cclient)
+	//cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
+	//client := engine2.NewDriverConnectClient(cclient)
+	client := driver
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]engine2.Driver{}

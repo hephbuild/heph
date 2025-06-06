@@ -144,6 +144,7 @@ func (m Model) View() string {
 	}
 
 	return lipgloss.NewStyle().
+		Renderer(m.renderer).
 		MaxWidth(m.width).
 		MaxHeight(m.height / 2).
 		Render(sb.String())
@@ -241,7 +242,7 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 		cancel(cause)
 	})
 
-	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin))
+	p := tea.NewProgram(m, tea.WithOutput(os.Stderr), tea.WithInput(os.Stdin), tea.WithFPS(25))
 	go func() {
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)

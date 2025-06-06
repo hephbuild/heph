@@ -15,7 +15,6 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
-	sync_map "github.com/zolstein/sync-map"
 	"google.golang.org/protobuf/types/known/structpb"
 	"os"
 	"path/filepath"
@@ -79,12 +78,12 @@ type goModGoWorkCache struct {
 type Plugin struct {
 	resultClient     engine.EngineHandle
 	root             string
-	resultStdListMem hsingleflight.GroupMem[[]Package]
+	resultStdListMem hsingleflight.GroupMem[Factors, []Package]
 
 	packageCache     *cache.Cache[packageCacheKey, *GetGoPackageCache]
-	moduleCache      sync_map.Map[moduleCacheKey, func() ([]Module, error)]
-	stdCache         sync_map.Map[stdCacheKey, func() (map[string]Package, error)]
-	goModGoWorkCache sync_map.Map[string, func() (goModGoWorkCache, error)]
+	moduleCache      hsingleflight.GroupMem[moduleCacheKey, []Module]
+	stdCache         hsingleflight.GroupMem[stdCacheKey, map[string]Package]
+	goModGoWorkCache hsingleflight.GroupMem[string, goModGoWorkCache]
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {

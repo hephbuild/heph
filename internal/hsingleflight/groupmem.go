@@ -5,9 +5,9 @@ import (
 	"sync/atomic"
 )
 
-type GroupMem[T any] struct {
-	c  sync_map.Map[string, groupMemEntry[T]]
-	o  Group[string, groupMemEntry[T]]
+type GroupMem[K comparable, T any] struct {
+	c  sync_map.Map[K, groupMemEntry[T]]
+	o  Group[K, groupMemEntry[T]]
 	cc atomic.Uint32
 }
 
@@ -17,7 +17,7 @@ type groupMemEntry[T any] struct {
 	id  uint32
 }
 
-func (g *GroupMem[T]) Do(key string, do func() (T, error)) (T, error, bool) {
+func (g *GroupMem[K, T]) Do(key K, do func() (T, error)) (T, error, bool) {
 	res, ok := g.c.Load(key)
 	if ok {
 		return res.v, res.err, true

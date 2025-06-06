@@ -78,34 +78,38 @@ type GetGoPackageCache struct {
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors, requestId string) *GetGoPackageCache {
-	stdListRes, _ := p.stdCache.LoadOrStore(stdCacheKey{
-		RequestId: requestId,
-		Factors:   factors,
-	}, sync.OnceValues(func() (map[string]Package, error) {
-		stdList, err := p.resultStdList(ctx, factors, requestId)
-		if err != nil {
-			return nil, err
-		}
-
-		stdListMap := make(map[string]Package, len(stdList))
-		for _, stdPkg := range stdList {
-			stdListMap[stdPkg.ImportPath] = stdPkg
-		}
-		return stdListMap, nil
-	}))
-
-	modulesRes, _ := p.moduleCache.LoadOrStore(moduleCacheKey{
-		RequestId: requestId,
-		Factors:   factors,
-		BasePkg:   basePkg,
-	}, sync.OnceValues(func() ([]Module, error) {
-		return p.goModules(ctx, basePkg, requestId)
-	}))
-
 	c := &GetGoPackageCache{
-		basePkg:    basePkg,
-		stdListRes: stdListRes,
-		modulesRes: modulesRes,
+		basePkg: basePkg,
+		stdListRes: func() (map[string]Package, error) {
+			res, err, _ := p.stdCache.Do(stdCacheKey{
+				RequestId: requestId,
+				Factors:   factors,
+			}, func() (map[string]Package, error) {
+				stdList, err := p.resultStdList(ctx, factors, requestId)
+				if err != nil {
+					return nil, err
+				}
+
+				stdListMap := make(map[string]Package, len(stdList))
+				for _, stdPkg := range stdList {
+					stdListMap[stdPkg.ImportPath] = stdPkg
+				}
+				return stdListMap, nil
+			})
+
+			return res, err
+		},
+		modulesRes: func() ([]Module, error) {
+			res, err, _ := p.moduleCache.Do(moduleCacheKey{
+				RequestId: requestId,
+				Factors:   factors,
+				BasePkg:   basePkg,
+			}, func() ([]Module, error) {
+				return p.goModules(ctx, basePkg, requestId)
+			})
+
+			return res, err
+		},
 	}
 
 	c, _ = p.packageCache.GetOrSet(packageCacheKey{
@@ -445,7 +449,7 @@ func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors 
 var errNotInGoModule = errors.New("not in go module")
 
 func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string, error) {
-	f, _ := p.goModGoWorkCache.LoadOrStore(pkg, sync.OnceValues(func() (goModGoWorkCache, error) {
+	res, err, _ := p.goModGoWorkCache.Do(pkg, sync.OnceValues(func() (goModGoWorkCache, error) {
 		gomod, gowork, err := p.getGoModGoWorkInner(ctx, pkg)
 		if err != nil {
 			return goModGoWorkCache{}, err
@@ -456,8 +460,6 @@ func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string
 			gowork: gowork,
 		}, nil
 	}))
-
-	res, err := f()
 	if err != nil {
 		return "", "", err
 	}

@@ -16,7 +16,7 @@ import (
 )
 
 func (p *Plugin) resultStdList(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
-	res, err, _ := p.resultStdListMem.Do(fmt.Sprintf("%#v", factors), func() ([]Package, error) {
+	res, err, _ := p.resultStdListMem.Do(factors, func() ([]Package, error) {
 		return p.resultStdListInner(ctx, factors, requestId)
 	})
 

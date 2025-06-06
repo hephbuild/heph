@@ -8,7 +8,7 @@ import (
 )
 
 type CacheRunpkg struct {
-	sf hsingleflight.GroupMem[CacheRunpkgEntry]
+	sf hsingleflight.GroupMem[string, CacheRunpkgEntry]
 }
 
 type CacheRunpkgEntry struct {

@@ -39,7 +39,7 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState, p EngineProvider) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
-	spec, err, _ := rs.memSpecGet.Do(providerKey+refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := rs.memSpecGet.Do(memSpecGetKey{providerName: providerKey, refKey: refKey(c.GetRef())}, func() (*pluginv1.TargetSpec, error) {
 		res, err := p.Get(ctx, &pluginv1.GetRequest{
 			RequestId: rs.ID,
 			Ref:       c.GetRef(),
@@ -191,6 +191,10 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref, spec or def must be specified")
 }
 
+type memSpecGetKey struct {
+	providerName, refKey string
+}
+
 type RequestState struct {
 	ID              string
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
@@ -198,15 +202,15 @@ type RequestState struct {
 	Force           *pluginv1.TargetMatcher
 	Interactive     *pluginv1.TargetRef
 
-	memSpecGet hsingleflight.GroupMem[*pluginv1.TargetSpec]
-	memRef     hsingleflight.GroupMem[*pluginv1.TargetSpec]
-	memProbe   hsingleflight.GroupMem[[]*pluginv1.ProviderState]
+	memSpecGet hsingleflight.GroupMem[memSpecGetKey, *pluginv1.TargetSpec]
+	memRef     hsingleflight.GroupMem[string, *pluginv1.TargetSpec]
+	memProbe   hsingleflight.GroupMem[string, []*pluginv1.ProviderState]
 
-	memLink hsingleflight.GroupMem[*LightLinkedTarget]
-	memDef  hsingleflight.GroupMem[*TargetDef]
+	memLink hsingleflight.GroupMem[string, *LightLinkedTarget]
+	memDef  hsingleflight.GroupMem[string, *TargetDef]
 
-	memResult  hsingleflight.GroupMem[*ExecuteResultLocks]
-	memExecute hsingleflight.GroupMem[*ExecuteResultLocks]
+	memResult  hsingleflight.GroupMem[string, *ExecuteResultLocks]
+	memExecute hsingleflight.GroupMem[string, *ExecuteResultLocks]
 }
 
 type TargetDef struct {
@@ -330,7 +334,7 @@ func (e *Engine) Link(ctx context.Context, c DefContainer, rs *RequestState) (*L
 		Inputs:    make([]*LightLinkedTargetInput, len(def.GetInputs())),
 	}
 
-	var sf hsingleflight.GroupMem[*TargetDef]
+	var sf hsingleflight.GroupMem[string, *TargetDef]
 	var g errgroup.Group
 	for i, input := range def.GetInputs() {
 		depRef := tref.WithoutOut(input.GetRef())

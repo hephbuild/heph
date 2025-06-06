@@ -11,6 +11,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 	"strings"
+	"unsafe"
 )
 
 type Ref = pluginv1.TargetRef
@@ -50,9 +51,40 @@ func sumRef(ref hproto.Hashable) uint64 {
 	defer formatHashPool.Put(h)
 	h.Reset()
 
-	ref.HashPB(h, nil)
+	switch ref := ref.(type) {
+	case *pluginv1.TargetRef:
+		sumRefTargetRef(h, ref)
+	case *pluginv1.TargetRefWithOutput:
+		sumRefTargetRefWithOutput(h, ref)
+	default:
+		ref.HashPB(h, nil)
+	}
 
 	return h.Sum64()
+}
+
+func sumRefTargetRef(hasher *xxh3.Hasher, m *pluginv1.TargetRef) {
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
+	for _, k := range hmaps.Sorted(m.Args) {
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.Args[k]), len(m.Args[k])))
+	}
+}
+
+func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOutput) {
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
+	for _, k := range hmaps.Sorted(m.Args) {
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.Args[k]), len(m.Args[k])))
+	}
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetOutput()), len(m.GetOutput())))
+	if len(m.Filters) > 0 {
+		for _, v := range m.Filters {
+			_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
+		}
+	}
 }
 
 func Format(ref Refable) string {
