@@ -7,10 +7,10 @@ import (
 	"github.com/hephbuild/heph/hsync"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto"
+	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 	"strings"
-	"sync"
 )
 
 type Ref = pluginv1.TargetRef
@@ -40,7 +40,8 @@ func FormatFile(pkg string, file string) string {
 	})
 }
 
-var formatCache = cache.New[uint64, func() string](cache.AsLFU[uint64, func() string](lfu.WithCapacity(10000)))
+var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
+var formatSf = hsingleflight.Group[uint64, string]{}
 
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
 
@@ -58,9 +59,25 @@ func Format(ref Refable) string {
 	if refh, ok := ref.(hproto.Hashable); ok {
 		sum := sumRef(refh)
 
-		f, _ := formatCache.GetOrSet(sum, sync.OnceValue(func() string { return format(ref) }))
+		f, ok := formatCache.Get(sum)
+		if ok {
+			return f
+		}
 
-		return f()
+		f, _, _ = formatSf.Do(sum, func() (string, error) {
+			f, ok := formatCache.Get(sum)
+			if ok {
+				return f, nil
+			}
+
+			f = format(ref)
+
+			formatCache.Set(sum, f)
+
+			return f, nil
+		})
+
+		return f
 	}
 
 	return format(ref)
