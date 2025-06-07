@@ -20,7 +20,7 @@ type groupMemEntry[T any] struct {
 func (g *GroupMem[K, T]) Do(key K, do func() (T, error)) (T, error, bool) {
 	res, ok := g.c.Load(key)
 	if ok {
-		return res.v, res.err, true
+		return res.v, res.err, false
 	}
 
 	i := g.cc.Add(1)
