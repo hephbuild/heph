@@ -1,5 +1,7 @@
 # Ironic isn't it ? :) Well, one need to bootstrap the build system...
 
+MAKEFLAGS += --always-make
+
 location = ~/.local/bin/heph2
 
 install-dev:

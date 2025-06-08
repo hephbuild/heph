@@ -100,23 +100,25 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 
 		b64Path := base64.URLEncoding.EncodeToString([]byte(path))
 
-		return l, "http://" + unixPathPrefix + b64Path, cleanup, nil
+		return l, unixPathPrefix + b64Path, cleanup, nil
 	} else {
 		l, err := net.Listen("tcp", "127.0.0.1:")
 		if err != nil {
 			return nil, "", nil, err
 		}
 
-		return l, "http://" + l.Addr().String(), func() {}, nil
+		return l, l.Addr().String(), func() {}, nil
 	}
 }
 
 func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
-	l, baseUrl, cleanup, err := e.newListener(ctx)
+	l, addr, cleanup, err := e.newListener(ctx)
 	if err != nil {
 		return ServerHandle{}, err
 	}
 	mux := http.NewServeMux()
+
+	baseUrl := "http://" + addr
 
 	go func() {
 		defer cleanup()
@@ -288,6 +290,15 @@ type DriverHandle struct {
 	Client engine2.Driver
 }
 
+type ComMode int
+
+const (
+	ComModeNone ComMode = iota
+	ComModeConnect
+)
+
+var comMode = ComModeNone
+
 func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, register RegisterMuxFunc) (DriverHandle, error) {
 	err := e.initPlugin(ctx, driver)
 	if err != nil {
@@ -301,23 +312,36 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver engine2.Driver, regi
 
 	pluginName := res.GetName()
 
-	handler := engine2.NewDriverConnectHandler(driver)
-
-	path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName), connectCompressOption)
-
-	pluginh, err := e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
-		mux.Handle(path, h)
-		if register != nil {
-			register(mux)
+	var client engine2.Driver
+	var pluginh PluginHandle
+	switch comMode {
+	case ComModeNone:
+		client = driver
+		pluginh, err = e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
+			if register != nil {
+				register(mux)
+			}
+		})
+		if err != nil {
+			return DriverHandle{}, err
 		}
-	})
-	if err != nil {
-		return DriverHandle{}, err
-	}
+	case ComModeConnect:
+		handler := engine2.NewDriverConnectHandler(driver)
+		path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName), connectCompressOption)
 
-	//cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
-	//client := engine2.NewDriverConnectClient(cclient)
-	client := driver
+		pluginh, err = e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
+			mux.Handle(path, h)
+			if register != nil {
+				register(mux)
+			}
+		})
+		if err != nil {
+			return DriverHandle{}, err
+		}
+
+		cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
+		client = engine2.NewDriverConnectClient(cclient)
+	}
 
 	if e.DriversByName == nil {
 		e.DriversByName = map[string]engine2.Driver{}
