@@ -94,6 +94,24 @@ func WriteManifest(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
 	return newManifestArtifact(fs), nil
 }
 
+func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
+	b, err := json.Marshal(m) //nolint:musttag
+	if err != nil {
+		return nil, err
+	}
+
+	return &pluginv1.Artifact{
+		Name: ManifestName,
+		Type: pluginv1.Artifact_TYPE_MANIFEST_V1,
+		Content: &pluginv1.Artifact_Raw{
+			Raw: &pluginv1.Artifact_ContentRaw{
+				Data: b,
+				Path: ManifestName,
+			},
+		},
+	}, nil
+}
+
 func newManifestArtifact(fs hfs.FS) *pluginv1.Artifact {
 	return &pluginv1.Artifact{
 		Name: ManifestName,

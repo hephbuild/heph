@@ -12,8 +12,9 @@ message TargetMatcher {
     string package = 2;
     string package_prefix = 3;
     string label = 4;
-    TargetMatchers or = 5;
-    TargetMatchers and = 6;
-    TargetMatcher not = 7;
+    string codegen_package = 5;
+    TargetMatchers or = 6;
+    TargetMatchers and = 7;
+    TargetMatcher not = 8;
   }
 }

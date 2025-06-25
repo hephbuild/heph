@@ -42,11 +42,12 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 	seen[key] = struct{}{}
 
 	return func(yield func(*pluginv1.TargetSpec, error) bool) {
-		res, err := p.List(ctx, &pluginv1.ListRequest{
-			RequestId: rs.ID,
-			Package:   pkg,
-		})
+		res, err := e.List(ctx, p, pkg, rs)
 		if err != nil {
+			if errors.Is(err, ErrStackRecursion{}) {
+				return
+			}
+
 			yield(nil, err)
 			return
 		}
@@ -54,6 +55,7 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 
 		for res.Receive() {
 			msg := res.Msg()
+
 			def, err := e.GetDef(ctx, DefContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()}, rs)
 			if err != nil {
 				yield(nil, err)
@@ -76,6 +78,32 @@ type seenPkgKey struct {
 	pkg   string
 }
 
+func (e *Engine) match(ctx context.Context, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher, rs *RequestState) (tmatch.Result, error) {
+	if r := tmatch.MatchPackage(ref.Package, matcher); r.Definitive() {
+		return r, nil
+	}
+
+	spec, err := e.GetSpec(ctx, SpecContainer{Ref: ref}, rs)
+	if err != nil {
+		return 0, err
+	}
+
+	if r := tmatch.MatchSpec(spec, matcher); r.Definitive() {
+		return r, nil
+	}
+
+	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, rs)
+	if err != nil {
+		return 0, err
+	}
+
+	if r := tmatch.MatchDef(spec, def.TargetDef, matcher); r.Definitive() {
+		return r, nil
+	}
+
+	return tmatch.MatchShrug, nil
+}
+
 func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) iter.Seq2[*pluginv1.TargetRef, error] {
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
 		seenPkg := map[seenPkgKey]struct{}{}
@@ -87,9 +115,17 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 				return
 			}
 
+			if tmatch.MatchPackage(pkg, matcher) == tmatch.MatchNo {
+				continue
+			}
+
 			for _, provider := range e.Providers {
 				for spec, err := range e.queryListProvider(ctx, provider, pkg, seenPkg, rs) {
 					if err != nil {
+						if errors.Is(err, ErrStackRecursion{}) {
+							continue
+						}
+
 						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
 						continue
 					}
@@ -102,7 +138,13 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 					}
 					seenRef[refstr] = struct{}{}
 
-					if tmatch.MatchSpec(spec, matcher) != tmatch.MatchYes {
+					res, err := e.match(ctx, ref, matcher, rs)
+					if err != nil {
+						yield(nil, err)
+						return
+					}
+
+					if res == tmatch.MatchNo {
 						continue
 					}
 
@@ -168,10 +210,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 	}
 	defer e.listSem.Release(1)
 
-	res, err := p.List(ctx, &pluginv1.ListRequest{
-		RequestId: e.rs.ID,
-		Package:   pkg,
-	})
+	res, err := e.List(ctx, p, pkg, e.rs)
 	if err != nil {
 		e.sendErr(ctx, fmt.Errorf("%v list: %w", p.Name, err))
 		return
@@ -201,7 +240,7 @@ func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef,
 
 	e.sendSpec(ctx, def.TargetSpec)
 
-	for _, input := range def.Inputs {
+	for _, input := range def.GetInputs() {
 		e.handleRefSpec(ctx, tref.WithoutOut(input.Ref), nil)
 	}
 }
@@ -244,7 +283,13 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 			}
 			seenRef[tref.Format(ref)] = struct{}{}
 
-			if tmatch.MatchSpec(spec, matcher) != tmatch.MatchYes {
+			res, err := e.match(ctx, ref, matcher, e.rs)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			if res == tmatch.MatchNo {
 				continue
 			}
 

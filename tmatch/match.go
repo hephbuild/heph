@@ -97,6 +97,14 @@ func ParsePackageMatcher(pkg, cwd, root string) (*pluginv1.TargetMatcher, error)
 
 type Result int
 
+func (r Result) Definitive() bool {
+	if r == 0 {
+		panic("invalid result")
+	}
+
+	return r != MatchShrug
+}
+
 func boolToResult(b bool) Result {
 	if b {
 		return MatchYes
@@ -120,6 +128,12 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	case *pluginv1.TargetMatcher_PackagePrefix:
 		return boolToResult(tref.HasPackagePrefix(pkg, item.PackagePrefix))
 	case *pluginv1.TargetMatcher_Label:
+		return MatchShrug
+	case *pluginv1.TargetMatcher_CodegenPackage:
+		if !tref.HasPackagePrefix(item.CodegenPackage, pkg) {
+			return MatchNo
+		}
+
 		return MatchShrug
 	case *pluginv1.TargetMatcher_Or:
 		out := MatchNo
@@ -183,6 +197,12 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 		return boolToResult(tref.HasPackagePrefix(spec.Ref.Package, item.PackagePrefix))
 	case *pluginv1.TargetMatcher_Label:
 		return boolToResult(slices.Contains(spec.Labels, item.Label))
+	case *pluginv1.TargetMatcher_CodegenPackage:
+		if !tref.HasPackagePrefix(spec.Ref.GetPackage(), item.CodegenPackage) {
+			return MatchNo
+		}
+
+		return MatchShrug
 	case *pluginv1.TargetMatcher_Or:
 		out := MatchNo
 		for _, matcher := range item.Or.Items {
@@ -231,6 +251,81 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 	}
 }
 
+func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.TargetMatcher) Result {
+	if m == nil {
+		return MatchNo
+	}
+
+	switch item := m.Item.(type) {
+	case *pluginv1.TargetMatcher_Ref:
+		return boolToResult(tref.Equal(item.Ref, def.Ref))
+	case *pluginv1.TargetMatcher_Package:
+		return boolToResult(item.Package == def.Ref.Package)
+	case *pluginv1.TargetMatcher_PackagePrefix:
+		return boolToResult(tref.HasPackagePrefix(def.Ref.Package, item.PackagePrefix))
+	case *pluginv1.TargetMatcher_Label:
+		return boolToResult(slices.Contains(spec.Labels, item.Label))
+	case *pluginv1.TargetMatcher_CodegenPackage:
+		if def.GetCodegenTree() == nil || def.GetCodegenTree().GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_UNSPECIFIED {
+			return MatchNo
+		}
+
+		for _, path := range def.CodegenTree.Paths {
+			pkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path))
+			if tref.HasPackagePrefix(pkg, item.CodegenPackage) {
+				return MatchYes
+			}
+		}
+
+		return MatchNo
+	case *pluginv1.TargetMatcher_Or:
+		out := MatchNo
+		for _, matcher := range item.Or.Items {
+			switch MatchDef(spec, def, matcher) {
+			case MatchYes:
+				out = MatchYes
+			case MatchNo:
+				// dont touch
+			case MatchShrug:
+				return MatchShrug
+			default:
+				panic("unhandled result")
+			}
+		}
+
+		return out
+	case *pluginv1.TargetMatcher_And:
+		out := MatchYes
+		for _, matcher := range item.And.Items {
+			switch MatchDef(spec, def, matcher) {
+			case MatchYes:
+				// dont touch
+			case MatchNo:
+				return MatchNo
+			case MatchShrug:
+				out = MatchShrug
+			default:
+				panic("unhandled result")
+			}
+		}
+
+		return out
+	case *pluginv1.TargetMatcher_Not:
+		switch MatchDef(spec, def, item.Not) {
+		case MatchYes:
+			return MatchNo
+		case MatchNo:
+			return MatchYes
+		case MatchShrug:
+			return MatchShrug
+		default:
+			panic("unhandled result")
+		}
+	default:
+		panic("unhandled target matcher type")
+	}
+}
+
 func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 	if m == nil {
 		return root
@@ -244,6 +339,8 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 	case *pluginv1.TargetMatcher_PackagePrefix:
 		return filepath.Join(root, tref.ToOSPath(item.PackagePrefix))
 	case *pluginv1.TargetMatcher_Label:
+		return root
+	case *pluginv1.TargetMatcher_CodegenPackage:
 		return root
 	case *pluginv1.TargetMatcher_Or:
 		var roots []string

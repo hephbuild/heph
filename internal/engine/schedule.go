@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
 	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -53,6 +54,7 @@ type ExecuteOptions struct {
 	shell       bool
 	force       bool
 	interactive bool
+	hashin      string
 }
 
 type InteractiveExecOptions struct {
@@ -81,12 +83,7 @@ func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []st
 
 	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, rs)
 }
-func (e *Engine) ResultFromDefWithManifest(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
-	ctx, span := tracer.Start(ctx, "ResultFromDefWithManifest", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
-	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, true, rs)
-}
 func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
@@ -153,14 +150,12 @@ func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, rs *RequestSta
 }
 
 func (e *Engine) meta(ctx context.Context, c DefContainer, rs *RequestState) (*Meta, error) {
-	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rs)
-	})
+	def, err := e.Link(ctx, c, rs)
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
 	}
 
-	manifests, err := e.depsManifests(ctx, def, rs)
+	manifests, err := e.depsResultMetas(ctx, def, rs)
 	if err != nil {
 		return nil, fmt.Errorf("deps manifests: %w", err)
 	}
@@ -175,36 +170,6 @@ func (e *Engine) meta(ctx context.Context, c DefContainer, rs *RequestState) (*M
 	}, nil
 }
 
-func (e *Engine) ManifestFromDef(ctx context.Context, def *TargetDef, rs *RequestState) (hartifact.Manifest, error) {
-	return e.manifest(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, rs)
-}
-
-func (e *Engine) manifest(ctx context.Context, c DefContainer, rs *RequestState) (hartifact.Manifest, error) {
-	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rs)
-	})
-	if err != nil {
-		return hartifact.Manifest{}, fmt.Errorf("link: %w", err)
-	}
-
-	res, err := e.ResultFromDefWithManifest(ctx, def.TargetDef, nil, rs)
-	if err != nil {
-		return hartifact.Manifest{}, fmt.Errorf("result from def: %w", err)
-	}
-	defer res.Unlock(ctx)
-
-	artifact := res.FindManifest()
-
-	manifest, err := hartifact.ManifestFromArtifact(ctx, artifact.Artifact)
-	if err != nil {
-		hlog.From(ctx).Error(fmt.Sprintf("%v: failed to read manifest: %v", tref.Format(c.GetRef()), err))
-
-		return hartifact.Manifest{}, nil
-	}
-
-	return manifest, nil
-}
-
 var meter = otel.Meter("heph_engine")
 
 var resultCounter = sync.OnceValue(func() metric.Int64Counter {
@@ -215,23 +180,25 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, withManifest bool, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, onlyManifest bool, rs *RequestState) (*ExecuteResultLocks, error) {
 	debugger.SetLabels(func() []string {
 		return []string{
 			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
 		}
 	})
 
-	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
-		return e.Link(ctx, c, rs)
-	})
+	def, err := e.Link(ctx, c, rs)
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
 	}
 
 	ref := def.GetRef()
 
-	if len(outputs) == 1 && outputs[0] == AllOutputs || !def.Cache {
+	if def.Cache {
+		outputs = def.Outputs
+	} else if onlyManifest {
+		outputs = nil
+	} else if len(outputs) == 1 && outputs[0] == AllOutputs {
 		outputs = def.Outputs
 	}
 
@@ -274,13 +241,13 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, w
 		res = res.CloneWithoutLocks()
 	}
 
-	if !withManifest {
+	if onlyManifest {
 		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
-			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
-				return false
-			}
-
-			return !slices.Contains(outputs, artifact.Group)
+			return artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1
+		})
+	} else {
+		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+			return artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1
 		})
 	}
 
@@ -330,6 +297,12 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *Requ
 				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT
 			})
 
+			for _, artifact := range res.Artifacts {
+				if artifact.Hashout == "" {
+					return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), artifact.Group)
+				}
+			}
+
 			results[i] = &ExecuteResultWithOrigin{
 				ExecuteResultLocks: res,
 				InputOrigin:        dep.Origin,
@@ -359,7 +332,56 @@ type DepMetaArtifact struct {
 	Hashout string
 }
 
-func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *RequestState) ([]DepMeta, error) {
+type ResultMeta struct {
+	Hashin    string
+	Artifacts []ResultMetaArtifact
+}
+
+type ResultMetaArtifact struct {
+	Hashout string
+	Group   string
+}
+
+func (e *Engine) ResultMetaFromDef(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (ResultMeta, error) {
+	res, err := e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, nil, true, rs)
+	if err != nil {
+		return ResultMeta{}, fmt.Errorf("result: %w", err)
+	}
+	defer res.Unlock(ctx)
+
+	manifestArtifact, ok := res.FindManifest()
+	if !ok {
+		return ResultMeta{}, fmt.Errorf("no manifest")
+	}
+
+	manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
+	if err != nil {
+		return ResultMeta{}, fmt.Errorf("manifest from artifact: %w", err)
+	}
+
+	m := ResultMeta{
+		Hashin: manifest.Hashin,
+	}
+
+	if len(outputs) == 1 && outputs[0] == AllOutputs {
+		outputs = def.Outputs
+	}
+
+	for _, artifact := range manifest.Artifacts {
+		if !slices.Contains(outputs, artifact.Group) {
+			continue
+		}
+
+		m.Artifacts = append(m.Artifacts, ResultMetaArtifact{
+			Hashout: artifact.Hashout,
+			Group:   artifact.Group,
+		})
+	}
+
+	return m, nil
+}
+
+func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *RequestState) ([]DepMeta, error) {
 	ctx, span := tracer.Start(ctx, "depsManifests", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -381,7 +403,7 @@ func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *Re
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ManifestFromDef(ctx, dep.TargetDef, rs)
+			res, err := e.ResultMetaFromDef(ctx, dep.TargetDef, dep.Outputs, rs)
 			if err != nil {
 				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
 			}
@@ -389,12 +411,12 @@ func (e *Engine) depsManifests(ctx context.Context, t *LightLinkedTarget, rs *Re
 			artifacts := make([]DepMetaArtifact, 0)
 			for _, output := range dep.Outputs {
 				for _, artifact := range res.Artifacts {
-					if pluginv1.Artifact_Type(artifact.Type) != pluginv1.Artifact_TYPE_OUTPUT {
+					if artifact.Group != output {
 						continue
 					}
 
-					if artifact.Group != output {
-						continue
+					if artifact.Hashout == "" {
+						return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), output)
 					}
 
 					artifacts = append(artifacts, DepMetaArtifact{
@@ -473,7 +495,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 	hashin := meta.Hashin
 
 	shouldShell := tref.Equal(rs.Shell, def.GetRef())
-	shouldForce := tmatch.MatchSpec(def.TargetSpec, rs.Force) == tmatch.MatchYes
+	shouldForce := tmatch.MatchDef(def.TargetSpec, def.TargetDef.TargetDef, rs.Force) == tmatch.MatchYes
 	getCache := def.Cache && !shouldShell && !shouldForce
 	storeCache := def.Cache && !shouldShell
 
@@ -502,6 +524,71 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 	}
 
 	res, err, computed := rs.memExecute.Do(refKey(def.GetRef()), func() (*ExecuteResultLocks, error) {
+		if def.TargetSpec.GetDriver() == plugingroup.Name {
+			results, err := e.depsResults(ctx, def, rs)
+			if err != nil {
+				return nil, fmt.Errorf("deps results: %w", err)
+			}
+			defer results.Unlock(ctx)
+
+			manifest := hartifact.Manifest{
+				Version:   "v1",
+				Target:    tref.Format(def.GetRef()),
+				CreatedAt: time.Now(),
+				Hashin:    "", // TODO
+			}
+
+			var artifacts []ExecuteResultArtifact
+			var locks CacheLocks
+			for _, result := range results {
+				for _, artifact := range result.Artifacts {
+					gartifact := &pluginv1.Artifact{
+						Name:    artifact.Name,
+						Type:    artifact.GetType(),
+						Content: artifact.GetContent(),
+					}
+
+					artifacts = append(artifacts, ExecuteResultArtifact{
+						Hashout:  artifact.Hashout,
+						Artifact: gartifact,
+					})
+
+					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+					if err != nil {
+						return nil, fmt.Errorf("proto artifact to manifest: %w", err)
+					}
+
+					manifest.Artifacts = append(manifest.Artifacts, martifact)
+
+					locks.AddFrom(result.Locks)
+				}
+			}
+
+			martifact, err := hartifact.NewManifestArtifact(manifest)
+			if err != nil {
+				return nil, fmt.Errorf("new manifest artifact: %w", err)
+			}
+
+			artifacts = append(artifacts, ExecuteResultArtifact{
+				Artifact: martifact,
+			})
+
+			err = locks.RLock(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			return &ExecuteResultLocks{
+				ExecuteResult: ExecuteResult{
+					Def:       def,
+					Executed:  true,
+					Hashin:    hashin,
+					Artifacts: artifacts,
+				}.Sorted(),
+				Locks: &locks,
+			}, nil
+		}
+
 		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, false)
 		if err != nil {
 			return nil, fmt.Errorf("lock cache: %w", err)
@@ -511,6 +598,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 			shell:       shouldShell,
 			force:       shouldForce,
 			interactive: tref.Equal(rs.Shell, def.GetRef()) || tref.Equal(rs.Interactive, def.GetRef()),
+			hashin:      hashin,
 		}
 
 		var res *ExecuteResult
@@ -658,16 +746,16 @@ type ExecuteResult struct {
 	Artifacts []ExecuteResultArtifact
 }
 
-func (r ExecuteResult) FindManifest() ExecuteResultArtifact {
+func (r ExecuteResult) FindManifest() (ExecuteResultArtifact, bool) {
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
 			continue
 		}
 
-		return artifact
+		return artifact, true
 	}
 
-	return ExecuteResultArtifact{}
+	return ExecuteResultArtifact{}, false
 }
 
 func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
@@ -927,6 +1015,10 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	hashin, err := e.hashin(ctx, def, results)
 	if err != nil {
 		return nil, fmt.Errorf("hashin1: %w", err)
+	}
+
+	if hashin != options.hashin {
+		return nil, fmt.Errorf("results hashin (%v) != meta hashin (%v)", hashin, options.hashin)
 	}
 
 	if def.Cache && !options.force && !options.shell {

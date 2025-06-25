@@ -2,6 +2,7 @@ package enginee2e
 
 import (
 	"context"
+	"github.com/hephbuild/heph/htypes"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 2)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, res.FindManifest().Artifact)
+		m, err := hartifact.ManifestFromArtifact(ctx, htypes.Must2Ok(res.FindManifest()).Artifact)
 		require.NoError(t, err)
 
 		at = m.CreatedAt
@@ -73,7 +74,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 2)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, res.FindManifest().Artifact)
+		m, err := hartifact.ManifestFromArtifact(ctx, htypes.Must2Ok(res.FindManifest()).Artifact)
 		require.NoError(t, err)
 
 		require.Equal(t, at, m.CreatedAt)

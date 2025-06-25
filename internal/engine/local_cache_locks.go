@@ -34,14 +34,7 @@ func (c *CacheLocks) RLock(ctx context.Context) error {
 	return c.lock(ctx, true)
 }
 
-func (c *CacheLocks) lock(ctx context.Context, ro bool) error {
-	lock := (*hlocks.TMutex).Lock
-	unlock := (*hlocks.TMutex).Unlock
-	if ro {
-		lock = (*hlocks.TMutex).RLock
-		unlock = (*hlocks.TMutex).RUnlock
-	}
-
+func (c *CacheLocks) ensureUnlocksLen() {
 	if len(c.unlocks) < len(c.ms) {
 		c.unlocks = hslices.GrowLen(c.unlocks, len(c.ms)-len(c.unlocks))
 
@@ -51,6 +44,17 @@ func (c *CacheLocks) lock(ctx context.Context, ro bool) error {
 			}
 		}
 	}
+}
+
+func (c *CacheLocks) lock(ctx context.Context, ro bool) error {
+	lock := (*hlocks.TMutex).Lock
+	unlock := (*hlocks.TMutex).Unlock
+	if ro {
+		lock = (*hlocks.TMutex).RLock
+		unlock = (*hlocks.TMutex).RUnlock
+	}
+
+	c.ensureUnlocksLen()
 
 	for i, m := range c.ms {
 		err := lock(m, ctx)
@@ -102,6 +106,12 @@ func (c *CacheLocks) Lock2RLock(ctx context.Context) error {
 func (c *CacheLocks) Clone() *CacheLocks {
 	return &CacheLocks{
 		ms: slices.Clone(c.ms),
+	}
+}
+
+func (c *CacheLocks) AddFrom(in *CacheLocks) {
+	for _, m := range in.ms {
+		c.ms = append(c.ms, m)
 	}
 }
 

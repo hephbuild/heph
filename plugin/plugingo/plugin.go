@@ -113,10 +113,6 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-		if _, ok := tref.CutPackagePrefix(req.GetPackage(), "@heph/file"); ok {
-			return nil
-		}
-
 		_, _, err := p.getGoModGoWork(ctx, req.Package)
 		if err != nil {
 			if errors.Is(err, errNotInGoModule) {
@@ -217,7 +213,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 	}
 
 	defer func() {
-		if rerr != nil {
+		if rerr != nil && connect.CodeOf(rerr) == connect.CodeUnknown {
 			rerr = connect.NewError(connect.CodeInternal, rerr)
 		}
 	}()
@@ -423,6 +419,8 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		if !hasGoFile {
 			return nil, nil, fmt.Errorf("no Go files")
 		}
+
+		files = append(files, fmt.Sprintf("//@heph/query:query@label=go_src,tree_output_to=%s", pkg))
 	} else {
 		args = hmaps.Concat(args, map[string]string{
 			"import": imp,

@@ -3,10 +3,13 @@ package plugingroup
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/plugin/tref"
+	"strconv"
 
 	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 	groupv1 "github.com/hephbuild/heph/plugin/plugingroup/gen/heph/plugin/group/v1"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -15,20 +18,42 @@ import (
 type Plugin struct {
 }
 
-func (p Plugin) Pipe(ctx context.Context, c *connect.Request[pluginv1.PipeRequest]) (*connect.Response[pluginv1.PipeResponse], error) {
+const Name = "group"
+
+func (p Plugin) Pipe(ctx context.Context, request *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
 }
 
-func (p Plugin) Config(ctx context.Context, c *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
+func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	desc := protodesc.ToDescriptorProto((&groupv1.Target{}).ProtoReflect().Descriptor())
 
-	return connect.NewResponse(&pluginv1.ConfigResponse{
-		Name:         "group",
+	return &pluginv1.ConfigResponse{
+		Name:         Name,
 		TargetSchema: desc,
-	}), nil
+	}, nil
 }
 
-func (p Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRequest]) (*connect.Response[pluginv1.ParseResponse], error) {
+func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
+	deps, err := hstructpb.DecodeSlice[string](req.Spec.Config["deps"])
+	if err != nil {
+		return nil, err
+	}
+
+	var inputs []*pluginv1.TargetDef_Input
+	for i, dep := range deps {
+		ref, err := tref.ParseWithOut(dep)
+		if err != nil {
+			return nil, err
+		}
+
+		inputs = append(inputs, &pluginv1.TargetDef_Input{
+			Ref: ref,
+			Origin: &pluginv1.TargetDef_InputOrigin{
+				Id: strconv.Itoa(i),
+			},
+		})
+	}
+
 	s := &groupv1.Target{}
 
 	target, err := anypb.New(s)
@@ -36,39 +61,23 @@ func (p Plugin) Parse(ctx context.Context, req *connect.Request[pluginv1.ParseRe
 		return nil, err
 	}
 
-	return connect.NewResponse(&pluginv1.ParseResponse{
-		Target: &pluginv1.TargetDef{Def: target},
-	}), nil
+	return &pluginv1.ParseResponse{
+		Target: &pluginv1.TargetDef{
+			Def:     target,
+			Ref:     req.Spec.Ref,
+			Cache:   false,
+			Inputs:  inputs,
+			Outputs: []string{""},
+		},
+	}, nil
 }
 
-func (p Plugin) Run(ctx context.Context, req *connect.Request[pluginv1.RunRequest]) (*connect.Response[pluginv1.RunResponse], error) {
-	var t groupv1.Target
-	err := req.Msg.GetTarget().GetDef().UnmarshalTo(&t)
-	if err != nil {
-		return nil, err
-	}
-
-	artifacts := make([]*pluginv1.Artifact, 0, len(req.Msg.GetInputs()))
-	for _, input := range req.Msg.GetInputs() {
-		artifact := input.GetArtifact()
-
-		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name:     artifact.GetName(),
-			Group:    artifact.GetGroup(),
-			Encoding: artifact.GetEncoding(),
-			Uri:      artifact.GetUri(),
-			Type:     artifact.GetType(),
-			Package:  artifact.Package,
-		})
-	}
-
-	return connect.NewResponse(&pluginv1.RunResponse{
-		Artifacts: artifacts,
-	}), nil
+func (p Plugin) Run(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+	panic("should not be called")
 }
 
 func New() *Plugin {
 	return &Plugin{}
 }
 
-var _ pluginv1connect.DriverHandler = (*Plugin)(nil)
+var _ engine2.Driver = (*Plugin)(nil)

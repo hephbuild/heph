@@ -210,7 +210,8 @@ func TestSrcOutEnv(t *testing.T) {
 
 				require.Len(t, res.Artifacts, len(test.expected)+1)
 
-				manifest := res.FindManifest()
+				manifest, ok := res.FindManifest()
+				require.True(t, ok)
 				assert.NotEmpty(t, manifest.Artifact)
 
 				for _, name := range test.expected {

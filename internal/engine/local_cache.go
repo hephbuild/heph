@@ -73,6 +73,10 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
+		if artifact.Type == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+			continue
+		}
+
 		if content, ok := artifact.Artifact.Content.(*pluginv1.Artifact_File); ok {
 			artifact.Name += ".tar"
 			tarf, err := hfs.Create(cachedir, artifact.Name)

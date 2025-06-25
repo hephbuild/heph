@@ -118,10 +118,6 @@ func TestDepsCache2(t *testing.T) {
 		Return(&pluginv1.ProviderConfigResponse{Name: "test_provider"}, nil).AnyTimes()
 
 	provider.EXPECT().
-		GetSpecs(gomock.Any(), gomock.Any()).
-		Return(nil, engine2.ErrNotImplemented).AnyTimes()
-
-	provider.EXPECT().
 		Get(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, request *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 			return &pluginv1.GetResponse{

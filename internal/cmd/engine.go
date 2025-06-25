@@ -16,6 +16,7 @@ import (
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginfs"
 	"github.com/hephbuild/heph/plugin/plugingo"
+	"github.com/hephbuild/heph/plugin/plugingroup"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"net/http"
 	"os"
@@ -53,6 +54,11 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
 		Name:    pluginfs.Name,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    plugingroup.Name,
 		Enabled: true,
 	})
 
@@ -126,6 +132,9 @@ func pluginExecFactory(d *pluginexec.Plugin) (engine2.Driver, func(mux *http.Ser
 var nameToDriver = map[string]func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)){
 	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		return pluginfs.NewDriver(), nil
+	},
+	plugingroup.Name: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
+		return plugingroup.New(), nil
 	},
 	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (engine2.Driver, func(mux *http.ServeMux)) {
 		d := pluginexec.New()

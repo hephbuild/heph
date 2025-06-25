@@ -80,3 +80,9 @@ func Wrap(f func(err error) error) Option {
 		o.wrap = f
 	})
 }
+
+func WithRecover(f func() error) func() error {
+	return func() error {
+		return Recover(f)
+	}
+}

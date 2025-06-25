@@ -42,9 +42,7 @@ func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*plugin
 }
 
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-		return nil
-	}), nil
+	return engine2.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {

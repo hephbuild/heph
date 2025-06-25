@@ -4,16 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	engine2 "github.com/hephbuild/heph/lib/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/types/known/structpb"
+	"maps"
 	"path"
 	"path/filepath"
 	"slices"
@@ -40,11 +45,7 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 	providerKey := p.Name
 
 	spec, err, _ := rs.memSpecGet.Do(memSpecGetKey{providerName: providerKey, refKey: refKey(c.GetRef())}, func() (*pluginv1.TargetSpec, error) {
-		res, err := p.Get(ctx, &pluginv1.GetRequest{
-			RequestId: rs.ID,
-			Ref:       c.GetRef(),
-			States:    states,
-		})
+		res, err := e.Get(ctx, p, c.GetRef(), states, rs)
 		if err != nil {
 			return nil, err
 		}
@@ -61,11 +62,44 @@ func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.Provide
 
 }
 
-func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState) (*pluginv1.TargetSpec, error) {
+func (e *Engine) resolveSpec(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState) (*pluginv1.TargetSpec, error) {
 	ctx, span := tracer.Start(ctx, "ResolveSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
-	spec, err, _ := rs.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	spec, err, computed := rs.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+		if ref := c.GetRef(); ref.Package == "@heph/query" {
+			items := []*pluginv1.TargetMatcher{}
+
+			if label, ok := ref.Args["label"]; ok {
+				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Label{Label: label}})
+			}
+
+			if treeOutputTo, ok := ref.Args["tree_output_to"]; ok {
+				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_CodegenPackage{CodegenPackage: treeOutputTo}})
+			}
+
+			if len(items) == 0 {
+				return nil, errors.New("invalid query: empty selection")
+			}
+
+			var deps []string
+			for ref, err := range e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_And{And: &pluginv1.TargetMatchers{Items: items}}}, rs) {
+				if err != nil {
+					return nil, err
+				}
+
+				deps = append(deps, tref.Format(ref))
+			}
+
+			return &pluginv1.TargetSpec{
+				Ref:    ref,
+				Driver: plugingroup.Name,
+				Config: map[string]*structpb.Value{
+					"deps": hstructpb.NewStringsValue(deps),
+				},
+			}, nil
+		}
+
 		for _, p := range e.Providers {
 			var providerStates []*pluginv1.ProviderState
 			for _, state := range states {
@@ -96,7 +130,7 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 		return nil, fmt.Errorf("resolve spec: %v: %w", tref.Format(c.GetRef()), err)
 	}
 
-	if !tref.Equal(spec.Ref, c.GetRef()) {
+	if computed && !tref.Equal(spec.Ref, c.GetRef()) {
 		hlog.From(ctx).Warn(fmt.Sprintf("%v resolved as %v", tref.Format(c.GetRef()), tref.Format(spec.Ref)))
 	}
 
@@ -106,6 +140,11 @@ func (e *Engine) ResolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rs *RequestState) (*pluginv1.TargetSpec, error) {
 	ctx, span := tracer.Start(ctx, "GetSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
+
+	rs, err := rs.Trace("GetSpec", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
 
 	if c.Spec != nil {
 		return c.Spec, nil
@@ -123,7 +162,7 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rs *RequestState)
 		return nil, err
 	}
 
-	return e.ResolveSpec(ctx, states, c, rs)
+	return e.resolveSpec(ctx, states, c, rs)
 }
 
 func (e *Engine) ProbeSegments(ctx context.Context, c SpecContainer, pkg string, rs *RequestState) ([]*pluginv1.ProviderState, error) {
@@ -195,8 +234,7 @@ type memSpecGetKey struct {
 	providerName, refKey string
 }
 
-type RequestState struct {
-	ID              string
+type RequestStateData struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
 	Force           *pluginv1.TargetMatcher
@@ -211,6 +249,113 @@ type RequestState struct {
 
 	memResult  hsingleflight.GroupMem[string, *ExecuteResultLocks]
 	memExecute hsingleflight.GroupMem[string, *ExecuteResultLocks]
+}
+
+type traceStackEntry struct {
+	fun string
+	id1 string
+	id2 string
+}
+
+type RequestState struct {
+	ID string
+
+	*RequestStateData
+
+	traceStack Stack[traceStackEntry]
+}
+
+func (s *RequestState) Trace(fun, id string) (*RequestState, error) {
+	return s.traceStackPush(traceStackEntry{fun: fun, id1: id})
+}
+
+func (s *RequestState) TraceList(name string, pkg string) (*RequestState, error) {
+	return s.traceStackPush(traceStackEntry{fun: "List", id1: name, id2: pkg})
+}
+
+func (s *RequestState) traceStackPush(e traceStackEntry) (*RequestState, error) {
+	stack, err := s.traceStack.Push(e)
+	if err != nil {
+		return nil, err
+	}
+
+	return &RequestState{
+		ID:               uuid.New().String(),
+		RequestStateData: s.RequestStateData,
+		traceStack:       stack,
+	}, nil
+}
+
+type Stack[K comparable] struct {
+	m     map[K]*K
+	first *K
+	last  *K
+}
+
+type ErrStackRecursion struct {
+	printer func() string
+}
+
+func (e ErrStackRecursion) Error() string {
+	return fmt.Sprintf("stack recursion detected: %v", e.printer())
+}
+
+func (e ErrStackRecursion) Is(err error) bool {
+	_, ok := err.(ErrStackRecursion)
+
+	return ok
+}
+
+func (s Stack[K]) Has(k K) bool {
+	_, ok := s.m[k]
+
+	return ok
+}
+
+func (s Stack[K]) Push(k K) (Stack[K], error) {
+	if _, ok := s.m[k]; ok {
+		return s, ErrStackRecursion{
+			printer: func() string {
+				return s.Print(k)
+			},
+		}
+	}
+
+	s.m = maps.Clone(s.m)
+	if s.m == nil {
+		s.m = map[K]*K{}
+		s.first = &k
+	}
+	if s.last != nil {
+		s.m[*s.last] = &k
+	}
+	s.m[k] = nil
+	s.last = &k
+
+	return s, nil
+}
+
+func (s Stack[K]) Print(v ...K) string {
+	var buf strings.Builder
+	next := s.first
+	for next != nil {
+		current := *next
+
+		if buf.Len() > 0 {
+			buf.WriteString(" -> ")
+		}
+
+		fmt.Fprintf(&buf, "%v", current)
+
+		next = s.m[current]
+	}
+
+	if len(v) > 0 {
+		buf.WriteString(" -> ")
+		fmt.Fprintf(&buf, "%v", v[0])
+	}
+
+	return buf.String()
 }
 
 type TargetDef struct {
@@ -229,6 +374,14 @@ func (t TargetDef) GetRef() *pluginv1.TargetRef {
 func (e *Engine) GetDef(ctx context.Context, c DefContainer, rs *RequestState) (*TargetDef, error) {
 	ctx, span := tracer.Start(ctx, "GetDef", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
+
+	rs, err := rs.Trace("GetDef", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
 
 	// put back when we have custom ids
 	// step, ctx := hstep.New(ctx, "Getting definition...")
@@ -315,6 +468,22 @@ func (t LightLinkedTarget) Clone() *LightLinkedTarget {
 }
 
 func (e *Engine) Link(ctx context.Context, c DefContainer, rs *RequestState) (*LightLinkedTarget, error) {
+	rs, err := rs.Trace("Link", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
+
+	def, err, _ := rs.memLink.Do(refKey(c.GetRef()), func() (*LightLinkedTarget, error) {
+		return e.innerLink(ctx, c, rs)
+	})
+
+	return def, err
+}
+
+func (e *Engine) innerLink(ctx context.Context, c DefContainer, rs *RequestState) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
 
@@ -329,14 +498,16 @@ func (e *Engine) Link(ctx context.Context, c DefContainer, rs *RequestState) (*L
 		return nil, err
 	}
 
+	inputs := def.GetInputs()
+
 	lt := &LightLinkedTarget{
 		TargetDef: def,
-		Inputs:    make([]*LightLinkedTargetInput, len(def.GetInputs())),
+		Inputs:    make([]*LightLinkedTargetInput, len(inputs)),
 	}
 
 	var sf hsingleflight.GroupMem[string, *TargetDef]
 	var g errgroup.Group
-	for i, input := range def.GetInputs() {
+	for i, input := range inputs {
 		depRef := tref.WithoutOut(input.GetRef())
 
 		g.Go(func() error {

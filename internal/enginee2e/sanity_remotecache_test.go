@@ -127,7 +127,8 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 2)
 
-			manifestArtifact := res.FindManifest()
+			manifestArtifact, ok := res.FindManifest()
+			require.True(t, ok)
 
 			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
 			require.NoError(t, err)
@@ -143,7 +144,8 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 2)
 
-			manifestArtifact := res.FindManifest()
+			manifestArtifact, ok := res.FindManifest()
+			require.True(t, ok)
 
 			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
 			require.NoError(t, err)
@@ -159,7 +161,8 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 2)
 
-			manifestArtifact := res.FindManifest()
+			manifestArtifact, ok := res.FindManifest()
+			require.True(t, ok)
 
 			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
 			require.NoError(t, err)

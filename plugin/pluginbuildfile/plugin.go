@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/go-viper/mapstructure/v2"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
@@ -131,7 +130,14 @@ type OnTargetPayload struct {
 	Name    string
 	Package string
 	Driver  string
+	Labels  []string
 	Args    map[string]starlark.Value
+}
+
+type TargetSpec struct {
+	Name   string
+	Driver string
+	Labels hstarlark.List[string]
 }
 
 type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
@@ -159,27 +165,35 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
 
 			switch name {
-			case "name", "driver":
+			case "name", "driver", "labels":
 				fkwargs = append(fkwargs, item)
 			default:
 				otherkwargs[string(name)] = arg
 			}
 		}
 
-		payload := OnTargetPayload{
-			Package: pkg,
-			Args:    otherkwargs,
-		}
+		var tspec TargetSpec
+		tspec.Driver = "bash"
+
 		if err := starlark.UnpackArgs(
 			"target", args, fkwargs,
-			"name", &payload.Name,
-			"driver?", &payload.Driver,
+			"name", &tspec.Name,
+			"driver?", &tspec.Driver,
+			"labels?", &tspec.Labels,
 		); err != nil {
-			if payload.Name != "" {
-				return nil, fmt.Errorf("%v: %w", payload.Name, err)
+			if tspec.Name != "" {
+				return nil, fmt.Errorf("%v: %w", tspec.Name, err)
 			}
 
 			return nil, err
+		}
+
+		payload := OnTargetPayload{
+			Name:    tspec.Name,
+			Package: pkg,
+			Driver:  tspec.Driver,
+			Labels:  tspec.Labels,
+			Args:    otherkwargs,
 		}
 
 		if payload.Name == "" {
@@ -326,28 +340,11 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 	}, nil
 }
 
-func parseLabels(v any) ([]string, error) {
-	var labels []string
-	err := mapstructure.Decode(v, &labels)
-	if err == nil {
-		return labels, nil
-	}
-
-	var label string
-	err = mapstructure.Decode(v, &label)
-	if err == nil {
-		return []string{label}, nil
-	}
-
-	return nil, fmt.Errorf("expected string or []string, got %T", v)
-}
-
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
 	if payload.Name == "" {
 		return nil, engine2.ErrNotFound
 	}
 
-	var labels []string
 	config := map[string]*structpb.Value{}
 	for k, v := range payload.Args {
 		v := hstarlark.FromStarlark(v)
@@ -358,13 +355,6 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		}
 
 		config[k] = pv
-
-		if k == "labels" {
-			labels, err = parseLabels(v)
-			if err != nil {
-				return nil, fmt.Errorf("invalid labels: %w", err)
-			}
-		}
 	}
 
 	spec := &pluginv1.TargetSpec{
@@ -374,7 +364,7 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		},
 		Driver: payload.Driver,
 		Config: config,
-		Labels: labels,
+		Labels: payload.Labels,
 	}
 
 	return spec, nil

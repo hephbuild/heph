@@ -116,7 +116,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarg
 			continue
 		}
 
-		tmpCacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef())+"_tmp_"+hinstance.UID+"_"+hrand.Str(7), hashin)
+		tmpCacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef())+"_remote_tmp_"+hinstance.UID+"_"+hrand.Str(7)+"_"+hashin)
 		err := tmpCacheDir.MkdirAll("", os.ModePerm)
 		if err != nil {
 			return nil, false, err

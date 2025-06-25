@@ -87,6 +87,13 @@ func NewChanHandlerStream[T any]() *ChanHandlerStream[T] {
 	}
 }
 
+func NewNoopChanHandlerStream[T any]() *ChanHandlerStream[T] {
+	strm := NewChanHandlerStream[T]()
+	strm.CloseSend(nil)
+
+	return strm
+}
+
 func NewChanHandlerStreamFunc[T any](f func(send func(T) error) error) *ChanHandlerStream[T] {
 	strm := NewChanHandlerStream[T]()
 
@@ -96,4 +103,29 @@ func NewChanHandlerStreamFunc[T any](f func(send func(T) error) error) *ChanHand
 	}()
 
 	return strm
+}
+
+var _ HandlerStreamReceive[*structpb.Value] = (*HookHandlerStream[*structpb.Value])(nil)
+
+type HookHandlerStream[T any] struct {
+	HandlerStreamReceive[T]
+
+	onCloseReceive func()
+}
+
+func WithOnCloseReceive[T any](r HandlerStreamReceive[T], f func()) HookHandlerStream[T] {
+	return HookHandlerStream[T]{
+		HandlerStreamReceive: r,
+		onCloseReceive:       f,
+	}
+}
+
+func (h HookHandlerStream[T]) CloseReceive() error {
+	defer func() {
+		if h.onCloseReceive != nil {
+			h.onCloseReceive()
+		}
+	}()
+
+	return h.HandlerStreamReceive.CloseReceive()
 }

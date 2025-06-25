@@ -183,12 +183,23 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 	id := uuid.New().String()
 
 	s := &RequestState{
-		ID: id,
+		ID:               id,
+		RequestStateData: &RequestStateData{},
 	}
 
 	e.requestState.Store(id, s)
 
 	return s, func() {
+		e.requestState.Delete(id)
+	}
+}
+
+func (e *Engine) StoreRequestState(rs *RequestState) func() {
+	id := rs.ID
+
+	e.requestState.Store(id, rs)
+
+	return func() {
 		e.requestState.Delete(id)
 	}
 }

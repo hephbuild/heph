@@ -13,11 +13,6 @@ import (
 func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
 	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
 
-	goPkg, err := p.getGoPackageFromHephPackage(ctx, goPkg.HephPackage, factors, requestId)
-	if err != nil {
-		return nil, fmt.Errorf("get pkg: %w", err)
-	}
-
 	goPkgs, err := p.goImportsToDeps(ctx, goPkg.Imports, factors, c, requestId, nil)
 	if err != nil {
 		return nil, err
