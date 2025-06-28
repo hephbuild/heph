@@ -92,6 +92,9 @@ func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, 
 }
 
 func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) ([]*ExecuteResultLocks, error) {
+	ctx, span := tracer.Start(ctx, "ResultsFromMatcher")
+	defer span.End()
+
 	var out []*ExecuteResultLocks
 	var outm sync.Mutex
 
@@ -343,6 +346,9 @@ type ResultMetaArtifact struct {
 }
 
 func (e *Engine) ResultMetaFromDef(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (ResultMeta, error) {
+	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+	defer span.End()
+
 	res, err := e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, nil, true, rs)
 	if err != nil {
 		return ResultMeta{}, fmt.Errorf("result: %w", err)
@@ -378,11 +384,15 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, def *TargetDef, outputs 
 		})
 	}
 
+	slices.SortFunc(m.Artifacts, func(a, b ResultMetaArtifact) int {
+		return strings.Compare(a.Hashout, b.Hashout)
+	})
+
 	return m, nil
 }
 
 func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *RequestState) ([]DepMeta, error) {
-	ctx, span := tracer.Start(ctx, "depsManifests", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
+	ctx, span := tracer.Start(ctx, "depsResultMetas", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
 	if len(t.Inputs) == 0 {
