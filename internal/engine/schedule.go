@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
 	engine2 "github.com/hephbuild/heph/lib/engine"
@@ -41,7 +42,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/hpipe"
 	"github.com/zeebo/xxh3"
-	"golang.org/x/sync/errgroup"
 )
 
 type ExecOptions struct {
@@ -96,7 +96,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.Targe
 	var outm sync.Mutex
 
 	var matched bool
-	var g errgroup.Group
+	var g herrgroup.Group
 	for ref, err := range e.Query(ctx, matcher, rs) {
 		if err != nil {
 			for _, locks := range out {
@@ -283,7 +283,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *Requ
 		return strings.Compare(a.Origin.Id, b.Origin.Id)
 	})
 
-	var g errgroup.Group
+	var g herrgroup.Group
 	results := make(DepsResults, len(inputs))
 
 	for i, dep := range inputs {
@@ -398,7 +398,7 @@ func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *
 		return strings.Compare(a.Origin.Id, b.Origin.Id)
 	})
 
-	var g errgroup.Group
+	var g herrgroup.Group
 	results := make([]DepMeta, len(inputs))
 
 	for i, dep := range inputs {
@@ -828,7 +828,7 @@ type ExecuteResultWithOrigin struct {
 
 func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions, rs *RequestState) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
-	eg := &errgroup.Group{}
+	eg := &herrgroup.Group{}
 
 	var cancels []func()
 	var stdinErrCh chan error

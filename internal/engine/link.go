@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/dlsniper/debugger"
 	"github.com/google/uuid"
+	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -16,7 +18,6 @@ import (
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
 	"maps"
 	"path"
@@ -44,6 +45,14 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 func (e *Engine) resolveProvider(ctx context.Context, states []*pluginv1.ProviderState, c SpecContainer, rs *RequestState, p EngineProvider) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
+	rs, err := rs.TraceResolveProvider(tref.Format(c.GetRef()), p.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
+
 	spec, err, _ := rs.memSpecGet.Do(memSpecGetKey{providerName: providerKey, refKey: refKey(c.GetRef())}, func() (*pluginv1.TargetSpec, error) {
 		res, err := e.Get(ctx, p, c.GetRef(), states, rs)
 		if err != nil {
@@ -66,7 +75,15 @@ func (e *Engine) resolveSpec(ctx context.Context, states []*pluginv1.ProviderSta
 	ctx, span := tracer.Start(ctx, "ResolveSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
-	spec, err, computed := rs.memRef.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
+	rs, err := rs.Trace("ResolveSpec", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
+
+	spec, err, computed := rs.memSpec.Do(refKey(c.GetRef()), func() (*pluginv1.TargetSpec, error) {
 		if ref := c.GetRef(); ref.Package == "@heph/query" {
 			items := []*pluginv1.TargetMatcher{}
 
@@ -145,6 +162,9 @@ func (e *Engine) GetSpec(ctx context.Context, c SpecContainer, rs *RequestState)
 	if err != nil {
 		return nil, err
 	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
 
 	if c.Spec != nil {
 		return c.Spec, nil
@@ -241,7 +261,7 @@ type RequestStateData struct {
 	Interactive     *pluginv1.TargetRef
 
 	memSpecGet hsingleflight.GroupMem[memSpecGetKey, *pluginv1.TargetSpec]
-	memRef     hsingleflight.GroupMem[string, *pluginv1.TargetSpec]
+	memSpec    hsingleflight.GroupMem[string, *pluginv1.TargetSpec]
 	memProbe   hsingleflight.GroupMem[string, []*pluginv1.ProviderState]
 
 	memLink hsingleflight.GroupMem[string, *LightLinkedTarget]
@@ -271,6 +291,10 @@ func (s *RequestState) Trace(fun, id string) (*RequestState, error) {
 
 func (s *RequestState) TraceList(name string, pkg string) (*RequestState, error) {
 	return s.traceStackPush(traceStackEntry{fun: "List", id1: name, id2: pkg})
+}
+
+func (s *RequestState) TraceResolveProvider(format string, name string) (*RequestState, error) {
+	return s.traceStackPush(traceStackEntry{fun: "ResolveProvider", id1: format, id2: name})
 }
 
 func (s *RequestState) traceStackPush(e traceStackEntry) (*RequestState, error) {
@@ -468,6 +492,12 @@ func (t LightLinkedTarget) Clone() *LightLinkedTarget {
 }
 
 func (e *Engine) Link(ctx context.Context, c DefContainer, rs *RequestState) (*LightLinkedTarget, error) {
+	debugger.SetLabels(func() []string {
+		return []string{
+			fmt.Sprintf("heph/engine: Link %v", tref.Format(c.GetRef())), "",
+		}
+	})
+
 	rs, err := rs.Trace("Link", tref.Format(c.GetRef()))
 	if err != nil {
 		return nil, err
@@ -506,7 +536,7 @@ func (e *Engine) innerLink(ctx context.Context, c DefContainer, rs *RequestState
 	}
 
 	var sf hsingleflight.GroupMem[string, *TargetDef]
-	var g errgroup.Group
+	var g herrgroup.Group
 	for i, input := range inputs {
 		depRef := tref.WithoutOut(input.GetRef())
 

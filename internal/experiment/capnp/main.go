@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"golang.org/x/sync/errgroup"
+	"github.com/hephbuild/heph/herrgroup"
 	"log"
 	"net"
 	"os"
@@ -22,7 +22,7 @@ func main() {
 	args := os.Args[1:]
 
 	if len(args) == 0 {
-		var g errgroup.Group
+		var g herrgroup.Group
 
 		dir, err := os.MkdirTemp("", "")
 		if err != nil {

@@ -3,6 +3,7 @@ package pluginexec
 import (
 	"bytes"
 	"context"
+	"github.com/hephbuild/heph/herrgroup"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -330,7 +331,7 @@ func TestPipe404(t *testing.T) {
 
 	var stdout bytes.Buffer
 
-	var eg errgroup.Group
+	var eg herrgroup.Group
 	eg.Go(func() error {
 		_, err = io.Copy(&stdout, outr)
 

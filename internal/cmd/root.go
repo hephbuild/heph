@@ -27,6 +27,7 @@ var debug bool
 var cpuprofile string
 var memprofile string
 var goroutineprofile string
+var goroutineprofileLast bool
 
 var levelVar slog.LevelVar
 
@@ -150,7 +151,12 @@ var rootCmd = &cobra.Command{
 					case <-ctx.Done():
 						return
 					case <-time.After(time.Second):
-						_, _ = goroutineFile.WriteString("\n####################\n")
+						if goroutineprofileLast {
+							_ = goroutineFile.Truncate(0)
+							_, _ = goroutineFile.Seek(0, 0)
+						} else {
+							_, _ = goroutineFile.WriteString("\n####################\n")
+						}
 
 						err := pprof.Lookup("goroutine").WriteTo(goroutineFile, 2)
 						if err != nil {
@@ -182,6 +188,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")
 	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
 	rootCmd.PersistentFlags().StringVar(&goroutineprofile, "goroutineprofile", "", "Goroutine Profile file")
+	rootCmd.PersistentFlags().BoolVar(&goroutineprofileLast, "goroutineprofilelast", false, "Goroutine Profile, keep only last")
 }
 
 func Execute() int {

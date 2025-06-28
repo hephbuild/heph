@@ -10,7 +10,7 @@ import (
 func (e *Engine) List(ctx context.Context, p EngineProvider, pkg string, rs *RequestState) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	rs, err := rs.TraceList(p.Name, pkg)
 	if err != nil {
-		return engine2.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
+		return nil, err
 	}
 
 	clean := e.StoreRequestState(rs)

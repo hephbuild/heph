@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
@@ -39,7 +40,7 @@ func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hash
 		return
 	}
 
-	var g errgroup.Group
+	var g herrgroup.Group
 	step, ctx := hstep.New(ctx, "Uploading to remote cache...")
 	defer step.Done()
 

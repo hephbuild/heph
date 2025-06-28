@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/goccy/go-json"
+	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
@@ -13,7 +14,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	sync_map "github.com/zolstein/sync-map"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/types/known/structpb"
 	"io"
 	"os"
@@ -285,7 +285,7 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
-	var g errgroup.Group
+	var g herrgroup.Group
 
 	g.Go(func() error {
 		if len(goPkg.TestGoFiles) > 0 {
@@ -361,7 +361,7 @@ func (p *Plugin) goListTestDepsPkgResult(ctx context.Context, pkg string, factor
 
 func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string) ([]Package, error) {
 	goPkgs := make([]Package, len(imports))
-	var g errgroup.Group
+	var g herrgroup.Group
 
 	for i, imp := range imports {
 		g.Go(func() error {
@@ -387,7 +387,7 @@ func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factor
 func (p *Plugin) goImportsToDeps(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string, seen *sync_map.Map[string, struct{}]) ([]LibPackage, error) {
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
-	var g errgroup.Group
+	var g herrgroup.Group
 
 	if seen == nil {
 		seen = &sync_map.Map[string, struct{}]{}
