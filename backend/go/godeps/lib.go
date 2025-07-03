@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"text/template"
 )
@@ -20,6 +22,21 @@ type Lib struct {
 }
 
 func (l Lib) Data() map[string]interface{} {
+	srcDep := make([]string, 0, len(l.SrcDep))
+	srcDepGlobs := make([]string, 0, len(l.SrcDep))
+	for _, s := range l.SrcDep {
+		if rest, ok := strings.CutPrefix(s, "glob:"); ok {
+			srcDepGlobs = append(srcDepGlobs, fmt.Sprintf("glob(%q)", rest))
+		} else {
+			srcDep = append(srcDep, strconv.Quote(s))
+		}
+	}
+
+	srcDepGlobsStr := strings.Join(srcDepGlobs, " + ")
+	if len(srcDepGlobs) > 0 {
+		srcDepGlobsStr = " + " + srcDepGlobsStr
+	}
+
 	return map[string]interface{}{
 		"Config":     Config,
 		"ModRoot":    l.ModRoot,
@@ -29,7 +46,7 @@ func (l Lib) Data() map[string]interface{} {
 		"GoFiles":    genStringArray(l.GoFiles, 2),
 		"SFiles":     genStringArray(l.SFiles, 2),
 		"GenEmbed":   l.GenEmbed,
-		"SrcDep":     genStringArray(l.SrcDep, 2),
+		"SrcDep":     genArray(srcDep, 2, true) + srcDepGlobsStr,
 		"Variant":    genVariant(l.Variant, true, false, false),
 	}
 }

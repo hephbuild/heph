@@ -170,7 +170,11 @@ func srcDepForLib(lib *Lib, embedPatterns []string) []string {
 			if o, ok := FilesOrigin[relRoot]; ok {
 				srcDep = append(srcDep, applyReplace(o))
 			} else {
-				srcDep = append(srcDep, relPkg)
+				if info, err := os.Stat(file); err == nil && info.IsDir() {
+					srcDep = append(srcDep, "glob:"+relPkg)
+				} else {
+					srcDep = append(srcDep, relPkg)
+				}
 			}
 		}
 	}
