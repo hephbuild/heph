@@ -2,7 +2,7 @@ module github.com/hephbuild/heph
 
 go 1.24
 
-toolchain go1.24.3
+toolchain go1.24.5
 
 tool github.com/cerbos/protoc-gen-go-hashpb
 
