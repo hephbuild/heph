@@ -72,11 +72,14 @@ func TestSanityTool(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, &engine.RequestState{}, "some/package", "sometarget", []string{""})
+	rs, clean := e.NewRequestState()
+	defer clean()
+
+	res, err := e.Result(ctx, rs, "some/package", "sometarget", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 
-	require.Len(t, res.Artifacts, 2)
+	require.Len(t, res.Artifacts, 1)
 
 	fs2 := hfstest.New(t)
 	err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs2)

@@ -29,11 +29,14 @@ func TestSmartProviderPlugin(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, &engine.RequestState{}, "", "do", []string{engine.AllOutputs})
+	rs, clean := e.NewRequestState()
+	defer clean()
+
+	res, err := e.Result(ctx, rs, "", "do", []string{engine.AllOutputs})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 
-	require.Len(t, res.Artifacts, 2)
+	require.Len(t, res.Artifacts, 1)
 
 	r, err := hartifact.FileReader(ctx, res.FindOutputs("")[0].Artifact)
 	require.NoError(t, err)

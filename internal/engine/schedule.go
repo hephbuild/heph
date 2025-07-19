@@ -349,11 +349,31 @@ type DepMetaArtifact struct {
 type ResultMeta struct {
 	Hashin    string
 	Artifacts []ResultMetaArtifact
+	CreatedAt time.Time
 }
 
 type ResultMetaArtifact struct {
 	Hashout string
 	Group   string
+}
+
+func (e *Engine) ResultMetaFromRef(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, outputs []string) (ResultMeta, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("ResultMetaFromRef %v", tref.Format(ref)),
+		}
+	})
+	defer cleanLabels()
+
+	ctx, span := tracer.Start(ctx, "ResultMetaFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
+	defer span.End()
+
+	def, err := e.GetDef(ctx, rs, DefContainer{Ref: ref})
+	if err != nil {
+		return ResultMeta{}, err
+	}
+
+	return e.ResultMetaFromDef(ctx, rs, def, outputs)
 }
 
 func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *TargetDef, outputs []string) (ResultMeta, error) {
@@ -384,7 +404,8 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 	}
 
 	m := ResultMeta{
-		Hashin: manifest.Hashin,
+		Hashin:    manifest.Hashin,
+		CreatedAt: manifest.CreatedAt,
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {

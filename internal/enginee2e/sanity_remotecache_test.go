@@ -6,12 +6,13 @@ import (
 	"io"
 	"testing"
 
+	"github.com/hephbuild/heph/plugin/tref"
+
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
-	"github.com/hephbuild/heph/internal/hartifact"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginstaticprovider"
@@ -122,53 +123,53 @@ func TestSanityRemoteCache(t *testing.T) {
 		require.NoError(t, err)
 
 		{
-			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t1", []string{""})
+			rs, clean := e.NewRequestState()
+			defer clean()
+
+			res, err := e.Result(ctx, rs, pkg, "t1", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
-			require.Len(t, res.Artifacts, 2)
+			require.Len(t, res.Artifacts, 1)
 
-			manifestArtifact, ok := res.FindManifest()
-			require.True(t, ok)
-
-			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
+			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: pkg, Name: "t1"}, []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "9c390c660da03694", manifest.Hashin)
+			assert.Equal(t, "c3fe3166a6593378", manifest.Hashin)
 			assert.Equal(t, "f406eea1fde8ad3f", manifest.Artifacts[0].Hashout)
 		}
 
 		{
-			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t2", []string{""})
+			rs, clean := e.NewRequestState()
+			defer clean()
+
+			res, err := e.Result(ctx, rs, pkg, "t2", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
-			require.Len(t, res.Artifacts, 2)
+			require.Len(t, res.Artifacts, 1)
 
-			manifestArtifact, ok := res.FindManifest()
-			require.True(t, ok)
-
-			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
+			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: pkg, Name: "t2"}, []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "7192756b68bcc6e1", manifest.Hashin)
+			assert.Equal(t, "68a0eae3b451f5fc", manifest.Hashin)
 			assert.Equal(t, "80c1a1818bce4532", manifest.Artifacts[0].Hashout)
 		}
 
 		{
-			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t3", []string{""})
+			rs, clean := e.NewRequestState()
+			defer clean()
+
+			res, err := e.Result(ctx, rs, pkg, "t3", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
-			require.Len(t, res.Artifacts, 2)
+			require.Len(t, res.Artifacts, 1)
 
-			manifestArtifact, ok := res.FindManifest()
-			require.True(t, ok)
-
-			manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
+			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: pkg, Name: "t3"}, []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "0deed014cb58c6f1", manifest.Hashin)
+			assert.Equal(t, "7623930ab0fdee24", manifest.Hashin)
 			assert.Equal(t, "80c1a1818bce4532", manifest.Artifacts[0].Hashout)
 		}
 

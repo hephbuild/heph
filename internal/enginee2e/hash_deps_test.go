@@ -4,12 +4,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hephbuild/heph/htypes"
+	"github.com/hephbuild/heph/plugin/tref"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
-	"github.com/hephbuild/heph/internal/hartifact"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginstaticprovider"
@@ -54,13 +53,16 @@ func TestHashDeps(t *testing.T) {
 
 	var at time.Time
 	{
-		res, err := e.Result(ctx, &engine.RequestState{}, "some/package", "sometarget", []string{""})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "some/package", "sometarget", []string{""})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
-		require.Len(t, res.Artifacts, 2)
+		require.Len(t, res.Artifacts, 1)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, htypes.Must2Ok(res.FindManifest()).Artifact)
+		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
 		require.NoError(t, err)
 
 		at = m.CreatedAt
@@ -68,13 +70,16 @@ func TestHashDeps(t *testing.T) {
 	}
 
 	{
-		res, err := e.Result(ctx, &engine.RequestState{}, "some/package", "sometarget", []string{""})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "some/package", "sometarget", []string{""})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
-		require.Len(t, res.Artifacts, 2)
+		require.Len(t, res.Artifacts, 1)
 
-		m, err := hartifact.ManifestFromArtifact(ctx, htypes.Must2Ok(res.FindManifest()).Artifact)
+		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
 		require.NoError(t, err)
 
 		require.Equal(t, at, m.CreatedAt)

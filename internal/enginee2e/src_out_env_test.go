@@ -203,15 +203,14 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, &engine.RequestState{}, "", test.target, []string{engine.AllOutputs})
+				rs, clean := e.NewRequestState()
+				defer clean()
+
+				res, err := e.Result(ctx, rs, "", test.target, []string{engine.AllOutputs})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 
-				require.Len(t, res.Artifacts, len(test.expected)+1)
-
-				manifest, ok := res.FindManifest()
-				require.True(t, ok)
-				assert.NotEmpty(t, manifest.Artifact)
+				require.Len(t, res.Artifacts, len(test.expected))
 
 				for _, name := range test.expected {
 					outputArtifacts := res.FindOutputs(name)
@@ -240,7 +239,10 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, &engine.RequestState{}, "", test.target, []string{})
+				rs, clean := e.NewRequestState()
+				defer clean()
+
+				res, err := e.Result(ctx, rs, "", test.target, []string{})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 			})

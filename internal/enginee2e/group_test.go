@@ -84,7 +84,10 @@ func TestGroup(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, &engine.RequestState{}, pkg, "g", []string{""})
+	rs, clean := e.NewRequestState()
+	defer clean()
+
+	res, err := e.Result(ctx, rs, pkg, "g", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

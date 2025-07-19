@@ -85,7 +85,10 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, &engine.RequestState{}, "", "parent", []string{engine.AllOutputs})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "", "parent", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -94,7 +97,10 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, &engine.RequestState{}, "", "parent", []string{engine.AllOutputs})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "", "parent", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -127,7 +133,7 @@ func TestDepsCache2(t *testing.T) {
 					Driver: "test_driver",
 				},
 			}, nil
-		}).Times(1)
+		}).Times(3)
 
 	_, err = e.RegisterProvider(ctx, provider)
 	require.NoError(t, err)
@@ -147,7 +153,7 @@ func TestDepsCache2(t *testing.T) {
 				Outputs: []string{""},
 				Cache:   true,
 			},
-		}, nil).Times(1)
+		}, nil).Times(3)
 
 	driver.EXPECT().
 		Run(gomock.Any(), gomock.Any()).
@@ -175,10 +181,10 @@ func TestDepsCache2(t *testing.T) {
 	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
-		Get(gomock.Any(), "__child/a758f2d4b1f498ef/manifest.v1.json").
+		Get(gomock.Any(), "__child/11721714eaaed295/manifest.v1.json").
 		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
-	for _, key := range []string{"__child/a758f2d4b1f498ef/manifest.v1.json", "__child/a758f2d4b1f498ef/out_out.tar"} {
+	for _, key := range []string{"__child/11721714eaaed295/manifest.v1.json", "__child/11721714eaaed295/out_out.tar"} {
 		cache.EXPECT().
 			Store(gomock.Any(), key, gomock.Any()).
 			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {
@@ -210,7 +216,10 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -219,7 +228,10 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -231,7 +243,10 @@ func TestDepsCache2(t *testing.T) {
 	require.NoError(t, err)
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
+		rs, clean := e.NewRequestState()
+		defer clean()
+
+		res, err := e.Result(ctx, rs, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 

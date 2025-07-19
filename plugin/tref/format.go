@@ -67,18 +67,18 @@ func sumRef(ref hproto.Hashable) uint64 {
 func sumRefTargetRef(hasher *xxh3.Hasher, m *pluginv1.TargetRef) {
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
-	for _, k := range hmaps.Sorted(m.GetArgs()) {
+	for k, v := range hmaps.Sorted(m.GetArgs()) {
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetArgs()[k]), len(m.GetArgs()[k])))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
 	}
 }
 
 func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOutput) {
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
-	for _, k := range hmaps.Sorted(m.GetArgs()) {
+	for k, v := range hmaps.Sorted(m.GetArgs()) {
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetArgs()[k]), len(m.GetArgs()[k])))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
 	}
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetOutput()), len(m.GetOutput())))
 	if len(m.GetFilters()) > 0 {
