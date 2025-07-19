@@ -5,6 +5,10 @@ import "heph/plugin/v1/driver.proto";
 import "heph/plugin/v1/plugin.proto";
 import "heph/plugin/v1/tref.proto";
 
+message StackRecursionError {
+  string stack = 1;
+}
+
 message ResultRequest {
   string request_id = 1;
   oneof of {

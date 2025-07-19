@@ -342,6 +342,10 @@ func (e ErrStackRecursion) Error() string {
 	return fmt.Sprintf("stack recursion detected: %v", e.printer())
 }
 
+func (e ErrStackRecursion) Print() string {
+	return e.printer()
+}
+
 func (e ErrStackRecursion) Is(err error) bool {
 	_, ok := err.(ErrStackRecursion)
 

@@ -4,6 +4,7 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -16,6 +17,20 @@ type Provider interface {
 	Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error)
 }
 
+type ErrStackRecursion struct {
+	Stack string
+}
+
+func (e ErrStackRecursion) Error() string {
+	return fmt.Sprintf("stack recursion detected: %v", e.Stack)
+}
+
+func (e ErrStackRecursion) Is(err error) bool {
+	_, ok := err.(ErrStackRecursion)
+
+	return ok
+}
+
 var _ Provider = (*providerConnectClient)(nil)
 
 func NewProviderConnectClient(client pluginv1connect.ProviderClient) Provider {
@@ -26,12 +41,17 @@ type providerConnectClient struct {
 	client pluginv1connect.ProviderClient
 }
 
-func (p providerConnectClient) handleErr(ctx context.Context, err error) error {
+func (p providerConnectClient) handleErr(err error) error {
 	if connect.CodeOf(err) == connect.CodeUnimplemented {
 		return ErrNotImplemented
 	}
+
 	if connect.CodeOf(err) == connect.CodeNotFound {
 		return ErrNotFound
+	}
+
+	if serr, ok := AsStackRecursionError(err); ok {
+		return ErrStackRecursion{Stack: serr.Stack}
 	}
 
 	return err
@@ -40,7 +60,7 @@ func (p providerConnectClient) handleErr(ctx context.Context, err error) error {
 func (p providerConnectClient) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	res, err := p.client.Config(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	return res.Msg, nil
@@ -49,10 +69,13 @@ func (p providerConnectClient) Config(ctx context.Context, req *pluginv1.Provide
 func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListRequest) (HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	res, err := p.client.List(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
-	return connectServerStream(res), nil
+	strm := connectServerStream(res)
+	strm = WithOnErr(strm, p.handleErr)
+
+	return strm, nil
 }
 
 func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
@@ -77,12 +100,12 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 
 	err := strm.Send(&pluginv1.GetContainer{Msg: &pluginv1.GetContainer_Start{Start: req}})
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	res, err := strm.Receive()
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	return res, nil
@@ -91,7 +114,7 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 func (p providerConnectClient) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	res, err := p.client.Probe(ctx, connect.NewRequest(req))
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	return res.Msg, nil

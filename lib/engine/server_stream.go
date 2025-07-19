@@ -111,6 +111,27 @@ type HookHandlerStream[T any] struct {
 	HandlerStreamReceive[T]
 
 	onCloseReceive func()
+	onErr          func(error) error
+}
+
+func (h HookHandlerStream[T]) CloseReceive() error {
+	if h.onCloseReceive == nil {
+		return h.HandlerStreamReceive.CloseReceive()
+	}
+
+	defer func() {
+		h.onCloseReceive()
+	}()
+
+	return h.HandlerStreamReceive.CloseReceive()
+}
+
+func (h HookHandlerStream[T]) Err() error {
+	if h.onErr == nil {
+		return h.HandlerStreamReceive.Err()
+	}
+
+	return h.onErr(h.HandlerStreamReceive.Err())
 }
 
 func WithOnCloseReceive[T any](r HandlerStreamReceive[T], f func()) HookHandlerStream[T] {
@@ -120,12 +141,9 @@ func WithOnCloseReceive[T any](r HandlerStreamReceive[T], f func()) HookHandlerS
 	}
 }
 
-func (h HookHandlerStream[T]) CloseReceive() error {
-	defer func() {
-		if h.onCloseReceive != nil {
-			h.onCloseReceive()
-		}
-	}()
-
-	return h.HandlerStreamReceive.CloseReceive()
+func WithOnErr[T any](r HandlerStreamReceive[T], f func(error) error) HookHandlerStream[T] {
+	return HookHandlerStream[T]{
+		HandlerStreamReceive: r,
+		onErr:                f,
+	}
 }

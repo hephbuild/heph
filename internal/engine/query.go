@@ -45,10 +45,6 @@ func (e *Engine) queryListProvider(ctx context.Context, rs *RequestState, p Engi
 	return func(yield func(*pluginv1.TargetSpec, error) bool) {
 		res, err := e.List(ctx, rs, p, pkg)
 		if err != nil {
-			if errors.Is(err, ErrStackRecursion{}) {
-				return
-			}
-
 			yield(nil, err)
 			return
 		}
@@ -124,10 +120,6 @@ func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1
 				for spec, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {
 						if errors.Is(err, ErrStackRecursion{}) {
-							if !yield(nil, err) {
-								return
-							}
-
 							continue
 						}
 

@@ -1,7 +1,6 @@
 package plugingo
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"fmt"
@@ -211,12 +210,6 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 	if tref.HasPackagePrefix(req.GetRef().GetPackage(), "@heph/file") {
 		return nil, engine2.ErrNotFound
 	}
-
-	defer func() {
-		if rerr != nil && connect.CodeOf(rerr) == connect.CodeUnknown {
-			rerr = connect.NewError(connect.CodeInternal, rerr)
-		}
-	}()
 
 	factors := FactorsFromArgs(req.GetRef().GetArgs())
 	if factors.GoVersion == "" {
