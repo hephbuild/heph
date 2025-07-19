@@ -15,12 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/htar"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 )
 

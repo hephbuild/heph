@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/internal/herrgroup"
 	"log"
 	"net"
 	"os"

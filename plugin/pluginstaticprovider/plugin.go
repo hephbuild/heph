@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/hephbuild/heph/lib/pluginsdk"
-	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 

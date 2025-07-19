@@ -3,8 +3,9 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/engine"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
 )
 

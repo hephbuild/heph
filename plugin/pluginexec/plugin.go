@@ -15,12 +15,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/zeebo/xxh3"
-
-	"github.com/hephbuild/heph/plugin/tref"
 
 	"github.com/google/uuid"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"

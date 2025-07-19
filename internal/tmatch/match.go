@@ -11,8 +11,9 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 )
 
 func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {

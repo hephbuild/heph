@@ -10,13 +10,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/lib/hpipe"
+
 	"github.com/hephbuild/heph/lib/pluginsdk/pluginsdkconnect"
 
 	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
-	"github.com/hephbuild/heph/plugin/hpipe"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lru"
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -17,7 +19,6 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 

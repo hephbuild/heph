@@ -5,9 +5,10 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/hephbuild/heph/internal/hsync"
+
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lfu"
-	"github.com/hephbuild/heph/hsync"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hsingleflight"

@@ -3,6 +3,8 @@ package enginee2e
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -10,7 +12,6 @@ import (
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/plugin/pluginstaticprovider"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
 )

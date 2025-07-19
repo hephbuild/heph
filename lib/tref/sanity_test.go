@@ -3,7 +3,8 @@ package tref
 import (
 	"testing"
 
-	"github.com/hephbuild/heph/plugin/tref/internal"
+	"github.com/hephbuild/heph/lib/tref/internal"
+
 	"github.com/stretchr/testify/require"
 )
 

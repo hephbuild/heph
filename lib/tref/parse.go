@@ -3,8 +3,9 @@ package tref
 import (
 	"strings"
 
+	"github.com/hephbuild/heph/lib/tref/internal"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref/internal"
 )
 
 func argsToProto(args []internal.Arg) map[string]string {

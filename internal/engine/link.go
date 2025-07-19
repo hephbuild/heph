@@ -11,9 +11,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/google/uuid"
-	"github.com/hephbuild/heph/hdebug"
-	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -21,7 +23,6 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/plugingroup"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"

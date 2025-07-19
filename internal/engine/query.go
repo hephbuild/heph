@@ -9,11 +9,12 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/hephbuild/heph/hdebug"
+	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/hephbuild/heph/tmatch"
 	sync_map "github.com/zolstein/sync-map"
 	"golang.org/x/sync/semaphore"
 )

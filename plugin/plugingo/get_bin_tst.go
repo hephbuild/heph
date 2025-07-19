@@ -7,8 +7,9 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 

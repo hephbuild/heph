@@ -5,8 +5,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hdebug"
+
 	"github.com/go-faker/faker/v4"
-	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"

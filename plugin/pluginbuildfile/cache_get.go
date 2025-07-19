@@ -3,7 +3,7 @@ package pluginbuildfile
 import (
 	"context"
 
-	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"

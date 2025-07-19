@@ -16,10 +16,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hephbuild/heph/hdebug"
+	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto"
-	"github.com/hephbuild/heph/plugin/tref"
 	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/semaphore"
 

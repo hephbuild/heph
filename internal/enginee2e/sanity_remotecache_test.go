@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
 

@@ -9,7 +9,8 @@ import (
 	"path"
 	"sync"
 
-	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/internal/herrgroup"
+
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"

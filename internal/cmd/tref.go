@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/hephbuild/heph/tmatch"
 	"github.com/spf13/cobra"
 )
 

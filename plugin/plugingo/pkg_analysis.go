@@ -12,15 +12,16 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"connectrpc.com/connect"
 	"github.com/goccy/go-json"
-	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	sync_map "github.com/zolstein/sync-map"
 	"google.golang.org/protobuf/types/known/structpb"
 )

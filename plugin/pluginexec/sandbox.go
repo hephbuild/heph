@@ -10,8 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/hmaps"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/zeebo/xxh3"
 
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"

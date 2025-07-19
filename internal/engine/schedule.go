@@ -18,13 +18,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hephbuild/heph/hdebug"
-	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/hpipe"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/plugingroup"
-	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
@@ -33,15 +36,12 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/hephbuild/heph/plugin/tref"
-
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hpty"
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/hpipe"
 	"github.com/zeebo/xxh3"
 )
 

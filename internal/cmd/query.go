@@ -8,10 +8,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
-	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
 )
 
