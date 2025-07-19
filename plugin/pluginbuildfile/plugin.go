@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hstarlark"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
@@ -25,7 +25,7 @@ type Plugin struct {
 	cacherunpkg CacheRunpkg
 }
 
-var _ engine2.Provider = (*Plugin)(nil)
+var _ pluginsdk.Provider = (*Plugin)(nil)
 
 const Name = "buildfile"
 
@@ -78,8 +78,8 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 	}, nil
 }
 
-func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		_, err := p.runPkg(ctx, req.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
 			spec, err := p.toTargetSpec(ctx, payload)
 			if err != nil {
@@ -342,7 +342,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
 	if payload.Name == "" {
-		return nil, engine2.ErrNotFound
+		return nil, pluginsdk.ErrNotFound
 	}
 
 	config := map[string]*structpb.Value{}

@@ -4,13 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.opentelemetry.io/otel"
 )
 
-func (e *Engine) Resulter() engine2.Resulter {
+func (e *Engine) Resulter() pluginsdk.Resulter {
 	return &resulterHandler{Engine: e}
 }
 
@@ -33,7 +33,7 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 		if err != nil {
 			var serr ErrStackRecursion
 			if errors.Is(err, &serr) {
-				return nil, engine2.ErrStackRecursion{Stack: serr.Print()}
+				return nil, pluginsdk.ErrStackRecursion{Stack: serr.Print()}
 			}
 
 			return nil, err
@@ -43,7 +43,7 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 		if err != nil {
 			var serr ErrStackRecursion
 			if errors.Is(err, &serr) {
-				return nil, engine2.ErrStackRecursion{Stack: serr.Print()}
+				return nil, pluginsdk.ErrStackRecursion{Stack: serr.Print()}
 			}
 
 			return nil, err

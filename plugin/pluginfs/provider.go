@@ -4,23 +4,22 @@ import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/lib/engine"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
 	"path/filepath"
 )
 
-var _ engine2.PluginIniter = (*Provider)(nil)
-var _ engine2.Provider = (*Provider)(nil)
+var _ pluginsdk.Initer = (*Provider)(nil)
+var _ pluginsdk.Provider = (*Provider)(nil)
 
 type Provider struct {
-	resultClient engine.EngineHandle
+	resultClient pluginsdk.Engine
 }
 
-func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error {
-	p.resultClient = init.CoreHandle
+func (p *Provider) PluginInit(ctx context.Context, init pluginsdk.InitPayload) error {
+	p.resultClient = init.Engine
 
 	return nil
 }
@@ -41,14 +40,14 @@ func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*plugin
 	return &pluginv1.ProbeResponse{}, nil
 }
 
-func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine2.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
+func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return pluginsdk.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	rest, ok := tref.CutPackagePrefix(req.GetRef().GetPackage(), "@heph/file")
 	if !ok {
-		return nil, engine2.ErrNotFound
+		return nil, pluginsdk.ErrNotFound
 	}
 
 	f := req.Ref.Args["f"]

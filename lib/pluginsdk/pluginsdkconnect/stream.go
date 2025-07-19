@@ -1,11 +1,12 @@
-package engine
+package pluginsdkconnect
 
 import (
 	"connectrpc.com/connect"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-var _ HandlerStreamReceive[*structpb.Value] = (*connectHandlerStreamReceive[structpb.Value, *structpb.Value])(nil)
+var _ pluginsdk.HandlerStreamReceive[*structpb.Value] = (*connectHandlerStreamReceive[structpb.Value, *structpb.Value])(nil)
 
 type connectHandlerStreamReceive[T any, TP *T] struct {
 	strm *connect.ServerStreamForClient[T]
@@ -27,7 +28,7 @@ func (c connectHandlerStreamReceive[T, TP]) CloseReceive() error {
 	return c.strm.Close()
 }
 
-func connectServerStream[T any](strm *connect.ServerStreamForClient[T]) HandlerStreamReceive[*T] {
+func connectServerStream[T any](strm *connect.ServerStreamForClient[T]) pluginsdk.HandlerStreamReceive[*T] {
 	return connectHandlerStreamReceive[T, *T]{
 		strm: strm,
 	}

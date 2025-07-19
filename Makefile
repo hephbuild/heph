@@ -19,6 +19,6 @@ gen:
 	cd plugin/pluginfs && buf generate
 	cd plugin/plugingroup && buf generate
 	cd internal/hproto && buf generate
-	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/engine -package=engine -source=lib/engine/plugin_driver.go > lib/engine/plugin_driver.mock.go
-	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/engine -package=engine -source=lib/engine/plugin_provider.go > lib/engine/plugin_provider.mock.go
-	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/engine -package=engine -source=lib/engine/plugin_cache.go > lib/engine/plugin_cache.mock.go
+	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_driver.go > lib/pluginsdk/plugin_driver.mock.go
+	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_provider.go > lib/pluginsdk/plugin_provider.mock.go
+	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_cache.go > lib/pluginsdk/plugin_cache.mock.go

@@ -9,8 +9,7 @@ import (
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
-	"github.com/hephbuild/heph/lib/engine"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -50,8 +49,8 @@ func FactorsFromArgs(args map[string]string) Factors {
 	}
 }
 
-var _ engine2.Provider = (*Plugin)(nil)
-var _ engine2.PluginIniter = (*Plugin)(nil)
+var _ pluginsdk.Provider = (*Plugin)(nil)
+var _ pluginsdk.Initer = (*Plugin)(nil)
 
 type packageCacheKey struct {
 	RequestId string
@@ -75,7 +74,7 @@ type goModGoWorkCache struct {
 }
 
 type Plugin struct {
-	resultClient     engine.EngineHandle
+	resultClient     pluginsdk.Engine
 	root             string
 	resultStdListMem hsingleflight.GroupMem[Factors, []Package]
 
@@ -85,8 +84,8 @@ type Plugin struct {
 	goModGoWorkCache hsingleflight.GroupMem[string, goModGoWorkCache]
 }
 
-func (p *Plugin) PluginInit(ctx context.Context, init engine.PluginInit) error {
-	p.resultClient = init.CoreHandle
+func (p *Plugin) PluginInit(ctx context.Context, init pluginsdk.InitPayload) error {
+	p.resultClient = init.Engine
 	p.root = init.Root
 
 	return nil
@@ -110,8 +109,8 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 	return &pluginv1.ProbeResponse{}, nil
 }
 
-func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine2.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		_, _, err := p.getGoModGoWork(ctx, req.Package)
 		if err != nil {
 			if errors.Is(err, errNotInGoModule) {
@@ -208,7 +207,7 @@ func getMode(ref *pluginv1.TargetRef) (string, error) {
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1.GetResponse, rerr error) {
 	if tref.HasPackagePrefix(req.GetRef().GetPackage(), "@heph/file") {
-		return nil, engine2.ErrNotFound
+		return nil, pluginsdk.ErrNotFound
 	}
 
 	factors := FactorsFromArgs(req.GetRef().GetArgs())
@@ -242,7 +241,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return p.stdLibBuild(ctx, factors, goImport)
 		}
 
-		return nil, engine2.ErrNotFound
+		return nil, pluginsdk.ErrNotFound
 	}
 
 	switch req.GetRef().GetName() {
@@ -373,7 +372,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.RequestId)
 	}
 
-	return nil, engine2.ErrNotFound
+	return nil, pluginsdk.ErrNotFound
 }
 
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {

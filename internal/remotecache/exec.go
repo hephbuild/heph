@@ -3,7 +3,7 @@ package remotecache
 import (
 	"context"
 	"errors"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 	"os/exec"
 	"strings"
@@ -22,7 +22,7 @@ func NewSh(cmd string) (*Exec, error) {
 	return NewExec([]string{"sh", "-u", "-e", "-c", cmd})
 }
 
-var _ engine2.Cache = (*Exec)(nil)
+var _ pluginsdk.Cache = (*Exec)(nil)
 
 type Exec struct {
 	args              []string
@@ -66,7 +66,7 @@ func (e *execReader) Read(p []byte) (n int, err error) {
 			if err != nil {
 				for _, sentinel := range e.notFoundSentinels {
 					if strings.Contains(err.Error(), sentinel) {
-						err = engine2.ErrCacheNotFound
+						err = pluginsdk.ErrCacheNotFound
 						break
 					}
 				}

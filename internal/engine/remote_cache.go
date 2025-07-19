@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hrand"
 	"github.com/hephbuild/heph/internal/hslices"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -175,7 +175,7 @@ func (e *Engine) manifestFromRemoteCache(ctx context.Context, ref *pluginv1.Targ
 
 	r, err := cache.Client.Get(ctx, manifestKey)
 	if err != nil {
-		if errors.Is(err, engine2.ErrCacheNotFound) {
+		if errors.Is(err, pluginsdk.ErrCacheNotFound) {
 			return hartifact.Manifest{}, false, nil
 		}
 
@@ -185,7 +185,7 @@ func (e *Engine) manifestFromRemoteCache(ctx context.Context, ref *pluginv1.Targ
 
 	m, err := hartifact.DecodeManifest(r)
 	if err != nil {
-		if errors.Is(err, engine2.ErrCacheNotFound) {
+		if errors.Is(err, pluginsdk.ErrCacheNotFound) {
 			return hartifact.Manifest{}, false, nil
 		}
 
@@ -242,8 +242,8 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 		g.Go(func() error {
 			r, err := cache.Client.Get(ctx, key)
 			if err != nil {
-				if errors.Is(err, engine2.ErrCacheNotFound) {
-					return engine2.ErrCacheNotFound
+				if errors.Is(err, pluginsdk.ErrCacheNotFound) {
+					return pluginsdk.ErrCacheNotFound
 				}
 
 				return err
@@ -278,7 +278,7 @@ func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.T
 	}
 	err = g.Wait()
 	if err != nil {
-		if errors.Is(err, engine2.ErrCacheNotFound) {
+		if errors.Is(err, pluginsdk.ErrCacheNotFound) {
 			return nil, false, nil
 		}
 

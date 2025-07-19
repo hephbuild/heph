@@ -3,7 +3,7 @@ package pluginstaticprovider
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/tref"
 
 	"connectrpc.com/connect"
@@ -14,7 +14,7 @@ type Target struct {
 	Spec *pluginv1.TargetSpec
 }
 
-var _ engine.Provider = (*Plugin)(nil)
+var _ pluginsdk.Provider = (*Plugin)(nil)
 
 type Plugin struct {
 	f func() []Target
@@ -42,8 +42,8 @@ func NewFunc(f func() []Target) *Plugin {
 	}
 }
 
-func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (engine.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		for _, target := range p.f() {
 			if req.GetPackage() != "" {
 				if target.Spec.GetRef().GetPackage() != req.GetPackage() {

@@ -1,4 +1,4 @@
-package engine
+package pluginsdkconnect
 
 import (
 	"github.com/stretchr/testify/assert"
@@ -7,7 +7,7 @@ import (
 )
 
 func TestStackRecursionError(t *testing.T) {
-	serr1 := NewStackRecursionConnectError("foobar")
+	serr1 := NewStackRecursionError("foobar")
 
 	assert.Equal(t, "aborted: stack recursion: foobar", serr1.Error())
 

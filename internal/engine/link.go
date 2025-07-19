@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -136,7 +136,7 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 
 			spec, err := e.resolveProvider(ctx, rs, providerStates, c, p)
 			if err != nil {
-				if errors.Is(err, engine2.ErrNotFound) {
+				if errors.Is(err, pluginsdk.ErrNotFound) {
 					continue
 				}
 

@@ -3,7 +3,7 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 	"testing"
 
@@ -46,7 +46,7 @@ func (m *mockCache) Store(ctx context.Context, key string, r io.Reader) error {
 func (m *mockCache) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	b, ok := m.store[key]
 	if !ok {
-		return nil, engine2.ErrCacheNotFound
+		return nil, pluginsdk.ErrCacheNotFound
 	}
 
 	return io.NopCloser(bytes.NewReader(b)), nil

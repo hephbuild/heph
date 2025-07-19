@@ -8,8 +8,7 @@ import (
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore"
-	"github.com/hephbuild/heph/internal/hsoftcontext"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	sync_map "github.com/zolstein/sync-map"
 	"go.opentelemetry.io/otel/attribute"
@@ -77,7 +76,7 @@ var getRoot = sync.OnceValues(func() (string, error) {
 
 type EngineHandle struct {
 	ServerHandle
-	engine2.EngineHandle
+	pluginsdk.Engine
 }
 
 type Engine struct {
@@ -90,20 +89,18 @@ type Engine struct {
 	CoreHandle EngineHandle
 
 	Providers     []EngineProvider
-	Drivers       []engine2.Driver
-	DriversHandle map[engine2.Driver]PluginHandle
-	DriversByName map[string]engine2.Driver
+	Drivers       []pluginsdk.Driver
+	DriversHandle map[pluginsdk.Driver]PluginHandle
+	DriversByName map[string]pluginsdk.Driver
 	DriversConfig map[string]*pluginv1.ConfigResponse
 	Caches        []CacheHandle
-
-	SoftCancel *hsoftcontext.Handler
 
 	requestState sync_map.Map[string, *RequestState]
 }
 
 type EngineProvider struct {
 	Name string
-	engine2.Provider
+	pluginsdk.Provider
 }
 
 func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
@@ -117,12 +114,11 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	sandboxfs := hfs.At(homefs, "sandbox")
 
 	e := &Engine{
-		Root:       rootfs,
-		Home:       homefs,
-		Cache:      cachefs,
-		Sandbox:    sandboxfs,
-		RootSpan:   trace.SpanFromContext(ctx),
-		SoftCancel: hsoftcontext.NewHandler(),
+		Root:     rootfs,
+		Home:     homefs,
+		Cache:    cachefs,
+		Sandbox:  sandboxfs,
+		RootSpan: trace.SpanFromContext(ctx),
 	}
 
 	otelInterceptor, err := otelconnect.NewInterceptor(
@@ -159,20 +155,16 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		connect.WithInterceptors(interceptors...),
 	}
 
-	srvh.Mux.Handle(corev1connect.NewControlServiceHandler(e.SoftCancel, handlerOpts...))
-	controlClient := corev1connect.NewControlServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...)
-
 	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
 	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
-	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), append(handlerOpts, connect.WithInterceptors(hsoftcontext.Interceptor(controlClient)))...))
+	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), handlerOpts...))
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
-		EngineHandle: engine2.EngineHandle{
-			LogClient:     corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
-			StepClient:    corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-			ResultClient:  e.Resulter(),
-			ControlClient: controlClient,
+		Engine: pluginsdk.Engine{
+			LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
+			StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+			ResultClient: e.Resulter(),
 		},
 	}
 

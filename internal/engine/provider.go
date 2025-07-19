@@ -3,12 +3,12 @@ package engine
 import (
 	"context"
 	"errors"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 )
 
-func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, pkg string) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, pkg string) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	rs, err := rs.TraceList(p.Name, pkg)
 	if err != nil {
 		return nil, err
@@ -26,8 +26,8 @@ func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, p
 		return nil, err
 	}
 
-	strm = engine2.WithOnCloseReceive(strm, clean)
-	strm = engine2.WithOnErr(strm, handleProviderErr)
+	strm = pluginsdk.WithOnCloseReceive(strm, clean)
+	strm = pluginsdk.WithOnErr(strm, handleProviderErr)
 
 	return strm, nil
 }
@@ -54,7 +54,7 @@ func (e *Engine) Get(ctx context.Context, rs *RequestState, p EngineProvider, re
 }
 
 func handleProviderErr(err error) error {
-	var serr engine2.ErrStackRecursion
+	var serr pluginsdk.ErrStackRecursion
 	if errors.As(err, &serr) {
 		return ErrStackRecursion{printer: func() string {
 			return serr.Stack

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/tref"
 	"strconv"
 
@@ -80,4 +80,4 @@ func New() *Plugin {
 	return &Plugin{}
 }
 
-var _ engine2.Driver = (*Plugin)(nil)
+var _ pluginsdk.Driver = (*Plugin)(nil)

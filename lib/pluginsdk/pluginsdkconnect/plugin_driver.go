@@ -1,24 +1,18 @@
-package engine
+package pluginsdkconnect
 
 import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
-type Driver interface {
-	Config(context.Context, *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error)
-	Parse(context.Context, *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error)
-	Run(context.Context, *pluginv1.RunRequest) (*pluginv1.RunResponse, error)
-	Pipe(context.Context, *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error)
-}
+var _ pluginsdk.Driver = (*driverConnectClient)(nil)
 
-var _ Driver = (*driverConnectClient)(nil)
-
-func NewDriverConnectClient(client pluginv1connect.DriverClient) Driver {
+func NewDriverConnectClient(client pluginv1connect.DriverClient) pluginsdk.Driver {
 	return driverConnectClient{client: client}
 }
 
@@ -89,21 +83,21 @@ func (p driverConnectClient) Pipe(ctx context.Context, req *pluginv1.PipeRequest
 
 func (p driverConnectClient) handleErr(ctx context.Context, err error) error {
 	if connect.CodeOf(err) == connect.CodeUnimplemented {
-		return ErrNotImplemented
+		return pluginsdk.ErrNotImplemented
 	}
 	if connect.CodeOf(err) == connect.CodeNotFound {
-		return ErrNotFound
+		return pluginsdk.ErrNotFound
 	}
 
-	return err
+	return connect.NewError(connect.CodeInternal, err)
 }
 
-func NewDriverConnectHandler(handler Driver) pluginv1connect.DriverHandler {
+func NewDriverConnectHandler(handler pluginsdk.Driver) pluginv1connect.DriverHandler {
 	return driverConnectHandler{handler: handler}
 }
 
 type driverConnectHandler struct {
-	handler Driver
+	handler pluginsdk.Driver
 }
 
 func (p driverConnectHandler) Config(ctx context.Context, req *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {
@@ -179,10 +173,10 @@ func (p driverConnectHandler) Pipe(ctx context.Context, req *connect.Request[plu
 }
 
 func (p driverConnectHandler) handleErr(ctx context.Context, err error) error {
-	if errors.Is(err, ErrNotImplemented) {
+	if errors.Is(err, pluginsdk.ErrNotImplemented) {
 		return connect.NewError(connect.CodeUnimplemented, err)
 	}
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, pluginsdk.ErrNotFound) {
 		return connect.NewError(connect.CodeNotFound, err)
 	}
 

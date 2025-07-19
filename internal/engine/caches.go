@@ -1,15 +1,17 @@
 package engine
 
-import engine2 "github.com/hephbuild/heph/lib/engine"
+import (
+	"github.com/hephbuild/heph/lib/pluginsdk"
+)
 
 type CacheHandle struct {
 	Name   string
-	Client engine2.Cache
+	Client pluginsdk.Cache
 	Read   bool
 	Write  bool
 }
 
-func (e *Engine) RegisterCache(name string, cache engine2.Cache, read, write bool) (CacheHandle, error) {
+func (e *Engine) RegisterCache(name string, cache pluginsdk.Cache, read, write bool) (CacheHandle, error) {
 	h := CacheHandle{
 		Name:   name,
 		Client: cache,

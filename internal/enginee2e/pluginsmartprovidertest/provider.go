@@ -3,6 +3,7 @@ package pluginsmartprovidertest
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -11,13 +12,11 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	engine2 "github.com/hephbuild/heph/lib/engine"
-
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-var _ engine2.Provider = (*Provider)(nil)
-var _ engine2.PluginIniter = (*Provider)(nil)
+var _ pluginsdk.Provider = (*Provider)(nil)
+var _ pluginsdk.Initer = (*Provider)(nil)
 
 const ProviderName = "smart_provider_test"
 
@@ -26,11 +25,11 @@ func New() *Provider {
 }
 
 type Provider struct {
-	resultClient engine2.EngineHandle
+	resultClient pluginsdk.Engine
 }
 
 func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error {
-	p.resultClient = init.CoreHandle
+	p.resultClient = init.Engine
 
 	return nil
 }
@@ -41,8 +40,8 @@ func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigReque
 	}, nil
 }
 
-func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
-	return engine2.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
+func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+	return pluginsdk.NewNoopChanHandlerStream[*pluginv1.ListResponse](), nil
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {

@@ -1,39 +1,18 @@
-package engine
+package pluginsdkconnect
 
 import (
 	"connectrpc.com/connect"
 	"context"
 	"errors"
-	"fmt"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
 )
 
-type Provider interface {
-	Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error)
-	List(ctx context.Context, req *pluginv1.ListRequest) (HandlerStreamReceive[*pluginv1.ListResponse], error)
-	Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error)
-	Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error)
-}
+var _ pluginsdk.Provider = (*providerConnectClient)(nil)
 
-type ErrStackRecursion struct {
-	Stack string
-}
-
-func (e ErrStackRecursion) Error() string {
-	return fmt.Sprintf("stack recursion detected: %v", e.Stack)
-}
-
-func (e ErrStackRecursion) Is(err error) bool {
-	_, ok := err.(ErrStackRecursion)
-
-	return ok
-}
-
-var _ Provider = (*providerConnectClient)(nil)
-
-func NewProviderConnectClient(client pluginv1connect.ProviderClient) Provider {
+func NewProviderConnectClient(client pluginv1connect.ProviderClient) pluginsdk.Provider {
 	return providerConnectClient{client: client}
 }
 
@@ -43,15 +22,15 @@ type providerConnectClient struct {
 
 func (p providerConnectClient) handleErr(err error) error {
 	if connect.CodeOf(err) == connect.CodeUnimplemented {
-		return ErrNotImplemented
+		return pluginsdk.ErrNotImplemented
 	}
 
 	if connect.CodeOf(err) == connect.CodeNotFound {
-		return ErrNotFound
+		return pluginsdk.ErrNotFound
 	}
 
 	if serr, ok := AsStackRecursionError(err); ok {
-		return ErrStackRecursion{Stack: serr.Stack}
+		return pluginsdk.ErrStackRecursion{Stack: serr.Stack}
 	}
 
 	return err
@@ -66,14 +45,14 @@ func (p providerConnectClient) Config(ctx context.Context, req *pluginv1.Provide
 	return res.Msg, nil
 }
 
-func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListRequest) (HandlerStreamReceive[*pluginv1.ListResponse], error) {
+func (p providerConnectClient) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	res, err := p.client.List(ctx, connect.NewRequest(req))
 	if err != nil {
 		return nil, p.handleErr(err)
 	}
 
 	strm := connectServerStream(res)
-	strm = WithOnErr(strm, p.handleErr)
+	strm = pluginsdk.WithOnErr(strm, p.handleErr)
 
 	return strm, nil
 }
@@ -120,29 +99,33 @@ func (p providerConnectClient) Probe(ctx context.Context, req *pluginv1.ProbeReq
 	return res.Msg, nil
 }
 
-func NewProviderConnectHandler(handler Provider) pluginv1connect.ProviderHandler {
+func NewProviderConnectHandler(handler pluginsdk.Provider) pluginv1connect.ProviderHandler {
 	return providerConnectHandler{handler: handler}
 }
 
 type providerConnectHandler struct {
-	handler Provider
+	handler pluginsdk.Provider
 }
 
-func (p providerConnectHandler) handleErr(ctx context.Context, err error) error {
-	if errors.Is(err, ErrNotImplemented) {
+func (p providerConnectHandler) handleErr(err error) error {
+	if errors.Is(err, pluginsdk.ErrNotImplemented) {
 		return connect.NewError(connect.CodeUnimplemented, err)
 	}
-	if errors.Is(err, ErrNotFound) {
+	if errors.Is(err, pluginsdk.ErrNotFound) {
 		return connect.NewError(connect.CodeNotFound, err)
 	}
+	var serr pluginsdk.ErrStackRecursion
+	if errors.Is(err, &serr) {
+		return NewStackRecursionError(serr.Stack)
+	}
 
-	return err
+	return connect.NewError(connect.CodeInternal, err)
 }
 
 func (p providerConnectHandler) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
 	res, err := p.handler.Config(ctx, req.Msg)
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	return connect.NewResponse(res), nil
@@ -151,7 +134,7 @@ func (p providerConnectHandler) Config(ctx context.Context, req *connect.Request
 func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[pluginv1.ListRequest], res *connect.ServerStream[pluginv1.ListResponse]) error {
 	strm, err := p.handler.List(ctx, req.Msg)
 	if err != nil {
-		return p.handleErr(ctx, err)
+		return p.handleErr(err)
 	}
 	defer strm.CloseReceive()
 
@@ -163,7 +146,7 @@ func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[p
 		}
 	}
 	if err := strm.Err(); err != nil {
-		return err
+		return p.handleErr(err)
 	}
 
 	return nil
@@ -202,7 +185,7 @@ func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStrea
 	case startMsg := <-startCh:
 		res, err := p.handler.Get(ctx, startMsg)
 		if err != nil {
-			return p.handleErr(ctx, err)
+			return p.handleErr(err)
 		}
 
 		err = strm.Send(res)
@@ -217,7 +200,7 @@ func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStrea
 func (p providerConnectHandler) Probe(ctx context.Context, req *connect.Request[pluginv1.ProbeRequest]) (*connect.Response[pluginv1.ProbeResponse], error) {
 	res, err := p.handler.Probe(ctx, req.Msg)
 	if err != nil {
-		return nil, p.handleErr(ctx, err)
+		return nil, p.handleErr(err)
 	}
 
 	return connect.NewResponse(res), nil

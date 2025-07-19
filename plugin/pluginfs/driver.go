@@ -3,7 +3,7 @@ package pluginfs
 import (
 	"context"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	"github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	fsv1 "github.com/hephbuild/heph/plugin/pluginfs/gen/heph/plugin/fs/v1"
 	"google.golang.org/protobuf/reflect/protodesc"
@@ -13,18 +13,18 @@ import (
 	"path/filepath"
 )
 
-var _ engine.Driver = (*Driver)(nil)
-var _ engine.PluginIniter = (*Driver)(nil)
+var _ pluginsdk.Driver = (*Driver)(nil)
+var _ pluginsdk.Initer = (*Driver)(nil)
 
 type Driver struct {
-	resultClient engine.PluginInit
+	resultClient pluginsdk.InitPayload
 }
 
 func NewDriver() *Driver {
 	return &Driver{}
 }
 
-func (p *Driver) PluginInit(ctx context.Context, init engine.PluginInit) error {
+func (p *Driver) PluginInit(ctx context.Context, init pluginsdk.InitPayload) error {
 	p.resultClient = init
 
 	return nil
@@ -98,5 +98,5 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 }
 
 func (p *Driver) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
-	return nil, engine.ErrNotImplemented
+	return nil, pluginsdk.ErrNotImplemented
 }

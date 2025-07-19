@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/zeebo/xxh3"
 	"io"
 	"maps"
@@ -352,4 +352,4 @@ func NewSh(options ...Option) *Plugin {
 	return New(options...)
 }
 
-var _ engine2.Driver = (*Plugin)(nil)
+var _ pluginsdk.Driver = (*Plugin)(nil)

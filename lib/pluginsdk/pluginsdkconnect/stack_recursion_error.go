@@ -1,4 +1,4 @@
-package engine
+package pluginsdkconnect
 
 import (
 	"connectrpc.com/connect"
@@ -7,7 +7,7 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
-func NewStackRecursionConnectError(stack string) *connect.Error {
+func NewStackRecursionError(stack string) *connect.Error {
 	cerr := connect.NewError(connect.CodeAborted, fmt.Errorf("stack recursion: %v", stack))
 
 	msg, err := connect.NewErrorDetail(&corev1.StackRecursionError{Stack: stack})

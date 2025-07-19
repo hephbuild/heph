@@ -4,7 +4,7 @@ import (
 	"cloud.google.com/go/storage"
 	"context"
 	"errors"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 )
 
@@ -21,8 +21,8 @@ func NewGCS(ctx context.Context, bucketName string) (*GCS, error) {
 	return &GCS{bucket: bucket}, nil
 }
 
-var _ engine2.Cache = (*GCS)(nil)
-var _ engine2.CacheHas = (*GCS)(nil)
+var _ pluginsdk.Cache = (*GCS)(nil)
+var _ pluginsdk.CacheHas = (*GCS)(nil)
 
 type GCS struct {
 	bucket *storage.BucketHandle
@@ -62,7 +62,7 @@ func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	r, err := obj.NewReader(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			return nil, engine2.ErrCacheNotFound
+			return nil, pluginsdk.ErrCacheNotFound
 		}
 
 		return nil, err

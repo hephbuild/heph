@@ -3,7 +3,7 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"go.uber.org/mock/gomock"
 	"io"
 	"os"
@@ -111,7 +111,7 @@ func TestDepsCache2(t *testing.T) {
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
 
-	provider := engine2.NewMockProvider(c)
+	provider := pluginsdk.NewMockProvider(c)
 
 	provider.EXPECT().
 		Config(gomock.Any(), gomock.Any()).
@@ -131,7 +131,7 @@ func TestDepsCache2(t *testing.T) {
 	_, err = e.RegisterProvider(ctx, provider)
 	require.NoError(t, err)
 
-	driver := engine2.NewMockDriver(c)
+	driver := pluginsdk.NewMockDriver(c)
 
 	driver.EXPECT().
 		Config(gomock.Any(), gomock.Any()).
@@ -171,11 +171,11 @@ func TestDepsCache2(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, driver, nil)
 	require.NoError(t, err)
 
-	cache := engine2.NewMockCache(c)
+	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
 		Get(gomock.Any(), "__child/a758f2d4b1f498ef/manifest.v1.json").
-		Return(nil, engine2.ErrNotFound).Times(1)
+		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
 	for _, key := range []string{"__child/a758f2d4b1f498ef/manifest.v1.json", "__child/a758f2d4b1f498ef/out_out.tar"} {
 		cache.EXPECT().

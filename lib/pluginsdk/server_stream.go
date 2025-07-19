@@ -1,8 +1,7 @@
-package engine
+package pluginsdk
 
 import (
 	"errors"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -25,8 +24,8 @@ type HandlerStream[T any] interface {
 	HandlerStreamSend[T]
 }
 
-var _ HandlerStreamReceive[*structpb.Value] = (*ChanHandlerStream[*structpb.Value])(nil)
-var _ HandlerStreamSend[*structpb.Value] = (*ChanHandlerStream[*structpb.Value])(nil)
+var _ HandlerStreamReceive[any] = (*ChanHandlerStream[any])(nil)
+var _ HandlerStreamSend[any] = (*ChanHandlerStream[any])(nil)
 
 type ChanHandlerStream[T any] struct {
 	ch           chan T
@@ -105,7 +104,7 @@ func NewChanHandlerStreamFunc[T any](f func(send func(T) error) error) *ChanHand
 	return strm
 }
 
-var _ HandlerStreamReceive[*structpb.Value] = (*HookHandlerStream[*structpb.Value])(nil)
+var _ HandlerStreamReceive[any] = (*HookHandlerStream[any])(nil)
 
 type HookHandlerStream[T any] struct {
 	HandlerStreamReceive[T]

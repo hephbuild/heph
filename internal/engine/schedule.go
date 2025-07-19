@@ -10,7 +10,7 @@ import (
 	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
-	engine2 "github.com/hephbuild/heph/lib/engine"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/tmatch"
 	"go.opentelemetry.io/otel"
@@ -861,7 +861,7 @@ type ExecuteResultWithOrigin struct {
 	InputOrigin *pluginv1.TargetDef_InputOrigin
 }
 
-func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Driver, options ExecOptions) ([]string, func() error, error) {
+func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.Driver, options ExecOptions) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
 	eg := &herrgroup.Group{}
 
@@ -894,7 +894,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Dri
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
 			RequestId: rs.ID,
 		})
-		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
+		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -925,7 +925,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Dri
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
 			RequestId: rs.ID,
 		})
-		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
+		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -949,7 +949,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Dri
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
 			RequestId: rs.ID,
 		})
-		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
+		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -973,7 +973,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Dri
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
 			RequestId: rs.ID,
 		})
-		if err != nil && errors.Is(err, engine2.ErrNotImplemented) {
+		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 		if res != nil && res.GetId() != "" {
