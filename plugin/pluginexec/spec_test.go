@@ -2,8 +2,9 @@ package pluginexec
 
 import (
 	"encoding/json"
-	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/stretchr/testify/require"
 )

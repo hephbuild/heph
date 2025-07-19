@@ -1,9 +1,9 @@
-//nolint:forbidigo
 package cmd
 
 import (
 	"context"
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/plugin/tref"

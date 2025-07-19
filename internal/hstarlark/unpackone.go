@@ -1,8 +1,9 @@
 package hstarlark
 
 import (
-	"go.starlark.net/starlark"
 	"strings"
+
+	"go.starlark.net/starlark"
 )
 
 type unpackError struct {

@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lru"
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -14,10 +19,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 )
 
 type Factors struct {
@@ -111,7 +112,7 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-		_, _, err := p.getGoModGoWork(ctx, req.Package)
+		_, _, err := p.getGoModGoWork(ctx, req.GetPackage())
 		if err != nil {
 			if errors.Is(err, errNotInGoModule) {
 				return nil
@@ -138,7 +139,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 				return nil
 			}
 
-			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.Package, factors, req.RequestId)
+			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetPackage(), factors, req.GetRequestId())
 			if err != nil {
 				if strings.Contains(err.Error(), "no Go files") {
 					return nil
@@ -195,17 +196,16 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 		}
 
 		return nil
-
 	}), nil
 }
 
 const ThirdpartyPrefix = "@heph/go/thirdparty"
 
 func getMode(ref *pluginv1.TargetRef) (string, error) {
-	return ref.Args["mode"], nil
+	return ref.GetArgs()["mode"], nil
 }
 
-func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1.GetResponse, rerr error) {
+func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	if tref.HasPackagePrefix(req.GetRef().GetPackage(), "@heph/file") {
 		return nil, pluginsdk.ErrNotFound
 	}
@@ -222,12 +222,10 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 	}
 
 	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.GetRef().GetPackage()); ok && basePkg == "" {
-		switch req.GetRef().GetName() {
-		case "download":
+		if req.GetRef().GetName() == "download" {
 			if modPkgPath != "" {
-				return nil, fmt.Errorf("modpath is unsupported on download")
+				return nil, errors.New("modpath is unsupported on download")
 			}
-
 			return p.goModDownload(ctx, req.GetRef().GetPackage(), modPath, version)
 		}
 	}
@@ -246,7 +244,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 	switch req.GetRef().GetName() {
 	case "build":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -256,16 +254,16 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
+		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
 	case "test":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
 
 		return p.runTest(ctx, goPkg, factors)
 	case "embedcfg":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -282,7 +280,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 		return p.embedCfg(ctx, tref.DirPackage(gomod), req.GetRef().GetPackage(), goPkg, factors, mode)
 	case "build_lib":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -297,9 +295,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.RequestId)
+		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.GetRequestId())
 	case "build_test":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -309,16 +307,16 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
+		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
 	case "testmain":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
 
 		return p.generateTestMain(ctx, goPkg, factors)
 	case "build_testmain_lib":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -328,9 +326,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, err
 		}
 
-		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors, req.RequestId)
+		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
 	case "build_lib#asm":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -340,9 +338,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibAsm(ctx, goPkg, factors, req.GetRef().Args["file"], mode)
+		return p.packageLibAsm(ctx, goPkg, factors, req.GetRef().GetArgs()["file"], mode)
 	case "build_lib#abi":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -354,7 +352,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 
 		return p.packageLibAbi(ctx, goPkg, factors, mode)
 	case "build_lib#incomplete":
-		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.RequestId)
+		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
@@ -369,7 +367,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (_ *pluginv1
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.RequestId)
+		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.GetRequestId())
 	}
 
 	return nil, pluginsdk.ErrNotFound
@@ -409,7 +407,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		}
 
 		if !hasGoFile {
-			return nil, nil, fmt.Errorf("no Go files")
+			return nil, nil, errors.New("no Go files")
 		}
 
 		files = append(files, fmt.Sprintf("//@heph/query:query@label=go_src,tree_output_to=%s", pkg))

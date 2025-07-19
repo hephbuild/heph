@@ -136,7 +136,7 @@ func checkTestFunc(fileSet *token.FileSet, fn *ast.FuncDecl, arg string) error {
 func processFile(fileSet *token.FileSet, pkgName string, filename string) (*Analysis, error) {
 	p, err := parser.ParseFile(fileSet, filename, nil, parser.ParseComments)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse: %s", err)
+		return nil, fmt.Errorf("failed to parse: %w", err)
 	}
 
 	var analysis Analysis
@@ -250,12 +250,12 @@ func analyzeTestMain(importPath string, files []string) (*Analysis, error) {
 		case "_xtest":
 			analysis.ImportXTest = true
 		default:
-			return nil, fmt.Errorf("Unknown package name: %q", parts[0])
+			return nil, fmt.Errorf("unknown package name: %q", parts[0])
 		}
 
 		fileMetadata, err := processFile(fileSet, parts[0], parts[1])
 		if err != nil {
-			return nil, fmt.Errorf("%s: %s", parts[1], err)
+			return nil, fmt.Errorf("%s: %w", parts[1], err)
 		}
 
 		// TODO: Flag duplicate test and benchmark names.

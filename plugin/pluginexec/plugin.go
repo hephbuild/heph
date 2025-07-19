@@ -3,10 +3,6 @@ package pluginexec
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hmaps"
-	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	"github.com/hephbuild/heph/lib/pluginsdk"
-	"github.com/zeebo/xxh3"
 	"io"
 	"maps"
 	"net/http"
@@ -18,6 +14,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	"github.com/hephbuild/heph/lib/pluginsdk"
+	"github.com/zeebo/xxh3"
 
 	"github.com/hephbuild/heph/plugin/tref"
 

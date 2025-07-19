@@ -3,12 +3,13 @@ package engine
 import (
 	"context"
 	"errors"
+	"slices"
+
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hlocks"
 	"github.com/hephbuild/heph/internal/hslices"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"slices"
 )
 
 type CacheLocks struct {
@@ -110,9 +111,7 @@ func (c *CacheLocks) Clone() *CacheLocks {
 }
 
 func (c *CacheLocks) AddFrom(in *CacheLocks) {
-	for _, m := range in.ms {
-		c.ms = append(c.ms, m)
-	}
+	c.ms = append(c.ms, in.ms...)
 }
 
 func (e *Engine) lockCache(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, hashin string, ro bool) (*CacheLocks, error) {

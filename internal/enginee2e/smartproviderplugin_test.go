@@ -1,7 +1,6 @@
 package enginee2e
 
 import (
-	"context"
 	"io"
 	"testing"
 
@@ -15,7 +14,7 @@ import (
 )
 
 func TestSmartProviderPlugin(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 
@@ -30,7 +29,7 @@ func TestSmartProviderPlugin(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, "", "do", []string{engine.AllOutputs}, &engine.RequestState{})
+	res, err := e.Result(ctx, &engine.RequestState{}, "", "do", []string{engine.AllOutputs})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

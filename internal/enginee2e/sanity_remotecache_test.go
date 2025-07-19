@@ -3,9 +3,10 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 	"testing"
+
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
@@ -53,7 +54,7 @@ func (m *mockCache) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 }
 
 func TestSanityRemoteCache(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	cache := &mockCache{}
 
 	pkg := t.Name()
@@ -138,7 +139,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		}
 
 		{
-			res, err := e.Result(ctx, pkg, "t2", []string{""}, &engine.RequestState{})
+			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t2", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 
@@ -155,7 +156,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		}
 
 		{
-			res, err := e.Result(ctx, pkg, "t3", []string{""}, &engine.RequestState{})
+			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t3", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 

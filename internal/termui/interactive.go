@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hsoftcontext"
-	"github.com/hephbuild/heph/internal/htime"
 	"maps"
 	"os"
 	"slices"
@@ -13,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hsoftcontext"
+	"github.com/hephbuild/heph/internal/htime"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -25,7 +26,7 @@ import (
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
 
-// We want our own QuitMsg so that we can do a graceful shotdown of the UI
+// We want our own QuitMsg so that we can do a graceful shotdown of the UI.
 type QuitMsg struct{}
 
 func Quit() tea.Msg {
@@ -105,8 +106,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.InterruptMsg:
 		m.cancelRoutine(errors.New("ctrl+c"))
 	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyBreak:
+		if msg.Type == tea.KeyBreak {
 			m.cancelRoutine(errors.New("ctrl+c"))
 		}
 	}
@@ -173,7 +173,7 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 				steps[step.GetId()] = step
 
 				if step.GetStatus() == corev1.Step_STATUS_COMPLETED {
-					//if step.GetParentId() == "" && step.Error {
+					// if step.GetParentId() == "" && step.Error {
 					//	hlog.From(ctx).Info(hstepfmt.Format(renderer, step, false))
 					//}
 
@@ -202,7 +202,7 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 				stepsm.Unlock()
 				stepsc := len(steps)
 				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
-					return time.Since(v.StartedAt.AsTime()) < 100*time.Millisecond
+					return time.Since(v.GetStartedAt().AsTime()) < 100*time.Millisecond
 				})
 				stepsa := slices.Collect(maps.Values(steps))
 				p.Send(stepsUpdateMsg{
@@ -262,7 +262,7 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 		err := hpanic.Recover(func() error {
 			return f(ctx, func(f hbbtexec.ExecFunc) error {
 				if !mu.TryLock() {
-					return fmt.Errorf("two concurrent interractive exec detected")
+					return errors.New("two concurrent interractive exec detected")
 				}
 				defer mu.Unlock()
 

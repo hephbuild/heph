@@ -1,10 +1,10 @@
 package enginee2e
 
 import (
-	"context"
-	"github.com/go-faker/faker/v4"
 	"io"
 	"testing"
+
+	"github.com/go-faker/faker/v4"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
@@ -28,7 +28,7 @@ func newValueMust(v any) *structpb.Value {
 }
 
 func TestSanity(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 
@@ -60,7 +60,7 @@ func TestSanity(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, pkg, "sometarget", []string{""}, &engine.RequestState{})
+	res, err := e.Result(ctx, &engine.RequestState{}, pkg, "sometarget", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

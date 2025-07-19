@@ -3,8 +3,9 @@ package hartifact
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htar"
 	"io"
+
+	"github.com/hephbuild/heph/internal/htar"
 
 	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -49,13 +50,13 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	}
 	defer r.Close()
 
-	switch content := artifact.Content.(type) {
+	switch content := artifact.GetContent().(type) {
 	case *pluginv1.Artifact_File:
 		if !cfg.filter(artifact.GetName()) {
 			return nil
 		}
 
-		f, err := hfs.Create(fs, content.File.OutPath)
+		f, err := hfs.Create(fs, content.File.GetOutPath())
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
@@ -67,7 +68,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 			return err
 		}
 	case *pluginv1.Artifact_Raw:
-		f, err := hfs.Create(fs, content.Raw.Path)
+		f, err := hfs.Create(fs, content.Raw.GetPath())
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
@@ -83,9 +84,9 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
-	//case *pluginv1.Artifact_TargzPath:
+	// case *pluginv1.Artifact_TargzPath:
 	default:
-		return fmt.Errorf("unsupported encoding %T", artifact.Content)
+		return fmt.Errorf("unsupported encoding %T", artifact.GetContent())
 	}
 
 	return nil

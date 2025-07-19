@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -54,9 +55,9 @@ func (e *Engine) Get(ctx context.Context, rs *RequestState, p EngineProvider, re
 }
 
 func handleProviderErr(err error) error {
-	var serr pluginsdk.ErrStackRecursion
+	var serr pluginsdk.StackRecursionError
 	if errors.As(err, &serr) {
-		return ErrStackRecursion{printer: func() string {
+		return StackRecursionError{printer: func() string {
 			return serr.Stack
 		}}
 	}

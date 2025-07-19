@@ -88,7 +88,7 @@ func NewChanHandlerStream[T any]() *ChanHandlerStream[T] {
 
 func NewNoopChanHandlerStream[T any]() *ChanHandlerStream[T] {
 	strm := NewChanHandlerStream[T]()
-	strm.CloseSend(nil)
+	_ = strm.CloseSend(nil)
 
 	return strm
 }
@@ -98,7 +98,7 @@ func NewChanHandlerStreamFunc[T any](f func(send func(T) error) error) *ChanHand
 
 	go func() {
 		err := f(strm.Send)
-		strm.CloseSend(err)
+		_ = strm.CloseSend(err)
 	}()
 
 	return strm

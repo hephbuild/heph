@@ -15,29 +15,29 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-// Reader gives a raw io.Reader of an artifact, useful for things like hashing
+// Reader gives a raw io.Reader of an artifact, useful for things like hashing.
 func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch content := a.Content.(type) {
+	switch content := a.GetContent().(type) {
 	case *pluginv1.Artifact_File:
-		return os.Open(content.File.SourcePath)
+		return os.Open(content.File.GetSourcePath())
 	case *pluginv1.Artifact_Raw:
-		return io.NopCloser(bytes.NewReader(content.Raw.Data)), nil
+		return io.NopCloser(bytes.NewReader(content.Raw.GetData())), nil
 	case *pluginv1.Artifact_TargzPath:
 		return os.Open(content.TargzPath)
 	case *pluginv1.Artifact_TarPath:
 		return os.Open(content.TarPath)
 	default:
-		return nil, fmt.Errorf("unsupported encoding %T", a.Content)
+		return nil, fmt.Errorf("unsupported encoding %T", a.GetContent())
 	}
 }
 
-// FileReader Assumes the output has a single file, and provides a reader for it (no matter the packaging)
+// FileReader Assumes the output has a single file, and provides a reader for it (no matter the packaging).
 func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch content := a.Content.(type) {
+	switch content := a.GetContent().(type) {
 	case *pluginv1.Artifact_File:
-		return os.Open(content.File.SourcePath)
+		return os.Open(content.File.GetSourcePath())
 	case *pluginv1.Artifact_Raw:
-		return io.NopCloser(bytes.NewReader(content.Raw.Data)), nil
+		return io.NopCloser(bytes.NewReader(content.Raw.GetData())), nil
 	case *pluginv1.Artifact_TarPath:
 		r, err := Reader(ctx, a)
 		if err != nil {
@@ -52,9 +52,9 @@ func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error
 		}
 
 		return hio.NewReadCloser(tr, r), nil
-	//case *pluginv1.Artifact_TargzPath:
+	// case *pluginv1.Artifact_TargzPath:
 	default:
-		return nil, fmt.Errorf("unsupported encoding %T", a.Content)
+		return nil, fmt.Errorf("unsupported encoding %T", a.GetContent())
 	}
 }
 
@@ -63,12 +63,12 @@ type File struct {
 	Path string
 }
 
-// FilesReader provides a reader for each file it (no matter the packaging)
+// FilesReader provides a reader for each file it (no matter the packaging).
 func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, error] {
 	return func(yield func(*File, error) bool) {
-		switch content := a.Content.(type) {
+		switch content := a.GetContent().(type) {
 		case *pluginv1.Artifact_File:
-			f, err := os.Open(content.File.SourcePath)
+			f, err := os.Open(content.File.GetSourcePath())
 			if err != nil {
 				if !yield(nil, err) {
 					return
@@ -78,16 +78,16 @@ func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, err
 
 			if !yield(&File{
 				ReadCloser: f,
-				Path:       content.File.OutPath,
+				Path:       content.File.GetOutPath(),
 			}, nil) {
 				return
 			}
 		case *pluginv1.Artifact_Raw:
-			f := io.NopCloser(bytes.NewReader(content.Raw.Data))
+			f := io.NopCloser(bytes.NewReader(content.Raw.GetData()))
 
 			if !yield(&File{
 				ReadCloser: f,
-				Path:       content.Raw.Path,
+				Path:       content.Raw.GetPath(),
 			}, nil) {
 				return
 			}
@@ -123,9 +123,9 @@ func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, err
 				}
 				return
 			}
-		//case *pluginv1.Artifact_TargzPath:
+		// case *pluginv1.Artifact_TargzPath:
 		default:
-			if !yield(nil, fmt.Errorf("unsupported encoding %T", a.Content)) {
+			if !yield(nil, fmt.Errorf("unsupported encoding %T", a.GetContent())) {
 				return
 			}
 		}

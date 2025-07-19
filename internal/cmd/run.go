@@ -1,10 +1,10 @@
-//nolint:forbidigo
 package cmd
 
 import (
 	"context"
 	"errors"
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -102,7 +102,7 @@ func init() {
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					if _, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok && len(res) == 1 {
+					if _, ok := matcher.GetItem().(*pluginv1.TargetMatcher_Ref); ok && len(res) == 1 {
 						for _, output := range res[0].Artifacts {
 							fmt.Println(output.Name)
 							fmt.Println("  group:    ", output.Group)

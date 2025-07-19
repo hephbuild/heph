@@ -2,17 +2,18 @@ package termui
 
 import (
 	"context"
-	"fmt"
-	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
+	"errors"
 	"os"
 	"sync"
+
+	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 )
 
 func NewNonInteractive(ctx context.Context, f RunFunc) error {
 	var mu sync.Mutex
 	return f(ctx, func(f hbbtexec.ExecFunc) error {
 		if !mu.TryLock() {
-			return fmt.Errorf("two concurrent interractive exec detected")
+			return errors.New("two concurrent interractive exec detected")
 		}
 		defer mu.Unlock()
 

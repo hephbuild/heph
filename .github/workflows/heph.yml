@@ -29,7 +29,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.23'
+          go-version: '1.24'
           cache: 'true'
 
       - name: Get buf
@@ -48,13 +48,12 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v1.62
+          version: v2.1
 
       - name: Build
         env:
           CGO_ENABLED: 0
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
-          HEPH_VERSION: ${{steps.version.outputs.version}}
         run: |
-          go build -ldflags "-s -w -X internal/hversion.Version=$HEPH_VERSION" -o heph_$HEPH_VERSION_${{ matrix.os }}_${{ matrix.arch }}
+          go build -ldflags "-s -w -X internal/hversion.Version=${{steps.version.outputs.version}}" -o heph_${{steps.version.outputs.version}}_${{ matrix.os }}_${{ matrix.arch }}

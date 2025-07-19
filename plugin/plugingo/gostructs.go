@@ -1,10 +1,11 @@
 package plugingo
 
 import (
-	"github.com/hephbuild/heph/internal/hmaps"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go/build"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hmaps"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 const MainPackage = "main"

@@ -2,6 +2,9 @@ package tref
 
 import (
 	"fmt"
+	"strings"
+	"unsafe"
+
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lfu"
 	"github.com/hephbuild/heph/hsync"
@@ -10,8 +13,6 @@ import (
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
-	"strings"
-	"unsafe"
 )
 
 type Ref = pluginv1.TargetRef
@@ -66,22 +67,22 @@ func sumRef(ref hproto.Hashable) uint64 {
 func sumRefTargetRef(hasher *xxh3.Hasher, m *pluginv1.TargetRef) {
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
-	for _, k := range hmaps.Sorted(m.Args) {
+	for _, k := range hmaps.Sorted(m.GetArgs()) {
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.Args[k]), len(m.Args[k])))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetArgs()[k]), len(m.GetArgs()[k])))
 	}
 }
 
 func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOutput) {
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
-	for _, k := range hmaps.Sorted(m.Args) {
+	for _, k := range hmaps.Sorted(m.GetArgs()) {
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.Args[k]), len(m.Args[k])))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetArgs()[k]), len(m.GetArgs()[k])))
 	}
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetOutput()), len(m.GetOutput())))
-	if len(m.Filters) > 0 {
-		for _, v := range m.Filters {
+	if len(m.GetFilters()) > 0 {
+		for _, v := range m.GetFilters() {
 			_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
 		}
 	}

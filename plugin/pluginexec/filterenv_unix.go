@@ -48,23 +48,23 @@ func maxArgs() (int64, error) {
 		return 0, err
 	}
 
-	max, err := strconv.ParseInt(string(bytes.TrimSpace(b)), 10, 64)
+	maxl, err := strconv.ParseInt(string(bytes.TrimSpace(b)), 10, 64)
 	if err != nil {
 		return 0, err
 	}
 
-	return max, nil
+	return maxl, nil
 }
 
 var maxArgsOnce = sync.OnceValues(maxArgs)
 
 func FilterLongEnv(env []string, args []string) ([]string, error) {
-	max, err := maxArgsOnce()
+	maxl, err := maxArgsOnce()
 	if err != nil {
 		return env, err
 	}
 
-	if max <= 0 {
+	if maxl <= 0 {
 		return env, nil
 	}
 
@@ -77,11 +77,7 @@ func FilterLongEnv(env []string, args []string) ([]string, error) {
 		return len(v) > MAX_ARG_STRLEN
 	})
 
-	for {
-		if envLength(env)+argsl < max {
-			break
-		}
-
+	for envLength(env)+argsl >= maxl {
 		var removed bool
 		env, removed = removeLongestSrc(env)
 		if !removed {

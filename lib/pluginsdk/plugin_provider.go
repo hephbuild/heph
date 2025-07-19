@@ -3,6 +3,7 @@ package pluginsdk
 import (
 	"context"
 	"fmt"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
@@ -13,16 +14,16 @@ type Provider interface {
 	Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error)
 }
 
-type ErrStackRecursion struct {
+type StackRecursionError struct {
 	Stack string
 }
 
-func (e ErrStackRecursion) Error() string {
+func (e StackRecursionError) Error() string {
 	return fmt.Sprintf("stack recursion detected: %v", e.Stack)
 }
 
-func (e ErrStackRecursion) Is(err error) bool {
-	_, ok := err.(ErrStackRecursion)
+func (e StackRecursionError) Is(err error) bool {
+	_, ok := err.(StackRecursionError)
 
 	return ok
 }

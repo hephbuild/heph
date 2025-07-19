@@ -2,9 +2,10 @@ package hproto
 
 import (
 	"fmt"
-	"github.com/zeebo/xxh3"
 	"hash"
 	"strings"
+
+	"github.com/zeebo/xxh3"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protopath"
@@ -83,13 +84,15 @@ func Compare(a, b Hashable) int {
 	hb := xxh3.New()
 	b.HashPB(hb, nil)
 
-	diff := hb.Sum64() - ha.Sum64()
+	suma := ha.Sum64()
+	sumb := hb.Sum64()
 
-	if diff < 0 {
+	switch {
+	case suma < sumb:
 		return -1
-	} else if diff > 0 {
+	case suma > sumb:
 		return 1
-	} else {
+	default:
 		return 0
 	}
 }

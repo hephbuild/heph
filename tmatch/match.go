@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/hephbuild/heph/plugin/tref"
 	"io/fs"
 	"iter"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/tref"
 )
 
 func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {
@@ -120,7 +121,7 @@ const (
 )
 
 func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
-	switch item := m.Item.(type) {
+	switch item := m.GetItem().(type) {
 	case *pluginv1.TargetMatcher_Ref:
 		return boolToResult(item.Ref.GetPackage() == pkg)
 	case *pluginv1.TargetMatcher_Package:
@@ -137,7 +138,7 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 		return MatchShrug
 	case *pluginv1.TargetMatcher_Or:
 		out := MatchNo
-		for _, matcher := range item.Or.Items {
+		for _, matcher := range item.Or.GetItems() {
 			switch MatchPackage(pkg, matcher) {
 			case MatchYes:
 				out = MatchYes
@@ -153,7 +154,7 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 		return out
 	case *pluginv1.TargetMatcher_And:
 		out := MatchYes
-		for _, matcher := range item.And.Items {
+		for _, matcher := range item.And.GetItems() {
 			switch MatchPackage(pkg, matcher) {
 			case MatchYes:
 				// dont touch
@@ -188,24 +189,24 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 		return MatchNo
 	}
 
-	switch item := m.Item.(type) {
+	switch item := m.GetItem().(type) {
 	case *pluginv1.TargetMatcher_Ref:
-		return boolToResult(tref.Equal(item.Ref, spec.Ref))
+		return boolToResult(tref.Equal(item.Ref, spec.GetRef()))
 	case *pluginv1.TargetMatcher_Package:
-		return boolToResult(item.Package == spec.Ref.Package)
+		return boolToResult(item.Package == spec.GetRef().GetPackage())
 	case *pluginv1.TargetMatcher_PackagePrefix:
-		return boolToResult(tref.HasPackagePrefix(spec.Ref.Package, item.PackagePrefix))
+		return boolToResult(tref.HasPackagePrefix(spec.GetRef().GetPackage(), item.PackagePrefix))
 	case *pluginv1.TargetMatcher_Label:
-		return boolToResult(slices.Contains(spec.Labels, item.Label))
+		return boolToResult(slices.Contains(spec.GetLabels(), item.Label))
 	case *pluginv1.TargetMatcher_CodegenPackage:
-		if !tref.HasPackagePrefix(item.CodegenPackage, spec.Ref.GetPackage()) {
+		if !tref.HasPackagePrefix(item.CodegenPackage, spec.GetRef().GetPackage()) {
 			return MatchNo
 		}
 
 		return MatchShrug
 	case *pluginv1.TargetMatcher_Or:
 		out := MatchNo
-		for _, matcher := range item.Or.Items {
+		for _, matcher := range item.Or.GetItems() {
 			switch MatchSpec(spec, matcher) {
 			case MatchYes:
 				out = MatchYes
@@ -221,7 +222,7 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 		return out
 	case *pluginv1.TargetMatcher_And:
 		out := MatchYes
-		for _, matcher := range item.And.Items {
+		for _, matcher := range item.And.GetItems() {
 			switch MatchSpec(spec, matcher) {
 			case MatchYes:
 				// dont touch
@@ -256,21 +257,21 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 		return MatchNo
 	}
 
-	switch item := m.Item.(type) {
+	switch item := m.GetItem().(type) {
 	case *pluginv1.TargetMatcher_Ref:
-		return boolToResult(tref.Equal(item.Ref, def.Ref))
+		return boolToResult(tref.Equal(item.Ref, def.GetRef()))
 	case *pluginv1.TargetMatcher_Package:
-		return boolToResult(item.Package == def.Ref.Package)
+		return boolToResult(item.Package == def.GetRef().GetPackage())
 	case *pluginv1.TargetMatcher_PackagePrefix:
-		return boolToResult(tref.HasPackagePrefix(def.Ref.Package, item.PackagePrefix))
+		return boolToResult(tref.HasPackagePrefix(def.GetRef().GetPackage(), item.PackagePrefix))
 	case *pluginv1.TargetMatcher_Label:
-		return boolToResult(slices.Contains(spec.Labels, item.Label))
+		return boolToResult(slices.Contains(spec.GetLabels(), item.Label))
 	case *pluginv1.TargetMatcher_CodegenPackage:
 		if def.GetCodegenTree() == nil || def.GetCodegenTree().GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_UNSPECIFIED {
 			return MatchNo
 		}
 
-		for _, path := range def.CodegenTree.Paths {
+		for _, path := range def.GetCodegenTree().GetPaths() {
 			outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path))
 			// TODO: differentiate file from dir output
 			if tref.HasPackagePrefix(outPkg, item.CodegenPackage) {
@@ -281,7 +282,7 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 		return MatchNo
 	case *pluginv1.TargetMatcher_Or:
 		out := MatchNo
-		for _, matcher := range item.Or.Items {
+		for _, matcher := range item.Or.GetItems() {
 			switch MatchDef(spec, def, matcher) {
 			case MatchYes:
 				out = MatchYes
@@ -297,7 +298,7 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 		return out
 	case *pluginv1.TargetMatcher_And:
 		out := MatchYes
-		for _, matcher := range item.And.Items {
+		for _, matcher := range item.And.GetItems() {
 			switch MatchDef(spec, def, matcher) {
 			case MatchYes:
 				// dont touch
@@ -332,7 +333,7 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		return root
 	}
 
-	switch item := m.Item.(type) {
+	switch item := m.GetItem().(type) {
 	case *pluginv1.TargetMatcher_Ref:
 		return filepath.Join(root, tref.ToOSPath(item.Ref.GetPackage()))
 	case *pluginv1.TargetMatcher_Package:
@@ -345,7 +346,7 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		return root
 	case *pluginv1.TargetMatcher_Or:
 		var roots []string
-		for _, matcher := range item.Or.Items {
+		for _, matcher := range item.Or.GetItems() {
 			r := extractRoot(root, matcher)
 			if r == root {
 				continue
@@ -361,7 +362,7 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		return root // TODO array
 	case *pluginv1.TargetMatcher_And:
 		var roots []string
-		for _, matcher := range item.And.Items {
+		for _, matcher := range item.And.GetItems() {
 			r := extractRoot(root, matcher)
 			if r == root {
 				continue

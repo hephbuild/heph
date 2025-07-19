@@ -42,11 +42,11 @@ func buildStepsTree(renderer *lipgloss.Renderer, steps []*corev1.Step) string {
 				return v
 			}
 
-			if v := strings.Compare(a.Id, b.Id); v != 0 {
+			if v := strings.Compare(a.GetId(), b.GetId()); v != 0 {
 				return v
 			}
 
-			return strings.Compare(a.Text, b.Text)
+			return strings.Compare(a.GetText(), b.GetText())
 		})
 	}
 

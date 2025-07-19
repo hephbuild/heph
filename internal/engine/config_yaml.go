@@ -1,9 +1,10 @@
 package engine
 
 import (
-	"github.com/goccy/go-yaml"
 	"os"
 	"slices"
+
+	"github.com/goccy/go-yaml"
 )
 
 type YAMLConfig struct {

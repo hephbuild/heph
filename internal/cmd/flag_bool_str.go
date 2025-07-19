@@ -1,8 +1,9 @@
 package cmd
 
 import (
-	"github.com/spf13/pflag"
 	"strconv"
+
+	"github.com/spf13/pflag"
 )
 
 func NewBoolStrFlag(bs *boolStr, name, shorthand, usage string) *pflag.Flag {

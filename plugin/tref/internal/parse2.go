@@ -96,7 +96,7 @@ func (p parser2) parseRoot(s string) (string, error) {
 func (p parser2) parsePackage(s string) (string, string, error) {
 	i := strings.Index(s, ":")
 	if i < 0 {
-		return "", "", errors.New("expected :")
+		return "", "", errors.New("expected :") //nolint:staticcheck
 	}
 
 	return s[:i], s[i:], nil
@@ -105,7 +105,7 @@ func (p parser2) parsePackage(s string) (string, string, error) {
 func (p parser2) parseName(s string) (string, string, error) {
 	s, ok := strings.CutPrefix(s, ":")
 	if !ok {
-		return "", "", errors.New("expected :")
+		return "", "", errors.New("expected :") //nolint:staticcheck
 	}
 
 	i := strings.IndexAny(s, "@| ")

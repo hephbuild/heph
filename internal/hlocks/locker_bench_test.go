@@ -1,7 +1,6 @@
 package hlocks
 
 import (
-	"context"
 	"testing"
 )
 
@@ -13,7 +12,7 @@ func BenchmarkFlock(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		err := l.Lock(context.Background())
+		err := l.Lock(b.Context())
 		if err != nil {
 			panic(err)
 		}
@@ -30,7 +29,7 @@ func BenchmarkMutex(b *testing.B) {
 	b.ResetTimer()
 
 	for b.Loop() {
-		err := l.Lock(context.Background())
+		err := l.Lock(b.Context())
 		if err != nil {
 			panic(err)
 		}

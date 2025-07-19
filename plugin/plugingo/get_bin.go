@@ -3,12 +3,15 @@ package plugingo
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path/filepath"
 )
+
+const unsafePkgName = "unsafe"
 
 func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
 	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
@@ -23,13 +26,20 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
 }
 
-func (p *Plugin) packageBinInner(ctx context.Context, targetName string, goPkg Package, factors Factors, mainRef string, goPkgs []LibPackage) (*pluginv1.GetResponse, error) {
+func (p *Plugin) packageBinInner(
+	ctx context.Context,
+	targetName string,
+	goPkg Package,
+	factors Factors,
+	mainRef string,
+	goPkgs []LibPackage,
+) (*pluginv1.GetResponse, error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
 	}
 	for i, goPkg := range goPkgs {
-		if goPkg.ImportPath == "unsafe" {
+		if goPkg.ImportPath == unsafePkgName {
 			// ignore pseudo package
 			continue
 		}

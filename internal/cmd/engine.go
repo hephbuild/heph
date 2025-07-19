@@ -4,6 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
@@ -18,11 +24,6 @@ import (
 	"github.com/hephbuild/heph/plugin/plugingo"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
-	"net/http"
-	"os"
-	"path/filepath"
-	"runtime"
-	"strings"
 )
 
 func parseConfig(ctx context.Context, root string) (engine.Config, error) {

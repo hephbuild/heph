@@ -1,11 +1,13 @@
+//nolint:lll
 package enginee2e
 
 import (
 	"context"
+	"testing"
+
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/plugin/plugingroup"
-	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
@@ -23,7 +25,7 @@ func TestCyclic1(t *testing.T) {
 		do   func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState)
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.Result(ctx, pkg, "c", []string{""}, rs)
+			_, err := e.Result(ctx, rs, pkg, "c", []string{""})
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
@@ -96,7 +98,7 @@ func TestCyclic2(t *testing.T) {
 		do   func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState)
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.Result(ctx, pkg, "a", []string{""}, rs)
+			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
@@ -152,7 +154,7 @@ func TestCyclic2(t *testing.T) {
 						},
 						Driver: "sh",
 						Config: map[string]*structpb.Value{
-							//"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
+							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 					},
@@ -173,36 +175,36 @@ func TestCyclic2(t *testing.T) {
 
 			test.do(t, ctx, e, pkg, rs)
 
-			//_, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
+			// _, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
 			//	Package: pkg,
 			//	Name:    "c",
-			//}}}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// }}}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//_, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 			//
-			//_, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 			//
-			//_, err = e.Result(ctx, pkg, "b", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "b", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//_, err = e.Result(ctx, pkg, "c", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "c", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
-			//var theErr error
-			//var matches int
-			//for _, err := range res {
+			// res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
+			// var theErr error
+			// var matches int
+			// for _, err := range res {
 			//	if err != nil {
 			//		theErr = err
 			//	} else {
 			//		matches++
 			//	}
 			//}
-			//require.Equal(t, 3, matches)
-			//require.ErrorContains(t, theErr, "stack recursion detected")
+			// require.Equal(t, 3, matches)
+			// require.ErrorContains(t, theErr, "stack recursion detected")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
 			require.ErrorContains(t, err, "stack recursion detected")
@@ -216,7 +218,7 @@ func TestCyclic3(t *testing.T) {
 		do   func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState)
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.Result(ctx, pkg, "a", []string{""}, rs)
+			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
@@ -285,7 +287,7 @@ func TestCyclic3(t *testing.T) {
 						},
 						Driver: "sh",
 						Config: map[string]*structpb.Value{
-							//"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
+							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 					},
@@ -306,36 +308,36 @@ func TestCyclic3(t *testing.T) {
 
 			test.do(t, ctx, e, pkg, rs)
 
-			//_, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
+			// _, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
 			//	Package: pkg,
 			//	Name:    "c",
-			//}}}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// }}}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//_, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 			//
-			//_, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 			//
-			//_, err = e.Result(ctx, pkg, "b", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "b", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//_, err = e.Result(ctx, pkg, "c", []string{""}, rs)
-			//require.ErrorContains(t, err, "stack recursion detected")
+			// _, err = e.Result(ctx, pkg, "c", []string{""}, rs)
+			// require.ErrorContains(t, err, "stack recursion detected")
 
-			//res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
-			//var theErr error
-			//var matches int
-			//for _, err := range res {
+			// res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
+			// var theErr error
+			// var matches int
+			// for _, err := range res {
 			//	if err != nil {
 			//		theErr = err
 			//	} else {
 			//		matches++
 			//	}
 			//}
-			//require.Equal(t, 3, matches)
-			//require.ErrorContains(t, theErr, "stack recursion detected")
+			// require.Equal(t, 3, matches)
+			// require.ErrorContains(t, theErr, "stack recursion detected")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
 			require.ErrorContains(t, err, "stack recursion detected")

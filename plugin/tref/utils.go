@@ -84,7 +84,7 @@ func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
 }
 
 func WithArgs(ref *pluginv1.TargetRef, m map[string]string) *pluginv1.TargetRef {
-	if len(m) == 0 && len(ref.Args) == 0 {
+	if len(m) == 0 && len(ref.GetArgs()) == 0 {
 		return ref
 	}
 

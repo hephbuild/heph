@@ -10,7 +10,7 @@ import (
 )
 
 func TestSanity(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	var steps []*corev1.Step
 	ctx = ContextWithHandler(ctx, func(ctx context.Context, pbstep *corev1.Step) *corev1.Step {

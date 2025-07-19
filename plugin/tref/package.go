@@ -1,6 +1,7 @@
 package tref
 
 import (
+	"errors"
 	"fmt"
 	"path"
 	"path/filepath"
@@ -14,7 +15,7 @@ func DirToPackage(dir, hephroot string) (string, error) {
 	}
 
 	if !filepath.IsAbs(hephroot) {
-		return "", fmt.Errorf("hephroot must be abs")
+		return "", errors.New("hephroot must be abs")
 	}
 
 	if rest, ok := strings.CutPrefix(dir, hephroot); ok {

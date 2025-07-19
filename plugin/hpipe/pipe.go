@@ -3,9 +3,10 @@ package hpipe
 import (
 	"context"
 	"fmt"
-	"go.opentelemetry.io/otel"
 	"io"
 	"net/http"
+
+	"go.opentelemetry.io/otel"
 )
 
 type ReaderCloser interface {

@@ -3,10 +3,11 @@ package plugingroup
 import (
 	"context"
 	"errors"
+	"strconv"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/tref"
-	"strconv"
 
 	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -34,12 +35,12 @@ func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*p
 }
 
 func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
-	deps, err := hstructpb.DecodeSlice[string](req.Spec.Config["deps"])
+	deps, err := hstructpb.DecodeSlice[string](req.GetSpec().GetConfig()["deps"])
 	if err != nil {
 		return nil, err
 	}
 
-	var inputs []*pluginv1.TargetDef_Input
+	inputs := make([]*pluginv1.TargetDef_Input, 0, len(deps))
 	for i, dep := range deps {
 		ref, err := tref.ParseWithOut(dep)
 		if err != nil {
@@ -64,7 +65,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 	return &pluginv1.ParseResponse{
 		Target: &pluginv1.TargetDef{
 			Def:     target,
-			Ref:     req.Spec.Ref,
+			Ref:     req.GetSpec().GetRef(),
 			Cache:   false,
 			Inputs:  inputs,
 			Outputs: []string{""},

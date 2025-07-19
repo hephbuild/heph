@@ -2,8 +2,6 @@ package pluginexec
 
 import (
 	"bytes"
-	"context"
-	"github.com/hephbuild/heph/herrgroup"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/lib/pluginsdk/pluginsdkconnect"
+
 	"connectrpc.com/connect"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
@@ -19,25 +20,23 @@ import (
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestSanity(t *testing.T) {
-	ctx := context.Background()
-	sandboxPath, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
+	ctx := t.Context()
+	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
 	p := New()
 
 	{
-		res, err := p.Config(ctx, connect.NewRequest(&pluginv1.ConfigRequest{}))
+		res, err := p.Config(ctx, &pluginv1.ConfigRequest{})
 		require.NoError(t, err)
 
-		b, err := protojson.Marshal(res.Msg.GetTargetSchema())
+		b, err := protojson.Marshal(res.GetTargetSchema())
 		require.NoError(t, err)
 		require.NotEmpty(t, b)
 		// require.JSONEq(t, `{"name":"Target", "field":[{"name":"run", "number":1, "label":"LABEL_REPEATED", "type":"TYPE_STRING", "jsonName":"run"}]}`, string(b))
@@ -48,7 +47,7 @@ func TestSanity(t *testing.T) {
 		runArg, err := structpb.NewValue([]any{"echo", "hello"})
 		require.NoError(t, err)
 
-		res, err := p.Parse(ctx, connect.NewRequest(&pluginv1.ParseRequest{
+		res, err := p.Parse(ctx, &pluginv1.ParseRequest{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
@@ -58,32 +57,31 @@ func TestSanity(t *testing.T) {
 					"run": runArg,
 				},
 			},
-		}))
+		})
 		require.NoError(t, err)
 
-		def = res.Msg.GetTarget()
+		def = res.GetTarget()
 	}
 
 	{
-		res, err := p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		res, err := p.Run(ctx, &pluginv1.RunRequest{
 			Target:      def,
 			SandboxPath: sandboxPath,
-		}))
+		})
 		require.NoError(t, err)
 
-		assert.Len(t, res.Msg.GetArtifacts(), 1)
+		assert.Len(t, res.GetArtifacts(), 1)
 	}
 }
 
 func TestPipeStdout(t *testing.T) {
-	ctx := context.Background()
-	sandboxPath, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
+	ctx := t.Context()
+	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
 	p := New()
 
-	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		path, h := p.PipesHandler()
@@ -109,7 +107,7 @@ func TestPipeStdout(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
@@ -119,7 +117,7 @@ func TestPipeStdout(t *testing.T) {
 			},
 			SandboxPath: sandboxPath,
 			Pipes:       []string{"", res.Msg.GetId(), ""},
-		}))
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -133,14 +131,13 @@ func TestPipeStdout(t *testing.T) {
 }
 
 func TestPipeStdin(t *testing.T) {
-	ctx := context.Background()
-	sandboxPath, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
+	ctx := t.Context()
+	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
 	p := New()
 
-	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		path, h := p.PipesHandler()
@@ -182,7 +179,7 @@ func TestPipeStdin(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
@@ -192,7 +189,7 @@ func TestPipeStdin(t *testing.T) {
 			},
 			SandboxPath: sandboxPath,
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		}))
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -216,14 +213,13 @@ func (s sleepReader) Read(p []byte) (int, error) {
 }
 
 func TestPipeStdinLargeAndSlow(t *testing.T) {
-	ctx := context.Background()
-	sandboxPath, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
+	ctx := t.Context()
+	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
 	p := New()
 
-	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		path, h := p.PipesHandler()
@@ -267,7 +263,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
 					Package: "some/pkg",
@@ -277,7 +273,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 			},
 			SandboxPath: sandboxPath,
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		}))
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -290,21 +286,20 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	actual := stdout.String()
 	expected := input + input
 
-	require.Equal(t, len(expected), len(actual))
+	require.Len(t, actual, len(expected))
 	assert.Equal(t, expected, actual)
 }
 
 func TestPipe404(t *testing.T) {
 	t.Skip() // This is expected to block forever, since there is no functional reader
 
-	ctx := context.Background()
-	sandboxPath, err := os.MkdirTemp("", "")
-	require.NoError(t, err)
+	ctx := t.Context()
+	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
 	p := New()
 
-	_, rpcHandler := pluginv1connect.NewDriverHandler(p)
+	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if strings.HasPrefix(req.URL.Path, PipesHandlerPath) {
@@ -338,7 +333,7 @@ func TestPipe404(t *testing.T) {
 		return err
 	})
 
-	_, err = p.Run(ctx, connect.NewRequest(&pluginv1.RunRequest{
+	_, err = p.Run(ctx, &pluginv1.RunRequest{
 		Target: &pluginv1.TargetDef{
 			Ref: &pluginv1.TargetRef{
 				Package: "some/pkg",
@@ -348,7 +343,7 @@ func TestPipe404(t *testing.T) {
 		},
 		SandboxPath: sandboxPath,
 		Pipes:       []string{"", res.Msg.GetId(), ""},
-	}))
+	})
 	require.NoError(t, err)
 
 	err = eg.Wait()

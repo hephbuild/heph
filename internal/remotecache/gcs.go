@@ -1,11 +1,12 @@
 package remotecache
 
 import (
-	"cloud.google.com/go/storage"
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
+
+	"cloud.google.com/go/storage"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 )
 
 const DriverNameGCS = "gcs"

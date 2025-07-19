@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/spf13/cobra"
@@ -20,11 +21,6 @@ var doctorCmd = func() *cobra.Command {
 		Use:  "doctor",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
-
-			ctx, stop := newSignalNotifyContext(ctx)
-			defer stop()
-
 			cwd, err := engine.Cwd()
 			printOrErr("Working dir:", cwd, err)
 

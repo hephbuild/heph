@@ -2,6 +2,9 @@ package pluginfs
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -9,8 +12,6 @@ import (
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"os"
-	"path/filepath"
 )
 
 var _ pluginsdk.Driver = (*Driver)(nil)
@@ -45,7 +46,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		File string `mapstructure:"file"`
 	}
 
-	cfg, err := hstructpb.Decode[Config](req.Spec.Config)
+	cfg, err := hstructpb.Decode[Config](req.GetSpec().GetConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +87,11 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	return &pluginv1.RunResponse{
 		Artifacts: []*pluginv1.Artifact{
 			{
-				Name: filepath.Base(t.File),
+				Name: filepath.Base(t.GetFile()),
 				Type: pluginv1.Artifact_TYPE_OUTPUT,
 				Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-					SourcePath: filepath.Join(p.resultClient.Root, t.File),
-					OutPath:    t.File,
+					SourcePath: filepath.Join(p.resultClient.Root, t.GetFile()),
+					OutPath:    t.GetFile(),
 				}},
 			},
 		},

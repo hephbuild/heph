@@ -49,11 +49,12 @@ func (c *ContextErr) cancel(err error) {
 	}
 
 	c.cancelInner()
-	if err == nil {
+	switch {
+	case err == nil:
 		c.err = c.Context.Err()
-	} else if errors.Is(err, context.Canceled) {
+	case errors.Is(err, context.Canceled):
 		c.err = err
-	} else {
+	default:
 		c.err = fmt.Errorf("%w: %w", c.Context.Err(), err)
 	}
 }

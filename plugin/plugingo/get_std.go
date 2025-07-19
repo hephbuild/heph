@@ -2,10 +2,12 @@ package plugingo
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/goccy/go-json"
 	"io"
 	"path"
+
+	"github.com/goccy/go-json"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -41,7 +43,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 	outputs := hartifact.FindOutputs(res.GetArtifacts(), "list")
 
 	if len(outputs) == 0 {
-		return nil, fmt.Errorf("no install artifact found")
+		return nil, errors.New("no install artifact found")
 	}
 
 	f, err := hartifact.FileReader(ctx, outputs[0])
@@ -56,7 +58,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 	for {
 		var goPkg Package
 		err := dec.Decode(&goPkg)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {

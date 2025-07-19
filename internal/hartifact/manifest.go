@@ -161,7 +161,7 @@ func DecodeManifest(r io.Reader) (Manifest, error) {
 }
 
 func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, error) {
-	switch a.Content.(type) {
+	switch a.GetContent().(type) {
 	case *pluginv1.Artifact_TargzPath:
 		return ManifestArtifactContentTypeTarGz, nil
 	case *pluginv1.Artifact_TarPath:
@@ -171,7 +171,7 @@ func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, err
 	default:
 	}
 
-	return "", fmt.Errorf("unsupported content %T", a.Content)
+	return "", fmt.Errorf("unsupported content %T", a.GetContent())
 }
 
 func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (ManifestArtifact, error) {
@@ -182,9 +182,9 @@ func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (Manif
 
 	return ManifestArtifact{
 		Hashout:     hashout,
-		Group:       artifact.Group,
-		Name:        artifact.Name,
-		Type:        ManifestArtifactType(artifact.Type),
+		Group:       artifact.GetGroup(),
+		Name:        artifact.GetName(),
+		Type:        ManifestArtifactType(artifact.GetType()),
 		ContentType: contentType,
 	}, nil
 }

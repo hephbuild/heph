@@ -211,7 +211,7 @@ func MakeDirsReadOnly(dir string) {
 		mode fs.FileMode
 	}
 	var dirs []pathMode // in lexical order
-	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
 			info, err := d.Info()
 			if err == nil && info.Mode()&0222 != 0 {
@@ -223,18 +223,18 @@ func MakeDirsReadOnly(dir string) {
 
 	// Run over list backward to chmod children before parents.
 	for i := len(dirs) - 1; i >= 0; i-- {
-		os.Chmod(dirs[i].path, dirs[i].mode&^0222)
+		_ = os.Chmod(dirs[i].path, dirs[i].mode&^0222)
 	}
 }
 
 func MakeDirsReadWrite(dir string) {
 	// Module cache has 0555 directories; make them writable in order to remove content.
-	filepath.WalkDir(dir, func(path string, info fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(dir, func(path string, info fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // ignore errors walking in file system
+			return nil //nolint:nilerr // ignore errors walking in file system
 		}
 		if info.IsDir() {
-			os.Chmod(path, 0777)
+			_ = os.Chmod(path, 0777)
 		}
 		return nil
 	})

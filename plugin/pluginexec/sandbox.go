@@ -5,13 +5,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hmaps"
-	"github.com/hephbuild/heph/plugin/tref"
-	"github.com/zeebo/xxh3"
 	"iter"
 	"os"
 	"path/filepath"
 	"slices"
+
+	"github.com/hephbuild/heph/internal/hmaps"
+	"github.com/hephbuild/heph/plugin/tref"
+	"github.com/zeebo/xxh3"
 
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 
@@ -20,7 +21,16 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.ArtifactWithOrigin, workfs, binfs, cwdfs, outfs hfs.OS, setupWd bool) ([]*pluginv1.ArtifactWithOrigin, error) {
+func SetupSandbox(
+	ctx context.Context,
+	t *execv1.Target,
+	results []*pluginv1.ArtifactWithOrigin,
+	workfs,
+	binfs,
+	cwdfs,
+	outfs hfs.OS,
+	setupWd bool,
+) ([]*pluginv1.ArtifactWithOrigin, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandbox")
 	defer span.End()
 
@@ -43,15 +53,15 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 
 		for _, dep := range hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()) {
 			for _, target := range dep.GetTargets() {
-				for artifact := range ArtifactsForId(results, target.Id, 1) {
-					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.Ref.Filters)
+				for artifact := range ArtifactsForId(results, target.GetId(), 1) {
+					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
 					if err != nil {
-						return nil, fmt.Errorf("setup artifact: %v: %w", target.Id, err)
+						return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 					}
 					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
 						Artifact: listArtifact,
 						Origin: &pluginv1.TargetDef_InputOrigin{
-							Id: target.Id,
+							Id: target.GetId(),
 						},
 					})
 				}
@@ -62,10 +72,10 @@ func SetupSandbox(ctx context.Context, t *execv1.Target, results []*pluginv1.Art
 	}
 
 	for _, tool := range t.GetTools() {
-		for artifact := range ArtifactsForId(results, tool.Id, 1) {
+		for artifact := range ArtifactsForId(results, tool.GetId(), 1) {
 			err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
-				return nil, fmt.Errorf("%v: %w", tref.Format(tool.Ref), err)
+				return nil, fmt.Errorf("%v: %w", tref.Format(tool.GetRef()), err)
 			}
 		}
 	}
@@ -89,7 +99,7 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 				continue
 			}
 
-			if input.Origin.Id != id {
+			if input.GetOrigin().GetId() != id {
 				continue
 			}
 

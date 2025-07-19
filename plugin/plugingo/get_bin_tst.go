@@ -3,11 +3,13 @@ package plugingo
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"path/filepath"
+
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path/filepath"
 )
 
 func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
@@ -56,7 +58,7 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 }
 
 func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
-	var absFiles []string
+	absFiles := make([]string, 0, len(goPkg.TestGoFiles)+len(goPkg.XTestGoFiles))
 	for _, file := range goPkg.TestGoFiles {
 		absFiles = append(absFiles, "_test:"+filepath.Join(goPkg.Dir, file))
 	}
@@ -118,7 +120,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 	}
 
 	if len(importsm) == 0 {
-		return nil, fmt.Errorf("this package has no tests")
+		return nil, errors.New("this package has no tests")
 	}
 
 	goPkg, err := p.getGoTestmainPackageFromImportPath(ctx, _goPkg.ImportPath, factors, c, requestId)
@@ -132,7 +134,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 	}
 
 	for _, impGoPkg := range imports {
-		if impGoPkg.ImportPath == "unsafe" {
+		if impGoPkg.ImportPath == unsafePkgName {
 			// ignore pseudo package
 			continue
 		}

@@ -1,9 +1,10 @@
 package pluginsdkconnect
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -30,7 +31,7 @@ func (p providerConnectClient) handleErr(err error) error {
 	}
 
 	if serr, ok := AsStackRecursionError(err); ok {
-		return pluginsdk.ErrStackRecursion{Stack: serr.Stack}
+		return pluginsdk.StackRecursionError{Stack: serr.GetStack()}
 	}
 
 	return err
@@ -62,8 +63,8 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 	defer cancelHardCtx()
 
 	strm := p.client.Get(hardCtx)
-	defer strm.CloseResponse()
-	defer strm.CloseRequest()
+	defer strm.CloseResponse() //nolint:errcheck
+	defer strm.CloseRequest()  //nolint:errcheck
 
 	go func() {
 		select {
@@ -114,7 +115,7 @@ func (p providerConnectHandler) handleErr(err error) error {
 	if errors.Is(err, pluginsdk.ErrNotFound) {
 		return connect.NewError(connect.CodeNotFound, err)
 	}
-	var serr pluginsdk.ErrStackRecursion
+	var serr pluginsdk.StackRecursionError
 	if errors.Is(err, &serr) {
 		return NewStackRecursionError(serr.Stack)
 	}
@@ -122,7 +123,10 @@ func (p providerConnectHandler) handleErr(err error) error {
 	return connect.NewError(connect.CodeInternal, err)
 }
 
-func (p providerConnectHandler) Config(ctx context.Context, req *connect.Request[pluginv1.ProviderConfigRequest]) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
+func (p providerConnectHandler) Config(
+	ctx context.Context,
+	req *connect.Request[pluginv1.ProviderConfigRequest],
+) (*connect.Response[pluginv1.ProviderConfigResponse], error) {
 	res, err := p.handler.Config(ctx, req.Msg)
 	if err != nil {
 		return nil, p.handleErr(err)
@@ -136,7 +140,7 @@ func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[p
 	if err != nil {
 		return p.handleErr(err)
 	}
-	defer strm.CloseReceive()
+	defer strm.CloseReceive() //nolint:errcheck
 
 	for strm.Receive() {
 		msg := strm.Msg()
@@ -169,7 +173,7 @@ func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStrea
 				return
 			}
 
-			switch msg := msg.Msg.(type) {
+			switch msg := msg.GetMsg().(type) {
 			case *pluginv1.GetContainer_Start:
 				startCh <- msg.Start
 				close(startCh)

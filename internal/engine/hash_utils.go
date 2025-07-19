@@ -3,17 +3,18 @@ package engine
 import (
 	"encoding/hex"
 	"encoding/json"
+	"hash"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
+
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
-	"hash"
-	"os"
-	"path/filepath"
-	"strconv"
-	"sync/atomic"
 )
 
 // Useful for figuring out why hash isnt deterministic

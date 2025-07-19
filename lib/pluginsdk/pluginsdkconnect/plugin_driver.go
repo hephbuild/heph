@@ -1,9 +1,10 @@
 package pluginsdkconnect
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -36,7 +37,6 @@ func (p driverConnectClient) Parse(ctx context.Context, req *pluginv1.ParseReque
 	}
 
 	return res.Msg, nil
-
 }
 
 func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
@@ -44,8 +44,8 @@ func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) 
 	defer cancelHardCtx()
 
 	strm := p.client.Run(hardCtx)
-	defer strm.CloseResponse()
-	defer strm.CloseRequest()
+	defer strm.CloseResponse() //nolint:errcheck
+	defer strm.CloseRequest()  //nolint:errcheck
 
 	go func() {
 		select {
@@ -135,7 +135,7 @@ func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[
 				return
 			}
 
-			switch msg := msg.Msg.(type) {
+			switch msg := msg.GetMsg().(type) {
 			case *pluginv1.RunContainer_Start:
 				startCh <- msg.Start
 				close(startCh)

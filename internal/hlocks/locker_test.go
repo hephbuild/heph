@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	runtime.GC()
-	fmt.Println("Giving the opportunity for the cleanup to run...")
+	fmt.Println("Giving the opportunity for the cleanup to run...") //nolint:forbidigo
 	time.Sleep(5 * time.Second)
 	os.Exit(code)
 }
@@ -30,8 +30,7 @@ func TestMain(m *testing.M) {
 func newfs(t testing.TB) hfs.OS {
 	t.Helper()
 
-	dir, err := os.MkdirTemp("", "flock")
-	require.NoError(t, err)
+	dir := t.TempDir()
 	t.Cleanup(func() {
 		_ = os.RemoveAll(dir)
 	})
@@ -135,7 +134,7 @@ func testLocker(t *testing.T, factory func() Locker) {
 	var n int32
 
 	logger := hlogtest.NewLogger(t)
-	ctx := hlog.ContextWithLogger(context.Background(), logger)
+	ctx := hlog.ContextWithLogger(t.Context(), logger)
 
 	do := func() {
 		defer wg.Done()
@@ -178,7 +177,7 @@ func testLockerContext(t *testing.T, factory func() Locker) {
 	ch := make(chan struct{})
 
 	logger := hlogtest.NewLogger(t)
-	ctx := hlog.ContextWithLogger(context.Background(), logger)
+	ctx := hlog.ContextWithLogger(t.Context(), logger)
 
 	go func() {
 		l := factory()
@@ -228,7 +227,7 @@ func testLockerTry(t *testing.T, factory func() Locker) {
 	l2 := factory()
 
 	logger := hlogtest.NewLogger(t)
-	ctx := hlog.ContextWithLogger(context.Background(), logger)
+	ctx := hlog.ContextWithLogger(t.Context(), logger)
 
 	err := l1.Lock(ctx)
 	require.NoError(t, err)
@@ -252,7 +251,7 @@ func testRLockTry(t *testing.T, factory func() RWLocker, shared bool) {
 	l3 := factory()
 
 	logger := hlogtest.NewLogger(t)
-	ctx := hlog.ContextWithLogger(context.Background(), logger)
+	ctx := hlog.ContextWithLogger(t.Context(), logger)
 
 	// 2 RLock
 	err := l1.RLock(ctx)
@@ -330,7 +329,7 @@ func TestFlockConcurrent(t *testing.T) {
 
 	lockAll := func(locks []Locker) error {
 		for _, lock := range locks {
-			err := lock.Lock(context.Background())
+			err := lock.Lock(t.Context())
 			if err != nil {
 				return err
 			}

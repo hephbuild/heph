@@ -17,7 +17,7 @@ func (p *Pool[T]) init() {
 func (p *Pool[T]) Get() T {
 	p.once.Do(p.init)
 
-	return p.p.Get().(T)
+	return p.p.Get().(T) //nolint:errcheck
 }
 
 func (p *Pool[T]) Put(v T) {

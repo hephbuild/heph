@@ -4,6 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/herrgroup"
@@ -19,14 +26,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/types/known/structpb"
-	"maps"
-	"os"
-	"path"
-	"path/filepath"
-	"slices"
-	"strconv"
-	"strings"
-	"sync"
 )
 
 type SpecContainer struct {
@@ -45,7 +44,13 @@ func (c SpecContainer) GetRef() *pluginv1.TargetRef {
 	panic("ref or spec must be specified")
 }
 
-func (e *Engine) resolveProvider(ctx context.Context, rs *RequestState, states []*pluginv1.ProviderState, c SpecContainer, p EngineProvider) (*pluginv1.TargetSpec, error) {
+func (e *Engine) resolveProvider(
+	ctx context.Context,
+	rs *RequestState,
+	states []*pluginv1.ProviderState,
+	c SpecContainer,
+	p EngineProvider,
+) (*pluginv1.TargetSpec, error) {
 	providerKey := p.Name
 
 	rs, err := rs.TraceResolveProvider(tref.Format(c.GetRef()), p.Name)
@@ -71,7 +76,6 @@ func (e *Engine) resolveProvider(ctx context.Context, rs *RequestState, states [
 	// TODO: what do we do if the spec.ref is different from the request ?
 
 	return spec, nil
-
 }
 
 func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pluginv1.ProviderState, c SpecContainer) (*pluginv1.TargetSpec, error) {
@@ -87,14 +91,14 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	defer clean()
 
 	spec, err, computed := rs.memSpec.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
-		if ref := c.GetRef(); ref.Package == "@heph/query" {
+		if ref := c.GetRef(); ref.GetPackage() == "@heph/query" {
 			items := []*pluginv1.TargetMatcher{}
 
-			if label, ok := ref.Args["label"]; ok {
+			if label, ok := ref.GetArgs()["label"]; ok {
 				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Label{Label: label}})
 			}
 
-			if treeOutputTo, ok := ref.Args["tree_output_to"]; ok {
+			if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
 				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_CodegenPackage{CodegenPackage: treeOutputTo}})
 			}
 
@@ -105,8 +109,8 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 			var deps []string
 			for ref, err := range e.Query(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_And{And: &pluginv1.TargetMatchers{Items: items}}}) {
 				if err != nil {
-					if errors.Is(err, ErrStackRecursion{}) {
-						//hlog.From(ctx).Error("resolve specs query", "err", err)
+					if errors.Is(err, StackRecursionError{}) {
+						// hlog.From(ctx).Error("resolve specs query", "err", err)
 
 						continue
 					}
@@ -156,8 +160,8 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 		return nil, fmt.Errorf("resolve spec: %v: %w", tref.Format(c.GetRef()), err)
 	}
 
-	if computed && !tref.Equal(spec.Ref, c.GetRef()) {
-		hlog.From(ctx).Warn(fmt.Sprintf("%v resolved as %v", tref.Format(c.GetRef()), tref.Format(spec.Ref)))
+	if computed && !tref.Equal(spec.GetRef(), c.GetRef()) {
+		hlog.From(ctx).Warn(fmt.Sprintf("%v resolved as %v", tref.Format(c.GetRef()), tref.Format(spec.GetRef())))
 	}
 
 	return spec, nil
@@ -197,41 +201,41 @@ func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer)
 func (e *Engine) ProbeSegments(ctx context.Context, rs *RequestState, c SpecContainer, pkg string) ([]*pluginv1.ProviderState, error) {
 	return nil, nil
 
-	ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
-	defer span.End()
-
-	// TODO: errgroup to parallelize probing
-
-	var states []*pluginv1.ProviderState
-	segments := strings.Split(pkg, string(filepath.Separator))
-	if len(segments) == 0 || len(segments) > 1 && segments[0] != "" {
-		// make sure to always probe root
-		segments = slices.Insert(segments, 0, "")
-	}
-	for i := range segments {
-		probePkg := path.Join(segments[:i]...)
-
-		for ip, p := range e.Providers {
-			probeStates, err, _ := rs.memProbe.Do(ctx, fmt.Sprintf("%v %v", ip, probePkg), func(ctx context.Context) ([]*pluginv1.ProviderState, error) {
-				res, err := p.Probe(ctx, &pluginv1.ProbeRequest{
-					RequestId: rs.ID,
-					Package:   probePkg,
-				})
-				if err != nil {
-					return nil, err
-				}
-
-				return res.States, nil
-			})
-			if err != nil {
-				return nil, err
-			}
-
-			states = append(states, probeStates...)
-		}
-	}
-
-	return states, nil
+	// ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
+	// defer span.End()
+	//
+	//// TODO: errgroup to parallelize probing
+	//
+	// var states []*pluginv1.ProviderState
+	// segments := strings.Split(pkg, string(filepath.Separator))
+	// if len(segments) == 0 || len(segments) > 1 && segments[0] != "" {
+	//	// make sure to always probe root
+	//	segments = slices.Insert(segments, 0, "")
+	//}
+	// for i := range segments {
+	//	probePkg := path.Join(segments[:i]...)
+	//
+	//	for ip, p := range e.Providers {
+	//		probeStates, err, _ := rs.memProbe.Do(ctx, fmt.Sprintf("%v %v", ip, probePkg), func(ctx context.Context) ([]*pluginv1.ProviderState, error) {
+	//			res, err := p.Probe(ctx, &pluginv1.ProbeRequest{
+	//				RequestId: rs.ID,
+	//				Package:   probePkg,
+	//			})
+	//			if err != nil {
+	//				return nil, err
+	//			}
+	//
+	//			return res.GetStates(), nil
+	//		})
+	//		if err != nil {
+	//			return nil, err
+	//		}
+	//
+	//		states = append(states, probeStates...)
+	//	}
+	//}
+	//
+	// return states, nil
 }
 
 type Refish interface {
@@ -271,7 +275,7 @@ type RequestStateData struct {
 
 	memSpecGet hsingleflight.GroupMemContext[memSpecGetKey, *pluginv1.TargetSpec]
 	memSpec    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
-	memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
+	// memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
 
 	memLink hsingleflight.GroupMemContext[string, *LightLinkedTarget]
 	memDef  hsingleflight.GroupMemContext[string, *TargetDef]
@@ -334,20 +338,20 @@ type Stack[K comparable] struct {
 	debugString string
 }
 
-type ErrStackRecursion struct {
+type StackRecursionError struct {
 	printer func() string
 }
 
-func (e ErrStackRecursion) Error() string {
+func (e StackRecursionError) Error() string {
 	return fmt.Sprintf("stack recursion detected: %v", e.printer())
 }
 
-func (e ErrStackRecursion) Print() string {
+func (e StackRecursionError) Print() string {
 	return e.printer()
 }
 
-func (e ErrStackRecursion) Is(err error) bool {
-	_, ok := err.(ErrStackRecursion)
+func (e StackRecursionError) Is(err error) bool {
+	_, ok := err.(StackRecursionError)
 
 	return ok
 }
@@ -366,7 +370,7 @@ var enableStackDebug = sync.OnceValue(func() bool {
 
 func (s Stack[K]) Push(k K) (Stack[K], error) {
 	if _, ok := s.m[k]; ok {
-		return s, ErrStackRecursion{
+		return s, StackRecursionError{
 			printer: func() string {
 				return s.StringWith(" -> ", k)
 			},
@@ -478,17 +482,17 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		def := res.GetTarget()
 
-		if !tref.Equal(def.Ref, spec.Ref) {
-			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.Ref), tref.Format(spec.Ref))
+		if !tref.Equal(def.GetRef(), spec.GetRef()) {
+			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.GetRef()), tref.Format(spec.GetRef()))
 		}
 
-		for _, output := range def.CollectOutputs {
-			if !slices.Contains(def.Outputs, output.Group) {
-				def.Outputs = append(def.Outputs, output.Group)
+		for _, output := range def.GetCollectOutputs() {
+			if !slices.Contains(def.GetOutputs(), output.GetGroup()) {
+				def.Outputs = append(def.Outputs, output.GetGroup())
 			}
 		}
 
-		if len(def.Hash) == 0 {
+		if len(def.GetHash()) == 0 {
 			h := xxh3.New()
 			def.HashPB(h, nil)
 
@@ -605,7 +609,7 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 			lt.Inputs[i] = &LightLinkedTargetInput{
 				TargetDef: linkedDep,
 				Outputs:   outputs,
-				Origin:    input.Origin,
+				Origin:    input.GetOrigin(),
 			}
 
 			return nil
@@ -617,11 +621,11 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 	}
 
 	slices.SortFunc(lt.Inputs, func(a, b *LightLinkedTargetInput) int {
-		if v := tref.Compare(a.TargetDef.GetRef(), a.TargetDef.GetRef()); v != 0 {
+		if v := tref.Compare(a.GetRef(), a.GetRef()); v != 0 {
 			return v
 		}
 
-		return strings.Compare(a.Origin.Id, a.Origin.Id)
+		return strings.Compare(a.Origin.GetId(), a.Origin.GetId())
 	})
 
 	return lt, nil

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -60,19 +61,26 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 	}
 }
 
-func parseMatcherResolve(ctx context.Context, e *engine.Engine, rs *engine.RequestState, args []string, cwd, root string) (*pluginv1.TargetMatcher, *pluginv1.TargetRef, error) {
+func parseMatcherResolve(
+	ctx context.Context,
+	e *engine.Engine,
+	rs *engine.RequestState,
+	args []string,
+	cwd,
+	root string,
+) (*pluginv1.TargetMatcher, *pluginv1.TargetRef, error) {
 	matcher, err := parseMatcher(args, cwd, root)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	if refm, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
+	if refm, ok := matcher.GetItem().(*pluginv1.TargetMatcher_Ref); ok {
 		spec, err := e.GetSpec(ctx, rs, engine.SpecContainer{Ref: refm.Ref})
 		if err != nil {
 			return nil, nil, err
 		}
 
-		return matcher, spec.Ref, nil
+		return matcher, spec.GetRef(), nil
 	}
 
 	return matcher, nil, nil

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -21,7 +22,7 @@ type resulterHandler struct {
 var tracer = otel.Tracer("heph/engine")
 
 func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*corev1.ResultResponse, error) {
-	rs, err := r.GetRequestState(req.RequestId)
+	rs, err := r.GetRequestState(req.GetRequestId())
 	if err != nil {
 		return nil, err
 	}
@@ -31,9 +32,9 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 	case *corev1.ResultRequest_Ref:
 		res, err = r.ResultFromRef(ctx, rs, kind.Ref, []string{AllOutputs})
 		if err != nil {
-			var serr ErrStackRecursion
+			var serr StackRecursionError
 			if errors.Is(err, &serr) {
-				return nil, pluginsdk.ErrStackRecursion{Stack: serr.Print()}
+				return nil, pluginsdk.StackRecursionError{Stack: serr.Print()}
 			}
 
 			return nil, err
@@ -41,9 +42,9 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 	case *corev1.ResultRequest_Spec:
 		res, err = r.ResultFromSpec(ctx, rs, kind.Spec, []string{AllOutputs})
 		if err != nil {
-			var serr ErrStackRecursion
+			var serr StackRecursionError
 			if errors.Is(err, &serr) {
-				return nil, pluginsdk.ErrStackRecursion{Stack: serr.Print()}
+				return nil, pluginsdk.StackRecursionError{Stack: serr.Print()}
 			}
 
 			return nil, err

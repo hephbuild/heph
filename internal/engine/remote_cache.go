@@ -3,6 +3,12 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path"
+	"sync"
+
 	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -16,11 +22,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
-	"io"
-	"log/slog"
-	"os"
-	"path"
-	"sync"
 )
 
 func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hashin string, manifest *hartifact.Manifest, artifacts []ExecuteResultArtifact) {
@@ -64,7 +65,13 @@ func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hash
 	}
 }
 
-func (e *Engine) cacheRemotelyInner(ctx context.Context, ref *pluginv1.TargetRef, hashin string, manifest *hartifact.Manifest, artifacts []ExecuteResultArtifact, cache CacheHandle) error {
+func (e *Engine) cacheRemotelyInner(ctx context.Context,
+	ref *pluginv1.TargetRef,
+	hashin string,
+	manifest *hartifact.Manifest,
+	artifacts []ExecuteResultArtifact,
+	cache CacheHandle,
+) error {
 	// TODO: remote lock ?
 
 	for _, artifact := range artifacts {
@@ -117,13 +124,17 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 			continue
 		}
 
-		tmpCacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef())+"_remote_tmp_"+hinstance.UID+"_"+hrand.Str(7)+"_"+hashin)
+		tmpCacheDir := hfs.At(
+			e.Cache,
+			def.GetRef().GetPackage(),
+			e.targetDirName(def.GetRef())+"_remote_tmp_"+hinstance.UID+"_"+hrand.Str(7)+"_"+hashin,
+		)
 		err := tmpCacheDir.MkdirAll("", os.ModePerm)
 		if err != nil {
 			return nil, false, err
 		}
 
-		defer tmpCacheDir.RemoveAll("")
+		defer tmpCacheDir.RemoveAll("") //nolint:errcheck
 
 		cacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
@@ -201,7 +212,14 @@ func (e *Engine) remoteCacheKey(ref *pluginv1.TargetRef, hashin, artifactName st
 	return path.Join(ref.GetPackage(), targetDirName, hashin, artifactName)
 }
 
-func (e *Engine) resultFromRemoteCacheInner(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, hashin string, cache CacheHandle, cachedir hfs.OS) ([]ExecuteResultArtifact, bool, error) {
+func (e *Engine) resultFromRemoteCacheInner(
+	ctx context.Context,
+	ref *pluginv1.TargetRef,
+	outputs []string,
+	hashin string,
+	cache CacheHandle,
+	cachedir hfs.OS,
+) ([]ExecuteResultArtifact, bool, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromLocalCacheInner", trace.WithAttributes(attribute.String("cache", cache.Name)))
 	defer span.End()
 

@@ -1,11 +1,16 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
-	"connectrpc.com/otelconnect"
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"connectrpc.com/connect"
+	"connectrpc.com/otelconnect"
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/lib/pluginsdk"
@@ -14,10 +19,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 	"go.opentelemetry.io/otel/trace"
-	"os"
-	"path/filepath"
-	"strings"
-	"sync"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"

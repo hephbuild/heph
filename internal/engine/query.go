@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
+	"path/filepath"
+	"slices"
+	"sync"
+
 	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -11,10 +16,6 @@ import (
 	"github.com/hephbuild/heph/tmatch"
 	sync_map "github.com/zolstein/sync-map"
 	"golang.org/x/sync/semaphore"
-	"iter"
-	"path/filepath"
-	"slices"
-	"sync"
 )
 
 func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
@@ -32,7 +33,13 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) queryListProvider(ctx context.Context, rs *RequestState, p EngineProvider, pkg string, seen map[seenPkgKey]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
+func (e *Engine) queryListProvider(
+	ctx context.Context,
+	rs *RequestState,
+	p EngineProvider,
+	pkg string,
+	seen map[seenPkgKey]struct{},
+) iter.Seq2[*pluginv1.TargetSpec, error] {
 	key := seenPkgKey{
 		pname: p.Name,
 		pkg:   pkg,
@@ -48,7 +55,7 @@ func (e *Engine) queryListProvider(ctx context.Context, rs *RequestState, p Engi
 			yield(nil, err)
 			return
 		}
-		defer res.CloseReceive()
+		defer res.CloseReceive() //nolint:errcheck
 
 		for res.Receive() {
 			msg := res.Msg()
@@ -76,7 +83,7 @@ type seenPkgKey struct {
 }
 
 func (e *Engine) match(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher) (tmatch.Result, error) {
-	if r := tmatch.MatchPackage(ref.Package, matcher); r.Definitive() {
+	if r := tmatch.MatchPackage(ref.GetPackage(), matcher); r.Definitive() {
 		return r, nil
 	}
 
@@ -119,7 +126,7 @@ func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1
 			for _, provider := range e.Providers {
 				for spec, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {
-						if errors.Is(err, ErrStackRecursion{}) {
+						if errors.Is(err, StackRecursionError{}) {
 							continue
 						}
 
@@ -127,7 +134,7 @@ func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1
 						continue
 					}
 
-					ref := spec.Ref
+					ref := spec.GetRef()
 					refstr := tref.Format(ref)
 
 					if _, ok := seenRef[refstr]; ok {
@@ -212,7 +219,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 		e.sendErr(ctx, fmt.Errorf("%v list: %w", p.Name, err))
 		return
 	}
-	defer res.CloseReceive()
+	defer res.CloseReceive() //nolint:errcheck
 
 	for res.Receive() {
 		msg := res.Msg()
@@ -238,7 +245,7 @@ func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef,
 	e.sendSpec(ctx, def.TargetSpec)
 
 	for _, input := range def.GetInputs() {
-		e.handleRefSpec(ctx, tref.WithoutOut(input.Ref), nil)
+		e.handleRefSpec(ctx, tref.WithoutOut(input.GetRef()), nil)
 	}
 }
 
@@ -273,7 +280,7 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 			}
 
 			spec := res.spec
-			ref := spec.Ref
+			ref := spec.GetRef()
 
 			if _, ok := seenRef[tref.Format(ref)]; ok {
 				continue
@@ -315,10 +322,10 @@ func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
-	if matcher, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
+	if matcher, ok := matcher.GetItem().(*pluginv1.TargetMatcher_Ref); ok {
 		return func(yield func(*pluginv1.TargetRef, error) bool) {
 			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: matcher.Ref}) // check if exist
-			yield(spec.Ref, err)
+			yield(spec.GetRef(), err)
 		}
 	}
 

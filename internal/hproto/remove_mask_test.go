@@ -1,8 +1,9 @@
 package hproto
 
 import (
-	"github.com/hephbuild/heph/internal/hmaps"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/hmaps"
 
 	"google.golang.org/protobuf/encoding/protojson"
 

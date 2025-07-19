@@ -6,16 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/hdebug"
-	"github.com/hephbuild/heph/herrgroup"
-	"github.com/hephbuild/heph/internal/hartifact"
-	"github.com/hephbuild/heph/internal/hinstance"
-	"github.com/hephbuild/heph/lib/pluginsdk"
-	"github.com/hephbuild/heph/plugin/plugingroup"
-	"github.com/hephbuild/heph/tmatch"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric"
-	"golang.org/x/sync/semaphore"
 	"hash"
 	"io"
 	"log/slog"
@@ -27,6 +17,17 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hephbuild/heph/hdebug"
+	"github.com/hephbuild/heph/herrgroup"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hinstance"
+	"github.com/hephbuild/heph/lib/pluginsdk"
+	"github.com/hephbuild/heph/plugin/plugingroup"
+	"github.com/hephbuild/heph/tmatch"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+	"golang.org/x/sync/semaphore"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -201,11 +202,12 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 
 	ref := def.GetRef()
 
-	if def.Cache {
+	switch {
+	case def.Cache:
 		outputs = def.Outputs
-	} else if onlyManifest {
+	case onlyManifest:
 		outputs = nil
-	} else if len(outputs) == 1 && outputs[0] == AllOutputs {
+	case len(outputs) == 1 && outputs[0] == AllOutputs:
 		outputs = def.Outputs
 	}
 
@@ -246,7 +248,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 			return nil, fmt.Errorf("lock: %w", err)
 		}
 
-		//e.ResultFromLocalCache(ctx, def, outputs, res.Hashin)
+		// e.ResultFromLocalCache(ctx, def, outputs, res.Hashin)
 
 		// TODO: recheck if things are in cache, and if not, clear memResult and call it again
 	} else {
@@ -292,7 +294,7 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 			return v
 		}
 
-		return strings.Compare(a.Origin.Id, b.Origin.Id)
+		return strings.Compare(a.Origin.GetId(), b.Origin.GetId())
 	})
 
 	var g herrgroup.Group
@@ -373,7 +375,7 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 
 	manifestArtifact, ok := res.FindManifest()
 	if !ok {
-		return ResultMeta{}, fmt.Errorf("no manifest")
+		return ResultMeta{}, errors.New("no manifest")
 	}
 
 	manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
@@ -428,7 +430,7 @@ func (e *Engine) depsResultMetas(ctx context.Context, rs *RequestState, def *Lig
 			return v
 		}
 
-		return strings.Compare(a.Origin.Id, b.Origin.Id)
+		return strings.Compare(a.Origin.GetId(), b.Origin.GetId())
 	})
 
 	var g herrgroup.Group
@@ -526,7 +528,7 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, rs *RequestStat
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, meta *Meta) (_ *ExecuteResultLocks, rerr error) {
+func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, meta *Meta) (*ExecuteResultLocks, error) {
 	hashin := meta.Hashin
 
 	shouldShell := tref.Equal(rs.Shell, def.GetRef())
@@ -559,7 +561,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 	}
 
 	res, err, computed := rs.memExecute.Do(ctx, refKey(def.GetRef()), func(ctx context.Context) (*ExecuteResultLocks, error) {
-		if def.TargetSpec.GetDriver() == plugingroup.Name {
+		if def.GetDriver() == plugingroup.Name {
 			results, err := e.depsResults(ctx, rs, def)
 			if err != nil {
 				return nil, fmt.Errorf("deps results: %w", err)
@@ -709,7 +711,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 	}
 
 	if len(def.Hash) == 0 {
-		return "", fmt.Errorf("hash is empty")
+		return "", errors.New("hash is empty")
 	}
 
 	_, err = h.Write(def.Hash)
@@ -719,7 +721,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 
 	// TODO support fieldmask of deps to include in hashin
 	for _, result := range results {
-		_, err = h.WriteString(result.Origin.Id)
+		_, err = h.WriteString(result.Origin.GetId())
 		if err != nil {
 			return "", err
 		}
@@ -745,7 +747,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 }
 
 func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*ExecuteResultWithOrigin) (string, error) {
-	var metas []DepMeta
+	metas := make([]DepMeta, 0, len(results))
 
 	for _, result := range results {
 		var artifacts []DepMetaArtifact
@@ -1026,14 +1028,14 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 	defer results.Unlock(ctx)
 
-	driver, ok := e.DriversByName[def.TargetSpec.GetDriver()]
+	driver, ok := e.DriversByName[def.GetDriver()]
 	if !ok {
-		return nil, fmt.Errorf("driver not found: %v", def.TargetSpec.GetDriver())
+		return nil, fmt.Errorf("driver not found: %v", def.GetDriver())
 	}
 
 	if options.shell {
-		shellDriver := def.TargetSpec.GetDriver() + "@shell"
-		shellDriver = "bash@shell" // TODO: make the original driver declare the shell config
+		shellDriver := def.GetDriver() + "@shell" //nolint:ineffassign,staticcheck,wastedassign
+		shellDriver = "bash@shell"                // TODO: make the original driver declare the shell config
 		driver, ok = e.DriversByName[shellDriver]
 		if !ok {
 			return nil, fmt.Errorf("shell driver not found: %v", shellDriver)

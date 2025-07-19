@@ -3,12 +3,13 @@ package hbbtexec
 import (
 	"errors"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/term"
-	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 	"io"
 	"os"
 	"sync"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/term"
+	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 )
 
 type ExecFunc func(args RunArgs) error

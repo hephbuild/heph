@@ -3,8 +3,9 @@ package pluginsmartprovidertest
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
+
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/engine"
 
@@ -46,7 +47,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: req.RequestId,
+		RequestId: req.GetRequestId(),
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{

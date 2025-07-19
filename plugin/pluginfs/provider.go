@@ -1,14 +1,15 @@
 package pluginfs
 
 import (
-	"connectrpc.com/connect"
 	"context"
 	"errors"
+	"path/filepath"
+
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
 	"google.golang.org/protobuf/types/known/structpb"
-	"path/filepath"
 )
 
 var _ pluginsdk.Initer = (*Provider)(nil)
@@ -50,7 +51,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		return nil, pluginsdk.ErrNotFound
 	}
 
-	f := req.Ref.Args["f"]
+	f := req.GetRef().GetArgs()["f"]
 	if f == "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("missing f argument"))
 	}

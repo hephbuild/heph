@@ -3,6 +3,7 @@ package hlocks
 import (
 	"context"
 	"errors"
+
 	"go.opentelemetry.io/otel"
 )
 

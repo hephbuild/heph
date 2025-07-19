@@ -1,8 +1,8 @@
-//nolint:forbidigo
 package cmd
 
 import (
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/tmatch"
 	"github.com/spf13/cobra"
@@ -52,7 +52,6 @@ func init() {
 			}
 
 			return nil
-
 		},
 	}
 

@@ -1,7 +1,6 @@
 package enginee2e
 
 import (
-	"context"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -19,7 +18,7 @@ import (
 )
 
 func TestSanityTool(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 

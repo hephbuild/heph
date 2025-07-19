@@ -2,7 +2,6 @@ package htar
 
 import (
 	"bytes"
-	"context"
 	"path"
 	"testing"
 
@@ -14,7 +13,7 @@ import (
 )
 
 func TestSanity(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srcfs := hfstest.New(t)
 
@@ -75,7 +74,7 @@ func fakePath() string {
 }
 
 func TestMonkey(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	srcfs := hfstest.New(t)
 

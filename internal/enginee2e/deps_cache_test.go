@@ -3,12 +3,13 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	"github.com/hephbuild/heph/lib/pluginsdk"
-	"go.uber.org/mock/gomock"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/hephbuild/heph/lib/pluginsdk"
+	"go.uber.org/mock/gomock"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
@@ -25,7 +26,7 @@ import (
 )
 
 func TestDepsCache(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 
@@ -84,7 +85,7 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, &engine.RequestState{})
+		res, err := e.Result(ctx, &engine.RequestState{}, "", "parent", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -93,7 +94,7 @@ func TestDepsCache(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "parent", []string{engine.AllOutputs}, &engine.RequestState{})
+		res, err := e.Result(ctx, &engine.RequestState{}, "", "parent", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -103,7 +104,7 @@ func TestDepsCache(t *testing.T) {
 }
 
 func TestDepsCache2(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	c := gomock.NewController(t)
 
 	dir := t.TempDir()
@@ -209,7 +210,7 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // This will run all
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
+		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -218,7 +219,7 @@ func TestDepsCache2(t *testing.T) {
 	}
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
+		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 
@@ -230,7 +231,7 @@ func TestDepsCache2(t *testing.T) {
 	require.NoError(t, err)
 
 	{ // this should reuse cache from deps
-		res, err := e.Result(ctx, "", "child", []string{engine.AllOutputs}, &engine.RequestState{})
+		res, err := e.Result(ctx, &engine.RequestState{}, "", "child", []string{engine.AllOutputs})
 		require.NoError(t, err)
 		defer res.Unlock(ctx)
 

@@ -1,23 +1,31 @@
 package pluginexec
 
 import (
+	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"reflect"
+
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 )
 
 type SpecStrings []string
 
 func (s *SpecStrings) MapstructureDecode(v any) error {
+	if v == nil {
+		*s = nil
+
+		return nil
+	}
+
 	rv := reflect.ValueOf(v)
 
-	switch rv.Kind() {
+	switch rv.Kind() { //nolint:exhaustive
 	case reflect.String:
-		*s = []string{rv.Interface().(string)}
+		*s = []string{rv.Interface().(string)} //nolint:errcheck
 		return nil
 	case reflect.Slice, reflect.Array:
 		values := make([]string, 0, rv.Len())
-		for i := 0; i < rv.Len(); i++ {
+		for i := range rv.Len() {
 			elem := rv.Index(i)
 
 			if v, ok := elem.Interface().(string); ok {
@@ -36,6 +44,12 @@ func (s *SpecStrings) MapstructureDecode(v any) error {
 type SpecDeps map[string]SpecStrings //nolint:recvcheck
 
 func (s *SpecDeps) MapstructureDecode(v any) error {
+	if v == nil {
+		*s = nil
+
+		return nil
+	}
+
 	if v, err := hstructpb.Decode[SpecStrings](v); err == nil {
 		*s = map[string]SpecStrings{"": v}
 		return nil
@@ -102,7 +116,7 @@ func (s *SpecCache) MapstructureDecode(v any) error {
 		}
 	}
 
-	return fmt.Errorf(`invalid value: must be bool or "local"`)
+	return errors.New(`invalid value: must be bool or "local"`)
 }
 
 type Spec struct {

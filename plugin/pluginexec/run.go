@@ -6,12 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/hdebug"
-	"github.com/hephbuild/heph/internal/hartifact"
-	"github.com/hephbuild/heph/internal/hproto"
-	"github.com/hephbuild/heph/plugin/tref"
-	"go.opentelemetry.io/otel"
-	"golang.org/x/sync/semaphore"
 	"io"
 	"os"
 	"os/exec"
@@ -21,6 +15,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/hephbuild/heph/hdebug"
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hproto"
+	"github.com/hephbuild/heph/plugin/tref"
+	"go.opentelemetry.io/otel"
+	"golang.org/x/sync/semaphore"
 
 	ptylib "github.com/creack/pty"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -252,7 +253,7 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	if err != nil {
 		step.SetError()
 
-		//err = fmt.Errorf("%v: %w", args, err)
+		// err = fmt.Errorf("%v: %w", args, err)
 
 		if cerr := ctx.Err(); cerr != nil {
 			err = fmt.Errorf("%w: %w", cerr, err)
@@ -334,8 +335,8 @@ func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps 
 				nd[k] = &execv1.Target_Deps{}
 			}
 
-			nd[k].Targets = append(nd[k].Targets, v.Targets...)
-			nd[k].Files = append(nd[k].Files, v.Files...)
+			nd[k].Targets = append(nd[k].Targets, v.GetTargets()...)
+			nd[k].Files = append(nd[k].Files, v.GetFiles()...)
 		}
 	}
 
@@ -345,16 +346,16 @@ func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps 
 func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
-	for name, deps := range Merge(t.Deps, t.RuntimeDeps) {
-		for _, dep := range deps.Targets {
-			id := dep.Id
+	for name, deps := range Merge(t.GetDeps(), t.GetRuntimeDeps()) {
+		for _, dep := range deps.GetTargets() {
+			id := dep.GetId()
 
 			allOutput := dep.Ref.Output == nil
 
 			for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
 				var outputName string
 				if allOutput {
-					outputName = artifact.Artifact.Group
+					outputName = artifact.GetArtifact().GetGroup()
 				}
 
 				envName := getEnvName("SRC", name, outputName)
@@ -371,15 +372,15 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 		sb.Reset()
 
 		slices.SortFunc(artifacts, func(a, b *pluginv1.ArtifactWithOrigin) int {
-			if v := strings.Compare(a.Origin.Id, b.Origin.Id); v != 0 {
+			if v := strings.Compare(a.GetOrigin().GetId(), b.GetOrigin().GetId()); v != 0 {
 				return v
 			}
 
-			if v := strings.Compare(a.Artifact.Group, a.Artifact.Group); v != 0 {
+			if v := strings.Compare(a.GetArtifact().GetGroup(), a.GetArtifact().GetGroup()); v != 0 {
 				return v
 			}
 
-			if v := strings.Compare(a.Artifact.Name, a.Artifact.Name); v != 0 {
+			if v := strings.Compare(a.GetArtifact().GetName(), a.GetArtifact().GetName()); v != 0 {
 				return v
 			}
 
@@ -391,7 +392,7 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 		})
 
 		for _, input := range artifacts {
-			r, err := hartifact.FileReader(ctx, input.Artifact)
+			r, err := hartifact.FileReader(ctx, input.GetArtifact())
 			if err != nil {
 				return nil, err
 			}

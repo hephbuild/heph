@@ -1,8 +1,9 @@
 package plugingo
 
 import (
-	"github.com/stretchr/testify/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRoundtrip1(t *testing.T) {
@@ -19,7 +20,7 @@ func TestRoundtrip2(t *testing.T) {
 	pkg := ThirdpartyContentPackage("github.com/foo/bar", "v1.2.3", "maps")
 	basePkg, goMod, version, pkgPath, ok := ParseThirdpartyPackage(pkg)
 	assert.True(t, ok)
-	assert.Equal(t, "", basePkg)
+	assert.Empty(t, basePkg)
 	assert.Equal(t, "github.com/foo/bar", goMod)
 	assert.Equal(t, "v1.2.3", version)
 	assert.Equal(t, "maps", pkgPath)

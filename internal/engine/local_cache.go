@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htar"
 	"hash"
 	"io"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hephbuild/heph/internal/htar"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -29,14 +30,14 @@ func (e *Engine) hashout(ctx context.Context, ref *pluginv1.TargetRef, artifact 
 		io.StringWriter
 	}
 	if enableHashDebug() {
-		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(ref), "//")+"_hashout_"+artifact.Name)
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(ref), "//")+"_hashout_"+artifact.GetName())
 	} else {
 		h = xxh3.New()
 	}
 
-	_, _ = h.WriteString(artifact.Group)
-	_, _ = h.WriteString(artifact.Name)
-	_, _ = h.WriteString(strconv.Itoa(int(artifact.Type)))
+	_, _ = h.WriteString(artifact.GetGroup())
+	_, _ = h.WriteString(artifact.GetName())
+	_, _ = h.WriteString(strconv.Itoa(int(artifact.GetType())))
 
 	for file, err := range hartifact.FilesReader(ctx, artifact) {
 		if err != nil {
@@ -67,7 +68,12 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
 }
 
-func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashin string, sandboxArtifacts []ExecuteResultArtifact) ([]ExecuteResultArtifact, *hartifact.Manifest, error) {
+func (e *Engine) CacheLocally(
+	ctx context.Context,
+	def *LightLinkedTarget,
+	hashin string,
+	sandboxArtifacts []ExecuteResultArtifact,
+) ([]ExecuteResultArtifact, *hartifact.Manifest, error) {
 	cachedir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
@@ -77,7 +83,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			continue
 		}
 
-		if content, ok := artifact.Artifact.Content.(*pluginv1.Artifact_File); ok {
+		if content, ok := artifact.Content.(*pluginv1.Artifact_File); ok {
 			artifact.Name += ".tar"
 			tarf, err := hfs.Create(cachedir, artifact.Name)
 			if err != nil {
@@ -86,7 +92,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			sourcefs := hfs.NewOS(content.File.SourcePath)
+			sourcefs := hfs.NewOS(content.File.GetSourcePath())
 
 			f, err := hfs.Open(sourcefs, "")
 			if err != nil {
@@ -94,7 +100,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			}
 			defer f.Close()
 
-			err = p.WriteFile(f, content.File.OutPath)
+			err = p.WriteFile(f, content.File.GetOutPath())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -102,11 +108,11 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			_ = f.Close()
 			_ = tarf.Close()
 
-			artifact.Artifact.Content = &pluginv1.Artifact_TarPath{
+			artifact.Content = &pluginv1.Artifact_TarPath{
 				TarPath: tarf.Name(),
 			}
 		}
-		if content, ok := artifact.Artifact.Content.(*pluginv1.Artifact_Raw); ok {
+		if content, ok := artifact.Content.(*pluginv1.Artifact_Raw); ok {
 			artifact.Name += ".tar"
 			tarf, err := hfs.Create(cachedir, artifact.Name)
 			if err != nil {
@@ -115,10 +121,10 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			err = p.Write(bytes.NewReader(content.Raw.Data), &tar.Header{
+			err = p.Write(bytes.NewReader(content.Raw.GetData()), &tar.Header{
 				Typeflag: tar.TypeReg,
-				Name:     content.Raw.Path,
-				Size:     int64(len(content.Raw.Data)),
+				Name:     content.Raw.GetPath(),
+				Size:     int64(len(content.Raw.GetData())),
 				Mode:     int64(os.ModePerm),
 			})
 			if err != nil {
@@ -127,7 +133,7 @@ func (e *Engine) CacheLocally(ctx context.Context, def *LightLinkedTarget, hashi
 
 			_ = tarf.Close()
 
-			artifact.Artifact.Content = &pluginv1.Artifact_TarPath{
+			artifact.Content = &pluginv1.Artifact_TarPath{
 				TarPath: tarf.Name(),
 			}
 		}
@@ -234,7 +240,6 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 
 	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin)
 	if err != nil {
-
 		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
 		if errors.Is(err, hfs.ErrNotExist) {
 			return nil, false, nil

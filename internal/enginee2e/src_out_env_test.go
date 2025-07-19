@@ -1,7 +1,6 @@
 package enginee2e
 
 import (
-	"context"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -16,7 +15,7 @@ import (
 )
 
 func TestSrcOutEnv(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 
@@ -241,7 +240,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, "", test.target, []string{}, &engine.RequestState{})
+				res, err := e.Result(ctx, &engine.RequestState{}, "", test.target, []string{})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 			})

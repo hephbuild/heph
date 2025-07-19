@@ -1,6 +1,7 @@
 package hfs
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	iofs "io/fs"
@@ -130,7 +131,7 @@ func Copy(from, to FS) error {
 	}
 
 	if fromi.IsDir() {
-		return fmt.Errorf("unsupported codepath")
+		return errors.New("unsupported codepath")
 	}
 
 	fromf, err := Open(from, "")
@@ -139,8 +140,8 @@ func Copy(from, to FS) error {
 	}
 	defer fromf.Close()
 
-	//toi, err := to.Stat("")
-	//if err != nil {
+	// toi, err := to.Stat("")
+	// if err != nil {
 	//	return err
 	//}
 

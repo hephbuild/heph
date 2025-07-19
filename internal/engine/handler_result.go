@@ -1,8 +1,9 @@
 package engine
 
 import (
-	"connectrpc.com/connect"
 	"context"
+
+	"connectrpc.com/connect"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
 )

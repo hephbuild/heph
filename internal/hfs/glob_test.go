@@ -1,7 +1,6 @@
 package hfs_test
 
 import (
-	"context"
 	"os"
 	"slices"
 	"testing"
@@ -47,10 +46,10 @@ func TestGlobNoPattern(t *testing.T) {
 
 	fn, get := collector()
 
-	err := hfs.Glob(context.Background(), fs, "", nil, fn)
+	err := hfs.Glob(t.Context(), fs, "", nil, fn)
 	require.NoError(t, err)
 
-	assert.EqualValues(t, []string{
+	assert.Equal(t, []string{
 		"file1",
 		"some/deep/file3",
 		"some/file2",
@@ -66,10 +65,10 @@ func TestGlobAllPattern(t *testing.T) {
 
 	fn, get := collector()
 
-	err := hfs.Glob(context.Background(), fs, "**/*", nil, fn)
+	err := hfs.Glob(t.Context(), fs, "**/*", nil, fn)
 	require.NoError(t, err)
 
-	assert.EqualValues(t, []string{
+	assert.Equal(t, []string{
 		"file1",
 		"some/deep/file3",
 		"some/file2",
@@ -85,10 +84,10 @@ func TestGlobAllFirstLevelPattern(t *testing.T) {
 
 	fn, get := collector()
 
-	err := hfs.Glob(context.Background(), fs, "*", nil, fn)
+	err := hfs.Glob(t.Context(), fs, "*", nil, fn)
 	require.NoError(t, err)
 
-	assert.EqualValues(t, []string{
+	assert.Equal(t, []string{
 		"file1",
 	}, get())
 }
@@ -102,10 +101,10 @@ func TestGlobAllFirstSecondLevelPattern(t *testing.T) {
 
 	fn, get := collector()
 
-	err := hfs.Glob(context.Background(), fs, "some/*", nil, fn)
+	err := hfs.Glob(t.Context(), fs, "some/*", nil, fn)
 	require.NoError(t, err)
 
-	assert.EqualValues(t, []string{
+	assert.Equal(t, []string{
 		"some/file2",
 	}, get())
 }
@@ -119,10 +118,10 @@ func TestGlobNoPatternSecondLevel(t *testing.T) {
 
 	fn, get := collector()
 
-	err := hfs.Glob(context.Background(), fs, "some", nil, fn)
+	err := hfs.Glob(t.Context(), fs, "some", nil, fn)
 	require.NoError(t, err)
 
-	assert.EqualValues(t, []string{
+	assert.Equal(t, []string{
 		"some/deep/file3",
 		"some/file2",
 	}, get())

@@ -64,7 +64,7 @@ func FileReader(ctx context.Context, r io.Reader, match Matcher) (io.Reader, err
 	}
 
 	if fileReader == nil {
-		return nil, fmt.Errorf("file not found")
+		return nil, errors.New("file not found")
 	}
 
 	return fileReader, nil
@@ -138,7 +138,7 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 	if info != nil {
 		// The file is probably not changed... This should prevent an infinite loop of
 		// a file being codegen copy_noexclude & input to another target
-		if hdr.Size == info.Size() && hdr.ModTime == info.ModTime() {
+		if hdr.Size == info.Size() && hdr.ModTime.Equal(info.ModTime()) {
 			onFile(info.Name())
 
 			return nil

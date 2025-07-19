@@ -3,13 +3,14 @@ package plugingo
 import (
 	"context"
 	"fmt"
-	"github.com/goccy/go-json"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"google.golang.org/protobuf/types/known/structpb"
 	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/goccy/go-json"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 type Cfg struct {
@@ -45,7 +46,8 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 	case ModeNormal:
 		patterns = goPkg.EmbedPatterns
 	case ModeTest:
-		patterns = append(goPkg.TestEmbedPatterns, goPkg.EmbedPatterns...)
+		patterns = append(patterns, goPkg.EmbedPatterns...)
+		patterns = append(patterns, goPkg.TestEmbedPatterns...)
 	case ModeXTest:
 		patterns = goPkg.XTestEmbedPatterns
 	}

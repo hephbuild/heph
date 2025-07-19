@@ -1,9 +1,10 @@
 package hlocks
 
 import (
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestTMutexRLock2Lock(t *testing.T) {
@@ -47,10 +48,10 @@ func TestTMutexLock2RLock(t *testing.T) {
 func TestTMutex(t *testing.T) {
 	ctx := t.Context()
 
-	//outer := NewMutex("outer")
-	//inner := NewMutex("inner")
-	//m1 := NewT(outer, inner)
-	//m2 := NewT(outer, inner)
+	// outer := NewMutex("outer")
+	// inner := NewMutex("inner")
+	// m1 := NewT(outer, inner)
+	// m2 := NewT(outer, inner)
 
 	fs := newfs(t)
 	m := NewT(
@@ -81,7 +82,7 @@ func TestTMutex(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, ok)
 
-	//cleanup
+	// cleanup
 	err = m.RUnlock()
 	require.NoError(t, err)
 

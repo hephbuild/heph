@@ -1,7 +1,8 @@
 package enginee2e
 
 import (
-	"context"
+	"testing"
+
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -12,11 +13,10 @@ import (
 	"github.com/hephbuild/heph/plugin/tref"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/structpb"
-	"testing"
 )
 
 func TestGroup(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 
@@ -84,7 +84,7 @@ func TestGroup(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, pkg, "g", []string{""}, &engine.RequestState{})
+	res, err := e.Result(ctx, &engine.RequestState{}, pkg, "g", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

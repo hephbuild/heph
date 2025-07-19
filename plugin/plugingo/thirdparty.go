@@ -3,6 +3,7 @@ package plugingo
 import (
 	"context"
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"

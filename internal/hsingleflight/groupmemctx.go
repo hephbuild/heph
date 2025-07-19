@@ -2,8 +2,9 @@ package hsingleflight
 
 import (
 	"context"
-	sync_map "github.com/zolstein/sync-map"
 	"sync/atomic"
+
+	sync_map "github.com/zolstein/sync-map"
 )
 
 type GroupMemContext[K comparable, T any] struct {

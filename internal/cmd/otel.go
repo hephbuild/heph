@@ -26,11 +26,11 @@ import (
 
 // setupOTelSDK bootstraps the OpenTelemetry pipeline.
 // If it does not return an error, make sure to call shutdown for proper cleanup.
-func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, err error) {
+func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 	otel.SetLogger(logr.FromSlogHandler(hlog.From(ctx).Handler()))
 
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
-		return func(ctx context.Context) error { return nil }, err
+		return func(ctx context.Context) error { return nil }, nil
 	}
 
 	var shutdownFuncs []func(context.Context) error
@@ -38,7 +38,7 @@ func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, er
 	// shutdown calls cleanup functions registered via shutdownFuncs.
 	// The errors from the calls are joined.
 	// Each registered cleanup will be invoked once.
-	shutdown = func(ctx context.Context) error {
+	shutdown := func(ctx context.Context) error {
 		var err error
 		for _, fn := range shutdownFuncs {
 			err = errors.Join(err, fn(ctx))
@@ -48,8 +48,8 @@ func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, er
 	}
 
 	// handleErr calls shutdown for cleanup and makes sure that all errors are returned.
-	handleErr := func(inErr error) {
-		err = errors.Join(inErr, shutdown(ctx))
+	handleErr := func(inErr error) error {
+		return errors.Join(inErr, shutdown(ctx))
 	}
 
 	// Set up propagator.
@@ -65,15 +65,13 @@ func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, er
 		),
 	)
 	if err != nil {
-		handleErr(err)
-		return
+		return shutdown, handleErr(err)
 	}
 
 	// Set up trace provider.
 	tracerProvider, err := newTracerProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-		return
+		return shutdown, handleErr(err)
 	}
 	shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
 	otel.SetTracerProvider(tracerProvider)
@@ -81,8 +79,7 @@ func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, er
 	// Set up meter provider.
 	meterProvider, err := newMeterProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-		return
+		return shutdown, handleErr(err)
 	}
 	shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
 	otel.SetMeterProvider(meterProvider)
@@ -90,13 +87,12 @@ func setupOTelSDK(ctx context.Context) (shutdown func(context.Context) error, er
 	// Set up logger provider.
 	loggerProvider, err := newLoggerProvider(ctx, res)
 	if err != nil {
-		handleErr(err)
-		return
+		return shutdown, handleErr(err)
 	}
 	shutdownFuncs = append(shutdownFuncs, loggerProvider.Shutdown)
 	global.SetLoggerProvider(loggerProvider)
 
-	return
+	return shutdown, nil
 }
 
 func newPropagator() propagation.TextMapPropagator {

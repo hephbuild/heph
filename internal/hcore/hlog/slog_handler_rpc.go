@@ -49,7 +49,7 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 			Key: attr.Key,
 		}
 
-		switch attr.Value.Kind() {
+		switch attr.Value.Kind() { //nolint:exhaustive
 		case slog.KindBool:
 			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueBool{ValueBool: attr.Value.Bool()}
 		case slog.KindString:

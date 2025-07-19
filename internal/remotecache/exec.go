@@ -3,11 +3,12 @@ package remotecache
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/lib/pluginsdk"
 	"io"
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/hephbuild/heph/lib/pluginsdk"
 )
 
 const DriverNameExec = "exec"
@@ -30,7 +31,7 @@ type Exec struct {
 }
 
 func (e Exec) Store(ctx context.Context, key string, r io.Reader) error {
-	cmd := exec.CommandContext(ctx, e.args[0], e.args[1:]...)
+	cmd := exec.CommandContext(ctx, e.args[0], e.args[1:]...) //nolint:gosec
 	cmd.Env = append(cmd.Environ(), "CACHE_KEY="+key)
 	cmd.Stdin = r
 
@@ -52,7 +53,7 @@ func (e *execReader) setRunErr(err error) {
 	close(e.runCh)
 }
 
-func (e *execReader) Read(p []byte) (n int, err error) {
+func (e *execReader) Read(p []byte) (n int, err error) { //nolint:nonamedreturns
 	e.o.Do(func() {
 		r, err := e.cmd.StdoutPipe()
 		if err != nil {
@@ -100,9 +101,9 @@ func (e *execReader) Close() error {
 	return errors.Join(closeErr, e.runErr)
 }
 
-// Get should return engine.ErrCacheNotFound if the key cannot be found, engine.ErrCacheNotFound can also be returned from Close()
+// Get should return engine.ErrCacheNotFound if the key cannot be found, engine.ErrCacheNotFound can also be returned from Close().
 func (e Exec) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	cmd := exec.CommandContext(ctx, e.args[0], e.args[1:]...)
+	cmd := exec.CommandContext(ctx, e.args[0], e.args[1:]...) //nolint:gosec
 	cmd.Env = append(cmd.Environ(), "CACHE_KEY="+key)
 
 	return &execReader{

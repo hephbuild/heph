@@ -2,9 +2,10 @@ package hstep
 
 import (
 	"context"
-	"github.com/hephbuild/heph/internal/hproto"
 	"sync/atomic"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hproto"
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"

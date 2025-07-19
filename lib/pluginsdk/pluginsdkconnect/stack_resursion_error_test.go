@@ -1,9 +1,10 @@
 package pluginsdkconnect
 
 import (
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestStackRecursionError(t *testing.T) {
@@ -14,5 +15,5 @@ func TestStackRecursionError(t *testing.T) {
 	serr2, ok := AsStackRecursionError(serr1)
 	require.True(t, ok)
 
-	assert.Equal(t, "foobar", serr2.Stack)
+	assert.Equal(t, "foobar", serr2.GetStack())
 }

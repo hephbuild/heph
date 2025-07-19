@@ -69,9 +69,10 @@ func indexMeta(s string) int {
 	l := len(s)
 	for i := 0; i < l; i++ {
 		c = s[i]
-		if c == '*' || c == '?' || c == '[' || c == '{' {
+		switch c {
+		case '*', '?', '[', '{':
 			return i
-		} else if c == '\\' {
+		case '\\':
 			// skip next byte
 			i++
 		}

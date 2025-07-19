@@ -3,9 +3,10 @@ package cmd
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"os"
 	"os/signal"
+
+	"github.com/hephbuild/heph/internal/hsoftcontext"
 )
 
 func newSignalNotifyContext(ctx context.Context) (context.Context, context.CancelFunc) {

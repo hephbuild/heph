@@ -2,10 +2,8 @@ package hlocks
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/flock"
-	"github.com/hephbuild/heph/internal/hcore/hlog"
-	"github.com/hephbuild/heph/internal/hfs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -13,6 +11,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/hephbuild/heph/internal/flock"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
@@ -237,7 +239,7 @@ func (l *Flock) unlock(ro bool) error {
 	f := l.f
 
 	if f == nil {
-		return fmt.Errorf("attempting to release lock when not held ")
+		return errors.New("attempting to release lock when not held ")
 	}
 
 	if l.allowCreate {
