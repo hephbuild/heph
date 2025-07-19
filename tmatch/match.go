@@ -130,7 +130,7 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	case *pluginv1.TargetMatcher_Label:
 		return MatchShrug
 	case *pluginv1.TargetMatcher_CodegenPackage:
-		if !tref.HasPackagePrefix(item.CodegenPackage, pkg) {
+		if !tref.HasPackagePrefix(pkg, item.CodegenPackage) {
 			return MatchNo
 		}
 
@@ -198,7 +198,7 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 	case *pluginv1.TargetMatcher_Label:
 		return boolToResult(slices.Contains(spec.Labels, item.Label))
 	case *pluginv1.TargetMatcher_CodegenPackage:
-		if !tref.HasPackagePrefix(spec.Ref.GetPackage(), item.CodegenPackage) {
+		if !tref.HasPackagePrefix(item.CodegenPackage, spec.Ref.GetPackage()) {
 			return MatchNo
 		}
 
@@ -271,8 +271,9 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 		}
 
 		for _, path := range def.CodegenTree.Paths {
-			pkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path))
-			if tref.HasPackagePrefix(pkg, item.CodegenPackage) {
+			outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path))
+			// TODO: differentiate file from dir output
+			if tref.HasPackagePrefix(outPkg, item.CodegenPackage) {
 				return MatchYes
 			}
 		}

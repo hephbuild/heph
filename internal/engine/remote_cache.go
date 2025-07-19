@@ -87,7 +87,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context, ref *pluginv1.TargetRef
 	return nil
 }
 
-func (e *Engine) ResultFromRemoteCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string, rs *RequestState) (*ExecuteResult, bool, error) {
+func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
 	ref := def.GetRef()
 
 	if def.DisableRemoteCache {

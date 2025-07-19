@@ -7,7 +7,7 @@ import (
 	"github.com/hephbuild/heph/plugin/tref"
 )
 
-func (e *Engine) List(ctx context.Context, p EngineProvider, pkg string, rs *RequestState) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
+func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, pkg string) (engine2.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	rs, err := rs.TraceList(p.Name, pkg)
 	if err != nil {
 		return nil, err
@@ -28,7 +28,7 @@ func (e *Engine) List(ctx context.Context, p EngineProvider, pkg string, rs *Req
 	return engine2.WithOnCloseReceive(strm, clean), nil
 }
 
-func (e *Engine) Get(ctx context.Context, p EngineProvider, ref *pluginv1.TargetRef, states []*pluginv1.ProviderState, rs *RequestState) (*pluginv1.GetResponse, error) {
+func (e *Engine) Get(ctx context.Context, rs *RequestState, p EngineProvider, ref *pluginv1.TargetRef, states []*pluginv1.ProviderState) (*pluginv1.GetResponse, error) {
 	rs, err := rs.Trace("Get", tref.Format(ref))
 	if err != nil {
 		return nil, err

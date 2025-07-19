@@ -90,7 +90,7 @@ func init() {
 					rs.Force = matcher
 				}
 
-				res, err := e.ResultsFromMatcher(ctx, matcher, rs)
+				res, err := e.ResultsFromMatcher(ctx, rs, matcher)
 				if err != nil {
 					return err
 				}

@@ -12,15 +12,15 @@ func TestStack(t *testing.T) {
 
 	s, err = s.Push("first")
 	require.NoError(t, err)
-	assert.Equal(t, "first", s.Print())
+	assert.Equal(t, "first", s.StringWith())
 
 	s, err = s.Push("second")
 	require.NoError(t, err)
-	assert.Equal(t, "first -> second", s.Print())
+	assert.Equal(t, "first -> second", s.StringWith())
 
 	s, err = s.Push("third")
 	require.NoError(t, err)
-	assert.Equal(t, "first -> second -> third", s.Print())
+	assert.Equal(t, "first -> second -> third", s.StringWith())
 
 	s, err = s.Push("second")
 	require.Error(t, err)

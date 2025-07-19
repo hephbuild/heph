@@ -73,7 +73,7 @@ func TestSanityTool(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
 	require.NoError(t, err)
 
-	res, err := e.Result(ctx, "some/package", "sometarget", []string{""}, &engine.RequestState{})
+	res, err := e.Result(ctx, &engine.RequestState{}, "some/package", "sometarget", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
 

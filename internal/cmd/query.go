@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,7 +66,7 @@ var queryCmd = func() *cobra.Command {
 				queue, flushResults := renderResults(ctx, execFunc)
 				defer flushResults()
 
-				for ref, err := range e.Query(ctx, matcher, rs) {
+				for ref, err := range e.Query(ctx, rs, matcher) {
 					if err != nil {
 						return err
 					}
@@ -93,18 +94,35 @@ func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error
 	ss := make([]string, 0, 100)
 	t := time.NewTicker(20 * time.Millisecond)
 
-	renderRefs := func() {
-		m.Lock()
-		if len(ss) == 0 {
-			m.Unlock()
+	var pending atomic.Bool
 
-			return
+	renderRefs := func(force bool) {
+		if !force {
+			m.Lock()
+			empty := len(ss) == 0
+			m.Unlock()
+			if empty {
+				return
+			}
+
+			if !pending.CompareAndSwap(false, true) {
+				return
+			}
 		}
-		pss := slices.Clone(ss)
-		ss = ss[:0]
-		m.Unlock()
 
 		err := execFunc(func(args hbbtexec.RunArgs) error {
+			defer pending.Swap(false)
+
+			m.Lock()
+			if len(ss) == 0 {
+				m.Unlock()
+
+				return nil
+			}
+			pss := slices.Clone(ss)
+			ss = ss[:0]
+			m.Unlock()
+
 			for _, s := range pss {
 				fmt.Fprintln(args.Stdout, s)
 			}
@@ -123,15 +141,15 @@ func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error
 		for {
 			select {
 			case <-closeCh:
-				renderRefs()
+				renderRefs(true)
 				return
 			default:
 				select {
 				case <-closeCh:
-					renderRefs()
+					renderRefs(true)
 					return
 				case <-t.C:
-					renderRefs()
+					renderRefs(false)
 				}
 			}
 		}

@@ -44,7 +44,7 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				def, err := e.Link(ctx, engine.DefContainer{Ref: ref}, rs)
+				def, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
 				if err != nil {
 					return err
 				}

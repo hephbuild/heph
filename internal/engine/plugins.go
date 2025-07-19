@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/google/uuid"
+	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	engine2 "github.com/hephbuild/heph/lib/engine"
@@ -112,7 +113,7 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 }
 
 func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
-	l, addr, cleanup, err := e.newListener(ctx)
+	l, addr, cleanupListener, err := e.newListener(ctx)
 	if err != nil {
 		return ServerHandle{}, err
 	}
@@ -121,13 +122,21 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 	baseUrl := "http://" + addr
 
 	go func() {
-		defer cleanup()
+		ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+			return []string{"where", "server"}
+		})
+		defer cleanLabels()
+
+		defer cleanupListener()
 		h2s := &http2.Server{
 			MaxReadFrameSize:     1 << 20,
 			MaxConcurrentStreams: 500,
 		}
+		hh := hdebug.Middleware(mux, func() []string {
+			return []string{"where", "server/handler"}
+		})
 		srv := &http.Server{
-			Handler: h2c.NewHandler(mux, h2s),
+			Handler: h2c.NewHandler(hh, h2s),
 			BaseContext: func(listener net.Listener) context.Context {
 				// to prevent inheriting from the root span, make a new noop span
 				ctx := trace.ContextWithSpan(context.WithoutCancel(ctx), trace.SpanFromContext(context.Background()))

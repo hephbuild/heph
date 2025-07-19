@@ -28,12 +28,12 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 	var res *ExecuteResultLocks
 	switch kind := req.GetOf().(type) {
 	case *corev1.ResultRequest_Ref:
-		res, err = r.ResultFromRef(ctx, kind.Ref, []string{AllOutputs}, rs)
+		res, err = r.ResultFromRef(ctx, rs, kind.Ref, []string{AllOutputs})
 		if err != nil {
 			return nil, err
 		}
 	case *corev1.ResultRequest_Spec:
-		res, err = r.ResultFromSpec(ctx, kind.Spec, []string{AllOutputs}, rs)
+		res, err = r.ResultFromSpec(ctx, rs, kind.Spec, []string{AllOutputs})
 		if err != nil {
 			return nil, err
 		}

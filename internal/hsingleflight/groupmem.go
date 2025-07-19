@@ -1,48 +1,13 @@
 package hsingleflight
 
-import (
-	sync_map "github.com/zolstein/sync-map"
-	"sync/atomic"
-)
+import "context"
 
 type GroupMem[K comparable, T any] struct {
-	c  sync_map.Map[K, groupMemEntry[T]]
-	o  Group[K, groupMemEntry[T]]
-	cc atomic.Uint32
-}
-
-type groupMemEntry[T any] struct {
-	v   T
-	err error
-	id  uint32
+	GroupMemContext[K, T]
 }
 
 func (g *GroupMem[K, T]) Do(key K, do func() (T, error)) (T, error, bool) {
-	res, ok := g.c.Load(key)
-	if ok {
-		return res.v, res.err, false
-	}
-
-	i := g.cc.Add(1)
-
-	res, err, _ := g.o.Do(key, func() (groupMemEntry[T], error) {
-		res, ok := g.c.Load(key)
-		if ok {
-			return res, nil
-		}
-
-		v, err := do()
-		res = groupMemEntry[T]{v: v, err: err, id: i}
-
-		g.c.Store(key, res)
-
-		return res, nil
+	return g.GroupMemContext.Do(context.Background(), key, func(ctx context.Context) (T, error) {
+		return do()
 	})
-	if err != nil {
-		return res.v, err, false
-	}
-
-	executed := res.id == i
-
-	return res.v, res.err, executed
 }

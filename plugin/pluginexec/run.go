@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -22,7 +23,6 @@ import (
 	"time"
 
 	ptylib "github.com/creack/pty"
-	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -37,11 +37,12 @@ var tracer = otel.Tracer("heph/pluginexec")
 var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
 
 func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
-	debugger.SetLabels(func() []string {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
-			fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.GetTarget().GetRef())), "",
+			"where", fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.GetTarget().GetRef())),
 		}
 	})
+	defer cleanLabels()
 
 	step, ctx := hstep.New(ctx, "Executing...")
 	defer step.Done()

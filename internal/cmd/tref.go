@@ -67,7 +67,7 @@ func parseMatcherResolve(ctx context.Context, e *engine.Engine, rs *engine.Reque
 	}
 
 	if refm, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
-		spec, err := e.GetSpec(ctx, engine.SpecContainer{Ref: refm.Ref}, rs)
+		spec, err := e.GetSpec(ctx, rs, engine.SpecContainer{Ref: refm.Ref})
 		if err != nil {
 			return nil, nil, err
 		}

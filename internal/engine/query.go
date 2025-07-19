@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/tref"
@@ -31,7 +32,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 	})
 }
 
-func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg string, seen map[seenPkgKey]struct{}, rs *RequestState) iter.Seq2[*pluginv1.TargetSpec, error] {
+func (e *Engine) queryListProvider(ctx context.Context, rs *RequestState, p EngineProvider, pkg string, seen map[seenPkgKey]struct{}) iter.Seq2[*pluginv1.TargetSpec, error] {
 	key := seenPkgKey{
 		pname: p.Name,
 		pkg:   pkg,
@@ -42,7 +43,7 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 	seen[key] = struct{}{}
 
 	return func(yield func(*pluginv1.TargetSpec, error) bool) {
-		res, err := e.List(ctx, p, pkg, rs)
+		res, err := e.List(ctx, rs, p, pkg)
 		if err != nil {
 			if errors.Is(err, ErrStackRecursion{}) {
 				return
@@ -56,13 +57,13 @@ func (e *Engine) queryListProvider(ctx context.Context, p EngineProvider, pkg st
 		for res.Receive() {
 			msg := res.Msg()
 
-			def, err := e.GetDef(ctx, DefContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()}, rs)
+			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: msg.GetRef(), Spec: msg.GetSpec()})
 			if err != nil {
 				yield(nil, err)
 				return
 			}
 
-			if !yield(def.TargetSpec, nil) {
+			if !yield(spec, nil) {
 				return
 			}
 		}
@@ -78,12 +79,12 @@ type seenPkgKey struct {
 	pkg   string
 }
 
-func (e *Engine) match(ctx context.Context, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher, rs *RequestState) (tmatch.Result, error) {
+func (e *Engine) match(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher) (tmatch.Result, error) {
 	if r := tmatch.MatchPackage(ref.Package, matcher); r.Definitive() {
 		return r, nil
 	}
 
-	spec, err := e.GetSpec(ctx, SpecContainer{Ref: ref}, rs)
+	spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: ref})
 	if err != nil {
 		return 0, err
 	}
@@ -92,7 +93,7 @@ func (e *Engine) match(ctx context.Context, ref *pluginv1.TargetRef, matcher *pl
 		return r, nil
 	}
 
-	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, rs)
+	def, err := e.GetDef(ctx, rs, DefContainer{Ref: ref, Spec: spec})
 	if err != nil {
 		return 0, err
 	}
@@ -104,7 +105,7 @@ func (e *Engine) match(ctx context.Context, ref *pluginv1.TargetRef, matcher *pl
 	return tmatch.MatchShrug, nil
 }
 
-func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
 		seenPkg := map[seenPkgKey]struct{}{}
 		seenRef := map[string]struct{}{}
@@ -120,9 +121,13 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 			}
 
 			for _, provider := range e.Providers {
-				for spec, err := range e.queryListProvider(ctx, provider, pkg, seenPkg, rs) {
+				for spec, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {
 						if errors.Is(err, ErrStackRecursion{}) {
+							if !yield(nil, err) {
+								return
+							}
+
 							continue
 						}
 
@@ -138,7 +143,7 @@ func (e *Engine) query1(ctx context.Context, matcher *pluginv1.TargetMatcher, rs
 					}
 					seenRef[refstr] = struct{}{}
 
-					res, err := e.match(ctx, ref, matcher, rs)
+					res, err := e.match(ctx, rs, ref, matcher)
 					if err != nil {
 						yield(nil, err)
 						return
@@ -210,7 +215,7 @@ func (e *queryState) queryListProvider(ctx context.Context, p EngineProvider, pk
 	}
 	defer e.listSem.Release(1)
 
-	res, err := e.List(ctx, p, pkg, e.rs)
+	res, err := e.List(ctx, e.rs, p, pkg)
 	if err != nil {
 		e.sendErr(ctx, fmt.Errorf("%v list: %w", p.Name, err))
 		return
@@ -232,7 +237,7 @@ func (e *queryState) handleRefSpec(ctx context.Context, ref *pluginv1.TargetRef,
 		return
 	}
 
-	def, err := e.GetDef(ctx, DefContainer{Ref: ref, Spec: spec}, e.rs)
+	def, err := e.GetDef(ctx, e.rs, DefContainer{Ref: ref, Spec: spec})
 	if err != nil {
 		e.sendErr(ctx, fmt.Errorf("get def: %w", err))
 		return
@@ -283,7 +288,7 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 			}
 			seenRef[tref.Format(ref)] = struct{}{}
 
-			res, err := e.match(ctx, ref, matcher, e.rs)
+			res, err := e.match(ctx, e.rs, ref, matcher)
 			if err != nil {
 				yield(nil, err)
 				return
@@ -300,10 +305,27 @@ func (e *queryState) query2(ctx context.Context, matcher *pluginv1.TargetMatcher
 	}
 }
 
-func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("Query %v", matcher.String()),
+		}
+	})
+	defer cleanLabels()
+
+	rs, err := rs.Trace("Query", matcher.String())
+	if err != nil {
+		return func(yield func(*pluginv1.TargetRef, error) bool) {
+			yield(nil, err)
+		}
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
+
 	if matcher, ok := matcher.Item.(*pluginv1.TargetMatcher_Ref); ok {
 		return func(yield func(*pluginv1.TargetRef, error) bool) {
-			spec, err := e.GetSpec(ctx, SpecContainer{Ref: matcher.Ref}, rs)
+			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: matcher.Ref}) // check if exist
 			yield(spec.Ref, err)
 		}
 	}
@@ -317,6 +339,6 @@ func (e *Engine) Query(ctx context.Context, matcher *pluginv1.TargetMatcher, rs 
 		}
 		return state.query2(ctx, matcher)
 	} else {
-		return e.query1(ctx, matcher, rs)
+		return e.query1(ctx, rs, matcher)
 	}
 }

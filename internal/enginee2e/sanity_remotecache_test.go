@@ -121,7 +121,7 @@ func TestSanityRemoteCache(t *testing.T) {
 		require.NoError(t, err)
 
 		{
-			res, err := e.Result(ctx, pkg, "t1", []string{""}, &engine.RequestState{})
+			res, err := e.Result(ctx, &engine.RequestState{}, pkg, "t1", []string{""})
 			require.NoError(t, err)
 			defer res.Unlock(ctx)
 

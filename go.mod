@@ -24,7 +24,6 @@ require (
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/term v0.2.1
 	github.com/creack/pty v1.1.20
-	github.com/dlsniper/debugger v0.6.0
 	github.com/go-faker/faker/v4 v4.5.0
 	github.com/go-logr/logr v1.4.2
 	github.com/go-viper/mapstructure/v2 v2.2.1

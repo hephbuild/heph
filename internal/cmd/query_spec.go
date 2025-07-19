@@ -44,7 +44,7 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				spec, err := e.GetSpec(ctx, engine.SpecContainer{Ref: ref}, rs)
+				spec, err := e.GetSpec(ctx, rs, engine.SpecContainer{Ref: ref})
 				if err != nil {
 					return err
 				}

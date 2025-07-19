@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/hdebug"
 	"github.com/hephbuild/heph/herrgroup"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hinstance"
@@ -33,7 +34,6 @@ import (
 
 	"github.com/hephbuild/heph/plugin/tref"
 
-	"github.com/dlsniper/debugger"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -62,8 +62,8 @@ type InteractiveExecOptions struct {
 	Pty bool
 }
 
-func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs, rs)
+func (e *Engine) Result(ctx context.Context, rs *RequestState, pkg, name string, outputs []string) (*ExecuteResultLocks, error) {
+	res, err := e.ResultFromRef(ctx, rs, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -71,27 +71,27 @@ func (e *Engine) Result(ctx context.Context, pkg, name string, outputs []string,
 	return res, nil
 }
 
-func (e *Engine) ResultFromRef(ctx context.Context, ref *pluginv1.TargetRef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromRef(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, outputs []string) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Ref: ref}, outputs, false, rs)
+	return e.result(ctx, rs, DefContainer{Ref: ref}, outputs, false)
 }
-func (e *Engine) ResultFromDef(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromDef(ctx context.Context, rs *RequestState, def *TargetDef, outputs []string) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false, rs)
+	return e.result(ctx, rs, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, outputs, false)
 }
 
-func (e *Engine) ResultFromSpec(ctx context.Context, spec *pluginv1.TargetSpec, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
+func (e *Engine) ResultFromSpec(ctx context.Context, rs *RequestState, spec *pluginv1.TargetSpec, outputs []string) (*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(spec.GetRef()))))
 	defer span.End()
 
-	return e.result(ctx, DefContainer{Spec: spec}, outputs, false, rs)
+	return e.result(ctx, rs, DefContainer{Spec: spec}, outputs, false)
 }
 
-func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.TargetMatcher, rs *RequestState) ([]*ExecuteResultLocks, error) {
+func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) ([]*ExecuteResultLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultsFromMatcher")
 	defer span.End()
 
@@ -100,7 +100,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.Targe
 
 	var matched bool
 	var g herrgroup.Group
-	for ref, err := range e.Query(ctx, matcher, rs) {
+	for ref, err := range e.Query(ctx, rs, matcher) {
 		if err != nil {
 			for _, locks := range out {
 				locks.Unlock(ctx)
@@ -112,7 +112,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, matcher *pluginv1.Targe
 		matched = true
 
 		g.Go(func() error {
-			res, err := e.ResultFromRef(ctx, ref, []string{AllOutputs}, rs)
+			res, err := e.ResultFromRef(ctx, rs, ref, []string{AllOutputs})
 			if err != nil {
 				return err
 			}
@@ -145,20 +145,15 @@ type Meta struct {
 	Hashin string
 }
 
-func (e *Engine) MetaFromDef(ctx context.Context, def *TargetDef, rs *RequestState) (*Meta, error) {
-	ctx, span := tracer.Start(ctx, "MetaFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
-	defer span.End()
+func (e *Engine) meta(ctx context.Context, rs *RequestState, def *LightLinkedTarget) (*Meta, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("meta %v", tref.Format(def.GetRef())),
+		}
+	})
+	defer cleanLabels()
 
-	return e.meta(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, rs)
-}
-
-func (e *Engine) meta(ctx context.Context, c DefContainer, rs *RequestState) (*Meta, error) {
-	def, err := e.Link(ctx, c, rs)
-	if err != nil {
-		return nil, fmt.Errorf("link: %w", err)
-	}
-
-	manifests, err := e.depsResultMetas(ctx, def, rs)
+	manifests, err := e.depsResultMetas(ctx, rs, def)
 	if err != nil {
 		return nil, fmt.Errorf("deps manifests: %w", err)
 	}
@@ -183,14 +178,23 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return i
 })
 
-func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, onlyManifest bool, rs *RequestState) (*ExecuteResultLocks, error) {
-	debugger.SetLabels(func() []string {
+func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, outputs []string, onlyManifest bool) (*ExecuteResultLocks, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
-			fmt.Sprintf("heph/engine: Result %v", tref.Format(c.GetRef())), "",
+			"where", fmt.Sprintf("Result %v", tref.Format(c.GetRef())),
 		}
 	})
+	defer cleanLabels()
 
-	def, err := e.Link(ctx, c, rs)
+	rs, err := rs.Trace("result", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
+
+	def, err := e.Link(ctx, rs, c)
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
 	}
@@ -205,7 +209,12 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		outputs = def.Outputs
 	}
 
-	res, err, computed := rs.memResult.Do(keyRefOutputs(ref, outputs), func() (*ExecuteResultLocks, error) {
+	meta, err := e.meta(ctx, rs, def)
+	if err != nil {
+		return nil, fmt.Errorf("meta: %w", err)
+	}
+
+	res, err, computed := rs.memResult.Do(ctx, keyRefOutputs(ref, outputs)+meta.Hashin, func(ctx context.Context) (*ExecuteResultLocks, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
@@ -216,7 +225,7 @@ func (e *Engine) result(ctx context.Context, c DefContainer, outputs []string, o
 		step, ctx := hstep.New(ctx, tref.Format(ref))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, def, outputs, rs)
+		res, err := e.innerResultWithSideEffects(ctx, rs, def, outputs, meta)
 		if err != nil {
 			step.SetError()
 
@@ -269,7 +278,7 @@ func (r DepsResults) Unlock(ctx context.Context) {
 	}
 }
 
-func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *RequestState) (DepsResults, error) {
+func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLinkedTarget) (DepsResults, error) {
 	ctx, span := tracer.Start(ctx, "depsResults", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
 	defer span.End()
 
@@ -291,7 +300,7 @@ func (e *Engine) depsResults(ctx context.Context, t *LightLinkedTarget, rs *Requ
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ResultFromDef(ctx, dep.TargetDef, dep.Outputs, rs)
+			res, err := e.ResultFromDef(ctx, rs, dep.TargetDef, dep.Outputs)
 			if err != nil {
 				return err
 			}
@@ -345,11 +354,18 @@ type ResultMetaArtifact struct {
 	Group   string
 }
 
-func (e *Engine) ResultMetaFromDef(ctx context.Context, def *TargetDef, outputs []string, rs *RequestState) (ResultMeta, error) {
-	ctx, span := tracer.Start(ctx, "ResultFromSpec", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
+func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *TargetDef, outputs []string) (ResultMeta, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("ResultMetaFromDef %v", tref.Format(def.GetRef())),
+		}
+	})
+	defer cleanLabels()
+
+	ctx, span := tracer.Start(ctx, "ResultMetaFromDef", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	res, err := e.result(ctx, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, nil, true, rs)
+	res, err := e.result(ctx, rs, DefContainer{Spec: def.TargetSpec, Def: def.TargetDef}, nil, true)
 	if err != nil {
 		return ResultMeta{}, fmt.Errorf("result: %w", err)
 	}
@@ -391,15 +407,22 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, def *TargetDef, outputs 
 	return m, nil
 }
 
-func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *RequestState) ([]DepMeta, error) {
-	ctx, span := tracer.Start(ctx, "depsResultMetas", trace.WithAttributes(attribute.String("target", tref.Format(t.GetRef()))))
+func (e *Engine) depsResultMetas(ctx context.Context, rs *RequestState, def *LightLinkedTarget) ([]DepMeta, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("depsResultMetas %v", tref.Format(def.GetRef())),
+		}
+	})
+	defer cleanLabels()
+
+	ctx, span := tracer.Start(ctx, "depsResultMetas", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	if len(t.Inputs) == 0 {
+	if len(def.Inputs) == 0 {
 		return nil, nil
 	}
 
-	inputs := slices.Clone(t.Inputs)
+	inputs := slices.Clone(def.Inputs)
 	slices.SortFunc(inputs, func(a, b *LightLinkedTargetInput) int {
 		if v := tref.Compare(a.GetRef(), b.GetRef()); v != 0 {
 			return v
@@ -413,7 +436,7 @@ func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *
 
 	for i, dep := range inputs {
 		g.Go(func() error {
-			res, err := e.ResultMetaFromDef(ctx, dep.TargetDef, dep.Outputs, rs)
+			res, err := e.ResultMetaFromDef(ctx, rs, dep.TargetDef, dep.Outputs)
 			if err != nil {
 				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
 			}
@@ -459,7 +482,7 @@ func (e *Engine) depsResultMetas(ctx context.Context, t *LightLinkedTarget, rs *
 
 const AllOutputs = "__all_outputs__"
 
-func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState, hashin string) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
 	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from local cache: %w", err)
@@ -469,7 +492,7 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 		return res, true, nil
 	}
 
-	res, ok, err = e.ResultFromRemoteCache(ctx, def, outputs, hashin, rs)
+	res, ok, err = e.ResultFromRemoteCache(ctx, rs, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from remote cache: %w", err)
 	}
@@ -481,8 +504,15 @@ func (e *Engine) resultFromCache(ctx context.Context, def *LightLinkedTarget, ou
 	return nil, false, nil
 }
 
-func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState) (*ExecuteResultLocks, error) {
-	res, err := e.innerResult(ctx, def, outputs, rs)
+func (e *Engine) innerResultWithSideEffects(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, meta *Meta) (*ExecuteResultLocks, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("innerResultWithSideEffects %v", tref.Format(def.GetRef())),
+		}
+	})
+	defer cleanLabels()
+
+	res, err := e.innerResult(ctx, rs, def, outputs, meta)
 	if err != nil {
 		return nil, err
 	}
@@ -496,12 +526,7 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, def *LightLinke
 	return res, nil
 }
 
-func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, outputs []string, rs *RequestState) (_ *ExecuteResultLocks, rerr error) {
-	meta, err := e.MetaFromDef(ctx, def.TargetDef, rs)
-	if err != nil {
-		return nil, fmt.Errorf("meta: %w", err)
-	}
-
+func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, meta *Meta) (_ *ExecuteResultLocks, rerr error) {
 	hashin := meta.Hashin
 
 	shouldShell := tref.Equal(rs.Shell, def.GetRef())
@@ -515,7 +540,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 			return nil, fmt.Errorf("lock cache: %w", err)
 		}
 
-		res, ok, err := e.resultFromCache(ctx, def, outputs, rs, hashin)
+		res, ok, err := e.resultFromCache(ctx, rs, def, outputs, hashin)
 		if err != nil {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
@@ -533,9 +558,9 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 		}
 	}
 
-	res, err, computed := rs.memExecute.Do(refKey(def.GetRef()), func() (*ExecuteResultLocks, error) {
+	res, err, computed := rs.memExecute.Do(ctx, refKey(def.GetRef()), func(ctx context.Context) (*ExecuteResultLocks, error) {
 		if def.TargetSpec.GetDriver() == plugingroup.Name {
-			results, err := e.depsResults(ctx, def, rs)
+			results, err := e.depsResults(ctx, rs, def)
 			if err != nil {
 				return nil, fmt.Errorf("deps results: %w", err)
 			}
@@ -545,7 +570,7 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 				Version:   "v1",
 				Target:    tref.Format(def.GetRef()),
 				CreatedAt: time.Now(),
-				Hashin:    "", // TODO
+				Hashin:    hashin,
 			}
 
 			var artifacts []ExecuteResultArtifact
@@ -613,14 +638,14 @@ func (e *Engine) innerResult(ctx context.Context, def *LightLinkedTarget, output
 
 		var res *ExecuteResult
 		if storeCache {
-			res, err = e.ExecuteAndCache(ctx, def, execOptions, rs)
+			res, err = e.ExecuteAndCache(ctx, rs, def, execOptions)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
 				return nil, err
 			}
 		} else {
-			res, err = e.Execute(ctx, def, execOptions, rs)
+			res, err = e.Execute(ctx, rs, def, execOptions)
 			if err != nil {
 				err = errors.Join(err, locks.Unlock())
 
@@ -836,7 +861,7 @@ type ExecuteResultWithOrigin struct {
 	InputOrigin *pluginv1.TargetDef_InputOrigin
 }
 
-func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecOptions, rs *RequestState) ([]string, func() error, error) {
+func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver engine2.Driver, options ExecOptions) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
 	eg := &herrgroup.Group{}
 
@@ -984,17 +1009,18 @@ func (e *Engine) pipes(ctx context.Context, driver engine2.Driver, options ExecO
 
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
-func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rs *RequestState) (*ExecuteResult, error) {
+func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*ExecuteResult, error) {
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
-	debugger.SetLabels(func() []string {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
-			fmt.Sprintf("heph/engine: Execute %v", tref.Format(def.GetRef())), "",
+			"where", fmt.Sprintf("Execute %v", tref.Format(def.GetRef())),
 		}
 	})
+	defer cleanLabels()
 
-	results, err := e.depsResults(ctx, def, rs)
+	results, err := e.depsResults(ctx, rs, def)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
 	}
@@ -1092,7 +1118,7 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 			pctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 			defer cancel()
 
-			pipes, pipesWait, err := e.pipes(pctx, driver, options, rs)
+			pipes, pipesWait, err := e.pipes(pctx, rs, driver, options)
 			if err != nil {
 				runErr = err
 				return
@@ -1228,8 +1254,8 @@ func (e *Engine) Execute(ctx context.Context, def *LightLinkedTarget, options Ex
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, def *LightLinkedTarget, options ExecuteOptions, rs *RequestState) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, def, options, rs)
+func (e *Engine) ExecuteAndCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*ExecuteResult, error) {
+	res, err := e.Execute(ctx, rs, def, options)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)
 	}

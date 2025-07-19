@@ -204,7 +204,7 @@ func TestSrcOutEnv(t *testing.T) {
 		}
 		for _, test := range tests {
 			t.Run(test.target, func(t *testing.T) {
-				res, err := e.Result(ctx, "", test.target, []string{engine.AllOutputs}, &engine.RequestState{})
+				res, err := e.Result(ctx, &engine.RequestState{}, "", test.target, []string{engine.AllOutputs})
 				require.NoError(t, err)
 				defer res.Unlock(ctx)
 
