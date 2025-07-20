@@ -268,15 +268,21 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 	case *pluginv1.TargetMatcher_Label:
 		return boolToResult(slices.Contains(spec.GetLabels(), item.Label))
 	case *pluginv1.TargetMatcher_CodegenPackage:
-		if def.GetCodegenTree() == nil || def.GetCodegenTree().GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_UNSPECIFIED {
+		if len(def.GetCodegenTree()) == 0 {
 			return MatchNo
 		}
 
-		for _, path := range def.GetCodegenTree().GetPaths() {
-			outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path))
-			// TODO: differentiate file from dir output
-			if tref.HasPackagePrefix(outPkg, item.CodegenPackage) {
-				return MatchYes
+		for _, gen := range def.GetCodegenTree() {
+			if gen.GetIsDir() {
+				outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(gen.GetPath()))
+				if tref.HasPackagePrefix(outPkg, item.CodegenPackage) {
+					return MatchYes
+				}
+			} else {
+				outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(filepath.Dir(gen.GetPath())))
+				if outPkg == item.CodegenPackage {
+					return MatchYes
+				}
 			}
 		}
 

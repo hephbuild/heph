@@ -46,10 +46,11 @@ message TargetDef {
     }
 
     Mode mode = 1;
-    repeated string paths = 2;
+    string path = 2;
+    bool is_dir = 3;
   }
 
-  CodegenTree codegen_tree = 7;
+  repeated CodegenTree codegen_tree = 7;
 
   bool pty = 8;
   bytes hash = 10;

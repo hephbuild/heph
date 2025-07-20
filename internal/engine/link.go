@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/hfs"
+
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/tref"
@@ -490,6 +492,18 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		for _, output := range def.GetCollectOutputs() {
 			if !slices.Contains(def.GetOutputs(), output.GetGroup()) {
 				def.Outputs = append(def.Outputs, output.GetGroup())
+			}
+
+			for _, path := range output.GetPaths() {
+				if path == ".." || strings.Contains(path, "../") {
+					return nil, errors.New("output path cannot go to the parent folder")
+				}
+			}
+		}
+
+		for i, gen := range def.GetCodegenTree() {
+			if hfs.IsGlob(gen.GetPath()) {
+				return nil, fmt.Errorf("codegen tree: %v: cannot be a glob", i)
 			}
 		}
 

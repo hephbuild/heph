@@ -26,11 +26,25 @@ func DirToPackage(dir, hephroot string) (string, error) {
 }
 
 func ToOSPath(s string) string {
-	return strings.ReplaceAll(s, "/", string(filepath.Separator))
+	if string(filepath.Separator) != "/" {
+		s = strings.ReplaceAll(s, "/", string(filepath.Separator))
+	}
+
+	return s
 }
 
 func ToPackage(s string) string {
-	return strings.ReplaceAll(s, string(filepath.Separator), "/")
+	s = strings.ReplaceAll(s, "./", "")
+
+	if s == "." {
+		return ""
+	}
+
+	if string(filepath.Separator) != "/" {
+		s = strings.ReplaceAll(s, string(filepath.Separator), "/")
+	}
+
+	return s
 }
 
 func SplitPackage(s string) []string {

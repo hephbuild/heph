@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hfs"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -106,13 +108,25 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		target.Context = execv1.Target_Tree
 	}
 
-	var allOutputPaths []string
+	var codegenPaths []string
 	for k, out := range targetSpec.Out {
 		target.Outputs = append(target.Outputs, &execv1.Target_Output{
 			Group: k,
 			Paths: out,
 		})
-		allOutputPaths = append(allOutputPaths, out...)
+
+		for _, s := range out {
+			if hfs.IsGlob(s) {
+				base, _ := hfs.GlobSplit(s)
+				if !strings.HasSuffix(base, "/") {
+					base += "/"
+				}
+
+				codegenPaths = append(codegenPaths, base)
+			} else {
+				codegenPaths = append(codegenPaths, s)
+			}
+		}
 	}
 
 	for _, output := range target.GetOutputs() {
@@ -202,19 +216,25 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, err
 	}
 
-	var codegenTree *pluginv1.TargetDef_CodegenTree
+	var codegenTree []*pluginv1.TargetDef_CodegenTree
 	switch targetSpec.Codegen {
 	case "":
 		// no codegen
 	case "copy":
-		codegenTree = &pluginv1.TargetDef_CodegenTree{
-			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY,
-			Paths: allOutputPaths,
+		for _, p := range codegenPaths {
+			codegenTree = append(codegenTree, &pluginv1.TargetDef_CodegenTree{
+				Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY,
+				Path:  p,
+				IsDir: strings.HasSuffix(p, "/"),
+			})
 		}
 	case "link":
-		codegenTree = &pluginv1.TargetDef_CodegenTree{
-			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK,
-			Paths: allOutputPaths,
+		for _, p := range codegenPaths {
+			codegenTree = append(codegenTree, &pluginv1.TargetDef_CodegenTree{
+				Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK,
+				Path:  p,
+				IsDir: strings.HasSuffix(p, "/"),
+			})
 		}
 	default:
 		return nil, fmt.Errorf("invalid codegen mode: %s", targetSpec.Codegen)

@@ -109,6 +109,23 @@ func TestGlobAllFirstSecondLevelPattern(t *testing.T) {
 	}, get())
 }
 
+func TestGlobAllFirstSecondLevelPattern2(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+
+	fn, get := collector()
+
+	err := hfs.Glob(t.Context(), fs, "some/file*", nil, fn)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"some/file2",
+	}, get())
+}
+
 func TestGlobNoPatternSecondLevel(t *testing.T) {
 	fs := setup(t, []string{
 		"file1",
@@ -122,6 +139,56 @@ func TestGlobNoPatternSecondLevel(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{
+		"some/deep/file3",
+		"some/file2",
+	}, get())
+}
+
+func TestGlobStrictDirError(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+
+	fn, _ := collector()
+
+	err := hfs.Glob(t.Context(), fs, "some", nil, fn, hfs.WithStrictDir(true))
+	require.ErrorIs(t, err, hfs.ErrStrictDir)
+}
+
+func TestGlobStrictDirSuccess(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+
+	fn, get := collector()
+
+	err := hfs.Glob(t.Context(), fs, "some/", nil, fn, hfs.WithStrictDir(true))
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"some/deep/file3",
+		"some/file2",
+	}, get())
+}
+
+func TestGlobStrictDirSuccess2(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+
+	fn, get := collector()
+
+	err := hfs.Glob(t.Context(), fs, "./", nil, fn, hfs.WithStrictDir(true))
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"file1",
 		"some/deep/file3",
 		"some/file2",
 	}, get())
