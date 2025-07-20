@@ -8,7 +8,7 @@ import (
 )
 
 type CacheRunpkg struct {
-	sf hsingleflight.GroupMem[string, CacheRunpkgEntry]
+	sf hsingleflight.GroupMemContext[string, CacheRunpkgEntry]
 }
 
 type CacheRunpkgEntry struct {
@@ -28,7 +28,7 @@ func (c *CacheRunpkg) Singleflight(
 	onProviderState onProviderStateFunc,
 	f func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error),
 ) (starlark.StringDict, error) {
-	v, err, _ := c.sf.Do(c.key(pkg), func() (CacheRunpkgEntry, error) {
+	v, err, _ := c.sf.Do(ctx, c.key(pkg), func(ctx context.Context) (CacheRunpkgEntry, error) {
 		var payloads []OnTargetPayload
 		onTarget := func(ctx context.Context, payload OnTargetPayload) error {
 			payloads = append(payloads, payload)

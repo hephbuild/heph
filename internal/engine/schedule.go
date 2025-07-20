@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"hash"
 	"io"
 	"log/slog"
@@ -172,11 +173,7 @@ func (e *Engine) meta(ctx context.Context, rs *RequestState, def *LightLinkedTar
 var meter = otel.Meter("heph_engine")
 
 var resultCounter = sync.OnceValue(func() metric.Int64Counter {
-	i, err := meter.Int64Counter("result", metric.WithUnit("{count}"))
-	if err != nil {
-		panic(err)
-	}
-	return i
+	return htypes.Must2(meter.Int64Counter("result", metric.WithUnit("{count}")))
 })
 
 func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, outputs []string, onlyManifest bool) (*ExecuteResultLocks, error) {

@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hsingleflight"
+	"github.com/hephbuild/heph/lib/tref"
+	"strings"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -22,7 +25,7 @@ type Options struct {
 type Plugin struct {
 	Options
 	repoRoot    hfs.FS
-	cacheget    CacheGet
+	cacheget    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	cacherunpkg CacheRunpkg
 }
 
@@ -295,6 +298,23 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 		Print: func(thread *starlark.Thread, msg string) {
 			hlog.From(ctx).Info(msg)
 		},
+		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
+			switch {
+			case strings.HasPrefix(module, "//"):
+				rest, _ := strings.CutPrefix(module, "//")
+
+				res, err :=  p.runPkg(ctx, rest, nil, nil)
+				if err != nil {
+					return nil, fmt.Errorf("%v: %w", module, err)
+				}
+
+				return res, nil
+			case strings.HasPrefix(module, "@"):
+				return nil, errors.New("import function from plugin not implemented")
+			default:
+				return nil, fmt.Errorf("unsupported module %q", module)
+			}
+		},
 	}
 	thread.SetLocal(ctxKey, ctx)
 	thread.SetLocal(packageKey, pkg)
@@ -329,7 +349,7 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 }
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	spec, err := p.cacheget.Singleflight(ctx, req.GetRef(), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := p.cacheget.Do(ctx, tref.Format(req.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
 		return p.getInner(ctx, req)
 	})
 	if err != nil {
