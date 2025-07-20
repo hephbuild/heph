@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"hash"
 	"io"
 	"log/slog"
