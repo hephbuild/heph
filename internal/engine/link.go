@@ -509,6 +509,10 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			if hfs.IsGlob(gen.GetPath()) {
 				return nil, fmt.Errorf("codegen tree: %v: cannot be a glob", i)
 			}
+
+			if gen.GetPath() == ".." || strings.Contains(gen.GetPath(), "../") {
+				return nil, errors.New("output path cannot go to the parent folder")
+			}
 		}
 
 		if len(def.GetHash()) == 0 {
