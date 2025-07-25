@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"hash"
 	"io"
@@ -200,7 +201,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	ref := def.GetRef()
 
 	switch {
-	case def.Cache:
+	case def.GetCache():
 		outputs = def.Outputs
 	case onlyManifest:
 		outputs = nil
@@ -551,8 +552,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 
 	shouldShell := tref.Equal(rs.Shell, def.GetRef())
 	shouldForce := tmatch.MatchDef(def.TargetSpec, def.TargetDef.TargetDef, rs.Force) == tmatch.MatchYes
-	getCache := def.Cache && !shouldShell && !shouldForce
-	storeCache := def.Cache && !shouldShell
+	getCache := def.GetCache() && !shouldShell && !shouldForce
+	storeCache := def.GetCache() && !shouldShell
 
 	if getCache {
 		locks, err := e.lockCache(ctx, def.GetRef(), outputs, hashin, true)
@@ -599,7 +600,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				for _, artifact := range result.Artifacts {
 					gartifact := &pluginv1.Artifact{
 						Name:    artifact.Name,
-						Type:    artifact.GetType(),
+						Type:    htypes.Ptr(artifact.GetType()),
 						Content: artifact.GetContent(),
 					}
 
@@ -719,8 +720,10 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 	} else {
 		h = xxh3.New()
 	}
-	writeProto := func(v proto.Message) error {
-		return stableProtoHashEncode(h, v)
+	writeProto := func(v hashpb.Hashable) error {
+		hashpb.Hash(h, v, nil)
+
+		return nil
 	}
 
 	err := writeProto(def.GetRef())
@@ -728,11 +731,11 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 		return "", err
 	}
 
-	if len(def.Hash) == 0 {
+	if len(def.GetHash()) == 0 {
 		return "", errors.New("hash is empty")
 	}
 
-	_, err = h.Write(def.Hash)
+	_, err = h.Write(def.GetHash())
 	if err != nil {
 		return "", err
 	}
@@ -752,7 +755,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 		}
 	}
 
-	if !def.Cache {
+	if !def.GetCache() {
 		_, err = h.WriteString(hinstance.UID)
 		if err != nil {
 			return "", err
@@ -819,7 +822,7 @@ func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}
-		if artifact.Group != group {
+		if artifact.GetGroup() != group {
 			continue
 		}
 
@@ -912,7 +915,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		stdinErrCh = make(chan error)
 
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 		})
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err

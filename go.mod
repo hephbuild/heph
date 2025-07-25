@@ -8,14 +8,19 @@ tool github.com/cerbos/protoc-gen-go-hashpb
 
 tool capnproto.org/go/capnp/v3/capnpc-go
 
-tool go.uber.org/mock/mockgen
+tool (
+	connectrpc.com/connect/cmd/protoc-gen-connect-go
+	github.com/golang/protobuf/protoc-gen-go
+	go.uber.org/mock/mockgen
+	google.golang.org/protobuf
+)
 
 replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20250529082417-38d0d515cbfb
 
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
 	cloud.google.com/go/storage v1.54.0
-	connectrpc.com/connect v1.17.0
+	connectrpc.com/connect v1.18.1
 	connectrpc.com/otelconnect v0.7.2
 	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/alecthomas/participle/v2 v2.1.1
@@ -73,7 +78,7 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.51.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
-	github.com/cerbos/protoc-gen-go-hashpb v0.4.1 // indirect
+	github.com/cerbos/protoc-gen-go-hashpb v0.4.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
 	github.com/charmbracelet/x/ansi v0.9.2 // indirect
@@ -88,6 +93,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.0.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
+	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.6 // indirect
 	github.com/googleapis/gax-go/v2 v2.14.1 // indirect

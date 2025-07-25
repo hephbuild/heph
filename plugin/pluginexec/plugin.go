@@ -3,6 +3,7 @@ package pluginexec
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"io"
 	"maps"
 	"net/http"
@@ -205,7 +206,7 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	hash := xxh3.New()
 	desc := target.ProtoReflect().Descriptor()
-	target.HashPB(hash, map[string]struct{}{
+	hashpb.Hash(hash, target, map[string]struct{}{
 		string(desc.FullName()) + ".runtime_deps":     {},
 		string(desc.FullName()) + ".runtime_env":      {},
 		string(desc.FullName()) + ".runtime_pass_env": {},

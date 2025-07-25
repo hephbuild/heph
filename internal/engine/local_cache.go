@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"hash"
 	"io"
 	"os"
@@ -64,7 +65,7 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 	}
 
 	h := xxh3.New()
-	ref.HashPB(h, nil)
+	hashpb.Hash(h, ref, nil)
 
 	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
 }

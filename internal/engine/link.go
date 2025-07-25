@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"maps"
 	"os"
 	"slices"
@@ -509,7 +510,7 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		if len(def.GetHash()) == 0 {
 			h := xxh3.New()
-			def.HashPB(h, nil)
+			hashpb.Hash(h, def, nil)
 
 			def.Hash = h.Sum(nil)
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"iter"
 	"os"
 	"path/filepath"
@@ -116,7 +117,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	defer span.End()
 
 	h := xxh3.New()
-	artifact.HashPB(h, nil)
+	hashpb.Hash(h, artifact, nil)
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {

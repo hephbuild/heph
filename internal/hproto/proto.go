@@ -2,7 +2,7 @@ package hproto
 
 import (
 	"fmt"
-	"hash"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"strings"
 
 	"github.com/zeebo/xxh3"
@@ -12,11 +12,6 @@ import (
 	"google.golang.org/protobuf/reflect/protorange"
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
-
-// match https://github.com/cerbos/protoc-gen-go-hashpb/blob/db0168880c5d9ad459ff3be9157f7f4eac77412c/internal/generator/generator_test.go#L24
-type Hashable interface {
-	HashPB(hash.Hash, map[string]struct{})
-}
 
 func Clone[T proto.Message](m T) T {
 	return proto.Clone(m).(T) //nolint:errcheck
@@ -77,12 +72,12 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	return m, err
 }
 
-func Compare(a, b Hashable) int {
+func Compare(a, b hashpb.Hashable) int {
 	ha := xxh3.New()
-	a.HashPB(ha, nil)
+	hashpb.Hash(ha, a, nil)
 
 	hb := xxh3.New()
-	b.HashPB(hb, nil)
+	hashpb.Hash(hb, b, nil)
 
 	suma := ha.Sum64()
 	sumb := hb.Sum64()
