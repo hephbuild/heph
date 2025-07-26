@@ -14,17 +14,17 @@ type Hashable interface {
 	HashPB(hash.Hash, map[string]struct{})
 }
 
-type StableWritable interface {
+type StableWriter interface {
 	proto.Message
-	StableWrite(w io.Writer) error
+	StableWrite(w io.Writer, ignore map[string]struct{}) error
 }
 
-func Hash(h hash.Hash, msg Hashable, omit map[string]struct{}) {
-	msg.HashPB(h, omit)
+func Hash(h hash.Hash, msg StableWriter, omit map[string]struct{}) {
+	_ = msg.StableWrite(h, omit)
 }
 
 func HashMessage(h hash.Hash, msg proto.Message) error {
-	if v, ok := msg.(Hashable); ok {
+	if v, ok := msg.(StableWriter); ok {
 		Hash(h, v, nil)
 
 		return nil

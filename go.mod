@@ -62,7 +62,7 @@ require (
 	golang.org/x/net v0.39.0
 	golang.org/x/sync v0.14.0
 	golang.org/x/sys v0.33.0
-	google.golang.org/protobuf v1.36.6
+	google.golang.org/protobuf v1.36.7-0.20250625222701-8e8926ef675d
 )
 
 require (

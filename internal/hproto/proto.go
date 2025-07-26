@@ -14,7 +14,7 @@ import (
 )
 
 func Clone[T proto.Message](m T) T {
-	return proto.Clone(m).(T) //nolint:errcheck
+	return proto.CloneOf(m)
 }
 
 func Equal[T proto.Message](a, b T) bool {
@@ -72,7 +72,7 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	return m, err
 }
 
-func Compare(a, b hashpb.Hashable) int {
+func Compare(a, b hashpb.StableWriter) int {
 	ha := xxh3.New()
 	hashpb.Hash(ha, a, nil)
 
