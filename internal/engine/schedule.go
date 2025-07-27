@@ -34,6 +34,10 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -41,8 +45,6 @@ import (
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type ExecOptions struct {
@@ -598,7 +600,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				for _, artifact := range result.Artifacts {
 					gartifact := &pluginv1.Artifact{
 						Name:    artifact.Name,
-						Type:    artifact.GetType(),
+						Type:    htypes.Ptr(artifact.GetType()),
 						Content: artifact.GetContent(),
 					}
 
@@ -718,7 +720,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 	} else {
 		h = xxh3.New()
 	}
-	writeProto := func(v hashpb.StableWriter) error {
+	writeProto := func(v hashpb.Hashable) error {
 		hashpb.Hash(h, v, nil)
 
 		return nil
@@ -913,7 +915,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		stdinErrCh = make(chan error)
 
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 		})
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
