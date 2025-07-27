@@ -3,6 +3,7 @@ package plugingroup
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/htypes"
 	"strconv"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -29,7 +30,7 @@ func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*p
 	desc := protodesc.ToDescriptorProto((&groupv1.Target{}).ProtoReflect().Descriptor())
 
 	return &pluginv1.ConfigResponse{
-		Name:         Name,
+		Name:         htypes.Ptr(Name),
 		TargetSchema: desc,
 	}, nil
 }
@@ -50,7 +51,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 		inputs = append(inputs, &pluginv1.TargetDef_Input{
 			Ref: ref,
 			Origin: &pluginv1.TargetDef_InputOrigin{
-				Id: strconv.Itoa(i),
+				Id: htypes.Ptr(strconv.Itoa(i)),
 			},
 		})
 	}
@@ -66,7 +67,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 		Target: &pluginv1.TargetDef{
 			Def:     target,
 			Ref:     req.GetSpec().GetRef(),
-			Cache:   false,
+			Cache:   htypes.Ptr(false),
 			Inputs:  inputs,
 			Outputs: []string{""},
 		},

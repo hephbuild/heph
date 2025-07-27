@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -19,8 +20,8 @@ func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, p
 	clean := e.StoreRequestState(rs)
 
 	strm, err := p.List(ctx, &pluginv1.ListRequest{
-		RequestId: rs.ID,
-		Package:   pkg,
+		RequestId: htypes.Ptr(rs.ID),
+		Package: htypes.Ptr(pkg),
 	})
 	if err != nil {
 		clean()
@@ -44,7 +45,7 @@ func (e *Engine) Get(ctx context.Context, rs *RequestState, p EngineProvider, re
 	defer clean()
 
 	res, err := p.Get(ctx, &pluginv1.GetRequest{
-		RequestId: rs.ID,
+		RequestId: htypes.Ptr(rs.ID),
 		Ref:       ref,
 		States:    states,
 	})

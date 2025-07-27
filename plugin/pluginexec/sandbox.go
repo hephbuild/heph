@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	"iter"
 	"os"
 	"path/filepath"
@@ -63,7 +64,7 @@ func SetupSandbox(
 					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
 						Artifact: listArtifact,
 						Origin: &pluginv1.TargetDef_InputOrigin{
-							Id: target.GetId(),
+							Id: htypes.Ptr(target.GetId()),
 						},
 					})
 				}
@@ -145,11 +146,11 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	}
 
 	return &pluginv1.Artifact{
-		Group: artifact.GetGroup(),
-		Name:  artifact.GetName() + ".list",
-		Type:  pluginv1.Artifact_TYPE_OUTPUT_LIST_V1,
+		Group: htypes.Ptr(artifact.GetGroup()),
+		Name: htypes.Ptr(artifact.GetName() + ".list"),
+		Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
 		Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-			SourcePath: listf.Name(),
+			SourcePath: htypes.Ptr(listf.Name()),
 		}},
 	}, nil
 }

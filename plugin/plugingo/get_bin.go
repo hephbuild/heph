@@ -3,6 +3,7 @@ package plugingo
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"path/filepath"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -57,11 +58,11 @@ func (p *Plugin) packageBinInner(
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    targetName,
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr(targetName),
 				Args:    factors.Args(),
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":               factors.GOOS,

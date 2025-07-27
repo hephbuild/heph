@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"path"
@@ -211,8 +212,8 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	goPkg.XTestGoFiles = nil
 
 	goPkg.LibTargetRef = &pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_testmain_lib",
+		Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+		Name:    htypes.Ptr("build_testmain_lib"),
 		Args:    factors.Args(),
 	}
 	goPkg.Imports = slices.Clone(testmainImports)
@@ -231,8 +232,8 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 		ImportPath: MainPackage,
 		Name:       MainPackage,
 		LibTargetRef: &pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
-			Name:    "build_testmain_lib",
+			Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+			Name:    htypes.Ptr("build_testmain_lib"),
 			Args:    factors.Args(),
 		},
 	}, nil
@@ -539,14 +540,14 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
+		RequestId: htypes.Ptr(requestId),
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: tref.DirPackage(gomod),
-					Name:    "_gomod",
+					Package: htypes.Ptr(tref.DirPackage(gomod)),
+					Name:    htypes.Ptr("_gomod"),
 				},
-				Driver: "sh",
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 					"run":              structpb.NewStringValue("go list -m -json > $OUT"),

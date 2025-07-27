@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"maps"
 	"net/http"
@@ -64,8 +65,8 @@ func (p *Plugin) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1
 	p.pipes[id] = &pipe{exp: time.Now().Add(time.Minute), r: r, w: w}
 
 	return &pluginv1.PipeResponse{
-		Path: path.Join(PipesHandlerPath, id),
-		Id:   id,
+		Path: htypes.Ptr(path.Join(PipesHandlerPath, id)),
+		Id:   htypes.Ptr(id),
 	}, nil
 }
 
@@ -74,7 +75,7 @@ func (p *Plugin) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*plugin
 	pdesc := protodesc.ToDescriptorProto(desc)
 
 	return &pluginv1.ConfigResponse{
-		Name:         p.name,
+		Name:         htypes.Ptr(p.name),
 		TargetSchema: pdesc,
 	}, nil
 }
@@ -102,17 +103,17 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		RuntimeEnv:     targetSpec.RuntimeEnv,
 		PassEnv:        targetSpec.PassEnv,
 		RuntimePassEnv: targetSpec.RuntimePassEnv,
-		Context:        execv1.Target_SoftSandbox,
+		Context:        htypes.Ptr(execv1.Target_SoftSandbox),
 	}
 
 	if targetSpec.InTree {
-		target.Context = execv1.Target_Tree
+		target.SetContext(execv1.Target_Tree)
 	}
 
 	var codegenPaths []string
 	for k, out := range targetSpec.Out {
 		target.Outputs = append(target.Outputs, &execv1.Target_Output{
-			Group: k,
+			Group: htypes.Ptr(k),
 			Paths: out,
 		})
 
@@ -141,7 +142,7 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))
 	for _, output := range target.GetOutputs() {
 		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
-			Group: output.GetGroup(),
+			Group: htypes.Ptr(output.GetGroup()),
 			Paths: output.GetPaths(),
 		})
 	}
@@ -165,13 +166,13 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 				Ref: ref,
 				Origin: &pluginv1.TargetDef_InputOrigin{
 					Meta: meta,
-					Id:   id,
+					Id:   htypes.Ptr(id),
 				},
 			})
 
 			execDeps.Targets = append(execDeps.Targets, &execv1.Target_InputRef{
 				Ref: ref,
-				Id:  id,
+				Id:  htypes.Ptr(id),
 			})
 		}
 		target.Deps[name] = &execDeps
@@ -194,12 +195,12 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 				Ref: ref,
 				Origin: &pluginv1.TargetDef_InputOrigin{
 					Meta: meta,
-					Id:   id,
+					Id:   htypes.Ptr(id),
 				},
 			})
 			target.Tools = append(target.Tools, &execv1.Target_InputRef{
 				Ref: ref,
-				Id:  id,
+				Id:  htypes.Ptr(id),
 			})
 		}
 	}
@@ -224,17 +225,17 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	case "copy":
 		for _, p := range codegenPaths {
 			codegenTree = append(codegenTree, &pluginv1.TargetDef_CodegenTree{
-				Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY,
-				Path:  p,
-				IsDir: strings.HasSuffix(p, "/"),
+				Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY),
+				Path:  htypes.Ptr(p),
+				IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
 			})
 		}
 	case "link":
 		for _, p := range codegenPaths {
 			codegenTree = append(codegenTree, &pluginv1.TargetDef_CodegenTree{
-				Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK,
-				Path:  p,
-				IsDir: strings.HasSuffix(p, "/"),
+				Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK),
+				Path:  htypes.Ptr(p),
+				IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
 			})
 		}
 	default:
@@ -247,11 +248,11 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			Def:                targetAny,
 			Inputs:             inputs,
 			Outputs:            slices.Collect(maps.Keys(targetSpec.Out)),
-			Cache:              targetSpec.Cache.Local,
-			DisableRemoteCache: !targetSpec.Cache.Remote,
+			Cache:              htypes.Ptr(targetSpec.Cache.Local),
+			DisableRemoteCache: htypes.Ptr(!targetSpec.Cache.Remote),
 			CollectOutputs:     collectOutputs,
 			CodegenTree:        codegenTree,
-			Pty:                targetSpec.Pty,
+			Pty:                htypes.Ptr(targetSpec.Pty),
 			Hash:               hash.Sum(nil),
 		},
 	}, nil

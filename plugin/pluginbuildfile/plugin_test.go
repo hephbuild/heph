@@ -1,6 +1,7 @@
 package pluginbuildfile
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"os"
 	"testing"
 
@@ -24,7 +25,7 @@ func TestSanity(t *testing.T) {
 	var ref *pluginv1.TargetRef
 	{
 		res, err := p.List(ctx, &pluginv1.ListRequest{
-			Package: "",
+			Package: htypes.Ptr(""),
 		})
 		require.NoError(t, err)
 
@@ -62,7 +63,7 @@ func TestLoad(t *testing.T) {
 	var ref *pluginv1.TargetRef
 	{
 		res, err := p.List(ctx, &pluginv1.ListRequest{
-			Package: "",
+			Package: htypes.Ptr(""),
 		})
 		require.NoError(t, err)
 

@@ -3,6 +3,7 @@ package plugingo
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -22,10 +23,10 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 
 	return &pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
 		Ref: &pluginv1.TargetRef{
-			Package: pkg,
-			Name:    "download",
+			Package: htypes.Ptr(pkg),
+			Name:    htypes.Ptr("download"),
 		},
-		Driver: "sh",
+		Driver: htypes.Ptr("sh"),
 		Config: map[string]*structpb.Value{
 			"env": hstructpb.NewMapStringStringValue(map[string]string{
 				"CGO_ENABLED": "0",

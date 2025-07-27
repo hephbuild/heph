@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"path"
 
@@ -28,11 +29,11 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors, requestId s
 
 func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
+		RequestId: htypes.Ptr(requestId),
 		Of: &corev1.ResultRequest_Ref{
 			Ref: &pluginv1.TargetRef{
-				Package: "@heph/go/std",
-				Name:    "install",
+				Package: htypes.Ptr("@heph/go/std"),
+				Name: htypes.Ptr("install"),
 				Args:    factors.Args(),
 			},
 		},
@@ -80,11 +81,11 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: "@heph/go/std",
-				Name:    "install",
+				Package: htypes.Ptr("@heph/go/std"),
+				Name: htypes.Ptr("install"),
 				Args:    factors.Args(),
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,
@@ -116,11 +117,11 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: path.Join("@heph/go/std", goImport),
-				Name:    "build_lib",
+				Package: htypes.Ptr(path.Join("@heph/go/std", goImport)),
+				Name: htypes.Ptr("build_lib"),
 				Args:    factors.Args(),
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":   factors.GOOS,
@@ -128,8 +129,8 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 					"GOTOOLCHAIN": "local",
 				}),
 				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-					Package: "@heph/go/std",
-					Name:    "install",
+					Package: htypes.Ptr("@heph/go/std"),
+					Name: htypes.Ptr("install"),
 					Args:    factors.Args(),
 				})),
 				"run": hstructpb.NewStringsValue([]string{

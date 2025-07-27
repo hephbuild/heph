@@ -26,7 +26,7 @@ import (
 )
 
 func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hashin string, manifest *hartifact.Manifest, artifacts []ExecuteResultArtifact) {
-	if def.DisableRemoteCache {
+	if def.GetDisableRemoteCache() {
 		return
 	}
 
@@ -82,7 +82,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 		}
 		defer r.Close()
 
-		key := e.remoteCacheKey(ref, hashin, artifact.Name)
+		key := e.remoteCacheKey(ref, hashin, artifact.GetName())
 
 		err = cache.Client.Store(ctx, key, r)
 		if err != nil {
@@ -98,7 +98,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
 	ref := def.GetRef()
 
-	if def.DisableRemoteCache {
+	if def.GetDisableRemoteCache() {
 		return nil, false, nil
 	}
 
@@ -148,9 +148,9 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 		if ok {
 			localArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
 			for _, artifact := range artifacts {
-				to := cacheDir.At(artifact.Name)
+				to := cacheDir.At(artifact.GetName())
 
-				err = hfs.Move(tmpCacheDir.At(artifact.Name), to)
+				err = hfs.Move(tmpCacheDir.At(artifact.GetName()), to)
 				if err != nil {
 					return nil, false, err
 				}

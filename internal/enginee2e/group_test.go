@@ -1,6 +1,7 @@
 package enginee2e
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -30,10 +31,10 @@ func TestGroup(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "t1",
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("t1"),
 				},
-				Driver: "exec",
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out1"}),
@@ -43,10 +44,10 @@ func TestGroup(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "t2",
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("t2"),
 				},
-				Driver: "exec",
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo world > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out2"}),
@@ -56,19 +57,19 @@ func TestGroup(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "g",
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("g"),
 				},
-				Driver: "group",
+				Driver: htypes.Ptr("group"),
 				Config: map[string]*structpb.Value{
 					"deps": hstructpb.NewStringsValue([]string{
 						tref.Format(&pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "t1",
+							Package: htypes.Ptr(pkg),
+							Name:    htypes.Ptr("t1"),
 						}),
 						tref.Format(&pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "t2",
+							Package: htypes.Ptr(pkg),
+							Name:    htypes.Ptr("t2"),
 						}),
 					}),
 				},

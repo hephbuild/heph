@@ -1,6 +1,7 @@
 package plugingo
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"go/build"
 	"time"
 
@@ -82,8 +83,8 @@ func (p Package) GetBuildLibTargetRef(mode string) *pluginv1.TargetRef {
 	}
 
 	return &pluginv1.TargetRef{
-		Package: p.GetHephBuildPackage(),
-		Name:    "build_lib",
+		Package: htypes.Ptr(p.GetHephBuildPackage()),
+		Name:    htypes.Ptr("build_lib"),
 		Args:    args,
 	}
 }

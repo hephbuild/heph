@@ -3,6 +3,7 @@ package enginee2e
 import (
 	"bytes"
 	"context"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"path/filepath"
@@ -37,10 +38,10 @@ func TestDepsCache(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "child",
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("child"),
 				},
-				Driver: "bash",
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out_child"}),
@@ -50,10 +51,10 @@ func TestDepsCache(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "parent",
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("parent"),
 				},
-				Driver: "bash",
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $(cat $SRC) > $OUT`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:child"}),
@@ -122,15 +123,15 @@ func TestDepsCache2(t *testing.T) {
 
 	provider.EXPECT().
 		Config(gomock.Any(), gomock.Any()).
-		Return(&pluginv1.ProviderConfigResponse{Name: "test_provider"}, nil).AnyTimes()
+		Return(&pluginv1.ProviderConfigResponse{Name: htypes.Ptr("test_provider")}, nil).AnyTimes()
 
 	provider.EXPECT().
 		Get(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, request *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 			return &pluginv1.GetResponse{
 				Spec: &pluginv1.TargetSpec{
-					Ref:    &pluginv1.TargetRef{Package: "", Name: "child"},
-					Driver: "test_driver",
+					Ref:    &pluginv1.TargetRef{Package: htypes.Ptr(""), Name: htypes.Ptr("child")},
+					Driver: htypes.Ptr("test_driver"),
 				},
 			}, nil
 		}).Times(3)
@@ -142,16 +143,16 @@ func TestDepsCache2(t *testing.T) {
 
 	driver.EXPECT().
 		Config(gomock.Any(), gomock.Any()).
-		Return(&pluginv1.ConfigResponse{Name: "test_driver"}, nil).AnyTimes()
+		Return(&pluginv1.ConfigResponse{Name: htypes.Ptr("test_driver")}, nil).AnyTimes()
 
 	driver.EXPECT().
 		Parse(gomock.Any(), gomock.Any()).
 		Return(&pluginv1.ParseResponse{
 			Target: &pluginv1.TargetDef{
-				Ref:     &pluginv1.TargetRef{Package: "", Name: "child"},
+				Ref:     &pluginv1.TargetRef{Package: htypes.Ptr(""), Name: htypes.Ptr("child")},
 				Inputs:  nil,
 				Outputs: []string{""},
-				Cache:   true,
+				Cache:   htypes.Ptr(true),
 			},
 		}, nil).Times(3)
 
@@ -161,13 +162,13 @@ func TestDepsCache2(t *testing.T) {
 			return &pluginv1.RunResponse{
 				Artifacts: []*pluginv1.Artifact{
 					{
-						Group: "",
-						Name:  "out",
-						Type:  pluginv1.Artifact_TYPE_OUTPUT,
+						Group: htypes.Ptr(""),
+						Name:  htypes.Ptr("out"),
+						Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 						Content: &pluginv1.Artifact_Raw{
 							Raw: &pluginv1.Artifact_ContentRaw{
 								Data: []byte("hello"),
-								Path: "out.txt",
+								Path: htypes.Ptr("out.txt"),
 							},
 						},
 					},
@@ -181,10 +182,10 @@ func TestDepsCache2(t *testing.T) {
 	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
-		Get(gomock.Any(), "__child/11721714eaaed295/manifest.v1.json").
+		Get(gomock.Any(), "__child/11c9ea1468646e02/manifest.v1.json").
 		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
-	for _, key := range []string{"__child/11721714eaaed295/manifest.v1.json", "__child/11721714eaaed295/out_out.tar"} {
+	for _, key := range []string{"__child/11c9ea1468646e02/manifest.v1.json", "__child/11c9ea1468646e02/out_out.tar"} {
 		cache.EXPECT().
 			Store(gomock.Any(), key, gomock.Any()).
 			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {

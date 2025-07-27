@@ -1,6 +1,7 @@
 package enginee2e
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"testing"
 
@@ -41,10 +42,10 @@ func TestSanity(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "sometarget",
+					Package: htypes.Ptr(pkg),
+					Name: htypes.Ptr("sometarget"),
 				},
-				Driver: "exec",
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > out`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),

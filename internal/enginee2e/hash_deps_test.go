@@ -1,6 +1,7 @@
 package enginee2e
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
 	"time"
 
@@ -29,10 +30,10 @@ func TestHashDeps(t *testing.T) {
 			{
 				Spec: &pluginv1.TargetSpec{
 					Ref: &pluginv1.TargetRef{
-						Package: "some/package",
-						Name:    "sometarget",
+						Package: htypes.Ptr("some/package"),
+						Name: htypes.Ptr("sometarget"),
 					},
-					Driver: "sh",
+					Driver: htypes.Ptr("sh"),
 					Config: map[string]*structpb.Value{
 						"run": hstructpb.NewStringsValue([]string{`echo hello > out`}),
 						"out": hstructpb.NewStringsValue([]string{"out"}),
@@ -62,7 +63,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 1)
 
-		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
+		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: htypes.Ptr("some/package"), Name: htypes.Ptr("sometarget")}, nil)
 		require.NoError(t, err)
 
 		at = m.CreatedAt
@@ -79,7 +80,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 1)
 
-		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
+		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: htypes.Ptr("some/package"), Name: htypes.Ptr("sometarget")}, nil)
 		require.NoError(t, err)
 
 		require.Equal(t, at, m.CreatedAt)

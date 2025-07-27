@@ -3,6 +3,7 @@ package plugingo
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io/fs"
 	"path"
 	"path/filepath"
@@ -82,11 +83,11 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    "embedcfg",
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr("embedcfg"),
 				Args:    args,
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q > $OUT", string(b))),
 				"out": structpb.NewStringValue("embedcfg.json"),

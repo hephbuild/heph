@@ -1,6 +1,7 @@
 package tref
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hproto"
@@ -17,15 +18,15 @@ func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
 		return v
 	}
 
-	if a.Output != nil && b.Output != nil {
+	if a.HasOutput() && b.HasOutput() {
 		if v := strings.Compare(a.GetOutput(), b.GetOutput()); v != 0 {
 			return v
 		}
 	} else {
-		if a.Output == nil {
+		if !a.HasOutput() {
 			return 1
 		}
-		if b.Output == nil {
+		if !b.HasOutput() {
 			return -1
 		}
 	}
@@ -60,26 +61,34 @@ func Compare(a, b *pluginv1.TargetRef) int {
 	return 0
 }
 
+func New(pkg, name string, args map[string]string) *pluginv1.TargetRef {
+	return pluginv1.TargetRef_builder{
+		Package: htypes.Ptr(pkg),
+		Name:    htypes.Ptr(name),
+		Args:    args,
+	}.Build()
+}
+
 func WithName(ref *pluginv1.TargetRef, name string) *pluginv1.TargetRef {
 	if ref.GetName() == name {
 		return ref
 	}
 
 	ref = hproto.Clone(ref)
-	ref.Name = name
+	ref.SetName(name)
 	return ref
 }
 
 func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
-	if ref.Args != nil && ref.GetArgs()[key] == value {
+	if ref.GetArgs() != nil && ref.GetArgs()[key] == value {
 		return ref
 	}
 
 	ref = hproto.Clone(ref)
-	if ref.Args == nil {
-		ref.Args = make(map[string]string)
+	if ref.GetArgs() == nil {
+		ref.SetArgs(make(map[string]string))
 	}
-	ref.Args[key] = value
+	ref.GetArgs()[key] = value
 	return ref
 }
 
@@ -89,7 +98,7 @@ func WithArgs(ref *pluginv1.TargetRef, m map[string]string) *pluginv1.TargetRef 
 	}
 
 	ref = hproto.Clone(ref)
-	ref.Args = m
+	ref.SetArgs(m)
 	return ref
 }
 
@@ -99,25 +108,21 @@ func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutp
 		outputp = &output
 	}
 
-	return &pluginv1.TargetRefWithOutput{
-		Package: ref.GetPackage(),
-		Name:    ref.GetName(),
+	return pluginv1.TargetRefWithOutput_builder{
+		Package: htypes.Ptr(ref.GetPackage()),
+		Name:    htypes.Ptr(ref.GetName()),
 		Args:    ref.GetArgs(),
 		Output:  outputp,
-	}
+	}.Build()
 }
 
 func WithFilters(ref *pluginv1.TargetRefWithOutput, filters []string) *pluginv1.TargetRefWithOutput {
 	ref = hproto.Clone(ref)
-	ref.Filters = filters
+	ref.SetFilters(filters)
 
 	return ref
 }
 
 func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
-	return &pluginv1.TargetRef{
-		Package: ref.GetPackage(),
-		Name:    ref.GetName(),
-		Args:    ref.GetArgs(),
-	}
+	return New(ref.GetPackage(), ref.GetName(), ref.GetArgs())
 }

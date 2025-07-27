@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	"maps"
 	"os"
 	"slices"
@@ -127,7 +128,7 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 
 			return &pluginv1.TargetSpec{
 				Ref:    ref,
-				Driver: plugingroup.Name,
+				Driver: htypes.Ptr(plugingroup.Name),
 				Config: map[string]*structpb.Value{
 					"deps": hstructpb.NewStringsValue(deps),
 				},
@@ -477,7 +478,7 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		}
 
 		res, err := driver.Parse(ctx, &pluginv1.ParseRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 			Spec:      spec,
 		})
 		if err != nil {

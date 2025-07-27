@@ -34,10 +34,6 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/semaphore"
 
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/protobuf/proto"
-
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -45,6 +41,8 @@ import (
 	"github.com/hephbuild/heph/internal/htar"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type ExecOptions struct {
@@ -66,7 +64,7 @@ type InteractiveExecOptions struct {
 }
 
 func (e *Engine) Result(ctx context.Context, rs *RequestState, pkg, name string, outputs []string) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, rs, &pluginv1.TargetRef{Package: pkg, Name: name}, outputs)
+	res, err := e.ResultFromRef(ctx, rs, &pluginv1.TargetRef{Package: htypes.Ptr(pkg), Name: htypes.Ptr(name)}, outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +309,7 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 
 			for _, artifact := range res.Artifacts {
 				if artifact.Hashout == "" {
-					return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), artifact.Group)
+					return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), artifact.GetGroup())
 				}
 			}
 
@@ -720,7 +718,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 	} else {
 		h = xxh3.New()
 	}
-	writeProto := func(v hashpb.Hashable) error {
+	writeProto := func(v hashpb.StableWriter) error {
 		hashpb.Hash(h, v, nil)
 
 		return nil
@@ -946,7 +944,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 
 	if options.Stdout != nil {
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 		})
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
@@ -970,7 +968,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 
 	if options.Stderr != nil {
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 		})
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
@@ -994,7 +992,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 
 	if stdin, ok := options.Stdin.(*os.File); ok {
 		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
-			RequestId: rs.ID,
+			RequestId: htypes.Ptr(rs.ID),
 		})
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
@@ -1061,11 +1059,11 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		if !ok {
 			return nil, fmt.Errorf("shell driver not found: %v", shellDriver)
 		}
-		def.Pty = true
+		def.SetPty(true)
 	}
 
 	var targetfolder string
-	if def.Cache || options.shell {
+	if def.GetCache() || options.shell {
 		targetfolder = e.targetDirName(def.GetRef())
 	} else {
 		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
@@ -1080,7 +1078,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		return nil, fmt.Errorf("results hashin (%v) != meta hashin (%v)", hashin, options.hashin)
 	}
 
-	if def.Cache && !options.force && !options.shell {
+	if def.GetCache() && !options.force && !options.shell {
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
 		if err != nil {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
@@ -1153,15 +1151,15 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}()
 
 			runRes, runErr = driver.Run(ctx, &pluginv1.RunRequest{
-				RequestId:    rs.ID,
+				RequestId:    htypes.Ptr(rs.ID),
 				Target:       def.TargetDef.TargetDef,
-				SandboxPath:  sandboxfs.Path(),
-				TreeRootPath: e.Root.Path(),
+				SandboxPath:  htypes.Ptr(sandboxfs.Path()),
+				TreeRootPath: htypes.Ptr(e.Root.Path()),
 				Inputs:       inputs,
 				Pipes:        pipes,
 			})
 		},
-		Pty: def.Pty,
+		Pty: def.GetPty(),
 	})
 	err = errors.Join(err, runErr)
 	if err != nil {
@@ -1231,9 +1229,9 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
 			Artifact: &pluginv1.Artifact{
-				Group: output.GetGroup(),
-				Name:  tarname,
-				Type:  pluginv1.Artifact_TYPE_OUTPUT,
+				Group: htypes.Ptr(output.GetGroup()),
+				Name:  htypes.Ptr(tarname),
+				Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 				Content: &pluginv1.Artifact_TarPath{
 					TarPath: tarf.Name(),
 				},

@@ -56,7 +56,7 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 	}
 
 	for _, output := range outputs {
-		if output.Type != pluginv1.Artifact_TYPE_OUTPUT {
+		if output.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}
 

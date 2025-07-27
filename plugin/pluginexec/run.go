@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"os/exec"
@@ -291,11 +292,11 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	var artifacts []*pluginv1.Artifact
 	if stat.Size() > 0 {
 		artifacts = append(artifacts, &pluginv1.Artifact{
-			Name: "log.txt",
-			Type: pluginv1.Artifact_TYPE_LOG,
+			Name: htypes.Ptr("log.txt"),
+			Type: htypes.Ptr(pluginv1.Artifact_TYPE_LOG),
 			Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-				SourcePath: logFile.Name(),
-				OutPath:    "log.txt",
+				SourcePath: htypes.Ptr(logFile.Name()),
+				OutPath: htypes.Ptr("log.txt"),
 			}},
 		})
 	}

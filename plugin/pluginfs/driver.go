@@ -2,6 +2,7 @@ package pluginfs
 
 import (
 	"context"
+	"github.com/hephbuild/heph/internal/htypes"
 	"os"
 	"path/filepath"
 
@@ -36,7 +37,7 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 	pdesc := protodesc.ToDescriptorProto(desc)
 
 	return &pluginv1.ConfigResponse{
-		Name:         "fs_driver",
+		Name:         htypes.Ptr("fs_driver"),
 		TargetSchema: pdesc,
 	}, nil
 }
@@ -57,7 +58,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}
 
 	target := &fsv1.Target{
-		File:       cfg.File,
+		File:       htypes.Ptr(cfg.File),
 		ModifiedAt: timestamppb.New(info.ModTime()),
 	}
 
@@ -71,8 +72,8 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			Ref:                req.GetSpec().GetRef(),
 			Def:                targetAny,
 			Outputs:            []string{""},
-			Cache:              true,
-			DisableRemoteCache: true,
+			Cache:              htypes.Ptr(true),
+			DisableRemoteCache: htypes.Ptr(true),
 		},
 	}, nil
 }
@@ -87,11 +88,11 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	return &pluginv1.RunResponse{
 		Artifacts: []*pluginv1.Artifact{
 			{
-				Name: filepath.Base(t.GetFile()),
-				Type: pluginv1.Artifact_TYPE_OUTPUT,
+				Name: htypes.Ptr(filepath.Base(t.GetFile())),
+				Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 				Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-					SourcePath: filepath.Join(p.resultClient.Root, t.GetFile()),
-					OutPath:    t.GetFile(),
+					SourcePath: htypes.Ptr(filepath.Join(p.resultClient.Root, t.GetFile())),
+					OutPath:    htypes.Ptr(t.GetFile()),
 				}},
 			},
 		},

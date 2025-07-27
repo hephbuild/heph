@@ -3,6 +3,7 @@ package hlog
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"log/slog"
 	"sync"
 
@@ -46,7 +47,7 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 	var attrs []*corev1.CreateRequest_Attr
 	appendAttr := func(attrs []*corev1.CreateRequest_Attr, attr slog.Attr) []*corev1.CreateRequest_Attr {
 		rpcAttr := &corev1.CreateRequest_Attr{
-			Key: attr.Key,
+			Key: htypes.Ptr(attr.Key),
 		}
 
 		switch attr.Value.Kind() { //nolint:exhaustive
@@ -76,8 +77,8 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 	})
 
 	_, err := l.client.Create(ctx, connect.NewRequest(&corev1.CreateRequest{
-		Level:   level,
-		Message: record.Message,
+		Level:   htypes.Ptr(level),
+		Message: htypes.Ptr(record.Message),
 		Attrs:   attrs,
 	}))
 	if err != nil {

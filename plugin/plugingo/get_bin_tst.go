@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"path/filepath"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -22,16 +23,16 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    "test",
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr("test"),
 				Args:    factors.Args(),
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue("$SRC"),
 				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-					Package: goPkg.GetHephBuildPackage(),
-					Name:    "build_test",
+					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+					Name:    htypes.Ptr("build_test"),
 					Args:    factors.Args(),
 				})),
 			},
@@ -82,11 +83,11 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    "testmain",
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr("testmain"),
 				Args:    factors.Args(),
 			},
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q | base64 --decode > $OUT", testmain)),
 				"out": structpb.NewStringValue("testmain.go"),
@@ -149,8 +150,8 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 		goPkg,
 		importsm,
 		[]string{tref.Format(&pluginv1.TargetRef{
-			Package: goPkg.GoPkg.GetHephBuildPackage(),
-			Name:    "testmain",
+			Package: htypes.Ptr(goPkg.GoPkg.GetHephBuildPackage()),
+			Name:    htypes.Ptr("testmain"),
 			Args:    factors.Args(),
 		})},
 		factors,

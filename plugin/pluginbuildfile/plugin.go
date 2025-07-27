@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/hephbuild/heph/internal/hsingleflight"
+	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	"strings"
 
@@ -42,7 +43,7 @@ func New(fs hfs.FS, cfg Options) *Plugin {
 
 func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
+		Name: htypes.Ptr(Name),
 	}, nil
 }
 
@@ -66,8 +67,8 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 		}
 
 		states = append(states, &pluginv1.ProviderState{
-			Package:  payload.Package,
-			Provider: payload.Provider,
+			Package:  htypes.Ptr(payload.Package),
+			Provider: htypes.Ptr(payload.Provider),
 			State:    state,
 		})
 
@@ -380,10 +381,10 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 
 	spec := &pluginv1.TargetSpec{
 		Ref: &pluginv1.TargetRef{
-			Package: payload.Package,
-			Name:    payload.Name,
+			Package: htypes.Ptr(payload.Package),
+			Name:    htypes.Ptr(payload.Name),
 		},
-		Driver: payload.Driver,
+		Driver: htypes.Ptr(payload.Driver),
 		Config: config,
 		Labels: payload.Labels,
 	}

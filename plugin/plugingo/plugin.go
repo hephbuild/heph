@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -103,7 +104,7 @@ func New() *Plugin {
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
+		Name: htypes.Ptr(Name),
 	}, nil
 }
 
@@ -161,8 +162,8 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			if goPkg.IsCommand() {
 				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
 					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "build",
+						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+						Name:    htypes.Ptr("build"),
 						Args:    factors.Args(),
 					},
 				}})
@@ -174,8 +175,8 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			if !goPkg.Is3rdParty && !goPkg.IsStd && (len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0) {
 				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
 					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "test",
+						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+						Name:    htypes.Ptr("test"),
 						Args:    factors.Args(),
 					},
 				}})
@@ -185,8 +186,8 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 
 				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
 					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "build_test",
+						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+						Name:    htypes.Ptr("build_test"),
 						Args:    factors.Args(),
 					},
 				}})
@@ -419,17 +420,17 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 	}
 
 	listRef := &pluginv1.TargetRef{
-		Package: pkg,
-		Name:    "_golist",
+		Package: htypes.Ptr(pkg),
+		Name: htypes.Ptr("_golist"),
 		Args:    args,
 	}
 
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
+		RequestId: htypes.Ptr(requestId),
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref:    listRef,
-				Driver: "sh",
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"env": hstructpb.NewMapStringStringValue(map[string]string{
 						"GOOS":        f.GOOS,

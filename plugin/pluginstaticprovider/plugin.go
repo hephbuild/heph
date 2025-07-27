@@ -3,6 +3,7 @@ package pluginstaticprovider
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -23,7 +24,7 @@ type Plugin struct {
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return &pluginv1.ProviderConfigResponse{
-		Name: "static",
+		Name: htypes.Ptr("static"),
 	}, nil
 }
 

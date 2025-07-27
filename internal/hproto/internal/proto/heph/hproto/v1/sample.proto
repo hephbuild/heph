@@ -1,5 +1,7 @@
-syntax = "proto3";
+edition = "2023";
 package heph.hproto.v1;
+import "google/protobuf/go_features.proto";
+option features.(pb.go).api_level = API_HYBRID;
 
 message Sample {
   message Nested {

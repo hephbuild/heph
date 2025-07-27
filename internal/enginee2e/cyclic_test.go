@@ -3,6 +3,7 @@ package enginee2e
 
 import (
 	"context"
+	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hdebug"
@@ -35,8 +36,8 @@ func TestCyclic1(t *testing.T) {
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
-				Package: pkg,
-				Name:    "c",
+				Package: htypes.Ptr(pkg),
+				Name: htypes.Ptr("c"),
 			}}})
 			require.ErrorContains(t, err, "stack recursion detected")
 
@@ -64,10 +65,10 @@ func TestCyclic1(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "c",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("c"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 						},
@@ -108,8 +109,8 @@ func TestCyclic2(t *testing.T) {
 		}},
 		{"ResultsFromMatcher ref leaf then ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
-				Package: pkg,
-				Name:    "c",
+				Package: htypes.Ptr(pkg),
+				Name: htypes.Ptr("c"),
 			}}})
 			require.ErrorContains(t, err, "stack recursion detected")
 
@@ -137,10 +138,10 @@ func TestCyclic2(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "a",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("a"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":c"}),
 						},
@@ -150,10 +151,10 @@ func TestCyclic2(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "c",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("c"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
@@ -228,8 +229,8 @@ func TestCyclic3(t *testing.T) {
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
-				Package: pkg,
-				Name:    "c",
+				Package: htypes.Ptr(pkg),
+				Name: htypes.Ptr("c"),
 			}}})
 			require.ErrorContains(t, err, "stack recursion detected")
 
@@ -257,10 +258,10 @@ func TestCyclic3(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "a",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("a"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":b"}),
 						},
@@ -270,10 +271,10 @@ func TestCyclic3(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "b",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("b"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
@@ -283,10 +284,10 @@ func TestCyclic3(t *testing.T) {
 				{
 					Spec: &pluginv1.TargetSpec{
 						Ref: &pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "c",
+							Package: htypes.Ptr(pkg),
+							Name: htypes.Ptr("c"),
 						},
-						Driver: "sh",
+						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),

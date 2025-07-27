@@ -1,6 +1,7 @@
 package enginee2e
 
 import (
+	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -29,10 +30,10 @@ func TestSanityTool(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "tools",
-					Name:    "mytool",
+					Package: htypes.Ptr("tools"),
+					Name: htypes.Ptr("mytool"),
 				},
-				Driver: "bash",
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`echo '#!/usr/bin/env bash' > $OUT`,
@@ -46,10 +47,10 @@ func TestSanityTool(t *testing.T) {
 		{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/package",
-					Name:    "sometarget",
+					Package: htypes.Ptr("some/package"),
+					Name: htypes.Ptr("sometarget"),
 				},
-				Driver: "bash",
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`which screw || echo 'screw bin not found'`,

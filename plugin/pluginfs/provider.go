@@ -3,6 +3,7 @@ package pluginfs
 import (
 	"context"
 	"errors"
+	"github.com/hephbuild/heph/internal/htypes"
 	"path/filepath"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -34,7 +35,7 @@ const Name = "fs"
 
 func (p *Provider) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
+		Name: htypes.Ptr(Name),
 	}, nil
 }
 
@@ -60,7 +61,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref:    req.GetRef(),
-			Driver: "fs_driver",
+			Driver: htypes.Ptr("fs_driver"),
 			Config: map[string]*structpb.Value{
 				"file": structpb.NewStringValue(filepath.Join(rest, f)),
 			},

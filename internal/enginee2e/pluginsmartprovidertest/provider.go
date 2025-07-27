@@ -3,6 +3,7 @@ package pluginsmartprovidertest
 import (
 	"context"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
@@ -37,7 +38,7 @@ func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error
 
 func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return &pluginv1.ProviderConfigResponse{
-		Name: ProviderName,
+		Name: htypes.Ptr(ProviderName),
 	}, nil
 }
 
@@ -47,14 +48,14 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: req.GetRequestId(),
+		RequestId: htypes.Ptr(req.GetRequestId()),
 		Of: &corev1.ResultRequest_Spec{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/package",
-					Name:    "think",
+					Package: htypes.Ptr("some/package"),
+					Name:    htypes.Ptr("think"),
 				},
-				Driver: "bash",
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"out": structpb.NewStringValue("out"),
 					"run": structpb.NewStringValue(`echo hello > $OUT`),
@@ -82,7 +83,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	return &pluginv1.GetResponse{
 		Spec: &pluginv1.TargetSpec{
 			Ref:    req.GetRef(),
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"out": structpb.NewStringValue("out"),
 				"run": structpb.NewStringValue(fmt.Sprintf(`echo 'parent: %s' > $OUT`, b)),

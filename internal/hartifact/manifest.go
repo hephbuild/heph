@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"time"
@@ -100,29 +101,25 @@ func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
 		return nil, err
 	}
 
-	return &pluginv1.Artifact{
-		Name: ManifestName,
-		Type: pluginv1.Artifact_TYPE_MANIFEST_V1,
-		Content: &pluginv1.Artifact_Raw{
-			Raw: &pluginv1.Artifact_ContentRaw{
-				Data: b,
-				Path: ManifestName,
-			},
-		},
-	}, nil
+	return pluginv1.Artifact_builder{
+		Name: htypes.Ptr(ManifestName),
+		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
+		Raw: pluginv1.Artifact_ContentRaw_builder{
+			Data: b,
+			Path: htypes.Ptr(ManifestName),
+		}.Build(),
+	}.Build(), nil
 }
 
 func newManifestArtifact(fs hfs.FS) *pluginv1.Artifact {
-	return &pluginv1.Artifact{
-		Name: ManifestName,
-		Type: pluginv1.Artifact_TYPE_MANIFEST_V1,
-		Content: &pluginv1.Artifact_File{
-			File: &pluginv1.Artifact_ContentFile{
-				SourcePath: fs.Path(ManifestName),
-				OutPath:    ManifestName,
-			},
-		},
-	}
+	return pluginv1.Artifact_builder{
+		Name: htypes.Ptr(ManifestName),
+		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
+		File: pluginv1.Artifact_ContentFile_builder{
+			SourcePath: htypes.Ptr(fs.Path(ManifestName)),
+			OutPath:    htypes.Ptr(ManifestName),
+		}.Build(),
+	}.Build()
 }
 
 func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, error) {
@@ -161,17 +158,17 @@ func DecodeManifest(r io.Reader) (Manifest, error) {
 }
 
 func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, error) {
-	switch a.GetContent().(type) {
-	case *pluginv1.Artifact_TargzPath:
+	switch a.WhichContent() {
+	case pluginv1.Artifact_TargzPath_case:
 		return ManifestArtifactContentTypeTarGz, nil
-	case *pluginv1.Artifact_TarPath:
+	case pluginv1.Artifact_TarPath_case:
 		return ManifestArtifactContentTypeTar, nil
-	case *pluginv1.Artifact_File:
-	case *pluginv1.Artifact_Raw:
+	case pluginv1.Artifact_File_case:
+	case pluginv1.Artifact_Raw_case:
 	default:
 	}
 
-	return "", fmt.Errorf("unsupported content %T", a.GetContent())
+	return "", fmt.Errorf("unsupported content %v", a.WhichContent().String())
 }
 
 func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (ManifestArtifact, error) {
@@ -190,21 +187,17 @@ func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (Manif
 }
 
 func ManifestArtifactToProto(artifact ManifestArtifact, path string) (*pluginv1.Artifact, error) {
-	partifact := &pluginv1.Artifact{
-		Group: artifact.Group,
-		Name:  artifact.Name,
-		Type:  pluginv1.Artifact_Type(artifact.Type),
-	}
+	partifact := pluginv1.Artifact_builder{
+		Group: htypes.Ptr(artifact.Group),
+		Name:  htypes.Ptr(artifact.Name),
+		Type:  htypes.Ptr(pluginv1.Artifact_Type(artifact.Type)),
+	}.Build()
 
 	switch artifact.ContentType {
 	case ManifestArtifactContentTypeTar:
-		partifact.Content = &pluginv1.Artifact_TarPath{
-			TarPath: path,
-		}
+		partifact.SetTarPath(path)
 	case ManifestArtifactContentTypeTarGz:
-		partifact.Content = &pluginv1.Artifact_TargzPath{
-			TargzPath: path,
-		}
+		partifact.SetTargzPath(path)
 	default:
 		return nil, fmt.Errorf("unsupported content type %q", artifact.ContentType)
 	}

@@ -8,13 +8,9 @@ managed:
 plugins:
   - local: [ "go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go" ]
     out: gen
-    opt: paths=source_relative,default_api_level=API_OPAQUE
-#  - remote: buf.build/protocolbuffers/go
-#    out: gen
-#    opt: paths=source_relative,default_api_level=API_OPAQUE
-#  - remote: buf.build/connectrpc/go
-#    out: gen
-#    opt: paths=source_relative
+    opt:
+      - paths=source_relative
+      - default_api_level=API_OPAQUE
   - local: ["go", "run", "connectrpc.com/connect/cmd/protoc-gen-connect-go"]
     out: gen
     opt: paths=source_relative

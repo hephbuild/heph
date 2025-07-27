@@ -2,6 +2,7 @@ package pluginexec
 
 import (
 	"bytes"
+	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -51,8 +52,8 @@ func TestSanity(t *testing.T) {
 		res, err := p.Parse(ctx, &pluginv1.ParseRequest{
 			Spec: &pluginv1.TargetSpec{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
+					Package: htypes.Ptr("some/pkg"),
+					Name: htypes.Ptr("target"),
 				},
 				Config: map[string]*structpb.Value{
 					"run": runArg,
@@ -67,7 +68,7 @@ func TestSanity(t *testing.T) {
 	{
 		res, err := p.Run(ctx, &pluginv1.RunRequest{
 			Target:      def,
-			SandboxPath: sandboxPath,
+			SandboxPath: htypes.Ptr(sandboxPath),
 		})
 		require.NoError(t, err)
 
@@ -111,12 +112,12 @@ func TestPipeStdout(t *testing.T) {
 		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
+					Package: htypes.Ptr("some/pkg"),
+					Name: htypes.Ptr("target"),
 				},
 				Def: def,
 			},
-			SandboxPath: sandboxPath,
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{"", res.Msg.GetId(), ""},
 		})
 		if err != nil {
@@ -183,12 +184,12 @@ func TestPipeStdin(t *testing.T) {
 		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
+					Package: htypes.Ptr("some/pkg"),
+					Name: htypes.Ptr("target"),
 				},
 				Def: def,
 			},
-			SandboxPath: sandboxPath,
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 		})
 		if err != nil {
@@ -267,12 +268,12 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 		_, err = p.Run(ctx, &pluginv1.RunRequest{
 			Target: &pluginv1.TargetDef{
 				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
+					Package: htypes.Ptr("some/pkg"),
+					Name: htypes.Ptr("target"),
 				},
 				Def: def,
 			},
-			SandboxPath: sandboxPath,
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 		})
 		if err != nil {
@@ -337,12 +338,12 @@ func TestPipe404(t *testing.T) {
 	_, err = p.Run(ctx, &pluginv1.RunRequest{
 		Target: &pluginv1.TargetDef{
 			Ref: &pluginv1.TargetRef{
-				Package: "some/pkg",
-				Name:    "target",
+				Package: htypes.Ptr("some/pkg"),
+				Name: htypes.Ptr("target"),
 			},
 			Def: def,
 		},
-		SandboxPath: sandboxPath,
+		SandboxPath: htypes.Ptr(sandboxPath),
 		Pipes:       []string{"", res.Msg.GetId(), ""},
 	})
 	require.NoError(t, err)
