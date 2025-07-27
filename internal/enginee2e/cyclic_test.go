@@ -18,6 +18,7 @@ import (
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	"github.com/hephbuild/heph/plugin/pluginstaticprovider"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -31,17 +32,17 @@ func TestCyclic1(t *testing.T) {
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
-				Name: htypes.Ptr("c"),
-			}}})
+				Name:    htypes.Ptr("c"),
+			}.Build()}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 
-			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 	}
@@ -63,17 +64,17 @@ func TestCyclic1(t *testing.T) {
 
 			staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("c"),
-						},
+							Name:    htypes.Ptr("c"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 						},
 						Labels: []string{"gen"},
-					},
+					}.Build(),
 				},
 			})
 
@@ -104,17 +105,17 @@ func TestCyclic2(t *testing.T) {
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher ref leaf then ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
-				Name: htypes.Ptr("c"),
-			}}})
+				Name:    htypes.Ptr("c"),
+			}.Build()}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 
-			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 	}
@@ -136,30 +137,30 @@ func TestCyclic2(t *testing.T) {
 
 			staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("a"),
-						},
+							Name:    htypes.Ptr("a"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":c"}),
 						},
 						Labels: []string{"gen"},
-					},
+					}.Build(),
 				},
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("c"),
-						},
+							Name:    htypes.Ptr("c"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
-					},
+					}.Build(),
 				},
 			})
 
@@ -208,7 +209,7 @@ func TestCyclic2(t *testing.T) {
 			// require.Equal(t, 3, matches)
 			// require.ErrorContains(t, theErr, "stack recursion detected")
 
-			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		})
 	}
@@ -224,17 +225,17 @@ func TestCyclic3(t *testing.T) {
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
+			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
-				Name: htypes.Ptr("c"),
-			}}})
+				Name:    htypes.Ptr("c"),
+			}.Build()}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 
-			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 	}
@@ -256,43 +257,43 @@ func TestCyclic3(t *testing.T) {
 
 			staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("a"),
-						},
+							Name:    htypes.Ptr("a"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":b"}),
 						},
 						Labels: []string{"gen"},
-					},
+					}.Build(),
 				},
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("b"),
-						},
+							Name:    htypes.Ptr("b"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 						Labels: []string{"gen"},
-					},
+					}.Build(),
 				},
 				{
-					Spec: &pluginv1.TargetSpec{
-						Ref: &pluginv1.TargetRef{
+					Spec: pluginv1.TargetSpec_builder{
+						Ref: pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
-							Name: htypes.Ptr("c"),
-						},
+							Name:    htypes.Ptr("c"),
+						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
 							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
-					},
+					}.Build(),
 				},
 			})
 
@@ -341,7 +342,7 @@ func TestCyclic3(t *testing.T) {
 			// require.Equal(t, 3, matches)
 			// require.ErrorContains(t, theErr, "stack recursion detected")
 
-			_, err = e.ResultsFromMatcher(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}})
+			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		})
 	}

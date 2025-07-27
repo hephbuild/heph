@@ -36,7 +36,7 @@ func (s *Step) SetText(text string) {
 	}
 
 	pbstep := s.getPbStep()
-	pbstep.SetText( text )
+	pbstep.SetText(text)
 
 	s.pbstep = s.handleStep(s.ctx, pbstep)
 }
@@ -59,7 +59,7 @@ func (s *Step) Done() {
 
 	pbstep := s.getPbStep()
 	pbstep.SetStatus(corev1.Step_STATUS_COMPLETED)
-	pbstep.CompletedAt = timestamppb.New(time.Now())
+	pbstep.SetCompletedAt(timestamppb.New(time.Now()))
 
 	s.pbstep = s.handleStep(s.ctx, pbstep)
 }
@@ -100,7 +100,7 @@ func ContextWithRPCHandler(ctx context.Context, client corev1connect.StepService
 				case <-t.C:
 					return
 				case step := <-ch:
-					_, err := client.Create(ctx, connect.NewRequest(&corev1.StepServiceCreateRequest{Step: step}))
+					_, err := client.Create(ctx, connect.NewRequest(corev1.StepServiceCreateRequest_builder{Step: step}.Build()))
 					if err != nil {
 						hlog.From(ctx).Error(err.Error())
 					}
@@ -152,9 +152,9 @@ func ContextWithParentID(ctx context.Context, parentID string) context.Context {
 	step := &Step{
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
-		pbstep: &corev1.Step{
+		pbstep: corev1.Step_builder{
 			Id: htypes.Ptr(parentID),
-		},
+		}.Build(),
 	}
 
 	ctx = context.WithValue(ctx, ctxStepKey{}, step)
@@ -173,13 +173,13 @@ func New(ctx context.Context, str string) (*Step, context.Context) {
 	step := &Step{
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
-		pbstep: &corev1.Step{
+		pbstep: corev1.Step_builder{
 			Id:        htypes.Ptr(uuid.New().String()),
 			ParentId:  htypes.Ptr(parentID),
 			Text:      htypes.Ptr(str),
 			Status:    htypes.Ptr(corev1.Step_STATUS_RUNNING),
 			StartedAt: timestamppb.New(time.Now()),
-		},
+		}.Build(),
 	}
 
 	handler(ctx, step.pbstep)

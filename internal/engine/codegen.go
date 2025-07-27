@@ -26,12 +26,12 @@ func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, output
 }
 
 func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
-	if len(def.CodegenTree) == 0 {
+	if len(def.GetCodegenTree()) == 0 {
 		return nil
 	}
 
 	codegenPaths := make([]string, 0, len(outputs))
-	for _, gen := range def.CodegenTree {
+	for _, gen := range def.GetCodegenTree() {
 		if gen.GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY {
 			codegenPaths = append(codegenPaths, filepath.Join(def.GetRef().GetPackage(), gen.GetPath()))
 		}
@@ -62,7 +62,7 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 
 		err := hartifact.Unpack(ctx, output.Artifact, e.Root, hartifact.WithFilter(isUnderCodegenPath))
 		if err != nil {
-			return fmt.Errorf("unpack: %v: %w", output.Group, err)
+			return fmt.Errorf("unpack: %v: %w", output.GetGroup(), err)
 		}
 	}
 

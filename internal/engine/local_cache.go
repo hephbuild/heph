@@ -85,8 +85,10 @@ func (e *Engine) CacheLocally(
 			continue
 		}
 
-		if content, ok := artifact.Content.(*pluginv1.Artifact_File); ok {
-			artifact.SetName(artifact.GetName()+".tar")
+		if artifact.HasFile() {
+			content := artifact.GetFile()
+
+			artifact.SetName(artifact.GetName() + ".tar")
 			tarf, err := hfs.Create(cachedir, artifact.GetName())
 			if err != nil {
 				return nil, nil, err
@@ -94,7 +96,7 @@ func (e *Engine) CacheLocally(
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			sourcefs := hfs.NewOS(content.File.GetSourcePath())
+			sourcefs := hfs.NewOS(content.GetSourcePath())
 
 			f, err := hfs.Open(sourcefs, "")
 			if err != nil {
@@ -102,7 +104,7 @@ func (e *Engine) CacheLocally(
 			}
 			defer f.Close()
 
-			err = p.WriteFile(f, content.File.GetOutPath())
+			err = p.WriteFile(f, content.GetOutPath())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -110,12 +112,12 @@ func (e *Engine) CacheLocally(
 			_ = f.Close()
 			_ = tarf.Close()
 
-			artifact.Content = &pluginv1.Artifact_TarPath{
-				TarPath: tarf.Name(),
-			}
+			artifact.SetTarPath(tarf.Name())
 		}
-		if content, ok := artifact.Content.(*pluginv1.Artifact_Raw); ok {
-			artifact.SetName(artifact.GetName()+".tar")
+		if artifact.HasRaw() {
+			content := artifact.GetRaw()
+
+			artifact.SetName(artifact.GetName() + ".tar")
 			tarf, err := hfs.Create(cachedir, artifact.GetName())
 			if err != nil {
 				return nil, nil, err
@@ -123,10 +125,10 @@ func (e *Engine) CacheLocally(
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			err = p.Write(bytes.NewReader(content.Raw.GetData()), &tar.Header{
+			err = p.Write(bytes.NewReader(content.GetData()), &tar.Header{
 				Typeflag: tar.TypeReg,
-				Name:     content.Raw.GetPath(),
-				Size:     int64(len(content.Raw.GetData())),
+				Name:     content.GetPath(),
+				Size:     int64(len(content.GetData())),
 				Mode:     int64(os.ModePerm),
 			})
 			if err != nil {
@@ -135,9 +137,7 @@ func (e *Engine) CacheLocally(
 
 			_ = tarf.Close()
 
-			artifact.Content = &pluginv1.Artifact_TarPath{
-				TarPath: tarf.Name(),
-			}
+			artifact.SetTarPath(tarf.Name())
 		}
 
 		fromPath, err := hartifact.Path(artifact.Artifact)
@@ -158,7 +158,7 @@ func (e *Engine) CacheLocally(
 		case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:
 			fallthrough
 		default:
-			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
+			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.GetType())
 		}
 
 		artifact.SetName(prefix + artifact.GetName())

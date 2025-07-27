@@ -80,18 +80,18 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 		return nil, err
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
 				Name:    htypes.Ptr("embedcfg"),
 				Args:    args,
-			},
+			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q > $OUT", string(b))),
 				"out": structpb.NewStringValue("embedcfg.json"),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

@@ -46,21 +46,21 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 
 	var attrs []*corev1.CreateRequest_Attr
 	appendAttr := func(attrs []*corev1.CreateRequest_Attr, attr slog.Attr) []*corev1.CreateRequest_Attr {
-		rpcAttr := &corev1.CreateRequest_Attr{
+		rpcAttr := corev1.CreateRequest_Attr_builder{
 			Key: htypes.Ptr(attr.Key),
-		}
+		}.Build()
 
 		switch attr.Value.Kind() { //nolint:exhaustive
 		case slog.KindBool:
-			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueBool{ValueBool: attr.Value.Bool()}
+			rpcAttr.SetValueBool(attr.Value.Bool())
 		case slog.KindString:
-			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueStr{ValueStr: attr.Value.String()}
+			rpcAttr.SetValueStr(attr.Value.String())
 		case slog.KindInt64:
-			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueInt{ValueInt: attr.Value.Int64()}
+			rpcAttr.SetValueInt(attr.Value.Int64())
 		case slog.KindFloat64:
-			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueFloat{ValueFloat: attr.Value.Float64()}
+			rpcAttr.SetValueFloat(attr.Value.Float64())
 		default:
-			rpcAttr.Value = &corev1.CreateRequest_Attr_ValueStr{ValueStr: fmt.Sprint(attr.Value.Any())}
+			rpcAttr.SetValueStr(fmt.Sprint(attr.Value.Any()))
 		}
 
 		attrs = append(attrs, rpcAttr)
@@ -76,11 +76,11 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 		return true
 	})
 
-	_, err := l.client.Create(ctx, connect.NewRequest(&corev1.CreateRequest{
+	_, err := l.client.Create(ctx, connect.NewRequest(corev1.CreateRequest_builder{
 		Level:   htypes.Ptr(level),
 		Message: htypes.Ptr(record.Message),
 		Attrs:   attrs,
-	}))
+	}.Build()))
 	if err != nil {
 		return err
 	}

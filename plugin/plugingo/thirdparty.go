@@ -21,11 +21,11 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		`cp -r "$MOD_DIR/." .`,
 	}
 
-	return &pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{Spec: pluginv1.TargetSpec_builder{
+		Ref: pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(pkg),
 			Name:    htypes.Ptr("download"),
-		},
+		}.Build(),
 		Driver: htypes.Ptr("sh"),
 		Config: map[string]*structpb.Value{
 			"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -38,7 +38,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 			"cache":            structpb.NewBoolValue(true),
 			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 		},
-	}}, nil
+	}.Build()}.Build(), nil
 }
 
 func ThirdpartyContentPackage(goMod, version, goPath string) string {

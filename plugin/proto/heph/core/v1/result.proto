@@ -5,7 +5,7 @@ import "heph/plugin/v1/driver.proto";
 import "heph/plugin/v1/plugin.proto";
 import "heph/plugin/v1/tref.proto";
 import "google/protobuf/go_features.proto";
-option features.(pb.go).api_level = API_HYBRID;
+option features.(pb.go).api_level = API_OPAQUE;
 
 message StackRecursionError {
   string stack = 1;

@@ -30,6 +30,7 @@ import (
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -100,11 +101,11 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 			items := []*pluginv1.TargetMatcher{}
 
 			if label, ok := ref.GetArgs()["label"]; ok {
-				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Label{Label: label}})
+				items = append(items, pluginv1.TargetMatcher_builder{Label: proto.String(label)}.Build())
 			}
 
 			if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
-				items = append(items, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_CodegenPackage{CodegenPackage: treeOutputTo}})
+				items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
 			}
 
 			if len(items) == 0 {
@@ -112,7 +113,7 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 			}
 
 			var deps []string
-			for ref, err := range e.Query(ctx, rs, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_And{And: &pluginv1.TargetMatchers{Items: items}}}) {
+			for ref, err := range e.Query(ctx, rs, pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()) {
 				if err != nil {
 					if errors.Is(err, StackRecursionError{}) {
 						// hlog.From(ctx).Error("resolve specs query", "err", err)
@@ -126,13 +127,13 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 				deps = append(deps, tref.Format(ref))
 			}
 
-			return &pluginv1.TargetSpec{
+			return pluginv1.TargetSpec_builder{
 				Ref:    ref,
 				Driver: htypes.Ptr(plugingroup.Name),
 				Config: map[string]*structpb.Value{
 					"deps": hstructpb.NewStringsValue(deps),
 				},
-			}, nil
+			}.Build(), nil
 		}
 
 		for _, p := range e.Providers {
@@ -477,10 +478,10 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetDriver())
 		}
 
-		res, err := driver.Parse(ctx, &pluginv1.ParseRequest{
+		res, err := driver.Parse(ctx, pluginv1.ParseRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
 			Spec:      spec,
-		})
+		}.Build())
 		if err != nil {
 			return nil, err
 		}
@@ -493,7 +494,7 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		for _, output := range def.GetCollectOutputs() {
 			if !slices.Contains(def.GetOutputs(), output.GetGroup()) {
-				def.Outputs = append(def.Outputs, output.GetGroup())
+				def.SetOutputs(append(def.GetOutputs(), output.GetGroup()))
 			}
 
 			for _, path := range output.GetPaths() {
@@ -513,7 +514,11 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			h := xxh3.New()
 			hashpb.Hash(h, def, nil)
 
-			def.Hash = h.Sum(nil)
+			if x := h.Sum(nil); x != nil {
+				def.SetHash(x)
+			} else {
+				def.ClearHash()
+			}
 		}
 
 		return &TargetDef{
@@ -613,10 +618,10 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				return err
 			}
 
-			outputs := linkedDep.Outputs
+			outputs := linkedDep.GetOutputs()
 
-			if input.GetRef().Output != nil {
-				if !slices.Contains(linkedDep.Outputs, input.GetRef().GetOutput()) {
+			if input.GetRef().HasOutput() {
+				if !slices.Contains(linkedDep.GetOutputs(), input.GetRef().GetOutput()) {
 					return fmt.Errorf("%v doesnt have a named output %q", tref.Format(input.GetRef()), input.GetRef().GetOutput())
 				}
 

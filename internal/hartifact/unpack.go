@@ -50,13 +50,13 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 	}
 	defer r.Close()
 
-	switch content := artifact.GetContent().(type) {
-	case *pluginv1.Artifact_File:
+	switch artifact.WhichContent() {
+	case pluginv1.Artifact_File_case:
 		if !cfg.filter(artifact.GetName()) {
 			return nil
 		}
 
-		f, err := hfs.Create(fs, content.File.GetOutPath())
+		f, err := hfs.Create(fs, artifact.GetFile().GetOutPath())
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
@@ -67,8 +67,8 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return err
 		}
-	case *pluginv1.Artifact_Raw:
-		f, err := hfs.Create(fs, content.Raw.GetPath())
+	case pluginv1.Artifact_Raw_case:
+		f, err := hfs.Create(fs, artifact.GetRaw().GetPath())
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
@@ -79,14 +79,14 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return err
 		}
-	case *pluginv1.Artifact_TarPath:
+	case pluginv1.Artifact_TarPath_case:
 		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
 	// case *pluginv1.Artifact_TargzPath:
 	default:
-		return fmt.Errorf("unsupported encoding %T", artifact.GetContent())
+		return fmt.Errorf("unsupported encoding %v", artifact.WhichContent())
 	}
 
 	return nil

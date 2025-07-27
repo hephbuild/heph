@@ -55,13 +55,13 @@ func (p *Plugin) packageBinInner(
 
 	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
 				Name:    htypes.Ptr(targetName),
 				Args:    factors.Args(),
-			},
+			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -69,7 +69,7 @@ func (p *Plugin) packageBinInner(
 					"GOARCH":             factors.GOARCH,
 					"CGO_ENABLED":        "0",
 					"GO_EXTLINK_ENABLED": "0",
-					"GOTOOLCHAIN": "local",
+					"GOTOOLCHAIN":        "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run":              hstructpb.NewStringsValue(run),
@@ -77,6 +77,6 @@ func (p *Plugin) packageBinInner(
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
 			},
 			Labels: []string{"go-build"},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

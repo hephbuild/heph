@@ -43,6 +43,7 @@ import (
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/proto"
 )
 
 type ExecOptions struct {
@@ -64,7 +65,7 @@ type InteractiveExecOptions struct {
 }
 
 func (e *Engine) Result(ctx context.Context, rs *RequestState, pkg, name string, outputs []string) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, rs, &pluginv1.TargetRef{Package: htypes.Ptr(pkg), Name: htypes.Ptr(name)}, outputs)
+	res, err := e.ResultFromRef(ctx, rs, pluginv1.TargetRef_builder{Package: htypes.Ptr(pkg), Name: htypes.Ptr(name)}.Build(), outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -200,11 +201,11 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 
 	switch {
 	case def.GetCache():
-		outputs = def.Outputs
+		outputs = def.GetOutputs()
 	case onlyManifest:
 		outputs = nil
 	case len(outputs) == 1 && outputs[0] == AllOutputs:
-		outputs = def.Outputs
+		outputs = def.GetOutputs()
 	}
 
 	meta, err := e.meta(ctx, rs, def)
@@ -405,7 +406,7 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {
-		outputs = def.Outputs
+		outputs = def.GetOutputs()
 	}
 
 	for _, artifact := range manifest.Artifacts {
@@ -596,11 +597,14 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			var locks CacheLocks
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
-					gartifact := &pluginv1.Artifact{
-						Name:    artifact.Name,
-						Type:    htypes.Ptr(artifact.GetType()),
-						Content: artifact.GetContent(),
-					}
+					gartifact := pluginv1.Artifact_builder{
+						Name:      htypes.Ptr(artifact.GetName()),
+						Type:      htypes.Ptr(artifact.GetType()),
+						File:      artifact.GetFile(),
+						Raw:       artifact.GetRaw(),
+						TarPath:   proto.ValueOrNil(artifact.HasTarPath(), artifact.GetTarPath),
+						TargzPath: proto.ValueOrNil(artifact.HasTargzPath(), artifact.GetTargzPath),
+					}.Build()
 
 					artifacts = append(artifacts, ExecuteResultArtifact{
 						Hashout:  artifact.Hashout,
@@ -912,9 +916,9 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 	if options.Stdin != nil {
 		stdinErrCh = make(chan error)
 
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
-		})
+		}.Build())
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -943,9 +947,9 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 	}
 
 	if options.Stdout != nil {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
-		})
+		}.Build())
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -967,9 +971,9 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 	}
 
 	if options.Stderr != nil {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
-		})
+		}.Build())
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -991,9 +995,9 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 	}
 
 	if stdin, ok := options.Stdin.(*os.File); ok {
-		res, err := driver.Pipe(ctx, &pluginv1.PipeRequest{
+		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
-		})
+		}.Build())
 		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
@@ -1079,7 +1083,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	if def.GetCache() && !options.force && !options.shell {
-		res, ok, err := e.ResultFromLocalCache(ctx, def, def.Outputs, hashin)
+		res, ok, err := e.ResultFromLocalCache(ctx, def, def.GetOutputs(), hashin)
 		if err != nil {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
@@ -1125,10 +1129,10 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	var inputs []*pluginv1.ArtifactWithOrigin
 	for _, result := range results {
 		for _, artifact := range result.Artifacts {
-			inputs = append(inputs, &pluginv1.ArtifactWithOrigin{
+			inputs = append(inputs, pluginv1.ArtifactWithOrigin_builder{
 				Artifact: artifact.Artifact,
 				Origin:   result.InputOrigin,
-			})
+			}.Build())
 		}
 	}
 
@@ -1150,14 +1154,14 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				}
 			}()
 
-			runRes, runErr = driver.Run(ctx, &pluginv1.RunRequest{
+			runRes, runErr = driver.Run(ctx, pluginv1.RunRequest_builder{
 				RequestId:    htypes.Ptr(rs.ID),
 				Target:       def.TargetDef.TargetDef,
 				SandboxPath:  htypes.Ptr(sandboxfs.Path()),
 				TreeRootPath: htypes.Ptr(e.Root.Path()),
 				Inputs:       inputs,
 				Pipes:        pipes,
-			})
+			}.Build())
 		},
 		Pty: def.GetPty(),
 	})
@@ -1184,9 +1188,9 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	cachefs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.CollectOutputs))
+	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.GetCollectOutputs()))
 
-	for _, output := range def.CollectOutputs {
+	for _, output := range def.GetCollectOutputs() {
 		tarname := output.GetGroup() + ".tar"
 		tarf, err := hfs.Create(cachefs, tarname)
 		if err != nil {
@@ -1228,14 +1232,12 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Artifact: &pluginv1.Artifact{
-				Group: htypes.Ptr(output.GetGroup()),
-				Name:  htypes.Ptr(tarname),
-				Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-				Content: &pluginv1.Artifact_TarPath{
-					TarPath: tarf.Name(),
-				},
-			},
+			Artifact: pluginv1.Artifact_builder{
+				Group:   htypes.Ptr(output.GetGroup()),
+				Name:    htypes.Ptr(tarname),
+				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+				TarPath: proto.String(tarf.Name()),
+			}.Build(),
 		})
 	}
 

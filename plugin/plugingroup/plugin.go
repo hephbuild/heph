@@ -29,10 +29,10 @@ func (p Plugin) Pipe(ctx context.Context, request *pluginv1.PipeRequest) (*plugi
 func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	desc := protodesc.ToDescriptorProto((&groupv1.Target{}).ProtoReflect().Descriptor())
 
-	return &pluginv1.ConfigResponse{
+	return pluginv1.ConfigResponse_builder{
 		Name:         htypes.Ptr(Name),
 		TargetSchema: desc,
-	}, nil
+	}.Build(), nil
 }
 
 func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
@@ -48,12 +48,12 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 			return nil, err
 		}
 
-		inputs = append(inputs, &pluginv1.TargetDef_Input{
+		inputs = append(inputs, pluginv1.TargetDef_Input_builder{
 			Ref: ref,
-			Origin: &pluginv1.TargetDef_InputOrigin{
+			Origin: pluginv1.TargetDef_InputOrigin_builder{
 				Id: htypes.Ptr(strconv.Itoa(i)),
-			},
-		})
+			}.Build(),
+		}.Build())
 	}
 
 	s := &groupv1.Target{}
@@ -63,15 +63,15 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 		return nil, err
 	}
 
-	return &pluginv1.ParseResponse{
-		Target: &pluginv1.TargetDef{
+	return pluginv1.ParseResponse_builder{
+		Target: pluginv1.TargetDef_builder{
 			Def:     target,
 			Ref:     req.GetSpec().GetRef(),
 			Cache:   htypes.Ptr(false),
 			Inputs:  inputs,
 			Outputs: []string{""},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p Plugin) Run(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {

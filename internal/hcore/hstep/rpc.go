@@ -16,7 +16,7 @@ func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.Step
 	step := req.Msg.GetStep()
 	step = r.handler(ctx, step)
 
-	return connect.NewResponse(&corev1.StepServiceCreateResponse{Step: step}), nil
+	return connect.NewResponse(corev1.StepServiceCreateResponse_builder{Step: step}.Build()), nil
 }
 
 func NewHandler(handler Handler) corev1connect.StepServiceHandler {

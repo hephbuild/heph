@@ -82,9 +82,9 @@ func (p Package) GetBuildLibTargetRef(mode string) *pluginv1.TargetRef {
 		args = hmaps.Concat(args, map[string]string{"mode": mode})
 	}
 
-	return &pluginv1.TargetRef{
+	return pluginv1.TargetRef_builder{
 		Package: htypes.Ptr(p.GetHephBuildPackage()),
 		Name:    htypes.Ptr("build_lib"),
 		Args:    args,
-	}
+	}.Build()
 }

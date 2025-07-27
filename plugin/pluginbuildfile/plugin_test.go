@@ -24,9 +24,9 @@ func TestSanity(t *testing.T) {
 
 	var ref *pluginv1.TargetRef
 	{
-		res, err := p.List(ctx, &pluginv1.ListRequest{
+		res, err := p.List(ctx, pluginv1.ListRequest_builder{
 			Package: htypes.Ptr(""),
-		})
+		}.Build())
 		require.NoError(t, err)
 
 		require.True(t, res.Receive())
@@ -38,9 +38,9 @@ func TestSanity(t *testing.T) {
 	}
 
 	{
-		res, err := p.Get(ctx, &pluginv1.GetRequest{
+		res, err := p.Get(ctx, pluginv1.GetRequest_builder{
 			Ref: ref,
-		})
+		}.Build())
 		require.NoError(t, err)
 
 		assert.Equal(t, []any{"hello"}, res.GetSpec().GetConfig()["run"].GetListValue().AsSlice())
@@ -62,9 +62,9 @@ func TestLoad(t *testing.T) {
 
 	var ref *pluginv1.TargetRef
 	{
-		res, err := p.List(ctx, &pluginv1.ListRequest{
+		res, err := p.List(ctx, pluginv1.ListRequest_builder{
 			Package: htypes.Ptr(""),
-		})
+		}.Build())
 		require.NoError(t, err)
 
 		assert.True(t, res.Receive())
@@ -77,9 +77,9 @@ func TestLoad(t *testing.T) {
 	}
 
 	{
-		res, err := p.Get(ctx, &pluginv1.GetRequest{
+		res, err := p.Get(ctx, pluginv1.GetRequest_builder{
 			Ref: ref,
-		})
+		}.Build())
 		require.NoError(t, err)
 
 		assert.Equal(t, []any{"hello"}, res.GetSpec().GetConfig()["run"].GetListValue().AsSlice())

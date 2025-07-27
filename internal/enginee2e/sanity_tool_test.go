@@ -28,11 +28,11 @@ func TestSanityTool(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr("tools"),
-					Name: htypes.Ptr("mytool"),
-				},
+					Name:    htypes.Ptr("mytool"),
+				}.Build(),
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
@@ -42,14 +42,14 @@ func TestSanityTool(t *testing.T) {
 					}),
 					"out": hstructpb.NewStringsValue([]string{"screw"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr("some/package"),
-					Name: htypes.Ptr("sometarget"),
-				},
+					Name:    htypes.Ptr("sometarget"),
+				}.Build(),
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
@@ -59,7 +59,7 @@ func TestSanityTool(t *testing.T) {
 					"out":   hstructpb.NewStringsValue([]string{"out"}),
 					"tools": hstructpb.NewStringsValue([]string{"//tools:mytool"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

@@ -40,17 +40,17 @@ func TestSanity(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr(pkg),
-					Name: htypes.Ptr("sometarget"),
-				},
+					Name:    htypes.Ptr("sometarget"),
+				}.Build(),
 				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > out`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

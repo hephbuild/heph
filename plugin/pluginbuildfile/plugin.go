@@ -16,6 +16,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -42,9 +43,9 @@ func New(fs hfs.FS, cfg Options) *Plugin {
 }
 
 func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
+	return pluginv1.ProviderConfigResponse_builder{
 		Name: htypes.Ptr(Name),
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -66,11 +67,11 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 			state[k] = pv
 		}
 
-		states = append(states, &pluginv1.ProviderState{
+		states = append(states, pluginv1.ProviderState_builder{
 			Package:  htypes.Ptr(payload.Package),
 			Provider: htypes.Ptr(payload.Provider),
 			State:    state,
-		})
+		}.Build())
 
 		return nil
 	})
@@ -78,9 +79,9 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 		return nil, err
 	}
 
-	return &pluginv1.ProbeResponse{
+	return pluginv1.ProbeResponse_builder{
 		States: states,
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -91,11 +92,9 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 				return err
 			}
 
-			err = send(&pluginv1.ListResponse{
-				Of: &pluginv1.ListResponse_Spec{
-					Spec: spec,
-				},
-			})
+			err = send(pluginv1.ListResponse_builder{
+				Spec: proto.ValueOrDefault(spec),
+			}.Build())
 
 			return err
 		}, nil)
@@ -304,7 +303,7 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 			case strings.HasPrefix(module, "//"):
 				rest, _ := strings.CutPrefix(module, "//")
 
-				res, err :=  p.runPkg(ctx, rest, nil, nil)
+				res, err := p.runPkg(ctx, rest, nil, nil)
 				if err != nil {
 					return nil, fmt.Errorf("%v: %w", module, err)
 				}
@@ -357,9 +356,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 		return nil, err
 	}
 
-	return &pluginv1.GetResponse{
+	return pluginv1.GetResponse_builder{
 		Spec: spec,
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
@@ -379,15 +378,15 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		config[k] = pv
 	}
 
-	spec := &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
+	spec := pluginv1.TargetSpec_builder{
+		Ref: pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(payload.Package),
 			Name:    htypes.Ptr(payload.Name),
-		},
+		}.Build(),
 		Driver: htypes.Ptr(payload.Driver),
 		Config: config,
 		Labels: payload.Labels,
-	}
+	}.Build()
 
 	return spec, nil
 }

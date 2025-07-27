@@ -9,34 +9,38 @@ import (
 )
 
 func Path(a *pluginv1.Artifact) (string, error) {
-	switch content := a.GetContent().(type) {
-	case *pluginv1.Artifact_File:
-		return content.File.GetSourcePath(), nil
-	case *pluginv1.Artifact_Raw:
+	switch a.WhichContent() {
+	case pluginv1.Artifact_File_case:
+		return a.GetFile().GetSourcePath(), nil
+	case pluginv1.Artifact_Raw_case:
 		return "", nil
-	case *pluginv1.Artifact_TargzPath:
-		return content.TargzPath, nil
-	case *pluginv1.Artifact_TarPath:
-		return content.TarPath, nil
+	case pluginv1.Artifact_TargzPath_case:
+		return a.GetTargzPath(), nil
+	case pluginv1.Artifact_TarPath_case:
+		return a.GetTarPath(), nil
 	default:
-		return "", fmt.Errorf("unsupported content %T", a.GetContent())
+		return "", fmt.Errorf("unsupported content %v", a.WhichContent())
 	}
 }
 
 func Relocated(artifact *pluginv1.Artifact, to string) (*pluginv1.Artifact, error) {
 	artifact = hproto.Clone(artifact)
 
-	switch content := artifact.GetContent().(type) {
-	case *pluginv1.Artifact_File:
-		content.File.SourcePath = htypes.Ptr(to)
-	case *pluginv1.Artifact_Raw:
-		return nil, fmt.Errorf("unsupported content %T", artifact.GetContent())
-	case *pluginv1.Artifact_TargzPath:
-		content.TargzPath = to
-	case *pluginv1.Artifact_TarPath:
-		content.TarPath = to
+	switch artifact.WhichContent() {
+	case pluginv1.Artifact_File_case:
+		if x := htypes.Ptr(to); x != nil {
+			artifact.GetFile().SetSourcePath(*x)
+		} else {
+			artifact.GetFile().ClearSourcePath()
+		}
+	case pluginv1.Artifact_Raw_case:
+		return nil, fmt.Errorf("unsupported content %v", artifact.WhichContent())
+	case pluginv1.Artifact_TargzPath_case:
+		artifact.SetTargzPath(to)
+	case pluginv1.Artifact_TarPath_case:
+		artifact.SetTarPath(to)
 	default:
-		return nil, fmt.Errorf("unsupported content %T", artifact.GetContent())
+		return nil, fmt.Errorf("unsupported content %v", artifact.WhichContent())
 	}
 
 	return artifact, nil

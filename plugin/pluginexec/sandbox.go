@@ -61,12 +61,12 @@ func SetupSandbox(
 					if err != nil {
 						return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 					}
-					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
+					listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
 						Artifact: listArtifact,
-						Origin: &pluginv1.TargetDef_InputOrigin{
+						Origin: pluginv1.TargetDef_InputOrigin_builder{
 							Id: htypes.Ptr(target.GetId()),
-						},
-					})
+						}.Build(),
+					}.Build())
 				}
 			}
 
@@ -145,14 +145,14 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 		return nil, err
 	}
 
-	return &pluginv1.Artifact{
+	return pluginv1.Artifact_builder{
 		Group: htypes.Ptr(artifact.GetGroup()),
-		Name: htypes.Ptr(artifact.GetName() + ".list"),
-		Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
-		Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
+		Name:  htypes.Ptr(artifact.GetName() + ".list"),
+		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
+		File: pluginv1.Artifact_ContentFile_builder{
 			SourcePath: htypes.Ptr(listf.Name()),
-		}},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) error {

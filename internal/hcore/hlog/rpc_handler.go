@@ -2,7 +2,6 @@ package hlog
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 
 	"connectrpc.com/connect"
@@ -31,7 +30,7 @@ func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.Crea
 			case corev1.CreateRequest_Attr_Value_not_set_case:
 				fallthrough
 			default:
-				attrs = append(attrs, slog.String(attr.GetKey(), fmt.Sprintf("%#v", attr.GetValue())))
+				attrs = append(attrs, slog.String(attr.GetKey(), attr.String()))
 			}
 		}
 

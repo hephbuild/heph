@@ -26,17 +26,17 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 	if mode != ModeXTest && len(goPkg.GoPkg.SFiles) > 0 {
 		var asmDeps []string
 		for _, file := range goPkg.GoPkg.SFiles {
-			asmDeps = append(asmDeps, tref.Format(&pluginv1.TargetRef{
+			asmDeps = append(asmDeps, tref.Format(pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 				Name:    htypes.Ptr("build_lib#asm"),
 				Args: hmaps.Concat(goPkg.LibTargetRef.GetArgs(), map[string]string{
 					"file": file,
 				}),
-			}))
+			}.Build()))
 		}
 
-		return &pluginv1.GetResponse{
-			Spec: &pluginv1.TargetSpec{
+		return pluginv1.GetResponse_builder{
+			Spec: pluginv1.TargetSpec_builder{
 				Ref:    goPkg.LibTargetRef,
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
@@ -56,16 +56,16 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 						"a": goPkg.Name + ".a",
 					}),
 					"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
-						"lib": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
+						"lib": {tref.Format(tref.WithOut(pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 							Name:    htypes.Ptr("build_lib#incomplete"),
 							Args:    goPkg.LibTargetRef.GetArgs(),
-						}, "a"))},
+						}.Build(), "a"))},
 						"asm": asmDeps,
 					}),
 				},
-			},
-		}, nil
+			}.Build(),
+		}.Build(), nil
 	}
 
 	return p.packageLibInner(ctx, basePkg, goPkg, factors, false, requestId)
@@ -210,11 +210,11 @@ func (p *Plugin) packageLibInner3(
 	var extra string
 
 	if len(goPkg.EmbedPatterns) > 0 {
-		deps["embed"] = append(deps["embed"], tref.Format(&pluginv1.TargetRef{
+		deps["embed"] = append(deps["embed"], tref.Format(pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 			Name:    htypes.Ptr("embedcfg"),
 			Args:    goPkg.LibTargetRef.GetArgs(),
-		}))
+		}.Build()))
 
 		extra += " -embedcfg $SRC_EMBED"
 	}
@@ -222,11 +222,11 @@ func (p *Plugin) packageLibInner3(
 	if incomplete {
 		extra += " -symabis $SRC_ABI_ABI -asmhdr $SRC_ABI_H"
 
-		deps["abi"] = append(deps["abi"], tref.Format(&pluginv1.TargetRef{
+		deps["abi"] = append(deps["abi"], tref.Format(pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 			Name:    htypes.Ptr("build_lib#abi"),
 			Args:    goPkg.LibTargetRef.GetArgs(),
-		}))
+		}.Build()))
 	} else {
 		extra += " -complete"
 	}
@@ -251,13 +251,13 @@ func (p *Plugin) packageLibInner3(
 		out["h"] = "go_asm.h"
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 				Name:    htypes.Ptr(name),
 				Args:    goPkg.LibTargetRef.GetArgs(),
-			},
+			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -271,8 +271,8 @@ func (p *Plugin) packageLibInner3(
 				"out":              hstructpb.NewMapStringStringValue(out),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func getFiles(goPkg Package, files []string) []string {
@@ -290,10 +290,10 @@ func getFiles(goPkg Package, files []string) []string {
 			filters = append(filters, path.Join(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), goPath, file))
 		}
 
-		out = append(out, tref.Format(tref.WithFilters(tref.WithOut(&pluginv1.TargetRef{
+		out = append(out, tref.Format(tref.WithFilters(tref.WithOut(pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, "")),
 			Name:    htypes.Ptr("download"),
-		}, ""), filters)))
+		}.Build(), ""), filters)))
 	} else {
 		for _, file := range files {
 			out = append(out, tref.FormatFile(goPkg.HephPackage, file))
@@ -322,13 +322,13 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 		args["mode"] = goPkg.Mode
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.GoPkg.GetHephBuildPackage()),
 				Name:    htypes.Ptr("build_lib#abi"),
 				Args:    args,
-			},
+			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -349,8 +349,8 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 				}),
 				"deps": hstructpb.NewMapStringStringsValue(deps),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Factors, asmFile string, mode string) (*pluginv1.GetResponse, error) {
@@ -367,13 +367,13 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 		return nil, fmt.Errorf("%s not found", asmFile)
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 				Name:    htypes.Ptr("build_lib#asm"),
 				Args:    hmaps.Concat(goPkg.LibTargetRef.GetArgs(), map[string]string{"file": asmFile}),
-			},
+			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -390,19 +390,19 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 				}),
 				"out": structpb.NewStringValue(strings.ReplaceAll(asmFile, ".s", ".o")),
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
-					"lib": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
+					"lib": {tref.Format(tref.WithOut(pluginv1.TargetRef_builder{
 						Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 						Name:    htypes.Ptr("build_lib#incomplete"),
 						Args:    goPkg.LibTargetRef.GetArgs(),
-					}, "a"))},
-					"hdr": {tref.Format(tref.WithOut(&pluginv1.TargetRef{
+					}.Build(), "a"))},
+					"hdr": {tref.Format(tref.WithOut(pluginv1.TargetRef_builder{
 						Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
 						Name:    htypes.Ptr("build_lib#incomplete"),
 						Args:    goPkg.LibTargetRef.GetArgs(),
-					}, "h"))},
+					}.Build(), "h"))},
 					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
 				}),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

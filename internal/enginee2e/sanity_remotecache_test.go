@@ -63,45 +63,45 @@ func TestSanityRemoteCache(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr(pkg),
 					Name:    htypes.Ptr("t1"),
-				},
+				}.Build(),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr(pkg),
 					Name:    htypes.Ptr("t2"),
-				},
+				}.Build(),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo world > $OUT`}),
 					"out":  hstructpb.NewStringsValue([]string{"out"}),
 					"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":t1"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
 					Package: htypes.Ptr(pkg),
 					Name:    htypes.Ptr("t3"),
-				},
+				}.Build(),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo world > $OUT`}),
 					"out":  hstructpb.NewStringsValue([]string{"out"}),
 					"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":t1", "//" + pkg + ":t2"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 
@@ -133,7 +133,7 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 1)
 
-			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: htypes.Ptr(pkg), Name: htypes.Ptr("t1")}, []string{""})
+			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t1", nil), []string{""})
 			require.NoError(t, err)
 
 			assert.Equal(t, "ead6120968cc07c5", manifest.Hashin)
@@ -150,7 +150,7 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 1)
 
-			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: htypes.Ptr(pkg), Name: htypes.Ptr("t2")}, []string{""})
+			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t2", nil), []string{""})
 			require.NoError(t, err)
 
 			assert.Equal(t, "bce04ee30b680dde", manifest.Hashin)
@@ -167,7 +167,7 @@ func TestSanityRemoteCache(t *testing.T) {
 
 			require.Len(t, res.Artifacts, 1)
 
-			manifest, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: htypes.Ptr(pkg), Name: htypes.Ptr("t3")}, []string{""})
+			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t3", nil), []string{""})
 			require.NoError(t, err)
 
 			assert.Equal(t, "da9694d6b4a6091f", manifest.Hashin)

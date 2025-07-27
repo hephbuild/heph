@@ -62,7 +62,7 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	const pipeTermSize = 3
 
 	for len(req.GetPipes()) < 4 {
-		req.Pipes = append(req.Pipes, "")
+		req.SetPipes(append(req.GetPipes(), ""))
 	}
 
 	t := &execv1.Target{}
@@ -291,19 +291,19 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 
 	var artifacts []*pluginv1.Artifact
 	if stat.Size() > 0 {
-		artifacts = append(artifacts, &pluginv1.Artifact{
+		artifacts = append(artifacts, pluginv1.Artifact_builder{
 			Name: htypes.Ptr("log.txt"),
 			Type: htypes.Ptr(pluginv1.Artifact_TYPE_LOG),
-			Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
+			File: pluginv1.Artifact_ContentFile_builder{
 				SourcePath: htypes.Ptr(logFile.Name()),
-				OutPath: htypes.Ptr("log.txt"),
-			}},
-		})
+				OutPath:    htypes.Ptr("log.txt"),
+			}.Build(),
+		}.Build())
 	}
 
-	return &pluginv1.RunResponse{
+	return pluginv1.RunResponse_builder{
 		Artifacts: artifacts,
-	}, nil
+	}.Build(), nil
 }
 
 func getEnvName(prefix, group, name string) string {
@@ -337,8 +337,8 @@ func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps 
 				nd[k] = &execv1.Target_Deps{}
 			}
 
-			nd[k].Targets = append(nd[k].Targets, v.GetTargets()...)
-			nd[k].Files = append(nd[k].Files, v.GetFiles()...)
+			nd[k].SetTargets(append(nd[k].GetTargets(), v.GetTargets()...))
+			nd[k].SetFiles(append(nd[k].GetFiles(), v.GetFiles()...))
 		}
 	}
 
@@ -352,7 +352,7 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 		for _, dep := range deps.GetTargets() {
 			id := dep.GetId()
 
-			allOutput := dep.Ref.Output == nil
+			allOutput := !dep.GetRef().HasOutput()
 
 			for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
 				var outputName string
