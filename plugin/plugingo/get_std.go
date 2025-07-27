@@ -91,6 +91,7 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 					"GOARCH":      factors.GOARCH,
 					"CGO_ENABLED": "0",
 					"GODEBUG":     "installgoroot=all",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run": hstructpb.NewStringsValue([]string{
@@ -124,6 +125,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":   factors.GOOS,
 					"GOARCH": factors.GOARCH,
+					"GOTOOLCHAIN": "local",
 				}),
 				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
 					Package: "@heph/go/std",

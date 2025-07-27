@@ -435,6 +435,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 						"GOOS":        f.GOOS,
 						"GOARCH":      f.GOARCH,
 						"CGO_ENABLED": "0",
+						"GOTOOLCHAIN": "local",
 					}),
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),

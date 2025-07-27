@@ -68,6 +68,7 @@ func (p *Plugin) packageBinInner(
 					"GOARCH":             factors.GOARCH,
 					"CGO_ENABLED":        "0",
 					"GO_EXTLINK_ENABLED": "0",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run":              hstructpb.NewStringsValue(run),

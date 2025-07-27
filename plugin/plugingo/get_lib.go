@@ -43,6 +43,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 						"GOOS":        factors.GOOS,
 						"GOARCH":      factors.GOARCH,
 						"CGO_ENABLED": "0",
+						"GOTOOLCHAIN": "local",
 					}),
 					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 					"run": hstructpb.NewStringsValue([]string{
@@ -262,6 +263,7 @@ func (p *Plugin) packageLibInner3(
 					"GOOS":        factors.GOOS,
 					"GOARCH":      factors.GOARCH,
 					"CGO_ENABLED": "0",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run":              hstructpb.NewStringsValue(run),
@@ -332,6 +334,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 					"GOOS":        factors.GOOS,
 					"GOARCH":      factors.GOARCH,
 					"CGO_ENABLED": "0",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run": hstructpb.NewStringsValue([]string{
@@ -376,6 +379,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 					"GOOS":        factors.GOOS,
 					"GOARCH":      factors.GOARCH,
 					"CGO_ENABLED": "0",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run": hstructpb.NewStringsValue([]string{
