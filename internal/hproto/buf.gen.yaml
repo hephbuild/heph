@@ -13,7 +13,6 @@ plugins:
     out: gen
     opt:
       - paths=source_relative
-      - default_api_level=API_OPAQUE
       - apilevelMgoogle/protobuf/timestamp.proto=API_OPEN
       - apilevelMgoogle/protobuf/any.proto=API_OPEN
       - apilevelMgoogle/protobuf/descriptor.proto=API_OPEN

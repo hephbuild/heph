@@ -48,7 +48,7 @@ var formatSf = hsingleflight.Group[uint64, string]{}
 
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
 
-func sumRef(ref hashpb.Hashable) uint64 {
+func sumRef(ref hashpb.StableWriter) uint64 {
 	h := formatHashPool.Get()
 	defer formatHashPool.Put(h)
 	h.Reset()
@@ -90,7 +90,7 @@ func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOut
 }
 
 func Format(ref Refable) string {
-	if refh, ok := ref.(hashpb.Hashable); ok {
+	if refh, ok := ref.(hashpb.StableWriter); ok {
 		sum := sumRef(refh)
 
 		f, ok := formatCache.Get(sum)

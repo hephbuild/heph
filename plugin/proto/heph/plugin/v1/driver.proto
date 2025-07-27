@@ -1,4 +1,4 @@
-edition = "2023";
+syntax = "proto3";
 package heph.plugin.v1;
 
 import "google/protobuf/struct.proto";

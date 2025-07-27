@@ -1,4 +1,4 @@
-edition = "2023";
+syntax = "proto3";
 package heph.plugin.v1;
 import "heph/plugin/v1/tref.proto";
 
