@@ -13,7 +13,9 @@ plugins:
       - default_api_level=API_OPAQUE
   - local: ["go", "run", "connectrpc.com/connect/cmd/protoc-gen-connect-go"]
     out: gen
-    opt: paths=source_relative
+    opt:
+      - paths=source_relative
+      - default_api_level=API_OPAQUE
   - local: ["go", "run", "github.com/hephbuild/heph/internal/hproto/protoc-gen-go-stablewrite"]
     out: gen
     opt:

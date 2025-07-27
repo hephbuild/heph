@@ -2,8 +2,6 @@ edition = "2023";
 package heph.plugin.fs.v1;
 
 import "google/protobuf/timestamp.proto";
-import "google/protobuf/go_features.proto";
-option features.(pb.go).api_level = API_OPAQUE;
 
 message Target {
   string file = 1;

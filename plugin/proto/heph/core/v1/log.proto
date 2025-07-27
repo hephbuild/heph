@@ -1,7 +1,5 @@
 edition = "2023";
 package heph.core.v1;
-import "google/protobuf/go_features.proto";
-option features.(pb.go).api_level = API_OPAQUE;
 
 message CreateRequest {
   enum Level {
