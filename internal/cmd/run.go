@@ -116,6 +116,8 @@ func init() {
 								fmt.Println("  content:", output.GetTarPath())
 							case pluginv1.Artifact_TargzPath_case:
 								fmt.Println("  content:", output.GetTargzPath())
+							case pluginv1.Artifact_Content_not_set_case:
+								fmt.Println("  content: <not set>")
 							}
 							fmt.Println("  type:     ", output.GetType().String())
 						}

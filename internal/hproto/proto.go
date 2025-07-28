@@ -49,7 +49,7 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 		last := p.Index(-1)
 
 		beforeLast := p.Index(-2)
-		switch last.Step.Kind() { //nolint:exhaustive
+		switch last.Step.Kind() {
 		case protopath.FieldAccessStep:
 			m := beforeLast.Value.Message()
 			fd := last.Step.FieldDescriptor()

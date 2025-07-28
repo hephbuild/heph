@@ -38,12 +38,9 @@ var (
 
 	appendFixed32Fn = protowireImp.Ident("AppendFixed32")
 	appendFixed64Fn = protowireImp.Ident("AppendFixed64")
-	appendVarintFn  = protowireImp.Ident("AppendVarint")
 	encodeBoolFn    = protowireImp.Ident("EncodeBool")
-	encodeZigZagFn  = protowireImp.Ident("EncodeZigZag")
 	float32BitsFn   = mathImp.Ident("Float32bits")
 	float64BitsFn   = mathImp.Ident("Float64bits")
-	writeFn         = ioImp.Ident("Write")
 	mapKeysFn       = mapsImp.Ident("Keys")
 	sortedFn        = slicesImp.Ident("Sorted")
 

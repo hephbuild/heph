@@ -142,6 +142,8 @@ func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[
 				close(startCh)
 			case pluginv1.RunContainer_Cancel_case:
 				cancel()
+			default:
+				// ignore
 			}
 		}
 	}()

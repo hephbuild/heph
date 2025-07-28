@@ -180,6 +180,8 @@ func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStrea
 				close(startCh)
 			case pluginv1.GetContainer_Cancel_case:
 				cancel()
+			default:
+				// ignore
 			}
 		}
 	}()

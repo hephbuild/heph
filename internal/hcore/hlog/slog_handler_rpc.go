@@ -51,7 +51,7 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 			Key: htypes.Ptr(attr.Key),
 		}.Build()
 
-		switch attr.Value.Kind() { //nolint:exhaustive
+		switch attr.Value.Kind() {
 		case slog.KindBool:
 			rpcAttr.SetValueBool(attr.Value.Bool())
 		case slog.KindString:
