@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"path"
@@ -12,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/tref"

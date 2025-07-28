@@ -5,12 +5,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
-	"github.com/hephbuild/heph/internal/htypes"
 	"iter"
 	"os"
 	"path/filepath"
 	"slices"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 

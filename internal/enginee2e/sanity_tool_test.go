@@ -1,8 +1,9 @@
 package enginee2e
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 

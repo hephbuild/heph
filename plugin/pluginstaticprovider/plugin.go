@@ -3,6 +3,7 @@ package pluginstaticprovider
 import (
 	"context"
 	"errors"
+
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"

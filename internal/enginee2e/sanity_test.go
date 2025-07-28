@@ -1,9 +1,10 @@
 package enginee2e
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/go-faker/faker/v4"
 

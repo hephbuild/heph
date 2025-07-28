@@ -1,9 +1,10 @@
 package plugingo
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"go/build"
 	"time"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hmaps"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"

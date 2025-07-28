@@ -3,11 +3,12 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"go.uber.org/mock/gomock"

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"hash"
 	"io"
 	"os"
@@ -15,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 
 	"github.com/hephbuild/heph/lib/tref"
 

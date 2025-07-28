@@ -3,8 +3,9 @@ package plugingo
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htypes"
 	"path/filepath"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 

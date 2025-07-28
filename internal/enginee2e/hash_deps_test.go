@@ -1,9 +1,10 @@
 package enginee2e
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
 	"time"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 

@@ -3,8 +3,9 @@ package plugingroup
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/internal/htypes"
 	"strconv"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 

@@ -2,6 +2,7 @@ package hartifact
 
 import (
 	"fmt"
+
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto"

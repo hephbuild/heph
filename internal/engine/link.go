@@ -4,14 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
-	"github.com/hephbuild/heph/internal/htypes"
 	"maps"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hfs"
 

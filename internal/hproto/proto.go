@@ -2,8 +2,9 @@ package hproto
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"strings"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 
 	"github.com/zeebo/xxh3"
 

@@ -3,8 +3,6 @@ package pluginexec
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"maps"
 	"net/http"
@@ -16,6 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hfs"
 

@@ -1,9 +1,10 @@
 package pluginbuildfile
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"os"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hfs/hfstest"

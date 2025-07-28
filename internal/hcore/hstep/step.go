@@ -2,9 +2,10 @@ package hstep
 
 import (
 	"context"
-	"github.com/hephbuild/heph/internal/htypes"
 	"sync/atomic"
 	"time"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto"
 

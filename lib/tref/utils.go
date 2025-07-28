@@ -1,8 +1,9 @@
 package tref
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
 	"strings"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"

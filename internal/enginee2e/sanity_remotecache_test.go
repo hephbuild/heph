@@ -3,9 +3,10 @@ package enginee2e
 import (
 	"bytes"
 	"context"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 

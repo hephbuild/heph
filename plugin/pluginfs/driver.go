@@ -2,9 +2,10 @@ package pluginfs
 
 import (
 	"context"
-	"github.com/hephbuild/heph/internal/htypes"
 	"os"
 	"path/filepath"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"

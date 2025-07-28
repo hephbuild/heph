@@ -3,8 +3,9 @@ package pluginsmartprovidertest
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
 

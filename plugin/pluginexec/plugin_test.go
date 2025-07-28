@@ -2,7 +2,6 @@ package pluginexec
 
 import (
 	"bytes"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/hpipe"

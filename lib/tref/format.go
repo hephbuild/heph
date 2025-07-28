@@ -2,9 +2,10 @@ package tref
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"strings"
 	"unsafe"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 
 	"github.com/hephbuild/heph/internal/hsync"
 

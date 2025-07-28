@@ -5,11 +5,12 @@ package main
 
 import (
 	"fmt"
-	"google.golang.org/protobuf/types/gofeaturespb"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
 	"sort"
+
+	"google.golang.org/protobuf/types/gofeaturespb"
 
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/reflect/protoreflect"

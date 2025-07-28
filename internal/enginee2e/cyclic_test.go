@@ -3,8 +3,9 @@ package enginee2e
 
 import (
 	"context"
-	"github.com/hephbuild/heph/internal/htypes"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hdebug"
 

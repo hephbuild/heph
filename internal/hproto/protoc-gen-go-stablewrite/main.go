@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+
 	"google.golang.org/protobuf/compiler/protogen"
 )
 

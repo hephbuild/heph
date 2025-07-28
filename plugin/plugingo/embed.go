@@ -3,11 +3,12 @@ package plugingo
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htypes"
 	"io/fs"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/goccy/go-json"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"

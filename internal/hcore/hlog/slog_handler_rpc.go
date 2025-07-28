@@ -3,9 +3,10 @@ package hlog
 import (
 	"context"
 	"fmt"
-	"github.com/hephbuild/heph/internal/htypes"
 	"log/slog"
 	"sync"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"connectrpc.com/connect"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"

@@ -3,8 +3,9 @@ package pluginfs
 import (
 	"context"
 	"errors"
-	"github.com/hephbuild/heph/internal/htypes"
 	"path/filepath"
+
+	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
