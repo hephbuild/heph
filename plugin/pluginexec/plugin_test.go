@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/hpipe"
 
@@ -48,27 +50,27 @@ func TestSanity(t *testing.T) {
 		runArg, err := structpb.NewValue([]any{"echo", "hello"})
 		require.NoError(t, err)
 
-		res, err := p.Parse(ctx, &pluginv1.ParseRequest{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
-				},
+		res, err := p.Parse(ctx, pluginv1.ParseRequest_builder{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/pkg"),
+					Name:    htypes.Ptr("target"),
+				}.Build(),
 				Config: map[string]*structpb.Value{
 					"run": runArg,
 				},
-			},
-		})
+			}.Build(),
+		}.Build())
 		require.NoError(t, err)
 
 		def = res.GetTarget()
 	}
 
 	{
-		res, err := p.Run(ctx, &pluginv1.RunRequest{
+		res, err := p.Run(ctx, pluginv1.RunRequest_builder{
 			Target:      def,
-			SandboxPath: sandboxPath,
-		})
+			SandboxPath: htypes.Ptr(sandboxPath),
+		}.Build())
 		require.NoError(t, err)
 
 		assert.Len(t, res.GetArtifacts(), 1)
@@ -99,26 +101,26 @@ func TestPipeStdout(t *testing.T) {
 	res, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&execv1.Target{
+	def, err := anypb.New(execv1.Target_builder{
 		Run: []string{"echo", "hello"},
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.GetPath())
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, &pluginv1.RunRequest{
-			Target: &pluginv1.TargetDef{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
-				},
+		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
+			Target: pluginv1.TargetDef_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/pkg"),
+					Name:    htypes.Ptr("target"),
+				}.Build(),
 				Def: def,
-			},
-			SandboxPath: sandboxPath,
+			}.Build(),
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{"", res.Msg.GetId(), ""},
-		})
+		}.Build())
 		if err != nil {
 			panic(err)
 		}
@@ -157,9 +159,9 @@ func TestPipeStdin(t *testing.T) {
 	pipeOut, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&execv1.Target{
+	def, err := anypb.New(execv1.Target_builder{
 		Run: []string{"cat"},
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.GetPath())
@@ -180,17 +182,17 @@ func TestPipeStdin(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, &pluginv1.RunRequest{
-			Target: &pluginv1.TargetDef{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
-				},
+		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
+			Target: pluginv1.TargetDef_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/pkg"),
+					Name:    htypes.Ptr("target"),
+				}.Build(),
 				Def: def,
-			},
-			SandboxPath: sandboxPath,
+			}.Build(),
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		})
+		}.Build())
 		if err != nil {
 			panic(err)
 		}
@@ -239,9 +241,9 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	pipeOut, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&execv1.Target{
+	def, err := anypb.New(execv1.Target_builder{
 		Run: []string{"cat"},
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	inw, err := hpipe.Writer(ctx, srv.Client(), srv.URL, pipeIn.Msg.GetPath())
@@ -264,17 +266,17 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, &pluginv1.RunRequest{
-			Target: &pluginv1.TargetDef{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/pkg",
-					Name:    "target",
-				},
+		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
+			Target: pluginv1.TargetDef_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/pkg"),
+					Name:    htypes.Ptr("target"),
+				}.Build(),
 				Def: def,
-			},
-			SandboxPath: sandboxPath,
+			}.Build(),
+			SandboxPath: htypes.Ptr(sandboxPath),
 			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		})
+		}.Build())
 		if err != nil {
 			panic(err)
 		}
@@ -317,9 +319,9 @@ func TestPipe404(t *testing.T) {
 	res, err := pc.Pipe(ctx, connect.NewRequest(&pluginv1.PipeRequest{}))
 	require.NoError(t, err)
 
-	def, err := anypb.New(&execv1.Target{
+	def, err := anypb.New(execv1.Target_builder{
 		Run: []string{"echo", "hello"},
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	outr, err := hpipe.Reader(ctx, srv.Client(), srv.URL, res.Msg.GetPath())
@@ -334,17 +336,17 @@ func TestPipe404(t *testing.T) {
 		return err
 	})
 
-	_, err = p.Run(ctx, &pluginv1.RunRequest{
-		Target: &pluginv1.TargetDef{
-			Ref: &pluginv1.TargetRef{
-				Package: "some/pkg",
-				Name:    "target",
-			},
+	_, err = p.Run(ctx, pluginv1.RunRequest_builder{
+		Target: pluginv1.TargetDef_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr("some/pkg"),
+				Name:    htypes.Ptr("target"),
+			}.Build(),
 			Def: def,
-		},
-		SandboxPath: sandboxPath,
+		}.Build(),
+		SandboxPath: htypes.Ptr(sandboxPath),
 		Pipes:       []string{"", res.Msg.GetId(), ""},
-	})
+	}.Build())
 	require.NoError(t, err)
 
 	err = eg.Wait()

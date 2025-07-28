@@ -12,33 +12,33 @@ import (
 )
 
 func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
-	if def.CodegenTree == nil {
-		return nil
+	err := e.codegenCopyTree(ctx, def, outputs)
+	if err != nil {
+		return fmt.Errorf("copy: %w", err)
 	}
 
-	switch def.CodegenTree.GetMode() {
-	case pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY:
-		err := e.codegenCopyTree(ctx, def, outputs)
-		if err != nil {
-			return fmt.Errorf("copy: %w", err)
-		}
-	case pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK:
-		err := e.codegenLinkTree(ctx, def, outputs)
-		if err != nil {
-			return fmt.Errorf("link: %w", err)
-		}
-	case pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_UNSPECIFIED:
-	default:
-		return fmt.Errorf("unknown codegen mode %v", def.CodegenTree.GetMode())
+	err = e.codegenLinkTree(ctx, def, outputs)
+	if err != nil {
+		return fmt.Errorf("link: %w", err)
 	}
 
 	return nil
 }
 
 func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
+	if len(def.GetCodegenTree()) == 0 {
+		return nil
+	}
+
 	codegenPaths := make([]string, 0, len(outputs))
-	for _, path := range def.CodegenTree.GetPaths() {
-		codegenPaths = append(codegenPaths, filepath.Join(def.GetRef().GetPackage(), path))
+	for _, gen := range def.GetCodegenTree() {
+		if gen.GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY {
+			codegenPaths = append(codegenPaths, filepath.Join(def.GetRef().GetPackage(), gen.GetPath()))
+		}
+	}
+
+	if len(codegenPaths) == 0 {
+		return nil
 	}
 
 	isUnderCodegenPath := func(p string) bool {
@@ -47,7 +47,7 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 		}
 
 		for _, codegenPath := range codegenPaths {
-			if strings.HasPrefix(p, codegenPath) {
+			if strings.HasPrefix(p, codegenPath+"/") {
 				return true
 			}
 		}
@@ -56,13 +56,13 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 	}
 
 	for _, output := range outputs {
-		if output.Type != pluginv1.Artifact_TYPE_OUTPUT {
+		if output.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
 		}
 
 		err := hartifact.Unpack(ctx, output.Artifact, e.Root, hartifact.WithFilter(isUnderCodegenPath))
 		if err != nil {
-			return fmt.Errorf("unpack: %v: %w", output.Group, err)
+			return fmt.Errorf("unpack: %v: %w", output.GetGroup(), err)
 		}
 	}
 

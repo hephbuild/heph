@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -27,12 +29,12 @@ func TestHashDeps(t *testing.T) {
 	staticprovider := pluginstaticprovider.NewFunc(func() []pluginstaticprovider.Target {
 		return []pluginstaticprovider.Target{
 			{
-				Spec: &pluginv1.TargetSpec{
-					Ref: &pluginv1.TargetRef{
-						Package: "some/package",
-						Name:    "sometarget",
-					},
-					Driver: "sh",
+				Spec: pluginv1.TargetSpec_builder{
+					Ref: pluginv1.TargetRef_builder{
+						Package: htypes.Ptr("some/package"),
+						Name:    htypes.Ptr("sometarget"),
+					}.Build(),
+					Driver: htypes.Ptr("sh"),
 					Config: map[string]*structpb.Value{
 						"run": hstructpb.NewStringsValue([]string{`echo hello > out`}),
 						"out": hstructpb.NewStringsValue([]string{"out"}),
@@ -40,7 +42,7 @@ func TestHashDeps(t *testing.T) {
 							"VAR1": time.Now().String(),
 						}),
 					},
-				},
+				}.Build(),
 			},
 		}
 	})
@@ -62,7 +64,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 1)
 
-		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
+		m, err := e.ResultMetaFromRef(ctx, rs, tref.New("some/package", "sometarget", nil), nil)
 		require.NoError(t, err)
 
 		at = m.CreatedAt
@@ -79,7 +81,7 @@ func TestHashDeps(t *testing.T) {
 
 		require.Len(t, res.Artifacts, 1)
 
-		m, err := e.ResultMetaFromRef(ctx, rs, &tref.Ref{Package: "some/package", Name: "sometarget"}, nil)
+		m, err := e.ResultMetaFromRef(ctx, rs, tref.New("some/package", "sometarget", nil), nil)
 		require.NoError(t, err)
 
 		require.Equal(t, at, m.CreatedAt)

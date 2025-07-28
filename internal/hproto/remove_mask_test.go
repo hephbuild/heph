@@ -13,18 +13,18 @@ import (
 )
 
 func TestRemoveMasked(t *testing.T) {
-	m := &hprotov1.Sample{
+	m := hprotov1.Sample_builder{
 		Included: []string{"hello"},
 		Excluded: []string{"world"},
-		Nested: &hprotov1.Sample_Nested{
+		Nested: hprotov1.Sample_Nested_builder{
 			Included: []string{"hello"},
 			Excluded: []string{"world"},
-		},
-		RepeatedNested: []*hprotov1.Sample_Nested{{
+		}.Build(),
+		RepeatedNested: []*hprotov1.Sample_Nested{hprotov1.Sample_Nested_builder{
 			Included: []string{"hello"},
 			Excluded: []string{"world"},
-		}},
-	}
+		}.Build()},
+	}.Build()
 
 	m2, err := RemoveMasked(m, hmaps.Keyed([]string{"excluded", "nested.excluded", "repeated_nested.excluded"}))
 	require.NoError(t, err)

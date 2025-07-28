@@ -5,12 +5,13 @@ import (
 	"strings"
 	"unsafe"
 
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+
 	"github.com/hephbuild/heph/internal/hsync"
 
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/Code-Hex/go-generics-cache/policy/lfu"
 	"github.com/hephbuild/heph/internal/hmaps"
-	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
@@ -36,11 +37,7 @@ type RefableOut interface {
 }
 
 func FormatFile(pkg string, file string) string {
-	return Format(&pluginv1.TargetRef{
-		Package: JoinPackage("@heph/file", pkg),
-		Name:    "content",
-		Args:    map[string]string{"f": file},
-	})
+	return Format(New(JoinPackage("@heph/file", pkg), "content", map[string]string{"f": file}))
 }
 
 var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
@@ -48,7 +45,7 @@ var formatSf = hsingleflight.Group[uint64, string]{}
 
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
 
-func sumRef(ref hproto.Hashable) uint64 {
+func sumRef(ref hashpb.StableWriter) uint64 {
 	h := formatHashPool.Get()
 	defer formatHashPool.Put(h)
 	h.Reset()
@@ -59,7 +56,7 @@ func sumRef(ref hproto.Hashable) uint64 {
 	case *pluginv1.TargetRefWithOutput:
 		sumRefTargetRefWithOutput(h, ref)
 	default:
-		ref.HashPB(h, nil)
+		hashpb.Hash(h, ref, nil)
 	}
 
 	return h.Sum64()
@@ -90,7 +87,7 @@ func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOut
 }
 
 func Format(ref Refable) string {
-	if refh, ok := ref.(hproto.Hashable); ok {
+	if refh, ok := ref.(hashpb.StableWriter); ok {
 		sum := sumRef(refh)
 
 		f, ok := formatCache.Get(sum)

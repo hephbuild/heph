@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"connectrpc.com/connect"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
@@ -11,7 +13,7 @@ import (
 func NewStackRecursionError(stack string) *connect.Error {
 	cerr := connect.NewError(connect.CodeAborted, fmt.Errorf("stack recursion: %v", stack))
 
-	msg, err := connect.NewErrorDetail(&corev1.StackRecursionError{Stack: stack})
+	msg, err := connect.NewErrorDetail(corev1.StackRecursionError_builder{Stack: htypes.Ptr(stack)}.Build())
 	if err != nil {
 		panic(err)
 	}

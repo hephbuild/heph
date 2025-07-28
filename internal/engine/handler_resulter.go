@@ -28,9 +28,9 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 	}
 
 	var res *ExecuteResultLocks
-	switch kind := req.GetOf().(type) {
-	case *corev1.ResultRequest_Ref:
-		res, err = r.ResultFromRef(ctx, rs, kind.Ref, []string{AllOutputs})
+	switch kind := req.WhichOf(); kind {
+	case corev1.ResultRequest_Ref_case:
+		res, err = r.ResultFromRef(ctx, rs, req.GetRef(), []string{AllOutputs})
 		if err != nil {
 			var serr StackRecursionError
 			if errors.Is(err, &serr) {
@@ -39,8 +39,8 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 
 			return nil, err
 		}
-	case *corev1.ResultRequest_Spec:
-		res, err = r.ResultFromSpec(ctx, rs, kind.Spec, []string{AllOutputs})
+	case corev1.ResultRequest_Spec_case:
+		res, err = r.ResultFromSpec(ctx, rs, req.GetSpec(), []string{AllOutputs})
 		if err != nil {
 			var serr StackRecursionError
 			if errors.Is(err, &serr) {
@@ -50,7 +50,7 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unexpected message type: %T", kind)
+		return nil, fmt.Errorf("unexpected message type: %v", kind)
 	}
 	// TODO: this is in the wrong place, the caller should be responsible for releasing the locks
 	defer res.Unlock(ctx)
@@ -60,8 +60,8 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 		artifacts = append(artifacts, artifact.Artifact)
 	}
 
-	return &corev1.ResultResponse{
+	return corev1.ResultResponse_builder{
 		Artifacts: artifacts,
 		Def:       res.Def.TargetDef.TargetDef,
-	}, nil
+	}.Build(), nil
 }

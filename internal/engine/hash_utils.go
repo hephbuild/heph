@@ -2,8 +2,6 @@ package engine
 
 import (
 	"encoding/hex"
-	"encoding/json"
-	"hash"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,10 +9,7 @@ import (
 
 	cache "github.com/Code-Hex/go-generics-cache"
 	"github.com/hephbuild/heph/internal/hinstance"
-	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/zeebo/xxh3"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 // Useful for figuring out why hash isnt deterministic
@@ -69,26 +64,4 @@ func (h hashWithDebug) Sum(b []byte) []byte {
 	_, _ = h.WriteString("SUM: " + hex.EncodeToString(sum))
 
 	return sum
-}
-
-func stableProtoHashEncode(w hash.Hash, v proto.Message) error {
-	if v, ok := v.(hproto.Hashable); ok {
-		v.HashPB(w, nil)
-
-		return nil
-	}
-
-	// this is pretty damn inefficient, but at least its stable
-	b, err := protojson.Marshal(v)
-	if err != nil {
-		return err
-	}
-
-	var a any
-	err = json.Unmarshal(b, &a)
-	if err != nil {
-		return err
-	}
-
-	return json.NewEncoder(w).Encode(a)
 }

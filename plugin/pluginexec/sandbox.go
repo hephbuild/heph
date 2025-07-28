@@ -10,6 +10,9 @@ import (
 	"path/filepath"
 	"slices"
 
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -59,12 +62,12 @@ func SetupSandbox(
 					if err != nil {
 						return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 					}
-					listArtifacts = append(listArtifacts, &pluginv1.ArtifactWithOrigin{
+					listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
 						Artifact: listArtifact,
-						Origin: &pluginv1.TargetDef_InputOrigin{
-							Id: target.GetId(),
-						},
-					})
+						Origin: pluginv1.TargetDef_InputOrigin_builder{
+							Id: htypes.Ptr(target.GetId()),
+						}.Build(),
+					}.Build())
 				}
 			}
 
@@ -116,7 +119,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	defer span.End()
 
 	h := xxh3.New()
-	artifact.HashPB(h, nil)
+	hashpb.Hash(h, artifact, nil)
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
@@ -143,14 +146,14 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 		return nil, err
 	}
 
-	return &pluginv1.Artifact{
-		Group: artifact.GetGroup(),
-		Name:  artifact.GetName() + ".list",
-		Type:  pluginv1.Artifact_TYPE_OUTPUT_LIST_V1,
-		Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-			SourcePath: listf.Name(),
-		}},
-	}, nil
+	return pluginv1.Artifact_builder{
+		Group: htypes.Ptr(artifact.GetGroup()),
+		Name:  htypes.Ptr(artifact.GetName() + ".list"),
+		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
+		File: pluginv1.Artifact_ContentFile_builder{
+			SourcePath: htypes.Ptr(listf.Name()),
+		}.Build(),
+	}.Build(), nil
 }
 
 func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) error {

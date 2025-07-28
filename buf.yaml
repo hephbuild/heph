@@ -9,3 +9,5 @@ lint:
 breaking:
   use:
     - FILE
+deps:
+  - buf.build/protocolbuffers/wellknowntypes:v31.1

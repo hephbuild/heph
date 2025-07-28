@@ -39,11 +39,7 @@ func parse(s, pkg string, optPkg bool) (*pluginv1.TargetRef, error) {
 		return nil, err
 	}
 
-	return &pluginv1.TargetRef{
-		Package: res.Pkg,
-		Name:    res.Name,
-		Args:    argsToProto(res.Args),
-	}, nil
+	return New(res.Pkg, res.Name, argsToProto(res.Args)), nil
 }
 
 func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
@@ -62,11 +58,10 @@ func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
 		filters = strings.Split(res.Filters, ",")
 	}
 
-	return &pluginv1.TargetRefWithOutput{
-		Package: res.Pkg,
-		Name:    res.Name,
-		Output:  res.Out,
-		Args:    res.Args,
-		Filters: filters,
-	}, nil
+	rref := New(res.Pkg, res.Name, res.Args)
+	if res.Out == nil {
+		return WithFilters(WithOut(rref, ""), filters), nil
+	} else {
+		return WithFilters(WithOut(rref, *res.Out), filters), nil
+	}
 }

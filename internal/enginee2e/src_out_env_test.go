@@ -3,6 +3,8 @@ package enginee2e
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -24,161 +26,161 @@ func TestSrcOutEnv(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "no_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("no_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello`}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "unamed_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("unamed_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_named_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_named_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`}),
 					"out": newValueMust(map[string]any{"out1": "out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "two_named_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("two_named_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_OUT1`, `echo world > $OUT_OUT2`}),
 					"out": newValueMust(map[string]any{"out1": "out1", "out2": "out1"}),
 				},
-			},
+			}.Build(),
 		},
 
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_unamed_dep_no_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_unamed_dep_no_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:no_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_unamed_dep_unamed_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_unamed_dep_unamed_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:unamed_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_unamed_dep_one_named_out_unspecified",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_unamed_dep_one_named_out_unspecified"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_OUT1`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_unamed_dep_one_named_out_specified",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_unamed_dep_one_named_out_specified"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC`}),
 					"deps": hstructpb.NewStringsValue([]string{"//:one_named_out|out1"}),
 				},
-			},
+			}.Build(),
 		},
 
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_named_dep_no_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_named_dep_no_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`env | grep -v SRC`}),
 					"deps": newValueMust(map[string]any{"in1": "//:no_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_named_dep_unamed_out",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_named_dep_unamed_out"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:unamed_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_named_dep_one_named_out_unspecified",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_named_dep_one_named_out_unspecified"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1_OUT1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "",
-					Name:    "one_named_dep_one_named_out_specified",
-				},
-				Driver: "sh",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(""),
+					Name:    htypes.Ptr("one_named_dep_one_named_out_specified"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"run":  hstructpb.NewStringsValue([]string{`echo $SRC_IN1`}),
 					"deps": newValueMust(map[string]any{"in1": "//:one_named_out|out1"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

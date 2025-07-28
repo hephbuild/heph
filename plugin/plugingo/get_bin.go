@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -54,20 +56,21 @@ func (p *Plugin) packageBinInner(
 
 	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    targetName,
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr(targetName),
 				Args:    factors.Args(),
-			},
-			Driver: "bash",
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":               factors.GOOS,
 					"GOARCH":             factors.GOARCH,
 					"CGO_ENABLED":        "0",
 					"GO_EXTLINK_ENABLED": "0",
+					"GOTOOLCHAIN":        "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run":              hstructpb.NewStringsValue(run),
@@ -75,6 +78,6 @@ func (p *Plugin) packageBinInner(
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
 			},
 			Labels: []string{"go-build"},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

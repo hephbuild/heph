@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 type Target struct {
@@ -22,9 +25,9 @@ type Plugin struct {
 }
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
-		Name: "static",
-	}, nil
+	return pluginv1.ProviderConfigResponse_builder{
+		Name: htypes.Ptr("static"),
+	}.Build(), nil
 }
 
 func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -52,11 +55,9 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 				}
 			}
 
-			err := send(&pluginv1.ListResponse{
-				Of: &pluginv1.ListResponse_Ref{
-					Ref: target.Spec.GetRef(),
-				},
-			})
+			err := send(pluginv1.ListResponse_builder{
+				Ref: proto.ValueOrDefault(target.Spec.GetRef()),
+			}.Build())
 			if err != nil {
 				return err
 			}
@@ -72,9 +73,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			continue
 		}
 
-		return &pluginv1.GetResponse{
+		return pluginv1.GetResponse_builder{
 			Spec: target.Spec,
-		}, nil
+		}.Build(), nil
 	}
 
 	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))

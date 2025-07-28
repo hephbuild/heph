@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/htar"
@@ -64,7 +66,7 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 	}
 
 	h := xxh3.New()
-	ref.HashPB(h, nil)
+	hashpb.Hash(h, ref, nil)
 
 	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
 }
@@ -80,20 +82,22 @@ func (e *Engine) CacheLocally(
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
-		if artifact.Type == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+		if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
 			continue
 		}
 
-		if content, ok := artifact.Content.(*pluginv1.Artifact_File); ok {
-			artifact.Name += ".tar"
-			tarf, err := hfs.Create(cachedir, artifact.Name)
+		if artifact.HasFile() {
+			content := artifact.GetFile()
+
+			artifact.SetName(artifact.GetName() + ".tar")
+			tarf, err := hfs.Create(cachedir, artifact.GetName())
 			if err != nil {
 				return nil, nil, err
 			}
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			sourcefs := hfs.NewOS(content.File.GetSourcePath())
+			sourcefs := hfs.NewOS(content.GetSourcePath())
 
 			f, err := hfs.Open(sourcefs, "")
 			if err != nil {
@@ -101,7 +105,7 @@ func (e *Engine) CacheLocally(
 			}
 			defer f.Close()
 
-			err = p.WriteFile(f, content.File.GetOutPath())
+			err = p.WriteFile(f, content.GetOutPath())
 			if err != nil {
 				return nil, nil, err
 			}
@@ -109,23 +113,23 @@ func (e *Engine) CacheLocally(
 			_ = f.Close()
 			_ = tarf.Close()
 
-			artifact.Content = &pluginv1.Artifact_TarPath{
-				TarPath: tarf.Name(),
-			}
+			artifact.SetTarPath(tarf.Name())
 		}
-		if content, ok := artifact.Content.(*pluginv1.Artifact_Raw); ok {
-			artifact.Name += ".tar"
-			tarf, err := hfs.Create(cachedir, artifact.Name)
+		if artifact.HasRaw() {
+			content := artifact.GetRaw()
+
+			artifact.SetName(artifact.GetName() + ".tar")
+			tarf, err := hfs.Create(cachedir, artifact.GetName())
 			if err != nil {
 				return nil, nil, err
 			}
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
-			err = p.Write(bytes.NewReader(content.Raw.GetData()), &tar.Header{
+			err = p.Write(bytes.NewReader(content.GetData()), &tar.Header{
 				Typeflag: tar.TypeReg,
-				Name:     content.Raw.GetPath(),
-				Size:     int64(len(content.Raw.GetData())),
+				Name:     content.GetPath(),
+				Size:     int64(len(content.GetData())),
 				Mode:     int64(os.ModePerm),
 			})
 			if err != nil {
@@ -134,9 +138,7 @@ func (e *Engine) CacheLocally(
 
 			_ = tarf.Close()
 
-			artifact.Content = &pluginv1.Artifact_TarPath{
-				TarPath: tarf.Name(),
-			}
+			artifact.SetTarPath(tarf.Name())
 		}
 
 		fromPath, err := hartifact.Path(artifact.Artifact)
@@ -145,11 +147,11 @@ func (e *Engine) CacheLocally(
 		}
 
 		if fromPath == "" {
-			return nil, nil, fmt.Errorf("artifact %s has no path", artifact.Name)
+			return nil, nil, fmt.Errorf("artifact %s has no path", artifact.GetName())
 		}
 
 		var prefix string
-		switch artifact.Type {
+		switch artifact.GetType() {
 		case pluginv1.Artifact_TYPE_OUTPUT:
 			prefix = "out_"
 		case pluginv1.Artifact_TYPE_LOG:
@@ -157,12 +159,12 @@ func (e *Engine) CacheLocally(
 		case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:
 			fallthrough
 		default:
-			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.Type)
+			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.GetType())
 		}
 
-		artifact.Name = prefix + artifact.Name
+		artifact.SetName(prefix + artifact.GetName())
 		fromfs := hfs.NewOS(fromPath)
-		tofs := hfs.At(cachedir, artifact.Name)
+		tofs := hfs.At(cachedir, artifact.GetName())
 
 		if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
 			// TODO: there was a bug here where when a target was running in tree, it would move things out from tree
@@ -183,7 +185,7 @@ func (e *Engine) CacheLocally(
 		}
 
 		hashout := artifact.Hashout
-		if hashout == "" && artifact.Type == pluginv1.Artifact_TYPE_OUTPUT {
+		if hashout == "" && artifact.GetType() == pluginv1.Artifact_TYPE_OUTPUT {
 			var err error
 			hashout, err = e.hashout(ctx, def.GetRef(), cachedArtifact)
 			if err != nil {

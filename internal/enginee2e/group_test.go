@@ -3,6 +3,8 @@ package enginee2e
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/go-faker/faker/v4"
@@ -28,51 +30,51 @@ func TestGroup(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "t1",
-				},
-				Driver: "exec",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("t1"),
+				}.Build(),
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out1"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "t2",
-				},
-				Driver: "exec",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("t2"),
+				}.Build(),
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo world > $OUT`}),
 					"out": hstructpb.NewStringsValue([]string{"out2"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "g",
-				},
-				Driver: "group",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("g"),
+				}.Build(),
+				Driver: htypes.Ptr("group"),
 				Config: map[string]*structpb.Value{
 					"deps": hstructpb.NewStringsValue([]string{
-						tref.Format(&pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "t1",
-						}),
-						tref.Format(&pluginv1.TargetRef{
-							Package: pkg,
-							Name:    "t2",
-						}),
+						tref.Format(pluginv1.TargetRef_builder{
+							Package: htypes.Ptr(pkg),
+							Name:    htypes.Ptr("t1"),
+						}.Build()),
+						tref.Format(pluginv1.TargetRef_builder{
+							Package: htypes.Ptr(pkg),
+							Name:    htypes.Ptr("t2"),
+						}.Build()),
 					}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

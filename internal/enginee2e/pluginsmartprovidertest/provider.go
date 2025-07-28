@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -36,9 +38,9 @@ func (p *Provider) PluginInit(ctx context.Context, init engine.PluginInit) error
 }
 
 func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
-		Name: ProviderName,
-	}, nil
+	return pluginv1.ProviderConfigResponse_builder{
+		Name: htypes.Ptr(ProviderName),
+	}.Build(), nil
 }
 
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -46,22 +48,20 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: req.GetRequestId(),
-		Of: &corev1.ResultRequest_Spec{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/package",
-					Name:    "think",
-				},
-				Driver: "bash",
-				Config: map[string]*structpb.Value{
-					"out": structpb.NewStringValue("out"),
-					"run": structpb.NewStringValue(`echo hello > $OUT`),
-				},
+	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		RequestId: htypes.Ptr(req.GetRequestId()),
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr("some/package"),
+				Name:    htypes.Ptr("think"),
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
+			Config: map[string]*structpb.Value{
+				"out": structpb.NewStringValue("out"),
+				"run": structpb.NewStringValue(`echo hello > $OUT`),
 			},
-		},
-	})
+		}.Build(),
+	}.Build())
 	if err != nil {
 		return nil, err
 	}
@@ -79,16 +79,16 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		return nil, err
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
 			Ref:    req.GetRef(),
-			Driver: "bash",
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"out": structpb.NewStringValue("out"),
 				"run": structpb.NewStringValue(fmt.Sprintf(`echo 'parent: %s' > $OUT`, b)),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p *Provider) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {

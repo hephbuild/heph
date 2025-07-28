@@ -1,6 +1,7 @@
-syntax = "proto3";
+edition = "2023";
 package heph.plugin.v1;
 import "heph/plugin/v1/tref.proto";
+
 
 message TargetMatchers {
   repeated TargetMatcher items = 1;

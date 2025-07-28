@@ -6,13 +6,19 @@ managed:
     - file_option: go_package_prefix
       value: github.com/hephbuild/heph/internal/hproto/internal/gen
 plugins:
-  - remote: buf.build/protocolbuffers/go
-    out: internal/gen
-    opt: paths=source_relative
-  - local: ["go", "run", "github.com/cerbos/protoc-gen-go-hashpb"]
+  - local: [ "go", "run", "google.golang.org/protobuf/cmd/protoc-gen-go" ]
     out: internal/gen
     opt:
       - paths=source_relative
-      - hashpb_out=.
+      - default_api_level=API_OPAQUE
+  - local: ["go", "run", "github.com/hephbuild/heph/internal/hproto/protoc-gen-go-stablewrite"]
+    out: internal/gen
+    opt:
+      - paths=source_relative
+      - default_api_level=API_OPAQUE
+      - apilevelMgoogle/protobuf/timestamp.proto=API_OPEN
+      - apilevelMgoogle/protobuf/any.proto=API_OPEN
+      - apilevelMgoogle/protobuf/descriptor.proto=API_OPEN
+      - apilevelMgoogle/protobuf/struct.proto=API_OPEN
 inputs:
   - directory: internal/proto

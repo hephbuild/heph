@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -35,10 +37,10 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 	desc := (&fsv1.Target{}).ProtoReflect().Descriptor()
 	pdesc := protodesc.ToDescriptorProto(desc)
 
-	return &pluginv1.ConfigResponse{
-		Name:         "fs_driver",
+	return pluginv1.ConfigResponse_builder{
+		Name:         htypes.Ptr("fs_driver"),
 		TargetSchema: pdesc,
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
@@ -56,25 +58,25 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, err
 	}
 
-	target := &fsv1.Target{
-		File:       cfg.File,
+	target := fsv1.Target_builder{
+		File:       htypes.Ptr(cfg.File),
 		ModifiedAt: timestamppb.New(info.ModTime()),
-	}
+	}.Build()
 
 	targetAny, err := anypb.New(target)
 	if err != nil {
 		return nil, err
 	}
 
-	return &pluginv1.ParseResponse{
-		Target: &pluginv1.TargetDef{
+	return pluginv1.ParseResponse_builder{
+		Target: pluginv1.TargetDef_builder{
 			Ref:                req.GetSpec().GetRef(),
 			Def:                targetAny,
 			Outputs:            []string{""},
-			Cache:              true,
-			DisableRemoteCache: true,
-		},
-	}, nil
+			Cache:              htypes.Ptr(true),
+			DisableRemoteCache: htypes.Ptr(true),
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
@@ -84,18 +86,18 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		return nil, err
 	}
 
-	return &pluginv1.RunResponse{
+	return pluginv1.RunResponse_builder{
 		Artifacts: []*pluginv1.Artifact{
-			{
-				Name: filepath.Base(t.GetFile()),
-				Type: pluginv1.Artifact_TYPE_OUTPUT,
-				Content: &pluginv1.Artifact_File{File: &pluginv1.Artifact_ContentFile{
-					SourcePath: filepath.Join(p.resultClient.Root, t.GetFile()),
-					OutPath:    t.GetFile(),
-				}},
-			},
+			pluginv1.Artifact_builder{
+				Name: htypes.Ptr(filepath.Base(t.GetFile())),
+				Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+				File: pluginv1.Artifact_ContentFile_builder{
+					SourcePath: htypes.Ptr(filepath.Join(p.resultClient.Root, t.GetFile())),
+					OutPath:    htypes.Ptr(t.GetFile()),
+				}.Build(),
+			}.Build(),
 		},
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Driver) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {

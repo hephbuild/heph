@@ -7,6 +7,8 @@ import (
 	"io"
 	"path"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/goccy/go-json"
@@ -27,16 +29,14 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors, requestId s
 }
 
 func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
-	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
-		Of: &corev1.ResultRequest_Ref{
-			Ref: &pluginv1.TargetRef{
-				Package: "@heph/go/std",
-				Name:    "install",
-				Args:    factors.Args(),
-			},
-		},
-	})
+	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		RequestId: htypes.Ptr(requestId),
+		Ref: pluginv1.TargetRef_builder{
+			Package: htypes.Ptr("@heph/go/std"),
+			Name:    htypes.Ptr("install"),
+			Args:    factors.Args(),
+		}.Build(),
+	}.Build())
 	if err != nil {
 		return nil, err
 	}
@@ -77,20 +77,21 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 }
 
 func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.GetResponse, error) {
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
-				Package: "@heph/go/std",
-				Name:    "install",
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr("@heph/go/std"),
+				Name:    htypes.Ptr("install"),
 				Args:    factors.Args(),
-			},
-			Driver: "bash",
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"GOOS":        factors.GOOS,
 					"GOARCH":      factors.GOARCH,
 					"CGO_ENABLED": "0",
 					"GODEBUG":     "installgoroot=all",
+					"GOTOOLCHAIN": "local",
 				}),
 				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
 				"run": hstructpb.NewStringsValue([]string{
@@ -107,29 +108,30 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 					"list": fmt.Sprintf("goroot/pkg/%v_%v/list.json", factors.GOOS, factors.GOARCH),
 				}),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport string) (*pluginv1.GetResponse, error) {
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
-				Package: path.Join("@heph/go/std", goImport),
-				Name:    "build_lib",
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr(path.Join("@heph/go/std", goImport)),
+				Name:    htypes.Ptr("build_lib"),
 				Args:    factors.Args(),
-			},
-			Driver: "bash",
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":   factors.GOOS,
-					"GOARCH": factors.GOARCH,
+					"GOOS":        factors.GOOS,
+					"GOARCH":      factors.GOARCH,
+					"GOTOOLCHAIN": "local",
 				}),
-				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-					Package: "@heph/go/std",
-					Name:    "install",
+				"deps": structpb.NewStringValue(tref.Format(pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("@heph/go/std"),
+					Name:    htypes.Ptr("install"),
 					Args:    factors.Args(),
-				})),
+				}.Build())),
 				"run": hstructpb.NewStringsValue([]string{
 					fmt.Sprintf("mv $WORKDIR/@heph/go/std/goroot/pkg/%v_%v/%v.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
 				}),
@@ -138,6 +140,6 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				}),
 				"cache": structpb.NewStringValue("local"),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

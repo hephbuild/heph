@@ -2,8 +2,9 @@ package hproto
 
 import (
 	"fmt"
-	"hash"
 	"strings"
+
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
 
 	"github.com/zeebo/xxh3"
 
@@ -13,13 +14,8 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// match https://github.com/cerbos/protoc-gen-go-hashpb/blob/db0168880c5d9ad459ff3be9157f7f4eac77412c/internal/generator/generator_test.go#L24
-type Hashable interface {
-	HashPB(hash.Hash, map[string]struct{})
-}
-
 func Clone[T proto.Message](m T) T {
-	return proto.Clone(m).(T) //nolint:errcheck
+	return proto.CloneOf(m)
 }
 
 func Equal[T proto.Message](a, b T) bool {
@@ -53,7 +49,7 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 		last := p.Index(-1)
 
 		beforeLast := p.Index(-2)
-		switch last.Step.Kind() { //nolint:exhaustive
+		switch last.Step.Kind() {
 		case protopath.FieldAccessStep:
 			m := beforeLast.Value.Message()
 			fd := last.Step.FieldDescriptor()
@@ -77,12 +73,12 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	return m, err
 }
 
-func Compare(a, b Hashable) int {
+func Compare(a, b hashpb.StableWriter) int {
 	ha := xxh3.New()
-	a.HashPB(ha, nil)
+	hashpb.Hash(ha, a, nil)
 
 	hb := xxh3.New()
-	b.HashPB(hb, nil)
+	hashpb.Hash(hb, b, nil)
 
 	suma := ha.Sum64()
 	sumb := hb.Sum64()

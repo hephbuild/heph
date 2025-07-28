@@ -2,7 +2,6 @@ package hlog
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 
 	"connectrpc.com/connect"
@@ -19,17 +18,19 @@ func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.Crea
 	if len(req.Msg.GetAttrs()) > 0 {
 		var attrs []any
 		for _, attr := range req.Msg.GetAttrs() {
-			switch value := attr.GetValue().(type) {
-			case *corev1.CreateRequest_Attr_ValueStr:
-				attrs = append(attrs, slog.String(attr.GetKey(), value.ValueStr))
-			case *corev1.CreateRequest_Attr_ValueBool:
-				attrs = append(attrs, slog.Bool(attr.GetKey(), value.ValueBool))
-			case *corev1.CreateRequest_Attr_ValueInt:
-				attrs = append(attrs, slog.Int64(attr.GetKey(), value.ValueInt))
-			case *corev1.CreateRequest_Attr_ValueFloat:
-				attrs = append(attrs, slog.Float64(attr.GetKey(), value.ValueFloat))
+			switch attr.WhichValue() {
+			case corev1.CreateRequest_Attr_ValueStr_case:
+				attrs = append(attrs, slog.String(attr.GetKey(), attr.GetValueStr()))
+			case corev1.CreateRequest_Attr_ValueBool_case:
+				attrs = append(attrs, slog.Bool(attr.GetKey(), attr.GetValueBool()))
+			case corev1.CreateRequest_Attr_ValueInt_case:
+				attrs = append(attrs, slog.Int64(attr.GetKey(), attr.GetValueInt()))
+			case corev1.CreateRequest_Attr_ValueFloat_case:
+				attrs = append(attrs, slog.Float64(attr.GetKey(), attr.GetValueFloat()))
+			case corev1.CreateRequest_Attr_Value_not_set_case:
+				fallthrough
 			default:
-				attrs = append(attrs, slog.String(attr.GetKey(), fmt.Sprintf("%#v", attr.GetValue())))
+				attrs = append(attrs, slog.String(attr.GetKey(), attr.String()))
 			}
 		}
 

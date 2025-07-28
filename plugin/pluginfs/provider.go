@@ -5,6 +5,8 @@ import (
 	"errors"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
@@ -33,9 +35,9 @@ func NewProvider() *Provider {
 const Name = "fs"
 
 func (p *Provider) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
-	}, nil
+	return pluginv1.ProviderConfigResponse_builder{
+		Name: htypes.Ptr(Name),
+	}.Build(), nil
 }
 
 func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -57,13 +59,13 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("missing f argument"))
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
 			Ref:    req.GetRef(),
-			Driver: "fs_driver",
+			Driver: htypes.Ptr("fs_driver"),
 			Config: map[string]*structpb.Value{
 				"file": structpb.NewStringValue(filepath.Join(rest, f)),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }

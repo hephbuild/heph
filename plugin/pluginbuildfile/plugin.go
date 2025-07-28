@@ -4,6 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+
+	"github.com/hephbuild/heph/internal/hsingleflight"
+	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -12,6 +17,7 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.starlark.net/starlark"
 	"go.starlark.net/syntax"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -22,7 +28,7 @@ type Options struct {
 type Plugin struct {
 	Options
 	repoRoot    hfs.FS
-	cacheget    CacheGet
+	cacheget    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	cacherunpkg CacheRunpkg
 }
 
@@ -38,9 +44,9 @@ func New(fs hfs.FS, cfg Options) *Plugin {
 }
 
 func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
-	}, nil
+	return pluginv1.ProviderConfigResponse_builder{
+		Name: htypes.Ptr(Name),
+	}.Build(), nil
 }
 
 func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -62,11 +68,11 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 			state[k] = pv
 		}
 
-		states = append(states, &pluginv1.ProviderState{
-			Package:  payload.Package,
-			Provider: payload.Provider,
+		states = append(states, pluginv1.ProviderState_builder{
+			Package:  htypes.Ptr(payload.Package),
+			Provider: htypes.Ptr(payload.Provider),
 			State:    state,
-		})
+		}.Build())
 
 		return nil
 	})
@@ -74,9 +80,9 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 		return nil, err
 	}
 
-	return &pluginv1.ProbeResponse{
+	return pluginv1.ProbeResponse_builder{
 		States: states,
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -87,11 +93,9 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 				return err
 			}
 
-			err = send(&pluginv1.ListResponse{
-				Of: &pluginv1.ListResponse_Spec{
-					Spec: spec,
-				},
-			})
+			err = send(pluginv1.ListResponse_builder{
+				Spec: proto.ValueOrDefault(spec),
+			}.Build())
 
 			return err
 		}, nil)
@@ -295,6 +299,23 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 		Print: func(thread *starlark.Thread, msg string) {
 			hlog.From(ctx).Info(msg)
 		},
+		Load: func(thread *starlark.Thread, module string) (starlark.StringDict, error) {
+			switch {
+			case strings.HasPrefix(module, "//"):
+				rest, _ := strings.CutPrefix(module, "//")
+
+				res, err := p.runPkg(ctx, rest, nil, nil)
+				if err != nil {
+					return nil, fmt.Errorf("%v: %w", module, err)
+				}
+
+				return res, nil
+			case strings.HasPrefix(module, "@"):
+				return nil, errors.New("import function from plugin not implemented")
+			default:
+				return nil, fmt.Errorf("unsupported module %q", module)
+			}
+		},
 	}
 	thread.SetLocal(ctxKey, ctx)
 	thread.SetLocal(packageKey, pkg)
@@ -329,16 +350,16 @@ func (p *Plugin) buildFile(ctx context.Context, file hfs.File, universe starlark
 }
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	spec, err := p.cacheget.Singleflight(ctx, req.GetRef(), func() (*pluginv1.TargetSpec, error) {
+	spec, err, _ := p.cacheget.Do(ctx, tref.Format(req.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
 		return p.getInner(ctx, req)
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return &pluginv1.GetResponse{
+	return pluginv1.GetResponse_builder{
 		Spec: spec,
-	}, nil
+	}.Build(), nil
 }
 
 func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pluginv1.TargetSpec, error) {
@@ -358,15 +379,15 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		config[k] = pv
 	}
 
-	spec := &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
-			Package: payload.Package,
-			Name:    payload.Name,
-		},
-		Driver: payload.Driver,
+	spec := pluginv1.TargetSpec_builder{
+		Ref: pluginv1.TargetRef_builder{
+			Package: htypes.Ptr(payload.Package),
+			Name:    htypes.Ptr(payload.Name),
+		}.Build(),
+		Driver: htypes.Ptr(payload.Driver),
 		Config: config,
 		Labels: payload.Labels,
-	}
+	}.Build()
 
 	return spec, nil
 }

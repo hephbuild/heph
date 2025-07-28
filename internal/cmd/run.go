@@ -103,12 +103,23 @@ func init() {
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					if _, ok := matcher.GetItem().(*pluginv1.TargetMatcher_Ref); ok && len(res) == 1 {
+					if matcher.HasRef() && len(res) == 1 {
 						for _, output := range res[0].Artifacts {
-							fmt.Println(output.Name)
-							fmt.Println("  group:    ", output.Group)
-							fmt.Println("  content:  ", output.Content)
-							fmt.Println("  type:     ", output.Type.String())
+							fmt.Println(output.GetName())
+							fmt.Println("  group:    ", output.GetGroup())
+							switch output.WhichContent() {
+							case pluginv1.Artifact_File_case:
+								fmt.Println("  content:", output.GetFile())
+							case pluginv1.Artifact_Raw_case:
+								fmt.Println("  content:", output.GetRaw())
+							case pluginv1.Artifact_TarPath_case:
+								fmt.Println("  content:", output.GetTarPath())
+							case pluginv1.Artifact_TargzPath_case:
+								fmt.Println("  content:", output.GetTargzPath())
+							case pluginv1.Artifact_Content_not_set_case:
+								fmt.Println("  content: <not set>")
+							}
+							fmt.Println("  type:     ", output.GetType().String())
 						}
 					} else {
 						fmt.Println("matched", len(res))

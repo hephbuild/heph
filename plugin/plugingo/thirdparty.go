@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -20,12 +22,12 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		`cp -r "$MOD_DIR/." .`,
 	}
 
-	return &pluginv1.GetResponse{Spec: &pluginv1.TargetSpec{
-		Ref: &pluginv1.TargetRef{
-			Package: pkg,
-			Name:    "download",
-		},
-		Driver: "sh",
+	return pluginv1.GetResponse_builder{Spec: pluginv1.TargetSpec_builder{
+		Ref: pluginv1.TargetRef_builder{
+			Package: htypes.Ptr(pkg),
+			Name:    htypes.Ptr("download"),
+		}.Build(),
+		Driver: htypes.Ptr("sh"),
 		Config: map[string]*structpb.Value{
 			"env": hstructpb.NewMapStringStringValue(map[string]string{
 				"CGO_ENABLED": "0",
@@ -37,7 +39,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 			"cache":            structpb.NewBoolValue(true),
 			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 		},
-	}}, nil
+	}.Build()}.Build(), nil
 }
 
 func ThirdpartyContentPackage(goMod, version, goPath string) string {

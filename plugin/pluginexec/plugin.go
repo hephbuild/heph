@@ -15,6 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
+
+	"github.com/hephbuild/heph/internal/hfs"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hmaps"
@@ -60,20 +65,20 @@ func (p *Plugin) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1
 
 	p.pipes[id] = &pipe{exp: time.Now().Add(time.Minute), r: r, w: w}
 
-	return &pluginv1.PipeResponse{
-		Path: path.Join(PipesHandlerPath, id),
-		Id:   id,
-	}, nil
+	return pluginv1.PipeResponse_builder{
+		Path: htypes.Ptr(path.Join(PipesHandlerPath, id)),
+		Id:   htypes.Ptr(id),
+	}.Build(), nil
 }
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	desc := (&execv1.Target{}).ProtoReflect().Descriptor()
 	pdesc := protodesc.ToDescriptorProto(desc)
 
-	return &pluginv1.ConfigResponse{
-		Name:         p.name,
+	return pluginv1.ConfigResponse_builder{
+		Name:         htypes.Ptr(p.name),
 		TargetSchema: pdesc,
-	}, nil
+	}.Build(), nil
 }
 
 func depId(prop string, group string, i int) string {
@@ -90,7 +95,7 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, err
 	}
 
-	target := &execv1.Target{
+	target := execv1.Target_builder{
 		Run:            targetSpec.Run,
 		Deps:           map[string]*execv1.Target_Deps{},
 		HashDeps:       map[string]*execv1.Target_Deps{},
@@ -99,20 +104,32 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		RuntimeEnv:     targetSpec.RuntimeEnv,
 		PassEnv:        targetSpec.PassEnv,
 		RuntimePassEnv: targetSpec.RuntimePassEnv,
-		Context:        execv1.Target_SoftSandbox,
-	}
+		Context:        htypes.Ptr(execv1.Target_SoftSandbox),
+	}.Build()
 
 	if targetSpec.InTree {
-		target.Context = execv1.Target_Tree
+		target.SetContext(execv1.Target_Tree)
 	}
 
-	var allOutputPaths []string
+	var codegenPaths []string
 	for k, out := range targetSpec.Out {
-		target.Outputs = append(target.Outputs, &execv1.Target_Output{
-			Group: k,
+		target.SetOutputs(append(target.GetOutputs(), execv1.Target_Output_builder{
+			Group: htypes.Ptr(k),
 			Paths: out,
-		})
-		allOutputPaths = append(allOutputPaths, out...)
+		}.Build()))
+
+		for _, s := range out {
+			if hfs.IsGlob(s) {
+				base, _ := hfs.GlobSplit(s)
+				if !strings.HasSuffix(base, "/") {
+					base += "/"
+				}
+
+				codegenPaths = append(codegenPaths, base)
+			} else {
+				codegenPaths = append(codegenPaths, s)
+			}
+		}
 	}
 
 	for _, output := range target.GetOutputs() {
@@ -125,10 +142,10 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))
 	for _, output := range target.GetOutputs() {
-		collectOutputs = append(collectOutputs, &pluginv1.TargetDef_CollectOutput{
-			Group: output.GetGroup(),
+		collectOutputs = append(collectOutputs, pluginv1.TargetDef_CollectOutput_builder{
+			Group: htypes.Ptr(output.GetGroup()),
 			Paths: output.GetPaths(),
-		})
+		}.Build())
 	}
 
 	var inputs []*pluginv1.TargetDef_Input
@@ -146,20 +163,20 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			}
 
 			id := depId("deps", name, i)
-			inputs = append(inputs, &pluginv1.TargetDef_Input{
+			inputs = append(inputs, pluginv1.TargetDef_Input_builder{
 				Ref: ref,
-				Origin: &pluginv1.TargetDef_InputOrigin{
+				Origin: pluginv1.TargetDef_InputOrigin_builder{
 					Meta: meta,
-					Id:   id,
-				},
-			})
+					Id:   htypes.Ptr(id),
+				}.Build(),
+			}.Build())
 
-			execDeps.Targets = append(execDeps.Targets, &execv1.Target_InputRef{
+			execDeps.SetTargets(append(execDeps.GetTargets(), execv1.Target_InputRef_builder{
 				Ref: ref,
-				Id:  id,
-			})
+				Id:  htypes.Ptr(id),
+			}.Build()))
 		}
-		target.Deps[name] = &execDeps
+		target.GetDeps()[name] = &execDeps
 	}
 
 	for _, tools := range targetSpec.Tools {
@@ -175,23 +192,23 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			}
 
 			id := depId("tools", "", i)
-			inputs = append(inputs, &pluginv1.TargetDef_Input{
+			inputs = append(inputs, pluginv1.TargetDef_Input_builder{
 				Ref: ref,
-				Origin: &pluginv1.TargetDef_InputOrigin{
+				Origin: pluginv1.TargetDef_InputOrigin_builder{
 					Meta: meta,
-					Id:   id,
-				},
-			})
-			target.Tools = append(target.Tools, &execv1.Target_InputRef{
+					Id:   htypes.Ptr(id),
+				}.Build(),
+			}.Build())
+			target.SetTools(append(target.GetTools(), execv1.Target_InputRef_builder{
 				Ref: ref,
-				Id:  id,
-			})
+				Id:  htypes.Ptr(id),
+			}.Build()))
 		}
 	}
 
 	hash := xxh3.New()
 	desc := target.ProtoReflect().Descriptor()
-	target.HashPB(hash, map[string]struct{}{
+	hashpb.Hash(hash, target, map[string]struct{}{
 		string(desc.FullName()) + ".runtime_deps":     {},
 		string(desc.FullName()) + ".runtime_env":      {},
 		string(desc.FullName()) + ".runtime_pass_env": {},
@@ -202,38 +219,44 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, err
 	}
 
-	var codegenTree *pluginv1.TargetDef_CodegenTree
+	var codegenTree []*pluginv1.TargetDef_CodegenTree
 	switch targetSpec.Codegen {
 	case "":
 		// no codegen
 	case "copy":
-		codegenTree = &pluginv1.TargetDef_CodegenTree{
-			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY,
-			Paths: allOutputPaths,
+		for _, p := range codegenPaths {
+			codegenTree = append(codegenTree, pluginv1.TargetDef_CodegenTree_builder{
+				Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY),
+				Path:  htypes.Ptr(p),
+				IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
+			}.Build())
 		}
 	case "link":
-		codegenTree = &pluginv1.TargetDef_CodegenTree{
-			Mode:  pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK,
-			Paths: allOutputPaths,
+		for _, p := range codegenPaths {
+			codegenTree = append(codegenTree, pluginv1.TargetDef_CodegenTree_builder{
+				Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK),
+				Path:  htypes.Ptr(p),
+				IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
+			}.Build())
 		}
 	default:
 		return nil, fmt.Errorf("invalid codegen mode: %s", targetSpec.Codegen)
 	}
 
-	return &pluginv1.ParseResponse{
-		Target: &pluginv1.TargetDef{
+	return pluginv1.ParseResponse_builder{
+		Target: pluginv1.TargetDef_builder{
 			Ref:                req.GetSpec().GetRef(),
 			Def:                targetAny,
 			Inputs:             inputs,
 			Outputs:            slices.Collect(maps.Keys(targetSpec.Out)),
-			Cache:              targetSpec.Cache.Local,
-			DisableRemoteCache: !targetSpec.Cache.Remote,
+			Cache:              htypes.Ptr(targetSpec.Cache.Local),
+			DisableRemoteCache: htypes.Ptr(!targetSpec.Cache.Remote),
 			CollectOutputs:     collectOutputs,
 			CodegenTree:        codegenTree,
-			Pty:                targetSpec.Pty,
+			Pty:                htypes.Ptr(targetSpec.Pty),
 			Hash:               hash.Sum(nil),
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 type Option func(*Plugin)

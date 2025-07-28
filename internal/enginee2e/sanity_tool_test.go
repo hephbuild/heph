@@ -3,6 +3,8 @@ package enginee2e
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -27,12 +29,12 @@ func TestSanityTool(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "tools",
-					Name:    "mytool",
-				},
-				Driver: "bash",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("tools"),
+					Name:    htypes.Ptr("mytool"),
+				}.Build(),
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`echo '#!/usr/bin/env bash' > $OUT`,
@@ -41,15 +43,15 @@ func TestSanityTool(t *testing.T) {
 					}),
 					"out": hstructpb.NewStringsValue([]string{"screw"}),
 				},
-			},
+			}.Build(),
 		},
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: "some/package",
-					Name:    "sometarget",
-				},
-				Driver: "bash",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/package"),
+					Name:    htypes.Ptr("sometarget"),
+				}.Build(),
+				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`which screw || echo 'screw bin not found'`,
@@ -58,7 +60,7 @@ func TestSanityTool(t *testing.T) {
 					"out":   hstructpb.NewStringsValue([]string{"out"}),
 					"tools": hstructpb.NewStringsValue([]string{"//tools:mytool"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

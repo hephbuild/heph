@@ -323,9 +323,10 @@ func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
-	if matcher, ok := matcher.GetItem().(*pluginv1.TargetMatcher_Ref); ok {
+	if matcher.HasRef() {
+		ref := matcher.GetRef()
 		return func(yield func(*pluginv1.TargetRef, error) bool) {
-			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: matcher.Ref}) // check if exist
+			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: ref}) // check if exist
 			yield(spec.GetRef(), err)
 		}
 	}

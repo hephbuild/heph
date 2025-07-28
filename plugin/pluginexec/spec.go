@@ -19,7 +19,7 @@ func (s *SpecStrings) MapstructureDecode(v any) error {
 
 	rv := reflect.ValueOf(v)
 
-	switch rv.Kind() { //nolint:exhaustive
+	switch rv.Kind() {
 	case reflect.String:
 		*s = []string{rv.Interface().(string)} //nolint:errcheck
 		return nil

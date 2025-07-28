@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	cache "github.com/Code-Hex/go-generics-cache"
@@ -19,6 +21,7 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -102,9 +105,9 @@ func New() *Plugin {
 }
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
-	return &pluginv1.ProviderConfigResponse{
-		Name: Name,
-	}, nil
+	return pluginv1.ProviderConfigResponse_builder{
+		Name: htypes.Ptr(Name),
+	}.Build(), nil
 }
 
 func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
@@ -150,46 +153,38 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			}
 
 			if len(goPkg.GoFiles) > 0 {
-				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
-					Ref: goPkg.GetBuildLibTargetRef(ModeNormal),
-				}})
+				err = send(pluginv1.ListResponse_builder{Ref: proto.ValueOrDefault(goPkg.GetBuildLibTargetRef(ModeNormal))}.Build())
 				if err != nil {
 					return err
 				}
 			}
 
 			if goPkg.IsCommand() {
-				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
-					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "build",
-						Args:    factors.Args(),
-					},
-				}})
+				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+					Name:    htypes.Ptr("build"),
+					Args:    factors.Args(),
+				}.Build()}.Build())
 				if err != nil {
 					return err
 				}
 			}
 
 			if !goPkg.Is3rdParty && !goPkg.IsStd && (len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0) {
-				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
-					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "test",
-						Args:    factors.Args(),
-					},
-				}})
+				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+					Name:    htypes.Ptr("test"),
+					Args:    factors.Args(),
+				}.Build()}.Build())
 				if err != nil {
 					return err
 				}
 
-				err = send(&pluginv1.ListResponse{Of: &pluginv1.ListResponse_Ref{
-					Ref: &pluginv1.TargetRef{
-						Package: goPkg.GetHephBuildPackage(),
-						Name:    "build_test",
-						Args:    factors.Args(),
-					},
-				}})
+				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+					Name:    htypes.Ptr("build_test"),
+					Args:    factors.Args(),
+				}.Build()}.Build())
 				if err != nil {
 					return err
 				}
@@ -418,35 +413,34 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		})
 	}
 
-	listRef := &pluginv1.TargetRef{
-		Package: pkg,
-		Name:    "_golist",
+	listRef := pluginv1.TargetRef_builder{
+		Package: htypes.Ptr(pkg),
+		Name:    htypes.Ptr("_golist"),
 		Args:    args,
-	}
+	}.Build()
 
-	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
-		Of: &corev1.ResultRequest_Spec{
-			Spec: &pluginv1.TargetSpec{
-				Ref:    listRef,
-				Driver: "sh",
-				Config: map[string]*structpb.Value{
-					"env": hstructpb.NewMapStringStringValue(map[string]string{
-						"GOOS":        f.GOOS,
-						"GOARCH":      f.GOARCH,
-						"CGO_ENABLED": "0",
-					}),
-					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
-					"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),
-					"out":              structpb.NewStringValue("golist.json"),
-					"in_tree":          structpb.NewBoolValue(true),
-					"cache":            structpb.NewStringValue("local"),
-					"hash_deps":        hstructpb.NewStringsValue(files),
-					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
-				},
+	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		RequestId: htypes.Ptr(requestId),
+		Spec: pluginv1.TargetSpec_builder{
+			Ref:    listRef,
+			Driver: htypes.Ptr("sh"),
+			Config: map[string]*structpb.Value{
+				"env": hstructpb.NewMapStringStringValue(map[string]string{
+					"GOOS":        f.GOOS,
+					"GOARCH":      f.GOARCH,
+					"CGO_ENABLED": "0",
+					"GOTOOLCHAIN": "local",
+				}),
+				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),
+				"out":              structpb.NewStringValue("golist.json"),
+				"in_tree":          structpb.NewBoolValue(true),
+				"cache":            structpb.NewStringValue("local"),
+				"hash_deps":        hstructpb.NewStringsValue(files),
+				// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 			},
-		},
-	})
+		}.Build(),
+	}.Build())
 	if err != nil {
 		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)
 	}

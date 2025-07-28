@@ -4,6 +4,8 @@ import (
 	"io"
 	"testing"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/go-faker/faker/v4"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -39,17 +41,17 @@ func TestSanity(t *testing.T) {
 
 	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
 		{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: pkg,
-					Name:    "sometarget",
-				},
-				Driver: "exec",
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("sometarget"),
+				}.Build(),
+				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `echo hello > out`}),
 					"out": hstructpb.NewStringsValue([]string{"out"}),
 				},
-			},
+			}.Build(),
 		},
 	})
 

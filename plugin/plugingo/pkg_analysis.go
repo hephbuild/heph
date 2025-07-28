@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -210,11 +212,11 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	goPkg.TestGoFiles = nil
 	goPkg.XTestGoFiles = nil
 
-	goPkg.LibTargetRef = &pluginv1.TargetRef{
-		Package: goPkg.GetHephBuildPackage(),
-		Name:    "build_testmain_lib",
+	goPkg.LibTargetRef = pluginv1.TargetRef_builder{
+		Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+		Name:    htypes.Ptr("build_testmain_lib"),
 		Args:    factors.Args(),
-	}
+	}.Build()
 	goPkg.Imports = slices.Clone(testmainImports)
 
 	// if hasTest {
@@ -230,11 +232,11 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 		GoPkg:      goPkg,
 		ImportPath: MainPackage,
 		Name:       MainPackage,
-		LibTargetRef: &pluginv1.TargetRef{
-			Package: goPkg.GetHephBuildPackage(),
-			Name:    "build_testmain_lib",
+		LibTargetRef: pluginv1.TargetRef_builder{
+			Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+			Name:    htypes.Ptr("build_testmain_lib"),
 			Args:    factors.Args(),
-		},
+		}.Build(),
 	}, nil
 }
 
@@ -538,27 +540,25 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gowork)))
 	}
 
-	res, err := p.resultClient.ResultClient.Get(ctx, &corev1.ResultRequest{
-		RequestId: requestId,
-		Of: &corev1.ResultRequest_Spec{
-			Spec: &pluginv1.TargetSpec{
-				Ref: &pluginv1.TargetRef{
-					Package: tref.DirPackage(gomod),
-					Name:    "_gomod",
-				},
-				Driver: "sh",
-				Config: map[string]*structpb.Value{
-					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
-					"run":              structpb.NewStringValue("go list -m -json > $OUT"),
-					"out":              structpb.NewStringValue("golist_mod.json"),
-					"in_tree":          structpb.NewBoolValue(true),
-					"cache":            structpb.NewStringValue("local"),
-					"hash_deps":        hstructpb.NewStringsValue(files),
-					// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
-				},
+	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		RequestId: htypes.Ptr(requestId),
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr(tref.DirPackage(gomod)),
+				Name:    htypes.Ptr("_gomod"),
+			}.Build(),
+			Driver: htypes.Ptr("sh"),
+			Config: map[string]*structpb.Value{
+				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"run":              structpb.NewStringValue("go list -m -json > $OUT"),
+				"out":              structpb.NewStringValue("golist_mod.json"),
+				"in_tree":          structpb.NewBoolValue(true),
+				"cache":            structpb.NewStringValue("local"),
+				"hash_deps":        hstructpb.NewStringsValue(files),
+				// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
 			},
-		},
-	})
+		}.Build(),
+	}.Build())
 	if err != nil {
 		return nil, fmt.Errorf("gomod: %w", err)
 	}

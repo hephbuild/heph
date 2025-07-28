@@ -84,13 +84,36 @@ func IsGlob(path string) bool {
 	return indexMeta(path) != -1
 }
 
-type GlobWalkFunc func(path string, d DirEntry) error
-
-func Glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc) error {
-	return glob(ctx, fs, pattern, ignore, fn)
+func GlobSplit(p string) (base, pattern string) { //nolint:nonamedreturns
+	return doublestar.SplitPattern(p)
 }
 
-func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc) error {
+type GlobWalkFunc func(path string, d DirEntry) error
+
+type GlobOption = func(*globConfig)
+
+type globConfig struct {
+	strictDir bool
+}
+
+func WithStrictDir(strictDir bool) GlobOption {
+	return func(g *globConfig) {
+		g.strictDir = strictDir
+	}
+}
+
+func Glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+	return glob(ctx, fs, pattern, ignore, fn, options...)
+}
+
+var ErrStrictDir = errors.New("strict directory is enabled, but pattern doesnt allow directory")
+
+func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+	config := &globConfig{}
+	for _, option := range options {
+		option(config)
+	}
+
 	prefix := ""
 
 	i := indexMeta(pattern)
@@ -104,13 +127,21 @@ func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWa
 			return err
 		}
 
+		if config.strictDir {
+			if strings.HasSuffix(pattern, "/") != info.IsDir() {
+				return ErrStrictDir
+			}
+		}
+
 		if info.IsDir() {
 			prefix = pattern
 			pattern = "**/*"
 		}
 	} else {
-		prefix = unescapeMeta(pattern[:i])
-		pattern = pattern[i:]
+		prefix, pattern = GlobSplit(pattern)
+		if prefix == "." {
+			prefix = ""
+		}
 	}
 
 	walkfs := fs

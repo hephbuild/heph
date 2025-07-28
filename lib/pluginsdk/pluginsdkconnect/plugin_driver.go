@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ pluginsdk.Driver = (*driverConnectClient)(nil)
@@ -52,14 +53,14 @@ func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) 
 		case <-hardCtx.Done():
 			return
 		case <-ctx.Done():
-			err := strm.Send(&pluginv1.RunContainer{Msg: &pluginv1.RunContainer_Cancel{Cancel: true}})
+			err := strm.Send(pluginv1.RunContainer_builder{Cancel: proto.Bool(true)}.Build())
 			if err != nil {
 				hlog.From(ctx).Error("failed to send cancel message", "err", err)
 			}
 		}
 	}()
 
-	err := strm.Send(&pluginv1.RunContainer{Msg: &pluginv1.RunContainer_Start{Start: req}})
+	err := strm.Send(pluginv1.RunContainer_builder{Start: proto.ValueOrDefault(req)}.Build())
 	if err != nil {
 		return nil, p.handleErr(ctx, err)
 	}
@@ -135,12 +136,14 @@ func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[
 				return
 			}
 
-			switch msg := msg.GetMsg().(type) {
-			case *pluginv1.RunContainer_Start:
-				startCh <- msg.Start
+			switch msg.WhichMsg() {
+			case pluginv1.RunContainer_Start_case:
+				startCh <- msg.GetStart()
 				close(startCh)
-			case *pluginv1.RunContainer_Cancel:
+			case pluginv1.RunContainer_Cancel_case:
 				cancel()
+			default:
+				// ignore
 			}
 		}
 	}()

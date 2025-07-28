@@ -9,6 +9,7 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"google.golang.org/protobuf/proto"
 )
 
 var _ pluginsdk.Provider = (*providerConnectClient)(nil)
@@ -71,14 +72,14 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 		case <-hardCtx.Done():
 			return
 		case <-ctx.Done():
-			err := strm.Send(&pluginv1.GetContainer{Msg: &pluginv1.GetContainer_Cancel{Cancel: true}})
+			err := strm.Send(pluginv1.GetContainer_builder{Cancel: proto.Bool(true)}.Build())
 			if err != nil {
 				hlog.From(ctx).Error("failed to send cancel message", "err", err)
 			}
 		}
 	}()
 
-	err := strm.Send(&pluginv1.GetContainer{Msg: &pluginv1.GetContainer_Start{Start: req}})
+	err := strm.Send(pluginv1.GetContainer_builder{Start: proto.ValueOrDefault(req)}.Build())
 	if err != nil {
 		return nil, p.handleErr(err)
 	}
@@ -173,12 +174,14 @@ func (p providerConnectHandler) Get(ctx context.Context, strm *connect.BidiStrea
 				return
 			}
 
-			switch msg := msg.GetMsg().(type) {
-			case *pluginv1.GetContainer_Start:
-				startCh <- msg.Start
+			switch msg.WhichMsg() {
+			case pluginv1.GetContainer_Start_case:
+				startCh <- msg.GetStart()
 				close(startCh)
-			case *pluginv1.GetContainer_Cancel:
+			case pluginv1.GetContainer_Cancel_case:
 				cancel()
+			default:
+				// ignore
 			}
 		}
 	}()

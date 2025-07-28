@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,18 +115,17 @@ func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error
 			defer pending.Swap(false)
 
 			m.Lock()
-			if len(ss) == 0 {
-				m.Unlock()
+			defer m.Unlock()
 
+			if len(ss) == 0 {
 				return nil
 			}
-			pss := slices.Clone(ss)
-			ss = ss[:0]
-			m.Unlock()
 
-			for _, s := range pss {
+			for _, s := range ss {
 				fmt.Fprintln(args.Stdout, s)
 			}
+
+			ss = ss[:0]
 
 			return nil
 		})

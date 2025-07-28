@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/internal/htypes"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -19,25 +21,25 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 		labels = nil
 	}
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    "test",
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr("test"),
 				Args:    factors.Args(),
-			},
-			Driver: "bash",
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue("$SRC"),
-				"deps": structpb.NewStringValue(tref.Format(&pluginv1.TargetRef{
-					Package: goPkg.GetHephBuildPackage(),
-					Name:    "build_test",
+				"deps": structpb.NewStringValue(tref.Format(pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+					Name:    htypes.Ptr("build_test"),
 					Args:    factors.Args(),
-				})),
+				}.Build())),
 			},
 			Labels: labels,
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Package, factors Factors, requestId string) (*pluginv1.GetResponse, error) {
@@ -79,20 +81,20 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 	testmain := base64.StdEncoding.EncodeToString(testmainb)
 
-	return &pluginv1.GetResponse{
-		Spec: &pluginv1.TargetSpec{
-			Ref: &pluginv1.TargetRef{
-				Package: goPkg.GetHephBuildPackage(),
-				Name:    "testmain",
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref: pluginv1.TargetRef_builder{
+				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+				Name:    htypes.Ptr("testmain"),
 				Args:    factors.Args(),
-			},
-			Driver: "bash",
+			}.Build(),
+			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q | base64 --decode > $OUT", testmain)),
 				"out": structpb.NewStringValue("testmain.go"),
 			},
-		},
-	}, nil
+		}.Build(),
+	}.Build(), nil
 }
 
 var testmainImports = []string{"os", "reflect", "testing", "testing/internal/testdeps"}
@@ -148,11 +150,11 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 		"build_testmain_lib",
 		goPkg,
 		importsm,
-		[]string{tref.Format(&pluginv1.TargetRef{
-			Package: goPkg.GoPkg.GetHephBuildPackage(),
-			Name:    "testmain",
+		[]string{tref.Format(pluginv1.TargetRef_builder{
+			Package: htypes.Ptr(goPkg.GoPkg.GetHephBuildPackage()),
+			Name:    htypes.Ptr("testmain"),
 			Args:    factors.Args(),
-		})},
+		}.Build())},
 		factors,
 		false,
 	)

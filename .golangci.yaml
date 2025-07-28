@@ -72,6 +72,7 @@ linters:
       check:
         - switch
         - map
+      default-signifies-exhaustive: true
     exhaustruct:
       exclude:
         - ^net/http.Client$
