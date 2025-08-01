@@ -312,37 +312,6 @@ func TestCyclic3(t *testing.T) {
 
 			test.do(t, ctx, e, pkg, rs)
 
-			// _, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
-			//	Package: pkg,
-			//	Name:    "c",
-			// }}}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-			//
-			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-			//
-			// _, err = e.Result(ctx, pkg, "b", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// _, err = e.Result(ctx, pkg, "c", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
-			// var theErr error
-			// var matches int
-			// for _, err := range res {
-			//	if err != nil {
-			//		theErr = err
-			//	} else {
-			//		matches++
-			//	}
-			//}
-			// require.Equal(t, 3, matches)
-			// require.ErrorContains(t, theErr, "stack recursion detected")
-
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 			require.ErrorContains(t, err, "stack recursion detected")
 		})

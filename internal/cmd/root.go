@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
+	pprofhttp "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -28,6 +30,7 @@ var cpuprofile string
 var memprofile string
 var goroutineprofile string
 var goroutineprofileLast bool
+var httpprofile boolStr
 
 var levelVar slog.LevelVar
 
@@ -99,6 +102,27 @@ var rootCmd = &cobra.Command{
 
 				hlog.From(ctx).Info("Trace ID: " + traceID)
 			}
+		}
+
+		if httpprofile.bool {
+			port := httpprofile.str
+			if port == "" {
+				port = "6060"
+			}
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/debug/pprof/", pprofhttp.Index)
+			mux.HandleFunc("/debug/pprof/cmdline", pprofhttp.Cmdline)
+			mux.HandleFunc("/debug/pprof/profile", pprofhttp.Profile)
+			mux.HandleFunc("/debug/pprof/symbol", pprofhttp.Symbol)
+			mux.HandleFunc("/debug/pprof/trace", pprofhttp.Trace)
+
+			go func() {
+				err := http.ListenAndServe(":"+port, mux)
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("pprof server: %v", err))
+				}
+			}()
 		}
 
 		if cpuprofile != "" {
@@ -185,6 +209,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
 
+	rootCmd.PersistentFlags().AddFlag(NewBoolStrFlag(&httpprofile, "httpprofile", "", "Start pprof server"))
 	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")
 	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
 	rootCmd.PersistentFlags().StringVar(&goroutineprofile, "goroutineprofile", "", "Goroutine Profile file")
