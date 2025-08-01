@@ -57,7 +57,7 @@ func SetupSandbox(
 
 		for _, dep := range hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()) {
 			for _, target := range dep.GetTargets() {
-				for artifact := range ArtifactsForId(results, target.GetId(), 1) {
+				for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
 					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
 					if err != nil {
 						return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
@@ -76,7 +76,7 @@ func SetupSandbox(
 	}
 
 	for _, tool := range t.GetTools() {
-		for artifact := range ArtifactsForId(results, tool.GetId(), 1) {
+		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
 			err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
 				return nil, fmt.Errorf("%v: %w", tref.Format(tool.GetRef()), err)

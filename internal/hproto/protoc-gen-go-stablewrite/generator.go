@@ -209,8 +209,8 @@ func (g *codegen) genOneOfField(gf *protogen.GeneratedFile, field *protogen.Fiel
 func (g *codegen) genOneOfFieldOpen(gf *protogen.GeneratedFile, field *protogen.Field) {
 	fieldName := oneOfAccess(field.Oneof)
 
-	gf.P("if ", fieldName, " != nil {")
 	gf.P("if _, ok := ignore[\"", field.Desc.ContainingOneof().FullName(), "\"]; !ok {")
+	gf.P("if ", fieldName, " != nil {")
 	gf.P("switch t := ", fieldName, ".(type) {")
 	for _, f := range field.Oneof.Fields {
 		gf.P("case *", f.GoIdent, ":")
@@ -224,14 +224,15 @@ func (g *codegen) genOneOfFieldOpen(gf *protogen.GeneratedFile, field *protogen.
 func (g *codegen) genOneOfFieldOpaque(gf *protogen.GeneratedFile, field *protogen.Field) {
 	fieldName := oneOfAccess(field.Oneof)
 
-	gf.P("if ", fieldHaser(field), " {")
 	gf.P("if _, ok := ignore[\"", field.Desc.ContainingOneof().FullName(), "\"]; !ok {")
+	gf.P("_, err := ", writeVarint, "(", writerIdent, ", uint64(", fieldName, "))")
+	gf.P("if err != nil {return err}")
+
 	gf.P("switch ", fieldName, " {")
 	for _, f := range field.Oneof.Fields {
 		gf.P("case ", f.GoIdent, "_case:")
 		g.genSingularField(gf, f.Desc, fieldAccess(f), false)
 	}
-	gf.P("}")
 	gf.P("}")
 	gf.P("}")
 }
