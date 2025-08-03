@@ -156,19 +156,23 @@ func (e *Engine) meta(ctx context.Context, rs *RequestState, def *LightLinkedTar
 	})
 	defer cleanLabels()
 
-	manifests, err := e.depsResultMetas(ctx, rs, def)
-	if err != nil {
-		return nil, fmt.Errorf("deps manifests: %w", err)
-	}
+	res, err, _ := rs.memMeta.Do(ctx, refKey(def.GetRef()), func(ctx context.Context) (*Meta, error) {
+		manifests, err := e.depsResultMetas(ctx, rs, def)
+		if err != nil {
+			return nil, fmt.Errorf("deps manifests: %w", err)
+		}
 
-	hashin, err := e.hashin2(ctx, def, manifests)
-	if err != nil {
-		return nil, fmt.Errorf("hashin: %w", err)
-	}
+		hashin, err := e.hashin2(ctx, def, manifests)
+		if err != nil {
+			return nil, fmt.Errorf("hashin: %w", err)
+		}
 
-	return &Meta{
-		Hashin: hashin,
-	}, nil
+		return &Meta{
+			Hashin: hashin,
+		}, nil
+	})
+
+	return res, err
 }
 
 var meter = otel.Meter("heph_engine")

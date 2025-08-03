@@ -11,11 +11,56 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hsingleflight"
+	sync_map "github.com/zolstein/sync-map"
+
 	"github.com/hephbuild/heph/lib/tref"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+type cachedFs struct {
+	fs.ReadDirFS
+
+	memReadDir hsingleflight.GroupMem[string, []fs.DirEntry]
+}
+
+func (c *cachedFs) ReadDir(name string) ([]fs.DirEntry, error) {
+	entries, err, _ := c.memReadDir.Do(name, func() ([]fs.DirEntry, error) {
+		return c.ReadDirFS.ReadDir(name)
+	})
+
+	return entries, err
+}
+
+// TODO: move to context or something like that
+var fsCaches sync_map.Map[string, *cachedFs]
+
+func walkDirs(ctx context.Context, root string, fn func(path string) error) error {
+	wfs := os.DirFS(root)
+	if rdfs, ok := wfs.(fs.ReadDirFS); ok {
+		wfs, _ = fsCaches.LoadOrStore(root, &cachedFs{ReadDirFS: rdfs})
+	}
+
+	return fs.WalkDir(wfs, ".", func(path string, d fs.DirEntry, err error) error {
+		if d == nil || !d.IsDir() {
+			return nil
+		}
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if err != nil {
+			return err
+		}
+
+		path = filepath.Join(root, path)
+
+		return fn(path)
+	})
+}
 
 func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {
 	if filter == nil {
@@ -27,23 +72,9 @@ func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filte
 	walkRoot := extractRoot(root, m)
 
 	return func(yield func(string, error) bool) {
-		err := fs.WalkDir(os.DirFS(walkRoot), ".", func(path string, d fs.DirEntry, err error) error {
-			if d == nil || !d.IsDir() {
-				return nil
-			}
-
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			path = filepath.Join(walkRoot, path)
-
+		err := walkDirs(ctx, walkRoot, func(path string) error {
 			if !filter(path) {
 				return fs.SkipDir
-			}
-
-			if err != nil {
-				return err
 			}
 
 			pkg, err := tref.DirToPackage(path, root)

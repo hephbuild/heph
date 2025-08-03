@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/hdag"
+	"github.com/hephbuild/heph/lib/tref"
+
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
 	"github.com/google/uuid"
@@ -176,8 +179,12 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 	id := uuid.New().String()
 
 	s := &RequestState{
-		ID:               id,
-		RequestStateData: &RequestStateData{},
+		ID: id,
+		RequestStateData: &RequestStateData{
+			dag: hdag.New(func(v *pluginv1.TargetRef) string {
+				return tref.Format(v)
+			}),
+		},
 	}
 
 	e.requestState.Store(id, s)

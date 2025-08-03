@@ -30,21 +30,21 @@ func TestCyclic1(t *testing.T) {
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.Result(ctx, rs, pkg, "c", []string{""})
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 	}
 	for _, test := range tests {
@@ -103,21 +103,21 @@ func TestCyclic2(t *testing.T) {
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher ref leaf then ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 	}
 	for _, test := range tests {
@@ -178,40 +178,6 @@ func TestCyclic2(t *testing.T) {
 			defer clean()
 
 			test.do(t, ctx, e, pkg, rs)
-
-			// _, err = e.ResultsFromMatcher(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_Ref{Ref: &pluginv1.TargetRef{
-			//	Package: pkg,
-			//	Name:    "c",
-			// }}}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-			//
-			// _, err = e.Result(ctx, pkg, "a", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-			//
-			// _, err = e.Result(ctx, pkg, "b", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// _, err = e.Result(ctx, pkg, "c", []string{""}, rs)
-			// require.ErrorContains(t, err, "stack recursion detected")
-
-			// res := e.Query(ctx, &pluginv1.TargetMatcher{Item: &pluginv1.TargetMatcher_PackagePrefix{PackagePrefix: ""}}, rs)
-			// var theErr error
-			// var matches int
-			// for _, err := range res {
-			//	if err != nil {
-			//		theErr = err
-			//	} else {
-			//		matches++
-			//	}
-			//}
-			// require.Equal(t, 3, matches)
-			// require.ErrorContains(t, theErr, "stack recursion detected")
-
-			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
 		})
 	}
 }
@@ -223,21 +189,21 @@ func TestCyclic3(t *testing.T) {
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
+			require.ErrorContains(t, err, "would create a loop")
 		}},
 	}
 	for _, test := range tests {
@@ -311,9 +277,6 @@ func TestCyclic3(t *testing.T) {
 			defer clean()
 
 			test.do(t, ctx, e, pkg, rs)
-
-			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "stack recursion detected")
 		})
 	}
 }

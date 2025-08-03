@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/hephbuild/heph/internal/hdag"
+	sync_map "github.com/zolstein/sync-map"
+
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 
@@ -283,12 +286,15 @@ type RequestStateData struct {
 	memSpecGet hsingleflight.GroupMemContext[memSpecGetKey, *pluginv1.TargetSpec]
 	memSpec    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	// memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
+	memMeta hsingleflight.GroupMemContext[string, *Meta]
 
 	memLink hsingleflight.GroupMemContext[string, *LightLinkedTarget]
 	memDef  hsingleflight.GroupMemContext[string, *TargetDef]
 
 	memResult  hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
 	memExecute hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
+
+	dag *hdag.DAG[*pluginv1.TargetRef]
 }
 
 type traceStackEntry struct {
@@ -586,6 +592,132 @@ func (e *Engine) Link(ctx context.Context, rs *RequestState, c DefContainer) (*L
 	return ldef, err
 }
 
+type DAGType int
+
+const (
+	DAGTypeAll DAGType = iota
+	DAGTypeAncestors
+	DAGTypeDescendants
+)
+
+func (e *Engine) DAG(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, t DAGType) (*hdag.DAG[*pluginv1.TargetRef], error) {
+	switch t {
+	case DAGTypeAncestors:
+		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{Ref: ref}.Build(), true)
+		if err != nil {
+			return nil, err
+		}
+
+		return rs.dag.GetAncestorsGraph(ref)
+	case DAGTypeAll:
+		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("")}.Build(), true)
+		if err != nil {
+			return nil, err
+		}
+
+		return rs.dag.GetGraph(ref)
+	case DAGTypeDescendants:
+		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("")}.Build(), true)
+		if err != nil {
+			return nil, err
+		}
+
+		return rs.dag.GetDescendantsGraph(ref)
+	default:
+		return nil, fmt.Errorf("unknown dag type %v", t)
+	}
+}
+
+func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m *pluginv1.TargetMatcher, deep bool) error {
+	var dedup sync_map.Map[string, htypes.Void]
+	var g herrgroup.Group
+
+	var link func(ref *tref.Ref) error
+	link = func(ref *tref.Ref) error {
+		if _, loaded := dedup.LoadOrStore(tref.Format(ref), htypes.Void{}); loaded {
+			return nil
+		}
+
+		lldef, err := e.Link(ctx, rs, DefContainer{Ref: ref})
+		if err != nil {
+			return err
+		}
+
+		if deep {
+			g.Go(func() error {
+				var err error
+				for _, def := range lldef.Inputs {
+					err = link(def.GetRef())
+					if err != nil {
+						return err
+					}
+				}
+
+				return nil
+			})
+		}
+
+		return nil
+	}
+
+	for ref, err := range e.Query(ctx, rs, m) {
+		if err != nil {
+			return err
+		}
+
+		g.Go(func() error {
+			return link(ref)
+		})
+	}
+
+	return g.Wait()
+}
+
+func (e *Engine) DeepLink(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) error {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("CheckCyclic %v", tref.Format(ref)),
+		}
+	})
+	defer cleanLabels()
+
+	var dedup sync_map.Map[string, htypes.Void]
+	var g herrgroup.Group
+
+	var link func(ref *tref.Ref) error
+	link = func(ref *tref.Ref) error {
+		if _, loaded := dedup.LoadOrStore(tref.Format(ref), htypes.Void{}); loaded {
+			return nil
+		}
+
+		lldef, err := e.Link(ctx, rs, DefContainer{Ref: ref})
+		if err != nil {
+			return err
+		}
+
+		g.Go(func() error {
+			var err error
+			for _, def := range lldef.Inputs {
+				err = link(def.GetRef())
+				if err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+
+		return nil
+	}
+
+	err := link(ref)
+	if err != nil {
+		return err
+	}
+
+	return g.Wait()
+}
+
 func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
@@ -610,10 +742,25 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 		Inputs:    make([]*LightLinkedTargetInput, len(inputs)),
 	}
 
+	err := rs.dag.AddVertex(def.GetRef())
+	if err != nil && !hdag.IsDuplicateVertexError(err) {
+		return nil, err
+	}
+
 	var sf hsingleflight.GroupMem[string, *TargetDef]
 	var g herrgroup.Group
 	for i, input := range inputs {
 		depRef := tref.WithoutOut(input.GetRef())
+
+		err := rs.dag.AddVertex(depRef)
+		if err != nil && !hdag.IsDuplicateVertexError(err) {
+			return nil, err
+		}
+
+		err = rs.dag.AddEdge(depRef, def.GetRef())
+		if err != nil && !hdag.IsDuplicateEdgeError(err) {
+			return nil, err
+		}
 
 		g.Go(func() error {
 			linkedDep, err, _ := sf.Do(refKey(depRef), func() (*TargetDef, error) {

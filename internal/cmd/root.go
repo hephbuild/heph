@@ -14,6 +14,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hdebug"
+
 	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -105,9 +107,9 @@ var rootCmd = &cobra.Command{
 		}
 
 		if httpprofile.bool {
-			port := httpprofile.str
-			if port == "" {
-				port = "6060"
+			addr := httpprofile.str
+			if addr == "" {
+				addr = ":6060"
 			}
 
 			mux := http.NewServeMux()
@@ -118,7 +120,16 @@ var rootCmd = &cobra.Command{
 			mux.HandleFunc("/debug/pprof/trace", pprofhttp.Trace)
 
 			go func() {
-				err := http.ListenAndServe(":"+port, mux)
+				ctx, clean := hdebug.SetLabels(ctx, func() []string {
+					return []string{"where", "pprof server"}
+				})
+				defer clean()
+
+				h := hdebug.Middleware(mux, func() []string {
+					return []string{"where", "pprof server"}
+				})
+
+				err := http.ListenAndServe(addr, h) //nolint:gosec
 				if err != nil {
 					hlog.From(ctx).Error(fmt.Sprintf("pprof server: %v", err))
 				}
