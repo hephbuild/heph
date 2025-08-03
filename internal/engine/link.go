@@ -673,51 +673,6 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m *pluginv1.Ta
 	return g.Wait()
 }
 
-func (e *Engine) DeepLink(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) error {
-	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
-		return []string{
-			"where", fmt.Sprintf("CheckCyclic %v", tref.Format(ref)),
-		}
-	})
-	defer cleanLabels()
-
-	var dedup sync_map.Map[string, htypes.Void]
-	var g herrgroup.Group
-
-	var link func(ref *tref.Ref) error
-	link = func(ref *tref.Ref) error {
-		if _, loaded := dedup.LoadOrStore(tref.Format(ref), htypes.Void{}); loaded {
-			return nil
-		}
-
-		lldef, err := e.Link(ctx, rs, DefContainer{Ref: ref})
-		if err != nil {
-			return err
-		}
-
-		g.Go(func() error {
-			var err error
-			for _, def := range lldef.Inputs {
-				err = link(def.GetRef())
-				if err != nil {
-					return err
-				}
-			}
-
-			return nil
-		})
-
-		return nil
-	}
-
-	err := link(ref)
-	if err != nil {
-		return err
-	}
-
-	return g.Wait()
-}
-
 func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef) (*LightLinkedTarget, error) {
 	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
 	ctx = hstep.WithoutParent(ctx)
