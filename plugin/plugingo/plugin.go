@@ -202,7 +202,7 @@ func getMode(ref *pluginv1.TargetRef) (string, error) {
 }
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	if tref.HasPackagePrefix(req.GetRef().GetPackage(), "@heph/file") {
+	if _, ok := tref.ParseFile(req.GetRef()); ok {
 		return nil, pluginsdk.ErrNotFound
 	}
 

@@ -2,6 +2,7 @@ package tref
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 	"unsafe"
 
@@ -38,6 +39,17 @@ type RefableOut interface {
 
 func FormatFile(pkg string, file string) string {
 	return Format(New(JoinPackage("@heph/file", pkg), "content", map[string]string{"f": file}))
+}
+
+func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
+	rest, ok := CutPackagePrefix(ref.GetPackage(), "@heph/file")
+	if !ok {
+		return "", false
+	}
+
+	f := ref.GetArgs()["f"]
+
+	return filepath.Join(ToOSPath(rest), f), true
 }
 
 var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))

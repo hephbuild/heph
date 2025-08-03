@@ -2,14 +2,10 @@ package pluginfs
 
 import (
 	"context"
-	"errors"
-	"path/filepath"
-
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -49,14 +45,9 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	rest, ok := tref.CutPackagePrefix(req.GetRef().GetPackage(), "@heph/file")
+	path, ok := tref.ParseFile(req.GetRef())
 	if !ok {
 		return nil, pluginsdk.ErrNotFound
-	}
-
-	f := req.GetRef().GetArgs()["f"]
-	if f == "" {
-		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("missing f argument"))
 	}
 
 	return pluginv1.GetResponse_builder{
@@ -64,7 +55,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 			Ref:    req.GetRef(),
 			Driver: htypes.Ptr("fs_driver"),
 			Config: map[string]*structpb.Value{
-				"file": structpb.NewStringValue(filepath.Join(rest, f)),
+				"file": structpb.NewStringValue(path),
 			},
 		}.Build(),
 	}.Build(), nil

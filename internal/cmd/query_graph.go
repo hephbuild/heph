@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hdag"
@@ -70,11 +69,19 @@ func init() {
 					return hdag.Dot(
 						args.Stdout, dag,
 						hdag.WithVertexRenderer(func(v *pluginv1.TargetRef) string {
+							if path, ok := tref.ParseFile(v); ok {
+								return path
+							}
+
 							return tref.Format(v)
 						}),
 						hdag.WithNodeExtra(func(v *pluginv1.TargetRef) string {
 							if tref.Equal(v, ref) {
 								return `style="filled", fillcolor="lightgreen"`
+							}
+
+							if _, ok := tref.ParseFile(v); ok {
+								return `style="filled", fillcolor="lightgrey"`
 							}
 
 							return ""

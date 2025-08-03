@@ -42,7 +42,6 @@ digraph G  {
     fontname="Helvetica,Arial,sans-serif"
     node [fontname="Helvetica,Arial,sans-serif"]
     edge [fontname="Helvetica,Arial,sans-serif"]
-    rankdir="LR"
     node [fontsize=10, shape=box, height=0.25]
     edge [fontsize=10]
 
