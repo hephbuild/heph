@@ -6,6 +6,11 @@ type Config struct {
 	Providers []ConfigProvider
 	Drivers   []ConfigDriver
 	Caches    []ConfigCache
+	Packages ConfigPackages
+}
+
+type ConfigPackages struct {
+	Exclude []string
 }
 
 type ConfigProvider struct {

@@ -116,6 +116,18 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+		if _, ok := tref.CutPackagePrefix(req.GetPackage(), "@heph/go/std"); ok {
+			// TODO: std
+
+			return nil
+		}
+
+		if tref.HasPackagePrefix(req.GetPackage(), "@heph/go/thirdparty") {
+			// TODO
+
+			return nil
+		}
+
 		_, _, err := p.getGoModGoWork(ctx, req.GetPackage())
 		if err != nil {
 			if errors.Is(err, errNotInGoModule) {
@@ -131,18 +143,6 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			GOOS:      runtime.GOOS,
 			GOARCH:    runtime.GOARCH,
 		}} {
-			if _, ok := tref.CutPackagePrefix(req.GetPackage(), "@heph/go/std"); ok {
-				// TODO: std
-
-				return nil
-			}
-
-			if tref.HasPackagePrefix(req.GetPackage(), "@heph/go/thirdparty") {
-				// TODO
-
-				return nil
-			}
-
 			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetPackage(), factors, req.GetRequestId())
 			if err != nil {
 				if strings.Contains(err.Error(), "no Go files") {

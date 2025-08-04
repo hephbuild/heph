@@ -164,54 +164,23 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	case pluginv1.TargetMatcher_Label_case:
 		return MatchShrug
 	case pluginv1.TargetMatcher_CodegenPackage_case:
-		if !tref.HasPackagePrefix(pkg, m.GetCodegenPackage()) {
+		if !tref.HasPackagePrefix(m.GetCodegenPackage(), pkg) {
 			return MatchNo
 		}
 
 		return MatchShrug
 	case pluginv1.TargetMatcher_Or_case:
-		out := MatchNo
-		for _, matcher := range m.GetOr().GetItems() {
-			switch MatchPackage(pkg, matcher) {
-			case MatchYes:
-				out = MatchYes
-			case MatchNo:
-				// dont touch
-			case MatchShrug:
-				return MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runOr(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchPackage(pkg, m)
+		})
 	case pluginv1.TargetMatcher_And_case:
-		out := MatchYes
-		for _, matcher := range m.GetAnd().GetItems() {
-			switch MatchPackage(pkg, matcher) {
-			case MatchYes:
-				// dont touch
-			case MatchNo:
-				return MatchNo
-			case MatchShrug:
-				out = MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runAnd(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchPackage(pkg, m)
+		})
 	case pluginv1.TargetMatcher_Not_case:
-		switch MatchPackage(pkg, m.GetNot()) {
-		case MatchYes:
-			return MatchNo
-		case MatchNo:
-			return MatchYes
-		case MatchShrug:
-			return MatchShrug
-		default:
-			panic("unhandled result")
-		}
+		return runNot(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchPackage(pkg, m)
+		})
 	default:
 		panic("unhandled target matcher type")
 	}
@@ -238,50 +207,68 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 
 		return MatchShrug
 	case pluginv1.TargetMatcher_Or_case:
-		out := MatchNo
-		for _, matcher := range m.GetOr().GetItems() {
-			switch MatchSpec(spec, matcher) {
-			case MatchYes:
-				out = MatchYes
-			case MatchNo:
-				// dont touch
-			case MatchShrug:
-				return MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runOr(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchSpec(spec, m)
+		})
 	case pluginv1.TargetMatcher_And_case:
-		out := MatchYes
-		for _, matcher := range m.GetAnd().GetItems() {
-			switch MatchSpec(spec, matcher) {
-			case MatchYes:
-				// dont touch
-			case MatchNo:
-				return MatchNo
-			case MatchShrug:
-				out = MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runAnd(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchSpec(spec, m)
+		})
 	case pluginv1.TargetMatcher_Not_case:
-		switch MatchSpec(spec, m.GetNot()) {
+		return runNot(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchSpec(spec, m)
+		})
+	default:
+		panic("unhandled target matcher type")
+	}
+}
+
+func runAnd(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result) Result {
+	out := MatchYes
+	for _, matcher := range m.GetAnd().GetItems() {
+		switch fn(matcher) {
 		case MatchYes:
-			return MatchNo
+			// dont touch
 		case MatchNo:
-			return MatchYes
+			return MatchNo
+		case MatchShrug:
+			out = MatchShrug
+		default:
+			panic("unhandled result")
+		}
+	}
+
+	return out
+}
+
+func runOr(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result) Result {
+	out := MatchNo
+	for _, matcher := range m.GetOr().GetItems() {
+		switch fn(matcher) {
+		case MatchYes:
+			out = MatchYes
+		case MatchNo:
+			// dont touch
 		case MatchShrug:
 			return MatchShrug
 		default:
 			panic("unhandled result")
 		}
+	}
+
+	return out
+}
+
+func runNot(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result) Result {
+	switch fn(m.GetNot()) {
+	case MatchYes:
+		return MatchNo
+	case MatchNo:
+		return MatchYes
+	case MatchShrug:
+		return MatchShrug
 	default:
-		panic("unhandled target matcher type")
+		panic("unhandled result")
 	}
 }
 
@@ -300,6 +287,10 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 	case pluginv1.TargetMatcher_Label_case:
 		return boolToResult(slices.Contains(spec.GetLabels(), m.GetLabel()))
 	case pluginv1.TargetMatcher_CodegenPackage_case:
+		if !tref.HasPackagePrefix(m.GetCodegenPackage(), spec.GetRef().GetPackage()) {
+			return MatchNo
+		}
+
 		if len(def.GetCodegenTree()) == 0 {
 			return MatchNo
 		}
@@ -320,48 +311,17 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 
 		return MatchNo
 	case pluginv1.TargetMatcher_Or_case:
-		out := MatchNo
-		for _, matcher := range m.GetOr().GetItems() {
-			switch MatchDef(spec, def, matcher) {
-			case MatchYes:
-				out = MatchYes
-			case MatchNo:
-				// dont touch
-			case MatchShrug:
-				return MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runAnd(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchDef(spec, def, m)
+		})
 	case pluginv1.TargetMatcher_And_case:
-		out := MatchYes
-		for _, matcher := range m.GetAnd().GetItems() {
-			switch MatchDef(spec, def, matcher) {
-			case MatchYes:
-				// dont touch
-			case MatchNo:
-				return MatchNo
-			case MatchShrug:
-				out = MatchShrug
-			default:
-				panic("unhandled result")
-			}
-		}
-
-		return out
+		return runAnd(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchDef(spec, def, m)
+		})
 	case pluginv1.TargetMatcher_Not_case:
-		switch MatchDef(spec, def, m.GetNot()) {
-		case MatchYes:
-			return MatchNo
-		case MatchNo:
-			return MatchYes
-		case MatchShrug:
-			return MatchShrug
-		default:
-			panic("unhandled result")
-		}
+		return runNot(m, func(m *pluginv1.TargetMatcher) Result {
+			return MatchDef(spec, def, m)
+		})
 	default:
 		panic("unhandled target matcher type")
 	}
@@ -391,6 +351,10 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 				continue
 			}
 
+			if slices.Contains(roots, r) {
+				continue
+			}
+
 			roots = append(roots, r)
 		}
 
@@ -404,6 +368,10 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		for _, matcher := range m.GetAnd().GetItems() {
 			r := extractRoot(root, matcher)
 			if r == root {
+				continue
+			}
+
+			if slices.Contains(roots, r) {
 				continue
 			}
 

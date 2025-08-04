@@ -3,6 +3,7 @@ package enginee2e
 
 import (
 	"context"
+	plugincyclicprovider "github.com/hephbuild/heph/internal/enginee2e/pluginscyclicprovider"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -279,4 +280,39 @@ func TestCyclic3(t *testing.T) {
 			test.do(t, ctx, e, pkg, rs)
 		})
 	}
+}
+
+func TestCyclic4(t *testing.T) {
+	ctx := t.Context()
+
+	ctx, clean := hdebug.SetLabels(ctx, func() []string {
+		return []string{"where", "test main"}
+	})
+	defer clean()
+
+	dir := t.TempDir()
+
+	e, err := engine.New(ctx, dir, engine.Config{})
+	require.NoError(t, err)
+
+	_, err = e.RegisterProvider(ctx, plugincyclicprovider.New())
+	require.NoError(t, err)
+
+	_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
+	require.NoError(t, err)
+
+	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
+	require.NoError(t, err)
+
+	rs, clean := e.NewRequestState()
+	defer clean()
+
+	res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
+	require.NoError(t, err)
+
+	defer func() {
+		for _, re := range res {
+			re.Unlock(ctx)
+		}
+	}()
 }

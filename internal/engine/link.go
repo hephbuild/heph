@@ -178,6 +178,11 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 }
 
 func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer) (*pluginv1.TargetSpec, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{"where", "GetSpec " + tref.Format(c.GetRef())}
+	})
+	defer cleanLabels()
+
 	ctx, span := tracer.Start(ctx, "GetSpec", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
 
@@ -705,19 +710,19 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 	var sf hsingleflight.GroupMem[string, *TargetDef]
 	var g herrgroup.Group
 	for i, input := range inputs {
-		depRef := tref.WithoutOut(input.GetRef())
-
-		err := rs.dag.AddVertex(depRef)
-		if err != nil && !hdag.IsDuplicateVertexError(err) {
-			return nil, err
-		}
-
-		err = rs.dag.AddEdge(depRef, def.GetRef())
-		if err != nil && !hdag.IsDuplicateEdgeError(err) {
-			return nil, err
-		}
-
 		g.Go(func() error {
+			depRef := tref.WithoutOut(input.GetRef())
+
+			err := rs.dag.AddVertex(depRef)
+			if err != nil && !hdag.IsDuplicateVertexError(err) {
+				return err
+			}
+
+			err = rs.dag.AddEdge(depRef, def.GetRef())
+			if err != nil && !hdag.IsDuplicateEdgeError(err) {
+				return err
+			}
+
 			linkedDep, err, _ := sf.Do(refKey(depRef), func() (*TargetDef, error) {
 				return e.GetDef(ctx, rs, DefContainer{Ref: depRef})
 			})

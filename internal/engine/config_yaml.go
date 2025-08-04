@@ -13,6 +13,11 @@ type YAMLConfig struct {
 	Drivers   []YAMLConfigDriver   `yaml:"drivers"`
 	Caches    []YAMLConfigCache    `yaml:"caches"`
 	HomeDir   *string              `yaml:"homeDir"`
+	Packages  YAMLConfigPackages   `yaml:"packages"`
+}
+
+type YAMLConfigPackages struct {
+	Exclude []string `yaml:"exclude"`
 }
 
 type YAMLConfigProvider struct {
@@ -60,6 +65,8 @@ func ApplyYAMLConfig(cfg Config, inc YAMLConfig) (Config, error) {
 	if inc.HomeDir != nil {
 		cfg.HomeDir = *inc.HomeDir
 	}
+
+	cfg.Packages.Exclude = append(cfg.Packages.Exclude, inc.Packages.Exclude...)
 
 	for _, incc := range inc.Caches {
 		i := slices.IndexFunc(cfg.Caches, func(p ConfigCache) bool {

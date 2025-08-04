@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hsingleflight"
@@ -111,24 +112,34 @@ func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc, 
 }
 
 func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+	out := starlark.StringDict{}
+
 	fs := hfs.At(p.repoRoot, pkg)
-	// TODO: parametrize
-	f, err := hfs.Open(fs, "BUILD")
-	if err != nil {
-		if errors.Is(err, hfs.ErrNotExist) {
-			return starlark.StringDict{}, nil
+	for _, pattern := range p.Patterns {
+		err := hfs.Glob(ctx, fs, pattern, nil, func(path string, d hfs.DirEntry) error {
+			f, err := hfs.Open(fs, path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+
+			res, err := p.runFile(ctx, pkg, f, onTarget, onProviderState)
+			if err != nil {
+				return err
+			}
+
+			maps.Copy(out, res)
+
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
-
-		return nil, err
-	}
-	defer f.Close()
-
-	res, err := p.runFile(ctx, pkg, f, onTarget, onProviderState)
-	if err != nil {
-		return nil, err
 	}
 
-	return res, nil
+	out.Freeze()
+
+	return out, nil
 }
 
 type OnTargetPayload struct {

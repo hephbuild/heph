@@ -4,9 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hfs"
 	"iter"
-	"path/filepath"
-	"slices"
 	"sync"
 
 	"github.com/hephbuild/heph/internal/hdebug"
@@ -25,8 +24,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 			return false
 		}
 
-		// TODO: parametrize
-		if slices.Contains([]string{"node_modules", "dist"}, filepath.Base(path)) {
+		if ok, _ := hfs.PathMatchAny(path, e.PackagesExlude...); ok {
 			return false
 		}
 
@@ -118,10 +116,6 @@ func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1
 			if err != nil {
 				yield(nil, err)
 				return
-			}
-
-			if tmatch.MatchPackage(pkg, matcher) == tmatch.MatchNo {
-				continue
 			}
 
 			for _, provider := range e.Providers {

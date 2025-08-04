@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/hephbuild/heph/internal/hdebug"
 	"io"
 	"os"
 	"path"
@@ -241,6 +242,11 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 }
 
 func (p *Plugin) getGoPackageFromImportPath(ctx context.Context, imp string, factors Factors, c *GetGoPackageCache, requestId string) (Package, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{"where", "getGoPackageFromImportPath " + imp}
+	})
+	defer cleanLabels()
+
 	stdList, err := c.stdListRes()
 	if err != nil {
 		return Package{}, err
