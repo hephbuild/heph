@@ -1,12 +1,13 @@
 package tmatch
 
 import (
-	"github.com/hephbuild/heph/internal/htypes"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"github.com/stretchr/testify/assert"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/hephbuild/heph/internal/htypes"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/stretchr/testify/require"
 )
@@ -73,7 +74,7 @@ func TestPackages(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(dir, "hello/world"), os.ModePerm))
 
 	var pkgs []string
-	for pkg, err := range Packages(t.Context(), OSPackageProvider(dir, nil), nil) {
+	for pkg, err := range Packages(t.Context(), OSPackageProvider(dir, nil), pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("")}.Build()) {
 		require.NoError(t, err)
 
 		pkgs = append(pkgs, pkg)

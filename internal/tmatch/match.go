@@ -170,7 +170,7 @@ const (
 
 func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	if m == nil {
-		return MatchYes
+		return MatchNo
 	}
 
 	switch m.WhichItem() {
@@ -207,7 +207,7 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 
 func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 	if m == nil {
-		return MatchYes
+		return MatchNo
 	}
 
 	switch m.WhichItem() {
@@ -293,7 +293,7 @@ func runNot(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result
 
 func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.TargetMatcher) Result {
 	if m == nil {
-		return MatchYes
+		return MatchNo
 	}
 
 	switch m.WhichItem() {
