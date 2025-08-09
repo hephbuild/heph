@@ -95,11 +95,7 @@ func init() {
 				if err != nil {
 					return err
 				}
-				defer func() {
-					for _, res := range res {
-						res.Unlock(ctx)
-					}
-				}()
+				defer res.Unlock(ctx)
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {

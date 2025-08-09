@@ -3,6 +3,9 @@ package tmatch
 import (
 	"github.com/hephbuild/heph/internal/htypes"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/stretchr/testify/assert"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -62,4 +65,34 @@ func TestMatchPackageCodegen(t *testing.T) {
 			require.Equal(t, test.expected, res)
 		})
 	}
+}
+
+func TestPackages(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "foo/bar/baz"), os.ModePerm))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "hello/world"), os.ModePerm))
+
+	var pkgs []string
+	for pkg, err := range Packages(t.Context(), OSPackageProvider(dir, nil), nil) {
+		require.NoError(t, err)
+
+		pkgs = append(pkgs, pkg)
+	}
+
+	assert.Equal(t, []string{"", "foo", "foo/bar", "foo/bar/baz", "hello", "hello/world"}, pkgs)
+}
+
+func TestPackagesSubselection(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "foo/bar/baz"), os.ModePerm))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "hello/world"), os.ModePerm))
+
+	var pkgs []string
+	for pkg, err := range Packages(t.Context(), OSPackageProvider(dir, nil), pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("foo/bar")}.Build()) {
+		require.NoError(t, err)
+
+		pkgs = append(pkgs, pkg)
+	}
+
+	assert.Equal(t, []string{"foo/bar", "foo/bar/baz"}, pkgs)
 }

@@ -45,10 +45,6 @@ func init() {
 					return err
 				}
 
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-
 				fmt.Println(pkg)
 			}
 

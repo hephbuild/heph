@@ -4,26 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"os"
 	"slices"
-	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/hephbuild/heph/internal/hdag"
-	sync_map "github.com/zolstein/sync-map"
-
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
-
-	"github.com/hephbuild/heph/internal/hfs"
+	sync_map "github.com/zolstein/sync-map"
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/tref"
 
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -102,42 +95,7 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 
 	spec, err, computed := rs.memSpec.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
 		if ref := c.GetRef(); ref.GetPackage() == "@heph/query" {
-			items := []*pluginv1.TargetMatcher{}
-
-			if label, ok := ref.GetArgs()["label"]; ok {
-				items = append(items, pluginv1.TargetMatcher_builder{Label: proto.String(label)}.Build())
-			}
-
-			if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
-				items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
-			}
-
-			if len(items) == 0 {
-				return nil, errors.New("invalid query: empty selection")
-			}
-
-			var deps []string
-			for ref, err := range e.Query(ctx, rs, pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()) {
-				if err != nil {
-					if errors.Is(err, StackRecursionError{}) {
-						// hlog.From(ctx).Error("resolve specs query", "err", err)
-
-						continue
-					}
-
-					return nil, err
-				}
-
-				deps = append(deps, tref.Format(ref))
-			}
-
-			return pluginv1.TargetSpec_builder{
-				Ref:    ref,
-				Driver: htypes.Ptr(plugingroup.Name),
-				Config: map[string]*structpb.Value{
-					"deps": hstructpb.NewStringsValue(deps),
-				},
-			}.Build(), nil
+			return e.resolveSpecQuery(ctx, rs, ref)
 		}
 
 		for _, p := range e.Providers {
@@ -175,6 +133,45 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	}
 
 	return spec, nil
+}
+
+func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) (*pluginv1.TargetSpec, error) {
+	var items []*pluginv1.TargetMatcher
+
+	if label, ok := ref.GetArgs()["label"]; ok {
+		items = append(items, pluginv1.TargetMatcher_builder{Label: proto.String(label)}.Build())
+	}
+
+	if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
+		items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
+	}
+
+	if len(items) == 0 {
+		return nil, errors.New("invalid query: empty selection")
+	}
+
+	var deps []string
+	for ref, err := range e.Query(ctx, rs, pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()) {
+		if err != nil {
+			if errors.Is(err, StackRecursionError{}) {
+				// hlog.From(ctx).Error("resolve specs query", "err", err)
+
+				continue
+			}
+
+			return nil, err
+		}
+
+		deps = append(deps, tref.Format(ref))
+	}
+
+	return pluginv1.TargetSpec_builder{
+		Ref:    ref,
+		Driver: htypes.Ptr(plugingroup.Name),
+		Config: map[string]*structpb.Value{
+			"deps": hstructpb.NewStringsValue(deps),
+		},
+	}.Build(), nil
 }
 
 func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer) (*pluginv1.TargetSpec, error) {
@@ -276,168 +273,6 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 	}
 
 	panic("ref, spec or def must be specified")
-}
-
-type memSpecGetKey struct {
-	providerName, refKey string
-}
-
-type RequestStateData struct {
-	InteractiveExec func(context.Context, InteractiveExecOptions) error
-	Shell           *pluginv1.TargetRef
-	Force           *pluginv1.TargetMatcher
-	Interactive     *pluginv1.TargetRef
-
-	memSpecGet hsingleflight.GroupMemContext[memSpecGetKey, *pluginv1.TargetSpec]
-	memSpec    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
-	// memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
-	memMeta hsingleflight.GroupMemContext[string, *Meta]
-
-	memLink hsingleflight.GroupMemContext[string, *LightLinkedTarget]
-	memDef  hsingleflight.GroupMemContext[string, *TargetDef]
-
-	memResult  hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
-	memExecute hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
-
-	dag *hdag.DAG[*pluginv1.TargetRef]
-}
-
-type traceStackEntry struct {
-	fun string
-	id1 string
-	id2 string
-}
-
-type RequestState struct {
-	ID string
-
-	*RequestStateData
-
-	traceStack Stack[traceStackEntry]
-}
-
-func (s *RequestState) Trace(fun, id string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: fun, id1: id})
-}
-
-func (s *RequestState) HasTrace(fun, id string) bool {
-	return s.traceStack.Has(traceStackEntry{fun: fun, id1: id})
-}
-
-func (s *RequestState) TraceList(name string, pkg string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "List", id1: name, id2: pkg})
-}
-
-func (s *RequestState) TraceResolveProvider(format string, name string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "ResolveProvider", id1: format, id2: name})
-}
-
-func (s *RequestState) TraceQueryListProvider(format string, name string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "QueryListProvider", id1: format, id2: name})
-}
-
-func (s *RequestState) traceStackPush(e traceStackEntry) (*RequestState, error) {
-	stack, err := s.traceStack.Push(e)
-	if err != nil {
-		return nil, err
-	}
-
-	return &RequestState{
-		ID:               uuid.New().String(),
-		RequestStateData: s.RequestStateData,
-		traceStack:       stack,
-	}, nil
-}
-
-type Stack[K comparable] struct {
-	m           map[K]*K
-	first       *K
-	last        *K
-	debugString string
-}
-
-type StackRecursionError struct {
-	printer func() string
-}
-
-func (e StackRecursionError) Error() string {
-	return fmt.Sprintf("stack recursion detected: %v", e.printer())
-}
-
-func (e StackRecursionError) Print() string {
-	return e.printer()
-}
-
-func (e StackRecursionError) Is(err error) bool {
-	_, ok := err.(StackRecursionError)
-
-	return ok
-}
-
-func (s Stack[K]) Has(k K) bool {
-	_, ok := s.m[k]
-
-	return ok
-}
-
-var enableStackDebug = sync.OnceValue(func() bool {
-	v, _ := strconv.ParseBool(os.Getenv("HEPH_DEBUG_STACK"))
-
-	return v
-})
-
-func (s Stack[K]) Push(k K) (Stack[K], error) {
-	if _, ok := s.m[k]; ok {
-		return s, StackRecursionError{
-			printer: func() string {
-				return s.StringWith(" -> ", k)
-			},
-		}
-	}
-
-	s.m = maps.Clone(s.m)
-	if s.m == nil {
-		s.m = map[K]*K{}
-		s.first = &k
-	}
-	if s.last != nil {
-		s.m[*s.last] = &k
-	}
-	s.m[k] = nil
-	s.last = &k
-
-	if enableStackDebug() {
-		s.debugString = s.StringWith("\n")
-	}
-
-	return s, nil
-}
-
-func (s Stack[K]) String() string {
-	return s.StringWith(" -> ")
-}
-
-func (s Stack[K]) StringWith(sep string, v ...K) string {
-	var buf strings.Builder
-	next := s.first
-	for next != nil {
-		current := *next
-
-		if buf.Len() > 0 {
-			buf.WriteString(sep)
-		}
-
-		fmt.Fprintf(&buf, "%v", current)
-
-		next = s.m[current]
-	}
-
-	if len(v) > 0 {
-		buf.WriteString(sep)
-		fmt.Fprintf(&buf, "%v", v[0])
-	}
-
-	return buf.String()
 }
 
 type TargetDef struct {

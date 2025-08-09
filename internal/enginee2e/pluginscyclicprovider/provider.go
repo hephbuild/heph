@@ -72,6 +72,10 @@ func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigReque
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
 		for _, spec := range p.targets() {
+			if spec.GetRef().GetPackage() != req.GetPackage() {
+				continue
+			}
+
 			err := send(pluginv1.ListResponse_builder{
 				Spec: spec,
 			}.Build())
@@ -85,6 +89,10 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
+	if req.GetRef().GetPackage() != "some/package" {
+		return nil, pluginsdk.ErrNotFound
+	}
+
 	_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(req.GetRequestId()),
 		Spec: pluginv1.TargetSpec_builder{

@@ -295,6 +295,8 @@ func TestCyclic4(t *testing.T) {
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
 
+	e.WellKnownPackages = []string{"", "some", "some/package"}
+
 	_, err = e.RegisterProvider(ctx, plugincyclicprovider.New())
 	require.NoError(t, err)
 
@@ -309,10 +311,5 @@ func TestCyclic4(t *testing.T) {
 
 	res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 	require.NoError(t, err)
-
-	defer func() {
-		for _, re := range res {
-			re.Unlock(ctx)
-		}
-	}()
+	defer res.Unlock(ctx)
 }

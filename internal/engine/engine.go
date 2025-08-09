@@ -90,6 +90,8 @@ type Engine struct {
 	Sandbox  hfs.OS
 	RootSpan trace.Span
 
+	WellKnownPackages []string // For testing, for now...
+
 	CoreHandle EngineHandle
 
 	Providers     []EngineProvider

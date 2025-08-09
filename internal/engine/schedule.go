@@ -94,9 +94,25 @@ func (e *Engine) ResultFromSpec(ctx context.Context, rs *RequestState, spec *plu
 	return e.result(ctx, rs, DefContainer{Spec: spec}, outputs, false)
 }
 
-func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) ([]*ExecuteResultLocks, error) {
+type ExecuteResultsLocks []*ExecuteResultLocks
+
+func (r ExecuteResultsLocks) Unlock(ctx context.Context) {
+	for _, re := range r {
+		re.Unlock(ctx)
+	}
+}
+
+func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) (ExecuteResultsLocks, error) {
 	ctx, span := tracer.Start(ctx, "ResultsFromMatcher")
 	defer span.End()
+
+	rs, err := rs.Trace("ResultsFromMatcher", matcher.String())
+	if err != nil {
+		return nil, err
+	}
+
+	clean := e.StoreRequestState(rs)
+	defer clean()
 
 	var out []*ExecuteResultLocks
 	var outm sync.Mutex
@@ -132,7 +148,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 		return nil, errors.New("did not match any target")
 	}
 
-	err := g.Wait()
+	err = g.Wait()
 	if err != nil {
 		for _, locks := range out {
 			locks.Unlock(ctx)

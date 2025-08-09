@@ -2,8 +2,6 @@ package tmatch
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io/fs"
 	"iter"
 	"os"
@@ -37,42 +35,34 @@ func (c *cachedFs) ReadDir(name string) ([]fs.DirEntry, error) {
 // TODO: move to context or something like that
 var fsCaches sync_map.Map[string, *cachedFs]
 
-func walkDirs(ctx context.Context, root string, fn func(path string) error) error {
-	wfs := os.DirFS(root)
-	if rdfs, ok := wfs.(fs.ReadDirFS); ok {
-		wfs, _ = fsCaches.LoadOrStore(root, &cachedFs{ReadDirFS: rdfs})
-	}
-
-	return fs.WalkDir(wfs, ".", func(path string, d fs.DirEntry, err error) error {
-		if d == nil || !d.IsDir() {
-			return nil
-		}
-
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-
-		if err != nil {
-			return err
-		}
-
-		path = filepath.Join(root, path)
-
-		return fn(path)
-	})
-}
-
-func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filter func(path string) bool) iter.Seq2[string, error] {
+func walkDirs(ctx context.Context, walkRoot, root string, filter func(path string) bool) iter.Seq2[string, error] {
 	if filter == nil {
 		filter = func(path string) bool {
 			return true
 		}
 	}
 
-	walkRoot := extractRoot(root, m)
+	wfs := os.DirFS(walkRoot)
+	if rdfs, ok := wfs.(fs.ReadDirFS); ok {
+		wfs, _ = fsCaches.LoadOrStore(walkRoot, &cachedFs{ReadDirFS: rdfs})
+	}
 
 	return func(yield func(string, error) bool) {
-		err := walkDirs(ctx, walkRoot, func(path string) error {
+		err := fs.WalkDir(wfs, ".", func(path string, d fs.DirEntry, err error) error {
+			if d == nil || !d.IsDir() {
+				return nil
+			}
+
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			if err != nil {
+				return err
+			}
+
+			path = filepath.Join(walkRoot, path)
+
 			if !filter(path) {
 				return fs.SkipDir
 			}
@@ -82,10 +72,6 @@ func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filte
 				return err
 			}
 
-			if MatchPackage(pkg, m) == MatchNo {
-				return nil
-			}
-
 			if !yield(pkg, nil) {
 				return fs.SkipAll
 			}
@@ -93,11 +79,40 @@ func Packages(ctx context.Context, root string, m *pluginv1.TargetMatcher, filte
 			return nil
 		})
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				err = fmt.Errorf("%v doesnt exist", walkRoot)
+			if !yield("", err) {
+				return
+			}
+		}
+	}
+}
+
+type PackageProvider = func(ctx context.Context, basePkg string) iter.Seq2[string, error]
+
+func OSPackageProvider(root string, filter func(path string) bool) PackageProvider {
+	return func(ctx context.Context, basePkg string) iter.Seq2[string, error] {
+		walkRoot := filepath.Join(root, tref.ToOSPath(basePkg))
+
+		return walkDirs(ctx, walkRoot, root, filter)
+	}
+}
+
+func Packages(ctx context.Context, p PackageProvider, m *pluginv1.TargetMatcher) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		basePkg, _ := extractRoot(m)
+
+		for pkg, err := range p(ctx, basePkg) {
+			if err != nil {
+				yield("", err)
+				return
 			}
 
-			yield("", err)
+			if MatchPackage(pkg, m) == MatchNo {
+				continue
+			}
+
+			if !yield(pkg, nil) {
+				break
+			}
 		}
 	}
 }
@@ -154,6 +169,10 @@ const (
 )
 
 func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
+	if m == nil {
+		return MatchYes
+	}
+
 	switch m.WhichItem() {
 	case pluginv1.TargetMatcher_Ref_case:
 		return boolToResult(m.GetRef().GetPackage() == pkg)
@@ -182,13 +201,13 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 			return MatchPackage(pkg, m)
 		})
 	default:
-		panic("unhandled target matcher type")
+		panic("unhandled target matcher type: " + m.String())
 	}
 }
 
 func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 	if m == nil {
-		return MatchNo
+		return MatchYes
 	}
 
 	switch m.WhichItem() {
@@ -219,7 +238,7 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 			return MatchSpec(spec, m)
 		})
 	default:
-		panic("unhandled target matcher type")
+		panic("unhandled target matcher type: " + m.String())
 	}
 }
 
@@ -274,7 +293,7 @@ func runNot(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result
 
 func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.TargetMatcher) Result {
 	if m == nil {
-		return MatchNo
+		return MatchYes
 	}
 
 	switch m.WhichItem() {
@@ -311,7 +330,7 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 
 		return MatchNo
 	case pluginv1.TargetMatcher_Or_case:
-		return runAnd(m, func(m *pluginv1.TargetMatcher) Result {
+		return runOr(m, func(m *pluginv1.TargetMatcher) Result {
 			return MatchDef(spec, def, m)
 		})
 	case pluginv1.TargetMatcher_And_case:
@@ -323,31 +342,31 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 			return MatchDef(spec, def, m)
 		})
 	default:
-		panic("unhandled target matcher type")
+		panic("unhandled target matcher type: " + m.String())
 	}
 }
 
-func extractRoot(root string, m *pluginv1.TargetMatcher) string {
+func extractRoot(m *pluginv1.TargetMatcher) (string, bool) {
 	if m == nil {
-		return root
+		return "", false
 	}
 
 	switch m.WhichItem() {
 	case pluginv1.TargetMatcher_Ref_case:
-		return filepath.Join(root, tref.ToOSPath(m.GetRef().GetPackage()))
+		return m.GetRef().GetPackage(), true
 	case pluginv1.TargetMatcher_Package_case:
-		return filepath.Join(root, tref.ToOSPath(m.GetPackage()))
+		return m.GetPackage(), true
 	case pluginv1.TargetMatcher_PackagePrefix_case:
-		return filepath.Join(root, tref.ToOSPath(m.GetPackagePrefix()))
+		return m.GetPackagePrefix(), true
 	case pluginv1.TargetMatcher_Label_case:
-		return root
+		return "", false
 	case pluginv1.TargetMatcher_CodegenPackage_case:
-		return root
+		return "", false
 	case pluginv1.TargetMatcher_Or_case:
 		var roots []string
 		for _, matcher := range m.GetOr().GetItems() {
-			r := extractRoot(root, matcher)
-			if r == root {
+			r, ok := extractRoot(matcher)
+			if !ok {
 				continue
 			}
 
@@ -359,15 +378,15 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		}
 
 		if len(roots) == 1 {
-			return roots[0]
+			return roots[0], true
 		}
 
-		return root // TODO array
+		return "", false // TODO array
 	case pluginv1.TargetMatcher_And_case:
 		var roots []string
 		for _, matcher := range m.GetAnd().GetItems() {
-			r := extractRoot(root, matcher)
-			if r == root {
+			r, ok := extractRoot(matcher)
+			if !ok {
 				continue
 			}
 
@@ -379,13 +398,13 @@ func extractRoot(root string, m *pluginv1.TargetMatcher) string {
 		}
 
 		if len(roots) == 1 {
-			return roots[0]
+			return roots[0], true
 		}
 
-		return root // TODO find smallest denominator
+		return "", false // TODO find smallest denominator
 	case pluginv1.TargetMatcher_Not_case:
-		return root
+		return "", false
 	default:
-		panic("unhandled target matcher type")
+		panic("unhandled target matcher type: " + m.String())
 	}
 }
