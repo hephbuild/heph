@@ -10,7 +10,6 @@ import (
 	"github.com/hephbuild/heph/internal/engine"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/spf13/cobra"
-	"google.golang.org/protobuf/proto"
 )
 
 func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
@@ -42,7 +41,7 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 			return nil, err
 		}
 
-		return pluginv1.TargetMatcher_builder{Ref: proto.ValueOrDefault(ref)}.Build(), nil
+		return tmatch.Ref(ref), nil
 	case 2:
 		pkgMatcher, err := tmatch.ParsePackageMatcher(args[1], cwd, root)
 		if err != nil {
@@ -54,10 +53,10 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 		}
 		label := args[0]
 		if label != "all" {
-			matchers = append(matchers, pluginv1.TargetMatcher_builder{Label: proto.String(label)}.Build())
+			matchers = append(matchers, tmatch.Label(label))
 		}
 
-		return pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: matchers}.Build()}.Build(), nil
+		return tmatch.And(matchers...), nil
 	default:
 		panic("unhandled")
 	}

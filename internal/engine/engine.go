@@ -80,7 +80,7 @@ var getRoot = sync.OnceValues(func() (string, error) {
 
 type EngineHandle struct {
 	ServerHandle
-	pluginsdk.Engine
+	Engine func(pluginName string) pluginsdk.Engine
 }
 
 type Engine struct {
@@ -172,10 +172,12 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
-		Engine: pluginsdk.Engine{
-			LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
-			StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-			ResultClient: e.Resulter(),
+		Engine: func(pluginName string) pluginsdk.Engine {
+			return pluginsdk.Engine{
+				LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
+				StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
+				ResultClient: e.Resulter(),
+			}
 		},
 	}
 
@@ -188,7 +190,7 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 	s := &RequestState{
 		ID: id,
 		RequestStateData: &RequestStateData{
-			dag: hdag.New(func(v *pluginv1.TargetRef) string {
+			dag: hdag.NewMeta[*pluginv1.TargetRef, string](func(v *pluginv1.TargetRef) string {
 				return tref.Format(v)
 			}),
 		},

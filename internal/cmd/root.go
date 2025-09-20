@@ -75,6 +75,11 @@ var rootCmd = &cobra.Command{
 			levelVar.Set(slog.LevelInfo)
 		}
 
+		ctx, clean := hdebug.SetLabels(ctx, func() []string {
+			return []string{"where", "cmd " + strings.Join(args, " ")}
+		})
+		defer clean()
+
 		if true {
 			var err error
 			otelShutdown, err := setupOTelSDK(ctx)

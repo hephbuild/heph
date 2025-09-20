@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"iter"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"iter"
 )
 
 func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
@@ -90,7 +91,7 @@ type seenPkgKey struct {
 	pkg   string
 }
 
-func (e *Engine) match(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher) (tmatch.Result, error) {
+func (e *Engine) match(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, matcher *pluginv1.TargetMatcher, opts queryOptions) (tmatch.Result, error) {
 	if r := tmatch.MatchPackage(ref.GetPackage(), matcher); r.Definitive() {
 		return r, nil
 	}
@@ -116,55 +117,17 @@ func (e *Engine) match(ctx context.Context, rs *RequestState, ref *pluginv1.Targ
 	return tmatch.MatchShrug, nil
 }
 
-func (e *Engine) query1(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
-	return func(yield func(*pluginv1.TargetRef, error) bool) {
-		seenPkg := map[seenPkgKey]struct{}{}
-		seenRef := map[string]struct{}{}
-
-		for pkg, err := range e.Packages(ctx, matcher) {
-			if err != nil {
-				yield(nil, err)
-				return
-			}
-
-			for _, provider := range e.Providers {
-				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
-					if err != nil {
-						if errors.Is(err, StackRecursionError{}) {
-							continue
-						}
-
-						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
-						continue
-					}
-
-					refstr := tref.Format(ref)
-
-					if _, ok := seenRef[refstr]; ok {
-						continue
-					}
-					seenRef[refstr] = struct{}{}
-
-					res, err := e.match(ctx, rs, ref, matcher)
-					if err != nil {
-						yield(nil, err)
-						return
-					}
-
-					if res == tmatch.MatchNo {
-						continue
-					}
-
-					if !yield(ref, nil) {
-						return
-					}
-				}
-			}
-		}
-	}
+type queryOptions struct {
+	filterProvider func(p EngineProvider) bool
 }
 
-func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher, opts queryOptions) iter.Seq2[*pluginv1.TargetRef, error] {
+	if opts.filterProvider == nil {
+		opts.filterProvider = func(p EngineProvider) bool {
+			return true
+		}
+	}
+
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
 			"where", fmt.Sprintf("Query %v", matcher.String()),
@@ -190,5 +153,57 @@ func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 		}
 	}
 
-	return e.query1(ctx, rs, matcher)
+	return func(yield func(*pluginv1.TargetRef, error) bool) {
+		seenPkg := map[seenPkgKey]struct{}{}
+		seenRef := map[string]struct{}{}
+
+		for pkg, err := range e.Packages(ctx, matcher) {
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			for _, provider := range e.Providers {
+				if !opts.filterProvider(provider) {
+					continue
+				}
+
+				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
+					if err != nil {
+						if errors.Is(err, StackRecursionError{}) {
+							continue
+						}
+
+						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
+						continue
+					}
+
+					refstr := tref.Format(ref)
+
+					if _, ok := seenRef[refstr]; ok {
+						continue
+					}
+					seenRef[refstr] = struct{}{}
+
+					res, err := e.match(ctx, rs, ref, matcher, opts)
+					if err != nil {
+						yield(nil, err)
+						return
+					}
+
+					if res == tmatch.MatchNo {
+						continue
+					}
+
+					if !yield(ref, nil) {
+						return
+					}
+				}
+			}
+		}
+	}
+}
+
+func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
+	return e.query(ctx, rs, matcher, queryOptions{})
 }

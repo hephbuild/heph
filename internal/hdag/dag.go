@@ -2,17 +2,27 @@ package hdag
 
 import (
 	"errors"
+	"fmt"
 	"iter"
+	"slices"
+	"sync"
 
 	"github.com/heimdalr/dag"
 )
 
-type DAG[V any] struct {
-	d    *dag.DAG
-	hash func(V) string
+type edgeMetaKey struct {
+	src, dst string
 }
 
-func New[V any](fn func(V) string) *DAG[V] {
+type DAG[V any, M comparable] struct {
+	d    *dag.DAG
+	hash func(V) string
+
+	mu       sync.Mutex
+	edgeMeta map[edgeMetaKey][]M
+}
+
+func NewMeta[V any, M comparable](fn func(V) string) *DAG[V, M] {
 	d := dag.NewDAG()
 	d.Options(dag.Options{
 		VertexHashFunc: func(v any) any {
@@ -24,21 +34,58 @@ func New[V any](fn func(V) string) *DAG[V] {
 		},
 	})
 
-	return &DAG[V]{
-		d:    d,
-		hash: fn,
+	return &DAG[V, M]{
+		d:        d,
+		hash:     fn,
+		edgeMeta: map[edgeMetaKey][]M{},
 	}
 }
 
-func (d *DAG[V]) AddVertex(v V) error {
+func New[V any](fn func(V) string) *DAG[V, struct{}] {
+	return NewMeta[V, struct{}](fn)
+}
+
+func (d *DAG[V, M]) AddVertex(v V) error {
 	return d.d.AddVertexByID(d.hash(v), v)
 }
 
-func (d *DAG[V]) AddEdge(src, dst V) error {
-	return d.d.AddEdge(d.hash(src), d.hash(dst))
+func (d *DAG[V, M]) AddEdge(src, dst V) error {
+	var meta M
+
+	return d.AddEdgeMeta(src, dst, meta)
 }
 
-func (d *DAG[V]) getVertex(id string) (V, error) {
+var ErrDuplicateEdgeMeta = errors.New("duplicate edge meta")
+
+func (d *DAG[V, M]) AddEdgeMeta(src, dst V, meta M) error {
+	srcId, dstId := d.hash(src), d.hash(dst)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	metaKey := edgeMetaKey{src: srcId, dst: dstId}
+	if slices.Contains(d.edgeMeta[metaKey], meta) {
+		return ErrDuplicateEdgeMeta
+	}
+
+	err := d.d.AddEdge(srcId, dstId)
+	if err != nil && !IsDuplicateEdgeError(err) {
+		return fmt.Errorf("%v: %w", meta, err)
+	}
+
+	d.edgeMeta[metaKey] = append(d.edgeMeta[metaKey], meta)
+
+	return nil
+}
+
+func (d *DAG[V, M]) GetEdgeMeta(src, dst V) []M {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.edgeMeta[edgeMetaKey{src: d.hash(src), dst: d.hash(dst)}]
+}
+
+func (d *DAG[V, M]) getVertex(id string) (V, error) {
 	v, err := d.d.GetVertex(id)
 	if err != nil {
 		var zero V
@@ -48,7 +95,7 @@ func (d *DAG[V]) getVertex(id string) (V, error) {
 	return v.(V), nil //nolint:errcheck
 }
 
-func (d *DAG[V]) vertexes(m map[string]any) iter.Seq2[string, V] {
+func (d *DAG[V, M]) vertexes(m map[string]any) iter.Seq2[string, V] {
 	return func(yield func(string, V) bool) {
 		for id := range m {
 			v, err := d.getVertex(id)
@@ -63,11 +110,11 @@ func (d *DAG[V]) vertexes(m map[string]any) iter.Seq2[string, V] {
 	}
 }
 
-func (d *DAG[V]) GetVertices() iter.Seq2[string, V] {
+func (d *DAG[V, M]) GetVertices() iter.Seq2[string, V] {
 	return d.vertexes(d.d.GetVertices())
 }
 
-func (d *DAG[V]) GetParents(v V) iter.Seq2[string, V] {
+func (d *DAG[V, M]) GetParents(v V) iter.Seq2[string, V] {
 	m, err := d.d.GetParents(d.hash(v))
 	if err != nil { // only unsane id
 		panic(err)
@@ -76,7 +123,7 @@ func (d *DAG[V]) GetParents(v V) iter.Seq2[string, V] {
 	return d.vertexes(m)
 }
 
-func (d *DAG[V]) GetChildren(v V) iter.Seq2[string, V] {
+func (d *DAG[V, M]) GetChildren(v V) iter.Seq2[string, V] {
 	m, err := d.d.GetChildren(d.hash(v))
 	if err != nil { // only unsane id
 		panic(err)
@@ -85,7 +132,7 @@ func (d *DAG[V]) GetChildren(v V) iter.Seq2[string, V] {
 	return d.vertexes(m)
 }
 
-func (d *DAG[V]) GetAncestorsGraph(v V) (*DAG[V], error) {
+func (d *DAG[V, M]) GetAncestorsGraph(v V) (*DAG[V, M], error) {
 	sd, _, err := d.d.GetAncestorsGraph(d.hash(v))
 	if err != nil {
 		return nil, err
@@ -94,8 +141,8 @@ func (d *DAG[V]) GetAncestorsGraph(v V) (*DAG[V], error) {
 	return repopulate(d, sd), nil
 }
 
-func repopulate[V any](src *DAG[V], idd *dag.DAG) *DAG[V] {
-	rd := New[V](src.hash)
+func repopulate[V any, M comparable](src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
+	rd := NewMeta[V, M](src.hash)
 	idd.BFSWalk(funcVisitor(func(vertexer dag.Vertexer) {
 		id, srcIda := vertexer.Vertex()
 		srcId := srcIda.(string) //nolint:errcheck
@@ -128,9 +175,12 @@ func repopulate[V any](src *DAG[V], idd *dag.DAG) *DAG[V] {
 				panic(err)
 			}
 
-			err = rd.AddEdge(v, child)
-			if err != nil && !IsDuplicateEdgeError(err) {
-				panic(err)
+			metas := src.GetEdgeMeta(v, child)
+			for _, meta := range metas {
+				err = rd.AddEdgeMeta(v, child, meta)
+				if err != nil && !IsDuplicateEdgeError(err) {
+					panic(err)
+				}
 			}
 		}
 	}))
@@ -138,7 +188,7 @@ func repopulate[V any](src *DAG[V], idd *dag.DAG) *DAG[V] {
 	return rd
 }
 
-func (d *DAG[V]) GetDescendantsGraph(v V) (*DAG[V], error) {
+func (d *DAG[V, M]) GetDescendantsGraph(v V) (*DAG[V, M], error) {
 	sd, _, err := d.d.GetDescendantsGraph(d.hash(v))
 	if err != nil {
 		return nil, err
@@ -147,7 +197,7 @@ func (d *DAG[V]) GetDescendantsGraph(v V) (*DAG[V], error) {
 	return repopulate(d, sd), nil
 }
 
-func (d *DAG[V]) GetGraph(v V) (*DAG[V], error) {
+func (d *DAG[V, M]) GetGraph(v V) (*DAG[V, M], error) {
 	sd, err := d.GetAncestorsGraph(v)
 	if err != nil {
 		return nil, err
@@ -170,9 +220,12 @@ func (d *DAG[V]) GetGraph(v V) (*DAG[V], error) {
 				return err
 			}
 
-			err = sd.AddEdge(desc, child)
-			if err != nil && !IsDuplicateEdgeError(err) {
-				return err
+			metas := descd.GetEdgeMeta(desc, child)
+			for _, meta := range metas {
+				err = sd.AddEdgeMeta(desc, child, meta)
+				if err != nil && !IsDuplicateEdgeError(err) {
+					return err
+				}
 			}
 		}
 
@@ -185,7 +238,7 @@ func (d *DAG[V]) GetGraph(v V) (*DAG[V], error) {
 	return sd, nil
 }
 
-func (d *DAG[V]) BFSWalk(visitor func(V) error) error {
+func (d *DAG[V, M]) BFSWalk(visitor func(V) error) error {
 	var err error
 	d.d.BFSWalk(funcVisitor(func(vertexer dag.Vertexer) {
 		if err != nil {
@@ -204,6 +257,15 @@ func (d *DAG[V]) BFSWalk(visitor func(V) error) error {
 	return err
 }
 
+func (d *DAG[V, M]) IsEdge(src, dst V) bool {
+	is, err := d.d.IsEdge(d.hash(src), d.hash(dst))
+	if err != nil {
+		panic(err)
+	}
+
+	return is
+}
+
 type funcVisitor func(dag.Vertexer)
 
 func (f funcVisitor) Visit(v dag.Vertexer) {
@@ -215,5 +277,5 @@ func IsDuplicateVertexError(err error) bool {
 }
 
 func IsDuplicateEdgeError(err error) bool {
-	return errors.As(err, &dag.EdgeDuplicateError{})
+	return errors.As(err, &dag.EdgeDuplicateError{}) || errors.Is(err, ErrDuplicateEdgeMeta)
 }

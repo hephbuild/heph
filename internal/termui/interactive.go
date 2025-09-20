@@ -145,8 +145,9 @@ func (m Model) View() string {
 
 	return lipgloss.NewStyle().
 		Renderer(m.renderer).
-		MaxWidth(m.width).
-		MaxHeight(m.height / 2).
+		// TODO: Not sure why this breaks the output
+		//MaxWidth(m.width).
+		//MaxHeight(m.height / 2).
 		Render(sb.String())
 }
 

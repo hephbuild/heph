@@ -3,8 +3,12 @@ package enginee2e
 
 import (
 	"context"
-	plugincyclicprovider "github.com/hephbuild/heph/internal/enginee2e/pluginscyclicprovider"
+	"runtime"
 	"testing"
+	"time"
+
+	plugincyclicprovider "github.com/hephbuild/heph/internal/enginee2e/pluginscyclicprovider"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/hephbuild/heph/internal/htypes"
 
@@ -284,6 +288,18 @@ func TestCyclic3(t *testing.T) {
 
 func TestCyclic4(t *testing.T) {
 	ctx := t.Context()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				if runtime.NumGoroutine() > 1000 {
+					panic("too many goroutines")
+				}
+			}
+		}
+	}()
 
 	ctx, clean := hdebug.SetLabels(ctx, func() []string {
 		return []string{"where", "test main"}
@@ -312,4 +328,6 @@ func TestCyclic4(t *testing.T) {
 	res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
+
+	assert.Len(t,  res, 2)
 }

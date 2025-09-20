@@ -1,8 +1,8 @@
 module github.com/hephbuild/heph
 
-go 1.24
+go 1.24.0
 
-toolchain go1.24.5
+toolchain go1.25.0
 
 tool github.com/cerbos/protoc-gen-go-hashpb
 
@@ -15,7 +15,7 @@ tool (
 	google.golang.org/protobuf
 )
 
-replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20250529082417-38d0d515cbfb
+replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20250913103120-6b2cb9e60fba
 
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
@@ -25,7 +25,7 @@ require (
 	github.com/Code-Hex/go-generics-cache v1.5.1
 	github.com/alecthomas/participle/v2 v2.1.1
 	github.com/bmatcuk/doublestar/v4 v4.7.1
-	github.com/charmbracelet/bubbletea v1.3.6-0.20250513162750-78ed49b060c8
+	github.com/charmbracelet/bubbletea v1.3.9
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/term v0.2.1
 	github.com/creack/pty v1.1.20
@@ -62,7 +62,7 @@ require (
 	go.uber.org/mock v0.5.2
 	golang.org/x/net v0.39.0
 	golang.org/x/sync v0.14.0
-	golang.org/x/sys v0.33.0
+	golang.org/x/sys v0.36.0
 	google.golang.org/protobuf v1.36.7-0.20250625222701-8e8926ef675d
 )
 
@@ -82,7 +82,7 @@ require (
 	github.com/cerbos/protoc-gen-go-hashpb v0.4.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/charmbracelet/colorprofile v0.2.3-0.20250311203215-f60798e515dc // indirect
-	github.com/charmbracelet/x/ansi v0.9.2 // indirect
+	github.com/charmbracelet/x/ansi v0.10.1 // indirect
 	github.com/charmbracelet/x/cellbuf v0.0.13-0.20250311204145-2c3ea96c31dd // indirect
 	github.com/cncf/xds/go v0.0.0-20250121191232-2f005788dc42 // indirect
 	github.com/colega/zeropool v0.0.0-20230505084239-6fb4a4f75381 // indirect

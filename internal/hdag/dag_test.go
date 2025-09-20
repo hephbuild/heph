@@ -53,3 +53,20 @@ func TestGetVertices(t *testing.T) {
 	}
 	assert.ElementsMatch(t, []int{1, 2, 3}, collected)
 }
+
+func TestMeta(t *testing.T) {
+	d := NewMeta[int, string](func(i int) string {
+		return fmt.Sprintf("node-%v", i)
+	})
+
+	require.NoError(t, d.AddVertex(1))
+	require.NoError(t, d.AddVertex(2))
+	require.NoError(t, d.AddVertex(3))
+
+	require.NoError(t, d.AddEdgeMeta(1, 2, "foo"))
+	require.NoError(t, d.AddEdgeMeta(1, 2, "bar"))
+	require.Error(t, d.AddEdgeMeta(1, 2, "bar"))
+
+	metas := d.GetEdgeMeta(1, 2)
+	assert.ElementsMatch(t, []string{"foo", "bar"}, metas)
+}

@@ -192,12 +192,9 @@ type PluginInit = pluginsdk.InitPayload
 
 type PluginIniter = pluginsdk.Initer
 
-func (e *Engine) initPlugin(ctx context.Context, handler any) error {
+func (e *Engine) initPlugin(ctx context.Context, handler any, init PluginInit) error {
 	if pi, ok := handler.(PluginIniter); ok {
-		err := pi.PluginInit(ctx, PluginInit{
-			Engine: e.CoreHandle.Engine,
-			Root:   e.Root.Path(),
-		})
+		err := pi.PluginInit(ctx, init)
 
 		return err
 	}
@@ -239,7 +236,7 @@ func (f pluginSpanDecorator) WrapStreamingHandler(next connect.StreamingHandlerF
 	}
 }
 
-func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option {
+func (e *Engine) pluginInterceptor(pluginType, pluginName string, handle pluginsdk.Engine) connect.Option {
 	otelInterceptor, err := otelconnect.NewInterceptor(
 		otelconnect.WithTrustRemote(),
 		otelconnect.WithAttributeFilter(func(spec connect.Spec, value attribute.KeyValue) bool {
@@ -262,7 +259,7 @@ func (e *Engine) pluginInterceptor(pluginType, pluginName string) connect.Option
 			pluginType: pluginType,
 			pluginName: pluginName,
 		},
-		hcore.NewInterceptor(e.CoreHandle.LogClient, e.CoreHandle.StepClient),
+		hcore.NewInterceptor(handle.LogClient, handle.StepClient),
 		hstepconnect.Interceptor(),
 	)
 }
@@ -271,17 +268,22 @@ var connectCompressOption = connect.WithCompression("gzip", nil, nil)
 var connectAcceptCompressOption = connect.WithAcceptCompression("gzip", nil, nil)
 
 func (e *Engine) RegisterProvider(ctx context.Context, provider pluginsdk.Provider) (ProviderHandle, error) {
-	err := e.initPlugin(ctx, provider)
-	if err != nil {
-		return ProviderHandle{}, err
-	}
-
 	res, err := provider.Config(ctx, &pluginv1.ProviderConfigRequest{})
 	if err != nil {
 		return ProviderHandle{}, err
 	}
 
 	pluginName := res.GetName()
+
+	initPayload := PluginInit{
+		Engine: e.CoreHandle.Engine(pluginName),
+		Root:   e.Root.Path(),
+	}
+
+	err = e.initPlugin(ctx, provider, initPayload)
+	if err != nil {
+		return ProviderHandle{}, err
+	}
 
 	provider2 := EngineProvider{
 		Name:     pluginName,
@@ -310,17 +312,22 @@ const (
 var comMode = ComModeNone
 
 func (e *Engine) RegisterDriver(ctx context.Context, driver pluginsdk.Driver, register RegisterMuxFunc) (DriverHandle, error) {
-	err := e.initPlugin(ctx, driver)
-	if err != nil {
-		return DriverHandle{}, err
-	}
-
 	res, err := driver.Config(ctx, &pluginv1.ConfigRequest{})
 	if err != nil {
 		return DriverHandle{}, err
 	}
 
 	pluginName := res.GetName()
+
+	initPayload := PluginInit{
+		Engine: e.CoreHandle.Engine(pluginName),
+		Root:   e.Root.Path(),
+	}
+
+	err = e.initPlugin(ctx, driver, initPayload)
+	if err != nil {
+		return DriverHandle{}, err
+	}
 
 	var client pluginsdk.Driver
 	var pluginh PluginHandle
@@ -337,7 +344,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver pluginsdk.Driver, re
 		}
 	case ComModeConnect:
 		handler := pluginsdkconnect.NewDriverConnectHandler(driver)
-		path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName), connectCompressOption)
+		path, h := pluginv1connect.NewDriverHandler(handler, e.pluginInterceptor("driver", pluginName, initPayload.Engine), connectCompressOption)
 
 		pluginh, err = e.RegisterPlugin(ctx, func(mux *http.ServeMux) {
 			mux.Handle(path, h)
@@ -349,7 +356,7 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver pluginsdk.Driver, re
 			return DriverHandle{}, err
 		}
 
-		cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName), connectAcceptCompressOption)
+		cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName, initPayload.Engine), connectAcceptCompressOption)
 		client = pluginsdkconnect.NewDriverConnectClient(cclient)
 	}
 

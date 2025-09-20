@@ -7,10 +7,12 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/internal/tmatch"
 	sync_map "github.com/zolstein/sync-map"
 
 	"github.com/hephbuild/heph/internal/hdebug"
@@ -20,7 +22,6 @@ import (
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/plugingroup"
@@ -54,9 +55,12 @@ func (e *Engine) resolveProvider(
 	c SpecContainer,
 	p EngineProvider,
 ) (*pluginv1.TargetSpec, error) {
-	providerKey := p.Name
-
 	rs, err := rs.TraceResolveProvider(tref.Format(c.GetRef()), p.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	rs, err = rs.TraceProviderCall(p.Name, c.GetRef().GetPackage())
 	if err != nil {
 		return nil, err
 	}
@@ -64,21 +68,14 @@ func (e *Engine) resolveProvider(
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
-	spec, err, _ := rs.memSpecGet.Do(ctx, memSpecGetKey{providerName: providerKey, refKey: refKey(c.GetRef())}, func(ctx context.Context) (*pluginv1.TargetSpec, error) {
-		res, err := e.Get(ctx, rs, p, c.GetRef(), states)
-		if err != nil {
-			return nil, err
-		}
-
-		return res.GetSpec(), nil
-	})
+	res, err := e.Get(ctx, rs, p, c.GetRef(), states)
 	if err != nil {
 		return nil, err
 	}
 
 	// TODO: what do we do if the spec.ref is different from the request ?
 
-	return spec, nil
+	return res.GetSpec(), nil
 }
 
 func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pluginv1.ProviderState, c SpecContainer) (*pluginv1.TargetSpec, error) {
@@ -139,7 +136,7 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 	var items []*pluginv1.TargetMatcher
 
 	if label, ok := ref.GetArgs()["label"]; ok {
-		items = append(items, pluginv1.TargetMatcher_builder{Label: proto.String(label)}.Build())
+		items = append(items, tmatch.Label(label))
 	}
 
 	if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
@@ -150,8 +147,8 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 		return nil, errors.New("invalid query: empty selection")
 	}
 
-	var deps []string
-	for ref, err := range e.Query(ctx, rs, pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()) {
+	var deps []string //nolint:prealloc
+	for ref, err := range e.query(ctx, rs, tmatch.And(items...), queryOptions{}) {
 		if err != nil {
 			if errors.Is(err, StackRecursionError{}) {
 				// hlog.From(ctx).Error("resolve specs query", "err", err)
@@ -174,6 +171,36 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 	}.Build(), nil
 }
 
+func dagAddParent(rs *RequestState, ref *pluginv1.TargetRef) (*RequestState, error) {
+	if rs.parent != nil {
+		err := rs.dag.AddVertex(rs.parent)
+		if err != nil && !hdag.IsDuplicateVertexError(err) {
+			return rs, err
+		}
+
+		err = rs.dag.AddVertex(ref)
+		if err != nil && !hdag.IsDuplicateVertexError(err) {
+			return rs, err
+		}
+
+		err = rs.dag.AddEdgeMeta(ref, rs.parent, "resolve")
+		if err != nil && !hdag.IsDuplicateEdgeError(err) {
+			if errors.As(err, &dag.EdgeLoopError{}) {
+				return rs, StackRecursionError{
+					printer: func() string {
+						return err.Error()
+					},
+				}
+			}
+			return rs, err
+		}
+	}
+
+	rs = rs.WithParent(ref)
+
+	return rs, nil
+}
+
 func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer) (*pluginv1.TargetSpec, error) {
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{"where", "GetSpec " + tref.Format(c.GetRef())}
@@ -188,6 +215,11 @@ func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer)
 		return nil, err
 	}
 
+	rs, err = dagAddParent(rs, c.GetRef())
+	if err != nil {
+		return nil, err
+	}
+
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
@@ -196,7 +228,7 @@ func (e *Engine) GetSpec(ctx context.Context, rs *RequestState, c SpecContainer)
 	}
 
 	var pkg string
-	if c.Ref != nil {
+	if c.GetRef() != nil {
 		pkg = c.GetRef().GetPackage()
 	} else {
 		return nil, errors.New("spec or ref must be specified")
@@ -293,6 +325,11 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 	defer span.End()
 
 	rs, err := rs.Trace("GetDef", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	rs, err = dagAddParent(rs, c.GetRef())
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +454,11 @@ func (e *Engine) Link(ctx context.Context, rs *RequestState, c DefContainer) (*L
 		return nil, err
 	}
 
+	rs, err = dagAddParent(rs, c.GetRef())
+	if err != nil {
+		return nil, err
+	}
+
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
@@ -440,24 +482,24 @@ const (
 	DAGTypeDescendants
 )
 
-func (e *Engine) DAG(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, t DAGType) (*hdag.DAG[*pluginv1.TargetRef], error) {
+func (e *Engine) DAG(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, t DAGType, scope *pluginv1.TargetMatcher) (*DAG, error) {
 	switch t {
 	case DAGTypeAncestors:
-		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{Ref: ref}.Build(), true)
+		err := e.QueryLink(ctx, rs, tmatch.And(scope, tmatch.Ref(ref)), scope)
 		if err != nil {
 			return nil, err
 		}
 
 		return rs.dag.GetAncestorsGraph(ref)
 	case DAGTypeAll:
-		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("")}.Build(), true)
+		err := e.QueryLink(ctx, rs, tmatch.And(scope, tmatch.All()), scope)
 		if err != nil {
 			return nil, err
 		}
 
 		return rs.dag.GetGraph(ref)
 	case DAGTypeDescendants:
-		err := e.QueryLink(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr("")}.Build(), true)
+		err := e.QueryLink(ctx, rs, tmatch.And(scope, tmatch.All()), scope)
 		if err != nil {
 			return nil, err
 		}
@@ -468,7 +510,7 @@ func (e *Engine) DAG(ctx context.Context, rs *RequestState, ref *pluginv1.Target
 	}
 }
 
-func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m *pluginv1.TargetMatcher, deep bool) error {
+func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher *pluginv1.TargetMatcher) error {
 	var dedup sync_map.Map[string, htypes.Void]
 	var g herrgroup.Group
 
@@ -483,17 +525,13 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m *pluginv1.Ta
 			return err
 		}
 
-		if deep {
-			g.Go(func() error {
-				var err error
-				for _, def := range lldef.Inputs {
-					err = link(def.GetRef())
-					if err != nil {
-						return err
-					}
-				}
+		if tmatch.MatchDef(lldef.TargetSpec, lldef.TargetDef.TargetDef, deepMatcher) == tmatch.MatchNo {
+			return nil
+		}
 
-				return nil
+		for _, def := range lldef.Inputs {
+			g.Go(func() error {
+				return link(def.GetRef())
 			})
 		}
 
@@ -542,7 +580,6 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 		return nil, err
 	}
 
-	var sf hsingleflight.GroupMem[string, *TargetDef]
 	var g herrgroup.Group
 	for i, input := range inputs {
 		g.Go(func() error {
@@ -553,14 +590,20 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				return err
 			}
 
-			err = rs.dag.AddEdge(depRef, def.GetRef())
+			err = rs.dag.AddEdgeMeta(depRef, def.GetRef(), "dep")
 			if err != nil && !hdag.IsDuplicateEdgeError(err) {
-				return err
+				if errors.As(err, &dag.EdgeLoopError{}) {
+					return StackRecursionError{
+						printer: func() string {
+							return err.Error()
+						},
+					}
+				}
+
+				return fmt.Errorf("innerlink: %w", err)
 			}
 
-			linkedDep, err, _ := sf.Do(refKey(depRef), func() (*TargetDef, error) {
-				return e.GetDef(ctx, rs, DefContainer{Ref: depRef})
-			})
+			linkedDep, err := e.GetDef(ctx, rs, DefContainer{Ref: depRef})
 			if err != nil {
 				return err
 			}

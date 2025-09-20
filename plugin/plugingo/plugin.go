@@ -377,10 +377,10 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 
 	var files []string
 	if gomod != "" {
-		files = append(files, tref.FormatFile(tref.DirPackage(gomod), "go.mod"))
+		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)))
 	}
 	if gowork != "" {
-		files = append(files, tref.FormatFile(tref.DirPackage(gowork), "go.mod"))
+		files = append(files, tref.FormatFile(tref.DirPackage(gowork), tref.BasePackage(gowork)))
 	}
 
 	args := f.Args()

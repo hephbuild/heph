@@ -5,7 +5,6 @@ import (
 	"errors"
 
 	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
@@ -14,6 +13,11 @@ import (
 
 func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, pkg string) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	rs, err := rs.TraceList(p.Name, pkg)
+	if err != nil {
+		return nil, err
+	}
+
+	rs, err = rs.TraceProviderCall(p.Name, pkg)
 	if err != nil {
 		return nil, err
 	}

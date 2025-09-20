@@ -2,14 +2,15 @@ package plugincyclicprovider
 
 import (
 	"context"
+
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
+	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/engine"
 
-	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -69,8 +70,30 @@ func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigReque
 	}.Build(), nil
 }
 
+// list get stuck
+//   x   x   -
+//   x   -   -
+//   -   x   x
+
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
+		//_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		//	RequestId: htypes.Ptr(req.GetRequestId()),
+		//	Spec: pluginv1.TargetSpec_builder{
+		//		Ref: pluginv1.TargetRef_builder{
+		//			Package: htypes.Ptr("some/package"),
+		//			Name:    htypes.Ptr("think"),
+		//		}.Build(),
+		//		Driver: htypes.Ptr("sh"),
+		//		Config: map[string]*structpb.Value{
+		//			"deps": structpb.NewStringValue("//@heph/query:query@label=gen,tree_output_to=some/package"),
+		//		},
+		//	}.Build(),
+		//}.Build())
+		//if err != nil {
+		//	return err
+		//}
+
 		for _, spec := range p.targets() {
 			if spec.GetRef().GetPackage() != req.GetPackage() {
 				continue
@@ -89,10 +112,6 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	if req.GetRef().GetPackage() != "some/package" {
-		return nil, pluginsdk.ErrNotFound
-	}
-
 	_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(req.GetRequestId()),
 		Spec: pluginv1.TargetSpec_builder{

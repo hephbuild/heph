@@ -19,14 +19,15 @@ type memSpecGetKey struct {
 	providerName, refKey string
 }
 
+type DAG = hdag.DAG[*pluginv1.TargetRef, string]
+
 type RequestStateData struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
 	Force           *pluginv1.TargetMatcher
 	Interactive     *pluginv1.TargetRef
 
-	memSpecGet hsingleflight.GroupMemContext[memSpecGetKey, *pluginv1.TargetSpec]
-	memSpec    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
+	memSpec hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	// memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
 	memMeta hsingleflight.GroupMemContext[string, *Meta]
 
@@ -36,7 +37,7 @@ type RequestStateData struct {
 	memResult  hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
 	memExecute hsingleflight.GroupMemContext[string, *ExecuteResultLocks]
 
-	dag *hdag.DAG[*pluginv1.TargetRef]
+	dag *DAG
 }
 
 type traceStackEntry struct {
@@ -51,7 +52,7 @@ type RequestState struct {
 	*RequestStateData
 
 	traceStack Stack[traceStackEntry]
-	fromPlugin bool
+	parent     *pluginv1.TargetRef
 }
 
 func (s *RequestState) Trace(fun, id string) (*RequestState, error) {
@@ -64,6 +65,10 @@ func (s *RequestState) HasTrace(fun, id string) bool {
 
 func (s *RequestState) TraceList(name string, pkg string) (*RequestState, error) {
 	return s.traceStackPush(traceStackEntry{fun: "List", id1: name, id2: pkg})
+}
+
+func (s *RequestState) TraceProviderCall(name string, pkg string) (*RequestState, error) {
+	return s.traceStackPush(traceStackEntry{fun: "ProviderCall", id1: name, id2: pkg})
 }
 
 func (s *RequestState) TraceResolveProvider(format string, name string) (*RequestState, error) {
@@ -85,6 +90,13 @@ func (s *RequestState) traceStackPush(e traceStackEntry) (*RequestState, error) 
 		RequestStateData: s.RequestStateData,
 		traceStack:       stack,
 	}, nil
+}
+
+func (s *RequestState) WithParent(parent *pluginv1.TargetRef) *RequestState {
+	rs := s.Copy()
+	rs.parent = parent
+
+	return rs
 }
 
 func (s *RequestState) Copy() *RequestState {

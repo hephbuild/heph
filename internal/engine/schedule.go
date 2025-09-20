@@ -114,16 +114,14 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
-	var out []*ExecuteResultLocks
+	var out ExecuteResultsLocks
 	var outm sync.Mutex
 
 	var matched bool
 	var g herrgroup.Group
 	for ref, err := range e.Query(ctx, rs, matcher) {
 		if err != nil {
-			for _, locks := range out {
-				locks.Unlock(ctx)
-			}
+			out.Unlock(ctx)
 
 			return nil, err
 		}
@@ -150,9 +148,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 
 	err = g.Wait()
 	if err != nil {
-		for _, locks := range out {
-			locks.Unlock(ctx)
-		}
+		out.Unlock(ctx)
 
 		return nil, err
 	}
@@ -206,6 +202,11 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	defer cleanLabels()
 
 	rs, err := rs.Trace("result", tref.Format(c.GetRef()))
+	if err != nil {
+		return nil, err
+	}
+
+	rs, err = dagAddParent(rs, c.GetRef())
 	if err != nil {
 		return nil, err
 	}

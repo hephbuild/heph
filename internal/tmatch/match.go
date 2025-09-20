@@ -15,7 +15,6 @@ import (
 	"github.com/hephbuild/heph/lib/tref"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 type cachedFs struct {
@@ -138,9 +137,9 @@ func ParsePackageMatcher(pkg, cwd, root string) (*pluginv1.TargetMatcher, error)
 	}
 
 	if prefix {
-		return pluginv1.TargetMatcher_builder{PackagePrefix: proto.String(pkg)}.Build(), nil
+		return PackagePrefix(pkg), nil
 	} else {
-		return pluginv1.TargetMatcher_builder{Package: proto.String(pkg)}.Build(), nil
+		return Package(pkg), nil
 	}
 }
 

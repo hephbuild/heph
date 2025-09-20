@@ -2,15 +2,20 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hdag"
+	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/spf13/cobra"
 )
 
 func init() {
+	var scope string
+
 	cmd := &cobra.Command{
 		Use:  "graph [descendants|ancestors] target",
 		Args: cobra.RangeArgs(1, 2),
@@ -43,9 +48,19 @@ func init() {
 					dagType = engine.DAGTypeDescendants
 				case "deps":
 					dagType = engine.DAGTypeAncestors
+				default:
+					return fmt.Errorf("invalid graph type: %v", args[0])
 				}
 
 				ref, err = parseTargetRef(args[1], cwd, root)
+				if err != nil {
+					return err
+				}
+			}
+
+			scopeMatcher := tmatch.All()
+			if scope != "" {
+				scopeMatcher, err = tmatch.ParsePackageMatcher(scope, cwd, root)
 				if err != nil {
 					return err
 				}
@@ -60,7 +75,7 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				dag, err := e.DAG(ctx, rs, ref, dagType)
+				dag, err := e.DAG(ctx, rs, ref, dagType, scopeMatcher)
 				if err != nil {
 					return err
 				}
@@ -75,7 +90,7 @@ func init() {
 
 							return tref.Format(v)
 						}),
-						hdag.WithNodeExtra(func(v *pluginv1.TargetRef) string {
+						hdag.WithVertexExtra(func(v *pluginv1.TargetRef) string {
 							if tref.Equal(v, ref) {
 								return `style="filled", fillcolor="lightgreen"`
 							}
@@ -85,6 +100,20 @@ func init() {
 							}
 
 							return ""
+						}),
+						hdag.WithEdgeRenderer(func(src, dst *pluginv1.TargetRef, meta string) string {
+							if meta == "dep" {
+								return ""
+							}
+
+							return meta
+						}),
+						hdag.WithEdgeFilter(func(src, dst *pluginv1.TargetRef, meta string) bool {
+							if meta == "resolve" {
+								return false
+							}
+
+							return true
 						}),
 					)
 				})
@@ -96,6 +125,8 @@ func init() {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&scope, "scope", "", "Filter universe of targets")
 
 	queryCmd.AddCommand(cmd)
 }
