@@ -20,6 +20,10 @@ func Decode[T any](from any) (T, error) {
 
 func DecodeTo(from, to any) error {
 	if to, ok := to.(MapstructureDecoder); ok {
+		if v, ok := from.(*structpb.Value); ok {
+			from = v.AsInterface()
+		}
+
 		err := to.MapstructureDecode(from)
 		if err != nil {
 			return err
@@ -62,6 +66,14 @@ func DecodeTo(from, to any) error {
 	return nil
 }
 
+func toType(v any) string {
+	if v, ok := v.(*structpb.Value); ok {
+		return v.String()
+	}
+
+	return fmt.Sprintf("%T", v)
+}
+
 func DecodeSlice[T any](v any) ([]T, error) {
 	var zero T
 
@@ -75,7 +87,7 @@ func DecodeSlice[T any](v any) ([]T, error) {
 		for i, va := range vas {
 			v, err := Decode[T](va)
 			if err != nil {
-				return nil, fmt.Errorf("%v: expected %T, got %T", i, zero, va)
+				return nil, fmt.Errorf("%v: expected %T, got %q", i, zero, toType(va))
 			}
 
 			out = append(out, v)
@@ -84,5 +96,5 @@ func DecodeSlice[T any](v any) ([]T, error) {
 		return out, nil
 	}
 
-	return nil, fmt.Errorf("expected %T or []%T, got %T", zero, zero, v)
+	return nil, fmt.Errorf("expected %T or []%T, got %q", zero, zero, toType(v))
 }

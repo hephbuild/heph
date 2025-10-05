@@ -125,6 +125,10 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 		items = append(items, tmatch.Label(label))
 	}
 
+	if pkg, ok := ref.GetArgs()["package"]; ok {
+		items = append(items, tmatch.Package(pkg))
+	}
+
 	if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
 		items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
 	}
@@ -361,7 +365,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			Spec:      spec,
 		}.Build())
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("parse: %q: %w", spec.GetDriver(), err)
 		}
 
 		def := res.GetTarget()

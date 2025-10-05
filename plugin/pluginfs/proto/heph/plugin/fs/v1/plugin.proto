@@ -4,6 +4,8 @@ package heph.plugin.fs.v1;
 import "google/protobuf/timestamp.proto";
 
 message Target {
-  string file = 1;
-  google.protobuf.Timestamp modified_at = 2;
+  oneof content {
+    string file = 1;
+    string pattern = 2;
+  }
 }

@@ -37,7 +37,7 @@ func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*p
 }
 
 func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
-	deps, err := hstructpb.DecodeSlice[string](req.GetSpec().GetConfig()["deps"])
+	deps, err := hstructpb.Decode[hstructpb.SpecStrings](req.GetSpec().GetConfig()["deps"])
 	if err != nil {
 		return nil, err
 	}

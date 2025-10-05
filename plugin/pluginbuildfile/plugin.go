@@ -165,6 +165,29 @@ type BuiltinFunc = func(
 	kwargs []starlark.Tuple,
 ) (starlark.Value, error)
 
+func (p *Plugin) glob() BuiltinFunc {
+	return func(
+		thread *starlark.Thread,
+		fn *starlark.Builtin,
+		args starlark.Tuple,
+		kwargs []starlark.Tuple,
+	) (starlark.Value, error) {
+		pkg := thread.Local(packageKey).(string) //nolint:errcheck
+
+		var pattern string
+		if err := starlark.UnpackArgs(
+			"glob", args, kwargs,
+			"pattern", &pattern,
+		); err != nil {
+			return nil, err
+		}
+
+		base, pattern := hfs.GlobSplit(pattern)
+
+		return starlark.String(tref.FormatFile(tref.JoinPackage(pkg, base), pattern)), nil
+	}
+}
+
 func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
@@ -299,6 +322,7 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 	}
 	universe := starlark.StringDict{
 		"target":         starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
+		"glob":           starlark.NewBuiltin("target", p.glob()),
 		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState(onProviderState)),
 	}
 	prog, err := p.buildFile(ctx, file, universe)

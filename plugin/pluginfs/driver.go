@@ -4,7 +4,9 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -13,7 +15,6 @@ import (
 	fsv1 "github.com/hephbuild/heph/plugin/pluginfs/gen/heph/plugin/fs/v1"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var _ pluginsdk.Driver = (*Driver)(nil)
@@ -22,6 +23,8 @@ var _ pluginsdk.Initer = (*Driver)(nil)
 type Driver struct {
 	resultClient pluginsdk.InitPayload
 }
+
+const DriverName = "fs_driver"
 
 func NewDriver() *Driver {
 	return &Driver{}
@@ -38,7 +41,7 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 	pdesc := protodesc.ToDescriptorProto(desc)
 
 	return pluginv1.ConfigResponse_builder{
-		Name:         htypes.Ptr("fs_driver"),
+		Name:         htypes.Ptr(DriverName),
 		TargetSchema: pdesc,
 	}.Build(), nil
 }
@@ -53,15 +56,21 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, err
 	}
 
-	info, err := os.Stat(filepath.Join(p.resultClient.Root, cfg.File))
-	if err != nil {
-		return nil, err
-	}
+	var target *fsv1.Target
+	if hfs.IsGlob(cfg.File) {
+		target = fsv1.Target_builder{
+			Pattern: htypes.Ptr(cfg.File),
+		}.Build()
+	} else {
+		_, err := os.Stat(filepath.Join(p.resultClient.Root, cfg.File))
+		if err != nil {
+			return nil, err
+		}
 
-	target := fsv1.Target_builder{
-		File:       htypes.Ptr(cfg.File),
-		ModifiedAt: timestamppb.New(info.ModTime()),
-	}.Build()
+		target = fsv1.Target_builder{
+			File: htypes.Ptr(cfg.File),
+		}.Build()
+	}
 
 	targetAny, err := anypb.New(target)
 	if err != nil {
@@ -86,17 +95,46 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		return nil, err
 	}
 
-	return pluginv1.RunResponse_builder{
-		Artifacts: []*pluginv1.Artifact{
-			pluginv1.Artifact_builder{
-				Name: htypes.Ptr(filepath.Base(t.GetFile())),
-				Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-				File: pluginv1.Artifact_ContentFile_builder{
-					SourcePath: htypes.Ptr(filepath.Join(p.resultClient.Root, t.GetFile())),
-					OutPath:    htypes.Ptr(t.GetFile()),
+	if t.HasFile() {
+		return pluginv1.RunResponse_builder{
+			Artifacts: []*pluginv1.Artifact{
+				pluginv1.Artifact_builder{
+					Name: htypes.Ptr(filepath.Base(t.GetFile())),
+					Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+					File: pluginv1.Artifact_ContentFile_builder{
+						SourcePath: htypes.Ptr(filepath.Join(p.resultClient.Root, t.GetFile())),
+						OutPath:    htypes.Ptr(t.GetFile()),
+					}.Build(),
 				}.Build(),
+			},
+		}.Build(), nil
+	}
+
+	fs := hfs.NewOS(p.resultClient.Root)
+
+	var artifacts []*pluginv1.Artifact
+	err = hfs.Glob(ctx, fs, t.GetPattern(), nil, func(path string, d hfs.DirEntry) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		artifacts = append(artifacts, pluginv1.Artifact_builder{
+			Name: htypes.Ptr(strings.ReplaceAll(path, "/", "_")),
+			Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+			File: pluginv1.Artifact_ContentFile_builder{
+				SourcePath: htypes.Ptr(fs.At(path).Path()),
+				OutPath:    htypes.Ptr(path),
 			}.Build(),
-		},
+		}.Build())
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return pluginv1.RunResponse_builder{
+		Artifacts: artifacts,
 	}.Build(), nil
 }
 

@@ -33,7 +33,7 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	}
 
 	cfg.Providers = append(cfg.Providers, engine.ConfigProvider{
-		Name:    pluginfs.Name,
+		Name:    pluginfs.ProviderName,
 		Enabled: true,
 	})
 
@@ -54,7 +54,7 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	})
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
-		Name:    pluginfs.Name,
+		Name:    pluginfs.ProviderName,
 		Enabled: true,
 	})
 
@@ -115,7 +115,7 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 	plugingo.Name: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
 		return plugingo.New()
 	},
-	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
+	pluginfs.ProviderName: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
 		return pluginfs.NewProvider()
 	},
 }
@@ -131,7 +131,7 @@ func pluginExecFactory(d *pluginexec.Plugin) (pluginsdk.Driver, func(mux *http.S
 }
 
 var nameToDriver = map[string]func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)){
-	pluginfs.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+	pluginfs.ProviderName: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginfs.NewDriver(), nil
 	},
 	plugingroup.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -30,12 +31,15 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue("$SRC"),
-				"deps": structpb.NewStringValue(tref.Format(pluginv1.TargetRef_builder{
-					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-					Name:    htypes.Ptr("build_test"),
-					Args:    factors.Args(),
-				}.Build())),
+				"run": structpb.NewStringValue("$SRC_BIN"),
+				"deps": hstructpb.NewMapStringStringValue(map[string]string{
+					"testdata": "//@heph/query:query@label=go_test_data,skip_provider=" + Name + ",package=" + goPkg.HephPackage,
+					"bin": tref.Format(pluginv1.TargetRef_builder{
+						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+						Name:    htypes.Ptr("build_test"),
+						Args:    factors.Args(),
+					}.Build()),
+				}),
 			},
 			Labels: labels,
 		}.Build(),
