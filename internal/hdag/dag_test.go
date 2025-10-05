@@ -9,6 +9,7 @@ import (
 )
 
 func TestBFSWalk(t *testing.T) {
+	ctx := t.Context()
 	d := New[int](func(i int) string {
 		return fmt.Sprintf("node-%v", i)
 	})
@@ -20,7 +21,7 @@ func TestBFSWalk(t *testing.T) {
 	require.NoError(t, d.AddEdge(1, 2))
 	require.NoError(t, d.AddEdge(1, 3))
 
-	oned, err := d.GetGraph(1)
+	oned, err := d.GetGraph(ctx, 1)
 	require.NoError(t, err)
 
 	collected := []int{}

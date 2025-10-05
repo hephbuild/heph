@@ -10,6 +10,7 @@ import (
 
 	plugincyclicprovider "github.com/hephbuild/heph/internal/enginee2e/pluginscyclicprovider"
 	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/tref"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -87,7 +88,10 @@ func TestCyclic1(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
-							"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen,skip_provider=" + pluginstaticprovider.Name}),
+							"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
+								Label:        "gen",
+								SkipProvider: pluginstaticprovider.Name,
+							})),
 						},
 						Labels: []string{"gen"},
 					}.Build(),
@@ -173,7 +177,6 @@ func TestCyclic2(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
-							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 					}.Build(),
@@ -272,7 +275,6 @@ func TestCyclic3(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
-							// "deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 					}.Build(),

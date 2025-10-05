@@ -1,6 +1,7 @@
 package tref
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -50,6 +51,60 @@ func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
 	f := ref.GetArgs()["f"]
 
 	return filepath.Join(ToOSPath(rest), f), true
+}
+
+const QueryPackage = "@heph/query"
+const QueryName = "query"
+
+type QueryOptions struct {
+	Label        string
+	Package      string
+	TreeOutputTo string
+	SkipProvider string
+}
+
+func FormatQuery(o QueryOptions) string {
+	m := map[string]string{}
+	if o.Label != "" {
+		m["label"] = o.Label
+	}
+	if o.Package != "" {
+		m["package"] = o.Package
+	}
+	if o.TreeOutputTo != "" {
+		m["tree_output_to"] = o.TreeOutputTo
+	}
+	if o.SkipProvider != "" {
+		m["skip_provider"] = o.SkipProvider
+	}
+
+	return Format(New(QueryPackage, QueryName, m))
+}
+
+func ParseQuery(ref *pluginv1.TargetRef) (QueryOptions, error) {
+	if ref.GetPackage() != QueryPackage || ref.GetName() != QueryName {
+		return QueryOptions{}, errors.New("invalid query ref")
+	}
+
+	var qo QueryOptions
+
+	if label, ok := ref.GetArgs()["label"]; ok {
+		qo.Label = label
+	}
+
+	if pkg, ok := ref.GetArgs()["package"]; ok {
+		qo.Package = pkg
+	}
+
+	if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
+		qo.TreeOutputTo = treeOutputTo
+	}
+
+	if p, ok := ref.GetArgs()["skip_provider"]; ok {
+		qo.SkipProvider = p
+	}
+
+	return qo, nil
 }
 
 var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))

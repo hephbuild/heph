@@ -33,7 +33,11 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue("$SRC_BIN"),
 				"deps": hstructpb.NewMapStringStringValue(map[string]string{
-					"testdata": "//@heph/query:query@label=go_test_data,skip_provider=" + Name + ",package=" + goPkg.HephPackage,
+					"testdata": tref.FormatQuery(tref.QueryOptions{
+						Label:        "go_test_data",
+						SkipProvider: Name,
+						Package:      goPkg.HephPackage,
+					}),
 					"bin": tref.Format(pluginv1.TargetRef_builder{
 						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
 						Name:    htypes.Ptr("build_test"),

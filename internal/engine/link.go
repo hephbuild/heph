@@ -71,7 +71,7 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	defer span.End()
 
 	spec, err, computed := rs.memSpec.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
-		if ref := c.GetRef(); ref.GetPackage() == "@heph/query" {
+		if ref := c.GetRef(); ref.GetPackage() == tref.QueryPackage {
 			return e.resolveSpecQuery(ctx, rs, ref)
 		}
 
@@ -121,19 +121,24 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 
 	var items []*pluginv1.TargetMatcher
 
-	if label, ok := ref.GetArgs()["label"]; ok {
+	qo, err := tref.ParseQuery(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	if label := qo.Label; label != "" {
 		items = append(items, tmatch.Label(label))
 	}
 
-	if pkg, ok := ref.GetArgs()["package"]; ok {
+	if pkg := qo.Package; pkg != "" {
 		items = append(items, tmatch.Package(pkg))
 	}
 
-	if treeOutputTo, ok := ref.GetArgs()["tree_output_to"]; ok {
+	if treeOutputTo := qo.TreeOutputTo; treeOutputTo != "" {
 		items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
 	}
 
-	skipProvider := ref.GetArgs()["skip_provider"] // TODO: can be automated by annotating the RequestState for List/Get
+	skipProvider := qo.SkipProvider // TODO: can be automated by annotating the RequestState for List/Get
 
 	if len(items) == 0 {
 		return nil, errors.New("invalid query: empty selection")
@@ -383,7 +388,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		inputs := def.GetInputs()
 		for _, input := range inputs {
-			if input.GetRef().GetPackage() != "@heph/query" {
+			if input.GetRef().GetPackage() != tref.QueryPackage {
 				continue
 			}
 

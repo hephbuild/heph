@@ -405,7 +405,11 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			return nil, nil, errors.New("no Go files")
 		}
 
-		files = append(files, fmt.Sprintf("//@heph/query:query@label=go_src,tree_output_to=%s,skip_provider=%v", pkg, Name))
+		files = append(files, tref.FormatQuery(tref.QueryOptions{
+			Label:        "go_src",
+			SkipProvider: Name,
+			TreeOutputTo: pkg,
+		}))
 	} else {
 		args = hmaps.Concat(args, map[string]string{
 			"import": imp,

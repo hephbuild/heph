@@ -2,13 +2,11 @@ package plugincyclicprovider
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/lib/tref"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
-
-	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/engine"
 
@@ -99,7 +97,11 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 					}.Build(),
 					Driver: htypes.Ptr("sh"),
 					Config: map[string]*structpb.Value{
-						"deps": structpb.NewStringValue(fmt.Sprintf("//@heph/query:query@label=gen,tree_output_to=%v,skip_provider=%v", hephPackage, ProviderName)),
+						"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
+							Label:        "gen",
+							SkipProvider: ProviderName,
+							TreeOutputTo: hephPackage,
+						})),
 					},
 				}.Build(),
 			}.Build())
@@ -140,7 +142,11 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 				}.Build(),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
-					"deps": structpb.NewStringValue(fmt.Sprintf("//@heph/query:query@label=gen,tree_output_to=%v,skip_provider=%v", hephPackage, ProviderName)),
+					"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
+						Label:        "gen",
+						SkipProvider: ProviderName,
+						TreeOutputTo: hephPackage,
+					})),
 				},
 			}.Build(),
 		}.Build())
