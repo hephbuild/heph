@@ -56,3 +56,7 @@ func Or(ms ...*pluginv1.TargetMatcher) *pluginv1.TargetMatcher {
 		return pluginv1.TargetMatcher_builder{Or: pluginv1.TargetMatchers_builder{Items: ms}.Build()}.Build()
 	}
 }
+
+func Not(m *pluginv1.TargetMatcher) *pluginv1.TargetMatcher {
+	return pluginv1.TargetMatcher_builder{Not: m}.Build()
+}

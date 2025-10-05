@@ -1,6 +1,7 @@
 package hdag
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"iter"
@@ -132,18 +133,22 @@ func (d *DAG[V, M]) GetChildren(v V) iter.Seq2[string, V] {
 	return d.vertexes(m)
 }
 
-func (d *DAG[V, M]) GetAncestorsGraph(v V) (*DAG[V, M], error) {
+func (d *DAG[V, M]) GetAncestorsGraph(ctx context.Context, v V) (*DAG[V, M], error) {
 	sd, _, err := d.d.GetAncestorsGraph(d.hash(v))
 	if err != nil {
 		return nil, err
 	}
 
-	return repopulate(d, sd), nil
+	return repopulate(ctx, d, sd), nil
 }
 
-func repopulate[V any, M comparable](src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
+func repopulate[V any, M comparable](ctx context.Context, src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
 	rd := NewMeta[V, M](src.hash)
 	idd.BFSWalk(funcVisitor(func(vertexer dag.Vertexer) {
+		if ctx.Err() != nil {
+			return
+		}
+
 		id, srcIda := vertexer.Vertex()
 		srcId := srcIda.(string) //nolint:errcheck
 
@@ -163,6 +168,10 @@ func repopulate[V any, M comparable](src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
 		}
 
 		for _, childSrcIda := range children {
+			if ctx.Err() != nil {
+				return
+			}
+
 			childSrcId := childSrcIda.(string) //nolint:errcheck
 
 			child, err := src.getVertex(childSrcId)
@@ -177,6 +186,10 @@ func repopulate[V any, M comparable](src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
 
 			metas := src.GetEdgeMeta(v, child)
 			for _, meta := range metas {
+				if ctx.Err() != nil {
+					return
+				}
+
 				err = rd.AddEdgeMeta(v, child, meta)
 				if err != nil && !IsDuplicateEdgeError(err) {
 					panic(err)
@@ -188,27 +201,31 @@ func repopulate[V any, M comparable](src *DAG[V, M], idd *dag.DAG) *DAG[V, M] {
 	return rd
 }
 
-func (d *DAG[V, M]) GetDescendantsGraph(v V) (*DAG[V, M], error) {
+func (d *DAG[V, M]) GetDescendantsGraph(ctx context.Context, v V) (*DAG[V, M], error) {
 	sd, _, err := d.d.GetDescendantsGraph(d.hash(v))
 	if err != nil {
 		return nil, err
 	}
 
-	return repopulate(d, sd), nil
+	return repopulate(ctx, d, sd), nil
 }
 
-func (d *DAG[V, M]) GetGraph(v V) (*DAG[V, M], error) {
-	sd, err := d.GetAncestorsGraph(v)
+func (d *DAG[V, M]) GetGraph(ctx context.Context, v V) (*DAG[V, M], error) {
+	sd, err := d.GetAncestorsGraph(ctx, v)
 	if err != nil {
 		return nil, err
 	}
 
-	descd, err := d.GetDescendantsGraph(v)
+	descd, err := d.GetDescendantsGraph(ctx, v)
 	if err != nil {
 		return nil, err
 	}
 
 	err = descd.BFSWalk(func(desc V) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		err := sd.AddVertex(desc)
 		if err != nil && !IsDuplicateVertexError(err) {
 			return err

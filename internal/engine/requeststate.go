@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,10 +15,6 @@ import (
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
-
-type memSpecGetKey struct {
-	providerName, refKey string
-}
 
 type DAG = hdag.DAG[*pluginv1.TargetRef, string]
 
@@ -40,56 +37,12 @@ type RequestStateData struct {
 	dag *DAG
 }
 
-type traceStackEntry struct {
-	fun string
-	id1 string
-	id2 string
-}
-
 type RequestState struct {
 	ID string
 
 	*RequestStateData
 
-	traceStack Stack[traceStackEntry]
-	parent     *pluginv1.TargetRef
-}
-
-func (s *RequestState) Trace(fun, id string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: fun, id1: id})
-}
-
-func (s *RequestState) HasTrace(fun, id string) bool {
-	return s.traceStack.Has(traceStackEntry{fun: fun, id1: id})
-}
-
-func (s *RequestState) TraceList(name string, pkg string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "List", id1: name, id2: pkg})
-}
-
-func (s *RequestState) TraceProviderCall(name string, pkg string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "ProviderCall", id1: name, id2: pkg})
-}
-
-func (s *RequestState) TraceResolveProvider(format string, name string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "ResolveProvider", id1: format, id2: name})
-}
-
-func (s *RequestState) TraceQueryListProvider(format string, name string) (*RequestState, error) {
-	return s.traceStackPush(traceStackEntry{fun: "QueryListProvider", id1: format, id2: name})
-}
-
-func (s *RequestState) traceStackPush(e traceStackEntry) (*RequestState, error) {
-	stack, err := s.traceStack.Push(e)
-	if err != nil {
-		return nil, err
-	}
-
-	return &RequestState{
-		ID:               uuid.New().String(),
-		RequestStateData: s.RequestStateData,
-		traceStack:       stack,
-	}, nil
+	parent *pluginv1.TargetRef
 }
 
 func (s *RequestState) WithParent(parent *pluginv1.TargetRef) *RequestState {
@@ -103,7 +56,6 @@ func (s *RequestState) Copy() *RequestState {
 	return &RequestState{
 		ID:               uuid.New().String(),
 		RequestStateData: s.RequestStateData,
-		traceStack:       s.traceStack,
 	}
 }
 
@@ -112,6 +64,22 @@ type Stack[K comparable] struct {
 	first       *K
 	last        *K
 	debugString string
+}
+
+func NewStackRecursionError(printer func() string) *StackRecursionError {
+	if false {
+		buf := make([]byte, 4096)
+		n := runtime.Stack(buf, false)
+
+		stack := string(buf[:n]) + "\n"
+
+		ogprinter := printer
+		printer = func() string {
+			return stack + ogprinter()
+		}
+	}
+
+	return &StackRecursionError{printer: printer}
 }
 
 type StackRecursionError struct {
@@ -146,11 +114,9 @@ var enableStackDebug = sync.OnceValue(func() bool {
 
 func (s Stack[K]) Push(k K) (Stack[K], error) {
 	if _, ok := s.m[k]; ok {
-		return s, StackRecursionError{
-			printer: func() string {
-				return s.StringWith(" -> ", k)
-			},
-		}
+		return s, NewStackRecursionError(func() string {
+			return s.StringWith(" -> ", k)
+		})
 	}
 
 	s.m = maps.Clone(s.m)

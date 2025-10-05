@@ -106,14 +106,6 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 	ctx, span := tracer.Start(ctx, "ResultsFromMatcher")
 	defer span.End()
 
-	rs, err := rs.Trace("ResultsFromMatcher", matcher.String())
-	if err != nil {
-		return nil, err
-	}
-
-	clean := e.StoreRequestState(rs)
-	defer clean()
-
 	var out ExecuteResultsLocks
 	var outm sync.Mutex
 
@@ -146,7 +138,7 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 		return nil, errors.New("did not match any target")
 	}
 
-	err = g.Wait()
+	err := g.Wait()
 	if err != nil {
 		out.Unlock(ctx)
 
@@ -201,12 +193,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	})
 	defer cleanLabels()
 
-	rs, err := rs.Trace("result", tref.Format(c.GetRef()))
-	if err != nil {
-		return nil, err
-	}
-
-	rs, err = dagAddParent(rs, c.GetRef())
+	rs, err := dagAddParent(rs, c.GetRef())
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +201,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	clean := e.StoreRequestState(rs)
 	defer clean()
 
-	def, err := e.Link(ctx, rs, c)
+	def, err := e.link(ctx, rs, c)
 	if err != nil {
 		return nil, fmt.Errorf("link: %w", err)
 	}
@@ -222,12 +209,20 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	ref := def.GetRef()
 
 	switch {
-	case def.GetCache():
-		outputs = def.GetOutputs()
 	case onlyManifest:
 		outputs = nil
 	case len(outputs) == 1 && outputs[0] == AllOutputs:
 		outputs = def.GetOutputs()
+	}
+
+	var doOutputs []string
+	switch {
+	case def.GetCache():
+		doOutputs = def.GetOutputs()
+	case len(outputs) == 1 && outputs[0] == AllOutputs:
+		doOutputs = outputs
+	default:
+		doOutputs = outputs
 	}
 
 	meta, err := e.meta(ctx, rs, def)
@@ -235,7 +230,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 		return nil, fmt.Errorf("meta: %w", err)
 	}
 
-	res, err, computed := rs.memResult.Do(ctx, keyRefOutputs(ref, outputs)+meta.Hashin, func(ctx context.Context) (*ExecuteResultLocks, error) {
+	res, err, computed := rs.memResult.Do(ctx, keyRefOutputs(ref, doOutputs)+meta.Hashin, func(ctx context.Context) (*ExecuteResultLocks, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
@@ -246,7 +241,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 		step, ctx := hstep.New(ctx, tref.Format(ref))
 		defer step.Done()
 
-		res, err := e.innerResultWithSideEffects(ctx, rs, def, outputs, meta)
+		res, err := e.innerResultWithSideEffects(ctx, rs, def, doOutputs, meta)
 		if err != nil {
 			step.SetError()
 
@@ -280,7 +275,15 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 		})
 	} else {
 		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
-			return artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1
+			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+				return true
+			}
+
+			if !slices.Contains(outputs, artifact.GetGroup()) {
+				return true
+			}
+
+			return false
 		})
 	}
 

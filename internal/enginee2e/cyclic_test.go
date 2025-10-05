@@ -3,11 +3,13 @@ package enginee2e
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
 
 	plugincyclicprovider "github.com/hephbuild/heph/internal/enginee2e/pluginscyclicprovider"
+	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -33,23 +35,31 @@ func TestCyclic1(t *testing.T) {
 		name string
 		do   func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState)
 	}{
-		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.Result(ctx, rs, pkg, "c", []string{""})
-			require.ErrorContains(t, err, "would create a loop")
+		{"link all", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
+			err := e.QueryLink(ctx, rs, tmatch.All(), tmatch.All())
+			require.NoError(t, err)
+		}},
+		{"result :c", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
+			res, err := e.Result(ctx, rs, pkg, "c", []string{""})
+			defer res.Unlock(ctx)
+			require.NoError(t, err)
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
+			defer res.Unlock(ctx)
+			require.NoError(t, err)
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
-			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
+			res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			defer res.Unlock(ctx)
+			require.NoError(t, err)
 
-			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			res, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
+			defer res.Unlock(ctx)
+			require.NoError(t, err)
 		}},
 	}
 	for _, test := range tests {
@@ -77,7 +87,7 @@ func TestCyclic1(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
-							"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen"}),
+							"deps": hstructpb.NewStringsValue([]string{"//@heph/query:query@label=gen,skip_provider=" + pluginstaticprovider.Name}),
 						},
 						Labels: []string{"gen"},
 					}.Build(),
@@ -108,21 +118,21 @@ func TestCyclic2(t *testing.T) {
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher ref leaf then ResultsFromMatcher pkg prefix: <root>", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 	}
 	for _, test := range tests {
@@ -194,21 +204,21 @@ func TestCyclic3(t *testing.T) {
 	}{
 		{"result :a", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.Result(ctx, rs, pkg, "a", []string{""})
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 		{"ResultsFromMatcher ref then ResultsFromMatcher pkg prefix:", func(t *testing.T, ctx context.Context, e *engine.Engine, pkg string, rs *engine.RequestState) {
 			_, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(pkg),
 				Name:    htypes.Ptr("c"),
 			}.Build()}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 
 			_, err = e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-			require.ErrorContains(t, err, "would create a loop")
+			require.ErrorContains(t, err, "stack recursion detected")
 		}},
 	}
 	for _, test := range tests {
@@ -287,47 +297,52 @@ func TestCyclic3(t *testing.T) {
 }
 
 func TestCyclic4(t *testing.T) {
-	ctx := t.Context()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-				if runtime.NumGoroutine() > 1000 {
-					panic("too many goroutines")
+	for _, test := range [][2]bool{{false, false}, {true, false}, {false, true}, {true, true}} {
+		t.Run(fmt.Sprintf("get: %v list: %v", test[0], test[1]), func(t *testing.T) {
+			ctx := t.Context()
+			go func() {
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(time.Second):
+						if runtime.NumGoroutine() > 1000 {
+							panic("too many goroutines")
+						}
+					}
 				}
-			}
-		}
-	}()
+			}()
 
-	ctx, clean := hdebug.SetLabels(ctx, func() []string {
-		return []string{"where", "test main"}
-	})
-	defer clean()
+			ctx, clean := hdebug.SetLabels(ctx, func() []string {
+				return []string{"where", "test main"}
+			})
+			defer clean()
 
-	dir := t.TempDir()
+			dir := t.TempDir()
 
-	e, err := engine.New(ctx, dir, engine.Config{})
-	require.NoError(t, err)
+			e, err := engine.New(ctx, dir, engine.Config{})
+			require.NoError(t, err)
 
-	e.WellKnownPackages = []string{"", "some", "some/package"}
+			e.WellKnownPackages = []string{"", "some", "some/package"}
 
-	_, err = e.RegisterProvider(ctx, plugincyclicprovider.New())
-	require.NoError(t, err)
+			_, err = e.RegisterProvider(ctx, plugincyclicprovider.New(test[0], test[1]))
+			require.NoError(t, err)
 
-	_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
-	require.NoError(t, err)
+			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
+			require.NoError(t, err)
 
-	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
-	require.NoError(t, err)
+			_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
+			require.NoError(t, err)
 
-	rs, clean := e.NewRequestState()
-	defer clean()
+			rs, clean := e.NewRequestState()
+			defer clean()
 
-	res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
-	require.NoError(t, err)
-	defer res.Unlock(ctx)
+			res, err := e.ResultsFromMatcher(ctx, rs, pluginv1.TargetMatcher_builder{PackagePrefix: proto.String("")}.Build())
+			require.NoError(t, err)
+			defer res.Unlock(ctx)
 
-	assert.Len(t,  res, 2)
+			assert.Len(t, res, 2)
+		})
+	}
+
 }

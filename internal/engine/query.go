@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"iter"
 
@@ -135,16 +134,6 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 	})
 	defer cleanLabels()
 
-	rs, err := rs.Trace("Query", matcher.String())
-	if err != nil {
-		return func(yield func(*pluginv1.TargetRef, error) bool) {
-			yield(nil, err)
-		}
-	}
-
-	clean := e.StoreRequestState(rs)
-	defer clean()
-
 	if matcher.HasRef() {
 		ref := matcher.GetRef()
 		return func(yield func(*pluginv1.TargetRef, error) bool) {
@@ -170,8 +159,13 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 
 				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {
-						if errors.Is(err, StackRecursionError{}) {
-							continue
+						//if errors.Is(err, StackRecursionError{}) {
+						//	continue
+						//}
+
+						if err != nil {
+							yield(nil, err)
+							return
 						}
 
 						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)

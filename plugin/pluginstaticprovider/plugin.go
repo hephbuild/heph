@@ -11,7 +11,6 @@ import (
 	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 type Target struct {
@@ -24,9 +23,11 @@ type Plugin struct {
 	f func() []Target
 }
 
+const Name = "static"
+
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
 	return pluginv1.ProviderConfigResponse_builder{
-		Name: htypes.Ptr("static"),
+		Name: htypes.Ptr(Name),
 	}.Build(), nil
 }
 
@@ -56,7 +57,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			}
 
 			err := send(pluginv1.ListResponse_builder{
-				Ref: proto.ValueOrDefault(target.Spec.GetRef()),
+				Ref: target.Spec.GetRef(),
 			}.Build())
 			if err != nil {
 				return err

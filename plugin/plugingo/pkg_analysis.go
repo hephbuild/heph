@@ -432,7 +432,7 @@ func (p *Plugin) goImportsToDeps(
 			g.Go(func() error {
 				depPkgs, err := p.goImportsToDeps(ctx, impGoPkg.Imports, factors, c, requestId, seen)
 				if err != nil {
-					return fmt.Errorf("get deps: %v: %w", impGoPkg, err)
+					return fmt.Errorf("get deps: %w", err)
 				}
 
 				goPkgsm.Lock()

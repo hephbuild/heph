@@ -21,7 +21,6 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -139,7 +138,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 
 		// TODO: factors matrix
 		for _, factors := range []Factors{{
-			GoVersion: "1.24",
+			GoVersion: "1.25",
 			GOOS:      runtime.GOOS,
 			GOARCH:    runtime.GOARCH,
 		}} {
@@ -153,7 +152,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			}
 
 			if len(goPkg.GoFiles) > 0 {
-				err = send(pluginv1.ListResponse_builder{Ref: proto.ValueOrDefault(goPkg.GetBuildLibTargetRef(ModeNormal))}.Build())
+				err = send(pluginv1.ListResponse_builder{Ref: goPkg.GetBuildLibTargetRef(ModeNormal)}.Build())
 				if err != nil {
 					return err
 				}
@@ -208,7 +207,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 
 	factors := FactorsFromArgs(req.GetRef().GetArgs())
 	if factors.GoVersion == "" {
-		factors.GoVersion = "1.24"
+		factors.GoVersion = "1.25"
 	}
 	if factors.GOOS == "" {
 		factors.GOOS = runtime.GOOS
@@ -406,7 +405,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			return nil, nil, errors.New("no Go files")
 		}
 
-		files = append(files, fmt.Sprintf("//@heph/query:query@label=go_src,tree_output_to=%s", pkg))
+		files = append(files, fmt.Sprintf("//@heph/query:query@label=go_src,tree_output_to=%s,skip_provider=%v", pkg, Name))
 	} else {
 		args = hmaps.Concat(args, map[string]string{
 			"import": imp,

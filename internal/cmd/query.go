@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -29,8 +30,12 @@ import (
 // heph r -e 'lint && //some/**/*'
 // heph r -e 'test || (k8s-validate && !k8s-validate-prod)'
 
-var queryCmd = func() *cobra.Command {
-	return &cobra.Command{
+var queryCmd *cobra.Command
+
+func init() {
+	var ignore []string
+
+	queryCmd = &cobra.Command{
 		Use:     "query",
 		Aliases: []string{"q"},
 		Args:    cobraArgs(),
@@ -53,6 +58,15 @@ var queryCmd = func() *cobra.Command {
 			matcher, err := parseMatcher(args, cwd, root)
 			if err != nil {
 				return err
+			}
+
+			for _, s := range ignore {
+				ignoreMatcher, err := tmatch.ParsePackageMatcher(s, cwd, root)
+				if err != nil {
+					return err
+				}
+
+				matcher = tmatch.And(matcher, tmatch.Not(ignoreMatcher))
 			}
 
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
@@ -88,7 +102,11 @@ var queryCmd = func() *cobra.Command {
 			return nil
 		},
 	}
-}()
+
+	queryCmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
+
+	rootCmd.AddCommand(queryCmd)
+}
 
 func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func(s string), func()) {
 	var m sync.Mutex
@@ -164,8 +182,4 @@ func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error
 			close(closeCh)
 			<-bgDoneCh
 		}
-}
-
-func init() {
-	rootCmd.AddCommand(queryCmd)
 }

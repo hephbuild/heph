@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -16,6 +17,7 @@ import (
 func init() {
 	var shell boolStr
 	var force bool
+	var ignore []string
 
 	var runCmd = &cobra.Command{
 		Use:     "run",
@@ -75,6 +77,15 @@ func init() {
 				matcher, matcherRef, err := parseMatcherResolve(ctx, e, rs, args, cwd, root)
 				if err != nil {
 					return err
+				}
+
+				for _, s := range ignore {
+					ignoreMatcher, err := tmatch.ParsePackageMatcher(s, cwd, root)
+					if err != nil {
+						return err
+					}
+
+					matcher = tmatch.And(matcher, tmatch.Not(ignoreMatcher))
 				}
 
 				rs.Interactive = matcherRef
@@ -137,6 +148,7 @@ func init() {
 		},
 	}
 
+	runCmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
 	runCmd.Flags().AddFlag(NewBoolStrFlag(&shell, "shell", "", "shell into target"))
 	runCmd.Flags().BoolVarP(&force, "force", "", false, "force running")
 

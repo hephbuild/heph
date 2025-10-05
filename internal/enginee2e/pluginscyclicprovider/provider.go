@@ -2,6 +2,7 @@ package plugincyclicprovider
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
@@ -21,19 +22,26 @@ var _ pluginsdk.Initer = (*Provider)(nil)
 
 const ProviderName = "cyclic_provider_test"
 
-func New() *Provider {
-	return &Provider{}
+func New(resultOnGet, resultOnList bool) *Provider {
+	return &Provider{
+		resultOnGet:  resultOnGet,
+		resultOnList: resultOnList,
+	}
 }
 
 type Provider struct {
+	resultOnGet, resultOnList bool
+
 	resultClient pluginsdk.Engine
 }
+
+const hephPackage = "some/package"
 
 func (p *Provider) targets() []*pluginv1.TargetSpec {
 	return []*pluginv1.TargetSpec{
 		pluginv1.TargetSpec_builder{
 			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr("some/package"),
+				Package: htypes.Ptr(hephPackage),
 				Name:    htypes.Ptr("t1"),
 			}.Build(),
 			Driver: htypes.Ptr("sh"),
@@ -44,7 +52,7 @@ func (p *Provider) targets() []*pluginv1.TargetSpec {
 		}.Build(),
 		pluginv1.TargetSpec_builder{
 			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr("some/package"),
+				Package: htypes.Ptr(hephPackage),
 				Name:    htypes.Ptr("t2"),
 			}.Build(),
 			Driver: htypes.Ptr("sh"),
@@ -77,22 +85,28 @@ func (p *Provider) Config(ctx context.Context, req *pluginv1.ProviderConfigReque
 
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-		//_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
-		//	RequestId: htypes.Ptr(req.GetRequestId()),
-		//	Spec: pluginv1.TargetSpec_builder{
-		//		Ref: pluginv1.TargetRef_builder{
-		//			Package: htypes.Ptr("some/package"),
-		//			Name:    htypes.Ptr("think"),
-		//		}.Build(),
-		//		Driver: htypes.Ptr("sh"),
-		//		Config: map[string]*structpb.Value{
-		//			"deps": structpb.NewStringValue("//@heph/query:query@label=gen,tree_output_to=some/package"),
-		//		},
-		//	}.Build(),
-		//}.Build())
-		//if err != nil {
-		//	return err
-		//}
+		if req.GetPackage() != hephPackage {
+			return nil
+		}
+
+		if p.resultOnList {
+			_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+				RequestId: htypes.Ptr(req.GetRequestId()),
+				Spec: pluginv1.TargetSpec_builder{
+					Ref: pluginv1.TargetRef_builder{
+						Package: htypes.Ptr(hephPackage),
+						Name:    htypes.Ptr("think"),
+					}.Build(),
+					Driver: htypes.Ptr("sh"),
+					Config: map[string]*structpb.Value{
+						"deps": structpb.NewStringValue(fmt.Sprintf("//@heph/query:query@label=gen,tree_output_to=%v,skip_provider=%v", hephPackage, ProviderName)),
+					},
+				}.Build(),
+			}.Build())
+			if err != nil {
+				return err
+			}
+		}
 
 		for _, spec := range p.targets() {
 			if spec.GetRef().GetPackage() != req.GetPackage() {
@@ -112,21 +126,27 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
-		RequestId: htypes.Ptr(req.GetRequestId()),
-		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr("some/package"),
-				Name:    htypes.Ptr("think"),
+	if req.GetRef().GetPackage() != hephPackage {
+		return nil, pluginsdk.ErrNotFound
+	}
+
+	if p.resultOnGet {
+		_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+			RequestId: htypes.Ptr(req.GetRequestId()),
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(hephPackage),
+					Name:    htypes.Ptr("think"),
+				}.Build(),
+				Driver: htypes.Ptr("sh"),
+				Config: map[string]*structpb.Value{
+					"deps": structpb.NewStringValue(fmt.Sprintf("//@heph/query:query@label=gen,tree_output_to=%v,skip_provider=%v", hephPackage, ProviderName)),
+				},
 			}.Build(),
-			Driver: htypes.Ptr("sh"),
-			Config: map[string]*structpb.Value{
-				"deps": structpb.NewStringValue("//@heph/query:query@label=gen,tree_output_to=some/package"),
-			},
-		}.Build(),
-	}.Build())
-	if err != nil {
-		return nil, err
+		}.Build())
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	for _, spec := range p.targets() {
