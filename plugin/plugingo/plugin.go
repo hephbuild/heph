@@ -144,7 +144,11 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 		}} {
 			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetPackage(), factors, req.GetRequestId())
 			if err != nil {
-				if strings.Contains(err.Error(), "no Go files") {
+				if errors.Is(err, errConstraintExcludeAllGoFiles) {
+					continue
+				}
+
+				if errors.Is(err, errNoGoFiles) {
 					return nil
 				}
 
@@ -368,6 +372,9 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 	return nil, pluginsdk.ErrNotFound
 }
 
+var errConstraintExcludeAllGoFiles = errors.New("build constraints exclude all Go files")
+var errNoGoFiles = errors.New("no Go files in package")
+
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
 	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
@@ -402,7 +409,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		}
 
 		if !hasGoFile {
-			return nil, nil, errors.New("no Go files")
+			return nil, nil, errNoGoFiles
 		}
 
 		files = append(files, tref.FormatQuery(tref.QueryOptions{
@@ -445,6 +452,10 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		}.Build(),
 	}.Build())
 	if err != nil {
+		if strings.Contains(err.Error(), "build constraints exclude all Go files") {
+			return nil, nil, errConstraintExcludeAllGoFiles
+		}
+
 		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)
 	}
 
