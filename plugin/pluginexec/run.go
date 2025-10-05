@@ -95,7 +95,7 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	}
 
 	env = append(env, inputEnv...)
-	env = append(env, fmt.Sprintf("PATH=%v:/usr/sbin:/usr/bin:/sbin:/bin:/opt/homebrew/bin:/usr/local/go/bin", binfs.Path())) // TODO: remove /opt/homebrew/bin
+	env = append(env, fmt.Sprintf("PATH=%v:%v", binfs.Path(), p.pathStr))
 
 	for key, value := range t.GetEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
@@ -368,6 +368,25 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 		}
 	}
 
+	requireSingleValue := map[string]struct{}{}
+	for _, tool := range t.GetTools() {
+		id := tool.GetId()
+
+		allOutput := !tool.GetRef().HasOutput()
+
+		for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
+			var outputName string
+			if allOutput {
+				outputName = artifact.GetArtifact().GetGroup()
+			}
+
+			envName := getEnvName("TOOL", "", outputName)
+
+			m[envName] = append(m[envName], artifact)
+			requireSingleValue[envName] = struct{}{}
+		}
+	}
+
 	env := make([]string, 0, len(m))
 	var sb strings.Builder
 	for name, artifacts := range m {
@@ -412,6 +431,10 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 				seenFiles[line] = struct{}{}
 
 				if sb.Len() > 0 {
+					if _, ok := requireSingleValue[name]; ok {
+						return nil, fmt.Errorf("tool require a single output %q", name)
+					}
+
 					sb.WriteString(" ")
 				}
 				sb.WriteString(line)
@@ -420,7 +443,9 @@ func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOr
 			_ = r.Close()
 		}
 
-		env = append(env, getEnvEntryWithName(name, sb.String()))
+		s := sb.String()
+
+		env = append(env, getEnvEntryWithName(name, s))
 	}
 
 	slices.Sort(env)

@@ -120,7 +120,22 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 	},
 }
 
-func pluginExecFactory(d *pluginexec.Plugin) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+func pluginExecFactory(factory func(options ...pluginexec.Option) *pluginexec.Plugin, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+	var cfg struct {
+		PATH []string `mapstructure:"PATH"`
+	}
+	cfg.PATH = []string{
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+	}
+	err := mapstructure.Decode(options, &cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	d := factory(pluginexec.WithPath(cfg.PATH))
+
 	return d, func(mux *http.ServeMux) {
 		path, h := d.PipesHandler()
 
@@ -138,24 +153,16 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 		return plugingroup.New(), nil
 	},
 	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
-		d := pluginexec.New()
-
-		return pluginExecFactory(d)
+		return pluginExecFactory(pluginexec.New, options)
 	},
 	pluginexec.NameSh: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
-		d := pluginexec.NewSh()
-
-		return pluginExecFactory(d)
+		return pluginExecFactory(pluginexec.NewSh, options)
 	},
 	pluginexec.NameBash: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
-		d := pluginexec.NewBash()
-
-		return pluginExecFactory(d)
+		return pluginExecFactory(pluginexec.NewBash, options)
 	},
 	pluginexec.NameBashShell: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
-		d := pluginexec.NewInteractiveBash()
-
-		return pluginExecFactory(d)
+		return pluginExecFactory(pluginexec.NewInteractiveBash, options)
 	},
 }
 

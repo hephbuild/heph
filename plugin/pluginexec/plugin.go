@@ -46,6 +46,8 @@ type RunToExecArgsFunc = func(sandboxPath string, run []string, termargs []strin
 type Plugin struct {
 	name          string
 	runToExecArgs RunToExecArgsFunc
+	path          []string
+	pathStr       string
 
 	pipes  map[string]*pipe
 	pipesm sync.RWMutex
@@ -273,6 +275,21 @@ func WithName(name string) Option {
 	}
 }
 
+func WithDefaultLinuxPath() Option {
+	return WithPath([]string{
+		"/usr/local/bin",
+		"/usr/bin",
+		"/bin",
+	})
+}
+
+func WithPath(path []string) Option {
+	return func(plugin *Plugin) {
+		plugin.path = path
+		plugin.pathStr = strings.Join(path, ":")
+	}
+}
+
 const NameExec = "exec"
 
 func New(options ...Option) *Plugin {
@@ -283,6 +300,7 @@ func New(options ...Option) *Plugin {
 		},
 		name: NameExec,
 	}
+	WithDefaultLinuxPath()(p)
 
 	for _, opt := range options {
 		opt(p)

@@ -55,7 +55,7 @@ func TestSanityTool(t *testing.T) {
 				Config: map[string]*structpb.Value{
 					"run": hstructpb.NewStringsValue([]string{
 						`which screw || echo 'screw bin not found'`,
-						`screw > out`,
+						`$TOOL > $OUT`,
 					}),
 					"out":   hstructpb.NewStringsValue([]string{"out"}),
 					"tools": hstructpb.NewStringsValue([]string{"//tools:mytool"}),

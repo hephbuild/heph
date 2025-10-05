@@ -77,10 +77,16 @@ func SetupSandbox(
 
 	for _, tool := range t.GetTools() {
 		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
-			err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
+			listArtifact, err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
 				return nil, fmt.Errorf("%v: %w", tref.Format(tool.GetRef()), err)
 			}
+			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+				Artifact: listArtifact,
+				Origin: pluginv1.TargetDef_InputOrigin_builder{
+					Id: htypes.Ptr(tool.GetId()),
+				}.Build(),
+			}.Build())
 		}
 	}
 
@@ -156,13 +162,13 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	}.Build(), nil
 }
 
-func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) error {
+func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxBinArtifact")
 	defer span.End()
 
 	dir, err := os.MkdirTemp("", "")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		_ = os.RemoveAll(dir)
@@ -170,26 +176,35 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, f
 
 	tmpfs := hfs.NewOS(dir)
 
-	var dest string
+	var binPath string
 	var count int
 	err = hartifact.Unpack(ctx, artifact, tmpfs, hartifact.WithOnFile(func(to string) {
-		dest = to
+		binPath = to
 		count++
 	}))
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if count != 1 {
-		return errors.New("must output exactly one file")
+		return nil, errors.New("must output exactly one file")
 	}
 
-	name := filepath.Base(dest)
+	name := filepath.Base(binPath)
 
-	err = fs.Move(dest, fs.Path(name))
+	dest := fs.Path(name)
+	err = fs.Move(binPath, dest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return nil
+	return pluginv1.Artifact_builder{
+		Group: htypes.Ptr(artifact.GetGroup()),
+		Name:  htypes.Ptr(artifact.GetName() + ".list"),
+		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
+		Raw: pluginv1.Artifact_ContentRaw_builder{
+			Data: []byte(dest),
+			Path: htypes.Ptr(artifact.GetName() + ".list"),
+		}.Build(),
+	}.Build(), nil
 }
