@@ -29,13 +29,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '1.24'
+          go-version: '1.25'
           cache: 'true'
 
       - name: Get buf
         run: |
           BIN="/usr/local/bin"
-          VERSION="1.55.1"
+          VERSION="1.57.2"
           curl -sSL "https://github.com/bufbuild/buf/releases/download/v${VERSION}/buf-$(uname -s)-$(uname -m)" -o "${BIN}/buf"
           chmod +x "${BIN}/buf"
 
@@ -48,7 +48,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.1
+          version: v2.5
 
       - name: Build
         env:
