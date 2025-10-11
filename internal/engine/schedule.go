@@ -18,11 +18,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
-	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/hpipe"
 	"github.com/hephbuild/heph/lib/tref"

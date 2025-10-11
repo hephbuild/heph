@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"iter"
 
-	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -159,17 +158,8 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 
 				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {
-						//if errors.Is(err, StackRecursionError{}) {
-						//	continue
-						//}
-
-						if err != nil {
-							yield(nil, err)
-							return
-						}
-
-						hlog.From(ctx).Error("failed query", "pkg", pkg, "provider", provider.Name, "err", err)
-						continue
+						yield(nil, err)
+						return
 					}
 
 					refstr := tref.Format(ref)
