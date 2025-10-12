@@ -33,7 +33,7 @@ func TestSanity(t *testing.T) {
 	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
-	p := New()
+	p := NewExec()
 
 	{
 		res, err := p.Config(ctx, &pluginv1.ConfigRequest{})
@@ -82,7 +82,7 @@ func TestPipeStdout(t *testing.T) {
 	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
-	p := New()
+	p := NewExec()
 
 	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
@@ -138,7 +138,7 @@ func TestPipeStdin(t *testing.T) {
 	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
-	p := New()
+	p := NewExec()
 
 	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
@@ -220,7 +220,7 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
-	p := New()
+	p := NewExec()
 
 	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 
@@ -300,7 +300,7 @@ func TestPipe404(t *testing.T) {
 	sandboxPath := t.TempDir()
 	defer os.RemoveAll(sandboxPath)
 
-	p := New()
+	p := NewExec()
 
 	_, rpcHandler := pluginv1connect.NewDriverHandler(pluginsdkconnect.NewDriverConnectHandler(p))
 

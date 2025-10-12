@@ -117,6 +117,15 @@ func Packages(ctx context.Context, p PackageProvider, m *pluginv1.TargetMatcher)
 }
 
 func ParsePackageMatcher(pkg, cwd, root string) (*pluginv1.TargetMatcher, error) {
+	if pkg == "..." {
+		cwp, err := tref.DirToPackage(cwd, root)
+		if err != nil {
+			return nil, err
+		}
+
+		return PackagePrefix(tref.JoinPackage(cwp)), nil
+	}
+
 	pkg = strings.TrimPrefix(pkg, "//")
 
 	prefix := false

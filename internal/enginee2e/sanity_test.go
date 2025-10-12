@@ -58,7 +58,7 @@ func TestSanity(t *testing.T) {
 	_, err = e.RegisterProvider(ctx, staticprovider)
 	require.NoError(t, err)
 
-	execdriver := pluginexec.New()
+	execdriver := pluginexec.NewExec()
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 

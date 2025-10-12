@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/lithammer/fuzzysearch/fuzzy"
 	sync_map "github.com/zolstein/sync-map"
 
 	"github.com/hephbuild/heph/internal/hdebug"
@@ -362,6 +365,15 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 	res, err, _ := rs.memDef.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*TargetDef, error) {
 		driver, ok := e.DriversByName[spec.GetDriver()]
 		if !ok {
+			matches := fuzzy.RankFindNormalizedFold(spec.GetDriver(), slices.Collect(maps.Keys(e.DriversByName)))
+			slices.SortFunc(matches, func(a, b fuzzy.Rank) int {
+				return cmp.Compare(a.Distance, b.Distance)
+			})
+
+			if len(matches) > 0 {
+				return nil, fmt.Errorf("driver %q doesnt exist, did you mean %q?", spec.GetDriver(), matches[0].Target)
+			}
+
 			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetDriver())
 		}
 

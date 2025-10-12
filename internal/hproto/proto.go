@@ -92,3 +92,8 @@ func Compare(a, b hashpb.StableWriter) int {
 		return 0
 	}
 }
+
+func New[T proto.Message]() T {
+	var v T
+	return v.ProtoReflect().New().Interface().(T) //nolint:errcheck
+}

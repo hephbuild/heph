@@ -81,7 +81,7 @@ func TestGroup(t *testing.T) {
 	_, err = e.RegisterProvider(ctx, staticprovider)
 	require.NoError(t, err)
 
-	_, err = e.RegisterDriver(ctx, pluginexec.New(), nil)
+	_, err = e.RegisterDriver(ctx, pluginexec.NewExec(), nil)
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)

@@ -20,9 +20,12 @@ import (
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
+	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	"github.com/hephbuild/heph/plugin/pluginfs"
 	"github.com/hephbuild/heph/plugin/plugingo"
 	"github.com/hephbuild/heph/plugin/plugingroup"
+	"github.com/hephbuild/heph/plugin/pluginnix"
+	nixv1 "github.com/hephbuild/heph/plugin/pluginnix/gen/heph/plugin/nix/v1"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -83,6 +86,16 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 		Enabled: true,
 	})
 
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginnix.NameBash,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginnix.NameBashShell,
+		Enabled: true,
+	})
+
 	for _, p := range []string{engine.ConfigFileName, engine.ConfigFileName + ".local"} {
 		yamlCfg, err := engine.ParseYAMLConfig(filepath.Join(root, p))
 		if err != nil {
@@ -120,7 +133,7 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 	},
 }
 
-func pluginExecFactory(factory func(options ...pluginexec.Option) *pluginexec.Plugin, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+func pluginExecFactory(factory func(options ...pluginexec.Option[*execv1.Target]) *pluginexec.Plugin[*execv1.Target], options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 	var cfg struct {
 		PATH []string `mapstructure:"PATH"`
 	}
@@ -134,7 +147,19 @@ func pluginExecFactory(factory func(options ...pluginexec.Option) *pluginexec.Pl
 		panic(err)
 	}
 
-	d := factory(pluginexec.WithPath(cfg.PATH))
+	d := factory(pluginexec.WithPath[*execv1.Target](cfg.PATH))
+
+	return d, func(mux *http.ServeMux) {
+		path, h := d.PipesHandler()
+
+		h = otelhttp.NewHandler(h, "Pipe")
+
+		mux.Handle(path, h)
+	}
+}
+
+func pluginNixFactory(factory func(options ...pluginexec.Option[*nixv1.Target]) *pluginexec.Plugin[*nixv1.Target], options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+	d := factory()
 
 	return d, func(mux *http.ServeMux) {
 		path, h := d.PipesHandler()
@@ -153,7 +178,7 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 		return plugingroup.New(), nil
 	},
 	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
-		return pluginExecFactory(pluginexec.New, options)
+		return pluginExecFactory(pluginexec.NewExec, options)
 	},
 	pluginexec.NameSh: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginExecFactory(pluginexec.NewSh, options)
@@ -163,6 +188,12 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 	},
 	pluginexec.NameBashShell: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginExecFactory(pluginexec.NewInteractiveBash, options)
+	},
+	pluginnix.NameBash: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginNixFactory(pluginnix.NewBash, options)
+	},
+	pluginnix.NameBashShell: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginNixFactory(pluginnix.NewInteractiveBash, options)
 	},
 }
 

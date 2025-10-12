@@ -15,10 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
-
-	"github.com/hephbuild/heph/internal/hfs"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -41,11 +42,13 @@ type pipe struct {
 	busy atomic.Bool
 }
 
-type RunToExecArgsFunc = func(sandboxPath string, run []string, termargs []string) []string
+type RunToExecArgsFunc[T any] = func(sandboxPath string, t T, termargs []string) []string
 
-type Plugin struct {
+type Plugin[S proto.Message] struct {
 	name          string
-	runToExecArgs RunToExecArgsFunc
+	runToExecArgs RunToExecArgsFunc[S]
+	parseConfig   func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error)
+	getExecTarget func(S) *execv1.Target
 	path          []string
 	pathStr       string
 
@@ -53,11 +56,11 @@ type Plugin struct {
 	pipesm sync.RWMutex
 }
 
-func (p *Plugin) PipesHandler() (string, http.Handler) {
-	return PipesHandlerPath + "/", PipesHandler{p}
+func (p *Plugin[S]) PipesHandler() (string, http.Handler) {
+	return PipesHandlerPath + "/", PipesHandler[S]{p}
 }
 
-func (p *Plugin) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
+func (p *Plugin[S]) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
 	p.pipesm.Lock()
 	defer p.pipesm.Unlock()
 
@@ -73,7 +76,7 @@ func (p *Plugin) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1
 	}.Build(), nil
 }
 
-func (p *Plugin) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
+func (p *Plugin[S]) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	desc := (&execv1.Target{}).ProtoReflect().Descriptor()
 	pdesc := protodesc.ToDescriptorProto(desc)
 
@@ -87,12 +90,18 @@ func depId(prop string, group string, i int) string {
 	return fmt.Sprintf("%q %q %v", prop, group, i)
 }
 
-func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
+func ParseConfig[T proto.Message](
+	ctx context.Context,
+	ref *pluginv1.TargetRef,
+	config map[string]*structpb.Value,
+	protoTarget func(Spec, *execv1.Target) (T, error),
+	filterTool func(ref *pluginv1.TargetRefWithOutput) bool,
+) (*pluginv1.TargetDef, error) {
 	var targetSpec Spec
 	targetSpec.Cache.Remote = true
 	targetSpec.Cache.Local = true
 
-	err := hstructpb.DecodeTo(req.GetSpec().GetConfig(), &targetSpec)
+	err := hstructpb.DecodeTo(config, &targetSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +197,10 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 				return nil, fmt.Errorf("tool[%d]: %q: %w", i, tool, err)
 			}
 
+			if !filterTool(ref) {
+				continue
+			}
+
 			meta, err := anypb.New(ref)
 			if err != nil {
 				return nil, err
@@ -216,7 +229,12 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		string(desc.FullName()) + ".runtime_pass_env": {},
 	})
 
-	targetAny, err := anypb.New(target)
+	ptarget, err := protoTarget(targetSpec, target)
+	if err != nil {
+		return nil, err
+	}
+
+	targetAny, err := anypb.New(ptarget)
 	if err != nil {
 		return nil, err
 	}
@@ -245,46 +263,55 @@ func (p *Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		return nil, fmt.Errorf("invalid codegen mode: %s", targetSpec.Codegen)
 	}
 
-	return pluginv1.ParseResponse_builder{
-		Target: pluginv1.TargetDef_builder{
-			Ref:                req.GetSpec().GetRef(),
-			Def:                targetAny,
-			Inputs:             inputs,
-			Outputs:            slices.Collect(maps.Keys(targetSpec.Out)),
-			Cache:              htypes.Ptr(targetSpec.Cache.Local),
-			DisableRemoteCache: htypes.Ptr(!targetSpec.Cache.Remote),
-			CollectOutputs:     collectOutputs,
-			CodegenTree:        codegenTree,
-			Pty:                htypes.Ptr(targetSpec.Pty),
-			Hash:               hash.Sum(nil),
-		}.Build(),
+	return pluginv1.TargetDef_builder{
+		Ref:                ref,
+		Def:                targetAny,
+		Inputs:             inputs,
+		Outputs:            slices.Collect(maps.Keys(targetSpec.Out)),
+		Cache:              htypes.Ptr(targetSpec.Cache.Local),
+		DisableRemoteCache: htypes.Ptr(!targetSpec.Cache.Remote),
+		CollectOutputs:     collectOutputs,
+		CodegenTree:        codegenTree,
+		Pty:                htypes.Ptr(targetSpec.Pty),
+		Hash:               hash.Sum(nil),
 	}.Build(), nil
 }
 
-type Option func(*Plugin)
+func (p *Plugin[S]) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
+	target, err := p.parseConfig(ctx, req.GetSpec().GetRef(), req.GetSpec().GetConfig())
+	if err != nil {
+		return nil, err
+	}
 
-func WithRunToExecArgs(f RunToExecArgsFunc) Option {
-	return func(plugin *Plugin) {
+	return pluginv1.ParseResponse_builder{
+		Target: target,
+	}.Build(), nil
+}
+
+type Option[S proto.Message] func(*Plugin[S])
+
+func WithRunToExecArgs[S proto.Message](f RunToExecArgsFunc[S]) Option[S] {
+	return func(plugin *Plugin[S]) {
 		plugin.runToExecArgs = f
 	}
 }
 
-func WithName(name string) Option {
-	return func(plugin *Plugin) {
+func WithName[S proto.Message](name string) Option[S] {
+	return func(plugin *Plugin[S]) {
 		plugin.name = name
 	}
 }
 
-func WithDefaultLinuxPath() Option {
-	return WithPath([]string{
+func WithDefaultLinuxPath[S proto.Message]() Option[S] {
+	return WithPath[S]([]string{
 		"/usr/local/bin",
 		"/usr/bin",
 		"/bin",
 	})
 }
 
-func WithPath(path []string) Option {
-	return func(plugin *Plugin) {
+func WithPath[S proto.Message](path []string) Option[S] {
+	return func(plugin *Plugin[S]) {
 		plugin.path = path
 		plugin.pathStr = strings.Join(path, ":")
 	}
@@ -292,21 +319,49 @@ func WithPath(path []string) Option {
 
 const NameExec = "exec"
 
-func New(options ...Option) *Plugin {
-	p := &Plugin{
-		pipes: map[string]*pipe{},
-		runToExecArgs: func(sandboxPath string, run []string, termargs []string) []string {
-			return append(run, termargs...)
-		},
-		name: NameExec,
+func New[S proto.Message](
+	name string,
+	getTarget func(S) *execv1.Target,
+	parseConfig func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error),
+	runToExecArgs RunToExecArgsFunc[S],
+	options ...Option[S],
+) *Plugin[S] {
+	p := &Plugin[S]{
+		pipes:         map[string]*pipe{},
+		name:          name,
+		getExecTarget: getTarget,
+		parseConfig:   parseConfig,
+		runToExecArgs: runToExecArgs,
 	}
-	WithDefaultLinuxPath()(p)
+	WithDefaultLinuxPath[S]()(p)
 
 	for _, opt := range options {
 		opt(p)
 	}
 
 	return p
+}
+
+func NewExec(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
+	return New[*execv1.Target](
+		NameExec,
+		func(t *execv1.Target) *execv1.Target { return t },
+		func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
+			return ParseConfig(
+				ctx, ref, config,
+				func(spec Spec, target *execv1.Target) (*execv1.Target, error) {
+					return target, nil
+				},
+				func(ref *pluginv1.TargetRefWithOutput) bool {
+					return true
+				},
+			)
+		},
+		func(sandboxPath string, t *execv1.Target, termargs []string) []string {
+			return append(t.GetRun(), termargs...)
+		},
+		options...,
+	)
 }
 
 func bashArgs(so, lo []string) []string {
@@ -318,51 +373,59 @@ func bashArgs(so, lo []string) []string {
 	)
 }
 
-const NameBash = "bash"
+func BashArgs(cmd string, termargs []string) []string {
+	args := bashArgs(
+		[]string{ /*"-x",*/ "-u", "-e", "-c", cmd},
+		[]string{"--norc"},
+	)
 
-func NewBash(options ...Option) *Plugin {
-	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
-		args := bashArgs(
-			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},
-			[]string{"--norc"},
-		)
-
-		if len(termargs) == 0 {
-			return args
-		} else {
-			// https://unix.stackexchange.com/a/144519
-			args = append(args, "bash")
-			args = append(args, termargs...)
-			return args
-		}
-	}), WithName(NameBash))
-
-	return New(options...)
+	if len(termargs) == 0 {
+		return args
+	} else {
+		// https://unix.stackexchange.com/a/144519
+		args = append(args, "bash")
+		args = append(args, termargs...)
+		return args
+	}
 }
 
-const NameBashShell = "bash@shell"
+const NameBash = "bash"
 
-func NewInteractiveBash(options ...Option) *Plugin {
-	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
-		content, err := RenderInitFile(strings.Join(run, "\n"))
-		if err != nil { //nolint:staticcheck
-			// TODO: log
-		}
+func NewBash(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
+	options = append(options, WithRunToExecArgs[*execv1.Target](func(sandboxPath string, t *execv1.Target, termargs []string) []string {
+		return BashArgs(strings.Join(t.GetRun(), "\n"), termargs)
+	}), WithName[*execv1.Target](NameBash))
 
-		initfilePath := filepath.Join(sandboxPath, "init.sh")
+	return NewExec(options...)
+}
 
-		err = os.WriteFile(initfilePath, []byte(content), 0644) //nolint:gosec
-		if err != nil {                                         //nolint:staticcheck
-			// TODO: log
-		}
+func InteractiveBashArgs(cmd, sandboxPath string) []string {
+	content, err := RenderInitFile(cmd)
+	if err != nil { //nolint:staticcheck
+		// TODO: log
+	}
 
-		return bashArgs(
-			nil,
-			[]string{"--rcfile", initfilePath},
-		)
-	}), WithName(NameBashShell))
+	initfilePath := filepath.Join(sandboxPath, "init.sh")
 
-	return New(options...)
+	err = os.WriteFile(initfilePath, []byte(content), 0644) //nolint:gosec
+	if err != nil {                                         //nolint:staticcheck
+		// TODO: log
+	}
+
+	return bashArgs(
+		nil,
+		[]string{"--rcfile", initfilePath},
+	)
+}
+
+const NameBashShell = NameBash + "@shell"
+
+func NewInteractiveBash(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
+	options = append(options, WithRunToExecArgs[*execv1.Target](func(sandboxPath string, t *execv1.Target, termargs []string) []string {
+		return InteractiveBashArgs(strings.Join(t.GetRun(), "\n"), sandboxPath)
+	}), WithName[*execv1.Target](NameBashShell))
+
+	return NewExec(options...)
 }
 
 func shArgs(initfile string, so []string) []string {
@@ -375,11 +438,11 @@ func shArgs(initfile string, so []string) []string {
 
 const NameSh = "sh"
 
-func NewSh(options ...Option) *Plugin {
-	options = append(options, WithRunToExecArgs(func(sandboxPath string, run []string, termargs []string) []string {
+func NewSh(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
+	options = append(options, WithRunToExecArgs[*execv1.Target](func(sandboxPath string, t *execv1.Target, termargs []string) []string {
 		args := shArgs(
 			"",
-			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(run, "\n")},
+			[]string{ /*"-x",*/ "-u", "-e", "-c", strings.Join(t.GetRun(), "\n")},
 		)
 
 		if len(termargs) == 0 {
@@ -390,8 +453,9 @@ func NewSh(options ...Option) *Plugin {
 			args = append(args, termargs...)
 			return args
 		}
-	}), WithName(NameSh))
-	return New(options...)
+	}), WithName[*execv1.Target](NameSh))
+
+	return NewExec(options...)
 }
 
-var _ pluginsdk.Driver = (*Plugin)(nil)
+var _ pluginsdk.Driver = (*Plugin[*execv1.Target])(nil)

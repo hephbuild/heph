@@ -22,7 +22,7 @@ func TestParsePackageMatcher(t *testing.T) {
 		{"./...", "/root", "/root", `package_prefix:""`},
 		{"./...", "/root", "/root/foo", `package_prefix:"foo"`},
 		{"...", "/root", "/root", `package_prefix:""`},
-		{"...", "/root", "/root/foo", `package_prefix:""`},
+		{"...", "/root", "/root/foo", `package_prefix:"foo"`},
 		{"//...", "/root", "/root/foo", `package_prefix:""`},
 		{".", "/root", "/root/foo", `package:"foo"`},
 		{"./foo", "/root", "/root", `package:"foo"`},

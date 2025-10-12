@@ -9,15 +9,16 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/plugin/gen/heph/plugin/v1/pluginv1connect"
+	"google.golang.org/protobuf/proto"
 )
 
-type PipesHandler struct {
-	*Plugin
+type PipesHandler[S proto.Message] struct {
+	*Plugin[S]
 }
 
 const PipesHandlerPath = pluginv1connect.DriverPipeProcedure + "Handler"
 
-func (p PipesHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+func (p PipesHandler[S]) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	status, err := p.serveHTTP(rw, req)
 	if status > 0 {
 		rw.WriteHeader(status)
@@ -40,7 +41,7 @@ func (w writerFlusher) Write(p []byte) (int, error) {
 	return n, err
 }
 
-func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int, error) {
+func (p PipesHandler[S]) serveHTTP(rw http.ResponseWriter, req *http.Request) (int, error) {
 	i := strings.Index(req.URL.Path, PipesHandlerPath)
 	if i < 0 {
 		return http.StatusBadRequest, errors.New("invalid path")
@@ -92,7 +93,7 @@ func (p PipesHandler) serveHTTP(rw http.ResponseWriter, req *http.Request) (int,
 	return -1, nil
 }
 
-func (p *Plugin) getPipe(id string) (*pipe, bool) {
+func (p *Plugin[S]) getPipe(id string) (*pipe, bool) {
 	p.pipesm.RLock()
 	pipe, ok := p.pipes[id]
 	p.pipesm.RUnlock()
@@ -100,7 +101,7 @@ func (p *Plugin) getPipe(id string) (*pipe, bool) {
 	return pipe, ok
 }
 
-func (p *Plugin) removePipe(id string) {
+func (p *Plugin[S]) removePipe(id string) {
 	p.pipesm.Lock()
 	defer p.pipesm.Unlock()
 	pipe, ok := p.pipes[id]
@@ -115,7 +116,7 @@ func (p *Plugin) removePipe(id string) {
 	p.housekeepingPipes()
 }
 
-func (p *Plugin) housekeepingPipes() {
+func (p *Plugin[S]) housekeepingPipes() {
 	for k, v := range p.pipes {
 		if !v.busy.Load() && time.Now().After(v.exp) {
 			delete(p.pipes, k)

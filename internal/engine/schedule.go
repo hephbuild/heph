@@ -20,6 +20,7 @@ import (
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/internal/hpanic"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -1056,6 +1057,24 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 	return pipes, wait, nil
 }
 
+func (e *Engine) pickShellDriver(ctx context.Context, def *LightLinkedTarget) (pluginsdk.Driver, error) {
+	var errs error
+	for _, shellDriver := range []string{def.GetDriver() + "@shell", "bash@shell"} {
+		driver, ok := e.DriversByName[shellDriver]
+		if ok {
+			return driver, nil
+		} else {
+			errs = errors.Join(fmt.Errorf("shell driver not found: %v", shellDriver))
+		}
+	}
+
+	if errs == nil {
+		errs = errors.New("no shell driver found")
+	}
+
+	return nil, errs
+}
+
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
 func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*ExecuteResult, error) {
@@ -1081,11 +1100,9 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	if options.shell {
-		shellDriver := def.GetDriver() + "@shell" //nolint:ineffassign,staticcheck,wastedassign
-		shellDriver = "bash@shell"                // TODO: make the original driver declare the shell config
-		driver, ok = e.DriversByName[shellDriver]
-		if !ok {
-			return nil, fmt.Errorf("shell driver not found: %v", shellDriver)
+		driver, err = e.pickShellDriver(ctx, def)
+		if err != nil {
+			return nil, err
 		}
 		def.SetPty(true)
 	}
@@ -1177,15 +1194,24 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 					hlog.From(ctx).Error(fmt.Sprintf("pipe wait: %v", err))
 				}
 			}()
+			defer func() {
+				select {
+				case <-pctx.Done():
+				case <-time.After(200 * time.Millisecond):
+					cancel()
+				}
+			}()
 
-			runRes, runErr = driver.Run(ctx, pluginv1.RunRequest_builder{
-				RequestId:    htypes.Ptr(rs.ID),
-				Target:       def.TargetDef.TargetDef,
-				SandboxPath:  htypes.Ptr(sandboxfs.Path()),
-				TreeRootPath: htypes.Ptr(e.Root.Path()),
-				Inputs:       inputs,
-				Pipes:        pipes,
-			}.Build())
+			runRes, runErr = hpanic.RecoverV(func() (*pluginv1.RunResponse, error) {
+				return driver.Run(ctx, pluginv1.RunRequest_builder{
+					RequestId:    htypes.Ptr(rs.ID),
+					Target:       def.TargetDef.TargetDef,
+					SandboxPath:  htypes.Ptr(sandboxfs.Path()),
+					TreeRootPath: htypes.Ptr(e.Root.Path()),
+					Inputs:       inputs,
+					Pipes:        pipes,
+				}.Build())
+			})
 		},
 		Pty: def.GetPty(),
 	})

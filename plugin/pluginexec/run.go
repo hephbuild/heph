@@ -40,7 +40,7 @@ var tracer = otel.Tracer("heph/pluginexec")
 
 var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
 
-func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
 			"where", fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.GetTarget().GetRef())),
@@ -66,11 +66,13 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		req.SetPipes(append(req.GetPipes(), ""))
 	}
 
-	t := &execv1.Target{}
+	t := hproto.New[S]()
 	err = req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {
 		return nil, err
 	}
+
+	texec := p.getExecTarget(t)
 
 	pty := req.GetTarget().GetPty()
 	sandboxfs := hfs.NewOS(req.GetSandboxPath())
@@ -78,18 +80,18 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	binfs := hfs.At(sandboxfs, "bin")
 	cwdfs := hfs.At(workfs, req.GetTarget().GetRef().GetPackage())
 	outfs := cwdfs
-	if t.GetContext() == execv1.Target_Tree {
+	if texec.GetContext() == execv1.Target_Tree {
 		cwdfs = hfs.At(hfs.NewOS(req.GetTreeRootPath()), req.GetTarget().GetRef().GetPackage())
 	}
 
-	listArtifacts, err := SetupSandbox(ctx, t, req.GetInputs(), workfs, binfs, cwdfs, outfs, t.GetContext() != execv1.Target_Tree)
+	listArtifacts, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_Tree)
 	if err != nil {
 		return nil, fmt.Errorf("setup sandbox: %w", err)
 	}
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, t)
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec)
 	if err != nil {
 		return nil, err
 	}
@@ -97,22 +99,22 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	env = append(env, inputEnv...)
 	env = append(env, fmt.Sprintf("PATH=%v:%v", binfs.Path(), p.pathStr))
 
-	for key, value := range t.GetEnv() {
+	for key, value := range texec.GetEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
-	for key, value := range t.GetRuntimeEnv() {
+	for key, value := range texec.GetRuntimeEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
-	for _, name := range t.GetRuntimePassEnv() {
+	for _, name := range texec.GetRuntimePassEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
 	}
-	for _, name := range t.GetPassEnv() {
+	for _, name := range texec.GetPassEnv() {
 		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
 	}
 	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))         // TODO: figure it out
 	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.GetTreeRootPath())) // TODO: figure it out
 
-	for _, output := range t.GetOutputs() {
+	for _, output := range texec.GetOutputs() {
 		paths := slices.Clone(output.GetPaths())
 		for i, path := range paths {
 			paths[i] = outfs.Path(path)
@@ -122,8 +124,7 @@ func (p *Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		env = append(env, getEnvEntry("OUT", output.GetGroup(), "", pathsStr))
 	}
 
-	hlog.From(ctx).Debug(fmt.Sprintf("run: %#v", t.GetRun()))
-	args := p.runToExecArgs(req.GetSandboxPath(), t.GetRun(), nil)
+	args := p.runToExecArgs(req.GetSandboxPath(), t, nil)
 	hlog.From(ctx).Debug(fmt.Sprintf("args: %#v", args))
 
 	var stdoutWriters, stderrWriters []io.Writer
@@ -346,7 +347,7 @@ func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps 
 	return nd
 }
 
-func (p *Plugin) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
+func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
 	for name, deps := range Merge(t.GetDeps(), t.GetRuntimeDeps()) {

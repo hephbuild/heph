@@ -79,8 +79,6 @@ func (s *SpecCache) MapstructureDecode(v any) error {
 				Remote: false,
 			}
 			return nil
-		} else {
-			return fmt.Errorf("invalid value: %q", v)
 		}
 	}
 
