@@ -15,6 +15,7 @@ func wrapWithNix(t *nixv1.Target, args []string) []string {
 	nargs := make([]string, 0, len(args))
 	nargs = append(nargs, "nix")
 	nargs = append(nargs, "shell")
+	nargs = append(nargs, "nixpkgs#bash")
 	if len(t.GetPackages()) > 0 {
 		for _, p := range t.GetPackages() {
 			nargs = append(nargs, "nixpkgs#"+p)

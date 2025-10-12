@@ -26,6 +26,7 @@ import (
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"github.com/hephbuild/heph/plugin/pluginnix"
 	nixv1 "github.com/hephbuild/heph/plugin/pluginnix/gen/heph/plugin/nix/v1"
+	"github.com/hephbuild/heph/plugin/plugintextfile"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -36,7 +37,12 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	}
 
 	cfg.Providers = append(cfg.Providers, engine.ConfigProvider{
-		Name:    pluginfs.ProviderName,
+		Name:    pluginfs.NameProvider,
+		Enabled: true,
+	})
+
+	cfg.Providers = append(cfg.Providers, engine.ConfigProvider{
+		Name:    pluginnix.NameProvider,
 		Enabled: true,
 	})
 
@@ -57,7 +63,12 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	})
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
-		Name:    pluginfs.ProviderName,
+		Name:    pluginfs.NameProvider,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    plugintextfile.Name,
 		Enabled: true,
 	})
 
@@ -128,8 +139,11 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 	plugingo.Name: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
 		return plugingo.New()
 	},
-	pluginfs.ProviderName: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
+	pluginfs.NameProvider: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
 		return pluginfs.NewProvider()
+	},
+	pluginnix.NameProvider: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
+		return pluginnix.NewProvider()
 	},
 }
 
@@ -138,6 +152,7 @@ func pluginExecFactory(factory func(options ...pluginexec.Option[*execv1.Target]
 		PATH []string `mapstructure:"PATH"`
 	}
 	cfg.PATH = []string{
+		"/nix/var/nix/profiles/default/bin", // TODO: figure out how to make plugins provide that
 		"/usr/local/bin",
 		"/usr/bin",
 		"/bin",
@@ -171,8 +186,11 @@ func pluginNixFactory(factory func(options ...pluginexec.Option[*nixv1.Target]) 
 }
 
 var nameToDriver = map[string]func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)){
-	pluginfs.ProviderName: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+	pluginfs.NameProvider: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginfs.NewDriver(), nil
+	},
+	plugintextfile.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return plugintextfile.New(), nil
 	},
 	plugingroup.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return plugingroup.New(), nil

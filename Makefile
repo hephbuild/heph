@@ -15,10 +15,11 @@ install-dev-build:
 
 gen:
 	cd plugin && buf generate
+	cd plugin/plugingroup && buf generate
+	cd plugin/plugintextfile && buf generate
 	cd plugin/pluginexec && buf generate
 	cd plugin/pluginnix && buf generate
 	cd plugin/pluginfs && buf generate
-	cd plugin/plugingroup && buf generate
 	cd internal/hproto && buf generate
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_driver.go > lib/pluginsdk/plugin_driver.mock.go
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_provider.go > lib/pluginsdk/plugin_provider.mock.go

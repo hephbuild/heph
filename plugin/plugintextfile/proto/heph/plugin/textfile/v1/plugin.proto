@@ -1,0 +1,7 @@
+edition = "2023";
+package heph.plugin.textfile.v1;
+
+message Target {
+  string text = 1;
+  string output = 2;
+}

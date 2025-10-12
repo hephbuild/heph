@@ -2,13 +2,11 @@ package pluginstaticprovider
 
 import (
 	"context"
-	"errors"
 
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
@@ -79,5 +77,5 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 		}.Build(), nil
 	}
 
-	return nil, connect.NewError(connect.CodeNotFound, errors.New("not found"))
+	return nil, pluginsdk.ErrNotFound
 }
