@@ -2,8 +2,6 @@ package pluginnix
 
 import (
 	"context"
-	"slices"
-	"strconv"
 	"strings"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -14,20 +12,16 @@ import (
 )
 
 func wrapWithNix(t *nixv1.Target, args []string) []string {
-	args = slices.Clone(args)
-	for i, arg := range args {
-		if strings.Contains(arg, " ") {
-			args[i] = strconv.Quote(arg)
+	nargs := make([]string, 0, len(args))
+	nargs = append(nargs, "nix")
+	nargs = append(nargs, "shell")
+	if len(t.GetPackages()) > 0 {
+		for _, p := range t.GetPackages() {
+			nargs = append(nargs, "nixpkgs#"+p)
 		}
 	}
-
-	nargs := make([]string, 0, len(args))
-	nargs = append(nargs, "nix-shell")
-	nargs = append(nargs, "--packages")
-	if len(t.GetPackages()) > 0 {
-		nargs = append(nargs, t.GetPackages()...)
-	}
-	nargs = append(nargs, "--pure", "--run", strings.Join(args, " "))
+	nargs = append(nargs, "-c")
+	nargs = append(nargs, args...)
 
 	return nargs
 }
@@ -37,10 +31,21 @@ const NameBash = "nix-bash"
 type Option = pluginexec.Option[*nixv1.Target]
 type Plugin = pluginexec.Plugin[*nixv1.Target]
 
+const nixConfig = `
+experimental-features = nix-command flakes
+`
+
 func ParseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
 	nixPackages := make([]string, 0)
 
 	return pluginexec.ParseConfig(ctx, ref, config, func(spec pluginexec.Spec, target *execv1.Target) (*nixv1.Target, error) {
+		renv := target.GetRuntimeEnv()
+		if renv == nil {
+			renv = map[string]string{}
+		}
+		renv["NIX_CONFIG"] = nixConfig
+		target.SetRuntimeEnv(renv)
+
 		return nixv1.Target_builder{
 			Target:   target,
 			Packages: nixPackages,
