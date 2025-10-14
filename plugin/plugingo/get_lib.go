@@ -64,6 +64,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 						}.Build(), "a"))},
 						"asm": asmDeps,
 					}),
+					"tools": p.getGoToolStructpb(),
 				},
 			}.Build(),
 		}.Build(), nil
@@ -271,6 +272,7 @@ func (p *Plugin) packageLibInner3(
 				"run":              hstructpb.NewStringsValue(run),
 				"out":              hstructpb.NewMapStringStringValue(out),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil
@@ -349,6 +351,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 					"h":   "go_asm.h",
 				}),
 				"deps": hstructpb.NewMapStringStringsValue(deps),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil
@@ -403,6 +406,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 					}.Build(), "h"))},
 					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
 				}),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

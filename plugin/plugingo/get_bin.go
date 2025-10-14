@@ -76,6 +76,7 @@ func (p *Plugin) packageBinInner(
 				"run":              hstructpb.NewStringsValue(run),
 				"out":              structpb.NewStringValue(filepath.Base(goPkg.HephPackage)),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
+				"tools":            p.getGoToolStructpb(),
 			},
 			Labels: []string{"go-build"},
 		}.Build(),

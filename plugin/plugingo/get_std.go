@@ -107,6 +107,7 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 					"pkg":  fmt.Sprintf("goroot/pkg/%v_%v", factors.GOOS, factors.GOARCH),
 					"list": fmt.Sprintf("goroot/pkg/%v_%v/list.json", factors.GOOS, factors.GOARCH),
 				}),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil
@@ -139,6 +140,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 					"a": goImport + ".a",
 				}),
 				"cache": structpb.NewStringValue("local"),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

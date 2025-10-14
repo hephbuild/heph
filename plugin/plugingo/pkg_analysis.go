@@ -562,7 +562,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 				"in_tree":          structpb.NewBoolValue(true),
 				"cache":            structpb.NewStringValue("local"),
 				"hash_deps":        hstructpb.NewStringsValue(files),
-				// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
+				"tools":            p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build())

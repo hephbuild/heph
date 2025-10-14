@@ -92,6 +92,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q > $OUT", string(b))),
 				"out": structpb.NewStringValue("embedcfg.json"),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

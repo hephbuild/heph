@@ -137,7 +137,13 @@ var nameToProvider = map[string]func(ctx context.Context, root string, options m
 		return pluginbuildfile.New(hfs.NewOS(root), cfg)
 	},
 	plugingo.Name: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
-		return plugingo.New()
+		var cfg plugingo.Options
+		err := mapstructure.Decode(options, &cfg)
+		if err != nil {
+			panic(err)
+		}
+
+		return plugingo.New(cfg)
 	},
 	pluginfs.NameProvider: func(ctx context.Context, root string, options map[string]any) pluginsdk.Provider {
 		return pluginfs.NewProvider()

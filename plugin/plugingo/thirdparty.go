@@ -37,7 +37,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 			"run":              hstructpb.NewStringsValue(run),
 			"out":              structpb.NewStringValue("."),
 			"cache":            structpb.NewBoolValue(true),
-			// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
+			"tools":            p.getGoToolStructpb(),
 		},
 	}.Build()}.Build(), nil
 }

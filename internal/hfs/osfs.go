@@ -1,9 +1,12 @@
 package hfs
 
 import (
+	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hephbuild/heph/internal/flock"
@@ -77,7 +80,53 @@ func (osfs OS) Open(name string, flag int, perm FileMode) (File, error) {
 }
 
 func (osfs OS) Move(oldname, newname string) error {
-	return os.Rename(osfs.join(oldname), osfs.join(newname))
+	oldpath := osfs.join(oldname)
+	newpath := osfs.join(newname)
+
+	err := os.Rename(oldpath, newpath)
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid cross-device link") {
+			return osfs.moveCrossDevice(oldpath, newpath)
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func (osfs OS) moveCrossDevice(source, destination string) error {
+	src, err := os.Open(source)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+
+	dst, err := os.Create(destination)
+	if err != nil {
+		_ = src.Close()
+		return fmt.Errorf("create: %w", err)
+	}
+	_, err = io.Copy(dst, src)
+	_ = src.Close()
+	_ = dst.Close()
+	if err != nil {
+		return fmt.Errorf("copy: %w", err)
+	}
+
+	fi, err := os.Stat(source)
+	if err != nil {
+		_ = os.Remove(destination)
+		return fmt.Errorf("stat: %w", err)
+	}
+
+	err = os.Chmod(destination, fi.Mode())
+	if err != nil {
+		_ = os.Remove(destination)
+		return fmt.Errorf("stat: %w", err)
+	}
+	_ = os.Remove(source)
+
+	return nil
 }
 
 func (osfs OS) Remove(path string) error {

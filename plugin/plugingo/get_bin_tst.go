@@ -44,6 +44,7 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 						Args:    factors.Args(),
 					}.Build()),
 				}),
+				"tools": p.getGoToolStructpb(),
 			},
 			Labels: labels,
 		}.Build(),
@@ -100,6 +101,7 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue(fmt.Sprintf("echo %q | base64 --decode > $OUT", testmain)),
 				"out": structpb.NewStringValue("testmain.go"),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

@@ -78,6 +78,7 @@ type goModGoWorkCache struct {
 }
 
 type Plugin struct {
+	goTool           string
 	resultClient     pluginsdk.Engine
 	root             string
 	resultStdListMem hsingleflight.GroupMem[Factors, []Package]
@@ -86,6 +87,14 @@ type Plugin struct {
 	moduleCache      hsingleflight.GroupMem[moduleCacheKey, []Module]
 	stdCache         hsingleflight.GroupMem[stdCacheKey, map[string]Package]
 	goModGoWorkCache hsingleflight.GroupMem[string, goModGoWorkCache]
+}
+
+func (p *Plugin) getGoToolStructpb() *structpb.Value {
+	if p.goTool != "" {
+		return structpb.NewStringValue(p.goTool)
+	}
+
+	return nil
 }
 
 func (p *Plugin) PluginInit(ctx context.Context, init pluginsdk.InitPayload) error {
@@ -97,10 +106,17 @@ func (p *Plugin) PluginInit(ctx context.Context, init pluginsdk.InitPayload) err
 
 const Name = "go"
 
-func New() *Plugin {
-	return &Plugin{
+type Options struct {
+	GoTool string
+}
+
+func New(options Options) *Plugin {
+	p := &Plugin{
 		packageCache: cache.New(cache.AsLRU[packageCacheKey, *GetGoPackageCache](lru.WithCapacity(10000))),
+		goTool:       options.GoTool,
 	}
+
+	return p
 }
 
 func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
@@ -447,7 +463,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 				"in_tree":          structpb.NewBoolValue(true),
 				"cache":            structpb.NewStringValue("local"),
 				"hash_deps":        hstructpb.NewStringsValue(files),
-				// "tools": hstructpb.NewStringsValue([]string{fmt.Sprintf("//go_toolchain/%v:go", f.GoVersion)}),
+				"tools":            p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build())

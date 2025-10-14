@@ -121,7 +121,7 @@ func Move(from, to FS) error {
 		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
 	}
 
-	return os.Rename(fromos.Path(), toos.Path())
+	return fromos.Move("", toos.Path())
 }
 
 func Copy(from, to FS) error {
