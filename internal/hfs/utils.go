@@ -59,6 +59,15 @@ func Create(fs FS, filename string) (File, error) {
 	return fs.Open(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
+func CreateExec(fs FS, filename string) (File, error) {
+	err := CreateParentDir(fs, filename)
+	if err != nil {
+		return nil, err
+	}
+
+	return fs.Open(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666|0111)
+}
+
 func CreateParentDir(fs FS, path string) error {
 	path = fs.Path(path)
 	if dir := filepath.Dir(path); dir != "." {

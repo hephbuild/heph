@@ -86,14 +86,10 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        factors.GOOS,
-					"GOARCH":      factors.GOARCH,
-					"CGO_ENABLED": "0",
-					"GODEBUG":     "installgoroot=all",
-					"GOTOOLCHAIN": "local",
+				"env": p.getEnvStructpb(factors, map[string]string{
+					"GODEBUG": "installgoroot=all",
 				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					"export LGOROOT=$(pwd)/goroot",
 					"rm -rf $LGOROOT",
@@ -140,7 +136,6 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 					"a": goImport + ".a",
 				}),
 				"cache": structpb.NewStringValue("local"),
-				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

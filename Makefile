@@ -16,6 +16,7 @@ install-dev-build:
 gen:
 	cd plugin && buf generate
 	cd plugin/plugingroup && buf generate
+	cd plugin/pluginbin && buf generate
 	cd plugin/plugintextfile && buf generate
 	cd plugin/pluginexec && buf generate
 	cd plugin/pluginnix && buf generate

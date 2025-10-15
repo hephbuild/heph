@@ -88,6 +88,10 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}.Build(), nil
 }
 
+func IsExecOwner(mode os.FileMode) bool {
+	return mode&0100 != 0
+}
+
 func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &fsv1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
@@ -96,14 +100,22 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	}
 
 	if t.HasFile() {
+		path := filepath.Join(p.resultClient.Root, t.GetFile())
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+
 		return pluginv1.RunResponse_builder{
 			Artifacts: []*pluginv1.Artifact{
 				pluginv1.Artifact_builder{
 					Name: htypes.Ptr(filepath.Base(t.GetFile())),
 					Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 					File: pluginv1.Artifact_ContentFile_builder{
-						SourcePath: htypes.Ptr(filepath.Join(p.resultClient.Root, t.GetFile())),
+						SourcePath: htypes.Ptr(path),
 						OutPath:    htypes.Ptr(t.GetFile()),
+						X:          htypes.Ptr(IsExecOwner(info.Mode())),
 					}.Build(),
 				}.Build(),
 			},
@@ -118,12 +130,18 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			return ctx.Err()
 		}
 
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
 		artifacts = append(artifacts, pluginv1.Artifact_builder{
 			Name: htypes.Ptr(strings.ReplaceAll(path, "/", "_")),
 			Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 			File: pluginv1.Artifact_ContentFile_builder{
 				SourcePath: htypes.Ptr(fs.At(path).Path()),
 				OutPath:    htypes.Ptr(path),
+				X:          htypes.Ptr(IsExecOwner(info.Mode())),
 			}.Build(),
 		}.Build())
 

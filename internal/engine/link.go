@@ -17,6 +17,7 @@ import (
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/plugin/pluginbin"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	sync_map "github.com/zolstein/sync-map"
 
@@ -74,8 +75,12 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	defer span.End()
 
 	spec, err, computed := rs.memSpec.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
-		if ref := c.GetRef(); ref.GetPackage() == tref.QueryPackage {
+		ref := c.GetRef()
+		switch {
+		case ref.GetPackage() == tref.QueryPackage:
 			return e.resolveSpecQuery(ctx, rs, ref)
+		case ref.GetPackage() == tref.BinPackage:
+			return e.resolveHostBin(ctx, rs, ref)
 		}
 
 		for _, p := range e.Providers {
@@ -171,6 +176,16 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 			"deps": structpb.NewListValue(&structpb.ListValue{
 				Values: deps,
 			}),
+		},
+	}.Build(), nil
+}
+
+func (e *Engine) resolveHostBin(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) (*pluginv1.TargetSpec, error) {
+	return pluginv1.TargetSpec_builder{
+		Ref:    tref.New(ref.GetPackage(), ref.GetName(), nil),
+		Driver: htypes.Ptr(pluginbin.Name),
+		Config: map[string]*structpb.Value{
+			"name": structpb.NewStringValue(ref.GetName()),
 		},
 	}.Build(), nil
 }

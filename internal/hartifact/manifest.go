@@ -2,6 +2,7 @@ package hartifact
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -49,6 +50,8 @@ type ManifestArtifactContentType string
 const (
 	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "application/x-tar"
 	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "application/x-gtar"
+	ManifestArtifactContentTypeFile  ManifestArtifactContentType = "file"
+	ManifestArtifactContentTypeRaw   ManifestArtifactContentType = "raw"
 )
 
 type ManifestArtifact struct {
@@ -58,7 +61,8 @@ type ManifestArtifact struct {
 	Name        string
 	Type        ManifestArtifactType
 	ContentType ManifestArtifactContentType
-	Package     string
+	OutPath     string `json:",omitempty"` // set for file & raw
+	X           bool   `json:",omitempty"` // set for file & raw
 }
 
 type Manifest struct {
@@ -165,7 +169,9 @@ func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, err
 	case pluginv1.Artifact_TarPath_case:
 		return ManifestArtifactContentTypeTar, nil
 	case pluginv1.Artifact_File_case:
+		return ManifestArtifactContentTypeFile, nil
 	case pluginv1.Artifact_Raw_case:
+		return ManifestArtifactContentTypeRaw, nil
 	default:
 	}
 
@@ -178,12 +184,25 @@ func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (Manif
 		return ManifestArtifact{}, err
 	}
 
+	var outPath string
+	var x bool
+	switch artifact.WhichContent() {
+	case pluginv1.Artifact_File_case:
+		outPath = artifact.GetFile().GetOutPath()
+		x = artifact.GetFile().GetX()
+	case pluginv1.Artifact_Raw_case:
+		outPath = artifact.GetRaw().GetPath()
+		x = artifact.GetRaw().GetX()
+	}
+
 	return ManifestArtifact{
 		Hashout:     hashout,
 		Group:       artifact.GetGroup(),
 		Name:        artifact.GetName(),
 		Type:        ManifestArtifactType(artifact.GetType()),
 		ContentType: contentType,
+		OutPath:     outPath,
+		X:           x,
 	}, nil
 }
 
@@ -199,6 +218,23 @@ func ManifestArtifactToProto(artifact ManifestArtifact, path string) (*pluginv1.
 		partifact.SetTarPath(path)
 	case ManifestArtifactContentTypeTarGz:
 		partifact.SetTargzPath(path)
+	case ManifestArtifactContentTypeFile:
+		partifact.SetFile(pluginv1.Artifact_ContentFile_builder{
+			SourcePath: &path,
+			OutPath:    &artifact.OutPath,
+			X:          &artifact.X,
+		}.Build())
+	case ManifestArtifactContentTypeRaw:
+		b, err := base64.StdEncoding.DecodeString(path)
+		if err != nil {
+			return nil, err
+		}
+
+		partifact.SetRaw(pluginv1.Artifact_ContentRaw_builder{
+			Data: b,
+			Path: &artifact.OutPath,
+			X:    &artifact.X,
+		}.Build())
 	default:
 		return nil, fmt.Errorf("unsupported content type %q", artifact.ContentType)
 	}

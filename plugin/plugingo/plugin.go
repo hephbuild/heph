@@ -97,6 +97,38 @@ func (p *Plugin) getGoToolStructpb() *structpb.Value {
 	return nil
 }
 
+func (p *Plugin) getRuntimePassEnvStructpb() *structpb.Value {
+	return hstructpb.NewStringsValue([]string{"HOME", "GOROOT"})
+}
+
+func (p *Plugin) getEnvStructpb2(ms ...map[string]string) *structpb.Value {
+	m := map[string]string{
+		"CGO_ENABLED": "0",
+		"GOWORK":      "off",
+		"GOTOOLCHAIN": "local",
+	}
+	if len(ms) == 0 {
+		return hstructpb.NewMapStringStringValue(m)
+	}
+
+	return hstructpb.NewMapStringStringValue(hmaps.Concat(append([]map[string]string{m}, ms...)...))
+}
+
+func (p *Plugin) getEnvStructpb(factors Factors, ms ...map[string]string) *structpb.Value {
+	m := map[string]string{
+		"GOOS":        factors.GOOS,
+		"GOARCH":      factors.GOARCH,
+		"CGO_ENABLED": "0",
+		"GOTOOLCHAIN": "local",
+	}
+
+	if len(ms) == 0 {
+		return hstructpb.NewMapStringStringValue(m)
+	}
+
+	return hstructpb.NewMapStringStringValue(hmaps.Concat(append([]map[string]string{m}, ms...)...))
+}
+
 func (p *Plugin) PluginInit(ctx context.Context, init pluginsdk.InitPayload) error {
 	p.resultClient = init.Engine
 	p.root = init.Root
@@ -451,13 +483,8 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			Ref:    listRef,
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        f.GOOS,
-					"GOARCH":      f.GOARCH,
-					"CGO_ENABLED": "0",
-					"GOTOOLCHAIN": "local",
-				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"env":              p.getEnvStructpb(f),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),
 				"out":              structpb.NewStringValue("golist.json"),
 				"in_tree":          structpb.NewBoolValue(true),

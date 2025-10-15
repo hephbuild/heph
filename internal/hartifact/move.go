@@ -3,8 +3,6 @@ package hartifact
 import (
 	"fmt"
 
-	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
@@ -29,11 +27,7 @@ func Relocated(artifact *pluginv1.Artifact, to string) (*pluginv1.Artifact, erro
 
 	switch artifact.WhichContent() {
 	case pluginv1.Artifact_File_case:
-		if x := htypes.Ptr(to); x != nil {
-			artifact.GetFile().SetSourcePath(*x)
-		} else {
-			artifact.GetFile().ClearSourcePath()
-		}
+		artifact.GetFile().SetSourcePath(to)
 	case pluginv1.Artifact_Raw_case:
 		return nil, fmt.Errorf("unsupported content %v", artifact.WhichContent())
 	case pluginv1.Artifact_TargzPath_case:

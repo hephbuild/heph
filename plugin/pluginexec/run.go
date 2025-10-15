@@ -106,10 +106,14 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 		env = append(env, fmt.Sprintf("%v=%v", key, value))
 	}
 	for _, name := range texec.GetRuntimePassEnv() {
-		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
+		if v, ok := os.LookupEnv(name); ok {
+			env = append(env, fmt.Sprintf("%v=%v", name, v))
+		}
 	}
 	for _, name := range texec.GetPassEnv() {
-		env = append(env, fmt.Sprintf("%v=%v", name, os.Getenv(name)))
+		if v, ok := os.LookupEnv(name); ok {
+			env = append(env, fmt.Sprintf("%v=%v", name, v))
+		}
 	}
 	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))         // TODO: figure it out
 	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.GetTreeRootPath())) // TODO: figure it out

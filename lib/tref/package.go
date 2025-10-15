@@ -55,7 +55,8 @@ func JoinPackage(s ...string) string {
 	s = slices.DeleteFunc(s, func(s string) bool {
 		return s == ""
 	})
-	return strings.Join(s, "/")
+
+	return path.Join(s...)
 }
 
 func DirPackage(s string) string {

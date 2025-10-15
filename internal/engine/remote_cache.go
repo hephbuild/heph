@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -74,6 +75,12 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 	cache CacheHandle,
 ) error {
 	// TODO: remote lock ?
+
+	for _, artifact := range artifacts {
+		if artifact.Artifact.WhichContent() == pluginv1.Artifact_File_case {
+			return fmt.Errorf("not supported: %v", artifact.Artifact.WhichContent())
+		}
+	}
 
 	for _, artifact := range artifacts {
 		r, err := hartifact.Reader(ctx, artifact.Artifact)

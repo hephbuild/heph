@@ -4,6 +4,7 @@ modules:
   - path: plugin/pluginexec/proto
   - path: plugin/pluginnix/proto
   - path: plugin/plugingroup/proto
+  - path: plugin/pluginbin/proto
 lint:
   use:
     - STANDARD

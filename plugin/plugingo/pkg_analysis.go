@@ -556,7 +556,8 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 			}.Build(),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"env":              p.getEnvStructpb2(),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run":              structpb.NewStringValue("go list -m -json > $OUT"),
 				"out":              structpb.NewStringValue("golist_mod.json"),
 				"in_tree":          structpb.NewBoolValue(true),

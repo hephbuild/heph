@@ -18,6 +18,7 @@ import (
 	"github.com/hephbuild/heph/internal/remotecache"
 	"github.com/hephbuild/heph/internal/termui"
 	"github.com/hephbuild/heph/lib/pluginsdk"
+	"github.com/hephbuild/heph/plugin/pluginbin"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -74,6 +75,11 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
 		Name:    plugingroup.Name,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginbin.Name,
 		Enabled: true,
 	})
 
@@ -200,6 +206,9 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 	},
 	plugingroup.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return plugingroup.New(), nil
+	},
+	pluginbin.Name: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginbin.New(), nil
 	},
 	pluginexec.NameExec: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginExecFactory(pluginexec.NewExec, options)

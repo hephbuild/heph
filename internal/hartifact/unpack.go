@@ -56,7 +56,12 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 			return nil
 		}
 
-		f, err := hfs.Create(fs, artifact.GetFile().GetOutPath())
+		create := hfs.Create
+		if artifact.GetFile().GetX() {
+			create = hfs.CreateExec
+		}
+
+		f, err := create(fs, artifact.GetFile().GetOutPath())
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
@@ -67,8 +72,18 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return err
 		}
+
+		err = hfs.CloseEnsureROFD(f)
+		if err != nil {
+			return err
+		}
 	case pluginv1.Artifact_Raw_case:
-		f, err := hfs.Create(fs, artifact.GetRaw().GetPath())
+		create := hfs.Create
+		if artifact.GetRaw().GetX() {
+			create = hfs.CreateExec
+		}
+
+		f, err := create(fs, artifact.GetRaw().GetPath())
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
@@ -76,6 +91,11 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		defer cfg.onFile(f.Name())
 
 		_, err = io.Copy(f, r)
+		if err != nil {
+			return err
+		}
+
+		err = hfs.CloseEnsureROFD(f)
 		if err != nil {
 			return err
 		}

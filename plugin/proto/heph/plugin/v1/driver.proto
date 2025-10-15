@@ -48,11 +48,13 @@ message Artifact {
   message ContentRaw {
     bytes data = 1;
     string path = 2;
+    bool x = 3;
   }
 
   message ContentFile {
     string source_path = 1;
     string out_path = 2;
+    bool x = 3;
   }
 
   string group = 1;

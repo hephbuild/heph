@@ -65,14 +65,10 @@ func (p *Plugin) packageBinInner(
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":               factors.GOOS,
-					"GOARCH":             factors.GOARCH,
-					"CGO_ENABLED":        "0",
+				"env": p.getEnvStructpb(factors, map[string]string{
 					"GO_EXTLINK_ENABLED": "0",
-					"GOTOOLCHAIN":        "local",
 				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run":              hstructpb.NewStringsValue(run),
 				"out":              structpb.NewStringValue(filepath.Base(goPkg.HephPackage)),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),

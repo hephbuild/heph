@@ -126,11 +126,16 @@ func (e *Engine) CacheLocally(
 			defer tarf.Close()
 			p := htar.NewPacker(tarf)
 
+			mode := int64(os.ModePerm)
+			if content.GetX() {
+				mode |= 0111 // executable
+			}
+
 			err = p.Write(bytes.NewReader(content.GetData()), &tar.Header{
 				Typeflag: tar.TypeReg,
 				Name:     content.GetPath(),
 				Size:     int64(len(content.GetData())),
-				Mode:     int64(os.ModePerm),
+				Mode:     mode,
 			})
 			if err != nil {
 				return nil, nil, err
@@ -184,17 +189,8 @@ func (e *Engine) CacheLocally(
 			return nil, nil, fmt.Errorf("relocated: %w", err)
 		}
 
-		hashout := artifact.Hashout
-		if hashout == "" && artifact.GetType() == pluginv1.Artifact_TYPE_OUTPUT {
-			var err error
-			hashout, err = e.hashout(ctx, def.GetRef(), cachedArtifact)
-			if err != nil {
-				return nil, nil, err
-			}
-		}
-
 		cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
-			Hashout:  hashout,
+			Hashout:  artifact.Hashout,
 			Artifact: cachedArtifact,
 		})
 	}

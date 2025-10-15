@@ -18,18 +18,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
+	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hpanic"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/hpipe"
-	"github.com/hephbuild/heph/lib/tref"
-
-	"github.com/hephbuild/heph/internal/hartifact"
-	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/lib/pluginsdk"
+	"github.com/hephbuild/heph/lib/tref"
 	"github.com/hephbuild/heph/plugin/plugingroup"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
@@ -699,6 +698,30 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 
 				return nil, err
 			}
+
+			m := hartifact.Manifest{
+				Version:   "v1",
+				Target:    tref.Format(def.GetRef()),
+				CreatedAt: time.Now(),
+				Hashin:    hashin,
+			}
+			for _, artifact := range res.Artifacts {
+				martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+				if err != nil {
+					return nil, err
+				}
+
+				m.Artifacts = append(m.Artifacts, martifact)
+			}
+
+			manifestArtifact, err := hartifact.NewManifestArtifact(m)
+			if err != nil {
+				return nil, err
+			}
+
+			res.Artifacts = append(res.Artifacts, ExecuteResultArtifact{
+				Artifact: manifestArtifact,
+			})
 		}
 
 		err = locks.Lock2RLock(ctx)
@@ -1155,6 +1178,11 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		return nil, err
 	}
 
+	err = sandboxfs.MkdirAll("", os.ModePerm)
+	if err != nil {
+		return nil, err
+	}
+
 	execWrapper := func(ctx context.Context, args InteractiveExecOptions) error {
 		args.Run(ctx, ExecOptions{})
 		return nil
@@ -1281,13 +1309,21 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, err
 		}
 
+		execArtifact := pluginv1.Artifact_builder{
+			Group:   htypes.Ptr(output.GetGroup()),
+			Name:    htypes.Ptr(tarname),
+			Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+			TarPath: proto.String(tarf.Name()),
+		}.Build()
+
+		hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
+		if err != nil {
+			return nil, err
+		}
+
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Artifact: pluginv1.Artifact_builder{
-				Group:   htypes.Ptr(output.GetGroup()),
-				Name:    htypes.Ptr(tarname),
-				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-				TarPath: proto.String(tarf.Name()),
-			}.Build(),
+			Hashout:  hashout,
+			Artifact: execArtifact,
 		})
 	}
 
@@ -1296,7 +1332,13 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			continue
 		}
 
+		hashout, err := e.hashout(ctx, def.GetRef(), artifact)
+		if err != nil {
+			return nil, err
+		}
+
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+			Hashout:  hashout,
 			Artifact: artifact,
 		})
 

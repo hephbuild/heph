@@ -53,6 +53,7 @@ func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
 	return filepath.Join(ToOSPath(rest), f), true
 }
 
+const BinPackage = "@heph/bin"
 const QueryPackage = "@heph/query"
 const QueryName = "query"
 

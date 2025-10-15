@@ -29,11 +29,8 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		}.Build(),
 		Driver: htypes.Ptr("sh"),
 		Config: map[string]*structpb.Value{
-			"env": hstructpb.NewMapStringStringValue(map[string]string{
-				"CGO_ENABLED": "0",
-				"GOWORK":      "off",
-			}),
-			"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+			"env":              p.getEnvStructpb2(),
+			"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 			"run":              hstructpb.NewStringsValue(run),
 			"out":              structpb.NewStringValue("."),
 			"cache":            structpb.NewBoolValue(true),

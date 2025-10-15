@@ -163,16 +163,9 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 		return err
 	}
 
-	if osto, ok := hfs.AsOs(to); ok {
-		err = osto.CloseEnsureROFD(f)
-		if err != nil {
-			return err
-		}
-	} else {
-		err = f.Close()
-		if err != nil {
-			return err
-		}
+	err = hfs.CloseEnsureROFD(f)
+	if err != nil {
+		return err
 	}
 
 	mode := os.FileMode(hdr.Mode) //nolint:gosec

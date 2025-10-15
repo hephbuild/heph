@@ -96,19 +96,20 @@ func (osfs OS) Move(oldname, newname string) error {
 }
 
 func (osfs OS) moveCrossDevice(source, destination string) error {
-	src, err := os.Open(source)
+	srcf, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)
 	}
 
-	dst, err := os.Create(destination)
+	dstf, err := os.Create(destination)
 	if err != nil {
-		_ = src.Close()
+		_ = srcf.Close()
 		return fmt.Errorf("create: %w", err)
 	}
-	_, err = io.Copy(dst, src)
-	_ = src.Close()
-	_ = dst.Close()
+
+	_, err = io.Copy(dstf, srcf)
+	_ = srcf.Close()
+	_ = CloseEnsureROFD(dstf)
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -217,7 +218,7 @@ func (osfs OS) Path(elems ...string) string {
 	return filepath.Join(args...)
 }
 
-func (osfs OS) CloseEnsureROFD(hf File) error {
+func CloseEnsureROFD(hf File) error {
 	f, ok := hf.(*os.File)
 	if !ok {
 		return hf.Close()

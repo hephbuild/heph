@@ -1,0 +1,6 @@
+edition = "2023";
+package heph.plugin.bin.v1;
+
+message Target {
+  string name = 1;
+}

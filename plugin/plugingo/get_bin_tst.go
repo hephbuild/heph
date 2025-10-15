@@ -2,15 +2,14 @@ package plugingo
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"path/filepath"
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/lib/tref"
+	"github.com/hephbuild/heph/plugin/plugintextfile"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -31,7 +30,7 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue("$SRC_BIN"),
+				"run": structpb.NewStringValue("$TOOL"),
 				"deps": hstructpb.NewMapStringStringValue(map[string]string{
 					"testdata": tref.FormatQuery(tref.QueryOptions{
 						Label:        "go_test_data",
@@ -44,7 +43,13 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 						Args:    factors.Args(),
 					}.Build()),
 				}),
-				"tools": p.getGoToolStructpb(),
+				"tools": hstructpb.NewMapStringStringValue(map[string]string{
+					"bin": tref.Format(pluginv1.TargetRef_builder{
+						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
+						Name:    htypes.Ptr("build_test"),
+						Args:    factors.Args(),
+					}.Build()),
+				}),
 			},
 			Labels: labels,
 		}.Build(),
@@ -88,8 +93,6 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 		return nil, fmt.Errorf("analyze: %w", err)
 	}
 
-	testmain := base64.StdEncoding.EncodeToString(testmainb)
-
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
 			Ref: pluginv1.TargetRef_builder{
@@ -97,11 +100,10 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 				Name:    htypes.Ptr("testmain"),
 				Args:    factors.Args(),
 			}.Build(),
-			Driver: htypes.Ptr("bash"),
+			Driver: htypes.Ptr(plugintextfile.Name),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue(fmt.Sprintf("echo %q | base64 --decode > $OUT", testmain)),
-				"out": structpb.NewStringValue("testmain.go"),
-				"tools": p.getGoToolStructpb(),
+				"text": structpb.NewStringValue(string(testmainb)),
+				"out":  structpb.NewStringValue("testmain.go"),
 			},
 		}.Build(),
 	}.Build(), nil

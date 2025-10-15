@@ -41,13 +41,8 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 				Ref:    goPkg.LibTargetRef,
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
-					"env": hstructpb.NewMapStringStringValue(map[string]string{
-						"GOOS":        factors.GOOS,
-						"GOARCH":      factors.GOARCH,
-						"CGO_ENABLED": "0",
-						"GOTOOLCHAIN": "local",
-					}),
-					"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+					"env":              p.getEnvStructpb(factors),
+					"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 					"run": hstructpb.NewStringsValue([]string{
 						// This appends to $SRC_LIB, so name of input & output need to be the same.
 						`go tool pack r "$SRC_LIB" $SRC_ASM`,
@@ -262,17 +257,12 @@ func (p *Plugin) packageLibInner3(
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        factors.GOOS,
-					"GOARCH":      factors.GOARCH,
-					"CGO_ENABLED": "0",
-					"GOTOOLCHAIN": "local",
-				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"env":              p.getEnvStructpb(factors),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run":              hstructpb.NewStringsValue(run),
 				"out":              hstructpb.NewMapStringStringValue(out),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
-				"tools": p.getGoToolStructpb(),
+				"tools":            p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil
@@ -334,13 +324,8 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        factors.GOOS,
-					"GOARCH":      factors.GOARCH,
-					"CGO_ENABLED": "0",
-					"GOTOOLCHAIN": "local",
-				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"env":              p.getEnvStructpb(factors),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch $OUT_H",
@@ -350,7 +335,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 					"abi": goPkg.Name + ".abi",
 					"h":   "go_asm.h",
 				}),
-				"deps": hstructpb.NewMapStringStringsValue(deps),
+				"deps":  hstructpb.NewMapStringStringsValue(deps),
 				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
@@ -380,13 +365,8 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"env": hstructpb.NewMapStringStringValue(map[string]string{
-					"GOOS":        factors.GOOS,
-					"GOARCH":      factors.GOARCH,
-					"CGO_ENABLED": "0",
-					"GOTOOLCHAIN": "local",
-				}),
-				"runtime_pass_env": hstructpb.NewStringsValue([]string{"HOME"}),
+				"env":              p.getEnvStructpb(factors),
+				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch go_asm.h",

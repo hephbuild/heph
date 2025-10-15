@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/goccy/go-json"
+	"github.com/hephbuild/heph/internal/htypes"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/plugintextfile"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -88,11 +88,10 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 				Name:    htypes.Ptr("embedcfg"),
 				Args:    args,
 			}.Build(),
-			Driver: htypes.Ptr("bash"),
+			Driver: htypes.Ptr(plugintextfile.Name),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue(fmt.Sprintf("echo %q > $OUT", string(b))),
-				"out": structpb.NewStringValue("embedcfg.json"),
-				"tools": p.getGoToolStructpb(),
+				"text": structpb.NewStringValue(string(b)),
+				"out":  structpb.NewStringValue("embedcfg.json"),
 			},
 		}.Build(),
 	}.Build(), nil
