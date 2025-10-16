@@ -184,10 +184,7 @@ var rootCmd = &cobra.Command{
 			}
 
 			var wg sync.WaitGroup
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
+			wg.Go(func() {
 				for {
 					select {
 					case <-ctx.Done():
@@ -207,7 +204,7 @@ var rootCmd = &cobra.Command{
 						continue
 					}
 				}
-			}()
+			})
 
 			registerFinalize(func() {
 				wg.Wait()
