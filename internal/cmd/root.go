@@ -19,20 +19,22 @@ import (
 	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/trace"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
+	"runtime/trace"
 )
 
 var plain bool
 var debug bool
-var cpuprofile string
-var memprofile string
-var goroutineprofile string
-var goroutineprofileLast bool
-var httpprofile boolStr
+var pprofCpuPath string
+var pprofMemPath string
+var pprofGoroutinePath string
+var pprofGoroutineLast bool
+var pprofServer boolStr
+var tracePath string
 
 var levelVar slog.LevelVar
 
@@ -97,7 +99,7 @@ var rootCmd = &cobra.Command{
 		spanArgs := []string{"heph"}
 		spanArgs = append(spanArgs, os.Args[1:]...)
 
-		ctx, rootSpan := tracer.Start(ctx, strings.Join(spanArgs, " "), trace.WithAttributes(attribute.StringSlice("heph.args", spanArgs)))
+		ctx, rootSpan := tracer.Start(ctx, strings.Join(spanArgs, " "), oteltrace.WithAttributes(attribute.StringSlice("heph.args", spanArgs)))
 		registerFinalize(func() {
 			rootSpan.End()
 		})
@@ -111,8 +113,8 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		if httpprofile.bool {
-			addr := httpprofile.str
+		if pprofServer.bool {
+			addr := pprofServer.str
 			if addr == "" {
 				addr = ":6060"
 			}
@@ -141,8 +143,8 @@ var rootCmd = &cobra.Command{
 			}()
 		}
 
-		if cpuprofile != "" {
-			cpuProfileFile, err := os.Create(cpuprofile)
+		if pprofCpuPath != "" {
+			cpuProfileFile, err := os.Create(pprofCpuPath)
 			if err != nil {
 				return fmt.Errorf("could not create CPU profile: %w", err)
 			}
@@ -159,9 +161,9 @@ var rootCmd = &cobra.Command{
 			})
 		}
 
-		if memprofile != "" {
+		if pprofMemPath != "" {
 			registerFinalize(func() {
-				f, err := os.Create(memprofile)
+				f, err := os.Create(pprofMemPath)
 				if err != nil {
 					hlog.From(ctx).Error(fmt.Sprintf("could not create memory profile: %v", err))
 					return
@@ -175,8 +177,8 @@ var rootCmd = &cobra.Command{
 			})
 		}
 
-		if goroutineprofile != "" {
-			goroutineFile, err := os.Create(goroutineprofile)
+		if pprofGoroutinePath != "" {
+			goroutineFile, err := os.Create(pprofGoroutinePath)
 			if err != nil {
 				return fmt.Errorf("could not create goroutine profile: %w", err)
 			}
@@ -191,7 +193,7 @@ var rootCmd = &cobra.Command{
 					case <-ctx.Done():
 						return
 					case <-time.After(time.Second):
-						if goroutineprofileLast {
+						if pprofGoroutineLast {
 							_ = goroutineFile.Truncate(0)
 							_, _ = goroutineFile.Seek(0, 0)
 						} else {
@@ -217,6 +219,27 @@ var rootCmd = &cobra.Command{
 			})
 		}
 
+		if tracePath != "" {
+			traceFile, err := os.Create(tracePath)
+			if err != nil {
+				return fmt.Errorf("could not create trace: %w", err)
+			}
+
+			err = trace.Start(traceFile)
+			if err != nil {
+				return fmt.Errorf("could not start trace: %w", err)
+			} else {
+				registerFinalize(func() {
+					trace.Stop()
+
+					err := traceFile.Close()
+					if err != nil {
+						hlog.From(ctx).Error(fmt.Sprintf("could not close trace: %v", err))
+					}
+				})
+			}
+		}
+
 		return nil
 	},
 }
@@ -225,11 +248,12 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
 
-	rootCmd.PersistentFlags().AddFlag(NewBoolStrFlag(&httpprofile, "httpprofile", "", "Start pprof server"))
-	rootCmd.PersistentFlags().StringVar(&cpuprofile, "cpuprofile", "", "CPU Profile file")
-	rootCmd.PersistentFlags().StringVar(&memprofile, "memprofile", "", "Memory Profile file")
-	rootCmd.PersistentFlags().StringVar(&goroutineprofile, "goroutineprofile", "", "Goroutine Profile file")
-	rootCmd.PersistentFlags().BoolVar(&goroutineprofileLast, "goroutineprofilelast", false, "Goroutine Profile, keep only last")
+	rootCmd.PersistentFlags().AddFlag(NewBoolStrFlag(&pprofServer, "pprof-http", "", "Start pprof server"))
+	rootCmd.PersistentFlags().StringVar(&pprofCpuPath, "pprof-cpu", "", "CPU Profile output file")
+	rootCmd.PersistentFlags().StringVar(&pprofMemPath, "pprof-mem", "", "Memory Profile output file")
+	rootCmd.PersistentFlags().StringVar(&pprofGoroutinePath, "pprof-goroutine", "", "Goroutine Profile output file")
+	rootCmd.PersistentFlags().BoolVar(&pprofGoroutineLast, "pprof-goroutine-last", false, "Goroutine Profile, keep only last")
+	rootCmd.PersistentFlags().StringVar(&tracePath, "trace", "", "Trace output file")
 }
 
 func Execute() int {

@@ -1082,7 +1082,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 
 func (e *Engine) pickShellDriver(ctx context.Context, def *LightLinkedTarget) (pluginsdk.Driver, error) {
 	var errs error
-	for _, shellDriver := range []string{def.GetDriver() + "@shell", "bash@shell"} {
+	for _, shellDriver := range []string{def.GetDriver() + "@shell"} {
 		driver, ok := e.DriversByName[shellDriver]
 		if ok {
 			return driver, nil
