@@ -93,6 +93,10 @@ func (p Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.Ru
 	}.Build(), nil
 }
 
+func (p Plugin) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("textfile doesnt support transitive"))
+}
+
 func New() *Plugin {
 	return &Plugin{}
 }

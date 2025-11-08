@@ -120,6 +120,7 @@ func (p *Plugin) getEnvStructpb(factors Factors, ms ...map[string]string) *struc
 		"GOARCH":      factors.GOARCH,
 		"CGO_ENABLED": "0",
 		"GOTOOLCHAIN": "local",
+		"GOWORK":      "off",
 	}
 
 	if len(ms) == 0 {

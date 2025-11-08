@@ -6,9 +6,45 @@ import "google/protobuf/any.proto";
 import "google/protobuf/field_mask.proto";
 import "heph/plugin/v1/tref.proto";
 
+message Sandbox {
+  message Tool {
+    TargetRefWithOutput ref = 1;
+    string group = 2;
+    bool hash = 4;
+    string id = 5;
+  }
+  repeated Tool tools = 1;
+
+  message Dep {
+    enum Mode {
+      MODE_UNSPECIFIED = 0; // deps will get expanded in sandbox
+      MODE_LINK = 1; // deps will get expanded in sandbox through hard links
+      MODE_NONE = 2; // deps will not get expanded
+    }
+
+    TargetRefWithOutput ref = 1;
+    Mode link = 5;
+    string group = 2;
+    bool runtime = 3;
+    bool hash = 4;
+    string id = 6;
+  }
+  repeated Dep deps = 2;
+
+  message Env {
+    oneof value {
+      string literal = 1;
+      bool pass = 2;
+    }
+    bool hash = 4;
+    bool append = 5;
+    string append_prefix = 6;
+  }
+  map<string, Env> env = 3;
+}
+
 message TargetDef {
   message InputOrigin {
-    google.protobuf.Any meta = 2;
     string id = 3;
   }
 
@@ -61,4 +97,5 @@ message TargetSpec {
   string driver = 2;
   map<string, google.protobuf.Value> config = 3;
   repeated string labels = 4;
+  Sandbox transitive = 5;
 }

@@ -4,10 +4,13 @@ import (
 	"context"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
 	nixv1 "github.com/hephbuild/heph/plugin/pluginnix/gen/heph/plugin/nix/v1"
+	"github.com/zeebo/xxh3"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -16,10 +19,8 @@ func wrapWithNix(t *nixv1.Target, args []string) []string {
 	nargs = append(nargs, "nix")
 	nargs = append(nargs, "shell")
 	nargs = append(nargs, "nixpkgs#bash")
-	if len(t.GetPackages()) > 0 {
-		for _, p := range t.GetPackages() {
-			nargs = append(nargs, "nixpkgs#"+p)
-		}
+	for _, p := range t.GetPackages() {
+		nargs = append(nargs, "nixpkgs#"+p)
 	}
 	nargs = append(nargs, "-c")
 	nargs = append(nargs, args...)
@@ -36,22 +37,10 @@ const nixConfig = `
 experimental-features = nix-command flakes
 `
 
-func ParseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
+func parseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
 	nixPackages := make([]string, 0)
 
-	return pluginexec.ParseConfig(ctx, ref, config, func(spec pluginexec.Spec, target *execv1.Target) (*nixv1.Target, error) {
-		renv := target.GetRuntimeEnv()
-		if renv == nil {
-			renv = map[string]string{}
-		}
-		renv["NIX_CONFIG"] = nixConfig
-		target.SetRuntimeEnv(renv)
-
-		return nixv1.Target_builder{
-			Target:   target,
-			Packages: nixPackages,
-		}.Build(), nil
-	}, func(ref *pluginv1.TargetRefWithOutput) bool {
+	execTarget, execTargetHash, err := pluginexec.ConfigToExecv1(ctx, ref, config, func(ref *pluginv1.TargetRefWithOutput) bool {
 		if ref.GetPackage() != "@nix" {
 			return true
 		}
@@ -60,13 +49,62 @@ func ParseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string
 
 		return false
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	renv := execTarget.GetEnv()
+	if renv == nil {
+		renv = map[string]*execv1.Target_Env{}
+	}
+	renv["NIX_CONFIG"] = execv1.Target_Env_builder{
+		Literal: htypes.Ptr(nixConfig),
+		Hash:    htypes.Ptr(true),
+	}.Build()
+	execTarget.SetEnv(renv)
+
+	return toDef(ref, nixv1.Target_builder{
+		Target:   execTarget,
+		Packages: nixPackages,
+	}.Build(), execTargetHash)
+}
+
+func hashTarget(nixTarget *nixv1.Target, execTargetHash []byte) []byte {
+	hash := xxh3.New()
+	_, _ = hash.Write(execTargetHash)
+	desc := nixTarget.ProtoReflect().Descriptor()
+	hashpb.Hash(hash, nixTarget, map[string]struct{}{
+		string(desc.FullName()) + ".target": {},
+	})
+
+	return hash.Sum(nil)
+}
+
+func applyTransitive(ctx context.Context, ref *pluginv1.TargetRef, sandbox *pluginv1.Sandbox, target *nixv1.Target) (*pluginv1.TargetDef, error) {
+	// TODO: filter tools
+	nixPackages := make([]string, 0)
+
+	execTarget, hash, err := pluginexec.ApplyTransitiveExecv1(ref, sandbox, target.GetTarget())
+	if err != nil {
+		return nil, err
+	}
+	target.SetTarget(execTarget)
+
+	target.SetPackages(append(target.GetPackages(), nixPackages...))
+
+	return toDef(ref, target, hash)
+}
+
+func toDef(ref *pluginv1.TargetRef, target *nixv1.Target, hash []byte) (*pluginv1.TargetDef, error) {
+	return pluginexec.ToDef(ref, target, (*nixv1.Target).GetTarget, hashTarget(target, hash))
 }
 
 func NewBash(options ...Option) *Plugin {
 	return pluginexec.New[*nixv1.Target](
 		NameBash,
-		func(t *nixv1.Target) *execv1.Target { return t.GetTarget() },
-		ParseConfig,
+		(*nixv1.Target).GetTarget,
+		parseConfig,
+		applyTransitive,
 		func(sandboxPath string, t *nixv1.Target, termargs []string) []string {
 			return wrapWithNix(t, pluginexec.BashArgs(strings.Join(t.GetTarget().GetRun(), "\n"), termargs))
 		},
@@ -79,8 +117,9 @@ const NameBashShell = NameBash + "@shell"
 func NewInteractiveBash(options ...Option) *Plugin {
 	return pluginexec.New[*nixv1.Target](
 		NameBashShell,
-		func(t *nixv1.Target) *execv1.Target { return t.GetTarget() },
-		ParseConfig,
+		(*nixv1.Target).GetTarget,
+		parseConfig,
+		applyTransitive,
 		func(sandboxPath string, t *nixv1.Target, termargs []string) []string {
 			return wrapWithNix(t, pluginexec.InteractiveBashArgs(strings.Join(t.GetTarget().GetRun(), "\n"), sandboxPath))
 		},

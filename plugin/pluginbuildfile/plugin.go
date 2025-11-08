@@ -10,6 +10,7 @@ import (
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
+	"go.starlark.net/starlarkstruct"
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
@@ -143,17 +144,51 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetF
 }
 
 type OnTargetPayload struct {
-	Name    string
-	Package string
-	Driver  string
-	Labels  []string
-	Args    map[string]starlark.Value
+	Name       string
+	Package    string
+	Driver     string
+	Labels     []string
+	Transitive TransitiveSpec
+
+	Args map[string]starlark.Value
 }
 
 type TargetSpec struct {
-	Name   string
-	Driver string
-	Labels hstarlark.List[string]
+	Name       string
+	Driver     string
+	Labels     hstarlark.List[string]
+	Transitive TransitiveSpec
+}
+
+type TransitiveSpec struct {
+	Tools hstarlark.List[string]
+}
+
+func (ts *TransitiveSpec) Empty() bool {
+	return len(ts.Tools) == 0
+}
+
+func (c *TransitiveSpec) Unpack(v starlark.Value) error {
+	if _, ok := v.(starlark.NoneType); ok {
+		return nil
+	}
+
+	d, err := hstarlark.UnpackDistruct(v)
+	if err != nil {
+		return err
+	}
+
+	var cs TransitiveSpec
+	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
+		"tools?", &cs.Tools,
+	)
+	if err != nil {
+		return err
+	}
+
+	*c = cs
+
+	return nil
 }
 
 type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
@@ -204,7 +239,7 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
 
 			switch name {
-			case "name", "driver", "labels":
+			case "name", "driver", "labels", "transitive":
 				fkwargs = append(fkwargs, item)
 			default:
 				otherkwargs[string(name)] = arg
@@ -219,6 +254,7 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 			"name", &tspec.Name,
 			"driver?", &tspec.Driver,
 			"labels?", &tspec.Labels,
+			"transitive?", &tspec.Transitive,
 		); err != nil {
 			if tspec.Name != "" {
 				return nil, fmt.Errorf("%v: %w", tspec.Name, err)
@@ -228,11 +264,12 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 		}
 
 		payload := OnTargetPayload{
-			Name:    tspec.Name,
-			Package: pkg,
-			Driver:  tspec.Driver,
-			Labels:  tspec.Labels,
-			Args:    otherkwargs,
+			Name:       tspec.Name,
+			Package:    pkg,
+			Driver:     tspec.Driver,
+			Labels:     tspec.Labels,
+			Transitive: tspec.Transitive,
+			Args:       otherkwargs,
 		}
 
 		if payload.Name == "" {
@@ -322,6 +359,7 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 	}
 	universe := starlark.StringDict{
 		"target":         starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
+		"struct":         starlark.NewBuiltin("struct", starlarkstruct.Make),
 		"glob":           starlark.NewBuiltin("target", p.glob()),
 		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState(onProviderState)),
 	}
@@ -414,14 +452,34 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 		config[k] = pv
 	}
 
+	var transitive *pluginv1.Sandbox
+	if !payload.Transitive.Empty() {
+		transitiveBuilder := pluginv1.Sandbox_builder{}
+
+		for _, tool := range payload.Transitive.Tools {
+			ref, err := tref.ParseWithOut(tool)
+			if err != nil {
+				return nil, err
+			}
+
+			transitiveBuilder.Tools = append(transitiveBuilder.Tools, pluginv1.Sandbox_Tool_builder{
+				Ref:  ref,
+				Hash: htypes.Ptr(true),
+			}.Build())
+		}
+
+		transitive = transitiveBuilder.Build()
+	}
+
 	spec := pluginv1.TargetSpec_builder{
 		Ref: pluginv1.TargetRef_builder{
 			Package: htypes.Ptr(payload.Package),
 			Name:    htypes.Ptr(payload.Name),
 		}.Build(),
-		Driver: htypes.Ptr(payload.Driver),
-		Config: config,
-		Labels: payload.Labels,
+		Driver:     htypes.Ptr(payload.Driver),
+		Config:     config,
+		Labels:     payload.Labels,
+		Transitive: transitive,
 	}.Build()
 
 	return spec, nil

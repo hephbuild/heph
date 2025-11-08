@@ -16,6 +16,7 @@ const NameProvider = "nix"
 var _ pluginsdk.Provider = (*Provider)(nil)
 
 type Provider struct {
+	nixToolRef *tref.Ref
 }
 
 func (p *Provider) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) (*pluginv1.ProviderConfigResponse, error) {
@@ -29,7 +30,9 @@ func (p *Provider) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*plugin
 }
 
 func NewProvider() *Provider {
-	return &Provider{}
+	return &Provider{
+		nixToolRef: tref.New("@heph/bin", "nix", nil),
+	}
 }
 
 func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -66,7 +69,13 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 				"text": structpb.NewStringValue(script),
 				"out":  structpb.NewStringValue(req.GetRef().GetName()),
 			},
-			Labels: nil,
+			Transitive: pluginv1.Sandbox_builder{
+				Tools: []*pluginv1.Sandbox_Tool{
+					pluginv1.Sandbox_Tool_builder{
+						Ref: tref.WithOut(p.nixToolRef, ""),
+					}.Build(),
+				},
+			}.Build(),
 		}.Build(),
 	}.Build(), nil
 }

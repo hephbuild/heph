@@ -80,11 +80,11 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	binfs := hfs.At(sandboxfs, "bin")
 	cwdfs := hfs.At(workfs, req.GetTarget().GetRef().GetPackage())
 	outfs := cwdfs
-	if texec.GetContext() == execv1.Target_Tree {
+	if texec.GetContext() == execv1.Target_CONTEXT_TREE {
 		cwdfs = hfs.At(hfs.NewOS(req.GetTreeRootPath()), req.GetTarget().GetRef().GetPackage())
 	}
 
-	listArtifacts, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_Tree)
+	listArtifacts, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_CONTEXT_TREE)
 	if err != nil {
 		return nil, fmt.Errorf("setup sandbox: %w", err)
 	}
@@ -99,20 +99,16 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	env = append(env, inputEnv...)
 	env = append(env, fmt.Sprintf("PATH=%v:%v", binfs.Path(), p.pathStr))
 
-	for key, value := range texec.GetEnv() {
-		env = append(env, fmt.Sprintf("%v=%v", key, value))
-	}
-	for key, value := range texec.GetRuntimeEnv() {
-		env = append(env, fmt.Sprintf("%v=%v", key, value))
-	}
-	for _, name := range texec.GetRuntimePassEnv() {
-		if v, ok := os.LookupEnv(name); ok {
-			env = append(env, fmt.Sprintf("%v=%v", name, v))
-		}
-	}
-	for _, name := range texec.GetPassEnv() {
-		if v, ok := os.LookupEnv(name); ok {
-			env = append(env, fmt.Sprintf("%v=%v", name, v))
+	for key, envSpec := range texec.GetEnv() {
+		switch envSpec.WhichValue() {
+		case execv1.Target_Env_Literal_case:
+			env = append(env, fmt.Sprintf("%v=%v", key, envSpec.GetLiteral()))
+		case execv1.Target_Env_Pass_case:
+			if v, ok := os.LookupEnv(key); ok {
+				env = append(env, fmt.Sprintf("%v=%v", key, v))
+			}
+		default:
+			return nil, fmt.Errorf("invalid env: %v", env)
 		}
 	}
 	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))         // TODO: figure it out
@@ -335,41 +331,23 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func Merge(ds ...map[string]*execv1.Target_Deps) map[string]*execv1.Target_Deps {
-	nd := map[string]*execv1.Target_Deps{}
-	for _, deps := range ds {
-		for k, v := range deps {
-			if _, ok := nd[k]; !ok {
-				nd[k] = &execv1.Target_Deps{}
-			}
-
-			nd[k].SetTargets(append(nd[k].GetTargets(), v.GetTargets()...))
-			nd[k].SetFiles(append(nd[k].GetFiles(), v.GetFiles()...))
-		}
-	}
-
-	return nd
-}
-
 func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
-	for name, deps := range Merge(t.GetDeps(), t.GetRuntimeDeps()) {
-		for _, dep := range deps.GetTargets() {
-			id := dep.GetId()
+	for _, dep := range t.GetDeps() {
+		id := dep.GetId()
 
-			allOutput := !dep.GetRef().HasOutput()
+		allOutput := !dep.GetRef().HasOutput()
 
-			for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
-				var outputName string
-				if allOutput {
-					outputName = artifact.GetArtifact().GetGroup()
-				}
-
-				envName := getEnvName("SRC", name, outputName)
-
-				m[envName] = append(m[envName], artifact)
+		for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {
+			var outputName string
+			if allOutput {
+				outputName = artifact.GetArtifact().GetGroup()
 			}
+
+			envName := getEnvName("SRC", dep.GetGroup(), outputName)
+
+			m[envName] = append(m[envName], artifact)
 		}
 	}
 
@@ -385,7 +363,7 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				outputName = artifact.GetArtifact().GetGroup()
 			}
 
-			envName := getEnvName("TOOL", "", outputName)
+			envName := getEnvName("TOOL", tool.GetGroup(), outputName)
 
 			m[envName] = append(m[envName], artifact)
 			requireSingleValue[envName] = struct{}{}

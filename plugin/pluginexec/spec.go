@@ -100,4 +100,9 @@ type Spec struct {
 	PassEnv        []string          `mapstructure:"pass_env"`
 	RuntimePassEnv []string          `mapstructure:"runtime_pass_env"`
 	InTree         bool              `mapstructure:"in_tree"`
+	Transitive     SpecTransitive    `mapstructure:"transitive"`
+}
+
+type SpecTransitive struct {
+	Tools SpecDeps `mapstructure:"tools"`
 }

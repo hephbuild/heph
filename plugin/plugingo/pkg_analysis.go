@@ -509,7 +509,7 @@ func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (string, s
 			}
 		}
 
-		if gowork == "" {
+		if false && gowork == "" {
 			_, err := os.Stat(filepath.Join(pkgDir, "go.work"))
 			if err == nil {
 				gowork = tref.JoinPackage(pkg, "go.work")

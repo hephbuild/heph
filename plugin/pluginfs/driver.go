@@ -2,10 +2,12 @@ package pluginfs
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/htypes"
 
@@ -154,6 +156,10 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	return pluginv1.RunResponse_builder{
 		Artifacts: artifacts,
 	}.Build(), nil
+}
+
+func (p Driver) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("files doesnt support transitive"))
 }
 
 func (p *Driver) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {

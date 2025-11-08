@@ -16,11 +16,20 @@ func NewExec(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
 		NameExec,
 		func(t *execv1.Target) *execv1.Target { return t },
 		func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
-			return ParseConfig(ctx, ref, config, func(spec Spec, target *execv1.Target) (*execv1.Target, error) {
-				return target, nil
-			}, func(ref *pluginv1.TargetRefWithOutput) bool {
-				return true
-			})
+			execTarget, execTargetHash, err := ConfigToExecv1(ctx, ref, config, nil)
+			if err != nil {
+				return nil, err
+			}
+
+			return execv1ToDef(ref, execTarget, execTarget, execTargetHash)
+		},
+		func(ctx context.Context, ref *pluginv1.TargetRef, sandbox *pluginv1.Sandbox, target *execv1.Target) (*pluginv1.TargetDef, error) {
+			target, hash, err := ApplyTransitiveExecv1(ref, sandbox, target)
+			if err != nil {
+				return nil, err
+			}
+
+			return execv1ToDef(ref, target, target, hash)
 		},
 		func(sandboxPath string, t *execv1.Target, termargs []string) []string {
 			return append(t.GetRun(), termargs...)

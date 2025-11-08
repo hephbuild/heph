@@ -45,15 +45,17 @@ func New[S proto.Message](
 	name string,
 	getTarget func(S) *execv1.Target,
 	parseConfig func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error),
+	applyTransitive func(context.Context, *pluginv1.TargetRef, *pluginv1.Sandbox, S) (*pluginv1.TargetDef, error),
 	runToExecArgs RunToExecArgsFunc[S],
 	options ...Option[S],
 ) *Plugin[S] {
 	p := &Plugin[S]{
-		pipes:         map[string]*pipe{},
-		name:          name,
-		getExecTarget: getTarget,
-		parseConfig:   parseConfig,
-		runToExecArgs: runToExecArgs,
+		pipes:           map[string]*pipe{},
+		name:            name,
+		getExecTarget:   getTarget,
+		parseConfig:     parseConfig,
+		runToExecArgs:   runToExecArgs,
+		applyTransitive: applyTransitive,
 	}
 	WithDefaultLinuxPath[S]()(p)
 

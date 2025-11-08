@@ -14,6 +14,7 @@ import (
 	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -332,6 +333,8 @@ func (c DefContainer) GetRef() *pluginv1.TargetRef {
 type TargetDef struct {
 	*pluginv1.TargetDef
 	*pluginv1.TargetSpec
+
+	AppliedTransitive *pluginv1.Sandbox
 }
 
 func refKey(ref *pluginv1.TargetRef) string {
@@ -366,6 +369,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		return &TargetDef{
 			TargetDef:  c.Def,
 			TargetSpec: c.Spec,
+			// TODO: missing transitive
 		}, nil
 	}
 
@@ -453,6 +457,24 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			}
 		}
 
+		allTransitive, err := e.collectTransitive(ctx, rs, inputs)
+		if err != nil {
+			return nil, fmt.Errorf("collect transitive: %w", err)
+		}
+
+		if !sandboxSpecEmpty(allTransitive) {
+			res, err := driver.ApplyTransitive(ctx, pluginv1.ApplyTransitiveRequest_builder{
+				RequestId:  htypes.Ptr(rs.ID),
+				Target:     def,
+				Transitive: allTransitive,
+			}.Build())
+			if err != nil {
+				return nil, fmt.Errorf("apply transitive: %w", err)
+			}
+
+			def = res.GetTarget()
+		}
+
 		if len(def.GetHash()) == 0 {
 			h := xxh3.New()
 			hashpb.Hash(h, def, nil)
@@ -465,12 +487,77 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		}
 
 		return &TargetDef{
-			TargetDef:  def,
-			TargetSpec: spec,
+			TargetDef:         def,
+			TargetSpec:        spec,
+			AppliedTransitive: allTransitive,
 		}, nil
 	})
 
 	return res, err
+}
+
+func sandboxSpecEmpty(sb *pluginv1.Sandbox) bool {
+	return len(sb.GetTools()) == 0 && len(sb.GetDeps()) == 0 && len(sb.GetEnv()) == 0
+}
+
+func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs []*pluginv1.TargetDef_Input) (*pluginv1.Sandbox, error) {
+	sb := &pluginv1.Sandbox{}
+
+	for i, input := range inputs {
+		inputRef := tref.WithoutOut(input.GetRef())
+
+		spec, err := e.getSpec(ctx, rs, SpecContainer{Ref: inputRef})
+		if err != nil {
+			return nil, err
+		}
+
+		if sandboxSpecEmpty(spec.GetTransitive()) {
+			continue
+		}
+
+		h := xxh3.New()
+		hashpb.Hash(h, inputRef, nil)
+
+		id := fmt.Sprintf("_transitive_%s_%v", hex.EncodeToString(h.Sum(nil)), i)
+
+		mergeSandbox(sb, spec.GetTransitive(), id)
+	}
+
+	slices.SortFunc(sb.GetDeps(), func(a, b *pluginv1.Sandbox_Dep) int {
+		return cmp.Compare(a.GetId(), b.GetId())
+	})
+	slices.SortFunc(sb.GetTools(), func(a, b *pluginv1.Sandbox_Tool) int {
+		return cmp.Compare(a.GetId(), b.GetId())
+	})
+
+	return sb, nil
+}
+
+func mergeSandbox(dst, src *pluginv1.Sandbox, id string) {
+	for _, tool := range src.GetTools() {
+		tool = hproto.Clone(tool)
+		tool.SetId(fmt.Sprintf("%v_%v", id, tool.GetId()))
+		tool.SetGroup(tool.GetId())
+
+		dst.SetTools(append(dst.GetTools(), tool))
+	}
+	for _, dep := range src.GetDeps() {
+		dep = hproto.Clone(dep)
+		dep.SetId(fmt.Sprintf("%v_%v", id, dep.GetId()))
+		dep.SetGroup(dep.GetId())
+
+		dst.SetDeps(append(dst.GetDeps(), dep))
+	}
+
+	allEnv := dst.GetEnv()
+	if allEnv == nil {
+		allEnv = map[string]*pluginv1.Sandbox_Env{}
+	}
+	for k, env := range src.GetEnv() {
+		// TODO append
+		allEnv[k] = env
+	}
+	dst.SetEnv(allEnv)
 }
 
 type LinkedTarget struct {

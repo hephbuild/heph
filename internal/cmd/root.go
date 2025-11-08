@@ -21,10 +21,11 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
 
+	"runtime/trace"
+
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
-	"runtime/trace"
 )
 
 var plain bool

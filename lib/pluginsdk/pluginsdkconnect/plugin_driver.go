@@ -22,6 +22,15 @@ type driverConnectClient struct {
 	client pluginv1connect.DriverClient
 }
 
+func (p driverConnectClient) ApplyTransitive(ctx context.Context, req *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
+	res, err := p.client.ApplyTransitive(ctx, connect.NewRequest(req))
+	if err != nil {
+		return nil, p.handleErr(ctx, err)
+	}
+
+	return res.Msg, nil
+}
+
 func (p driverConnectClient) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
 	res, err := p.client.Config(ctx, connect.NewRequest(req))
 	if err != nil {
@@ -99,6 +108,15 @@ func NewDriverConnectHandler(handler pluginsdk.Driver) pluginv1connect.DriverHan
 
 type driverConnectHandler struct {
 	handler pluginsdk.Driver
+}
+
+func (p driverConnectHandler) ApplyTransitive(ctx context.Context, req *connect.Request[pluginv1.ApplyTransitiveRequest]) (*connect.Response[pluginv1.ApplyTransitiveResponse], error) {
+	res, err := p.handler.ApplyTransitive(ctx, req.Msg)
+	if err != nil {
+		return nil, p.handleErr(ctx, err)
+	}
+
+	return connect.NewResponse(res), nil
 }
 
 func (p driverConnectHandler) Config(ctx context.Context, req *connect.Request[pluginv1.ConfigRequest]) (*connect.Response[pluginv1.ConfigResponse], error) {

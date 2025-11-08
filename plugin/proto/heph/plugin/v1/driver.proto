@@ -15,6 +15,16 @@ message ParseResponse {
   TargetDef target = 1;
 }
 
+message ApplyTransitiveRequest {
+  string request_id = 1;
+  TargetDef target = 2;
+  Sandbox transitive = 3;
+}
+
+message ApplyTransitiveResponse {
+  TargetDef target = 1;
+}
+
 message ArtifactWithOrigin {
   Artifact artifact = 1;
   TargetDef.InputOrigin origin = 2;
@@ -91,6 +101,7 @@ message PipeResponse {
 service Driver {
   rpc Config(ConfigRequest) returns (ConfigResponse) {}
   rpc Parse(ParseRequest) returns (ParseResponse) {}
+  rpc ApplyTransitive(ApplyTransitiveRequest) returns (ApplyTransitiveResponse) {}
   rpc Run(stream RunContainer) returns (stream RunResponse) {}
   rpc Pipe(PipeRequest) returns (PipeResponse) {}
 }

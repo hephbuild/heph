@@ -15,7 +15,6 @@ import (
 
 	"github.com/hephbuild/heph/lib/tref"
 
-	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/zeebo/xxh3"
 
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -55,23 +54,19 @@ func SetupSandbox(
 			return nil, err
 		}
 
-		for _, dep := range hmaps.Concat(t.GetDeps(), t.GetRuntimeDeps()) {
-			for _, target := range dep.GetTargets() {
-				for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
-					listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
-					if err != nil {
-						return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
-					}
-					listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
-						Artifact: listArtifact,
-						Origin: pluginv1.TargetDef_InputOrigin_builder{
-							Id: htypes.Ptr(target.GetId()),
-						}.Build(),
-					}.Build())
+		for _, target := range t.GetDeps() {
+			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
+				if err != nil {
+					return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 				}
+				listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+					Artifact: listArtifact,
+					Origin: pluginv1.TargetDef_InputOrigin_builder{
+						Id: htypes.Ptr(target.GetId()),
+					}.Build(),
+				}.Build())
 			}
-
-			// TODO: files
 		}
 	}
 

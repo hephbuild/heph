@@ -4,36 +4,65 @@ package heph.plugin.exec.v1;
 import "heph/plugin/v1/tref.proto";
 
 message Target {
+  repeated string run = 1;
+
+  message Tool {
+    heph.plugin.v1.TargetRefWithOutput ref = 1;
+    string group = 2;
+    bool hash = 3;
+    string id = 4;
+  }
+  repeated Tool tools = 2;
+
+  message Dep {
+    enum Mode {
+      MODE_UNSPECIFIED = 0; // deps will get expanded in sandbox
+      MODE_LINK = 1; // deps will get expanded in sandbox through hard links
+      MODE_NONE = 2; // deps will not get expanded
+    }
+
+    heph.plugin.v1.TargetRefWithOutput ref = 1;
+    Mode link = 6;
+    string group = 2;
+    bool runtime = 3;
+    bool hash = 4;
+    string id = 5;
+  }
+  repeated Dep deps = 3;
+
+  message Env {
+    oneof value {
+      string literal = 1;
+      bool pass = 2;
+    }
+    bool hash = 4;
+    bool append = 5;
+    string append_prefix = 6;
+  }
+  map<string, Env> env = 4;
+
   message Output {
+    enum CodegenMode {
+      CODEGEN_MODE_UNSPECIFIED = 0;
+      CODEGEN_MODE_COPY = 2;
+      CODEGEN_MODE_LINK = 3;
+    }
+
     string group = 1;
     repeated string paths = 2;
+    CodegenMode codegen = 3;
+    // TODO: in tree ?
   }
-
-  message InputRef {
-    heph.plugin.v1.TargetRefWithOutput ref = 1;
-    string id = 2;
-  }
-
-  message Deps {
-    repeated string files = 1;
-    repeated InputRef targets = 2;
-  }
-
-  repeated string run = 1;
-  map<string, Deps> deps = 2;
-  map<string, Deps> hash_deps = 3;
-  map<string, Deps> runtime_deps = 4;
-  repeated InputRef tools = 10;
   repeated Output outputs = 5;
-  map<string, string> env = 6;
-  map<string, string> runtime_env = 7;
-  repeated string pass_env = 8;
-  repeated string runtime_pass_env = 9;
 
   enum Context {
-    Unspecified = 0;
-    Tree = 1;
-    SoftSandbox = 2;
+    CONTEXT_UNSPECIFIED = 0;
+    CONTEXT_TREE = 1;
+    CONTEXT_SOFT_SANDBOX = 2;
   }
-  Context context = 11;
+  Context context = 6;
+
+  bool local_cache = 7;
+  bool remote_cache = 8;
+  bool pty = 9;
 }

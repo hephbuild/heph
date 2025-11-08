@@ -2,7 +2,6 @@ package pluginexec
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"path"
@@ -10,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/htypes"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -31,15 +31,33 @@ type pipe struct {
 type RunToExecArgsFunc[T any] = func(sandboxPath string, t T, termargs []string) []string
 
 type Plugin[S proto.Message] struct {
-	name          string
-	runToExecArgs RunToExecArgsFunc[S]
-	parseConfig   func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error)
-	getExecTarget func(S) *execv1.Target
-	path          []string
-	pathStr       string
+	name            string
+	runToExecArgs   RunToExecArgsFunc[S]
+	parseConfig     func(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error)
+	getExecTarget   func(S) *execv1.Target
+	applyTransitive func(context.Context, *pluginv1.TargetRef, *pluginv1.Sandbox, S) (*pluginv1.TargetDef, error)
+	path            []string
+	pathStr         string
 
 	pipes  map[string]*pipe
 	pipesm sync.RWMutex
+}
+
+func (p *Plugin[S]) ApplyTransitive(ctx context.Context, req *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
+	ts := hproto.New[S]()
+	err := req.GetTarget().GetDef().UnmarshalTo(ts)
+	if err != nil {
+		return nil, err
+	}
+
+	target, err := p.applyTransitive(ctx, req.GetTarget().GetRef(), req.GetTransitive(), ts)
+	if err != nil {
+		return nil, err
+	}
+
+	return pluginv1.ApplyTransitiveResponse_builder{
+		Target: target,
+	}.Build(), nil
 }
 
 func (p *Plugin[S]) PipesHandler() (string, http.Handler) {
@@ -70,10 +88,6 @@ func (p *Plugin[S]) Config(ctx context.Context, c *pluginv1.ConfigRequest) (*plu
 		Name:         htypes.Ptr(p.name),
 		TargetSchema: pdesc,
 	}.Build(), nil
-}
-
-func depId(prop string, group string, i int) string {
-	return fmt.Sprintf("%q %q %v", prop, group, i)
 }
 
 func (p *Plugin[S]) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
