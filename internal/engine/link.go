@@ -125,7 +125,7 @@ const querySrcTargetArg = "src_target"
 
 func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) (*pluginv1.TargetSpec, error) {
 	if ref.GetArgs()[querySrcTargetArg] == "" {
-		return nil, errors.New(querySrcTargetArg + " required")
+		return nil, fmt.Errorf("%v required", querySrcTargetArg)
 	}
 
 	var items []*pluginv1.TargetMatcher
@@ -417,23 +417,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			return hex.EncodeToString(h.Sum(nil))
 		})
 
-		inputs := def.GetInputs()
-		for _, input := range inputs {
-			if input.GetRef().GetPackage() != tref.QueryPackage {
-				continue
-			}
-
-			ref := input.GetRef()
-			args := ref.GetArgs()
-			if args == nil {
-				args = map[string]string{}
-			}
-			args[querySrcTargetArg] = currentTargetAddrHash()
-			ref.SetArgs(args)
-
-			input.SetRef(ref)
-		}
-		def.SetInputs(inputs)
+		addSrcTargetToInputs(def, currentTargetAddrHash)
 
 		for _, output := range def.GetCollectOutputs() {
 			if !slices.Contains(def.GetOutputs(), output.GetGroup()) {
@@ -457,7 +441,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			}
 		}
 
-		allTransitive, err := e.collectTransitive(ctx, rs, inputs)
+		allTransitive, err := e.collectTransitive(ctx, rs, def.GetInputs())
 		if err != nil {
 			return nil, fmt.Errorf("collect transitive: %w", err)
 		}
@@ -473,17 +457,15 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			}
 
 			def = res.GetTarget()
+
+			addSrcTargetToInputs(def, currentTargetAddrHash)
 		}
 
 		if len(def.GetHash()) == 0 {
 			h := xxh3.New()
 			hashpb.Hash(h, def, nil)
 
-			if x := h.Sum(nil); x != nil {
-				def.SetHash(x)
-			} else {
-				def.ClearHash()
-			}
+			def.SetHash(h.Sum(nil))
 		}
 
 		return &TargetDef{
@@ -494,6 +476,26 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 	})
 
 	return res, err
+}
+
+func addSrcTargetToInputs(def *pluginv1.TargetDef, currentTargetAddrHash func() string) {
+	inputs := def.GetInputs()
+	for _, input := range inputs {
+		if input.GetRef().GetPackage() != tref.QueryPackage {
+			continue
+		}
+
+		ref := input.GetRef()
+		args := ref.GetArgs()
+		if args == nil {
+			args = map[string]string{}
+		}
+		args[querySrcTargetArg] = currentTargetAddrHash()
+		ref.SetArgs(args)
+
+		input.SetRef(ref)
+	}
+	def.SetInputs(inputs)
 }
 
 func sandboxSpecEmpty(sb *pluginv1.Sandbox) bool {
