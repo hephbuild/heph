@@ -35,21 +35,21 @@ func (p *Plugin) packageBinInner(
 	goPkg Package,
 	factors Factors,
 	mainRef string,
-	goPkgs []LibPackage,
+	depsGoPkgs []LibPackage,
 ) (*pluginv1.GetResponse, error) {
 	deps := map[string][]string{}
 	run := []string{
 		`echo > importconfig`,
 	}
-	for i, goPkg := range goPkgs {
-		if goPkg.ImportPath == unsafePkgName {
+	for i, depGoPkg := range depsGoPkgs {
+		if depGoPkg.ImportPath == unsafePkgName {
 			// ignore pseudo package
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(goPkg.LibTargetRef, "a"))}
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(depGoPkg.LibTargetRef, "a"))}
 
-		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, goPkg.ImportPath, i))
+		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, depGoPkg.ImportPath, i))
 	}
 
 	deps["main"] = []string{mainRef}

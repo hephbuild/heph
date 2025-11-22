@@ -98,7 +98,7 @@ func (p *Plugin) getGoToolStructpb() *structpb.Value {
 }
 
 func (p *Plugin) getRuntimePassEnvStructpb() *structpb.Value {
-	return hstructpb.NewStringsValue([]string{"HOME", "GOROOT"})
+	return hstructpb.NewStringsValue([]string{"HOME"})
 }
 
 func (p *Plugin) getEnvStructpb2(ms ...map[string]string) *structpb.Value {
@@ -140,7 +140,7 @@ func (p *Plugin) PluginInit(ctx context.Context, init pluginsdk.InitPayload) err
 const Name = "go"
 
 type Options struct {
-	GoTool string
+	GoTool string `mapstructure:"gotool"`
 }
 
 func New(options Options) *Plugin {
@@ -309,7 +309,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, err
 		}
 
-		return p.runTest(ctx, goPkg, factors)
+		return p.runTest(ctx, goPkg, factors, req.GetRef().GetArgs()["v"] == "1")
 	case "embedcfg":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {

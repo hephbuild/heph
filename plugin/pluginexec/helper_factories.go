@@ -131,3 +131,13 @@ func NewSh(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
 
 	return NewExec(options...)
 }
+
+const NameShShell = NameSh + "@shell"
+
+func NewInteractiveSh(options ...Option[*execv1.Target]) *Plugin[*execv1.Target] {
+	options = append(options, WithRunToExecArgs[*execv1.Target](func(sandboxPath string, t *execv1.Target, termargs []string) []string {
+		return InteractiveBashArgs(strings.Join(t.GetRun(), "\n"), sandboxPath)
+	}), WithName[*execv1.Target](NameShShell))
+
+	return NewExec(options...)
+}

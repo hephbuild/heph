@@ -98,12 +98,17 @@ func (p *Plugin) packageLibInner(
 
 	importsm := map[string]string{}
 	for _, impGoPkg := range imports {
-		if impGoPkg.ImportPath == "unsafe" {
+		if impGoPkg.ImportPath == unsafePkgName {
 			// ignore pseudo package
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(ModeNormal), "a"))
+		mode := ModeNormal
+		if impGoPkg.ImportPath == goPkg.GoPkg.ImportPath && goPkg.Mode == ModeXTest {
+			mode = ModeTest
+		}
+
+		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(mode), "a"))
 	}
 
 	return p.packageLibInner3(
@@ -194,7 +199,7 @@ func (p *Plugin) packageLibInner3(
 	for importPath, depRef := range hmaps.Sorted(imports) {
 		i++
 
-		if importPath == "unsafe" {
+		if importPath == unsafePkgName {
 			// ignore pseudo package
 			continue
 		}

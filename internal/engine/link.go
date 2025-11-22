@@ -538,14 +538,14 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 func mergeSandbox(dst, src *pluginv1.Sandbox, id string) {
 	for _, tool := range src.GetTools() {
 		tool = hproto.Clone(tool)
-		tool.SetId(fmt.Sprintf("%v_%v", id, tool.GetId()))
+		tool.SetId(fmt.Sprintf("%v_tool_%v", id, tool.GetId()))
 		tool.SetGroup(tool.GetId())
 
 		dst.SetTools(append(dst.GetTools(), tool))
 	}
 	for _, dep := range src.GetDeps() {
 		dep = hproto.Clone(dep)
-		dep.SetId(fmt.Sprintf("%v_%v", id, dep.GetId()))
+		dep.SetId(fmt.Sprintf("%v_dep_%v", id, dep.GetId()))
 		dep.SetGroup(dep.GetId())
 
 		dst.SetDeps(append(dst.GetDeps(), dep))

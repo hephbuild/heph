@@ -94,22 +94,17 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	})
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginexec.NameShShell,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
 		Name:    pluginexec.NameBash,
 		Enabled: true,
 	})
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
 		Name:    pluginexec.NameBashShell,
-		Enabled: true,
-	})
-
-	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
-		Name:    pluginnix.NameBash,
-		Enabled: true,
-	})
-
-	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
-		Name:    pluginnix.NameBashShell,
 		Enabled: true,
 	})
 
@@ -215,6 +210,9 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 	},
 	pluginexec.NameSh: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginExecFactory(pluginexec.NewSh, options)
+	},
+	pluginexec.NameShShell: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginExecFactory(pluginexec.NewInteractiveSh, options)
 	},
 	pluginexec.NameBash: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginExecFactory(pluginexec.NewBash, options)

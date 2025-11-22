@@ -2,8 +2,10 @@ package pluginnix
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/lib/tref"
@@ -47,32 +49,94 @@ export NIX_CONFIG=$(cat <<'EOF'
 EOF
 )
 
-exec nix run nixpkgs#<PKG> --offline -- "$@" 
+exec nix run <REF> -- "$@" 
 `
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	if req.GetRef().GetPackage() != "@nix" {
+	nixRef, ok := strings.CutPrefix(req.GetRef().GetPackage(), "@nix")
+	if !ok {
 		return nil, pluginsdk.ErrNotFound
 	}
 
-	script := strings.NewReplacer(
-		"<CONFIG>", nixConfig,
-		"<PKG>", req.GetRef().GetName(),
-	).Replace(wrapperScript)
-	script = strings.TrimSpace(script)
+	// https://nix.dev/manual/nix/2.24/command-ref/new-cli/nix3-flake#examples
+
+	nixRef = strings.TrimPrefix(nixRef, "/")
+	if nixRef == "" {
+		nixRef = "nixpkgs"
+	}
+
+	nixPkg := req.GetRef().GetName()
+
+	if req.GetRef().GetArgs()["install"] == "1" {
+		return p.install(ctx, nixRef, nixPkg)
+	} else {
+		hash := true
+		if v := req.GetRef().GetArgs()["hash"]; v != "" {
+			hash = v == "0"
+		}
+
+		return p.get(ctx, nixRef, nixPkg, hash)
+	}
+}
+
+// temporary until we get can heph heph to manage the nix cache
+func (p *Provider) install(ctx context.Context, nixRef, nixPkg string) (*pluginv1.GetResponse, error) {
+	ref := tref.New(tref.JoinPackage("@nix", nixRef), nixPkg, map[string]string{
+		"install": "1",
+	})
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref:    tref.New(req.GetRef().GetPackage(), req.GetRef().GetName(), nil),
+			Ref:    ref,
+			Driver: htypes.Ptr("sh"),
+			Config: map[string]*structpb.Value{
+				"run": structpb.NewStringValue(fmt.Sprintf("nix hash path $(nix build %v#%v --print-out-paths) > $OUT", nixRef, nixPkg)),
+				"env": hstructpb.NewMapStringStringValue(map[string]string{
+					"NIX_CONFIG": nixConfig,
+				}),
+				"tools": structpb.NewStringValue(tref.Format(tref.WithOut(p.nixToolRef, ""))),
+				"out":   structpb.NewStringValue(fmt.Sprintf("nix_hash_%v_%v", nixRef, nixPkg)),
+			},
+		}.Build(),
+	}.Build(), nil
+}
+
+func (p *Provider) get(ctx context.Context, nixRef, nixPkg string, hash bool) (*pluginv1.GetResponse, error) {
+	script := strings.NewReplacer(
+		"<CONFIG>", nixConfig,
+		"<REF>", fmt.Sprintf("%v#%v", nixRef, nixPkg),
+	).Replace(wrapperScript)
+	script = strings.TrimSpace(script)
+
+	var args map[string]string
+	if hash {
+		args = map[string]string{"hash": "1"}
+	} else {
+		args = map[string]string{"hash": "0"}
+	}
+
+	ref := tref.New(tref.JoinPackage("@nix", nixRef), nixPkg, args)
+
+	return pluginv1.GetResponse_builder{
+		Spec: pluginv1.TargetSpec_builder{
+			Ref:    ref,
 			Driver: htypes.Ptr("textfile"),
 			Config: map[string]*structpb.Value{
 				"text": structpb.NewStringValue(script),
-				"out":  structpb.NewStringValue(req.GetRef().GetName()),
+				"out":  structpb.NewStringValue(nixPkg),
 			},
 			Transitive: pluginv1.Sandbox_builder{
 				Tools: []*pluginv1.Sandbox_Tool{
 					pluginv1.Sandbox_Tool_builder{
-						Ref: tref.WithOut(p.nixToolRef, ""),
+						Ref:  tref.WithOut(p.nixToolRef, ""),
+						Hash: htypes.Ptr(false),
+					}.Build(),
+				},
+				Deps: []*pluginv1.Sandbox_Dep{
+					pluginv1.Sandbox_Dep_builder{
+						Ref:     tref.WithOut(tref.WithArgs(ref, map[string]string{"install": "1"}), ""),
+						Hash:    htypes.Ptr(hash),
+						Runtime: htypes.Ptr(false),
 					}.Build(),
 				},
 			}.Build(),

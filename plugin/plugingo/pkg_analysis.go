@@ -301,6 +301,12 @@ func (p *Plugin) goListTestDepsPkgResult(
 	imports = append(imports, goPkg.XTestImports...)
 	imports = append(imports, extraImports...)
 
+	if len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0 {
+		imports = slices.DeleteFunc(imports, func(imp string) bool {
+			return imp == goPkg.ImportPath
+		})
+	}
+
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
 	var g herrgroup.Group
@@ -341,6 +347,40 @@ func (p *Plugin) goListTestDepsPkgResult(
 				goPkgs = append(goPkgs, libGoPkg)
 				goPkgsm.Unlock()
 
+				// Add the test mode version of the package under test
+				testGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
+				if err != nil {
+					return err
+				}
+
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, testGoPkg)
+				goPkgsm.Unlock()
+
+				// Collect dependencies of the test mode package
+				testDeps, err := p.goImportsToDeps(ctx, testGoPkg.Imports, factors, c, requestId, nil)
+				if err != nil {
+					return fmt.Errorf("get test deps: %w", err)
+				}
+
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, testDeps...)
+				goPkgsm.Unlock()
+
+				// Filter out the package under test from xtest imports before processing
+				filteredImports := slices.DeleteFunc(slices.Clone(libGoPkg.Imports), func(imp string) bool {
+					return imp == goPkg.ImportPath
+				})
+
+				res, err := p.goImportsToDeps(ctx, filteredImports, factors, c, requestId, nil)
+				if err != nil {
+					return fmt.Errorf("get deps: %w", err)
+				}
+
+				goPkgsm.Lock()
+				goPkgs = append(goPkgs, res...)
+				goPkgsm.Unlock()
+
 				return nil
 			})
 		}
@@ -370,9 +410,30 @@ func (p *Plugin) goListTestDepsPkgResult(
 		return strings.Compare(a.ImportPath, b.ImportPath)
 	})
 
-	goPkgs = hslices.UniqBy(goPkgs, func(item LibPackage) string {
-		return item.ImportPath
-	})
+	// Deduplicate by ImportPath, preferring Mode Test over ModeNormal
+	seen := make(map[string]int)
+	deduped := make([]LibPackage, 0, len(goPkgs))
+	for _, pkg := range goPkgs {
+		if idx, exists := seen[pkg.ImportPath]; exists {
+			// If we already have this import path, keep ModeTest if either is ModeTest
+			if pkg.Mode == ModeTest || deduped[idx].Mode == ModeTest {
+				deduped[idx] = LibPackage{
+					Mode:          ModeTest,
+					Imports:       pkg.Imports,
+					EmbedPatterns: pkg.EmbedPatterns,
+					GoFiles:       pkg.GoFiles,
+					GoPkg:         pkg.GoPkg,
+					ImportPath:    pkg.ImportPath,
+					Name:          pkg.Name,
+					LibTargetRef:  pkg.GoPkg.GetBuildLibTargetRef(ModeTest),
+				}
+			}
+		} else {
+			seen[pkg.ImportPath] = len(deduped)
+			deduped = append(deduped, pkg)
+		}
+	}
+	goPkgs = deduped
 
 	return goPkgs, nil
 }

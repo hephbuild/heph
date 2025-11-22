@@ -15,10 +15,17 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {
+func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors, v bool) (*pluginv1.GetResponse, error) {
 	labels := []string{"test", "go-test"}
 	if goPkg.IsStd || goPkg.Is3rdParty {
 		labels = nil
+	}
+
+	var targs string
+	rargs := factors.Args()
+	if v {
+		targs = " -test.v"
+		rargs["v"] = "1"
 	}
 
 	return pluginv1.GetResponse_builder{
@@ -26,22 +33,17 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors) (*
 			Ref: pluginv1.TargetRef_builder{
 				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
 				Name:    htypes.Ptr("test"),
-				Args:    factors.Args(),
+				Args:    rargs,
 			}.Build(),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue("$TOOL"),
+				"run": structpb.NewStringValue("$TOOL" + targs),
 				"deps": hstructpb.NewMapStringStringValue(map[string]string{
 					"testdata": tref.FormatQuery(tref.QueryOptions{
 						Label:        "go_test_data",
 						SkipProvider: Name,
 						Package:      goPkg.HephPackage,
 					}),
-					"bin": tref.Format(pluginv1.TargetRef_builder{
-						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-						Name:    htypes.Ptr("build_test"),
-						Args:    factors.Args(),
-					}.Build()),
 				}),
 				"tools": hstructpb.NewMapStringStringValue(map[string]string{
 					"bin": tref.Format(pluginv1.TargetRef_builder{

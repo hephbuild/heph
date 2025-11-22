@@ -84,7 +84,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			Ref:                req.GetSpec().GetRef(),
 			Def:                targetAny,
 			Outputs:            []string{""},
-			Cache:              htypes.Ptr(true),
+			Cache:              htypes.Ptr(false),
 			DisableRemoteCache: htypes.Ptr(true),
 		}.Build(),
 	}.Build(), nil
