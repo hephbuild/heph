@@ -390,6 +390,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 						Args:    goPkg.LibTargetRef.GetArgs(),
 					}.Build(), "h"))},
 					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
+					"h":   getFiles(goPkg.GoPkg, goPkg.GoPkg.HFiles),
 				}),
 				"tools": p.getGoToolStructpb(),
 			},
