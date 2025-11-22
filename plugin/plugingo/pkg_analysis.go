@@ -348,24 +348,27 @@ func (p *Plugin) goListTestDepsPkgResult(
 				goPkgsm.Unlock()
 
 				// Add the test mode version of the package under test
-				testGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
-				if err != nil {
-					return err
+				// Only add it if the package has GoFiles or TestGoFiles (not xtest-only)
+				if len(goPkg.GoFiles) > 0 || len(goPkg.TestGoFiles) > 0 {
+					testGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
+					if err != nil {
+						return err
+					}
+
+					goPkgsm.Lock()
+					goPkgs = append(goPkgs, testGoPkg)
+					goPkgsm.Unlock()
+
+					// Collect dependencies of the test mode package
+					testDeps, err := p.goImportsToDeps(ctx, testGoPkg.Imports, factors, c, requestId, nil)
+					if err != nil {
+						return fmt.Errorf("get test deps: %w", err)
+					}
+
+					goPkgsm.Lock()
+					goPkgs = append(goPkgs, testDeps...)
+					goPkgsm.Unlock()
 				}
-
-				goPkgsm.Lock()
-				goPkgs = append(goPkgs, testGoPkg)
-				goPkgsm.Unlock()
-
-				// Collect dependencies of the test mode package
-				testDeps, err := p.goImportsToDeps(ctx, testGoPkg.Imports, factors, c, requestId, nil)
-				if err != nil {
-					return fmt.Errorf("get test deps: %w", err)
-				}
-
-				goPkgsm.Lock()
-				goPkgs = append(goPkgs, testDeps...)
-				goPkgsm.Unlock()
 
 				// Filter out the package under test from xtest imports before processing
 				filteredImports := slices.DeleteFunc(slices.Clone(libGoPkg.Imports), func(imp string) bool {
