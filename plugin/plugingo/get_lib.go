@@ -235,7 +235,7 @@ func (p *Plugin) packageLibInner3(
 
 	deps["src"] = srcRefs
 
-	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v $SRC_SRC`, goPkg.ImportPath, extra))
+	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v ${SRC_SRC}`, goPkg.ImportPath, extra))
 
 	outFile := goPkg.Name + ".a"
 	if goPkg.Mode != "" {

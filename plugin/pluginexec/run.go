@@ -80,8 +80,10 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	binfs := hfs.At(sandboxfs, "bin")
 	cwdfs := hfs.At(workfs, req.GetTarget().GetRef().GetPackage())
 	outfs := cwdfs
+	srcEnvBasePath := cwdfs.Path()
 	if texec.GetContext() == execv1.Target_CONTEXT_TREE {
 		cwdfs = hfs.At(hfs.NewOS(req.GetTreeRootPath()), req.GetTarget().GetRef().GetPackage())
+		srcEnvBasePath = ""
 	}
 
 	listArtifacts, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_CONTEXT_TREE)
@@ -91,7 +93,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec)
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec, srcEnvBasePath)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +145,8 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	}
 
 	env = append(env, "SHELLOPTS=")
+
+	fmt.Println(env)
 
 	env, err = FilterLongEnv(env, args)
 	if err != nil {
@@ -331,7 +335,7 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target) ([]string, error) {
+func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, basePath string) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
 	for _, dep := range t.GetDeps() {
@@ -420,6 +424,14 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 
 					sb.WriteString(" ")
 				}
+
+				if basePath != "" {
+					line, err = filepath.Rel(basePath, line)
+					if err != nil {
+						return nil, err
+					}
+				}
+
 				sb.WriteString(line)
 			}
 

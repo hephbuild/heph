@@ -54,7 +54,7 @@ func (p *Plugin) packageBinInner(
 
 	deps["main"] = []string{mainRef}
 
-	run = append(run, `go tool link -importcfg "importconfig" -o $OUT $SRC_MAIN`)
+	run = append(run, `go tool link -importcfg "importconfig" -o $OUT ${SRC_MAIN}`)
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
