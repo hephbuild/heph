@@ -74,6 +74,9 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 	artifacts []ExecuteResultArtifact,
 	cache CacheHandle,
 ) error {
+	step, ctx := hstep.New(ctx, fmt.Sprintf("Caching %q...", cache.Name))
+	defer step.Done()
+
 	// TODO: remote lock ?
 
 	for _, artifact := range artifacts {

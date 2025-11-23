@@ -13,28 +13,46 @@ var runningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("4"))
 var okStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 var koStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 
-func Format(renderer *lipgloss.Renderer, step *corev1.Step, interactive bool) string {
-	var t time.Duration
-
-	status := " "
+func FormatStatus(renderer *lipgloss.Renderer, step *corev1.Step) string {
 	switch step.GetStatus() {
 	case corev1.Step_STATUS_RUNNING:
-		status = runningStyle.Renderer(renderer).Render("☲")
-		if interactive {
-			t = time.Since(step.GetStartedAt().AsTime())
-		}
+		return runningStyle.Renderer(renderer).Render("☲")
+
 	case corev1.Step_STATUS_COMPLETED:
-		status = okStyle.Renderer(renderer).Render("✔")
 		if step.GetError() {
-			status = koStyle.Renderer(renderer).Render("✘")
+			return koStyle.Renderer(renderer).Render("✘")
 		}
+
+		return okStyle.Renderer(renderer).Render("✔")
+	case corev1.Step_STATUS_UNSPECIFIED:
+	}
+
+	return " "
+}
+
+func FormatDuration(step *corev1.Step) string {
+	var t time.Duration
+	switch step.GetStatus() {
+	case corev1.Step_STATUS_RUNNING:
+		t = time.Since(step.GetStartedAt().AsTime())
+	case corev1.Step_STATUS_COMPLETED:
 		t = step.GetCompletedAt().AsTime().Sub(step.GetStartedAt().AsTime())
 	case corev1.Step_STATUS_UNSPECIFIED:
 	}
 
-	if t > 0 {
-		return fmt.Sprintf("%v %.5s %v", status, htime.FormatFixedWidthDuration(t), step.GetText())
+	if t <= 0 {
+		return ""
 	}
 
-	return fmt.Sprintf("%v %v", status, step.GetText())
+	return htime.FormatFixedWidthDuration(t)
+}
+
+func Format(renderer *lipgloss.Renderer, step *corev1.Step, interactive bool) string {
+	d := FormatDuration(step)
+
+	if d != "" {
+		return fmt.Sprintf("%s %.5s %s", FormatStatus(renderer, step), d, step.GetText())
+	}
+
+	return fmt.Sprintf("%s %s", FormatStatus(renderer, step), step.GetText())
 }

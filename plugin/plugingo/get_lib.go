@@ -27,13 +27,9 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 	if mode != ModeXTest && len(goPkg.GoPkg.SFiles) > 0 {
 		var asmDeps []string
 		for _, file := range goPkg.GoPkg.SFiles {
-			asmDeps = append(asmDeps, tref.Format(pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
-				Name:    htypes.Ptr("build_lib#asm"),
-				Args: hmaps.Concat(goPkg.LibTargetRef.GetArgs(), map[string]string{
-					"file": file,
-				}),
-			}.Build()))
+			asmDeps = append(asmDeps, tref.Format(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#asm", hmaps.Concat(goPkg.LibTargetRef.GetArgs(), map[string]string{
+				"file": file,
+			}))))
 		}
 
 		return pluginv1.GetResponse_builder{
@@ -212,11 +208,7 @@ func (p *Plugin) packageLibInner3(
 	var extra string
 
 	if len(goPkg.EmbedPatterns) > 0 {
-		deps["embed"] = append(deps["embed"], tref.Format(pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
-			Name:    htypes.Ptr("embedcfg"),
-			Args:    goPkg.LibTargetRef.GetArgs(),
-		}.Build()))
+		deps["embed"] = append(deps["embed"], tref.Format(tref.New(goPkg.LibTargetRef.GetPackage(), "embedcfg", goPkg.LibTargetRef.GetArgs())))
 
 		extra += " -embedcfg $SRC_EMBED"
 	}
@@ -224,11 +216,7 @@ func (p *Plugin) packageLibInner3(
 	if incomplete {
 		extra += " -symabis $SRC_ABI_ABI -asmhdr $SRC_ABI_H"
 
-		deps["abi"] = append(deps["abi"], tref.Format(pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(goPkg.LibTargetRef.GetPackage()),
-			Name:    htypes.Ptr("build_lib#abi"),
-			Args:    goPkg.LibTargetRef.GetArgs(),
-		}.Build()))
+		deps["abi"] = append(deps["abi"], tref.Format(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#abi", goPkg.LibTargetRef.GetArgs())))
 	} else {
 		extra += " -complete"
 	}

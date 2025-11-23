@@ -8,10 +8,14 @@ import (
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hcore/hstep"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
+	step, ctx := hstep.New(ctx, "Copying to tree...")
+	defer step.Done()
+
 	err := e.codegenCopyTree(ctx, def, outputs)
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)

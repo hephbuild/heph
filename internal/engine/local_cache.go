@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -77,6 +78,9 @@ func (e *Engine) CacheLocally(
 	hashin string,
 	sandboxArtifacts []ExecuteResultArtifact,
 ) ([]ExecuteResultArtifact, *hartifact.Manifest, error) {
+	step, ctx := hstep.New(ctx, "Caching...")
+	defer step.Done()
+
 	cachedir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
 	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))

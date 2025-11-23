@@ -146,8 +146,6 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 
 	env = append(env, "SHELLOPTS=")
 
-	fmt.Println(env)
-
 	env, err = FilterLongEnv(env, args)
 	if err != nil {
 		return nil, err

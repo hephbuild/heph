@@ -34,11 +34,12 @@ func Quit() tea.Msg {
 }
 
 type stepsUpdateMsg struct {
-	steps     []*corev1.Step
+	steps     map[string]*corev1.Step
 	stepsc    int
 	total     uint64
 	completed uint64
 	failed    uint64
+	leafs     []*corev1.Step
 }
 
 type Model struct {
@@ -139,16 +140,10 @@ func (m Model) View() string {
 		sb.WriteString(strings.Repeat("-", m.width))
 		sb.WriteString("\n")
 
-		stepsTree := buildStepsTree(m.renderer, m.stepsState.steps)
-		sb.WriteString(stepsTree)
+		buildStepsTree(m.renderer, m.stepsState.steps, m.stepsState.leafs, &sb, m.width, (m.height-2)/2)
 	}
 
-	return lipgloss.NewStyle().
-		Renderer(m.renderer).
-		// TODO: Not sure why this breaks the output
-		//MaxWidth(m.width).
-		//MaxHeight(m.height / 2).
-		Render(sb.String())
+	return sb.String()
 }
 
 func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Renderer) (func(*corev1.Step), func()) {
@@ -156,6 +151,8 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 
 	stepsCh := make(chan *corev1.Step)
 	steps := map[string]*corev1.Step{}
+	leafs := map[string]*corev1.Step{}
+	children := map[string]int{}
 	var stepsm sync.Mutex
 	var total uint64
 	var completed uint64
@@ -169,6 +166,14 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 				_, ok := steps[step.GetId()]
 				if !ok {
 					total++
+
+					leafs[step.GetId()] = step
+					if step.GetParentId() != "" {
+						children[step.GetParentId()]++
+						if len(children) > 0 {
+							delete(leafs, step.GetParentId())
+						}
+					}
 				}
 
 				steps[step.GetId()] = step
@@ -183,6 +188,18 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 						failed++
 					}
 					delete(steps, step.GetId())
+					delete(leafs, step.GetId())
+					delete(children, step.GetId())
+					if step.GetParentId() != "" {
+						children[step.GetParentId()]--
+
+						if children[step.GetParentId()] == 0 {
+							parent, ok := steps[step.GetParentId()]
+							if ok {
+								leafs[parent.GetId()] = parent
+							}
+						}
+					}
 				}
 				stepsm.Unlock()
 			case <-doCtx.Done():
@@ -200,15 +217,28 @@ func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Rende
 			case <-t.C:
 				stepsm.Lock()
 				steps := maps.Clone(steps)
+				leafs := slices.Collect(maps.Values(leafs))
+				total := total
+				completed := completed
+				failed := failed
 				stepsm.Unlock()
-				stepsc := len(steps)
-				maps.DeleteFunc(steps, func(k string, v *corev1.Step) bool { // prevent stroboscopic effect
-					return time.Since(v.GetStartedAt().AsTime()) < 100*time.Millisecond
+
+				slices.SortFunc(leafs, func(a, b *corev1.Step) int {
+					if v := a.GetStartedAt().AsTime().Compare(b.GetStartedAt().AsTime()); v != 0 {
+						return v
+					}
+
+					if v := strings.Compare(a.GetId(), b.GetId()); v != 0 {
+						return v
+					}
+
+					return strings.Compare(a.GetText(), b.GetText())
 				})
-				stepsa := slices.Collect(maps.Values(steps))
+
 				p.Send(stepsUpdateMsg{
-					steps:     stepsa,
-					stepsc:    stepsc,
+					steps:     steps,
+					leafs:     leafs,
+					stepsc:    len(steps),
 					total:     total,
 					completed: completed,
 					failed:    failed,
