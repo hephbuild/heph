@@ -128,9 +128,14 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	}
 	defer listf.Close()
 
+	writeNl := false
+
 	err = hartifact.Unpack(ctx, artifact, fs, hartifact.WithOnFile(func(to string) {
+		if writeNl {
+			_, _ = listf.Write([]byte("\n"))
+		}
 		_, _ = listf.Write([]byte(to))
-		_, _ = listf.Write([]byte("\n"))
+		writeNl = true
 	}), hartifact.WithFilter(func(from string) bool {
 		if len(filters) == 0 {
 			return true

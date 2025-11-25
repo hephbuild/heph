@@ -51,7 +51,9 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	step, ctx := hstep.New(ctx, "Executing...")
 	defer step.Done()
 
+	wstep, ctx := hstep.New(ctx, "Executing/Waiting...")
 	err := sem.Acquire(ctx, 1)
+	wstep.Done()
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +95,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec, srcEnvBasePath)
+	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec, workfs, srcEnvBasePath)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +335,7 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, basePath string) ([]string, error) {
+func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, listfs hfs.FS, basePath string) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
 	for _, dep := range t.GetDeps() {
@@ -373,10 +375,10 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 	}
 
 	env := make([]string, 0, len(m))
-	var sb strings.Builder
+	var envSb strings.Builder
 	for name, artifacts := range m {
 		seenFiles := map[string]struct{}{}
-		sb.Reset()
+		envSb.Reset()
 
 		slices.SortFunc(artifacts, func(a, b *pluginv1.ArtifactWithOrigin) int {
 			if v := strings.Compare(a.GetOrigin().GetId(), b.GetOrigin().GetId()); v != 0 {
@@ -398,6 +400,12 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 			return 0
 		})
 
+		listf, err := hfs.Create(listfs, "env_list_"+name+".list")
+		if err != nil {
+			return nil, err
+		}
+		defer listf.Close()
+
 		for _, input := range artifacts {
 			r, err := hartifact.FileReader(ctx, input.GetArtifact())
 			if err != nil {
@@ -415,12 +423,14 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				}
 				seenFiles[line] = struct{}{}
 
-				if sb.Len() > 0 {
+				_, _ = fmt.Fprintf(listf, "%s\n", line)
+
+				if envSb.Len() > 0 {
 					if _, ok := requireSingleValue[name]; ok {
 						return nil, fmt.Errorf("tool require a single output %q", name)
 					}
 
-					sb.WriteString(" ")
+					envSb.WriteString(" ")
 				}
 
 				if basePath != "" {
@@ -430,15 +440,14 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 					}
 				}
 
-				sb.WriteString(line)
+				envSb.WriteString(line)
 			}
 
 			_ = r.Close()
 		}
 
-		s := sb.String()
-
-		env = append(env, getEnvEntryWithName(name, s))
+		env = append(env, getEnvEntryWithName(name, envSb.String()))
+		env = append(env, getEnvEntryWithName(name+"_LIST", listf.Name()))
 	}
 
 	slices.Sort(env)
