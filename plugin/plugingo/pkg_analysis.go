@@ -84,12 +84,23 @@ type GetGoPackageCache struct {
 }
 
 func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, factors Factors, requestId string) *GetGoPackageCache {
-	c := &GetGoPackageCache{
+	key := packageCacheKey{
+		RequestId: requestId,
+		Factors:   factors,
+		BasePkg:   basePkg,
+	}
+
+	c, ok := p.packageCache.Get(key)
+	if ok {
+		return c
+	}
+
+	c, _ = p.packageCache.GetOrSet(key, &GetGoPackageCache{
 		basePkg: basePkg,
 		stdListRes: func() (map[string]Package, error) {
 			res, err, _ := p.stdCache.Do(stdCacheKey{
-				RequestId: requestId,
-				Factors:   factors,
+				//RequestId: requestId, TODO: bring back with a "master request id"
+				Factors: factors,
 			}, func() (map[string]Package, error) {
 				stdList, err := p.resultStdList(ctx, factors, requestId)
 				if err != nil {
@@ -107,22 +118,16 @@ func (p *Plugin) newGetGoPackageCache(ctx context.Context, basePkg string, facto
 		},
 		modulesRes: func() ([]Module, error) {
 			res, err, _ := p.moduleCache.Do(moduleCacheKey{
-				RequestId: requestId,
-				Factors:   factors,
-				BasePkg:   basePkg,
+				//RequestId: requestId, TODO: bring back with a "master request id"
+				Factors: factors,
+				BasePkg: basePkg,
 			}, func() ([]Module, error) {
 				return p.goModules(ctx, basePkg, requestId)
 			})
 
 			return res, err
 		},
-	}
-
-	c, _ = p.packageCache.GetOrSet(packageCacheKey{
-		RequestId: requestId,
-		Factors:   factors,
-		BasePkg:   basePkg,
-	}, c)
+	})
 
 	return c
 }
