@@ -4,14 +4,12 @@ import (
 	"context"
 	"io/fs"
 	"iter"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hsingleflight"
-	sync_map "github.com/zolstein/sync-map"
-
 	"github.com/hephbuild/heph/lib/tref"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -32,7 +30,7 @@ func (c *cachedFs) ReadDir(name string) ([]fs.DirEntry, error) {
 }
 
 // TODO: move to context or something like that
-var fsCaches sync_map.Map[string, *cachedFs]
+var fsWalkCache = hfs.NewFSCache()
 
 func walkDirs(ctx context.Context, walkRoot, root string, filter func(path string) bool) iter.Seq2[string, error] {
 	if filter == nil {
@@ -41,13 +39,8 @@ func walkDirs(ctx context.Context, walkRoot, root string, filter func(path strin
 		}
 	}
 
-	wfs := os.DirFS(walkRoot)
-	if rdfs, ok := wfs.(fs.ReadDirFS); ok {
-		wfs, _ = fsCaches.LoadOrStore(walkRoot, &cachedFs{ReadDirFS: rdfs})
-	}
-
 	return func(yield func(string, error) bool) {
-		err := fs.WalkDir(wfs, ".", func(path string, d fs.DirEntry, err error) error {
+		err := fsWalkCache.Walk(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if d == nil || !d.IsDir() {
 				return nil
 			}
@@ -59,8 +52,6 @@ func walkDirs(ctx context.Context, walkRoot, root string, filter func(path strin
 			if err != nil {
 				return err
 			}
-
-			path = filepath.Join(walkRoot, path)
 
 			if !filter(path) {
 				return fs.SkipDir
