@@ -10,6 +10,7 @@ import (
 
 	"github.com/goccy/go-json"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/plugintextfile"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -83,11 +84,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-				Name:    htypes.Ptr("embedcfg"),
-				Args:    args,
-			}.Build(),
+			Ref:    tref.New(goPkg.GetHephBuildPackage(), "embedcfg", args),
 			Driver: htypes.Ptr(plugintextfile.Name),
 			Config: map[string]*structpb.Value{
 				"text": structpb.NewStringValue(string(b)),

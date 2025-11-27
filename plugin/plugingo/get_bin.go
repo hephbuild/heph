@@ -58,11 +58,7 @@ func (p *Plugin) packageBinInner(
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-				Name:    htypes.Ptr(targetName),
-				Args:    factors.Args(),
-			}.Build(),
+			Ref: tref.New(goPkg.GetHephBuildPackage(), targetName, factors.Args()),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": p.getEnvStructpb(factors, map[string]string{

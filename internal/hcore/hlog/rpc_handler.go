@@ -16,7 +16,7 @@ type rpcHandler struct {
 func (r rpcHandler) Create(ctx context.Context, req *connect.Request[corev1.CreateRequest]) (*connect.Response[corev1.CreateResponse], error) {
 	logger := r.logger
 	if len(req.Msg.GetAttrs()) > 0 {
-		var attrs []any
+		attrs := make([]any, 0, len(req.Msg.GetAttrs()))
 		for _, attr := range req.Msg.GetAttrs() {
 			switch attr.WhichValue() {
 			case corev1.CreateRequest_Attr_ValueStr_case:

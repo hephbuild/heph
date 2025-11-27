@@ -31,11 +31,7 @@ func (p *Plugin) resultStdList(ctx context.Context, factors Factors, requestId s
 func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, requestId string) ([]Package, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(requestId),
-		Ref: pluginv1.TargetRef_builder{
-			Package: htypes.Ptr("@heph/go/std"),
-			Name:    htypes.Ptr("install"),
-			Args:    factors.Args(),
-		}.Build(),
+		Ref:       tref.New("@heph/go/std", "install", factors.Args()),
 	}.Build())
 	if err != nil {
 		return nil, err
@@ -79,11 +75,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.GetResponse, error) {
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr("@heph/go/std"),
-				Name:    htypes.Ptr("install"),
-				Args:    factors.Args(),
-			}.Build(),
+			Ref:    tref.New("@heph/go/std", "install", factors.Args()),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": p.getEnvStructpb(factors, map[string]string{
@@ -112,11 +104,7 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport string) (*pluginv1.GetResponse, error) {
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(path.Join("@heph/go/std", goImport)),
-				Name:    htypes.Ptr("build_lib"),
-				Args:    factors.Args(),
-			}.Build(),
+			Ref:    tref.New(tref.JoinPackage("@heph/go/std", goImport), "build_lib", factors.Args()),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
@@ -124,11 +112,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 					"GOARCH":      factors.GOARCH,
 					"GOTOOLCHAIN": "local",
 				}),
-				"deps": structpb.NewStringValue(tref.Format(pluginv1.TargetRef_builder{
-					Package: htypes.Ptr("@heph/go/std"),
-					Name:    htypes.Ptr("install"),
-					Args:    factors.Args(),
-				}.Build())),
+				"deps": structpb.NewStringValue(tref.Format(tref.New("@heph/go/std", "install", factors.Args()))),
 				"run": hstructpb.NewStringsValue([]string{
 					fmt.Sprintf("mv $WORKDIR/@heph/go/std/goroot/pkg/%v_%v/%v.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
 				}),

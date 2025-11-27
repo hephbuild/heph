@@ -30,11 +30,7 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors, v 
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-				Name:    htypes.Ptr("test"),
-				Args:    rargs,
-			}.Build(),
+			Ref:    tref.New(goPkg.GetHephBuildPackage(), "test", rargs),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"run": structpb.NewStringValue("$TOOL" + targs),
@@ -46,11 +42,7 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors, v 
 					}),
 				}),
 				"tools": hstructpb.NewMapStringStringValue(map[string]string{
-					"bin": tref.Format(pluginv1.TargetRef_builder{
-						Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-						Name:    htypes.Ptr("build_test"),
-						Args:    factors.Args(),
-					}.Build()),
+					"bin": tref.Format(tref.New(goPkg.GetHephBuildPackage(), "build_test", factors.Args())),
 				}),
 			},
 			Labels: labels,
@@ -97,11 +89,7 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-				Name:    htypes.Ptr("testmain"),
-				Args:    factors.Args(),
-			}.Build(),
+			Ref: tref.New(goPkg.GetHephBuildPackage(), "testmain", factors.Args()),
 			Driver: htypes.Ptr(plugintextfile.Name),
 			Config: map[string]*structpb.Value{
 				"text": structpb.NewStringValue(string(testmainb)),
@@ -164,11 +152,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 		"build_testmain_lib",
 		goPkg,
 		importsm,
-		[]string{tref.Format(pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(goPkg.GoPkg.GetHephBuildPackage()),
-			Name:    htypes.Ptr("testmain"),
-			Args:    factors.Args(),
-		}.Build())},
+		[]string{tref.Format(tref.New(goPkg.GoPkg.GetHephBuildPackage(), "testmain", factors.Args()))},
 		factors,
 		false,
 	)

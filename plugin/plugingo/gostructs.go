@@ -4,7 +4,7 @@ import (
 	"go/build"
 	"time"
 
-	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/hmaps"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -83,9 +83,5 @@ func (p Package) GetBuildLibTargetRef(mode string) *pluginv1.TargetRef {
 		args = hmaps.Concat(args, map[string]string{"mode": mode})
 	}
 
-	return pluginv1.TargetRef_builder{
-		Package: htypes.Ptr(p.GetHephBuildPackage()),
-		Name:    htypes.Ptr("build_lib"),
-		Args:    args,
-	}.Build()
+	return tref.New(p.GetHephBuildPackage(), "build_lib", args)
 }

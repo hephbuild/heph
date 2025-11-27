@@ -32,6 +32,12 @@ type Refable interface {
 	GetName() string
 }
 
+type HashStore interface {
+	GetHash() uint64
+	HasHash() bool
+	SetHash(uint64)
+}
+
 type RefableOut interface {
 	Refable
 	GetOutput() string
@@ -156,7 +162,17 @@ func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOut
 
 func Format(ref Refable) string {
 	if refh, ok := ref.(hashpb.StableWriter); ok {
-		sum := sumRef(refh)
+		var sum uint64
+		if s, ok := ref.(HashStore); ok {
+			if s.HasHash() {
+				sum = s.GetHash()
+			} else {
+				sum = sumRef(refh)
+				s.SetHash(sum)
+			}
+		} else {
+			sum = sumRef(refh)
+		}
 
 		f, ok := formatCache.Get(sum)
 		if ok {

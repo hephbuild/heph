@@ -45,8 +45,7 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 		level = corev1.CreateRequest_LEVEL_INFO
 	}
 
-	var attrs []*corev1.CreateRequest_Attr
-	appendAttr := func(attrs []*corev1.CreateRequest_Attr, attr slog.Attr) []*corev1.CreateRequest_Attr {
+	buildAttr := func(attr slog.Attr) *corev1.CreateRequest_Attr {
 		rpcAttr := corev1.CreateRequest_Attr_builder{
 			Key: htypes.Ptr(attr.Key),
 		}.Build()
@@ -64,16 +63,15 @@ func (l slogRPCHandler) Handle(ctx context.Context, record slog.Record) error {
 			rpcAttr.SetValueStr(fmt.Sprint(attr.Value.Any()))
 		}
 
-		attrs = append(attrs, rpcAttr)
-
-		return attrs
+		return rpcAttr
 	}
 
+	attrs := make([]*corev1.CreateRequest_Attr, 0, len(l.attrs)+record.NumAttrs())
 	for _, attr := range l.attrs {
-		attrs = appendAttr(attrs, attr)
+		attrs = append(attrs, buildAttr(attr))
 	}
 	record.Attrs(func(attr slog.Attr) bool {
-		attrs = appendAttr(attrs, attr)
+		attrs = append(attrs, buildAttr(attr))
 		return true
 	})
 

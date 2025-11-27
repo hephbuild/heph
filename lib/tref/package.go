@@ -73,7 +73,15 @@ func BasePackage(s string) string {
 }
 
 func HasPackagePrefix(pkg, prefix string) bool {
-	return prefix == "" || pkg == prefix || strings.HasPrefix(pkg, prefix+"/")
+	if prefix == "" || pkg == prefix {
+		return true
+	}
+
+	if cut, found := strings.CutPrefix(pkg, prefix); found {
+		return strings.HasPrefix(cut, "/")
+	}
+
+	return false
 }
 
 func CutPackagePrefix(pkg, prefix string) (string, bool) {

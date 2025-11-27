@@ -101,7 +101,7 @@ func Packages(ctx context.Context, p PackageProvider, m *pluginv1.TargetMatcher)
 			}
 
 			if !yield(pkg, nil) {
-				break
+				return
 			}
 		}
 	}

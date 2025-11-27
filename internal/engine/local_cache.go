@@ -262,7 +262,7 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 		return nil, false, fmt.Errorf("ManifestFromFS: %w", err)
 	}
 
-	var artifacts []hartifact.ManifestArtifact
+	artifacts := make([]hartifact.ManifestArtifact, 0, len(outputs))
 	for _, output := range outputs {
 		outputArtifacts := manifest.GetArtifacts(output)
 

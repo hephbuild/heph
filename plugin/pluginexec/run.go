@@ -51,7 +51,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	step, ctx := hstep.New(ctx, "Executing...")
 	defer step.Done()
 
-	wstep, ctx := hstep.New(ctx, "Executing/Waiting...")
+	wstep, ctx := hstep.New(ctx, "Waiting...")
 	err := sem.Acquire(ctx, 1)
 	wstep.Done()
 	if err != nil {

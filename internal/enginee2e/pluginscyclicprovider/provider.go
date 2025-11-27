@@ -38,10 +38,7 @@ const hephPackage = "some/package"
 func (p *Provider) targets() []*pluginv1.TargetSpec {
 	return []*pluginv1.TargetSpec{
 		pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(hephPackage),
-				Name:    htypes.Ptr("t1"),
-			}.Build(),
+			Ref:    tref.New(hephPackage, "t1", nil),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
 				"out": structpb.NewStringValue("t1"),
@@ -49,10 +46,7 @@ func (p *Provider) targets() []*pluginv1.TargetSpec {
 			},
 		}.Build(),
 		pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(hephPackage),
-				Name:    htypes.Ptr("t2"),
-			}.Build(),
+			Ref:    tref.New(hephPackage, "t2", nil),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
 				"out":     structpb.NewStringValue("t2"),
@@ -91,10 +85,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 			_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 				RequestId: htypes.Ptr(req.GetRequestId()),
 				Spec: pluginv1.TargetSpec_builder{
-					Ref: pluginv1.TargetRef_builder{
-						Package: htypes.Ptr(hephPackage),
-						Name:    htypes.Ptr("think"),
-					}.Build(),
+					Ref:    tref.New(hephPackage, "think", nil),
 					Driver: htypes.Ptr("sh"),
 					Config: map[string]*structpb.Value{
 						"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
@@ -136,10 +127,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 			RequestId: htypes.Ptr(req.GetRequestId()),
 			Spec: pluginv1.TargetSpec_builder{
-				Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr(hephPackage),
-					Name:    htypes.Ptr("think"),
-				}.Build(),
+				Ref: tref.New(hephPackage, "think", nil),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{

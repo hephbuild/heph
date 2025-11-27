@@ -65,7 +65,7 @@ type InteractiveExecOptions struct {
 }
 
 func (e *Engine) Result(ctx context.Context, rs *RequestState, pkg, name string, outputs []string) (*ExecuteResultLocks, error) {
-	res, err := e.ResultFromRef(ctx, rs, pluginv1.TargetRef_builder{Package: htypes.Ptr(pkg), Name: htypes.Ptr(name)}.Build(), outputs)
+	res, err := e.ResultFromRef(ctx, rs, tref.New(pkg, name, nil), outputs)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +821,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 	metas := make([]DepMeta, 0, len(results))
 
 	for _, result := range results {
-		var artifacts []DepMetaArtifact
+		artifacts := make([]DepMetaArtifact, 0, len(result.Artifacts))
 		for _, artifact := range result.Artifacts {
 			artifacts = append(artifacts, DepMetaArtifact{
 				Hashout: artifact.Hashout,

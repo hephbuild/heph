@@ -212,31 +212,20 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			}
 
 			if goPkg.IsCommand() {
-				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-					Name:    htypes.Ptr("build"),
-					Args:    factors.Args(),
-				}.Build()}.Build())
+				err = send(pluginv1.ListResponse_builder{Ref: tref.New(goPkg.GetHephBuildPackage(), "build", factors.Args())}.Build())
 				if err != nil {
 					return err
 				}
 			}
 
 			if !goPkg.Is3rdParty && !goPkg.IsStd && (len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0) {
-				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-					Name:    htypes.Ptr("test"),
-					Args:    factors.Args(),
-				}.Build()}.Build())
+
+				err = send(pluginv1.ListResponse_builder{Ref: tref.New(goPkg.GetHephBuildPackage(), "test", factors.Args())}.Build())
 				if err != nil {
 					return err
 				}
 
-				err = send(pluginv1.ListResponse_builder{Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-					Name:    htypes.Ptr("build_test"),
-					Args:    factors.Args(),
-				}.Build()}.Build())
+				err = send(pluginv1.ListResponse_builder{Ref: tref.New(goPkg.GetHephBuildPackage(), "build_test", factors.Args())}.Build())
 				if err != nil {
 					return err
 				}
@@ -472,11 +461,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		})
 	}
 
-	listRef := pluginv1.TargetRef_builder{
-		Package: htypes.Ptr(pkg),
-		Name:    htypes.Ptr("_golist"),
-		Args:    args,
-	}.Build()
+	listRef := tref.New(pkg, "_golist", args)
 
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(requestId),

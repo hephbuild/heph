@@ -472,10 +472,7 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 	}
 
 	spec := pluginv1.TargetSpec_builder{
-		Ref: pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(payload.Package),
-			Name:    htypes.Ptr(payload.Name),
-		}.Build(),
+		Ref:        tref.New(payload.Package, payload.Name, nil),
 		Driver:     htypes.Ptr(payload.Driver),
 		Config:     config,
 		Labels:     payload.Labels,

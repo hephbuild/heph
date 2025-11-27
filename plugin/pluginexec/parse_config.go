@@ -187,19 +187,49 @@ func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S)
 }
 
 func hashTarget(target *execv1.Target) []byte {
-	target = hproto.Clone(target)
+	var cloned bool
 
-	env := maps.Clone(target.GetEnv())
-	maps.DeleteFunc(env, func(s string, env *execv1.Target_Env) bool {
-		return !env.GetHash()
-	})
-	target.SetEnv(env)
+	env := target.GetEnv()
 
-	deps := slices.Clone(target.GetDeps())
-	slices.DeleteFunc(deps, func(dep *execv1.Target_Dep) bool {
-		return !dep.GetHash()
-	})
-	target.SetDeps(deps)
+	if func() bool {
+		for _, env := range env {
+			if !env.GetHash() {
+				return true
+			}
+		}
+
+		return false
+	}() {
+		if !cloned {
+			cloned = true
+			target = hproto.Clone(target)
+		}
+
+		maps.DeleteFunc(env, func(s string, env *execv1.Target_Env) bool {
+			return !env.GetHash()
+		})
+		target.SetEnv(env)
+	}
+
+	if func() bool {
+		for _, dep := range target.GetDeps() {
+			if !dep.GetHash() {
+				return true
+			}
+		}
+
+		return false
+	}() {
+		if !cloned {
+			cloned = true
+			target = hproto.Clone(target)
+		}
+
+		deps := slices.DeleteFunc(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
+			return !dep.GetHash()
+		})
+		target.SetDeps(deps)
+	}
 
 	h := xxh3.New()
 	hashpb.Hash(h, target, nil)

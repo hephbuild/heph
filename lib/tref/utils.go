@@ -1,17 +1,17 @@
 package tref
 
 import (
+	"maps"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/hproto"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
-	"google.golang.org/protobuf/proto"
 )
 
 func Equal(a, b *pluginv1.TargetRef) bool {
-	return proto.Equal(a, b)
+	return a.GetPackage() == b.GetPackage() && a.GetName() == b.GetName() && maps.Equal(a.GetArgs(), b.GetArgs())
 }
 
 func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
@@ -76,6 +76,7 @@ func WithName(ref *pluginv1.TargetRef, name string) *pluginv1.TargetRef {
 	}
 
 	ref = hproto.Clone(ref)
+	ref.ClearHash()
 	ref.SetName(name)
 	return ref
 }
@@ -86,6 +87,7 @@ func WithArg(ref *pluginv1.TargetRef, key, value string) *pluginv1.TargetRef {
 	}
 
 	ref = hproto.Clone(ref)
+	ref.ClearHash()
 	if ref.GetArgs() == nil {
 		ref.SetArgs(make(map[string]string))
 	}
@@ -99,6 +101,7 @@ func WithArgs(ref *pluginv1.TargetRef, m map[string]string) *pluginv1.TargetRef 
 	}
 
 	ref = hproto.Clone(ref)
+	ref.ClearHash()
 	ref.SetArgs(m)
 	return ref
 }

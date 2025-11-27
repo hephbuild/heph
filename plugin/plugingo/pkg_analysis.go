@@ -219,11 +219,7 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	goPkg.TestGoFiles = nil
 	goPkg.XTestGoFiles = nil
 
-	goPkg.LibTargetRef = pluginv1.TargetRef_builder{
-		Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-		Name:    htypes.Ptr("build_testmain_lib"),
-		Args:    factors.Args(),
-	}.Build()
+	goPkg.LibTargetRef = tref.New(goPkg.GetHephBuildPackage(), "build_testmain_lib", factors.Args())
 	goPkg.Imports = slices.Clone(testmainImports)
 
 	// if hasTest {
@@ -234,16 +230,12 @@ func (p *Plugin) getGoTestmainPackageFromImportPath(ctx context.Context, imp str
 	//}
 
 	return LibPackage{
-		Mode:       ModeNormal,
-		Imports:    goPkg.Imports,
-		GoPkg:      goPkg,
-		ImportPath: MainPackage,
-		Name:       MainPackage,
-		LibTargetRef: pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(goPkg.GetHephBuildPackage()),
-			Name:    htypes.Ptr("build_testmain_lib"),
-			Args:    factors.Args(),
-		}.Build(),
+		Mode:         ModeNormal,
+		Imports:      goPkg.Imports,
+		GoPkg:        goPkg,
+		ImportPath:   MainPackage,
+		Name:         MainPackage,
+		LibTargetRef: tref.New(goPkg.GetHephBuildPackage(), "build_testmain_lib", factors.Args()),
 	}, nil
 }
 
@@ -619,10 +611,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(requestId),
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr(tref.DirPackage(gomod)),
-				Name:    htypes.Ptr("_gomod"),
-			}.Build(),
+			Ref:    tref.New(tref.DirPackage(gomod), "_gomod", nil),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
 				"env":              p.getEnvStructpb2(),

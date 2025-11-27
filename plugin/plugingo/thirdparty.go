@@ -23,10 +23,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 	}
 
 	return pluginv1.GetResponse_builder{Spec: pluginv1.TargetSpec_builder{
-		Ref: pluginv1.TargetRef_builder{
-			Package: htypes.Ptr(pkg),
-			Name:    htypes.Ptr("download"),
-		}.Build(),
+		Ref:    tref.New(pkg, "download", nil),
 		Driver: htypes.Ptr("sh"),
 		Config: map[string]*structpb.Value{
 			"env":              p.getEnvStructpb2(),
