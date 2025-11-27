@@ -101,8 +101,9 @@ type Engine struct {
 	DriversConfig map[string]*pluginv1.ConfigResponse
 	Caches        []CacheHandle
 
-	requestState   sync_map.Map[string, *RequestState]
-	PackagesExlude []string
+	requestState    sync_map.Map[string, *RequestState]
+	PackagesExclude []string
+	FSLock          bool
 }
 
 type EngineProvider struct {
@@ -126,10 +127,11 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		Cache:    cachefs,
 		Sandbox:  sandboxfs,
 		RootSpan: trace.SpanFromContext(ctx),
+		FSLock:   cfg.LockDriver == "fs",
 	}
 
 	for _, s := range cfg.Packages.Exclude {
-		e.PackagesExlude = append(e.PackagesExlude, filepath.Join(root, s))
+		e.PackagesExclude = append(e.PackagesExclude, filepath.Join(root, s))
 	}
 
 	otelInterceptor, err := otelconnect.NewInterceptor(

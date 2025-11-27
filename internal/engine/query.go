@@ -30,7 +30,7 @@ func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) 
 				return false
 			}
 
-			if ok, _ := hfs.PathMatchAny(path, e.PackagesExlude...); ok {
+			if ok, _ := hfs.PathMatchAny(path, e.PackagesExclude...); ok {
 				return false
 			}
 

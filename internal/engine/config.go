@@ -1,12 +1,13 @@
 package engine
 
 type Config struct {
-	Version   string
-	HomeDir   string
-	Providers []ConfigProvider
-	Drivers   []ConfigDriver
-	Caches    []ConfigCache
-	Packages ConfigPackages
+	Version    string
+	HomeDir    string
+	Providers  []ConfigProvider
+	Drivers    []ConfigDriver
+	Caches     []ConfigCache
+	Packages   ConfigPackages
+	LockDriver string // fs or mem
 }
 
 type ConfigPackages struct {

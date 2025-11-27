@@ -122,16 +122,24 @@ func (e *Engine) lockCache(ctx context.Context, ref *pluginv1.TargetRef, outputs
 
 	locks := &CacheLocks{}
 
+	lockFactory := func(fs hfs.OS, path string) hlocks.RWLocker {
+		if e.FSLock {
+			return hlocks.NewFlock2(fs, "", path, true)
+		}
+
+		return hlocks.NewGlobalMutex(fs.Path() + "/" + path)
+	}
+
 	{
-		outer := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName+".outer.lock", true)
-		inner := hlocks.NewFlock2(dirfs, "", hartifact.ManifestName+".inner.lock", true)
+		outer := lockFactory(dirfs, hartifact.ManifestName+".outer.lock")
+		inner := lockFactory(dirfs, hartifact.ManifestName+".inner.lock")
 
 		locks.Add(hlocks.NewT(outer, inner))
 	}
 
 	for _, output := range outputs {
-		outer := hlocks.NewFlock2(dirfs, "", "out_"+output+".outer.lock", true)
-		inner := hlocks.NewFlock2(dirfs, "", "out_"+output+".inner.lock", true)
+		outer := lockFactory(dirfs, "out_"+output+".outer.lock")
+		inner := lockFactory(dirfs, "out_"+output+".inner.lock")
 
 		locks.Add(hlocks.NewT(outer, inner))
 	}

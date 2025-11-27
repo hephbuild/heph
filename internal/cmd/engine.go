@@ -33,8 +33,9 @@ import (
 
 func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	cfg := engine.Config{
-		Version: "dev", // TODO
-		HomeDir: ".heph",
+		Version:    "dev", // TODO
+		HomeDir:    ".heph",
+		LockDriver: "fs",
 	}
 
 	cfg.Providers = append(cfg.Providers, engine.ConfigProvider{

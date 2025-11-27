@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"os"
 	"slices"
 
@@ -8,12 +9,13 @@ import (
 )
 
 type YAMLConfig struct {
-	Version   *string              `yaml:"version"`
-	Providers []YAMLConfigProvider `yaml:"providers"`
-	Drivers   []YAMLConfigDriver   `yaml:"drivers"`
-	Caches    []YAMLConfigCache    `yaml:"caches"`
-	HomeDir   *string              `yaml:"homeDir"`
-	Packages  YAMLConfigPackages   `yaml:"packages"`
+	Version    *string              `yaml:"version"`
+	Providers  []YAMLConfigProvider `yaml:"providers"`
+	Drivers    []YAMLConfigDriver   `yaml:"drivers"`
+	Caches     []YAMLConfigCache    `yaml:"caches"`
+	HomeDir    *string              `yaml:"homeDir"`
+	Packages   YAMLConfigPackages   `yaml:"packages"`
+	LockDriver *string              `yaml:"lockDriver"`
 }
 
 type YAMLConfigPackages struct {
@@ -64,6 +66,17 @@ func ApplyYAMLConfig(cfg Config, inc YAMLConfig) (Config, error) {
 
 	if inc.HomeDir != nil {
 		cfg.HomeDir = *inc.HomeDir
+	}
+
+	if inc.LockDriver != nil {
+		switch *inc.LockDriver {
+		case "fs":
+			cfg.LockDriver = "fs"
+		case "mem":
+			cfg.LockDriver = "mem"
+		default:
+			return Config{}, fmt.Errorf("unknown lock driver: %s", *inc.LockDriver)
+		}
 	}
 
 	cfg.Packages.Exclude = append(cfg.Packages.Exclude, inc.Packages.Exclude...)

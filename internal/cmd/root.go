@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/internal/hlocks"
 
 	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
@@ -73,6 +74,11 @@ var rootCmd = &cobra.Command{
 		defer func() {
 			cmd.SetContext(ctx)
 		}()
+
+		hlocks.StartGlobalMutexGC()
+		registerFinalize(func() {
+			hlocks.StopGlobalMutexGC()
+		})
 
 		if !debug {
 			levelVar.Set(slog.LevelInfo)

@@ -385,11 +385,7 @@ func extractRoot(m *pluginv1.TargetMatcher) (string, bool) {
 			roots = append(roots, r)
 		}
 
-		if len(roots) == 1 {
-			return roots[0], true
-		}
-
-		return "", false // TODO array
+		return longestCommonPath(roots)
 	case pluginv1.TargetMatcher_And_case:
 		var roots []string
 		for _, matcher := range m.GetAnd().GetItems() {
@@ -405,14 +401,53 @@ func extractRoot(m *pluginv1.TargetMatcher) (string, bool) {
 			roots = append(roots, r)
 		}
 
-		if len(roots) == 1 {
-			return roots[0], true
-		}
-
-		return "", false // TODO find smallest denominator
+		return longestCommonPath(roots)
 	case pluginv1.TargetMatcher_Not_case:
 		return "", false
 	default:
 		panic("unhandled target matcher type: " + m.String())
 	}
+}
+
+func longestCommonPath(paths []string) (string, bool) {
+	switch len(paths) {
+	case 0:
+		return "", false
+	case 1:
+		return paths[0], true
+	}
+
+	// 1. Find the raw string common prefix (standard horizontal scanning)
+	prefix := paths[0]
+	for _, path := range paths[1:] {
+		for !strings.HasPrefix(path, prefix) {
+			prefix = prefix[:len(prefix)-1]
+			if prefix == "" {
+				return "", true
+			}
+		}
+	}
+
+	// 2. Verify Segment Integrity
+	// The prefix might be "/usr/bin" derived from ["/usr/bin", "/usr/binder"].
+	// We must ensure this prefix is a valid directory boundary for ALL paths.
+	for _, path := range paths {
+		// Check if the path continues after the prefix.
+		// If it does, the next character MUST be a '/' separator.
+		// If it is not, we have cut a word in half (e.g., matching "bin" inside "binder").
+		if len(path) > len(prefix) && path[len(prefix)] != '/' {
+			// We are mid-segment. Cut back to the last separator.
+			lastSlash := strings.LastIndex(prefix, "/")
+			if lastSlash == -1 {
+				return "", true
+			}
+			prefix = prefix[:lastSlash]
+
+			// Once we truncate, we are guaranteed to be safe because the shorter
+			// prefix matches the parent directory, which is common to all.
+			break
+		}
+	}
+
+	return prefix, true
 }

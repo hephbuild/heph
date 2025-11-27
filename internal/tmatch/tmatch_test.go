@@ -97,3 +97,82 @@ func TestPackagesSubselection(t *testing.T) {
 
 	assert.Equal(t, []string{"foo/bar", "foo/bar/baz"}, pkgs)
 }
+
+func TestLongestCommonPath(t *testing.T) {
+	tests := []struct {
+		name         string
+		paths        []string
+		expectedPath string
+		expectedOk   bool
+	}{
+		{
+			name:         "empty slice",
+			paths:        []string{},
+			expectedPath: "",
+			expectedOk:   false,
+		},
+		{
+			name:         "single path",
+			paths:        []string{"foo/bar/baz"},
+			expectedPath: "foo/bar/baz",
+			expectedOk:   true,
+		},
+		{
+			name:         "two identical paths",
+			paths:        []string{"foo/bar", "foo/bar"},
+			expectedPath: "foo/bar",
+			expectedOk:   true,
+		},
+		{
+			name:         "common prefix",
+			paths:        []string{"foo/bar/baz", "foo/bar/qux"},
+			expectedPath: "foo/bar",
+			expectedOk:   true,
+		},
+		{
+			name:         "multiple paths with common prefix",
+			paths:        []string{"foo/bar/baz", "foo/bar/qux", "foo/baz"},
+			expectedPath: "foo",
+			expectedOk:   true,
+		},
+		{
+			name:         "no common prefix",
+			paths:        []string{"foo/bar", "hello/world"},
+			expectedPath: "",
+			expectedOk:   true,
+		},
+		{
+			name:         "segment boundary - bin vs binder",
+			paths:        []string{"usr/bin", "usr/binder"},
+			expectedPath: "usr",
+			expectedOk:   true,
+		},
+		{
+			name:         "segment boundary - common word prefix",
+			paths:        []string{"package/bar", "packages/baz"},
+			expectedPath: "",
+			expectedOk:   true,
+		},
+		{
+			name:         "nested paths",
+			paths:        []string{"a/b/c/d", "a/b/c", "a/b"},
+			expectedPath: "a/b",
+			expectedOk:   true,
+		},
+		{
+			name:         "root level paths",
+			paths:        []string{"a", "b", "c"},
+			expectedPath: "",
+			expectedOk:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path, ok := longestCommonPath(test.paths)
+
+			assert.Equal(t, test.expectedOk, ok)
+			assert.Equal(t, test.expectedPath, path)
+		})
+	}
+}
