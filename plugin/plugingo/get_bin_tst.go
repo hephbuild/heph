@@ -63,7 +63,7 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 		return nil, err
 	}
 
-	mainRef := tref.Format(tref.WithOut(libGoPkg.LibTargetRef, "a"))
+	mainRef := tref.FormatOut(tref.WithOut(libGoPkg.LibTargetRef, "a"))
 
 	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs)
 }
@@ -112,7 +112,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.LibTargetRef, "a"))
+		importsm[testGoPkg.ImportPath] = tref.FormatOut(tref.WithOut(testGoPkg.LibTargetRef, "a"))
 	}
 
 	if len(_goPkg.XTestGoFiles) > 0 {
@@ -121,7 +121,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 			return nil, err
 		}
 
-		importsm[testGoPkg.ImportPath] = tref.Format(tref.WithOut(testGoPkg.LibTargetRef, "a"))
+		importsm[testGoPkg.ImportPath] = tref.FormatOut(tref.WithOut(testGoPkg.LibTargetRef, "a"))
 	}
 
 	if len(importsm) == 0 {
@@ -144,7 +144,7 @@ func (p *Plugin) testMainLib(ctx context.Context, basePkg string, _goPkg Package
 			continue
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(ModeNormal), "a"))
+		importsm[impGoPkg.ImportPath] = tref.FormatOut(tref.WithOut(impGoPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 	}
 
 	return p.packageLibInner3(

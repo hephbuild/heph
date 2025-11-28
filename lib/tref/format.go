@@ -7,8 +7,6 @@ import (
 	"strings"
 	"unsafe"
 
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
-
 	"github.com/hephbuild/heph/internal/hsync"
 
 	cache "github.com/Code-Hex/go-generics-cache"
@@ -22,26 +20,10 @@ import (
 type Ref = pluginv1.TargetRef
 type RefOut = pluginv1.TargetRefWithOutput
 
-var _ Refable = (*Ref)(nil)
-var _ Refable = (*RefOut)(nil)
-var _ RefableOut = (*RefOut)(nil)
-
-type Refable interface {
-	GetArgs() map[string]string
-	GetPackage() string
-	GetName() string
-}
-
 type HashStore interface {
 	GetHash() uint64
 	HasHash() bool
 	SetHash(uint64)
-}
-
-type RefableOut interface {
-	Refable
-	GetOutput() string
-	GetFilters() []string
 }
 
 func FormatFile(pkg string, file string) string {
@@ -117,89 +99,84 @@ func ParseQuery(ref *pluginv1.TargetRef) (QueryOptions, error) {
 var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
 var formatSf = hsingleflight.Group[uint64, string]{}
 
+var formatOutCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
+var formatOutSf = hsingleflight.Group[uint64, string]{}
+
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
 
-func sumRef(ref hashpb.StableWriter) uint64 {
-	h := formatHashPool.Get()
-	defer formatHashPool.Put(h)
-	h.Reset()
+func sumRefTargetRef(m *pluginv1.TargetRef) uint64 {
+	hasher := formatHashPool.Get()
+	defer formatHashPool.Put(hasher)
+	hasher.Reset()
 
-	switch ref := ref.(type) {
-	case *pluginv1.TargetRef:
-		sumRefTargetRef(h, ref)
-	case *pluginv1.TargetRefWithOutput:
-		sumRefTargetRefWithOutput(h, ref)
-	default:
-		hashpb.Hash(h, ref, nil)
-	}
-
-	return h.Sum64()
-}
-
-func sumRefTargetRef(hasher *xxh3.Hasher, m *pluginv1.TargetRef) {
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
 	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
 	for k, v := range hmaps.Sorted(m.GetArgs()) {
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
 		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
 	}
+
+	return hasher.Sum64()
 }
 
-func sumRefTargetRefWithOutput(hasher *xxh3.Hasher, m *pluginv1.TargetRefWithOutput) {
-	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
-	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
-	for k, v := range hmaps.Sorted(m.GetArgs()) {
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
-		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
-	}
-	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetOutput()), len(m.GetOutput())))
-	if len(m.GetFilters()) > 0 {
-		for _, v := range m.GetFilters() {
+func sumRefTargetRefWithOutput(m *pluginv1.TargetRefWithOutput) uint64 {
+	hasher := formatHashPool.Get()
+	defer formatHashPool.Put(hasher)
+	hasher.Reset()
+
+	{
+		m := m.GetTarget()
+
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetPackage()), len(m.GetPackage())))
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetName()), len(m.GetName())))
+		for k, v := range hmaps.Sorted(m.GetArgs()) {
+			_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(k), len(k)))
 			_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
 		}
 	}
+
+	_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(m.GetOutput()), len(m.GetOutput())))
+	for _, v := range m.GetFilters() {
+		_, _ = hasher.Write(unsafe.Slice(unsafe.StringData(v), len(v)))
+	}
+
+	return hasher.Sum64()
 }
 
-func Format(ref Refable) string {
-	if refh, ok := ref.(hashpb.StableWriter); ok {
-		var sum uint64
-		if s, ok := ref.(HashStore); ok {
-			if s.HasHash() {
-				sum = s.GetHash()
-			} else {
-				sum = sumRef(refh)
-				s.SetHash(sum)
-			}
-		} else {
-			sum = sumRef(refh)
-		}
+func Format(ref *Ref) string {
+	var sum uint64
+	if ref.HasHash() {
+		sum = ref.GetHash()
+	} else {
+		sum = sumRefTargetRef(ref)
+		ref.SetHash(sum)
+	}
 
-		f, ok := formatCache.Get(sum)
-		if ok {
-			return f
-		}
-
-		f, _, _ = formatSf.Do(sum, func() (string, error) {
-			f, ok := formatCache.Get(sum)
-			if ok {
-				return f, nil
-			}
-
-			f = format(ref)
-
-			formatCache.Set(sum, f)
-
-			return f, nil
-		})
-
+	f, ok := formatCache.Get(sum)
+	if ok {
 		return f
 	}
 
-	return format(ref)
+	f, _, _ = formatSf.Do(sum, func() (string, error) {
+		f, ok := formatCache.Get(sum)
+		if ok {
+			return f, nil
+		}
+
+		f = format(ref)
+
+		formatCache.Set(sum, f)
+
+		return f, nil
+	})
+
+	return f
+
 }
 
-func format(ref Refable) string {
+func format(ref *Ref) string {
 	var sb strings.Builder
+
 	sb.WriteString("//")
 	sb.WriteString(ref.GetPackage())
 	sb.WriteString(":")
@@ -225,24 +202,65 @@ func format(ref Refable) string {
 		}
 	}
 
-	if ref, ok := ref.(RefableOut); ok {
-		out := ref.GetOutput()
-		if out != "" {
-			sb.WriteString("|")
-			sb.WriteString(out)
+	return sb.String()
+}
+
+func FormatOut(ref *RefOut) string {
+	var sum uint64
+	if ref.HasHash() {
+		sum = ref.GetHash()
+	} else {
+		sum = sumRefTargetRefWithOutput(ref)
+		ref.SetHash(sum)
+	}
+
+	f, ok := formatOutCache.Get(sum)
+	if ok {
+		return f
+	}
+
+	f, _, _ = formatOutSf.Do(sum, func() (string, error) {
+		f, ok := formatOutCache.Get(sum)
+		if ok {
+			return f, nil
 		}
 
-		if len(ref.GetFilters()) > 0 {
-			sb.WriteString(" filters=")
-			first := true
-			for _, f := range ref.GetFilters() {
-				if !first {
-					sb.WriteString(",")
-				} else {
-					first = false
-				}
-				sb.WriteString(f)
+		f = formatOut(ref)
+
+		formatOutCache.Set(sum, f)
+
+		return f, nil
+	})
+
+	return f
+
+}
+
+func formatOut(ref *RefOut) string {
+	if ref.GetOutput() == "" && len(ref.GetFilters()) == 0 {
+		return Format(ref.GetTarget())
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString(Format(ref.GetTarget()))
+
+	out := ref.GetOutput()
+	if out != "" {
+		sb.WriteString("|")
+		sb.WriteString(out)
+	}
+
+	if len(ref.GetFilters()) > 0 {
+		sb.WriteString(" filters=")
+		first := true
+		for _, f := range ref.GetFilters() {
+			if !first {
+				sb.WriteString(",")
+			} else {
+				first = false
 			}
+			sb.WriteString(f)
 		}
 	}
 

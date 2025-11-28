@@ -41,11 +41,11 @@ func parseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string
 	nixPackages := make([]string, 0)
 
 	execTarget, execTargetHash, err := pluginexec.ConfigToExecv1(ctx, ref, config, func(ref *pluginv1.TargetRefWithOutput) bool {
-		if ref.GetPackage() != "@nix" {
+		if ref.GetTarget().GetPackage() != "@nix" {
 			return true
 		}
 
-		nixPackages = append(nixPackages, ref.GetName())
+		nixPackages = append(nixPackages, ref.GetTarget().GetName())
 
 		return false
 	})

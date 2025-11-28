@@ -47,7 +47,7 @@ func (p *Plugin) packageLib(ctx context.Context, basePkg string, _goPkg Package,
 						"a": goPkg.Name + ".a",
 					}),
 					"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
-						"lib": {tref.Format(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "a"))},
+						"lib": {tref.FormatOut(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "a"))},
 						"asm": asmDeps,
 					}),
 					"tools": p.getGoToolStructpb(),
@@ -99,7 +99,7 @@ func (p *Plugin) packageLibInner(
 			mode = ModeTest
 		}
 
-		importsm[impGoPkg.ImportPath] = tref.Format(tref.WithOut(impGoPkg.GetBuildLibTargetRef(mode), "a"))
+		importsm[impGoPkg.ImportPath] = tref.FormatOut(tref.WithOut(impGoPkg.GetBuildLibTargetRef(mode), "a"))
 	}
 
 	return p.packageLibInner3(
@@ -266,7 +266,7 @@ func getFiles(goPkg Package, files []string) []string {
 			filters = append(filters, tref.JoinPackage(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, goPath), file))
 		}
 
-		return []string{tref.Format(tref.WithFilters(tref.WithOut(tref.New(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), "download", nil), ""), filters))}
+		return []string{tref.FormatOut(tref.WithFilters(tref.WithOut(tref.New(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), "download", nil), ""), filters))}
 	} else {
 		out := make([]string, 0, len(files))
 		for _, file := range files {
@@ -348,8 +348,8 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 				}),
 				"out": structpb.NewStringValue(strings.ReplaceAll(asmFile, ".s", ".o")),
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
-					"lib": {tref.Format(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "a"))},
-					"hdr": {tref.Format(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "h"))},
+					"lib": {tref.FormatOut(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "a"))},
+					"hdr": {tref.FormatOut(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "h"))},
 					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
 					"h":   getFiles(goPkg.GoPkg, goPkg.GoPkg.HFiles),
 				}),

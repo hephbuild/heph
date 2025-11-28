@@ -14,27 +14,6 @@ func Equal(a, b *pluginv1.TargetRef) bool {
 	return a.GetPackage() == b.GetPackage() && a.GetName() == b.GetName() && maps.Equal(a.GetArgs(), b.GetArgs())
 }
 
-func CompareOut(a, b *pluginv1.TargetRefWithOutput) int {
-	if v := Compare(WithoutOut(a), WithoutOut(b)); v != 0 {
-		return v
-	}
-
-	if a.HasOutput() && b.HasOutput() {
-		if v := strings.Compare(a.GetOutput(), b.GetOutput()); v != 0 {
-			return v
-		}
-	} else {
-		if !a.HasOutput() {
-			return 1
-		}
-		if !b.HasOutput() {
-			return -1
-		}
-	}
-
-	return 0
-}
-
 func Compare(a, b *pluginv1.TargetRef) int {
 	if v := strings.Compare(a.GetPackage(), b.GetPackage()); v != 0 {
 		return v
@@ -113,20 +92,23 @@ func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutp
 	}
 
 	return pluginv1.TargetRefWithOutput_builder{
-		Package: htypes.Ptr(ref.GetPackage()),
-		Name:    htypes.Ptr(ref.GetName()),
-		Args:    ref.GetArgs(),
-		Output:  outputp,
+		Target: ref,
+		Output: outputp,
 	}.Build()
 }
 
 func WithFilters(ref *pluginv1.TargetRefWithOutput, filters []string) *pluginv1.TargetRefWithOutput {
+	if len(filters) == 0 && len(ref.GetFilters()) == 0 {
+		return ref
+	}
+
 	ref = hproto.Clone(ref)
+	ref.ClearHash()
 	ref.SetFilters(filters)
 
 	return ref
 }
 
 func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
-	return New(ref.GetPackage(), ref.GetName(), ref.GetArgs())
+	return ref.GetTarget()
 }

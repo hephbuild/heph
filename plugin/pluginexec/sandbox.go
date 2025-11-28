@@ -74,7 +74,7 @@ func SetupSandbox(
 		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
 			listArtifact, err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
-				return nil, fmt.Errorf("%v: %w", tref.Format(tool.GetRef()), err)
+				return nil, fmt.Errorf("%v: %w", tref.FormatOut(tool.GetRef()), err)
 			}
 			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
 				Artifact: listArtifact,

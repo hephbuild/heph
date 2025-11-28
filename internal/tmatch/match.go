@@ -25,6 +25,7 @@ func walkDirs(ctx context.Context, walkRoot, root string, filter func(path strin
 	}
 
 	return func(yield func(string, error) bool) {
+		stop := false
 		err := fsWalkCache.Walk(walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if d == nil || !d.IsDir() {
 				return nil
@@ -48,13 +49,14 @@ func walkDirs(ctx context.Context, walkRoot, root string, filter func(path strin
 			}
 
 			if !yield(pkg, nil) {
+				stop = true
 				return fs.SkipAll
 			}
 
 			return nil
 		})
 		if err != nil {
-			if !yield("", err) {
+			if !stop && !yield("", err) {
 				return
 			}
 		}

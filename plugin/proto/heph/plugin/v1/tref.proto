@@ -9,9 +9,8 @@ message TargetRef {
 }
 
 message TargetRefWithOutput {
-  string package = 1;
-  string name = 2;
-  map<string, string> args = 3;
+  TargetRef target = 1;
   string output = 4;
   repeated string filters = 5;
+  uint64 hash = 6;
 }

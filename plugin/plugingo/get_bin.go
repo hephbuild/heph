@@ -24,7 +24,7 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 		return nil, err
 	}
 
-	mainRef := tref.Format(tref.WithOut(goPkg.GetBuildLibTargetRef(ModeNormal), "a"))
+	mainRef := tref.FormatOut(tref.WithOut(goPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 
 	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
 }
@@ -47,7 +47,7 @@ func (p *Plugin) packageBinInner(
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.Format(tref.WithOut(depGoPkg.LibTargetRef, "a"))}
+		deps[fmt.Sprintf("lib%v", i)] = []string{tref.FormatOut(tref.WithOut(depGoPkg.LibTargetRef, "a"))}
 
 		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, depGoPkg.ImportPath, i))
 	}
@@ -58,7 +58,7 @@ func (p *Plugin) packageBinInner(
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: tref.New(goPkg.GetHephBuildPackage(), targetName, factors.Args()),
+			Ref:    tref.New(goPkg.GetHephBuildPackage(), targetName, factors.Args()),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"env": p.getEnvStructpb(factors, map[string]string{

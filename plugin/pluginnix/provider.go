@@ -94,7 +94,7 @@ func (p *Provider) install(ctx context.Context, nixRef, nixPkg string) (*pluginv
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"NIX_CONFIG": nixConfig,
 				}),
-				"tools": structpb.NewStringValue(tref.Format(tref.WithOut(p.nixToolRef, ""))),
+				"tools": structpb.NewStringValue(tref.FormatOut(tref.WithOut(p.nixToolRef, ""))),
 				"out":   structpb.NewStringValue(fmt.Sprintf("nix_hash_%v_%v", nixRef, nixPkg)),
 			},
 		}.Build(),

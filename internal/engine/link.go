@@ -481,19 +481,16 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 func addSrcTargetToInputs(def *pluginv1.TargetDef, currentTargetAddrHash func() string) {
 	inputs := def.GetInputs()
 	for _, input := range inputs {
-		if input.GetRef().GetPackage() != tref.QueryPackage {
+		refo := input.GetRef()
+		ref := refo.GetTarget()
+
+		if ref.GetPackage() != tref.QueryPackage {
 			continue
 		}
 
-		ref := input.GetRef()
-		args := ref.GetArgs()
-		if args == nil {
-			args = map[string]string{}
-		}
-		args[querySrcTargetArg] = currentTargetAddrHash()
-		ref.SetArgs(args)
-
-		input.SetRef(ref)
+		ref = tref.WithArg(ref, querySrcTargetArg, currentTargetAddrHash())
+		refo.SetTarget(ref)
+		refo.ClearHash()
 	}
 	def.SetInputs(inputs)
 }
@@ -760,7 +757,7 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 
 			if input.GetRef().HasOutput() {
 				if !slices.Contains(linkedDep.GetOutputs(), input.GetRef().GetOutput()) {
-					return fmt.Errorf("%v doesnt have a named output %q", tref.Format(input.GetRef()), input.GetRef().GetOutput())
+					return fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(input.GetRef()), input.GetRef().GetOutput())
 				}
 
 				outputs = []string{input.GetRef().GetOutput()}
