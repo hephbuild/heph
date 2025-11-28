@@ -9,25 +9,10 @@ import (
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/lib/tref"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
-
-type cachedFs struct {
-	fs.ReadDirFS
-
-	memReadDir hsingleflight.GroupMem[string, []fs.DirEntry]
-}
-
-func (c *cachedFs) ReadDir(name string) ([]fs.DirEntry, error) {
-	entries, err, _ := c.memReadDir.Do(name, func() ([]fs.DirEntry, error) {
-		return c.ReadDirFS.ReadDir(name)
-	})
-
-	return entries, err
-}
 
 // TODO: move to context or something like that
 var fsWalkCache = hfs.NewFSCache()

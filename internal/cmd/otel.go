@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace/noop"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
@@ -30,6 +31,8 @@ func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 	otel.SetLogger(logr.FromSlogHandler(hlog.From(ctx).Handler()))
 
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+
 		return func(ctx context.Context) error { return nil }, nil
 	}
 

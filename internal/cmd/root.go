@@ -16,7 +16,6 @@ import (
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hlocks"
-
 	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -90,7 +89,6 @@ var rootCmd = &cobra.Command{
 		defer clean()
 
 		if true {
-			var err error
 			otelShutdown, err := setupOTelSDK(ctx)
 			if err != nil {
 				return err
@@ -117,6 +115,10 @@ var rootCmd = &cobra.Command{
 				traceID := spanCtx.TraceID().String()
 
 				hlog.From(ctx).Info("Trace ID: " + traceID)
+			} else {
+				// add a span context that is not nil so that the noop tracer doesnt allocate new spans going forward
+				// see go/pkg/mod/go.opentelemetry.io/otel/trace@v1.35.0/noop/noop.go Tracer.Start
+				ctx = oteltrace.ContextWithSpanContext(ctx, rootSpan.SpanContext().WithTraceID(oteltrace.TraceID{0x1}))
 			}
 		}
 

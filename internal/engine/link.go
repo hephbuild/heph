@@ -695,7 +695,9 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher
 }
 
 func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef) (*LightLinkedTarget, error) {
-	ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+	if e.RootSpan.IsRecording() {
+		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+	}
 	ctx = hstep.WithoutParent(ctx)
 
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {

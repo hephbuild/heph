@@ -12,10 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hephbuild/heph/internal/hdebug"
-
 	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/lib/pluginsdk/pluginsdkconnect"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -129,6 +128,9 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 		})
 		defer cleanLabels()
 
+		// to prevent inheriting from the root span, make a new noop span
+		ctx = trace.ContextWithSpan(context.WithoutCancel(ctx), trace.SpanFromContext(context.Background()))
+
 		defer cleanupListener()
 		h2s := &http2.Server{
 			MaxReadFrameSize:     1 << 20,
@@ -140,9 +142,6 @@ func (e *Engine) newServer(ctx context.Context) (ServerHandle, error) {
 		srv := &http.Server{
 			Handler: h2c.NewHandler(hh, h2s),
 			BaseContext: func(listener net.Listener) context.Context {
-				// to prevent inheriting from the root span, make a new noop span
-				ctx := trace.ContextWithSpan(context.WithoutCancel(ctx), trace.SpanFromContext(context.Background()))
-
 				return ctx
 			},
 			ReadHeaderTimeout: 5 * time.Second,
@@ -208,6 +207,10 @@ type pluginSpanDecorator struct {
 
 func (f pluginSpanDecorator) decorate(ctx context.Context) {
 	span := trace.SpanFromContext(ctx)
+	if !span.IsRecording() {
+		return
+	}
+
 	span.SetAttributes(attribute.String("heph.plugin.type", f.pluginType))
 	span.SetAttributes(attribute.String("heph.plugin.name", f.pluginName))
 }

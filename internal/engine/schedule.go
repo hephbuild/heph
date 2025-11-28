@@ -234,7 +234,9 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 			attribute.String("target", tref.Format(ref)),
 		))
 
-		ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+		if e.RootSpan.IsRecording() {
+			ctx = trace.ContextWithSpan(ctx, e.RootSpan)
+		}
 		ctx = hstep.WithoutParent(ctx)
 
 		step, ctx := hstep.New(ctx, tref.Format(ref))
