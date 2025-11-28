@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
@@ -34,7 +37,10 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 	switch len(args) {
 	case 1:
 		// TODO: complicated expression with `-e` flag
-		// TODO: targets list from stdin
+
+		if args[0] == "-" {
+			return parseMatcherFromStdin(cwd, root)
+		}
 
 		ref, err := parseTargetRef(args[0], cwd, root)
 		if err != nil {
@@ -60,6 +66,27 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 	default:
 		panic("unhandled")
 	}
+}
+
+func parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
+	var matchers []*pluginv1.TargetMatcher
+
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		s := strings.TrimSpace(sc.Text())
+		if s == "" {
+			continue
+		}
+
+		ref, err := parseTargetRef(s, cwd, root)
+		if err != nil {
+			return nil, err
+		}
+
+		matchers = append(matchers, tmatch.Ref(ref))
+	}
+
+	return tmatch.Or(matchers...), nil
 }
 
 func parseMatcherResolve(
