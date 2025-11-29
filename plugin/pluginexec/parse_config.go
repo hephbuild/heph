@@ -232,7 +232,7 @@ func hashTarget(target *execv1.Target) []byte {
 	}
 
 	h := xxh3.New()
-	hashpb.Hash(h, target, nil)
+	hashpb.Hash(h, target, tref.OmitHashPb)
 
 	return h.Sum(nil)
 }

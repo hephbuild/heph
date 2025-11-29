@@ -393,7 +393,7 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				return v
 			}
 
-			if v := hproto.Compare(a, b); v != 0 {
+			if v := hproto.Compare(a, b, nil); v != 0 {
 				return v
 			}
 

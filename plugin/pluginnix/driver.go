@@ -4,8 +4,10 @@ import (
 	"context"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginexec"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -69,13 +71,14 @@ func parseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string
 	}.Build(), execTargetHash)
 }
 
+var omitHashPb = hmaps.Concat(map[string]struct{}{
+	string((&nixv1.Target{}).ProtoReflect().Descriptor().Name()) + ".target": {},
+}, tref.OmitHashPb)
+
 func hashTarget(nixTarget *nixv1.Target, execTargetHash []byte) []byte {
 	hash := xxh3.New()
 	_, _ = hash.Write(execTargetHash)
-	desc := nixTarget.ProtoReflect().Descriptor()
-	hashpb.Hash(hash, nixTarget, map[string]struct{}{
-		string(desc.FullName()) + ".target": {},
-	})
+	hashpb.Hash(hash, nixTarget, omitHashPb)
 
 	return hash.Sum(nil)
 }

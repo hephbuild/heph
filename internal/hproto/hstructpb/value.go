@@ -14,7 +14,7 @@ func NewStringsValue(ss []string) *structpb.Value {
 }
 
 func NewMapStringStringValue(m map[string]string) *structpb.Value {
-	values := map[string]*structpb.Value{}
+	values := make(map[string]*structpb.Value, len(m))
 	for k, v := range m {
 		values[k] = structpb.NewStringValue(v)
 	}
@@ -25,7 +25,7 @@ func NewMapStringStringValue(m map[string]string) *structpb.Value {
 }
 
 func NewMapStringStringsValue(m map[string][]string) *structpb.Value {
-	values := map[string]*structpb.Value{}
+	values := make(map[string]*structpb.Value, len(m))
 	for k, v := range m {
 		values[k] = NewStringsValue(v)
 	}

@@ -412,7 +412,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		currentTargetAddrHash := sync.OnceValue(func() string {
 			h := xxh3.New()
-			hashpb.Hash(h, def.GetRef(), nil)
+			hashpb.Hash(h, def.GetRef(), tref.OmitHashPb)
 
 			return hex.EncodeToString(h.Sum(nil))
 		})
@@ -463,7 +463,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		if len(def.GetHash()) == 0 {
 			h := xxh3.New()
-			hashpb.Hash(h, def, nil)
+			hashpb.Hash(h, def, tref.OmitHashPb)
 
 			def.SetHash(h.Sum(nil))
 		}
@@ -515,7 +515,7 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 		}
 
 		h := xxh3.New()
-		hashpb.Hash(h, inputRef, nil)
+		hashpb.Hash(h, inputRef, tref.OmitHashPb)
 
 		id := fmt.Sprintf("_transitive_%s_%v", hex.EncodeToString(h.Sum(nil)), i)
 

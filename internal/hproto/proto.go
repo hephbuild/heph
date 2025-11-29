@@ -73,12 +73,12 @@ func RemoveMasked[T proto.Message](m T, paths map[string]struct{}) (T, error) {
 	return m, err
 }
 
-func Compare(a, b hashpb.StableWriter) int {
+func Compare(a, b hashpb.StableWriter, omit map[string]struct{}) int {
 	ha := xxh3.New()
-	hashpb.Hash(ha, a, nil)
+	hashpb.Hash(ha, a, omit)
 
 	hb := xxh3.New()
-	hashpb.Hash(hb, b, nil)
+	hashpb.Hash(hb, b, omit)
 
 	suma := ha.Sum64()
 	sumb := hb.Sum64()

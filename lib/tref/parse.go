@@ -3,6 +3,9 @@ package tref
 import (
 	"strings"
 
+	cache "github.com/Code-Hex/go-generics-cache"
+	"github.com/Code-Hex/go-generics-cache/policy/lru"
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/lib/tref/internal"
 	"github.com/hephbuild/heph/lib/tref/internal/lexer"
 
@@ -43,7 +46,25 @@ func parse(s, pkg string, optPkg bool) (*pluginv1.TargetRef, error) {
 	return New(res.Pkg, res.Name, argsToProto(res.Args)), nil
 }
 
+var parseWithOutCache = cache.New(cache.AsLRU[string, *pluginv1.TargetRefWithOutput](lru.WithCapacity(10000)))
+
 func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
+	v, ok := parseWithOutCache.Get(s)
+	if ok {
+		return hproto.Clone(v), nil
+	}
+
+	v, err := parseWithOutInner(s)
+	if err != nil {
+		return nil, err
+	}
+
+	parseWithOutCache.Set(s, v)
+
+	return hproto.Clone(v), nil
+}
+
+func parseWithOutInner(s string) (*pluginv1.TargetRefWithOutput, error) {
 	res, err := internal.ParseWithOut(s) // this one gives better err messages
 	if err != nil {
 		return nil, err

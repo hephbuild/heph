@@ -67,7 +67,7 @@ func (e *Engine) targetDirName(ref *pluginv1.TargetRef) string {
 	}
 
 	h := xxh3.New()
-	hashpb.Hash(h, ref, nil)
+	hashpb.Hash(h, ref, tref.OmitHashPb)
 
 	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
 }

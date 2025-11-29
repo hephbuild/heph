@@ -773,7 +773,7 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 		h = xxh3.New()
 	}
 	writeProto := func(v hashpb.StableWriter) error {
-		hashpb.Hash(h, v, nil)
+		hashpb.Hash(h, v, tref.OmitHashPb)
 
 		return nil
 	}

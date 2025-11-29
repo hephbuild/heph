@@ -2,6 +2,7 @@ package tref
 
 import (
 	"maps"
+	"slices"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -98,7 +99,7 @@ func WithOut(ref *pluginv1.TargetRef, output string) *pluginv1.TargetRefWithOutp
 }
 
 func WithFilters(ref *pluginv1.TargetRefWithOutput, filters []string) *pluginv1.TargetRefWithOutput {
-	if len(filters) == 0 && len(ref.GetFilters()) == 0 {
+	if slices.Equal(filters, ref.GetFilters()) {
 		return ref
 	}
 
@@ -111,4 +112,9 @@ func WithFilters(ref *pluginv1.TargetRefWithOutput, filters []string) *pluginv1.
 
 func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
 	return ref.GetTarget()
+}
+
+var OmitHashPb = map[string]struct{} {
+	string((&pluginv1.TargetRefWithOutput{}).ProtoReflect().Descriptor().Name())+".hash": {},
+	string((&pluginv1.TargetRef{}).ProtoReflect().Descriptor().Name())+".hash": {},
 }

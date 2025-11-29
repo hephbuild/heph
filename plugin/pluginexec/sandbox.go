@@ -120,7 +120,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 	defer span.End()
 
 	h := xxh3.New()
-	hashpb.Hash(h, artifact, nil)
+	hashpb.Hash(h, artifact, tref.OmitHashPb)
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {
