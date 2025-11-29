@@ -142,7 +142,7 @@ func ConfigToExecv1(
 		return strings.Compare(a.GetId(), b.GetId())
 	})
 
-	tbuild.Env = map[string]*execv1.Target_Env{}
+	tbuild.Env = make(map[string]*execv1.Target_Env, len(targetSpec.Env)+len(targetSpec.RuntimeEnv)+len(targetSpec.PassEnv)+len(targetSpec.RuntimePassEnv))
 	for k, v := range targetSpec.Env {
 		tbuild.Env[k] = execv1.Target_Env_builder{
 			Literal: htypes.Ptr(v),
@@ -189,10 +189,8 @@ func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S)
 func hashTarget(target *execv1.Target) []byte {
 	var cloned bool
 
-	env := target.GetEnv()
-
 	if func() bool {
-		for _, env := range env {
+		for _, env := range target.GetEnv() {
 			if !env.GetHash() {
 				return true
 			}
@@ -204,6 +202,8 @@ func hashTarget(target *execv1.Target) []byte {
 			cloned = true
 			target = hproto.Clone(target)
 		}
+
+		env := target.GetEnv()
 
 		maps.DeleteFunc(env, func(s string, env *execv1.Target_Env) bool {
 			return !env.GetHash()

@@ -439,16 +439,18 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			if e.IsDir() {
 				continue
 			}
-			files = append(files, tref.FormatFile(pkg, e.Name()))
 
-			if !hasGoFile && strings.HasSuffix(e.Name(), ".go") {
+			if strings.HasSuffix(e.Name(), ".go") {
 				hasGoFile = true
+				break
 			}
 		}
 
 		if !hasGoFile {
 			return nil, nil, errNoGoFiles
 		}
+
+		files = append(files, tref.FormatFile(pkg, "*.go"))
 
 		files = append(files, tref.FormatQuery(tref.QueryOptions{
 			Label:        "go_src",

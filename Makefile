@@ -14,6 +14,7 @@ install-dev-build:
 	go build -o $(location)
 
 gen:
+	cd lib/tref/internal && ./gen.sh
 	cd plugin && buf generate
 	cd plugin/plugingroup && buf generate
 	cd plugin/pluginbin && buf generate

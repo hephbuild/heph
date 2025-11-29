@@ -268,12 +268,7 @@ func getFiles(goPkg Package, files []string) []string {
 
 		return []string{tref.FormatOut(tref.WithFilters(tref.WithOut(tref.New(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), "download", nil), ""), filters))}
 	} else {
-		out := make([]string, 0, len(files))
-		for _, file := range files {
-			out = append(out, tref.FormatFile(goPkg.HephPackage, file))
-		}
-
-		return out
+		return []string{tref.FormatFile(goPkg.HephPackage, "{"+strings.Join(files, ",")+"}")}
 	}
 }
 

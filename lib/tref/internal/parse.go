@@ -1,4 +1,3 @@
-//nolint:govet,forbidigo
 package internal
 
 import (
@@ -8,66 +7,11 @@ import (
 
 	"github.com/alecthomas/participle/v2"
 	"github.com/alecthomas/participle/v2/lexer"
+	lexer2 "github.com/hephbuild/heph/lib/tref/internal/lexer"
 )
 
-type Ref struct {
-	SS    string `@SS`
-	Pkg   string `@PackageIdent?`
-	Colon string `@Colon`
-	Name  string `@NameIdent`
-	Args  []Arg  `(At (@@ Comma?)*)?`
-}
-
-type RefWithOut struct {
-	Ref
-	Out     *string `((Pipe|ParamsPipe) @NameIdent)?`
-	Filters string  `("filters" OptEq (@OptValue|@OptIdent))?`
-}
-
-type Arg struct {
-	Key   string   `@Ident`
-	Eq    string   `@Eq`
-	Value ArgValue `@@?`
-}
-
-type ArgValue struct {
-	Ident string `  @Ident`
-	Str   string `| (StrStart @StrValue StrEnd)`
-}
-
-var def = lexer.MustStateful(lexer.Rules{
-	"Root": {
-		{`SS`, `//`, nil},
-		{`Colon`, `:`, lexer.Push("Name")},
-		{`PackageIdent`, `[^:]+`, nil},
-	},
-	"Name": {
-		{`Pipe`, `\|`, nil},
-		{`At`, `@`, lexer.Push("Params")},
-		{`NameIdent`, `[^ @|]+`, nil},
-		{"NameEOR", ` `, lexer.Push("Opts")},
-	},
-	"Params": {
-		{"Ident", `[^, =|"]+`, nil},
-		{"StrStart", `"`, lexer.Push("ParamString")},
-		{"Eq", `=`, nil},
-		{"Comma", `,`, nil},
-		{"ParamsPipe", `\|`, lexer.Pop()},
-		{"ParamsEOR", ` `, lexer.Push("Opts")},
-	},
-	"ParamString": {
-		{"StrValue", `(\\"|[^"])+`, nil},
-		{"StrEnd", `"`, lexer.Pop()},
-	},
-	"Opts": {
-		{`OptIdent`, `[^ =]+`, nil},
-		{`OptEq`, `=`, nil},
-		{"OptValue", `[^ ]+`, nil},
-	},
-})
-
-var parser = participle.MustBuild[Ref](participle.Lexer(def))
-var parserWithOut = participle.MustBuild[RefWithOut](participle.Lexer(def), participle.Elide("NameEOR", "ParamsEOR"))
+var parser = participle.MustBuild[lexer2.Ref](participle.Lexer(Lexer))
+var parserWithOut = participle.MustBuild[lexer2.RefWithOut](participle.Lexer(Lexer), participle.Elide("NameEOR", "ParamsEOR"))
 
 func LexDebug(s string, out bool) {
 	var parser interface {
@@ -103,7 +47,7 @@ func IsRelative(s string) bool {
 	return strings.HasPrefix(s, ":")
 }
 
-func Parse(s, pkg string, optPkg bool) (*Ref, error) {
+func Parse(s, pkg string, optPkg bool) (*lexer2.Ref, error) {
 	if optPkg && IsRelative(s) {
 		s = "//" + pkg + s
 	}
@@ -111,6 +55,6 @@ func Parse(s, pkg string, optPkg bool) (*Ref, error) {
 	return parser.ParseString("", s)
 }
 
-func ParseWithOut(s string) (*RefWithOut, error) {
+func ParseWithOut(s string) (*lexer2.RefWithOut, error) {
 	return parserWithOut.ParseString("", s)
 }

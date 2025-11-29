@@ -4,11 +4,12 @@ import (
 	"strings"
 
 	"github.com/hephbuild/heph/lib/tref/internal"
+	"github.com/hephbuild/heph/lib/tref/internal/lexer"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-func argsToProto(args []internal.Arg) map[string]string {
+func argsToProto(args []lexer.Arg) map[string]string {
 	margs := map[string]string{}
 	for _, arg := range args {
 		v := arg.Value.Ident
@@ -43,13 +44,8 @@ func parse(s, pkg string, optPkg bool) (*pluginv1.TargetRef, error) {
 }
 
 func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
-	res, err := internal.FastParseWithOut(s, "", false)
+	res, err := internal.ParseWithOut(s) // this one gives better err messages
 	if err != nil {
-		_, err2 := internal.ParseWithOut(s) // this one gives better err messages
-		if err2 != nil {
-			return nil, err2
-		}
-
 		return nil, err
 	}
 
@@ -58,7 +54,7 @@ func ParseWithOut(s string) (*pluginv1.TargetRefWithOutput, error) {
 		filters = strings.Split(res.Filters, ",")
 	}
 
-	rref := New(res.Pkg, res.Name, res.Args)
+	rref := New(res.Pkg, res.Name, argsToProto(res.Args))
 	if res.Out == nil {
 		return WithFilters(WithOut(rref, ""), filters), nil
 	} else {

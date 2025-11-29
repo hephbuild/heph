@@ -19,6 +19,7 @@ func TestSanity(t *testing.T) {
 		{`//some:name@key1="some \"cool\" | value, very 'complicated'"`},
 		{`//some/@foo:name@key=value`},
 		{`//some/@foo:name@@key1=value,@key2=value`},
+		{`//@heph/file/mgmt/go/lib/bskms:content@f="{gcp.go,interface.go}"`},
 	}
 	for _, test := range tests {
 		t.Run(test.ref, func(t *testing.T) {
@@ -82,7 +83,7 @@ func TestSanityOut(t *testing.T) {
 
 			t.Log(actual)
 
-			fmted := Format(actual)
+			fmted := FormatOut(actual)
 			require.Equal(t, test.ref, fmted)
 		})
 	}
