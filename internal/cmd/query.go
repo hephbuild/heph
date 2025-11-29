@@ -38,7 +38,7 @@ func init() {
 	queryCmd = &cobra.Command{
 		Use:     "query",
 		Aliases: []string{"q"},
-		Args:    cobraArgs(),
+		Args:    parseMatcherCobraArgs(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 

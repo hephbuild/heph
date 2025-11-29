@@ -27,11 +27,11 @@ type HashStore interface {
 }
 
 func FormatFile(pkg string, file string) string {
-	return Format(New(JoinPackage("@heph/file", pkg), "content", map[string]string{"f": file}))
+	return Format(New(JoinPackage(FilePackage, pkg), "content", map[string]string{"f": file}))
 }
 
 func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
-	rest, ok := CutPackagePrefix(ref.GetPackage(), "@heph/file")
+	rest, ok := CutPackagePrefix(ref.GetPackage(), FilePackage)
 	if !ok {
 		return "", false
 	}
@@ -41,6 +41,7 @@ func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
 	return filepath.Join(ToOSPath(rest), f), true
 }
 
+const FilePackage = "@heph/file"
 const BinPackage = "@heph/bin"
 const QueryPackage = "@heph/query"
 const QueryName = "query"

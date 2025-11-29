@@ -29,7 +29,7 @@ func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
 	return ref, nil
 }
 
-func cobraArgs() cobra.PositionalArgs {
+func parseMatcherCobraArgs() cobra.PositionalArgs {
 	return cobra.RangeArgs(1, 2)
 }
 

@@ -226,6 +226,19 @@ func (e *Engine) CacheLocally(
 	return cacheArtifacts, &m, nil
 }
 
+func (e *Engine) ClearCacheLocally(
+	ctx context.Context,
+	ref *pluginv1.TargetRef,
+	hashin string,
+) error {
+	step, ctx := hstep.New(ctx, "Clearing...")
+	defer step.Done()
+
+	cachedir := hfs.At(e.Cache, ref.GetPackage(), e.targetDirName(ref), hashin)
+
+	return cachedir.RemoveAll("")
+}
+
 func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
 	if len(outputs) == 0 {
 		outputs = nil

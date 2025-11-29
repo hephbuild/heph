@@ -22,7 +22,7 @@ func init() {
 	var runCmd = &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"r"},
-		Args:    cobraArgs(),
+		Args:    parseMatcherCobraArgs(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
