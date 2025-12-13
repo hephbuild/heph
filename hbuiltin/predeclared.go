@@ -61,6 +61,8 @@ func computePredeclaredGlobals(config starlark.StringDict) {
 
 var predeclaredFunctionOnce = xsync.Once[starlark.StringDict]{}
 
+// Maybe wrap StringDict with documentation?
+// Something like { Name: "target", Signature: "target(...)", "Description": "Target is a ... \nArgs:..." }
 func predeclared_functions() starlark.StringDict {
 	return predeclaredFunctionOnce.MustDo(func() (starlark.StringDict, error) {
 		p := starlark.StringDict{}
