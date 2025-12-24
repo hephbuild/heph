@@ -8,8 +8,11 @@ import (
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/plugin/pluginfs"
 )
 
 func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
@@ -64,7 +67,12 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 			continue
 		}
 
-		err := hartifact.Unpack(ctx, output.Artifact, e.Root, hartifact.WithFilter(isUnderCodegenPath))
+		err := hartifact.Unpack(ctx, output.Artifact, e.Root, hartifact.WithFilter(isUnderCodegenPath), hartifact.WithOnFile(func(to string) {
+			err := pluginfs.MarkCodegen(ctx, def.GetRef(), to)
+			if err != nil {
+				hlog.From(ctx).Warn("mark codegen", "target", tref.Format(def.GetRef()), "err", err)
+			}
+		}))
 		if err != nil {
 			return fmt.Errorf("unpack: %v: %w", output.GetGroup(), err)
 		}

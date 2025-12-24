@@ -2,16 +2,14 @@ package pluginfs
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hfs"
-	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	fsv1 "github.com/hephbuild/heph/plugin/pluginfs/gen/heph/plugin/fs/v1"
@@ -49,11 +47,9 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 }
 
 func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
-	type Config struct {
+	cfg, err := hstructpb.Decode[struct {
 		File string `mapstructure:"file"`
-	}
-
-	cfg, err := hstructpb.Decode[Config](req.GetSpec().GetConfig())
+	}](req.GetSpec().GetConfig())
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +105,12 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			return nil, err
 		}
 
+		if IsCodegen(ctx, path) {
+			return pluginv1.RunResponse_builder{
+				Artifacts: []*pluginv1.Artifact{},
+			}.Build(), nil
+		}
+
 		return pluginv1.RunResponse_builder{
 			Artifacts: []*pluginv1.Artifact{
 				pluginv1.Artifact_builder{
@@ -137,6 +139,10 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			return err
 		}
 
+		if IsCodegen(ctx, fs.At(path).Path()) {
+			return nil
+		}
+
 		artifacts = append(artifacts, pluginv1.Artifact_builder{
 			Name: htypes.Ptr(strings.ReplaceAll(path, "/", "_")),
 			Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
@@ -158,8 +164,8 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	}.Build(), nil
 }
 
-func (p Driver) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("files doesnt support transitive"))
+func (p *Driver) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
+	return nil, fmt.Errorf("%w: files doesnt support transitive", pluginsdk.ErrNotImplemented)
 }
 
 func (p *Driver) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {

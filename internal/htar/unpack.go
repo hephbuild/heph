@@ -154,9 +154,8 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	defer onFile(f.Name())
+	defer f.Close()
 
 	_, err = io.CopyN(f, tr, hdr.Size)
 	if err != nil {

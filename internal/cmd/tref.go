@@ -86,6 +86,10 @@ func parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
 		matchers = append(matchers, tmatch.Ref(ref))
 	}
 
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
 	return tmatch.Or(matchers...), nil
 }
 

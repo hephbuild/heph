@@ -1,10 +1,15 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/lib/tref"
+	"github.com/hephbuild/heph/plugin/pluginfs"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/spf13/cobra"
@@ -48,10 +53,43 @@ var doctorCmd = func() *cobra.Command {
 				}
 			}
 
+			err = doctorXattr(ctx, root)
+			if err != nil {
+				fmt.Println("Xattr failed:", err)
+			} else {
+				fmt.Println("Xattr ok")
+			}
+
 			return nil
 		},
 	}
 }()
+
+func doctorXattr(ctx context.Context, root string) error {
+	path := filepath.Join(root, "heph_doctor_xattr_test")
+
+	err := os.RemoveAll(path)
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(path, []byte("test"), 0600)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(path)
+
+	err = pluginfs.MarkCodegen(ctx, tref.New("", "heph_doctor_test", nil), path)
+	if err != nil {
+		return err
+	}
+
+	if !pluginfs.IsCodegen(ctx, path) {
+		return errors.New("xattr not set, something went wrong")
+	}
+
+	return err
+}
 
 func init() {
 	rootCmd.AddCommand(doctorCmd)

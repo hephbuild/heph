@@ -65,8 +65,8 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
-		defer f.Close()
 		defer cfg.onFile(f.Name())
+		defer f.Close()
 
 		_, err = io.Copy(f, r)
 		if err != nil {
@@ -87,8 +87,8 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
-		defer f.Close()
 		defer cfg.onFile(f.Name())
+		defer f.Close()
 
 		_, err = io.Copy(f, r)
 		if err != nil {
