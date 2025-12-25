@@ -6,6 +6,8 @@ import (
 	"io"
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog/hlogtest"
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -58,6 +60,8 @@ func (m *mockCache) Get(ctx context.Context, key string) (io.ReadCloser, error) 
 
 func TestSanityRemoteCache(t *testing.T) {
 	ctx := t.Context()
+	ctx = hlog.ContextWithLogger(ctx, hlogtest.NewLogger(t))
+
 	cache := &mockCache{}
 
 	pkg := t.Name()
@@ -137,8 +141,8 @@ func TestSanityRemoteCache(t *testing.T) {
 			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t1", nil), []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "ead6120968cc07c5", manifest.Hashin)
-			assert.Equal(t, "f406eea1fde8ad3f", manifest.Artifacts[0].Hashout)
+			assert.Equal(t, "e52c3f7fe43c3c02", manifest.Hashin)
+			assert.Equal(t, "d4fd9c2c4c50146f", manifest.Artifacts[0].Hashout)
 		}
 
 		{
@@ -154,8 +158,8 @@ func TestSanityRemoteCache(t *testing.T) {
 			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t2", nil), []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "bce04ee30b680dde", manifest.Hashin)
-			assert.Equal(t, "80c1a1818bce4532", manifest.Artifacts[0].Hashout)
+			assert.Equal(t, "7103b83d26040e7a", manifest.Hashin)
+			assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
 		}
 
 		{
@@ -171,13 +175,13 @@ func TestSanityRemoteCache(t *testing.T) {
 			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t3", nil), []string{""})
 			require.NoError(t, err)
 
-			assert.Equal(t, "da9694d6b4a6091f", manifest.Hashin)
-			assert.Equal(t, "80c1a1818bce4532", manifest.Artifacts[0].Hashout)
+			assert.Equal(t, "7a65fe455c8b6178", manifest.Hashin)
+			assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
 		}
 
 		assert.Len(t, cache.storeWrites, 6)
-		for _, c := range cache.storeWrites {
-			assert.Equal(t, 1, c)
+		for k, c := range cache.storeWrites {
+			assert.Equalf(t, 1, c, "cache hit count for %v", k)
 		}
 	}
 }

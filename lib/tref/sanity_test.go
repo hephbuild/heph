@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/hephbuild/heph/lib/tref/internal"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/stretchr/testify/require"
 )
@@ -87,4 +88,57 @@ func TestSanityOut(t *testing.T) {
 			require.Equal(t, test.ref, fmted)
 		})
 	}
+}
+
+func TestParentPackages(t *testing.T) {
+	tests := []struct {
+		pkg      string
+		expected []string
+	}{
+		{
+			pkg:      "a/b/c",
+			expected: []string{"a/b/c", "a/b", "a", ""},
+		},
+		{
+			pkg:      "a/b",
+			expected: []string{"a/b", "a", ""},
+		},
+		{
+			pkg:      "a",
+			expected: []string{"a", ""},
+		},
+		{
+			pkg:      "",
+			expected: []string{""},
+		},
+		{
+			pkg:      "foo/bar/baz/qux",
+			expected: []string{"foo/bar/baz/qux", "foo/bar/baz", "foo/bar", "foo", ""},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.pkg, func(t *testing.T) {
+			var actual []string
+			for p := range ParentPackages(test.pkg) {
+				actual = append(actual, p)
+			}
+			require.Equal(t, test.expected, actual)
+		})
+	}
+}
+
+func TestParentPackagesEarlyBreak(t *testing.T) {
+	pkg := "a/b/c/d/e"
+	var got []string
+
+	count := 0
+	for p := range ParentPackages(pkg) {
+		got = append(got, p)
+		count++
+		if count == 3 {
+			break
+		}
+	}
+
+	assert.Equal(t, []string{"a/b/c/d/e", "a/b/c/d", "a/b/c"}, got)
 }

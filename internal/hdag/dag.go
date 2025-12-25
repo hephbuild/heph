@@ -221,57 +221,55 @@ func (d *DAG[V, M]) GetGraph(ctx context.Context, v V) (*DAG[V, M], error) {
 		return nil, err
 	}
 
-	err = descd.BFSWalk(func(desc V) error {
+	for desc := range descd.BFSWalk(ctx) {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 
 		err := sd.AddVertex(desc)
 		if err != nil && !IsDuplicateVertexError(err) {
-			return err
+			return nil, err
 		}
 
 		for _, child := range descd.GetChildren(desc) {
 			err = sd.AddVertex(child)
 			if err != nil && !IsDuplicateVertexError(err) {
-				return err
+				return nil, err
 			}
 
 			metas := descd.GetEdgeMeta(desc, child)
 			for _, meta := range metas {
 				err = sd.AddEdgeMeta(desc, child, meta)
 				if err != nil && !IsDuplicateEdgeError(err) {
-					return err
+					return nil, err
 				}
 			}
 		}
-
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	return sd, nil
 }
 
-func (d *DAG[V, M]) BFSWalk(visitor func(V) error) error {
-	var err error
-	d.d.BFSWalk(funcVisitor(func(vertexer dag.Vertexer) {
-		if err != nil {
-			return
-		}
+func (d *DAG[V, M]) BFSWalk(ctx context.Context) iter.Seq[V] {
+	return func(yield func(V) bool) {
+		var stop bool
+		d.d.BFSWalk(funcVisitor(func(vertexer dag.Vertexer) {
+			if stop || ctx.Err() != nil {
+				return
+			}
 
-		id, _ := vertexer.Vertex()
-		var v V
-		v, err = d.getVertex(id)
-		if err != nil {
-			return
-		}
-		err = visitor(v)
-	}))
+			id, _ := vertexer.Vertex()
+			var v V
+			v, err := d.getVertex(id)
+			if err != nil {
+				return
+			}
 
-	return err
+			if !yield(v) {
+				stop = true
+			}
+		}))
+	}
 }
 
 func (d *DAG[V, M]) IsEdge(src, dst V) bool {

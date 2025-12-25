@@ -11,12 +11,20 @@ func All() *pluginv1.TargetMatcher {
 	return PackagePrefix("")
 }
 
+func None() *pluginv1.TargetMatcher {
+	return Not(PackagePrefix(""))
+}
+
 func PackagePrefix(prefix string) *pluginv1.TargetMatcher {
 	return pluginv1.TargetMatcher_builder{PackagePrefix: htypes.Ptr(prefix)}.Build()
 }
 
 func Package(pkg string) *pluginv1.TargetMatcher {
 	return pluginv1.TargetMatcher_builder{Package: htypes.Ptr(pkg)}.Build()
+}
+
+func CodegenPackage(pkg string) *pluginv1.TargetMatcher {
+	return pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(pkg)}.Build()
 }
 
 func Ref(ref *pluginv1.TargetRef) *pluginv1.TargetMatcher {

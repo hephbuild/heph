@@ -14,6 +14,6 @@ target(
         "echo hello > $OUT/hello",
         "echo world > $OUT/world",
     ],
-    out = "dir",
+    out = "dir/",
     codegen = 'copy',
 )

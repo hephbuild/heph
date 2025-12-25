@@ -3,6 +3,7 @@ package tref
 import (
 	"errors"
 	"fmt"
+	"iter"
 	"path"
 	"path/filepath"
 	"slices"
@@ -49,6 +50,25 @@ func ToPackage(s string) string {
 
 func SplitPackage(s string) []string {
 	return strings.Split(s, "/")
+}
+
+func ParentPackages(p string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for p != "" {
+			if !yield(p) {
+				return
+			}
+
+			p, _ = path.Split(p)
+			p = strings.TrimSuffix(p, "/")
+
+			if p == "" {
+				break
+			}
+		}
+
+		yield("")
+	}
 }
 
 func JoinPackage(s ...string) string {

@@ -80,19 +80,18 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 	// TODO: remote lock ?
 
 	for _, artifact := range artifacts {
-		if artifact.Artifact.WhichContent() == pluginv1.Artifact_File_case {
-			return fmt.Errorf("not supported: %v", artifact.Artifact.WhichContent())
-		}
-	}
-
-	for _, artifact := range artifacts {
 		r, err := hartifact.Reader(ctx, artifact.Artifact)
 		if err != nil {
 			return err
 		}
 		defer r.Close()
 
-		key := e.remoteCacheKey(ref, hashin, artifact.GetName())
+		artifactName := artifact.GetName()
+		if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
+			artifactName = hartifact.ManifestName
+		}
+
+		key := e.remoteCacheKey(ref, hashin, artifactName)
 
 		err = cache.Client.Store(ctx, key, r)
 		if err != nil {
@@ -191,9 +190,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 }
 
 func (e *Engine) manifestFromRemoteCache(ctx context.Context, ref *pluginv1.TargetRef, hashin string, cache CacheHandle) (hartifact.Manifest, bool, error) {
-	targetDirName := e.targetDirName(ref)
-
-	manifestKey := path.Join(ref.GetPackage(), targetDirName, hashin, hartifact.ManifestName)
+	manifestKey := e.remoteCacheKey(ref, hashin, hartifact.ManifestName)
 
 	r, err := cache.Client.Get(ctx, manifestKey)
 	if err != nil {

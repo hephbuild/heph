@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -689,6 +691,80 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher
 	}
 
 	return g.Wait()
+}
+
+func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.TargetMatcher) error {
+	step, ctx := hstep.New(ctx, "Validating...")
+	defer step.Done()
+
+	err := e.QueryLink(ctx, rs, m, tmatch.All())
+	if err != nil {
+		return err
+	}
+
+	codegenPkg := map[string]htypes.Void{}
+	for _, ref := range rs.dag.GetVertices() {
+		def, err := e.GetDef(ctx, rs, DefContainer{Ref: ref})
+		if err != nil {
+			return err
+		}
+
+		for _, codegen := range def.GetCodegenTree() {
+			pkg := tref.JoinPackage(ref.GetPackage(), tref.ToPackage(codegen.GetPath()))
+			if _, ok := codegenPkg[pkg]; ok {
+				continue
+			}
+			codegenPkg[pkg] = htypes.Void{}
+
+			for p := range tref.ParentPackages(m.GetPackage()) {
+				err := e.QueryLink(ctx, rs, tmatch.CodegenPackage(p), tmatch.None())
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	paths := map[string]*pluginv1.TargetRef{}
+	dirs := map[string]*pluginv1.TargetRef{}
+	for _, ref := range rs.dag.GetVertices() {
+		def, err := e.GetDef(ctx, rs, DefContainer{Ref: ref})
+		if err != nil {
+			return err
+		}
+
+		for _, codegen := range def.GetCodegenTree() {
+			codegenPath := filepath.Join(tref.ToOSPath(ref.GetPackage()), codegen.GetPath())
+
+			if src, ok := paths[codegenPath]; ok {
+				return fmt.Errorf("%v: %v already outputs %v", tref.Format(ref), tref.Format(src), codegenPath)
+			}
+
+			p := codegenPath
+			for p != "" {
+				if src, ok := dirs[p]; ok {
+					return fmt.Errorf("%v: %v already outputs %v, cannot output %v because it's in a generated directory", tref.Format(ref), tref.Format(src), p, codegenPath)
+				}
+
+				p, _ = path.Split(p)
+				p = strings.TrimSuffix(p, "/")
+			}
+
+			if codegen.GetIsDir() {
+				for p, src := range paths {
+					if hfs.HasPathPrefix(p, codegenPath) {
+						return fmt.Errorf("%v: %v already outputs %v, it would shadow be shadowed by %v", tref.Format(ref), tref.Format(src), p, codegenPath)
+					}
+				}
+
+				dirs[codegenPath] = ref
+			}
+
+			paths[codegenPath] = ref
+		}
+	}
+
+	return nil
 }
 
 func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef) (*LightLinkedTarget, error) {

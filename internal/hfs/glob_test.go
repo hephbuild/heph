@@ -193,3 +193,5 @@ func TestGlobStrictDirSuccess2(t *testing.T) {
 		"some/file2",
 	}, get())
 }
+
+

@@ -49,7 +49,7 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				err = e.QueryLink(ctx, rs, pkgMatcher, tmatch.All())
+				err = e.Validate(ctx, rs, pkgMatcher)
 				if err != nil {
 					return err
 				}

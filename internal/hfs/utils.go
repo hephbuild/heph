@@ -130,6 +130,11 @@ func Move(from, to FS) error {
 		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
 	}
 
+	err := CreateParentDir(toos, "")
+	if err != nil {
+		return err
+	}
+
 	return fromos.Move("", toos.Path())
 }
 

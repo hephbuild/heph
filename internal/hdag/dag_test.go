@@ -2,6 +2,7 @@ package hdag
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -24,12 +25,7 @@ func TestBFSWalk(t *testing.T) {
 	oned, err := d.GetGraph(ctx, 1)
 	require.NoError(t, err)
 
-	collected := []int{}
-	err = oned.BFSWalk(func(i int) error {
-		collected = append(collected, i)
-		return nil
-	})
-	require.NoError(t, err)
+	collected := slices.Collect(oned.BFSWalk(ctx))
 
 	assert.Equal(t, []int{1, 2, 3}, collected)
 }

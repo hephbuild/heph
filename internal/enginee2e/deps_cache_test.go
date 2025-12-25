@@ -181,10 +181,10 @@ func TestDepsCache2(t *testing.T) {
 	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
-		Get(gomock.Any(), "__child/11c9ea1468646e02/manifest.v1.json").
+		Get(gomock.Any(), "__child/1ccb3ce4fd2fac20/manifest.v1.json").
 		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
-	for _, key := range []string{"__child/11c9ea1468646e02/manifest.v1.json", "__child/11c9ea1468646e02/out_out.tar"} {
+	for _, key := range []string{"__child/1ccb3ce4fd2fac20/manifest.v1.json", "__child/1ccb3ce4fd2fac20/out_out.tar"} {
 		cache.EXPECT().
 			Store(gomock.Any(), key, gomock.Any()).
 			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {

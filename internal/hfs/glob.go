@@ -12,7 +12,7 @@ import (
 
 // Equivalent to `strings.HasPrefix(path, prefix+"/")`, without the string concat.
 func matchPrefix(path, prefix string) bool {
-	return len(path) >= len(prefix) &&
+	return path == prefix || len(path) >= len(prefix) &&
 		strings.HasPrefix(path, prefix) &&
 		path[len(prefix)] == '/'
 }
@@ -20,7 +20,7 @@ func matchPrefix(path, prefix string) bool {
 func fastMatchDir(path, matcher string) bool {
 	i := indexMeta(matcher)
 	if i == -1 {
-		if path == matcher || matchPrefix(path, matcher) {
+		if matchPrefix(path, matcher) {
 			return true
 		}
 	}

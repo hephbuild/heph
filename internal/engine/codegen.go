@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
-	"strings"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginfs"
@@ -40,7 +40,7 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 	codegenPaths := make([]string, 0, len(outputs))
 	for _, gen := range def.GetCodegenTree() {
 		if gen.GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY {
-			codegenPaths = append(codegenPaths, filepath.Join(def.GetRef().GetPackage(), gen.GetPath()))
+			codegenPaths = append(codegenPaths, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), gen.GetPath()))
 		}
 	}
 
@@ -54,7 +54,7 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 		}
 
 		for _, codegenPath := range codegenPaths {
-			if strings.HasPrefix(p, codegenPath+"/") {
+			if hfs.HasPathPrefix(p, codegenPath) {
 				return true
 			}
 		}
