@@ -211,13 +211,13 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	case onlyManifest:
 		outputs = nil
 	case len(outputs) == 1 && outputs[0] == AllOutputs:
-		outputs = def.GetOutputs()
+		outputs = def.OutputNames()
 	}
 
 	var doOutputs []string
 	switch {
 	case def.GetCache():
-		doOutputs = def.GetOutputs()
+		doOutputs = def.OutputNames()
 	case len(outputs) == 1 && outputs[0] == AllOutputs:
 		doOutputs = outputs
 	default:
@@ -432,7 +432,7 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {
-		outputs = def.GetOutputs()
+		outputs = def.OutputNames()
 	}
 
 	for _, artifact := range manifest.Artifacts {
@@ -1149,7 +1149,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	if def.GetCache() && !options.force && !options.shell {
-		res, ok, err := e.ResultFromLocalCache(ctx, def, def.GetOutputs(), hashin)
+		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), hashin)
 		if err != nil {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
@@ -1268,9 +1268,21 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	cachefs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.GetCollectOutputs()))
+	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.OutputNames()))
 
-	for _, output := range def.GetCollectOutputs() {
+	for _, output := range def.GetOutputs() {
+		shouldCollect := false
+		for _, path := range output.GetPaths() {
+			if path.GetCollect() {
+				shouldCollect = true
+				break
+			}
+		}
+
+		if !shouldCollect {
+			break
+		}
+
 		tarname := output.GetGroup() + ".tar"
 		tarf, err := hfs.Create(cachefs, tarname)
 		if err != nil {
@@ -1279,18 +1291,33 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		defer tarf.Close()
 
 		tar := htar.NewPacker(tarf)
+		defer tar.Close()
+
 		for _, path := range output.GetPaths() {
-			found := false
-			err := hfs.Glob(ctx, cwdfs, path, nil, func(path string, d hfs.DirEntry) error {
+			if !path.GetCollect() {
+				continue
+			}
+
+			var globPath string
+			switch path.WhichContent() {
+			case pluginv1.TargetDef_Output_Path_FilePath_case:
+				globPath = path.GetFilePath()
+			case pluginv1.TargetDef_Output_Path_DirPath_case:
+				globPath = path.GetDirPath()
+			case pluginv1.TargetDef_Output_Path_Glob_case:
+				globPath = path.GetGlob()
+			default:
+				return nil, fmt.Errorf("unknown path type: %v", path.WhichContent())
+			}
+
+			err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
 				f, err := hfs.Open(cwdfs, path)
 				if err != nil {
 					return err
 				}
 				defer f.Close()
 
-				found = true
-
-				err = tar.WriteFile(f, filepath.Join(def.GetRef().GetPackage(), path))
+				err = tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path))
 				if err != nil {
 					return err
 				}
@@ -1300,13 +1327,9 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			if err != nil {
 				return nil, fmt.Errorf("collect: %v: %w", path, err)
 			}
-
-			if !found {
-				return nil, fmt.Errorf("collect: %v: not found", path)
-			}
 		}
 
-		err = tarf.Close()
+		err = tar.Close()
 		if err != nil {
 			return nil, err
 		}

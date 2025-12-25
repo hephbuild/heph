@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -257,39 +258,40 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 		}.Build())
 	}
 
-	collectOutputs := make([]*pluginv1.TargetDef_CollectOutput, 0, len(target.GetOutputs()))
-	var codegenTree []*pluginv1.TargetDef_CodegenTree
-	outputNames := make([]string, 0, len(target.GetOutputs()))
+	outputs := make([]*pluginv1.TargetDef_Output, 0, len(target.GetOutputs()))
 	for _, output := range target.GetOutputs() {
-		collectOutputs = append(collectOutputs, pluginv1.TargetDef_CollectOutput_builder{
-			Group: htypes.Ptr(output.GetGroup()),
-			Paths: output.GetPaths(),
-		}.Build())
-
-		outputNames = append(outputNames, output.GetGroup())
-
-		switch output.GetCodegen() {
-		case execv1.Target_Output_CODEGEN_MODE_UNSPECIFIED:
-			// no codegen
-		case execv1.Target_Output_CODEGEN_MODE_COPY:
-			for _, p := range output.GetPaths() {
-				codegenTree = append(codegenTree, pluginv1.TargetDef_CodegenTree_builder{
-					Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY),
-					Path:  htypes.Ptr(p),
-					IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
-				}.Build())
+		ppaths := make([]*pluginv1.TargetDef_Output_Path, 0, len(output.GetPaths()))
+		for _, p := range output.GetPaths() {
+			ppath := pluginv1.TargetDef_Output_Path_builder{
+				Collect: htypes.Ptr(true),
 			}
-		case execv1.Target_Output_CODEGEN_MODE_LINK:
-			for _, p := range output.GetPaths() {
-				codegenTree = append(codegenTree, pluginv1.TargetDef_CodegenTree_builder{
-					Mode:  htypes.Ptr(pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_LINK),
-					Path:  htypes.Ptr(p),
-					IsDir: htypes.Ptr(strings.HasSuffix(p, "/")),
-				}.Build())
+
+			if strings.HasSuffix(p, "/") {
+				ppath.DirPath = htypes.Ptr(p)
+			} else if hfs.IsGlob(p) {
+				ppath.Glob = htypes.Ptr(p)
+			} else {
+				ppath.FilePath = htypes.Ptr(p)
 			}
-		default:
-			return nil, fmt.Errorf("invalid codegen mode: %s", output.GetCodegen())
+
+			switch output.GetCodegen() {
+			case execv1.Target_Output_CODEGEN_MODE_UNSPECIFIED:
+				// no codegen
+			case execv1.Target_Output_CODEGEN_MODE_COPY:
+				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_COPY)
+			case execv1.Target_Output_CODEGEN_MODE_LINK:
+				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_LINK)
+			default:
+				return nil, fmt.Errorf("invalid codegen mode: %s", output.GetCodegen())
+			}
+
+			ppaths = append(ppaths, ppath.Build())
 		}
+
+		outputs = append(outputs, pluginv1.TargetDef_Output_builder{
+			Group: htypes.Ptr(output.GetGroup()),
+			Paths: ppaths,
+		}.Build())
 	}
 
 	anyTarget, err := anypb.New(targetDef)
@@ -300,11 +302,9 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 	return pluginv1.TargetDef_builder{
 		Ref:                ref,
 		Inputs:             inputs,
-		Outputs:            outputNames,
+		Outputs:            outputs,
 		Cache:              htypes.Ptr(target.GetLocalCache()),
 		DisableRemoteCache: htypes.Ptr(!target.GetRemoteCache()),
-		CollectOutputs:     collectOutputs,
-		CodegenTree:        codegenTree,
 		Pty:                htypes.Ptr(target.GetPty()),
 		Def:                anyTarget,
 		Hash:               hash,

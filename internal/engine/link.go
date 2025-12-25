@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/hslices"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/plugin/pluginbin"
@@ -346,6 +346,14 @@ func refKey(ref *pluginv1.TargetRef) string {
 func (t TargetDef) GetRef() *pluginv1.TargetRef {
 	return t.TargetSpec.GetRef()
 }
+func (t TargetDef) OutputNames() []string {
+	outputs := make([]string, 0, len(t.GetOutputs()))
+	for _, output := range t.GetOutputs() {
+		outputs = append(outputs, output.GetGroup())
+	}
+
+	return outputs
+}
 
 func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (*TargetDef, error) {
 	rs, err := dagAddParent(rs, c.GetRef())
@@ -421,25 +429,27 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 
 		addSrcTargetToInputs(def, currentTargetAddrHash)
 
-		for _, output := range def.GetCollectOutputs() {
-			if !slices.Contains(def.GetOutputs(), output.GetGroup()) {
-				def.SetOutputs(append(def.GetOutputs(), output.GetGroup()))
-			}
-
+		for _, output := range def.GetOutputs() {
 			for _, path := range output.GetPaths() {
-				if path == ".." || strings.Contains(path, "../") {
+				var pathStr string
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Output_Path_FilePath_case:
+					pathStr = path.GetFilePath()
+				case pluginv1.TargetDef_Output_Path_DirPath_case:
+					pathStr = path.GetDirPath()
+				case pluginv1.TargetDef_Output_Path_Glob_case:
+					pathStr = path.GetGlob() // TODO: may need more brain
+
+					if path.GetCodegenTree() != pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+						return nil, fmt.Errorf("codegen tree: %v: cannot be a glob", pathStr)
+					}
+				default:
+					return nil, fmt.Errorf("unexpected path type: %v", path.WhichContent())
+				}
+
+				if pathStr == ".." || strings.Contains(pathStr, "../") {
 					return nil, errors.New("output path cannot go to the parent folder")
 				}
-			}
-		}
-
-		for i, gen := range def.GetCodegenTree() {
-			if hfs.IsGlob(gen.GetPath()) {
-				return nil, fmt.Errorf("codegen tree: %v: cannot be a glob", i)
-			}
-
-			if gen.GetPath() == ".." || strings.Contains(gen.GetPath(), "../") {
-				return nil, errors.New("output path cannot go to the parent folder")
 			}
 		}
 
@@ -709,17 +719,34 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 			return err
 		}
 
-		for _, codegen := range def.GetCodegenTree() {
-			pkg := tref.JoinPackage(ref.GetPackage(), tref.ToPackage(codegen.GetPath()))
-			if _, ok := codegenPkg[pkg]; ok {
-				continue
-			}
-			codegenPkg[pkg] = htypes.Void{}
+		for _, output := range def.GetOutputs() {
+			for _, path := range output.GetPaths() {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+					continue
+				}
 
-			for p := range tref.ParentPackages(m.GetPackage()) {
-				err := e.QueryLink(ctx, rs, tmatch.CodegenPackage(p), tmatch.None())
-				if err != nil {
-					return err
+				var pkg string
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Output_Path_FilePath_case:
+					pkg = tref.JoinPackage(ref.GetPackage(), tref.ToPackage(filepath.Dir(path.GetFilePath())))
+				case pluginv1.TargetDef_Output_Path_DirPath_case:
+					pkg = tref.JoinPackage(ref.GetPackage(), tref.ToPackage(path.GetFilePath()))
+				case pluginv1.TargetDef_Output_Path_Glob_case:
+					return fmt.Errorf("glob codegen path %q not supported", path.GetGlob())
+				default:
+					panic("unreachable")
+				}
+
+				if _, ok := codegenPkg[pkg]; ok {
+					continue
+				}
+				codegenPkg[pkg] = htypes.Void{}
+
+				for p := range tref.ParentPackages(m.GetPackage()) {
+					err := e.QueryLink(ctx, rs, tmatch.CodegenPackage(p), tmatch.None())
+					if err != nil {
+						return err
+					}
 				}
 			}
 		}
@@ -732,36 +759,48 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 		if err != nil {
 			return err
 		}
-
-		for _, codegen := range def.GetCodegenTree() {
-			codegenPath := filepath.Join(tref.ToOSPath(ref.GetPackage()), codegen.GetPath())
-
-			if src, ok := paths[codegenPath]; ok {
-				return fmt.Errorf("%v: %v already outputs %v", tref.Format(ref), tref.Format(src), codegenPath)
-			}
-
-			p := codegenPath
-			for p != "" {
-				if src, ok := dirs[p]; ok {
-					return fmt.Errorf("%v: %v already outputs %v, cannot output %v because it's in a generated directory", tref.Format(ref), tref.Format(src), p, codegenPath)
+		for _, output := range def.GetOutputs() {
+			for _, path := range output.GetPaths() {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+					continue
 				}
 
-				p, _ = path.Split(p)
-				p = strings.TrimSuffix(p, "/")
-			}
+				var codegenPath string
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Output_Path_FilePath_case:
+					codegenPath = filepath.Join(tref.ToOSPath(ref.GetPackage()), path.GetFilePath())
+				case pluginv1.TargetDef_Output_Path_DirPath_case:
+					codegenPath = filepath.Join(tref.ToOSPath(ref.GetPackage()), path.GetDirPath())
+				case pluginv1.TargetDef_Output_Path_Glob_case:
+					return fmt.Errorf("glob codegen path %q not supported", path.GetGlob())
+				default:
+					panic("unreachable")
+				}
 
-			if codegen.GetIsDir() {
-				for p, src := range paths {
-					if hfs.HasPathPrefix(p, codegenPath) {
-						return fmt.Errorf("%v: %v already outputs %v, it would shadow be shadowed by %v", tref.Format(ref), tref.Format(src), p, codegenPath)
+				if src, ok := paths[codegenPath]; ok {
+					return fmt.Errorf("%v: %v already outputs %v", tref.Format(ref), tref.Format(src), codegenPath)
+				}
+
+				for p := range hfs.ParentPaths(codegenPath) {
+					if src, ok := dirs[p]; ok {
+						return fmt.Errorf("%v: %v already outputs %v, cannot output %v because it's in a generated directory", tref.Format(ref), tref.Format(src), p, codegenPath)
 					}
 				}
 
-				dirs[codegenPath] = ref
-			}
+				if path.WhichContent() == pluginv1.TargetDef_Output_Path_DirPath_case {
+					for p, src := range paths {
+						if hfs.HasPathPrefix(p, codegenPath) {
+							return fmt.Errorf("%v: %v already outputs %v, it would shadow be shadowed by %v", tref.Format(ref), tref.Format(src), p, codegenPath)
+						}
+					}
 
-			paths[codegenPath] = ref
+					dirs[codegenPath] = ref
+				}
+
+				paths[codegenPath] = ref
+			}
 		}
+
 	}
 
 	return nil
@@ -829,19 +868,24 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				return err
 			}
 
-			outputs := linkedDep.GetOutputs()
+			outputNames := make([]string, 0, len(linkedDep.GetOutputs()))
+			for _, output := range linkedDep.GetOutputs() {
+				outputNames = append(outputNames, output.GetGroup())
+			}
 
 			if input.GetRef().HasOutput() {
-				if !slices.Contains(linkedDep.GetOutputs(), input.GetRef().GetOutput()) {
+				if !hslices.Has(linkedDep.GetOutputs(), func(output *pluginv1.TargetDef_Output) bool {
+					return output.GetGroup() == input.GetRef().GetOutput()
+				}) {
 					return fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(input.GetRef()), input.GetRef().GetOutput())
 				}
 
-				outputs = []string{input.GetRef().GetOutput()}
+				outputNames = []string{input.GetRef().GetOutput()}
 			}
 
 			lt.Inputs[i] = &LightLinkedTargetInput{
 				TargetDef: linkedDep,
-				Outputs:   outputs,
+				Outputs:   outputNames,
 				Origin:    input.GetOrigin(),
 			}
 

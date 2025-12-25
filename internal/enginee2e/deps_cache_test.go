@@ -150,10 +150,15 @@ func TestDepsCache2(t *testing.T) {
 		Parse(gomock.Any(), gomock.Any()).
 		Return(pluginv1.ParseResponse_builder{
 			Target: pluginv1.TargetDef_builder{
-				Ref:     pluginv1.TargetRef_builder{Package: htypes.Ptr(""), Name: htypes.Ptr("child")}.Build(),
-				Inputs:  nil,
-				Outputs: []string{""},
-				Cache:   htypes.Ptr(true),
+				Ref:    pluginv1.TargetRef_builder{Package: htypes.Ptr(""), Name: htypes.Ptr("child")}.Build(),
+				Inputs: nil,
+				Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
+					Group: htypes.Ptr(""),
+					Paths: []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+						FilePath: htypes.Ptr("out.txt"),
+					}.Build()},
+				}.Build()},
+				Cache: htypes.Ptr(true),
 			}.Build(),
 		}.Build(), nil).Times(3)
 
@@ -181,10 +186,10 @@ func TestDepsCache2(t *testing.T) {
 	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
-		Get(gomock.Any(), "__child/1ccb3ce4fd2fac20/manifest.v1.json").
+		Get(gomock.Any(), "__child/e5d50f4b478a3687/manifest.v1.json").
 		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
-	for _, key := range []string{"__child/1ccb3ce4fd2fac20/manifest.v1.json", "__child/1ccb3ce4fd2fac20/out_out.tar"} {
+	for _, key := range []string{"__child/e5d50f4b478a3687/manifest.v1.json", "__child/e5d50f4b478a3687/out_out.tar"} {
 		cache.EXPECT().
 			Store(gomock.Any(), key, gomock.Any()).
 			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {

@@ -296,20 +296,42 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 			return MatchNo
 		}
 
-		if len(def.GetCodegenTree()) == 0 {
-			return MatchNo
-		}
+		for _, out := range def.GetOutputs() {
+			if out.GetUnknownPaths() {
+				continue
+			}
 
-		for _, gen := range def.GetCodegenTree() {
-			if gen.GetIsDir() {
-				outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(gen.GetPath()))
-				if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
-					return MatchYes
+			for _, path := range out.GetPaths() {
+				if path.GetCodegenTree() != pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+					continue
 				}
-			} else {
-				outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(filepath.Dir(gen.GetPath())))
-				if outPkg == m.GetCodegenPackage() {
-					return MatchYes
+
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Output_Path_FilePath_case:
+					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(filepath.Dir(path.GetFilePath())))
+					if outPkg == m.GetCodegenPackage() {
+						return MatchYes
+					}
+				case pluginv1.TargetDef_Output_Path_DirPath_case:
+					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path.GetDirPath()))
+					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
+						return MatchYes
+					}
+				case pluginv1.TargetDef_Output_Path_Glob_case:
+					base, pattern := hfs.GlobSplit(path.GetGlob())
+					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(base))
+
+					if strings.Contains(pattern, string(filepath.Separator)) {
+						if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
+							return MatchYes
+						}
+					} else {
+						if outPkg == m.GetCodegenPackage() {
+							return MatchYes
+						}
+					}
+				default:
+					continue
 				}
 			}
 		}

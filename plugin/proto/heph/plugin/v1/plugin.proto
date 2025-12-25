@@ -60,33 +60,33 @@ message TargetDef {
     InputOrigin origin = 3;
   }
 
+  message Output {
+    message Path {
+      enum CodegenMode {
+        CODEGEN_MODE_UNSPECIFIED = 0;
+        CODEGEN_MODE_COPY = 2;
+        CODEGEN_MODE_LINK = 3;
+      }
+      oneof content {
+        string file_path = 1;
+        string dir_path = 2;
+        string glob = 3;
+      }
+      CodegenMode codegen_tree = 5;
+      bool collect = 6;
+    }
+
+    string group = 1;
+    bool unknown_paths = 2;
+    repeated Path paths = 3;
+  }
+
   TargetRef ref = 1;
   google.protobuf.Any def = 2;
   repeated Input inputs = 3;
-  repeated string outputs = 4;
+  repeated Output outputs = 4;
   bool cache = 5;
   bool disable_remote_cache = 9;
-
-  message CollectOutput {
-    string group = 1;
-    repeated string paths = 2;
-  }
-
-  repeated CollectOutput collect_outputs = 6;
-
-  message CodegenTree {
-    enum Mode {
-      CODEGEN_MODE_UNSPECIFIED = 0;
-      CODEGEN_MODE_COPY = 2;
-      CODEGEN_MODE_LINK = 3;
-    }
-
-    Mode mode = 1;
-    string path = 2;
-    bool is_dir = 3;
-  }
-
-  repeated CodegenTree codegen_tree = 7;
 
   bool pty = 8;
   bytes hash = 10;

@@ -51,10 +51,16 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 
 	return pluginv1.ParseResponse_builder{
 		Target: pluginv1.TargetDef_builder{
-			Def:     target,
-			Ref:     req.GetSpec().GetRef(),
-			Cache:   htypes.Ptr(false),
-			Outputs: []string{""},
+			Def:   target,
+			Ref:   req.GetSpec().GetRef(),
+			Cache: htypes.Ptr(false),
+			Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
+				Group: htypes.Ptr(""),
+				Paths: []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+					FilePath: htypes.Ptr(binName),
+					Collect:  htypes.Ptr(false),
+				}.Build()},
+			}.Build()},
 		}.Build(),
 	}.Build(), nil
 }

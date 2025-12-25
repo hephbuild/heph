@@ -64,7 +64,12 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 			Ref:                req.GetSpec().GetRef(),
 			Cache:              htypes.Ptr(true),
 			DisableRemoteCache: htypes.Ptr(true),
-			Outputs:            []string{""},
+			Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
+				Group: htypes.Ptr(""),
+				Paths: []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+					FilePath: htypes.Ptr(s.GetOutput()),
+				}.Build()},
+			}.Build()},
 		}.Build(),
 	}.Build(), nil
 }

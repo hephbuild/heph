@@ -19,12 +19,12 @@ func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, output
 	step, ctx := hstep.New(ctx, "Copying to tree...")
 	defer step.Done()
 
-	err := e.codegenCopyTree(ctx, def, outputs)
+	err := e.codegenTreeCopy(ctx, def, outputs, pluginv1.TargetDef_Output_Path_CODEGEN_MODE_COPY)
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
 
-	err = e.codegenLinkTree(ctx, def, outputs)
+	err = e.codegenTreeCopy(ctx, def, outputs, pluginv1.TargetDef_Output_Path_CODEGEN_MODE_LINK) // TODO: this will copy too
 	if err != nil {
 		return fmt.Errorf("link: %w", err)
 	}
@@ -32,15 +32,22 @@ func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, output
 	return nil
 }
 
-func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
-	if len(def.GetCodegenTree()) == 0 {
-		return nil
-	}
-
-	codegenPaths := make([]string, 0, len(outputs))
-	for _, gen := range def.GetCodegenTree() {
-		if gen.GetMode() == pluginv1.TargetDef_CodegenTree_CODEGEN_MODE_COPY {
-			codegenPaths = append(codegenPaths, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), gen.GetPath()))
+func (e *Engine) codegenTreeCopy(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact, mode pluginv1.TargetDef_Output_Path_CodegenMode) error {
+	codegenPaths := make([]string, 0)
+	for _, output := range def.GetOutputs() {
+		for _, path := range output.GetPaths() {
+			if path.GetCodegenTree() == mode {
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Output_Path_FilePath_case:
+					codegenPaths = append(codegenPaths, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path.GetFilePath()))
+				case pluginv1.TargetDef_Output_Path_DirPath_case:
+					codegenPaths = append(codegenPaths, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path.GetDirPath()))
+				case pluginv1.TargetDef_Output_Path_Glob_case:
+					return fmt.Errorf("codegen tree: %v: cannot be a glob", path.GetGlob())
+				default:
+					return fmt.Errorf("invalid codegen content: %s", path.WhichContent())
+				}
+			}
 		}
 	}
 
@@ -79,10 +86,4 @@ func (e *Engine) codegenCopyTree(ctx context.Context, def *LightLinkedTarget, ou
 	}
 
 	return nil
-}
-
-func (e *Engine) codegenLinkTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
-	// TODO
-
-	return e.codegenCopyTree(ctx, def, outputs)
 }

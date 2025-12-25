@@ -55,10 +55,15 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}
 
 	var target *fsv1.Target
+	var outPaths []*pluginv1.TargetDef_Output_Path
 	if hfs.IsGlob(cfg.File) {
 		target = fsv1.Target_builder{
 			Pattern: htypes.Ptr(cfg.File),
 		}.Build()
+		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+			Glob:    htypes.Ptr(cfg.File),
+			Collect: htypes.Ptr(false),
+		}.Build()}
 	} else {
 		_, err := os.Stat(filepath.Join(p.resultClient.Root, cfg.File))
 		if err != nil {
@@ -68,6 +73,10 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		target = fsv1.Target_builder{
 			File: htypes.Ptr(cfg.File),
 		}.Build()
+		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+			FilePath: htypes.Ptr(cfg.File),
+			Collect:  htypes.Ptr(false),
+		}.Build()}
 	}
 
 	targetAny, err := anypb.New(target)
@@ -77,9 +86,12 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	return pluginv1.ParseResponse_builder{
 		Target: pluginv1.TargetDef_builder{
-			Ref:                req.GetSpec().GetRef(),
-			Def:                targetAny,
-			Outputs:            []string{""},
+			Ref: req.GetSpec().GetRef(),
+			Def: targetAny,
+			Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
+				Group: htypes.Ptr(""),
+				Paths: outPaths,
+			}.Build()},
 			Cache:              htypes.Ptr(false),
 			DisableRemoteCache: htypes.Ptr(true),
 		}.Build(),
