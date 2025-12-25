@@ -12,7 +12,7 @@ import (
 
 func init() {
 	cmd := &cobra.Command{
-		Use:  "validate",
+		Use:  "validate [ <package-matcher> ]",
 		Args: cobra.RangeArgs(0, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

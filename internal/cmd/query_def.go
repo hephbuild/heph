@@ -11,9 +11,12 @@ import (
 )
 
 func init() {
+	cmdArgs := parseRefArgs{cmdName: "def"}
+
 	cmd := &cobra.Command{
-		Use:  "def",
-		Args: cobra.ExactArgs(1),
+		Use:               cmdArgs.Use(),
+		Args:              cmdArgs.Args(),
+		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -30,7 +33,7 @@ func init() {
 				return err
 			}
 
-			ref, err := parseTargetRef(args[0], cwd, root)
+			ref, err := cmdArgs.Parse(args[0], cwd, root)
 			if err != nil {
 				return err
 			}

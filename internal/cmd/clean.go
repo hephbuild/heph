@@ -17,9 +17,12 @@ var cleanCmd *cobra.Command
 func init() {
 	var ignore []string
 
+	cmdArgs := parseMatcherArgs{cmdName: "clean"}
+
 	cleanCmd = &cobra.Command{
-		Use:  "clean",
-		Args: parseMatcherCobraArgs(),
+		Use:               cmdArgs.Use(),
+		Args:              cmdArgs.Args(),
+		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -36,7 +39,7 @@ func init() {
 				return err
 			}
 
-			matcher, err := parseMatcher(args, cwd, root)
+			matcher, err := cmdArgs.Parse(args, cwd, root)
 			if err != nil {
 				return err
 			}

@@ -3,48 +3,58 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
-	"github.com/hephbuild/heph/internal/tmatch"
-	"github.com/hephbuild/heph/lib/tref"
-
 	"github.com/hephbuild/heph/internal/engine"
+	"github.com/hephbuild/heph/internal/tmatch"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/spf13/cobra"
 )
 
-func parseTargetRef(s, cwd, root string) (*pluginv1.TargetRef, error) {
-	cwp, err := tref.DirToPackage(cwd, root)
-	if err != nil {
-		return nil, err
-	}
+type ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective)
 
-	ref, err := tref.ParseInPackage(s, cwp)
-	if err != nil {
-		return nil, fmt.Errorf("target: %w", err)
-	}
-
-	return ref, nil
+type parseMatcherArgs struct {
+	cmdName string
 }
 
-func parseMatcherCobraArgs() cobra.PositionalArgs {
-	return cobra.RangeArgs(1, 2)
+func (r parseMatcherArgs) Use() string {
+	return fmt.Sprintf("%v {<label> <package-matcher> | <target-addr>}", r.cmdName)
 }
 
-func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {
+func (r parseMatcherArgs) hint() string {
+	return fmt.Sprintf("must be `%[1]v <label> <package-matcher>` or `%[1]v <target-addr>`", r.cmdName)
+}
+
+func (r parseMatcherArgs) Args() cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		switch len(args) {
+		case 1, 2:
+			return nil
+		default:
+			return errors.New(r.hint())
+		}
+	}
+}
+
+func (r parseMatcherArgs) ValidArgsFunction() ValidArgsFunction {
+	return nil // TODO
+}
+
+func (r parseMatcherArgs) Parse(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {
 	switch len(args) {
 	case 1:
 		// TODO: complicated expression with `-e` flag
 
 		if args[0] == "-" {
-			return parseMatcherFromStdin(cwd, root)
+			return r.parseMatcherFromStdin(cwd, root)
 		}
 
 		ref, err := parseTargetRef(args[0], cwd, root)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", err, r.hint())
 		}
 
 		return tmatch.Ref(ref), nil
@@ -68,7 +78,7 @@ func parseMatcher(args []string, cwd, root string) (*pluginv1.TargetMatcher, err
 	}
 }
 
-func parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
+func (r parseMatcherArgs) parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
 	var matchers []*pluginv1.TargetMatcher
 
 	sc := bufio.NewScanner(os.Stdin)
@@ -93,7 +103,7 @@ func parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
 	return tmatch.Or(matchers...), nil
 }
 
-func parseMatcherResolve(
+func (r parseMatcherArgs) ParseResolve(
 	ctx context.Context,
 	e *engine.Engine,
 	rs *engine.RequestState,
@@ -101,7 +111,7 @@ func parseMatcherResolve(
 	cwd,
 	root string,
 ) (*pluginv1.TargetMatcher, *pluginv1.TargetRef, error) {
-	matcher, err := parseMatcher(args, cwd, root)
+	matcher, err := r.Parse(args, cwd, root)
 	if err != nil {
 		return nil, nil, err
 	}

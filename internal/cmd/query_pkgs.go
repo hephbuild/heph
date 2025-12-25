@@ -11,7 +11,7 @@ import (
 
 func init() {
 	cmd := &cobra.Command{
-		Use:     "packages",
+		Use:     "packages <package-matcher>",
 		Aliases: []string{"pkgs"},
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

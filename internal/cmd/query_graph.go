@@ -17,7 +17,7 @@ func init() {
 	var scope string
 
 	cmd := &cobra.Command{
-		Use:  "graph [descendants|ancestors] target",
+		Use:  "graph [ dependees | deps ] <target-addr>",
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()

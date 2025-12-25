@@ -19,10 +19,13 @@ func init() {
 	var force bool
 	var ignore []string
 
+	cmdArgs := parseMatcherArgs{cmdName: "run"}
+
 	var runCmd = &cobra.Command{
-		Use:     "run",
-		Aliases: []string{"r"},
-		Args:    parseMatcherCobraArgs(),
+		Use:               cmdArgs.Use(),
+		Aliases:           []string{"r"},
+		Args:              cmdArgs.Args(),
+		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -74,7 +77,7 @@ func init() {
 					}
 				}
 
-				matcher, matcherRef, err := parseMatcherResolve(ctx, e, rs, args, cwd, root)
+				matcher, matcherRef, err := cmdArgs.ParseResolve(ctx, e, rs, args, cwd, root)
 				if err != nil {
 					return err
 				}
