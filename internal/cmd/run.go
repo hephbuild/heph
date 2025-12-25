@@ -21,7 +21,7 @@ func init() {
 
 	cmdArgs := parseTargetMatcherArgs{cmdName: "run"}
 
-	var runCmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
 		Aliases:           []string{"r"},
 		Args:              cmdArgs.Args(),
@@ -151,9 +151,9 @@ func init() {
 		},
 	}
 
-	runCmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
-	runCmd.Flags().AddFlag(NewBoolStrFlag(&shell, "shell", "", "shell into target"))
-	runCmd.Flags().BoolVarP(&force, "force", "", false, "force running")
+	cmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
+	cmd.Flags().AddFlag(NewBoolStrFlag(&shell, "shell", "", "shell into target"))
+	cmd.Flags().BoolVarP(&force, "force", "", false, "force running")
 
-	rootCmd.AddCommand(runCmd)
+	rootCmd.AddCommand(cmd)
 }

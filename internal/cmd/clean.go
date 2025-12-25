@@ -12,14 +12,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var cleanCmd *cobra.Command
-
 func init() {
 	var ignore []string
 
 	cmdArgs := parseTargetMatcherArgs{cmdName: "clean"}
 
-	cleanCmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
@@ -92,7 +90,7 @@ func init() {
 		},
 	}
 
-	cleanCmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
+	cmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
 
-	rootCmd.AddCommand(cleanCmd)
+	rootCmd.AddCommand(cmd)
 }
