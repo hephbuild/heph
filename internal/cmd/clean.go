@@ -17,7 +17,7 @@ var cleanCmd *cobra.Command
 func init() {
 	var ignore []string
 
-	cmdArgs := parseMatcherArgs{cmdName: "clean"}
+	cmdArgs := parseTargetMatcherArgs{cmdName: "clean"}
 
 	cleanCmd = &cobra.Command{
 		Use:               cmdArgs.Use(),

@@ -19,7 +19,7 @@ func init() {
 	var force bool
 	var ignore []string
 
-	cmdArgs := parseMatcherArgs{cmdName: "run"}
+	cmdArgs := parseTargetMatcherArgs{cmdName: "run"}
 
 	var runCmd = &cobra.Command{
 		Use:               cmdArgs.Use(),

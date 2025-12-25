@@ -35,7 +35,7 @@ var queryCmd *cobra.Command
 func init() {
 	var ignore []string
 
-	cmdArgs := parseMatcherArgs{cmdName: "query"}
+	cmdArgs := parseTargetMatcherArgs{cmdName: "query"}
 
 	queryCmd = &cobra.Command{
 		Use:               cmdArgs.Use(),

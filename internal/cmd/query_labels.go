@@ -9,7 +9,7 @@ import (
 )
 
 func init() {
-	cmdArgs := parsePackageMatcherArgs{cmdName: "validate"}
+	cmdArgs := parsePackageMatcherArgs{cmdName: "labels"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
@@ -31,7 +31,7 @@ func init() {
 				return err
 			}
 
-			pkgMatcher, err := cmdArgs.Parse(args, cwd, root)
+			matcher, err := cmdArgs.Parse(args, cwd, root)
 			if err != nil {
 				return err
 			}
@@ -45,9 +45,19 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				err = e.Validate(ctx, rs, pkgMatcher)
-				if err != nil {
-					return err
+				queue, flushResults := renderResults(ctx, execFunc)
+				defer flushResults()
+
+				for label, err := range e.Labels(ctx, rs, matcher) {
+					if err != nil {
+						return err
+					}
+
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+
+					queue(label)
 				}
 
 				return nil
@@ -60,5 +70,5 @@ func init() {
 		},
 	}
 
-	rootCmd.AddCommand(cmd)
+	queryCmd.AddCommand(cmd)
 }

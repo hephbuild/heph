@@ -7,6 +7,7 @@ import (
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -190,4 +191,34 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 
 func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[*pluginv1.TargetRef, error] {
 	return e.query(ctx, rs, matcher, queryOptions{})
+}
+
+func (e *Engine) Labels(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		m := map[string]htypes.Void{}
+
+		for ref, err := range e.query(ctx, rs, matcher, queryOptions{}) {
+			if err != nil {
+				yield("", err)
+				return
+			}
+
+			spec, err := e.GetSpec(ctx, rs, SpecContainer{Ref: ref})
+			if err != nil {
+				yield("", err)
+				return
+			}
+
+			for _, label := range spec.GetLabels() {
+				if _, ok := m[label]; ok {
+					continue
+				}
+				m[label] = htypes.Void{}
+
+				if !yield(label, nil) {
+					return
+				}
+			}
+		}
+	}
 }

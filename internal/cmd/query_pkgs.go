@@ -3,17 +3,18 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/hephbuild/heph/internal/tmatch"
-
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/spf13/cobra"
 )
 
 func init() {
+	cmdArgs := parsePackageMatcherArgs{cmdName: "packages"}
+
 	cmd := &cobra.Command{
-		Use:     "packages <package-matcher>",
-		Aliases: []string{"pkgs"},
-		Args:    cobra.ExactArgs(1),
+		Use:               cmdArgs.Use(),
+		Aliases:           []string{"pkgs"},
+		Args:              cmdArgs.Args(),
+		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -35,7 +36,7 @@ func init() {
 				return err
 			}
 
-			pkgMatcher, err := tmatch.ParsePackageMatcher(args[0], cwd, root)
+			pkgMatcher, err := cmdArgs.Parse(args, cwd, root)
 			if err != nil {
 				return err
 			}

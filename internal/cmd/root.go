@@ -30,6 +30,7 @@ import (
 
 var plain bool
 var debug bool
+var quiet bool
 var pprofCpuPath string
 var pprofMemPath string
 var pprofGoroutinePath string
@@ -79,7 +80,11 @@ var rootCmd = &cobra.Command{
 			hlocks.StopGlobalMutexGC()
 		})
 
-		if !debug {
+		if quiet {
+			levelVar.Set(slog.LevelError)
+		} else if debug {
+			levelVar.Set(slog.LevelDebug)
+		} else {
 			levelVar.Set(slog.LevelInfo)
 		}
 
@@ -253,6 +258,7 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
+	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "set log level to error")
 
 	rootCmd.PersistentFlags().AddFlag(NewBoolStrFlag(&pprofServer, "pprof-http", "", "Start pprof server"))
 	rootCmd.PersistentFlags().StringVar(&pprofCpuPath, "pprof-cpu", "", "CPU Profile output file")

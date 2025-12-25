@@ -16,19 +16,19 @@ import (
 
 type ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective)
 
-type parseMatcherArgs struct {
+type parseTargetMatcherArgs struct {
 	cmdName string
 }
 
-func (r parseMatcherArgs) Use() string {
+func (r parseTargetMatcherArgs) Use() string {
 	return fmt.Sprintf("%v {<label> <package-matcher> | <target-addr>}", r.cmdName)
 }
 
-func (r parseMatcherArgs) hint() string {
+func (r parseTargetMatcherArgs) hint() string {
 	return fmt.Sprintf("must be `%[1]v <label> <package-matcher>` or `%[1]v <target-addr>`", r.cmdName)
 }
 
-func (r parseMatcherArgs) Args() cobra.PositionalArgs {
+func (r parseTargetMatcherArgs) Args() cobra.PositionalArgs {
 	return func(cmd *cobra.Command, args []string) error {
 		switch len(args) {
 		case 1, 2:
@@ -39,11 +39,11 @@ func (r parseMatcherArgs) Args() cobra.PositionalArgs {
 	}
 }
 
-func (r parseMatcherArgs) ValidArgsFunction() ValidArgsFunction {
+func (r parseTargetMatcherArgs) ValidArgsFunction() ValidArgsFunction {
 	return nil // TODO
 }
 
-func (r parseMatcherArgs) Parse(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {
+func (r parseTargetMatcherArgs) Parse(args []string, cwd, root string) (*pluginv1.TargetMatcher, error) {
 	switch len(args) {
 	case 1:
 		// TODO: complicated expression with `-e` flag
@@ -78,7 +78,7 @@ func (r parseMatcherArgs) Parse(args []string, cwd, root string) (*pluginv1.Targ
 	}
 }
 
-func (r parseMatcherArgs) parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
+func (r parseTargetMatcherArgs) parseMatcherFromStdin(cwd, root string) (*pluginv1.TargetMatcher, error) {
 	var matchers []*pluginv1.TargetMatcher
 
 	sc := bufio.NewScanner(os.Stdin)
@@ -103,7 +103,7 @@ func (r parseMatcherArgs) parseMatcherFromStdin(cwd, root string) (*pluginv1.Tar
 	return tmatch.Or(matchers...), nil
 }
 
-func (r parseMatcherArgs) ParseResolve(
+func (r parseTargetMatcherArgs) ParseResolve(
 	ctx context.Context,
 	e *engine.Engine,
 	rs *engine.RequestState,
