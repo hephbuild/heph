@@ -344,11 +344,13 @@ func ApplyTransitiveExecv1(ref *pluginv1.TargetRef, sandbox *pluginv1.Sandbox, e
 		b := execv1.Target_Env_builder{
 			Hash: htypes.Ptr(envSpec.GetHash()),
 		}
-		switch {
-		case envSpec.HasLiteral():
+		switch envSpec.WhichValue() {
+		case pluginv1.Sandbox_Env_Literal_case:
 			b.Literal = htypes.Ptr(envSpec.GetLiteral())
-		case envSpec.HasPass():
+		case pluginv1.Sandbox_Env_Pass_case:
 			b.Pass = htypes.Ptr(envSpec.GetPass())
+		default:
+			return nil, nil, fmt.Errorf("invalid env spec: %v", envSpec.WhichValue())
 		}
 
 		env[key] = b.Build()

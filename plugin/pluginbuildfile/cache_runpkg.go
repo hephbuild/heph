@@ -17,18 +17,14 @@ type CacheRunpkgEntry struct {
 	providerStates []OnProviderStatePayload
 }
 
-func (c *CacheRunpkg) key(pkg string) string {
-	return pkg
-}
-
 func (c *CacheRunpkg) Singleflight(
 	ctx context.Context,
-	pkg string,
+	key string,
 	onTarget onTargetFunc,
 	onProviderState onProviderStateFunc,
 	f func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error),
 ) (starlark.StringDict, error) {
-	v, err, _ := c.sf.Do(ctx, c.key(pkg), func(ctx context.Context) (CacheRunpkgEntry, error) {
+	v, err, _ := c.sf.Do(ctx, key, func(ctx context.Context) (CacheRunpkgEntry, error) {
 		var payloads []OnTargetPayload
 		onTarget := func(ctx context.Context, payload OnTargetPayload) error {
 			payloads = append(payloads, payload)
@@ -54,6 +50,9 @@ func (c *CacheRunpkg) Singleflight(
 			providerStates: providerStates,
 		}, nil
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	if onTarget != nil {
 		for _, payload := range v.payloads {
@@ -73,5 +72,5 @@ func (c *CacheRunpkg) Singleflight(
 		}
 	}
 
-	return v.dict, err
+	return v.dict, nil
 }

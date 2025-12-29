@@ -484,7 +484,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 	}.Build())
 	if err != nil {
 		if strings.Contains(err.Error(), "build constraints exclude all Go files") {
-			return nil, nil, errConstraintExcludeAllGoFiles
+			return nil, nil, fmt.Errorf("%w: %w", errConstraintExcludeAllGoFiles, err)
 		}
 
 		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)

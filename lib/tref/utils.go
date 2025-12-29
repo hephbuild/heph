@@ -114,7 +114,7 @@ func WithoutOut(ref *pluginv1.TargetRefWithOutput) *pluginv1.TargetRef {
 	return ref.GetTarget()
 }
 
-var OmitHashPb = map[string]struct{} {
-	string((&pluginv1.TargetRefWithOutput{}).ProtoReflect().Descriptor().Name())+".hash": {},
-	string((&pluginv1.TargetRef{}).ProtoReflect().Descriptor().Name())+".hash": {},
+var OmitHashPb = map[string]struct{}{
+	string((&pluginv1.TargetRefWithOutput{}).ProtoReflect().Descriptor().Name()) + ".hash": {},
+	string((&pluginv1.TargetRef{}).ProtoReflect().Descriptor().Name()) + ".hash":           {},
 }

@@ -458,7 +458,7 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			return nil, fmt.Errorf("collect transitive: %w", err)
 		}
 
-		if !sandboxSpecEmpty(allTransitive) {
+		if spec.GetDriver() != plugingroup.Name && !sandboxSpecEmpty(allTransitive) {
 			res, err := driver.ApplyTransitive(ctx, pluginv1.ApplyTransitiveRequest_builder{
 				RequestId:  htypes.Ptr(rs.ID),
 				Target:     def,
@@ -515,23 +515,34 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 	sb := &pluginv1.Sandbox{}
 
 	for i, input := range inputs {
-		inputRef := tref.WithoutOut(input.GetRef())
-
-		spec, err := e.getSpec(ctx, rs, SpecContainer{Ref: inputRef})
+		spec, err := e.getSpec(ctx, rs, SpecContainer{Ref: tref.WithoutOut(input.GetRef())})
 		if err != nil {
 			return nil, err
 		}
 
-		if sandboxSpecEmpty(spec.GetTransitive()) {
+		transitive := spec.GetTransitive()
+		if spec.GetDriver() == plugingroup.Name {
+			def, err := e.GetDef(ctx, rs, DefContainer{Spec: spec})
+			if err != nil {
+				return nil, err
+			}
+
+			if !sandboxSpecEmpty(def.AppliedTransitive) {
+				transitive = hproto.Clone(transitive)
+				mergeSandbox(transitive, def.AppliedTransitive, "group")
+			}
+		}
+
+		if sandboxSpecEmpty(transitive) {
 			continue
 		}
 
 		h := xxh3.New()
-		hashpb.Hash(h, inputRef, tref.OmitHashPb)
+		hashpb.Hash(h, spec.GetRef(), tref.OmitHashPb)
 
 		id := fmt.Sprintf("_transitive_%s_%v", hex.EncodeToString(h.Sum(nil)), i)
 
-		mergeSandbox(sb, spec.GetTransitive(), id)
+		mergeSandbox(sb, transitive, id)
 	}
 
 	slices.SortFunc(sb.GetDeps(), func(a, b *pluginv1.Sandbox_Dep) int {

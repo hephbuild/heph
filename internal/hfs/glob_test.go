@@ -194,4 +194,31 @@ func TestGlobStrictDirSuccess2(t *testing.T) {
 	}, get())
 }
 
-
+func TestIsGlob(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    bool
+	}{
+		{`file`, false},
+		{`**/*`, true},
+		{`test/**/*`, true},
+		{`file*`, true},
+		{`file?`, true},
+		{`file[a-z]`, true},
+		{`file{a,b}`, true},
+		{`file\*`, false},
+		{`file\?`, false},
+		{`file\[a-z]`, false},
+		{`file\{a,b}`, false},
+		{`*`, true},
+		{`?`, true},
+		{`[`, true},
+		{`{`, true},
+		{`\*`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			assert.Equal(t, tt.want, hfs.IsGlob(tt.pattern))
+		})
+	}
+}

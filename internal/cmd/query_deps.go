@@ -12,7 +12,7 @@ import (
 )
 
 func init() {
-	cmdArgs := parseRefArgs{cmdName: "def"}
+	cmdArgs := parseRefArgs{cmdName: "deps"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),

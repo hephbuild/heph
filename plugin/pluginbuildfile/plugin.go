@@ -161,11 +161,13 @@ type TargetSpec struct {
 }
 
 type TransitiveSpec struct {
-	Tools hstarlark.List[string]
+	Tools          hstarlark.List[string]
+	PassEnv        hstarlark.List[string]
+	RuntimePassEnv hstarlark.List[string]
 }
 
 func (ts *TransitiveSpec) Empty() bool {
-	return len(ts.Tools) == 0
+	return len(ts.Tools) == 0 && len(ts.PassEnv) == 0 && len(ts.RuntimePassEnv) == 0
 }
 
 func (c *TransitiveSpec) Unpack(v starlark.Value) error {
@@ -181,6 +183,8 @@ func (c *TransitiveSpec) Unpack(v starlark.Value) error {
 	var cs TransitiveSpec
 	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
 		"tools?", &cs.Tools,
+		"pass_env?", &cs.PassEnv,
+		"runtime_pass_env?", &cs.RuntimePassEnv,
 	)
 	if err != nil {
 		return err
@@ -200,7 +204,7 @@ type BuiltinFunc = func(
 	kwargs []starlark.Tuple,
 ) (starlark.Value, error)
 
-func (p *Plugin) glob() BuiltinFunc {
+func (p *Plugin) file(name string) BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
 		fn *starlark.Builtin,
@@ -211,7 +215,7 @@ func (p *Plugin) glob() BuiltinFunc {
 
 		var pattern string
 		if err := starlark.UnpackArgs(
-			"glob", args, kwargs,
+			name, args, kwargs,
 			"pattern", &pattern,
 		); err != nil {
 			return nil, err
@@ -219,19 +223,24 @@ func (p *Plugin) glob() BuiltinFunc {
 
 		base, pattern := hfs.GlobSplit(pattern)
 
+		if strings.HasPrefix(base, "/") {
+			return starlark.String(tref.FormatFile(base, pattern)), nil
+		}
+
 		return starlark.String(tref.FormatFile(tref.JoinPackage(pkg, base), pattern)), nil
 	}
 }
 
-func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
+func (p *Plugin) builtinTarget() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
 		fn *starlark.Builtin,
 		args starlark.Tuple,
 		kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		ctx := thread.Local(ctxKey).(context.Context) //nolint:errcheck
-		pkg := thread.Local(packageKey).(string)      //nolint:errcheck
+		ctx := thread.Local(ctxKey).(context.Context)        //nolint:errcheck
+		pkg := thread.Local(packageKey).(string)             //nolint:errcheck
+		onTarget := thread.Local(onTargetKey).(onTargetFunc) //nolint:errcheck
 
 		var fkwargs []starlark.Tuple
 		var otherkwargs = map[string]starlark.Value{}
@@ -281,8 +290,7 @@ func (p *Plugin) builtinTarget(onTarget onTargetFunc) BuiltinFunc {
 			return nil, err
 		}
 
-		// TODO: addr
-		return starlark.String("//" + pkg + ":" + payload.Name), nil
+		return starlark.String(tref.Format(tref.New(pkg, payload.Name, nil))), nil
 	}
 }
 
@@ -294,15 +302,16 @@ type OnProviderStatePayload struct {
 
 type onProviderStateFunc = func(ctx context.Context, payload OnProviderStatePayload) error
 
-func (p *Plugin) builtinProviderState(onState onProviderStateFunc) BuiltinFunc {
+func (p *Plugin) builtinProviderState() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
 		fn *starlark.Builtin,
 		args starlark.Tuple,
 		kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		ctx := thread.Local(ctxKey).(context.Context) //nolint:errcheck
-		pkg := thread.Local(packageKey).(string)      //nolint:errcheck
+		ctx := thread.Local(ctxKey).(context.Context)                     //nolint:errcheck
+		pkg := thread.Local(packageKey).(string)                          //nolint:errcheck
+		onState := thread.Local(onProviderStateKey).(onProviderStateFunc) //nolint:errcheck
 
 		var fkwargs []starlark.Tuple
 		var otherkwargs = map[string]starlark.Value{}
@@ -342,11 +351,19 @@ func (p *Plugin) builtinProviderState(onState onProviderStateFunc) BuiltinFunc {
 }
 
 const (
-	ctxKey     = "__heph_ctx"
-	packageKey = "__heph_pkg"
+	ctxKey             = "__heph_ctx"
+	packageKey         = "__heph_pkg"
+	onTargetKey        = "__heph_on_target"
+	onProviderStateKey = "__heph_on_provider_state"
 )
 
 func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, file.Name(), onTarget, onProviderState, func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+		return p.runFileInner(ctx, pkg, file, onTarget, onProviderState)
+	})
+}
+
+func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
 	if onTarget == nil {
 		onTarget = func(ctx context.Context, payload OnTargetPayload) error {
 			return nil
@@ -358,10 +375,11 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 		}
 	}
 	universe := starlark.StringDict{
-		"target":         starlark.NewBuiltin("target", p.builtinTarget(onTarget)),
+		"target":         starlark.NewBuiltin("target", p.builtinTarget()),
 		"struct":         starlark.NewBuiltin("struct", starlarkstruct.Make),
-		"glob":           starlark.NewBuiltin("target", p.glob()),
-		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState(onProviderState)),
+		"glob":           starlark.NewBuiltin("glob", p.file("glob")),
+		"file":           starlark.NewBuiltin("file", p.file("file")),
+		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState()),
 	}
 	prog, err := p.buildFile(ctx, file, universe)
 	if err != nil {
@@ -377,7 +395,7 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 			case strings.HasPrefix(module, "//"):
 				rest, _ := strings.CutPrefix(module, "//")
 
-				res, err := p.runPkg(ctx, rest, nil, nil)
+				res, err := p.runPkg(ctx, rest, onTarget, onProviderState)
 				if err != nil {
 					return nil, fmt.Errorf("%v: %w", module, err)
 				}
@@ -392,6 +410,8 @@ func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarge
 	}
 	thread.SetLocal(ctxKey, ctx)
 	thread.SetLocal(packageKey, pkg)
+	thread.SetLocal(onTargetKey, onTarget)
+	thread.SetLocal(onProviderStateKey, onProviderState)
 
 	res, err := prog.Init(thread, universe)
 	if err != nil {
@@ -454,7 +474,9 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 
 	var transitive *pluginv1.Sandbox
 	if !payload.Transitive.Empty() {
-		transitiveBuilder := pluginv1.Sandbox_builder{}
+		transitiveBuilder := pluginv1.Sandbox_builder{
+			Env: make(map[string]*pluginv1.Sandbox_Env),
+		}
 
 		for _, tool := range payload.Transitive.Tools {
 			ref, err := tref.ParseWithOut(tool)
@@ -466,6 +488,20 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 				Ref:  ref,
 				Hash: htypes.Ptr(true),
 			}.Build())
+		}
+
+		for _, env := range payload.Transitive.PassEnv {
+			transitiveBuilder.Env[env] = pluginv1.Sandbox_Env_builder{
+				Pass: htypes.Ptr(true),
+				Hash: htypes.Ptr(true),
+			}.Build()
+		}
+
+		for _, env := range payload.Transitive.RuntimePassEnv {
+			transitiveBuilder.Env[env] = pluginv1.Sandbox_Env_builder{
+				Pass: htypes.Ptr(true),
+				Hash: htypes.Ptr(false),
+			}.Build()
 		}
 
 		transitive = transitiveBuilder.Build()

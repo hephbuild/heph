@@ -186,6 +186,10 @@ func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntr
 		return nil
 	}
 
+	if d.Type() == iofs.ModeSymlink { // TODO: skip symlinks for now
+		return nil
+	}
+
 	skip, err := PathMatchAny(path, ignore...)
 	if err != nil {
 		return err

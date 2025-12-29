@@ -86,3 +86,45 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, []any{"hello"}, res.GetSpec().GetConfig()["run"].GetListValue().AsSlice())
 	}
 }
+
+func TestLoadFunc(t *testing.T) {
+	ctx := t.Context()
+
+	fs := hfstest.New(t)
+
+	err := hfs.WriteFile(fs, "some/BUILD", []byte(`load("//some/deep", "mytarget"); mytarget()`), os.ModePerm)
+	require.NoError(t, err)
+
+	err = hfs.WriteFile(fs, "some/deep/BUILD", []byte(`
+def mytarget():
+	target(name="hello", driver="exec", run=["hello"])
+`), os.ModePerm)
+	require.NoError(t, err)
+
+	p := New(fs, Options{Patterns: []string{"BUILD"}})
+
+	var ref *pluginv1.TargetRef
+	{
+		res, err := p.List(ctx, pluginv1.ListRequest_builder{
+			Package: htypes.Ptr("some"),
+		}.Build())
+		require.NoError(t, err)
+
+		require.True(t, res.Receive())
+		require.NoError(t, res.Err())
+		spec := res.Msg().GetSpec()
+		ref = spec.GetRef()
+
+		assert.Equal(t, "some", ref.GetPackage())
+		assert.Equal(t, "hello", ref.GetName())
+	}
+
+	{
+		res, err := p.Get(ctx, pluginv1.GetRequest_builder{
+			Ref: ref,
+		}.Build())
+		require.NoError(t, err)
+
+		assert.Equal(t, []any{"hello"}, res.GetSpec().GetConfig()["run"].GetListValue().AsSlice())
+	}
+}

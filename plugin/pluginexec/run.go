@@ -355,7 +355,6 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 		}
 	}
 
-	requireSingleValue := map[string]struct{}{}
 	for _, tool := range t.GetTools() {
 		id := tool.GetId()
 
@@ -370,7 +369,6 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 			envName := getEnvName("TOOL", tool.GetGroup(), outputName)
 
 			m[envName] = append(m[envName], artifact)
-			requireSingleValue[envName] = struct{}{}
 		}
 	}
 
@@ -426,10 +424,6 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				_, _ = fmt.Fprintf(listf, "%s\n", line)
 
 				if envSb.Len() > 0 {
-					if _, ok := requireSingleValue[name]; ok {
-						return nil, fmt.Errorf("tool require a single output %q", name)
-					}
-
 					envSb.WriteString(" ")
 				}
 
@@ -445,6 +439,8 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 
 			_ = r.Close()
 		}
+
+		_ = listf.Close()
 
 		env = append(env, getEnvEntryWithName(name, envSb.String()))
 		env = append(env, getEnvEntryWithName(name+"_LIST", listf.Name()))

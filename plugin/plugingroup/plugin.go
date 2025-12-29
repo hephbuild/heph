@@ -79,11 +79,11 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 }
 
 func (p Plugin) Run(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
-	panic("should not be called") // custom handling in engine
+	panic("group: run should not be called") // custom handling in engine
 }
 
 func (p Plugin) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
-	panic("should not be called") // custom handling in engine
+	panic("group: apply transitive should not be called") // custom handling in engine
 }
 
 func New() *Plugin {

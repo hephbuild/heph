@@ -1,12 +1,13 @@
 package hfs
 
 import (
-	sync_map "github.com/zolstein/sync-map"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+
+	sync_map "github.com/zolstein/sync-map"
 )
 
 type CachedEntry struct {
@@ -98,7 +99,7 @@ func (c *FSCache) walkRecursive(node *Node, fn fs.WalkDirFunc) error {
 		}
 
 		// Hydrate children into cache
-		node.Children = make([]*Node, 0, len(entries))
+		children := make([]*Node, 0, len(entries))
 		for _, e := range entries {
 			childPath := filepath.Join(node.Path, e.Name())
 
@@ -120,14 +121,15 @@ func (c *FSCache) walkRecursive(node *Node, fn fs.WalkDirFunc) error {
 				c.nodes.Store(childPath, childNode)
 			}
 
-			node.Children = append(node.Children, childNode)
+			children = append(children, childNode)
 		}
 
 		// Sort to maintain deterministic order
-		slices.SortFunc(node.Children, func(i, j *Node) int {
+		slices.SortFunc(children, func(i, j *Node) int {
 			return strings.Compare(i.Entry.Name(), j.Entry.Name())
 		})
 
+		node.Children = children // set to nodes once its immutable, for safe concurrency
 		node.scanned = true
 	}
 
