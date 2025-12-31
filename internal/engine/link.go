@@ -517,14 +517,14 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 	for i, input := range inputs {
 		spec, err := e.getSpec(ctx, rs, SpecContainer{Ref: tref.WithoutOut(input.GetRef())})
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("get spec %v: %w", tref.FormatOut(input.GetRef()), err)
 		}
 
 		transitive := spec.GetTransitive()
 		if spec.GetDriver() == plugingroup.Name {
 			def, err := e.GetDef(ctx, rs, DefContainer{Spec: spec})
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("get def %v: %w", tref.FormatOut(input.GetRef()), err)
 			}
 
 			if !sandboxSpecEmpty(def.AppliedTransitive) {

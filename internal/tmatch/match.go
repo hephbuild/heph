@@ -2,6 +2,7 @@ package tmatch
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"iter"
 	"path/filepath"
@@ -138,6 +139,19 @@ func (r Result) Definitive() bool {
 	}
 
 	return r != MatchShrug
+}
+
+func (r Result) String() string {
+	switch r {
+	case MatchYes:
+		return "yes"
+	case MatchNo:
+		return "no"
+	case MatchShrug:
+		return "shrug"
+	default:
+		return fmt.Sprintf("<unknown %v>", int(r))
+	}
 }
 
 func boolToResult(b bool) Result {
@@ -302,7 +316,7 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 			}
 
 			for _, path := range out.GetPaths() {
-				if path.GetCodegenTree() != pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
 					continue
 				}
 

@@ -3,9 +3,12 @@ package tmatch
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/stretchr/testify/assert"
 
@@ -39,7 +42,7 @@ func TestParsePackageMatcher(t *testing.T) {
 	}
 }
 
-func TestMatchPackageCodegen(t *testing.T) {
+func TestMatchCodegenPackage(t *testing.T) {
 	tests := []struct {
 		pkg        string
 		codegenPkg string
@@ -64,6 +67,64 @@ func TestMatchPackageCodegen(t *testing.T) {
 			)
 
 			require.Equal(t, test.expected, res)
+		})
+	}
+}
+
+func TestMatchCodegenPackageDef(t *testing.T) {
+	tests := []struct {
+		pkg        string
+		codegenPkg string
+		outPath    string
+		expected   Result
+	}{
+		{"foo/bar", "foo/bar", "file.txt", MatchYes},
+		{"foo/bar", "foo/bar", "./", MatchYes},
+		{"foo/bar", "foo/bar", "*.txt", MatchYes},
+		{"foo/bar", "foo/bar", "some/*.txt", MatchNo},
+		{"foo/bar", "foo/bar", "some/*/file.txt", MatchYes},
+		{"foo", "foo/bar", "file.txt", MatchNo},
+		{"foo", "foo/bar", "bar/file.txt", MatchYes},
+		{"foo", "foo/bar", "bar/", MatchYes},
+		{"", "foo/bar", "file.txt", MatchNo},
+		{"", "foo/bar", "foo/bar/file.txt", MatchYes},
+		{"foo/bar/baz", "foo/bar", "file.txt", MatchNo},
+		{"unrelated/bar", "foo/bar", "file.txt", MatchNo},
+	}
+	for _, test := range tests {
+		t.Run("MatchSpec "+test.pkg+" "+test.codegenPkg+" "+test.outPath, func(t *testing.T) {
+			ref := tref.New(test.pkg, "foo", nil)
+
+			outPath := pluginv1.TargetDef_Output_Path_builder{
+				FilePath:    nil,
+				DirPath:     nil,
+				Glob:        nil,
+				CodegenTree: htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_COPY),
+			}
+			if hfs.IsGlob(test.outPath) {
+				outPath.Glob = htypes.Ptr(test.outPath)
+			} else if strings.HasSuffix(test.outPath, "/") {
+				outPath.DirPath = htypes.Ptr(test.outPath)
+			} else {
+				outPath.FilePath = htypes.Ptr(test.outPath)
+			}
+
+			res := MatchDef(
+				pluginv1.TargetSpec_builder{Ref: ref}.Build(),
+				pluginv1.TargetDef_builder{
+					Ref: ref,
+					Outputs: []*pluginv1.TargetDef_Output{
+						pluginv1.TargetDef_Output_builder{
+							Paths: []*pluginv1.TargetDef_Output_Path{
+								outPath.Build(),
+							},
+						}.Build(),
+					},
+				}.Build(),
+				pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(test.codegenPkg)}.Build(),
+			)
+
+			require.Equal(t, test.expected.String(), res.String())
 		})
 	}
 }
