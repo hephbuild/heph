@@ -1,12 +1,14 @@
 package tmatch
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hslices"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -235,5 +237,155 @@ func TestLongestCommonPath(t *testing.T) {
 			assert.Equal(t, test.expectedOk, ok)
 			assert.Equal(t, test.expectedPath, path)
 		})
+	}
+}
+
+func testMatch(m *pluginv1.TargetMatcher) Result {
+	switch m.WhichItem() {
+	case pluginv1.TargetMatcher_Label_case:
+		switch m.GetLabel() {
+		case "yes":
+			return MatchYes
+		case "no":
+			return MatchNo
+		case "shrug":
+			return MatchShrug
+		default:
+			panic("unhandled")
+		}
+	case pluginv1.TargetMatcher_Not_case:
+		return runNot(m, testMatch)
+	case pluginv1.TargetMatcher_Or_case:
+		return runOr(m, testMatch)
+	case pluginv1.TargetMatcher_And_case:
+		return runAnd(m, testMatch)
+	default:
+		panic("unhandled")
+	}
+}
+
+func TestNot(t *testing.T) {
+	tests := []struct {
+		in       string
+		expected Result
+	}{
+		{"yes", MatchNo},
+		{"no", MatchYes},
+		{"shrug", MatchShrug},
+	}
+	for _, test := range tests {
+		t.Run(test.in, func(t *testing.T) {
+			res := testMatch(Not(Label(test.in)))
+
+			require.Equal(t, test.expected.String(), res.String())
+		})
+	}
+}
+
+func TestOr(t *testing.T) {
+	tests := []struct {
+		values   []string
+		expected Result
+	}{
+		{[]string{}, MatchNo},
+		{[]string{"yes"}, MatchYes},
+		{[]string{"no"}, MatchNo},
+		{[]string{"yes", "no"}, MatchYes},
+		{[]string{"yes", "shrug"}, MatchYes},
+		{[]string{"no", "shrug"}, MatchShrug},
+		{[]string{"yes", "no", "shrug"}, MatchYes},
+	}
+	for _, test := range tests {
+		for values := range hslices.Permute(test.values) {
+			t.Run(fmt.Sprintf("%v", values), func(t *testing.T) {
+				var items []*pluginv1.TargetMatcher
+				for _, value := range values {
+					items = append(items, Label(value))
+				}
+
+				// have to manually construct to bypass the auto inlining
+				m := pluginv1.TargetMatcher_builder{Or: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()
+
+				res := testMatch(m)
+
+				assert.Equal(t, test.expected.String(), res.String())
+
+				expectedNot := runNot(nil, func(m *pluginv1.TargetMatcher) Result {
+					return test.expected
+				})
+
+				t.Run("not factorized", func(t *testing.T) {
+					res := testMatch(Not(m))
+
+					assert.Equal(t, expectedNot.String(), res.String())
+				})
+
+				t.Run("not distributed", func(t *testing.T) {
+					var items []*pluginv1.TargetMatcher
+					for _, value := range values {
+						items = append(items, Not(Label(value)))
+					}
+					m := pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()
+
+					res := testMatch(m)
+
+					assert.Equal(t, expectedNot.String(), res.String())
+				})
+			})
+		}
+	}
+}
+
+func TestAnd(t *testing.T) {
+	tests := []struct {
+		values   []string
+		expected Result
+	}{
+		{[]string{}, MatchYes},
+		{[]string{"yes"}, MatchYes},
+		{[]string{"no"}, MatchNo},
+		{[]string{"yes", "no"}, MatchNo},
+		{[]string{"yes", "shrug"}, MatchShrug},
+		{[]string{"no", "shrug"}, MatchNo},
+		{[]string{"yes", "no", "shrug"}, MatchNo},
+	}
+	for _, test := range tests {
+		for values := range hslices.Permute(test.values) {
+			t.Run(fmt.Sprintf("%v", values), func(t *testing.T) {
+				var items []*pluginv1.TargetMatcher
+				for _, value := range values {
+					items = append(items, Label(value))
+				}
+
+				// have to manually construct to bypass the auto inlining
+				m := pluginv1.TargetMatcher_builder{And: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()
+
+				res := testMatch(m)
+
+				assert.Equal(t, test.expected.String(), res.String())
+
+				expectedNot := runNot(nil, func(m *pluginv1.TargetMatcher) Result {
+					return test.expected
+				})
+
+				t.Run("not factorized", func(t *testing.T) {
+					res := testMatch(Not(m))
+
+					assert.Equal(t, expectedNot.String(), res.String())
+				})
+
+				t.Run("not distributed", func(t *testing.T) {
+					var items []*pluginv1.TargetMatcher
+					for _, value := range values {
+						items = append(items, Not(Label(value)))
+					}
+					m := pluginv1.TargetMatcher_builder{Or: pluginv1.TargetMatchers_builder{Items: items}.Build()}.Build()
+
+					res := testMatch(m)
+
+					assert.Equal(t, expectedNot.String(), res.String())
+				})
+			})
+		}
 	}
 }

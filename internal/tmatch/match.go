@@ -265,11 +265,11 @@ func runOr(m *pluginv1.TargetMatcher, fn func(m *pluginv1.TargetMatcher) Result)
 	for _, matcher := range m.GetOr().GetItems() {
 		switch fn(matcher) {
 		case MatchYes:
-			out = MatchYes
+			return MatchYes
 		case MatchNo:
 			// dont touch
 		case MatchShrug:
-			return MatchShrug
+			out = MatchShrug
 		default:
 			panic("unhandled result")
 		}
