@@ -153,50 +153,6 @@ type OnTargetPayload struct {
 	Args map[string]starlark.Value
 }
 
-type TargetSpec struct {
-	Name       string
-	Driver     string
-	Labels     hstarlark.List[string]
-	Transitive TransitiveSpec
-}
-
-type TransitiveSpec struct {
-	Tools          hstarlark.List[string]
-	PassEnv        hstarlark.List[string]
-	RuntimePassEnv hstarlark.List[string]
-}
-
-func (ts *TransitiveSpec) Empty() bool {
-	return len(ts.Tools) == 0 && len(ts.PassEnv) == 0 && len(ts.RuntimePassEnv) == 0
-}
-
-func (c *TransitiveSpec) Unpack(v starlark.Value) error {
-	if _, ok := v.(starlark.NoneType); ok {
-		return nil
-	}
-
-	d, err := hstarlark.UnpackDistruct(v)
-	if err != nil {
-		return err
-	}
-
-	var cs TransitiveSpec
-	err = starlark.UnpackArgs("", nil, d.Items().Tuples(),
-		"tools?", &cs.Tools,
-		"pass_env?", &cs.PassEnv,
-		"runtime_pass_env?", &cs.RuntimePassEnv,
-	)
-	if err != nil {
-		return err
-	}
-
-	*c = cs
-
-	return nil
-}
-
-type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
-
 type BuiltinFunc = func(
 	thread *starlark.Thread,
 	fn *starlark.Builtin,
@@ -211,7 +167,7 @@ func (p *Plugin) file(name string) BuiltinFunc {
 		args starlark.Tuple,
 		kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		pkg := thread.Local(packageKey).(string) //nolint:errcheck
+		execCtx := getExecContext(thread)
 
 		var pattern string
 		if err := starlark.UnpackArgs(
@@ -227,7 +183,7 @@ func (p *Plugin) file(name string) BuiltinFunc {
 			return starlark.String(tref.FormatFile(base, pattern)), nil
 		}
 
-		return starlark.String(tref.FormatFile(tref.JoinPackage(pkg, base), pattern)), nil
+		return starlark.String(tref.FormatFile(tref.JoinPackage(execCtx.Package, base), pattern)), nil
 	}
 }
 
@@ -238,9 +194,7 @@ func (p *Plugin) builtinTarget() BuiltinFunc {
 		args starlark.Tuple,
 		kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		ctx := thread.Local(ctxKey).(context.Context)        //nolint:errcheck
-		pkg := thread.Local(packageKey).(string)             //nolint:errcheck
-		onTarget := thread.Local(onTargetKey).(onTargetFunc) //nolint:errcheck
+		execCtx := getExecContext(thread)
 
 		var fkwargs []starlark.Tuple
 		var otherkwargs = map[string]starlark.Value{}
@@ -274,7 +228,7 @@ func (p *Plugin) builtinTarget() BuiltinFunc {
 
 		payload := OnTargetPayload{
 			Name:       tspec.Name,
-			Package:    pkg,
+			Package:    execCtx.Package,
 			Driver:     tspec.Driver,
 			Labels:     tspec.Labels,
 			Transitive: tspec.Transitive,
@@ -285,12 +239,12 @@ func (p *Plugin) builtinTarget() BuiltinFunc {
 			return nil, errors.New("missing name")
 		}
 
-		err := onTarget(ctx, payload)
+		err := execCtx.OnTarget(execCtx.Ctx, payload)
 		if err != nil {
 			return nil, err
 		}
 
-		return starlark.String(tref.Format(tref.New(pkg, payload.Name, nil))), nil
+		return starlark.String(tref.Format(tref.New(execCtx.Package, payload.Name, nil))), nil
 	}
 }
 
@@ -300,8 +254,6 @@ type OnProviderStatePayload struct {
 	Args     map[string]starlark.Value
 }
 
-type onProviderStateFunc = func(ctx context.Context, payload OnProviderStatePayload) error
-
 func (p *Plugin) builtinProviderState() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
@@ -309,9 +261,7 @@ func (p *Plugin) builtinProviderState() BuiltinFunc {
 		args starlark.Tuple,
 		kwargs []starlark.Tuple,
 	) (starlark.Value, error) {
-		ctx := thread.Local(ctxKey).(context.Context)                     //nolint:errcheck
-		pkg := thread.Local(packageKey).(string)                          //nolint:errcheck
-		onState := thread.Local(onProviderStateKey).(onProviderStateFunc) //nolint:errcheck
+		execCtx := getExecContext(thread)
 
 		var fkwargs []starlark.Tuple
 		var otherkwargs = map[string]starlark.Value{}
@@ -327,7 +277,7 @@ func (p *Plugin) builtinProviderState() BuiltinFunc {
 		}
 
 		payload := OnProviderStatePayload{
-			Package: pkg,
+			Package: execCtx.Package,
 			Args:    otherkwargs,
 		}
 		if err := starlark.UnpackArgs(
@@ -341,7 +291,7 @@ func (p *Plugin) builtinProviderState() BuiltinFunc {
 			return nil, errors.New("missing provider")
 		}
 
-		err := onState(ctx, payload)
+		err := execCtx.OnProviderState(execCtx.Ctx, payload)
 		if err != nil {
 			return nil, err
 		}
@@ -349,13 +299,6 @@ func (p *Plugin) builtinProviderState() BuiltinFunc {
 		return starlark.None, nil
 	}
 }
-
-const (
-	ctxKey             = "__heph_ctx"
-	packageKey         = "__heph_pkg"
-	onTargetKey        = "__heph_on_target"
-	onProviderStateKey = "__heph_on_provider_state"
-)
 
 func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
 	return p.cacherunpkg.Singleflight(ctx, file.Name(), onTarget, onProviderState, func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
@@ -408,10 +351,12 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, on
 			}
 		},
 	}
-	thread.SetLocal(ctxKey, ctx)
-	thread.SetLocal(packageKey, pkg)
-	thread.SetLocal(onTargetKey, onTarget)
-	thread.SetLocal(onProviderStateKey, onProviderState)
+	setExecContext(thread, execContext{
+		Ctx:             ctx,
+		Package:         pkg,
+		OnTarget:        onTarget,
+		OnProviderState: onProviderState,
+	})
 
 	res, err := prog.Init(thread, universe)
 	if err != nil {
