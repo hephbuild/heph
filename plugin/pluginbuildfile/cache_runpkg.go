@@ -20,9 +20,8 @@ type CacheRunpkgEntry struct {
 func (c *CacheRunpkg) Singleflight(
 	ctx context.Context,
 	key string,
-	onTarget onTargetFunc,
-	onProviderState onProviderStateFunc,
-	f func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error),
+	hooks Hooks,
+	f func(hooks Hooks) (starlark.StringDict, error),
 ) (starlark.StringDict, error) {
 	v, err, _ := c.sf.Do(ctx, key, func(ctx context.Context) (CacheRunpkgEntry, error) {
 		var payloads []OnTargetPayload
@@ -39,7 +38,10 @@ func (c *CacheRunpkg) Singleflight(
 			return nil
 		}
 
-		dict, err := f(onTarget, onProviderState)
+		dict, err := f(Hooks{
+			onTarget:        onTarget,
+			onProviderState: onProviderState,
+		})
 		if err != nil {
 			return CacheRunpkgEntry{}, err
 		}
@@ -54,18 +56,18 @@ func (c *CacheRunpkg) Singleflight(
 		return nil, err
 	}
 
-	if onTarget != nil {
+	if hooks.onTarget != nil {
 		for _, payload := range v.payloads {
-			err := onTarget(ctx, payload)
+			err := hooks.onTarget(ctx, payload)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
 
-	if onProviderState != nil {
+	if hooks.onProviderState != nil {
 		for _, providerState := range v.providerStates {
-			err := onProviderState(ctx, providerState)
+			err := hooks.onProviderState(ctx, providerState)
 			if err != nil {
 				return nil, err
 			}

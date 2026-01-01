@@ -8,7 +8,24 @@ import (
 
 const execContextKey = "__heph_ctx"
 
+type OnProviderStatePayload struct {
+	Package  string
+	Provider string
+	Args     map[string]starlark.Value
+}
+
 type onProviderStateFunc = func(ctx context.Context, payload OnProviderStatePayload) error
+
+type OnTargetPayload struct {
+	Name       string
+	Package    string
+	Driver     string
+	Labels     []string
+	Transitive TransitiveSpec
+
+	Args map[string]starlark.Value
+}
+
 type onTargetFunc = func(ctx context.Context, payload OnTargetPayload) error
 
 type execContext struct {

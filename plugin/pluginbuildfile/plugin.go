@@ -34,6 +34,11 @@ type Plugin struct {
 	cacherunpkg CacheRunpkg
 }
 
+type Hooks struct {
+	onTarget        onTargetFunc
+	onProviderState onProviderStateFunc
+}
+
 var _ pluginsdk.Provider = (*Plugin)(nil)
 
 const Name = "buildfile"
@@ -53,30 +58,32 @@ func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest
 
 func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	var states []*pluginv1.ProviderState
-	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, req.GetPackage()).Path(), nil, func(ctx context.Context, payload OnProviderStatePayload) error {
-		if payload.Provider == Name {
-			return nil
-		}
-
-		state := map[string]*structpb.Value{}
-		for k, v := range payload.Args {
-			v := hstarlark.FromStarlark(v)
-
-			pv, err := structpb.NewValue(v)
-			if err != nil {
-				return err
+	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, req.GetPackage()).Path(), Hooks{
+		onProviderState: func(ctx context.Context, payload OnProviderStatePayload) error {
+			if payload.Provider == Name {
+				return nil
 			}
 
-			state[k] = pv
-		}
+			state := map[string]*structpb.Value{}
+			for k, v := range payload.Args {
+				v := hstarlark.FromStarlark(v)
 
-		states = append(states, pluginv1.ProviderState_builder{
-			Package:  htypes.Ptr(payload.Package),
-			Provider: htypes.Ptr(payload.Provider),
-			State:    state,
-		}.Build())
+				pv, err := structpb.NewValue(v)
+				if err != nil {
+					return err
+				}
 
-		return nil
+				state[k] = pv
+			}
+
+			states = append(states, pluginv1.ProviderState_builder{
+				Package:  htypes.Ptr(payload.Package),
+				Provider: htypes.Ptr(payload.Provider),
+				State:    state,
+			}.Build())
+
+			return nil
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -89,30 +96,32 @@ func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*plugin
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
 	return pluginsdk.NewChanHandlerStreamFunc(func(send func(*pluginv1.ListResponse) error) error {
-		_, err := p.runPkg(ctx, req.GetPackage(), func(ctx context.Context, payload OnTargetPayload) error {
-			spec, err := p.toTargetSpec(ctx, payload)
-			if err != nil {
+		_, err := p.runPkg(ctx, req.GetPackage(), Hooks{
+			onTarget: func(ctx context.Context, payload OnTargetPayload) error {
+				spec, err := p.toTargetSpec(ctx, payload)
+				if err != nil {
+					return err
+				}
+
+				err = send(pluginv1.ListResponse_builder{
+					Spec: proto.ValueOrDefault(spec),
+				}.Build())
+
 				return err
-			}
-
-			err = send(pluginv1.ListResponse_builder{
-				Spec: proto.ValueOrDefault(spec),
-			}.Build())
-
-			return err
-		}, nil)
+			},
+		})
 
 		return err
 	}), nil
 }
 
-func (p *Plugin) runPkg(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
-	return p.cacherunpkg.Singleflight(ctx, pkg, onTarget, onProviderState, func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
-		return p.runPkgInner(ctx, pkg, onTarget, onProviderState)
+func (p *Plugin) runPkg(ctx context.Context, pkg string, hooks Hooks) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, pkg, hooks, func(hooks Hooks) (starlark.StringDict, error) {
+		return p.runPkgInner(ctx, pkg, hooks)
 	})
 }
 
-func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
+func (p *Plugin) runPkgInner(ctx context.Context, pkg string, hooks Hooks) (starlark.StringDict, error) {
 	out := starlark.StringDict{}
 
 	fs := hfs.At(p.repoRoot, pkg)
@@ -124,7 +133,7 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetF
 			}
 			defer f.Close()
 
-			res, err := p.runFile(ctx, pkg, f, onTarget, onProviderState)
+			res, err := p.runFile(ctx, pkg, f, hooks)
 			if err != nil {
 				return err
 			}
@@ -141,16 +150,6 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, onTarget onTargetF
 	out.Freeze()
 
 	return out, nil
-}
-
-type OnTargetPayload struct {
-	Name       string
-	Package    string
-	Driver     string
-	Labels     []string
-	Transitive TransitiveSpec
-
-	Args map[string]starlark.Value
 }
 
 type BuiltinFunc = func(
@@ -248,12 +247,6 @@ func (p *Plugin) builtinTarget() BuiltinFunc {
 	}
 }
 
-type OnProviderStatePayload struct {
-	Package  string
-	Provider string
-	Args     map[string]starlark.Value
-}
-
 func (p *Plugin) builtinProviderState() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
@@ -300,20 +293,20 @@ func (p *Plugin) builtinProviderState() BuiltinFunc {
 	}
 }
 
-func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
-	return p.cacherunpkg.Singleflight(ctx, file.Name(), onTarget, onProviderState, func(onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
-		return p.runFileInner(ctx, pkg, file, onTarget, onProviderState)
+func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, hooks Hooks) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, file.Name(), hooks, func(hooks Hooks) (starlark.StringDict, error) {
+		return p.runFileInner(ctx, pkg, file, hooks)
 	})
 }
 
-func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, onTarget onTargetFunc, onProviderState onProviderStateFunc) (starlark.StringDict, error) {
-	if onTarget == nil {
-		onTarget = func(ctx context.Context, payload OnTargetPayload) error {
+func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, hooks Hooks) (starlark.StringDict, error) {
+	if hooks.onTarget == nil {
+		hooks.onTarget = func(ctx context.Context, payload OnTargetPayload) error {
 			return nil
 		}
 	}
-	if onProviderState == nil {
-		onProviderState = func(ctx context.Context, payload OnProviderStatePayload) error {
+	if hooks.onProviderState == nil {
+		hooks.onProviderState = func(ctx context.Context, payload OnProviderStatePayload) error {
 			return nil
 		}
 	}
@@ -338,7 +331,7 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, on
 			case strings.HasPrefix(module, "//"):
 				rest, _ := strings.CutPrefix(module, "//")
 
-				res, err := p.runPkg(ctx, rest, onTarget, onProviderState)
+				res, err := p.runPkg(ctx, rest, hooks)
 				if err != nil {
 					return nil, fmt.Errorf("%v: %w", module, err)
 				}
@@ -354,8 +347,8 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, on
 	setExecContext(thread, execContext{
 		Ctx:             ctx,
 		Package:         pkg,
-		OnTarget:        onTarget,
-		OnProviderState: onProviderState,
+		OnTarget:        hooks.onTarget,
+		OnProviderState: hooks.onProviderState,
 	})
 
 	res, err := prog.Init(thread, universe)
@@ -465,14 +458,16 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 
 func (p *Plugin) getInner(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.TargetSpec, error) {
 	var payload OnTargetPayload
-	_, err := p.runPkg(ctx, req.GetRef().GetPackage(), func(ctx context.Context, p OnTargetPayload) error {
-		if p.Package == req.GetRef().GetPackage() && p.Name == req.GetRef().GetName() {
-			payload = p
-			return nil // TODO: StopErr
-		}
+	_, err := p.runPkg(ctx, req.GetRef().GetPackage(), Hooks{
+		onTarget: func(ctx context.Context, p OnTargetPayload) error {
+			if p.Package == req.GetRef().GetPackage() && p.Name == req.GetRef().GetName() {
+				payload = p
+				return nil // TODO: StopErr
+			}
 
-		return nil
-	}, nil)
+			return nil
+		},
+	})
 	if err != nil {
 		return nil, err
 	}
