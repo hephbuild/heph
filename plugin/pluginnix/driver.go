@@ -30,8 +30,6 @@ func wrapWithNix(t *nixv1.Target, args []string) []string {
 	return nargs
 }
 
-const NameBash = "nix-bash"
-
 type Option = pluginexec.Option[*nixv1.Target]
 type Plugin = pluginexec.Plugin[*nixv1.Target]
 
@@ -101,6 +99,8 @@ func applyTransitive(ctx context.Context, ref *pluginv1.TargetRef, sandbox *plug
 func toDef(ref *pluginv1.TargetRef, target *nixv1.Target, hash []byte) (*pluginv1.TargetDef, error) {
 	return pluginexec.ToDef(ref, target, (*nixv1.Target).GetTarget, hashTarget(target, hash))
 }
+
+const NameBash = "nix-bash"
 
 func NewBash(options ...Option) *Plugin {
 	return pluginexec.New[*nixv1.Target](

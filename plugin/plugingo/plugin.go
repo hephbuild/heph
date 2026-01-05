@@ -453,9 +453,10 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		files = append(files, tref.FormatFile(pkg, "*.go"))
 
 		files = append(files, tref.FormatQuery(tref.QueryOptions{
-			Label:        "go_src",
-			SkipProvider: Name,
-			TreeOutputTo: pkg,
+			Label:         "go_src",
+			SkipProvider:  Name,
+			TreeOutputTo:  pkg,
+			PackagePrefix: pkg,
 		}))
 	} else {
 		args = hmaps.Concat(args, map[string]string{

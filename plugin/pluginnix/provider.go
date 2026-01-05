@@ -49,7 +49,7 @@ export NIX_CONFIG=$(cat <<'EOF'
 EOF
 )
 
-exec nix run <REF> -- "$@" 
+exec nix shell <REF> -- "$@" 
 `
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
@@ -72,7 +72,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	} else {
 		hash := true
 		if v := req.GetRef().GetArgs()["hash"]; v != "" {
-			hash = v == "0"
+			hash = v != "0"
 		}
 
 		return p.get(ctx, nixRef, nixPkg, hash)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hsingleflight"
@@ -332,6 +333,21 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, ho
 				rest, _ := strings.CutPrefix(module, "//")
 
 				res, err := p.runPkg(ctx, rest, hooks)
+				if err != nil {
+					return nil, fmt.Errorf("%v: %w", module, err)
+				}
+
+				return res, nil
+			case strings.HasPrefix(module, "./"):
+				execCtx := getExecContext(thread)
+
+				f, err := hfs.Open(p.repoRoot, filepath.Join(tref.ToOSPath(execCtx.Package), module))
+				if err != nil {
+					return nil, err
+				}
+				defer f.Close()
+
+				res, err := p.runFile(ctx, execCtx.Package, f, hooks)
 				if err != nil {
 					return nil, fmt.Errorf("%v: %w", module, err)
 				}

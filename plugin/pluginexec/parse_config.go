@@ -134,7 +134,7 @@ func ConfigToExecv1(
 			tbuild.Tools = append(tbuild.Tools, execv1.Target_Tool_builder{
 				Ref:   ref,
 				Hash:  htypes.Ptr(true),
-				Group: htypes.Ptr(""),
+				Group: htypes.Ptr(name),
 				Id:    htypes.Ptr(id),
 			}.Build())
 		}

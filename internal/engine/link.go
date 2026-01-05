@@ -145,6 +145,10 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 		items = append(items, tmatch.Package(pkg))
 	}
 
+	if pkg := qo.PackagePrefix; pkg != "" {
+		items = append(items, tmatch.PackagePrefix(pkg))
+	}
+
 	if treeOutputTo := qo.TreeOutputTo; treeOutputTo != "" {
 		items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
 	}

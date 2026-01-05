@@ -47,10 +47,11 @@ const QueryPackage = "@heph/query"
 const QueryName = "query"
 
 type QueryOptions struct {
-	Label        string
-	Package      string
-	TreeOutputTo string
-	SkipProvider string
+	Label         string
+	Package       string
+	TreeOutputTo  string
+	SkipProvider  string
+	PackagePrefix string
 }
 
 func FormatQuery(o QueryOptions) string {
@@ -66,6 +67,9 @@ func FormatQuery(o QueryOptions) string {
 	}
 	if o.SkipProvider != "" {
 		m["skip_provider"] = o.SkipProvider
+	}
+	if o.PackagePrefix != "" {
+		m["package_prefix"] = o.PackagePrefix
 	}
 
 	return Format(New(QueryPackage, QueryName, m))
@@ -92,6 +96,10 @@ func ParseQuery(ref *pluginv1.TargetRef) (QueryOptions, error) {
 
 	if p, ok := ref.GetArgs()["skip_provider"]; ok {
 		qo.SkipProvider = p
+	}
+
+	if p, ok := ref.GetArgs()["package_prefix"]; ok {
+		qo.PackagePrefix = p
 	}
 
 	return qo, nil
