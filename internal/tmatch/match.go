@@ -311,10 +311,6 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 		}
 
 		for _, out := range def.GetOutputs() {
-			if out.GetUnknownPaths() {
-				continue
-			}
-
 			for _, path := range out.GetPaths() {
 				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
 					continue

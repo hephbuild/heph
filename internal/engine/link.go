@@ -379,16 +379,13 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 	// step, ctx := hstep.New(ctx, "Getting definition...")
 	// defer step.Done()
 
-	if c.Def != nil && c.Spec != nil {
-		return &TargetDef{
-			TargetDef:  c.Def,
-			TargetSpec: c.Spec,
-			// TODO: missing transitive
-		}, nil
+	ref := c.Ref
+	if c.Def != nil {
+		ref = c.GetRef()
 	}
 
 	spec, err := e.getSpec(ctx, rs, SpecContainer{
-		Ref:  c.Ref,
+		Ref:  ref,
 		Spec: c.Spec,
 	})
 	if err != nil {
@@ -419,6 +416,13 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		}
 
 		def := res.GetTarget()
+
+		if spec.GetDriver() == plugingroup.Name {
+			def, err = e.getDefGroup(ctx, rs, def)
+			if err != nil {
+				return nil, err
+			}
+		}
 
 		if !tref.Equal(def.GetRef(), spec.GetRef()) {
 			return nil, fmt.Errorf("mismatch def ref %v %v", tref.Format(def.GetRef()), tref.Format(spec.GetRef()))
@@ -883,19 +887,18 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				return err
 			}
 
-			outputNames := make([]string, 0, len(linkedDep.GetOutputs()))
-			for _, output := range linkedDep.GetOutputs() {
-				outputNames = append(outputNames, output.GetGroup())
-			}
-
+			var outputNames []string
 			if input.GetRef().HasOutput() {
-				if !hslices.Has(linkedDep.GetOutputs(), func(output *pluginv1.TargetDef_Output) bool {
-					return output.GetGroup() == input.GetRef().GetOutput()
-				}) {
+				if !checkRefOutputExists(linkedDep, input.GetRef()) {
 					return fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(input.GetRef()), input.GetRef().GetOutput())
 				}
 
 				outputNames = []string{input.GetRef().GetOutput()}
+			} else {
+				outputNames = make([]string, 0, len(linkedDep.GetOutputs()))
+				for _, output := range linkedDep.GetOutputs() {
+					outputNames = append(outputNames, output.GetGroup())
+				}
 			}
 
 			lt.Inputs[i] = &LightLinkedTargetInput{
@@ -921,4 +924,68 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 	})
 
 	return lt, nil
+}
+
+func (e *Engine) getDefGroup(ctx context.Context, rs *RequestState, def *pluginv1.TargetDef) (*pluginv1.TargetDef, error) {
+	type getDefContainer struct {
+		input *pluginv1.TargetDef_Input
+		def   *TargetDef
+	}
+
+	results := make([]getDefContainer, len(def.GetInputs()))
+
+	var g herrgroup.Group
+	for i, input := range def.GetInputs() {
+		g.Go(func() error {
+			linkedInput, err := e.GetDef(ctx, rs, DefContainer{Ref: tref.WithoutOut(input.GetRef())})
+			if err != nil {
+				return err
+			}
+
+			results[i] = getDefContainer{
+				input: input,
+				def:   linkedInput,
+			}
+
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	def.SetOutputs(nil)
+
+	for _, c := range results {
+		input := c.input
+		linkedInput := c.def
+
+		inputRef := input.GetRef()
+
+		if inputRef.HasOutput() {
+			if !checkRefOutputExists(linkedInput, inputRef) {
+				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(inputRef), inputRef.GetOutput())
+			}
+
+			for _, output := range def.GetOutputs() {
+				if output.GetGroup() != inputRef.GetOutput() {
+					continue
+				}
+
+				def.SetOutputs(append(def.GetOutputs(), output))
+			}
+		} else {
+			def.SetOutputs(append(def.GetOutputs(), linkedInput.GetOutputs()...))
+		}
+	}
+
+	return def, nil
+}
+
+func checkRefOutputExists(linkedInput *TargetDef, inputRef *pluginv1.TargetRefWithOutput) bool {
+	return hslices.Has(linkedInput.GetOutputs(), func(output *pluginv1.TargetDef_Output) bool {
+		return output.GetGroup() == inputRef.GetOutput()
+	})
 }

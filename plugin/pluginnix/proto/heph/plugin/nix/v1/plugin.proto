@@ -6,4 +6,5 @@ import "heph/plugin/exec/v1/plugin.proto";
 message Target {
   heph.plugin.exec.v1.Target target = 1;
   repeated string packages = 2;
+  repeated string programs = 3;  // Explicit list of programs to wrap (optional)
 }

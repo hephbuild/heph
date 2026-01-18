@@ -69,14 +69,14 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 
 	if req.GetRef().GetArgs()["install"] == "1" {
 		return p.install(ctx, nixRef, nixPkg)
-	} else {
-		hash := true
-		if v := req.GetRef().GetArgs()["hash"]; v != "" {
-			hash = v != "0"
-		}
-
-		return p.get(ctx, nixRef, nixPkg, hash)
 	}
+
+	hash := true
+	if v := req.GetRef().GetArgs()["hash"]; v != "" {
+		hash = v != "0"
+	}
+
+	return p.get(ctx, nixRef, nixPkg, hash)
 }
 
 // temporary until we get can heph heph to manage the nix cache

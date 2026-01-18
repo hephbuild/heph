@@ -165,7 +165,7 @@ func (e *Engine) meta(ctx context.Context, rs *RequestState, def *LightLinkedTar
 			return nil, fmt.Errorf("deps manifests: %w", err)
 		}
 
-		hashin, err := e.hashin2(ctx, def, manifests)
+		hashin, err := e.hashin2(ctx, def, manifests, "meta")
 		if err != nil {
 			return nil, fmt.Errorf("hashin: %w", err)
 		}
@@ -624,6 +624,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
 					gartifact := pluginv1.Artifact_builder{
+						Group:     htypes.Ptr(artifact.GetGroup()),
 						Name:      htypes.Ptr(artifact.GetName()),
 						Type:      htypes.Ptr(artifact.GetType()),
 						File:      artifact.GetFile(),
@@ -757,18 +758,18 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 }
 
 var enableHashDebug = sync.OnceValue(func() bool {
-	v, _ := strconv.ParseBool(os.Getenv("HEPH_HASH_DEBUG"))
+	v, _ := strconv.ParseBool(os.Getenv("HEPH_DEBUG_HASH"))
 
 	return v
 })
 
-func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []DepMeta) (string, error) {
+func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []DepMeta, debugHint string) (string, error) {
 	var h interface {
 		hash.Hash
 		io.StringWriter
 	}
 	if enableHashDebug() {
-		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.GetRef()), "//"))
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.GetRef()), "//"), debugHint)
 	} else {
 		h = xxh3.New()
 	}
@@ -841,7 +842,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		})
 	}
 
-	return e.hashin2(ctx, def, metas)
+	return e.hashin2(ctx, def, metas, "res")
 }
 
 type ExecuteResultArtifact struct {

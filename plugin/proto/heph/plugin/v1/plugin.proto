@@ -77,8 +77,7 @@ message TargetDef {
     }
 
     string group = 1;
-    bool unknown_paths = 2;
-    repeated Path paths = 3;
+    repeated Path paths = 2;
   }
 
   TargetRef ref = 1;

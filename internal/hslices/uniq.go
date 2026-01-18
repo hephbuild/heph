@@ -17,3 +17,9 @@ func UniqBy[T any, U comparable, Slice ~[]T](collection Slice, iteratee func(ite
 
 	return result
 }
+
+func Uniq[T comparable, Slice ~[]T](collection Slice) Slice {
+	return UniqBy(collection, func(item T) T {
+		return item
+	})
+}

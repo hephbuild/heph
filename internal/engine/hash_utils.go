@@ -21,11 +21,11 @@ type hashWithDebug struct {
 
 var debugCounter = cache.New[string, *atomic.Int32]()
 
-func newHashWithDebug(w *xxh3.Hasher, name string) hashWithDebug {
+func newHashWithDebug(w *xxh3.Hasher, name, hint string) hashWithDebug {
 	c, _ := debugCounter.GetOrSet(name, &atomic.Int32{})
 	id := c.Add(1)
 
-	path := filepath.Join("/tmp/hashdebug", hinstance.UID, name, strconv.Itoa(int(id))+".txt")
+	path := filepath.Join("/tmp/hashdebug", hinstance.UID, name, strconv.Itoa(int(id))+hint+".txt")
 
 	return hashWithDebug{Hasher: w, path: path}
 }

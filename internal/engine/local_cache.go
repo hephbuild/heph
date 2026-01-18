@@ -34,7 +34,7 @@ func (e *Engine) hashout(ctx context.Context, ref *pluginv1.TargetRef, artifact 
 		io.StringWriter
 	}
 	if enableHashDebug() {
-		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(ref), "//")+"_hashout_"+artifact.GetName())
+		h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(ref), "//")+"_hashout_"+artifact.GetName(), "")
 	} else {
 		h = xxh3.New()
 	}
@@ -240,9 +240,12 @@ func (e *Engine) ClearCacheLocally(
 }
 
 func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
-	if len(outputs) == 0 {
+	switch len(outputs) {
+	case 0:
 		outputs = nil
-	} else {
+	case 1:
+		// noop
+	default:
 		outputs = slices.Clone(outputs)
 		slices.Sort(outputs)
 	}

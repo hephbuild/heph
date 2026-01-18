@@ -15,6 +15,7 @@ import (
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hversion"
 	"github.com/hephbuild/heph/internal/remotecache"
 	"github.com/hephbuild/heph/internal/termui"
 	"github.com/hephbuild/heph/lib/pluginsdk"
@@ -33,7 +34,7 @@ import (
 
 func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	cfg := engine.Config{
-		Version:    "dev", // TODO
+		Version:    hversion.Version,
 		HomeDir:    ".heph",
 		LockDriver: "fs",
 	}
@@ -116,6 +117,16 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 
 	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
 		Name:    pluginnix.NameBashShell,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginnix.NameWrapper,
+		Enabled: true,
+	})
+
+	cfg.Drivers = append(cfg.Drivers, engine.ConfigDriver{
+		Name:    pluginnix.NameShellWrapper,
 		Enabled: true,
 	})
 
@@ -236,6 +247,12 @@ var nameToDriver = map[string]func(ctx context.Context, root string, options map
 	},
 	pluginnix.NameBashShell: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
 		return pluginNixFactory(pluginnix.NewInteractiveBash, options)
+	},
+	pluginnix.NameWrapper: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginNixFactory(pluginnix.NewWrapper, options)
+	},
+	pluginnix.NameShellWrapper: func(ctx context.Context, root string, options map[string]any) (pluginsdk.Driver, func(mux *http.ServeMux)) {
+		return pluginNixFactory(pluginnix.NewShellWrapper, options)
 	},
 }
 
