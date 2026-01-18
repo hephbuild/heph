@@ -11,6 +11,7 @@ import (
 )
 
 func init() {
+	var link bool
 	cmdArgs := parseRefArgs{cmdName: "def"}
 
 	cmd := &cobra.Command{
@@ -47,9 +48,21 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				def, err := e.GetDef(ctx, rs, engine.DefContainer{Ref: ref})
-				if err != nil {
-					return err
+				var def *engine.TargetDef
+				if link {
+					res, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
+					if err != nil {
+						return err
+					}
+
+					def = res.TargetDef
+				} else {
+					res, err := e.GetDef(ctx, rs, engine.DefContainer{Ref: ref})
+					if err != nil {
+						return err
+					}
+
+					def = res
 				}
 
 				// TODO how to render res natively without exec
@@ -71,6 +84,8 @@ func init() {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&link, "link", false, "Link target")
 
 	queryCmd.AddCommand(cmd)
 }
