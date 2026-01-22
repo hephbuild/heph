@@ -158,6 +158,10 @@ func (osfs OS) Symlink(oldname, newname string) error {
 	return os.Symlink(oldname, osfs.join(newname))
 }
 
+func (osfs OS) Readlink(name string) (string, error) {
+	return os.Readlink(osfs.join(name))
+}
+
 func (osfs OS) Mkdir(name string, mode os.FileMode) error {
 	return os.Mkdir(osfs.join(name), mode)
 }

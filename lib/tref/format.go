@@ -30,15 +30,30 @@ func FormatFile(pkg string, file string) string {
 	return Format(New(JoinPackage(FilePackage, pkg), "content", map[string]string{"f": file}))
 }
 
+func FormatGlob(pkg string, file string, exclude []string) string {
+	if len(exclude) == 0 {
+		return FormatFile(pkg, file)
+	}
+
+	return Format(New(JoinPackage(FilePackage, pkg), "content", map[string]string{"f": file, "e": strings.Join(exclude, ",")}))
+}
+
 func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
+	f, _, ok := ParseGlob(ref)
+
+	return f, ok
+}
+
+func ParseGlob(ref *pluginv1.TargetRef) (string, []string, bool) {
 	rest, ok := CutPackagePrefix(ref.GetPackage(), FilePackage)
 	if !ok {
-		return "", false
+		return "", nil, false
 	}
 
 	f := ref.GetArgs()["f"]
+	e := ref.GetArgs()["e"]
 
-	return filepath.Join(ToOSPath(rest), f), true
+	return filepath.Join(ToOSPath(rest), f), strings.Split(e, ","), true
 }
 
 const FilePackage = "@heph/file"

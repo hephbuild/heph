@@ -341,6 +341,10 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 	for _, dep := range t.GetDeps() {
 		id := dep.GetId()
 
+		if !dep.GetRuntime() {
+			continue
+		}
+
 		allOutput := !dep.GetRef().HasOutput()
 
 		for artifact := range ArtifactsForId(inputs, id, pluginv1.Artifact_TYPE_OUTPUT_LIST_V1) {

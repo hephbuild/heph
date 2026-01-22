@@ -29,6 +29,10 @@ func fastMatchDir(path, matcher string) bool {
 }
 
 func PathMatchAny(path string, matchers ...string) (bool, error) {
+	if len(matchers) == 0 {
+		return false, nil
+	}
+
 	path = filepath.Clean(path)
 
 	for _, matcher := range matchers {
@@ -183,10 +187,6 @@ func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntr
 			return filepath.SkipDir
 		}
 		// Only match files
-		return nil
-	}
-
-	if d.Type() == iofs.ModeSymlink { // TODO: skip symlinks for now
 		return nil
 	}
 

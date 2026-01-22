@@ -8,4 +8,5 @@ message Target {
     string file = 1;
     string pattern = 2;
   }
+  repeated string exclude = 3;
 }

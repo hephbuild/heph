@@ -170,9 +170,11 @@ func (p *Plugin) file(name string) BuiltinFunc {
 		execCtx := getExecContext(thread)
 
 		var pattern string
+		var exclude hstarlark.List[string]
 		if err := starlark.UnpackArgs(
 			name, args, kwargs,
 			"pattern", &pattern,
+			"exclude?", &exclude,
 		); err != nil {
 			return nil, err
 		}
@@ -180,10 +182,10 @@ func (p *Plugin) file(name string) BuiltinFunc {
 		base, pattern := hfs.GlobSplit(pattern)
 
 		if strings.HasPrefix(base, "/") {
-			return starlark.String(tref.FormatFile(base, pattern)), nil
+			return starlark.String(tref.FormatGlob(base, pattern, exclude)), nil
 		}
 
-		return starlark.String(tref.FormatFile(tref.JoinPackage(execCtx.Package, base), pattern)), nil
+		return starlark.String(tref.FormatGlob(tref.JoinPackage(execCtx.Package, base), pattern, exclude)), nil
 	}
 }
 
@@ -442,6 +444,22 @@ func (p *Plugin) toTargetSpec(ctx context.Context, payload OnTargetPayload) (*pl
 				Ref:  ref,
 				Hash: htypes.Ptr(true),
 			}.Build())
+		}
+
+		for name, deps := range payload.Transitive.Deps {
+			for _, dep := range deps {
+				ref, err := tref.ParseWithOut(dep)
+				if err != nil {
+					return nil, err
+				}
+
+				transitiveBuilder.Deps = append(transitiveBuilder.Deps, pluginv1.Sandbox_Dep_builder{
+					Ref:     ref,
+					Group:   htypes.Ptr(name),
+					Runtime: htypes.Ptr(true),
+					Hash:    htypes.Ptr(true),
+				}.Build())
+			}
 		}
 
 		for _, env := range payload.Transitive.PassEnv {

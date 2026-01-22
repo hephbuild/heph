@@ -3,6 +3,7 @@ package pluginfs
 import (
 	"context"
 
+	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -46,7 +47,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	path, ok := tref.ParseFile(req.GetRef())
+	path, exclude, ok := tref.ParseGlob(req.GetRef())
 	if !ok {
 		return nil, pluginsdk.ErrNotFound
 	}
@@ -56,7 +57,8 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 			Ref:    req.GetRef(),
 			Driver: htypes.Ptr(DriverName),
 			Config: map[string]*structpb.Value{
-				"file": structpb.NewStringValue(path),
+				"file":    structpb.NewStringValue(path),
+				"exclude": hstructpb.NewStringsValue(exclude),
 			},
 		}.Build(),
 	}.Build(), nil

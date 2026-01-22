@@ -894,11 +894,19 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				}
 
 				outputNames = []string{input.GetRef().GetOutput()}
-			} else {
+			} else if len(linkedDep.GetOutputs()) <= 1 { // no need to alloc map & sort
 				outputNames = make([]string, 0, len(linkedDep.GetOutputs()))
 				for _, output := range linkedDep.GetOutputs() {
 					outputNames = append(outputNames, output.GetGroup())
 				}
+			} else {
+				m := make(map[string]struct{}, len(linkedDep.GetOutputs()))
+				for _, output := range linkedDep.GetOutputs() {
+					m[output.GetGroup()] = struct{}{}
+				}
+
+				outputNames = slices.Collect(maps.Keys(m))
+				slices.Sort(outputNames)
 			}
 
 			lt.Inputs[i] = &LightLinkedTargetInput{

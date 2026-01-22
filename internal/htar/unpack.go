@@ -117,7 +117,12 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 				return fmt.Errorf("untar: unsupported symlink on fs %T", to)
 			}
 
-			err := osto.Symlink(hdr.Linkname, hdr.Name)
+			err := hfs.CreateParentDir(to, hdr.Name)
+			if err != nil {
+				return err
+			}
+
+			err = osto.Symlink(hdr.Linkname, hdr.Name)
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}

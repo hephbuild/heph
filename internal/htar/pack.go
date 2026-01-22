@@ -60,12 +60,24 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 	return nil
 }
 
+func (p *Packer) WriteSymlink(at, dst string) error {
+	if err := p.tw.WriteHeader(&tar.Header{
+		Typeflag: tar.TypeSymlink,
+		Name:     at,
+		Linkname: dst,
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (p *Packer) Write(r io.Reader, hdr *tar.Header) error {
 	if err := p.tw.WriteHeader(hdr); err != nil {
 		return err
 	}
 
-	if _, err := io.Copy(p.tw, r); err != nil {
+	if _, err := io.Copy(p.tw, io.LimitReader(r, hdr.Size)); err != nil {
 		return err
 	}
 

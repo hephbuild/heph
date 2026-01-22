@@ -48,7 +48,8 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 
 func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
 	cfg, err := hstructpb.Decode[struct {
-		File string `mapstructure:"file"`
+		File    string   `mapstructure:"file"`
+		Exclude []string `mapstructure:"exclude"`
 	}](req.GetSpec().GetConfig())
 	if err != nil {
 		return nil, err
@@ -59,6 +60,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	if hfs.IsGlob(cfg.File) {
 		target = fsv1.Target_builder{
 			Pattern: htypes.Ptr(cfg.File),
+			Exclude: cfg.Exclude,
 		}.Build()
 		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
 			Glob:    htypes.Ptr(cfg.File),
@@ -123,6 +125,17 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			}.Build(), nil
 		}
 
+		excluded, err := hfs.PathMatchAny(path, t.GetExclude()...)
+		if err != nil {
+			return nil, err
+		}
+
+		if excluded {
+			return pluginv1.RunResponse_builder{
+				Artifacts: []*pluginv1.Artifact{},
+			}.Build(), nil
+		}
+
 		return pluginv1.RunResponse_builder{
 			Artifacts: []*pluginv1.Artifact{
 				pluginv1.Artifact_builder{
@@ -152,6 +165,15 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		}
 
 		if IsCodegen(ctx, fs.At(path).Path()) {
+			return nil
+		}
+
+		excluded, err := hfs.PathMatchAny(fs.At(path).Path(), t.GetExclude()...)
+		if err != nil {
+			return err
+		}
+
+		if excluded {
 			return nil
 		}
 
