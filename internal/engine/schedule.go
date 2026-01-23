@@ -971,7 +971,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
 		}.Build())
-		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
+		if err != nil && !errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -1002,7 +1002,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
 		}.Build())
-		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
+		if err != nil && !errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -1026,7 +1026,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
 		}.Build())
-		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
+		if err != nil && !errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 
@@ -1050,7 +1050,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		res, err := driver.Pipe(ctx, pluginv1.PipeRequest_builder{
 			RequestId: htypes.Ptr(rs.ID),
 		}.Build())
-		if err != nil && errors.Is(err, pluginsdk.ErrNotImplemented) {
+		if err != nil && !errors.Is(err, pluginsdk.ErrNotImplemented) {
 			return nil, wait, err
 		}
 		if res != nil && res.GetId() != "" {
@@ -1249,6 +1249,10 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	})
 	err = errors.Join(err, runErr)
 	if err != nil {
+		if errors.Is(err, pluginsdk.ErrNotImplemented) {
+			return nil, fmt.Errorf("run: %v: %w", def.GetDriver(), err)
+		}
+
 		return nil, fmt.Errorf("run: %w", err)
 	}
 

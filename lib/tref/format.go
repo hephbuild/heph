@@ -2,8 +2,8 @@ package tref
 
 import (
 	"errors"
-	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"unsafe"
 
@@ -27,36 +27,49 @@ type HashStore interface {
 }
 
 func FormatFile(pkg string, file string) string {
-	return Format(New(JoinPackage(FilePackage, pkg), "content", map[string]string{"f": file}))
+	return Format(New(JoinPackage(FSPackage, pkg), "file", map[string]string{"f": file}))
 }
 
-func FormatGlob(pkg string, file string, exclude []string) string {
+func FormatGlob(pkg, pattern string, exclude []string) string {
 	if len(exclude) == 0 {
-		return FormatFile(pkg, file)
+		return Format(New(JoinPackage(FSPackage, pkg), "glob", map[string]string{"p": pattern}))
 	}
 
-	return Format(New(JoinPackage(FilePackage, pkg), "content", map[string]string{"f": file, "e": strings.Join(exclude, ",")}))
+	return Format(New(JoinPackage(FSPackage, pkg), "glob", map[string]string{"p": pattern, "e": strings.Join(exclude, ",")}))
 }
 
 func ParseFile(ref *pluginv1.TargetRef) (string, bool) {
-	f, _, ok := ParseGlob(ref)
+	rest, ok := CutPackagePrefix(ref.GetPackage(), FSPackage)
+	if !ok {
+		return "", false
+	}
 
-	return f, ok
+	if ref.GetName() != "file" {
+		return "", false
+	}
+
+	f := ref.GetArgs()["f"]
+
+	return filepath.Join(ToOSPath(rest), f), true
 }
 
 func ParseGlob(ref *pluginv1.TargetRef) (string, []string, bool) {
-	rest, ok := CutPackagePrefix(ref.GetPackage(), FilePackage)
+	rest, ok := CutPackagePrefix(ref.GetPackage(), FSPackage)
 	if !ok {
 		return "", nil, false
 	}
 
-	f := ref.GetArgs()["f"]
+	if ref.GetName() != "glob" {
+		return "", nil, false
+	}
+
+	p := ref.GetArgs()["p"]
 	e := ref.GetArgs()["e"]
 
-	return filepath.Join(ToOSPath(rest), f), strings.Split(e, ","), true
+	return filepath.Join(ToOSPath(rest), p), strings.Split(e, ","), true
 }
 
-const FilePackage = "@heph/file"
+const FSPackage = "@heph/fs"
 const BinPackage = "@heph/bin"
 const QueryPackage = "@heph/query"
 const QueryName = "query"
@@ -219,7 +232,7 @@ func format(ref *Ref) string {
 			sb.WriteString(k)
 			sb.WriteString("=")
 			if strings.ContainsAny(v, ` ,"'`) {
-				sb.WriteString(fmt.Sprintf("%q", v))
+				sb.WriteString(strconv.Quote(v))
 			} else {
 				sb.WriteString(v)
 			}

@@ -47,19 +47,30 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 }
 
 func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	path, exclude, ok := tref.ParseGlob(req.GetRef())
-	if !ok {
-		return nil, pluginsdk.ErrNotFound
+	if path, ok := tref.ParseFile(req.GetRef()); ok {
+		return pluginv1.GetResponse_builder{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref:    req.GetRef(),
+				Driver: htypes.Ptr(DriverName),
+				Config: map[string]*structpb.Value{
+					"file": structpb.NewStringValue(path),
+				},
+			}.Build(),
+		}.Build(), nil
 	}
 
-	return pluginv1.GetResponse_builder{
-		Spec: pluginv1.TargetSpec_builder{
-			Ref:    req.GetRef(),
-			Driver: htypes.Ptr(DriverName),
-			Config: map[string]*structpb.Value{
-				"file":    structpb.NewStringValue(path),
-				"exclude": hstructpb.NewStringsValue(exclude),
-			},
-		}.Build(),
-	}.Build(), nil
+	if path, exclude, ok := tref.ParseGlob(req.GetRef()); ok {
+		return pluginv1.GetResponse_builder{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref:    req.GetRef(),
+				Driver: htypes.Ptr(DriverName),
+				Config: map[string]*structpb.Value{
+					"glob":    structpb.NewStringValue(path),
+					"exclude": hstructpb.NewStringsValue(exclude),
+				},
+			}.Build(),
+		}.Build(), nil
+	}
+
+	return nil, pluginsdk.ErrNotFound
 }

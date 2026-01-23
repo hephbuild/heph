@@ -168,6 +168,15 @@ func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn Glob
 			return err
 		}
 
+		if d.Type() == iofs.ModeSymlink {
+			info, err := fs.Stat(path)
+			if err != nil {
+				return err
+			}
+
+			d = iofs.FileInfoToDirEntry(info)
+		}
+
 		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
 	})
 }

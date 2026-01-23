@@ -87,6 +87,9 @@ func init() {
 							if path, ok := tref.ParseFile(v); ok {
 								return path
 							}
+							if path, _, ok := tref.ParseGlob(v); ok {
+								return path
+							}
 
 							return tref.Format(v)
 						}),
@@ -95,7 +98,7 @@ func init() {
 								return `style="filled", fillcolor="lightgreen"`
 							}
 
-							if _, ok := tref.ParseFile(v); ok {
+							if v.GetPackage() == tref.FSPackage {
 								return `style="filled", fillcolor="lightgrey"`
 							}
 

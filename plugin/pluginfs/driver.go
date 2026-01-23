@@ -48,7 +48,9 @@ func (p *Driver) Config(ctx context.Context, req *pluginv1.ConfigRequest) (*plug
 
 func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv1.ParseResponse, error) {
 	cfg, err := hstructpb.Decode[struct {
-		File    string   `mapstructure:"file"`
+		File string `mapstructure:"file"`
+
+		Glob    string   `mapstructure:"glob"`
 		Exclude []string `mapstructure:"exclude"`
 	}](req.GetSpec().GetConfig())
 	if err != nil {
@@ -57,13 +59,13 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 
 	var target *fsv1.Target
 	var outPaths []*pluginv1.TargetDef_Output_Path
-	if hfs.IsGlob(cfg.File) {
+	if cfg.Glob != "" {
 		target = fsv1.Target_builder{
-			Pattern: htypes.Ptr(cfg.File),
+			Pattern: htypes.Ptr(cfg.Glob),
 			Exclude: cfg.Exclude,
 		}.Build()
 		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
-			Glob:    htypes.Ptr(cfg.File),
+			Glob:    htypes.Ptr(cfg.Glob),
 			Collect: htypes.Ptr(false),
 		}.Build()}
 	} else {
@@ -155,10 +157,6 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 
 	var artifacts []*pluginv1.Artifact
 	err = hfs.Glob(ctx, fs, t.GetPattern(), nil, func(path string, d hfs.DirEntry) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-
 		info, err := d.Info()
 		if err != nil {
 			return err

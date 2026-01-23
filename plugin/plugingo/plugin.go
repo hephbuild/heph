@@ -243,7 +243,7 @@ func getMode(ref *pluginv1.TargetRef) (string, error) {
 }
 
 func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
-	if _, ok := tref.ParseFile(req.GetRef()); ok {
+	if req.GetRef().GetPackage() == tref.FSPackage {
 		return nil, pluginsdk.ErrNotFound
 	}
 
@@ -450,7 +450,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			return nil, nil, errNoGoFiles
 		}
 
-		files = append(files, tref.FormatFile(pkg, "*.go"))
+		files = append(files, tref.FormatGlob(pkg, "*.go", nil))
 
 		files = append(files, tref.FormatQuery(tref.QueryOptions{
 			Label:         "go_src",
