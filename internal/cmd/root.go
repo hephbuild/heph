@@ -14,10 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hcobra"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hlocks"
 	"github.com/hephbuild/heph/internal/hversion"
-	"github.com/hephbuild/heph/lib/hcobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"

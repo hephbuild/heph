@@ -7,9 +7,9 @@ import (
 	"io"
 
 	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hcobra"
 	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/tmatch"
-	"github.com/hephbuild/heph/lib/hcobra"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
