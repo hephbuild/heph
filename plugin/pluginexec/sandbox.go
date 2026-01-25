@@ -3,7 +3,6 @@ package pluginexec
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"iter"
 	"os"
@@ -67,6 +66,19 @@ func SetupSandbox(
 					}.Build(),
 				}.Build())
 			}
+
+			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
+				if err != nil {
+					return nil, fmt.Errorf("setup support file artifact: %v: %w", target.GetId(), err)
+				}
+				listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+					Artifact: listArtifact,
+					Origin: pluginv1.TargetDef_InputOrigin_builder{
+						Id: htypes.Ptr(target.GetId()),
+					}.Build(),
+				}.Build())
+			}
 		}
 	}
 
@@ -75,6 +87,19 @@ func SetupSandbox(
 			listArtifact, err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
 			if err != nil {
 				return nil, fmt.Errorf("%v: %w", tref.FormatOut(tool.GetRef()), err)
+			}
+			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+				Artifact: listArtifact,
+				Origin: pluginv1.TargetDef_InputOrigin_builder{
+					Id: htypes.Ptr(tool.GetId()),
+				}.Build(),
+			}.Build())
+		}
+
+		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
+			listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, tool.GetRef().GetFilters())
+			if err != nil {
+				return nil, fmt.Errorf("setup support file artifact: %v: %w", tref.FormatOut(tool.GetRef()), err)
 			}
 			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
 				Artifact: listArtifact,
@@ -152,10 +177,16 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 		return nil, err
 	}
 
+	// Determine the list type based on the input artifact type
+	listType := pluginv1.Artifact_TYPE_OUTPUT_LIST_V1
+	if artifact.GetType() == pluginv1.Artifact_TYPE_SUPPORT_FILE {
+		listType = pluginv1.Artifact_TYPE_SUPPORT_FILE_LIST_V1
+	}
+
 	return pluginv1.Artifact_builder{
 		Group: htypes.Ptr(artifact.GetGroup()),
 		Name:  htypes.Ptr(artifact.GetName() + ".list"),
-		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
+		Type:  htypes.Ptr(listType),
 		File: pluginv1.Artifact_ContentFile_builder{
 			SourcePath: htypes.Ptr(listf.Name()),
 		}.Build(),
@@ -187,7 +218,7 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, f
 	}
 
 	if count != 1 {
-		return nil, errors.New("must output exactly one file")
+		return nil, fmt.Errorf("must output exactly one file, got %v", count)
 	}
 
 	name := filepath.Base(binPath)

@@ -203,7 +203,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 
 	def, err := e.link(ctx, rs, c)
 	if err != nil {
-		return nil, fmt.Errorf("link: %w", err)
+		return nil, fmt.Errorf("link: %v: %w", tref.Format(c.GetRef()), err)
 	}
 
 	ref := def.GetRef()
@@ -332,7 +332,7 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 			}
 
 			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
-				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT
+				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT && output.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE
 			})
 
 			for _, artifact := range res.Artifacts {
@@ -379,6 +379,30 @@ type ResultMeta struct {
 type ResultMetaArtifact struct {
 	Hashout string
 	Group   string
+}
+
+func (e *Engine) MetaFromRef(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef) (*Meta, error) {
+	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
+		return []string{
+			"where", fmt.Sprintf("MetaFromRef %v", tref.Format(ref)),
+		}
+	})
+	defer cleanLabels()
+
+	ctx, span := tracer.Start(ctx, "MetaFromRef", trace.WithAttributes(attribute.String("target", tref.Format(ref))))
+	defer span.End()
+
+	def, err := e.Link(ctx, rs, DefContainer{Ref: ref})
+	if err != nil {
+		return nil, err
+	}
+
+	meta, err := e.meta(ctx, rs, def)
+	if err != nil {
+		return nil, err
+	}
+
+	return meta, nil
 }
 
 func (e *Engine) ResultMetaFromRef(ctx context.Context, rs *RequestState, ref *pluginv1.TargetRef, outputs []string) (ResultMeta, error) {
@@ -951,6 +975,7 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		}
 
 		err := eg.Wait()
+
 		// this is complicated...
 		// if the stdin connected was stdin, and we exec a command, stdin never closes, but the Read interface
 		// doesnt have a way to stop reading based on context cancellation, so this just hangs until there is a write into stdin,
@@ -958,6 +983,10 @@ func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.D
 		// TODO: explore https://github.com/muesli/cancelreader
 		if false && stdinErrCh != nil {
 			err = errors.Join(err, <-stdinErrCh)
+		}
+
+		if errors.Is(err, context.Canceled) {
+			return nil
 		}
 
 		return err
@@ -1242,6 +1271,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 					TreeRootPath: htypes.Ptr(e.Root.Path()),
 					Inputs:       inputs,
 					Pipes:        pipes,
+					Hashin:       htypes.Ptr(hashin),
 				}.Build())
 			})
 		},
@@ -1306,11 +1336,11 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 			var globPath string
 			switch path.WhichContent() {
-			case pluginv1.TargetDef_Output_Path_FilePath_case:
+			case pluginv1.TargetDef_Path_FilePath_case:
 				globPath = path.GetFilePath()
-			case pluginv1.TargetDef_Output_Path_DirPath_case:
+			case pluginv1.TargetDef_Path_DirPath_case:
 				globPath = path.GetDirPath()
-			case pluginv1.TargetDef_Output_Path_Glob_case:
+			case pluginv1.TargetDef_Path_Glob_case:
 				globPath = path.GetGlob()
 			default:
 				return nil, fmt.Errorf("unknown path type: %v", path.WhichContent())
@@ -1372,6 +1402,90 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			Hashout:  hashout,
 			Artifact: execArtifact,
 		})
+	}
+
+	{
+		shouldCollect := false
+		for _, path := range def.GetSupportFiles() {
+			if path.GetCollect() {
+				shouldCollect = true
+				break
+			}
+		}
+
+		if shouldCollect {
+			tarname := "support.tar"
+			tarf, err := hfs.Create(cachefs, tarname)
+			if err != nil {
+				return nil, err
+			}
+			defer tarf.Close()
+
+			tar := htar.NewPacker(tarf)
+			defer tar.Close()
+
+			for _, path := range def.GetSupportFiles() {
+				if !path.GetCollect() {
+					continue
+				}
+
+				var globPath string
+				switch path.WhichContent() {
+				case pluginv1.TargetDef_Path_FilePath_case:
+					globPath = path.GetFilePath()
+				case pluginv1.TargetDef_Path_DirPath_case:
+					globPath = path.GetDirPath()
+				case pluginv1.TargetDef_Path_Glob_case:
+					globPath = path.GetGlob()
+				default:
+					return nil, fmt.Errorf("unknown support file path type: %v", path.WhichContent())
+				}
+
+				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
+					dstPath := filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path)
+
+					if d.Type() == fs.ModeSymlink {
+						linkDstPath, err := cwdfs.Readlink(path)
+						if err != nil {
+							return err
+						}
+						return tar.WriteSymlink(dstPath, linkDstPath)
+					}
+
+					f, err := hfs.Open(cwdfs, path)
+					if err != nil {
+						return err
+					}
+					defer f.Close()
+
+					return tar.WriteFile(f, dstPath)
+				})
+				if err != nil {
+					return nil, fmt.Errorf("collect support file %v: %w", globPath, err)
+				}
+			}
+
+			err = tar.Close()
+			if err != nil {
+				return nil, err
+			}
+
+			execArtifact := pluginv1.Artifact_builder{
+				Name:    htypes.Ptr(tarname),
+				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
+				TarPath: proto.String(tarf.Name()),
+			}.Build()
+
+			hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
+			if err != nil {
+				return nil, err
+			}
+
+			execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+				Hashout:  hashout,
+				Artifact: execArtifact,
+			})
+		}
 	}
 
 	for _, artifact := range runRes.GetArtifacts() {

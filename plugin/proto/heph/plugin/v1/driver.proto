@@ -37,6 +37,7 @@ message RunRequest {
   string tree_root_path = 4;
   repeated ArtifactWithOrigin inputs = 5;
   repeated string pipes = 6;
+  string hashin = 7;
 }
 
 message RunContainer {
@@ -53,6 +54,8 @@ message Artifact {
     TYPE_OUTPUT_LIST_V1 = 2;
     TYPE_LOG = 3;
     TYPE_MANIFEST_V1 = 4;
+    TYPE_SUPPORT_FILE = 5;
+    TYPE_SUPPORT_FILE_LIST_V1 = 6;
   }
 
   message ContentRaw {

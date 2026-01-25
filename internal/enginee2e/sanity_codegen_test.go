@@ -71,7 +71,7 @@ func TestCodegen(t *testing.T) {
 				}.Build(),
 				Driver: htypes.Ptr("exec"),
 				Config: map[string]*structpb.Value{
-					"deps":  hstructpb.NewStringsValue([]string{tref.FormatFile(pkg, "*"), tref.Format(tref.New(pkg, "t1", nil))}),
+					"deps":  hstructpb.NewStringsValue([]string{tref.FormatGlob(pkg, "*", nil), tref.Format(tref.New(pkg, "t1", nil))}),
 					"run":   hstructpb.NewStringsValue([]string{"sh", "-c", "-e", `RES=$(ls); echo $RES > $OUT`}),
 					"out":   hstructpb.NewStringsValue([]string{"out_ls"}),
 					"cache": structpb.NewBoolValue(false),

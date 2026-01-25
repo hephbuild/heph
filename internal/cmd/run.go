@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 
+	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/hcobra"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
@@ -15,9 +19,13 @@ import (
 )
 
 func init() {
-	var shell boolStr
+	var shell hcobra.BoolStr
 	var force bool
 	var ignore []string
+	var listOut bool
+	var listArtifacts bool
+	var catOut bool
+	var hashOut bool
 
 	cmdArgs := parseTargetMatcherArgs{cmdName: "run"}
 
@@ -70,8 +78,8 @@ func init() {
 					})
 				}
 
-				if shell.bool && shell.str != "" {
-					rs.Shell, err = tref.Parse(shell.str)
+				if shell.Bool && shell.Str != "" {
+					rs.Shell, err = tref.Parse(shell.Str)
 					if err != nil {
 						return fmt.Errorf("shell flag: %w", err)
 					}
@@ -93,7 +101,7 @@ func init() {
 
 				rs.Interactive = matcherRef
 
-				if shell.bool && rs.Shell == nil {
+				if shell.Bool && rs.Shell == nil {
 					if matcherRef != nil {
 						rs.Shell = matcherRef
 					} else {
@@ -111,28 +119,87 @@ func init() {
 				}
 				defer res.Unlock(ctx)
 
-				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					if matcher.HasRef() && len(res) == 1 {
-						for _, output := range res[0].Artifacts {
-							fmt.Println(output.GetName())
-							fmt.Println("  group:    ", output.GetGroup())
-							switch output.WhichContent() {
-							case pluginv1.Artifact_File_case:
-								fmt.Println("  content:", output.GetFile())
-							case pluginv1.Artifact_Raw_case:
-								fmt.Println("  content:", output.GetRaw())
-							case pluginv1.Artifact_TarPath_case:
-								fmt.Println("  content:", output.GetTarPath())
-							case pluginv1.Artifact_TargzPath_case:
-								fmt.Println("  content:", output.GetTargzPath())
-							case pluginv1.Artifact_Content_not_set_case:
-								fmt.Println("  content: <not set>")
+					switch {
+					case listOut:
+						for _, re := range res {
+							for _, output := range re.Artifacts {
+								if output.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+									continue
+								}
+
+								for f, err := range hartifact.FilesReader(ctx, output.Artifact) {
+									if err != nil {
+										return err
+									}
+
+									_ = f.Close()
+
+									fmt.Println(f.Path)
+								}
 							}
-							fmt.Println("  type:     ", output.GetType().String())
 						}
-					} else {
-						fmt.Println("matched", len(res))
+					case catOut:
+						stdout := &hio.SpyLast{Writer: args.Stdout}
+						for _, re := range res {
+							for _, output := range re.Artifacts {
+								if output.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+									continue
+								}
+
+								for f, err := range hartifact.FilesReader(ctx, output.Artifact) {
+									if err != nil {
+										return err
+									}
+
+									if stdout.Written && stdout.LastByte != '\n' {
+										fmt.Println() // new line
+									}
+									stdout.Reset()
+
+									_, err = io.Copy(stdout, f)
+									if err != nil {
+										return err
+									}
+
+									_ = f.Close()
+								}
+							}
+						}
+					case listArtifacts:
+						for _, re := range res {
+							for _, output := range re.Artifacts {
+								fmt.Println(output.GetName())
+								fmt.Println("  group:    ", output.GetGroup())
+								switch output.WhichContent() {
+								case pluginv1.Artifact_File_case:
+									fmt.Println("  content:", output.GetFile())
+								case pluginv1.Artifact_Raw_case:
+									fmt.Println("  content:", output.GetRaw())
+								case pluginv1.Artifact_TarPath_case:
+									fmt.Println("  content:", output.GetTarPath())
+								case pluginv1.Artifact_TargzPath_case:
+									fmt.Println("  content:", output.GetTargzPath())
+								case pluginv1.Artifact_Content_not_set_case:
+									fmt.Println("  content: <not set>")
+								}
+								fmt.Println("  type:     ", output.GetType().String())
+							}
+						}
+					case hashOut:
+						for _, re := range res {
+							for _, output := range re.Artifacts {
+								if output.GetName() == "" {
+									fmt.Println(output.Hashout)
+								} else {
+									fmt.Println(output.GetGroup(), output.Hashout)
+								}
+							}
+						}
+					default:
+						if !matcher.HasRef() {
+							fmt.Println("matched", len(res))
+						}
 					}
 
 					return nil
@@ -151,9 +218,18 @@ func init() {
 		},
 	}
 
-	cmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
-	cmd.Flags().AddFlag(NewBoolStrFlag(&shell, "shell", "", "shell into target"))
-	cmd.Flags().BoolVarP(&force, "force", "", false, "force running")
+	runFlagGroup := hcobra.NewFlagSet("Flags")
+	runFlagGroup.StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
+	runFlagGroup.BoolStrVar(&shell, "shell", "", "shell into target")
+	runFlagGroup.BoolVarP(&force, "force", "", false, "force running")
+	hcobra.AddLocalFlagSet(cmd, runFlagGroup)
+
+	outFlagGroup := hcobra.NewFlagSet("Output Flags")
+	outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
+	outFlagGroup.BoolVarP(&listOut, "list-out", "", false, "List output paths")
+	outFlagGroup.BoolVarP(&catOut, "cat-out", "", false, "Print outputs to stdout")
+	outFlagGroup.BoolVarP(&hashOut, "hashout", "", false, "Print output hashes to stdout")
+	hcobra.AddLocalFlagSet(cmd, outFlagGroup)
 
 	rootCmd.AddCommand(cmd)
 }

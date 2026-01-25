@@ -17,6 +17,7 @@ import (
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hlocks"
 	"github.com/hephbuild/heph/internal/hversion"
+	"github.com/hephbuild/heph/lib/hcobra"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -35,7 +36,7 @@ var pprofCpuPath string
 var pprofMemPath string
 var pprofGoroutinePath string
 var pprofGoroutineLast bool
-var pprofServer boolStr
+var pprofServer hcobra.BoolStr
 var tracePath string
 
 var levelVar slog.LevelVar
@@ -127,8 +128,8 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
-		if pprofServer.bool {
-			addr := pprofServer.str
+		if pprofServer.Bool {
+			addr := pprofServer.Str
 			if addr == "" {
 				addr = ":6060"
 			}
@@ -256,16 +257,22 @@ var rootCmd = &cobra.Command{
 }
 
 func init() {
+	hcobra.Setup(rootCmd)
+
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
 	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "set log level to error")
 
-	rootCmd.PersistentFlags().AddFlag(NewBoolStrFlag(&pprofServer, "pprof-http", "", "Start pprof server"))
-	rootCmd.PersistentFlags().StringVar(&pprofCpuPath, "pprof-cpu", "", "CPU Profile output file")
-	rootCmd.PersistentFlags().StringVar(&pprofMemPath, "pprof-mem", "", "Memory Profile output file")
-	rootCmd.PersistentFlags().StringVar(&pprofGoroutinePath, "pprof-goroutine", "", "Goroutine Profile output file")
-	rootCmd.PersistentFlags().BoolVar(&pprofGoroutineLast, "pprof-goroutine-last", false, "Goroutine Profile, keep only last")
-	rootCmd.PersistentFlags().StringVar(&tracePath, "trace", "", "Trace output file")
+	debugFlagSet := hcobra.NewFlagSet("Global Debug Flags")
+	debugFlagSet.BoolStrVar(&pprofServer, "pprof-http", "", "Start pprof server")
+	debugFlagSet.StringVar(&pprofCpuPath, "pprof-cpu", "", "CPU Profile output file")
+	debugFlagSet.StringVar(&pprofMemPath, "pprof-mem", "", "Memory Profile output file")
+	debugFlagSet.StringVar(&pprofGoroutinePath, "pprof-goroutine", "", "Goroutine Profile output file")
+	debugFlagSet.BoolVar(&pprofGoroutineLast, "pprof-goroutine-last", false, "Goroutine Profile, keep only last")
+	debugFlagSet.StringVar(&tracePath, "trace", "", "Trace output file")
+
+	hcobra.AddLocalFlagSet(rootCmd, debugFlagSet)
+	hcobra.AddPersistentFlagSet(rootCmd, debugFlagSet)
 }
 
 func Execute() int {

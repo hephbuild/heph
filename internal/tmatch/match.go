@@ -312,22 +312,22 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 
 		for _, out := range def.GetOutputs() {
 			for _, path := range out.GetPaths() {
-				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {
 					continue
 				}
 
 				switch path.WhichContent() {
-				case pluginv1.TargetDef_Output_Path_FilePath_case:
+				case pluginv1.TargetDef_Path_FilePath_case:
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(filepath.Dir(path.GetFilePath())))
 					if outPkg == m.GetCodegenPackage() {
 						return MatchYes
 					}
-				case pluginv1.TargetDef_Output_Path_DirPath_case:
+				case pluginv1.TargetDef_Path_DirPath_case:
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path.GetDirPath()))
 					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
 						return MatchYes
 					}
-				case pluginv1.TargetDef_Output_Path_Glob_case:
+				case pluginv1.TargetDef_Path_Glob_case:
 					base, pattern := hfs.GlobSplit(path.GetGlob())
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(base))
 

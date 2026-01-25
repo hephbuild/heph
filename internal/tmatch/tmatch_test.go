@@ -97,11 +97,11 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 		t.Run("MatchSpec "+test.pkg+" "+test.codegenPkg+" "+test.outPath, func(t *testing.T) {
 			ref := tref.New(test.pkg, "foo", nil)
 
-			outPath := pluginv1.TargetDef_Output_Path_builder{
+			outPath := pluginv1.TargetDef_Path_builder{
 				FilePath:    nil,
 				DirPath:     nil,
 				Glob:        nil,
-				CodegenTree: htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_COPY),
+				CodegenTree: htypes.Ptr(pluginv1.TargetDef_Path_CODEGEN_MODE_COPY),
 			}
 			if hfs.IsGlob(test.outPath) {
 				outPath.Glob = htypes.Ptr(test.outPath)
@@ -117,7 +117,7 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 					Ref: ref,
 					Outputs: []*pluginv1.TargetDef_Output{
 						pluginv1.TargetDef_Output_builder{
-							Paths: []*pluginv1.TargetDef_Output_Path{
+							Paths: []*pluginv1.TargetDef_Path{
 								outPath.Build(),
 							},
 						}.Build(),

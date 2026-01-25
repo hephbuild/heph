@@ -1,4 +1,4 @@
-package cmd
+package hcobra
 
 import (
 	"strconv"
@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-func NewBoolStrFlag(bs *boolStr, name, shorthand, usage string) *pflag.Flag {
+func NewBoolStrFlag(bs *BoolStr, name, shorthand, usage string) *pflag.Flag {
 	flag := &pflag.Flag{
 		Name:        name,
 		Shorthand:   shorthand,
@@ -19,12 +19,12 @@ func NewBoolStrFlag(bs *boolStr, name, shorthand, usage string) *pflag.Flag {
 	return flag
 }
 
-type boolStr struct {
-	bool bool
-	str  string
+type BoolStr struct {
+	Bool bool
+	Str  string
 }
 
-func (bs *boolStr) Set(s string) error {
+func (bs *BoolStr) Set(s string) error {
 	b, err := strconv.ParseBool(s)
 	if err == nil {
 		s = ""
@@ -32,21 +32,21 @@ func (bs *boolStr) Set(s string) error {
 		b = true
 	}
 
-	*bs = boolStr{
-		bool: b,
-		str:  s,
+	*bs = BoolStr{
+		Bool: b,
+		Str:  s,
 	}
 
 	return nil
 }
 
-func (bs *boolStr) Type() string {
+func (bs *BoolStr) Type() string {
 	return "bool|str"
 }
 
-func (bs *boolStr) String() string {
-	if bs.bool {
-		return bs.str
+func (bs *BoolStr) String() string {
+	if bs.Bool {
+		return bs.Str
 	}
 
 	return "false"

@@ -114,7 +114,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				}),
 				"deps": structpb.NewStringValue(tref.Format(tref.New("@heph/go/std", "install", factors.Args()))),
 				"run": hstructpb.NewStringsValue([]string{
-					fmt.Sprintf("mv $WORKDIR/@heph/go/std/goroot/pkg/%v_%v/%v.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
+					fmt.Sprintf("mv $WORKSPACE_ROOT/@heph/go/std/goroot/pkg/%v_%v/%v.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"a": goImport + ".a",

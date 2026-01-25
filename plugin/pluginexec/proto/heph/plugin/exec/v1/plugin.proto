@@ -55,6 +55,8 @@ message Target {
   }
   repeated Output outputs = 5;
 
+  repeated string support_files = 10;
+
   enum Context {
     CONTEXT_UNSPECIFIED = 0;
     CONTEXT_TREE = 1;

@@ -2,12 +2,13 @@ package plugintextfile
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"path/filepath"
 
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/tref"
 	textfilev1 "github.com/hephbuild/heph/plugin/plugintextfile/gen/heph/plugin/textfile/v1"
 
-	"connectrpc.com/connect"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -22,7 +23,7 @@ type Plugin struct {
 const Name = "textfile"
 
 func (p Plugin) Pipe(ctx context.Context, request *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
+	return nil, fmt.Errorf("%w, textfile doesnt support pipe", pluginsdk.ErrNotImplemented)
 }
 
 func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {
@@ -66,7 +67,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 			DisableRemoteCache: htypes.Ptr(true),
 			Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
 				Group: htypes.Ptr(""),
-				Paths: []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+				Paths: []*pluginv1.TargetDef_Path{pluginv1.TargetDef_Path_builder{
 					FilePath: htypes.Ptr(s.GetOutput()),
 				}.Build()},
 			}.Build()},
@@ -81,17 +82,15 @@ func (p Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.Ru
 		return nil, err
 	}
 
-	outputName := t.GetOutput()
-
 	return pluginv1.RunResponse_builder{
 		Artifacts: []*pluginv1.Artifact{
 			pluginv1.Artifact_builder{
 				Group: htypes.Ptr(""),
-				Name:  htypes.Ptr(outputName),
+				Name:  htypes.Ptr(t.GetOutput()),
 				Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 				Raw: pluginv1.Artifact_ContentRaw_builder{
 					Data: []byte(t.GetText()),
-					Path: htypes.Ptr(outputName),
+					Path: htypes.Ptr(filepath.Join(tref.ToOSPath(req.GetTarget().GetRef().GetPackage()), t.GetOutput())),
 				}.Build(),
 			}.Build(),
 		},
@@ -99,7 +98,7 @@ func (p Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.Ru
 }
 
 func (p Plugin) ApplyTransitive(ctx context.Context, request *pluginv1.ApplyTransitiveRequest) (*pluginv1.ApplyTransitiveResponse, error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("textfile doesnt support transitive"))
+	return nil, fmt.Errorf("%w, textfile doesnt support transitive", pluginsdk.ErrNotImplemented)
 }
 
 func New() *Plugin {

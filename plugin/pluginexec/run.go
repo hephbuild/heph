@@ -101,22 +101,23 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	}
 
 	env = append(env, inputEnv...)
-	env = append(env, fmt.Sprintf("PATH=%v:%v", binfs.Path(), p.pathStr))
+	env = append(env, fmt.Sprintf("PATH=%s:%s", binfs.Path(), p.pathStr))
 
 	for key, envSpec := range texec.GetEnv() {
 		switch envSpec.WhichValue() {
 		case execv1.Target_Env_Literal_case:
-			env = append(env, fmt.Sprintf("%v=%v", key, envSpec.GetLiteral()))
+			env = append(env, fmt.Sprintf("%s=%s", key, envSpec.GetLiteral()))
 		case execv1.Target_Env_Pass_case:
 			if v, ok := os.LookupEnv(key); ok {
-				env = append(env, fmt.Sprintf("%v=%v", key, v))
+				env = append(env, fmt.Sprintf("%s=%s", key, v))
 			}
 		default:
-			return nil, fmt.Errorf("invalid env: %v", env)
+			return nil, fmt.Errorf("invalid env: %s", env)
 		}
 	}
-	env = append(env, fmt.Sprintf("WORKDIR=%v", workfs.Path()))         // TODO: figure it out
-	env = append(env, fmt.Sprintf("ROOTDIR=%v", req.GetTreeRootPath())) // TODO: figure it out
+	env = append(env, fmt.Sprintf("HASHIN=%s", req.GetHashin()))
+	env = append(env, fmt.Sprintf("WORKSPACE_ROOT=%s", workfs.Path()))    // TODO: figure it out
+	env = append(env, fmt.Sprintf("TREE_ROOT=%s", req.GetTreeRootPath())) // TODO: figure it out
 
 	for _, output := range texec.GetOutputs() {
 		paths := slices.Clone(output.GetPaths())
@@ -129,7 +130,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	}
 
 	args := p.runToExecArgs(req.GetSandboxPath(), t, nil)
-	hlog.From(ctx).Debug(fmt.Sprintf("args: %#v", args))
+	hlog.From(ctx).Debug("args", hlog.PHV("args", args))
 
 	var stdoutWriters, stderrWriters []io.Writer
 

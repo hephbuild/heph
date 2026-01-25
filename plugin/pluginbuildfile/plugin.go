@@ -189,6 +189,19 @@ func (p *Plugin) file(name string) BuiltinFunc {
 	}
 }
 
+func (p *Plugin) get_pkg() BuiltinFunc {
+	return func(
+		thread *starlark.Thread,
+		fn *starlark.Builtin,
+		args starlark.Tuple,
+		kwargs []starlark.Tuple,
+	) (starlark.Value, error) {
+		execCtx := getExecContext(thread)
+
+		return starlark.String(execCtx.Package), nil
+	}
+}
+
 func (p *Plugin) builtinTarget() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
@@ -319,6 +332,7 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, ho
 		"glob":           starlark.NewBuiltin("glob", p.file("glob")),
 		"file":           starlark.NewBuiltin("file", p.file("file")),
 		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState()),
+		"get_pkg":        starlark.NewBuiltin("get_pkg", p.get_pkg()),
 	}
 	prog, err := p.buildFile(ctx, file, universe)
 	if err != nil {

@@ -37,10 +37,11 @@ func ConfigToExecv1(
 	}
 
 	tbuild := execv1.Target_builder{
-		Run:         targetSpec.Run,
-		LocalCache:  htypes.Ptr(targetSpec.Cache.Local),
-		RemoteCache: htypes.Ptr(targetSpec.Cache.Remote),
-		Pty:         htypes.Ptr(targetSpec.Pty),
+		Run:          targetSpec.Run,
+		LocalCache:   htypes.Ptr(targetSpec.Cache.Local),
+		RemoteCache:  htypes.Ptr(targetSpec.Cache.Remote),
+		Pty:          htypes.Ptr(targetSpec.Pty),
+		SupportFiles: targetSpec.SupportFiles,
 	}
 
 	if targetSpec.InTree {
@@ -260,17 +261,18 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 
 	outputs := make([]*pluginv1.TargetDef_Output, 0, len(target.GetOutputs()))
 	for _, output := range target.GetOutputs() {
-		ppaths := make([]*pluginv1.TargetDef_Output_Path, 0, len(output.GetPaths()))
+		ppaths := make([]*pluginv1.TargetDef_Path, 0, len(output.GetPaths()))
 		for _, p := range output.GetPaths() {
-			ppath := pluginv1.TargetDef_Output_Path_builder{
+			ppath := pluginv1.TargetDef_Path_builder{
 				Collect: htypes.Ptr(true),
 			}
 
-			if strings.HasSuffix(p, "/") {
+			switch {
+			case strings.HasSuffix(p, "/"):
 				ppath.DirPath = htypes.Ptr(p)
-			} else if hfs.IsGlob(p) {
+			case hfs.IsGlob(p):
 				ppath.Glob = htypes.Ptr(p)
-			} else {
+			default:
 				ppath.FilePath = htypes.Ptr(p)
 			}
 
@@ -278,9 +280,9 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 			case execv1.Target_Output_CODEGEN_MODE_UNSPECIFIED:
 				// no codegen
 			case execv1.Target_Output_CODEGEN_MODE_COPY:
-				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_COPY)
+				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Path_CODEGEN_MODE_COPY)
 			case execv1.Target_Output_CODEGEN_MODE_LINK:
-				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Output_Path_CODEGEN_MODE_LINK)
+				ppath.CodegenTree = htypes.Ptr(pluginv1.TargetDef_Path_CODEGEN_MODE_LINK)
 			default:
 				return nil, fmt.Errorf("invalid codegen mode: %s", output.GetCodegen())
 			}
@@ -294,6 +296,24 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 		}.Build())
 	}
 
+	supportFiles := make([]*pluginv1.TargetDef_Path, 0, len(target.GetSupportFiles()))
+	for _, p := range target.GetSupportFiles() {
+		ppath := pluginv1.TargetDef_Path_builder{
+			Collect: htypes.Ptr(true),
+		}
+
+		switch {
+		case strings.HasSuffix(p, "/"):
+			ppath.DirPath = htypes.Ptr(p)
+		case hfs.IsGlob(p):
+			ppath.Glob = htypes.Ptr(p)
+		default:
+			ppath.FilePath = htypes.Ptr(p)
+		}
+
+		supportFiles = append(supportFiles, ppath.Build())
+	}
+
 	anyTarget, err := anypb.New(targetDef)
 	if err != nil {
 		return nil, err
@@ -303,6 +323,7 @@ func execv1ToDef(ref *pluginv1.TargetRef, target *execv1.Target, targetDef proto
 		Ref:                ref,
 		Inputs:             inputs,
 		Outputs:            outputs,
+		SupportFiles:       supportFiles,
 		Cache:              htypes.Ptr(target.GetLocalCache()),
 		DisableRemoteCache: htypes.Ptr(!target.GetRemoteCache()),
 		Pty:                htypes.Ptr(target.GetPty()),

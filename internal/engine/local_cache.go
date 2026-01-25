@@ -163,6 +163,8 @@ func (e *Engine) CacheLocally(
 		switch artifact.GetType() {
 		case pluginv1.Artifact_TYPE_OUTPUT:
 			prefix = "out_"
+		case pluginv1.Artifact_TYPE_SUPPORT_FILE:
+			prefix = "support_"
 		case pluginv1.Artifact_TYPE_LOG:
 			prefix = "log_"
 		case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:

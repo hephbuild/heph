@@ -92,6 +92,7 @@ type Spec struct {
 	HashDeps       SpecDeps          `mapstructure:"hash_deps"`
 	RuntimeDeps    SpecDeps          `mapstructure:"runtime_deps"`
 	Out            SpecOutputs       `mapstructure:"out"`
+	SupportFiles   SpecStrings       `mapstructure:"support_files"`
 	Cache          SpecCache         `mapstructure:"cache"`
 	Pty            bool              `mapstructure:"pty"`
 	Codegen        string            `mapstructure:"codegen"`

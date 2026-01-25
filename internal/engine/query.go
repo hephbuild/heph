@@ -195,7 +195,7 @@ func (e *Engine) Query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 
 func (e *Engine) Labels(ctx context.Context, rs *RequestState, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		m := map[string]htypes.Void{}
+		seen := map[string]htypes.Void{}
 
 		for ref, err := range e.query(ctx, rs, matcher, queryOptions{}) {
 			if err != nil {
@@ -210,10 +210,10 @@ func (e *Engine) Labels(ctx context.Context, rs *RequestState, matcher *pluginv1
 			}
 
 			for _, label := range spec.GetLabels() {
-				if _, ok := m[label]; ok {
+				if _, ok := seen[label]; ok {
 					continue
 				}
-				m[label] = htypes.Void{}
+				seen[label] = htypes.Void{}
 
 				if !yield(label, nil) {
 					return

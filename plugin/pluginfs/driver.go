@@ -58,13 +58,13 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}
 
 	var target *fsv1.Target
-	var outPaths []*pluginv1.TargetDef_Output_Path
+	var outPaths []*pluginv1.TargetDef_Path
 	if cfg.Glob != "" {
 		target = fsv1.Target_builder{
 			Pattern: htypes.Ptr(cfg.Glob),
 			Exclude: cfg.Exclude,
 		}.Build()
-		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+		outPaths = []*pluginv1.TargetDef_Path{pluginv1.TargetDef_Path_builder{
 			Glob:    htypes.Ptr(cfg.Glob),
 			Collect: htypes.Ptr(false),
 		}.Build()}
@@ -77,7 +77,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 		target = fsv1.Target_builder{
 			File: htypes.Ptr(cfg.File),
 		}.Build()
-		outPaths = []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+		outPaths = []*pluginv1.TargetDef_Path{pluginv1.TargetDef_Path_builder{
 			FilePath: htypes.Ptr(cfg.File),
 			Collect:  htypes.Ptr(false),
 		}.Build()}

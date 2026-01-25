@@ -61,29 +61,30 @@ message TargetDef {
   }
 
   message Output {
-    message Path {
-      enum CodegenMode {
-        CODEGEN_MODE_UNSPECIFIED = 0;
-        CODEGEN_MODE_COPY = 2;
-        CODEGEN_MODE_LINK = 3;
-      }
-      oneof content {
-        string file_path = 1;
-        string dir_path = 2;
-        string glob = 3;
-      }
-      CodegenMode codegen_tree = 5;
-      bool collect = 6;
-    }
-
     string group = 1;
     repeated Path paths = 2;
+  }
+
+  message Path {
+    enum CodegenMode {
+      CODEGEN_MODE_UNSPECIFIED = 0;
+      CODEGEN_MODE_COPY = 2;
+      CODEGEN_MODE_LINK = 3;
+    }
+    oneof content {
+      string file_path = 1;
+      string dir_path = 2;
+      string glob = 3;
+    }
+    CodegenMode codegen_tree = 5;
+    bool collect = 6;
   }
 
   TargetRef ref = 1;
   google.protobuf.Any def = 2;
   repeated Input inputs = 3;
   repeated Output outputs = 4;
+  repeated Path support_files = 11;
   bool cache = 5;
   bool disable_remote_cache = 9;
 

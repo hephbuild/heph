@@ -154,7 +154,7 @@ func TestDepsCache2(t *testing.T) {
 				Inputs: nil,
 				Outputs: []*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
 					Group: htypes.Ptr(""),
-					Paths: []*pluginv1.TargetDef_Output_Path{pluginv1.TargetDef_Output_Path_builder{
+					Paths: []*pluginv1.TargetDef_Path{pluginv1.TargetDef_Path_builder{
 						FilePath: htypes.Ptr("out.txt"),
 					}.Build()},
 				}.Build()},

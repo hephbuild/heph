@@ -441,14 +441,14 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			for _, path := range output.GetPaths() {
 				var pathStr string
 				switch path.WhichContent() {
-				case pluginv1.TargetDef_Output_Path_FilePath_case:
+				case pluginv1.TargetDef_Path_FilePath_case:
 					pathStr = path.GetFilePath()
-				case pluginv1.TargetDef_Output_Path_DirPath_case:
+				case pluginv1.TargetDef_Path_DirPath_case:
 					pathStr = path.GetDirPath()
-				case pluginv1.TargetDef_Output_Path_Glob_case:
+				case pluginv1.TargetDef_Path_Glob_case:
 					pathStr = path.GetGlob() // TODO: may need more brain
 
-					if path.GetCodegenTree() != pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+					if path.GetCodegenTree() != pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {
 						return nil, fmt.Errorf("codegen tree: %v: cannot be a glob", pathStr)
 					}
 				default:
@@ -740,17 +740,17 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 
 		for _, output := range def.GetOutputs() {
 			for _, path := range output.GetPaths() {
-				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {
 					continue
 				}
 
 				var pkg string
 				switch path.WhichContent() {
-				case pluginv1.TargetDef_Output_Path_FilePath_case:
+				case pluginv1.TargetDef_Path_FilePath_case:
 					pkg = tref.JoinPackage(ref.GetPackage(), tref.ToPackage(filepath.Dir(path.GetFilePath())))
-				case pluginv1.TargetDef_Output_Path_DirPath_case:
+				case pluginv1.TargetDef_Path_DirPath_case:
 					pkg = tref.JoinPackage(ref.GetPackage(), tref.ToPackage(path.GetFilePath()))
-				case pluginv1.TargetDef_Output_Path_Glob_case:
+				case pluginv1.TargetDef_Path_Glob_case:
 					return fmt.Errorf("glob codegen path %q not supported", path.GetGlob())
 				default:
 					panic("unreachable")
@@ -780,17 +780,17 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 		}
 		for _, output := range def.GetOutputs() {
 			for _, path := range output.GetPaths() {
-				if path.GetCodegenTree() == pluginv1.TargetDef_Output_Path_CODEGEN_MODE_UNSPECIFIED {
+				if path.GetCodegenTree() == pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {
 					continue
 				}
 
 				var codegenPath string
 				switch path.WhichContent() {
-				case pluginv1.TargetDef_Output_Path_FilePath_case:
+				case pluginv1.TargetDef_Path_FilePath_case:
 					codegenPath = filepath.Join(tref.ToOSPath(ref.GetPackage()), path.GetFilePath())
-				case pluginv1.TargetDef_Output_Path_DirPath_case:
+				case pluginv1.TargetDef_Path_DirPath_case:
 					codegenPath = filepath.Join(tref.ToOSPath(ref.GetPackage()), path.GetDirPath())
-				case pluginv1.TargetDef_Output_Path_Glob_case:
+				case pluginv1.TargetDef_Path_Glob_case:
 					return fmt.Errorf("glob codegen path %q not supported", path.GetGlob())
 				default:
 					panic("unreachable")
@@ -806,7 +806,7 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 					}
 				}
 
-				if path.WhichContent() == pluginv1.TargetDef_Output_Path_DirPath_case {
+				if path.WhichContent() == pluginv1.TargetDef_Path_DirPath_case {
 					for p, src := range paths {
 						if hfs.HasPathPrefix(p, codegenPath) {
 							return fmt.Errorf("%v: %v already outputs %v, it would shadow be shadowed by %v", tref.Format(ref), tref.Format(src), p, codegenPath)
