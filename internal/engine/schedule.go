@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1347,29 +1346,13 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}
 
 			err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-				dstPath := filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path)
-
-				if d.Type() == fs.ModeSymlink {
-					linkDstPath, err := cwdfs.Readlink(path)
-					if err != nil {
-						return err
-					}
-
-					err = tar.WriteSymlink(dstPath, linkDstPath)
-					if err != nil {
-						return err
-					}
-
-					return nil
-				}
-
 				f, err := hfs.Open(cwdfs, path)
 				if err != nil {
 					return err
 				}
 				defer f.Close()
 
-				err = tar.WriteFile(f, dstPath)
+				err = tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path))
 				if err != nil {
 					return err
 				}
@@ -1442,23 +1425,13 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				}
 
 				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-					dstPath := filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path)
-
-					if d.Type() == fs.ModeSymlink {
-						linkDstPath, err := cwdfs.Readlink(path)
-						if err != nil {
-							return err
-						}
-						return tar.WriteSymlink(dstPath, linkDstPath)
-					}
-
 					f, err := hfs.Open(cwdfs, path)
 					if err != nil {
 						return err
 					}
 					defer f.Close()
 
-					return tar.WriteFile(f, dstPath)
+					return tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path))
 				})
 				if err != nil {
 					return nil, fmt.Errorf("collect support file %v: %w", globPath, err)

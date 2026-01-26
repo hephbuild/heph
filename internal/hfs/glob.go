@@ -168,7 +168,7 @@ func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn Glob
 			return err
 		}
 
-		if d.Type() == iofs.ModeSymlink {
+		if d.Type()&iofs.ModeSymlink != 0 {
 			info, err := fs.Stat(path)
 			if err != nil {
 				return err

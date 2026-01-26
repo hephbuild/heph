@@ -133,6 +133,8 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 	for _, s := range cfg.Packages.Exclude {
 		e.PackagesExclude = append(e.PackagesExclude, filepath.Join(root, s))
 	}
+	e.PackagesExclude = append(e.PackagesExclude, homefs.Path())
+	e.PackagesExclude = append(e.PackagesExclude, cachefs.Path())
 
 	otelInterceptor, err := otelconnect.NewInterceptor(
 		otelconnect.WithTrustRemote(),

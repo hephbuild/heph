@@ -153,7 +153,7 @@ func init() {
 									}
 
 									if stdout.Written && stdout.LastByte != '\n' {
-										fmt.Println() // new line
+										_, _ = io.WriteString(stdout, "\n")
 									}
 									stdout.Reset()
 

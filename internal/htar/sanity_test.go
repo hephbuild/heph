@@ -60,6 +60,57 @@ func TestSanity(t *testing.T) {
 	}
 }
 
+func TestSanitySymlink(t *testing.T) {
+	ctx := t.Context()
+
+	srcfs := hfstest.New(t)
+
+	{
+		f, err := hfs.Create(srcfs, "file1")
+		require.NoError(t, err)
+
+		_, err = f.Write([]byte(`hello, world`))
+		require.NoError(t, err)
+
+		err = f.Close()
+		require.NoError(t, err)
+
+		err = srcfs.Symlink("file1", "./file1.link")
+		require.NoError(t, err)
+	}
+
+	var b bytes.Buffer
+
+	{
+		p := NewPacker(&b)
+		defer p.Close()
+
+		f, err := hfs.Open(srcfs, "file1.link")
+		require.NoError(t, err)
+
+		err = p.WriteFile(f, "some/file1.link")
+		require.NoError(t, err)
+
+		err = f.Close()
+		require.NoError(t, err)
+
+		err = p.Close()
+		require.NoError(t, err)
+	}
+
+	{
+		dstfs := hfstest.New(t)
+
+		err := Unpack(ctx, &b, dstfs)
+		require.NoError(t, err)
+
+		dst, err := dstfs.Readlink("some/file1.link")
+		require.NoError(t, err)
+
+		assert.Equal(t, "file1", dst)
+	}
+}
+
 func fakePath() string {
 	var names []string
 	n, _ := faker.RandomInt(1, 100, 1)

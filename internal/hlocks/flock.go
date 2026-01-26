@@ -80,7 +80,8 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 		return false, err
 	}
 
-	f := hf.(*os.File) //nolint:errcheck
+	osf := hf.(hfs.OSFile) //nolint:errcheck
+	f := osf.GetOSFile()
 
 	err = flock.Flock(f, ro, false)
 	if err != nil { //nolint:nestif

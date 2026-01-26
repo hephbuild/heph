@@ -155,23 +155,17 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 
 	fs := hfs.NewOS(p.resultClient.Root)
 
+	exclude := []string{} // TODO: exclude home, cache, git etc...
+	exclude = append(exclude, t.GetExclude()...)
+
 	var artifacts []*pluginv1.Artifact
-	err = hfs.Glob(ctx, fs, t.GetPattern(), nil, func(path string, d hfs.DirEntry) error {
+	err = hfs.Glob(ctx, fs, t.GetPattern(), exclude, func(path string, d hfs.DirEntry) error {
 		info, err := d.Info()
 		if err != nil {
 			return err
 		}
 
 		if IsCodegen(ctx, fs.At(path).Path()) {
-			return nil
-		}
-
-		excluded, err := hfs.PathMatchAny(fs.At(path).Path(), t.GetExclude()...)
-		if err != nil {
-			return err
-		}
-
-		if excluded {
 			return nil
 		}
 

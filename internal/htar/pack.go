@@ -19,13 +19,13 @@ func NewPacker(w io.Writer) *Packer {
 }
 
 func (p *Packer) WriteFile(f hfs.File, path string) error {
-	info, err := f.Stat()
+	info, err := f.LStat()
 	if err != nil {
 		return err
 	}
 
 	var link string
-	if info.Mode().Type() == os.ModeSymlink {
+	if info.Mode().Type()&os.ModeSymlink != 0 {
 		l, err := os.Readlink(f.Name())
 		if err != nil {
 			return err
@@ -53,19 +53,7 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 		return nil
 	}
 
-	if _, err := io.Copy(p.tw, f); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (p *Packer) WriteSymlink(at, dst string) error {
-	if err := p.tw.WriteHeader(&tar.Header{
-		Typeflag: tar.TypeSymlink,
-		Name:     at,
-		Linkname: dst,
-	}); err != nil {
+	if _, err := io.Copy(p.tw, io.LimitReader(f, info.Size())); err != nil {
 		return err
 	}
 

@@ -75,8 +75,41 @@ func (osfs OS) Lstat(name string) (FileInfo, error) {
 	return wrapOsInfo{FileInfo: info, name: path}, err
 }
 
+type wrapOsFile struct {
+	*os.File
+}
+
+var _ OSFile = (*wrapOsFile)(nil)
+
+func (f wrapOsFile) GetOSFile() *os.File {
+	return f.File
+}
+
+func (f wrapOsFile) Stat() (FileInfo, error) {
+	info, err := os.Stat(f.Name())
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapOsInfo{FileInfo: info, name: f.Name()}, nil
+}
+
+func (f wrapOsFile) LStat() (FileInfo, error) {
+	info, err := os.Lstat(f.Name())
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapOsInfo{FileInfo: info, name: f.Name()}, nil
+}
+
 func (osfs OS) Open(name string, flag int, perm FileMode) (File, error) {
-	return os.OpenFile(osfs.join(name), flag, perm)
+	f, err := os.OpenFile(osfs.join(name), flag, perm)
+	if err != nil {
+		return nil, err
+	}
+
+	return wrapOsFile{f}, nil
 }
 
 func (osfs OS) Move(oldname, newname string) error {
@@ -109,7 +142,7 @@ func (osfs OS) moveCrossDevice(source, destination string) error {
 
 	_, err = io.Copy(dstf, srcf)
 	_ = srcf.Close()
-	_ = CloseEnsureROFD(dstf)
+	_ = CloseEnsureROFD(wrapOsFile{File: dstf})
 	if err != nil {
 		return fmt.Errorf("copy: %w", err)
 	}
@@ -223,10 +256,12 @@ func (osfs OS) Path(elems ...string) string {
 }
 
 func CloseEnsureROFD(hf File) error {
-	f, ok := hf.(*os.File)
+	osf, ok := hf.(OSFile)
 	if !ok {
 		return hf.Close()
 	}
+
+	f := osf.GetOSFile()
 
 	err := flock.Flock(f, false, true)
 	if err != nil {

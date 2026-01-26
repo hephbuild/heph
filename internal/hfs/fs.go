@@ -3,6 +3,7 @@ package hfs
 import (
 	"io"
 	"io/fs"
+	"os"
 )
 
 type FileInfo = fs.FileInfo
@@ -18,7 +19,12 @@ var ErrNotExist = fs.ErrNotExist
 type File interface {
 	io.ReadWriteCloser
 	Stat() (FileInfo, error)
+	LStat() (FileInfo, error)
 	Name() string
+}
+
+type OSFile interface {
+	GetOSFile() *os.File
 }
 
 type FS interface {
