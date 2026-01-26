@@ -189,7 +189,7 @@ func init() {
 					case hashOut:
 						for _, re := range res {
 							for _, output := range re.Artifacts {
-								if output.GetName() == "" {
+								if output.GetGroup() == "" {
 									fmt.Println(output.Hashout)
 								} else {
 									fmt.Println(output.GetGroup(), output.Hashout)
