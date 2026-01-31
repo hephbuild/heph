@@ -99,6 +99,24 @@ jobs:
 
           gsutil -h "${NOCACHE}" rsync -r './dist' gs://heph-build/${VERSION}
 
+      - uses: actions/checkout@v3
+        with:
+          repository: hephbuild/heph-artifacts-v0
+          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          path: artifacts
+
+      - name: Create Release in artifacts repo
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: hephbuild/heph-artifacts-v0
+          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          tag_name: ${{needs.build.outputs.version}}
+          name: Build ${{needs.build.outputs.version}}
+          body: "Artifacts automatically published from source-repo."
+          draft: false
+          prerelease: true
+          files: dist/*
+
   release:
     name: Release
     runs-on: ubuntu-latest
@@ -124,6 +142,15 @@ jobs:
           gsutil -h "${NOCACHE}" cp './latest_version' gs://heph-build/latest_version
           gsutil -h "${NOCACHE}" cp './install.sh' gs://heph-build/install.sh
           gsutil -h "${NOCACHE}" cp './hephw' gs://heph-build/hephw
+
+      - name: Update Release to Production
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: hephbuild/heph-artifacts-v0
+          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          tag_name: ${{needs.build.outputs.version}}
+          prerelease: false
+          make_latest: true
   test:
     name: Test
     needs: [ build ]

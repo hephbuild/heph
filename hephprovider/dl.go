@@ -2,15 +2,18 @@ package hephprovider
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils/xfs"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils/xfs"
 )
 
-const BaseUrl = "https://storage.googleapis.com/heph-build"
+func GetDownloadURL(version, goos, goarch string) string {
+	return fmt.Sprintf("https://github.com/hephbuild/heph-artifacts-v0/releases/download/%v/heph_%v_%v", version, goos, goarch)
+}
 
 func Download(dir, binName, version, goos, goarch string) (string, error) {
 	err := os.MkdirAll(dir, os.ModePerm)
@@ -31,7 +34,7 @@ func Download(dir, binName, version, goos, goarch string) (string, error) {
 
 	log.Infof("Downloading heph %v %v/%v", version, goos, goarch)
 
-	url := fmt.Sprintf("%v/%v/heph_%v_%v", BaseUrl, version, goos, goarch)
+	url := GetDownloadURL(version, goos, goarch)
 
 	res, err := http.Get(url)
 	if err != nil {

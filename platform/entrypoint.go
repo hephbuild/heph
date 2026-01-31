@@ -2,10 +2,11 @@ package platform
 
 import (
 	"fmt"
-	"github.com/hephbuild/heph/log/log"
 	"io"
 	"os"
 	"strings"
+
+	"github.com/hephbuild/heph/log/log"
 )
 
 type EntrypointExec interface {
