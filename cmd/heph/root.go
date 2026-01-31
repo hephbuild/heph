@@ -86,6 +86,7 @@ func init() {
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(cleanCmd)
 	rootCmd.AddCommand(queryCmd)
+	rootCmd.AddCommand(lspCommand)
 	rootCmd.AddCommand(cloudCmd)
 	rootCmd.AddCommand(gcCmd)
 	rootCmd.AddCommand(validateCmd)
