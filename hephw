@@ -8,8 +8,6 @@ GREEN="\x1B[32m"
 YELLOW="\x1B[33m"
 RESET="\x1B[0m"
 
-DEFAULT_URL_BASE="https://storage.googleapis.com/heph-build"
-
 OS="$(uname)"
 ARCH="$(uname -m)"
 
@@ -83,13 +81,13 @@ VERSION="${VERSION#*:}"    # Strip until after first :
 VERSION="${VERSION/ /}"    # Remove all spaces
 VERSION="${VERSION#>=}"    # Strip any initial >=
 if [ "$VERSION" = "latest" ]; then
-    VERSION=$(curl -fsSL ${URL_BASE}/latest_version)
+    VERSION=$(curl -s https://api.github.com/repos/hephbuild/heph-artifacts-v0/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 elif [ -z "$VERSION" ]; then
     echo -e >&2 "${YELLOW}Can't determine version, will use latest.${RESET}"
-    VERSION=$(curl -fsSL ${URL_BASE}/latest_version)
+    VERSION=$(curl -s https://api.github.com/repos/hephbuild/heph-artifacts-v0/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 fi
 
-HEPH_URL="$DEFAULT_URL_BASE/${VERSION}/heph_${GOOS}_${ARCH}"
+HEPH_URL="https://github.com/hephbuild/heph-artifacts-v0/releases/download/${VERSION}/heph_${GOOS}_${ARCH}"
 DIR="${LOCATION}/${VERSION}"
 # Potentially we could reuse this but it's easier not to really.
 if [ ! -d "$DIR" ]; then

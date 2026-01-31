@@ -1,13 +1,14 @@
 import CodeBlock from '@theme/CodeBlock';
-import React, {useEffect, useState} from "react";
+import React, { useEffect, useState } from "react";
 
 export default function HephConfig() {
     const [version, setVersion] = useState('<VERSION>');
 
     async function fetchVersion() {
-        const res = await fetch('https://storage.googleapis.com/heph-build/latest_version');
+        const res = await fetch('https://api.github.com/repos/hephbuild/heph-artifacts-v0/releases/latest');
 
-        const version = await res.text();
+        const body = await res.json();
+        const version = body.tag_name;
 
         setVersion(version);
     }

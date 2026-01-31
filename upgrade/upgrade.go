@@ -2,15 +2,8 @@ package upgrade
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"github.com/coreos/go-semver/semver"
-	"github.com/hephbuild/heph/config"
-	"github.com/hephbuild/heph/hephprovider"
-	"github.com/hephbuild/heph/log/log"
-	"github.com/hephbuild/heph/utils"
-	"github.com/hephbuild/heph/utils/locks"
-	"github.com/mitchellh/go-homedir"
-	"io"
 	"net/http"
 	"os"
 	"path"
@@ -18,6 +11,14 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+
+	"github.com/coreos/go-semver/semver"
+	"github.com/hephbuild/heph/config"
+	"github.com/hephbuild/heph/hephprovider"
+	"github.com/hephbuild/heph/log/log"
+	"github.com/hephbuild/heph/utils"
+	"github.com/hephbuild/heph/utils/locks"
+	"github.com/mitchellh/go-homedir"
 )
 
 func CheckAndUpdate(ctx context.Context, cfg config.Config) error {
@@ -84,22 +85,29 @@ func shouldUpdate(cfg config.Config) bool {
 }
 
 func findLatestVersion() (string, error) {
-	res, err := http.Get(fmt.Sprintf("%v/latest_version", hephprovider.BaseUrl))
+	url := "https://api.github.com/repos/hephbuild/heph-artifacts-v0/releases/latest"
+	res, err := http.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer res.Body.Close()
 
-	b, err := io.ReadAll(res.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if res.StatusCode != http.StatusOK {
+	if !(res.StatusCode == http.StatusOK || res.StatusCode == http.StatusNotFound) {
 		return "", fmt.Errorf("http status: %v", res.StatusCode)
 	}
 
-	return strings.TrimSpace(string(b)), nil
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&release); err != nil {
+		return "", err
+	}
+
+	if release.TagName == "" {
+		return "", fmt.Errorf("no releases found")
+	}
+
+	return release.TagName, nil
 }
 
 func homeDir(cfg config.Config) (string, error) {

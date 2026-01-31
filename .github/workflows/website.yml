@@ -6,6 +6,7 @@ on:
       - 'master'
     paths:
       - 'website/**'
+      - .github/workflows/website.yml
 
 concurrency:
   group: "pages"
@@ -34,9 +35,16 @@ jobs:
       - name: Install dependencies
         run: npm install --frozen-lockfile
         working-directory: website
+
       - name: Build website
         run: npm run build
         working-directory: website
+
+      - name: Copy scripts
+        run: |
+          mkdir -p website/build/v0
+          cp install.sh website/build/v0/install
+          cp hephw website/build/v0/hephw
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v1

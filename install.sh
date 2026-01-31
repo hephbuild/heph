@@ -1,11 +1,11 @@
 #!/bin/sh
 #
-# Downloads a precompiled copy of Heph from our gcp bucket and installs it.
+# Downloads a precompiled copy of Heph from GitHub releases and installs it.
 set -e
 
-DEFAULT_URL_BASE="https://storage.googleapis.com/heph-build"
 
-VERSION=`curl -fsSL $DEFAULT_URL_BASE/latest_version`
+VERSION=$(curl -s https://api.github.com/repos/hephbuild/heph-artifacts-v0/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+
 # Find the os / arch to download. You can do this quite nicely with go env
 # but we use this script on machines that don't necessarily have Go itself.
 OS=`uname`
@@ -34,7 +34,7 @@ else
     exit 1
 fi
 
-HEPH_URL="$DEFAULT_URL_BASE/${VERSION}/heph_${GOOS}_${ARCH}"
+HEPH_URL="https://github.com/hephbuild/heph-artifacts-v0/releases/download/${VERSION}/heph_${GOOS}_${ARCH}"
 
 LOCATION="${HOME}/.heph"
 DIR="${LOCATION}/${VERSION}"
@@ -60,7 +60,7 @@ else
     for x in `ls "$DIR"`; do
         ln -sf "${DIR}/${x}" "$LOCATION"
     done
-    curl $DEFAULT_URL_BASE/hephw -sL --output "${LOCATION}/bin/heph"
+    curl https://hephbuild.github.io/heph/hephw -sL --output "${LOCATION}/bin/heph"
     chmod +x "${LOCATION}/bin/heph"
 fi
 
