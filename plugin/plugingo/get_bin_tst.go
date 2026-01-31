@@ -89,7 +89,7 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: tref.New(goPkg.GetHephBuildPackage(), "testmain", factors.Args()),
+			Ref:    tref.New(goPkg.GetHephBuildPackage(), "testmain", factors.Args()),
 			Driver: htypes.Ptr(plugintextfile.Name),
 			Config: map[string]*structpb.Value{
 				"text": structpb.NewStringValue(string(testmainb)),

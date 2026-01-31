@@ -36,15 +36,24 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 		return Package{}, fmt.Errorf("go list: %w", err)
 	}
 
-	outputArtifacts := hartifact.FindOutputs(artifacts, "")
+	jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
+	rootArtifacts := hartifact.FindOutputs(artifacts, "root")
 
-	if len(outputArtifacts) == 0 {
-		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no output found"))
+	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 {
+		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no json found"))
 	}
 
-	outputArtifact := outputArtifacts[0]
+	jsonArtifact := jsonArtifacts[0]
+	rootArtifact := rootArtifacts[0]
 
-	f, err := hartifact.FileReader(ctx, outputArtifact)
+	rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
+	if err != nil {
+		return Package{}, err
+	}
+
+	root := strings.TrimSpace(string(rootb))
+
+	f, err := hartifact.FileReader(ctx, jsonArtifact)
 	if err != nil {
 		return Package{}, err
 	}
@@ -56,7 +65,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 		return Package{}, err
 	}
 
-	relPkg, err := tref.DirToPackage(goPkg.Dir, p.root)
+	relPkg, err := tref.DirToPackage(goPkg.Dir, root)
 	if err != nil {
 		goPkg.Is3rdParty = true
 
@@ -157,14 +166,12 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		return goPkg, nil
 	}
 
-	gomod, _, err := p.getGoModGoWork(ctx, pkg)
+	gomod, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
 		return Package{}, err
 	}
 
-	basePkg := tref.DirPackage(gomod)
-
-	c := p.newGetGoPackageCache(ctx, basePkg, factors, requestId)
+	c := p.newGetGoPackageCache(ctx, gomod.basePkg, factors, requestId)
 
 	stdList, err := c.stdListRes()
 	if err != nil {
@@ -177,7 +184,7 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 		}
 	}
 
-	goPkg, err := p.goListPkgResult(ctx, basePkg, pkg, ".", factors, requestId)
+	goPkg, err := p.goListPkgResult(ctx, gomod.basePkg, pkg, ".", factors, requestId)
 	if err != nil {
 		return Package{}, fmt.Errorf("in tree: %w", err)
 	}
@@ -534,29 +541,27 @@ func (p *Plugin) goImportsToDeps(
 
 var errNotInGoModule = errors.New("not in go module")
 
-func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (string, string, error) {
-	res, err, _ := p.goModGoWorkCache.Do(pkg, sync.OnceValues(func() (goModGoWorkCache, error) {
-		gomod, gowork, err := p.getGoModGoWorkInner(ctx, pkg)
-		if err != nil {
-			return goModGoWorkCache{}, err
-		}
-
-		return goModGoWorkCache{
-			gomod:  gomod,
-			gowork: gowork,
-		}, nil
-	}))
-	if err != nil {
-		return "", "", err
-	}
-
-	return res.gomod, res.gowork, nil
+type goModRoot struct {
+	basePkg        string
+	goModFileDeps  []string
+	goWorkFileDeps []string
 }
 
-func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (string, string, error) {
+func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (goModRoot, error) {
+	res, err, _ := p.goModGoWorkCache.Do(ctx, pkg, func(ctx context.Context) (goModRoot, error) {
+		return p.getGoModGoWorkInner(ctx, pkg)
+	})
+	if err != nil {
+		return goModRoot{}, err
+	}
+
+	return res, nil
+}
+
+func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (goModRoot, error) {
 	pkgParts := tref.SplitPackage(pkg)
 
-	var gomod, gowork string
+	var gomod, gosum, gowork string
 
 	for {
 		pkg := tref.JoinPackage(pkgParts...)
@@ -567,6 +572,11 @@ func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (string, s
 			_, err := os.Stat(filepath.Join(pkgDir, "go.mod"))
 			if err == nil {
 				gomod = tref.JoinPackage(pkg, "go.mod")
+			}
+
+			_, err = os.Stat(filepath.Join(pkgDir, "go.mod"))
+			if err == nil {
+				gosum = tref.JoinPackage(pkg, "go.sum")
 			}
 		}
 
@@ -589,39 +599,58 @@ func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (string, s
 	}
 
 	if gomod == "" {
-		return "", "", fmt.Errorf("%v: %w", pkg, errNotInGoModule)
+		return goModRoot{}, fmt.Errorf("%v: %w", pkg, errNotInGoModule)
 	}
 
-	return gomod, gowork, nil
+	mr := goModRoot{
+		basePkg: tref.DirPackage(gomod),
+		goModFileDeps: []string{
+			tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)),
+		},
+	}
+
+	if gosum != "" {
+		mr.goModFileDeps = append(mr.goModFileDeps, tref.FormatFile(tref.DirPackage(gosum), tref.BasePackage(gosum)))
+	}
+
+	if gowork != "" {
+		mr.goWorkFileDeps = []string{
+			tref.FormatFile(tref.DirPackage(gowork), tref.BasePackage(gowork)),
+		}
+	}
+
+	return mr, nil
 }
 
 func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module, error) {
-	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
+	gomod, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
 		return nil, err
 	}
 
-	files := []string{
-		tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)),
-	}
-	if gowork != "" {
-		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gowork)))
-	}
+	files := []string{}
+	files = append(files, gomod.goModFileDeps...)
+	files = append(files, gomod.goWorkFileDeps...)
 
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(requestId),
 		Spec: pluginv1.TargetSpec_builder{
-			Ref:    tref.New(tref.DirPackage(gomod), "_gomod", nil),
+			Ref:    tref.New(gomod.basePkg, "_gomod", nil),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
 				"env":              p.getEnvStructpb2(),
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
-				"run":              structpb.NewStringValue("go list -m -json > $OUT"),
-				"out":              structpb.NewStringValue("golist_mod.json"),
-				"in_tree":          structpb.NewBoolValue(true),
-				"cache":            structpb.NewStringValue("local"),
-				"hash_deps":        hstructpb.NewStringsValue(files),
-				"tools":            p.getGoToolStructpb(),
+				"run": hstructpb.NewStringsValue([]string{
+					"go list -m -json > $OUT_JSON",
+					"echo $WORKSPACE_ROOT > $OUT_ROOT",
+				}),
+				"out": hstructpb.NewMapStringStringValue(map[string]string{
+					"json": "golist_mod.json",
+					"root": "golist_mod_root",
+				}),
+				"cache":     structpb.NewStringValue("local"),
+				"hash_deps": hstructpb.NewStringsValue(files),
+				"tools":     p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build())
@@ -629,23 +658,32 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 		return nil, fmt.Errorf("gomod: %w", err)
 	}
 
-	outputArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "")
+	jsonArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "json")
+	rootArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "root")
 
-	if len(outputArtifacts) == 0 {
+	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 {
 		return nil, connect.NewError(connect.CodeInternal, errors.New("gomodules: no output found"))
 	}
 
-	outputArtifact := outputArtifacts[0]
+	jsonArtifact := jsonArtifacts[0]
+	rootArtifact := rootArtifacts[0]
 
-	f, err := hartifact.FileReader(ctx, outputArtifact)
+	rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+
+	root := strings.TrimSpace(string(rootb))
+
+	jsonf, err := hartifact.FileReader(ctx, jsonArtifact)
+	if err != nil {
+		return nil, err
+	}
+	defer jsonf.Close()
 
 	var modules []Module
 
-	dec := json.NewDecoder(f)
+	dec := json.NewDecoder(jsonf)
 	for {
 		var mod Module
 		err := dec.Decode(&mod)
@@ -656,7 +694,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 			return nil, err
 		}
 
-		mod.HephPackage, err = tref.DirToPackage(mod.Dir, p.root)
+		mod.HephPackage, err = tref.DirToPackage(mod.Dir, root)
 		if err != nil {
 			return nil, err
 		}

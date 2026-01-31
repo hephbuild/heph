@@ -86,7 +86,7 @@ type Plugin struct {
 	packageCache     *cache.Cache[packageCacheKey, *GetGoPackageCache]
 	moduleCache      hsingleflight.GroupMem[moduleCacheKey, []Module]
 	stdCache         hsingleflight.GroupMem[stdCacheKey, map[string]Package]
-	goModGoWorkCache hsingleflight.GroupMem[string, goModGoWorkCache]
+	goModGoWorkCache hsingleflight.GroupMemContext[string, goModRoot]
 }
 
 func (p *Plugin) getGoToolStructpb() *structpb.Value {
@@ -176,7 +176,7 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			return nil
 		}
 
-		_, _, err := p.getGoModGoWork(ctx, req.GetPackage())
+		_, err := p.getGoModGoWork(ctx, req.GetPackage())
 		if err != nil {
 			if errors.Is(err, errNotInGoModule) {
 				return nil
@@ -286,12 +286,12 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
 
-		return p.packageBin(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
+		return p.packageBin(ctx, gomod.basePkg, goPkg, factors, req.GetRequestId())
 	case "test":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
@@ -305,7 +305,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
@@ -315,14 +315,14 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.embedCfg(ctx, tref.DirPackage(gomod), req.GetRef().GetPackage(), goPkg, factors, mode)
+		return p.embedCfg(ctx, gomod.basePkg, req.GetRef().GetPackage(), goPkg, factors, mode)
 	case "build_lib":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
@@ -332,19 +332,19 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLib(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.GetRequestId())
+		return p.packageLib(ctx, gomod.basePkg, goPkg, factors, mode, req.GetRequestId())
 	case "build_test":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
 
-		return p.packageBinTest(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
+		return p.packageBinTest(ctx, gomod.basePkg, goPkg, factors, req.GetRequestId())
 	case "testmain":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
@@ -358,12 +358,12 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
 
-		return p.testMainLib(ctx, tref.DirPackage(gomod), goPkg, factors, req.GetRequestId())
+		return p.testMainLib(ctx, gomod.basePkg, goPkg, factors, req.GetRequestId())
 	case "build_lib#asm":
 		goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetRef().GetPackage(), factors, req.GetRequestId())
 		if err != nil {
@@ -394,7 +394,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, err
 		}
 
-		gomod, _, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
+		gomod, err := p.getGoModGoWork(ctx, req.GetRef().GetPackage())
 		if err != nil {
 			return nil, err
 		}
@@ -404,7 +404,7 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 			return nil, fmt.Errorf("parse mode: %w", err)
 		}
 
-		return p.packageLibIncomplete(ctx, tref.DirPackage(gomod), goPkg, factors, mode, req.GetRequestId())
+		return p.packageLibIncomplete(ctx, gomod.basePkg, goPkg, factors, mode, req.GetRequestId())
 	}
 
 	return nil, pluginsdk.ErrNotFound
@@ -414,18 +414,14 @@ var errConstraintExcludeAllGoFiles = errors.New("build constraints exclude all G
 var errNoGoFiles = errors.New("no Go files in package")
 
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
-	gomod, gowork, err := p.getGoModGoWork(ctx, pkg)
+	gomod, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	var files []string
-	if gomod != "" {
-		files = append(files, tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)))
-	}
-	if gowork != "" {
-		files = append(files, tref.FormatFile(tref.DirPackage(gowork), tref.BasePackage(gowork)))
-	}
+	files := []string{}
+	files = append(files, gomod.goModFileDeps...)
+	files = append(files, gomod.goWorkFileDeps...)
 
 	args := f.Args()
 	if imp == "." {
@@ -474,12 +470,17 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			Config: map[string]*structpb.Value{
 				"env":              p.getEnvStructpb(f),
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
-				"run":              structpb.NewStringValue(fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT", f.Tags, imp)),
-				"out":              structpb.NewStringValue("golist.json"),
-				"in_tree":          structpb.NewBoolValue(true),
-				"cache":            structpb.NewStringValue("local"),
-				"hash_deps":        hstructpb.NewStringsValue(files),
-				"tools":            p.getGoToolStructpb(),
+				"run": hstructpb.NewStringsValue([]string{
+					fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT_JSON", f.Tags, imp),
+					"echo $WORKSPACE_ROOT > $OUT_ROOT",
+				}),
+				"out": hstructpb.NewMapStringStringValue(map[string]string{
+					"json": "golist.json",
+					"root": "golist_root",
+				}),
+				"cache": structpb.NewStringValue("local"),
+				"deps":  hstructpb.NewStringsValue(files),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build())

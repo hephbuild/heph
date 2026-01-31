@@ -58,6 +58,17 @@ func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error
 	}
 }
 
+// FileReader Assumes the output has a single file, and provides the bytes for it (no matter the packaging).
+func FileReadAll(ctx context.Context, a *pluginv1.Artifact) ([]byte, error) {
+	f, err := FileReader(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return io.ReadAll(f)
+}
+
 type File struct {
 	io.ReadCloser
 	Path string
