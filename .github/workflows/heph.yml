@@ -24,7 +24,7 @@ jobs:
           VERSION=$(.github/workflows/version.sh)
           echo "$VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "::notice title=Version Computed::Building version: $VERSION"
+          echo "::notice title=Build Version::$VERSION"
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -91,6 +91,8 @@ jobs:
     name: Upload artifacts
     needs: [gen, build]
     runs-on: ubuntu-latest
+    outputs:
+      release_url: ${{ steps.create_release.outputs.url }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v7
@@ -103,6 +105,7 @@ jobs:
         run: ls -lahR dist
 
       - name: Create Release in artifacts repo
+        id: create_release
         uses: softprops/action-gh-release@v2
         with:
           repository: hephbuild/heph-artifacts-v1
@@ -155,3 +158,23 @@ jobs:
           tag_name: ${{needs.gen.outputs.version}}
           prerelease: false
           make_latest: true
+
+  summary:
+    name: Summary
+    needs: [gen, upload_artifacts]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{needs.gen.outputs.version}}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.upload_artifacts.result }}" == "success" ]; then
+            echo "**Release:** [${{needs.gen.outputs.version}}](${{needs.upload_artifacts.outputs.release_url}})" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.upload_artifacts.result }}" == "skipped" ]; then
+            echo "**Release:** Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
+          fi
