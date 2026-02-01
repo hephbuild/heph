@@ -208,7 +208,6 @@ func Format(ref *Ref) string {
 	})
 
 	return f
-
 }
 
 func format(ref *Ref) string {
@@ -270,7 +269,6 @@ func FormatOut(ref *RefOut) string {
 	})
 
 	return f
-
 }
 
 func formatOut(ref *RefOut) string {

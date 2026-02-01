@@ -52,7 +52,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(req.GetRequestId()),
 		Spec: pluginv1.TargetSpec_builder{
-			Ref: tref.New("some/package", "think", nil),
+			Ref:    tref.New("some/package", "think", nil),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
 				"out": structpb.NewStringValue("out"),

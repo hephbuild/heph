@@ -15,7 +15,6 @@ func (e *Engine) List(ctx context.Context, rs *RequestState, p EngineProvider, p
 		Package:   htypes.Ptr(pkg),
 	}.Build())
 	if err != nil {
-
 		return nil, err
 	}
 

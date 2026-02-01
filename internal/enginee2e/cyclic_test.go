@@ -346,5 +346,4 @@ func TestCyclic4(t *testing.T) {
 			assert.Len(t, res, 2)
 		})
 	}
-
 }

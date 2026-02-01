@@ -127,7 +127,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 			RequestId: htypes.Ptr(req.GetRequestId()),
 			Spec: pluginv1.TargetSpec_builder{
-				Ref: tref.New(hephPackage, "think", nil),
+				Ref:    tref.New(hephPackage, "think", nil),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
 					"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{

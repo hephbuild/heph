@@ -835,7 +835,6 @@ func (e *Engine) Validate(ctx context.Context, rs *RequestState, m *pluginv1.Tar
 				paths[codegenPath] = ref
 			}
 		}
-
 	}
 
 	return nil

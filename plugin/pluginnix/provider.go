@@ -79,7 +79,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	return p.get(ctx, nixRef, nixPkg, hash)
 }
 
-// temporary until we get can heph heph to manage the nix cache
+// temporary until we get can heph heph to manage the nix cache.
 func (p *Provider) install(ctx context.Context, nixRef, nixPkg string) (*pluginv1.GetResponse, error) {
 	ref := tref.New(tref.JoinPackage("@nix", nixRef), nixPkg, map[string]string{
 		"install": "1",

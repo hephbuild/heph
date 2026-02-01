@@ -30,7 +30,7 @@ func TestPermute(t *testing.T) {
 				res = append(res, arr)
 			}
 
-			require.EqualValues(t, expected, res)
+			require.Equal(t, expected, res)
 		})
 	}
 }

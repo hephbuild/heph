@@ -3,6 +3,7 @@ package pluginnix
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,7 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-// Nix expression template for creating wrapper binaries
+// Nix expression template for creating wrapper binaries.
 const nixWrapperTemplate = `
 with import <nixpkgs> {};
 let
@@ -61,17 +62,15 @@ type nixWrapperData struct {
 	NixRef   string
 }
 
-// generateWrapperNix creates the Nix expression for building wrapper scripts
+// generateWrapperNix creates the Nix expression for building wrapper scripts.
 func generateWrapperNix(nixRef string, packages []string, wrapperName string) (string, error) {
 	if len(packages) == 0 {
-		return "", fmt.Errorf("packages list cannot be empty")
+		return "", errors.New("packages list cannot be empty")
 	}
 
 	// Convert package names to nix package references
 	nixPackages := make([]string, len(packages))
-	for i, pkg := range packages {
-		nixPackages[i] = pkg
-	}
+	copy(nixPackages, packages)
 
 	data := nixWrapperData{
 		Name:     wrapperName,
@@ -92,7 +91,7 @@ func generateWrapperNix(nixRef string, packages []string, wrapperName string) (s
 	return buf.String(), nil
 }
 
-// runNixBuild executes nix-build with the given Nix expression and returns the store path
+// runNixBuild executes nix-build with the given Nix expression and returns the store path.
 func runNixBuild(ctx context.Context, nixExpr string) (string, error) {
 	// Create temporary file for the nix expression
 	tmpFile, err := os.CreateTemp("", "nix-wrapper-*.nix")
@@ -113,7 +112,8 @@ func runNixBuild(ctx context.Context, nixExpr string) (string, error) {
 
 	output, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		exitErr := &exec.ExitError{}
+		if errors.As(err, &exitErr) {
 			return "", fmt.Errorf("nix-build failed: %w\nstderr: %s", err, exitErr.Stderr)
 		}
 		return "", fmt.Errorf("nix-build failed: %w", err)
@@ -123,7 +123,7 @@ func runNixBuild(ctx context.Context, nixExpr string) (string, error) {
 	return storePath, nil
 }
 
-// discoverBinaries lists all executables in a Nix store path
+// discoverBinaries lists all executables in a Nix store path.
 func discoverBinaries(storePath string) ([]string, error) {
 	binDir := filepath.Join(storePath, "bin")
 
@@ -152,10 +152,10 @@ func discoverBinaries(storePath string) ([]string, error) {
 	return binaries, nil
 }
 
-// createWrapperTargets creates target specs for each discovered binary
+// createWrapperTargets creates target specs for each discovered binary.
 func createWrapperTargets(nixRef, nixPkg string, storePath string, binaries []string, nixToolRef *tref.Ref, hash bool) ([]*pluginv1.GetResponse, error) {
 	if len(binaries) == 0 {
-		return nil, fmt.Errorf("no binaries found in wrapper")
+		return nil, errors.New("no binaries found in wrapper")
 	}
 
 	responses := make([]*pluginv1.GetResponse, 0, len(binaries))

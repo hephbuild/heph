@@ -157,7 +157,7 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 	return &pluginv1.ProbeResponse{}, nil
 }
 
-// getCodegenRoot extracts the codegen root package from provider states
+// getCodegenRoot extracts the codegen root package from provider states.
 func getCodegenRoot(states []*pluginv1.ProviderState, providerName string) string {
 	for _, state := range states {
 		if state.GetProvider() == providerName {
@@ -226,7 +226,6 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 			}
 
 			if !goPkg.Is3rdParty && !goPkg.IsStd && (len(goPkg.TestGoFiles) > 0 || len(goPkg.XTestGoFiles) > 0) {
-
 				err = send(pluginv1.ListResponse_builder{Ref: tref.New(goPkg.GetHephBuildPackage(), "test", factors.Args())}.Build())
 				if err != nil {
 					return err

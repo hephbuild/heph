@@ -1,6 +1,7 @@
 package hfs
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -67,7 +68,7 @@ func (c *FSCache) walkRecursive(node *Node, fn fs.WalkDirFunc) error {
 	err := fn(node.Path, node.Entry, nil)
 
 	// Handle SkipDir
-	if err == fs.SkipDir {
+	if errors.Is(err, fs.SkipDir) {
 		if node.Entry.IsDir() {
 			return nil // Skip processing children
 		}
@@ -90,7 +91,7 @@ func (c *FSCache) walkRecursive(node *Node, fn fs.WalkDirFunc) error {
 		if readErr != nil {
 			err = fn(node.Path, node.Entry, readErr)
 			if err != nil {
-				if err == fs.SkipDir {
+				if errors.Is(err, fs.SkipDir) {
 					return nil
 				}
 				return err
@@ -136,7 +137,7 @@ func (c *FSCache) walkRecursive(node *Node, fn fs.WalkDirFunc) error {
 	// 3. Recurse into children (using memory cache)
 	for _, child := range node.Children {
 		if err := c.walkRecursive(child, fn); err != nil {
-			if err == fs.SkipDir {
+			if errors.Is(err, fs.SkipDir) {
 				continue
 			}
 			return err

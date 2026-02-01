@@ -131,7 +131,7 @@ func NewInteractiveBash(options ...Option) *Plugin {
 	)
 }
 
-// parseWrapperConfig extracts nix-wrapper specific parameters and builds exec config
+// parseWrapperConfig extracts nix-wrapper specific parameters and builds exec config.
 func parseWrapperConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string]*structpb.Value) (*pluginv1.TargetDef, error) {
 	nixPackages := make([]string, 0)
 	nixPrograms := make([]string, 0)
