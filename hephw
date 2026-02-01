@@ -70,12 +70,6 @@ if [ -f "$TARGET" ]; then
     exec "$TARGET" ${HEPH_ARGS:-} "$@"
 fi
 
-URL_BASE="$(read_config "^downloadlocation" | cut -d ':' -f 2 | tr -d ' ')"
-if [ -z "$URL_BASE" ]; then
-    URL_BASE=$DEFAULT_URL_BASE
-fi
-URL_BASE="${URL_BASE%/}"
-
 VERSION="$(read_config "^version[^\n]")"
 VERSION="${VERSION#*:}"    # Strip until after first :
 VERSION="${VERSION/ /}"    # Remove all spaces
