@@ -91,7 +91,7 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 
 		path := dir.At(fmt.Sprintf("%v_%v", os.Getpid(), uuid.New().String())).Path()
 
-		l, err := net.Listen("unix", path)
+		l, err := (&net.ListenConfig{}).Listen(ctx, "unix", path)
 		if err != nil {
 			return nil, "", nil, err
 		}
@@ -104,7 +104,7 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 
 		return l, unixPathPrefix + b64Path, cleanup, nil
 	} else {
-		l, err := net.Listen("tcp", "127.0.0.1:")
+		l, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:")
 		if err != nil {
 			return nil, "", nil, err
 		}
@@ -364,7 +364,12 @@ func (e *Engine) RegisterDriver(ctx context.Context, driver pluginsdk.Driver, re
 			return DriverHandle{}, err
 		}
 
-		cclient := pluginv1connect.NewDriverClient(pluginh.HTTPClient(), pluginh.GetBaseURL(), e.pluginInterceptor("driver", pluginName, initPayload.Engine), connectAcceptCompressOption)
+		cclient := pluginv1connect.NewDriverClient(
+			pluginh.HTTPClient(),
+			pluginh.GetBaseURL(),
+			e.pluginInterceptor("driver", pluginName, initPayload.Engine),
+			connectAcceptCompressOption,
+		)
 		client = pluginsdkconnect.NewDriverConnectClient(cclient)
 	}
 

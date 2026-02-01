@@ -2,10 +2,12 @@ package pluginexec
 
 import (
 	"bytes"
+	"context"
 	"os/exec"
 	"slices"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // See https://www.in-ulm.de/~mascheck/various/argmax/
@@ -42,7 +44,10 @@ func envLength(env []string) int64 {
 }
 
 func maxArgs() (int64, error) {
-	cmd := exec.Command("getconf", "ARG_MAX")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "getconf", "ARG_MAX")
 	b, err := cmd.Output()
 	if err != nil {
 		return 0, err

@@ -186,7 +186,7 @@ func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (Manif
 
 	var outPath string
 	var x bool
-	switch artifact.WhichContent() {
+	switch artifact.WhichContent() { //nolint:exhaustive
 	case pluginv1.Artifact_File_case:
 		outPath = artifact.GetFile().GetOutPath()
 		x = artifact.GetFile().GetX()

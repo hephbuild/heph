@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 
 	runtime.GC()
-	fmt.Println("Giving the opportunity for the cleanup to run...") //nolint:forbidigo
+	fmt.Println("Giving the opportunity for the cleanup to run...")
 	time.Sleep(5 * time.Second)
 	os.Exit(code)
 }

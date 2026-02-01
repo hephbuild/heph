@@ -8,9 +8,11 @@ import (
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
+	"github.com/hephbuild/heph/internal/hslices"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -190,20 +192,17 @@ func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S)
 
 func hashTarget(target *execv1.Target) []byte {
 	var cloned bool
-
-	if func() bool {
-		for _, env := range target.GetEnv() {
-			if !env.GetHash() {
-				return true
-			}
-		}
-
-		return false
-	}() {
+	clonedOnce := func() {
 		if !cloned {
 			cloned = true
 			target = hproto.Clone(target)
 		}
+	}
+
+	if hmaps.Has(target.GetEnv(), func(s string, env *execv1.Target_Env) bool {
+		return !env.GetHash()
+	}) {
+		clonedOnce()
 
 		env := target.GetEnv()
 
@@ -213,19 +212,10 @@ func hashTarget(target *execv1.Target) []byte {
 		target.SetEnv(env)
 	}
 
-	if func() bool {
-		for _, dep := range target.GetDeps() {
-			if !dep.GetHash() {
-				return true
-			}
-		}
-
-		return false
-	}() {
-		if !cloned {
-			cloned = true
-			target = hproto.Clone(target)
-		}
+	if hslices.Has(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
+		return !dep.GetHash()
+	}) {
+		clonedOnce()
 
 		deps := slices.DeleteFunc(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
 			return !dep.GetHash()

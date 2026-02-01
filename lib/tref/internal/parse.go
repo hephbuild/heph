@@ -24,7 +24,7 @@ func LexDebug(s string, out bool) {
 
 	toks, err := parser.Lex("", strings.NewReader(s))
 	if err != nil {
-		fmt.Println(err)
+		fmt.Println(err) //nolint:forbidigo
 
 		return
 	}
@@ -40,7 +40,7 @@ func LexDebug(s string, out bool) {
 		buf.WriteString(fmt.Sprintf("%v{%v}", syms[tok.Type], tok.String()))
 	}
 
-	fmt.Println(buf.String())
+	fmt.Println(buf.String()) //nolint:forbidigo
 }
 
 func IsRelative(s string) bool {

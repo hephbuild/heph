@@ -903,18 +903,19 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 			}
 
 			var outputNames []string
-			if input.GetRef().HasOutput() {
+			switch {
+			case input.GetRef().HasOutput():
 				if !checkRefOutputExists(linkedDep, input.GetRef()) {
 					return fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(input.GetRef()), input.GetRef().GetOutput())
 				}
 
 				outputNames = []string{input.GetRef().GetOutput()}
-			} else if len(linkedDep.GetOutputs()) <= 1 { // no need to alloc map & sort
+			case len(linkedDep.GetOutputs()) <= 1: // no need to alloc map & sort
 				outputNames = make([]string, 0, len(linkedDep.GetOutputs()))
 				for _, output := range linkedDep.GetOutputs() {
 					outputNames = append(outputNames, output.GetGroup())
 				}
-			} else {
+			default:
 				m := make(map[string]struct{}, len(linkedDep.GetOutputs()))
 				for _, output := range linkedDep.GetOutputs() {
 					m[output.GetGroup()] = struct{}{}

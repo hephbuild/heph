@@ -164,13 +164,14 @@ linters:
       - legacy
       - std-error-handling
     rules:
-      - linters:
+      - source: (noinspection|TODO)
+        linters:
           - godot
-        source: (noinspection|TODO)
-      - linters:
+      - source: //noinspection
+        linters:
           - gocritic
-        source: //noinspection
-      - linters:
+      - path: _test\.go
+        linters:
           - bodyclose
           - dupl
           - errcheck
@@ -180,11 +181,24 @@ linters:
           - noctx
           - prealloc
           - wrapcheck
-        path: _test\.go
-      - linters:
           - forbidigo
-        path: internal/cmd/.*
+          - lll
+      - path: internal/cmd/.*
         text: use of `fmt.Println` forbidden by pattern
+        linters:
+          - forbidigo
+      - path: internal/cmd/.*
+        linters:
+          - dupl
+      - source: "^func "
+        linters:
+          - lll
+      - path: (.+)\.go$
+        text: 'ineffectual assignment to ctx'
+      - path: (.+)\.go$
+        text: 'SA4006: this value of ctx is never used'
+      - path: (.+)\.go$
+        text: 'assigned to ctx, but never used afterwards'
     paths:
       - internal/experiment
       - third_party$

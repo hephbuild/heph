@@ -112,11 +112,7 @@ func init() {
 							return meta
 						}),
 						hdag.WithEdgeFilter(func(src, dst *pluginv1.TargetRef, meta string) bool {
-							if meta == "resolve" {
-								return false
-							}
-
-							return true
+							return meta != "resolve"
 						}),
 					)
 				})

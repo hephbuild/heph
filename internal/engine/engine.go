@@ -195,9 +195,7 @@ func (e *Engine) NewRequestState() (*RequestState, func()) {
 	s := &RequestState{
 		ID: id,
 		RequestStateData: &RequestStateData{
-			dag: hdag.NewMeta[*pluginv1.TargetRef, string](func(v *pluginv1.TargetRef) string {
-				return tref.Format(v)
-			}),
+			dag: hdag.NewMeta[*pluginv1.TargetRef, string](tref.Format),
 		},
 	}
 

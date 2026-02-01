@@ -103,11 +103,12 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 				Glob:        nil,
 				CodegenTree: htypes.Ptr(pluginv1.TargetDef_Path_CODEGEN_MODE_COPY),
 			}
-			if hfs.IsGlob(test.outPath) {
+			switch {
+			case hfs.IsGlob(test.outPath):
 				outPath.Glob = htypes.Ptr(test.outPath)
-			} else if strings.HasSuffix(test.outPath, "/") {
+			case strings.HasSuffix(test.outPath, "/"):
 				outPath.DirPath = htypes.Ptr(test.outPath)
-			} else {
+			default:
 				outPath.FilePath = htypes.Ptr(test.outPath)
 			}
 
