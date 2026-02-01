@@ -82,7 +82,7 @@ jobs:
         run: |
           BIN_NAME="heph_${{ matrix.os }}_${{ matrix.arch }}"
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
-          go build -ldflags "-s -w -X internal/hversion.Version=${{needs.gen.outputs.version}}" -o $BIN_NAME
+          go build -trimpath -ldflags "-s -w -X internal/hversion.Version=${{needs.gen.outputs.version}}" -o $BIN_NAME
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
