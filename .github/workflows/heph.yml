@@ -10,6 +10,7 @@ jobs:
   gen:
     name: Codegen
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -51,6 +52,7 @@ jobs:
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: gen
     strategy:
       fail-fast: false
@@ -91,6 +93,7 @@ jobs:
     name: Upload artifacts
     needs: [gen, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       release_url: ${{ steps.create_release.outputs.url }}
     steps:
@@ -120,6 +123,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: gen
     steps:
       - name: Download repo
@@ -136,15 +140,16 @@ jobs:
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: gen
     strategy:
       fail-fast: false
-      # matrix:
-      #   os: [linux, darwin]
-      #   arch: [arm64, amd64]
-      matrix: # good enough for now
-        os: [linux]
-        arch: [amd64]
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: darwin
+            arch: arm64
     steps:
       - name: Download repo
         uses: actions/download-artifact@v7
@@ -160,6 +165,7 @@ jobs:
     needs: [gen, upload_artifacts, lint, test]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v1'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Update Release to Production
         uses: softprops/action-gh-release@v2
@@ -175,6 +181,7 @@ jobs:
     needs: [gen, upload_artifacts]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Generate summary
         run: |

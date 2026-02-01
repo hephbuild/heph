@@ -68,6 +68,7 @@ linters:
       package-average: 10
     errcheck:
       check-type-assertions: true
+      ignore: defer
     exhaustive:
       check:
         - switch

@@ -143,7 +143,7 @@ func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error
 			}
 
 			for _, s := range ss {
-				fmt.Fprintln(args.Stdout, s)
+				_, _ = fmt.Fprintln(args.Stdout, s)
 			}
 
 			ss = ss[:0]
