@@ -22,7 +22,7 @@ jobs:
       - name: Compute version
         id: version
         run: |
-          VERSION=$(.github/workflows/version.sh)
+          VERSION=$(.github/workflows/version.sh "${{github.run_number}}")
           echo "$VERSION"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "::notice title=Build Version::$VERSION"

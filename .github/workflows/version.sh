@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Optional first argument: build number
+build_number="${1:-}"
+
 # Get the most recent tag
 latest_tag=$(git describe --tags --abbrev=0)
 
@@ -21,11 +24,16 @@ else
     # Parse the describe output
     # Format is like: 1.2.3-5-g36e65
     # We want to transform it to: 1.2.3-build.5+g36e65
+    # If build_number is provided, append it: 1.2.3-build.5.123+g36e65
 
     # Extract components using sed
     version=$(echo "$describe" | sed -E 's/^(.*)-([0-9]+)-g([0-9a-f]+)$/\1/')
     commits=$(echo "$describe" | sed -E 's/^(.*)-([0-9]+)-g([0-9a-f]+)$/\2/')
     hash=$(echo "$describe" | sed -E 's/^(.*)-([0-9]+)-g([0-9a-f]+)$/\3/')
 
-    echo "$version-build.$commits+g$hash"
+    if [ -n "$build_number" ]; then
+        echo "$version-build.$commits.$build_number+g$hash"
+    else
+        echo "$version-build.$commits+g$hash"
+    fi
 fi
