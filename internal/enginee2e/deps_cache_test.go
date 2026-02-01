@@ -127,6 +127,12 @@ func TestDepsCache2(t *testing.T) {
 		Return(pluginv1.ProviderConfigResponse_builder{Name: htypes.Ptr("test_provider")}.Build(), nil).AnyTimes()
 
 	provider.EXPECT().
+		Probe(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, request *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
+			return pluginv1.ProbeResponse_builder{}.Build(), nil
+		}).AnyTimes()
+
+	provider.EXPECT().
 		Get(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, request *pluginv1.GetRequest) (*pluginv1.GetResponse, error) {
 			return pluginv1.GetResponse_builder{

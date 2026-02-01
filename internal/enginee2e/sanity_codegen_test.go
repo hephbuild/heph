@@ -93,7 +93,9 @@ func TestCodegen(t *testing.T) {
 	_, err = e.RegisterDriver(ctx, execdriver, nil)
 	require.NoError(t, err)
 
-	assertEmpty := func() {
+	assertEmpty := func(t *testing.T) {
+		t.Helper()
+
 		rs, clean := e.NewRequestState()
 		defer clean()
 
@@ -113,7 +115,7 @@ func TestCodegen(t *testing.T) {
 		assert.Equal(t, "out_t1", strings.TrimSpace(string(b)))
 	}
 
-	assertEmpty()
+	assertEmpty(t)
 
 	{
 		rs, clean := e.NewRequestState()
@@ -124,7 +126,7 @@ func TestCodegen(t *testing.T) {
 		res.Unlock(ctx)
 	}
 
-	assertEmpty()
+	assertEmpty(t)
 }
 
 func TestCodegenValidateConflict1(t *testing.T) {

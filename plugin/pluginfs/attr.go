@@ -3,7 +3,7 @@ package pluginfs
 import (
 	"context"
 	"fmt"
-	"maps"
+	"runtime"
 	"slices"
 
 	"github.com/hephbuild/heph/lib/tref"
@@ -16,8 +16,18 @@ const (
 	xattrCodegenSource = "heph.codegen.source"
 )
 
+func prefix() string {
+	if runtime.GOOS == "linux" {
+		// linux enforces user namespace for xattrs
+
+		return "user."
+	}
+
+	return ""
+}
+
 func IsCodegen(ctx context.Context, path string) bool {
-	v, err := xattr.LGet(path, xattrCodegen)
+	v, err := xattr.LGet(path, prefix()+xattrCodegen)
 	if err != nil {
 		return false
 	}
@@ -32,12 +42,12 @@ func MarkCodegen(ctx context.Context, source *pluginv1.TargetRef, to string) err
 	}
 
 	attrs := map[string]string{
-		xattrCodegen:       "true",
-		xattrCodegenSource: tref.Format(source),
+		prefix() + xattrCodegen:       "true",
+		prefix() + xattrCodegenSource: tref.Format(source),
 	}
 
 	hasAll := true
-	for k := range maps.Keys(attrs) {
+	for k := range attrs {
 		if !slices.Contains(existingAttrs, k) {
 			hasAll = false
 
