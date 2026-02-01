@@ -17,6 +17,7 @@ type ConfigPackages struct {
 type ConfigProvider struct {
 	Name    string
 	Enabled bool
+	Exclude []string
 	Options map[string]any
 }
 

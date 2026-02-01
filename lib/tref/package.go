@@ -48,10 +48,6 @@ func ToPackage(s string) string {
 	return s
 }
 
-func SplitPackage(s string) []string {
-	return strings.Split(s, "/")
-}
-
 func ParentPackages(p string) iter.Seq[string] {
 	return func(yield func(string) bool) {
 		for p != "" {
@@ -69,6 +65,10 @@ func ParentPackages(p string) iter.Seq[string] {
 
 		yield("")
 	}
+}
+
+func SplitPackage(s string) []string {
+	return strings.Split(s, "/")
 }
 
 func JoinPackage(s ...string) string {

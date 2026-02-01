@@ -98,7 +98,7 @@ func TestCyclic1(t *testing.T) {
 				},
 			})
 
-			_, err = e.RegisterProvider(ctx, staticprovider)
+			_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 			require.NoError(t, err)
 
 			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
@@ -183,7 +183,7 @@ func TestCyclic2(t *testing.T) {
 				},
 			})
 
-			_, err = e.RegisterProvider(ctx, staticprovider)
+			_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 			require.NoError(t, err)
 
 			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
@@ -281,7 +281,7 @@ func TestCyclic3(t *testing.T) {
 				},
 			})
 
-			_, err = e.RegisterProvider(ctx, staticprovider)
+			_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 			require.NoError(t, err)
 
 			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
@@ -327,7 +327,7 @@ func TestCyclic4(t *testing.T) {
 
 			e.WellKnownPackages = []string{"", "some", "some/package"}
 
-			_, err = e.RegisterProvider(ctx, plugincyclicprovider.New(test[0], test[1]))
+			_, err = e.RegisterProvider(ctx, plugincyclicprovider.New(test[0], test[1]), engine.RegisterProviderConfig{})
 			require.NoError(t, err)
 
 			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)

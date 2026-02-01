@@ -24,6 +24,7 @@ type YAMLConfigPackages struct {
 
 type YAMLConfigProvider struct {
 	YAMLConfigPlugin `yaml:",inline"`
+	Exclude          []string `yaml:"exclude,omitempty"`
 }
 
 type YAMLConfigDriver struct {
@@ -130,6 +131,9 @@ func ApplyYAMLConfig(cfg Config, inc YAMLConfig) (Config, error) {
 		}
 		if incp.Options != nil {
 			cp.Options = incp.Options
+		}
+		if incp.Exclude != nil {
+			cp.Exclude = incp.Exclude
 		}
 		cfg.Providers[i] = cp
 	}

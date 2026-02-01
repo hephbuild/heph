@@ -65,7 +65,7 @@ func TestDepsCache(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginexec.NewExec(), nil)
@@ -137,7 +137,7 @@ func TestDepsCache2(t *testing.T) {
 			}.Build(), nil
 		}).Times(3)
 
-	_, err = e.RegisterProvider(ctx, provider)
+	_, err = e.RegisterProvider(ctx, provider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	driver := pluginsdk.NewMockDriver(c)

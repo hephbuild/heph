@@ -108,6 +108,7 @@ type Engine struct {
 
 type EngineProvider struct {
 	Name string
+	RegisterProviderConfig
 	pluginsdk.Provider
 }
 

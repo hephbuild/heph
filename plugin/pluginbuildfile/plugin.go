@@ -59,7 +59,7 @@ func (p *Plugin) Config(ctx context.Context, req *pluginv1.ProviderConfigRequest
 
 func (p *Plugin) Probe(ctx context.Context, req *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	var states []*pluginv1.ProviderState
-	_, err := p.runPkg(ctx, hfs.At(p.repoRoot, req.GetPackage()).Path(), Hooks{
+	_, err := p.runPkg(ctx, req.GetPackage(), Hooks{
 		onProviderState: func(ctx context.Context, payload OnProviderStatePayload) error {
 			if payload.Provider == Name {
 				return nil
@@ -116,16 +116,16 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 	}), nil
 }
 
-func (p *Plugin) runPkg(ctx context.Context, pkg string, hooks Hooks) (starlark.StringDict, error) {
-	return p.cacherunpkg.Singleflight(ctx, pkg, hooks, func(hooks Hooks) (starlark.StringDict, error) {
-		return p.runPkgInner(ctx, pkg, hooks)
+func (p *Plugin) runPkg(ctx context.Context, pkgDir string, hooks Hooks) (starlark.StringDict, error) {
+	return p.cacherunpkg.Singleflight(ctx, pkgDir, hooks, func(hooks Hooks) (starlark.StringDict, error) {
+		return p.runPkgInner(ctx, pkgDir, hooks)
 	})
 }
 
-func (p *Plugin) runPkgInner(ctx context.Context, pkg string, hooks Hooks) (starlark.StringDict, error) {
+func (p *Plugin) runPkgInner(ctx context.Context, pkgDir string, hooks Hooks) (starlark.StringDict, error) {
 	out := starlark.StringDict{}
 
-	fs := hfs.At(p.repoRoot, pkg)
+	fs := hfs.At(p.repoRoot, pkgDir)
 	for _, pattern := range p.Patterns {
 		err := hfs.Glob(ctx, fs, pattern, nil, func(path string, d hfs.DirEntry) error {
 			f, err := hfs.Open(fs, path)
@@ -134,7 +134,7 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkg string, hooks Hooks) (star
 			}
 			defer f.Close()
 
-			res, err := p.runFile(ctx, pkg, f, hooks)
+			res, err := p.runFile(ctx, pkgDir, f, hooks)
 			if err != nil {
 				return err
 			}

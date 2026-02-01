@@ -21,7 +21,7 @@ func TestSmartProviderPlugin(t *testing.T) {
 	e, err := engine.New(ctx, dir, engine.Config{})
 	require.NoError(t, err)
 
-	_, err = e.RegisterProvider(ctx, pluginsmartprovidertest.New())
+	_, err = e.RegisterProvider(ctx, pluginsmartprovidertest.New(), engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginexec.NewExec(), nil)

@@ -13,7 +13,7 @@ import (
 	"sync"
 
 	"github.com/hephbuild/heph/internal/hdebug"
-
+	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/htypes"
 
 	"github.com/hephbuild/heph/internal/herrgroup"
@@ -29,6 +29,26 @@ import (
 	sync_map "github.com/zolstein/sync-map"
 	"google.golang.org/protobuf/types/known/structpb"
 )
+
+var errConstraintExcludeAllGoFiles = errors.New("build constraints exclude all Go files")
+
+func (p *Plugin) goListPkg(ctx context.Context, pkg string, factors Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		RequestId: htypes.Ptr(requestId),
+		Ref: tref.New(pkg, "_golist", hmaps.Concat(factors.Args(), map[string]string{
+			"imp": imp,
+		})),
+	}.Build())
+	if err != nil {
+		if strings.Contains(err.Error(), "build constraints exclude all Go files") {
+			return nil, nil, fmt.Errorf("%w: %w", errConstraintExcludeAllGoFiles, err)
+		}
+
+		return nil, nil, fmt.Errorf("golist: %v (in %v): %w", imp, pkg, err)
+	}
+
+	return res.GetArtifacts(), res.GetDef().GetRef(), nil
+}
 
 func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors, requestId string) (Package, error) {
 	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp, requestId)
@@ -358,7 +378,6 @@ func (p *Plugin) goListTestDepsPkgResult(
 					if err != nil {
 						return err
 					}
-
 					goPkgsm.Lock()
 					goPkgs = append(goPkgs, testGoPkg)
 					goPkgsm.Unlock()
@@ -547,6 +566,14 @@ type goModRoot struct {
 	goWorkFileDeps []string
 }
 
+func (mr goModRoot) hasMod() bool {
+	return len(mr.goModFileDeps) > 0
+}
+
+func (mr goModRoot) hasWork() bool {
+	return len(mr.goWorkFileDeps) > 0
+}
+
 func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (goModRoot, error) {
 	res, err, _ := p.goModGoWorkCache.Do(ctx, pkg, func(ctx context.Context) (goModRoot, error) {
 		return p.getGoModGoWorkInner(ctx, pkg)
@@ -559,64 +586,45 @@ func (p *Plugin) getGoModGoWork(ctx context.Context, pkg string) (goModRoot, err
 }
 
 func (p *Plugin) getGoModGoWorkInner(ctx context.Context, pkg string) (goModRoot, error) {
-	pkgParts := tref.SplitPackage(pkg)
+	mr := goModRoot{}
 
-	var gomod, gosum, gowork string
+	gowork := false
 
-	for {
-		pkg := tref.JoinPackage(pkgParts...)
-		pkgDirParts := append([]string{p.root}, pkgParts...)
-		pkgDir := filepath.Join(pkgDirParts...)
+	for pkg := range tref.ParentPackages(pkg) {
+		pkgDir := filepath.Join(p.root, tref.ToOSPath(pkg))
 
-		if gomod == "" {
+		if !mr.hasMod() {
 			_, err := os.Stat(filepath.Join(pkgDir, "go.mod"))
 			if err == nil {
-				gomod = tref.JoinPackage(pkg, "go.mod")
+				mr.goModFileDeps = append(mr.goModFileDeps, tref.FormatFile(pkg, "go.mod"))
+				mr.basePkg = pkg
 			}
 
-			_, err = os.Stat(filepath.Join(pkgDir, "go.mod"))
+			_, err = os.Stat(filepath.Join(pkgDir, "go.sum"))
 			if err == nil {
-				gosum = tref.JoinPackage(pkg, "go.sum")
+				mr.goModFileDeps = append(mr.goModFileDeps, tref.FormatFile(pkg, "go.sum"))
 			}
 		}
 
-		if false && gowork == "" {
+		if gowork && mr.hasMod() {
 			_, err := os.Stat(filepath.Join(pkgDir, "go.work"))
 			if err == nil {
-				gowork = tref.JoinPackage(pkg, "go.work")
+				mr.goWorkFileDeps = append(mr.goWorkFileDeps, tref.FormatFile(pkg, "go.work"))
+			}
+
+			_, err = os.Stat(filepath.Join(pkgDir, "go.work.sum"))
+			if err == nil {
+				mr.goWorkFileDeps = append(mr.goWorkFileDeps, tref.FormatFile(pkg, "go.work.sum"))
 			}
 		}
 
-		if gomod != "" && gowork != "" {
+		if mr.hasMod() && (!gowork || mr.hasWork()) {
 			break
 		}
-
-		if len(pkgParts) == 0 {
-			break
-		}
-
-		pkgParts = pkgParts[:len(pkgParts)-1]
 	}
 
-	if gomod == "" {
+	if !mr.hasMod() {
 		return goModRoot{}, fmt.Errorf("%v: %w", pkg, errNotInGoModule)
-	}
-
-	mr := goModRoot{
-		basePkg: tref.DirPackage(gomod),
-		goModFileDeps: []string{
-			tref.FormatFile(tref.DirPackage(gomod), tref.BasePackage(gomod)),
-		},
-	}
-
-	if gosum != "" {
-		mr.goModFileDeps = append(mr.goModFileDeps, tref.FormatFile(tref.DirPackage(gosum), tref.BasePackage(gosum)))
-	}
-
-	if gowork != "" {
-		mr.goWorkFileDeps = []string{
-			tref.FormatFile(tref.DirPackage(gowork), tref.BasePackage(gowork)),
-		}
 	}
 
 	return mr, nil
@@ -642,12 +650,13 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					"go list -m -json > $OUT_JSON",
-					"echo $WORKSPACE_ROOT > $OUT_ROOT",
+					"echo $TREE_ROOT > $OUT_ROOT",
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"json": "golist_mod.json",
 					"root": "golist_mod_root",
 				}),
+				"in_tree":   structpb.NewBoolValue(true),
 				"cache":     structpb.NewStringValue("local"),
 				"hash_deps": hstructpb.NewStringsValue(files),
 				"tools":     p.getGoToolStructpb(),

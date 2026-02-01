@@ -33,7 +33,7 @@ func (p *Plugin) runTest(ctx context.Context, goPkg Package, factors Factors, v 
 			Ref:    tref.New(goPkg.GetHephBuildPackage(), "test", rargs),
 			Driver: htypes.Ptr("bash"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue("$TOOL" + targs),
+				"run": structpb.NewStringValue("$TOOL_BIN" + targs),
 				"deps": hstructpb.NewMapStringStringValue(map[string]string{
 					"testdata": tref.FormatQuery(tref.QueryOptions{
 						Label:        "go_test_data",

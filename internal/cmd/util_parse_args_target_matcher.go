@@ -122,7 +122,7 @@ func (r parseTargetMatcherArgs) ParseResolve(
 			return nil, nil, err
 		}
 
-		return matcher, spec.GetRef(), nil
+		return tmatch.Ref(spec.GetRef()), spec.GetRef(), nil
 	}
 
 	return matcher, nil, nil

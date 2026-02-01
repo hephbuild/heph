@@ -270,7 +270,11 @@ func (e *Engine) pluginInterceptor(pluginType, pluginName string, handle plugins
 var connectCompressOption = connect.WithCompression("gzip", nil, nil)
 var connectAcceptCompressOption = connect.WithAcceptCompression("gzip", nil, nil)
 
-func (e *Engine) RegisterProvider(ctx context.Context, provider pluginsdk.Provider) (ProviderHandle, error) {
+type RegisterProviderConfig struct {
+	Exclude []*pluginv1.TargetMatcher
+}
+
+func (e *Engine) RegisterProvider(ctx context.Context, provider pluginsdk.Provider, cfg RegisterProviderConfig) (ProviderHandle, error) {
 	res, err := provider.Config(ctx, &pluginv1.ProviderConfigRequest{})
 	if err != nil {
 		return ProviderHandle{}, err
@@ -289,8 +293,9 @@ func (e *Engine) RegisterProvider(ctx context.Context, provider pluginsdk.Provid
 	}
 
 	provider2 := EngineProvider{
-		Name:     pluginName,
-		Provider: provider,
+		Name:                   pluginName,
+		Provider:               provider,
+		RegisterProviderConfig: cfg,
 	}
 
 	e.Providers = append(e.Providers, provider2)

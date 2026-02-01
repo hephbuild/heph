@@ -18,7 +18,9 @@ import (
 	"github.com/hephbuild/heph/internal/hversion"
 	"github.com/hephbuild/heph/internal/remotecache"
 	"github.com/hephbuild/heph/internal/termui"
+	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/pluginsdk"
+	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/hephbuild/heph/plugin/pluginbin"
 	"github.com/hephbuild/heph/plugin/pluginbuildfile"
 	"github.com/hephbuild/heph/plugin/pluginexec"
@@ -320,7 +322,19 @@ func newEngine(ctx context.Context, root string) (*engine.Engine, error) {
 
 		p := factory(ctx, root, plugin.Options)
 
-		_, err = e.RegisterProvider(ctx, p)
+		var excludes []*pluginv1.TargetMatcher
+		for _, e := range plugin.Exclude {
+			m, err := tmatch.ParsePackageMatcher(e, root, root)
+			if err != nil {
+				return nil, fmt.Errorf("invalid exclude pattern %q: %w", e, err)
+			}
+
+			excludes = append(excludes, m)
+		}
+
+		_, err = e.RegisterProvider(ctx, p, engine.RegisterProviderConfig{
+			Exclude: excludes,
+		})
 		if err != nil {
 			return nil, err
 		}

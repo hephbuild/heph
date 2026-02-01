@@ -55,7 +55,7 @@ func TestSanity(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	execdriver := pluginexec.NewExec()
@@ -137,7 +137,7 @@ func TestSanity2(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	execdriver := pluginexec.NewSh()

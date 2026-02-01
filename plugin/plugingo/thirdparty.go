@@ -19,6 +19,7 @@ func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) 
 		fmt.Sprintf("go mod download -modcacherw -json %v@%v | tee mod.json", goMod, version),
 		"rm go.mod",
 		`export MOD_DIR=$(cat mod.json | awk -F\" '/"Dir": / { print $4 }')`,
+		`[[ -z "$MOD_DIR" ]] && { exit 1; }`,
 		`cp -r "$MOD_DIR/." .`,
 	}
 

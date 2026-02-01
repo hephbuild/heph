@@ -64,7 +64,7 @@ func TestSanityTool(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginexec.NewExec(), nil)

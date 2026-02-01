@@ -80,10 +80,10 @@ func TestCodegen(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
-	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider())
+	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider(), engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginfs.NewDriver(), nil)
@@ -168,10 +168,10 @@ func TestCodegenValidateConflict1(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
-	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider())
+	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider(), engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginfs.NewDriver(), nil)
@@ -233,10 +233,10 @@ func TestCodegenValidateConflict2(t *testing.T) {
 		},
 	})
 
-	_, err = e.RegisterProvider(ctx, staticprovider)
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
-	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider())
+	_, err = e.RegisterProvider(ctx, pluginfs.NewProvider(), engine.RegisterProviderConfig{})
 	require.NoError(t, err)
 
 	_, err = e.RegisterDriver(ctx, pluginfs.NewDriver(), nil)

@@ -18,15 +18,20 @@ import (
 
 type DAG = hdag.DAG[*pluginv1.TargetRef, string]
 
+type memProbeInnerKey struct {
+	name, pkg string
+}
+
 type RequestStateData struct {
 	InteractiveExec func(context.Context, InteractiveExecOptions) error
 	Shell           *pluginv1.TargetRef
 	Force           *pluginv1.TargetMatcher
 	Interactive     *pluginv1.TargetRef
 
-	memSpec hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
-	// memProbe   hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
-	memMeta hsingleflight.GroupMemContext[string, *Meta]
+	memSpec       hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
+	memProbe      hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]
+	memProbeInner hsingleflight.GroupMemContext[memProbeInnerKey, []*pluginv1.ProviderState]
+	memMeta       hsingleflight.GroupMemContext[string, *Meta]
 
 	memLink hsingleflight.GroupMemContext[string, *LightLinkedTarget]
 	memDef  hsingleflight.GroupMemContext[string, *TargetDef]

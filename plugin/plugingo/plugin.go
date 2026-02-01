@@ -19,7 +19,6 @@ import (
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	"github.com/hephbuild/heph/lib/pluginsdk"
-	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -71,10 +70,6 @@ type moduleCacheKey struct {
 	RequestId string
 	Factors   Factors
 	BasePkg   string
-}
-
-type goModGoWorkCache struct {
-	gomod, gowork string
 }
 
 type Plugin struct {
@@ -160,6 +155,18 @@ func (p *Plugin) Config(ctx context.Context, c *pluginv1.ProviderConfigRequest) 
 
 func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1.ProbeResponse, error) {
 	return &pluginv1.ProbeResponse{}, nil
+}
+
+// getCodegenRoot extracts the codegen root package from provider states
+func getCodegenRoot(states []*pluginv1.ProviderState, providerName string) string {
+	for _, state := range states {
+		if state.GetProvider() == providerName {
+			if isCodegenRoot := state.GetState()["go_codegen_root"]; isCodegenRoot != nil && isCodegenRoot.GetBoolValue() {
+				return state.GetPackage()
+			}
+		}
+	}
+	return ""
 }
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -256,6 +263,12 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 	}
 	if factors.GOARCH == "" {
 		factors.GOARCH = runtime.GOARCH
+	}
+
+	if req.GetRef().GetName() == "_golist" {
+		imp := req.GetRef().GetArgs()["imp"]
+
+		return p.goList(ctx, req.GetRef().GetPackage(), factors, imp, req.GetStates())
 	}
 
 	if basePkg, modPath, version, modPkgPath, ok := ParseThirdpartyPackage(req.GetRef().GetPackage()); ok && basePkg == "" {
@@ -410,13 +423,12 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 	return nil, pluginsdk.ErrNotFound
 }
 
-var errConstraintExcludeAllGoFiles = errors.New("build constraints exclude all Go files")
 var errNoGoFiles = errors.New("no Go files in package")
 
-func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, states []*pluginv1.ProviderState) (*pluginv1.GetResponse, error) {
 	gomod, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	files := []string{}
@@ -424,10 +436,22 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 	files = append(files, gomod.goWorkFileDeps...)
 
 	args := f.Args()
+	args = hmaps.Concat(args, map[string]string{
+		"imp": imp,
+	})
+
+	var inTree bool
+
 	if imp == "." {
+		// Determine package prefix from probe states
+		packagePrefix := pkg // default to current package
+		if codegenRoot := getCodegenRoot(states, Name); codegenRoot != "" {
+			packagePrefix = codegenRoot
+		}
+
 		entries, err := os.ReadDir(filepath.Join(p.root, pkg))
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		var hasGoFile bool
@@ -443,7 +467,7 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 		}
 
 		if !hasGoFile {
-			return nil, nil, errNoGoFiles
+			return nil, errNoGoFiles
 		}
 
 		files = append(files, tref.FormatGlob(pkg, "*.go", nil))
@@ -452,45 +476,43 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, f Factors, imp, requ
 			Label:         "go_src",
 			SkipProvider:  Name,
 			TreeOutputTo:  pkg,
-			PackagePrefix: pkg,
+			PackagePrefix: packagePrefix, // Use determined prefix instead of pkg
 		}))
-	} else {
-		args = hmaps.Concat(args, map[string]string{
-			"import": imp,
-		})
+
+		inTree = true
+		// directories from heph v0 linked to tree will cause the exec to be in the .heph cache dir, causing wrong go mod
+		if _, err := os.Readlink(filepath.Join(p.root, tref.ToOSPath(pkg))); err == nil {
+			inTree = false
+		}
 	}
 
-	listRef := tref.New(pkg, "_golist", args)
+	var rootVar string
+	if inTree {
+		rootVar = "$TREE_ROOT"
+	} else {
+		rootVar = "$WORKSPACE_ROOT"
+	}
 
-	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
-		RequestId: htypes.Ptr(requestId),
+	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
-			Ref:    listRef,
+			Ref:    tref.New(pkg, "_golist", args),
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
 				"env":              p.getEnvStructpb(f),
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT_JSON", f.Tags, imp),
-					"echo $WORKSPACE_ROOT > $OUT_ROOT",
+					"echo " + rootVar + " > $OUT_ROOT",
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"json": "golist.json",
 					"root": "golist_root",
 				}),
-				"cache": structpb.NewStringValue("local"),
-				"deps":  hstructpb.NewStringsValue(files),
-				"tools": p.getGoToolStructpb(),
+				"in_tree":   structpb.NewBoolValue(inTree),
+				"cache":     structpb.NewStringValue("local"),
+				"hash_deps": hstructpb.NewStringsValue(files),
+				"tools":     p.getGoToolStructpb(),
 			},
 		}.Build(),
-	}.Build())
-	if err != nil {
-		if strings.Contains(err.Error(), "build constraints exclude all Go files") {
-			return nil, nil, fmt.Errorf("%w: %w", errConstraintExcludeAllGoFiles, err)
-		}
-
-		return nil, nil, fmt.Errorf("golist: %v (in %v): %v: %w", imp, pkg, tref.Format(listRef), err)
-	}
-
-	return res.GetArtifacts(), res.GetDef().GetRef(), nil
+	}.Build(), nil
 }

@@ -87,6 +87,19 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 		}
 
 		for _, p := range e.Providers {
+			skip := false
+			for _, matcher := range p.Exclude {
+				if tmatch.MatchPackage(ref.GetPackage(), matcher) == tmatch.MatchYes {
+					skip = true
+
+					break
+				}
+			}
+
+			if skip {
+				continue
+			}
+
 			var providerStates []*pluginv1.ProviderState
 			for _, state := range states {
 				if state.GetProvider() == p.Name {
@@ -117,6 +130,11 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	}
 
 	if computed && !tref.Equal(spec.GetRef(), c.GetRef()) {
+		// pre-hydrate the resolved ref's spec
+		_, _, _ = rs.memSpec.Do(ctx, refKey(spec.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
+			return spec, nil
+		})
+
 		hlog.From(ctx).Warn(fmt.Sprintf("%v resolved as %v", tref.Format(c.GetRef()), tref.Format(spec.GetRef())))
 	}
 
@@ -263,7 +281,7 @@ func (e *Engine) getSpec(ctx context.Context, rs *RequestState, c SpecContainer)
 		return nil, errors.New("spec or ref must be specified")
 	}
 
-	states, err := e.ProbeSegments(ctx, rs, c, pkg)
+	states, err := e.ProbeSegments(ctx, rs, pkg)
 	if err != nil {
 		return nil, err
 	}
@@ -271,44 +289,42 @@ func (e *Engine) getSpec(ctx context.Context, rs *RequestState, c SpecContainer)
 	return e.resolveSpec(ctx, rs, states, c)
 }
 
-func (e *Engine) ProbeSegments(ctx context.Context, rs *RequestState, c SpecContainer, pkg string) ([]*pluginv1.ProviderState, error) {
-	return nil, nil
+func (e *Engine) ProbeSegments(ctx context.Context, rs *RequestState, pkg string) ([]*pluginv1.ProviderState, error) {
+	ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("pkg", pkg)))
+	defer span.End()
 
-	// ctx, span := tracer.Start(ctx, "ProbeSegments", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
-	// defer span.End()
-	//
-	//// TODO: errgroup to parallelize probing
-	//
-	// var states []*pluginv1.ProviderState
-	// segments := strings.Split(pkg, string(filepath.Separator))
-	// if len(segments) == 0 || len(segments) > 1 && segments[0] != "" {
-	//	// make sure to always probe root
-	//	segments = slices.Insert(segments, 0, "")
-	//}
-	// for i := range segments {
-	//	probePkg := path.Join(segments[:i]...)
-	//
-	//	for ip, p := range e.Providers {
-	//		probeStates, err, _ := rs.memProbe.Do(ctx, fmt.Sprintf("%v %v", ip, probePkg), func(ctx context.Context) ([]*pluginv1.ProviderState, error) {
-	//			res, err := p.Probe(ctx, &pluginv1.ProbeRequest{
-	//				RequestId: rs.ID,
-	//				Package:   probePkg,
-	//			})
-	//			if err != nil {
-	//				return nil, err
-	//			}
-	//
-	//			return res.GetStates(), nil
-	//		})
-	//		if err != nil {
-	//			return nil, err
-	//		}
-	//
-	//		states = append(states, probeStates...)
-	//	}
-	//}
-	//
-	// return states, nil
+	states, err, _ := rs.memProbe.Do(ctx, pkg, func(ctx context.Context) ([]*pluginv1.ProviderState, error) {
+		var states []*pluginv1.ProviderState
+		for probePkg := range tref.ParentPackages(pkg) {
+			for _, p := range e.Providers {
+				probeStates, err, _ := rs.memProbeInner.Do(ctx, memProbeInnerKey{name: p.Name, pkg: probePkg}, func(ctx context.Context) ([]*pluginv1.ProviderState, error) {
+					res, err := p.Probe(ctx, pluginv1.ProbeRequest_builder{
+						RequestId: &rs.ID,
+						Package:   &probePkg,
+					}.Build())
+					if err != nil {
+						return nil, err
+					}
+
+					return res.GetStates(), nil
+				})
+				if err != nil {
+					return nil, err
+				}
+
+				if len(probeStates) > 0 {
+					states = append(states, probeStates...)
+				}
+			}
+		}
+
+		return states, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return states, nil
 }
 
 type Refish interface {
