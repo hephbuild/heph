@@ -54,8 +54,8 @@ func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) 
 	defer cancelHardCtx()
 
 	strm := p.client.Run(hardCtx)
-	defer strm.CloseResponse() //nolint:errcheck
-	defer strm.CloseRequest()  //nolint:errcheck
+	defer strm.CloseResponse()
+	defer strm.CloseRequest()
 
 	go func() {
 		select {

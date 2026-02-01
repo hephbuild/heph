@@ -64,7 +64,7 @@ func (e *Engine) queryListProvider(
 			yield(nil, err)
 			return
 		}
-		defer res.CloseReceive() //nolint:errcheck
+		defer res.CloseReceive()
 
 		for res.Receive() {
 			msg := res.Msg()

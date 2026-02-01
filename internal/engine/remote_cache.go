@@ -144,7 +144,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 			return nil, false, err
 		}
 
-		defer tmpCacheDir.RemoveAll("") //nolint:errcheck
+		defer tmpCacheDir.RemoveAll("")
 
 		cacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 

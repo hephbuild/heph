@@ -17,7 +17,7 @@ type AtomicFile struct {
 }
 
 func (f *AtomicFile) Close() error {
-	defer f.fs.Remove(f.tmpname) //nolint:errcheck
+	defer f.fs.Remove(f.tmpname)
 
 	err := f.File.Close()
 	if err != nil {

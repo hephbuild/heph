@@ -64,8 +64,8 @@ func (p providerConnectClient) Get(ctx context.Context, req *pluginv1.GetRequest
 	defer cancelHardCtx()
 
 	strm := p.client.Get(hardCtx)
-	defer strm.CloseResponse() //nolint:errcheck
-	defer strm.CloseRequest()  //nolint:errcheck
+	defer strm.CloseResponse()
+	defer strm.CloseRequest()
 
 	go func() {
 		select {
@@ -141,7 +141,7 @@ func (p providerConnectHandler) List(ctx context.Context, req *connect.Request[p
 	if err != nil {
 		return p.handleErr(err)
 	}
-	defer strm.CloseReceive() //nolint:errcheck
+	defer strm.CloseReceive()
 
 	for strm.Receive() {
 		msg := strm.Msg()

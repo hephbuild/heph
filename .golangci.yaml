@@ -68,7 +68,6 @@ linters:
       package-average: 10
     errcheck:
       check-type-assertions: true
-      ignore: defer
     exhaustive:
       check:
         - switch
@@ -193,12 +192,15 @@ linters:
       - source: "^func "
         linters:
           - lll
+      - source: "defer "
+        linters:
+          - errcheck
       - path: (.+)\.go$
-        text: 'ineffectual assignment to ctx'
+        text: "ineffectual assignment to ctx"
       - path: (.+)\.go$
-        text: 'SA4006: this value of ctx is never used'
+        text: "SA4006: this value of ctx is never used"
       - path: (.+)\.go$
-        text: 'assigned to ctx, but never used afterwards'
+        text: "assigned to ctx, but never used afterwards"
     paths:
       - internal/experiment
       - third_party$
@@ -218,4 +220,3 @@ formatters:
       - third_party$
       - builtin$
       - examples$
-
