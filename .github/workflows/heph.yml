@@ -48,6 +48,7 @@ jobs:
         with:
           name: repo
           path: .
+          include-hidden-files: true
 
   build:
     name: Build ${{ matrix.os }}/${{ matrix.arch }}
@@ -133,7 +134,7 @@ jobs:
           path: .
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.5
 
