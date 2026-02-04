@@ -15,6 +15,7 @@ func init() {
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Dump the driver configuration for a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -72,5 +73,5 @@ func init() {
 		},
 	}
 
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

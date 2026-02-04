@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
@@ -10,10 +9,11 @@ import (
 )
 
 func init() {
-	cmdArgs := parseRefArgs{cmdName: "hashin"}
+	cmdArgs := parsePackageMatcherArgs{cmdName: "labels"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "List the labels in the universe of targets",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -32,7 +32,7 @@ func init() {
 				return err
 			}
 
-			ref, err := cmdArgs.Parse(args[0], cwd, root)
+			matcher, err := cmdArgs.Parse(args, cwd, root)
 			if err != nil {
 				return err
 			}
@@ -46,19 +46,15 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				meta, err := e.MetaFromRef(ctx, rs, ref)
-				if err != nil {
-					return err
-				}
+				queue, flushResults := render(ctx, execFunc)
+				defer flushResults()
 
-				// TODO how to render res natively without exec
-				err = execFunc(func(args hbbtexec.RunArgs) error {
-					fmt.Println(meta.Hashin)
+				for label, err := range e.Labels(ctx, rs, matcher) {
+					if err != nil {
+						return err
+					}
 
-					return nil
-				})
-				if err != nil {
-					return err
+					queue(label)
 				}
 
 				return nil
@@ -71,5 +67,5 @@ func init() {
 		},
 	}
 
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

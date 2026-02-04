@@ -4,18 +4,19 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/hephbuild/heph/lib/tref"
-
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func init() {
-	cmdArgs := parseRefArgs{cmdName: "deps"}
+	var link bool
+	cmdArgs := parseRefArgs{cmdName: "applied-transitive"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "List transitives configuration applied to a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -48,16 +49,26 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				def, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
-				if err != nil {
-					return err
+				var def *engine.TargetDef
+				if link {
+					res, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
+					if err != nil {
+						return err
+					}
+
+					def = res.TargetDef
+				} else {
+					res, err := e.GetDef(ctx, rs, engine.DefContainer{Ref: ref})
+					if err != nil {
+						return err
+					}
+
+					def = res
 				}
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					for _, dep := range def.Inputs {
-						fmt.Println(tref.Format(dep.GetRef()))
-					}
+					fmt.Println(protojson.Format(def.AppliedTransitive))
 
 					return nil
 				})
@@ -75,5 +86,7 @@ func init() {
 		},
 	}
 
-	queryCmd.AddCommand(cmd)
+	cmd.Flags().BoolVar(&link, "link", false, "Link target")
+
+	inspectCmd.AddCommand(cmd)
 }

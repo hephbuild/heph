@@ -13,6 +13,7 @@ func init() {
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Ensures the build graph is valid",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {

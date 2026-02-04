@@ -4,18 +4,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hephbuild/heph/lib/tref"
+
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/spf13/cobra"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 func init() {
-	var link bool
-	cmdArgs := parseRefArgs{cmdName: "def"}
+	cmdArgs := parseRefArgs{cmdName: "deps"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "List the dependencies for a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -48,26 +49,16 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				var def *engine.TargetDef
-				if link {
-					res, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
-					if err != nil {
-						return err
-					}
-
-					def = res.TargetDef
-				} else {
-					res, err := e.GetDef(ctx, rs, engine.DefContainer{Ref: ref})
-					if err != nil {
-						return err
-					}
-
-					def = res
+				def, err := e.Link(ctx, rs, engine.DefContainer{Ref: ref})
+				if err != nil {
+					return err
 				}
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					fmt.Println(protojson.Format(def.TargetDef))
+					for _, dep := range def.Inputs {
+						fmt.Println(tref.Format(dep.GetRef()))
+					}
 
 					return nil
 				})
@@ -85,7 +76,5 @@ func init() {
 		},
 	}
 
-	cmd.Flags().BoolVar(&link, "link", false, "Link target")
-
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

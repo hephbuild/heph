@@ -2,17 +2,12 @@ package cmd
 
 import (
 	"context"
-	"fmt"
-	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
-	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/spf13/cobra"
 )
 
@@ -30,15 +25,14 @@ import (
 // heph r -e 'lint && //some/**/*'
 // heph r -e 'test || (k8s-validate && !k8s-validate-prod)'
 
-var queryCmd *cobra.Command
-
 func init() {
 	var ignore []string
 
 	cmdArgs := parseTargetMatcherArgs{cmdName: "query"}
 
-	queryCmd = &cobra.Command{
+	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Query the universe of targets",
 		Aliases:           []string{"q"},
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
@@ -81,7 +75,7 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				queue, flushResults := renderResults(ctx, execFunc)
+				queue, flushResults := render(ctx, execFunc)
 				defer flushResults()
 
 				for ref, err := range e.Query(ctx, rs, matcher) {
@@ -106,83 +100,7 @@ func init() {
 		},
 	}
 
-	queryCmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
+	cmd.Flags().StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
 
-	rootCmd.AddCommand(queryCmd)
-}
-
-func renderResults(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func(s string), func()) {
-	var m sync.Mutex
-	ss := make([]string, 0, 100)
-	t := time.NewTicker(20 * time.Millisecond)
-
-	var pending atomic.Bool
-
-	renderRefs := func(force bool) {
-		if !force {
-			m.Lock()
-			empty := len(ss) == 0
-			m.Unlock()
-			if empty {
-				return
-			}
-
-			if !pending.CompareAndSwap(false, true) {
-				return
-			}
-		}
-
-		err := execFunc(func(args hbbtexec.RunArgs) error {
-			defer pending.Swap(false)
-
-			m.Lock()
-			defer m.Unlock()
-
-			if len(ss) == 0 {
-				return nil
-			}
-
-			for _, s := range ss {
-				_, _ = fmt.Fprintln(args.Stdout, s)
-			}
-
-			ss = ss[:0]
-
-			return nil
-		})
-		if err != nil {
-			hlog.From(ctx).Error(fmt.Sprintf("exec: %v", err))
-		}
-	}
-
-	closeCh := make(chan struct{})
-	bgDoneCh := make(chan struct{})
-	go func() {
-		defer close(bgDoneCh)
-		for {
-			select {
-			case <-closeCh:
-				renderRefs(true)
-				return
-			default:
-				select {
-				case <-closeCh:
-					renderRefs(true)
-					return
-				case <-t.C:
-					renderRefs(false)
-				}
-			}
-		}
-	}()
-
-	return func(s string) {
-			m.Lock()
-			ss = append(ss, s)
-			m.Unlock()
-		}, func() {
-			t.Stop()
-			close(closeCh)
-			<-bgDoneCh
-		}
+	rootCmd.AddCommand(cmd)
 }

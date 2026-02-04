@@ -19,6 +19,7 @@ func init() {
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Clear the cache for targets matching the given pattern",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {

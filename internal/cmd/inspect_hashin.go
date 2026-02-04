@@ -4,21 +4,17 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/hephbuild/heph/internal/tmatch"
-	"github.com/hephbuild/heph/lib/tref"
-
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/spf13/cobra"
 )
 
 func init() {
-	var scope string
-
-	cmdArgs := parseRefArgs{cmdName: "revdeps"}
+	cmdArgs := parseRefArgs{cmdName: "hashin"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Print the input hash for a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -42,14 +38,6 @@ func init() {
 				return err
 			}
 
-			scopeMatcher := tmatch.All()
-			if scope != "" {
-				scopeMatcher, err = tmatch.ParsePackageMatcher(scope, cwd, root)
-				if err != nil {
-					return err
-				}
-			}
-
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
 				e, err := newEngine(ctx, root)
 				if err != nil {
@@ -59,16 +47,14 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				desc, err := e.DAG(ctx, rs, ref, engine.DAGTypeDescendants, scopeMatcher)
+				meta, err := e.MetaFromRef(ctx, rs, ref)
 				if err != nil {
 					return err
 				}
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					for _, ref := range desc.GetVertices() {
-						fmt.Println(tref.Format(ref))
-					}
+					fmt.Println(meta.Hashin)
 
 					return nil
 				})
@@ -86,7 +72,5 @@ func init() {
 		},
 	}
 
-	cmd.Flags().StringVar(&scope, "scope", "", "Filter universe of targets")
-
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

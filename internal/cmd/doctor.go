@@ -25,8 +25,9 @@ var doctorCmd = func() *cobra.Command {
 	}
 
 	return &cobra.Command{
-		Use:  "doctor",
-		Args: cobra.NoArgs,
+		Use:   "doctor",
+		Short: "Run a series of checks to diagnose issues related to the environment",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 

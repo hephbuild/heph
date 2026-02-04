@@ -31,6 +31,7 @@ func init() {
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Run targets matching the given pattern",
 		Aliases:           []string{"r"},
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),

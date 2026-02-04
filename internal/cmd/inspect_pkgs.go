@@ -12,6 +12,7 @@ func init() {
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "List the packages",
 		Aliases:           []string{"pkgs"},
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
@@ -53,5 +54,5 @@ func init() {
 		},
 	}
 
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

@@ -2,6 +2,10 @@ package cmd
 
 import (
 	"context"
+	"fmt"
+
+	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/tref"
 
 	"github.com/hephbuild/heph/internal/engine"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
@@ -9,10 +13,13 @@ import (
 )
 
 func init() {
-	cmdArgs := parsePackageMatcherArgs{cmdName: "labels"}
+	var scope string
+
+	cmdArgs := parseRefArgs{cmdName: "revdeps"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "List targets that depend on a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -31,9 +38,17 @@ func init() {
 				return err
 			}
 
-			matcher, err := cmdArgs.Parse(args, cwd, root)
+			ref, err := cmdArgs.Parse(args[0], cwd, root)
 			if err != nil {
 				return err
+			}
+
+			scopeMatcher := tmatch.All()
+			if scope != "" {
+				scopeMatcher, err = tmatch.ParsePackageMatcher(scope, cwd, root)
+				if err != nil {
+					return err
+				}
 			}
 
 			err = newTermui(ctx, func(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) error {
@@ -45,15 +60,21 @@ func init() {
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
 
-				queue, flushResults := renderResults(ctx, execFunc)
-				defer flushResults()
+				desc, err := e.DAG(ctx, rs, ref, engine.DAGTypeDescendants, scopeMatcher)
+				if err != nil {
+					return err
+				}
 
-				for label, err := range e.Labels(ctx, rs, matcher) {
-					if err != nil {
-						return err
+				// TODO how to render res natively without exec
+				err = execFunc(func(args hbbtexec.RunArgs) error {
+					for _, ref := range desc.GetVertices() {
+						fmt.Println(tref.Format(ref))
 					}
 
-					queue(label)
+					return nil
+				})
+				if err != nil {
+					return err
 				}
 
 				return nil
@@ -66,5 +87,7 @@ func init() {
 		},
 	}
 
-	queryCmd.AddCommand(cmd)
+	cmd.Flags().StringVar(&scope, "scope", "", "Filter universe of targets")
+
+	inspectCmd.AddCommand(cmd)
 }

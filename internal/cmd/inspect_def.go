@@ -12,10 +12,11 @@ import (
 
 func init() {
 	var link bool
-	cmdArgs := parseRefArgs{cmdName: "applied-transitive"}
+	cmdArgs := parseRefArgs{cmdName: "def"}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
+		Short:             "Dump the driver definition for a target",
 		Args:              cmdArgs.Args(),
 		ValidArgsFunction: cmdArgs.ValidArgsFunction(),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -67,7 +68,7 @@ func init() {
 
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
-					fmt.Println(protojson.Format(def.AppliedTransitive))
+					fmt.Println(protojson.Format(def.TargetDef))
 
 					return nil
 				})
@@ -87,5 +88,5 @@ func init() {
 
 	cmd.Flags().BoolVar(&link, "link", false, "Link target")
 
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }

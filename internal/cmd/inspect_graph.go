@@ -17,8 +17,9 @@ func init() {
 	var scope string
 
 	cmd := &cobra.Command{
-		Use:  "graph [ dependees | deps ] <target-addr>",
-		Args: cobra.RangeArgs(1, 2),
+		Use:   "graph [ dependees | deps ] <target-addr>",
+		Short: "Outputs a DOT representation of the dependency graph",
+		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -127,5 +128,5 @@ func init() {
 
 	cmd.Flags().StringVar(&scope, "scope", "", "Filter universe of targets")
 
-	queryCmd.AddCommand(cmd)
+	inspectCmd.AddCommand(cmd)
 }
