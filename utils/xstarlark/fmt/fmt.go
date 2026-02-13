@@ -300,6 +300,12 @@ func (f *formatter) formatStmt(w Writer, sstmt syntax.Stmt) error {
 			return err
 		}
 	case *syntax.ReturnStmt:
+		if stmt.Result == nil {
+			w.WriteString("return")
+
+			return nil
+		}
+
 		w.WriteString("return ")
 		return f.formatExpr(w, stmt.Result)
 	case *IfStmt:

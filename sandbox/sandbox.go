@@ -200,14 +200,22 @@ func Make(ctx context.Context, cfg MakeConfig) error {
 		}
 		untarDedup.Add(to)
 
-		err := xfs.CreateParentDir(to)
+		err = xfs.CreateParentDir(to)
 		if err != nil {
 			return err
 		}
 
-		err = os.Link(file.From, to)
-		if err != nil {
-			return fmt.Errorf("make: link %v to %v: %w", file.From, to, err)
+		target, err := os.Readlink(file.From)
+		if err == nil {
+			err = os.Symlink(target, to)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = os.Link(file.From, to)
+			if err != nil {
+				return fmt.Errorf("make: link %v to %v: %w", file.From, to, err)
+			}
 		}
 
 		if cfg.ProgressLinks != nil {
