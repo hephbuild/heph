@@ -1,10 +1,13 @@
 package enginee2e
 
 import (
+	"io"
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
+	"github.com/stretchr/testify/assert"
 
 	"github.com/go-faker/faker/v4"
 	"github.com/hephbuild/heph/internal/engine"
@@ -148,6 +151,8 @@ func TestGroupNamed(t *testing.T) {
 				}.Build(),
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
+					"out": hstructpb.NewStringsValue([]string{"out"}),
+					"run": hstructpb.NewStringsValue([]string{`env | grep SRC | grep -v LIST > $OUT`}),
 					"deps": hstructpb.NewStringsValue([]string{
 						tref.Format(pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
@@ -174,4 +179,111 @@ func TestGroupNamed(t *testing.T) {
 	res, err := e.Result(ctx, rs, pkg, "res", []string{""})
 	require.NoError(t, err)
 	defer res.Unlock(ctx)
+
+	require.Len(t, res.Artifacts, 1)
+
+	r, err := hartifact.FileReader(ctx, res.FindOutputs("")[0].Artifact)
+	require.NoError(t, err)
+	defer r.Close()
+
+	b, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	assert.Equal(t, "SRC_2=out2\nSRC_1=out1\n", string(b))
+}
+
+func TestGroupNamed2(t *testing.T) {
+	ctx := t.Context()
+
+	dir := t.TempDir()
+
+	e, err := engine.New(ctx, dir, engine.Config{})
+	require.NoError(t, err)
+
+	pkg := faker.UUIDDigit()
+
+	staticprovider := pluginstaticprovider.New([]pluginstaticprovider.Target{
+		{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("t"),
+				}.Build(),
+				Driver: htypes.Ptr("bash"),
+				Config: map[string]*structpb.Value{
+					"run": hstructpb.NewStringsValue([]string{`echo hello > $OUT_1`, `echo hello > $OUT_2`}),
+					"out": hstructpb.NewMapStringStringValue(map[string]string{
+						"1": "out1",
+						"2": "out2",
+					}),
+				},
+			}.Build(),
+		},
+		{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("g"),
+				}.Build(),
+				Driver: htypes.Ptr("group"),
+				Config: map[string]*structpb.Value{
+					"deps": hstructpb.NewStringsValue([]string{
+						tref.FormatOut(pluginv1.TargetRefWithOutput_builder{
+							Target: pluginv1.TargetRef_builder{
+								Package: htypes.Ptr(pkg),
+								Name:    htypes.Ptr("t"),
+							}.Build(),
+							Output: htypes.Ptr("1"),
+						}.Build()),
+					}),
+				},
+			}.Build(),
+		},
+		{
+			Spec: pluginv1.TargetSpec_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr(pkg),
+					Name:    htypes.Ptr("res"),
+				}.Build(),
+				Driver: htypes.Ptr("bash"),
+				Config: map[string]*structpb.Value{
+					"out": hstructpb.NewStringsValue([]string{"out"}),
+					"run": hstructpb.NewStringsValue([]string{`env | grep SRC | grep -v LIST > $OUT`}),
+					"deps": hstructpb.NewStringsValue([]string{
+						tref.Format(pluginv1.TargetRef_builder{
+							Package: htypes.Ptr(pkg),
+							Name:    htypes.Ptr("g"),
+						}.Build()),
+					}),
+				},
+			}.Build(),
+		},
+	})
+
+	_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
+	require.NoError(t, err)
+
+	_, err = e.RegisterDriver(ctx, pluginexec.NewBash(), nil)
+	require.NoError(t, err)
+
+	_, err = e.RegisterDriver(ctx, plugingroup.New(), nil)
+	require.NoError(t, err)
+
+	rs, clean := e.NewRequestState()
+	defer clean()
+
+	res, err := e.Result(ctx, rs, pkg, "res", []string{""})
+	require.NoError(t, err)
+	defer res.Unlock(ctx)
+
+	require.Len(t, res.Artifacts, 1)
+
+	r, err := hartifact.FileReader(ctx, res.FindOutputs("")[0].Artifact)
+	require.NoError(t, err)
+	defer r.Close()
+
+	b, err := io.ReadAll(r)
+	require.NoError(t, err)
+
+	assert.Equal(t, "SRC_1=out1\n", string(b))
 }

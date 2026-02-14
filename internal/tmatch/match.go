@@ -306,10 +306,6 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 	case pluginv1.TargetMatcher_Label_case:
 		return boolToResult(slices.Contains(spec.GetLabels(), m.GetLabel()))
 	case pluginv1.TargetMatcher_CodegenPackage_case:
-		if !tref.HasPackagePrefix(m.GetCodegenPackage(), spec.GetRef().GetPackage()) {
-			return MatchNo
-		}
-
 		for _, out := range def.GetOutputs() {
 			for _, path := range out.GetPaths() {
 				if path.GetCodegenTree() == pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {
@@ -319,7 +315,7 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 				switch path.WhichContent() {
 				case pluginv1.TargetDef_Path_FilePath_case:
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(filepath.Dir(path.GetFilePath())))
-					if outPkg == m.GetCodegenPackage() {
+					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
 						return MatchYes
 					}
 				case pluginv1.TargetDef_Path_DirPath_case:
@@ -328,17 +324,11 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 						return MatchYes
 					}
 				case pluginv1.TargetDef_Path_Glob_case:
-					base, pattern := hfs.GlobSplit(path.GetGlob())
+					base, _ := hfs.GlobSplit(path.GetGlob())
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(base))
 
-					if strings.Contains(pattern, string(filepath.Separator)) {
-						if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
-							return MatchYes
-						}
-					} else {
-						if outPkg == m.GetCodegenPackage() {
-							return MatchYes
-						}
+					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
+						return MatchYes
 					}
 				default:
 					continue

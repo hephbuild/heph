@@ -153,162 +153,6 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkgDir string, hooks Hooks) (s
 	return out, nil
 }
 
-type BuiltinFunc = func(
-	thread *starlark.Thread,
-	fn *starlark.Builtin,
-	args starlark.Tuple,
-	kwargs []starlark.Tuple,
-) (starlark.Value, error)
-
-func (p *Plugin) file(name string) BuiltinFunc {
-	return func(
-		thread *starlark.Thread,
-		fn *starlark.Builtin,
-		args starlark.Tuple,
-		kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		execCtx := getExecContext(thread)
-
-		var pattern string
-		var exclude hstarlark.List[string]
-		if err := starlark.UnpackArgs(
-			name, args, kwargs,
-			"pattern", &pattern,
-			"exclude?", &exclude,
-		); err != nil {
-			return nil, err
-		}
-
-		base, pattern := hfs.GlobSplit(pattern)
-
-		if strings.HasPrefix(base, "/") {
-			return starlark.String(tref.FormatGlob(base, pattern, exclude)), nil
-		}
-
-		return starlark.String(tref.FormatGlob(tref.JoinPackage(execCtx.Package, base), pattern, exclude)), nil
-	}
-}
-
-func (p *Plugin) get_pkg() BuiltinFunc {
-	return func(
-		thread *starlark.Thread,
-		fn *starlark.Builtin,
-		args starlark.Tuple,
-		kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		execCtx := getExecContext(thread)
-
-		return starlark.String(execCtx.Package), nil
-	}
-}
-
-func (p *Plugin) builtinTarget() BuiltinFunc {
-	return func(
-		thread *starlark.Thread,
-		fn *starlark.Builtin,
-		args starlark.Tuple,
-		kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		execCtx := getExecContext(thread)
-
-		var fkwargs []starlark.Tuple
-		var otherkwargs = map[string]starlark.Value{}
-		for _, item := range kwargs {
-			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
-
-			switch name {
-			case "name", "driver", "labels", "transitive":
-				fkwargs = append(fkwargs, item)
-			default:
-				otherkwargs[string(name)] = arg
-			}
-		}
-
-		var tspec TargetSpec
-		tspec.Driver = "bash"
-
-		if err := starlark.UnpackArgs(
-			"target", args, fkwargs,
-			"name", &tspec.Name,
-			"driver?", &tspec.Driver,
-			"labels?", &tspec.Labels,
-			"transitive?", &tspec.Transitive,
-		); err != nil {
-			if tspec.Name != "" {
-				return nil, fmt.Errorf("%v: %w", tspec.Name, err)
-			}
-
-			return nil, err
-		}
-
-		payload := OnTargetPayload{
-			Name:       tspec.Name,
-			Package:    execCtx.Package,
-			Driver:     tspec.Driver,
-			Labels:     tspec.Labels,
-			Transitive: tspec.Transitive,
-			Args:       otherkwargs,
-		}
-
-		if payload.Name == "" {
-			return nil, errors.New("missing name")
-		}
-
-		err := execCtx.OnTarget(execCtx.Ctx, payload)
-		if err != nil {
-			return nil, err
-		}
-
-		return starlark.String(tref.Format(tref.New(execCtx.Package, payload.Name, nil))), nil
-	}
-}
-
-func (p *Plugin) builtinProviderState() BuiltinFunc {
-	return func(
-		thread *starlark.Thread,
-		fn *starlark.Builtin,
-		args starlark.Tuple,
-		kwargs []starlark.Tuple,
-	) (starlark.Value, error) {
-		execCtx := getExecContext(thread)
-
-		var fkwargs []starlark.Tuple
-		var otherkwargs = map[string]starlark.Value{}
-		for _, item := range kwargs {
-			name, arg := item[0].(starlark.String), item[1] //nolint:errcheck
-
-			switch name {
-			case "provider":
-				fkwargs = append(fkwargs, item)
-			default:
-				otherkwargs[string(name)] = arg
-			}
-		}
-
-		payload := OnProviderStatePayload{
-			Package: execCtx.Package,
-			Args:    otherkwargs,
-		}
-		if err := starlark.UnpackArgs(
-			"provider_state", args, fkwargs,
-			"provider?", &payload.Provider,
-		); err != nil {
-			return nil, err
-		}
-
-		if payload.Provider == "" {
-			return nil, errors.New("missing provider")
-		}
-
-		err := execCtx.OnProviderState(execCtx.Ctx, payload)
-		if err != nil {
-			return nil, err
-		}
-
-		return starlark.None, nil
-	}
-}
-
 func (p *Plugin) runFile(ctx context.Context, pkg string, file hfs.File, hooks Hooks) (starlark.StringDict, error) {
 	return p.cacherunpkg.Singleflight(ctx, file.Name(), hooks, func(hooks Hooks) (starlark.StringDict, error) {
 		return p.runFileInner(ctx, pkg, file, hooks)
@@ -329,10 +173,22 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, ho
 	universe := starlark.StringDict{
 		"target":         starlark.NewBuiltin("target", p.builtinTarget()),
 		"struct":         starlark.NewBuiltin("struct", starlarkstruct.Make),
-		"glob":           starlark.NewBuiltin("glob", p.file("glob")),
-		"file":           starlark.NewBuiltin("file", p.file("file")),
+		"glob":           starlark.NewBuiltin("glob", p.builtinFile("glob")),
+		"file":           starlark.NewBuiltin("file", p.builtinFile("file")),
 		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState()),
-		"get_pkg":        starlark.NewBuiltin("get_pkg", p.get_pkg()),
+		"get_pkg":        starlark.NewBuiltin("get_pkg", p.builtinGetPkg()),
+
+		"heph": &starlarkstruct.Module{
+			Name: "heph",
+			Members: starlark.StringDict{
+				"fs": &starlarkstruct.Module{
+					Name: "heph.fs",
+					Members: starlark.StringDict{
+						"glob": starlark.NewBuiltin("heph.fs.glob", p.builtinfsglob()),
+					},
+				},
+			},
+		},
 	}
 	prog, err := p.buildFile(ctx, file, universe)
 	if err != nil {

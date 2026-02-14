@@ -36,7 +36,6 @@ import (
 	"github.com/zeebo/xxh3"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -168,7 +167,7 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 	}
 
 	if treeOutputTo := qo.TreeOutputTo; treeOutputTo != "" {
-		items = append(items, pluginv1.TargetMatcher_builder{CodegenPackage: proto.String(treeOutputTo)}.Build())
+		items = append(items, tmatch.CodegenPackage(treeOutputTo))
 	}
 
 	skipProvider := qo.SkipProvider // TODO: can be automated by annotating the RequestState for List/Get
@@ -545,6 +544,9 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 		}
 
 		transitive := spec.GetTransitive()
+		if transitive == nil {
+			transitive = &pluginv1.Sandbox{}
+		}
 		if spec.GetDriver() == plugingroup.Name {
 			def, err := e.GetDef(ctx, rs, DefContainer{Spec: spec})
 			if err != nil {
@@ -639,6 +641,33 @@ func (e *Engine) Link(ctx context.Context, rs *RequestState, c DefContainer) (*L
 	defer clean()
 
 	return e.link(ctx, rs, c)
+}
+
+func (e *Engine) Resolve(ctx context.Context, rs *RequestState, def *LightLinkedTarget) (*LightLinkedTarget, error) {
+	rdef := &LightLinkedTarget{
+		TargetDef: def.TargetDef,
+		Inputs:    make([]*LightLinkedTargetInput, 0, len(def.Inputs)),
+	}
+
+	for _, input := range def.Inputs {
+		if input.GetRef().GetPackage() == tref.QueryPackage || input.GetDriver() == plugingroup.Name {
+			inputDef, err := e.Link(ctx, rs, DefContainer{Ref: input.GetRef()})
+			if err != nil {
+				return nil, err
+			}
+
+			inputDef, err = e.Resolve(ctx, rs, inputDef)
+			if err != nil {
+				return nil, err
+			}
+
+			rdef.Inputs = append(rdef.Inputs, inputDef.Inputs...)
+		} else {
+			rdef.Inputs = append(rdef.Inputs, input)
+		}
+	}
+
+	return rdef, nil
 }
 
 func (e *Engine) link(ctx context.Context, rs *RequestState, c DefContainer) (*LightLinkedTarget, error) {
@@ -993,7 +1022,7 @@ func (e *Engine) getDefGroup(ctx context.Context, rs *RequestState, def *pluginv
 				return nil, fmt.Errorf("%v doesnt have a named output %q", tref.FormatOut(inputRef), inputRef.GetOutput())
 			}
 
-			for _, output := range def.GetOutputs() {
+			for _, output := range linkedInput.GetOutputs() {
 				if output.GetGroup() != inputRef.GetOutput() {
 					continue
 				}

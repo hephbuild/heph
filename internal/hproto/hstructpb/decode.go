@@ -19,6 +19,14 @@ func Decode[T any](from any) (T, error) {
 }
 
 func DecodeTo(from, to any) error {
+	return decodeTo(from, to, true)
+}
+
+func DecodeToLax(from, to any) error {
+	return decodeTo(from, to, false)
+}
+
+func decodeTo(from, to any, errorUnused bool) error {
 	if to, ok := to.(MapstructureDecoder); ok {
 		if v, ok := from.(*structpb.Value); ok {
 			from = v.AsInterface()
@@ -52,7 +60,7 @@ func DecodeTo(from, to any) error {
 				return from.Interface(), nil
 			}),
 		),
-		ErrorUnused: true,
+		ErrorUnused: errorUnused,
 	})
 	if err != nil {
 		return err

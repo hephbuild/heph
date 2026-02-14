@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 
 	"github.com/hephbuild/heph/internal/htypes"
 
@@ -158,15 +157,40 @@ func (p *Plugin) Probe(ctx context.Context, c *pluginv1.ProbeRequest) (*pluginv1
 }
 
 // getCodegenRoot extracts the codegen root package from provider states.
-func getCodegenRoot(states []*pluginv1.ProviderState, providerName string) string {
+func getCodegenRoot(states []*pluginv1.ProviderState) (string, error) {
 	for _, state := range states {
-		if state.GetProvider() == providerName {
-			if isCodegenRoot := state.GetState()["go_codegen_root"]; isCodegenRoot != nil && isCodegenRoot.GetBoolValue() {
-				return state.GetPackage()
-			}
+		var v struct {
+			Root bool `mapstructure:"go_codegen_root"`
+		}
+		err := hstructpb.DecodeToLax(state.GetState(), &v)
+		if err != nil {
+			return "", err
+		}
+
+		if v.Root {
+			return state.GetPackage(), nil
 		}
 	}
-	return ""
+
+	return "", nil
+}
+
+func getCodegenDeps(states []*pluginv1.ProviderState) ([]string, error) {
+	for _, state := range states {
+		var v struct {
+			Deps []string `mapstructure:"go_codegen_deps"`
+		}
+		err := hstructpb.DecodeToLax(state.GetState(), &v)
+		if err != nil {
+			return nil, err
+		}
+
+		if v.Deps != nil {
+			return v.Deps, nil
+		}
+	}
+
+	return nil, nil
 }
 
 func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk.HandlerStreamReceive[*pluginv1.ListResponse], error) {
@@ -422,8 +446,6 @@ func (p *Plugin) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1.G
 	return nil, pluginsdk.ErrNotFound
 }
 
-var errNoGoFiles = errors.New("no Go files in package")
-
 func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, states []*pluginv1.ProviderState) (*pluginv1.GetResponse, error) {
 	gomod, err := p.getGoModGoWork(ctx, pkg)
 	if err != nil {
@@ -442,34 +464,18 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 	var inTree bool
 
 	if imp == "." {
-		// Determine package prefix from probe states
 		packagePrefix := pkg // default to current package
-		if codegenRoot := getCodegenRoot(states, Name); codegenRoot != "" {
-			packagePrefix = codegenRoot
-		}
-
-		entries, err := os.ReadDir(filepath.Join(p.root, pkg))
+		codegenRoot, err := getCodegenRoot(states)
 		if err != nil {
 			return nil, err
 		}
 
-		var hasGoFile bool
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
-			}
-
-			if strings.HasSuffix(e.Name(), ".go") {
-				hasGoFile = true
-				break
-			}
-		}
-
-		if !hasGoFile {
-			return nil, errNoGoFiles
+		if codegenRoot != "" {
+			packagePrefix = codegenRoot
 		}
 
 		files = append(files, tref.FormatGlob(pkg, "*.go", nil))
+		files = append(files, tref.FormatGlob(pkg, "**/*", []string{"**/*.go"}))
 
 		files = append(files, tref.FormatQuery(tref.QueryOptions{
 			Label:         "go_src",
@@ -478,12 +484,21 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 			PackagePrefix: packagePrefix, // Use determined prefix instead of pkg
 		}))
 
+		stateDeps, err := getCodegenDeps(states)
+		if err != nil {
+			return nil, err
+		}
+
+		files = append(files, stateDeps...)
+
 		inTree = true
 		// directories from heph v0 linked to tree will cause the exec to be in the .heph cache dir, causing wrong go mod
 		if _, err := os.Readlink(filepath.Join(p.root, tref.ToOSPath(pkg))); err == nil {
 			inTree = false
 		}
 	}
+
+	inTree = false
 
 	var rootVar string
 	if inTree {

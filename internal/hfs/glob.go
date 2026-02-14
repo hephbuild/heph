@@ -165,6 +165,10 @@ func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWa
 func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn GlobWalkFunc) error {
 	return iofs.WalkDir(ToIOFS(fs), "", func(path string, d DirEntry, err error) error {
 		if err != nil {
+			if errors.Is(err, iofs.ErrNotExist) {
+				return nil
+			}
+
 			return err
 		}
 

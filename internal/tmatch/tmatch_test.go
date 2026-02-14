@@ -75,27 +75,34 @@ func TestMatchCodegenPackage(t *testing.T) {
 
 func TestMatchCodegenPackageDef(t *testing.T) {
 	tests := []struct {
-		pkg        string
-		codegenPkg string
-		outPath    string
-		expected   Result
+		queryCodegenPkg string
+		targetPkg       string
+		targetOutPath   string
+		expected        Result
 	}{
 		{"foo/bar", "foo/bar", "file.txt", MatchYes},
+		{"foo/bar", "foo", "bar/file.txt", MatchYes},
+		{"foo/bar", "", "foo/bar/file.txt", MatchYes},
+		{"foo/bar", "", "foo/baz/file.txt", MatchNo},
 		{"foo/bar", "foo/bar", "./", MatchYes},
 		{"foo/bar", "foo/bar", "*.txt", MatchYes},
-		{"foo/bar", "foo/bar", "some/*.txt", MatchNo},
+		{"foo/bar", "foo/bar", "some/*.txt", MatchYes},
 		{"foo/bar", "foo/bar", "some/*/file.txt", MatchYes},
-		{"foo", "foo/bar", "file.txt", MatchNo},
-		{"foo", "foo/bar", "bar/file.txt", MatchYes},
-		{"foo", "foo/bar", "bar/", MatchYes},
-		{"", "foo/bar", "file.txt", MatchNo},
-		{"", "foo/bar", "foo/bar/file.txt", MatchYes},
-		{"foo/bar/baz", "foo/bar", "file.txt", MatchNo},
-		{"unrelated/bar", "foo/bar", "file.txt", MatchNo},
+		{"foo/bar", "foo", "file.txt", MatchNo},
+		{"foo/bar", "foo", "bar/file.txt", MatchYes},
+		{"foo/bar", "foo", "bar/baz/", MatchYes},
+		{"foo/bar", "foo", "bar/baz/file.txt", MatchYes},
+		{"foo/bar", "foo", "bar/", MatchYes},
+		{"foo/bar", "", "file.txt", MatchNo},
+		{"foo/bar", "", "foo/bar/file.txt", MatchYes},
+		{"foo/bar", "foo/bar/baz", "file.txt", MatchYes},
+		{"foo/bar", "foo/bar/baz", "bar/file.txt", MatchYes},
+		{"foo/bar", "foo/bar/baz", "bar/", MatchYes},
+		{"foo/bar", "unrelated/bar", "file.txt", MatchNo},
 	}
 	for _, test := range tests {
-		t.Run("MatchSpec "+test.pkg+" "+test.codegenPkg+" "+test.outPath, func(t *testing.T) {
-			ref := tref.New(test.pkg, "foo", nil)
+		t.Run("MatchSpec "+test.targetPkg+" "+test.queryCodegenPkg+" "+test.targetOutPath, func(t *testing.T) {
+			ref := tref.New(test.targetPkg, "foo", nil)
 
 			outPath := pluginv1.TargetDef_Path_builder{
 				FilePath:    nil,
@@ -104,12 +111,12 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 				CodegenTree: htypes.Ptr(pluginv1.TargetDef_Path_CODEGEN_MODE_COPY),
 			}
 			switch {
-			case hfs.IsGlob(test.outPath):
-				outPath.Glob = htypes.Ptr(test.outPath)
-			case strings.HasSuffix(test.outPath, "/"):
-				outPath.DirPath = htypes.Ptr(test.outPath)
+			case hfs.IsGlob(test.targetOutPath):
+				outPath.Glob = htypes.Ptr(test.targetOutPath)
+			case strings.HasSuffix(test.targetOutPath, "/"):
+				outPath.DirPath = htypes.Ptr(test.targetOutPath)
 			default:
-				outPath.FilePath = htypes.Ptr(test.outPath)
+				outPath.FilePath = htypes.Ptr(test.targetOutPath)
 			}
 
 			res := MatchDef(
@@ -124,7 +131,7 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 						}.Build(),
 					},
 				}.Build(),
-				pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(test.codegenPkg)}.Build(),
+				pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(test.queryCodegenPkg)}.Build(),
 			)
 
 			require.Equal(t, test.expected.String(), res.String())

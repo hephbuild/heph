@@ -12,6 +12,7 @@ import (
 )
 
 func init() {
+	var resolve bool
 	cmdArgs := parseRefArgs{cmdName: "deps"}
 
 	cmd := &cobra.Command{
@@ -54,6 +55,13 @@ func init() {
 					return err
 				}
 
+				if resolve {
+					def, err = e.Resolve(ctx, rs, def)
+					if err != nil {
+						return err
+					}
+				}
+
 				// TODO how to render res natively without exec
 				err = execFunc(func(args hbbtexec.RunArgs) error {
 					for _, dep := range def.Inputs {
@@ -75,6 +83,8 @@ func init() {
 			return nil
 		},
 	}
+
+	cmd.Flags().BoolVar(&resolve, "resolve", false, "Resolve query & groups")
 
 	inspectCmd.AddCommand(cmd)
 }

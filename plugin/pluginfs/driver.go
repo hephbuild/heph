@@ -159,8 +159,8 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	exclude = append(exclude, t.GetExclude()...)
 
 	var artifacts []*pluginv1.Artifact
-	err = hfs.Glob(ctx, fs, t.GetPattern(), exclude, func(path string, d hfs.DirEntry) error {
-		info, err := d.Info()
+	err = hfs.Glob(ctx, fs, t.GetPattern(), exclude, func(path string, e hfs.DirEntry) error {
+		info, err := e.Info()
 		if err != nil {
 			return err
 		}
