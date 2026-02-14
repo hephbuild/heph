@@ -152,7 +152,7 @@ func TestGroupNamed(t *testing.T) {
 				Driver: htypes.Ptr("bash"),
 				Config: map[string]*structpb.Value{
 					"out": hstructpb.NewStringsValue([]string{"out"}),
-					"run": hstructpb.NewStringsValue([]string{`env | grep SRC | grep -v LIST > $OUT`}),
+					"run": hstructpb.NewStringsValue([]string{`env | grep SRC | grep -v LIST | sort > $OUT`}),
 					"deps": hstructpb.NewStringsValue([]string{
 						tref.Format(pluginv1.TargetRef_builder{
 							Package: htypes.Ptr(pkg),
@@ -189,7 +189,7 @@ func TestGroupNamed(t *testing.T) {
 	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 
-	assert.Equal(t, "SRC_2=out2\nSRC_1=out1\n", string(b))
+	assert.Equal(t, "SRC_1=out1\nSRC_2=out2\n", string(b))
 }
 
 func TestGroupNamed2(t *testing.T) {

@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -461,8 +459,6 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 		"imp": imp,
 	})
 
-	var inTree bool
-
 	if imp == "." {
 		packagePrefix := pkg // default to current package
 		codegenRoot, err := getCodegenRoot(states)
@@ -490,22 +486,9 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 		}
 
 		files = append(files, stateDeps...)
-
-		inTree = true
-		// directories from heph v0 linked to tree will cause the exec to be in the .heph cache dir, causing wrong go mod
-		if _, err := os.Readlink(filepath.Join(p.root, tref.ToOSPath(pkg))); err == nil {
-			inTree = false
-		}
 	}
 
-	inTree = false
-
-	var rootVar string
-	if inTree {
-		rootVar = "$TREE_ROOT"
-	} else {
-		rootVar = "$WORKSPACE_ROOT"
-	}
+	rootVar := "$WORKSPACE_ROOT"
 
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
@@ -522,7 +505,6 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 					"json": "golist.json",
 					"root": "golist_root",
 				}),
-				"in_tree":   structpb.NewBoolValue(inTree),
 				"cache":     structpb.NewStringValue("local"),
 				"hash_deps": hstructpb.NewStringsValue(files),
 				"tools":     p.getGoToolStructpb(),
