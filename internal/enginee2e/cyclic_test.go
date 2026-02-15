@@ -87,6 +87,7 @@ func TestCyclic1(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
+							"run": structpb.NewStringValue("echo"),
 							"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
 								Label:        "gen",
 								SkipProvider: pluginstaticprovider.Name,
@@ -163,6 +164,7 @@ func TestCyclic2(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
+							"run":  structpb.NewStringValue("echo"),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":c"}),
 						},
 						Labels: []string{"gen"},
@@ -176,6 +178,7 @@ func TestCyclic2(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
+							"run":  structpb.NewStringValue("echo"),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 					}.Build(),
@@ -248,6 +251,7 @@ func TestCyclic3(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
+							"run":  structpb.NewStringValue("echo"),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":b"}),
 						},
 						Labels: []string{"gen"},
@@ -261,6 +265,7 @@ func TestCyclic3(t *testing.T) {
 						}.Build(),
 						Driver: htypes.Ptr("sh"),
 						Config: map[string]*structpb.Value{
+							"run":  structpb.NewStringValue("echo"),
 							"deps": hstructpb.NewStringsValue([]string{"//" + pkg + ":a"}),
 						},
 						Labels: []string{"gen"},

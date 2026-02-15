@@ -293,7 +293,7 @@ func getFiles(goPkg Package, files []string) ([]string, error) {
 		for source, filters := range hmaps.Sorted(refsToFilters) {
 			ref, err := tref.ParseWithOut(source)
 			if err != nil {
-				return nil, fmt.Errorf("%v: %v", source, err)
+				return nil, fmt.Errorf("%v: %w", source, err)
 			}
 
 			refs = append(refs, tref.FormatOut(tref.WithFilters(ref, filters)))
