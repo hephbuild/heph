@@ -53,14 +53,14 @@ func TestMatchCodegenPackage(t *testing.T) {
 		{"foo/bar", "foo/bar", MatchShrug},
 		{"foo", "foo/bar", MatchShrug},
 		{"", "foo/bar", MatchShrug},
-		{"foo/bar/baz", "foo/bar", MatchNo},
+		{"foo/bar/baz", "foo/bar", MatchShrug},
 		{"unrelated/bar", "foo/bar", MatchNo},
 	}
 	for _, test := range tests {
 		t.Run("MatchPackage "+test.pkg+" "+test.codegenPkg, func(t *testing.T) {
 			res := MatchPackage(test.pkg, pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(test.codegenPkg)}.Build())
 
-			require.Equal(t, test.expected, res)
+			require.Equal(t, test.expected.String(), res.String())
 		})
 		t.Run("MatchSpec "+test.pkg+" "+test.codegenPkg, func(t *testing.T) {
 			res := MatchSpec(
@@ -68,7 +68,7 @@ func TestMatchCodegenPackage(t *testing.T) {
 				pluginv1.TargetMatcher_builder{CodegenPackage: htypes.Ptr(test.codegenPkg)}.Build(),
 			)
 
-			require.Equal(t, test.expected, res)
+			require.Equal(t, test.expected.String(), res.String())
 		})
 	}
 }
@@ -101,7 +101,7 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 		{"foo/bar", "unrelated/bar", "file.txt", MatchNo},
 	}
 	for _, test := range tests {
-		t.Run("MatchSpec "+test.targetPkg+" "+test.queryCodegenPkg+" "+test.targetOutPath, func(t *testing.T) {
+		t.Run("MatchSpec "+test.queryCodegenPkg+" "+test.targetPkg+" "+test.targetOutPath, func(t *testing.T) {
 			ref := tref.New(test.targetPkg, "foo", nil)
 
 			outPath := pluginv1.TargetDef_Path_builder{

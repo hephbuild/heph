@@ -460,12 +460,12 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 	})
 
 	if imp == "." {
-		packagePrefix := pkg // default to current package
 		codegenRoot, err := getCodegenRoot(states)
 		if err != nil {
 			return nil, err
 		}
 
+		packagePrefix := pkg // default to current package
 		if codegenRoot != "" {
 			packagePrefix = codegenRoot
 		}
@@ -488,8 +488,6 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 		files = append(files, stateDeps...)
 	}
 
-	rootVar := "$WORKSPACE_ROOT"
-
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
 			Ref:    tref.New(pkg, "_golist", args),
@@ -499,15 +497,17 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
 					fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT_JSON", f.Tags, imp),
-					"echo " + rootVar + " > $OUT_ROOT",
+					"echo $WORKSPACE_ROOT > $OUT_ROOT",
+					"cp $SOURCEMAP $OUT_SM",
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"json": "golist.json",
 					"root": "golist_root",
+					"sm":   "golist_sm.json",
 				}),
-				"cache":     structpb.NewStringValue("local"),
-				"hash_deps": hstructpb.NewStringsValue(files),
-				"tools":     p.getGoToolStructpb(),
+				"cache": structpb.NewStringValue("local"),
+				"deps":  hstructpb.NewStringsValue(files),
+				"tools": p.getGoToolStructpb(),
 			},
 		}.Build(),
 	}.Build(), nil

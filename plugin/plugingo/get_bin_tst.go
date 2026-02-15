@@ -84,7 +84,7 @@ func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Fa
 
 	testmainb, err := generateTestMain(analysis)
 	if err != nil {
-		return nil, fmt.Errorf("analyze: %w", err)
+		return nil, fmt.Errorf("generate: %w", err)
 	}
 
 	return pluginv1.GetResponse_builder{

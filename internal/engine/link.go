@@ -728,10 +728,11 @@ func (e *Engine) DAG(ctx context.Context, rs *RequestState, ref *pluginv1.Target
 
 func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher *pluginv1.TargetMatcher) error {
 	var dedup sync_map.Map[string, htypes.Void]
-	var g herrgroup.Group
 
-	var link func(ref *tref.Ref) error
-	link = func(ref *tref.Ref) error {
+	g := herrgroup.NewContext(ctx, rs.FailFast)
+
+	var link func(ctx context.Context, ref *tref.Ref) error
+	link = func(ctx context.Context, ref *tref.Ref) error {
 		if _, loaded := dedup.LoadOrStore(tref.Format(ref), htypes.Void{}); loaded {
 			return nil
 		}
@@ -746,8 +747,8 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher
 		}
 
 		for _, def := range lldef.Inputs {
-			g.Go(func() error {
-				return link(def.GetRef())
+			g.Go(func(ctx context.Context) error {
+				return link(ctx, def.GetRef())
 			})
 		}
 
@@ -755,12 +756,16 @@ func (e *Engine) QueryLink(ctx context.Context, rs *RequestState, m, deepMatcher
 	}
 
 	for ref, err := range e.Query(ctx, rs, m) {
+		if g.Failed() {
+			break
+		}
+
 		if err != nil {
 			return err
 		}
 
-		g.Go(func() error {
-			return link(ref)
+		g.Go(func(ctx context.Context) error {
+			return link(ctx, ref)
 		})
 	}
 
@@ -900,9 +905,9 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 		return nil, err
 	}
 
-	var g herrgroup.Group
+	g := herrgroup.NewContext(ctx, rs.FailFast)
 	for i, input := range inputs {
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			depRef := tref.WithoutOut(input.GetRef())
 
 			err := rs.dag.AddVertex(depRef)
@@ -987,9 +992,9 @@ func (e *Engine) getDefGroup(ctx context.Context, rs *RequestState, def *pluginv
 
 	results := make([]getDefContainer, len(def.GetInputs()))
 
-	var g herrgroup.Group
+	g := herrgroup.NewContext(ctx, rs.FailFast)
 	for i, input := range def.GetInputs() {
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			linkedInput, err := e.GetDef(ctx, rs, DefContainer{Ref: tref.WithoutOut(input.GetRef())})
 			if err != nil {
 				return err
@@ -1009,8 +1014,15 @@ func (e *Engine) getDefGroup(ctx context.Context, rs *RequestState, def *pluginv
 		return nil, err
 	}
 
-	def.SetOutputs(nil)
+	processPath := func(path *pluginv1.TargetDef_Path) *pluginv1.TargetDef_Path {
+		path = hproto.Clone(path)
+		path.SetCodegenTree(pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED)
+		path.SetCollect(false)
 
+		return path
+	}
+
+	var paths []*pluginv1.TargetDef_Path
 	for _, c := range results {
 		input := c.input
 		linkedInput := c.def
@@ -1027,12 +1039,23 @@ func (e *Engine) getDefGroup(ctx context.Context, rs *RequestState, def *pluginv
 					continue
 				}
 
-				def.SetOutputs(append(def.GetOutputs(), output))
+				for _, path := range output.GetPaths() {
+					paths = append(paths, processPath(path))
+				}
 			}
 		} else {
-			def.SetOutputs(append(def.GetOutputs(), linkedInput.GetOutputs()...))
+			for _, output := range linkedInput.GetOutputs() {
+				for _, path := range output.GetPaths() {
+					paths = append(paths, processPath(path))
+				}
+			}
 		}
 	}
+
+	def.SetOutputs([]*pluginv1.TargetDef_Output{pluginv1.TargetDef_Output_builder{
+		Group: htypes.Ptr(""), // TODO support output group
+		Paths: paths,
+	}.Build()})
 
 	return def, nil
 }

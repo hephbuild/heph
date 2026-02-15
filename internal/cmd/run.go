@@ -21,6 +21,7 @@ import (
 func init() {
 	var shell hcobra.BoolStr
 	var force bool
+	var failFast bool
 	var ignore []string
 	var listOut bool
 	var listArtifacts bool
@@ -59,6 +60,8 @@ func init() {
 
 				rs, cleanRs := e.NewRequestState()
 				defer cleanRs()
+
+				rs.FailFast = failFast
 
 				rs.InteractiveExec = func(ctx context.Context, iargs engine.InteractiveExecOptions) error {
 					return execFunc(func(args hbbtexec.RunArgs) error {
@@ -223,6 +226,7 @@ func init() {
 	runFlagGroup.StringArrayVar(&ignore, "ignore", nil, "Filter universe of targets")
 	runFlagGroup.BoolStrVar(&shell, "shell", "", "shell into target")
 	runFlagGroup.BoolVarP(&force, "force", "", false, "force running")
+	runFlagGroup.BoolVarP(&failFast, "fail-fast", "", false, "fail on first error")
 	hcobra.AddLocalFlagSet(cmd, runFlagGroup)
 
 	outFlagGroup := hcobra.NewFlagSet("Output Flags")

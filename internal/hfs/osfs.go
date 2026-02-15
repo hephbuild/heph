@@ -255,6 +255,7 @@ func (osfs OS) Path(elems ...string) string {
 	return filepath.Join(args...)
 }
 
+// CloseEnsureROFD ensures the fd is ro; fixing the issue described in https://github.com/rust-lang/rust/issues/114554
 func CloseEnsureROFD(hf File) error {
 	osf, ok := hf.(OSFile)
 	if !ok {

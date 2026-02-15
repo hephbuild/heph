@@ -183,7 +183,7 @@ func MatchPackage(pkg string, m *pluginv1.TargetMatcher) Result {
 	case pluginv1.TargetMatcher_Label_case:
 		return MatchShrug
 	case pluginv1.TargetMatcher_CodegenPackage_case:
-		if !tref.HasPackagePrefix(m.GetCodegenPackage(), pkg) {
+		if !tref.HasPackagePrefix(m.GetCodegenPackage(), pkg) && !tref.HasPackagePrefix(pkg, m.GetCodegenPackage()) {
 			return MatchNo
 		}
 
@@ -220,7 +220,7 @@ func MatchSpec(spec *pluginv1.TargetSpec, m *pluginv1.TargetMatcher) Result {
 	case pluginv1.TargetMatcher_Label_case:
 		return boolToResult(slices.Contains(spec.GetLabels(), m.GetLabel()))
 	case pluginv1.TargetMatcher_CodegenPackage_case:
-		if !tref.HasPackagePrefix(m.GetCodegenPackage(), spec.GetRef().GetPackage()) {
+		if !tref.HasPackagePrefix(m.GetCodegenPackage(), spec.GetRef().GetPackage()) && !tref.HasPackagePrefix(spec.GetRef().GetPackage(), m.GetCodegenPackage()) {
 			return MatchNo
 		}
 
@@ -306,6 +306,10 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 	case pluginv1.TargetMatcher_Label_case:
 		return boolToResult(slices.Contains(spec.GetLabels(), m.GetLabel()))
 	case pluginv1.TargetMatcher_CodegenPackage_case:
+		if !tref.HasPackagePrefix(m.GetCodegenPackage(), def.GetRef().GetPackage()) && !tref.HasPackagePrefix(def.GetRef().GetPackage(), m.GetCodegenPackage()) {
+			return MatchNo
+		}
+
 		for _, out := range def.GetOutputs() {
 			for _, path := range out.GetPaths() {
 				if path.GetCodegenTree() == pluginv1.TargetDef_Path_CODEGEN_MODE_UNSPECIFIED {

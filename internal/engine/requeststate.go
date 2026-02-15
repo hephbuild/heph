@@ -27,6 +27,7 @@ type RequestStateData struct {
 	Shell           *pluginv1.TargetRef
 	Force           *pluginv1.TargetMatcher
 	Interactive     *pluginv1.TargetRef
+	FailFast        bool
 
 	memSpec       hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	memProbe      hsingleflight.GroupMemContext[string, []*pluginv1.ProviderState]

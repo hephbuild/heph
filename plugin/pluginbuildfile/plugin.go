@@ -173,8 +173,8 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, ho
 	universe := starlark.StringDict{
 		"target":         starlark.NewBuiltin("target", p.builtinTarget()),
 		"struct":         starlark.NewBuiltin("struct", starlarkstruct.Make),
-		"glob":           starlark.NewBuiltin("glob", p.builtinFile("glob")),
-		"file":           starlark.NewBuiltin("file", p.builtinFile("file")),
+		"glob":           starlark.NewBuiltin("glob", p.builtinGlob()),
+		"file":           starlark.NewBuiltin("file", p.builtinFile()),
 		"provider_state": starlark.NewBuiltin("provider_state", p.builtinProviderState()),
 		"get_pkg":        starlark.NewBuiltin("get_pkg", p.builtinGetPkg()),
 

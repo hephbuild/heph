@@ -23,6 +23,7 @@ import (
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hpanic"
+	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -109,17 +110,23 @@ func (e *Engine) ResultsFromMatcher(ctx context.Context, rs *RequestState, match
 	var outm sync.Mutex
 
 	var matched bool
-	var g herrgroup.Group
+	g := herrgroup.NewContext(ctx, rs.FailFast)
 	for ref, err := range e.Query(ctx, rs, matcher) {
 		if err != nil {
+			_ = g.Wait()
+
 			out.Unlock(ctx)
 
 			return nil, err
 		}
 
+		if g.Failed() {
+			break
+		}
+
 		matched = true
 
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			res, err := e.ResultFromRef(ctx, rs, ref, []string{AllOutputs})
 			if err != nil {
 				return err
@@ -320,11 +327,11 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 		return strings.Compare(a.Origin.GetId(), b.Origin.GetId())
 	})
 
-	var g herrgroup.Group
-	results := make(DepsResults, len(inputs))
+	g := herrgroup.NewContext(ctx, rs.FailFast)
 
+	results := make(DepsResults, len(inputs))
 	for i, dep := range inputs {
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			res, err := e.ResultFromDef(ctx, rs, dep.TargetDef, dep.Outputs)
 			if err != nil {
 				return err
@@ -501,11 +508,11 @@ func (e *Engine) depsResultMetas(ctx context.Context, rs *RequestState, def *Lig
 		return strings.Compare(a.Origin.GetId(), b.Origin.GetId())
 	})
 
-	var g herrgroup.Group
+	g := herrgroup.NewContext(ctx, rs.FailFast)
 	results := make([]DepMeta, len(inputs))
 
 	for i, dep := range inputs {
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			res, err := e.ResultMetaFromDef(ctx, rs, dep.TargetDef, dep.Outputs)
 			if err != nil {
 				return fmt.Errorf("%v: %w", tref.Format(dep.GetRef()), err)
@@ -590,6 +597,8 @@ func (e *Engine) innerResultWithSideEffects(ctx context.Context, rs *RequestStat
 	// TODO: move after execute
 	err = e.codegenTree(ctx, res.Def, res.Artifacts)
 	if err != nil {
+		res.Unlock(ctx)
+
 		return nil, fmt.Errorf("codegen tree: %w", err)
 	}
 
@@ -647,22 +656,15 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			var locks CacheLocks
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
-					gartifact := pluginv1.Artifact_builder{
-						Group:     htypes.Ptr(artifact.GetGroup()),
-						Name:      htypes.Ptr(artifact.GetName()),
-						Type:      htypes.Ptr(artifact.GetType()),
-						File:      artifact.GetFile(),
-						Raw:       artifact.GetRaw(),
-						TarPath:   proto.ValueOrNil(artifact.HasTarPath(), artifact.GetTarPath),
-						TargzPath: proto.ValueOrNil(artifact.HasTargzPath(), artifact.GetTargzPath),
-					}.Build()
+					gartifact := hproto.Clone(artifact.Artifact)
+					gartifact.ClearGroup() // TODO support output group
 
 					artifacts = append(artifacts, ExecuteResultArtifact{
 						Hashout:  artifact.Hashout,
 						Artifact: gartifact,
 					})
 
-					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, gartifact)
 					if err != nil {
 						return nil, fmt.Errorf("proto artifact to manifest: %w", err)
 					}
@@ -735,6 +737,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			for _, artifact := range res.Artifacts {
 				martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
 				if err != nil {
+					err = errors.Join(err, locks.Unlock())
+
 					return nil, err
 				}
 
@@ -743,6 +747,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 
 			manifestArtifact, err := hartifact.NewManifestArtifact(m)
 			if err != nil {
+				err = errors.Join(err, locks.Unlock())
+
 				return nil, err
 			}
 
@@ -772,6 +778,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 
 		err := res.Locks.RLock(ctx)
 		if err != nil {
+			err = errors.Join(err, res.Locks.Unlock())
+
 			return nil, err
 		}
 	} else {
@@ -963,7 +971,7 @@ type ExecuteResultWithOrigin struct {
 
 func (e *Engine) pipes(ctx context.Context, rs *RequestState, driver pluginsdk.Driver, options ExecOptions) ([]string, func() error, error) {
 	pipes := []string{"", "", "", "", ""}
-	eg := &herrgroup.Group{}
+	var eg herrgroup.Group
 
 	var cancels []func()
 	var stdinErrCh chan error

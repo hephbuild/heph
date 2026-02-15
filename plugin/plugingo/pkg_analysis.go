@@ -63,13 +63,15 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 	jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
 	rootArtifacts := hartifact.FindOutputs(artifacts, "root")
+	smArtifacts := hartifact.FindOutputs(artifacts, "sm")
 
-	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 {
+	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 || len(smArtifacts) == 0 {
 		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no json found"))
 	}
 
 	jsonArtifact := jsonArtifacts[0]
 	rootArtifact := rootArtifacts[0]
+	smArtifact := smArtifacts[0]
 
 	rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
 	if err != nil {
@@ -78,17 +80,35 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 	root := strings.TrimSpace(string(rootb))
 
-	f, err := hartifact.FileReader(ctx, jsonArtifact)
-	if err != nil {
-		return Package{}, err
-	}
-	defer f.Close()
-
 	var goPkg Package
-	err = json.NewDecoder(f).Decode(&goPkg)
-	if err != nil {
-		return Package{}, err
+	{
+		f, err := hartifact.FileReader(ctx, jsonArtifact)
+		if err != nil {
+			return Package{}, err
+		}
+		defer f.Close()
+
+		err = json.NewDecoder(f).Decode(&goPkg)
+		if err != nil {
+			return Package{}, err
+		}
 	}
+
+	var sourcemap map[string]string
+	{
+		f, err := hartifact.FileReader(ctx, smArtifact)
+		if err != nil {
+			return Package{}, err
+		}
+		defer f.Close()
+
+		err = json.NewDecoder(f).Decode(&sourcemap)
+		if err != nil {
+			return Package{}, err
+		}
+	}
+
+	goPkg.Sourcemap = sourcemap
 
 	relPkg, err := tref.DirToPackage(goPkg.Dir, root)
 	if err != nil {
@@ -104,6 +124,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 		goPkg.HephPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
 		goPkg.HephBuildPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
 	} else {
+		goPkg.Dir = filepath.Join(p.root, relPkg)
 		goPkg.HephPackage = relPkg
 	}
 	goPkg.Factors = factors
@@ -338,11 +359,12 @@ func (p *Plugin) goListTestDepsPkgResult(
 
 	goPkgs := make([]LibPackage, 0)
 	var goPkgsm sync.Mutex
-	var g herrgroup.Group
 
-	g.Go(func() error {
+	g := herrgroup.NewContext(ctx, true)
+
+	g.Go(func(ctx context.Context) error {
 		if len(goPkg.TestGoFiles) > 0 {
-			g.Go(func() error {
+			g.Go(func(ctx context.Context) error {
 				libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeTest)
 				if err != nil {
 					return err
@@ -366,7 +388,7 @@ func (p *Plugin) goListTestDepsPkgResult(
 		}
 
 		if len(goPkg.XTestGoFiles) > 0 {
-			g.Go(func() error {
+			g.Go(func(ctx context.Context) error {
 				libGoPkg, err := p.libGoPkg(ctx, goPkg, ModeXTest)
 				if err != nil {
 					return err
@@ -419,7 +441,7 @@ func (p *Plugin) goListTestDepsPkgResult(
 		return nil
 	})
 
-	g.Go(func() error {
+	g.Go(func(ctx context.Context) error {
 		res, err := p.goImportsToDeps(ctx, imports, factors, c, requestId, nil)
 		if err != nil {
 			return fmt.Errorf("get deps: %w", err)
@@ -471,10 +493,10 @@ func (p *Plugin) goListTestDepsPkgResult(
 
 func (p *Plugin) goImportsToGoPkgs(ctx context.Context, imports []string, factors Factors, c *GetGoPackageCache, requestId string) ([]Package, error) {
 	goPkgs := make([]Package, len(imports))
-	var g herrgroup.Group
+	g := herrgroup.NewContext(ctx, true)
 
 	for i, imp := range imports {
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
 				return fmt.Errorf("get pkg: %w", err)
@@ -502,26 +524,26 @@ func (p *Plugin) goImportsToDeps(
 	requestId string,
 	seen *sync_map.Map[string, struct{}],
 ) ([]LibPackage, error) {
-	goPkgs := make([]LibPackage, 0)
-	var goPkgsm sync.Mutex
-	var g herrgroup.Group
-
 	if seen == nil {
 		seen = &sync_map.Map[string, struct{}]{}
 	}
+
+	goPkgs := make([]LibPackage, 0)
+	var goPkgsm sync.Mutex
+	g := herrgroup.NewContext(ctx, true)
 
 	for _, imp := range imports {
 		if _, loaded := seen.LoadOrStore(imp, struct{}{}); loaded {
 			continue
 		}
 
-		g.Go(func() error {
+		g.Go(func(ctx context.Context) error {
 			impGoPkg, err := p.getGoPackageFromImportPath(ctx, imp, factors, c, requestId)
 			if err != nil {
 				return fmt.Errorf("get pkg: %v: %w", imp, err)
 			}
 
-			g.Go(func() error {
+			g.Go(func(ctx context.Context) error {
 				depPkgs, err := p.goImportsToDeps(ctx, impGoPkg.Imports, factors, c, requestId, seen)
 				if err != nil {
 					return fmt.Errorf("get deps: %w", err)

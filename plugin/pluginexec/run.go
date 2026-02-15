@@ -76,6 +76,10 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 
 	texec := p.getExecTarget(t)
 
+	if len(texec.GetRun()) == 0 {
+		return nil, errors.New("empty `run`, nothing to execute")
+	}
+
 	pty := req.GetTarget().GetPty()
 	sandboxfs := hfs.NewOS(req.GetSandboxPath())
 	workfs := hfs.At(sandboxfs, "ws")
@@ -88,19 +92,34 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 		srcEnvBasePath = ""
 	}
 
-	listArtifacts, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_CONTEXT_TREE)
+	sandboxRes, err := SetupSandbox(ctx, texec, req.GetInputs(), workfs, binfs, cwdfs, outfs, texec.GetContext() != execv1.Target_CONTEXT_TREE)
 	if err != nil {
 		return nil, fmt.Errorf("setup sandbox: %w", err)
 	}
 
 	env := make([]string, 0)
 
-	inputEnv, err := p.inputEnv(ctx, listArtifacts, texec, workfs, srcEnvBasePath)
+	inputEnv, err := p.inputEnv(ctx, sandboxRes.ListArtifacts, texec, workfs, srcEnvBasePath)
 	if err != nil {
 		return nil, err
 	}
 
 	env = append(env, inputEnv...)
+
+	if true {
+		b, err := json.Marshal(sandboxRes.Sourcemap)
+		if err != nil {
+			return nil, err
+		}
+
+		err = hfs.WriteFile(workfs, "sandbox-sourcemap.json", b, hfs.ModePerm)
+		if err != nil {
+			return nil, err
+		}
+
+		env = append(env, fmt.Sprintf("SOURCEMAP=%s", workfs.At("sandbox-sourcemap.json").Path()))
+	}
+
 	env = append(env, fmt.Sprintf("PATH=%s:%s", binfs.Path(), p.pathStr))
 
 	for key, envSpec := range texec.GetEnv() {

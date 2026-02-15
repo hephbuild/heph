@@ -23,6 +23,11 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
+type SetupSandboxResult struct {
+	ListArtifacts []*pluginv1.ArtifactWithOrigin
+	Sourcemap     map[string]string
+}
+
 func SetupSandbox(
 	ctx context.Context,
 	t *execv1.Target,
@@ -32,7 +37,7 @@ func SetupSandbox(
 	cwdfs,
 	outfs hfs.OS,
 	setupWd bool,
-) ([]*pluginv1.ArtifactWithOrigin, error) {
+) (*SetupSandboxResult, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandbox")
 	defer span.End()
 
@@ -46,6 +51,8 @@ func SetupSandbox(
 		return nil, err
 	}
 
+	sourcemap := map[string]string{}
+
 	var listArtifacts []*pluginv1.ArtifactWithOrigin
 	if setupWd {
 		err = cwdfs.MkdirAll("", os.ModePerm)
@@ -55,7 +62,7 @@ func SetupSandbox(
 
 		for _, target := range t.GetDeps() {
 			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
-				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), target, workfs, target.GetRef().GetFilters(), sourcemap)
 				if err != nil {
 					return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 				}
@@ -68,7 +75,7 @@ func SetupSandbox(
 			}
 
 			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
-				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, target.GetRef().GetFilters())
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), target, workfs, nil, nil)
 				if err != nil {
 					return nil, fmt.Errorf("setup support file artifact: %v: %w", target.GetId(), err)
 				}
@@ -97,7 +104,7 @@ func SetupSandbox(
 		}
 
 		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
-			listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), workfs, tool.GetRef().GetFilters())
+			listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), nil, workfs, nil, nil)
 			if err != nil {
 				return nil, fmt.Errorf("setup support file artifact: %v: %w", tref.FormatOut(tool.GetRef()), err)
 			}
@@ -119,7 +126,10 @@ func SetupSandbox(
 		}
 	}
 
-	return listArtifacts, nil
+	return &SetupSandboxResult{
+		ListArtifacts: listArtifacts,
+		Sourcemap:     sourcemap,
+	}, nil
 }
 
 func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ pluginv1.Artifact_Type) iter.Seq[*pluginv1.ArtifactWithOrigin] {
@@ -140,7 +150,7 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 	}
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, filters []string) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, fs hfs.FS, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
@@ -161,6 +171,15 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs h
 		}
 		_, _ = listf.Write([]byte(to))
 		writeNl = true
+
+		if sourcemap != nil {
+			rel, err := filepath.Rel(fs.Path(), to)
+			if err != nil {
+				panic(err)
+			}
+
+			sourcemap[rel] = tref.FormatOut(source.GetRef())
+		}
 	}), hartifact.WithFilter(func(from string) bool {
 		if len(filters) == 0 {
 			return true

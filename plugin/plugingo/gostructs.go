@@ -42,13 +42,16 @@ type ModuleError struct {
 
 type Package struct {
 	build.Package
-	Factors          Factors
-	Module           *Module
-	HephPackage      string
-	HephBuildPackage string
-	IsStd            bool
-	Is3rdParty       bool
-	LibTargetRef     *pluginv1.TargetRef
+
+	Module *Module
+
+	Factors          Factors             `json:"-"`
+	HephPackage      string              `json:"-"`
+	HephBuildPackage string              `json:"-"`
+	IsStd            bool                `json:"-"`
+	Is3rdParty       bool                `json:"-"`
+	LibTargetRef     *pluginv1.TargetRef `json:"-"`
+	Sourcemap        map[string]string   `json:"-"`
 }
 
 func (p Package) HasTest() bool {

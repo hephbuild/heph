@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -102,12 +103,17 @@ func (p *Plugin) packageLibInner(
 		importsm[impGoPkg.ImportPath] = tref.FormatOut(tref.WithOut(impGoPkg.GetBuildLibTargetRef(mode), "a"))
 	}
 
+	refs, err := getFiles(goPkg.GoPkg, goPkg.GoFiles)
+	if err != nil {
+		return nil, err
+	}
+
 	return p.packageLibInner3(
 		ctx,
 		"build_lib",
 		goPkg,
 		importsm,
-		getFiles(goPkg.GoPkg, goPkg.GoFiles),
+		refs,
 		factors,
 		incomplete,
 	)
@@ -252,13 +258,13 @@ func (p *Plugin) packageLibInner3(
 	}.Build(), nil
 }
 
-func getFiles(goPkg Package, files []string) []string {
+func getFiles(goPkg Package, files []string) ([]string, error) {
 	goPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
 	goPath = strings.TrimPrefix(goPath, "/")
 
 	if goPkg.Is3rdParty {
 		if len(files) == 0 {
-			return nil
+			return nil, nil
 		}
 
 		filters := make([]string, 0, len(files))
@@ -269,9 +275,31 @@ func getFiles(goPkg Package, files []string) []string {
 		return []string{tref.FormatOut(tref.WithFilters(tref.WithOut(
 			tref.New(ThirdpartyContentPackage(goPkg.Module.Path, goPkg.Module.Version, ""), "download", nil), ""),
 			filters,
-		))}
+		))}, nil
 	} else {
-		return []string{tref.FormatGlob(goPkg.HephPackage, "{"+strings.Join(files, ",")+"}", nil)}
+		refsToFilters := map[string][]string{}
+
+		refs := make([]string, 0, len(files))
+		for _, file := range files {
+			path := filepath.Join(tref.ToOSPath(goPkg.HephPackage), file)
+			source, ok := goPkg.Sourcemap[path]
+			if !ok {
+				return nil, fmt.Errorf("%v not found in sourcemap", path)
+			}
+
+			refsToFilters[source] = append(refsToFilters[source], path)
+		}
+
+		for source, filters := range hmaps.Sorted(refsToFilters) {
+			ref, err := tref.ParseWithOut(source)
+			if err != nil {
+				return nil, fmt.Errorf("%v: %v", source, err)
+			}
+
+			refs = append(refs, tref.FormatOut(tref.WithFilters(ref, filters)))
+		}
+
+		return refs, nil
 	}
 }
 
@@ -287,7 +315,12 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 
 	deps := map[string][]string{}
 	for k, files := range map[string][]string{"": goPkg.GoPkg.SFiles, "hdr": goPkg.GoPkg.HFiles} {
-		deps[k] = append(deps[k], getFiles(goPkg.GoPkg, files)...)
+		refs, err := getFiles(goPkg.GoPkg, files)
+		if err != nil {
+			return nil, err
+		}
+
+		deps[k] = append(deps[k], refs...)
 	}
 
 	args := factors.Args()
@@ -332,6 +365,16 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 		return nil, fmt.Errorf("%s not found", asmFile)
 	}
 
+	asmRefs, err := getFiles(goPkg.GoPkg, []string{asmFile})
+	if err != nil {
+		return nil, err
+	}
+
+	hRefs, err := getFiles(goPkg.GoPkg, goPkg.GoPkg.HFiles)
+	if err != nil {
+		return nil, err
+	}
+
 	return pluginv1.GetResponse_builder{
 		Spec: pluginv1.TargetSpec_builder{
 			Ref:    tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#asm", hmaps.Concat(goPkg.LibTargetRef.GetArgs(), map[string]string{"file": asmFile})),
@@ -348,8 +391,8 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
 					"lib": {tref.FormatOut(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "a"))},
 					"hdr": {tref.FormatOut(tref.WithOut(tref.New(goPkg.LibTargetRef.GetPackage(), "build_lib#incomplete", goPkg.LibTargetRef.GetArgs()), "h"))},
-					"asm": getFiles(goPkg.GoPkg, []string{asmFile}),
-					"h":   getFiles(goPkg.GoPkg, goPkg.GoPkg.HFiles),
+					"asm": asmRefs,
+					"h":   hRefs,
 				}),
 				"tools": p.getGoToolStructpb(),
 			},

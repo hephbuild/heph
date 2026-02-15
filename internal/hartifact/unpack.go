@@ -52,7 +52,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 
 	switch artifact.WhichContent() {
 	case pluginv1.Artifact_File_case:
-		if !cfg.filter(artifact.GetName()) {
+		if !cfg.filter(artifact.GetFile().GetOutPath()) {
 			return nil
 		}
 
@@ -78,6 +78,10 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS, options
 			return err
 		}
 	case pluginv1.Artifact_Raw_case:
+		if !cfg.filter(artifact.GetRaw().GetPath()) {
+			return nil
+		}
+
 		create := hfs.Create
 		if artifact.GetRaw().GetX() {
 			create = hfs.CreateExec

@@ -3,6 +3,7 @@ package pluginbuildfile
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hfs"
@@ -18,7 +19,37 @@ type BuiltinFunc = func(
 	kwargs []starlark.Tuple,
 ) (starlark.Value, error)
 
-func (p *Plugin) builtinFile(name string) BuiltinFunc {
+func (p *Plugin) builtinFile() BuiltinFunc {
+	return func(
+		thread *starlark.Thread,
+		fn *starlark.Builtin,
+		args starlark.Tuple,
+		kwargs []starlark.Tuple,
+	) (starlark.Value, error) {
+		execCtx := getExecContext(thread)
+
+		var path string
+		var abs bool
+		if err := starlark.UnpackArgs(
+			fn.Name(), args, kwargs,
+			"path", &path,
+			"abs?", &abs,
+		); err != nil {
+			return nil, err
+		}
+
+		dir, file := filepath.Split(path)
+
+		pkg := dir
+		if !abs {
+			pkg = tref.JoinPackage(execCtx.Package, dir)
+		}
+
+		return starlark.String(tref.FormatFile(pkg, file)), nil
+	}
+}
+
+func (p *Plugin) builtinGlob() BuiltinFunc {
 	return func(
 		thread *starlark.Thread,
 		fn *starlark.Builtin,
@@ -30,7 +61,7 @@ func (p *Plugin) builtinFile(name string) BuiltinFunc {
 		var pattern string
 		var exclude hstarlark.List[string]
 		if err := starlark.UnpackArgs(
-			name, args, kwargs,
+			fn.Name(), args, kwargs,
 			"pattern", &pattern,
 			"exclude?", &exclude,
 		); err != nil {

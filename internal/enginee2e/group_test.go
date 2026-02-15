@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/hephbuild/heph/internal/hartifact"
+	"github.com/hephbuild/heph/internal/hcore/hlog"
+	"github.com/hephbuild/heph/internal/hcore/hlog/hlogtest"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	"github.com/stretchr/testify/assert"
@@ -100,7 +102,10 @@ func TestGroup(t *testing.T) {
 }
 
 func TestGroupNamed(t *testing.T) {
+	t.Setenv("HEPH_DEBUG_HASH", "1")
+
 	ctx := t.Context()
+	ctx = hlog.ContextWithLogger(ctx, hlogtest.NewLogger(t))
 
 	dir := t.TempDir()
 
@@ -189,7 +194,7 @@ func TestGroupNamed(t *testing.T) {
 	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 
-	assert.Equal(t, "SRC_1=out1\nSRC_2=out2\n", string(b))
+	assert.Equal(t, "SRC=out1 out2\n", string(b))
 }
 
 func TestGroupNamed2(t *testing.T) {
@@ -285,5 +290,5 @@ func TestGroupNamed2(t *testing.T) {
 	b, err := io.ReadAll(r)
 	require.NoError(t, err)
 
-	assert.Equal(t, "SRC_1=out1\n", string(b))
+	assert.Equal(t, "SRC=out1\n", string(b))
 }
