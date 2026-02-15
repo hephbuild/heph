@@ -88,6 +88,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 					Ref:    tref.New(hephPackage, "think", nil),
 					Driver: htypes.Ptr("sh"),
 					Config: map[string]*structpb.Value{
+						"run": structpb.NewStringValue("echo"),
 						"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
 							Label:        "gen",
 							SkipProvider: ProviderName,
@@ -130,6 +131,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 				Ref:    tref.New(hephPackage, "think", nil),
 				Driver: htypes.Ptr("sh"),
 				Config: map[string]*structpb.Value{
+					"run": structpb.NewStringValue("echo"),
 					"deps": structpb.NewStringValue(tref.FormatQuery(tref.QueryOptions{
 						Label:        "gen",
 						SkipProvider: ProviderName,
