@@ -163,6 +163,7 @@ func parseWrapperConfig(ctx context.Context, ref *pluginv1.TargetRef, config map
 	}
 
 	execConfig := map[string]*structpb.Value{
+		"run":   structpb.NewStringValue("echo"),                              // doesnt really do anything
 		"tools": hstructpb.NewStringsValue([]string{"//@heph/bin:nix-build"}), // Hardcode nix as required tool
 	}
 

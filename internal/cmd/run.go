@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcobra"
@@ -24,6 +25,7 @@ func init() {
 	var failFast bool
 	var ignore []string
 	var listOut bool
+	var copyOut string
 	var listArtifacts bool
 	var catOut bool
 	var hashOut bool
@@ -122,6 +124,36 @@ func init() {
 					return err
 				}
 				defer res.Unlock(ctx)
+
+				if copyOut != "" {
+					for _, re := range res {
+						for _, output := range re.Artifacts {
+							if output.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+								continue
+							}
+
+							for f, err := range hartifact.FilesReader(ctx, output.Artifact) {
+								if err != nil {
+									return err
+								}
+
+								of, err := os.Create(copyOut)
+								if err != nil {
+									return err
+								}
+								defer of.Close()
+
+								_, err = io.Copy(of, f)
+								if err != nil {
+									return err
+								}
+
+								_ = f.Close()
+								_ = of.Close()
+							}
+						}
+					}
+				}
 
 				err = execFunc(func(args hbbtexec.RunArgs) error {
 					switch {
@@ -232,6 +264,7 @@ func init() {
 	outFlagGroup := hcobra.NewFlagSet("Output Flags")
 	outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
 	outFlagGroup.BoolVarP(&listOut, "list-out", "", false, "List output paths")
+	outFlagGroup.StringVarP(&copyOut, "copy-out", "", "", "Copy output to path")
 	outFlagGroup.BoolVarP(&catOut, "cat-out", "", false, "Print outputs to stdout")
 	outFlagGroup.BoolVarP(&hashOut, "hashout", "", false, "Print output hashes to stdout")
 	hcobra.AddLocalFlagSet(cmd, outFlagGroup)
