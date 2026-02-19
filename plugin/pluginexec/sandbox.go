@@ -156,6 +156,9 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 
 	h := xxh3.New()
 	hashpb.Hash(h, artifact, tref.OmitHashPb)
+	for _, f := range filters {
+		_, _ = h.WriteString(f)
+	}
 
 	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
 	if err != nil {

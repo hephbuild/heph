@@ -278,8 +278,6 @@ func getFiles(goPkg Package, files []string) ([]string, error) {
 		))}, nil
 	} else {
 		refsToFilters := map[string][]string{}
-
-		refs := make([]string, 0, len(files))
 		for _, file := range files {
 			path := filepath.Join(tref.ToOSPath(goPkg.HephPackage), file)
 			source, ok := goPkg.Sourcemap[path]
@@ -290,6 +288,7 @@ func getFiles(goPkg Package, files []string) ([]string, error) {
 			refsToFilters[source] = append(refsToFilters[source], path)
 		}
 
+		refs := make([]string, 0, len(files))
 		for source, filters := range hmaps.Sorted(refsToFilters) {
 			ref, err := tref.ParseWithOut(source)
 			if err != nil {
