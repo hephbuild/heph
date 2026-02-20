@@ -230,7 +230,7 @@ func format(ref *Ref) string {
 
 			sb.WriteString(k)
 			sb.WriteString("=")
-			if strings.ContainsAny(v, ` ,"'`) {
+			if strings.ContainsAny(v, ` ,"'=`) {
 				sb.WriteString(strconv.Quote(v))
 			} else {
 				sb.WriteString(v)
