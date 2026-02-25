@@ -156,6 +156,10 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 				if !opts.filterProvider(provider) {
 					continue
 				}
+				if err := ctx.Err(); err != nil {
+					yield(nil, err)
+					return
+				}
 
 				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
 					if err != nil {

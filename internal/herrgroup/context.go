@@ -1,15 +1,28 @@
 package herrgroup
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 type ContextGroup struct {
 	*Group
-	ctx context.Context
-	ff  bool
+	ctx        context.Context
+	ff         bool
+	failedOnce sync.Once
+}
+
+func (g *ContextGroup) goCtxErr() {
+	// make sure there is some error to be returned by .Wait
+	g.Group.Go(func() error {
+		return g.ctx.Err()
+	})
 }
 
 func (g *ContextGroup) Go(f func(ctx context.Context) error) {
-	if g.Failed() && g.ff {
+	if g.Failed() {
+		g.failedOnce.Do(g.goCtxErr)
+
 		return
 	}
 
@@ -23,7 +36,7 @@ func (g *ContextGroup) Go(f func(ctx context.Context) error) {
 }
 
 func (g *ContextGroup) Failed() bool {
-	return g.ctx.Err() != nil
+	return g.ff && g.ctx.Err() != nil
 }
 
 func NewContext(ctx context.Context, failFast bool) ContextGroup {

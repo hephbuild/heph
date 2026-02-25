@@ -99,6 +99,7 @@ func TestMatchCodegenPackageDef(t *testing.T) {
 		{"foo/bar", "foo/bar/baz", "bar/file.txt", MatchYes},
 		{"foo/bar", "foo/bar/baz", "bar/", MatchYes},
 		{"foo/bar", "unrelated/bar", "file.txt", MatchNo},
+		{"foo/bar/gen/models", "foo/bar", "gen/", MatchYes},
 	}
 	for _, test := range tests {
 		t.Run("MatchSpec "+test.queryCodegenPkg+" "+test.targetPkg+" "+test.targetOutPath, func(t *testing.T) {

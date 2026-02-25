@@ -324,14 +324,14 @@ func MatchDef(spec *pluginv1.TargetSpec, def *pluginv1.TargetDef, m *pluginv1.Ta
 					}
 				case pluginv1.TargetDef_Path_DirPath_case:
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(path.GetDirPath()))
-					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
+					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) || tref.HasPackagePrefix(m.GetCodegenPackage(), outPkg) {
 						return MatchYes
 					}
 				case pluginv1.TargetDef_Path_Glob_case:
 					base, _ := hfs.GlobSplit(path.GetGlob())
 					outPkg := tref.JoinPackage(def.GetRef().GetPackage(), tref.ToPackage(base))
 
-					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) {
+					if tref.HasPackagePrefix(outPkg, m.GetCodegenPackage()) || tref.HasPackagePrefix(m.GetCodegenPackage(), outPkg) {
 						return MatchYes
 					}
 				default:

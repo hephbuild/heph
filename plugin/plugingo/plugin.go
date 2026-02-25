@@ -222,10 +222,6 @@ func (p *Plugin) List(ctx context.Context, req *pluginv1.ListRequest) (pluginsdk
 		}} {
 			goPkg, err := p.getGoPackageFromHephPackage(ctx, req.GetPackage(), factors, req.GetRequestId())
 			if err != nil {
-				if errors.Is(err, errConstraintExcludeAllGoFiles) {
-					continue
-				}
-
 				if errors.Is(err, errNoGoFiles) {
 					return nil
 				}
@@ -496,14 +492,30 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 				"env":              p.getEnvStructpb(f),
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run": hstructpb.NewStringsValue([]string{
-					fmt.Sprintf("go list -mod=readonly -json -tags %q %v > $OUT_JSON", f.Tags, imp),
+					"touch $OUT_NOGO",
 					"echo $WORKSPACE_ROOT > $OUT_ROOT",
 					"cp $SOURCEMAP $OUT_SM",
+					fmt.Sprintf(`
+						# Capture stderr to a variable while sending stdout to the JSON file
+						if ERR=$(go list -mod=readonly -json -tags %q %v 2>&1 > $OUT_JSON); then
+							: # Success, do nothing
+						else
+							# Check if the error is one we want to ignore
+							if echo "$ERR" | grep -qE "build constraints exclude all Go files|no Go files in"; then
+								echo "true" > $OUT_NOGO
+							else
+								# It's a real error, print it and exit
+								echo "$ERR" >&2
+								exit 1
+							fi
+						fi
+					`, f.Tags, imp),
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"json": "golist.json",
 					"root": "golist_root",
 					"sm":   "golist_sm.json",
+					"nogo": "golist_nogo",
 				}),
 				"cache": structpb.NewStringValue("local"),
 				"deps":  hstructpb.NewStringsValue(files),

@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -30,7 +31,6 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-var errConstraintExcludeAllGoFiles = errors.New("build constraints exclude all Go files")
 var errNoGoFiles = errors.New("no Go files in package")
 
 func (p *Plugin) goListPkg(ctx context.Context, pkg string, factors Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
@@ -41,14 +41,6 @@ func (p *Plugin) goListPkg(ctx context.Context, pkg string, factors Factors, imp
 		})),
 	}.Build())
 	if err != nil {
-		if strings.Contains(err.Error(), "build constraints exclude all Go files") {
-			return nil, nil, fmt.Errorf("%w: %w", errConstraintExcludeAllGoFiles, err)
-		}
-
-		if strings.Contains(err.Error(), "no Go files in") {
-			return nil, nil, fmt.Errorf("%w: %w", errNoGoFiles, err)
-		}
-
 		return nil, nil, fmt.Errorf("golist: %v (in %v): %w", imp, pkg, err)
 	}
 
@@ -64,18 +56,31 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 	jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
 	rootArtifacts := hartifact.FindOutputs(artifacts, "root")
 	smArtifacts := hartifact.FindOutputs(artifacts, "sm")
+	nogoArtifacts := hartifact.FindOutputs(artifacts, "nogo")
 
-	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 || len(smArtifacts) == 0 {
+	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 || len(smArtifacts) == 0 || len(nogoArtifacts) == 0 {
 		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no json found"))
 	}
 
 	jsonArtifact := jsonArtifacts[0]
 	rootArtifact := rootArtifacts[0]
 	smArtifact := smArtifacts[0]
+	nogoArtifact := nogoArtifacts[0]
+
+	{
+		b, err := hartifact.FileReadAll(ctx, nogoArtifact)
+		if err != nil {
+			return Package{}, err
+		}
+
+		if ok, _ := strconv.ParseBool(strings.TrimSpace(string(b))); ok {
+			return Package{}, errNoGoFiles
+		}
+	}
 
 	rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
 	if err != nil {
-		return Package{}, err
+		return Package{}, fmt.Errorf("root artifact: %w", err)
 	}
 
 	root := strings.TrimSpace(string(rootb))
@@ -90,7 +95,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 		err = json.NewDecoder(f).Decode(&goPkg)
 		if err != nil {
-			return Package{}, err
+			return Package{}, fmt.Errorf("gopkg decode: %w", err)
 		}
 	}
 
@@ -104,7 +109,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 		err = json.NewDecoder(f).Decode(&sourcemap)
 		if err != nil {
-			return Package{}, err
+			return Package{}, fmt.Errorf("sourcemap decode: %w", err)
 		}
 	}
 
@@ -232,7 +237,7 @@ func (p *Plugin) getGoPackageFromHephPackage(ctx context.Context, pkg string, fa
 
 	goPkg, err := p.goListPkgResult(ctx, gomod.basePkg, pkg, ".", factors, requestId)
 	if err != nil {
-		return Package{}, fmt.Errorf("in tree: %w", err)
+		return Package{}, err
 	}
 
 	return goPkg, nil

@@ -224,7 +224,7 @@ func (p *Plugin) packageLibInner3(
 
 	deps["src"] = srcRefs
 
-	run = append(run, fmt.Sprintf(`go tool compile -importcfg importconfig -o $OUT_A -pack -p %v %v "@${SRC_SRC_LIST}"`, goPkg.ImportPath, extra))
+	run = append(run, fmt.Sprintf(`go tool compile -trimpath "$WORKSPACE_ROOT/" -importcfg importconfig -o $OUT_A -pack -p %v %v "@${SRC_SRC_LIST}"`, goPkg.ImportPath, extra)) //nolint:lll
 
 	outFile := goPkg.Name + ".a"
 	if goPkg.Mode != "" {
@@ -337,7 +337,7 @@ func (p *Plugin) packageLibAbi(ctx context.Context, _goPkg Package, factors Fact
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch $OUT_H",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.ImportPath),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -trimpath "$WORKSPACE_ROOT/" -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -gensymabis -o "$OUT_ABI" $SRC`, goPkg.ImportPath), //nolint:lll
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"abi": goPkg.Name + ".abi",
@@ -384,7 +384,7 @@ func (p *Plugin) packageLibAsm(ctx context.Context, _goPkg Package, factors Fact
 				"run": hstructpb.NewStringsValue([]string{
 					"eval $(go env)",
 					"touch go_asm.h",
-					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.ImportPath),
+					fmt.Sprintf(`go tool asm -I . -I $GOROOT/pkg/include -trimpath "$WORKSPACE_ROOT/" -D GOOS_$GOOS -D GOARCH_$GOARCH -p %v -o "$OUT" $SRC_ASM`, goPkg.ImportPath),
 				}),
 				"out": structpb.NewStringValue(strings.ReplaceAll(asmFile, ".s", ".o")),
 				"deps": hstructpb.NewMapStringStringsValue(map[string][]string{
