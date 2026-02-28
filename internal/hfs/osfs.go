@@ -51,6 +51,10 @@ func (osfs OS) At(name string) FS {
 	return osfs
 }
 
+func (osfs OS) AtRO(name string) ROFS {
+	return osfs.At(name)
+}
+
 func (osfs OS) Stat(name string) (FileInfo, error) {
 	return os.Stat(osfs.join(name))
 }

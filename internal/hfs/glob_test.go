@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func setup(t *testing.T, paths []string) hfs.FS {
+func setup(t *testing.T, paths []string) hfs.OS {
 	fs := hfstest.New(t)
 	for _, path := range paths {
 		err := hfs.CreateParentDir(fs, path)
@@ -75,6 +75,76 @@ func TestGlobAllPattern(t *testing.T) {
 	}, get())
 }
 
+func TestGlobAllPatternCached(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+	cachefs := hfs.FromIOFS(hfs.NewFSCache()).AtRO(fs.Path())
+
+	for range 2 {
+		fn, get := collector()
+
+		err := hfs.Glob(t.Context(), cachefs, "**/*", nil, fn)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{
+			"file1",
+			"some/deep/file3",
+			"some/file2",
+		}, get())
+	}
+}
+
+func TestGlobAllPatternLink(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+	err := os.Symlink(fs.Path("some/deep"), fs.Path("some/deep2"))
+	require.NoError(t, err)
+
+	fn, get := collector()
+
+	err = hfs.Glob(t.Context(), fs, "**/*", nil, fn)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{
+		"file1",
+		"some/deep/file3",
+		"some/deep2/file3",
+		"some/file2",
+	}, get())
+}
+
+func TestGlobAllPatternLinkCached(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+	err := os.Symlink(fs.Path("some/deep"), fs.Path("some/deep2"))
+	require.NoError(t, err)
+
+	cachefs := hfs.FromIOFS(hfs.NewFSCache()).AtRO(fs.Path())
+
+	for range 2 {
+		fn, get := collector()
+
+		err := hfs.Glob(t.Context(), cachefs, "**/*", nil, fn)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{
+			"file1",
+			"some/deep/file3",
+			"some/deep2/file3",
+			"some/file2",
+		}, get())
+	}
+}
+
 func TestGlobAllFirstLevelPattern(t *testing.T) {
 	fs := setup(t, []string{
 		"file1",
@@ -107,6 +177,26 @@ func TestGlobAllFirstSecondLevelPattern(t *testing.T) {
 	assert.Equal(t, []string{
 		"some/file2",
 	}, get())
+}
+
+func TestGlobAllFirstSecondLevelPatternCached(t *testing.T) {
+	fs := setup(t, []string{
+		"file1",
+		"some/file2",
+		"some/deep/file3",
+	})
+	cachefs := hfs.FromIOFS(hfs.NewFSCache()).AtRO(fs.Path())
+
+	for range 2 {
+		fn, get := collector()
+
+		err := hfs.Glob(t.Context(), cachefs, "some/*", nil, fn)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{
+			"some/file2",
+		}, get())
+	}
 }
 
 func TestGlobAllFirstSecondLevelPattern2(t *testing.T) {

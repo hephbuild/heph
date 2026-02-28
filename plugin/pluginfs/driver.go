@@ -3,7 +3,6 @@ package pluginfs
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -69,7 +68,9 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 			Collect: htypes.Ptr(false),
 		}.Build()}
 	} else {
-		_, err := os.Stat(filepath.Join(p.resultClient.Root, cfg.File))
+		fs := hfs.FromIOFS(hfs.DefaultOSCache).AtRO(p.resultClient.Root)
+
+		_, err := fs.Stat(cfg.File)
 		if err != nil {
 			return nil, err
 		}
@@ -102,10 +103,6 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}.Build(), nil
 }
 
-func IsExecOwner(mode os.FileMode) bool {
-	return mode&0100 != 0
-}
-
 func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &fsv1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
@@ -113,21 +110,23 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		return nil, err
 	}
 
-	if t.HasFile() {
-		path := filepath.Join(p.resultClient.Root, t.GetFile())
+	fs := hfs.FromIOFS(hfs.DefaultOSCache).AtRO(p.resultClient.Root)
 
-		info, err := os.Stat(path)
+	if t.HasFile() {
+		abspath := fs.AtRO(t.GetFile()).Path()
+
+		info, err := fs.Stat(t.GetFile())
 		if err != nil {
 			return nil, err
 		}
 
-		if IsCodegen(ctx, path) {
+		if IsCodegen(ctx, abspath) {
 			return pluginv1.RunResponse_builder{
 				Artifacts: []*pluginv1.Artifact{},
 			}.Build(), nil
 		}
 
-		excluded, err := hfs.PathMatchAny(path, t.GetExclude()...)
+		excluded, err := hfs.PathMatchAny(abspath, t.GetExclude()...)
 		if err != nil {
 			return nil, err
 		}
@@ -144,16 +143,14 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 					Name: htypes.Ptr(filepath.Base(t.GetFile())),
 					Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 					File: pluginv1.Artifact_ContentFile_builder{
-						SourcePath: htypes.Ptr(path),
+						SourcePath: htypes.Ptr(abspath),
 						OutPath:    htypes.Ptr(t.GetFile()),
-						X:          htypes.Ptr(IsExecOwner(info.Mode())),
+						X:          htypes.Ptr(hfs.IsExecOwner(info.Mode())),
 					}.Build(),
 				}.Build(),
 			},
 		}.Build(), nil
 	}
-
-	fs := hfs.NewOS(p.resultClient.Root)
 
 	exclude := []string{} // TODO: exclude home, cache, git etc...
 	exclude = append(exclude, t.GetExclude()...)
@@ -165,7 +162,9 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			return err
 		}
 
-		if IsCodegen(ctx, fs.At(path).Path()) {
+		abspath := fs.AtRO(path).Path()
+
+		if IsCodegen(ctx, abspath) {
 			return nil
 		}
 
@@ -173,9 +172,9 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 			Name: htypes.Ptr(strings.ReplaceAll(path, "/", "_")),
 			Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 			File: pluginv1.Artifact_ContentFile_builder{
-				SourcePath: htypes.Ptr(fs.At(path).Path()),
+				SourcePath: htypes.Ptr(abspath),
 				OutPath:    htypes.Ptr(path),
-				X:          htypes.Ptr(IsExecOwner(info.Mode())),
+				X:          htypes.Ptr(hfs.IsExecOwner(info.Mode())),
 			}.Build(),
 		}.Build())
 

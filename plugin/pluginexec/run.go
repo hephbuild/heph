@@ -407,11 +407,11 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				return v
 			}
 
-			if v := strings.Compare(a.GetArtifact().GetGroup(), a.GetArtifact().GetGroup()); v != 0 {
+			if v := strings.Compare(a.GetArtifact().GetGroup(), b.GetArtifact().GetGroup()); v != 0 {
 				return v
 			}
 
-			if v := strings.Compare(a.GetArtifact().GetName(), a.GetArtifact().GetName()); v != 0 {
+			if v := strings.Compare(a.GetArtifact().GetName(), b.GetArtifact().GetName()); v != 0 {
 				return v
 			}
 

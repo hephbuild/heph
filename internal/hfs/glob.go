@@ -106,13 +106,13 @@ func WithStrictDir(strictDir bool) GlobOption {
 	}
 }
 
-func Glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+func Glob(ctx context.Context, fs ROFS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
 	return glob(ctx, fs, pattern, ignore, fn, options...)
 }
 
 var ErrStrictDir = errors.New("strict directory is enabled, but pattern doesnt allow directory")
 
-func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+func glob(ctx context.Context, fs ROFS, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
 	config := &globConfig{}
 	for _, option := range options {
 		option(config)
@@ -162,8 +162,12 @@ func glob(ctx context.Context, fs FS, pattern string, ignore []string, fn GlobWa
 	})
 }
 
-func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn GlobWalkFunc) error {
-	return iofs.WalkDir(ToIOFS(fs), "", func(path string, d DirEntry, err error) error {
+func globAll(ctx context.Context, fs ROFS, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return globAllWalk(ctx, fs, fs, prefix, ignore, fn)
+}
+
+func globAllWalk(ctx context.Context, rootFS ROFS, walkFS ROFS, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return iofs.WalkDir(ToIOFS(walkFS), "", func(relPath string, d DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				return nil
@@ -172,16 +176,23 @@ func globAll(ctx context.Context, fs FS, prefix string, ignore []string, fn Glob
 			return err
 		}
 
+		fullpath := filepath.Join(prefix, relPath)
+
 		if d.Type()&iofs.ModeSymlink != 0 {
-			info, err := fs.Stat(path)
+			// iofs.WalkDir does not descend into symlink directories.
+			// Resolve the symlink target and handle manually.
+			info, err := rootFS.Stat(fullpath)
 			if err != nil {
 				return err
 			}
 
-			d = iofs.FileInfoToDirEntry(info)
+			if info.IsDir() {
+				// Recurse into the symlink target as if it were a regular directory.
+				return globAllWalk(ctx, rootFS, walkFS.AtRO(relPath), fullpath, ignore, fn)
+			}
 		}
 
-		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
+		return innerGlob(ctx, fullpath, ignore, d, fn)
 	})
 }
 
@@ -218,4 +229,8 @@ func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntr
 	}
 
 	return nil
+}
+
+func IsExecOwner(mode FileMode) bool {
+	return mode&0100 != 0
 }

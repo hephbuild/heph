@@ -14,7 +14,7 @@ func Exists(fs FS, filename string) bool {
 	return err == nil
 }
 
-func Open(fs FS, filename string) (File, error) {
+func Open(fs ROFS, filename string) (File, error) {
 	return fs.Open(filename, os.O_RDONLY, 0)
 }
 
@@ -80,9 +80,16 @@ func CreateParentDir(fs FS, path string) error {
 	return nil
 }
 
-func At[T FS](fs T, names ...string) T {
+func At[T any](fs T, names ...string) T {
 	for _, name := range names {
-		fs = fs.At(name).(T) //nolint:errcheck
+		switch ffs := any(fs).(type) {
+		case FS:
+			fs = ffs.At(name).(T) //nolint:errcheck
+		case ROFS:
+			fs = ffs.AtRO(name).(T) //nolint:errcheck
+		default:
+			panic(fmt.Sprintf("At: unknown FS type: %T", ffs))
+		}
 	}
 	return fs
 }
@@ -90,7 +97,7 @@ func At[T FS](fs T, names ...string) T {
 type WalkDirFunc = iofs.WalkDirFunc
 
 type iofsAdapter struct {
-	fs FS
+	fs ROFS
 }
 
 func (i iofsAdapter) ReadDir(name string) ([]iofs.DirEntry, error) {
@@ -111,7 +118,7 @@ type StdFS interface {
 	iofs.ReadDirFS
 }
 
-func ToIOFS(fs FS) StdFS {
+func ToIOFS(fs ROFS) StdFS {
 	return iofsAdapter{fs: fs}
 }
 

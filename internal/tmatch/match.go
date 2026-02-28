@@ -15,9 +15,6 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
-// TODO: move to context or something like that
-var fsWalkCache = hfs.NewFSCache()
-
 func walkDirs(ctx context.Context, walkRoot, root string, filter func(path string) bool) iter.Seq2[string, error] {
 	if filter == nil {
 		filter = func(path string) bool {
@@ -27,7 +24,8 @@ func walkDirs(ctx context.Context, walkRoot, root string, filter func(path strin
 
 	return func(yield func(string, error) bool) {
 		stop := false
-		err := fsWalkCache.Walk(walkRoot, func(path string, d fs.DirEntry, err error) error {
+		wfs := hfs.DefaultOSCache
+		err := fs.WalkDir(wfs, walkRoot, func(path string, d fs.DirEntry, err error) error {
 			if d == nil || !d.IsDir() {
 				return nil
 			}

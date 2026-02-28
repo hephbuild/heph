@@ -287,6 +287,10 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 				return true
 			}
 
+			if artifact.GetType() == pluginv1.Artifact_TYPE_SUPPORT_FILE {
+				return false
+			}
+
 			if !slices.Contains(outputs, artifact.GetGroup()) {
 				return true
 			}
@@ -917,6 +921,19 @@ func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
 	return res
 }
 
+func (r ExecuteResult) FindSupport() []ExecuteResultArtifact {
+	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+	for _, artifact := range r.Artifacts {
+		if artifact.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE {
+			continue
+		}
+
+		res = append(res, artifact)
+	}
+
+	return res
+}
+
 type ExecuteResultLocks struct {
 	*ExecuteResult
 	Locks *CacheLocks
@@ -1476,7 +1493,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 		hashout, err := e.hashout(ctx, def.GetRef(), artifact)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("hashout: %w", err)
 		}
 
 		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
