@@ -1,7 +1,6 @@
 package hfs
 
 import (
-	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -48,11 +47,15 @@ func collectWalk(t *testing.T, cache *FSCache, root string) []string {
 
 	var paths []string
 	err := fs.WalkDir(cache, root, func(path string, d fs.DirEntry, err error) error {
-		require.NoError(t, err)
+		if err != nil {
+			return err
+		}
+
 		paths = append(paths, path)
 		return nil
 	})
-	require.NoError(t, err)
+	assert.NoError(t, err)
+
 	return paths
 }
 
@@ -247,7 +250,7 @@ func TestFSCache2_OpenNonExistent(t *testing.T) {
 
 	_, err := cache.Open("/this/path/does/not/exist")
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, fs.ErrNotExist))
+	assert.ErrorIs(t, err, fs.ErrNotExist)
 }
 
 func TestFSCache2_WalkNonExistentRoot(t *testing.T) {
