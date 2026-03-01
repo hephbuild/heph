@@ -13,6 +13,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       version: ${{ steps.version.outputs.version }}
+      repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -44,6 +45,7 @@ jobs:
         run: make gen
 
       - name: Upload repo
+        id: upload_repo
         uses: actions/upload-artifact@v6
         with:
           name: repo
@@ -197,3 +199,12 @@ jobs:
           else
             echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
           fi
+      - name: Delete Repo Artifact
+        uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.actions.deleteArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: "${{ needs.gen.outputs.repo_artifact_id }}",
+            });
