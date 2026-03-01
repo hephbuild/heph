@@ -17,7 +17,6 @@ import (
 	"github.com/hephbuild/heph/internal/hcobra"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hlocks"
-	"github.com/hephbuild/heph/internal/hversion"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -69,7 +68,6 @@ var rootCmd = &cobra.Command{
 	TraverseChildren: true,
 	SilenceUsage:     true,
 	SilenceErrors:    true,
-	Version:          hversion.Version,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 		defer func() {
@@ -260,7 +258,6 @@ func init() {
 	hcobra.Setup(rootCmd)
 
 	rootCmd.PersistentFlags().BoolVarP(&plain, "plain", "", false, "disable terminal UI")
-	rootCmd.PersistentFlags().BoolVarP(&debug, "debug", "", false, "enable debug log")
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false, "set log level to error")
 
 	debugFlagSet := hcobra.NewFlagSet("Global Debug Flags")
@@ -270,6 +267,7 @@ func init() {
 	debugFlagSet.StringVar(&pprofGoroutinePath, "pprof-goroutine", "", "Goroutine Profile output file")
 	debugFlagSet.BoolVar(&pprofGoroutineLast, "pprof-goroutine-last", false, "Goroutine Profile, keep only last")
 	debugFlagSet.StringVar(&tracePath, "trace", "", "Trace output file")
+	debugFlagSet.BoolVarP(&debug, "debug", "", false, "Enable debug log")
 
 	hcobra.AddLocalFlagSet(rootCmd, debugFlagSet)
 	hcobra.AddPersistentFlagSet(rootCmd, debugFlagSet)
