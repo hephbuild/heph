@@ -92,7 +92,12 @@ func GlobSplit(p string) (base, pattern string) { //nolint:nonamedreturns
 	return doublestar.SplitPattern(p)
 }
 
-type GlobWalkFunc func(path string, d DirEntry) error
+type GlobEntry struct {
+	RelPath string
+	Node    RONode
+}
+
+type GlobWalkFunc func(entry GlobEntry) error
 
 type GlobOption = func(*globConfig)
 
@@ -154,19 +159,19 @@ func glob(ctx context.Context, node RONode, pattern string, ignore []string, fn 
 	}
 
 	if pattern == "**/*" {
-		return globAll(ctx, walkNode, prefix, ignore, fn)
+		return globAll(ctx, node, walkNode, prefix, ignore, fn)
 	}
 
 	return doublestar.GlobWalk(ToIOFS(walkNode), pattern, func(path string, d iofs.DirEntry) error {
-		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
+		return innerGlob(ctx, node, filepath.Join(prefix, path), ignore, d, fn)
 	})
 }
 
-func globAll(ctx context.Context, node RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
-	return globAllWalk(ctx, node, node, prefix, ignore, fn)
+func globAll(ctx context.Context, rootNode RONode, node RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return globAllWalk(ctx, rootNode, node, node, prefix, ignore, fn)
 }
 
-func globAllWalk(ctx context.Context, rootNode RONode, walkNode RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
+func globAllWalk(ctx context.Context, globRootNode RONode, rootNode RONode, walkNode RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
 	return iofs.WalkDir(ToIOFS(walkNode), ".", func(relPath string, d DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
@@ -193,15 +198,15 @@ func globAllWalk(ctx context.Context, rootNode RONode, walkNode RONode, prefix s
 
 			if info.IsDir() {
 				// Recurse into the symlink target as if it were a regular directory.
-				return globAllWalk(ctx, rootNode, walkNode.AtRO(relPath), fullpath, ignore, fn)
+				return globAllWalk(ctx, globRootNode, rootNode, walkNode.AtRO(relPath), fullpath, ignore, fn)
 			}
 		}
 
-		return innerGlob(ctx, fullpath, ignore, d, fn)
+		return innerGlob(ctx, globRootNode, fullpath, ignore, d, fn)
 	})
 }
 
-func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntry, fn GlobWalkFunc) error {
+func innerGlob(ctx context.Context, rootNode RONode, path string, ignore []string, d iofs.DirEntry, fn GlobWalkFunc) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -228,12 +233,29 @@ func innerGlob(ctx context.Context, path string, ignore []string, d iofs.DirEntr
 		return nil
 	}
 
-	err = fn(path, d)
+	err = fn(GlobEntry{
+		RelPath: path,
+		Node:    withInfo(rootNode.AtRO(path), d.Info),
+	})
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+type rONodeWithInfoFunc struct {
+	RONode
+
+	infoFunc func() (iofs.FileInfo, error)
+}
+
+func (r rONodeWithInfoFunc) Stat() (FileInfo, error) {
+	return r.infoFunc()
+}
+
+func withInfo(ro RONode, info func() (iofs.FileInfo, error)) RONode {
+	return &rONodeWithInfoFunc{ro, info}
 }
 
 func IsExecOwner(mode FileMode) bool {

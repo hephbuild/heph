@@ -27,8 +27,8 @@ func setup(t *testing.T, paths []string) hfs.OS {
 func collector() (hfs.GlobWalkFunc, func() []string) {
 	var matches []string
 
-	return func(path string, d hfs.DirEntry) error {
-			matches = append(matches, path)
+	return func(entry hfs.GlobEntry) error {
+			matches = append(matches, entry.RelPath)
 
 			return nil
 		}, func() []string {

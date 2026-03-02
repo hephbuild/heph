@@ -1370,14 +1370,14 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				return nil, fmt.Errorf("unknown path type: %v", path.WhichContent())
 			}
 
-			err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-				f, err := hfs.Open(cwdfs.At(path))
+			err := hfs.Glob(ctx, cwdfs, globPath, nil, func(entry hfs.GlobEntry) error {
+				f, err := hfs.Open(entry.Node)
 				if err != nil {
 					return err
 				}
 				defer f.Close()
 
-				err = tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path))
+				err = tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
 				if err != nil {
 					return err
 				}
@@ -1449,14 +1449,14 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 					return nil, fmt.Errorf("unknown support file path type: %v", path.WhichContent())
 				}
 
-				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-					f, err := hfs.Open(cwdfs.At(path))
+				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(entry hfs.GlobEntry) error {
+					f, err := hfs.Open(entry.Node)
 					if err != nil {
 						return err
 					}
 					defer f.Close()
 
-					return tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), path))
+					return tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
 				})
 				if err != nil {
 					return nil, fmt.Errorf("collect support file %v: %w", globPath, err)

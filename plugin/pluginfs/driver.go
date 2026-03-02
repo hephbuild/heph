@@ -157,24 +157,24 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	exclude = append(exclude, t.GetExclude()...)
 
 	var artifacts []*pluginv1.Artifact
-	err = hfs.Glob(ctx, fs, t.GetPattern(), exclude, func(path string, e hfs.DirEntry) error {
-		info, err := e.Info()
+	err = hfs.Glob(ctx, fs, t.GetPattern(), exclude, func(entry hfs.GlobEntry) error {
+		info, err := entry.Node.Stat()
 		if err != nil {
 			return err
 		}
 
-		abspath := fs.AtRO(path).Path()
+		abspath := entry.Node.Path()
 
 		if IsCodegen(ctx, abspath) {
 			return nil
 		}
 
 		artifacts = append(artifacts, pluginv1.Artifact_builder{
-			Name: htypes.Ptr(strings.ReplaceAll(path, "/", "_")),
+			Name: htypes.Ptr(strings.ReplaceAll(entry.RelPath, "/", "_")),
 			Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 			File: pluginv1.Artifact_ContentFile_builder{
 				SourcePath: htypes.Ptr(abspath),
-				OutPath:    htypes.Ptr(path),
+				OutPath:    htypes.Ptr(entry.RelPath),
 				X:          htypes.Ptr(hfs.IsExecOwner(info.Mode())),
 			}.Build(),
 		}.Build())

@@ -26,3 +26,6 @@ gen:
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_driver.go > lib/pluginsdk/plugin_driver.mock.go
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_provider.go > lib/pluginsdk/plugin_provider.mock.go
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_cache.go > lib/pluginsdk/plugin_cache.mock.go
+
+lint:
+	golangci-lint run --fix

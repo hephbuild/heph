@@ -126,8 +126,8 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkgDir string, hooks Hooks) (s
 
 	node := hfs.At(p.repoRoot, pkgDir)
 	for _, pattern := range p.Patterns {
-		err := hfs.Glob(ctx, node, pattern, nil, func(path string, d hfs.DirEntry) error {
-			f, err := hfs.Open(node.At(path))
+		err := hfs.Glob(ctx, node, pattern, nil, func(entry hfs.GlobEntry) error {
+			f, err := hfs.Open(entry.Node)
 			if err != nil {
 				return err
 			}

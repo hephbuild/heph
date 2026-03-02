@@ -218,8 +218,8 @@ func (p *Plugin) builtinfsglob() BuiltinFunc {
 		}
 
 		paths := starlark.NewList(nil)
-		err := hfs.Glob(execCtx.Ctx, p.repoRoot.At(tref.ToOSPath(execCtx.Package)), pattern, exclude, func(path string, d hfs.DirEntry) error {
-			return paths.Append(starlark.String(path))
+		err := hfs.Glob(execCtx.Ctx, p.repoRoot.At(tref.ToOSPath(execCtx.Package)), pattern, exclude, func(entry hfs.GlobEntry) error {
+			return paths.Append(starlark.String(entry.RelPath))
 		})
 		if err != nil {
 			return nil, err
