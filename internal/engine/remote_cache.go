@@ -139,12 +139,12 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 			def.GetRef().GetPackage(),
 			e.targetDirName(def.GetRef())+"_remote_tmp_"+hinstance.UID+"_"+hrand.Str(7)+"_"+hashin,
 		)
-		err := tmpCacheDir.MkdirAll("", os.ModePerm)
+		err := tmpCacheDir.MkdirAll(os.ModePerm)
 		if err != nil {
 			return nil, false, err
 		}
 
-		defer tmpCacheDir.RemoveAll("")
+		defer tmpCacheDir.RemoveAll()
 
 		cacheDir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
 
@@ -183,7 +183,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 			}.Sorted(), true, nil
 		}
 
-		_ = tmpCacheDir.RemoveAll("")
+		_ = tmpCacheDir.RemoveAll()
 	}
 
 	return nil, false, nil
@@ -275,7 +275,7 @@ func (e *Engine) resultFromRemoteCacheInner(
 				return err
 			}
 
-			f, err := hfs.Create(tofs, "")
+			f, err := hfs.Create(tofs)
 			if err != nil {
 				return err
 			}

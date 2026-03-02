@@ -9,25 +9,25 @@ import (
 	"path/filepath"
 )
 
-func Exists(fs FS, filename string) bool {
-	_, err := fs.Lstat(filename)
+func Exists(fs RONode) bool {
+	_, err := fs.Lstat()
 	return err == nil
 }
 
-func Open(fs ROFS, filename string) (File, error) {
-	return fs.Open(filename, os.O_RDONLY, 0)
+func Open(fs RONode) (File, error) {
+	return fs.Open(os.O_RDONLY, 0)
 }
 
 type FileReader interface {
-	ReadFile(filename string) ([]byte, error)
+	ReadFile() ([]byte, error)
 }
 
-func ReadFile(fs FS, filename string) ([]byte, error) {
+func ReadFile(fs RONode) ([]byte, error) {
 	if fr, ok := fs.(FileReader); ok {
-		return fr.ReadFile(filename)
+		return fr.ReadFile()
 	}
 
-	f, err := Open(fs, filename)
+	f, err := Open(fs)
 	if err != nil {
 		return nil, err
 	}
@@ -36,11 +36,12 @@ func ReadFile(fs FS, filename string) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-func WriteFile(fs FS, filename string, b []byte, mode FileMode) error {
-	f, err := Create(fs, filename)
+func WriteFile(fs Node, b []byte) error {
+	f, err := Create(fs)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
 	_, err = f.Write(b)
 	if err != nil {
@@ -50,28 +51,28 @@ func WriteFile(fs FS, filename string, b []byte, mode FileMode) error {
 	return f.Close()
 }
 
-func Create(fs FS, filename string) (File, error) {
-	err := CreateParentDir(fs, filename)
+func Create(fs Node) (File, error) {
+	err := CreateParentDir(fs)
 	if err != nil {
 		return nil, err
 	}
 
-	return fs.Open(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	return fs.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
-func CreateExec(fs FS, filename string) (File, error) {
-	err := CreateParentDir(fs, filename)
+func CreateExec(fs Node) (File, error) {
+	err := CreateParentDir(fs)
 	if err != nil {
 		return nil, err
 	}
 
-	return fs.Open(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666|0111)
+	return fs.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666|0111)
 }
 
-func CreateParentDir(fs FS, path string) error {
-	path = fs.Path(path)
-	if dir := filepath.Dir(path); dir != "." {
-		err := fs.At(dir).MkdirAll("", ModePerm)
+func CreateParentDir(fs Node) error {
+	p := fs.Path()
+	if dir := filepath.Dir(p); dir != "." && dir != p {
+		err := At(fs, dir).MkdirAll(ModePerm)
 		if err != nil {
 			return err
 		}
@@ -83,9 +84,9 @@ func CreateParentDir(fs FS, path string) error {
 func At[T any](fs T, names ...string) T {
 	for _, name := range names {
 		switch ffs := any(fs).(type) {
-		case FS:
+		case Node:
 			fs = ffs.At(name).(T) //nolint:errcheck
-		case ROFS:
+		case RONode:
 			fs = ffs.AtRO(name).(T) //nolint:errcheck
 		default:
 			panic(fmt.Sprintf("At: unknown FS type: %T", ffs))
@@ -96,57 +97,21 @@ func At[T any](fs T, names ...string) T {
 
 type WalkDirFunc = iofs.WalkDirFunc
 
-type iofsAdapter struct {
-	fs ROFS
+func Walk(fs Node, walkFn WalkDirFunc) error {
+	return iofs.WalkDir(ToIOFS(fs), ".", walkFn)
 }
 
-func (i iofsAdapter) ReadDir(name string) ([]iofs.DirEntry, error) {
-	return i.fs.ReadDir(name)
-}
-
-func (i iofsAdapter) Stat(name string) (iofs.FileInfo, error) {
-	return i.fs.Stat(name)
-}
-
-func (i iofsAdapter) Open(name string) (iofs.File, error) {
-	return Open(i.fs, name)
-}
-
-type StdFS interface {
-	iofs.FS
-	iofs.StatFS
-	iofs.ReadDirFS
-}
-
-func ToIOFS(fs ROFS) StdFS {
-	return iofsAdapter{fs: fs}
-}
-
-func Walk(fs FS, walkFn WalkDirFunc) error {
-	return iofs.WalkDir(ToIOFS(fs), "", walkFn)
-}
-
-func Move(from, to FS) error {
-	fromos, ok := from.(OS)
-	if !ok {
-		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
-	}
-
-	toos, ok := to.(OS)
-	if !ok {
-		return fmt.Errorf("cannot move filesystem from %T to %T", from, to)
-	}
-
-	err := CreateParentDir(toos, "")
+func Move(from, to Node) error {
+	err := CreateParentDir(to)
 	if err != nil {
 		return err
 	}
 
-	return fromos.Move("", toos.Path())
+	return from.Move(to)
 }
 
-func Copy(from, to FS) error {
-	fromi, err := from.Stat("")
+func Copy(from, to Node) error {
+	fromi, err := from.Stat()
 	if err != nil {
 		return err
 	}
@@ -155,18 +120,13 @@ func Copy(from, to FS) error {
 		return errors.New("unsupported codepath")
 	}
 
-	fromf, err := Open(from, "")
+	fromf, err := Open(from)
 	if err != nil {
 		return err
 	}
 	defer fromf.Close()
 
-	// toi, err := to.Stat("")
-	// if err != nil {
-	//	return err
-	//}
-
-	tof, err := Create(to, "")
+	tof, err := Create(to)
 	if err != nil {
 		return err
 	}

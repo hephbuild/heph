@@ -3,6 +3,7 @@ package hlocks
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -11,7 +12,7 @@ func TestFlockMultiRLock(t *testing.T) {
 	ctx := t.Context()
 
 	fs := newfs(t)
-	m := NewFlock(fs, t.Name(), t.Name()+".lock")
+	m := NewFlock(hfs.At(fs, t.Name()+".lock"), t.Name())
 
 	err := m.RLock(ctx)
 	require.NoError(t, err)

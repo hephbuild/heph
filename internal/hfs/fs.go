@@ -27,22 +27,22 @@ type OSFile interface {
 	GetOSFile() *os.File
 }
 
-type ROFS interface {
-	Stat(name string) (FileInfo, error)
-	Lstat(name string) (FileInfo, error)
-	Open(name string, flag int, perm FileMode) (File, error)
-	ReadDir(name string) ([]DirEntry, error)
-	Path(names ...string) string
-	AtRO(name string) ROFS
+type RONode interface {
+	Stat() (FileInfo, error)
+	Lstat() (FileInfo, error)
+	Open(flag int, perm FileMode) (File, error)
+	ReadDir() ([]DirEntry, error)
+	Path() string
+	AtRO(name string) RONode
 }
 
-type FS interface {
-	ROFS
+type Node interface {
+	RONode
 
-	Move(oldname, newname string) error
-	Remove(path string) error
-	RemoveAll(path string) error
-	Mkdir(name string, mode FileMode) error
-	MkdirAll(name string, mode FileMode) error
-	At(name string) FS
+	Move(to Node) error
+	Remove() error
+	RemoveAll() error
+	Mkdir(mode FileMode) error
+	MkdirAll(mode FileMode) error
+	At(names ...string) Node
 }

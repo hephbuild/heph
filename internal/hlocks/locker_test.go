@@ -42,7 +42,7 @@ func TestFlock(t *testing.T) {
 	fs := newfs(t)
 
 	testLocker(t, func() Locker {
-		return NewFlock(fs, t.Name(), t.Name()+".lock")
+		return NewFlock(hfs.At(fs, t.Name()+".lock"), t.Name())
 	})
 }
 
@@ -50,7 +50,7 @@ func TestFlockContext(t *testing.T) {
 	fs := newfs(t)
 
 	testLockerContext(t, func() Locker {
-		return NewFlock(fs, t.Name(), t.Name()+".lock")
+		return NewFlock(hfs.At(fs, t.Name()+".lock"), t.Name())
 	})
 }
 
@@ -58,14 +58,14 @@ func TestFlockTry(t *testing.T) {
 	fs := newfs(t)
 
 	testLockerTry(t, func() Locker {
-		return NewFlock(fs, t.Name(), t.Name()+".lock")
+		return NewFlock(hfs.At(fs, t.Name()+".lock"), t.Name())
 	})
 }
 
 func TestFlockSingleInstance(t *testing.T) {
 	fs := newfs(t)
 
-	l := NewFlock(fs, "lock", t.Name()+".lock")
+	l := NewFlock(hfs.At(fs, t.Name()+".lock"), "lock")
 
 	testLocker(t, func() Locker {
 		return l
@@ -75,7 +75,7 @@ func TestFlockSingleInstance(t *testing.T) {
 func TestFlockSingleInstanceContext(t *testing.T) {
 	fs := newfs(t)
 
-	l := NewFlock(fs, "lock", t.Name()+".lock")
+	l := NewFlock(hfs.At(fs, t.Name()+".lock"), "lock")
 
 	testLockerContext(t, func() Locker {
 		return l
@@ -85,7 +85,7 @@ func TestFlockSingleInstanceContext(t *testing.T) {
 func TestFlockSingleInstanceTry(t *testing.T) {
 	fs := newfs(t)
 
-	l := NewFlock(fs, "lock", t.Name()+".lock")
+	l := NewFlock(hfs.At(fs, t.Name()+".lock"), "lock")
 
 	testLockerTry(t, func() Locker {
 		return l
@@ -96,7 +96,7 @@ func TestFlockRLock(t *testing.T) {
 	fs := newfs(t)
 
 	testRLockTry(t, func() RWLocker {
-		return NewFlock(fs, "lock", t.Name()+".lock")
+		return NewFlock(hfs.At(fs, t.Name()+".lock"), "lock")
 	}, false)
 }
 
@@ -306,7 +306,7 @@ func TestFlockConcurrent(t *testing.T) {
 	factory := func(i int) Locker {
 		p := fmt.Sprintf("%v-%v.lock", name, i)
 
-		return NewFlock(fs, name, p)
+		return NewFlock(hfs.At(fs, p), name)
 	}
 
 	locks1 := []Locker{

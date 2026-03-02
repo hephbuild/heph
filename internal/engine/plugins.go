@@ -84,7 +84,7 @@ var httpClientWithOtel = &http.Client{
 func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(), error) {
 	if false {
 		dir := e.Home.At("socks")
-		err := dir.MkdirAll("", os.ModePerm)
+		err := dir.MkdirAll(os.ModePerm)
 		if err != nil {
 			return nil, "", nil, err
 		}

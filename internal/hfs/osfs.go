@@ -16,7 +16,7 @@ func NewOS(root string) OS {
 	return OS{root: root}
 }
 
-func AsOs(fs FS) (OS, bool) {
+func AsOs(fs Node) (OS, bool) {
 	osfs, ok := fs.(OS)
 
 	return osfs, ok
@@ -26,7 +26,7 @@ type OS struct {
 	root string
 }
 
-var _ FS = (*OS)(nil)
+var _ Node = (*OS)(nil)
 var _ FileReader = (*OS)(nil)
 
 func (osfs OS) join(name string) string {
@@ -45,18 +45,20 @@ func (osfs OS) join(name string) string {
 	return filepath.Join(osfs.root, name)
 }
 
-func (osfs OS) At(name string) FS {
-	osfs.root = osfs.join(name)
+func (osfs OS) At(names ...string) Node {
+	for _, name := range names {
+		osfs.root = osfs.join(name)
+	}
 
 	return osfs
 }
 
-func (osfs OS) AtRO(name string) ROFS {
+func (osfs OS) AtRO(name string) RONode {
 	return osfs.At(name)
 }
 
-func (osfs OS) Stat(name string) (FileInfo, error) {
-	return os.Stat(osfs.join(name))
+func (osfs OS) Stat() (FileInfo, error) {
+	return os.Stat(osfs.root)
 }
 
 type wrapOsInfo struct {
@@ -69,14 +71,13 @@ func (i wrapOsInfo) Name() string {
 	return i.name
 }
 
-func (osfs OS) Lstat(name string) (FileInfo, error) {
-	path := osfs.join(name)
-	info, err := os.Lstat(path)
+func (osfs OS) Lstat() (FileInfo, error) {
+	info, err := os.Lstat(osfs.root)
 	if err != nil {
 		return nil, err
 	}
 
-	return wrapOsInfo{FileInfo: info, name: path}, err
+	return wrapOsInfo{FileInfo: info, name: osfs.root}, err
 }
 
 type wrapOsFile struct {
@@ -107,8 +108,8 @@ func (f wrapOsFile) LStat() (FileInfo, error) {
 	return wrapOsInfo{FileInfo: info, name: f.Name()}, nil
 }
 
-func (osfs OS) Open(name string, flag int, perm FileMode) (File, error) {
-	f, err := os.OpenFile(osfs.join(name), flag, perm)
+func (osfs OS) Open(flag int, perm FileMode) (File, error) {
+	f, err := os.OpenFile(osfs.root, flag, perm)
 	if err != nil {
 		return nil, err
 	}
@@ -116,9 +117,14 @@ func (osfs OS) Open(name string, flag int, perm FileMode) (File, error) {
 	return wrapOsFile{f}, nil
 }
 
-func (osfs OS) Move(oldname, newname string) error {
-	oldpath := osfs.join(oldname)
-	newpath := osfs.join(newname)
+func (osfs OS) Move(to Node) error {
+	toos, ok := to.(OS)
+	if !ok {
+		return fmt.Errorf("cannot move filesystem from %T to %T", osfs, to)
+	}
+
+	oldpath := osfs.root
+	newpath := toos.root
 
 	err := os.Rename(oldpath, newpath)
 	if err != nil {
@@ -167,55 +173,53 @@ func (osfs OS) moveCrossDevice(source, destination string) error {
 	return nil
 }
 
-func (osfs OS) Remove(path string) error {
-	return os.Remove(osfs.join(path))
+func (osfs OS) Remove() error {
+	return os.Remove(osfs.root)
 }
 
-func (osfs OS) RemoveAll(path string) error {
-	dir := osfs.join(path)
+func (osfs OS) RemoveAll() error {
+	MakeDirsReadWrite(osfs.root)
 
-	MakeDirsReadWrite(dir)
-
-	return os.RemoveAll(dir)
+	return os.RemoveAll(osfs.root)
 }
 
-func (osfs OS) Chown(name string, uid, gid int) error {
-	return os.Chown(osfs.join(name), uid, gid)
+func (osfs OS) Chown(uid, gid int) error {
+	return os.Chown(osfs.root, uid, gid)
 }
 
-func (osfs OS) Chmod(name string, mode os.FileMode) error {
-	return os.Chmod(osfs.join(name), mode)
+func (osfs OS) Chmod(mode os.FileMode) error {
+	return os.Chmod(osfs.root, mode)
 }
 
-func (osfs OS) Chtimes(name string, atime time.Time, mtime time.Time) error {
-	return os.Chtimes(osfs.join(name), atime, mtime)
+func (osfs OS) Chtimes(atime time.Time, mtime time.Time) error {
+	return os.Chtimes(osfs.root, atime, mtime)
 }
 
-func (osfs OS) Symlink(oldname, newname string) error {
-	return os.Symlink(oldname, osfs.join(newname))
+func (osfs OS) Symlink(oldname string) error {
+	return os.Symlink(oldname, osfs.root)
 }
 
-func (osfs OS) Readlink(name string) (string, error) {
-	return os.Readlink(osfs.join(name))
+func (osfs OS) Readlink() (string, error) {
+	return os.Readlink(osfs.root)
 }
 
-func (osfs OS) Mkdir(name string, mode os.FileMode) error {
-	return os.Mkdir(osfs.join(name), mode)
+func (osfs OS) Mkdir(mode os.FileMode) error {
+	return os.Mkdir(osfs.root, mode)
 }
 
-func (osfs OS) MkdirAll(name string, mode os.FileMode) error {
-	return os.MkdirAll(osfs.join(name), mode)
+func (osfs OS) MkdirAll(mode os.FileMode) error {
+	return os.MkdirAll(osfs.root, mode)
 }
 
 // Inspired from https://github.com/golang/go/blob/3c72dd513c30df60c0624360e98a77c4ae7ca7c8/src/cmd/go/internal/modfetch/fetch.go
 
-func (osfs OS) MakeDirsReadOnly(dir string) {
+func (osfs OS) MakeDirsReadOnly() {
 	type pathMode struct {
 		path string
 		mode fs.FileMode
 	}
 	var dirs []pathMode // in lexical order
-	_ = filepath.WalkDir(osfs.join(dir), func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(osfs.root, func(path string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
 			info, err := d.Info()
 			if err == nil && info.Mode()&0222 != 0 {
@@ -231,9 +235,9 @@ func (osfs OS) MakeDirsReadOnly(dir string) {
 	}
 }
 
-func (osfs OS) MakeDirsReadWrite(dir string) {
+func (osfs OS) MakeDirsReadWrite() {
 	// Module cache has 0555 directories; make them writable in order to remove content.
-	_ = filepath.WalkDir(osfs.join(dir), func(path string, info fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(osfs.root, func(path string, info fs.DirEntry, err error) error {
 		if err != nil {
 			return nil //nolint:nilerr // ignore errors walking in file system
 		}
@@ -244,19 +248,16 @@ func (osfs OS) MakeDirsReadWrite(dir string) {
 	})
 }
 
-func (osfs OS) ReadFile(filename string) ([]byte, error) {
-	return os.ReadFile(osfs.join(filename))
+func (osfs OS) ReadFile() ([]byte, error) {
+	return os.ReadFile(osfs.root)
 }
 
-func (osfs OS) ReadDir(name string) ([]DirEntry, error) {
-	return os.ReadDir(osfs.join(name))
+func (osfs OS) ReadDir() ([]DirEntry, error) {
+	return os.ReadDir(osfs.root)
 }
 
-func (osfs OS) Path(elems ...string) string {
-	args := []string{osfs.root}
-	args = append(args, elems...)
-
-	return filepath.Join(args...)
+func (osfs OS) Path() string {
+	return osfs.root
 }
 
 // CloseEnsureROFD ensures the fd is ro; fixing the issue described in https://github.com/rust-lang/rust/issues/114554

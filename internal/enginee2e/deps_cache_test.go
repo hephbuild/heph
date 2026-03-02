@@ -80,7 +80,7 @@ func TestDepsCache(t *testing.T) {
 		err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs)
 		require.NoError(t, err)
 
-		b, err := hfs.ReadFile(fs, "out_parent")
+		b, err := hfs.ReadFile(fs.At("out_parent"))
 		require.NoError(t, err)
 
 		assert.Equal(t, "hello\n", string(b))
@@ -220,7 +220,7 @@ func TestDepsCache2(t *testing.T) {
 		err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs)
 		require.NoError(t, err)
 
-		b, err := hfs.ReadFile(fs, "out.txt")
+		b, err := hfs.ReadFile(fs.At("out.txt"))
 		require.NoError(t, err)
 
 		assert.Equal(t, "hello", string(b))

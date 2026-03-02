@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"time"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -86,13 +85,13 @@ func (m Manifest) GetArtifacts(output string) []ManifestArtifact {
 	return a
 }
 
-func WriteManifest(fs hfs.FS, m Manifest) (*pluginv1.Artifact, error) {
+func WriteManifest(fs hfs.Node, m Manifest) (*pluginv1.Artifact, error) {
 	b, err := json.Marshal(m) //nolint:musttag
 	if err != nil {
 		return nil, err
 	}
 
-	err = hfs.WriteFile(fs, ManifestName, b, os.ModePerm)
+	err = hfs.WriteFile(fs.At(ManifestName), b)
 	if err != nil {
 		return nil, err
 	}
@@ -116,12 +115,12 @@ func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
 	}.Build(), nil
 }
 
-func newManifestArtifact(fs hfs.FS) *pluginv1.Artifact {
+func newManifestArtifact(fs hfs.Node) *pluginv1.Artifact {
 	return pluginv1.Artifact_builder{
 		Name: htypes.Ptr(ManifestName),
 		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
 		File: pluginv1.Artifact_ContentFile_builder{
-			SourcePath: htypes.Ptr(fs.Path(ManifestName)),
+			SourcePath: htypes.Ptr(fs.At(ManifestName).Path()),
 			OutPath:    htypes.Ptr(ManifestName),
 		}.Build(),
 	}.Build()
@@ -137,8 +136,8 @@ func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, 
 	return DecodeManifest(r)
 }
 
-func ManifestFromFS(fs hfs.FS) (Manifest, *pluginv1.Artifact, error) {
-	f, err := hfs.Open(fs, ManifestName)
+func ManifestFromFS(fs hfs.Node) (Manifest, *pluginv1.Artifact, error) {
+	f, err := hfs.Open(fs.At(ManifestName))
 	if err != nil {
 		return Manifest{}, nil, err
 	}

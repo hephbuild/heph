@@ -2,12 +2,14 @@ package hlocks
 
 import (
 	"testing"
+
+	"github.com/hephbuild/heph/internal/hfs"
 )
 
 func BenchmarkFlock(b *testing.B) {
 	fs := newfs(b)
 
-	l := NewFlock(fs, "", "a.lock")
+	l := NewFlock(hfs.At(fs, "a.lock"), "")
 
 	b.ResetTimer()
 

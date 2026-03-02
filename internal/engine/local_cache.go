@@ -94,7 +94,7 @@ func (e *Engine) CacheLocally(
 			content := artifact.GetFile()
 
 			artifact.SetName(artifact.GetName() + ".tar")
-			tarf, err := hfs.Create(cachedir, artifact.GetName())
+			tarf, err := hfs.Create(cachedir.At(artifact.GetName()))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -103,7 +103,7 @@ func (e *Engine) CacheLocally(
 
 			sourcefs := hfs.NewOS(content.GetSourcePath())
 
-			f, err := hfs.Open(sourcefs, "")
+			f, err := hfs.Open(sourcefs)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -123,7 +123,7 @@ func (e *Engine) CacheLocally(
 			content := artifact.GetRaw()
 
 			artifact.SetName(artifact.GetName() + ".tar")
-			tarf, err := hfs.Create(cachedir, artifact.GetName())
+			tarf, err := hfs.Create(cachedir.At(artifact.GetName()))
 			if err != nil {
 				return nil, nil, err
 			}
@@ -238,7 +238,7 @@ func (e *Engine) ClearCacheLocally(
 
 	cachedir := hfs.At(e.Cache, ref.GetPackage(), e.targetDirName(ref), hashin)
 
-	return cachedir.RemoveAll("")
+	return cachedir.RemoveAll()
 }
 
 func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
@@ -289,11 +289,11 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 
 	execArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		if !hfs.Exists(dirfs, artifact.Name) {
+		if !hfs.Exists(dirfs.At(artifact.Name)) {
 			return nil, false, nil
 		}
 
-		partifact, err := hartifact.ManifestArtifactToProto(artifact, dirfs.Path(artifact.Name))
+		partifact, err := hartifact.ManifestArtifactToProto(artifact, dirfs.At(artifact.Name).Path())
 		if err != nil {
 			return nil, false, fmt.Errorf("ManifestArtifactToProto: %w", err)
 		}

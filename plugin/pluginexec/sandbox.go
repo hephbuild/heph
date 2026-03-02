@@ -41,12 +41,12 @@ func SetupSandbox(
 	ctx, span := tracer.Start(ctx, "SetupSandbox")
 	defer span.End()
 
-	err := workfs.MkdirAll("", os.ModePerm)
+	err := workfs.MkdirAll(os.ModePerm)
 	if err != nil {
 		return nil, err
 	}
 
-	err = binfs.MkdirAll("", hfs.ModePerm)
+	err = binfs.MkdirAll(hfs.ModePerm)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +55,7 @@ func SetupSandbox(
 
 	var listArtifacts []*pluginv1.ArtifactWithOrigin
 	if setupWd {
-		err = cwdfs.MkdirAll("", os.ModePerm)
+		err = cwdfs.MkdirAll(os.ModePerm)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +119,7 @@ func SetupSandbox(
 
 	for _, output := range t.GetOutputs() {
 		for _, path := range output.GetPaths() {
-			err := hfs.CreateParentDir(outfs, path)
+			err := hfs.CreateParentDir(outfs.At(path))
 			if err != nil {
 				return nil, err
 			}
@@ -150,7 +150,7 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 	}
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, fs hfs.FS, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, fs hfs.Node, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
@@ -160,7 +160,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 		_, _ = h.WriteString(f)
 	}
 
-	listf, err := hfs.Create(fs, hex.EncodeToString(h.Sum(nil))+".list")
+	listf, err := hfs.Create(fs.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
 	if err != nil {
 		return nil, fmt.Errorf("create list file: %w", err)
 	}
@@ -215,7 +215,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 	}.Build(), nil
 }
 
-func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.FS) (*pluginv1.Artifact, error) {
+func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxBinArtifact")
 	defer span.End()
 
@@ -245,8 +245,8 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, f
 
 	name := filepath.Base(binPath)
 
-	dest := fs.Path(name)
-	err = fs.Move(binPath, dest)
+	dest := fs.At(name)
+	err = tmpfs.At(binPath).Move(dest)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, f
 		Name:  htypes.Ptr(artifact.GetName() + ".list"),
 		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
 		Raw: pluginv1.Artifact_ContentRaw_builder{
-			Data: []byte(dest),
+			Data: []byte(dest.Path()),
 			Path: htypes.Ptr(artifact.GetName() + ".list"),
 		}.Build(),
 	}.Build(), nil

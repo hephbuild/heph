@@ -18,7 +18,7 @@ func TestSanity(t *testing.T) {
 	srcfs := hfstest.New(t)
 
 	{
-		f, err := hfs.Create(srcfs, "file1")
+		f, err := hfs.Create(srcfs.At("file1"))
 		require.NoError(t, err)
 
 		_, err = f.Write([]byte(`hello, world`))
@@ -34,7 +34,7 @@ func TestSanity(t *testing.T) {
 		p := NewPacker(&b)
 		defer p.Close()
 
-		f, err := hfs.Open(srcfs, "file1")
+		f, err := hfs.Open(srcfs.At("file1"))
 		require.NoError(t, err)
 
 		err = p.WriteFile(f, "some/file1")
@@ -53,7 +53,7 @@ func TestSanity(t *testing.T) {
 		err := Unpack(ctx, &b, dstfs)
 		require.NoError(t, err)
 
-		b, err := hfs.ReadFile(dstfs, "some/file1")
+		b, err := hfs.ReadFile(dstfs.At("some/file1"))
 		require.NoError(t, err)
 
 		assert.Equal(t, "hello, world", string(b))
@@ -66,7 +66,7 @@ func TestSanitySymlink(t *testing.T) {
 	srcfs := hfstest.New(t)
 
 	{
-		f, err := hfs.Create(srcfs, "file1")
+		f, err := hfs.Create(srcfs.At("file1"))
 		require.NoError(t, err)
 
 		_, err = f.Write([]byte(`hello, world`))
@@ -75,7 +75,7 @@ func TestSanitySymlink(t *testing.T) {
 		err = f.Close()
 		require.NoError(t, err)
 
-		err = srcfs.Symlink("file1", "./file1.link")
+		err = srcfs.At("./file1.link").(hfs.OS).Symlink("file1")
 		require.NoError(t, err)
 	}
 
@@ -85,7 +85,7 @@ func TestSanitySymlink(t *testing.T) {
 		p := NewPacker(&b)
 		defer p.Close()
 
-		f, err := hfs.Open(srcfs, "file1.link")
+		f, err := hfs.Open(srcfs.At("file1.link"))
 		require.NoError(t, err)
 
 		err = p.WriteFile(f, "some/file1.link")
@@ -104,7 +104,7 @@ func TestSanitySymlink(t *testing.T) {
 		err := Unpack(ctx, &b, dstfs)
 		require.NoError(t, err)
 
-		dst, err := dstfs.Readlink("some/file1.link")
+		dst, err := dstfs.At("some/file1.link").(hfs.OS).Readlink()
 		require.NoError(t, err)
 
 		assert.Equal(t, "file1", dst)
@@ -138,7 +138,7 @@ func TestMonkey(t *testing.T) {
 		content := faker.Paragraph()
 		pathscontent[filepath] = content
 
-		err := hfs.WriteFile(srcfs, filepath, []byte(content), hfs.ModePerm)
+		err := hfs.WriteFile(srcfs.At(filepath), []byte(content))
 		require.NoError(t, err)
 	}
 
@@ -149,7 +149,7 @@ func TestMonkey(t *testing.T) {
 		defer p.Close()
 
 		for _, filepath := range paths {
-			f, err := hfs.Open(srcfs, filepath)
+			f, err := hfs.Open(srcfs.At(filepath))
 			require.NoError(t, err)
 
 			err = p.WriteFile(f, filepath)
@@ -170,7 +170,7 @@ func TestMonkey(t *testing.T) {
 		require.NoError(t, err)
 
 		for _, filepath := range paths {
-			b, err := hfs.ReadFile(dstfs, filepath)
+			b, err := hfs.ReadFile(dstfs.At(filepath))
 			require.NoError(t, err)
 
 			assert.Equal(t, pathscontent[filepath], string(b))

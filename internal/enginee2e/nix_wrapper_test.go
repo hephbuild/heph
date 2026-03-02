@@ -90,7 +90,7 @@ func TestNixWrapper(t *testing.T) {
 	err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs2)
 	require.NoError(t, err)
 
-	b, err := hfs.ReadFile(fs2, "test/output")
+	b, err := hfs.ReadFile(fs2.At("test/output"))
 	require.NoError(t, err)
 
 	// Verify that hello was executed successfully
@@ -162,7 +162,7 @@ func TestNixWrapperMultiProgram(t *testing.T) {
 	err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs2)
 	require.NoError(t, err)
 
-	b, err := hfs.ReadFile(fs2, "test/output")
+	b, err := hfs.ReadFile(fs2.At("test/output"))
 	require.NoError(t, err)
 
 	output := string(b)

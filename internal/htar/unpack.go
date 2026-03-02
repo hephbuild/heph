@@ -11,7 +11,7 @@ import (
 	"github.com/hephbuild/heph/internal/hfs"
 )
 
-func UnpackFromPath(ctx context.Context, path string, to hfs.FS) error {
+func UnpackFromPath(ctx context.Context, path string, to hfs.Node) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -70,7 +70,7 @@ func FileReader(ctx context.Context, r io.Reader, match Matcher) (io.Reader, err
 	return fileReader, nil
 }
 
-func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) error {
+func Unpack(ctx context.Context, r io.Reader, to hfs.Node, options ...Option) error {
 	cfg := &config{}
 	for _, option := range options {
 		option(cfg)
@@ -99,7 +99,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 			}
 
 		case tar.TypeDir:
-			err := to.MkdirAll(hdr.Name, hfs.FileMode(hdr.Mode)) //nolint:gosec
+			err := to.At(hdr.Name).MkdirAll(hfs.FileMode(hdr.Mode)) //nolint:gosec
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
@@ -108,7 +108,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 				return fmt.Errorf("untar: symlink empty for %v", hdr.Name)
 			}
 
-			if hfs.Exists(to, hdr.Name) {
+			if hfs.Exists(to.At(hdr.Name)) {
 				return nil
 			}
 
@@ -117,12 +117,12 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 				return fmt.Errorf("untar: unsupported symlink on fs %T", to)
 			}
 
-			err := hfs.CreateParentDir(to, hdr.Name)
+			err := hfs.CreateParentDir(to.At(hdr.Name))
 			if err != nil {
 				return err
 			}
 
-			err = osto.Symlink(hdr.Linkname, hdr.Name)
+			err = hfs.At(osto, hdr.Name).Symlink(hdr.Linkname)
 			if err != nil {
 				return fmt.Errorf("untar: %v: %w", hdr.Name, err)
 			}
@@ -134,8 +134,10 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.FS, options ...Option) erro
 	})
 }
 
-func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func(to string)) error {
-	info, err := to.Lstat(hdr.Name)
+func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.Node, ro bool, onFile func(to string)) error {
+	fileNode := to.At(hdr.Name)
+
+	info, err := fileNode.Lstat()
 	if err != nil && !errors.Is(err, hfs.ErrNotExist) {
 		return err
 	}
@@ -150,12 +152,12 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 		}
 	}
 
-	err = hfs.CreateParentDir(to, hdr.Name)
+	err = hfs.CreateParentDir(fileNode)
 	if err != nil {
 		return err
 	}
 
-	f, err := hfs.Create(to, hdr.Name)
+	f, err := hfs.Create(fileNode)
 	if err != nil {
 		return err
 	}
@@ -177,13 +179,13 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.FS, ro bool, onFile func
 		mode &^= 0222
 	}
 
-	if osto, ok := hfs.AsOs(to); ok {
-		err = osto.Chmod(hdr.Name, mode)
+	if osFileNode, ok := hfs.AsOs(fileNode); ok {
+		err = osFileNode.Chmod(mode)
 		if err != nil {
 			return err
 		}
 
-		err = osto.Chtimes(hdr.Name, hdr.AccessTime, hdr.ModTime)
+		err = osFileNode.Chtimes(hdr.AccessTime, hdr.ModTime)
 		if err != nil {
 			return err
 		}

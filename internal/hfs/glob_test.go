@@ -14,10 +14,10 @@ import (
 func setup(t *testing.T, paths []string) hfs.OS {
 	fs := hfstest.New(t)
 	for _, path := range paths {
-		err := hfs.CreateParentDir(fs, path)
+		err := hfs.CreateParentDir(fs.At(path))
 		require.NoError(t, err)
 
-		err = hfs.WriteFile(fs, path, nil, os.ModePerm)
+		err = hfs.WriteFile(fs.At(path), nil)
 		require.NoError(t, err)
 	}
 
@@ -103,7 +103,7 @@ func TestGlobAllPatternLink(t *testing.T) {
 		"some/file2",
 		"some/deep/file3",
 	})
-	err := os.Symlink(fs.Path("some/deep"), fs.Path("some/deep2"))
+	err := os.Symlink(fs.At("some/deep").Path(), fs.At("some/deep2").Path())
 	require.NoError(t, err)
 
 	fn, get := collector()
@@ -125,7 +125,7 @@ func TestGlobAllPatternLinkCached(t *testing.T) {
 		"some/file2",
 		"some/deep/file3",
 	})
-	err := os.Symlink(fs.Path("some/deep"), fs.Path("some/deep2"))
+	err := os.Symlink(fs.At("some/deep").Path(), fs.At("some/deep2").Path())
 	require.NoError(t, err)
 
 	cachefs := hfs.FromIOFS(hfs.NewFSCache()).AtRO(fs.Path())

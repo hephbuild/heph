@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"sync"
@@ -17,17 +16,17 @@ import (
 	"github.com/hephbuild/heph/internal/hfs"
 )
 
-func NewFlock2(fs hfs.OS, name, path string, allowCreate bool) *Flock {
+func NewFlock2(node hfs.OS, name string, allowCreate bool) *Flock {
 	if name == "" {
-		name = fs.Path(path)
+		name = node.Path()
 	}
-	l := &Flock{fs: fs, path: path, name: name, allowCreate: allowCreate}
+	l := &Flock{node: node, name: name, allowCreate: allowCreate}
 
 	return l
 }
 
-func NewFlock(fs hfs.OS, name, path string) *Flock {
-	return NewFlock2(fs, name, path, true)
+func NewFlock(fs hfs.OS, name string) *Flock {
+	return NewFlock2(fs, name, true)
 }
 
 type Flock struct {
@@ -35,10 +34,9 @@ type Flock struct {
 	rc          int          // count of read locks, allows multiple rlock on this instance
 	opm         sync.RWMutex // op mutex, protects this instances against races with with itself
 	lm          sync.RWMutex // lock mutex, protects this instances specifically against lock races
-	path        string
 	f           *os.File
 	cleanup     runtime.Cleanup
-	fs          hfs.OS
+	node        hfs.OS
 	allowCreate bool
 }
 
@@ -67,7 +65,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 	}
 
 	if l.allowCreate {
-		err := l.fs.MkdirAll(filepath.Dir(l.path), hfs.ModePerm)
+		err := hfs.CreateParentDir(l.node)
 		if err != nil {
 			return false, err
 		}
@@ -75,7 +73,7 @@ func (l *Flock) tryLock(ctx context.Context, ro bool, onErr func(f *os.File, ro 
 		fhow |= os.O_CREATE
 	}
 
-	hf, err := l.fs.Open(l.path, fhow, 0644)
+	hf, err := l.node.Open(fhow, 0644)
 	if err != nil {
 		return false, err
 	}
@@ -160,7 +158,7 @@ func (l *Flock) lock(ctx context.Context, ro bool) error {
 
 				var pidStr string
 				if l.allowCreate {
-					pidb, _ := hfs.ReadFile(l.fs, f.Name())
+					pidb, _ := hfs.ReadFile(hfs.NewOS(f.Name()))
 					pidStr = string(pidb)
 				}
 
@@ -283,7 +281,7 @@ func (l *Flock) RUnlock() error {
 }
 
 func (l *Flock) Clean() error {
-	err := l.fs.RemoveAll(l.path)
+	err := l.node.RemoveAll()
 	if err != nil {
 		return err
 	}

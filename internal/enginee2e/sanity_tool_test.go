@@ -87,7 +87,7 @@ func TestSanityTool(t *testing.T) {
 	err = hartifact.Unpack(ctx, res.FindOutputs("")[0].Artifact, fs2)
 	require.NoError(t, err)
 
-	b, err := hfs.ReadFile(fs2, "some/package/out")
+	b, err := hfs.ReadFile(fs2.At("some/package/out"))
 	require.NoError(t, err)
 
 	assert.Equal(t, "hello\n", string(b))

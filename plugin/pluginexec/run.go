@@ -112,7 +112,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 			return nil, err
 		}
 
-		err = hfs.WriteFile(workfs, "sandbox-sourcemap.json", b, hfs.ModePerm)
+		err = hfs.WriteFile(workfs.At("sandbox-sourcemap.json"), b)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +141,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	for _, output := range texec.GetOutputs() {
 		paths := slices.Clone(output.GetPaths())
 		for i, path := range paths {
-			paths[i] = outfs.Path(path)
+			paths[i] = outfs.At(path).Path()
 		}
 		pathsStr := strings.Join(paths, " ")
 
@@ -162,7 +162,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv
 	stdoutWriters = append(stdoutWriters, logFile)
 	stderrWriters = append(stderrWriters, logFile)
 
-	if !hfs.Exists(cwdfs, "") {
+	if !hfs.Exists(cwdfs) {
 		return nil, fmt.Errorf("cwd not found: %v", cwdfs.Path())
 	}
 
@@ -355,7 +355,7 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, listfs hfs.FS, basePath string) ([]string, error) {
+func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, listfs hfs.Node, basePath string) ([]string, error) {
 	m := map[string][]*pluginv1.ArtifactWithOrigin{}
 
 	for _, dep := range t.GetDeps() {
@@ -422,7 +422,7 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 			return 0
 		})
 
-		listf, err := hfs.Create(listfs, "env_list_"+name+".list")
+		listf, err := hfs.Create(listfs.At("env_list_" + name + ".list"))
 		if err != nil {
 			return nil, err
 		}

@@ -3,6 +3,7 @@ package hlocks
 import (
 	"testing"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -12,8 +13,8 @@ func TestTMutexRLock2Lock(t *testing.T) {
 	fs := newfs(t)
 
 	m := NewT(
-		NewFlock(fs, t.Name(), t.Name()+".outer.lock"),
-		NewFlock(fs, t.Name(), t.Name()+".inner.lock"),
+		NewFlock(hfs.At(fs, t.Name()+".outer.lock"), t.Name()),
+		NewFlock(hfs.At(fs, t.Name()+".inner.lock"), t.Name()),
 	)
 
 	err := m.RLock(ctx)
@@ -31,8 +32,8 @@ func TestTMutexLock2RLock(t *testing.T) {
 	fs := newfs(t)
 
 	m := NewT(
-		NewFlock(fs, t.Name(), t.Name()+".outer.lock"),
-		NewFlock(fs, t.Name(), t.Name()+".inner.lock"),
+		NewFlock(hfs.At(fs, t.Name()+".outer.lock"), t.Name()),
+		NewFlock(hfs.At(fs, t.Name()+".inner.lock"), t.Name()),
 	)
 
 	err := m.Lock(ctx)
@@ -55,8 +56,8 @@ func TestTMutex(t *testing.T) {
 
 	fs := newfs(t)
 	m := NewT(
-		NewFlock(fs, t.Name(), t.Name()+".outer.lock"),
-		NewFlock(fs, t.Name(), t.Name()+".inner.lock"),
+		NewFlock(hfs.At(fs, t.Name()+".outer.lock"), t.Name()),
+		NewFlock(hfs.At(fs, t.Name()+".inner.lock"), t.Name()),
 	)
 
 	// try lock/rlock

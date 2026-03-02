@@ -1230,12 +1230,12 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	workdirfs := hfs.At(sandboxfs, "ws") // TODO: remove the ws from here
 	cwdfs := hfs.At(workdirfs, def.GetRef().GetPackage())
 
-	err = sandboxfs.RemoveAll("")
+	err = sandboxfs.RemoveAll()
 	if err != nil {
 		return nil, err
 	}
 
-	err = sandboxfs.MkdirAll("", os.ModePerm)
+	err = sandboxfs.MkdirAll(os.ModePerm)
 	if err != nil {
 		return nil, err
 	}
@@ -1344,7 +1344,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		tarname := output.GetGroup() + ".tar"
-		tarf, err := hfs.Create(cachefs, tarname)
+		tarf, err := hfs.Create(cachefs.At(tarname))
 		if err != nil {
 			return nil, err
 		}
@@ -1371,7 +1371,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}
 
 			err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-				f, err := hfs.Open(cwdfs, path)
+				f, err := hfs.Open(cwdfs.At(path))
 				if err != nil {
 					return err
 				}
@@ -1423,7 +1423,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 		if shouldCollect {
 			tarname := "support.tar"
-			tarf, err := hfs.Create(cachefs, tarname)
+			tarf, err := hfs.Create(cachefs.At(tarname))
 			if err != nil {
 				return nil, err
 			}
@@ -1450,7 +1450,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				}
 
 				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(path string, d hfs.DirEntry) error {
-					f, err := hfs.Open(cwdfs, path)
+					f, err := hfs.Open(cwdfs.At(path))
 					if err != nil {
 						return err
 					}
@@ -1515,7 +1515,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		// })
 	}
 
-	err = sandboxfs.RemoveAll("")
+	err = sandboxfs.RemoveAll()
 	if err != nil {
 		return nil, err
 	}

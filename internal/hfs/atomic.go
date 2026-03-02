@@ -10,34 +10,33 @@ func processUniquePath(p string) string {
 }
 
 type AtomicFile struct {
-	tmpname string
-	name    string
-	fs      FS
+	tmpNode Node
+	dstNode Node
 	File
 }
 
 func (f *AtomicFile) Close() error {
-	defer f.fs.Remove(f.tmpname)
+	defer f.tmpNode.Remove()
 
 	err := f.File.Close()
 	if err != nil {
 		return err
 	}
 
-	return f.fs.Move(f.tmpname, f.name)
+	return f.tmpNode.Move(f.dstNode)
 }
 
-func AtomicCreate(fs FS, name string) (*AtomicFile, error) {
-	tmpname := processUniquePath(name)
+func AtomicCreate(fs Node) (*AtomicFile, error) {
+	tmpNode := fs.At(processUniquePath(fs.Path()))
 
-	f, err := Create(fs, tmpname)
+	f, err := Create(tmpNode)
 	if err != nil {
 		return nil, err
 	}
 
 	return &AtomicFile{
-		tmpname: tmpname,
-		name:    name,
+		tmpNode: tmpNode,
+		dstNode: fs,
 		File:    f,
 	}, nil
 }

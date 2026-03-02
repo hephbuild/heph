@@ -1,7 +1,6 @@
 package pluginbuildfile
 
 import (
-	"os"
 	"testing"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -18,7 +17,7 @@ func TestSanity(t *testing.T) {
 
 	fs := hfstest.New(t)
 
-	err := hfs.WriteFile(fs, "BUILD", []byte(`target(name="hello", driver="exec", run=["hello"])`), os.ModePerm)
+	err := hfs.WriteFile(fs.At("BUILD"), []byte(`target(name="hello", driver="exec", run=["hello"])`))
 	require.NoError(t, err)
 
 	p := New(fs, Options{Patterns: []string{"BUILD"}})
@@ -53,10 +52,10 @@ func TestLoad(t *testing.T) {
 
 	fs := hfstest.New(t)
 
-	err := hfs.WriteFile(fs, "BUILD", []byte(`load("//some/deep", "myvar"); target(name="hello", driver="exec", run=[myvar])`), os.ModePerm)
+	err := hfs.WriteFile(fs.At("BUILD"), []byte(`load("//some/deep", "myvar"); target(name="hello", driver="exec", run=[myvar])`))
 	require.NoError(t, err)
 
-	err = hfs.WriteFile(fs, "some/deep/BUILD", []byte(`myvar = "hello"`), os.ModePerm)
+	err = hfs.WriteFile(fs.At("some/deep/BUILD"), []byte(`myvar = "hello"`))
 	require.NoError(t, err)
 
 	p := New(fs, Options{Patterns: []string{"BUILD"}})
@@ -92,13 +91,13 @@ func TestLoadFunc(t *testing.T) {
 
 	fs := hfstest.New(t)
 
-	err := hfs.WriteFile(fs, "some/BUILD", []byte(`load("//some/deep", "mytarget"); mytarget()`), os.ModePerm)
+	err := hfs.WriteFile(fs.At("some/BUILD"), []byte(`load("//some/deep", "mytarget"); mytarget()`))
 	require.NoError(t, err)
 
-	err = hfs.WriteFile(fs, "some/deep/BUILD", []byte(`
+	err = hfs.WriteFile(fs.At("some/deep/BUILD"), []byte(`
 def mytarget():
 	target(name="hello", driver="exec", run=["hello"])
-`), os.ModePerm)
+`))
 	require.NoError(t, err)
 
 	p := New(fs, Options{Patterns: []string{"BUILD"}})

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"path/filepath"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hsingleflight"
@@ -30,7 +29,7 @@ type Options struct {
 
 type Plugin struct {
 	Options
-	repoRoot    hfs.FS
+	repoRoot    hfs.Node
 	cacheget    hsingleflight.GroupMemContext[string, *pluginv1.TargetSpec]
 	cacherunpkg CacheRunpkg
 }
@@ -44,7 +43,7 @@ var _ pluginsdk.Provider = (*Plugin)(nil)
 
 const Name = "buildfile"
 
-func New(fs hfs.FS, cfg Options) *Plugin {
+func New(fs hfs.Node, cfg Options) *Plugin {
 	return &Plugin{
 		Options:  cfg,
 		repoRoot: fs,
@@ -128,7 +127,7 @@ func (p *Plugin) runPkgInner(ctx context.Context, pkgDir string, hooks Hooks) (s
 	fs := hfs.At(p.repoRoot, pkgDir)
 	for _, pattern := range p.Patterns {
 		err := hfs.Glob(ctx, fs, pattern, nil, func(path string, d hfs.DirEntry) error {
-			f, err := hfs.Open(fs, path)
+			f, err := hfs.Open(fs.At(path))
 			if err != nil {
 				return err
 			}
@@ -213,7 +212,7 @@ func (p *Plugin) runFileInner(ctx context.Context, pkg string, file hfs.File, ho
 			case strings.HasPrefix(module, "./"):
 				execCtx := getExecContext(thread)
 
-				f, err := hfs.Open(p.repoRoot, filepath.Join(tref.ToOSPath(execCtx.Package), module))
+				f, err := hfs.Open(p.repoRoot.At(tref.ToOSPath(execCtx.Package), module))
 				if err != nil {
 					return nil, err
 				}

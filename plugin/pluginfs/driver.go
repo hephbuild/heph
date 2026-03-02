@@ -70,7 +70,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	} else {
 		fs := hfs.FromIOFS(hfs.DefaultOSCache).AtRO(p.resultClient.Root)
 
-		_, err := fs.Stat(cfg.File)
+		_, err := fs.AtRO(cfg.File).Stat()
 		if err != nil {
 			return nil, err
 		}
@@ -113,20 +113,21 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 	fs := hfs.FromIOFS(hfs.DefaultOSCache).AtRO(p.resultClient.Root)
 
 	if t.HasFile() {
-		abspath := fs.AtRO(t.GetFile()).Path()
+		source := fs.AtRO(t.GetFile())
+		sourcePath := source.Path()
 
-		info, err := fs.Stat(t.GetFile())
+		info, err := source.Stat()
 		if err != nil {
 			return nil, err
 		}
 
-		if IsCodegen(ctx, abspath) {
+		if IsCodegen(ctx, sourcePath) {
 			return pluginv1.RunResponse_builder{
 				Artifacts: []*pluginv1.Artifact{},
 			}.Build(), nil
 		}
 
-		excluded, err := hfs.PathMatchAny(abspath, t.GetExclude()...)
+		excluded, err := hfs.PathMatchAny(sourcePath, t.GetExclude()...)
 		if err != nil {
 			return nil, err
 		}
@@ -143,7 +144,7 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 					Name: htypes.Ptr(filepath.Base(t.GetFile())),
 					Type: htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
 					File: pluginv1.Artifact_ContentFile_builder{
-						SourcePath: htypes.Ptr(abspath),
+						SourcePath: htypes.Ptr(sourcePath),
 						OutPath:    htypes.Ptr(t.GetFile()),
 						X:          htypes.Ptr(hfs.IsExecOwner(info.Mode())),
 					}.Build(),
