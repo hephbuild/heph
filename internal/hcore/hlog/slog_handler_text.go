@@ -3,36 +3,43 @@ package hlog
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"io"
 	"log/slog"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/hephbuild/heph/internal/hlipgloss"
 )
 
-var levelColors = map[slog.Level]lipgloss.TerminalColor{
+var levelColors = map[slog.Level]color.Color{
 	slog.LevelDebug: lipgloss.Color("#29C6E8"),
 	slog.LevelInfo:  lipgloss.Color("#2C75FE"),
 	slog.LevelWarn:  lipgloss.Color("#E7C229"),
 	slog.LevelError: lipgloss.Color("#FF2A25"),
 }
 
+var levelStyles = map[slog.Level]lipgloss.Style{}
+
+func init() {
+	for lvl, c := range levelColors {
+		levelStyles[lvl] = lipgloss.NewStyle().Bold(true).Foreground(c)
+	}
+}
+
 type textHandler struct {
 	attrs   []slog.Attr
 	leveler slog.Leveler
 	w       io.Writer
-
-	renderer Renderer
 }
 
 func (t textHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return level >= t.leveler.Level()
 }
 
-func FormatRecord(r Renderer, attrs []slog.Attr, record slog.Record) string {
+func FormatRecord(attrs []slog.Attr, record slog.Record) string {
 	var sb strings.Builder
-	sb.WriteString(r.lvlStyles[record.Level].Render(record.Level.String()))
+	sb.WriteString(levelStyles[record.Level].Render(record.Level.String()))
 	sb.WriteString(" ")
 	sb.WriteString(record.Message)
 
@@ -57,7 +64,7 @@ func FormatRecord(r Renderer, attrs []slog.Attr, record slog.Record) string {
 }
 
 func (t textHandler) Handle(ctx context.Context, record slog.Record) error {
-	_, err := t.w.Write([]byte(FormatRecord(t.renderer, t.attrs, record)))
+	_, err := t.w.Write([]byte(FormatRecord(t.attrs, record)))
 	if err != nil {
 		return err
 	}
@@ -78,25 +85,9 @@ func (t textHandler) WithGroup(name string) slog.Handler {
 	return t
 }
 
-type Renderer struct {
-	lvlStyles map[slog.Level]lipgloss.Style
-}
-
-func NewRenderer(w io.Writer) Renderer {
-	r := hlipgloss.NewRenderer(w)
-
-	lvlStyles := map[slog.Level]lipgloss.Style{}
-	for lvl, color := range levelColors {
-		lvlStyles[lvl] = r.NewStyle().Bold(true).Foreground(color)
-	}
-
-	return Renderer{lvlStyles: lvlStyles}
-}
-
 func NewTextLogger(w io.Writer, leveler slog.Leveler) Logger {
 	return NewLogger(textHandler{
-		w:        w,
-		leveler:  leveler,
-		renderer: NewRenderer(w),
+		w:       hlipgloss.NewWriter(w),
+		leveler: leveler,
 	})
 }

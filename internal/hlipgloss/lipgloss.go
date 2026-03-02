@@ -5,8 +5,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/charmbracelet/lipgloss"
-	"github.com/muesli/termenv"
+	"github.com/charmbracelet/colorprofile"
 )
 
 var forcetty bool
@@ -15,14 +14,11 @@ func init() {
 	forcetty, _ = strconv.ParseBool(os.Getenv("FORCE_TTY"))
 }
 
-func EnvForceTTY() termenv.OutputOption {
+func NewWriter(w io.Writer) *colorprofile.Writer {
+	p := colorprofile.NewWriter(w, os.Environ())
 	if forcetty {
-		return termenv.WithTTY(true)
+		p.Profile = colorprofile.TrueColor
 	}
 
-	return func(output *termenv.Output) {}
-}
-
-func NewRenderer(w io.Writer) *lipgloss.Renderer {
-	return lipgloss.NewRenderer(w, EnvForceTTY(), termenv.WithColorCache(true))
+	return p
 }

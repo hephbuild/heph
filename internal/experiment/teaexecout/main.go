@@ -6,7 +6,7 @@ import (
 	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 type execCmd struct {
@@ -58,14 +58,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
 	var sb strings.Builder
 
 	for i := range 5 {
 		sb.WriteString(fmt.Sprintf("view %v\n", i))
 	}
 
-	return sb.String()
+	return tea.NewView(sb.String())
 }
 
 func main() {

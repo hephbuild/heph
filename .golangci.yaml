@@ -112,7 +112,7 @@ linters:
           skipRecvDeref: false
     gomoddirectives:
       replace-allow-list:
-        - github.com/charmbracelet/bubbletea
+        - charm.land/bubbletea/v2
     gomodguard:
       blocked:
         modules:

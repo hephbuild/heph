@@ -15,13 +15,11 @@ import (
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"github.com/hephbuild/heph/internal/htime"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
-	"github.com/hephbuild/heph/internal/hlipgloss"
 	"github.com/hephbuild/heph/internal/hpanic"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 )
@@ -45,7 +43,6 @@ type stepsUpdateMsg struct {
 type Model struct {
 	log           hbbtlog.Hijacker
 	Exec          hbbtexec.Model
-	renderer      *lipgloss.Renderer
 	cancelRoutine context.CancelCauseFunc
 	startedAt     time.Time
 
@@ -60,7 +57,6 @@ type Model struct {
 func initialModel(cancelRoutine context.CancelCauseFunc) Model {
 	m := Model{
 		log:           hbbtlog.NewLogHijacker(),
-		renderer:      hlipgloss.NewRenderer(os.Stderr),
 		cancelRoutine: cancelRoutine,
 		startedAt:     time.Now(),
 	}
@@ -106,8 +102,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tea.Quit)
 	case tea.InterruptMsg:
 		m.cancelRoutine(errors.New("ctrl+c"))
-	case tea.KeyMsg:
-		if msg.Type == tea.KeyBreak {
+	case tea.KeyPressMsg:
+		if msg.String() == "ctrl+c" {
 			m.cancelRoutine(errors.New("ctrl+c"))
 		}
 	}
@@ -117,9 +113,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
 	if m.pauseRendering {
-		return ""
+		return tea.NewView("")
 	}
 
 	var sb strings.Builder
@@ -140,13 +136,13 @@ func (m Model) View() string {
 		sb.WriteString(strings.Repeat("-", m.width))
 		sb.WriteString("\n")
 
-		buildStepsTree(m.renderer, m.stepsState.steps, m.stepsState.leafs, &sb, m.width, (m.height-2)/2)
+		buildStepsTree(m.stepsState.steps, m.stepsState.leafs, &sb, m.width, (m.height-2)/2)
 	}
 
-	return sb.String()
+	return tea.NewView(sb.String())
 }
 
-func NewStepsStore(ctx context.Context, p *tea.Program, renderer *lipgloss.Renderer) (func(*corev1.Step), func()) {
+func NewStepsStore(ctx context.Context, p *tea.Program) (func(*corev1.Step), func()) {
 	doCtx, cancel := context.WithCancel(context.Background())
 
 	stepsCh := make(chan *corev1.Step)
@@ -278,7 +274,7 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 		ctx := ctx
 		ctx = hlog.NewContextWithHijacker(ctx, m.log.Handler)
 
-		sendStep, cancelStepStore := NewStepsStore(ctx, p, m.renderer)
+		sendStep, cancelStepStore := NewStepsStore(ctx, p)
 		defer cancelStepStore()
 
 		ctx = hstep.ContextWithHandler(ctx, func(ctx context.Context, step *corev1.Step) *corev1.Step {
@@ -293,7 +289,7 @@ func NewInteractive(ctx context.Context, f RunFunc) error {
 		err := hpanic.Recover(func() error {
 			return f(ctx, func(f hbbtexec.ExecFunc) error {
 				if !mu.TryLock() {
-					return errors.New("two concurrent interractive exec detected")
+					return errors.New("two concurrent interactive exec detected")
 				}
 				defer mu.Unlock()
 

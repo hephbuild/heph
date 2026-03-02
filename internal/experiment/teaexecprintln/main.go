@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtlog"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
@@ -99,8 +99,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m model) View() string {
-	return fmt.Sprintf("Running command %v...\n", m.i)
+func (m model) View() tea.View {
+	return tea.NewView(fmt.Sprintf("Running command %v...\n", m.i))
 }
 
 func main() {

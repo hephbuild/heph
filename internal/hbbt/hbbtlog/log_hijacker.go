@@ -3,11 +3,10 @@ package hbbtlog
 import (
 	"context"
 	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/hephbuild/heph/internal/hbbt/hbbtch"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 )
@@ -97,11 +96,9 @@ type RecordContainer struct {
 }
 
 func NewLogHijacker() Hijacker {
-	renderer := hlog.NewRenderer(os.Stderr)
-
 	h := Hijacker{
 		Model: hbbtch.New[RecordContainer](func(c RecordContainer) tea.Cmd {
-			return tea.Println(hlog.FormatRecord(renderer, c.Attrs, c.Record))
+			return tea.Println(hlog.FormatRecord(c.Attrs, c.Record))
 		}),
 		hijackerData: &hijackerData{
 			cond: sync.NewCond(&sync.Mutex{}),

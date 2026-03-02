@@ -1,6 +1,6 @@
 package hbbtch
 
-import tea "github.com/charmbracelet/bubbletea"
+import tea "charm.land/bubbletea/v2"
 
 type Model[T any] struct {
 	ch    chan container[T]
@@ -29,10 +29,6 @@ func (m Model[T]) Update(msg tea.Msg) (Model[T], tea.Cmd) {
 	}
 
 	return m, nil
-}
-
-func (m Model[T]) View() string {
-	return ""
 }
 
 func (m Model[T]) Send(v T) {
