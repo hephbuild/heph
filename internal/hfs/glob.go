@@ -106,13 +106,13 @@ func WithStrictDir(strictDir bool) GlobOption {
 	}
 }
 
-func Glob(ctx context.Context, fs RONode, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
-	return glob(ctx, fs, pattern, ignore, fn, options...)
+func Glob(ctx context.Context, node RONode, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+	return glob(ctx, node, pattern, ignore, fn, options...)
 }
 
 var ErrStrictDir = errors.New("strict directory is enabled, but pattern doesnt allow directory")
 
-func glob(ctx context.Context, fs RONode, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
+func glob(ctx context.Context, node RONode, pattern string, ignore []string, fn GlobWalkFunc, options ...GlobOption) error {
 	config := &globConfig{}
 	for _, option := range options {
 		option(config)
@@ -122,7 +122,7 @@ func glob(ctx context.Context, fs RONode, pattern string, ignore []string, fn Gl
 
 	i := indexMeta(pattern)
 	if i == -1 {
-		info, err := fs.AtRO(unescapeMeta(pattern)).Lstat()
+		info, err := node.AtRO(unescapeMeta(pattern)).Lstat()
 		if err != nil {
 			if errors.Is(err, ErrNotExist) {
 				return nil
@@ -148,26 +148,26 @@ func glob(ctx context.Context, fs RONode, pattern string, ignore []string, fn Gl
 		}
 	}
 
-	walkfs := fs
+	walkNode := node
 	if prefix != "" {
-		walkfs = At(fs, prefix)
+		walkNode = At(node, prefix)
 	}
 
 	if pattern == "**/*" {
-		return globAll(ctx, walkfs, prefix, ignore, fn)
+		return globAll(ctx, walkNode, prefix, ignore, fn)
 	}
 
-	return doublestar.GlobWalk(ToIOFS(walkfs), pattern, func(path string, d iofs.DirEntry) error {
+	return doublestar.GlobWalk(ToIOFS(walkNode), pattern, func(path string, d iofs.DirEntry) error {
 		return innerGlob(ctx, filepath.Join(prefix, path), ignore, d, fn)
 	})
 }
 
-func globAll(ctx context.Context, fs RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
-	return globAllWalk(ctx, fs, fs, prefix, ignore, fn)
+func globAll(ctx context.Context, node RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return globAllWalk(ctx, node, node, prefix, ignore, fn)
 }
 
-func globAllWalk(ctx context.Context, rootFS RONode, walkFS RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
-	return iofs.WalkDir(ToIOFS(walkFS), ".", func(relPath string, d DirEntry, err error) error {
+func globAllWalk(ctx context.Context, rootNode RONode, walkNode RONode, prefix string, ignore []string, fn GlobWalkFunc) error {
+	return iofs.WalkDir(ToIOFS(walkNode), ".", func(relPath string, d DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, iofs.ErrNotExist) {
 				return nil
@@ -176,7 +176,7 @@ func globAllWalk(ctx context.Context, rootFS RONode, walkFS RONode, prefix strin
 			return err
 		}
 
-		// "." is the root of the walkFS; skip it (it has no meaningful path-based name)
+		// "." is the root of the walkNode; skip it (it has no meaningful path-based name)
 		if relPath == "." {
 			return nil
 		}
@@ -186,14 +186,14 @@ func globAllWalk(ctx context.Context, rootFS RONode, walkFS RONode, prefix strin
 		if d.Type()&iofs.ModeSymlink != 0 {
 			// iofs.WalkDir does not descend into symlink directories.
 			// Resolve the symlink target and handle manually.
-			info, err := rootFS.AtRO(fullpath).Stat()
+			info, err := rootNode.AtRO(fullpath).Stat()
 			if err != nil {
 				return err
 			}
 
 			if info.IsDir() {
 				// Recurse into the symlink target as if it were a regular directory.
-				return globAllWalk(ctx, rootFS, walkFS.AtRO(relPath), fullpath, ignore, fn)
+				return globAllWalk(ctx, rootNode, walkNode.AtRO(relPath), fullpath, ignore, fn)
 			}
 		}
 

@@ -25,8 +25,8 @@ func NewFlock2(node hfs.OS, name string, allowCreate bool) *Flock {
 	return l
 }
 
-func NewFlock(fs hfs.OS, name string) *Flock {
-	return NewFlock2(fs, name, true)
+func NewFlock(node hfs.OS, name string) *Flock {
+	return NewFlock2(node, name, true)
 }
 
 type Flock struct {

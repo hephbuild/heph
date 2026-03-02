@@ -9,25 +9,25 @@ import (
 	"path/filepath"
 )
 
-func Exists(fs RONode) bool {
-	_, err := fs.Lstat()
+func Exists(node RONode) bool {
+	_, err := node.Lstat()
 	return err == nil
 }
 
-func Open(fs RONode) (File, error) {
-	return fs.Open(os.O_RDONLY, 0)
+func Open(node RONode) (File, error) {
+	return node.Open(os.O_RDONLY, 0)
 }
 
 type FileReader interface {
 	ReadFile() ([]byte, error)
 }
 
-func ReadFile(fs RONode) ([]byte, error) {
-	if fr, ok := fs.(FileReader); ok {
+func ReadFile(node RONode) ([]byte, error) {
+	if fr, ok := node.(FileReader); ok {
 		return fr.ReadFile()
 	}
 
-	f, err := Open(fs)
+	f, err := Open(node)
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +36,8 @@ func ReadFile(fs RONode) ([]byte, error) {
 	return io.ReadAll(f)
 }
 
-func WriteFile(fs Node, b []byte) error {
-	f, err := Create(fs)
+func WriteFile(node Node, b []byte) error {
+	f, err := Create(node)
 	if err != nil {
 		return err
 	}
@@ -51,28 +51,28 @@ func WriteFile(fs Node, b []byte) error {
 	return f.Close()
 }
 
-func Create(fs Node) (File, error) {
-	err := CreateParentDir(fs)
+func Create(node Node) (File, error) {
+	err := CreateParentDir(node)
 	if err != nil {
 		return nil, err
 	}
 
-	return fs.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	return node.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 }
 
-func CreateExec(fs Node) (File, error) {
-	err := CreateParentDir(fs)
+func CreateExec(node Node) (File, error) {
+	err := CreateParentDir(node)
 	if err != nil {
 		return nil, err
 	}
 
-	return fs.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666|0111)
+	return node.Open(os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666|0111)
 }
 
-func CreateParentDir(fs Node) error {
-	p := fs.Path()
+func CreateParentDir(node Node) error {
+	p := node.Path()
 	if dir := filepath.Dir(p); dir != "." && dir != p {
-		err := At(fs, dir).MkdirAll(ModePerm)
+		err := At(node, dir).MkdirAll(ModePerm)
 		if err != nil {
 			return err
 		}
@@ -81,24 +81,24 @@ func CreateParentDir(fs Node) error {
 	return nil
 }
 
-func At[T any](fs T, names ...string) T {
+func At[T any](node T, names ...string) T {
 	for _, name := range names {
-		switch ffs := any(fs).(type) {
+		switch n := any(node).(type) {
 		case Node:
-			fs = ffs.At(name).(T) //nolint:errcheck
+			node = n.At(name).(T) //nolint:errcheck
 		case RONode:
-			fs = ffs.AtRO(name).(T) //nolint:errcheck
+			node = n.AtRO(name).(T) //nolint:errcheck
 		default:
-			panic(fmt.Sprintf("At: unknown FS type: %T", ffs))
+			panic(fmt.Sprintf("At: unknown node type: %T", n))
 		}
 	}
-	return fs
+	return node
 }
 
 type WalkDirFunc = iofs.WalkDirFunc
 
-func Walk(fs Node, walkFn WalkDirFunc) error {
-	return iofs.WalkDir(ToIOFS(fs), ".", walkFn)
+func Walk(node Node, walkFn WalkDirFunc) error {
+	return iofs.WalkDir(ToIOFS(node), ".", walkFn)
 }
 
 func Move(from, to Node) error {

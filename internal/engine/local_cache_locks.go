@@ -122,12 +122,12 @@ func (e *Engine) lockCache(ctx context.Context, ref *pluginv1.TargetRef, outputs
 
 	locks := &CacheLocks{}
 
-	lockFactory := func(fs hfs.OS, path string) hlocks.RWLocker {
+	lockFactory := func(node hfs.OS, path string) hlocks.RWLocker {
 		if e.FSLock {
-			return hlocks.NewFlock2(hfs.At(fs, path), "", true)
+			return hlocks.NewFlock2(hfs.At(node, path), "", true)
 		}
 
-		return hlocks.NewGlobalMutex(fs.Path() + "/" + path)
+		return hlocks.NewGlobalMutex(node.Path() + "/" + path)
 	}
 
 	{

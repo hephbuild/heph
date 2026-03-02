@@ -30,7 +30,7 @@ func WithFilter(filter func(from string) bool) UnpackOption {
 	}
 }
 
-func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node, options ...UnpackOption) error {
+func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, options ...UnpackOption) error {
 	var cfg unpackConfig
 	for _, option := range options {
 		option(&cfg)
@@ -61,7 +61,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node, optio
 			create = hfs.CreateExec
 		}
 
-		f, err := create(fs.At(artifact.GetFile().GetOutPath()))
+		f, err := create(node.At(artifact.GetFile().GetOutPath()))
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
@@ -87,7 +87,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node, optio
 			create = hfs.CreateExec
 		}
 
-		f, err := create(fs.At(artifact.GetRaw().GetPath()))
+		f, err := create(node.At(artifact.GetRaw().GetPath()))
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
@@ -104,7 +104,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node, optio
 			return err
 		}
 	case pluginv1.Artifact_TarPath_case:
-		err = htar.Unpack(ctx, r, fs, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
+		err = htar.Unpack(ctx, r, node, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}

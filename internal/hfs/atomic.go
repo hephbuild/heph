@@ -26,8 +26,8 @@ func (f *AtomicFile) Close() error {
 	return f.tmpNode.Move(f.dstNode)
 }
 
-func AtomicCreate(fs Node) (*AtomicFile, error) {
-	tmpNode := fs.At(processUniquePath(fs.Path()))
+func AtomicCreate(node Node) (*AtomicFile, error) {
+	tmpNode := node.At(processUniquePath(node.Path()))
 
 	f, err := Create(tmpNode)
 	if err != nil {
@@ -36,7 +36,7 @@ func AtomicCreate(fs Node) (*AtomicFile, error) {
 
 	return &AtomicFile{
 		tmpNode: tmpNode,
-		dstNode: fs,
+		dstNode: node,
 		File:    f,
 	}, nil
 }

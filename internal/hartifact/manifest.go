@@ -85,18 +85,18 @@ func (m Manifest) GetArtifacts(output string) []ManifestArtifact {
 	return a
 }
 
-func WriteManifest(fs hfs.Node, m Manifest) (*pluginv1.Artifact, error) {
+func WriteManifest(node hfs.Node, m Manifest) (*pluginv1.Artifact, error) {
 	b, err := json.Marshal(m) //nolint:musttag
 	if err != nil {
 		return nil, err
 	}
 
-	err = hfs.WriteFile(fs.At(ManifestName), b)
+	err = hfs.WriteFile(node.At(ManifestName), b)
 	if err != nil {
 		return nil, err
 	}
 
-	return newManifestArtifact(fs), nil
+	return newManifestArtifact(node), nil
 }
 
 func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
@@ -115,12 +115,12 @@ func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
 	}.Build(), nil
 }
 
-func newManifestArtifact(fs hfs.Node) *pluginv1.Artifact {
+func newManifestArtifact(node hfs.Node) *pluginv1.Artifact {
 	return pluginv1.Artifact_builder{
 		Name: htypes.Ptr(ManifestName),
 		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
 		File: pluginv1.Artifact_ContentFile_builder{
-			SourcePath: htypes.Ptr(fs.At(ManifestName).Path()),
+			SourcePath: htypes.Ptr(node.At(ManifestName).Path()),
 			OutPath:    htypes.Ptr(ManifestName),
 		}.Build(),
 	}.Build()
@@ -136,8 +136,8 @@ func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, 
 	return DecodeManifest(r)
 }
 
-func ManifestFromFS(fs hfs.Node) (Manifest, *pluginv1.Artifact, error) {
-	f, err := hfs.Open(fs.At(ManifestName))
+func ManifestFromFS(node hfs.Node) (Manifest, *pluginv1.Artifact, error) {
+	f, err := hfs.Open(node.At(ManifestName))
 	if err != nil {
 		return Manifest{}, nil, err
 	}
@@ -148,7 +148,7 @@ func ManifestFromFS(fs hfs.Node) (Manifest, *pluginv1.Artifact, error) {
 		return Manifest{}, nil, err
 	}
 
-	return m, newManifestArtifact(fs), nil
+	return m, newManifestArtifact(node), nil
 }
 
 func DecodeManifest(r io.Reader) (Manifest, error) {

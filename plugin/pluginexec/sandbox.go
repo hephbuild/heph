@@ -150,7 +150,7 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 	}
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, fs hfs.Node, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, node hfs.Node, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
@@ -160,7 +160,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 		_, _ = h.WriteString(f)
 	}
 
-	listf, err := hfs.Create(fs.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
+	listf, err := hfs.Create(node.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
 	if err != nil {
 		return nil, fmt.Errorf("create list file: %w", err)
 	}
@@ -168,7 +168,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 
 	writeNl := false
 
-	err = hartifact.Unpack(ctx, artifact, fs, hartifact.WithOnFile(func(to string) {
+	err = hartifact.Unpack(ctx, artifact, node, hartifact.WithOnFile(func(to string) {
 		if writeNl {
 			_, _ = listf.Write([]byte("\n"))
 		}
@@ -176,7 +176,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 		writeNl = true
 
 		if sourcemap != nil {
-			rel, err := filepath.Rel(fs.Path(), to)
+			rel, err := filepath.Rel(node.Path(), to)
 			if err != nil {
 				panic(err)
 			}
@@ -215,7 +215,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 	}.Build(), nil
 }
 
-func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, fs hfs.Node) (*pluginv1.Artifact, error) {
+func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node) (*pluginv1.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxBinArtifact")
 	defer span.End()
 
@@ -245,7 +245,7 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, f
 
 	name := filepath.Base(binPath)
 
-	dest := fs.At(name)
+	dest := node.At(name)
 	err = tmpfs.At(binPath).Move(dest)
 	if err != nil {
 		return nil, err

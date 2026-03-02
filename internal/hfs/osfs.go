@@ -16,8 +16,8 @@ func NewOS(root string) OS {
 	return OS{root: root}
 }
 
-func AsOs(fs Node) (OS, bool) {
-	osfs, ok := fs.(OS)
+func AsOs(node Node) (OS, bool) {
+	osfs, ok := node.(OS)
 
 	return osfs, ok
 }

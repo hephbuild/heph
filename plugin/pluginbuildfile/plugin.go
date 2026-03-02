@@ -43,10 +43,10 @@ var _ pluginsdk.Provider = (*Plugin)(nil)
 
 const Name = "buildfile"
 
-func New(fs hfs.Node, cfg Options) *Plugin {
+func New(node hfs.Node, cfg Options) *Plugin {
 	return &Plugin{
 		Options:  cfg,
-		repoRoot: fs,
+		repoRoot: node,
 	}
 }
 
@@ -124,10 +124,10 @@ func (p *Plugin) runPkg(ctx context.Context, pkgDir string, hooks Hooks) (starla
 func (p *Plugin) runPkgInner(ctx context.Context, pkgDir string, hooks Hooks) (starlark.StringDict, error) {
 	out := starlark.StringDict{}
 
-	fs := hfs.At(p.repoRoot, pkgDir)
+	node := hfs.At(p.repoRoot, pkgDir)
 	for _, pattern := range p.Patterns {
-		err := hfs.Glob(ctx, fs, pattern, nil, func(path string, d hfs.DirEntry) error {
-			f, err := hfs.Open(fs.At(path))
+		err := hfs.Glob(ctx, node, pattern, nil, func(path string, d hfs.DirEntry) error {
+			f, err := hfs.Open(node.At(path))
 			if err != nil {
 				return err
 			}
