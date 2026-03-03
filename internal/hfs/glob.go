@@ -3,6 +3,7 @@ package hfs
 import (
 	"context"
 	"errors"
+	"fmt"
 	iofs "io/fs"
 	"path/filepath"
 	"strings"
@@ -191,9 +192,9 @@ func globAllWalk(ctx context.Context, globRootNode RONode, rootNode RONode, walk
 		if d.Type()&iofs.ModeSymlink != 0 {
 			// iofs.WalkDir does not descend into symlink directories.
 			// Resolve the symlink target and handle manually.
-			info, err := rootNode.AtRO(fullpath).Stat()
+			info, err := rootNode.AtRO(relPath).Stat()
 			if err != nil {
-				return err
+				return fmt.Errorf("symlink stat: %w", err)
 			}
 
 			if info.IsDir() {
@@ -244,18 +245,18 @@ func innerGlob(ctx context.Context, rootNode RONode, path string, ignore []strin
 	return nil
 }
 
-type rONodeWithInfoFunc struct {
+type roNodeWithInfoFunc struct {
 	RONode
 
 	infoFunc func() (iofs.FileInfo, error)
 }
 
-func (r rONodeWithInfoFunc) Stat() (FileInfo, error) {
+func (r roNodeWithInfoFunc) Stat() (FileInfo, error) {
 	return r.infoFunc()
 }
 
 func withInfo(ro RONode, info func() (iofs.FileInfo, error)) RONode {
-	return &rONodeWithInfoFunc{ro, info}
+	return &roNodeWithInfoFunc{ro, info}
 }
 
 func IsExecOwner(mode FileMode) bool {

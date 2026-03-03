@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/hephbuild/heph/internal/hsingleflight"
 	sync_map "github.com/zolstein/sync-map"
 )
 
@@ -17,10 +18,8 @@ var DefaultOSCache = NewFSCache()
 
 // node2 represents a file or directory node in the FSCache tree.
 type node2 struct {
-	path     string
-	info     fs.FileInfo
-	scanned  bool // true if directory children have been read from disk
-	children []*node2
+	path string
+	info fs.FileInfo
 }
 
 // FSCache implements fs.FS using absolute OS paths. Unlike the standard
@@ -35,6 +34,7 @@ type node2 struct {
 // the same subtree are served entirely from memory.
 type FSCache struct {
 	nodes sync_map.Map[string, *node2]
+	sf    hsingleflight.GroupMem[string, []*node2]
 }
 
 // NewFSCache creates an empty FSCache. It has no associated root; any
@@ -81,14 +81,18 @@ func (c *FSCache) getOrLoad(abs string) (*node2, error) {
 }
 
 // ensureScanned populates n.children from disk if not already done.
-func (c *FSCache) ensureScanned(n *node2) error {
-	if n.scanned {
-		return nil
-	}
+func (c *FSCache) ensureScanned(n *node2) ([]*node2, error) {
+	children, err, _ := c.sf.Do(n.path, func() ([]*node2, error) {
+		return c.ensureScannedInner(n)
+	})
 
+	return children, err
+}
+
+func (c *FSCache) ensureScannedInner(n *node2) ([]*node2, error) {
 	entries, err := os.ReadDir(n.path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	children := make([]*node2, 0, len(entries))
@@ -121,9 +125,7 @@ func (c *FSCache) ensureScanned(n *node2) error {
 		return strings.Compare(a.info.Name(), b.info.Name())
 	})
 
-	n.children = children // set after slice is immutable for safe concurrent reads
-	n.scanned = true
-	return nil
+	return children, nil
 }
 
 // ---- cachedFile2 -----------------------------------------------------------
@@ -167,11 +169,11 @@ func (f *cachedFile2) ReadDir(n int) ([]fs.DirEntry, error) {
 		return nil, &fs.PathError{Op: "readdir", Path: f.name, Err: errors.New("not a directory")}
 	}
 
-	if err := f.cache.ensureScanned(f.node); err != nil {
+	children, err := f.cache.ensureScanned(f.node)
+	if err != nil {
 		return nil, &fs.PathError{Op: "readdir", Path: f.name, Err: err}
 	}
 
-	children := f.node.children
 	remaining := children[f.offset:]
 
 	if n <= 0 {

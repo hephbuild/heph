@@ -25,6 +25,10 @@ func NewGroup[K, V any](ctx context.Context, yield func(K, V) bool) *Group[K, V]
 var errYieldExited = errors.New("yield exited")
 
 func (g *Group[K, V]) Go(f func(ctx context.Context, yield func(K, V) bool)) {
+	if g.yieldExited {
+		return
+	}
+
 	g.wg.Go(func(ctx context.Context) error {
 		if g.yieldExited {
 			return errYieldExited
