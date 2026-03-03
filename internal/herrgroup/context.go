@@ -20,6 +20,10 @@ func (g *ContextGroup) goCtxErr() {
 }
 
 func (g *ContextGroup) Go(f func(ctx context.Context) error) {
+	if g.Group == nil {
+		panic("you forgot to call NewContext")
+	}
+
 	if g.Failed() {
 		g.failedOnce.Do(g.goCtxErr)
 

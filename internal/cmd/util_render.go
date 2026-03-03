@@ -3,8 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
+	"runtime"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hephbuild/heph/internal/hbbt/hbbtexec"
@@ -14,39 +15,39 @@ import (
 func render(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func(s string), func()) {
 	var m sync.Mutex
 	ss := make([]string, 0, 100)
-	t := time.NewTicker(20 * time.Millisecond)
+	t := time.NewTicker(50 * time.Millisecond)
 
-	var pending atomic.Bool
+	innerRender := func(w io.Writer) bool {
+		m.Lock()
+		defer m.Unlock()
+		if len(ss) == 0 {
+			return false
+		}
 
-	renderRefs := func(force bool) {
-		if !force {
-			m.Lock()
-			empty := len(ss) == 0
-			m.Unlock()
-			if empty {
-				return
-			}
+		for _, s := range ss {
+			_, _ = fmt.Fprintln(w, s)
+		}
+		ss = ss[:0]
 
-			if !pending.CompareAndSwap(false, true) {
-				return
-			}
+		return true
+	}
+
+	execRender := func() {
+		m.Lock()
+		empty := len(ss) == 0
+		m.Unlock()
+
+		if empty {
+			return
 		}
 
 		err := execFunc(func(args hbbtexec.RunArgs) error {
-			defer pending.Swap(false)
-
-			m.Lock()
-			defer m.Unlock()
-
-			if len(ss) == 0 {
-				return nil
+			for {
+				if !innerRender(args.Stdout) { //nolint:staticcheck
+					break
+				}
+				runtime.Gosched()
 			}
-
-			for _, s := range ss {
-				_, _ = fmt.Fprintln(args.Stdout, s)
-			}
-
-			ss = ss[:0]
 
 			return nil
 		})
@@ -56,25 +57,24 @@ func render(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func
 	}
 
 	closeCh := make(chan struct{})
-	bgDoneCh := make(chan struct{})
-	go func() {
-		defer close(bgDoneCh)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		defer execRender()
+
 		for {
 			select {
 			case <-closeCh:
-				renderRefs(true)
 				return
 			default:
 				select {
 				case <-closeCh:
-					renderRefs(true)
 					return
 				case <-t.C:
-					renderRefs(false)
+					execRender()
 				}
 			}
 		}
-	}()
+	})
 
 	return func(s string) {
 			m.Lock()
@@ -83,6 +83,6 @@ func render(ctx context.Context, execFunc func(f hbbtexec.ExecFunc) error) (func
 		}, func() {
 			t.Stop()
 			close(closeCh)
-			<-bgDoneCh
+			wg.Wait()
 		}
 }

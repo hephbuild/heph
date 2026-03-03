@@ -58,6 +58,14 @@ func (g *Group) Wait() error {
 	return g.g.Wait()
 }
 
+func (g *Group) SetLimit(n int) {
+	if g.g == nil {
+		return
+	}
+
+	g.g.SetLimit(n)
+}
+
 func WithContext(ctx context.Context) (Group, context.Context) {
 	g, ctx := errgroup.WithContext(ctx)
 

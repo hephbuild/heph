@@ -7,10 +7,12 @@ import (
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/internal/hiter"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	sync_map "github.com/zolstein/sync-map"
 )
 
 func (e *Engine) Packages(ctx context.Context, matcher *pluginv1.TargetMatcher) iter.Seq2[string, error] {
@@ -47,16 +49,15 @@ func (e *Engine) queryListProvider(
 	rs *RequestState,
 	p EngineProvider,
 	pkg string,
-	seen map[seenPkgKey]struct{},
+	seen *sync_map.Map[seenPkgKey, struct{}],
 ) iter.Seq2[*pluginv1.TargetRef, error] {
 	key := seenPkgKey{
 		pname: p.Name,
 		pkg:   pkg,
 	}
-	if _, ok := seen[key]; ok {
+	if _, ok := seen.LoadOrStore(key, struct{}{}); ok {
 		return func(yield func(*pluginv1.TargetRef, error) bool) {}
 	}
-	seen[key] = struct{}{}
 
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
 		res, err := e.List(ctx, rs, p, pkg)
@@ -143,53 +144,67 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 	}
 
 	return func(yield func(*pluginv1.TargetRef, error) bool) {
-		seenPkg := map[seenPkgKey]struct{}{}
-		seenRef := map[string]struct{}{}
+		seenPkg := sync_map.Map[seenPkgKey, struct{}]{}
+		seenRef := sync_map.Map[string, struct{}]{}
 
+		wg := hiter.NewGroup(ctx, yield)
 		for pkg, err := range e.Packages(ctx, matcher) {
 			if err != nil {
 				yield(nil, err)
 				return
 			}
 
-			for _, provider := range e.Providers {
-				if !opts.filterProvider(provider) {
-					continue
-				}
-				if err := ctx.Err(); err != nil {
-					yield(nil, err)
-					return
-				}
-
-				for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, seenPkg) {
-					if err != nil {
+			wg.Go(func(ctx context.Context, yield func(*pluginv1.TargetRef, error) bool) {
+				for _, provider := range e.Providers {
+					if err := ctx.Err(); err != nil {
 						yield(nil, err)
 						return
 					}
 
-					refstr := tref.Format(ref)
+					wg.Go(func(ctx context.Context, yield func(*pluginv1.TargetRef, error) bool) {
+						if !opts.filterProvider(provider) {
+							return
+						}
 
-					if _, ok := seenRef[refstr]; ok {
-						continue
-					}
-					seenRef[refstr] = struct{}{}
+						for ref, err := range e.queryListProvider(ctx, rs, provider, pkg, &seenPkg) {
+							if err != nil {
+								yield(nil, err)
+								return
+							}
 
-					res, err := e.match(ctx, rs, ref, matcher, opts)
-					if err != nil {
-						yield(nil, err)
-						return
-					}
+							if err := ctx.Err(); err != nil {
+								yield(nil, err)
+								return
+							}
 
-					if res == tmatch.MatchNo {
-						continue
-					}
+							wg.Go(func(ctx context.Context, yield func(*pluginv1.TargetRef, error) bool) {
+								refstr := tref.Format(ref)
 
-					if !yield(ref, nil) {
-						return
-					}
+								if _, ok := seenRef.LoadOrStore(refstr, struct{}{}); ok {
+									return
+								}
+
+								res, err := e.match(ctx, rs, ref, matcher, opts)
+								if err != nil {
+									yield(nil, err)
+									return
+								}
+
+								if res == tmatch.MatchNo {
+									return
+								}
+
+								if !yield(ref, nil) {
+									return
+								}
+							})
+						}
+					})
 				}
-			}
+			})
 		}
+
+		wg.Wait()
 	}
 }
 

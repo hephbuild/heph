@@ -1452,7 +1452,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				err := hfs.Glob(ctx, cwdfs, globPath, nil, func(entry hfs.GlobEntry) error {
 					f, err := hfs.Open(entry.Node)
 					if err != nil {
-						return err
+						return fmt.Errorf("open: %w", err)
 					}
 					defer f.Close()
 
