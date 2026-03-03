@@ -13,8 +13,6 @@ tool (
 	google.golang.org/protobuf
 )
 
-replace github.com/charmbracelet/bubbletea => github.com/raphaelvigee/bubbletea v0.0.0-20250913103120-6b2cb9e60fba
-
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
 	charm.land/bubbletea/v2 v2.0.0
