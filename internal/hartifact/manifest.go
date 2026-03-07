@@ -1,14 +1,11 @@
 package hartifact
 
 import (
-	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"time"
 
-	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -48,8 +45,6 @@ type ManifestArtifactContentType string
 const (
 	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "application/x-tar"
 	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "application/x-gtar"
-	ManifestArtifactContentTypeFile  ManifestArtifactContentType = "file"
-	ManifestArtifactContentTypeRaw   ManifestArtifactContentType = "raw"
 )
 
 type ManifestArtifact struct {
@@ -92,16 +87,6 @@ func EncodeManifest(w io.Writer, m *Manifest) error {
 	return nil
 }
 
-func ManifestFromArtifact(ctx context.Context, a pluginsdk.Artifact) (*Manifest, error) {
-	r, err := FileReader(ctx, a)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
-	return DecodeManifest(r)
-}
-
 func DecodeManifest(r io.Reader) (*Manifest, error) {
 	var manifest Manifest
 	err := json.NewDecoder(r).Decode(&manifest) //nolint:musttag
@@ -123,10 +108,6 @@ func ManifestContentType(a pluginsdk.Artifact) (ManifestArtifactContentType, err
 		return ManifestArtifactContentTypeTarGz, nil
 	case pluginsdk.ArtifactContentTypeTar:
 		return ManifestArtifactContentTypeTar, nil
-	case pluginsdk.ArtifactContentTypeFile:
-		return ManifestArtifactContentTypeFile, nil
-	case pluginsdk.ArtifactContentTypeRaw:
-		return ManifestArtifactContentTypeRaw, nil
 	default:
 	}
 
@@ -152,40 +133,4 @@ func ProtoArtifactToManifest(hashout string, a pluginsdk.Artifact) (ManifestArti
 		Type:        ManifestArtifactType(a.GetType()),
 		ContentType: contentType,
 	}, nil
-}
-
-func ManifestArtifactToProto(artifact ManifestArtifact, path string) (*pluginv1.Artifact, error) {
-	partifact := pluginv1.Artifact_builder{
-		Group: htypes.Ptr(artifact.Group),
-		Name:  htypes.Ptr(artifact.Name),
-		Type:  htypes.Ptr(pluginv1.Artifact_Type(artifact.Type)),
-	}.Build()
-
-	switch artifact.ContentType {
-	case ManifestArtifactContentTypeTar:
-		partifact.SetTarPath(path)
-	case ManifestArtifactContentTypeTarGz:
-		partifact.SetTargzPath(path)
-	case ManifestArtifactContentTypeFile:
-		partifact.SetFile(pluginv1.Artifact_ContentFile_builder{
-			SourcePath: &path,
-			OutPath:    &artifact.OutPath,
-			X:          &artifact.X,
-		}.Build())
-	case ManifestArtifactContentTypeRaw:
-		b, err := base64.StdEncoding.DecodeString(path)
-		if err != nil {
-			return nil, err
-		}
-
-		partifact.SetRaw(pluginv1.Artifact_ContentRaw_builder{
-			Data: b,
-			Path: &artifact.OutPath,
-			X:    &artifact.X,
-		}.Build())
-	default:
-		return nil, fmt.Errorf("unsupported content type %q", artifact.ContentType)
-	}
-
-	return partifact, nil
 }

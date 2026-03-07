@@ -4,13 +4,12 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"iter"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync/atomic"
 
-	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
@@ -152,15 +151,14 @@ func ArtifactsForId(inputs []*pluginsdk.ArtifactWithOrigin, id string, typ plugi
 	}
 }
 
+var artifactId atomic.Int64
+
 func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, source *execv1.Target_Dep, node hfs.Node, filters []string, sourcemap map[string]string) (pluginsdk.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
 	h := xxh3.New()
-	hashpb.Hash(h, artifact.GetProto(), tref.OmitHashPb)
-	for _, f := range filters {
-		_, _ = h.WriteString(f)
-	}
+	_, _ = fmt.Fprintf(h, "%d", artifactId.Add(1))
 
 	listf, err := hfs.Create(node.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
 	if err != nil {
@@ -216,12 +214,6 @@ func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, sour
 				SourcePath: htypes.Ptr(listf.Name()),
 			}.Build(),
 		}.Build(),
-		ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
-			return hartifact.Reader(e)
-		},
-		ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
-			return hartifact.Size(e)
-		},
 	}, nil
 }
 
@@ -271,11 +263,5 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact pluginsdk.Artifact, n
 				Path: htypes.Ptr(artifact.GetName() + ".list"),
 			}.Build(),
 		}.Build(),
-		ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
-			return hartifact.Reader(e)
-		},
-		ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
-			return hartifact.Size(e)
-		},
 	}, nil
 }

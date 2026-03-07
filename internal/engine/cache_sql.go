@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -22,8 +21,7 @@ import (
 )
 
 type SQLCache struct {
-	db   *sql.DB
-	root hfs.OS
+	db *sql.DB
 }
 
 func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, error) {
@@ -251,7 +249,7 @@ func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 	}, nil
 }
 
-func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) iter.Seq2[string, error] {
+func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		targetAddr := c.targetKey(ref)
 
@@ -283,7 +281,7 @@ func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, h
 	}
 }
 
-func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef, name string) iter.Seq2[string, error] {
+func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		targetAddr := c.targetKey(ref)
 

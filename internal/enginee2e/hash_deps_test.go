@@ -67,7 +67,7 @@ func TestHashDeps(t *testing.T) {
 		m, err := e.ResultMetaFromRef(ctx, rs, tref.New("some/package", "sometarget", nil), nil)
 		require.NoError(t, err)
 
-		at = m.CreatedAt
+		at = m.CreatedAt.UTC()
 		res.Unlock(ctx)
 	}
 

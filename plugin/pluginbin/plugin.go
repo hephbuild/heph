@@ -22,7 +22,7 @@ type Plugin struct {
 const Name = "bin"
 
 func (p Plugin) Pipe(ctx context.Context, request *pluginv1.PipeRequest) (*pluginv1.PipeResponse, error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("not implemented"))
+	return nil, pluginsdk.ErrNotImplemented
 }
 
 func (p Plugin) Config(ctx context.Context, request *pluginv1.ConfigRequest) (*pluginv1.ConfigResponse, error) {

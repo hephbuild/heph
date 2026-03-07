@@ -416,10 +416,6 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginsdk.ArtifactWi
 				return v
 			}
 
-			if v := hproto.Compare(a.GetProto(), b.GetProto(), nil); v != 0 {
-				return v
-			}
-
 			return 0
 		})
 

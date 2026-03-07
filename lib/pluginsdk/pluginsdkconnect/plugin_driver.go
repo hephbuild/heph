@@ -3,10 +3,8 @@ package pluginsdkconnect
 import (
 	"context"
 	"errors"
-	"io"
 
 	"connectrpc.com/connect"
-	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -143,14 +141,8 @@ func (p driverConnectHandler) runRequest(rr *pluginv1.RunRequest) *pluginsdk.Run
 	inputs := make([]*pluginsdk.ArtifactWithOrigin, 0, len(rr.GetInputs()))
 	for _, input := range rr.GetInputs() {
 		inputs = append(inputs, &pluginsdk.ArtifactWithOrigin{
-			Artifact: pluginsdk.ProtoArtifact{
-				Artifact: input.GetArtifact(),
-				ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
-					return hartifact.Reader(e)
-				},
-				ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
-					return hartifact.Size(e)
-				},
+			Artifact: ProtoArtifact{
+				RunRequest_Input_Artifact: input.GetArtifact(),
 			},
 			Origin: input.GetOrigin(),
 		})

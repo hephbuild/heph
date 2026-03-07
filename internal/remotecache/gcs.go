@@ -60,19 +60,10 @@ func (g GCS) Store(ctx context.Context, key string, r io.Reader) error {
 func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	obj := g.bucket.Object(key)
 
-	attr, err := obj.Attrs(ctx)
-	if err != nil {
-		if errors.Is(err, storage.ErrObjectNotExist) {
-			return nil, 0, pluginsdk.ErrCacheNotFound
-		}
-
-		return nil, err
-	}
-
 	r, err := obj.NewReader(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			return nil, 0, pluginsdk.ErrCacheNotFound
+			return nil, pluginsdk.ErrCacheNotFound
 		}
 
 		return nil, err

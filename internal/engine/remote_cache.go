@@ -77,7 +77,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 
 	for _, artifact := range artifacts {
 		g.Go(func(ctx context.Context) error {
-			r, err := hartifact.Reader(artifact.Artifact)
+			r, err := artifact.GetContentReader()
 			if err != nil {
 				return err
 			}

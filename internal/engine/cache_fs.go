@@ -49,7 +49,7 @@ func (c FSCache) targetDirName(ref *pluginv1.TargetRef) string {
 }
 
 func (c FSCache) path(ref *pluginv1.TargetRef, hashin, name string) hfs.Node {
-	return c.root.At(ref.GetPackage(), c.targetDirName(ref), hashin)
+	return c.root.At(ref.GetPackage(), c.targetDirName(ref), hashin, name)
 }
 
 func (c FSCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error) {
@@ -64,7 +64,7 @@ func (c FSCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, na
 	return c.path(ref, hashin, name).RemoveAll()
 }
 
-func (c FSCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) iter.Seq2[string, error] {
+func (c FSCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		entries, err := c.path(ref, hashin, "").ReadDir()
 		if err != nil {
@@ -84,7 +84,7 @@ func (c FSCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, has
 	}
 }
 
-func (c FSCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef, name string) iter.Seq2[string, error] {
+func (c FSCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		entries, err := c.path(ref, "", "").ReadDir()
 		if err != nil {

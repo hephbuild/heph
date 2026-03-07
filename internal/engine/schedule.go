@@ -277,15 +277,9 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	}
 
 	if onlyManifest {
-		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact *ResultArtifact) bool {
-			return artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1
-		})
+		res.Artifacts = nil
 	} else {
 		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact *ResultArtifact) bool {
-			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
-				return true
-			}
-
 			if artifact.GetType() == pluginv1.Artifact_TYPE_SUPPORT_FILE {
 				return false
 			}
@@ -651,10 +645,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			var locks CacheLocks
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
-					gartifact := artifact.GetProto()
-					gartifact.ClearGroup() // TODO support output group
-
-					partifact := protoPluginArtifact{Artifact: gartifact}
+					partifact := artifactGroupMap{Artifact: artifact, group: ""} // TODO support output group
 
 					artifacts = append(artifacts, &ResultArtifact{
 						Hashout:  artifact.Hashout,
@@ -868,19 +859,7 @@ func (r Result) Clone() *Result {
 	}
 }
 
-type ExecuteArtifact struct {
-	Hashout string
-	pluginsdk.Artifact
-}
-
-type ResultArtifact struct {
-	Hashout  string
-	Manifest hartifact.ManifestArtifact
-
-	pluginsdk.Artifact
-}
-
-func (r ExecuteResult) FindOutputs(group string) []*ResultArtifact {
+func (r Result) FindOutputs(group string) []*ResultArtifact {
 	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
@@ -896,7 +875,7 @@ func (r ExecuteResult) FindOutputs(group string) []*ResultArtifact {
 	return res
 }
 
-func (r ExecuteResult) FindSupport() []*ResultArtifact {
+func (r Result) FindSupport() []*ResultArtifact {
 	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE {
@@ -907,6 +886,18 @@ func (r ExecuteResult) FindSupport() []*ResultArtifact {
 	}
 
 	return res
+}
+
+type ExecuteArtifact struct {
+	Hashout string
+	pluginsdk.Artifact
+}
+
+type ResultArtifact struct {
+	Hashout  string
+	Manifest hartifact.ManifestArtifact
+
+	pluginsdk.Artifact
 }
 
 type ExecuteResultLocks struct {
@@ -1206,12 +1197,19 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 		inputLen += len(result.Artifacts)
 	}
 
-	inputs := make([]*pluginv1.ArtifactWithOrigin, 0, inputLen)
+	inputs := make([]*pluginv1.RunRequest_Input, 0, inputLen)
 	inputsSdk := make([]*pluginsdk.ArtifactWithOrigin, 0, inputLen)
 	for _, result := range results {
 		for _, artifact := range result.Artifacts {
-			inputs = append(inputs, pluginv1.ArtifactWithOrigin_builder{
-				Artifact: artifact.GetProto(),
+			partifact := pluginv1.RunRequest_Input_Artifact_builder{
+				Group: htypes.Ptr(artifact.GetGroup()),
+				Name:  htypes.Ptr(artifact.GetName()),
+				Type:  htypes.Ptr(artifact.GetType()),
+				Id:    htypes.Ptr("TODO"), // to be implemented along with the pluginsdkconnect.ProtoArtifact
+			}.Build()
+
+			inputs = append(inputs, pluginv1.RunRequest_Input_builder{
+				Artifact: partifact,
 				Origin:   result.InputOrigin,
 			}.Build())
 
@@ -1361,7 +1359,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, err
 		}
 
-		execArtifact := protoPluginArtifact{
+		execArtifact := pluginsdk.ProtoArtifact{
 			Artifact: pluginv1.Artifact_builder{
 				Group:   htypes.Ptr(output.GetGroup()),
 				Name:    htypes.Ptr(tarname),
@@ -1437,7 +1435,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 				return nil, err
 			}
 
-			execArtifact := protoPluginArtifact{
+			execArtifact := pluginsdk.ProtoArtifact{
 				Artifact: pluginv1.Artifact_builder{
 					Name:    htypes.Ptr(tarname),
 					Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
@@ -1462,7 +1460,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 			continue
 		}
 
-		artifact := protoPluginArtifact{
+		artifact := pluginsdk.ProtoArtifact{
 			Artifact: partifact,
 		}
 
