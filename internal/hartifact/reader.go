@@ -107,35 +107,15 @@ type File struct {
 
 // FilesReader provides a reader for each file it (no matter the packaging).
 func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, error] {
-	ap := a.GetProto()
-
 	return func(yield func(*File, error) bool) {
-		switch ap.WhichContent() {
-		case pluginv1.Artifact_File_case:
-			f, err := os.Open(ap.GetFile().GetSourcePath())
-			if err != nil {
-				if !yield(nil, err) {
-					return
-				}
-				return
-			}
+		contentType, err := a.GetContentType()
+		if err != nil {
+			yield(nil, fmt.Errorf("get content type: %w", err))
+			return
+		}
 
-			if !yield(&File{
-				ReadCloser: f,
-				Path:       ap.GetFile().GetOutPath(),
-			}, nil) {
-				return
-			}
-		case pluginv1.Artifact_Raw_case:
-			f := io.NopCloser(bytes.NewReader(ap.GetRaw().GetData()))
-
-			if !yield(&File{
-				ReadCloser: f,
-				Path:       ap.GetRaw().GetPath(),
-			}, nil) {
-				return
-			}
-		case pluginv1.Artifact_TarPath_case:
+		switch contentType {
+		case pluginsdk.ArtifactContentTypeTar:
 			r, err := Reader(a)
 			if err != nil {
 				if !yield(nil, err) {
@@ -169,7 +149,7 @@ func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, err
 			}
 		// case pluginsdk.Artifact_TargzPath:
 		default:
-			if !yield(nil, fmt.Errorf("unsupported encoding %v", ap.WhichContent())) {
+			if !yield(nil, fmt.Errorf("unsupported encoding %v", contentType)) {
 				return
 			}
 		}

@@ -57,7 +57,7 @@ func (g GCS) Store(ctx context.Context, key string, r io.Reader) error {
 	return w.Close()
 }
 
-func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	obj := g.bucket.Object(key)
 
 	attr, err := obj.Attrs(ctx)
@@ -66,7 +66,7 @@ func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) 
 			return nil, 0, pluginsdk.ErrCacheNotFound
 		}
 
-		return nil, 0, err
+		return nil, err
 	}
 
 	r, err := obj.NewReader(ctx)
@@ -75,8 +75,8 @@ func (g GCS) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) 
 			return nil, 0, pluginsdk.ErrCacheNotFound
 		}
 
-		return nil, 0, err
+		return nil, err
 	}
 
-	return r, attr.Size, nil
+	return r, nil
 }

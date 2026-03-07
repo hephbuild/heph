@@ -60,8 +60,6 @@ type ManifestArtifact struct {
 	Size        int64
 	Type        ManifestArtifactType
 	ContentType ManifestArtifactContentType
-	OutPath     string `json:",omitempty"` // set for file & raw
-	X           bool   `json:",omitempty"` // set for file & raw
 }
 
 type Manifest struct {
@@ -85,7 +83,7 @@ func (m Manifest) GetArtifacts(output string) []ManifestArtifact {
 	return a
 }
 
-func EncodeManifest(w io.Writer, m Manifest) error {
+func EncodeManifest(w io.Writer, m *Manifest) error {
 	err := json.NewEncoder(w).Encode(m) //nolint:musttag
 	if err != nil {
 		return err
@@ -94,77 +92,51 @@ func EncodeManifest(w io.Writer, m Manifest) error {
 	return nil
 }
 
-func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
-	b, err := json.Marshal(m) //nolint:musttag
-	if err != nil {
-		return nil, err
-	}
-
-	return pluginv1.Artifact_builder{
-		Name: htypes.Ptr(ManifestName),
-		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
-		Raw: pluginv1.Artifact_ContentRaw_builder{
-			Data: b,
-			Path: htypes.Ptr(ManifestName),
-		}.Build(),
-	}.Build(), nil
-}
-
-func ManifestFromArtifact(ctx context.Context, a pluginsdk.Artifact) (Manifest, error) {
+func ManifestFromArtifact(ctx context.Context, a pluginsdk.Artifact) (*Manifest, error) {
 	r, err := FileReader(ctx, a)
 	if err != nil {
-		return Manifest{}, err
+		return nil, err
 	}
 	defer r.Close()
 
 	return DecodeManifest(r)
 }
 
-func DecodeManifest(r io.Reader) (Manifest, error) {
+func DecodeManifest(r io.Reader) (*Manifest, error) {
 	var manifest Manifest
 	err := json.NewDecoder(r).Decode(&manifest) //nolint:musttag
 	if err != nil {
-		return Manifest{}, err
+		return nil, err
 	}
 
-	return manifest, nil
+	return &manifest, nil
 }
 
 func ManifestContentType(a pluginsdk.Artifact) (ManifestArtifactContentType, error) {
-	ap := a.GetProto()
+	contentType, err := a.GetContentType()
+	if err != nil {
+		return "", err
+	}
 
-	switch ap.WhichContent() {
-	case pluginv1.Artifact_TargzPath_case:
+	switch contentType {
+	case pluginsdk.ArtifactContentTypeTarGz:
 		return ManifestArtifactContentTypeTarGz, nil
-	case pluginv1.Artifact_TarPath_case:
+	case pluginsdk.ArtifactContentTypeTar:
 		return ManifestArtifactContentTypeTar, nil
-	case pluginv1.Artifact_File_case:
+	case pluginsdk.ArtifactContentTypeFile:
 		return ManifestArtifactContentTypeFile, nil
-	case pluginv1.Artifact_Raw_case:
+	case pluginsdk.ArtifactContentTypeRaw:
 		return ManifestArtifactContentTypeRaw, nil
 	default:
 	}
 
-	return "", fmt.Errorf("unsupported content %v", ap.WhichContent().String())
+	return "", fmt.Errorf("unsupported content %v", contentType)
 }
 
 func ProtoArtifactToManifest(hashout string, a pluginsdk.Artifact) (ManifestArtifact, error) {
 	contentType, err := ManifestContentType(a)
 	if err != nil {
 		return ManifestArtifact{}, err
-	}
-
-	ap := a.GetProto()
-
-	var outPath string
-	var x bool
-	switch ap.WhichContent() { //nolint:exhaustive
-	case pluginv1.Artifact_File_case:
-		outPath = ap.GetFile().GetOutPath()
-		x = ap.GetFile().GetX()
-	case pluginv1.Artifact_Raw_case:
-		outPath = ap.GetRaw().GetPath()
-		x = ap.GetRaw().GetX()
 	}
 
 	size, err := a.GetContentSize()
@@ -174,13 +146,11 @@ func ProtoArtifactToManifest(hashout string, a pluginsdk.Artifact) (ManifestArti
 
 	return ManifestArtifact{
 		Hashout:     hashout,
-		Group:       ap.GetGroup(),
-		Name:        ap.GetName(),
+		Group:       a.GetGroup(),
+		Name:        a.GetName(),
 		Size:        size,
-		Type:        ManifestArtifactType(ap.GetType()),
+		Type:        ManifestArtifactType(a.GetType()),
 		ContentType: contentType,
-		OutPath:     outPath,
-		X:           x,
 	}, nil
 }
 

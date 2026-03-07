@@ -1,9 +1,17 @@
 package pluginsdk
 
 import (
+	"fmt"
 	"io"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+)
+
+type ArtifactContentType string
+
+const (
+	ArtifactContentTypeTar   ArtifactContentType = "application/x-tar"
+	ArtifactContentTypeTarGz ArtifactContentType = "application/x-gtar"
 )
 
 type Artifact interface {
@@ -12,6 +20,7 @@ type Artifact interface {
 	GetType() pluginv1.Artifact_Type
 	GetContentReader() (io.ReadCloser, error)
 	GetContentSize() (int64, error)
+	GetContentType() (ArtifactContentType, error)
 
 	GetProto() *pluginv1.Artifact
 }
@@ -33,6 +42,17 @@ func (e ProtoArtifact) GetContentReader() (io.ReadCloser, error) {
 }
 func (e ProtoArtifact) GetContentSize() (int64, error) {
 	return e.ContentSizeFunc(e)
+}
+func (e ProtoArtifact) GetContentType() (ArtifactContentType, error) {
+	switch e.Artifact.WhichContent() {
+	case pluginv1.Artifact_TargzPath_case:
+		return ArtifactContentTypeTarGz, nil
+	case pluginv1.Artifact_TarPath_case:
+		return ArtifactContentTypeTar, nil
+	default:
+	}
+
+	return "", fmt.Errorf("unsupported content %v", e.WhichContent().String())
 }
 
 type ArtifactWithOrigin struct {
