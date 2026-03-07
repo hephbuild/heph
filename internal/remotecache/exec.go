@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os/exec"
 	"strings"
 	"sync"
@@ -102,7 +103,7 @@ func (e *execReader) Close() error {
 }
 
 // Get should return engine.ErrCacheNotFound if the key cannot be found, engine.ErrCacheNotFound can also be returned from Close().
-func (e Exec) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+func (e Exec) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	cmd := exec.CommandContext(ctx, e.args[0], e.args[1:]...) //nolint:gosec
 	cmd.Env = append(cmd.Environ(), "CACHE_KEY="+key)
 
@@ -110,5 +111,5 @@ func (e Exec) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 		runCh:             make(chan struct{}),
 		notFoundSentinels: e.notFoundSentinels,
 		cmd:               cmd,
-	}, nil
+	}, math.MaxInt64, nil
 }

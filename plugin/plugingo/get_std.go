@@ -36,8 +36,9 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 	if err != nil {
 		return nil, err
 	}
+	defer res.Release()
 
-	outputs := hartifact.FindOutputs(res.GetArtifacts(), "list")
+	outputs := hartifact.FindOutputs(res.Artifacts, "list")
 
 	if len(outputs) == 0 {
 		return nil, errors.New("no install artifact found")

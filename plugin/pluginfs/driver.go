@@ -103,7 +103,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}.Build(), nil
 }
 
-func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p *Driver) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &fsv1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {

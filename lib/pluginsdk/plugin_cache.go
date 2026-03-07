@@ -10,7 +10,7 @@ var ErrCacheNotFound = errors.New("not found")
 
 type Cache interface {
 	Store(ctx context.Context, key string, r io.Reader) error
-	Get(ctx context.Context, key string) (io.ReadCloser, error)
+	Get(ctx context.Context, key string) (io.ReadCloser, int64, error)
 }
 
 type CacheHas interface {

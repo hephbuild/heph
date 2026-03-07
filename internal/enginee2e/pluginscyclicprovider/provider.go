@@ -82,7 +82,7 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 		}
 
 		if p.resultOnList {
-			_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+			res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 				RequestId: htypes.Ptr(req.GetRequestId()),
 				Spec: pluginv1.TargetSpec_builder{
 					Ref:    tref.New(hephPackage, "think", nil),
@@ -100,6 +100,8 @@ func (p *Provider) List(ctx context.Context, req *pluginv1.ListRequest) (plugins
 			if err != nil {
 				return err
 			}
+
+			defer res.Release()
 		}
 
 		for _, spec := range p.targets() {
@@ -125,7 +127,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	}
 
 	if p.resultOnGet {
-		_, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+		res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 			RequestId: htypes.Ptr(req.GetRequestId()),
 			Spec: pluginv1.TargetSpec_builder{
 				Ref:    tref.New(hephPackage, "think", nil),
@@ -143,6 +145,8 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 		if err != nil {
 			return nil, err
 		}
+
+		defer res.Release()
 	}
 
 	for _, spec := range p.targets() {

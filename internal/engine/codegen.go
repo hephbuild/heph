@@ -15,7 +15,7 @@ import (
 	"github.com/hephbuild/heph/plugin/pluginfs"
 )
 
-func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact) error {
+func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, outputs []*ResultArtifact) error {
 	step, ctx := hstep.New(ctx, "Copying to tree...")
 	defer step.Done()
 
@@ -32,7 +32,7 @@ func (e *Engine) codegenTree(ctx context.Context, def *LightLinkedTarget, output
 	return nil
 }
 
-func (e *Engine) codegenTreeCopy(ctx context.Context, def *LightLinkedTarget, outputs []ExecuteResultArtifact, mode pluginv1.TargetDef_Path_CodegenMode) error {
+func (e *Engine) codegenTreeCopy(ctx context.Context, def *LightLinkedTarget, outputs []*ResultArtifact, mode pluginv1.TargetDef_Path_CodegenMode) error {
 	codegenPaths := make([]string, 0)
 	for _, output := range def.GetOutputs() {
 		for _, path := range output.GetPaths() {

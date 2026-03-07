@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/hephbuild/heph/internal/htar"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -30,7 +31,7 @@ func WithFilter(filter func(from string) bool) UnpackOption {
 	}
 }
 
-func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, options ...UnpackOption) error {
+func Unpack(ctx context.Context, artifact pluginsdk.Artifact, node hfs.Node, options ...UnpackOption) error {
 	var cfg unpackConfig
 	for _, option := range options {
 		option(&cfg)
@@ -44,24 +45,26 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, opt
 		}
 	}
 
-	r, err := Reader(ctx, artifact)
+	r, err := Reader(artifact)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	switch artifact.WhichContent() {
+	artifactp := artifact.GetProto()
+
+	switch artifactp.WhichContent() {
 	case pluginv1.Artifact_File_case:
-		if !cfg.filter(artifact.GetFile().GetOutPath()) {
+		if !cfg.filter(artifactp.GetFile().GetOutPath()) {
 			return nil
 		}
 
 		create := hfs.Create
-		if artifact.GetFile().GetX() {
+		if artifactp.GetFile().GetX() {
 			create = hfs.CreateExec
 		}
 
-		f, err := create(node.At(artifact.GetFile().GetOutPath()))
+		f, err := create(node.At(artifactp.GetFile().GetOutPath()))
 		if err != nil {
 			return fmt.Errorf("file: create: %w", err)
 		}
@@ -78,16 +81,16 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, opt
 			return err
 		}
 	case pluginv1.Artifact_Raw_case:
-		if !cfg.filter(artifact.GetRaw().GetPath()) {
+		if !cfg.filter(artifactp.GetRaw().GetPath()) {
 			return nil
 		}
 
 		create := hfs.Create
-		if artifact.GetRaw().GetX() {
+		if artifactp.GetRaw().GetX() {
 			create = hfs.CreateExec
 		}
 
-		f, err := create(node.At(artifact.GetRaw().GetPath()))
+		f, err := create(node.At(artifactp.GetRaw().GetPath()))
 		if err != nil {
 			return fmt.Errorf("raw: create: %w", err)
 		}
@@ -110,7 +113,7 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, opt
 		}
 	// case *pluginv1.Artifact_TargzPath:
 	default:
-		return fmt.Errorf("unsupported encoding %v", artifact.WhichContent())
+		return fmt.Errorf("unsupported encoding %v", artifactp.WhichContent())
 	}
 
 	return nil

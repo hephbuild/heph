@@ -49,13 +49,13 @@ func (m *mockCache) Store(ctx context.Context, key string, r io.Reader) error {
 	return nil
 }
 
-func (m *mockCache) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+func (m *mockCache) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
 	b, ok := m.store[key]
 	if !ok {
-		return nil, pluginsdk.ErrCacheNotFound
+		return nil, 0, pluginsdk.ErrCacheNotFound
 	}
 
-	return io.NopCloser(bytes.NewReader(b)), nil
+	return io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil
 }
 
 func TestSanityRemoteCache(t *testing.T) {

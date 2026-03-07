@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path"
@@ -23,10 +22,9 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"golang.org/x/sync/errgroup"
 )
 
-func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hashin string, manifest *hartifact.Manifest, artifacts []ExecuteResultArtifact) {
+func (e *Engine) CacheRemotely(ctx context.Context, def *LightLinkedTarget, hashin string, manifest *hartifact.Manifest, artifacts []*ResultArtifact) {
 	if def.GetDisableRemoteCache() {
 		return
 	}
@@ -71,7 +69,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 	ref *pluginv1.TargetRef,
 	hashin string,
 	manifest *hartifact.Manifest,
-	artifacts []ExecuteResultArtifact,
+	artifacts []*ResultArtifact,
 	cache CacheHandle,
 ) error {
 	step, ctx := hstep.New(ctx, fmt.Sprintf("Caching %q...", cache.Name))
@@ -80,7 +78,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 	// TODO: remote lock ?
 
 	for _, artifact := range artifacts {
-		r, err := hartifact.Reader(ctx, artifact.Artifact)
+		r, err := hartifact.Reader(artifact.Artifact)
 		if err != nil {
 			return err
 		}
@@ -155,7 +153,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 		}
 
 		if ok {
-			localArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
+			localArtifacts := make([]*ResultArtifact, 0, len(artifacts))
 			for _, artifact := range artifacts {
 				to := cacheDir.At(artifact.GetName())
 
@@ -164,14 +162,14 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 					return nil, false, err
 				}
 
-				rartifact, err := hartifact.Relocated(artifact.Artifact, to.Path())
+				rartifact, err := hartifact.Relocated(artifact.GetProto(), to.Path())
 				if err != nil {
 					return nil, false, err
 				}
 
-				localArtifacts = append(localArtifacts, ExecuteResultArtifact{
+				localArtifacts = append(localArtifacts, &ResultArtifact{
 					Hashout:  artifact.Hashout,
-					Artifact: rartifact,
+					Artifact: protoPluginArtifact{Artifact: rartifact},
 				})
 			}
 
@@ -192,7 +190,7 @@ func (e *Engine) ResultFromRemoteCache(ctx context.Context, rs *RequestState, de
 func (e *Engine) manifestFromRemoteCache(ctx context.Context, ref *pluginv1.TargetRef, hashin string, cache CacheHandle) (hartifact.Manifest, bool, error) {
 	manifestKey := e.remoteCacheKey(ref, hashin, hartifact.ManifestName)
 
-	r, err := cache.Client.Get(ctx, manifestKey)
+	r, _, err := cache.Client.Get(ctx, manifestKey)
 	if err != nil {
 		if errors.Is(err, pluginsdk.ErrCacheNotFound) {
 			return hartifact.Manifest{}, false, nil
@@ -227,7 +225,7 @@ func (e *Engine) resultFromRemoteCacheInner(
 	hashin string,
 	cache CacheHandle,
 	cachedir hfs.OS,
-) ([]ExecuteResultArtifact, bool, error) {
+) ([]*ResultArtifact, bool, error) {
 	ctx, span := tracer.Start(ctx, "ResultFromLocalCacheInner", trace.WithAttributes(attribute.String("cache", cache.Name)))
 	defer span.End()
 
@@ -256,17 +254,15 @@ func (e *Engine) resultFromRemoteCacheInner(
 	}
 
 	var localArtifactsm sync.Mutex
-	localArtifacts := make([]ExecuteResultArtifact, 0, len(outputs))
+	localArtifacts := make([]*ResultArtifact, 0, len(outputs))
 
-	g, ctx := errgroup.WithContext(ctx)
+	g := herrgroup.NewContext(ctx, true)
 
 	for _, artifact := range remoteArtifacts {
 		key := e.remoteCacheKey(ref, hashin, artifact.Name)
 
-		tofs := cachedir.At(artifact.Name)
-
-		g.Go(func() error {
-			r, err := cache.Client.Get(ctx, key)
+		g.Go(func(ctx context.Context) error {
+			r, size, err := cache.Client.Get(ctx, key)
 			if err != nil {
 				if errors.Is(err, pluginsdk.ErrCacheNotFound) {
 					return pluginsdk.ErrCacheNotFound
@@ -274,29 +270,21 @@ func (e *Engine) resultFromRemoteCacheInner(
 
 				return err
 			}
+			defer r.Close()
 
-			f, err := hfs.Create(tofs)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-
-			_, err = io.Copy(f, r)
-			if err != nil {
-				return err
-			}
-			_ = f.Close()
-
-			lartifact, err := hartifact.ManifestArtifactToProto(artifact, tofs.Path())
+			localArtifact, err := e.cacheLocally(ctx, ref, hashin, CacheLocallyArtifact{
+				Reader: r,
+				Size:   size,
+				Type:   pluginv1.Artifact_Type(artifact.Type),
+				Group:  artifact.Group,
+				Name:   artifact.Name,
+			}, artifact.Hashout)
 			if err != nil {
 				return err
 			}
 
 			localArtifactsm.Lock()
-			localArtifacts = append(localArtifacts, ExecuteResultArtifact{
-				Hashout:  artifact.Hashout,
-				Artifact: lartifact,
-			})
+			localArtifacts = append(localArtifacts, localArtifact)
 			localArtifactsm.Unlock()
 
 			return nil
@@ -311,13 +299,8 @@ func (e *Engine) resultFromRemoteCacheInner(
 		return nil, false, err
 	}
 
-	manifestArtifact, err := hartifact.WriteManifest(cachedir, manifest)
-	if err != nil {
-		return nil, false, err
-	}
-
-	localArtifacts = append(localArtifacts, ExecuteResultArtifact{
-		Artifact: manifestArtifact,
+	localArtifacts = append(localArtifacts, &ResultArtifact{
+		Artifact: &manifestPluginArtifact{manifest: manifest},
 	})
 
 	return localArtifacts, true, nil

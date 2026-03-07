@@ -33,25 +33,19 @@ import (
 
 var errNoGoFiles = errors.New("no Go files in package")
 
-func (p *Plugin) goListPkg(ctx context.Context, pkg string, factors Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
+func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors, requestId string) (Package, error) {
 	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
 		RequestId: htypes.Ptr(requestId),
-		Ref: tref.New(pkg, "_golist", hmaps.Concat(factors.Args(), map[string]string{
+		Ref: tref.New(runPkg, "_golist", hmaps.Concat(factors.Args(), map[string]string{
 			"imp": imp,
 		})),
 	}.Build())
 	if err != nil {
-		return nil, nil, fmt.Errorf("golist: %v (in %v): %w", imp, pkg, err)
+		return Package{}, fmt.Errorf("golist: %v (in %v): %w", imp, runPkg, err)
 	}
+	defer res.Release()
 
-	return res.GetArtifacts(), res.GetDef().GetRef(), nil
-}
-
-func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors, requestId string) (Package, error) {
-	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp, requestId)
-	if err != nil {
-		return Package{}, fmt.Errorf("go list: %w", err)
-	}
+	artifacts := res.Artifacts
 
 	jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
 	rootArtifacts := hartifact.FindOutputs(artifacts, "root")
@@ -699,8 +693,10 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 		return nil, fmt.Errorf("gomod: %w", err)
 	}
 
-	jsonArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "json")
-	rootArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "root")
+	defer res.Release()
+
+	jsonArtifacts := hartifact.FindOutputs(res.Artifacts, "json")
+	rootArtifacts := hartifact.FindOutputs(res.Artifacts, "root")
 
 	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 {
 		return nil, connect.NewError(connect.CodeInternal, errors.New("gomodules: no output found"))

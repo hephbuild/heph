@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/lib/tref"
@@ -40,7 +41,7 @@ var tracer = otel.Tracer("heph/pluginexec")
 
 var sem = semaphore.NewWeighted(int64(runtime.GOMAXPROCS(-1)))
 
-func (p *Plugin[S]) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p *Plugin[S]) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
 			"where", fmt.Sprintf("hephpluginexec %v: %v", p.name, tref.Format(req.GetTarget().GetRef())),
@@ -355,8 +356,8 @@ func getEnvEntryWithName(name, value string) string {
 	return name + "=" + value
 }
 
-func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWithOrigin, t *execv1.Target, listfs hfs.Node, basePath string) ([]string, error) {
-	m := map[string][]*pluginv1.ArtifactWithOrigin{}
+func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginsdk.ArtifactWithOrigin, t *execv1.Target, listfs hfs.Node, basePath string) ([]string, error) {
+	m := map[string][]*pluginsdk.ArtifactWithOrigin{}
 
 	for _, dep := range t.GetDeps() {
 		id := dep.GetId()
@@ -402,7 +403,7 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 		seenFiles := map[string]struct{}{}
 		envSb.Reset()
 
-		slices.SortFunc(artifacts, func(a, b *pluginv1.ArtifactWithOrigin) int {
+		slices.SortFunc(artifacts, func(a, b *pluginsdk.ArtifactWithOrigin) int {
 			if v := strings.Compare(a.GetOrigin().GetId(), b.GetOrigin().GetId()); v != 0 {
 				return v
 			}
@@ -415,7 +416,7 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginv1.ArtifactWit
 				return v
 			}
 
-			if v := hproto.Compare(a, b, nil); v != 0 {
+			if v := hproto.Compare(a.GetProto(), b.GetProto(), nil); v != 0 {
 				return v
 			}
 

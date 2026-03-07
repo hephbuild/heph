@@ -170,7 +170,7 @@ func TestDepsCache2(t *testing.T) {
 
 	driver.EXPECT().
 		Run(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+		DoAndReturn(func(ctx context.Context, request *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 			return pluginv1.RunResponse_builder{
 				Artifacts: []*pluginv1.Artifact{
 					pluginv1.Artifact_builder{
@@ -193,7 +193,7 @@ func TestDepsCache2(t *testing.T) {
 
 	cache.EXPECT().
 		Get(gomock.Any(), "__child/e5d50f4b478a3687/manifest.v1.json").
-		Return(nil, pluginsdk.ErrNotFound).Times(1)
+		Return(nil, 0, pluginsdk.ErrNotFound).Times(1)
 
 	for _, key := range []string{"__child/e5d50f4b478a3687/manifest.v1.json", "__child/e5d50f4b478a3687/out_out.tar"} {
 		cache.EXPECT().
@@ -206,7 +206,7 @@ func TestDepsCache2(t *testing.T) {
 
 				cache.EXPECT().
 					Get(gomock.Any(), key).
-					Return(io.NopCloser(bytes.NewReader(b)), nil).Times(1)
+					Return(io.NopCloser(bytes.NewReader(b)), int64(len(b)), nil).AnyTimes()
 
 				return nil
 			}).Times(1)

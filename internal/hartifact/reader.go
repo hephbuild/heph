@@ -11,35 +11,66 @@ import (
 
 	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/htar"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 // Reader gives a raw io.Reader of an artifact, useful for things like hashing.
-func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch a.WhichContent() {
+func Reader(a pluginsdk.Artifact) (io.ReadCloser, error) {
+	ap := a.GetProto()
+
+	switch ap.WhichContent() {
 	case pluginv1.Artifact_File_case:
-		return os.Open(a.GetFile().GetSourcePath())
+		return os.Open(ap.GetFile().GetSourcePath())
 	case pluginv1.Artifact_Raw_case:
-		return io.NopCloser(bytes.NewReader(a.GetRaw().GetData())), nil
+		return io.NopCloser(bytes.NewReader(ap.GetRaw().GetData())), nil
 	case pluginv1.Artifact_TargzPath_case:
-		return os.Open(a.GetTargzPath())
+		return os.Open(ap.GetTargzPath())
 	case pluginv1.Artifact_TarPath_case:
-		return os.Open(a.GetTarPath())
+		return os.Open(ap.GetTarPath())
 	default:
-		return nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())
+		return nil, fmt.Errorf("unsupported encoding %v", ap.WhichContent())
+	}
+}
+
+func fileSize(p string) (int64, error) {
+	info, err := os.Stat(p)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Size(), nil
+}
+
+func Size(a pluginsdk.Artifact) (int64, error) {
+	ap := a.GetProto()
+
+	switch ap.WhichContent() {
+	case pluginv1.Artifact_File_case:
+		return fileSize(ap.GetFile().GetSourcePath())
+	case pluginv1.Artifact_Raw_case:
+		return int64(len(ap.GetRaw().GetData())), nil
+	case pluginv1.Artifact_TargzPath_case:
+		return fileSize(ap.GetTargzPath())
+	case pluginv1.Artifact_TarPath_case:
+		return fileSize(ap.GetTarPath())
+	default:
+		return -1, fmt.Errorf("unsupported encoding %v", ap.WhichContent())
 	}
 }
 
 // FileReader Assumes the output has a single file, and provides a reader for it (no matter the packaging).
-func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch a.WhichContent() {
+func FileReader(ctx context.Context, a pluginsdk.Artifact) (io.ReadCloser, error) {
+	ap := a.GetProto()
+
+	switch ap.WhichContent() {
 	case pluginv1.Artifact_File_case:
-		return os.Open(a.GetFile().GetSourcePath())
+		return os.Open(ap.GetFile().GetSourcePath())
 	case pluginv1.Artifact_Raw_case:
-		return io.NopCloser(bytes.NewReader(a.GetRaw().GetData())), nil
+		return io.NopCloser(bytes.NewReader(ap.GetRaw().GetData())), nil
 	case pluginv1.Artifact_TarPath_case:
-		r, err := Reader(ctx, a)
+		r, err := Reader(a)
 		if err != nil {
 			return nil, err
 		}
@@ -52,14 +83,14 @@ func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error
 		}
 
 		return hio.NewReadCloser(tr, r), nil
-	// case *pluginv1.Artifact_TargzPath:
+	// case pluginsdk.Artifact_TargzPath:
 	default:
-		return nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())
+		return nil, fmt.Errorf("unsupported encoding %v", ap.WhichContent())
 	}
 }
 
 // FileReader Assumes the output has a single file, and provides the bytes for it (no matter the packaging).
-func FileReadAll(ctx context.Context, a *pluginv1.Artifact) ([]byte, error) {
+func FileReadAll(ctx context.Context, a pluginsdk.Artifact) ([]byte, error) {
 	f, err := FileReader(ctx, a)
 	if err != nil {
 		return nil, err
@@ -75,11 +106,13 @@ type File struct {
 }
 
 // FilesReader provides a reader for each file it (no matter the packaging).
-func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, error] {
+func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, error] {
+	ap := a.GetProto()
+
 	return func(yield func(*File, error) bool) {
-		switch a.WhichContent() {
+		switch ap.WhichContent() {
 		case pluginv1.Artifact_File_case:
-			f, err := os.Open(a.GetFile().GetSourcePath())
+			f, err := os.Open(ap.GetFile().GetSourcePath())
 			if err != nil {
 				if !yield(nil, err) {
 					return
@@ -89,21 +122,21 @@ func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, err
 
 			if !yield(&File{
 				ReadCloser: f,
-				Path:       a.GetFile().GetOutPath(),
+				Path:       ap.GetFile().GetOutPath(),
 			}, nil) {
 				return
 			}
 		case pluginv1.Artifact_Raw_case:
-			f := io.NopCloser(bytes.NewReader(a.GetRaw().GetData()))
+			f := io.NopCloser(bytes.NewReader(ap.GetRaw().GetData()))
 
 			if !yield(&File{
 				ReadCloser: f,
-				Path:       a.GetRaw().GetPath(),
+				Path:       ap.GetRaw().GetPath(),
 			}, nil) {
 				return
 			}
 		case pluginv1.Artifact_TarPath_case:
-			r, err := Reader(ctx, a)
+			r, err := Reader(a)
 			if err != nil {
 				if !yield(nil, err) {
 					return
@@ -134,9 +167,9 @@ func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, err
 				}
 				return
 			}
-		// case *pluginv1.Artifact_TargzPath:
+		// case pluginsdk.Artifact_TargzPath:
 		default:
-			if !yield(nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())) {
+			if !yield(nil, fmt.Errorf("unsupported encoding %v", ap.WhichContent())) {
 				return
 			}
 		}

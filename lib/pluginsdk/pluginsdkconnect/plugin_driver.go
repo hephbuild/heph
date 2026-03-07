@@ -3,8 +3,10 @@ package pluginsdkconnect
 import (
 	"context"
 	"errors"
+	"io"
 
 	"connectrpc.com/connect"
+	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -49,7 +51,7 @@ func (p driverConnectClient) Parse(ctx context.Context, req *pluginv1.ParseReque
 	return res.Msg, nil
 }
 
-func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p driverConnectClient) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	hardCtx, cancelHardCtx := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelHardCtx()
 
@@ -69,7 +71,7 @@ func (p driverConnectClient) Run(ctx context.Context, req *pluginv1.RunRequest) 
 		}
 	}()
 
-	err := strm.Send(pluginv1.RunContainer_builder{Start: proto.ValueOrDefault(req)}.Build())
+	err := strm.Send(pluginv1.RunContainer_builder{Start: req.RunRequest}.Build())
 	if err != nil {
 		return nil, p.handleErr(ctx, err)
 	}
@@ -137,11 +139,34 @@ func (p driverConnectHandler) Parse(ctx context.Context, req *connect.Request[pl
 	return connect.NewResponse(res), nil
 }
 
+func (p driverConnectHandler) runRequest(rr *pluginv1.RunRequest) *pluginsdk.RunRequest {
+	inputs := make([]*pluginsdk.ArtifactWithOrigin, 0, len(rr.GetInputs()))
+	for _, input := range rr.GetInputs() {
+		inputs = append(inputs, &pluginsdk.ArtifactWithOrigin{
+			Artifact: pluginsdk.ProtoArtifact{
+				Artifact: input.GetArtifact(),
+				ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
+					return hartifact.Reader(e)
+				},
+				ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
+					return hartifact.Size(e)
+				},
+			},
+			Origin: input.GetOrigin(),
+		})
+	}
+
+	return &pluginsdk.RunRequest{
+		RunRequest: rr,
+		Inputs:     inputs,
+	}
+}
+
 func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[pluginv1.RunContainer, pluginv1.RunResponse]) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	startCh := make(chan *pluginv1.RunRequest, 1)
+	startCh := make(chan *pluginsdk.RunRequest, 1)
 	errCh := make(chan error, 1)
 
 	go func() {
@@ -156,7 +181,7 @@ func (p driverConnectHandler) Run(ctx context.Context, strm *connect.BidiStream[
 
 			switch msg.WhichMsg() {
 			case pluginv1.RunContainer_Start_case:
-				startCh <- msg.GetStart()
+				startCh <- p.runRequest(msg.GetStart())
 				close(startCh)
 			case pluginv1.RunContainer_Cancel_case:
 				cancel()

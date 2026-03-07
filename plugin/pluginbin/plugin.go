@@ -71,7 +71,7 @@ const wrapperScript = `
 exec <PATH> "$@" 
 `
 
-func (p Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p Plugin) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &binv1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {

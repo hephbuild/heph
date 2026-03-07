@@ -75,7 +75,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 	}.Build(), nil
 }
 
-func (p Plugin) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p Plugin) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &textfilev1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {

@@ -207,18 +207,18 @@ func init() {
 							for _, output := range re.Artifacts {
 								fmt.Println(output.GetName())
 								fmt.Println("  group:    ", output.GetGroup())
-								switch output.WhichContent() {
-								case pluginv1.Artifact_File_case:
-									fmt.Println("  content:", output.GetFile())
-								case pluginv1.Artifact_Raw_case:
-									fmt.Println("  content:", output.GetRaw())
-								case pluginv1.Artifact_TarPath_case:
-									fmt.Println("  content:", output.GetTarPath())
-								case pluginv1.Artifact_TargzPath_case:
-									fmt.Println("  content:", output.GetTargzPath())
-								case pluginv1.Artifact_Content_not_set_case:
-									fmt.Println("  content: <not set>")
-								}
+								//switch output.WhichContent() {
+								//case pluginv1.Artifact_File_case:
+								//	fmt.Println("  content:", output.GetFile())
+								//case pluginv1.Artifact_Raw_case:
+								//	fmt.Println("  content:", output.GetRaw())
+								//case pluginv1.Artifact_TarPath_case:
+								//	fmt.Println("  content:", output.GetTarPath())
+								//case pluginv1.Artifact_TargzPath_case:
+								//	fmt.Println("  content:", output.GetTargzPath())
+								//case pluginv1.Artifact_Content_not_set_case:
+								//	fmt.Println("  content: <not set>")
+								//}
 								fmt.Println("  type:     ", output.GetType().String())
 							}
 						}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -24,14 +26,14 @@ import (
 )
 
 type SetupSandboxResult struct {
-	ListArtifacts []*pluginv1.ArtifactWithOrigin
+	ListArtifacts []*pluginsdk.ArtifactWithOrigin
 	Sourcemap     map[string]string
 }
 
 func SetupSandbox(
 	ctx context.Context,
 	t *execv1.Target,
-	results []*pluginv1.ArtifactWithOrigin,
+	results []*pluginsdk.ArtifactWithOrigin,
 	workfs,
 	binfs,
 	cwdfs,
@@ -53,7 +55,7 @@ func SetupSandbox(
 
 	sourcemap := map[string]string{}
 
-	var listArtifacts []*pluginv1.ArtifactWithOrigin
+	var listArtifacts []*pluginsdk.ArtifactWithOrigin
 	if setupWd {
 		err = cwdfs.MkdirAll(os.ModePerm)
 		if err != nil {
@@ -62,58 +64,58 @@ func SetupSandbox(
 
 		for _, target := range t.GetDeps() {
 			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
-				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), target, workfs, target.GetRef().GetFilters(), sourcemap)
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact, target, workfs, target.GetRef().GetFilters(), sourcemap)
 				if err != nil {
 					return nil, fmt.Errorf("setup artifact: %v: %w", target.GetId(), err)
 				}
-				listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+				listArtifacts = append(listArtifacts, &pluginsdk.ArtifactWithOrigin{
 					Artifact: listArtifact,
 					Origin: pluginv1.TargetDef_InputOrigin_builder{
 						Id: htypes.Ptr(target.GetId()),
 					}.Build(),
-				}.Build())
+				})
 			}
 
 			for artifact := range ArtifactsForId(results, target.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
-				listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), target, workfs, nil, nil)
+				listArtifact, err := SetupSandboxArtifact(ctx, artifact, target, workfs, nil, nil)
 				if err != nil {
 					return nil, fmt.Errorf("setup support file artifact: %v: %w", target.GetId(), err)
 				}
-				listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+				listArtifacts = append(listArtifacts, &pluginsdk.ArtifactWithOrigin{
 					Artifact: listArtifact,
 					Origin: pluginv1.TargetDef_InputOrigin_builder{
 						Id: htypes.Ptr(target.GetId()),
 					}.Build(),
-				}.Build())
+				})
 			}
 		}
 	}
 
 	for _, tool := range t.GetTools() {
 		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_OUTPUT) {
-			listArtifact, err := SetupSandboxBinArtifact(ctx, artifact.GetArtifact(), binfs)
+			listArtifact, err := SetupSandboxBinArtifact(ctx, artifact, binfs)
 			if err != nil {
 				return nil, fmt.Errorf("%v: %w", tref.FormatOut(tool.GetRef()), err)
 			}
-			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+			listArtifacts = append(listArtifacts, &pluginsdk.ArtifactWithOrigin{
 				Artifact: listArtifact,
 				Origin: pluginv1.TargetDef_InputOrigin_builder{
 					Id: htypes.Ptr(tool.GetId()),
 				}.Build(),
-			}.Build())
+			})
 		}
 
 		for artifact := range ArtifactsForId(results, tool.GetId(), pluginv1.Artifact_TYPE_SUPPORT_FILE) {
-			listArtifact, err := SetupSandboxArtifact(ctx, artifact.GetArtifact(), nil, workfs, nil, nil)
+			listArtifact, err := SetupSandboxArtifact(ctx, artifact, nil, workfs, nil, nil)
 			if err != nil {
 				return nil, fmt.Errorf("setup support file artifact: %v: %w", tref.FormatOut(tool.GetRef()), err)
 			}
-			listArtifacts = append(listArtifacts, pluginv1.ArtifactWithOrigin_builder{
+			listArtifacts = append(listArtifacts, &pluginsdk.ArtifactWithOrigin{
 				Artifact: listArtifact,
 				Origin: pluginv1.TargetDef_InputOrigin_builder{
 					Id: htypes.Ptr(tool.GetId()),
 				}.Build(),
-			}.Build())
+			})
 		}
 	}
 
@@ -132,8 +134,8 @@ func SetupSandbox(
 	}, nil
 }
 
-func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ pluginv1.Artifact_Type) iter.Seq[*pluginv1.ArtifactWithOrigin] {
-	return func(yield func(origin *pluginv1.ArtifactWithOrigin) bool) {
+func ArtifactsForId(inputs []*pluginsdk.ArtifactWithOrigin, id string, typ pluginv1.Artifact_Type) iter.Seq[*pluginsdk.ArtifactWithOrigin] {
+	return func(yield func(origin *pluginsdk.ArtifactWithOrigin) bool) {
 		for _, input := range inputs {
 			if input.GetArtifact().GetType() != typ {
 				continue
@@ -150,12 +152,12 @@ func ArtifactsForId(inputs []*pluginv1.ArtifactWithOrigin, id string, typ plugin
 	}
 }
 
-func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, source *execv1.Target_Dep, node hfs.Node, filters []string, sourcemap map[string]string) (*pluginv1.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, source *execv1.Target_Dep, node hfs.Node, filters []string, sourcemap map[string]string) (pluginsdk.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
 	h := xxh3.New()
-	hashpb.Hash(h, artifact, tref.OmitHashPb)
+	hashpb.Hash(h, artifact.GetProto(), tref.OmitHashPb)
 	for _, f := range filters {
 		_, _ = h.WriteString(f)
 	}
@@ -205,17 +207,25 @@ func SetupSandboxArtifact(ctx context.Context, artifact *pluginv1.Artifact, sour
 		listType = pluginv1.Artifact_TYPE_SUPPORT_FILE_LIST_V1
 	}
 
-	return pluginv1.Artifact_builder{
-		Group: htypes.Ptr(artifact.GetGroup()),
-		Name:  htypes.Ptr(artifact.GetName() + ".list"),
-		Type:  htypes.Ptr(listType),
-		File: pluginv1.Artifact_ContentFile_builder{
-			SourcePath: htypes.Ptr(listf.Name()),
+	return &pluginsdk.ProtoArtifact{
+		Artifact: pluginv1.Artifact_builder{
+			Group: htypes.Ptr(artifact.GetGroup()),
+			Name:  htypes.Ptr(artifact.GetName() + ".list"),
+			Type:  htypes.Ptr(listType),
+			File: pluginv1.Artifact_ContentFile_builder{
+				SourcePath: htypes.Ptr(listf.Name()),
+			}.Build(),
 		}.Build(),
-	}.Build(), nil
+		ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
+			return hartifact.Reader(e)
+		},
+		ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
+			return hartifact.Size(e)
+		},
+	}, nil
 }
 
-func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node) (*pluginv1.Artifact, error) {
+func SetupSandboxBinArtifact(ctx context.Context, artifact pluginsdk.Artifact, node hfs.Node) (pluginsdk.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxBinArtifact")
 	defer span.End()
 
@@ -251,13 +261,21 @@ func SetupSandboxBinArtifact(ctx context.Context, artifact *pluginv1.Artifact, n
 		return nil, err
 	}
 
-	return pluginv1.Artifact_builder{
-		Group: htypes.Ptr(artifact.GetGroup()),
-		Name:  htypes.Ptr(artifact.GetName() + ".list"),
-		Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
-		Raw: pluginv1.Artifact_ContentRaw_builder{
-			Data: []byte(dest.Path()),
-			Path: htypes.Ptr(artifact.GetName() + ".list"),
+	return &pluginsdk.ProtoArtifact{
+		Artifact: pluginv1.Artifact_builder{
+			Group: htypes.Ptr(artifact.GetGroup()),
+			Name:  htypes.Ptr(artifact.GetName() + ".list"),
+			Type:  htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT_LIST_V1),
+			Raw: pluginv1.Artifact_ContentRaw_builder{
+				Data: []byte(dest.Path()),
+				Path: htypes.Ptr(artifact.GetName() + ".list"),
+			}.Build(),
 		}.Build(),
-	}.Build(), nil
+		ContentReaderFunc: func(e pluginsdk.ProtoArtifact) (io.ReadCloser, error) {
+			return hartifact.Reader(e)
+		},
+		ContentSizeFunc: func(e pluginsdk.ProtoArtifact) (int64, error) {
+			return hartifact.Size(e)
+		},
+	}, nil
 }

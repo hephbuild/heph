@@ -23,7 +23,6 @@ import (
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hpanic"
-	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -278,11 +277,11 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	}
 
 	if onlyManifest {
-		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact *ResultArtifact) bool {
 			return artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1
 		})
 	} else {
-		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
+		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact *ResultArtifact) bool {
 			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
 				return true
 			}
@@ -341,7 +340,7 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 				return err
 			}
 
-			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
+			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output *ResultArtifact) bool {
 				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT && output.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE
 			})
 
@@ -456,7 +455,7 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 		return ResultMeta{}, errors.New("no manifest")
 	}
 
-	manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
+	manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact)
 	if err != nil {
 		return ResultMeta{}, fmt.Errorf("manifest from artifact: %w", err)
 	}
@@ -656,19 +655,21 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				Hashin:    hashin,
 			}
 
-			var artifacts []ExecuteResultArtifact
+			var artifacts []*ResultArtifact
 			var locks CacheLocks
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
-					gartifact := hproto.Clone(artifact.Artifact)
+					gartifact := artifact.GetProto()
 					gartifact.ClearGroup() // TODO support output group
 
-					artifacts = append(artifacts, ExecuteResultArtifact{
+					partifact := protoPluginArtifact{Artifact: gartifact}
+
+					artifacts = append(artifacts, &ResultArtifact{
 						Hashout:  artifact.Hashout,
-						Artifact: gartifact,
+						Artifact: partifact,
 					})
 
-					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, gartifact)
+					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, partifact)
 					if err != nil {
 						return nil, fmt.Errorf("proto artifact to manifest: %w", err)
 					}
@@ -684,8 +685,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				return nil, fmt.Errorf("new manifest artifact: %w", err)
 			}
 
-			artifacts = append(artifacts, ExecuteResultArtifact{
-				Artifact: martifact,
+			artifacts = append(artifacts, &ResultArtifact{
+				Artifact: protoPluginArtifact{Artifact: martifact},
 			})
 
 			err = locks.RLock(ctx)
@@ -739,7 +740,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				Hashin:    hashin,
 			}
 			for _, artifact := range res.Artifacts {
-				martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+				martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact)
 				if err != nil {
 					err = errors.Join(err, locks.Unlock())
 
@@ -756,8 +757,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				return nil, err
 			}
 
-			res.Artifacts = append(res.Artifacts, ExecuteResultArtifact{
-				Artifact: manifestArtifact,
+			res.Artifacts = append(res.Artifacts, &ResultArtifact{
+				Artifact: protoPluginArtifact{Artifact: manifestArtifact},
 			})
 		}
 
@@ -881,19 +882,35 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 	return e.hashin2(ctx, def, metas, "res")
 }
 
-type ExecuteResultArtifact struct {
-	Hashout string
+type protoPluginArtifact struct {
 	*pluginv1.Artifact
+}
+
+func (e protoPluginArtifact) GetProto() *pluginv1.Artifact {
+	return e.Artifact
+}
+
+func (e protoPluginArtifact) GetContentReader() (io.ReadCloser, error) {
+	return hartifact.Reader(e)
+}
+
+func (e protoPluginArtifact) GetContentSize() (int64, error) {
+	return hartifact.Size(e)
 }
 
 type ExecuteResult struct {
 	Def       *LightLinkedTarget
 	Executed  bool
 	Hashin    string
-	Artifacts []ExecuteResultArtifact
+	Artifacts []*ResultArtifact
 }
 
-func (r ExecuteResult) FindManifest() (ExecuteResultArtifact, bool) {
+type ResultArtifact struct {
+	Hashout string
+	pluginsdk.Artifact
+}
+
+func (r ExecuteResult) FindManifest() (*ResultArtifact, bool) {
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
 			continue
@@ -902,11 +919,11 @@ func (r ExecuteResult) FindManifest() (ExecuteResultArtifact, bool) {
 		return artifact, true
 	}
 
-	return ExecuteResultArtifact{}, false
+	return nil, false
 }
 
-func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
-	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+func (r ExecuteResult) FindOutputs(group string) []*ResultArtifact {
+	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
@@ -921,8 +938,8 @@ func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
 	return res
 }
 
-func (r ExecuteResult) FindSupport() []ExecuteResultArtifact {
-	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+func (r ExecuteResult) FindSupport() []*ResultArtifact {
+	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE {
 			continue
@@ -965,7 +982,7 @@ func (r *ExecuteResultLocks) Unlock(ctx context.Context) {
 }
 
 func (r ExecuteResult) Sorted() *ExecuteResult {
-	slices.SortFunc(r.Artifacts, func(a, b ExecuteResultArtifact) int {
+	slices.SortFunc(r.Artifacts, func(a, b *ResultArtifact) int {
 		return strings.Compare(a.Hashout, b.Hashout)
 	})
 
@@ -1256,10 +1273,20 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	for _, result := range results {
 		for _, artifact := range result.Artifacts {
 			inputs = append(inputs, pluginv1.ArtifactWithOrigin_builder{
-				Artifact: artifact.Artifact,
+				Artifact: artifact.GetProto(),
 				Origin:   result.InputOrigin,
 			}.Build())
 		}
+	}
+
+	inputsSdk := make([]*pluginsdk.ArtifactWithOrigin, 0, len(inputs))
+	for _, input := range inputs {
+		inputsSdk = append(inputsSdk, &pluginsdk.ArtifactWithOrigin{
+			Artifact: protoPluginArtifact{
+				Artifact: input.GetArtifact(),
+			},
+			Origin: input.GetOrigin(),
+		})
 	}
 
 	var runRes *pluginv1.RunResponse
@@ -1288,15 +1315,18 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}()
 
 			runRes, runErr = hpanic.RecoverV(func() (*pluginv1.RunResponse, error) {
-				return driver.Run(ctx, pluginv1.RunRequest_builder{
-					RequestId:    htypes.Ptr(rs.ID),
-					Target:       def.TargetDef.TargetDef,
-					SandboxPath:  htypes.Ptr(sandboxfs.Path()),
-					TreeRootPath: htypes.Ptr(e.Root.Path()),
-					Inputs:       inputs,
-					Pipes:        pipes,
-					Hashin:       htypes.Ptr(hashin),
-				}.Build())
+				return driver.Run(ctx, &pluginsdk.RunRequest{
+					RunRequest: pluginv1.RunRequest_builder{
+						RequestId:    htypes.Ptr(rs.ID),
+						Target:       def.TargetDef.TargetDef,
+						SandboxPath:  htypes.Ptr(sandboxfs.Path()),
+						TreeRootPath: htypes.Ptr(e.Root.Path()),
+						Inputs:       inputs,
+						Pipes:        pipes,
+						Hashin:       htypes.Ptr(hashin),
+					}.Build(),
+					Inputs: inputsSdk,
+				})
 			})
 		},
 		Pty: def.GetPty(),
@@ -1328,7 +1358,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}
 
 	cachefs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.OutputNames()))
+	execArtifacts := make([]*ResultArtifact, 0, len(def.OutputNames()))
 
 	for _, output := range def.GetOutputs() {
 		shouldCollect := false
@@ -1394,19 +1424,21 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, err
 		}
 
-		execArtifact := pluginv1.Artifact_builder{
-			Group:   htypes.Ptr(output.GetGroup()),
-			Name:    htypes.Ptr(tarname),
-			Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-			TarPath: proto.String(tarf.Name()),
-		}.Build()
+		execArtifact := protoPluginArtifact{
+			Artifact: pluginv1.Artifact_builder{
+				Group:   htypes.Ptr(output.GetGroup()),
+				Name:    htypes.Ptr(tarname),
+				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+				TarPath: proto.String(tarf.Name()),
+			}.Build(),
+		}
 
 		hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
 		if err != nil {
 			return nil, err
 		}
 
-		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+		execArtifacts = append(execArtifacts, &ResultArtifact{
 			Hashout:  hashout,
 			Artifact: execArtifact,
 		})
@@ -1468,27 +1500,33 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				return nil, err
 			}
 
-			execArtifact := pluginv1.Artifact_builder{
-				Name:    htypes.Ptr(tarname),
-				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
-				TarPath: proto.String(tarf.Name()),
-			}.Build()
+			execArtifact := protoPluginArtifact{
+				Artifact: pluginv1.Artifact_builder{
+					Name:    htypes.Ptr(tarname),
+					Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
+					TarPath: proto.String(tarf.Name()),
+				}.Build(),
+			}
 
 			hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
 			if err != nil {
 				return nil, err
 			}
 
-			execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+			execArtifacts = append(execArtifacts, &ResultArtifact{
 				Hashout:  hashout,
 				Artifact: execArtifact,
 			})
 		}
 	}
 
-	for _, artifact := range runRes.GetArtifacts() {
-		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+	for _, partifact := range runRes.GetArtifacts() {
+		if partifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
+		}
+
+		artifact := protoPluginArtifact{
+			Artifact: partifact,
 		}
 
 		hashout, err := e.hashout(ctx, def.GetRef(), artifact)
@@ -1496,7 +1534,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, fmt.Errorf("hashout: %w", err)
 		}
 
-		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+		execArtifacts = append(execArtifacts, &ResultArtifact{
 			Hashout:  hashout,
 			Artifact: artifact,
 		})
@@ -1534,7 +1572,7 @@ func (e *Engine) ExecuteAndCache(ctx context.Context, rs *RequestState, def *Lig
 		return nil, fmt.Errorf("execute: %w", err)
 	}
 
-	var cachedArtifacts []ExecuteResultArtifact
+	var cachedArtifacts []*ResultArtifact
 	if res.Executed {
 		artifacts, manifest, err := e.CacheLocally(ctx, def, res.Hashin, res.Artifacts)
 		if err != nil {

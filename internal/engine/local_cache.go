@@ -5,18 +5,22 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
 	"io"
+	"iter"
 	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hephbuild/heph/internal/hcore/hstep"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/lib/tref"
 
@@ -28,7 +32,18 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-func (e *Engine) hashout(ctx context.Context, ref *pluginv1.TargetRef, artifact *pluginv1.Artifact) (string, error) {
+var LocalCacheNotFoundError = errors.New("artifact not found")
+
+type LocalCache interface {
+	Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error)
+	Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, error)
+	Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.WriteCloser, error)
+	Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) error
+	ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) iter.Seq2[string, error]
+	ListVersions(ctx context.Context, ref *pluginv1.TargetRef, name string) iter.Seq2[string, error]
+}
+
+func (e *Engine) hashout(ctx context.Context, ref *pluginv1.TargetRef, artifact pluginsdk.Artifact) (string, error) {
 	var h interface {
 		hash.Hash
 		io.StringWriter
@@ -76,129 +91,36 @@ func (e *Engine) CacheLocally(
 	ctx context.Context,
 	def *LightLinkedTarget,
 	hashin string,
-	sandboxArtifacts []ExecuteResultArtifact,
-) ([]ExecuteResultArtifact, *hartifact.Manifest, error) {
+	sandboxArtifacts []*ResultArtifact,
+) ([]*ResultArtifact, *hartifact.Manifest, error) {
 	step, ctx := hstep.New(ctx, "Caching...")
 	defer step.Done()
 
-	cachedir := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-
-	cacheArtifacts := make([]ExecuteResultArtifact, 0, len(sandboxArtifacts))
+	cacheArtifacts := make([]*ResultArtifact, 0, len(sandboxArtifacts))
 
 	for _, artifact := range sandboxArtifacts {
 		if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
 			continue
 		}
 
-		if artifact.HasFile() {
-			content := artifact.GetFile()
-
-			artifact.SetName(artifact.GetName() + ".tar")
-			tarf, err := hfs.Create(cachedir.At(artifact.GetName()))
-			if err != nil {
-				return nil, nil, err
-			}
-			defer tarf.Close()
-			p := htar.NewPacker(tarf)
-
-			sourcefs := hfs.NewOS(content.GetSourcePath())
-
-			f, err := hfs.Open(sourcefs)
-			if err != nil {
-				return nil, nil, err
-			}
-			defer f.Close()
-
-			err = p.WriteFile(f, content.GetOutPath())
-			if err != nil {
-				return nil, nil, err
-			}
-
-			_ = f.Close()
-			_ = tarf.Close()
-
-			artifact.SetTarPath(tarf.Name())
+		src, err := e.contentReaderNormalizer(artifact)
+		if err != nil {
+			return nil, nil, err
 		}
-		if artifact.HasRaw() {
-			content := artifact.GetRaw()
+		defer src.Close()
 
-			artifact.SetName(artifact.GetName() + ".tar")
-			tarf, err := hfs.Create(cachedir.At(artifact.GetName()))
-			if err != nil {
-				return nil, nil, err
-			}
-			defer tarf.Close()
-			p := htar.NewPacker(tarf)
-
-			mode := int64(os.ModePerm)
-			if content.GetX() {
-				mode |= 0111 // executable
-			}
-
-			err = p.Write(bytes.NewReader(content.GetData()), &tar.Header{
-				Typeflag: tar.TypeReg,
-				Name:     content.GetPath(),
-				Size:     int64(len(content.GetData())),
-				Mode:     mode,
-			})
-			if err != nil {
-				return nil, nil, err
-			}
-
-			_ = tarf.Close()
-
-			artifact.SetTarPath(tarf.Name())
-		}
-
-		fromPath, err := hartifact.Path(artifact.Artifact)
+		cacheArtifact, err := e.cacheLocally(ctx, def.GetRef(), hashin, CacheLocallyArtifact{
+			Reader: src,
+			Size:   0,
+			Type:   artifact.GetType(),
+			Group:  artifact.GetGroup(),
+			Name:   artifact.GetName(),
+		}, artifact.Hashout)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if fromPath == "" {
-			return nil, nil, fmt.Errorf("artifact %s has no path", artifact.GetName())
-		}
-
-		var prefix string
-		switch artifact.GetType() {
-		case pluginv1.Artifact_TYPE_OUTPUT:
-			prefix = "out_"
-		case pluginv1.Artifact_TYPE_SUPPORT_FILE:
-			prefix = "support_"
-		case pluginv1.Artifact_TYPE_LOG:
-			prefix = "log_"
-		case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:
-			fallthrough
-		default:
-			return nil, nil, fmt.Errorf("invalid artifact type: %s", artifact.GetType())
-		}
-
-		artifact.SetName(prefix + artifact.GetName())
-		fromfs := hfs.NewOS(fromPath)
-		tofs := hfs.At(cachedir, artifact.GetName())
-
-		if false && strings.HasPrefix(fromfs.Path(), e.Home.Path()) {
-			// TODO: there was a bug here where when a target was running in tree, it would move things out from tree
-			err = hfs.Move(fromfs, tofs)
-			if err != nil {
-				return nil, nil, fmt.Errorf("move: %w", err)
-			}
-		} else {
-			err = hfs.Copy(fromfs, tofs)
-			if err != nil {
-				return nil, nil, fmt.Errorf("copy: %w", err)
-			}
-		}
-
-		cachedArtifact, err := hartifact.Relocated(artifact.Artifact, tofs.Path())
-		if err != nil {
-			return nil, nil, fmt.Errorf("relocated: %w", err)
-		}
-
-		cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
-			Hashout:  artifact.Hashout,
-			Artifact: cachedArtifact,
-		})
+		cacheArtifacts = append(cacheArtifacts, cacheArtifact)
 	}
 
 	m := hartifact.Manifest{
@@ -216,16 +138,152 @@ func (e *Engine) CacheLocally(
 		m.Artifacts = append(m.Artifacts, martifact)
 	}
 
-	manifestArtifact, err := hartifact.WriteManifest(cachedir, m)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	cacheArtifacts = append(cacheArtifacts, ExecuteResultArtifact{
-		Artifact: manifestArtifact,
+	cacheArtifacts = append(cacheArtifacts, &ResultArtifact{
+		Artifact: &manifestPluginArtifact{manifest: m},
 	})
 
 	return cacheArtifacts, &m, nil
+}
+
+type cachePluginArtifact struct {
+	group, name string
+	type_       pluginv1.Artifact_Type
+	cache       LocalCache
+}
+
+func (e cachePluginArtifact) GetGroup() string {
+	return e.group
+}
+func (e cachePluginArtifact) GetName() string {
+	return e.name
+}
+func (e cachePluginArtifact) GetType() pluginv1.Artifact_Type {
+	return e.type_
+}
+
+func (e cachePluginArtifact) GetProto() *pluginv1.Artifact {
+	panic("TO REMOVE")
+}
+
+func (e cachePluginArtifact) GetContentReader() (io.ReadCloser, error) {
+	return hartifact.Reader(e)
+}
+
+func (e cachePluginArtifact) GetContentSize() (int64, error) {
+	return hartifact.Size(e)
+}
+
+type manifestPluginArtifact struct {
+	manifest hartifact.Manifest
+
+	manifestBytes     []byte
+	manifestBytesOnce sync.Once
+}
+
+func (e *manifestPluginArtifact) GetGroup() string {
+	return ""
+}
+func (e *manifestPluginArtifact) GetName() string {
+	return hartifact.ManifestName
+}
+func (e *manifestPluginArtifact) GetType() pluginv1.Artifact_Type {
+	return pluginv1.Artifact_TYPE_MANIFEST_V1
+}
+
+func (e *manifestPluginArtifact) GetProto() *pluginv1.Artifact {
+	panic("TO REMOVE")
+}
+
+func (e *manifestPluginArtifact) marshal() {
+	e.manifestBytesOnce.Do(func() {
+		b, err := json.Marshal(e.manifest)
+		if err != nil {
+			panic(err)
+		}
+
+		e.manifestBytes = b
+	})
+}
+
+func (e *manifestPluginArtifact) GetContentReader() (io.ReadCloser, error) {
+	e.marshal()
+
+	return io.NopCloser(bytes.NewReader(e.manifestBytes)), nil
+}
+
+func (e *manifestPluginArtifact) GetContentSize() (int64, error) {
+	e.marshal()
+
+	return int64(len(e.manifestBytes)), nil
+}
+
+func (e *Engine) contentReaderNormalizer(artifact pluginsdk.Artifact) (io.ReadCloser, error) {
+	partifact := artifact.GetProto()
+
+	if partifact.HasFile() {
+		content := partifact.GetFile()
+
+		pr, pw := io.Pipe()
+
+		p := htar.NewPacker(pw)
+
+		sourcefs := hfs.NewOS(content.GetSourcePath())
+
+		go func() {
+			f, err := hfs.Open(sourcefs)
+			if err != nil {
+				_ = pr.CloseWithError(err)
+
+				return
+			}
+			defer f.Close()
+
+			err = p.WriteFile(f, content.GetOutPath())
+			if err != nil {
+				_ = pr.CloseWithError(err)
+
+				return
+			}
+
+			_ = f.Close()
+			_ = pw.Close()
+		}()
+
+		return pr, nil
+	}
+
+	if partifact.HasRaw() {
+		content := partifact.GetRaw()
+
+		pr, pw := io.Pipe()
+
+		p := htar.NewPacker(pw)
+
+		mode := int64(os.ModePerm)
+		if content.GetX() {
+			mode |= 0111 // executable
+		}
+
+		go func() {
+			err := p.Write(bytes.NewReader(content.GetData()), &tar.Header{
+				Typeflag: tar.TypeReg,
+				Name:     content.GetPath(),
+				Size:     int64(len(content.GetData())),
+				Mode:     mode,
+			})
+			if err != nil {
+				_ = pr.CloseWithError(err)
+
+				return
+			}
+		}()
+
+		_ = pw.Close()
+
+		return pr, nil
+	}
+
+	return artifact.GetContentReader()
 }
 
 func (e *Engine) ClearCacheLocally(
@@ -236,9 +294,15 @@ func (e *Engine) ClearCacheLocally(
 	step, ctx := hstep.New(ctx, "Clearing...")
 	defer step.Done()
 
-	cachedir := hfs.At(e.Cache, ref.GetPackage(), e.targetDirName(ref), hashin)
+	if err := e.CacheLarge.Delete(ctx, ref, hashin, ""); err != nil {
+		return fmt.Errorf("fs: %w", err)
+	}
 
-	return cachedir.RemoveAll()
+	if err := e.CacheSmall.Delete(ctx, ref, hashin, ""); err != nil {
+		return fmt.Errorf("db: %w", err)
+	}
+
+	return nil
 }
 
 func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
@@ -261,56 +325,154 @@ func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarge
 
 	res, ok, err := e.resultFromLocalCacheInner(ctx, def, outputs, hashin)
 	if err != nil {
-		// if the file doesnt exist, thats not an error, just means the cache doesnt exist locally
 		if errors.Is(err, hfs.ErrNotExist) {
 			return nil, false, nil
 		}
-
 		return nil, false, err
 	}
 
 	return res, ok, nil
 }
 
-func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
-	dirfs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
+func (e *Engine) readAnyCache(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error) {
+	for _, c := range []LocalCache{e.CacheSmall, e.CacheLarge} {
+		r, err := c.Reader(ctx, ref, hashin, name)
+		if err != nil {
+			if errors.Is(err, LocalCacheNotFoundError) {
+				continue
+			}
 
-	manifest, manifestArtifact, err := hartifact.ManifestFromFS(dirfs)
+			return nil, err
+		}
+
+		return r, nil
+	}
+
+	return nil, LocalCacheNotFoundError
+}
+
+func (e *Engine) existsAnyCache(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, LocalCache, error) {
+	for _, c := range [...]LocalCache{e.CacheSmall, e.CacheLarge} {
+		exists, err := c.Exists(ctx, ref, hashin, name)
+		if err != nil {
+			return false, c, err
+		}
+
+		if exists {
+			return true, c, nil
+		}
+	}
+
+	return false, nil, nil
+}
+
+func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
+	r, err := e.readAnyCache(ctx, def.GetRef(), hashin, hartifact.ManifestName)
 	if err != nil {
-		return nil, false, fmt.Errorf("ManifestFromFS: %w", err)
+		if errors.Is(err, LocalCacheNotFoundError) {
+			return nil, false, nil
+		}
+
+		return nil, false, err
+	}
+	defer r.Close()
+
+	m, err := hartifact.DecodeManifest(r)
+	if err != nil {
+		return nil, false, err
 	}
 
 	artifacts := make([]hartifact.ManifestArtifact, 0, len(outputs))
 	for _, output := range outputs {
-		outputArtifacts := manifest.GetArtifacts(output)
+		outputArtifacts := m.GetArtifacts(output)
 
 		artifacts = append(artifacts, outputArtifacts...)
 	}
 
-	execArtifacts := make([]ExecuteResultArtifact, 0, len(artifacts))
+	execArtifacts := make([]*ResultArtifact, 0, len(artifacts))
 	for _, artifact := range artifacts {
-		if !hfs.Exists(dirfs.At(artifact.Name)) {
+		exists, cache, err := e.existsAnyCache(ctx, def.GetRef(), hashin, artifact.Name)
+		if err != nil {
+			return nil, false, err
+		}
+
+		if !exists {
 			return nil, false, nil
 		}
 
-		partifact, err := hartifact.ManifestArtifactToProto(artifact, dirfs.At(artifact.Name).Path())
-		if err != nil {
-			return nil, false, fmt.Errorf("ManifestArtifactToProto: %w", err)
-		}
-
-		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-			Hashout:  artifact.Hashout,
-			Artifact: partifact,
+		execArtifacts = append(execArtifacts, &ResultArtifact{
+			Hashout: artifact.Hashout,
+			Artifact: cachePluginArtifact{
+				group: artifact.Group,
+				name:  artifact.Name,
+				type_: pluginv1.Artifact_Type(artifact.Type),
+				cache: cache,
+			},
 		})
 	}
 
-	execArtifacts = append(execArtifacts, ExecuteResultArtifact{
-		Artifact: manifestArtifact,
+	execArtifacts = append(execArtifacts, &ResultArtifact{
+		Artifact: &manifestPluginArtifact{manifest: m},
 	})
 
 	return ExecuteResult{
 		Def:       def,
-		Hashin:    manifest.Hashin,
+		Hashin:    m.Hashin,
 		Artifacts: execArtifacts,
 	}.Sorted(), true, nil
+}
+
+type CacheLocallyArtifact struct {
+	Reader io.Reader
+	Size   int64
+	Type   pluginv1.Artifact_Type
+	Group  string
+	Name   string
+}
+
+func (e *Engine) cacheLocally(ctx context.Context, ref *pluginv1.TargetRef, hashin string, art CacheLocallyArtifact, hashout string) (*ResultArtifact, error) {
+	cache := e.CacheSmall
+	if art.Size > 100_000 {
+		cache = e.CacheLarge
+	}
+
+	var prefix string
+	switch art.Type {
+	case pluginv1.Artifact_TYPE_OUTPUT:
+		prefix = "out_"
+	case pluginv1.Artifact_TYPE_SUPPORT_FILE:
+		prefix = "support_"
+	case pluginv1.Artifact_TYPE_LOG:
+		prefix = "log_"
+	case pluginv1.Artifact_TYPE_OUTPUT_LIST_V1, pluginv1.Artifact_TYPE_MANIFEST_V1, pluginv1.Artifact_TYPE_UNSPECIFIED:
+		fallthrough
+	default:
+		return nil, fmt.Errorf("invalid artifact type: %s", art.Type)
+	}
+
+	dst, err := cache.Writer(ctx, ref, hashin, prefix+art.Name)
+	if err != nil {
+		return nil, err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, art.Reader)
+	if err != nil {
+		return nil, err
+	}
+
+	err = dst.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	return &ResultArtifact{
+		Hashout: hashout,
+		Artifact: cachePluginArtifact{
+			group: art.Group,
+			name:  prefix + art.Name,
+			type_: art.Type,
+			cache: cache,
+		},
+	}, nil
 }

@@ -9,8 +9,7 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/htypes"
-
-	"github.com/hephbuild/heph/internal/hfs"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
@@ -58,6 +57,7 @@ type ManifestArtifact struct {
 
 	Group       string
 	Name        string
+	Size        int64
 	Type        ManifestArtifactType
 	ContentType ManifestArtifactContentType
 	OutPath     string `json:",omitempty"` // set for file & raw
@@ -85,18 +85,13 @@ func (m Manifest) GetArtifacts(output string) []ManifestArtifact {
 	return a
 }
 
-func WriteManifest(node hfs.Node, m Manifest) (*pluginv1.Artifact, error) {
-	b, err := json.Marshal(m) //nolint:musttag
+func EncodeManifest(w io.Writer, m Manifest) error {
+	err := json.NewEncoder(w).Encode(m) //nolint:musttag
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	err = hfs.WriteFile(node.At(ManifestName), b)
-	if err != nil {
-		return nil, err
-	}
-
-	return newManifestArtifact(node), nil
+	return nil
 }
 
 func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
@@ -115,18 +110,7 @@ func NewManifestArtifact(m Manifest) (*pluginv1.Artifact, error) {
 	}.Build(), nil
 }
 
-func newManifestArtifact(node hfs.Node) *pluginv1.Artifact {
-	return pluginv1.Artifact_builder{
-		Name: htypes.Ptr(ManifestName),
-		Type: htypes.Ptr(pluginv1.Artifact_TYPE_MANIFEST_V1),
-		File: pluginv1.Artifact_ContentFile_builder{
-			SourcePath: htypes.Ptr(node.At(ManifestName).Path()),
-			OutPath:    htypes.Ptr(ManifestName),
-		}.Build(),
-	}.Build()
-}
-
-func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, error) {
+func ManifestFromArtifact(ctx context.Context, a pluginsdk.Artifact) (Manifest, error) {
 	r, err := FileReader(ctx, a)
 	if err != nil {
 		return Manifest{}, err
@@ -134,21 +118,6 @@ func ManifestFromArtifact(ctx context.Context, a *pluginv1.Artifact) (Manifest, 
 	defer r.Close()
 
 	return DecodeManifest(r)
-}
-
-func ManifestFromFS(node hfs.Node) (Manifest, *pluginv1.Artifact, error) {
-	f, err := hfs.Open(node.At(ManifestName))
-	if err != nil {
-		return Manifest{}, nil, err
-	}
-	defer f.Close()
-
-	m, err := DecodeManifest(f)
-	if err != nil {
-		return Manifest{}, nil, err
-	}
-
-	return m, newManifestArtifact(node), nil
 }
 
 func DecodeManifest(r io.Reader) (Manifest, error) {
@@ -161,8 +130,10 @@ func DecodeManifest(r io.Reader) (Manifest, error) {
 	return manifest, nil
 }
 
-func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, error) {
-	switch a.WhichContent() {
+func ManifestContentType(a pluginsdk.Artifact) (ManifestArtifactContentType, error) {
+	ap := a.GetProto()
+
+	switch ap.WhichContent() {
 	case pluginv1.Artifact_TargzPath_case:
 		return ManifestArtifactContentTypeTarGz, nil
 	case pluginv1.Artifact_TarPath_case:
@@ -174,31 +145,39 @@ func ManifestContentType(a *pluginv1.Artifact) (ManifestArtifactContentType, err
 	default:
 	}
 
-	return "", fmt.Errorf("unsupported content %v", a.WhichContent().String())
+	return "", fmt.Errorf("unsupported content %v", ap.WhichContent().String())
 }
 
-func ProtoArtifactToManifest(hashout string, artifact *pluginv1.Artifact) (ManifestArtifact, error) {
-	contentType, err := ManifestContentType(artifact)
+func ProtoArtifactToManifest(hashout string, a pluginsdk.Artifact) (ManifestArtifact, error) {
+	contentType, err := ManifestContentType(a)
 	if err != nil {
 		return ManifestArtifact{}, err
 	}
 
+	ap := a.GetProto()
+
 	var outPath string
 	var x bool
-	switch artifact.WhichContent() { //nolint:exhaustive
+	switch ap.WhichContent() { //nolint:exhaustive
 	case pluginv1.Artifact_File_case:
-		outPath = artifact.GetFile().GetOutPath()
-		x = artifact.GetFile().GetX()
+		outPath = ap.GetFile().GetOutPath()
+		x = ap.GetFile().GetX()
 	case pluginv1.Artifact_Raw_case:
-		outPath = artifact.GetRaw().GetPath()
-		x = artifact.GetRaw().GetX()
+		outPath = ap.GetRaw().GetPath()
+		x = ap.GetRaw().GetX()
+	}
+
+	size, err := a.GetContentSize()
+	if err != nil {
+		return ManifestArtifact{}, err
 	}
 
 	return ManifestArtifact{
 		Hashout:     hashout,
-		Group:       artifact.GetGroup(),
-		Name:        artifact.GetName(),
-		Type:        ManifestArtifactType(artifact.GetType()),
+		Group:       ap.GetGroup(),
+		Name:        ap.GetName(),
+		Size:        size,
+		Type:        ManifestArtifactType(ap.GetType()),
 		ContentType: contentType,
 		OutPath:     outPath,
 		X:           x,
