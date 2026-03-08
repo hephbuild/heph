@@ -94,6 +94,11 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 		})
 	}
 
+	err := g.Wait()
+	if err != nil {
+		return err
+	}
+
 	key := e.remoteCacheKey(ref, hashin, hartifact.ManifestName)
 
 	pr, pw := io.Pipe()
@@ -108,7 +113,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 		}
 	}()
 
-	err := cache.Client.Store(ctx, key, pr)
+	err = cache.Client.Store(ctx, key, pr)
 	if err != nil {
 		return err
 	}

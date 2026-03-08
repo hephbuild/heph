@@ -3,7 +3,6 @@ package pluginexec
 import (
 	"context"
 	"fmt"
-	"maps"
 	"slices"
 	"strings"
 
@@ -11,7 +10,6 @@ import (
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
-	"github.com/hephbuild/heph/internal/hslices"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -189,51 +187,32 @@ func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S)
 	return def, nil
 }
 
-var targetProtoName = string((&execv1.Target{}).ProtoReflect().Descriptor().Name())
+var targetProtoName = string((&execv1.Target{}).ProtoReflect().Descriptor().FullName())
 
 func hashTarget(target *execv1.Target) []byte {
-	omit := tref.OmitHashPb
-	var cloned bool
-	clonedOnce := func() {
-		if !cloned {
-			cloned = true
-			omit = maps.Clone(omit)
-		}
-	}
+	omit := hmaps.Concat(tref.OmitHashPb, map[string]struct{}{
+		targetProtoName + ".env":  {},
+		targetProtoName + ".deps": {},
+	})
 	h := xxh3.New()
-
-	if hmaps.Has(target.GetEnv(), func(s string, env *execv1.Target_Env) bool {
-		return !env.GetHash()
-	}) {
-		clonedOnce()
-		omit[targetProtoName+".env"] = struct{}{}
-
-		for k, v := range hmaps.Sorted(target.GetEnv()) {
-			if !v.GetHash() {
-				continue
-			}
-
-			_, _ = h.WriteString(k)
-			hashpb.Hash(h, v, omit)
-		}
-	}
-
-	if hslices.Has(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
-		return !dep.GetHash()
-	}) {
-		clonedOnce()
-		omit[targetProtoName+".deps"] = struct{}{}
-
-		for _, v := range target.GetDeps() {
-			if !v.GetHash() {
-				continue
-			}
-
-			hashpb.Hash(h, v, omit)
-		}
-	}
-
 	hashpb.Hash(h, target, omit)
+
+	for k, v := range hmaps.Sorted(target.GetEnv()) {
+		if !v.GetHash() {
+			continue
+		}
+
+		_, _ = h.WriteString(k)
+		hashpb.Hash(h, v, omit)
+	}
+
+	for _, v := range target.GetDeps() {
+		if !v.GetHash() {
+			continue
+		}
+
+		hashpb.Hash(h, v, omit)
+	}
 
 	return h.Sum(nil)
 }

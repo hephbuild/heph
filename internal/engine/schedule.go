@@ -450,7 +450,7 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 
 	m := ResultMeta{
 		Hashin:    manifest.Hashin,
-		CreatedAt: manifest.CreatedAt,
+		CreatedAt: manifest.CreatedAt.UTC(),
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {

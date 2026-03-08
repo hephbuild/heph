@@ -71,7 +71,7 @@ func parseConfig(ctx context.Context, ref *pluginv1.TargetRef, config map[string
 }
 
 var omitHashPb = hmaps.Concat(map[string]struct{}{
-	string((&nixv1.Target{}).ProtoReflect().Descriptor().Name()) + ".target": {},
+	string((&nixv1.Target{}).ProtoReflect().Descriptor().FullName()) + ".target": {},
 }, tref.OmitHashPb)
 
 func hashTarget(nixTarget *nixv1.Target, execTargetHash []byte) []byte {

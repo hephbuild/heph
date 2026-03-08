@@ -276,10 +276,10 @@ func TestDepsCacheRemote(t *testing.T) {
 	cache := pluginsdk.NewMockCache(c)
 
 	cache.EXPECT().
-		Get(gomock.Any(), "__child/e5d50f4b478a3687/manifest.v1.json").
+		Get(gomock.Any(), "__child/16f2c56460420e9a/manifest.v1.json").
 		Return(nil, pluginsdk.ErrNotFound).Times(1)
 
-	for _, key := range []string{"__child/e5d50f4b478a3687/manifest.v1.json", "__child/e5d50f4b478a3687/out_out.tar"} {
+	for _, key := range []string{"__child/16f2c56460420e9a/manifest.v1.json", "__child/16f2c56460420e9a/out_out.tar"} {
 		cache.EXPECT().
 			Store(gomock.Any(), key, gomock.Any()).
 			DoAndReturn(func(ctx context.Context, key string, reader io.Reader) error {

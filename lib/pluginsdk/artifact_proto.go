@@ -147,6 +147,17 @@ func (a ProtoArtifact) GetContentType() (ArtifactContentType, error) {
 	}
 }
 
+func (a ProtoArtifact) GetName() string {
+	partifact := a.Artifact
+
+	switch partifact.WhichContent() {
+	case pluginv1.Artifact_File_case, pluginv1.Artifact_Raw_case:
+		return a.Artifact.GetName() + ".tar"
+	default:
+		return a.Artifact.GetName()
+	}
+}
+
 func (a ProtoArtifact) FSNode() hfs.Node {
 	partifact := a.Artifact
 
