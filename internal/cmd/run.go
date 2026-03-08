@@ -210,20 +210,8 @@ func init() {
 						for _, re := range res {
 							for _, output := range re.Artifacts {
 								fmt.Println(output.GetName())
-								fmt.Println("  group:    ", output.GetGroup())
-								//switch output.WhichContent() {
-								//case pluginv1.Artifact_File_case:
-								//	fmt.Println("  content:", output.GetFile())
-								//case pluginv1.Artifact_Raw_case:
-								//	fmt.Println("  content:", output.GetRaw())
-								//case pluginv1.Artifact_TarPath_case:
-								//	fmt.Println("  content:", output.GetTarPath())
-								//case pluginv1.Artifact_TargzPath_case:
-								//	fmt.Println("  content:", output.GetTargzPath())
-								//case pluginv1.Artifact_Content_not_set_case:
-								//	fmt.Println("  content: <not set>")
-								//}
-								fmt.Println("  type:     ", output.GetType().String())
+								fmt.Println("  group: ", output.GetGroup())
+								fmt.Println("  type:  ", output.GetType().String())
 							}
 						}
 					case hashOut:
@@ -266,7 +254,7 @@ func init() {
 	hcobra.AddLocalFlagSet(cmd, runFlagGroup)
 
 	outFlagGroup := hcobra.NewFlagSet("Output Flags")
-	//outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
+	outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
 	outFlagGroup.BoolVarP(&listOut, "list-out", "", false, "List output paths")
 	outFlagGroup.StringVarP(&copyOut, "copy-out", "", "", "Copy output to path")
 	outFlagGroup.BoolVarP(&catOut, "cat-out", "", false, "Print outputs to stdout")

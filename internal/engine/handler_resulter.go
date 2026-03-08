@@ -71,5 +71,4 @@ func (r *resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*
 		Artifacts: artifacts,
 		Def:       res.Def.TargetDef.TargetDef,
 	}, nil
-
 }

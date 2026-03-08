@@ -51,7 +51,7 @@ func TestSQLCache(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, exists)
 	_, err = cache.Reader(ctx, ref, hashin, "art2")
-	require.ErrorIs(t, err, engine.LocalCacheNotFoundError)
+	require.ErrorIs(t, err, engine.ErrLocalCacheNotFound)
 
 	// Test ListArtifacts
 	w, err = cache.Writer(ctx, ref, hashin, "art2")

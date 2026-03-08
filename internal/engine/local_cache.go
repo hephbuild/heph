@@ -25,7 +25,7 @@ import (
 	"github.com/zeebo/xxh3"
 )
 
-var LocalCacheNotFoundError = errors.New("artifact not found")
+var ErrLocalCacheNotFound = errors.New("artifact not found")
 
 type LocalCache interface {
 	Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error)
@@ -251,7 +251,7 @@ func (e *Engine) readAnyCache(ctx context.Context, ref *pluginv1.TargetRef, hash
 	for _, c := range [...]LocalCache{e.CacheSmall, e.CacheLarge} {
 		r, err := c.Reader(ctx, ref, hashin, name)
 		if err != nil {
-			if errors.Is(err, LocalCacheNotFoundError) {
+			if errors.Is(err, ErrLocalCacheNotFound) {
 				continue
 			}
 
@@ -261,7 +261,7 @@ func (e *Engine) readAnyCache(ctx context.Context, ref *pluginv1.TargetRef, hash
 		return r, nil
 	}
 
-	return nil, LocalCacheNotFoundError
+	return nil, ErrLocalCacheNotFound
 }
 
 func (e *Engine) existsAnyCache(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, LocalCache, error) {
@@ -282,7 +282,7 @@ func (e *Engine) existsAnyCache(ctx context.Context, ref *pluginv1.TargetRef, ha
 func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*Result, bool, error) {
 	r, err := e.readAnyCache(ctx, def.GetRef(), hashin, hartifact.ManifestName)
 	if err != nil {
-		if errors.Is(err, LocalCacheNotFoundError) {
+		if errors.Is(err, ErrLocalCacheNotFound) {
 			return nil, false, nil
 		}
 

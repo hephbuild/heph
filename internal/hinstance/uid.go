@@ -18,7 +18,7 @@ func gen() string {
 var UID = gen()
 
 func localgen() string {
-	return fmt.Sprintf("%v_%v_%v", os.Getpid(), time.Now().UnixNano())
+	return fmt.Sprintf("%v_%v", os.Getpid(), time.Now().UnixNano())
 }
 
 var LocalUID = localgen()

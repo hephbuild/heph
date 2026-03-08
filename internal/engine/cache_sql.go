@@ -21,23 +21,26 @@ import (
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
 	"modernc.org/sqlite"
-	_ "modernc.org/sqlite"
 )
 
 // SQLCacheDB holds the path and lazily opens both connection pools on first use.
 // Call Close only if the DB was actually used; it is safe to call regardless.
 type SQLCacheDB struct {
-	path string
-	once sync.Once
-	rdb  *sql.DB
-	wdb  *sql.DB
-	err  error
+	path       string
+	once       sync.Once
+	rdb        *sql.DB
+	wdb        *sql.DB
+	readerStmt *sql.Stmt
+	existsStmt *sql.Stmt
+	err        error
 }
 
 func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
+	ctx := context.Background()
+
 	s.once.Do(func() {
 		sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
-			_, err := conn.ExecContext(context.Background(), `
+			_, err := conn.ExecContext(ctx, `
 				PRAGMA journal_mode = WAL;
 				PRAGMA busy_timeout = 10000;
 				PRAGMA synchronous = NORMAL;
@@ -63,7 +66,7 @@ func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 		// One writer at a time — prevents SQLITE_BUSY.
 		wdb.SetMaxOpenConns(1)
 
-		if err := initSQLCacheDB(wdb); err != nil {
+		if err := initSQLCacheDB(ctx, wdb); err != nil {
 			_ = wdb.Close()
 			s.err = fmt.Errorf("OpenSQLCacheDB init: %w", err)
 			return
@@ -76,9 +79,34 @@ func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 			return
 		}
 		// No cap — WAL lets concurrent readers run in parallel.
+		rdb.SetMaxIdleConns(100)
+		rdb.SetMaxOpenConns(100)
+
+		readerStmt, err := rdb.Prepare(`
+			SELECT data
+			FROM cache_blobs
+			WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
+		`)
+		if err != nil {
+			_ = rdb.Close()
+			_ = wdb.Close()
+			s.err = fmt.Errorf("OpenSQLCacheDB prepare reader: %w", err)
+			return
+		}
+
+		existsStmt, err := rdb.Prepare(`SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`)
+		if err != nil {
+			_ = readerStmt.Close()
+			_ = rdb.Close()
+			_ = wdb.Close()
+			s.err = fmt.Errorf("OpenSQLCacheDB prepare exists: %w", err)
+			return
+		}
 
 		s.rdb = rdb
 		s.wdb = wdb
+		s.readerStmt = readerStmt
+		s.existsStmt = existsStmt
 	})
 	return s.rdb, s.wdb, s.err
 }
@@ -90,8 +118,16 @@ func (s *SQLCacheDB) Close() error {
 	}
 	errR := s.rdb.Close()
 	errW := s.wdb.Close()
+	errS := s.readerStmt.Close()
+	errE := s.existsStmt.Close()
 	if errR != nil {
 		return errR
+	}
+	if errS != nil {
+		return errS
+	}
+	if errE != nil {
+		return errE
 	}
 	return errW
 }
@@ -102,16 +138,17 @@ type SQLCache struct {
 	rpool hsync.Pool[[]byte]
 }
 
-func (c *SQLCache) rwdb(ctx context.Context) (rdb, wdb *sql.DB, err error) {
-	rdb, wdb, err = c.db.pools()
+func (c *SQLCache) rwdb(ctx context.Context) (*sql.DB, *sql.DB, error) {
+	rdb, wdb, err := c.db.pools()
 	if err != nil {
 		return nil, nil, fmt.Errorf("sqlcache open db: %w", err)
 	}
+
 	return rdb, wdb, nil
 }
 
 func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, error) {
-	rdb, _, err := c.rwdb(ctx)
+	_, _, err := c.rwdb(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -119,9 +156,8 @@ func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 	targetAddr := c.targetKey(ref)
 
 	var exists bool
-	err = rdb.QueryRowContext(
+	err = c.db.existsStmt.QueryRowContext(
 		ctx,
-		`SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`,
 		targetAddr, hashin, name,
 	).Scan(&exists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -161,8 +197,8 @@ func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 var _ LocalCache = (*SQLCache)(nil)
 
-func initSQLCacheDB(db *sql.DB) error {
-	_, err := db.Exec(`
+func initSQLCacheDB(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS cache_blobs (
 			target_addr   TEXT    NOT NULL,
 			hashin        TEXT    NOT NULL,
@@ -175,6 +211,7 @@ func initSQLCacheDB(db *sql.DB) error {
 		CREATE INDEX IF NOT EXISTS cache_blobs_target_hashin
 			ON cache_blobs (target_addr, hashin);
 	`)
+
 	return err
 }
 
@@ -222,20 +259,15 @@ func (c *SQLCache) targetKey(ref *pluginv1.TargetRef) string {
 }
 
 func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error) {
-	rdb, _, err := c.rwdb(ctx)
+	_, _, err := c.rwdb(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	targetAddr := c.targetKey(ref)
 
-	rows, err := rdb.QueryContext(
+	rows, err := c.db.readerStmt.QueryContext(
 		ctx,
-		`
-		SELECT data
-		FROM cache_blobs
-		WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
-		`,
 		targetAddr, hashin, name,
 	)
 	if err != nil {
@@ -247,7 +279,7 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 		if err := rows.Err(); err != nil {
 			return nil, fmt.Errorf("reader next: %w", err)
 		}
-		return nil, LocalCacheNotFoundError
+		return nil, ErrLocalCacheNotFound
 	}
 
 	var raw sql.RawBytes
