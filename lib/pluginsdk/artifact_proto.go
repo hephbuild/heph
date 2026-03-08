@@ -27,16 +27,15 @@ func (a ProtoArtifact) GetContentReader() (io.ReadCloser, error) {
 
 		pr, pw := io.Pipe()
 
-		sourcefs := hfs.NewOS(content.GetSourcePath())
-
 		go func() {
 			defer pw.Close()
 
 			tarPacker := htar.NewPacker(pw)
+			tarPacker.AllowAbsLink = true // TODO: This is wrong., but let's ignore for now...
 
-			f, err := hfs.Open(sourcefs)
+			f, err := hfs.Open(hfs.NewOS(content.GetSourcePath()))
 			if err != nil {
-				_ = pr.CloseWithError(err)
+				_ = pw.CloseWithError(err)
 
 				return
 			}
@@ -44,12 +43,10 @@ func (a ProtoArtifact) GetContentReader() (io.ReadCloser, error) {
 
 			err = tarPacker.WriteFile(f, content.GetOutPath())
 			if err != nil {
-				_ = pr.CloseWithError(err)
+				_ = pw.CloseWithError(err)
 
 				return
 			}
-
-			_ = f.Close()
 		}()
 
 		return pr, nil
@@ -75,7 +72,7 @@ func (a ProtoArtifact) GetContentReader() (io.ReadCloser, error) {
 				Mode:     mode,
 			})
 			if err != nil {
-				_ = pr.CloseWithError(err)
+				_ = pw.CloseWithError(err)
 
 				return
 			}

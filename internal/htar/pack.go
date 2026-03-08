@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -11,7 +12,8 @@ import (
 )
 
 type Packer struct {
-	tw *tar.Writer
+	tw           *tar.Writer
+	AllowAbsLink bool
 }
 
 func NewPacker(w io.Writer) *Packer {
@@ -25,7 +27,7 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 	}
 
 	var link string
-	if info.Mode().Type()&os.ModeSymlink != 0 {
+	if info.Mode().Type()&fs.ModeSymlink != 0 {
 		l, err := os.Readlink(f.Name())
 		if err != nil {
 			return err
@@ -33,7 +35,7 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 
 		link = l
 
-		if filepath.IsAbs(link) {
+		if !p.AllowAbsLink && filepath.IsAbs(link) {
 			return fmt.Errorf("absolute link not allowed: %v -> %v", f.Name(), link)
 		}
 	}
@@ -45,19 +47,7 @@ func (p *Packer) WriteFile(f hfs.File, path string) error {
 
 	hdr.Name = path
 
-	if err := p.tw.WriteHeader(hdr); err != nil {
-		return err
-	}
-
-	if !info.Mode().IsRegular() { // nothing more to do for non-regular
-		return nil
-	}
-
-	if _, err := io.Copy(p.tw, io.LimitReader(f, info.Size())); err != nil {
-		return err
-	}
-
-	return nil
+	return p.Write(f, hdr)
 }
 
 func (p *Packer) Write(r io.Reader, hdr *tar.Header) error {

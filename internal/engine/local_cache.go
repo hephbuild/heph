@@ -121,6 +121,8 @@ func (e *Engine) cacheLocally(
 		}
 
 		cacheArtifacts = append(cacheArtifacts, cacheArtifact)
+
+		_ = src.Close()
 	}
 
 	manifest, err := e.createLocalCacheManifest(ctx, def.GetRef(), hashin, cacheArtifacts)
@@ -347,7 +349,7 @@ type CacheLocallyArtifact struct {
 
 func (e *Engine) cacheArtifactLocally(ctx context.Context, ref *pluginv1.TargetRef, hashin string, art CacheLocallyArtifact, hashout string) (*ResultArtifact, error) {
 	cache := e.CacheSmall
-	if art.Size > 100_000 {
+	if art.Size > 100_000 { // 100kb
 		cache = e.CacheLarge
 	}
 
@@ -373,7 +375,7 @@ func (e *Engine) cacheArtifactLocally(ctx context.Context, ref *pluginv1.TargetR
 
 	_, err = io.Copy(dst, art.Reader)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("copy to local: %w", err)
 	}
 
 	err = dst.Close()

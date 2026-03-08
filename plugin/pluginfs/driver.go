@@ -153,7 +153,12 @@ func (p *Driver) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.
 		}.Build(), nil
 	}
 
-	exclude := []string{} // TODO: exclude home, cache, git etc...
+	// TODO: exclude home, cache, git etc...
+	exclude := []string{
+		".git/**/*",
+		".heph/**/*",
+		".heph2/**/*",
+	}
 	exclude = append(exclude, t.GetExclude()...)
 
 	var artifacts []*pluginv1.Artifact

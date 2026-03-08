@@ -153,14 +153,14 @@ func ArtifactsForId(inputs []*pluginsdk.ArtifactWithOrigin, id string, typ plugi
 
 var artifactId atomic.Int64
 
-func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, source *execv1.Target_Dep, node hfs.Node, filters []string, sourcemap map[string]string) (pluginsdk.Artifact, error) {
+func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, source *execv1.Target_Dep, workfs hfs.Node, filters []string, sourcemap map[string]string) (pluginsdk.Artifact, error) {
 	ctx, span := tracer.Start(ctx, "SetupSandboxArtifact")
 	defer span.End()
 
 	h := xxh3.New()
 	_, _ = fmt.Fprintf(h, "%d", artifactId.Add(1))
 
-	listf, err := hfs.Create(node.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
+	listf, err := hfs.Create(workfs.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
 	if err != nil {
 		return nil, fmt.Errorf("create list file: %w", err)
 	}
@@ -168,7 +168,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, sour
 
 	writeNl := false
 
-	err = hartifact.Unpack(ctx, artifact, node, hartifact.WithOnFile(func(to string) {
+	err = hartifact.Unpack(ctx, artifact, workfs, hartifact.WithOnFile(func(to string) {
 		if writeNl {
 			_, _ = listf.Write([]byte("\n"))
 		}
@@ -176,7 +176,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, sour
 		writeNl = true
 
 		if sourcemap != nil {
-			rel, err := filepath.Rel(node.Path(), to)
+			rel, err := filepath.Rel(workfs.Path(), to)
 			if err != nil {
 				panic(err)
 			}

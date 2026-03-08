@@ -76,7 +76,7 @@ func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, err
 
 			tr := tar.NewReader(r)
 
-			err = htar.Walk(tr, func(header *tar.Header, reader *tar.Reader) error {
+			err = htar.Walk(tr, func(header *tar.Header, reader io.Reader) error {
 				if header.Typeflag != tar.TypeReg {
 					return nil
 				}

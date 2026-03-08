@@ -58,9 +58,8 @@ func TestSQLCache(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
 
-	artSeq := cache.ListArtifacts(ctx, ref, hashin, "")
 	var artifacts []string
-	for a, e := range artSeq {
+	for a, e := range cache.ListArtifacts(ctx, ref, hashin) {
 		require.NoError(t, e)
 		artifacts = append(artifacts, a)
 	}
@@ -71,9 +70,8 @@ func TestSQLCache(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
 
-	verSeq := cache.ListVersions(ctx, ref, "")
 	var versions []string
-	for v, e := range verSeq {
+	for v, e := range cache.ListVersions(ctx, ref) {
 		require.NoError(t, e)
 		versions = append(versions, v)
 	}

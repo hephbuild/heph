@@ -43,31 +43,44 @@ type config struct {
 type Matcher = func(hdr *tar.Header) bool
 
 func FileReader(ctx context.Context, r io.Reader, match Matcher) (io.Reader, error) {
-	tr := tar.NewReader(r)
+	pr, pw := io.Pipe()
 
-	var fileReader io.Reader
-	err := Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
-		if !match(hdr) {
-			return nil
+	go func() {
+		defer pw.Close()
+
+		tr := tar.NewReader(r)
+
+		var matched bool
+		err := Walk(tr, func(hdr *tar.Header, r io.Reader) error {
+			if !match(hdr) {
+				return nil
+			}
+
+			switch hdr.Typeflag {
+			case tar.TypeReg:
+				matched = true
+				_, err := io.Copy(pw, r)
+				if err != nil {
+					return err
+				}
+
+				return ErrStopWalk
+			default:
+				return fmt.Errorf("is not a file, is %v: %s", hdr.Typeflag, hdr.Name)
+			}
+		})
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
 		}
 
-		switch hdr.Typeflag {
-		case tar.TypeReg:
-			fileReader = r
-			return ErrStopWalk
-		default:
-			return fmt.Errorf("is not a file, is %v: %s", hdr.Typeflag, hdr.Name)
+		if !matched {
+			_ = pw.CloseWithError(errors.New("tar is empty"))
+			return
 		}
-	})
-	if err != nil {
-		return nil, err
-	}
+	}()
 
-	if fileReader == nil {
-		return nil, errors.New("file not found")
-	}
-
-	return fileReader, nil
+	return pr, nil
 }
 
 func Unpack(ctx context.Context, r io.Reader, to hfs.Node, options ...Option) error {
@@ -86,7 +99,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.Node, options ...Option) er
 
 	tr := tar.NewReader(r)
 
-	return Walk(tr, func(hdr *tar.Header, r *tar.Reader) error {
+	return Walk(tr, func(hdr *tar.Header, r io.Reader) error {
 		if !cfg.filter(hdr.Name) {
 			return nil
 		}
@@ -134,7 +147,7 @@ func Unpack(ctx context.Context, r io.Reader, to hfs.Node, options ...Option) er
 	})
 }
 
-func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.Node, ro bool, onFile func(to string)) error {
+func unpackFile(hdr *tar.Header, tr io.Reader, to hfs.Node, ro bool, onFile func(to string)) error {
 	fileNode := to.At(hdr.Name)
 
 	info, err := fileNode.Lstat()
@@ -196,7 +209,7 @@ func unpackFile(hdr *tar.Header, tr *tar.Reader, to hfs.Node, ro bool, onFile fu
 
 var ErrStopWalk = errors.New("stop walk")
 
-func Walk(tr *tar.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
+func Walk(tr *tar.Reader, f func(*tar.Header, io.Reader) error) error {
 	for {
 		hdr, err := tr.Next()
 		if err != nil {
@@ -207,15 +220,13 @@ func Walk(tr *tar.Reader, fs ...func(*tar.Header, *tar.Reader) error) error {
 			return fmt.Errorf("walk: %w", err)
 		}
 
-		for _, f := range fs {
-			err = f(hdr, tr)
-			if err != nil {
-				if errors.Is(err, ErrStopWalk) {
-					return nil
-				}
-
-				return err
+		err = f(hdr, io.LimitReader(tr, hdr.Size))
+		if err != nil {
+			if errors.Is(err, ErrStopWalk) {
+				break
 			}
+
+			return err
 		}
 	}
 

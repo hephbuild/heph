@@ -852,7 +852,7 @@ func (r Result) Sorted() *Result {
 
 func (r Result) Clone() *Result {
 	return &Result{
-		Def:       r.Def.Clone(),
+		Def:       r.Def,
 		Hashin:    r.Hashin,
 		Artifacts: slices.Clone(r.Artifacts),
 		Manifest:  r.Manifest,
@@ -1305,7 +1305,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		if !shouldCollect {
-			break
+			continue
 		}
 
 		tarname := output.GetGroup() + ".tar"
@@ -1355,6 +1355,11 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		err = tar.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		err = tarf.Close()
 		if err != nil {
 			return nil, err
 		}

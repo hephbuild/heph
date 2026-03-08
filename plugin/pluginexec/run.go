@@ -436,6 +436,9 @@ func (p *Plugin[S]) inputEnv(ctx context.Context, inputs []*pluginsdk.ArtifactWi
 
 			for sc.Scan() {
 				line := sc.Text()
+				if line == "" {
+					continue
+				}
 
 				if _, ok := seenFiles[line]; ok {
 					continue

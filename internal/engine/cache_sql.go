@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
+	"github.com/hephbuild/heph/internal/hsync"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
@@ -22,6 +23,8 @@ import (
 
 type SQLCache struct {
 	db *sql.DB
+
+	pool hsync.Pool[[]byte]
 }
 
 func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, error) {
@@ -99,6 +102,11 @@ func OpenSQLCacheDB(path string) (*sql.DB, error) {
 		return nil, fmt.Errorf("OpenSQLCacheDB open: %w", err)
 	}
 
+	// SQLite supports only one concurrent writer. Capping the pool to a single
+	// connection serialises all access at the Go level and avoids SQLITE_BUSY
+	// races that busy_timeout alone cannot prevent across multiple pool conns.
+	db.SetMaxOpenConns(1)
+
 	if err := migrateSQLCacheDB(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("OpenSQLCacheDB migrate: %w", err)
@@ -110,6 +118,9 @@ func OpenSQLCacheDB(path string) (*sql.DB, error) {
 func NewSQLCache(db *sql.DB) *SQLCache {
 	return &SQLCache{
 		db: db,
+		pool: hsync.Pool[[]byte]{New: func() []byte {
+			return make([]byte, 100_000)
+		}},
 	}
 }
 
@@ -118,18 +129,18 @@ func NewSQLCache(db *sql.DB) *SQLCache {
 // a hash of the full ref is appended to disambiguate.
 func (c *SQLCache) targetAddr(ref *pluginv1.TargetRef) string {
 	if len(ref.GetArgs()) == 0 {
-		return "__" + ref.GetName()
+		return ref.GetName()
 	}
 
 	h := xxh3.New()
 	hashpb.Hash(h, ref, tref.OmitHashPb)
 
-	return "__" + ref.GetName() + "_" + hex.EncodeToString(h.Sum(nil))
+	return ref.GetName() + "@" + hex.EncodeToString(h.Sum(nil))
 }
 
 // targetKey returns the compound target address used as target_addr in the DB.
 func (c *SQLCache) targetKey(ref *pluginv1.TargetRef) string {
-	return ref.GetPackage() + "/" + c.targetAddr(ref)
+	return ref.GetPackage() + ":" + c.targetAddr(ref)
 }
 
 func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error) {
@@ -163,30 +174,6 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 	return io.NopCloser(bytes.NewReader(scanned)), nil
 }
 
-type sqlWriter struct {
-	pw     *io.PipeWriter
-	errC   chan error
-	closed bool
-}
-
-func (w *sqlWriter) Write(p []byte) (n int, err error) {
-	return w.pw.Write(p)
-}
-
-func (w *sqlWriter) Close() error {
-	if w.closed {
-		return nil
-	}
-	w.closed = true
-
-	err := w.pw.Close()
-	writeErr := <-w.errC
-	if writeErr != nil {
-		return writeErr
-	}
-	return err
-}
-
 func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name string, data io.Reader) error {
 	_, err := c.db.ExecContext(
 		ctx,
@@ -200,10 +187,12 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 		targetAddr, hashin, name, []byte{}, time.Now().UnixNano(),
 	)
 	if err != nil {
-		return fmt.Errorf("writeEntry upsert %w", err)
+		return fmt.Errorf("writeEntry upsert: %w", err)
 	}
 
-	buf := make([]byte, 32*1024) // 32KB chunks
+	buf := c.pool.Get()
+	defer c.pool.Put(buf)
+
 	for {
 		n, err := data.Read(buf)
 		if n > 0 {
@@ -213,40 +202,58 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 				WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
 			`, buf[:n], targetAddr, hashin, name)
 			if errAppend != nil {
-				return fmt.Errorf("writeEntry append chunk %w", errAppend)
+				return fmt.Errorf("writeEntry append chunk: %w", errAppend)
 			}
 		}
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("writeEntry read %w", err)
+			return fmt.Errorf("writeEntry read: %w", err)
 		}
 	}
 
 	return nil
 }
 
+type sqlCacheWriter struct {
+	pw   *io.PipeWriter
+	done <-chan error
+}
+
+func (w *sqlCacheWriter) Write(p []byte) (int, error) {
+	return w.pw.Write(p)
+}
+
+func (w *sqlCacheWriter) Close() error {
+	// Close the write end; this unblocks the goroutine's reader.
+	if err := w.pw.Close(); err != nil {
+		return err
+	}
+	// Wait for the goroutine to finish and return any write error.
+	return <-w.done
+}
+
 func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.WriteCloser, error) {
 	targetAddr := c.targetKey(ref)
 
 	pr, pw := io.Pipe()
-
-	errC := make(chan error, 1)
+	done := make(chan error, 1)
 
 	go func() {
 		defer pr.Close()
 		err := c.writeEntry(ctx, targetAddr, hashin, name, pr)
 		if err != nil {
-			err = fmt.Errorf("writer write: %q %q %q %w", tref.Format(ref), hashin, name, err)
+			wrappedErr := fmt.Errorf("writer write: %q %q %q %w", tref.Format(ref), hashin, name, err)
+			_ = pr.CloseWithError(wrappedErr)
+			done <- wrappedErr
+		} else {
+			done <- nil
 		}
-		errC <- err
+		close(done)
 	}()
 
-	return &sqlWriter{
-		pw:   pw,
-		errC: errC,
-	}, nil
+	return &sqlCacheWriter{pw: pw, done: done}, nil
 }
 
 func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {

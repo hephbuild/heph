@@ -150,7 +150,7 @@ func (e *Engine) query(ctx context.Context, rs *RequestState, matcher *pluginv1.
 		wg := hiter.NewGroup(ctx, yield)
 		for pkg, err := range e.Packages(ctx, matcher) {
 			if err != nil {
-				yield(nil, err)
+				wg.Yield(nil, err)
 				return
 			}
 

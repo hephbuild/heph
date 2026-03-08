@@ -195,7 +195,7 @@ func TestDepsCacheLarge(t *testing.T) {
 	}
 }
 
-func TestDepsCache2(t *testing.T) {
+func TestDepsCacheRemote(t *testing.T) {
 	ctx := t.Context()
 	c := gomock.NewController(t)
 

@@ -102,7 +102,7 @@ func (e *Engine) cacheRemotelyInner(ctx context.Context,
 		defer pw.Close()
 		err := hartifact.EncodeManifest(pw, manifest)
 		if err != nil {
-			pr.CloseWithError(err)
+			_ = pw.CloseWithError(err)
 
 			return
 		}
@@ -245,10 +245,6 @@ func (e *Engine) resultFromRemoteCacheInner(
 		g.Go(func(ctx context.Context) error {
 			r, err := cache.Client.Get(ctx, key)
 			if err != nil {
-				if errors.Is(err, pluginsdk.ErrCacheNotFound) {
-					return pluginsdk.ErrCacheNotFound
-				}
-
 				return err
 			}
 			defer r.Close()

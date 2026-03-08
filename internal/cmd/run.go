@@ -200,6 +200,10 @@ func init() {
 
 									_ = f.Close()
 								}
+
+								if stdout.Written && stdout.LastByte != '\n' {
+									_, _ = io.WriteString(stdout, "\n")
+								}
 							}
 						}
 					case listArtifacts:
@@ -262,7 +266,7 @@ func init() {
 	hcobra.AddLocalFlagSet(cmd, runFlagGroup)
 
 	outFlagGroup := hcobra.NewFlagSet("Output Flags")
-	outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
+	//outFlagGroup.BoolVarP(&listArtifacts, "list-artifacts", "", false, "List output artifacts")
 	outFlagGroup.BoolVarP(&listOut, "list-out", "", false, "List output paths")
 	outFlagGroup.StringVarP(&copyOut, "copy-out", "", "", "Copy output to path")
 	outFlagGroup.BoolVarP(&catOut, "cat-out", "", false, "Print outputs to stdout")

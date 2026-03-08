@@ -89,7 +89,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 		err = json.NewDecoder(f).Decode(&goPkg)
 		if err != nil {
-			return Package{}, fmt.Errorf("gopkg decode: %w", err)
+			return Package{}, fmt.Errorf("gopkg decode %q: %w", tref.Format(res.Def.GetRef()), err)
 		}
 	}
 
@@ -103,7 +103,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 
 		err = json.NewDecoder(f).Decode(&sourcemap)
 		if err != nil {
-			return Package{}, fmt.Errorf("sourcemap decode: %w", err)
+			return Package{}, fmt.Errorf("sourcemap decode: %q: %w", tref.Format(res.Def.GetRef()), err)
 		}
 	}
 
