@@ -82,7 +82,7 @@ func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 		rdb.SetMaxIdleConns(100)
 		rdb.SetMaxOpenConns(100)
 
-		readerStmt, err := rdb.Prepare(`
+		readerStmt, err := rdb.PrepareContext(ctx, `
 			SELECT data
 			FROM cache_blobs
 			WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
@@ -94,9 +94,9 @@ func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 			return
 		}
 
-		existsStmt, err := rdb.Prepare(`SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`)
+		existsStmt, err := rdb.PrepareContext(ctx, `SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`)
 		if err != nil {
-			_ = readerStmt.Close()
+			_ = readerStmt.Close() //nolint:sqlclosecheck
 			_ = rdb.Close()
 			_ = wdb.Close()
 			s.err = fmt.Errorf("OpenSQLCacheDB prepare exists: %w", err)
