@@ -69,6 +69,14 @@ type moduleCacheKey struct {
 	BasePkg   string
 }
 
+type goListPkgResultKey struct {
+	RequestId string
+	Factors   Factors
+	BasePkg   string
+	RunPkg    string
+	Imp       string
+}
+
 type Plugin struct {
 	goTool           string
 	resultClient     pluginsdk.Engine
@@ -79,6 +87,7 @@ type Plugin struct {
 	moduleCache      hsingleflight.GroupMem[moduleCacheKey, []Module]
 	stdCache         hsingleflight.GroupMem[stdCacheKey, map[string]Package]
 	goModGoWorkCache hsingleflight.GroupMemContext[string, goModRoot]
+	goListPkgCache   hsingleflight.GroupMemContext[goListPkgResultKey, Package]
 }
 
 func (p *Plugin) getGoToolStructpb() *structpb.Value {

@@ -200,35 +200,27 @@ func init() {
 
 									_ = f.Close()
 								}
+
+								if stdout.Written && stdout.LastByte != '\n' {
+									_, _ = io.WriteString(stdout, "\n")
+								}
 							}
 						}
 					case listArtifacts:
 						for _, re := range res {
 							for _, output := range re.Artifacts {
 								fmt.Println(output.GetName())
-								fmt.Println("  group:    ", output.GetGroup())
-								switch output.WhichContent() {
-								case pluginv1.Artifact_File_case:
-									fmt.Println("  content:", output.GetFile())
-								case pluginv1.Artifact_Raw_case:
-									fmt.Println("  content:", output.GetRaw())
-								case pluginv1.Artifact_TarPath_case:
-									fmt.Println("  content:", output.GetTarPath())
-								case pluginv1.Artifact_TargzPath_case:
-									fmt.Println("  content:", output.GetTargzPath())
-								case pluginv1.Artifact_Content_not_set_case:
-									fmt.Println("  content: <not set>")
-								}
-								fmt.Println("  type:     ", output.GetType().String())
+								fmt.Println("  group: ", output.GetGroup())
+								fmt.Println("  type:  ", output.GetType().String())
 							}
 						}
 					case hashOut:
 						for _, re := range res {
 							for _, output := range re.Artifacts {
 								if output.GetGroup() == "" {
-									fmt.Println(output.Hashout)
+									fmt.Println(output.GetHashout())
 								} else {
-									fmt.Println(output.GetGroup(), output.Hashout)
+									fmt.Println(output.GetGroup(), output.GetHashout())
 								}
 							}
 						}

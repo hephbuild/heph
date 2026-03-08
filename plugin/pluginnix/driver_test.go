@@ -7,6 +7,7 @@ import (
 
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/stretchr/testify/assert"
@@ -64,10 +65,12 @@ func TestSanity(t *testing.T) {
 	}
 
 	{
-		res, err := p.Run(ctx, pluginv1.RunRequest_builder{
-			Target:      def,
-			SandboxPath: htypes.Ptr(sandboxPath),
-		}.Build())
+		res, err := p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target:      def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+			}.Build(),
+		})
 		require.NoError(t, err)
 
 		assert.Len(t, res.GetArtifacts(), 1)
@@ -108,10 +111,12 @@ func TestToolSanity(t *testing.T) {
 	}
 
 	{
-		res, err := p.Run(ctx, pluginv1.RunRequest_builder{
-			Target:      def,
-			SandboxPath: htypes.Ptr(sandboxPath),
-		}.Build())
+		res, err := p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target:      def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+			}.Build(),
+		})
 		require.NoError(t, err)
 
 		assert.Len(t, res.GetArtifacts(), 1)

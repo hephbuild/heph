@@ -33,108 +33,117 @@ import (
 
 var errNoGoFiles = errors.New("no Go files in package")
 
-func (p *Plugin) goListPkg(ctx context.Context, pkg string, factors Factors, imp, requestId string) ([]*pluginv1.Artifact, *pluginv1.TargetRef, error) {
-	res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
-		RequestId: htypes.Ptr(requestId),
-		Ref: tref.New(pkg, "_golist", hmaps.Concat(factors.Args(), map[string]string{
-			"imp": imp,
-		})),
-	}.Build())
-	if err != nil {
-		return nil, nil, fmt.Errorf("golist: %v (in %v): %w", imp, pkg, err)
-	}
-
-	return res.GetArtifacts(), res.GetDef().GetRef(), nil
-}
-
 func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp string, factors Factors, requestId string) (Package, error) {
-	artifacts, _, err := p.goListPkg(ctx, runPkg, factors, imp, requestId)
+	key := goListPkgResultKey{
+		RequestId: requestId,
+		Factors:   factors,
+		BasePkg:   basePkg,
+		RunPkg:    runPkg,
+		Imp:       imp,
+	}
+
+	res, err, _ := p.goListPkgCache.Do(ctx, key, func(ctx context.Context) (Package, error) {
+		res, err := p.resultClient.ResultClient.Get(ctx, corev1.ResultRequest_builder{
+			RequestId: htypes.Ptr(requestId),
+			Ref: tref.New(runPkg, "_golist", hmaps.Concat(factors.Args(), map[string]string{
+				"imp": imp,
+			})),
+		}.Build())
+		if err != nil {
+			return Package{}, fmt.Errorf("golist: %v (in %v): %w", imp, runPkg, err)
+		}
+		defer res.Release()
+
+		artifacts := res.Artifacts
+
+		jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
+		rootArtifacts := hartifact.FindOutputs(artifacts, "root")
+		smArtifacts := hartifact.FindOutputs(artifacts, "sm")
+		nogoArtifacts := hartifact.FindOutputs(artifacts, "nogo")
+
+		if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 || len(smArtifacts) == 0 || len(nogoArtifacts) == 0 {
+			return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no json found"))
+		}
+
+		jsonArtifact := jsonArtifacts[0]
+		rootArtifact := rootArtifacts[0]
+		smArtifact := smArtifacts[0]
+		nogoArtifact := nogoArtifacts[0]
+
+		{
+			b, err := hartifact.FileReadAll(ctx, nogoArtifact)
+			if err != nil {
+				return Package{}, err
+			}
+
+			if ok, _ := strconv.ParseBool(strings.TrimSpace(string(b))); ok {
+				return Package{}, errNoGoFiles
+			}
+		}
+
+		rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
+		if err != nil {
+			return Package{}, fmt.Errorf("root artifact: %w", err)
+		}
+
+		root := strings.TrimSpace(string(rootb))
+
+		var goPkg Package
+		{
+			f, err := hartifact.FileReader(ctx, jsonArtifact)
+			if err != nil {
+				return Package{}, err
+			}
+			defer f.Close()
+
+			err = json.NewDecoder(f).Decode(&goPkg)
+			if err != nil {
+				return Package{}, fmt.Errorf("gopkg decode %q: %w", tref.Format(res.Def.GetRef()), err)
+			}
+		}
+
+		var sourcemap map[string]string
+		{
+			f, err := hartifact.FileReader(ctx, smArtifact)
+			if err != nil {
+				return Package{}, err
+			}
+			defer f.Close()
+
+			err = json.NewDecoder(f).Decode(&sourcemap)
+			if err != nil {
+				return Package{}, fmt.Errorf("sourcemap decode: %q: %w", tref.Format(res.Def.GetRef()), err)
+			}
+		}
+
+		goPkg.Sourcemap = sourcemap
+
+		relPkg, err := tref.DirToPackage(goPkg.Dir, root)
+		if err != nil {
+			goPkg.Is3rdParty = true
+
+			if goPkg.Module == nil {
+				return Package{}, fmt.Errorf("%v: not in a module", imp)
+			}
+
+			modPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
+			modPath = strings.TrimPrefix(modPath, "/")
+
+			goPkg.HephPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+			goPkg.HephBuildPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
+		} else {
+			goPkg.Dir = filepath.Join(p.root, relPkg)
+			goPkg.HephPackage = relPkg
+		}
+		goPkg.Factors = factors
+
+		return goPkg, nil
+	})
 	if err != nil {
-		return Package{}, fmt.Errorf("go list: %w", err)
+		return Package{}, err
 	}
 
-	jsonArtifacts := hartifact.FindOutputs(artifacts, "json")
-	rootArtifacts := hartifact.FindOutputs(artifacts, "root")
-	smArtifacts := hartifact.FindOutputs(artifacts, "sm")
-	nogoArtifacts := hartifact.FindOutputs(artifacts, "nogo")
-
-	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 || len(smArtifacts) == 0 || len(nogoArtifacts) == 0 {
-		return Package{}, connect.NewError(connect.CodeInternal, errors.New("golist: no json found"))
-	}
-
-	jsonArtifact := jsonArtifacts[0]
-	rootArtifact := rootArtifacts[0]
-	smArtifact := smArtifacts[0]
-	nogoArtifact := nogoArtifacts[0]
-
-	{
-		b, err := hartifact.FileReadAll(ctx, nogoArtifact)
-		if err != nil {
-			return Package{}, err
-		}
-
-		if ok, _ := strconv.ParseBool(strings.TrimSpace(string(b))); ok {
-			return Package{}, errNoGoFiles
-		}
-	}
-
-	rootb, err := hartifact.FileReadAll(ctx, rootArtifact)
-	if err != nil {
-		return Package{}, fmt.Errorf("root artifact: %w", err)
-	}
-
-	root := strings.TrimSpace(string(rootb))
-
-	var goPkg Package
-	{
-		f, err := hartifact.FileReader(ctx, jsonArtifact)
-		if err != nil {
-			return Package{}, err
-		}
-		defer f.Close()
-
-		err = json.NewDecoder(f).Decode(&goPkg)
-		if err != nil {
-			return Package{}, fmt.Errorf("gopkg decode: %w", err)
-		}
-	}
-
-	var sourcemap map[string]string
-	{
-		f, err := hartifact.FileReader(ctx, smArtifact)
-		if err != nil {
-			return Package{}, err
-		}
-		defer f.Close()
-
-		err = json.NewDecoder(f).Decode(&sourcemap)
-		if err != nil {
-			return Package{}, fmt.Errorf("sourcemap decode: %w", err)
-		}
-	}
-
-	goPkg.Sourcemap = sourcemap
-
-	relPkg, err := tref.DirToPackage(goPkg.Dir, root)
-	if err != nil {
-		goPkg.Is3rdParty = true
-
-		if goPkg.Module == nil {
-			return Package{}, fmt.Errorf("%v: not in a module", imp)
-		}
-
-		modPath := strings.ReplaceAll(goPkg.ImportPath, goPkg.Module.Path, "")
-		modPath = strings.TrimPrefix(modPath, "/")
-
-		goPkg.HephPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
-		goPkg.HephBuildPackage = ThirdpartyBuildPackage(basePkg, goPkg.Module.Path, goPkg.Module.Version, modPath)
-	} else {
-		goPkg.Dir = filepath.Join(p.root, relPkg)
-		goPkg.HephPackage = relPkg
-	}
-	goPkg.Factors = factors
-
-	return goPkg, nil
+	return res, nil
 }
 
 type GetGoPackageCache struct {
@@ -699,8 +708,10 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 		return nil, fmt.Errorf("gomod: %w", err)
 	}
 
-	jsonArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "json")
-	rootArtifacts := hartifact.FindOutputs(res.GetArtifacts(), "root")
+	defer res.Release()
+
+	jsonArtifacts := hartifact.FindOutputs(res.Artifacts, "json")
+	rootArtifacts := hartifact.FindOutputs(res.Artifacts, "root")
 
 	if len(jsonArtifacts) == 0 || len(rootArtifacts) == 0 {
 		return nil, connect.NewError(connect.CodeInternal, errors.New("gomodules: no output found"))

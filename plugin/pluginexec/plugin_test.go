@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/lib/hpipe"
@@ -67,10 +68,12 @@ func TestSanity(t *testing.T) {
 	}
 
 	{
-		res, err := p.Run(ctx, pluginv1.RunRequest_builder{
-			Target:      def,
-			SandboxPath: htypes.Ptr(sandboxPath),
-		}.Build())
+		res, err := p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target:      def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+			}.Build(),
+		})
 		require.NoError(t, err)
 
 		assert.Len(t, res.GetArtifacts(), 1)
@@ -110,17 +113,19 @@ func TestPipeStdout(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
-			Target: pluginv1.TargetDef_builder{
-				Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr("some/pkg"),
-					Name:    htypes.Ptr("target"),
+		_, err = p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target: pluginv1.TargetDef_builder{
+					Ref: pluginv1.TargetRef_builder{
+						Package: htypes.Ptr("some/pkg"),
+						Name:    htypes.Ptr("target"),
+					}.Build(),
+					Def: def,
 				}.Build(),
-				Def: def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+				Pipes:       []string{"", res.Msg.GetId(), ""},
 			}.Build(),
-			SandboxPath: htypes.Ptr(sandboxPath),
-			Pipes:       []string{"", res.Msg.GetId(), ""},
-		}.Build())
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -182,17 +187,19 @@ func TestPipeStdin(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
-			Target: pluginv1.TargetDef_builder{
-				Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr("some/pkg"),
-					Name:    htypes.Ptr("target"),
+		_, err = p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target: pluginv1.TargetDef_builder{
+					Ref: pluginv1.TargetRef_builder{
+						Package: htypes.Ptr("some/pkg"),
+						Name:    htypes.Ptr("target"),
+					}.Build(),
+					Def: def,
 				}.Build(),
-				Def: def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+				Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 			}.Build(),
-			SandboxPath: htypes.Ptr(sandboxPath),
-			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		}.Build())
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -266,17 +273,19 @@ func TestPipeStdinLargeAndSlow(t *testing.T) {
 	require.NoError(t, err)
 
 	go func() {
-		_, err = p.Run(ctx, pluginv1.RunRequest_builder{
-			Target: pluginv1.TargetDef_builder{
-				Ref: pluginv1.TargetRef_builder{
-					Package: htypes.Ptr("some/pkg"),
-					Name:    htypes.Ptr("target"),
+		_, err = p.Run(ctx, &pluginsdk.RunRequest{
+			RunRequest: pluginv1.RunRequest_builder{
+				Target: pluginv1.TargetDef_builder{
+					Ref: pluginv1.TargetRef_builder{
+						Package: htypes.Ptr("some/pkg"),
+						Name:    htypes.Ptr("target"),
+					}.Build(),
+					Def: def,
 				}.Build(),
-				Def: def,
+				SandboxPath: htypes.Ptr(sandboxPath),
+				Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
 			}.Build(),
-			SandboxPath: htypes.Ptr(sandboxPath),
-			Pipes:       []string{pipeIn.Msg.GetId(), pipeOut.Msg.GetId(), ""},
-		}.Build())
+		})
 		if err != nil {
 			panic(err)
 		}
@@ -336,17 +345,19 @@ func TestPipe404(t *testing.T) {
 		return err
 	})
 
-	_, err = p.Run(ctx, pluginv1.RunRequest_builder{
-		Target: pluginv1.TargetDef_builder{
-			Ref: pluginv1.TargetRef_builder{
-				Package: htypes.Ptr("some/pkg"),
-				Name:    htypes.Ptr("target"),
+	_, err = p.Run(ctx, &pluginsdk.RunRequest{
+		RunRequest: pluginv1.RunRequest_builder{
+			Target: pluginv1.TargetDef_builder{
+				Ref: pluginv1.TargetRef_builder{
+					Package: htypes.Ptr("some/pkg"),
+					Name:    htypes.Ptr("target"),
+				}.Build(),
+				Def: def,
 			}.Build(),
-			Def: def,
+			SandboxPath: htypes.Ptr(sandboxPath),
+			Pipes:       []string{"", res.Msg.GetId(), ""},
 		}.Build(),
-		SandboxPath: htypes.Ptr(sandboxPath),
-		Pipes:       []string{"", res.Msg.GetId(), ""},
-	}.Build())
+	})
 	require.NoError(t, err)
 
 	err = eg.Wait()

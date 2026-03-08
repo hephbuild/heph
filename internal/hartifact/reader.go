@@ -2,44 +2,26 @@ package hartifact
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"iter"
-	"os"
 
 	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/htar"
-
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 )
 
-// Reader gives a raw io.Reader of an artifact, useful for things like hashing.
-func Reader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch a.WhichContent() {
-	case pluginv1.Artifact_File_case:
-		return os.Open(a.GetFile().GetSourcePath())
-	case pluginv1.Artifact_Raw_case:
-		return io.NopCloser(bytes.NewReader(a.GetRaw().GetData())), nil
-	case pluginv1.Artifact_TargzPath_case:
-		return os.Open(a.GetTargzPath())
-	case pluginv1.Artifact_TarPath_case:
-		return os.Open(a.GetTarPath())
-	default:
-		return nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())
-	}
-}
-
 // FileReader Assumes the output has a single file, and provides a reader for it (no matter the packaging).
-func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error) {
-	switch a.WhichContent() {
-	case pluginv1.Artifact_File_case:
-		return os.Open(a.GetFile().GetSourcePath())
-	case pluginv1.Artifact_Raw_case:
-		return io.NopCloser(bytes.NewReader(a.GetRaw().GetData())), nil
-	case pluginv1.Artifact_TarPath_case:
-		r, err := Reader(ctx, a)
+func FileReader(ctx context.Context, a pluginsdk.Artifact) (io.ReadCloser, error) {
+	contentType, err := a.GetContentType()
+	if err != nil {
+		return nil, fmt.Errorf("get content type: %w", err)
+	}
+
+	switch contentType {
+	case pluginsdk.ArtifactContentTypeTar:
+		r, err := a.GetContentReader()
 		if err != nil {
 			return nil, err
 		}
@@ -52,14 +34,14 @@ func FileReader(ctx context.Context, a *pluginv1.Artifact) (io.ReadCloser, error
 		}
 
 		return hio.NewReadCloser(tr, r), nil
-	// case *pluginv1.Artifact_TargzPath:
+	// case pluginsdk.ArtifactContentTypeTarGz:
 	default:
-		return nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())
+		return nil, fmt.Errorf("unsupported encoding %v", contentType)
 	}
 }
 
 // FileReader Assumes the output has a single file, and provides the bytes for it (no matter the packaging).
-func FileReadAll(ctx context.Context, a *pluginv1.Artifact) ([]byte, error) {
+func FileReadAll(ctx context.Context, a pluginsdk.Artifact) ([]byte, error) {
 	f, err := FileReader(ctx, a)
 	if err != nil {
 		return nil, err
@@ -75,46 +57,26 @@ type File struct {
 }
 
 // FilesReader provides a reader for each file it (no matter the packaging).
-func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, error] {
+func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, error] {
 	return func(yield func(*File, error) bool) {
-		switch a.WhichContent() {
-		case pluginv1.Artifact_File_case:
-			f, err := os.Open(a.GetFile().GetSourcePath())
-			if err != nil {
-				if !yield(nil, err) {
-					return
-				}
-				return
-			}
+		contentType, err := a.GetContentType()
+		if err != nil {
+			yield(nil, fmt.Errorf("get content type: %w", err))
+			return
+		}
 
-			if !yield(&File{
-				ReadCloser: f,
-				Path:       a.GetFile().GetOutPath(),
-			}, nil) {
-				return
-			}
-		case pluginv1.Artifact_Raw_case:
-			f := io.NopCloser(bytes.NewReader(a.GetRaw().GetData()))
-
-			if !yield(&File{
-				ReadCloser: f,
-				Path:       a.GetRaw().GetPath(),
-			}, nil) {
-				return
-			}
-		case pluginv1.Artifact_TarPath_case:
-			r, err := Reader(ctx, a)
+		switch contentType {
+		case pluginsdk.ArtifactContentTypeTar:
+			r, err := a.GetContentReader()
 			if err != nil {
-				if !yield(nil, err) {
-					return
-				}
+				yield(nil, err)
 				return
 			}
 			defer r.Close()
 
 			tr := tar.NewReader(r)
 
-			err = htar.Walk(tr, func(header *tar.Header, reader *tar.Reader) error {
+			err = htar.Walk(tr, func(header *tar.Header, reader io.Reader) error {
 				if header.Typeflag != tar.TypeReg {
 					return nil
 				}
@@ -129,16 +91,15 @@ func FilesReader(ctx context.Context, a *pluginv1.Artifact) iter.Seq2[*File, err
 				return nil
 			})
 			if err != nil {
-				if !yield(nil, err) {
-					return
-				}
+				yield(nil, err)
 				return
 			}
-		// case *pluginv1.Artifact_TargzPath:
+
+			return
+		// case pluginsdk.Artifact_TargzPath:
 		default:
-			if !yield(nil, fmt.Errorf("unsupported encoding %v", a.WhichContent())) {
-				return
-			}
+			yield(nil, fmt.Errorf("unsupported encoding %v", contentType))
+			return
 		}
 	}
 }

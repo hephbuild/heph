@@ -193,6 +193,10 @@ func (e *Engine) resolveSpecQuery(ctx context.Context, rs *RequestState, ref *pl
 		deps = append(deps, structpb.NewStringValue(tref.Format(qref)))
 	}
 
+	slices.SortFunc(deps, func(a, b *structpb.Value) int {
+		return strings.Compare(a.GetStringValue(), b.GetStringValue())
+	})
+
 	return pluginv1.TargetSpec_builder{
 		Ref:    ref,
 		Driver: htypes.Ptr(plugingroup.Name),

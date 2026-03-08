@@ -6,7 +6,7 @@ import (
 )
 
 func processUniquePath(p string) string {
-	return p + "_tmp_" + hinstance.UID + "_" + hrand.Str(7)
+	return p + "_tmp_" + hinstance.LocalUID + "_" + hrand.Str(7)
 }
 
 type AtomicFile struct {

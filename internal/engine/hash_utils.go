@@ -25,7 +25,7 @@ func newHashWithDebug(w *xxh3.Hasher, name, hint string) hashWithDebug {
 	c, _ := debugCounter.GetOrSet(name, &atomic.Int32{})
 	id := c.Add(1)
 
-	path := filepath.Join("/tmp/hashdebug", hinstance.UID, name, fmt.Sprintf("%d_%s.txt", id, hint))
+	path := filepath.Join("/tmp/hashdebug", hinstance.LocalUID, name, fmt.Sprintf("%d_%s.txt", id, hint))
 
 	return hashWithDebug{Hasher: w, path: path}
 }

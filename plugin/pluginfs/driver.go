@@ -103,7 +103,7 @@ func (p *Driver) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*plugin
 	}.Build(), nil
 }
 
-func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p *Driver) Run(ctx context.Context, req *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	t := &fsv1.Target{}
 	err := req.GetTarget().GetDef().UnmarshalTo(t)
 	if err != nil {
@@ -153,7 +153,12 @@ func (p *Driver) Run(ctx context.Context, req *pluginv1.RunRequest) (*pluginv1.R
 		}.Build(), nil
 	}
 
-	exclude := []string{} // TODO: exclude home, cache, git etc...
+	// TODO: exclude home, cache, git etc...
+	exclude := []string{
+		".git/**/*",
+		".heph/**/*",
+		".heph2/**/*",
+	}
 	exclude = append(exclude, t.GetExclude()...)
 
 	var artifacts []*pluginv1.Artifact

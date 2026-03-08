@@ -18,10 +18,7 @@ message ResultRequest {
 }
 
 message ResultResponse {
-  repeated heph.plugin.v1.Artifact artifacts = 1;
-  heph.plugin.v1.TargetDef def = 2;
-}
-
-service ResultService {
-  rpc Get(ResultRequest) returns (ResultResponse) {}
+  string id = 1;
+  repeated heph.plugin.v1.Artifact artifacts = 2;
+  heph.plugin.v1.TargetDef def = 3;
 }

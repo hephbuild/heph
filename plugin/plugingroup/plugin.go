@@ -75,7 +75,7 @@ func (p Plugin) Parse(ctx context.Context, req *pluginv1.ParseRequest) (*pluginv
 	}.Build(), nil
 }
 
-func (p Plugin) Run(ctx context.Context, request *pluginv1.RunRequest) (*pluginv1.RunResponse, error) {
+func (p Plugin) Run(ctx context.Context, request *pluginsdk.RunRequest) (*pluginv1.RunResponse, error) {
 	panic("group: run should not be called") // custom handling in engine
 }
 

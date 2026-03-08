@@ -34,7 +34,7 @@ func (g *Group[K, V]) Go(f func(ctx context.Context, yield func(K, V) bool)) {
 			return errYieldExited
 		}
 
-		f(ctx, g.gyield)
+		f(ctx, g.Yield)
 
 		if g.yieldExited {
 			return errYieldExited
@@ -52,7 +52,7 @@ func (g *Group[K, V]) SetLimit(n int) {
 	g.wg.SetLimit(n)
 }
 
-func (g *Group[K, V]) gyield(k K, v V) bool {
+func (g *Group[K, V]) Yield(k K, v V) bool {
 	g.yieldmu.Lock()
 	defer g.yieldmu.Unlock()
 

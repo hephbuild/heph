@@ -90,6 +90,9 @@ type Engine struct {
 	Sandbox  hfs.OS
 	RootSpan trace.Span
 
+	CacheSmall LocalCache
+	CacheLarge LocalCache
+
 	WellKnownPackages []string // For testing, for now...
 
 	CoreHandle EngineHandle
@@ -130,6 +133,13 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		RootSpan: trace.SpanFromContext(ctx),
 		FSLock:   cfg.LockDriver == "fs",
 	}
+
+	db, err := OpenSQLCacheDB(filepath.Join(cachefs.Path(), "cache.db"))
+	if err != nil {
+		return nil, fmt.Errorf("open cache db: %w", err)
+	}
+	e.CacheSmall = NewSQLCache(db)
+	e.CacheLarge = NewFSCache(cachefs)
 
 	for _, s := range cfg.Packages.Exclude {
 		e.PackagesExclude = append(e.PackagesExclude, filepath.Join(root, s))
@@ -173,7 +183,6 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 	srvh.Mux.Handle(corev1connect.NewLogServiceHandler(hlog.NewLoggerHandler(hlog.From(ctx))))
 	srvh.Mux.Handle(corev1connect.NewStepServiceHandler(hstep.NewHandler(hstep.HandlerFromContext(ctx)), handlerOpts...))
-	srvh.Mux.Handle(corev1connect.NewResultServiceHandler(e.ResultHandler(), handlerOpts...))
 
 	e.CoreHandle = EngineHandle{
 		ServerHandle: srvh,
@@ -181,7 +190,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 			return pluginsdk.Engine{
 				LogClient:    corev1connect.NewLogServiceClient(srvh.HTTPClient(), srvh.GetBaseURL()),
 				StepClient:   corev1connect.NewStepServiceClient(srvh.HTTPClient(), srvh.GetBaseURL(), clientOpts...),
-				ResultClient: e.Resulter(),
+				ResultClient: pluginsdk.Resulter{Engine: e.Resulter()},
 			}
 		},
 	}

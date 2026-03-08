@@ -63,8 +63,9 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 	if err != nil {
 		return nil, err
 	}
+	defer res.Release()
 
-	artifacts := hartifact.FindOutputs(res.GetArtifacts(), "")
+	artifacts := hartifact.FindOutputs(res.Artifacts, "")
 
 	r, err := hartifact.FileReader(ctx, artifacts[0])
 	if err != nil {

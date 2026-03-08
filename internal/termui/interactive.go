@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/hephbuild/heph/internal/hsoftcontext"
 	"github.com/hephbuild/heph/internal/htime"
 
@@ -125,12 +126,13 @@ func (m Model) View() tea.View {
 		failed = fmt.Sprintf(" Failed jobs: %-6d", m.stepsState.failed)
 	}
 
-	sb.WriteString(fmt.Sprintf(
+	_, _ = fmt.Fprintf(
+		&sb,
 		"Total jobs: %-6d Completed jobs: %-6d%v Total time: %v\n",
 		m.stepsState.total, m.stepsState.completed,
 		failed,
 		htime.FormatFixedWidthDuration(time.Since(m.startedAt)),
-	))
+	)
 
 	if !m.finalRendering {
 		sb.WriteString(strings.Repeat("-", m.width))
@@ -139,7 +141,7 @@ func (m Model) View() tea.View {
 		buildStepsTree(m.stepsState.steps, m.stepsState.leafs, &sb, m.width, (m.height-2)/2)
 	}
 
-	return tea.NewView(sb.String())
+	return tea.NewView(lipgloss.NewStyle().MaxWidth(m.width).Render(sb.String()))
 }
 
 func NewStepsStore(ctx context.Context, p *tea.Program) (func(*corev1.Step), func()) {

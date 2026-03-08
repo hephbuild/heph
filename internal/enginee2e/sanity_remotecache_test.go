@@ -3,6 +3,7 @@ package enginee2e
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"testing"
 
@@ -112,76 +113,76 @@ func TestSanityRemoteCache(t *testing.T) {
 
 	// Simulates 2 independent runs, with the same cache
 	for i := 1; i <= 2; i++ {
-		t.Log("RUN", i)
+		t.Run(fmt.Sprintf("run %v", i), func(t *testing.T) {
+			dir := t.TempDir()
 
-		dir := t.TempDir()
-
-		e, err := engine.New(ctx, dir, engine.Config{})
-		require.NoError(t, err)
-
-		_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
-		require.NoError(t, err)
-
-		_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
-		require.NoError(t, err)
-
-		_, err = e.RegisterCache("test", cache, true, true)
-		require.NoError(t, err)
-
-		{
-			rs, clean := e.NewRequestState()
-			defer clean()
-
-			res, err := e.Result(ctx, rs, pkg, "t1", []string{""})
-			require.NoError(t, err)
-			defer res.Unlock(ctx)
-
-			require.Len(t, res.Artifacts, 1)
-
-			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t1", nil), []string{""})
+			e, err := engine.New(ctx, dir, engine.Config{})
 			require.NoError(t, err)
 
-			assert.Equal(t, "e52c3f7fe43c3c02", manifest.Hashin)
-			assert.Equal(t, "d4fd9c2c4c50146f", manifest.Artifacts[0].Hashout)
-		}
-
-		{
-			rs, clean := e.NewRequestState()
-			defer clean()
-
-			res, err := e.Result(ctx, rs, pkg, "t2", []string{""})
-			require.NoError(t, err)
-			defer res.Unlock(ctx)
-
-			require.Len(t, res.Artifacts, 1)
-
-			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t2", nil), []string{""})
+			_, err = e.RegisterProvider(ctx, staticprovider, engine.RegisterProviderConfig{})
 			require.NoError(t, err)
 
-			assert.Equal(t, "7103b83d26040e7a", manifest.Hashin)
-			assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
-		}
-
-		{
-			rs, clean := e.NewRequestState()
-			defer clean()
-
-			res, err := e.Result(ctx, rs, pkg, "t3", []string{""})
-			require.NoError(t, err)
-			defer res.Unlock(ctx)
-
-			require.Len(t, res.Artifacts, 1)
-
-			manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t3", nil), []string{""})
+			_, err = e.RegisterDriver(ctx, pluginexec.NewSh(), nil)
 			require.NoError(t, err)
 
-			assert.Equal(t, "7a65fe455c8b6178", manifest.Hashin)
-			assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
-		}
+			_, err = e.RegisterCache("test", cache, true, true)
+			require.NoError(t, err)
 
-		assert.Len(t, cache.storeWrites, 6)
-		for k, c := range cache.storeWrites {
-			assert.Equalf(t, 1, c, "cache hit count for %v", k)
-		}
+			{
+				rs, clean := e.NewRequestState()
+				defer clean()
+
+				res, err := e.Result(ctx, rs, pkg, "t1", []string{""})
+				require.NoError(t, err)
+				defer res.Unlock(ctx)
+
+				require.Len(t, res.Artifacts, 1)
+
+				manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t1", nil), []string{""})
+				require.NoError(t, err)
+
+				assert.Equal(t, "9d12ac88089ebc06", manifest.Hashin)
+				assert.Equal(t, "d4fd9c2c4c50146f", manifest.Artifacts[0].Hashout)
+			}
+
+			{
+				rs, clean := e.NewRequestState()
+				defer clean()
+
+				res, err := e.Result(ctx, rs, pkg, "t2", []string{""})
+				require.NoError(t, err)
+				defer res.Unlock(ctx)
+
+				require.Len(t, res.Artifacts, 1)
+
+				manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t2", nil), []string{""})
+				require.NoError(t, err)
+
+				assert.Equal(t, "c4bc4a188996ffc8", manifest.Hashin)
+				assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
+			}
+
+			{
+				rs, clean := e.NewRequestState()
+				defer clean()
+
+				res, err := e.Result(ctx, rs, pkg, "t3", []string{""})
+				require.NoError(t, err)
+				defer res.Unlock(ctx)
+
+				require.Len(t, res.Artifacts, 1)
+
+				manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t3", nil), []string{""})
+				require.NoError(t, err)
+
+				assert.Equal(t, "7e2b9b570c832965", manifest.Hashin)
+				assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
+			}
+
+			assert.Len(t, cache.storeWrites, 6)
+			for k, c := range cache.storeWrites {
+				assert.Equalf(t, 1, c, "cache hit count for %v", k)
+			}
+		})
 	}
 }

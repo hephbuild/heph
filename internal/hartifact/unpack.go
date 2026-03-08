@@ -3,12 +3,11 @@ package hartifact
 import (
 	"context"
 	"fmt"
-	"io"
 
 	"github.com/hephbuild/heph/internal/htar"
+	"github.com/hephbuild/heph/lib/pluginsdk"
 
 	"github.com/hephbuild/heph/internal/hfs"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
 type unpackConfig struct {
@@ -30,7 +29,7 @@ func WithFilter(filter func(from string) bool) UnpackOption {
 	}
 }
 
-func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, options ...UnpackOption) error {
+func Unpack(ctx context.Context, artifact pluginsdk.Artifact, node hfs.Node, options ...UnpackOption) error {
 	var cfg unpackConfig
 	for _, option := range options {
 		option(&cfg)
@@ -44,74 +43,27 @@ func Unpack(ctx context.Context, artifact *pluginv1.Artifact, node hfs.Node, opt
 		}
 	}
 
-	r, err := Reader(ctx, artifact)
+	r, err := artifact.GetContentReader()
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	switch artifact.WhichContent() {
-	case pluginv1.Artifact_File_case:
-		if !cfg.filter(artifact.GetFile().GetOutPath()) {
-			return nil
-		}
+	contentType, err := artifact.GetContentType()
+	if err != nil {
+		return err
+	}
 
-		create := hfs.Create
-		if artifact.GetFile().GetX() {
-			create = hfs.CreateExec
-		}
-
-		f, err := create(node.At(artifact.GetFile().GetOutPath()))
-		if err != nil {
-			return fmt.Errorf("file: create: %w", err)
-		}
-		defer cfg.onFile(f.Name())
-		defer f.Close()
-
-		_, err = io.Copy(f, r)
-		if err != nil {
-			return err
-		}
-
-		err = hfs.CloseEnsureROFD(f)
-		if err != nil {
-			return err
-		}
-	case pluginv1.Artifact_Raw_case:
-		if !cfg.filter(artifact.GetRaw().GetPath()) {
-			return nil
-		}
-
-		create := hfs.Create
-		if artifact.GetRaw().GetX() {
-			create = hfs.CreateExec
-		}
-
-		f, err := create(node.At(artifact.GetRaw().GetPath()))
-		if err != nil {
-			return fmt.Errorf("raw: create: %w", err)
-		}
-		defer cfg.onFile(f.Name())
-		defer f.Close()
-
-		_, err = io.Copy(f, r)
-		if err != nil {
-			return err
-		}
-
-		err = hfs.CloseEnsureROFD(f)
-		if err != nil {
-			return err
-		}
-	case pluginv1.Artifact_TarPath_case:
+	switch contentType {
+	case pluginsdk.ArtifactContentTypeTar:
 		err = htar.Unpack(ctx, r, node, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
 		}
+
+		return nil
 	// case *pluginv1.Artifact_TargzPath:
 	default:
-		return fmt.Errorf("unsupported encoding %v", artifact.WhichContent())
+		return fmt.Errorf("unsupported encoding %v", contentType)
 	}
-
-	return nil
 }

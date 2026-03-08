@@ -23,7 +23,6 @@ import (
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hpanic"
-	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/internal/tmatch"
@@ -57,7 +56,9 @@ type ExecuteOptions struct {
 	shell       bool
 	force       bool
 	interactive bool
-	hashin      string
+	metaHashin  string
+	getCache    bool
+	storeCache  bool
 }
 
 type InteractiveExecOptions struct {
@@ -278,15 +279,9 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 	}
 
 	if onlyManifest {
-		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
-			return artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1
-		})
+		res.Artifacts = nil
 	} else {
-		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact ExecuteResultArtifact) bool {
-			if artifact.GetType() == pluginv1.Artifact_TYPE_MANIFEST_V1 {
-				return true
-			}
-
+		res.Artifacts = slices.DeleteFunc(res.Artifacts, func(artifact *ResultArtifact) bool {
 			if artifact.GetType() == pluginv1.Artifact_TYPE_SUPPORT_FILE {
 				return false
 			}
@@ -341,12 +336,12 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 				return err
 			}
 
-			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output ExecuteResultArtifact) bool {
+			res.Artifacts = slices.DeleteFunc(res.Artifacts, func(output *ResultArtifact) bool {
 				return output.GetType() != pluginv1.Artifact_TYPE_OUTPUT && output.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE
 			})
 
 			for _, artifact := range res.Artifacts {
-				if artifact.Hashout == "" {
+				if artifact.GetHashout() == "" {
 					return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), artifact.GetGroup())
 				}
 			}
@@ -451,19 +446,11 @@ func (e *Engine) ResultMetaFromDef(ctx context.Context, rs *RequestState, def *T
 	}
 	defer res.Unlock(ctx)
 
-	manifestArtifact, ok := res.FindManifest()
-	if !ok {
-		return ResultMeta{}, errors.New("no manifest")
-	}
-
-	manifest, err := hartifact.ManifestFromArtifact(ctx, manifestArtifact.Artifact)
-	if err != nil {
-		return ResultMeta{}, fmt.Errorf("manifest from artifact: %w", err)
-	}
+	manifest := res.Manifest
 
 	m := ResultMeta{
 		Hashin:    manifest.Hashin,
-		CreatedAt: manifest.CreatedAt,
+		CreatedAt: manifest.CreatedAt.UTC(),
 	}
 
 	if len(outputs) == 1 && outputs[0] == AllOutputs {
@@ -563,7 +550,7 @@ func (e *Engine) depsResultMetas(ctx context.Context, rs *RequestState, def *Lig
 
 const AllOutputs = "__all_outputs__"
 
-func (e *Engine) resultFromCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, hashin string) (*ExecuteResult, bool, error) {
+func (e *Engine) resultFromCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, outputs []string, hashin string) (*Result, bool, error) {
 	res, ok, err := e.ResultFromLocalCache(ctx, def, outputs, hashin)
 	if err != nil {
 		return nil, false, fmt.Errorf("result from local cache: %w", err)
@@ -624,14 +611,14 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 		}
 
 		res, ok, err := e.resultFromCache(ctx, rs, def, outputs, hashin)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
 
 		if ok {
 			return &ExecuteResultLocks{
-				ExecuteResult: res,
-				Locks:         locks,
+				Result: res,
+				Locks:  locks,
 			}, nil
 		}
 
@@ -649,29 +636,28 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			}
 			defer results.Unlock(ctx)
 
-			manifest := hartifact.Manifest{
+			manifest := &hartifact.Manifest{
 				Version:   "v1",
 				Target:    tref.Format(def.GetRef()),
 				CreatedAt: time.Now(),
 				Hashin:    hashin,
 			}
 
-			var artifacts []ExecuteResultArtifact
+			var artifacts []*ResultArtifact
 			var locks CacheLocks
 			for _, result := range results {
 				for _, artifact := range result.Artifacts {
-					gartifact := hproto.Clone(artifact.Artifact)
-					gartifact.ClearGroup() // TODO support output group
+					partifact := artifactGroupMap{Artifact: artifact, group: ""} // TODO support output group
 
-					artifacts = append(artifacts, ExecuteResultArtifact{
-						Hashout:  artifact.Hashout,
-						Artifact: gartifact,
-					})
-
-					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, gartifact)
+					martifact, err := hartifact.ProtoArtifactToManifest(artifact.GetHashout(), partifact)
 					if err != nil {
 						return nil, fmt.Errorf("proto artifact to manifest: %w", err)
 					}
+
+					artifacts = append(artifacts, &ResultArtifact{
+						Artifact: partifact,
+						Manifest: martifact,
+					})
 
 					manifest.Artifacts = append(manifest.Artifacts, martifact)
 
@@ -679,26 +665,17 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				}
 			}
 
-			martifact, err := hartifact.NewManifestArtifact(manifest)
-			if err != nil {
-				return nil, fmt.Errorf("new manifest artifact: %w", err)
-			}
-
-			artifacts = append(artifacts, ExecuteResultArtifact{
-				Artifact: martifact,
-			})
-
 			err = locks.RLock(ctx)
 			if err != nil {
 				return nil, err
 			}
 
 			return &ExecuteResultLocks{
-				ExecuteResult: ExecuteResult{
+				Result: Result{
 					Def:       def,
-					Executed:  true,
 					Hashin:    hashin,
 					Artifacts: artifacts,
+					Manifest:  manifest,
 				}.Sorted(),
 				Locks: &locks,
 			}, nil
@@ -713,52 +690,16 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			shell:       shouldShell,
 			force:       shouldForce,
 			interactive: tref.Equal(rs.Shell, def.GetRef()) || tref.Equal(rs.Interactive, def.GetRef()),
-			hashin:      hashin,
+			metaHashin:  hashin,
+			getCache:    getCache,
+			storeCache:  storeCache,
 		}
 
-		var res *ExecuteResult
-		if storeCache {
-			res, err = e.ExecuteAndCache(ctx, rs, def, execOptions)
-			if err != nil {
-				err = errors.Join(err, locks.Unlock())
+		res, err := e.executeAndCacheInner(ctx, rs, def, execOptions)
+		if err != nil {
+			err = errors.Join(err, locks.Unlock())
 
-				return nil, err
-			}
-		} else {
-			res, err = e.Execute(ctx, rs, def, execOptions)
-			if err != nil {
-				err = errors.Join(err, locks.Unlock())
-
-				return nil, err
-			}
-
-			m := hartifact.Manifest{
-				Version:   "v1",
-				Target:    tref.Format(def.GetRef()),
-				CreatedAt: time.Now(),
-				Hashin:    hashin,
-			}
-			for _, artifact := range res.Artifacts {
-				martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
-				if err != nil {
-					err = errors.Join(err, locks.Unlock())
-
-					return nil, err
-				}
-
-				m.Artifacts = append(m.Artifacts, martifact)
-			}
-
-			manifestArtifact, err := hartifact.NewManifestArtifact(m)
-			if err != nil {
-				err = errors.Join(err, locks.Unlock())
-
-				return nil, err
-			}
-
-			res.Artifacts = append(res.Artifacts, ExecuteResultArtifact{
-				Artifact: manifestArtifact,
-			})
+			return nil, err
 		}
 
 		err = locks.Lock2RLock(ctx)
@@ -769,8 +710,8 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 		}
 
 		return &ExecuteResultLocks{
-			ExecuteResult: res,
-			Locks:         locks,
+			Result: res,
+			Locks:  locks,
 		}, nil
 	})
 	if err != nil {
@@ -863,7 +804,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		artifacts := make([]DepMetaArtifact, 0, len(result.Artifacts))
 		for _, artifact := range result.Artifacts {
 			artifacts = append(artifacts, DepMetaArtifact{
-				Hashout: artifact.Hashout,
+				Hashout: artifact.GetHashout(),
 			})
 		}
 
@@ -881,32 +822,39 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 	return e.hashin2(ctx, def, metas, "res")
 }
 
-type ExecuteResultArtifact struct {
-	Hashout string
-	*pluginv1.Artifact
-}
-
 type ExecuteResult struct {
+	Def        *LightLinkedTarget
+	Hashin     string
+	Artifacts  []*ExecuteArtifact
+	AfterCache func()
+}
+
+type Result struct {
 	Def       *LightLinkedTarget
-	Executed  bool
 	Hashin    string
-	Artifacts []ExecuteResultArtifact
+	Artifacts []*ResultArtifact
+	Manifest  *hartifact.Manifest
 }
 
-func (r ExecuteResult) FindManifest() (ExecuteResultArtifact, bool) {
-	for _, artifact := range r.Artifacts {
-		if artifact.GetType() != pluginv1.Artifact_TYPE_MANIFEST_V1 {
-			continue
-		}
+func (r Result) Sorted() *Result {
+	slices.SortFunc(r.Artifacts, func(a, b *ResultArtifact) int {
+		return strings.Compare(a.GetHashout(), b.GetHashout())
+	})
 
-		return artifact, true
+	return &r
+}
+
+func (r Result) Clone() *Result {
+	return &Result{
+		Def:       r.Def,
+		Hashin:    r.Hashin,
+		Artifacts: slices.Clone(r.Artifacts),
+		Manifest:  r.Manifest,
 	}
-
-	return ExecuteResultArtifact{}, false
 }
 
-func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
-	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+func (r Result) FindOutputs(group string) []*ResultArtifact {
+	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
@@ -921,8 +869,8 @@ func (r ExecuteResult) FindOutputs(group string) []ExecuteResultArtifact {
 	return res
 }
 
-func (r ExecuteResult) FindSupport() []ExecuteResultArtifact {
-	res := make([]ExecuteResultArtifact, 0, len(r.Artifacts))
+func (r Result) FindSupport() []*ResultArtifact {
+	res := make([]*ResultArtifact, 0, len(r.Artifacts))
 	for _, artifact := range r.Artifacts {
 		if artifact.GetType() != pluginv1.Artifact_TYPE_SUPPORT_FILE {
 			continue
@@ -934,22 +882,37 @@ func (r ExecuteResult) FindSupport() []ExecuteResultArtifact {
 	return res
 }
 
+type ExecuteArtifact struct {
+	Hashout string
+	pluginsdk.Artifact
+}
+
+type ResultArtifact struct {
+	Manifest hartifact.ManifestArtifact
+
+	pluginsdk.Artifact
+}
+
+func (r ResultArtifact) GetHashout() string {
+	return r.Manifest.Hashout
+}
+
 type ExecuteResultLocks struct {
-	*ExecuteResult
+	*Result
 	Locks *CacheLocks
 }
 
 func (r *ExecuteResultLocks) Clone() *ExecuteResultLocks {
 	return &ExecuteResultLocks{
-		ExecuteResult: r.ExecuteResult.Clone(),
-		Locks:         r.Locks.Clone(),
+		Result: r.Result.Clone(),
+		Locks:  r.Locks.Clone(),
 	}
 }
 
 func (r *ExecuteResultLocks) CloneWithoutLocks() *ExecuteResultLocks {
 	return &ExecuteResultLocks{
-		ExecuteResult: r.ExecuteResult.Clone(),
-		Locks:         r.Locks,
+		Result: r.Result.Clone(),
+		Locks:  r.Locks,
 	}
 }
 
@@ -965,7 +928,7 @@ func (r *ExecuteResultLocks) Unlock(ctx context.Context) {
 }
 
 func (r ExecuteResult) Sorted() *ExecuteResult {
-	slices.SortFunc(r.Artifacts, func(a, b ExecuteResultArtifact) int {
+	slices.SortFunc(r.Artifacts, func(a, b *ExecuteArtifact) int {
 		return strings.Compare(a.Hashout, b.Hashout)
 	})
 
@@ -974,10 +937,10 @@ func (r ExecuteResult) Sorted() *ExecuteResult {
 
 func (r ExecuteResult) Clone() *ExecuteResult {
 	return &ExecuteResult{
-		Def:       r.Def.Clone(),
-		Executed:  r.Executed,
-		Hashin:    r.Hashin,
-		Artifacts: slices.Clone(r.Artifacts),
+		Def:        r.Def.Clone(),
+		Hashin:     r.Hashin,
+		Artifacts:  slices.Clone(r.Artifacts),
+		AfterCache: r.AfterCache,
 	}
 }
 
@@ -1157,7 +1120,9 @@ func (e *Engine) pickShellDriver(ctx context.Context, def *LightLinkedTarget) (p
 
 var sem = semaphore.NewWeighted(1000 * int64(runtime.GOMAXPROCS(-1)))
 
-func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*ExecuteResult, error) {
+func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinkedTarget, results DepsResults, options ExecuteOptions) (*ExecuteResult, error) {
+	hashin := options.metaHashin
+
 	ctx, span := tracer.Start(ctx, "Execute")
 	defer span.End()
 
@@ -1168,18 +1133,13 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 	})
 	defer cleanLabels()
 
-	results, err := e.depsResults(ctx, rs, def)
-	if err != nil {
-		return nil, fmt.Errorf("deps results: %w", err)
-	}
-	defer results.Unlock(ctx)
-
 	driver, ok := e.DriversByName[def.GetDriver()]
 	if !ok {
 		return nil, fmt.Errorf("driver not found: %v", def.GetDriver())
 	}
 
 	if options.shell {
+		var err error
 		driver, err = e.pickShellDriver(ctx, def)
 		if err != nil {
 			return nil, err
@@ -1194,30 +1154,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		targetfolder = fmt.Sprintf("__%v__%v", e.targetDirName(def.GetRef()), time.Now().UnixNano())
 	}
 
-	hashin, err := e.hashin(ctx, def, results)
-	if err != nil {
-		return nil, fmt.Errorf("hashin1: %w", err)
-	}
-
-	if hashin != options.hashin {
-		return nil, fmt.Errorf("results hashin (%v) != meta hashin (%v)", hashin, options.hashin)
-	}
-
-	if def.GetCache() && !options.force && !options.shell {
-		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), hashin)
-		if err != nil {
-			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
-		}
-
-		if ok {
-			step := hstep.From(ctx)
-			step.SetText(fmt.Sprintf("%v: cached", tref.Format(def.GetRef())))
-
-			return res, nil
-		}
-	}
-
-	err = sem.Acquire(ctx, 1)
+	err := sem.Acquire(ctx, 1)
 	if err != nil {
 		return nil, err
 	}
@@ -1252,13 +1189,31 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 	}
 
-	var inputs []*pluginv1.ArtifactWithOrigin
+	var inputLen int
+	for _, result := range results {
+		inputLen += len(result.Artifacts)
+	}
+
+	inputs := make([]*pluginv1.RunRequest_Input, 0, inputLen)
+	inputsSdk := make([]*pluginsdk.ArtifactWithOrigin, 0, inputLen)
 	for _, result := range results {
 		for _, artifact := range result.Artifacts {
-			inputs = append(inputs, pluginv1.ArtifactWithOrigin_builder{
-				Artifact: artifact.Artifact,
+			partifact := pluginv1.RunRequest_Input_Artifact_builder{
+				Group: htypes.Ptr(artifact.GetGroup()),
+				Name:  htypes.Ptr(artifact.GetName()),
+				Type:  htypes.Ptr(artifact.GetType()),
+				Id:    htypes.Ptr("TODO"), // to be implemented along with the pluginsdkconnect.ProtoArtifact
+			}.Build()
+
+			inputs = append(inputs, pluginv1.RunRequest_Input_builder{
+				Artifact: partifact,
 				Origin:   result.InputOrigin,
 			}.Build())
+
+			inputsSdk = append(inputsSdk, &pluginsdk.ArtifactWithOrigin{
+				Artifact: artifact.Artifact,
+				Origin:   result.InputOrigin,
+			})
 		}
 	}
 
@@ -1288,15 +1243,18 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}()
 
 			runRes, runErr = hpanic.RecoverV(func() (*pluginv1.RunResponse, error) {
-				return driver.Run(ctx, pluginv1.RunRequest_builder{
-					RequestId:    htypes.Ptr(rs.ID),
-					Target:       def.TargetDef.TargetDef,
-					SandboxPath:  htypes.Ptr(sandboxfs.Path()),
-					TreeRootPath: htypes.Ptr(e.Root.Path()),
-					Inputs:       inputs,
-					Pipes:        pipes,
-					Hashin:       htypes.Ptr(hashin),
-				}.Build())
+				return driver.Run(ctx, &pluginsdk.RunRequest{
+					RunRequest: pluginv1.RunRequest_builder{
+						RequestId:    htypes.Ptr(rs.ID),
+						Target:       def.TargetDef.TargetDef,
+						SandboxPath:  htypes.Ptr(sandboxfs.Path()),
+						TreeRootPath: htypes.Ptr(e.Root.Path()),
+						Inputs:       inputs,
+						Pipes:        pipes,
+						Hashin:       htypes.Ptr(hashin),
+					}.Build(),
+					Inputs: inputsSdk,
+				})
 			})
 		},
 		Pty: def.GetPty(),
@@ -1321,14 +1279,18 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 	if options.shell {
 		return &ExecuteResult{
-			Def:      def,
-			Hashin:   hashin,
-			Executed: true,
+			Def:    def,
+			Hashin: hashin,
+			AfterCache: func() {
+				err := sandboxfs.RemoveAll()
+				if err != nil {
+					hlog.From(ctx).Error(fmt.Sprintf("failed to remove sandboxfs: %v", err))
+				}
+			},
 		}, nil
 	}
 
-	cachefs := hfs.At(e.Cache, def.GetRef().GetPackage(), e.targetDirName(def.GetRef()), hashin)
-	execArtifacts := make([]ExecuteResultArtifact, 0, len(def.OutputNames()))
+	execArtifacts := make([]*ExecuteArtifact, 0, len(def.OutputNames()))
 
 	for _, output := range def.GetOutputs() {
 		shouldCollect := false
@@ -1340,11 +1302,11 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		if !shouldCollect {
-			break
+			continue
 		}
 
 		tarname := output.GetGroup() + ".tar"
-		tarf, err := hfs.Create(cachefs.At(tarname))
+		tarf, err := hfs.Create(sandboxfs.At("collect", tarname))
 		if err != nil {
 			return nil, err
 		}
@@ -1394,19 +1356,26 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, err
 		}
 
-		execArtifact := pluginv1.Artifact_builder{
-			Group:   htypes.Ptr(output.GetGroup()),
-			Name:    htypes.Ptr(tarname),
-			Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-			TarPath: proto.String(tarf.Name()),
-		}.Build()
+		err = tarf.Close()
+		if err != nil {
+			return nil, err
+		}
+
+		execArtifact := pluginsdk.ProtoArtifact{
+			Artifact: pluginv1.Artifact_builder{
+				Group:   htypes.Ptr(output.GetGroup()),
+				Name:    htypes.Ptr(tarname),
+				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+				TarPath: proto.String(tarf.Name()),
+			}.Build(),
+		}
 
 		hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
 		if err != nil {
 			return nil, err
 		}
 
-		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+		execArtifacts = append(execArtifacts, &ExecuteArtifact{
 			Hashout:  hashout,
 			Artifact: execArtifact,
 		})
@@ -1423,7 +1392,7 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 
 		if shouldCollect {
 			tarname := "support.tar"
-			tarf, err := hfs.Create(cachefs.At(tarname))
+			tarf, err := hfs.Create(sandboxfs.At("collect", tarname))
 			if err != nil {
 				return nil, err
 			}
@@ -1468,27 +1437,33 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 				return nil, err
 			}
 
-			execArtifact := pluginv1.Artifact_builder{
-				Name:    htypes.Ptr(tarname),
-				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
-				TarPath: proto.String(tarf.Name()),
-			}.Build()
+			execArtifact := pluginsdk.ProtoArtifact{
+				Artifact: pluginv1.Artifact_builder{
+					Name:    htypes.Ptr(tarname),
+					Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
+					TarPath: proto.String(tarf.Name()),
+				}.Build(),
+			}
 
 			hashout, err := e.hashout(ctx, def.GetRef(), execArtifact)
 			if err != nil {
 				return nil, err
 			}
 
-			execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+			execArtifacts = append(execArtifacts, &ExecuteArtifact{
 				Hashout:  hashout,
 				Artifact: execArtifact,
 			})
 		}
 	}
 
-	for _, artifact := range runRes.GetArtifacts() {
-		if artifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
+	for _, partifact := range runRes.GetArtifacts() {
+		if partifact.GetType() != pluginv1.Artifact_TYPE_OUTPUT {
 			continue
+		}
+
+		artifact := pluginsdk.ProtoArtifact{
+			Artifact: partifact,
 		}
 
 		hashout, err := e.hashout(ctx, def.GetRef(), artifact)
@@ -1496,62 +1471,131 @@ func (e *Engine) Execute(ctx context.Context, rs *RequestState, def *LightLinked
 			return nil, fmt.Errorf("hashout: %w", err)
 		}
 
-		execArtifacts = append(execArtifacts, ExecuteResultArtifact{
+		execArtifacts = append(execArtifacts, &ExecuteArtifact{
 			Hashout:  hashout,
 			Artifact: artifact,
 		})
-
-		// panic("copy to cache not implemented yet")
-
-		// TODO: copy to cache
-		// hfs.Copy()
-		//
-		// artifact.Uri
-		//
-		// execOutputs = append(execOutputs, ExecuteResultOutput{
-		//	Name:    artifact.Group,
-		//	Hashout: "",
-		//	TarPath: "",
-		// })
-	}
-
-	err = sandboxfs.RemoveAll()
-	if err != nil {
-		return nil, err
 	}
 
 	return ExecuteResult{
 		Hashin:    hashin,
 		Def:       def,
-		Executed:  true,
 		Artifacts: execArtifacts,
+		AfterCache: func() {
+			err := sandboxfs.RemoveAll()
+			if err != nil {
+				hlog.From(ctx).Error(fmt.Sprintf("failed to remove sandboxfs: %v", err))
+			}
+		},
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*ExecuteResult, error) {
-	res, err := e.Execute(ctx, rs, def, options)
+func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*Result, error) {
+	results, err := e.depsResults(ctx, rs, def)
+	if err != nil {
+		return nil, fmt.Errorf("deps results: %w", err)
+	}
+	defer results.Unlock(ctx)
+
+	hashin, err := e.hashin(ctx, def, results)
+	if err != nil {
+		return nil, fmt.Errorf("results hashin: %w", err)
+	}
+
+	if hashin != options.metaHashin {
+		return nil, fmt.Errorf("results hashin (%v) != meta hashin (%v)", hashin, options.metaHashin)
+	}
+
+	cacheHashin := hashin
+	if !options.storeCache {
+		cacheHashin = hinstance.UID + "_" + hashin
+	}
+
+	if options.storeCache {
+		// One last cache check after the deps have completed
+		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), cacheHashin)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
+		}
+
+		if ok {
+			return res, nil
+		}
+	}
+
+	res, err := e.execute(ctx, rs, def, results, options)
 	if err != nil {
 		return nil, fmt.Errorf("execute: %w", err)
 	}
 
-	var cachedArtifacts []ExecuteResultArtifact
-	if res.Executed {
-		artifacts, manifest, err := e.CacheLocally(ctx, def, res.Hashin, res.Artifacts)
-		if err != nil {
-			return nil, fmt.Errorf("cache locally: %w", err)
-		}
-
-		cachedArtifacts = artifacts
-
-		// TODO: move this to a background execution model , so that local build can proceed, while this is uploading in the background
-		e.CacheRemotely(ctx, def, res.Hashin, manifest, cachedArtifacts)
+	var artifactsToCache []*ExecuteArtifact
+	var artifactsToPassthrough []*ResultArtifact
+	if options.storeCache {
+		artifactsToCache = res.Artifacts
 	} else {
-		cachedArtifacts = res.Artifacts
+		// this caters for the pluginfs case where it doesnt make sense to copy the tree into the cache, if it's
+		// an uncached target
+		artifactsToPassthrough = make([]*ResultArtifact, 0, len(res.Artifacts))
+		for _, artifact := range res.Artifacts {
+			if e.isPassthroughArtifact(artifact) {
+				m, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact)
+				if err != nil {
+					return nil, fmt.Errorf("protoartifacttomanifest: %w", err)
+				}
+
+				artifactsToPassthrough = append(artifactsToPassthrough, &ResultArtifact{
+					Manifest: m,
+					Artifact: artifact,
+				})
+			} else {
+				artifactsToCache = append(artifactsToCache, artifact)
+			}
+		}
 	}
 
-	return ExecuteResult{
+	cachedArtifacts, err := e.cacheLocally(ctx, def, cacheHashin, artifactsToCache)
+	if err != nil {
+		return nil, fmt.Errorf("cache locally: %w", err)
+	}
+
+	cachedArtifacts = append(cachedArtifacts, artifactsToPassthrough...)
+
+	manifest, err := e.createLocalCacheManifest(ctx, def.GetRef(), hashin, cachedArtifacts)
+	if err != nil {
+		return nil, fmt.Errorf("create local cache manifest: %w", err)
+	}
+
+	if res.AfterCache != nil {
+		res.AfterCache()
+	}
+
+	if options.storeCache {
+		// TODO: move this to a background execution so that local build can proceed, while this is uploading in the background
+		e.CacheRemotely(ctx, def, res.Hashin, manifest, cachedArtifacts)
+	}
+
+	return Result{
 		Def:       def,
 		Hashin:    res.Hashin,
 		Artifacts: cachedArtifacts,
+		Manifest:  manifest,
 	}.Sorted(), nil
+}
+
+func (e *Engine) isPassthroughArtifact(artifact *ExecuteArtifact) bool {
+	fsartifact, ok := artifact.Artifact.(pluginsdk.FSArtifact)
+	if !ok {
+		return false
+	}
+
+	node := fsartifact.FSNode()
+	if node == nil {
+		return false
+	}
+
+	if hfs.HasPathPrefix(node.Path(), e.Home.Path()) {
+		return false
+	}
+
+	return true
 }

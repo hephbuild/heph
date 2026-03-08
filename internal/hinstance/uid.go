@@ -12,12 +12,18 @@ import (
 
 func gen() string {
 	host, _ := os.Hostname()
-	return fmt.Sprintf("%v_%v_%v", os.Getpid(), host, time.Now().UnixNano())
+	return fmt.Sprintf("%v_%v_%v", host, os.Getpid(), time.Now().UnixNano())
 }
 
 var UID = gen()
 
-var Hash = sync.OnceValue(func() string {
+func localgen() string {
+	return fmt.Sprintf("%v_%v", os.Getpid(), time.Now().UnixNano())
+}
+
+var LocalUID = localgen()
+
+var HashExec = sync.OnceValue(func() string {
 	p, err := os.Executable()
 	if err != nil {
 		panic(err)

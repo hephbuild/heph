@@ -5,23 +5,26 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
-	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
+	sync_map "github.com/zolstein/sync-map"
 	"go.opentelemetry.io/otel"
 )
 
-func (e *Engine) Resulter() pluginsdk.Resulter {
+func (e *Engine) Resulter() pluginsdk.EngineResulter {
 	return &resulterHandler{Engine: e}
 }
 
 type resulterHandler struct {
 	*Engine
+
+	m sync_map.Map[string, *ExecuteResultLocks]
 }
 
 var tracer = otel.Tracer("heph/engine")
 
-func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*corev1.ResultResponse, error) {
+func (r *resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*pluginsdk.GetResult, error) {
 	rs, err := r.GetRequestState(req.GetRequestId())
 	if err != nil {
 		return nil, err
@@ -52,16 +55,20 @@ func (r resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*c
 	default:
 		return nil, fmt.Errorf("unexpected message type: %v", kind)
 	}
-	// TODO: this is in the wrong place, the caller should be responsible for releasing the locks
-	defer res.Unlock(ctx)
 
-	artifacts := make([]*pluginv1.Artifact, 0, len(res.Artifacts))
+	id := uuid.New().String()
+	r.m.Store(id, res)
+
+	artifacts := make([]pluginsdk.Artifact, 0, len(res.Artifacts))
 	for _, artifact := range res.Artifacts {
-		artifacts = append(artifacts, artifact.Artifact)
+		artifacts = append(artifacts, artifact)
 	}
 
-	return corev1.ResultResponse_builder{
+	return &pluginsdk.GetResult{
+		Release: func() {
+			res.Unlock(ctx)
+		},
 		Artifacts: artifacts,
 		Def:       res.Def.TargetDef.TargetDef,
-	}.Build(), nil
+	}, nil
 }
