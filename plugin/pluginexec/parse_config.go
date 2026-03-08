@@ -39,6 +39,7 @@ func ConfigToExecv1(
 		Run:          targetSpec.Run,
 		LocalCache:   htypes.Ptr(targetSpec.Cache.Local),
 		RemoteCache:  htypes.Ptr(targetSpec.Cache.Remote),
+		SourceMap:    htypes.Ptr(targetSpec.SourceMap),
 		Pty:          htypes.Ptr(targetSpec.Pty),
 		SupportFiles: targetSpec.SupportFiles,
 	}

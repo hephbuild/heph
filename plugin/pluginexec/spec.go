@@ -94,6 +94,7 @@ type Spec struct {
 	Out            SpecOutputs       `mapstructure:"out"`
 	SupportFiles   SpecStrings       `mapstructure:"support_files"`
 	Cache          SpecCache         `mapstructure:"cache"`
+	SourceMap      bool              `mapstructure:"source_map"`
 	Pty            bool              `mapstructure:"pty"`
 	Codegen        string            `mapstructure:"codegen"`
 	Env            map[string]string `mapstructure:"env"`

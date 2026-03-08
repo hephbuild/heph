@@ -67,4 +67,5 @@ message Target {
   bool local_cache = 7;
   bool remote_cache = 8;
   bool pty = 9;
+  bool source_map = 11;
 }

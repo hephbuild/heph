@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -364,4 +365,63 @@ func TestPipe404(t *testing.T) {
 	require.ErrorContains(t, err, "status: 404 404 Not Found")
 
 	assert.Equal(t, "Not found :(", stdout.String())
+}
+
+func TestSourceMap(t *testing.T) {
+	ctx := t.Context()
+
+	p := NewExec()
+
+	tests := []struct {
+		name      string
+		sourceMap bool
+	}{
+		{"enabled", true},
+		{"disabled", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandboxPath := t.TempDir()
+			defer os.RemoveAll(sandboxPath)
+
+			def, err := anypb.New(execv1.Target_builder{
+				Run:       []string{"env"},
+				SourceMap: htypes.Ptr(tt.sourceMap),
+			}.Build())
+			require.NoError(t, err)
+
+			res, err := p.Run(ctx, &pluginsdk.RunRequest{
+				RunRequest: pluginv1.RunRequest_builder{
+					Target: pluginv1.TargetDef_builder{
+						Ref: pluginv1.TargetRef_builder{
+							Package: htypes.Ptr("some/pkg"),
+							Name:    htypes.Ptr("target_" + tt.name),
+						}.Build(),
+						Def: def,
+					}.Build(),
+					SandboxPath: htypes.Ptr(sandboxPath),
+				}.Build(),
+			})
+			require.NoError(t, err)
+
+			require.Len(t, res.GetArtifacts(), 1)
+
+			logFilePath := res.GetArtifacts()[0].GetFile().GetSourcePath()
+			b, err := os.ReadFile(logFilePath)
+			require.NoError(t, err)
+			logOutput := string(b)
+
+			smPath := filepath.Join(sandboxPath, "ws", "sandbox-sourcemap.json")
+			_, err = os.Stat(smPath)
+
+			if tt.sourceMap {
+				assert.NoError(t, err) // Should exist
+				assert.Contains(t, logOutput, "SOURCEMAP=")
+			} else {
+				assert.ErrorIs(t, err, os.ErrNotExist) // Should not exist
+				assert.NotContains(t, logOutput, "SOURCEMAP=")
+			}
+		})
+	}
 }

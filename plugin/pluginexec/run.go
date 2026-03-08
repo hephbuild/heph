@@ -107,7 +107,7 @@ func (p *Plugin[S]) Run(ctx context.Context, req *pluginsdk.RunRequest) (*plugin
 
 	env = append(env, inputEnv...)
 
-	if true {
+	if texec.GetSourceMap() {
 		b, err := json.Marshal(sandboxRes.Sourcemap)
 		if err != nil {
 			return nil, err
