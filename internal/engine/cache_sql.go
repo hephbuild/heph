@@ -20,6 +20,7 @@ import (
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/zeebo/xxh3"
+	"modernc.org/sqlite"
 	_ "modernc.org/sqlite"
 )
 
@@ -35,6 +36,20 @@ type SQLCacheDB struct {
 
 func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 	s.once.Do(func() {
+		sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+			_, err := conn.ExecContext(context.Background(), `
+				PRAGMA journal_mode = WAL;
+				PRAGMA busy_timeout = 10000;
+				PRAGMA synchronous = NORMAL;
+				PRAGMA foreign_keys = ON;
+				PRAGMA cache_size = -64000;
+				PRAGMA page_size = 8192;
+				PRAGMA mmap_size = 268435456;
+				PRAGMA temp_store = MEMORY;
+			`, nil)
+			return err
+		})
+
 		if err := os.MkdirAll(filepath.Dir(s.path), os.ModePerm); err != nil {
 			s.err = fmt.Errorf("OpenSQLCacheDB mkdir: %w", err)
 			return
@@ -85,7 +100,6 @@ type SQLCache struct {
 	db *SQLCacheDB
 
 	rpool hsync.Pool[[]byte]
-	wpool hsync.Pool[[]byte]
 }
 
 func (c *SQLCache) rwdb(ctx context.Context) (rdb, wdb *sql.DB, err error) {
@@ -166,13 +180,7 @@ func initSQLCacheDB(db *sql.DB) error {
 
 // openSQLiteDB opens a connection pool to a SQLite file with common pragmas.
 func openSQLiteDB(path string) (*sql.DB, error) {
-	dsn := path +
-		"?_pragma=journal_mode(WAL)" +
-		"&_pragma=busy_timeout(10000)" +
-		"&_pragma=synchronous(NORMAL)" +
-		"&_pragma=foreign_keys(ON)"
-
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
@@ -188,9 +196,6 @@ func OpenSQLCacheDB(path string) (*SQLCacheDB, error) {
 func NewSQLCache(db *SQLCacheDB) *SQLCache {
 	return &SQLCache{
 		db: db,
-		wpool: hsync.Pool[[]byte]{New: func() []byte {
-			return make([]byte, 100_000)
-		}},
 		rpool: hsync.Pool[[]byte]{New: func() []byte {
 			return make([]byte, 100_000)
 		}},
@@ -260,19 +265,10 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 		return err
 	}
 
-	buf := c.wpool.Get()
-	defer c.wpool.Put(buf)
-
-	// Read the full payload into the pool buffer without allocating.
-	// io.ReadFull returns:
-	//   io.EOF              — empty stream (zero bytes written)
-	//   io.ErrUnexpectedEOF — stream shorter than buf (normal < 100KB case)
-	//   nil                 — stream filled the buffer exactly
-	n, err := io.ReadFull(data, buf)
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	payload, err := io.ReadAll(data)
+	if err != nil {
 		return fmt.Errorf("writeEntry read: %w", err)
 	}
-	payload := buf[:n]
 
 	// Single UPSERT — write lock held for exactly one statement.
 	_, err = wdb.ExecContext(
@@ -294,8 +290,10 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 }
 
 type sqlCacheWriter struct {
-	pw   *io.PipeWriter
-	done <-chan error
+	pw        *io.PipeWriter
+	done      <-chan error
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (w *sqlCacheWriter) Write(p []byte) (int, error) {
@@ -303,12 +301,16 @@ func (w *sqlCacheWriter) Write(p []byte) (int, error) {
 }
 
 func (w *sqlCacheWriter) Close() error {
-	// Close the write end; this unblocks the goroutine's reader.
-	if err := w.pw.Close(); err != nil {
-		return err
-	}
-	// Wait for the goroutine to finish and return any write error.
-	return <-w.done
+	w.closeOnce.Do(func() {
+		// Close the write end; this unblocks the goroutine's reader.
+		if err := w.pw.Close(); err != nil {
+			w.closeErr = err
+			return
+		}
+		// Wait for the goroutine to finish and return any write error.
+		w.closeErr = <-w.done
+	})
+	return w.closeErr
 }
 
 func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.WriteCloser, error) {
