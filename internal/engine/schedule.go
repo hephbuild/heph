@@ -611,7 +611,7 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 		}
 
 		res, ok, err := e.resultFromCache(ctx, rs, def, outputs, hashin)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
 
@@ -1514,7 +1514,7 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 	if options.storeCache {
 		// One last cache check after the deps have completed
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), cacheHashin)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			hlog.From(ctx).With(slog.String("target", tref.Format(def.GetRef())), slog.String("err", err.Error())).Warn("failed to get result from local cache")
 		}
 
