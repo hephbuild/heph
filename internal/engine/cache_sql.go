@@ -118,17 +118,17 @@ func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 	targetAddr := c.targetKey(ref)
 
-	var count int
+	var exists bool
 	err = rdb.QueryRowContext(
 		ctx,
-		`SELECT COUNT(*) FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`,
+		`SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`,
 		targetAddr, hashin, name,
-	).Scan(&count)
-	if err != nil {
+	).Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("exists: %w", err)
 	}
 
-	return count > 0, nil
+	return exists, nil
 }
 
 func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) error {
@@ -229,10 +229,7 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 	targetAddr := c.targetKey(ref)
 
-	buf := c.rpool.Get()
-	buf = buf[0:]
-
-	err = rdb.QueryRowContext(
+	rows, err := rdb.QueryContext(
 		ctx,
 		`
 		SELECT data
@@ -240,17 +237,27 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 		WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
 		`,
 		targetAddr, hashin, name,
-	).Scan(&buf)
-
+	)
 	if err != nil {
-		c.rpool.Put(buf)
+		return nil, fmt.Errorf("reader query: %w", err)
+	}
+	defer rows.Close()
 
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, LocalCacheNotFoundError
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("reader next: %w", err)
 		}
+		return nil, LocalCacheNotFoundError
+	}
 
+	var raw sql.RawBytes
+	err = rows.Scan(&raw)
+	if err != nil {
 		return nil, fmt.Errorf("reader scan: %w", err)
 	}
+
+	buf := c.rpool.Get()
+	buf = append(buf[:0], raw...)
 
 	return hio.NewReadCloserFunc(bytes.NewReader(buf), func() error {
 		c.rpool.Put(buf)
