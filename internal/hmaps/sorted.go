@@ -14,9 +14,8 @@ func Sorted[Map ~map[K]V, K cmp.Ordered, V any](m Map) iter.Seq2[K, V] {
 			return
 		case 1:
 			for k, v := range m {
-				if !yield(k, v) {
-					return
-				}
+				yield(k, v)
+				break
 			}
 
 			return

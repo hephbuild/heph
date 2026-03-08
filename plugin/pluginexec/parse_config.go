@@ -9,7 +9,6 @@ import (
 
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hmaps"
-	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
@@ -190,41 +189,51 @@ func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S)
 	return def, nil
 }
 
+var targetProtoName = string((&execv1.Target{}).ProtoReflect().Descriptor().Name())
+
 func hashTarget(target *execv1.Target) []byte {
+	omit := tref.OmitHashPb
 	var cloned bool
 	clonedOnce := func() {
 		if !cloned {
 			cloned = true
-			target = hproto.Clone(target)
+			omit = maps.Clone(omit)
 		}
 	}
+	h := xxh3.New()
 
 	if hmaps.Has(target.GetEnv(), func(s string, env *execv1.Target_Env) bool {
 		return !env.GetHash()
 	}) {
 		clonedOnce()
+		omit[targetProtoName+".env"] = struct{}{}
 
-		env := target.GetEnv()
+		for k, v := range hmaps.Sorted(target.GetEnv()) {
+			if !v.GetHash() {
+				continue
+			}
 
-		maps.DeleteFunc(env, func(s string, env *execv1.Target_Env) bool {
-			return !env.GetHash()
-		})
-		target.SetEnv(env)
+			_, _ = h.WriteString(k)
+			hashpb.Hash(h, v, omit)
+		}
 	}
 
 	if hslices.Has(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
 		return !dep.GetHash()
 	}) {
 		clonedOnce()
+		omit[targetProtoName+".deps"] = struct{}{}
 
-		deps := slices.DeleteFunc(target.GetDeps(), func(dep *execv1.Target_Dep) bool {
-			return !dep.GetHash()
-		})
-		target.SetDeps(deps)
+		for _, v := range target.GetDeps() {
+			if !v.GetHash() {
+				continue
+			}
+
+			hashpb.Hash(h, v, omit)
+		}
 	}
 
-	h := xxh3.New()
-	hashpb.Hash(h, target, tref.OmitHashPb)
+	hashpb.Hash(h, target, omit)
 
 	return h.Sum(nil)
 }
