@@ -230,9 +230,9 @@ func init() {
 						for _, re := range res {
 							for _, output := range re.Artifacts {
 								if output.GetGroup() == "" {
-									fmt.Println(output.Hashout)
+									fmt.Println(output.GetHashout())
 								} else {
-									fmt.Println(output.GetGroup(), output.Hashout)
+									fmt.Println(output.GetGroup(), output.GetHashout())
 								}
 							}
 						}

@@ -57,6 +57,8 @@ type ExecuteOptions struct {
 	force       bool
 	interactive bool
 	metaHashin  string
+	getCache    bool
+	storeCache  bool
 }
 
 type InteractiveExecOptions struct {
@@ -339,7 +341,7 @@ func (e *Engine) depsResults(ctx context.Context, rs *RequestState, t *LightLink
 			})
 
 			for _, artifact := range res.Artifacts {
-				if artifact.Hashout == "" {
+				if artifact.GetHashout() == "" {
 					return fmt.Errorf("%v: output %q has empty hashout", tref.Format(dep.GetRef()), artifact.GetGroup())
 				}
 			}
@@ -647,15 +649,15 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 				for _, artifact := range result.Artifacts {
 					partifact := artifactGroupMap{Artifact: artifact, group: ""} // TODO support output group
 
-					artifacts = append(artifacts, &ResultArtifact{
-						Hashout:  artifact.Hashout,
-						Artifact: partifact,
-					})
-
-					martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, partifact)
+					martifact, err := hartifact.ProtoArtifactToManifest(artifact.GetHashout(), partifact)
 					if err != nil {
 						return nil, fmt.Errorf("proto artifact to manifest: %w", err)
 					}
+
+					artifacts = append(artifacts, &ResultArtifact{
+						Artifact: partifact,
+						Manifest: martifact,
+					})
 
 					manifest.Artifacts = append(manifest.Artifacts, martifact)
 
@@ -689,23 +691,15 @@ func (e *Engine) innerResult(ctx context.Context, rs *RequestState, def *LightLi
 			force:       shouldForce,
 			interactive: tref.Equal(rs.Shell, def.GetRef()) || tref.Equal(rs.Interactive, def.GetRef()),
 			metaHashin:  hashin,
+			getCache:    getCache,
+			storeCache:  storeCache,
 		}
 
-		var res *Result
-		if storeCache {
-			res, err = e.ExecuteAndCache(ctx, rs, def, execOptions)
-			if err != nil {
-				err = errors.Join(err, locks.Unlock())
+		res, err := e.executeAndCacheInner(ctx, rs, def, execOptions)
+		if err != nil {
+			err = errors.Join(err, locks.Unlock())
 
-				return nil, err
-			}
-		} else {
-			res, err = e.ExecuteNoCache(ctx, rs, def, execOptions)
-			if err != nil {
-				err = errors.Join(err, locks.Unlock())
-
-				return nil, err
-			}
+			return nil, err
 		}
 
 		err = locks.Lock2RLock(ctx)
@@ -810,7 +804,7 @@ func (e *Engine) hashin(ctx context.Context, def *LightLinkedTarget, results []*
 		artifacts := make([]DepMetaArtifact, 0, len(result.Artifacts))
 		for _, artifact := range result.Artifacts {
 			artifacts = append(artifacts, DepMetaArtifact{
-				Hashout: artifact.Hashout,
+				Hashout: artifact.GetHashout(),
 			})
 		}
 
@@ -844,7 +838,7 @@ type Result struct {
 
 func (r Result) Sorted() *Result {
 	slices.SortFunc(r.Artifacts, func(a, b *ResultArtifact) int {
-		return strings.Compare(a.Hashout, b.Hashout)
+		return strings.Compare(a.GetHashout(), b.GetHashout())
 	})
 
 	return &r
@@ -894,10 +888,13 @@ type ExecuteArtifact struct {
 }
 
 type ResultArtifact struct {
-	Hashout  string
 	Manifest hartifact.ManifestArtifact
 
 	pluginsdk.Artifact
+}
+
+func (r ResultArtifact) GetHashout() string {
+	return r.Manifest.Hashout
 }
 
 type ExecuteResultLocks struct {
@@ -1493,7 +1490,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 	}.Sorted(), nil
 }
 
-func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions, persistentCache bool) (*Result, error) {
+func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*Result, error) {
 	results, err := e.depsResults(ctx, rs, def)
 	if err != nil {
 		return nil, fmt.Errorf("deps results: %w", err)
@@ -1510,11 +1507,11 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 	}
 
 	cacheHashin := hashin
-	if !persistentCache {
+	if !options.storeCache {
 		cacheHashin = hinstance.UID + "_" + hashin
 	}
 
-	if def.GetCache() && !options.force && !options.shell {
+	if options.storeCache {
 		// One last cache check after the deps have completed
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), cacheHashin)
 		if err != nil {
@@ -1531,16 +1528,48 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 		return nil, fmt.Errorf("execute: %w", err)
 	}
 
-	cachedArtifacts, manifest, err := e.cacheLocally(ctx, def, cacheHashin, res.Artifacts)
+	var artifactsToCache []*ExecuteArtifact
+	var artifactsToPassthrough []*ResultArtifact
+	if options.storeCache {
+		artifactsToCache = res.Artifacts
+	} else {
+		// this caters for the pluginfs case where it doesnt make sense to copy the tree into the cache, if it's
+		// an uncached target
+		artifactsToPassthrough = make([]*ResultArtifact, 0, len(res.Artifacts))
+		for _, artifact := range res.Artifacts {
+			if e.isPassthroughArtifact(artifact) {
+				m, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact)
+				if err != nil {
+					return nil, fmt.Errorf("protoartifacttomanifest: %w", err)
+				}
+
+				artifactsToPassthrough = append(artifactsToPassthrough, &ResultArtifact{
+					Manifest: m,
+					Artifact: artifact,
+				})
+			} else {
+				artifactsToCache = append(artifactsToCache, artifact)
+			}
+		}
+	}
+
+	cachedArtifacts, err := e.cacheLocally(ctx, def, cacheHashin, artifactsToCache)
 	if err != nil {
 		return nil, fmt.Errorf("cache locally: %w", err)
+	}
+
+	cachedArtifacts = append(cachedArtifacts, artifactsToPassthrough...)
+
+	manifest, err := e.createLocalCacheManifest(ctx, def.GetRef(), hashin, cachedArtifacts)
+	if err != nil {
+		return nil, fmt.Errorf("create local cache manifest: %w", err)
 	}
 
 	if res.AfterCache != nil {
 		res.AfterCache()
 	}
 
-	if persistentCache {
+	if options.storeCache {
 		// TODO: move this to a background execution so that local build can proceed, while this is uploading in the background
 		e.CacheRemotely(ctx, def, res.Hashin, manifest, cachedArtifacts)
 	}
@@ -1553,12 +1582,20 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 	}.Sorted(), nil
 }
 
-func (e *Engine) ExecuteAndCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*Result, error) {
-	return e.executeAndCacheInner(ctx, rs, def, options, true)
-}
+func (e *Engine) isPassthroughArtifact(artifact *ExecuteArtifact) bool {
+	fsartifact, ok := artifact.Artifact.(pluginsdk.FSArtifact)
+	if !ok {
+		return false
+	}
 
-func (e *Engine) ExecuteNoCache(ctx context.Context, rs *RequestState, def *LightLinkedTarget, options ExecuteOptions) (*Result, error) {
-	// cached and uncached targets should go through the same mechanism, the only difference is that uncached targets should be removed upon session completion
+	node := fsartifact.FSNode()
+	if node == nil {
+		return false
+	}
 
-	return e.executeAndCacheInner(ctx, rs, def, options, false)
+	if hfs.HasPathPrefix(node.Path(), e.Home.Path()) {
+		return false
+	}
+
+	return true
 }

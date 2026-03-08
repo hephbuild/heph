@@ -85,7 +85,7 @@ func (e *Engine) cacheLocally(
 	def *LightLinkedTarget,
 	hashin string,
 	sandboxArtifacts []*ExecuteArtifact,
-) ([]*ResultArtifact, *hartifact.Manifest, error) {
+) ([]*ResultArtifact, error) {
 	step, ctx := hstep.New(ctx, "Caching...")
 	defer step.Done()
 
@@ -94,17 +94,17 @@ func (e *Engine) cacheLocally(
 	for _, artifact := range sandboxArtifacts {
 		contentType, err := artifact.GetContentType()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		contentSize, err := artifact.GetContentSize()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 
 		src, err := artifact.GetContentReader()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		defer src.Close()
 
@@ -117,7 +117,7 @@ func (e *Engine) cacheLocally(
 			ContentType: hartifact.ManifestArtifactContentType(contentType),
 		}, artifact.Hashout)
 		if err != nil {
-			return nil, nil, fmt.Errorf("%q/%q: %w", artifact.GetGroup(), artifact.GetName(), err)
+			return nil, fmt.Errorf("%q/%q: %w", artifact.GetGroup(), artifact.GetName(), err)
 		}
 
 		cacheArtifacts = append(cacheArtifacts, cacheArtifact)
@@ -125,12 +125,7 @@ func (e *Engine) cacheLocally(
 		_ = src.Close()
 	}
 
-	manifest, err := e.createLocalCacheManifest(ctx, def.GetRef(), hashin, cacheArtifacts)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return cacheArtifacts, manifest, nil
+	return cacheArtifacts, nil
 }
 
 func (e *Engine) createLocalCacheManifest(ctx context.Context, ref *pluginv1.TargetRef, hashin string, artifacts []*ResultArtifact) (*hartifact.Manifest, error) {
@@ -141,7 +136,7 @@ func (e *Engine) createLocalCacheManifest(ctx context.Context, ref *pluginv1.Tar
 		Hashin:    hashin,
 	}
 	for _, artifact := range artifacts {
-		martifact, err := hartifact.ProtoArtifactToManifest(artifact.Hashout, artifact.Artifact)
+		martifact, err := hartifact.ProtoArtifactToManifest(artifact.GetHashout(), artifact.Artifact)
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +314,6 @@ func (e *Engine) resultFromLocalCacheInner(ctx context.Context, def *LightLinked
 		}
 
 		execArtifacts = append(execArtifacts, &ResultArtifact{
-			Hashout: artifact.Hashout,
 			Artifact: cachePluginArtifact{
 				artifact: artifact,
 				ref:      def.GetRef(),
@@ -393,7 +387,6 @@ func (e *Engine) cacheArtifactLocally(ctx context.Context, ref *pluginv1.TargetR
 	}
 
 	return &ResultArtifact{
-		Hashout: hashout,
 		Artifact: cachePluginArtifact{
 			artifact: manifestArtifact,
 			ref:      ref,

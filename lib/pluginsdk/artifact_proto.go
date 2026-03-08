@@ -146,3 +146,20 @@ func (a ProtoArtifact) GetContentType() (ArtifactContentType, error) {
 		return "", fmt.Errorf("unsupported encoding %v", partifact.WhichContent())
 	}
 }
+
+func (a ProtoArtifact) FSNode() hfs.Node {
+	partifact := a.Artifact
+
+	switch partifact.WhichContent() {
+	case pluginv1.Artifact_File_case:
+		return hfs.NewOS(partifact.GetFile().GetSourcePath())
+	case pluginv1.Artifact_Raw_case:
+		return nil
+	case pluginv1.Artifact_TargzPath_case:
+		return hfs.NewOS(partifact.GetTargzPath())
+	case pluginv1.Artifact_TarPath_case:
+		return hfs.NewOS(partifact.GetTarPath())
+	default:
+		return nil
+	}
+}

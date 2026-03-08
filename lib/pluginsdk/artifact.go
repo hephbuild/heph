@@ -3,6 +3,7 @@ package pluginsdk
 import (
 	"io"
 
+	"github.com/hephbuild/heph/internal/hfs"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
@@ -20,6 +21,11 @@ type Artifact interface {
 	GetContentReader() (io.ReadCloser, error)
 	GetContentSize() (int64, error)
 	GetContentType() (ArtifactContentType, error)
+}
+
+type FSArtifact interface {
+	Artifact
+	FSNode() hfs.Node
 }
 
 type ArtifactWithOrigin struct {
