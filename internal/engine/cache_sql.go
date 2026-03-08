@@ -26,21 +26,23 @@ import (
 // SQLCacheDB holds the path and lazily opens both connection pools on first use.
 // Call Close only if the DB was actually used; it is safe to call regardless.
 type SQLCacheDB struct {
-	path       string
-	once       sync.Once
-	rdb        *sql.DB
-	wdb        *sql.DB
-	readerStmt *sql.Stmt
-	existsStmt *sql.Stmt
-	err        error
+	path              string
+	once              sync.Once
+	rdb               *sql.DB
+	wdb               *sql.DB
+	readerStmt        *sql.Stmt
+	existsStmt        *sql.Stmt
+	listArtifactsStmt *sql.Stmt
+	listVersionsStmt  *sql.Stmt
+	deleteHashinStmt  *sql.Stmt
+	deleteNameStmt    *sql.Stmt
+	upsertStmt        *sql.Stmt
+	err               error
 }
 
-func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
-	ctx := context.Background()
-
-	s.once.Do(func() {
-		sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
-			_, err := conn.ExecContext(ctx, `
+func (s *SQLCacheDB) openInner(ctx context.Context) error {
+	sqlite.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+		_, err := conn.ExecContext(ctx, `
 				PRAGMA journal_mode = WAL;
 				PRAGMA busy_timeout = 10000;
 				PRAGMA synchronous = NORMAL;
@@ -50,86 +52,128 @@ func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
 				PRAGMA mmap_size = 268435456;
 				PRAGMA temp_store = MEMORY;
 			`, nil)
-			return err
-		})
+		return err
+	})
 
-		if err := os.MkdirAll(filepath.Dir(s.path), os.ModePerm); err != nil {
-			s.err = fmt.Errorf("OpenSQLCacheDB mkdir: %w", err)
-			return
-		}
+	if err := os.MkdirAll(filepath.Dir(s.path), os.ModePerm); err != nil {
+		return fmt.Errorf("OpenSQLCacheDB mkdir: %w", err)
+	}
 
-		wdb, err := openSQLiteDB(s.path)
-		if err != nil {
-			s.err = fmt.Errorf("OpenSQLCacheDB open wdb: %w", err)
-			return
-		}
-		// One writer at a time — prevents SQLITE_BUSY.
-		wdb.SetMaxOpenConns(1)
+	wdb, err := openSQLiteDB(s.path)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB open wdb: %w", err)
+	}
+	// One writer at a time — prevents SQLITE_BUSY.
+	wdb.SetMaxOpenConns(1)
 
-		if err := initSQLCacheDB(ctx, wdb); err != nil {
-			_ = wdb.Close()
-			s.err = fmt.Errorf("OpenSQLCacheDB init: %w", err)
-			return
-		}
+	if err := initSQLCacheDB(ctx, wdb); err != nil {
+		_ = wdb.Close()
+		return fmt.Errorf("OpenSQLCacheDB init: %w", err)
+	}
 
-		rdb, err := openSQLiteDB(s.path)
-		if err != nil {
-			_ = wdb.Close()
-			s.err = fmt.Errorf("OpenSQLCacheDB open rdb: %w", err)
-			return
-		}
-		// No cap — WAL lets concurrent readers run in parallel.
-		rdb.SetMaxIdleConns(100)
-		rdb.SetMaxOpenConns(100)
+	rdb, err := openSQLiteDB(s.path)
+	if err != nil {
+		_ = wdb.Close()
+		return fmt.Errorf("OpenSQLCacheDB open rdb: %w", err)
+	}
+	// No cap — WAL lets concurrent readers run in parallel.
+	rdb.SetMaxIdleConns(100)
+	rdb.SetMaxOpenConns(100)
 
-		readerStmt, err := rdb.PrepareContext(ctx, `
+	s.rdb = rdb
+	s.wdb = wdb
+
+	s.readerStmt, err = rdb.PrepareContext(ctx, `
 			SELECT data
 			FROM cache_blobs
 			WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
 		`)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare reader: %w", err)
+	}
+
+	s.existsStmt, err = rdb.PrepareContext(ctx, `SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare exists: %w", err)
+	}
+
+	s.listArtifactsStmt, err = rdb.PrepareContext(ctx, "SELECT artifact_name FROM cache_blobs WHERE target_addr = ? AND hashin = ?")
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare list artifacts: %w", err)
+	}
+
+	s.listVersionsStmt, err = rdb.PrepareContext(ctx, "SELECT DISTINCT hashin FROM cache_blobs WHERE target_addr = ?")
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare list versions: %w", err)
+	}
+
+	s.deleteHashinStmt, err = wdb.PrepareContext(ctx, `DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ?`)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare delete hashin: %w", err)
+	}
+
+	s.deleteNameStmt, err = wdb.PrepareContext(ctx, `DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ?`)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare delete name: %w", err)
+	}
+
+	s.upsertStmt, err = wdb.PrepareContext(ctx, `
+		INSERT INTO cache_blobs (target_addr, hashin, artifact_name, data, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(target_addr, hashin, artifact_name) DO UPDATE SET
+			data       = excluded.data,
+			created_at = excluded.created_at
+		`)
+	if err != nil {
+		return fmt.Errorf("OpenSQLCacheDB prepare upsert: %w", err)
+	}
+	return nil
+}
+func (s *SQLCacheDB) open() (*sql.DB, *sql.DB, error) {
+	ctx := context.Background()
+
+	s.once.Do(func() {
+		err := s.openInner(ctx)
 		if err != nil {
-			_ = rdb.Close()
-			_ = wdb.Close()
-			s.err = fmt.Errorf("OpenSQLCacheDB prepare reader: %w", err)
+			s.err = fmt.Errorf("sqlcache open: %w", err)
+			_ = s.Close()
 			return
 		}
-
-		existsStmt, err := rdb.PrepareContext(ctx, `SELECT 1 FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`)
-		if err != nil {
-			_ = readerStmt.Close() //nolint:sqlclosecheck
-			_ = rdb.Close()
-			_ = wdb.Close()
-			s.err = fmt.Errorf("OpenSQLCacheDB prepare exists: %w", err)
-			return
-		}
-
-		s.rdb = rdb
-		s.wdb = wdb
-		s.readerStmt = readerStmt
-		s.existsStmt = existsStmt
 	})
 	return s.rdb, s.wdb, s.err
 }
 
 func (s *SQLCacheDB) Close() error {
-	// If pools() was never called, once.Do has never run and rdb/wdb are nil.
-	if s.rdb == nil {
-		return nil
+	var errs []error
+	if s.readerStmt != nil {
+		errs = append(errs, s.readerStmt.Close())
 	}
-	errR := s.rdb.Close()
-	errW := s.wdb.Close()
-	errS := s.readerStmt.Close()
-	errE := s.existsStmt.Close()
-	if errR != nil {
-		return errR
+	if s.existsStmt != nil {
+		errs = append(errs, s.existsStmt.Close())
 	}
-	if errS != nil {
-		return errS
+	if s.listArtifactsStmt != nil {
+		errs = append(errs, s.listArtifactsStmt.Close())
 	}
-	if errE != nil {
-		return errE
+	if s.listVersionsStmt != nil {
+		errs = append(errs, s.listVersionsStmt.Close())
 	}
-	return errW
+	if s.deleteHashinStmt != nil {
+		errs = append(errs, s.deleteHashinStmt.Close())
+	}
+	if s.deleteNameStmt != nil {
+		errs = append(errs, s.deleteNameStmt.Close())
+	}
+	if s.upsertStmt != nil {
+		errs = append(errs, s.upsertStmt.Close())
+	}
+	if s.rdb != nil {
+		errs = append(errs, s.rdb.Close())
+	}
+	if s.wdb != nil {
+		errs = append(errs, s.wdb.Close())
+	}
+
+	return errors.Join(errs...)
 }
 
 type SQLCache struct {
@@ -139,7 +183,7 @@ type SQLCache struct {
 }
 
 func (c *SQLCache) rwdb(ctx context.Context) (*sql.DB, *sql.DB, error) {
-	rdb, wdb, err := c.db.pools()
+	rdb, wdb, err := c.db.open()
 	if err != nil {
 		return nil, nil, fmt.Errorf("sqlcache open db: %w", err)
 	}
@@ -168,7 +212,7 @@ func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 }
 
 func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) error {
-	_, wdb, err := c.rwdb(ctx)
+	_, _, err := c.rwdb(ctx)
 	if err != nil {
 		return err
 	}
@@ -176,15 +220,13 @@ func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 	targetAddr := c.targetKey(ref)
 
 	if name == "" {
-		_, err = wdb.ExecContext(
+		_, err = c.db.deleteHashinStmt.ExecContext(
 			ctx,
-			`DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ?`,
 			targetAddr, hashin,
 		)
 	} else {
-		_, err = wdb.ExecContext(
+		_, err = c.db.deleteNameStmt.ExecContext(
 			ctx,
-			`DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ?`,
 			targetAddr, hashin, name,
 		)
 	}
@@ -299,7 +341,7 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 }
 
 func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name string, data io.Reader) error {
-	_, wdb, err := c.rwdb(ctx)
+	_, _, err := c.rwdb(ctx)
 	if err != nil {
 		return err
 	}
@@ -310,15 +352,8 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 	}
 
 	// Single UPSERT — write lock held for exactly one statement.
-	_, err = wdb.ExecContext(
+	_, err = c.db.upsertStmt.ExecContext(
 		ctx,
-		`
-		INSERT INTO cache_blobs (target_addr, hashin, artifact_name, data, created_at)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(target_addr, hashin, artifact_name) DO UPDATE SET
-			data       = excluded.data,
-			created_at = excluded.created_at
-		`,
 		targetAddr, hashin, name, payload, time.Now().UnixNano(),
 	)
 	if err != nil {
@@ -376,7 +411,7 @@ func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		rdb, _, err := c.rwdb(ctx)
+		_, _, err := c.rwdb(ctx)
 		if err != nil {
 			yield("", err)
 			return
@@ -384,8 +419,7 @@ func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, h
 
 		targetAddr := c.targetKey(ref)
 
-		rows, err := rdb.QueryContext(ctx,
-			"SELECT artifact_name FROM cache_blobs WHERE target_addr = ? AND hashin = ?",
+		rows, err := c.db.listArtifactsStmt.QueryContext(ctx,
 			targetAddr, hashin,
 		)
 		if err != nil {
@@ -414,7 +448,7 @@ func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, h
 
 func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		rdb, _, err := c.rwdb(ctx)
+		_, _, err := c.rwdb(ctx)
 		if err != nil {
 			yield("", err)
 			return
@@ -422,8 +456,7 @@ func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) it
 
 		targetAddr := c.targetKey(ref)
 
-		rows, err := rdb.QueryContext(ctx,
-			"SELECT DISTINCT hashin FROM cache_blobs WHERE target_addr = ?",
+		rows, err := c.db.listVersionsStmt.QueryContext(ctx,
 			targetAddr,
 		)
 		if err != nil {
