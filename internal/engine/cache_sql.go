@@ -11,8 +11,10 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
+	"github.com/hephbuild/heph/internal/hio"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hsync"
 	"github.com/hephbuild/heph/lib/tref"
@@ -21,16 +23,56 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// SQLCacheDB holds the two connection pools used by SQLCache.
-// Use OpenSQLCacheDB to open it and Close to shut down both pools.
+// SQLCacheDB holds the path and lazily opens both connection pools on first use.
+// Call Close only if the DB was actually used; it is safe to call regardless.
 type SQLCacheDB struct {
-	// rdb is the read pool: uncapped, WAL allows concurrent readers.
-	rdb *sql.DB
-	// wdb is the write pool: MaxOpenConns(1) serialises writers.
-	wdb *sql.DB
+	path string
+	once sync.Once
+	rdb  *sql.DB
+	wdb  *sql.DB
+	err  error
+}
+
+func (s *SQLCacheDB) pools() (*sql.DB, *sql.DB, error) {
+	s.once.Do(func() {
+		if err := os.MkdirAll(filepath.Dir(s.path), os.ModePerm); err != nil {
+			s.err = fmt.Errorf("OpenSQLCacheDB mkdir: %w", err)
+			return
+		}
+
+		wdb, err := openSQLiteDB(s.path)
+		if err != nil {
+			s.err = fmt.Errorf("OpenSQLCacheDB open wdb: %w", err)
+			return
+		}
+		// One writer at a time — prevents SQLITE_BUSY.
+		wdb.SetMaxOpenConns(1)
+
+		if err := initSQLCacheDB(wdb); err != nil {
+			_ = wdb.Close()
+			s.err = fmt.Errorf("OpenSQLCacheDB init: %w", err)
+			return
+		}
+
+		rdb, err := openSQLiteDB(s.path)
+		if err != nil {
+			_ = wdb.Close()
+			s.err = fmt.Errorf("OpenSQLCacheDB open rdb: %w", err)
+			return
+		}
+		// No cap — WAL lets concurrent readers run in parallel.
+
+		s.rdb = rdb
+		s.wdb = wdb
+	})
+	return s.rdb, s.wdb, s.err
 }
 
 func (s *SQLCacheDB) Close() error {
+	// If pools() was never called, once.Do has never run and rdb/wdb are nil.
+	if s.rdb == nil {
+		return nil
+	}
 	errR := s.rdb.Close()
 	errW := s.wdb.Close()
 	if errR != nil {
@@ -40,21 +82,30 @@ func (s *SQLCacheDB) Close() error {
 }
 
 type SQLCache struct {
-	// rdb is used for all read operations. WAL mode allows many concurrent
-	// readers, so this pool is uncapped.
-	rdb *sql.DB
-	// wdb is used for all write operations. SetMaxOpenConns(1) serialises
-	// writers at the Go level, preventing SQLITE_BUSY races.
-	wdb *sql.DB
+	db *SQLCacheDB
 
-	pool hsync.Pool[[]byte]
+	rpool hsync.Pool[[]byte]
+	wpool hsync.Pool[[]byte]
+}
+
+func (c *SQLCache) rwdb(ctx context.Context) (rdb, wdb *sql.DB, err error) {
+	rdb, wdb, err = c.db.pools()
+	if err != nil {
+		return nil, nil, fmt.Errorf("sqlcache open db: %w", err)
+	}
+	return rdb, wdb, nil
 }
 
 func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (bool, error) {
+	rdb, _, err := c.rwdb(ctx)
+	if err != nil {
+		return false, err
+	}
+
 	targetAddr := c.targetKey(ref)
 
 	var count int
-	err := c.rdb.QueryRowContext(
+	err = rdb.QueryRowContext(
 		ctx,
 		`SELECT COUNT(*) FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ? LIMIT 1`,
 		targetAddr, hashin, name,
@@ -67,17 +118,21 @@ func (c *SQLCache) Exists(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 }
 
 func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) error {
+	_, wdb, err := c.rwdb(ctx)
+	if err != nil {
+		return err
+	}
+
 	targetAddr := c.targetKey(ref)
 
-	var err error
 	if name == "" {
-		_, err = c.wdb.ExecContext(
+		_, err = wdb.ExecContext(
 			ctx,
 			`DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ?`,
 			targetAddr, hashin,
 		)
 	} else {
-		_, err = c.wdb.ExecContext(
+		_, err = wdb.ExecContext(
 			ctx,
 			`DELETE FROM cache_blobs WHERE target_addr = ? AND hashin = ? AND artifact_name = ?`,
 			targetAddr, hashin, name,
@@ -92,7 +147,7 @@ func (c *SQLCache) Delete(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 var _ LocalCache = (*SQLCache)(nil)
 
-func migrateSQLCacheDB(db *sql.DB) error {
+func initSQLCacheDB(db *sql.DB) error {
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS cache_blobs (
 			target_addr   TEXT    NOT NULL,
@@ -124,41 +179,19 @@ func openSQLiteDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// OpenSQLCacheDB opens a SQLCacheDB with two connection pools to the same SQLite file:
-//   - wdb: a single-connection write pool (serialises writers, no SQLITE_BUSY)
-//   - rdb: an uncapped read pool (WAL allows fully concurrent readers)
+// OpenSQLCacheDB returns a SQLCacheDB that opens its connection pools lazily
+// on first use. No file I/O happens until the first cache operation.
 func OpenSQLCacheDB(path string) (*SQLCacheDB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
-		return nil, fmt.Errorf("OpenSQLCacheDB mkdir: %w", err)
-	}
-
-	wdb, err := openSQLiteDB(path)
-	if err != nil {
-		return nil, fmt.Errorf("OpenSQLCacheDB open wdb: %w", err)
-	}
-	// One writer at a time — prevents SQLITE_BUSY without busy-retry overhead.
-	wdb.SetMaxOpenConns(1)
-
-	if err := migrateSQLCacheDB(wdb); err != nil {
-		_ = wdb.Close()
-		return nil, fmt.Errorf("OpenSQLCacheDB migrate: %w", err)
-	}
-
-	rdb, err := openSQLiteDB(path)
-	if err != nil {
-		_ = wdb.Close()
-		return nil, fmt.Errorf("OpenSQLCacheDB open rdb: %w", err)
-	}
-	// No cap — WAL lets concurrent readers run in parallel.
-
-	return &SQLCacheDB{rdb: rdb, wdb: wdb}, nil
+	return &SQLCacheDB{path: path}, nil
 }
 
 func NewSQLCache(db *SQLCacheDB) *SQLCache {
 	return &SQLCache{
-		rdb: db.rdb,
-		wdb: db.wdb,
-		pool: hsync.Pool[[]byte]{New: func() []byte {
+		db: db,
+		wpool: hsync.Pool[[]byte]{New: func() []byte {
+			return make([]byte, 100_000)
+		}},
+		rpool: hsync.Pool[[]byte]{New: func() []byte {
 			return make([]byte, 100_000)
 		}},
 	}
@@ -184,11 +217,17 @@ func (c *SQLCache) targetKey(ref *pluginv1.TargetRef) string {
 }
 
 func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.ReadCloser, error) {
+	rdb, _, err := c.rwdb(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	targetAddr := c.targetKey(ref)
 
-	var dataBytes sql.NullString
+	buf := c.rpool.Get()
+	buf = buf[0:]
 
-	err := c.rdb.QueryRowContext(
+	err = rdb.QueryRowContext(
 		ctx,
 		`
 		SELECT data
@@ -196,9 +235,11 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 		WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
 		`,
 		targetAddr, hashin, name,
-	).Scan(&dataBytes)
+	).Scan(&buf)
 
 	if err != nil {
+		c.rpool.Put(buf)
+
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, LocalCacheNotFoundError
 		}
@@ -206,16 +247,35 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 		return nil, fmt.Errorf("reader scan: %w", err)
 	}
 
-	if !dataBytes.Valid {
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
+	return hio.NewReadCloserFunc(bytes.NewReader(buf), func() error {
+		c.rpool.Put(buf)
 
-	scanned := []byte(dataBytes.String)
-	return io.NopCloser(bytes.NewReader(scanned)), nil
+		return nil
+	}), nil
 }
 
 func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name string, data io.Reader) error {
-	_, err := c.wdb.ExecContext(
+	_, wdb, err := c.rwdb(ctx)
+	if err != nil {
+		return err
+	}
+
+	buf := c.wpool.Get()
+	defer c.wpool.Put(buf)
+
+	// Read the full payload into the pool buffer without allocating.
+	// io.ReadFull returns:
+	//   io.EOF              — empty stream (zero bytes written)
+	//   io.ErrUnexpectedEOF — stream shorter than buf (normal < 100KB case)
+	//   nil                 — stream filled the buffer exactly
+	n, err := io.ReadFull(data, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("writeEntry read: %w", err)
+	}
+	payload := buf[:n]
+
+	// Single UPSERT — write lock held for exactly one statement.
+	_, err = wdb.ExecContext(
 		ctx,
 		`
 		INSERT INTO cache_blobs (target_addr, hashin, artifact_name, data, created_at)
@@ -224,33 +284,10 @@ func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name stri
 			data       = excluded.data,
 			created_at = excluded.created_at
 		`,
-		targetAddr, hashin, name, []byte{}, time.Now().UnixNano(),
+		targetAddr, hashin, name, payload, time.Now().UnixNano(),
 	)
 	if err != nil {
 		return fmt.Errorf("writeEntry upsert: %w", err)
-	}
-
-	buf := c.pool.Get()
-	defer c.pool.Put(buf)
-
-	for {
-		n, err := data.Read(buf)
-		if n > 0 {
-			_, errAppend := c.wdb.ExecContext(ctx, `
-				UPDATE cache_blobs 
-				SET data = data || ? 
-				WHERE target_addr = ? AND hashin = ? AND artifact_name = ?
-			`, buf[:n], targetAddr, hashin, name)
-			if errAppend != nil {
-				return fmt.Errorf("writeEntry append chunk: %w", errAppend)
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("writeEntry read: %w", err)
-		}
 	}
 
 	return nil
@@ -298,9 +335,15 @@ func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
+		rdb, _, err := c.rwdb(ctx)
+		if err != nil {
+			yield("", err)
+			return
+		}
+
 		targetAddr := c.targetKey(ref)
 
-		rows, err := c.rdb.QueryContext(ctx,
+		rows, err := rdb.QueryContext(ctx,
 			"SELECT artifact_name FROM cache_blobs WHERE target_addr = ? AND hashin = ?",
 			targetAddr, hashin,
 		)
@@ -330,9 +373,15 @@ func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, h
 
 func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
+		rdb, _, err := c.rwdb(ctx)
+		if err != nil {
+			yield("", err)
+			return
+		}
+
 		targetAddr := c.targetKey(ref)
 
-		rows, err := c.rdb.QueryContext(ctx,
+		rows, err := rdb.QueryContext(ctx,
 			"SELECT DISTINCT hashin FROM cache_blobs WHERE target_addr = ?",
 			targetAddr,
 		)

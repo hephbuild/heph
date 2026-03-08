@@ -13,3 +13,19 @@ func NewReadCloser(r io.Reader, c io.Closer) io.ReadCloser {
 		Closer: c,
 	}
 }
+
+type readCloserFunc struct {
+	io.Reader
+	CloserFunc func() error
+}
+
+func (r readCloserFunc) Close() error {
+	return r.CloserFunc()
+}
+
+func NewReadCloserFunc(r io.Reader, f func() error) io.ReadCloser {
+	return readCloserFunc{
+		Reader:     r,
+		CloserFunc: f,
+	}
+}
