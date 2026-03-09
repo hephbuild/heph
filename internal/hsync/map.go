@@ -1,3 +1,4 @@
+//nolint:errcheck
 package hsync
 
 import "sync"

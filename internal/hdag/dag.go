@@ -316,7 +316,7 @@ func (d *DAG[V, M]) GetChildren(v V) iter.Seq2[string, V] {
 	}
 }
 
-func (d *DAG[V, M]) GetAncestorsGraph(ctx context.Context, v V) (*DAG[V, M], error) {
+func (d *DAG[V, M]) getSubGraph(ctx context.Context, v V, ancestors bool) (*DAG[V, M], error) {
 	rd := NewMeta[V, M](d.hash)
 	startId := d.hash(v)
 	startNode := d.getNode(startId)
@@ -341,29 +341,44 @@ func (d *DAG[V, M]) GetAncestorsGraph(ctx context.Context, v V) (*DAG[V, M], err
 		}
 
 		currNode.mu.RLock()
-		parents := make([]string, 0, len(currNode.parents))
-		for pid := range currNode.parents {
-			parents = append(parents, pid)
+		var adjs []string
+		if ancestors {
+			adjs = make([]string, 0, len(currNode.parents))
+			for id := range currNode.parents {
+				adjs = append(adjs, id)
+			}
+		} else {
+			adjs = make([]string, 0, len(currNode.children))
+			for id := range currNode.children {
+				adjs = append(adjs, id)
+			}
 		}
 		currNode.mu.RUnlock()
 
-		for _, pid := range parents {
-			pNode := d.getNode(pid)
-			if pNode == nil {
+		for _, id := range adjs {
+			adjNode := d.getNode(id)
+			if adjNode == nil {
 				continue
 			}
-			if !visited[pid] {
-				visited[pid] = true
-				queue = append(queue, pid)
+			if !visited[id] {
+				visited[id] = true
+				queue = append(queue, id)
 			}
-			_ = rd.AddVertex(pNode.v)
+			_ = rd.AddVertex(adjNode.v)
 
-			metas := d.GetEdgeMeta(pNode.v, currNode.v)
+			var src, dst V
+			if ancestors {
+				src, dst = adjNode.v, currNode.v
+			} else {
+				src, dst = currNode.v, adjNode.v
+			}
+
+			metas := d.GetEdgeMeta(src, dst)
 			if len(metas) == 0 {
-				_ = rd.AddEdge(pNode.v, currNode.v)
+				_ = rd.AddEdge(src, dst)
 			} else {
 				for _, m := range metas {
-					_ = rd.AddEdgeMeta(pNode.v, currNode.v, m)
+					_ = rd.AddEdgeMeta(src, dst, m)
 				}
 			}
 		}
@@ -371,59 +386,12 @@ func (d *DAG[V, M]) GetAncestorsGraph(ctx context.Context, v V) (*DAG[V, M], err
 	return rd, nil
 }
 
+func (d *DAG[V, M]) GetAncestorsGraph(ctx context.Context, v V) (*DAG[V, M], error) {
+	return d.getSubGraph(ctx, v, true)
+}
+
 func (d *DAG[V, M]) GetDescendantsGraph(ctx context.Context, v V) (*DAG[V, M], error) {
-	rd := NewMeta[V, M](d.hash)
-	startId := d.hash(v)
-	startNode := d.getNode(startId)
-	if startNode == nil {
-		return nil, VertexNotFoundError{ID: startId}
-	}
-	_ = rd.AddVertex(startNode.v)
-	queue := []string{startId}
-	visited := map[string]bool{startId: true}
-
-	for len(queue) > 0 {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-
-		currId := queue[0]
-		queue = queue[1:]
-
-		currNode := d.getNode(currId)
-		if currNode == nil {
-			continue
-		}
-
-		currNode.mu.RLock()
-		children := make([]string, 0, len(currNode.children))
-		for cid := range currNode.children {
-			children = append(children, cid)
-		}
-		currNode.mu.RUnlock()
-
-		for _, cid := range children {
-			cNode := d.getNode(cid)
-			if cNode == nil {
-				continue
-			}
-			if !visited[cid] {
-				visited[cid] = true
-				queue = append(queue, cid)
-			}
-			_ = rd.AddVertex(cNode.v)
-
-			metas := d.GetEdgeMeta(currNode.v, cNode.v)
-			if len(metas) == 0 {
-				_ = rd.AddEdge(currNode.v, cNode.v)
-			} else {
-				for _, m := range metas {
-					_ = rd.AddEdgeMeta(currNode.v, cNode.v, m)
-				}
-			}
-		}
-	}
-	return rd, nil
+	return d.getSubGraph(ctx, v, false)
 }
 
 func (d *DAG[V, M]) GetGraph(ctx context.Context, v V) (*DAG[V, M], error) {
@@ -490,8 +458,7 @@ func (d *DAG[V, M]) BFSWalk(ctx context.Context) iter.Seq[V] {
 		slices.Sort(roots)
 
 		visited := make(map[string]bool)
-		queue := make([]string, len(roots))
-		copy(queue, roots)
+		queue := slices.Clone(roots)
 		for _, r := range roots {
 			visited[r] = true
 		}

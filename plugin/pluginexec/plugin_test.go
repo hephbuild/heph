@@ -416,10 +416,10 @@ func TestSourceMap(t *testing.T) {
 			_, err = os.Stat(smPath)
 
 			if tt.sourceMap {
-				assert.NoError(t, err) // Should exist
+				require.NoError(t, err) // Should exist
 				assert.Contains(t, logOutput, "SOURCEMAP=")
 			} else {
-				assert.ErrorIs(t, err, os.ErrNotExist) // Should not exist
+				require.ErrorIs(t, err, os.ErrNotExist) // Should not exist
 				assert.NotContains(t, logOutput, "SOURCEMAP=")
 			}
 		})
