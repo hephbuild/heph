@@ -142,7 +142,7 @@ func TestSanityRemoteCache(t *testing.T) {
 				require.NoError(t, err)
 
 				assert.Equal(t, "45f43fa56fc9edac", manifest.Hashin)
-				assert.Equal(t, "d4fd9c2c4c50146f", manifest.Artifacts[0].Hashout)
+				assert.Equal(t, "c213ad27305edd83", manifest.Artifacts[0].Hashout)
 			}
 
 			{
@@ -158,8 +158,8 @@ func TestSanityRemoteCache(t *testing.T) {
 				manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t2", nil), []string{""})
 				require.NoError(t, err)
 
-				assert.Equal(t, "c7aa9c7fd026ecdb", manifest.Hashin)
-				assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
+				assert.Equal(t, "936e01aae2b4f956", manifest.Hashin)
+				assert.Equal(t, "f5dfd291c48848f4", manifest.Artifacts[0].Hashout)
 			}
 
 			{
@@ -175,8 +175,8 @@ func TestSanityRemoteCache(t *testing.T) {
 				manifest, err := e.ResultMetaFromRef(ctx, rs, tref.New(pkg, "t3", nil), []string{""})
 				require.NoError(t, err)
 
-				assert.Equal(t, "5e18c3b12b69ae7d", manifest.Hashin)
-				assert.Equal(t, "3b0f519635c52211", manifest.Artifacts[0].Hashout)
+				assert.Equal(t, "7412a97a6378e1ee", manifest.Hashin)
+				assert.Equal(t, "f5dfd291c48848f4", manifest.Artifacts[0].Hashout)
 			}
 
 			assert.Len(t, cache.storeWrites, 6)

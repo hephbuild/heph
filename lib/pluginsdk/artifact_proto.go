@@ -78,8 +78,6 @@ func (a ProtoArtifact) GetContentReader() (io.ReadCloser, error) {
 		}()
 
 		return pr, nil
-	case pluginv1.Artifact_TargzPath_case:
-		return os.Open(partifact.GetTargzPath())
 	case pluginv1.Artifact_TarPath_case:
 		return os.Open(partifact.GetTarPath())
 	case pluginv1.Artifact_CpioPath_case:
@@ -108,15 +106,6 @@ func (a ProtoArtifact) GetContentSize() (int64, error) {
 		content := partifact.GetRaw()
 
 		return int64(len(content.GetData())), nil
-	case pluginv1.Artifact_TargzPath_case:
-		sourcefs := hfs.NewOS(partifact.GetTargzPath())
-
-		info, err := sourcefs.Lstat()
-		if err != nil {
-			return 0, err
-		}
-
-		return info.Size(), nil
 	case pluginv1.Artifact_TarPath_case:
 		sourcefs := hfs.NewOS(partifact.GetTarPath())
 
@@ -148,8 +137,6 @@ func (a ProtoArtifact) GetContentType() (ArtifactContentType, error) {
 		return ArtifactContentTypeCpio, nil
 	case pluginv1.Artifact_Raw_case:
 		return ArtifactContentTypeCpio, nil
-	case pluginv1.Artifact_TargzPath_case:
-		return ArtifactContentTypeTarGz, nil
 	case pluginv1.Artifact_TarPath_case:
 		return ArtifactContentTypeTar, nil
 	case pluginv1.Artifact_CpioPath_case:
@@ -178,8 +165,6 @@ func (a ProtoArtifact) FSNode() hfs.Node {
 		return hfs.NewOS(partifact.GetFile().GetSourcePath())
 	case pluginv1.Artifact_Raw_case:
 		return nil
-	case pluginv1.Artifact_TargzPath_case:
-		return hfs.NewOS(partifact.GetTargzPath())
 	case pluginv1.Artifact_TarPath_case:
 		return hfs.NewOS(partifact.GetTarPath())
 	case pluginv1.Artifact_CpioPath_case:

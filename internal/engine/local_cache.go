@@ -192,8 +192,6 @@ func (e cachePluginArtifact) GetContentType() (pluginsdk.ArtifactContentType, er
 	switch e.artifact.ContentType {
 	case hartifact.ManifestArtifactContentTypeTar:
 		return pluginsdk.ArtifactContentTypeTar, nil
-	case hartifact.ManifestArtifactContentTypeTarGz:
-		return pluginsdk.ArtifactContentTypeTarGz, nil
 	case hartifact.ManifestArtifactContentTypeCpio:
 		return pluginsdk.ArtifactContentTypeCpio, nil
 	}

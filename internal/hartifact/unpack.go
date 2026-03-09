@@ -70,7 +70,6 @@ func Unpack(ctx context.Context, artifact pluginsdk.Artifact, node hfs.Node, opt
 		}
 
 		return nil
-	// case *pluginv1.Artifact_TargzPath:
 	default:
 		return fmt.Errorf("unsupported encoding %v", contentType)
 	}

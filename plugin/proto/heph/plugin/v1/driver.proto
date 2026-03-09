@@ -83,7 +83,6 @@ message Artifact {
     ContentFile file = 4;
     ContentRaw raw = 5;
     string tar_path = 6;
-    string targz_path = 7;
     string cpio_path = 8;
   }
 }

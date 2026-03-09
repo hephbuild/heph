@@ -50,7 +50,6 @@ func FileReader(ctx context.Context, a pluginsdk.Artifact) (io.ReadCloser, error
 		}
 
 		return hio.NewReadCloser(cr, r), nil
-	// case pluginsdk.ArtifactContentTypeTarGz:
 	default:
 		return nil, fmt.Errorf("unsupported encoding %v", contentType)
 	}
@@ -142,7 +141,6 @@ func FilesReader(ctx context.Context, a pluginsdk.Artifact) iter.Seq2[*File, err
 			}
 
 			return
-		// case pluginsdk.Artifact_TargzPath:
 		default:
 			yield(nil, fmt.Errorf("unsupported encoding %v", contentType))
 			return
