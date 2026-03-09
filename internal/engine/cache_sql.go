@@ -273,11 +273,13 @@ func OpenSQLCacheDB(path string) (*SQLCacheDB, error) {
 	return &SQLCacheDB{path: path}, nil
 }
 
+const sqlCacheDataSize = 100_000
+
 func NewSQLCache(db *SQLCacheDB) *SQLCache {
 	return &SQLCache{
 		db: db,
 		rpool: hsync.Pool[[]byte]{New: func() []byte {
-			return make([]byte, 100_000)
+			return make([]byte, sqlCacheDataSize)
 		}},
 	}
 }
@@ -331,14 +333,23 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 		return nil, fmt.Errorf("reader scan: %w", err)
 	}
 
-	buf := c.rpool.Get()
-	buf = append(buf[:0], raw...)
+	if len(raw) > sqlCacheDataSize {
+		data := bytes.Clone(raw)
 
-	return hio.NewReadCloserFunc(bytes.NewReader(buf), func() error {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+
+	buf := c.rpool.Get()
+	onClose := func() error {
 		c.rpool.Put(buf)
 
 		return nil
-	}), nil
+	}
+	n := copy(buf, raw)
+
+	data := buf[:n]
+
+	return hio.NewReadCloserFunc(bytes.NewReader(data), onClose), nil
 }
 
 func (c *SQLCache) writeEntry(ctx context.Context, targetAddr, hashin, name string, data io.Reader) error {
