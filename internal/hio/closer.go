@@ -1,6 +1,9 @@
 package hio
 
-import "io"
+import (
+	"io"
+	"sync"
+)
 
 type readCloser struct {
 	io.Reader
@@ -20,10 +23,18 @@ type readCloserFunc struct {
 }
 
 func (r readCloserFunc) Close() error {
+	if r.CloserFunc == nil {
+		return nil
+	}
+
 	return r.CloserFunc()
 }
 
 func NewReadCloserFunc(r io.Reader, f func() error) io.ReadCloser {
+	if f != nil {
+		f = sync.OnceValue(f)
+	}
+
 	return readCloserFunc{
 		Reader:     r,
 		CloserFunc: f,
