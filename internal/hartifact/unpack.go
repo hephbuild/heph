@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hephbuild/heph/internal/hcpio"
 	"github.com/hephbuild/heph/internal/htar"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 
@@ -59,6 +60,13 @@ func Unpack(ctx context.Context, artifact pluginsdk.Artifact, node hfs.Node, opt
 		err = htar.Unpack(ctx, r, node, htar.WithOnFile(cfg.onFile), htar.WithFilter(cfg.filter))
 		if err != nil {
 			return fmt.Errorf("tar: %w", err)
+		}
+
+		return nil
+	case pluginsdk.ArtifactContentTypeCpio:
+		err = hcpio.Unpack(ctx, r, node, hcpio.WithOnFile(cfg.onFile), hcpio.WithFilter(cfg.filter))
+		if err != nil {
+			return fmt.Errorf("cpio: %w", err)
 		}
 
 		return nil

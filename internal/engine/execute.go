@@ -15,12 +15,12 @@ import (
 
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hcore/hstep"
+	"github.com/hephbuild/heph/internal/hcpio"
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hpanic"
 	"github.com/hephbuild/heph/internal/hpty"
-	"github.com/hephbuild/heph/internal/htar"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/hpipe"
 	"github.com/hephbuild/heph/lib/pluginsdk"
@@ -301,15 +301,15 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 			continue
 		}
 
-		tarname := output.GetGroup() + ".tar"
-		tarf, err := hfs.Create(sandboxfs.At("collect", tarname))
+		cpioname := output.GetGroup() + ".cpio"
+		cpiof, err := hfs.Create(sandboxfs.At("collect", cpioname))
 		if err != nil {
 			return nil, err
 		}
-		defer tarf.Close()
+		defer cpiof.Close()
 
-		tar := htar.NewPacker(tarf)
-		defer tar.Close()
+		cpiop := hcpio.NewPacker(cpiof)
+		defer cpiop.Close()
 
 		for _, path := range output.GetPaths() {
 			if !path.GetCollect() {
@@ -335,7 +335,7 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 				}
 				defer f.Close()
 
-				err = tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
+				err = cpiop.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
 				if err != nil {
 					return err
 				}
@@ -347,22 +347,22 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 			}
 		}
 
-		err = tar.Close()
+		err = cpiop.Close()
 		if err != nil {
 			return nil, err
 		}
 
-		err = tarf.Close()
+		err = cpiof.Close()
 		if err != nil {
 			return nil, err
 		}
 
 		execArtifact := pluginsdk.ProtoArtifact{
 			Artifact: pluginv1.Artifact_builder{
-				Group:   htypes.Ptr(output.GetGroup()),
-				Name:    htypes.Ptr(tarname),
-				Type:    htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
-				TarPath: proto.String(tarf.Name()),
+				Group:    htypes.Ptr(output.GetGroup()),
+				Name:     htypes.Ptr(cpioname),
+				Type:     htypes.Ptr(pluginv1.Artifact_TYPE_OUTPUT),
+				CpioPath: proto.String(cpiof.Name()),
 			}.Build(),
 		}
 
@@ -387,15 +387,15 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 		}
 
 		if shouldCollect {
-			tarname := "support.tar"
-			tarf, err := hfs.Create(sandboxfs.At("collect", tarname))
+			cpioname := "support.cpio"
+			cpiof, err := hfs.Create(sandboxfs.At("collect", cpioname))
 			if err != nil {
 				return nil, err
 			}
-			defer tarf.Close()
+			defer cpiof.Close()
 
-			tar := htar.NewPacker(tarf)
-			defer tar.Close()
+			cpiop := hcpio.NewPacker(cpiof)
+			defer cpiop.Close()
 
 			for _, path := range def.GetSupportFiles() {
 				if !path.GetCollect() {
@@ -421,23 +421,23 @@ func (e *Engine) execute(ctx context.Context, rs *RequestState, def *LightLinked
 					}
 					defer f.Close()
 
-					return tar.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
+					return cpiop.WriteFile(f, filepath.Join(tref.ToOSPath(def.GetRef().GetPackage()), entry.RelPath))
 				})
 				if err != nil {
 					return nil, fmt.Errorf("collect support file %v: %w", globPath, err)
 				}
 			}
 
-			err = tar.Close()
+			err = cpiop.Close()
 			if err != nil {
 				return nil, err
 			}
 
 			execArtifact := pluginsdk.ProtoArtifact{
 				Artifact: pluginv1.Artifact_builder{
-					Name:    htypes.Ptr(tarname),
-					Type:    htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
-					TarPath: proto.String(tarf.Name()),
+					Name:     htypes.Ptr(cpioname),
+					Type:     htypes.Ptr(pluginv1.Artifact_TYPE_SUPPORT_FILE),
+					CpioPath: proto.String(cpiof.Name()),
 				}.Build(),
 			}
 

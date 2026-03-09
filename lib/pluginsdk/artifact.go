@@ -12,6 +12,7 @@ type ArtifactContentType string
 const (
 	ArtifactContentTypeTar   ArtifactContentType = "application/x-tar"
 	ArtifactContentTypeTarGz ArtifactContentType = "application/x-gtar"
+	ArtifactContentTypeCpio  ArtifactContentType = "application/x-cpio"
 )
 
 type Artifact interface {

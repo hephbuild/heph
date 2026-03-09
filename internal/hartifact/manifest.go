@@ -45,6 +45,7 @@ type ManifestArtifactContentType string
 const (
 	ManifestArtifactContentTypeTar   ManifestArtifactContentType = "application/x-tar"
 	ManifestArtifactContentTypeTarGz ManifestArtifactContentType = "application/x-gtar"
+	ManifestArtifactContentTypeCpio  ManifestArtifactContentType = "application/x-cpio"
 )
 
 type ManifestArtifact struct {
@@ -108,6 +109,8 @@ func ManifestContentType(a pluginsdk.Artifact) (ManifestArtifactContentType, err
 		return ManifestArtifactContentTypeTarGz, nil
 	case pluginsdk.ArtifactContentTypeTar:
 		return ManifestArtifactContentTypeTar, nil
+	case pluginsdk.ArtifactContentTypeCpio:
+		return ManifestArtifactContentTypeCpio, nil
 	default:
 	}
 

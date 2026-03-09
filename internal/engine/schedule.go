@@ -783,16 +783,37 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 		}
 	}
 
-	cachedArtifacts, err := e.cacheLocally(ctx, def, cacheHashin, artifactsToCache)
-	if err != nil {
-		return nil, fmt.Errorf("cache locally: %w", err)
-	}
+	var cachedArtifacts []*ResultArtifact
+	var manifest *hartifact.Manifest
+	if !options.storeCache && len(artifactsToCache) == 0 {
+		cachedArtifacts = artifactsToPassthrough
 
-	cachedArtifacts = append(cachedArtifacts, artifactsToPassthrough...)
+		manifest = &hartifact.Manifest{
+			Version:   "v1",
+			Target:    tref.Format(def.GetRef()),
+			CreatedAt: time.Now(),
+			Hashin:    hashin,
+		}
+		for _, artifact := range cachedArtifacts {
+			martifact, err := hartifact.ProtoArtifactToManifest(artifact.GetHashout(), artifact.Artifact)
+			if err != nil {
+				return nil, err
+			}
 
-	manifest, err := e.createLocalCacheManifest(ctx, def.GetRef(), hashin, cachedArtifacts)
-	if err != nil {
-		return nil, fmt.Errorf("create local cache manifest: %w", err)
+			manifest.Artifacts = append(manifest.Artifacts, martifact)
+		}
+	} else {
+		cachedArtifacts, err = e.cacheLocally(ctx, def, cacheHashin, artifactsToCache)
+		if err != nil {
+			return nil, fmt.Errorf("cache locally: %w", err)
+		}
+
+		cachedArtifacts = append(cachedArtifacts, artifactsToPassthrough...)
+
+		manifest, err = e.createLocalCacheManifest(ctx, def.GetRef(), cacheHashin, cachedArtifacts)
+		if err != nil {
+			return nil, fmt.Errorf("create local cache manifest: %w", err)
+		}
 	}
 
 	if res.AfterCache != nil {

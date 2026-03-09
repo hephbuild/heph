@@ -194,6 +194,8 @@ func (e cachePluginArtifact) GetContentType() (pluginsdk.ArtifactContentType, er
 		return pluginsdk.ArtifactContentTypeTar, nil
 	case hartifact.ManifestArtifactContentTypeTarGz:
 		return pluginsdk.ArtifactContentTypeTarGz, nil
+	case hartifact.ManifestArtifactContentTypeCpio:
+		return pluginsdk.ArtifactContentTypeCpio, nil
 	}
 
 	return "", fmt.Errorf("invalid artifact content type: %q", e.artifact.ContentType)
