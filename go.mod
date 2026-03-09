@@ -15,8 +15,8 @@ tool (
 
 require (
 	capnproto.org/go/capnp/v3 v3.1.0-alpha.1
-	charm.land/bubbletea/v2 v2.0.0
-	charm.land/lipgloss/v2 v2.0.0
+	charm.land/bubbletea/v2 v2.0.2
+	charm.land/lipgloss/v2 v2.0.1
 	cloud.google.com/go/storage v1.54.0
 	connectrpc.com/connect v1.18.1
 	connectrpc.com/otelconnect v0.7.2
@@ -33,7 +33,6 @@ require (
 	github.com/goccy/go-yaml v1.17.1
 	github.com/google/uuid v1.6.0
 	github.com/hanwen/go-fuse/v2 v2.7.2
-	github.com/heimdalr/dag v1.5.0
 	github.com/lithammer/fuzzysearch v1.1.8
 	github.com/mattn/go-isatty v0.0.20
 	github.com/pkg/xattr v0.4.12
@@ -60,7 +59,7 @@ require (
 	go.uber.org/mock v0.5.2
 	golang.org/x/net v0.46.0
 	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.41.0
+	golang.org/x/sys v0.42.0
 	google.golang.org/protobuf v1.36.7-0.20250625222701-8e8926ef675d
 	modernc.org/sqlite v1.46.1
 )
@@ -89,7 +88,6 @@ require (
 	github.com/colega/zeropool v0.0.0-20230505084239-6fb4a4f75381 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4 // indirect
 	github.com/envoyproxy/protoc-gen-validate v1.2.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect

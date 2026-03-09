@@ -1,69 +1,138 @@
 package hdag
 
 import (
+	"context"
 	"fmt"
-	"slices"
+	"sync"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestBFSWalk(t *testing.T) {
-	ctx := t.Context()
-	d := New[int](func(i int) string {
-		return fmt.Sprintf("node-%v", i)
-	})
+type Vertex struct {
+	ID string
+}
 
-	require.NoError(t, d.AddVertex(1))
-	require.NoError(t, d.AddVertex(2))
-	require.NoError(t, d.AddVertex(3))
+func TestDAGAddVertex(t *testing.T) {
+	d := New(func(v Vertex) string { return v.ID })
 
-	require.NoError(t, d.AddEdge(1, 2))
-	require.NoError(t, d.AddEdge(1, 3))
-
-	oned, err := d.GetGraph(ctx, 1)
+	err := d.AddVertex(Vertex{"A"})
 	require.NoError(t, err)
 
-	collected := slices.Collect(oned.BFSWalk(ctx))
-
-	assert.Equal(t, []int{1, 2, 3}, collected)
+	err = d.AddVertex(Vertex{"A"})
+	require.Error(t, err)
+	require.True(t, IsDuplicateVertexError(err), "expected duplicate vertex error, got %v", err)
 }
 
-func TestGetVertices(t *testing.T) {
-	d := New[int](func(i int) string {
-		return fmt.Sprintf("node-%v", i)
-	})
+func TestDAGAddEdgeCycle(t *testing.T) {
+	d := New(func(v Vertex) string { return v.ID })
 
-	require.NoError(t, d.AddVertex(1))
-	require.NoError(t, d.AddVertex(2))
-	require.NoError(t, d.AddVertex(3))
+	d.AddVertex(Vertex{"A"})
+	d.AddVertex(Vertex{"B"})
+	d.AddVertex(Vertex{"C"})
 
-	require.NoError(t, d.AddEdge(1, 2))
-	require.NoError(t, d.AddEdge(1, 3))
+	require.NoError(t, d.AddEdge(Vertex{"A"}, Vertex{"B"}))
+	require.NoError(t, d.AddEdge(Vertex{"B"}, Vertex{"C"}))
+	require.Error(t, d.AddEdge(Vertex{"C"}, Vertex{"A"}), "expected cycle error")
+}
 
-	vertices := d.GetVertices()
+func TestDAGConcurrent(t *testing.T) {
+	d := NewMeta[Vertex, int](func(v Vertex) string { return v.ID })
 
-	collected := []int{}
-	for _, v := range vertices {
-		collected = append(collected, v)
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			v := Vertex{fmt.Sprintf("V%d", i)}
+			_ = d.AddVertex(v)
+		}(i)
 	}
-	assert.ElementsMatch(t, []int{1, 2, 3}, collected)
+	wg.Wait() // Ensure all roots exist
+
+	for i := 1; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			v := Vertex{fmt.Sprintf("V%d", i)}
+			parent := Vertex{fmt.Sprintf("V%d", i/2)}
+			_ = d.AddEdgeMeta(parent, v, i*10)
+		}(i)
+	}
+	wg.Wait()
+
+	// Check metas
+	for i := 1; i < 100; i++ {
+		v := Vertex{fmt.Sprintf("V%d", i)}
+		parent := Vertex{fmt.Sprintf("V%d", i/2)}
+		metas := d.GetEdgeMeta(parent, v)
+		require.Len(t, metas, 1)
+		require.Equal(t, i*10, metas[0])
+	}
 }
 
-func TestMeta(t *testing.T) {
-	d := NewMeta[int, string](func(i int) string {
-		return fmt.Sprintf("node-%v", i)
-	})
+func TestDAGBFS(t *testing.T) {
+	d := New(func(v Vertex) string { return v.ID })
 
-	require.NoError(t, d.AddVertex(1))
-	require.NoError(t, d.AddVertex(2))
-	require.NoError(t, d.AddVertex(3))
+	d.AddVertex(Vertex{"A"})
+	d.AddVertex(Vertex{"B"})
+	d.AddVertex(Vertex{"C"})
+	d.AddVertex(Vertex{"D"})
 
-	require.NoError(t, d.AddEdgeMeta(1, 2, "foo"))
-	require.NoError(t, d.AddEdgeMeta(1, 2, "bar"))
-	require.Error(t, d.AddEdgeMeta(1, 2, "bar"))
+	d.AddEdge(Vertex{"A"}, Vertex{"B"})
+	d.AddEdge(Vertex{"A"}, Vertex{"C"})
+	d.AddEdge(Vertex{"B"}, Vertex{"D"})
+	d.AddEdge(Vertex{"C"}, Vertex{"D"})
 
-	metas := d.GetEdgeMeta(1, 2)
-	assert.ElementsMatch(t, []string{"foo", "bar"}, metas)
+	ctx := context.Background()
+	visited := make([]string, 0)
+	for v := range d.BFSWalk(ctx) {
+		visited = append(visited, v.ID)
+	}
+
+	require.NotEmpty(t, visited)
+	require.Equal(t, "A", visited[0])
+	require.Contains(t, visited, "B")
+	require.Contains(t, visited, "C")
+	require.Contains(t, visited, "D")
+}
+
+func TestSubgraphs(t *testing.T) {
+	d := New(func(v Vertex) string { return v.ID })
+
+	// A -> B -> C -> D
+	d.AddVertex(Vertex{"A"})
+	d.AddVertex(Vertex{"B"})
+	d.AddVertex(Vertex{"C"})
+	d.AddVertex(Vertex{"D"})
+	d.AddEdge(Vertex{"A"}, Vertex{"B"})
+	d.AddEdge(Vertex{"B"}, Vertex{"C"})
+	d.AddEdge(Vertex{"C"}, Vertex{"D"})
+
+	ctx := context.Background()
+	anc, _ := d.GetAncestorsGraph(ctx, Vertex{"C"})
+
+	var ancIDs []string
+	for _, v := range anc.GetVertices() {
+		ancIDs = append(ancIDs, v.ID)
+	}
+	require.Contains(t, ancIDs, "A", "incorrect ancestors")
+	require.NotContains(t, ancIDs, "D", "incorrect ancestors")
+
+	desc, _ := d.GetDescendantsGraph(ctx, Vertex{"B"})
+	var descIDs []string
+	for _, v := range desc.GetVertices() {
+		descIDs = append(descIDs, v.ID)
+	}
+	require.NotContains(t, descIDs, "A", "incorrect descendants")
+	require.Contains(t, descIDs, "C", "incorrect descendants")
+	require.Contains(t, descIDs, "D", "incorrect descendants")
+
+	graph, _ := d.GetGraph(ctx, Vertex{"C"})
+
+	var total int
+	for range graph.GetVertices() {
+		total++
+	}
+	require.Equal(t, 4, total, "expected 4 vertices in total graph")
 }

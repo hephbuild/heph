@@ -65,6 +65,7 @@ func (s *SQLCacheDB) openInner(ctx context.Context) error {
 	}
 	// One writer at a time — prevents SQLITE_BUSY.
 	wdb.SetMaxOpenConns(1)
+	wdb.SetMaxIdleConns(1)
 
 	if err := initSQLCacheDB(ctx, wdb); err != nil {
 		_ = wdb.Close()

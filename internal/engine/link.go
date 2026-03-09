@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/heimdalr/dag"
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto"
@@ -232,12 +231,12 @@ func dagAddParent(rs *RequestState, ref *pluginv1.TargetRef) (*RequestState, err
 
 		err = rs.dag.AddEdgeMeta(ref, rs.parent, "resolve")
 		if err != nil && !hdag.IsDuplicateEdgeError(err) {
-			if errors.As(err, &dag.EdgeLoopError{}) {
+			if errors.As(err, &hdag.CycleError{}) {
 				return rs, NewStackRecursionError(func() string {
 					return err.Error()
 				})
 			}
-			if errors.As(err, &dag.SrcDstEqualError{}) {
+			if errors.As(err, &hdag.SelfLoopError{}) {
 				return rs, NewStackRecursionError(func() string {
 					return err.Error()
 				})
@@ -921,12 +920,12 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 
 			err = rs.dag.AddEdgeMeta(depRef, def.GetRef(), "dep")
 			if err != nil && !hdag.IsDuplicateEdgeError(err) {
-				if errors.As(err, &dag.EdgeLoopError{}) {
+				if errors.As(err, &hdag.CycleError{}) {
 					return NewStackRecursionError(func() string {
 						return err.Error()
 					})
 				}
-				if errors.As(err, &dag.SrcDstEqualError{}) {
+				if errors.As(err, &hdag.SelfLoopError{}) {
 					return NewStackRecursionError(func() string {
 						return err.Error()
 					})
