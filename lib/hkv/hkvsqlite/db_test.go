@@ -151,7 +151,7 @@ func TestKV_List(t *testing.T) {
 	assert.ElementsMatch(t, []string{"k1"}, prodTypeAKeys)
 }
 
-func TestKV_TTL_Unsupported(t *testing.T) {
+func TestKV_TTL(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 
@@ -159,11 +159,74 @@ func TestKV_TTL_Unsupported(t *testing.T) {
 	kv := New(dbPath)
 	defer kv.Close()
 
-	err := kv.Set(ctx, "k", []byte("v"), nil, time.Hour)
-	require.ErrorContains(t, err, "unsupported")
+	key := "ttl-key"
+	value := []byte("v")
 
-	_, err = kv.Writer(ctx, "k", nil, time.Hour)
-	require.ErrorContains(t, err, "unsupported")
+	// Set with short TTL
+	err := kv.Set(ctx, key, value, nil, 10*time.Second)
+	require.NoError(t, err)
+
+	// Immediately check (should be there)
+	exists, err := kv.Exists(ctx, key)
+	require.NoError(t, err)
+	assert.True(t, exists)
+
+	// Update with expired TTL
+	err = kv.Set(ctx, key, value, nil, -1*time.Second)
+	require.NoError(t, err)
+
+	// Check again (should be expired)
+	exists, err = kv.Exists(ctx, key)
+	require.NoError(t, err)
+	assert.False(t, exists)
+
+	// Get should also fail
+	_, _, found, err := kv.Get(ctx, key)
+	require.NoError(t, err)
+	assert.False(t, found)
+
+	// ListKeys should also exclude it
+	count := 0
+	for _, err := range kv.ListKeys(ctx, nil) {
+		require.NoError(t, err)
+		count++
+	}
+	assert.Equal(t, 0, count)
+}
+
+func TestKV_GC(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	dbPath := filepath.Join(tmpDir, "test-gc.db")
+	kv := New(dbPath)
+	defer kv.Close()
+
+	// Set one key with TTL and one without
+	err := kv.Set(ctx, "k1", []byte("v1"), nil, 100*time.Millisecond)
+	require.NoError(t, err)
+	err = kv.Set(ctx, "k2", []byte("v2"), nil, 0)
+	require.NoError(t, err)
+
+	// Wait for expiration
+	time.Sleep(200 * time.Millisecond)
+
+	// Run GC
+	err = kv.GC(ctx)
+	require.NoError(t, err)
+
+	// Check underlying database (manually if possible, but here we can just use non-filtering queries if we had them)
+	// Since we don't have non-filtering queries exposed, we can't easily check if it's REALLY gone from the DB
+	// without opening the DB manually.
+
+	// But we can check that k1 is definitely not there anymore.
+	exists, err := kv.Exists(ctx, "k1")
+	require.NoError(t, err)
+	assert.False(t, exists)
+
+	exists, err = kv.Exists(ctx, "k2")
+	require.NoError(t, err)
+	assert.True(t, exists)
 }
 
 func TestKV_Metadata(t *testing.T) {

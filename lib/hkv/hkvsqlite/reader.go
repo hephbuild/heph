@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/hephbuild/heph/internal/hio"
 )
@@ -19,6 +20,7 @@ func (c *KV) Reader(ctx context.Context, key string) (io.ReadCloser, bool, error
 	rows, err := c.readerStmt.QueryContext(
 		ctx,
 		key,
+		time.Now().Unix(),
 	)
 	if err != nil {
 		return nil, false, fmt.Errorf("reader query: %w", err)

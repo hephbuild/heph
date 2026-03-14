@@ -36,6 +36,7 @@ type KV struct {
 	getMetaStmt    *sql.Stmt
 
 	listStmt *sql.Stmt
+	gcStmt   *sql.Stmt
 }
 
 var _ hkv.KV[[]byte] = (*KV)(nil)
@@ -68,12 +69,14 @@ func (c *KV) open(ctx context.Context) (*sql.DB, *sql.DB, error) {
 func (c *KV) migrate(ctx context.Context) error {
 	_, err := c.wdb.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS kv (
-			key      TEXT NOT NULL,
-			data     BLOB,
+			key       TEXT NOT NULL,
+			data      BLOB,
+			expire_at INTEGER,
 			PRIMARY KEY (key)
 		);
 
 		CREATE INDEX IF NOT EXISTS kv_key ON kv (key);
+		CREATE INDEX IF NOT EXISTS kv_expire_at ON kv (expire_at);
 
 		CREATE TABLE IF NOT EXISTS kv_meta (
 			key  TEXT NOT NULL,
@@ -126,23 +129,24 @@ func (c *KV) openInner(ctx context.Context) error {
 	c.readerStmt, err = rdb.PrepareContext(ctx, `
 			SELECT data
 			FROM kv
-			WHERE key = ?
+			WHERE key = ? AND (expire_at IS NULL OR expire_at > ?)
 			LIMIT 1
 		`)
 	if err != nil {
 		return fmt.Errorf("prepare reader: %w", err)
 	}
 
-	c.existsStmt, err = rdb.PrepareContext(ctx, `SELECT 1 FROM kv WHERE key = ? LIMIT 1`)
+	c.existsStmt, err = rdb.PrepareContext(ctx, `SELECT 1 FROM kv WHERE key = ? AND (expire_at IS NULL OR expire_at > ?) LIMIT 1`)
 	if err != nil {
 		return fmt.Errorf("prepare exists: %w", err)
 	}
 
 	c.upsertStmt, err = wdb.PrepareContext(ctx, `
-		INSERT INTO kv (key, data)
-		VALUES (?, ?)
+		INSERT INTO kv (key, data, expire_at)
+		VALUES (?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
-			data     = excluded.data
+			data      = excluded.data,
+			expire_at = excluded.expire_at
 		`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert: %w", err)
@@ -171,7 +175,8 @@ func (c *KV) openInner(ctx context.Context) error {
 	c.listStmt, err = rdb.PrepareContext(ctx, `
 		SELECT k.key
 		FROM kv k
-		WHERE (SELECT COUNT(*) FROM json_each(?)) = (
+		WHERE (expire_at IS NULL OR expire_at > ?)
+		AND (SELECT COUNT(*) FROM json_each(?)) = (
 			SELECT COUNT(*)
 			FROM kv_meta km
 			WHERE km.key = k.key
@@ -180,6 +185,11 @@ func (c *KV) openInner(ctx context.Context) error {
 	`)
 	if err != nil {
 		return fmt.Errorf("prepare list with metadata: %w", err)
+	}
+
+	c.gcStmt, err = wdb.PrepareContext(ctx, `DELETE FROM kv WHERE expire_at IS NOT NULL AND expire_at <= ?`)
+	if err != nil {
+		return fmt.Errorf("prepare gc: %w", err)
 	}
 
 	return nil
@@ -259,7 +269,7 @@ func (c *KV) Exists(ctx context.Context, key string) (bool, error) {
 	}
 
 	var exists bool
-	err = c.existsStmt.QueryRowContext(ctx, key).Scan(&exists)
+	err = c.existsStmt.QueryRowContext(ctx, key, time.Now().Unix()).Scan(&exists)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, fmt.Errorf("exists: %w", err)
 	}
@@ -268,10 +278,6 @@ func (c *KV) Exists(ctx context.Context, key string) (bool, error) {
 }
 
 func (c *KV) Set(ctx context.Context, key string, value []byte, metadata map[string]string, ttl time.Duration) error {
-	if ttl > 0 {
-		return errors.New("unsupported")
-	}
-
 	w, err := c.Writer(ctx, key, metadata, ttl)
 	if err != nil {
 		return err
@@ -321,7 +327,7 @@ func (c *KV) ListKeys(ctx context.Context, query map[string]string) iter.Seq2[st
 			}
 		}
 
-		rows, err := c.listStmt.QueryContext(ctx, queryJSON, queryJSON)
+		rows, err := c.listStmt.QueryContext(ctx, time.Now().Unix(), queryJSON, queryJSON)
 		if err != nil {
 			yield("", err)
 			return
@@ -348,6 +354,22 @@ func (c *KV) ListKeys(ctx context.Context, query map[string]string) iter.Seq2[st
 	}
 }
 
+func (c *KV) GC(ctx context.Context) error {
+	_, wdb, err := c.open(ctx)
+	if err != nil {
+		return err
+	}
+
+	_, err = c.gcStmt.ExecContext(ctx, time.Now().Unix())
+	if err != nil {
+		return err
+	}
+
+	_, err = wdb.ExecContext(ctx, "PRAGMA incremental_vacuum(500);")
+
+	return err
+}
+
 func (c *KV) Close() error {
 	var errs []error
 	if c.readerStmt != nil {
@@ -370,6 +392,9 @@ func (c *KV) Close() error {
 	}
 	if c.listStmt != nil {
 		errs = append(errs, c.listStmt.Close())
+	}
+	if c.gcStmt != nil {
+		errs = append(errs, c.gcStmt.Close())
 	}
 	if c.rdb != nil {
 		errs = append(errs, c.rdb.Close())

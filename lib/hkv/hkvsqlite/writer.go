@@ -2,7 +2,6 @@ package hkvsqlite
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -33,7 +32,7 @@ func (w *kvWriter) Close() error {
 	return w.closeErr
 }
 
-func (c *KV) writeEntry(ctx context.Context, key string, metadata map[string]string, data io.Reader) error {
+func (c *KV) writeEntry(ctx context.Context, key string, metadata map[string]string, ttl time.Duration, data io.Reader) error {
 	payload, err := io.ReadAll(data)
 	if err != nil {
 		return fmt.Errorf("writeEntry read: %w", err)
@@ -50,10 +49,16 @@ func (c *KV) writeEntry(ctx context.Context, key string, metadata map[string]str
 	}
 	defer tx.Rollback()
 
+	var expireAt *int64
+	if ttl != 0 {
+		t := time.Now().Add(ttl).Unix()
+		expireAt = &t
+	}
+
 	// Single UPSERT — write lock held for exactly one statement.
 	_, err = tx.StmtContext(ctx, c.upsertStmt).ExecContext(
 		ctx,
-		key, payload,
+		key, payload, expireAt,
 	)
 	if err != nil {
 		return fmt.Errorf("writeEntry upsert: %w", err)
@@ -78,10 +83,6 @@ func (c *KV) writeEntry(ctx context.Context, key string, metadata map[string]str
 }
 
 func (c *KV) Writer(ctx context.Context, key string, metadata map[string]string, ttl time.Duration) (io.WriteCloser, error) {
-	if ttl > 0 {
-		return nil, errors.New("unsupported")
-	}
-
 	_, _, err := c.open(ctx)
 	if err != nil {
 		return nil, err
@@ -92,7 +93,7 @@ func (c *KV) Writer(ctx context.Context, key string, metadata map[string]string,
 
 	go func() {
 		defer pr.Close()
-		err := c.writeEntry(ctx, key, metadata, pr)
+		err := c.writeEntry(ctx, key, metadata, ttl, pr)
 		if err != nil {
 			wrappedErr := fmt.Errorf("writer write: %q %w", key, err)
 			_ = pr.CloseWithError(wrappedErr)

@@ -38,6 +38,7 @@ func newConnector(dsn string, cfg ConnConfig) dsnConnector {
 		PRAGMA synchronous = NORMAL;
 		PRAGMA foreign_keys = ON;
 		PRAGMA temp_store = MEMORY;
+		PRAGMA auto_vacuum = INCREMENTAL;
 	`)
 	if cfg.PageSize != 0 {
 		_, _ = fmt.Fprintf(&sb, "PRAGMA page_size = %d;", cfg.PageSize)

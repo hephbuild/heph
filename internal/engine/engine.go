@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/lib/hkv/hkvsqlite"
@@ -91,6 +93,7 @@ type Engine struct {
 	Sandbox  hfs.OS
 	RootSpan trace.Span
 
+	KV         *hkvsqlite.KV
 	CacheSmall LocalCache
 	CacheLarge LocalCache
 
@@ -135,13 +138,33 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		FSLock:   cfg.LockDriver == "fs",
 	}
 
-	db := hkvsqlite.New(filepath.Join(cachefs.Path(), "cache.db"))
-	err := db.Migrate(ctx)
+	e.KV = hkvsqlite.New(filepath.Join(cachefs.Path(), "cache.db"))
+	err := e.KV.Migrate(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("migrate cache db: %w", err)
 	}
 
-	e.CacheSmall = NewSQLCache(db)
+	go func() {
+		if rand.Float32() > 0.95 { // 5% chance of GC on startup
+			err := e.KV.GC(ctx)
+			if err != nil {
+				hlog.From(ctx).Error("gc", "err", err)
+			}
+		}
+
+		for {
+			select {
+			case <-time.After(time.Minute * 10):
+				err := e.KV.GC(ctx)
+				if err != nil {
+					hlog.From(ctx).Error("gc", "err", err)
+				}
+			case <-ctx.Done():
+			}
+		}
+	}()
+
+	e.CacheSmall = NewSQLCache(e.KV)
 	e.CacheLarge = NewFSCache(cachefs)
 
 	for _, s := range cfg.Packages.Exclude {

@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSQLCache(t *testing.T) {
+func TestKVCache_sqlite(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "cache.db")
 	kv := hkvsqlite.New(dbPath)
