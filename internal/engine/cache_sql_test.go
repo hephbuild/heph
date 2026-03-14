@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/hephbuild/heph/internal/engine"
+	"github.com/hephbuild/heph/lib/hkv/hkvsqlite"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	"github.com/stretchr/testify/require"
 )
@@ -14,11 +15,13 @@ import (
 func TestSQLCache(t *testing.T) {
 	tempDir := t.TempDir()
 	dbPath := filepath.Join(tempDir, "cache.db")
-	db, err := engine.OpenSQLCacheDB(dbPath)
-	require.NoError(t, err)
-	defer db.Close()
+	kv := hkvsqlite.New(dbPath)
+	defer kv.Close()
 
-	cache := engine.NewSQLCache(db)
+	err := kv.Migrate(t.Context())
+	require.NoError(t, err)
+
+	cache := engine.NewSQLCache(kv)
 
 	ctx := context.Background()
 	pkg := "pkg"

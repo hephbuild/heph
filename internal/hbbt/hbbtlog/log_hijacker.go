@@ -3,6 +3,7 @@ package hbbtlog
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -98,7 +99,18 @@ type RecordContainer struct {
 func NewLogHijacker() Hijacker {
 	h := Hijacker{
 		Model: hbbtch.New[RecordContainer](func(c RecordContainer) tea.Cmd {
-			return tea.Println(hlog.FormatRecord(c.Attrs, c.Record))
+			s := hlog.FormatRecord(c.Attrs, c.Record)
+			n := strings.Count(s, "\n")
+			if n > 0 {
+				return tea.Println(s)
+			}
+
+			cmds := make([]tea.Cmd, 0, n+1)
+			for l := range strings.SplitSeq(s, "\n") {
+				cmds = append(cmds, tea.Println(l))
+			}
+
+			return tea.Sequence(cmds...)
 		}),
 		hijackerData: &hijackerData{
 			cond: sync.NewCond(&sync.Mutex{}),

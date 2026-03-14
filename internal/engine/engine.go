@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/hephbuild/heph/internal/hdag"
+	"github.com/hephbuild/heph/lib/hkv/hkvsqlite"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
@@ -134,10 +135,12 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 		FSLock:   cfg.LockDriver == "fs",
 	}
 
-	db, err := OpenSQLCacheDB(filepath.Join(cachefs.Path(), "cache.db"))
+	db := hkvsqlite.New(filepath.Join(cachefs.Path(), "cache.db"))
+	err := db.Migrate(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("open cache db: %w", err)
+		return nil, fmt.Errorf("migrate cache db: %w", err)
 	}
+
 	e.CacheSmall = NewSQLCache(db)
 	e.CacheLarge = NewFSCache(cachefs)
 

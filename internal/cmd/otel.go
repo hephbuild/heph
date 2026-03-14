@@ -3,6 +3,8 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"go.opentelemetry.io/otel/trace/noop"
+	"google.golang.org/grpc/grpclog"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
@@ -25,10 +28,61 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
+type slogGRPCBridge struct {
+	logger hlog.Logger
+}
+
+func (s slogGRPCBridge) Info(args ...interface{})   { s.logger.Info(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Infoln(args ...interface{}) { s.logger.Info(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Infof(format string, args ...interface{}) {
+	s.logger.Info(fmt.Sprintf(format, args...))
+}
+
+func (s slogGRPCBridge) Warning(args ...interface{})   { s.logger.Warn(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Warningln(args ...interface{}) { s.logger.Warn(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Warningf(format string, args ...interface{}) {
+	s.logger.Warn(fmt.Sprintf(format, args...))
+}
+
+func (s slogGRPCBridge) Error(args ...interface{})   { s.logger.Error(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Errorln(args ...interface{}) { s.logger.Error(fmt.Sprint(args...)) }
+func (s slogGRPCBridge) Errorf(format string, args ...interface{}) {
+	s.logger.Error(fmt.Sprintf(format, args...))
+}
+
+func (s slogGRPCBridge) Fatal(args ...interface{}) {
+	s.logger.Error(fmt.Sprint(args...))
+	panic(fmt.Sprint(args...))
+}
+func (s slogGRPCBridge) Fatalln(args ...interface{}) {
+	s.logger.Error(fmt.Sprint(args...))
+	panic(fmt.Sprint(args...))
+}
+func (s slogGRPCBridge) Fatalf(format string, args ...interface{}) {
+	s.logger.Error(fmt.Sprintf(format, args...))
+	panic(fmt.Sprintf(format, args...))
+}
+
+func (s slogGRPCBridge) V(l int) bool {
+	return s.logger.Enabled(context.Background(), slog.LevelDebug)
+}
+
+type slogErrorHandler struct {
+	logger hlog.Logger
+}
+
+func (h *slogErrorHandler) Handle(err error) {
+	h.logger.Error("otel internal error", "error", err)
+}
+
 // setupOTelSDK bootstraps the OpenTelemetry pipeline.
 // If it does not return an error, make sure to call shutdown for proper cleanup.
 func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 	otel.SetLogger(logr.FromSlogHandler(hlog.From(ctx).Handler()))
+	otel.SetErrorHandler(&slogErrorHandler{
+		logger: hlog.From(ctx),
+	})
+	grpclog.SetLoggerV2(slogGRPCBridge{hlog.From(ctx)})
 
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" {
 		otel.SetTracerProvider(noop.NewTracerProvider())
