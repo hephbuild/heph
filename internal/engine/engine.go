@@ -156,12 +156,13 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 
 		for {
 			select {
-			case <-time.After(time.Minute * 10):
+			case <-time.After(10 * time.Minute):
 				err := sqlitekv.GC(ctx)
 				if err != nil {
 					hlog.From(ctx).Error("gc", "err", err)
 				}
 			case <-ctx.Done():
+				return
 			}
 		}
 	}()
