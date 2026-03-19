@@ -8,9 +8,8 @@ import (
 	"unsafe"
 
 	"github.com/hephbuild/heph/internal/hsync"
+	sync_map "github.com/zolstein/sync-map"
 
-	cache "github.com/Code-Hex/go-generics-cache"
-	"github.com/Code-Hex/go-generics-cache/policy/lfu"
 	"github.com/hephbuild/heph/internal/hmaps"
 	"github.com/hephbuild/heph/internal/hsingleflight"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -133,10 +132,10 @@ func ParseQuery(ref *pluginv1.TargetRef) (QueryOptions, error) {
 	return qo, nil
 }
 
-var formatCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
+var formatCache = sync_map.Map[uint64, string]{}
 var formatSf = hsingleflight.Group[uint64, string]{}
 
-var formatOutCache = cache.New[uint64, string](cache.AsLFU[uint64, string](lfu.WithCapacity(10000)))
+var formatOutCache = sync_map.Map[uint64, string]{}
 var formatOutSf = hsingleflight.Group[uint64, string]{}
 
 var formatHashPool = hsync.Pool[*xxh3.Hasher]{New: xxh3.New}
@@ -189,20 +188,20 @@ func Format(ref *Ref) string {
 		ref.SetHash(sum)
 	}
 
-	f, ok := formatCache.Get(sum)
+	f, ok := formatCache.Load(sum)
 	if ok {
 		return f
 	}
 
 	f, _, _ = formatSf.Do(sum, func() (string, error) {
-		f, ok := formatCache.Get(sum)
+		f, ok := formatCache.Load(sum)
 		if ok {
 			return f, nil
 		}
 
 		f = format(ref)
 
-		formatCache.Set(sum, f)
+		formatCache.Store(sum, f)
 
 		return f, nil
 	})
@@ -250,20 +249,20 @@ func FormatOut(ref *RefOut) string {
 		ref.SetHash(sum)
 	}
 
-	f, ok := formatOutCache.Get(sum)
+	f, ok := formatOutCache.Load(sum)
 	if ok {
 		return f
 	}
 
 	f, _, _ = formatOutSf.Do(sum, func() (string, error) {
-		f, ok := formatOutCache.Get(sum)
+		f, ok := formatOutCache.Load(sum)
 		if ok {
 			return f, nil
 		}
 
 		f = formatOut(ref)
 
-		formatOutCache.Set(sum, f)
+		formatOutCache.Store(sum, f)
 
 		return f, nil
 	})

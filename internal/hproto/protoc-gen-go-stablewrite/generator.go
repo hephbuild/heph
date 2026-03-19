@@ -41,13 +41,12 @@ var (
 	encodeBoolFn    = protowireImp.Ident("EncodeBool")
 	float32BitsFn   = mathImp.Ident("Float32bits")
 	float64BitsFn   = mathImp.Ident("Float64bits")
-	mapKeysFn       = mapsImp.Ident("Keys")
-	sortedFn        = slicesImp.Ident("Sorted")
 
 	unsafeSliceFn      = unsafeImp.Ident("Slice")
 	unsafeStringDataFn = unsafeImp.Ident("StringData")
 
-	writeVarint = stablewriteImp.Ident("WriteVarint")
+	writeVarint   = stablewriteImp.Ident("WriteVarint")
+	itSortedMapFn = stablewriteImp.Ident("SortedMap")
 
 	nonIdentifierChars = regexp.MustCompile(`\W+`)
 )
@@ -249,9 +248,9 @@ func (g *codegen) genListField(gf *protogen.GeneratedFile, field *protogen.Field
 func (g *codegen) genMapField(gf *protogen.GeneratedFile, field *protogen.Field) {
 	fieldName := fieldAccess(field)
 	gf.P("if ", fieldHaser(field), " {")
-	gf.P("for _, k := range ", sortedFn, "(", mapKeysFn, "(", fieldName, ")) {")
+	gf.P("for k, v := range ", itSortedMapFn, "(", fieldName, ") {")
 	g.genSingularField(gf, field.Desc.MapKey(), "k", true)
-	g.genSingularField(gf, field.Desc.MapValue(), fmt.Sprintf("%s[k]", fieldName), true)
+	g.genSingularField(gf, field.Desc.MapValue(), "v", true)
 	gf.P("}")
 	gf.P("}")
 }

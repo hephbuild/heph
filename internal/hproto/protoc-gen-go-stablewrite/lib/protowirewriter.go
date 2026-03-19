@@ -1,6 +1,12 @@
 package lib
 
-import "io"
+import (
+	"cmp"
+	"io"
+	"iter"
+	"maps"
+	"slices"
+)
 
 // copied from google.golang.org/protobuf@v1.36.6/encoding/protowire/wire.go
 
@@ -89,5 +95,28 @@ func WriteVarint(w io.Writer, v uint64) (n int, err error) { //nolint:nonamedret
 			byte((v>>56)&0x7f | 0x80),
 			1,
 		})
+	}
+}
+
+func SortedMap[K cmp.Ordered, V any](m map[K]V) iter.Seq2[K, V] {
+	switch len(m) {
+	case 0:
+		return func(yield func(K, V) bool) {}
+	case 1:
+		return func(yield func(K, V) bool) {
+			for k, v := range m {
+				if !yield(k, v) {
+					return
+				}
+			}
+		}
+	default:
+		return func(yield func(K, V) bool) {
+			for _, k := range slices.Sorted(maps.Keys(m)) {
+				if !yield(k, m[k]) {
+					return
+				}
+			}
+		}
 	}
 }

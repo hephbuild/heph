@@ -6,11 +6,11 @@ import (
 	"time"
 
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/huuid"
 
 	"github.com/hephbuild/heph/internal/hproto"
 
 	"connectrpc.com/connect"
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	"github.com/hephbuild/heph/plugin/gen/heph/core/v1/corev1connect"
@@ -175,7 +175,7 @@ func New(ctx context.Context, str string) (*Step, context.Context) {
 		ctx:        context.WithoutCancel(ctx),
 		handleStep: handler,
 		pbstep: corev1.Step_builder{
-			Id:        htypes.Ptr(uuid.New().String()),
+			Id:        htypes.Ptr(huuid.New()),
 			ParentId:  htypes.Ptr(parentID),
 			Text:      htypes.Ptr(str),
 			Status:    htypes.Ptr(corev1.Step_STATUS_RUNNING),

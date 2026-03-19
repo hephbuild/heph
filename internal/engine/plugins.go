@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore/hlog"
 	"github.com/hephbuild/heph/internal/hdebug"
+	"github.com/hephbuild/heph/lib/huuid"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	"github.com/hephbuild/heph/lib/pluginsdk/pluginsdkconnect"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -89,7 +89,7 @@ func (e *Engine) newListener(ctx context.Context) (net.Listener, string, func(),
 			return nil, "", nil, err
 		}
 
-		path := dir.At(fmt.Sprintf("%v_%v", os.Getpid(), uuid.New().String())).Path()
+		path := dir.At(fmt.Sprintf("%v_%v", os.Getpid(), huuid.New())).Path()
 
 		l, err := (&net.ListenConfig{}).Listen(ctx, "unix", path)
 		if err != nil {

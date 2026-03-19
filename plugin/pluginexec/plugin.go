@@ -11,10 +11,10 @@ import (
 
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/lib/huuid"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 	execv1 "github.com/hephbuild/heph/plugin/pluginexec/gen/heph/plugin/exec/v1"
@@ -68,7 +68,7 @@ func (p *Plugin[S]) Pipe(ctx context.Context, req *pluginv1.PipeRequest) (*plugi
 	p.pipesm.Lock()
 	defer p.pipesm.Unlock()
 
-	id := uuid.New().String()
+	id := huuid.New()
 
 	r, w := io.Pipe()
 

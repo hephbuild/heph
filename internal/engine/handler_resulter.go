@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/google/uuid"
+	"github.com/hephbuild/heph/lib/huuid"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	corev1 "github.com/hephbuild/heph/plugin/gen/heph/core/v1"
 	sync_map "github.com/zolstein/sync-map"
@@ -56,7 +56,7 @@ func (r *resulterHandler) Get(ctx context.Context, req *corev1.ResultRequest) (*
 		return nil, fmt.Errorf("unexpected message type: %v", kind)
 	}
 
-	id := uuid.New().String()
+	id := huuid.New()
 	r.m.Store(id, res)
 
 	artifacts := make([]pluginsdk.Artifact, 0, len(res.Artifacts))

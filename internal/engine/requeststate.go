@@ -10,9 +10,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/internal/hsingleflight"
+	"github.com/hephbuild/heph/lib/huuid"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
 )
 
@@ -60,7 +60,7 @@ func (s *RequestState) WithParent(parent *pluginv1.TargetRef) *RequestState {
 
 func (s *RequestState) Copy() *RequestState {
 	return &RequestState{
-		ID:               uuid.New().String(),
+		ID:               huuid.New(),
 		RequestStateData: s.RequestStateData,
 	}
 }

@@ -14,11 +14,11 @@ import (
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/lib/hkv"
 	"github.com/hephbuild/heph/lib/hkv/hkvsqlite"
+	"github.com/hephbuild/heph/lib/huuid"
 	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
 	"connectrpc.com/otelconnect"
-	"github.com/google/uuid"
 	"github.com/hephbuild/heph/internal/hcore"
 	"github.com/hephbuild/heph/lib/pluginsdk"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -228,7 +228,7 @@ func New(ctx context.Context, root string, cfg Config) (*Engine, error) {
 }
 
 func (e *Engine) NewRequestState() (*RequestState, func()) {
-	id := uuid.New().String()
+	id := huuid.New()
 
 	s := &RequestState{
 		ID: id,
