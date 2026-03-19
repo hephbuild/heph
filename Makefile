@@ -27,5 +27,10 @@ gen:
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_provider.go > lib/pluginsdk/plugin_provider.mock.go
 	go run go.uber.org/mock/mockgen -typed -self_package=github.com/hephbuild/heph/lib/pluginsdk -package=pluginsdk -source=lib/pluginsdk/plugin_cache.go > lib/pluginsdk/plugin_cache.mock.go
 
+genlargego:
+	rm -rf example/go/large
+	go run ./tools/gorepogen -seed 42 -out example/go/large -module example.com/large -pkgs 150 -max-depth 6
+	cd example/go/large && go mod tidy
+
 lint:
 	golangci-lint run --fix

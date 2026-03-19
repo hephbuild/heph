@@ -162,6 +162,9 @@ func (g *codegen) genHelperForMsg(gf *protogen.GeneratedFile, msg *protogen.Mess
 
 	gf.P("// ", msg.Desc.FullName(), " from ", msg.Location.SourceFile)
 	gf.P("func ", sumFuncName(msg.Desc), "(", receiverIdent, " *", msg.GoIdent, ",", writerIdent, " ", writerType, ", ignore map[string]struct{}) error {")
+	gf.P("if ", receiverIdent, " == nil {")
+	gf.P("return nil")
+	gf.P("}")
 
 	oneOfs := make(map[string]struct{})
 

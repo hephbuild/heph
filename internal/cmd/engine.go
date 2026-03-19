@@ -132,7 +132,7 @@ func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 		Enabled: true,
 	})
 
-	for _, p := range []string{engine.ConfigFileName, engine.ConfigFileName + ".local"} {
+	for _, p := range []string{engine.ConfigFileName, "local" + engine.ConfigFileName} {
 		yamlCfg, err := engine.ParseYAMLConfig(filepath.Join(root, p))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
