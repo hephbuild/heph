@@ -36,7 +36,7 @@ import (
 
 func parseConfig(ctx context.Context, root string) (engine.Config, error) {
 	cfg := engine.Config{
-		Version:    hversion.Version,
+		Version:    hversion.Version(),
 		HomeDir:    ".heph",
 		LockDriver: "fs",
 	}

@@ -118,7 +118,7 @@ func setupOTelSDK(ctx context.Context) (func(context.Context) error, error) {
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceName("heph"),
-			semconv.ServiceVersion(hversion.Version),
+			semconv.ServiceVersion(hversion.Version()),
 		),
 	)
 	if err != nil {

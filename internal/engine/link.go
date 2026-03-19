@@ -6,22 +6,31 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"maps"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hephbuild/heph/internal/hdag"
 	"github.com/hephbuild/heph/internal/hfs"
 	"github.com/hephbuild/heph/internal/hproto"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/internal/hslices"
+	"github.com/hephbuild/heph/internal/htime"
 	"github.com/hephbuild/heph/internal/htypes"
+	"github.com/hephbuild/heph/internal/hversion"
 	"github.com/hephbuild/heph/internal/tmatch"
+	"github.com/hephbuild/heph/lib/hkv"
+	"github.com/hephbuild/heph/lib/hkv/hkvproto"
 	"github.com/hephbuild/heph/plugin/pluginbin"
 	"github.com/lithammer/fuzzysearch/fuzzy"
 	sync_map "github.com/zolstein/sync-map"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/hephbuild/heph/internal/hdebug"
 	"github.com/hephbuild/heph/internal/herrgroup"
@@ -61,14 +70,55 @@ func (e *Engine) resolveProvider(
 	c SpecContainer,
 	p EngineProvider,
 ) (*pluginv1.TargetSpec, error) {
+	start := time.Now()
+	defer func() {
+		providerGetHistogram().Record(
+			ctx,
+			time.Since(start).Seconds(),
+			metric.WithAttributeSet(attribute.NewSet(
+				attribute.String("target", tref.Format(c.GetRef())),
+				attribute.String("provider", p.Name),
+			)),
+		)
+	}()
+	kv := hkv.NewT(e.KV, hkvproto.New[*pluginv1.TargetSpec]())
+
+	h := xxh3.New()
+	_, _ = h.WriteString(hversion.Version())
+	for _, state := range states {
+		hashpb.Hash(h, state, nil)
+	}
+
+	kvKey := "spec " + p.Name + " " + tref.Format(c.GetRef())
+	spec, _, ok, err := kv.Get(ctx, kvKey)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		if spec == nil {
+			return nil, pluginsdk.ErrNotFound
+		}
+
+		return spec, nil
+	}
+
 	res, err := e.Get(ctx, rs, p, c.GetRef(), states)
 	if err != nil {
 		return nil, err
 	}
 
+	spec = res.GetSpec()
+
 	// TODO: what do we do if the spec.ref is different from the request ?
 
-	return res.GetSpec(), nil
+	if res.GetCacheSpec().GetStatic() {
+		err = kv.Set(ctx, kvKey, spec, hkv.Meta{"type": "spec_cache"}, htime.JitterPercent(3*24*time.Hour, 0.5))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return spec, nil
 }
 
 func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pluginv1.ProviderState, c SpecContainer) (*pluginv1.TargetSpec, error) {
@@ -76,6 +126,8 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 	defer span.End()
 
 	spec, err, computed := rs.memSpec.Do(ctx, refKey(c.GetRef()), func(ctx context.Context) (*pluginv1.TargetSpec, error) {
+		providerKv := hkv.NewT(e.KV, hkv.StringCodec())
+
 		ref := c.GetRef()
 		switch {
 		case ref.GetPackage() == tref.QueryPackage:
@@ -84,7 +136,27 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 			return e.resolveHostBin(ctx, rs, ref)
 		}
 
-		for _, p := range e.Providers {
+		providerKey := "specproviderhint " + tref.Format(c.GetRef())
+
+		cachedProvider, _, ok, err := providerKv.Get(ctx, providerKey)
+		if err != nil {
+			return nil, err
+		}
+
+		providers := e.Providers
+		if ok {
+			idx := slices.IndexFunc(providers, func(p EngineProvider) bool {
+				return p.Name == cachedProvider
+			})
+			if idx < 0 {
+				_ = providerKv.Delete(ctx, providerKey)
+			} else if idx > 0 {
+				providers = slices.Clone(e.Providers)
+				providers[0], providers[idx] = providers[idx], providers[0]
+			}
+		}
+
+		for _, p := range providers {
 			skip := false
 			for _, matcher := range p.Exclude {
 				if tmatch.MatchPackage(ref.GetPackage(), matcher) == tmatch.MatchYes {
@@ -104,6 +176,9 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 					providerStates = append(providerStates, state)
 				}
 			}
+			slices.SortFunc(providerStates, func(a, b *pluginv1.ProviderState) int {
+				return strings.Compare(a.GetPackage(), b.GetPackage())
+			})
 
 			spec, err := e.resolveProvider(ctx, rs, providerStates, c, p)
 			if err != nil {
@@ -116,6 +191,11 @@ func (e *Engine) resolveSpec(ctx context.Context, rs *RequestState, states []*pl
 
 			if spec == nil {
 				return nil, fmt.Errorf("invalid nil spec: %v", tref.Format(c.GetRef()))
+			}
+
+			err = providerKv.Set(ctx, providerKey, p.Name, hkv.Meta{"type": "provider_hint"}, 0)
+			if err != nil {
+				return nil, err
 			}
 
 			return spec, nil
@@ -389,6 +469,76 @@ func (e *Engine) GetDef(ctx context.Context, rs *RequestState, c DefContainer) (
 	return e.getDef(ctx, rs, c)
 }
 
+func (e *Engine) parseSpec(ctx context.Context, rs *RequestState, driver pluginsdk.Driver, spec *pluginv1.TargetSpec) (*pluginv1.TargetDef, error) {
+	kv := hkv.NewT(e.KV, hkvproto.New[*pluginv1.TargetDef]())
+
+	h := xxh3.New()
+	_, _ = h.WriteString(hversion.Version())
+	hashpb.Hash(h, spec, tref.OmitHashPb)
+
+	key := "parse_spec " + spec.GetDriver() + " " + tref.Format(spec.GetRef()) + " " + hex.EncodeToString(h.Sum(nil))
+	def, _, ok, err := kv.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return def, nil
+	}
+
+	res, err := driver.Parse(ctx, pluginv1.ParseRequest_builder{
+		RequestId: htypes.Ptr(rs.ID),
+		Spec:      spec,
+	}.Build())
+	if err != nil {
+		return nil, fmt.Errorf("parse: %q: %w", spec.GetDriver(), err)
+	}
+
+	def = res.GetTarget()
+
+	err = kv.Set(ctx, key, def, hkv.Meta{"type": "parse_spec_cache"}, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	return def, nil
+}
+
+func (e *Engine) applyTransitive(ctx context.Context, rs *RequestState, driver pluginsdk.Driver, def *pluginv1.TargetDef, transitive *pluginv1.Sandbox) (*pluginv1.TargetDef, error) {
+	kv := hkv.NewT(e.KV, hkvproto.New[*pluginv1.TargetDef]())
+
+	h := xxh3.New()
+	_, _ = h.WriteString(hversion.Version())
+	hashpb.Hash(h, def, tref.OmitHashPb)
+	hashpb.Hash(h, transitive, tref.OmitHashPb)
+
+	key := "apply_transitive " + tref.Format(def.GetRef()) + " " + hex.EncodeToString(h.Sum(nil))
+	cdef, _, ok, err := kv.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		return cdef, nil
+	}
+
+	res, err := driver.ApplyTransitive(ctx, pluginv1.ApplyTransitiveRequest_builder{
+		RequestId:  htypes.Ptr(rs.ID),
+		Target:     def,
+		Transitive: transitive,
+	}.Build())
+	if err != nil {
+		return nil, fmt.Errorf("apply transitive: %w", err)
+	}
+
+	def = res.GetTarget()
+
+	err = kv.Set(ctx, key, def, hkv.Meta{"type": "apply_transitive_cache"}, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	return def, nil
+}
+
 func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (*TargetDef, error) {
 	ctx, span := tracer.Start(ctx, "GetDef", trace.WithAttributes(attribute.String("target", tref.Format(c.GetRef()))))
 	defer span.End()
@@ -425,15 +575,10 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 			return nil, fmt.Errorf("driver %q doesnt exist", spec.GetDriver())
 		}
 
-		res, err := driver.Parse(ctx, pluginv1.ParseRequest_builder{
-			RequestId: htypes.Ptr(rs.ID),
-			Spec:      spec,
-		}.Build())
+		def, err := e.parseSpec(ctx, rs, driver, spec)
 		if err != nil {
-			return nil, fmt.Errorf("parse: %q: %w", spec.GetDriver(), err)
+			return nil, err
 		}
-
-		def := res.GetTarget()
 
 		if spec.GetDriver() == plugingroup.Name {
 			def, err = e.getDefGroup(ctx, rs, def)
@@ -485,22 +630,24 @@ func (e *Engine) getDef(ctx context.Context, rs *RequestState, c DefContainer) (
 		}
 
 		if spec.GetDriver() != plugingroup.Name && !sandboxSpecEmpty(allTransitive) {
-			res, err := driver.ApplyTransitive(ctx, pluginv1.ApplyTransitiveRequest_builder{
-				RequestId:  htypes.Ptr(rs.ID),
-				Target:     def,
-				Transitive: allTransitive,
-			}.Build())
+			def, err = e.applyTransitive(ctx, rs, driver, def, allTransitive)
 			if err != nil {
 				return nil, fmt.Errorf("apply transitive: %w", err)
 			}
-
-			def = res.GetTarget()
 
 			addSrcTargetToInputs(def, currentTargetAddrHash)
 		}
 
 		if len(def.GetHash()) == 0 {
-			h := xxh3.New()
+			var h interface {
+				hash.Hash
+				io.StringWriter
+			}
+			if enableHashDebug() {
+				h = newHashWithDebug(xxh3.New(), strings.TrimPrefix(tref.Format(def.GetRef()), "//"), "defhash")
+			} else {
+				h = xxh3.New()
+			}
 			hashpb.Hash(h, def, tref.OmitHashPb)
 
 			def.SetHash(h.Sum(nil))
@@ -538,7 +685,7 @@ func sandboxSpecEmpty(sb *pluginv1.Sandbox) bool {
 }
 
 func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs []*pluginv1.TargetDef_Input) (*pluginv1.Sandbox, error) {
-	sb := &pluginv1.Sandbox{}
+	var sb *pluginv1.Sandbox
 
 	for i, input := range inputs {
 		spec, err := e.getSpec(ctx, rs, SpecContainer{Ref: tref.WithoutOut(input.GetRef())})
@@ -547,9 +694,7 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 		}
 
 		transitive := spec.GetTransitive()
-		if transitive == nil {
-			transitive = &pluginv1.Sandbox{}
-		}
+
 		if spec.GetDriver() == plugingroup.Name {
 			def, err := e.GetDef(ctx, rs, DefContainer{Spec: spec})
 			if err != nil {
@@ -557,8 +702,10 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 			}
 
 			if !sandboxSpecEmpty(def.AppliedTransitive) {
-				transitive = hproto.Clone(transitive)
-				mergeSandbox(transitive, def.AppliedTransitive, "group")
+				if transitive != nil {
+					transitive = hproto.Clone(transitive)
+				}
+				sb = mergeSandbox(transitive, def.AppliedTransitive, "group")
 			}
 		}
 
@@ -569,9 +716,13 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 		h := xxh3.New()
 		hashpb.Hash(h, spec.GetRef(), tref.OmitHashPb)
 
-		id := fmt.Sprintf("_transitive_%s_%v", hex.EncodeToString(h.Sum(nil)), i)
+		id := "_transitive_" + hex.EncodeToString(h.Sum(nil)) + "_" + strconv.Itoa(i)
 
-		mergeSandbox(sb, transitive, id)
+		sb = mergeSandbox(sb, transitive, id)
+	}
+
+	if sb == nil {
+		return sb, nil
 	}
 
 	slices.SortFunc(sb.GetDeps(), func(a, b *pluginv1.Sandbox_Dep) int {
@@ -584,24 +735,28 @@ func (e *Engine) collectTransitive(ctx context.Context, rs *RequestState, inputs
 	return sb, nil
 }
 
-func mergeSandbox(dst, src *pluginv1.Sandbox, id string) {
+func mergeSandbox(dst, src *pluginv1.Sandbox, id string) *pluginv1.Sandbox {
+	if dst == nil {
+		dst = &pluginv1.Sandbox{}
+	}
+
 	for _, tool := range src.GetTools() {
 		tool = hproto.Clone(tool)
-		tool.SetId(fmt.Sprintf("%v_tool_%v", id, tool.GetId()))
+		tool.SetId(id + "_tool_" + tool.GetId())
 		tool.SetGroup(tool.GetId())
 
 		dst.SetTools(append(dst.GetTools(), tool))
 	}
 	for _, dep := range src.GetDeps() {
 		dep = hproto.Clone(dep)
-		dep.SetId(fmt.Sprintf("%v_dep_%v", id, dep.GetId()))
+		dep.SetId(id + "_dep_" + dep.GetId())
 		dep.SetGroup(dep.GetId())
 
 		dst.SetDeps(append(dst.GetDeps(), dep))
 	}
 
 	allEnv := dst.GetEnv()
-	if allEnv == nil {
+	if allEnv == nil && len(src.GetEnv()) > 0 {
 		allEnv = map[string]*pluginv1.Sandbox_Env{}
 	}
 	for k, env := range src.GetEnv() {
@@ -609,6 +764,8 @@ func mergeSandbox(dst, src *pluginv1.Sandbox, id string) {
 		allEnv[k] = env
 	}
 	dst.SetEnv(allEnv)
+
+	return dst
 }
 
 type LinkedTarget struct {
@@ -893,7 +1050,7 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 	ctx, span := tracer.Start(ctx, "Link", trace.WithAttributes(attribute.String("target", tref.Format(def.GetRef()))))
 	defer span.End()
 
-	step, ctx := hstep.New(ctx, fmt.Sprintf("Linking %v...", tref.Format(def.GetRef())))
+	step, ctx := hstep.New(ctx, "Linking "+tref.Format(def.GetRef())+"...")
 	defer step.Done()
 
 	inputs := def.GetInputs()
@@ -947,11 +1104,10 @@ func (e *Engine) innerLink(ctx context.Context, rs *RequestState, def *TargetDef
 				}
 
 				outputNames = []string{input.GetRef().GetOutput()}
-			case len(linkedDep.GetOutputs()) <= 1: // no need to alloc map & sort
-				outputNames = make([]string, 0, len(linkedDep.GetOutputs()))
-				for _, output := range linkedDep.GetOutputs() {
-					outputNames = append(outputNames, output.GetGroup())
-				}
+			case len(linkedDep.GetOutputs()) == 0: // no need to alloc map & sort
+				outputNames = nil
+			case len(linkedDep.GetOutputs()) == 1: // no need to alloc map & sort
+				outputNames = []string{linkedDep.GetOutputs()[0].GetGroup()}
 			default:
 				m := make(map[string]struct{}, len(linkedDep.GetOutputs()))
 				for _, output := range linkedDep.GetOutputs() {

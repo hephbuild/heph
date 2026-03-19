@@ -2,7 +2,7 @@
 services:
   otel-lgtm:
     environment:
-      ENABLE_LOGS_TEMPO: "true"
+      ENABLE_LOGS_ALL: "true"
     volumes:
       - data:/data
     build: .

@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/hephbuild/heph/internal/hinstance"
 	"github.com/hephbuild/heph/internal/hproto/hashpb"
 	"github.com/hephbuild/heph/lib/tref"
 	"github.com/zeebo/xxh3"
@@ -57,13 +56,6 @@ func (e *Engine) hashin2(ctx context.Context, def *LightLinkedTarget, results []
 			if err != nil {
 				return "", err
 			}
-		}
-	}
-
-	if !def.GetCache() {
-		_, err = h.WriteString(hinstance.UID)
-		if err != nil {
-			return "", err
 		}
 	}
 

@@ -90,12 +90,12 @@ func (p *Provider) install(ctx context.Context, nixRef, nixPkg string) (*pluginv
 			Ref:    ref,
 			Driver: htypes.Ptr("sh"),
 			Config: map[string]*structpb.Value{
-				"run": structpb.NewStringValue(fmt.Sprintf("nix hash path $(nix build %v#%v --print-out-paths) > $OUT", nixRef, nixPkg)),
+				"run": structpb.NewStringValue(fmt.Sprintf("nix hash path $(nix build %s#%s --print-out-paths) > $OUT", nixRef, nixPkg)),
 				"env": hstructpb.NewMapStringStringValue(map[string]string{
 					"NIX_CONFIG": nixConfig,
 				}),
 				"tools": structpb.NewStringValue(tref.FormatOut(tref.WithOut(p.nixToolRef, ""))),
-				"out":   structpb.NewStringValue(fmt.Sprintf("nix_hash_%v_%v", nixRef, nixPkg)),
+				"out":   structpb.NewStringValue(fmt.Sprintf("nix_hash_%s_%s", nixRef, nixPkg)),
 			},
 		}.Build(),
 	}.Build(), nil
@@ -104,7 +104,7 @@ func (p *Provider) install(ctx context.Context, nixRef, nixPkg string) (*pluginv
 func (p *Provider) get(ctx context.Context, nixRef, nixPkg string, hash bool) (*pluginv1.GetResponse, error) {
 	script := strings.NewReplacer(
 		"<CONFIG>", nixConfig,
-		"<REF>", fmt.Sprintf("%v#%v", nixRef, nixPkg),
+		"<REF>", fmt.Sprintf("%s#%s", nixRef, nixPkg),
 	).Replace(wrapperScript)
 	script = strings.TrimSpace(script)
 

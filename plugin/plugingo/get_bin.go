@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strconv"
 
 	"github.com/hephbuild/heph/internal/htypes"
 
@@ -47,9 +48,9 @@ func (p *Plugin) packageBinInner(
 			continue
 		}
 
-		deps[fmt.Sprintf("lib%v", i)] = []string{tref.FormatOut(tref.WithOut(depGoPkg.LibTargetRef, "a"))}
+		deps["lib"+strconv.Itoa(i)] = []string{tref.FormatOut(tref.WithOut(depGoPkg.LibTargetRef, "a"))}
 
-		run = append(run, fmt.Sprintf(`echo "packagefile %v=${SRC_LIB%v}" >> importconfig`, depGoPkg.ImportPath, i))
+		run = append(run, fmt.Sprintf(`echo "packagefile %s=${SRC_LIB%s}" >> importconfig`, depGoPkg.ImportPath, strconv.Itoa(i)))
 	}
 
 	deps["main"] = []string{mainRef}

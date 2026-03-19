@@ -1,7 +1,6 @@
 package hstepfmt
 
 import (
-	"fmt"
 	"time"
 
 	"charm.land/lipgloss/v2"
@@ -45,14 +44,4 @@ func FormatDuration(step *corev1.Step) string {
 	}
 
 	return htime.FormatFixedWidthDuration(t)
-}
-
-func Format(step *corev1.Step, interactive bool) string {
-	d := FormatDuration(step)
-
-	if d != "" {
-		return fmt.Sprintf("%s %.5s %s", FormatStatus(step), d, step.GetText())
-	}
-
-	return fmt.Sprintf("%s %s", FormatStatus(step), step.GetText())
 }

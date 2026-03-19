@@ -21,7 +21,7 @@ import (
 	"github.com/hephbuild/heph/lib/tref"
 
 	"connectrpc.com/connect"
-	"github.com/goccy/go-json"
+	json "github.com/bytedance/sonic"
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
 	"github.com/hephbuild/heph/internal/hslices"
@@ -96,7 +96,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 			}
 			defer f.Close()
 
-			err = json.NewDecoder(f).Decode(&goPkg)
+			err = json.ConfigDefault.NewDecoder(f).Decode(&goPkg)
 			if err != nil {
 				return Package{}, fmt.Errorf("gopkg decode %q: %w", tref.Format(res.Def.GetRef()), err)
 			}
@@ -110,7 +110,7 @@ func (p *Plugin) goListPkgResult(ctx context.Context, basePkg, runPkg, imp strin
 			}
 			defer f.Close()
 
-			err = json.NewDecoder(f).Decode(&sourcemap)
+			err = json.ConfigDefault.NewDecoder(f).Decode(&sourcemap)
 			if err != nil {
 				return Package{}, fmt.Errorf("sourcemap decode: %q: %w", tref.Format(res.Def.GetRef()), err)
 			}
@@ -735,7 +735,7 @@ func (p *Plugin) goModules(ctx context.Context, pkg, requestId string) ([]Module
 
 	var modules []Module
 
-	dec := json.NewDecoder(jsonf)
+	dec := json.ConfigDefault.NewDecoder(jsonf)
 	for {
 		var mod Module
 		err := dec.Decode(&mod)

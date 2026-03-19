@@ -1,4 +1,4 @@
-# Copied from https://github.com/grafana/docker-otel-lgtm/blob/0fa1021cca8745b471bf3027512237528049409c/docker/tempo-config.yaml
+# Copied from https://github.com/grafana/docker-otel-lgtm/blob/v0.21.0/docker/tempo-config.yaml
 
 server:
   http_listen_port: 3200
@@ -9,11 +9,14 @@ distributor:
     otlp:
       protocols:
         grpc:
-          endpoint: "localhost:4417"
+          endpoint: "127.0.0.1:4417"
         http:
-          endpoint: "localhost:4418"
+          endpoint: "127.0.0.1:4418"
 
 ingester:
+  trace_idle_period: 1s
+  max_block_duration: 1s
+  flush_check_period: 1s
   lifecycler:
     address: 127.0.0.1
     ring:
@@ -21,6 +24,14 @@ ingester:
         store: inmemory
       replication_factor: 1
     min_ready_duration: 1s
+
+memberlist:
+  bind_addr: [127.0.0.1]
+  bind_port: 7947
+
+querier:
+  frontend_worker:
+    frontend_address: 127.0.0.1:9096
 
 storage:
   trace:
@@ -44,7 +55,7 @@ metrics_generator:
   storage:
     path: /data/tempo/generator/wal
     remote_write:
-      - url: http://localhost:9090/api/v1/write
+      - url: http://127.0.0.1:9090/api/v1/write
         send_exemplars: true
 
 overrides:

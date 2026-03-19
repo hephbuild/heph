@@ -40,7 +40,14 @@ message GetRequest {
 }
 
 message GetResponse {
+  message Cache {
+    oneof value {
+      bool static = 1;
+    }
+  }
+
   TargetSpec spec = 1;
+  Cache cache_spec = 2;
 }
 
 message ProbeRequest {

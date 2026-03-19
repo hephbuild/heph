@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/hephbuild/heph/internal/hfs"
@@ -176,7 +177,7 @@ func ConfigToExecv1(
 }
 
 func depId(prop string, group string, i int) string {
-	return fmt.Sprintf("%q %q %v", prop, group, i)
+	return prop + " " + group + " " + strconv.Itoa(i)
 }
 
 func ToDef[S proto.Message](ref *pluginv1.TargetRef, target S, getTarget func(S) *execv1.Target, hash []byte) (*pluginv1.TargetDef, error) {

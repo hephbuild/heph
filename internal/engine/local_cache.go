@@ -222,14 +222,23 @@ func keyRefOutputs(ref *pluginv1.TargetRef, outputs []string) string {
 	switch len(outputs) {
 	case 0:
 		outputs = nil
+		return refKey(ref)
 	case 1:
 		// noop
+		return refKey(ref) + outputs[0]
 	default:
 		outputs = slices.Clone(outputs)
 		slices.Sort(outputs)
-	}
+		var sb strings.Builder
+		for _, output := range outputs {
+			if sb.Len() > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(output)
+		}
 
-	return refKey(ref) + fmt.Sprintf("%#v", outputs)
+		return refKey(ref) + sb.String()
+	}
 }
 
 func (e *Engine) ResultFromLocalCache(ctx context.Context, def *LightLinkedTarget, outputs []string, hashin string) (*Result, bool, error) {

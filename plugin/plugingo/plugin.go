@@ -7,7 +7,6 @@ import (
 	"runtime"
 
 	"github.com/hephbuild/heph/internal/htypes"
-
 	"github.com/hephbuild/heph/lib/tref"
 
 	cache "github.com/Code-Hex/go-generics-cache"
@@ -506,7 +505,7 @@ func (p *Plugin) goList(ctx context.Context, pkg string, f Factors, imp string, 
 					"cp $SOURCEMAP $OUT_SM",
 					fmt.Sprintf(`
 						# Capture stderr to a variable while sending stdout to the JSON file
-						if ERR=$(go list -mod=readonly -json -tags %q %v 2>&1 > $OUT_JSON); then
+						if ERR=$(go list -mod=readonly -json -tags %q %s 2>&1 > $OUT_JSON); then
 							: # Success, do nothing
 						else
 							# Check if the error is one we want to ignore

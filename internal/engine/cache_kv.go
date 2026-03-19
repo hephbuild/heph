@@ -62,7 +62,7 @@ func (c *SQLCache) Reader(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, name string) (io.WriteCloser, error) {
 	key := c.targetKey(ref, hashin, name)
 
-	return c.kv.Writer(ctx, key, map[string]string{
+	return c.kv.Writer(ctx, key, hkv.Meta{
 		"target_pkg":    ref.GetPackage(),
 		"target_addr":   tref.Format(ref),
 		"hashin":        hashin,
@@ -72,7 +72,7 @@ func (c *SQLCache) Writer(ctx context.Context, ref *pluginv1.TargetRef, hashin, 
 
 func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, hashin string) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		for key, err := range c.kv.ListKeys(ctx, map[string]string{
+		for key, err := range c.kv.ListKeys(ctx, hkv.Meta{
 			"target_addr": tref.Format(ref),
 			"hashin":      hashin,
 		}) {
@@ -98,7 +98,7 @@ func (c *SQLCache) ListArtifacts(ctx context.Context, ref *pluginv1.TargetRef, h
 func (c *SQLCache) ListVersions(ctx context.Context, ref *pluginv1.TargetRef) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
 		seen := map[string]struct{}{}
-		for key, err := range c.kv.ListKeys(ctx, map[string]string{
+		for key, err := range c.kv.ListKeys(ctx, hkv.Meta{
 			"target_addr": tref.Format(ref),
 		}) {
 			if err != nil {

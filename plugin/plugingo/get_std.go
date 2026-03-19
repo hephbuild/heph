@@ -11,7 +11,7 @@ import (
 
 	"github.com/hephbuild/heph/lib/tref"
 
-	"github.com/goccy/go-json"
+	json "github.com/bytedance/sonic"
 
 	"github.com/hephbuild/heph/internal/hartifact"
 	"github.com/hephbuild/heph/internal/hproto/hstructpb"
@@ -52,7 +52,7 @@ func (p *Plugin) resultStdListInner(ctx context.Context, factors Factors, reques
 
 	var packages []Package
 
-	dec := json.NewDecoder(f)
+	dec := json.ConfigDefault.NewDecoder(f)
 	for {
 		var goPkg Package
 		err := dec.Decode(&goPkg)
@@ -93,8 +93,8 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 					"go list -json std > $OUT_LIST",
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
-					"pkg":  fmt.Sprintf("goroot/pkg/%v_%v", factors.GOOS, factors.GOARCH),
-					"list": fmt.Sprintf("goroot/pkg/%v_%v/list.json", factors.GOOS, factors.GOARCH),
+					"pkg":  fmt.Sprintf("goroot/pkg/%s_%s", factors.GOOS, factors.GOARCH),
+					"list": fmt.Sprintf("goroot/pkg/%s_%s/list.json", factors.GOOS, factors.GOARCH),
 				}),
 				"tools": p.getGoToolStructpb(),
 			},
@@ -115,7 +115,7 @@ func (p *Plugin) stdLibBuild(ctx context.Context, factors Factors, goImport stri
 				}),
 				"deps": structpb.NewStringValue(tref.Format(tref.New("@heph/go/std", "install", factors.Args()))),
 				"run": hstructpb.NewStringsValue([]string{
-					fmt.Sprintf("mv $WORKSPACE_ROOT/@heph/go/std/goroot/pkg/%v_%v/%v.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
+					fmt.Sprintf("mv $WORKSPACE_ROOT/@heph/go/std/goroot/pkg/%s_%s/%s.a $OUT_A", factors.GOOS, factors.GOARCH, goImport),
 				}),
 				"out": hstructpb.NewMapStringStringValue(map[string]string{
 					"a": goImport + ".a",

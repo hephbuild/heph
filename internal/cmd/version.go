@@ -13,7 +13,7 @@ func init() {
 		Short: "Print version",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println(hversion.Version)
+			fmt.Println(hversion.Version())
 
 			return nil
 		},

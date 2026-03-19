@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/hephbuild/heph/internal/htypes"
@@ -158,7 +159,7 @@ func SetupSandboxArtifact(ctx context.Context, artifact pluginsdk.Artifact, sour
 	defer span.End()
 
 	h := xxh3.New()
-	_, _ = fmt.Fprintf(h, "%d", artifactId.Add(1))
+	_, _ = h.WriteString(strconv.FormatInt(artifactId.Add(1), 10))
 
 	listf, err := hfs.Create(workfs.At(hex.EncodeToString(h.Sum(nil)) + ".list"))
 	if err != nil {

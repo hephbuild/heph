@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/goccy/go-json"
+	json "github.com/bytedance/sonic"
 	"github.com/hephbuild/heph/internal/htypes"
 	"github.com/hephbuild/heph/lib/tref"
 	pluginv1 "github.com/hephbuild/heph/plugin/gen/heph/plugin/v1"
@@ -77,7 +77,7 @@ func (p *Plugin) embedCfg(ctx context.Context, basePkg, currentPkg string, goPkg
 		}
 	}
 
-	b, err := json.Marshal(cfg)
+	b, err := json.ConfigStd.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -16,7 +16,7 @@ import (
 func (p *Plugin) goModDownload(ctx context.Context, pkg, goMod, version string) (*pluginv1.GetResponse, error) {
 	run := []string{
 		"echo module heph_ignore > go.mod", // stops go from reading the main go.mod, and downloading all of those too
-		fmt.Sprintf("go mod download -modcacherw -json %v@%v | tee mod.json", goMod, version),
+		fmt.Sprintf("go mod download -modcacherw -json %s@%s | tee mod.json", goMod, version),
 		"rm go.mod",
 		`export MOD_DIR=$(cat mod.json | awk -F\" '/"Dir": / { print $4 }')`,
 		`[[ -z "$MOD_DIR" ]] && { exit 1; }`,

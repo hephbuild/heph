@@ -10,6 +10,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 
@@ -112,11 +113,15 @@ func (c *KV) openInner(ctx context.Context) error {
 	// One writer at a time — prevents SQLITE_BUSY.
 	wdb.SetMaxOpenConns(1)
 	wdb.SetMaxIdleConns(1)
+	wdb.SetConnMaxLifetime(0)
+	wdb.SetConnMaxIdleTime(0)
 
 	rdb := sql.OpenDB(newConnector(c.path, connConfig))
 	// No cap — WAL lets concurrent readers run in parallel.
-	rdb.SetMaxIdleConns(100)
-	rdb.SetMaxOpenConns(100)
+	rdb.SetMaxIdleConns(runtime.GOMAXPROCS(0) + 1)
+	rdb.SetMaxOpenConns(runtime.GOMAXPROCS(0) + 1)
+	rdb.SetConnMaxLifetime(0)
+	rdb.SetConnMaxIdleTime(0)
 
 	c.rdb = rdb
 	c.wdb = wdb

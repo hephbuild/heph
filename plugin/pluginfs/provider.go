@@ -56,6 +56,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 					"file": structpb.NewStringValue(path),
 				},
 			}.Build(),
+			CacheSpec: pluginv1.GetResponse_Cache_builder{Static: htypes.Ptr(true)}.Build(),
 		}.Build(), nil
 	}
 
@@ -69,6 +70,7 @@ func (p *Provider) Get(ctx context.Context, req *pluginv1.GetRequest) (*pluginv1
 					"exclude": hstructpb.NewStringsValue(exclude),
 				},
 			}.Build(),
+			CacheSpec: pluginv1.GetResponse_Cache_builder{Static: htypes.Ptr(true)}.Build(),
 		}.Build(), nil
 	}
 

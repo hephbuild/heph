@@ -157,6 +157,14 @@ var resultCounter = sync.OnceValue(func() metric.Int64Counter {
 	return htypes.Must2(meter.Int64Counter("result", metric.WithUnit("{count}")))
 })
 
+var providerGetHistogram = sync.OnceValue(func() metric.Float64Histogram {
+	return htypes.Must2(meter.Float64Histogram(
+		"provider.get",
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1, 2.5, 5, 7.5, 10),
+	))
+})
+
 func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, outputs []string, onlyManifest bool) (*ExecuteResultLocks, error) {
 	ctx, cleanLabels := hdebug.SetLabels(ctx, func() []string {
 		return []string{
@@ -202,7 +210,7 @@ func (e *Engine) result(ctx context.Context, rs *RequestState, c DefContainer, o
 		return nil, fmt.Errorf("meta: %w", err)
 	}
 
-	res, err, computed := rs.memResult.Do(ctx, keyRefOutputs(ref, doOutputs)+meta.Hashin, func(ctx context.Context) (*ExecuteResultLocks, error) {
+	res, err, computed := rs.memResult.Do(ctx, keyRefOutputs(ref, doOutputs), func(ctx context.Context) (*ExecuteResultLocks, error) {
 		resultCounter().Add(ctx, 1, metric.WithAttributes(
 			attribute.String("target", tref.Format(ref)),
 		))
@@ -741,7 +749,7 @@ func (e *Engine) executeAndCacheInner(ctx context.Context, rs *RequestState, def
 		cacheHashin = hinstance.UID + "_" + hashin
 	}
 
-	if options.storeCache {
+	if options.getCache {
 		// One last cache check after the deps have completed
 		res, ok, err := e.ResultFromLocalCache(ctx, def, def.OutputNames(), cacheHashin)
 		if err != nil && !errors.Is(err, context.Canceled) {

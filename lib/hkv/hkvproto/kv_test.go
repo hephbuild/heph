@@ -1,4 +1,4 @@
-package hkv
+package hkvproto
 
 import (
 	"context"
@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hephbuild/heph/lib/hkv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -40,7 +41,7 @@ func (m *mockBytes) Delete(ctx context.Context, key string) error {
 func TestKV_Get(t *testing.T) {
 	ctx := context.Background()
 	m := new(mockBytes)
-	p := New[*structpb.Value](m)
+	p := hkv.NewT(m, New[*structpb.Value]())
 
 	t.Run("success", func(t *testing.T) {
 		val := structpb.NewStringValue("hello")
@@ -94,7 +95,7 @@ func TestKV_Get(t *testing.T) {
 func TestKV_Exists(t *testing.T) {
 	ctx := context.Background()
 	m := new(mockBytes)
-	p := New[*structpb.Value](m)
+	p := hkv.NewT(m, New[*structpb.Value]())
 
 	m.On("Exists", ctx, "key1").Return(true, nil).Once()
 	ok, err := p.Exists(ctx, "key1")
@@ -112,7 +113,7 @@ func TestKV_Exists(t *testing.T) {
 func TestKV_Set(t *testing.T) {
 	ctx := context.Background()
 	m := new(mockBytes)
-	p := New[*structpb.Value](m)
+	p := hkv.NewT(m, New[*structpb.Value]())
 
 	t.Run("success", func(t *testing.T) {
 		val := structpb.NewStringValue("hello")
@@ -137,12 +138,26 @@ func TestKV_Set(t *testing.T) {
 		assert.Error(t, err)
 		m.AssertExpectations(t)
 	})
+
+	t.Run("nil", func(t *testing.T) {
+		m.On("Set", ctx, "key3", []byte(nil), mock.Anything, mock.Anything).Return(nil).Once()
+		m.On("Get", ctx, "key3").Return([]byte(nil), map[string]string(nil), true, nil).Once()
+
+		err := p.Set(ctx, "key3", nil, nil, 0)
+		require.NoError(t, err)
+
+		res, _, ok, err := p.Get(ctx, "key3")
+		require.NoError(t, err)
+		assert.True(t, ok)
+		assert.Nil(t, res)
+		m.AssertExpectations(t)
+	})
 }
 
 func TestKV_Delete(t *testing.T) {
 	ctx := context.Background()
 	m := new(mockBytes)
-	p := New[*structpb.Value](m)
+	p := hkv.NewT(m, New[*structpb.Value]())
 
 	m.On("Delete", ctx, "key1").Return(nil).Once()
 	err := p.Delete(ctx, "key1")
@@ -150,7 +165,7 @@ func TestKV_Delete(t *testing.T) {
 
 	m.On("Delete", ctx, "key2").Return(errors.New("some error")).Once()
 	err = p.Delete(ctx, "key2")
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	m.AssertExpectations(t)
 }
