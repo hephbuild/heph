@@ -65,7 +65,7 @@ func (p *Plugin) packageBinTest(ctx context.Context, basePkg string, goPkg Packa
 
 	mainRef := tref.FormatOut(tref.WithOut(libGoPkg.LibTargetRef, "a"))
 
-	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs)
+	return p.packageBinInner(ctx, "build_test", goPkg, factors, mainRef, goPkgs, filepath.Base(goPkg.HephPackage)+"_test")
 }
 
 func (p *Plugin) generateTestMain(ctx context.Context, goPkg Package, factors Factors) (*pluginv1.GetResponse, error) {

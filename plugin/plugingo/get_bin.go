@@ -27,7 +27,7 @@ func (p *Plugin) packageBin(ctx context.Context, basePkg string, goPkg Package, 
 
 	mainRef := tref.FormatOut(tref.WithOut(goPkg.GetBuildLibTargetRef(ModeNormal), "a"))
 
-	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs)
+	return p.packageBinInner(ctx, "build", goPkg, factors, mainRef, goPkgs, filepath.Base(goPkg.HephPackage))
 }
 
 func (p *Plugin) packageBinInner(
@@ -37,6 +37,7 @@ func (p *Plugin) packageBinInner(
 	factors Factors,
 	mainRef string,
 	depsGoPkgs []LibPackage,
+	binName string,
 ) (*pluginv1.GetResponse, error) {
 	deps := map[string][]string{}
 	run := []string{
@@ -67,7 +68,7 @@ func (p *Plugin) packageBinInner(
 				}),
 				"runtime_pass_env": p.getRuntimePassEnvStructpb(),
 				"run":              hstructpb.NewStringsValue(run),
-				"out":              structpb.NewStringValue(filepath.Base(goPkg.HephPackage)),
+				"out":              structpb.NewStringValue(binName),
 				"deps":             hstructpb.NewMapStringStringsValue(deps),
 				"tools":            p.getGoToolStructpb(),
 			},

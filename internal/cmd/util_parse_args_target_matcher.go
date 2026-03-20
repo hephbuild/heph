@@ -17,7 +17,8 @@ import (
 type ValidArgsFunction = func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective)
 
 type parseTargetMatcherArgs struct {
-	cmdName string
+	cmdName  string
+	allowAll bool
 }
 
 func (r parseTargetMatcherArgs) Use() string {
@@ -68,7 +69,11 @@ func (r parseTargetMatcherArgs) Parse(args []string, cwd, root string) (*pluginv
 			pkgMatcher,
 		}
 		label := args[0]
-		if label != "all" {
+		if label == "all" {
+			if !r.allowAll {
+				return nil, fmt.Errorf("cannot use 'all' label with command %q", r.cmdName)
+			}
+		} else {
 			matchers = append(matchers, tmatch.Label(label))
 		}
 

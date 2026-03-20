@@ -28,7 +28,7 @@ import (
 func init() {
 	var ignore []string
 
-	cmdArgs := parseTargetMatcherArgs{cmdName: "query"}
+	cmdArgs := parseTargetMatcherArgs{cmdName: "query", allowAll: true}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),

@@ -11,7 +11,8 @@ install-dev:
 	mv /tmp/heph $(location)
 
 install-dev-build:
-	go build -o $(location)
+	go build -ldflags "-s -w" -o /tmp/heph
+	mv /tmp/heph $(location)
 
 gen:
 	cd lib/tref/internal && ./gen.sh
@@ -29,7 +30,7 @@ gen:
 
 genlargego:
 	rm -rf example/go/large
-	go run ./tools/gorepogen -seed 42 -out example/go/large -module example.com/large -pkgs 150 -max-depth 6
+	go run ./tools/gorepogen -seed 42 -out example/go/large -module example.com/large -pkgs 200 -max-depth 7
 	cd example/go/large && go mod tidy
 
 lint:

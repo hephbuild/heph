@@ -89,6 +89,7 @@ func (p *Plugin) stdInstall(ctx context.Context, factors Factors) (*pluginv1.Get
 					"cp -r $(go env GOROOT) $LGOROOT",
 					"export GOROOT=$LGOROOT",
 					"chmod -R 777 $GOROOT",
+					"echo 'module dummy' > go.mod",
 					"go install --trimpath std",
 					"go list -json std > $OUT_LIST",
 				}),

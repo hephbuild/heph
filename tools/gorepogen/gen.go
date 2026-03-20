@@ -358,7 +358,6 @@ func (e importEntry) Line() string {
 type srcData struct {
 	PkgName     string
 	Imports     []importEntry
-	HasImports  bool
 	Usages      []string
 	EmbedImport bool
 }
@@ -380,20 +379,27 @@ type xtestData struct {
 }
 
 const srcTmpl = `package {{.PkgName}}
-{{if .HasImports}}
+
 import (
+	"reflect"
 {{- range .Imports}}
 	{{.Line}}
 {{- end}}
 )
-{{end}}
+
+// PkgType is an exported struct so the reflect-based init prevents tree shaking.
+type PkgType struct{ Name string }
+
 // Pkg is the exported identifier for package {{.PkgName}}.
-var Pkg = "{{.PkgName}}"
+var Pkg = PkgType{Name: "{{.PkgName}}"}
 {{if .EmbedImport}}
 //go:embed assets
 var pkgAssets embed.FS
 {{end}}
 func init() {
+	// reflect.TypeOf forces the linker into conservative mode, preventing
+	// dead-code elimination of any exported symbol reachable from this package.
+	_ = reflect.TypeOf(Pkg)
 {{- range .Usages}}
 	{{.}}
 {{- end}}
@@ -537,7 +543,6 @@ func generatePackage(outRoot string, pkg Package, allPkgs []Package) error {
 	if err := writeFile(filepath.Join(dir, pkg.Name+".go"), tmplSrc, srcData{
 		PkgName:     pkg.Name,
 		Imports:     allImports,
-		HasImports:  len(allImports) > 0,
 		Usages:      allUsages,
 		EmbedImport: embedImport,
 	}); err != nil {
