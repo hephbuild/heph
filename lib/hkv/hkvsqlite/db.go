@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -32,9 +31,10 @@ type KV struct {
 	upsertStmt *sql.Stmt
 	deleteStmt *sql.Stmt
 
-	insertMetaStmt *sql.Stmt
-	deleteMetaStmt *sql.Stmt
-	getMetaStmt    *sql.Stmt
+	insertMetaStmt  *sql.Stmt
+	deleteMetaStmt  *sql.Stmt
+	getMetaStmt     *sql.Stmt
+	getCombinedStmt *sql.Stmt
 
 	listStmt *sql.Stmt
 	gcStmt   *sql.Stmt
@@ -79,18 +79,15 @@ func (c *KV) migrate(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS kv_key ON kv (key);
 		CREATE INDEX IF NOT EXISTS kv_expire_at ON kv (expire_at);
 
-		CREATE TABLE IF NOT EXISTS kv_meta (
-			key  TEXT NOT NULL,
-			mkey TEXT NOT NULL,
-			mval TEXT NOT NULL,
-			PRIMARY KEY (key, mkey),
-			FOREIGN KEY (key) REFERENCES kv(key) ON DELETE CASCADE
-		);
-
-		CREATE INDEX IF NOT EXISTS kv_meta_mkey_mval ON kv_meta (mkey, mval);
+		DROP TABLE IF EXISTS kv_meta;
 	`)
+	if err != nil {
+		return err
+	}
 
-	return err
+	_, _ = c.wdb.ExecContext(ctx, `ALTER TABLE kv ADD COLUMN meta TEXT;`)
+
+	return nil
 }
 
 func (c *KV) Migrate(ctx context.Context) error {
@@ -147,11 +144,12 @@ func (c *KV) openInner(ctx context.Context) error {
 	}
 
 	c.upsertStmt, err = wdb.PrepareContext(ctx, `
-		INSERT INTO kv (key, data, expire_at)
-		VALUES (?, ?, ?)
+		INSERT INTO kv (key, data, expire_at, meta)
+		VALUES (?, ?, ?, ?)
 		ON CONFLICT(key) DO UPDATE SET
 			data      = excluded.data,
-			expire_at = excluded.expire_at
+			expire_at = excluded.expire_at,
+			meta      = excluded.meta
 		`)
 	if err != nil {
 		return fmt.Errorf("prepare upsert: %w", err)
@@ -162,30 +160,27 @@ func (c *KV) openInner(ctx context.Context) error {
 		return fmt.Errorf("prepare delete: %w", err)
 	}
 
-	c.insertMetaStmt, err = wdb.PrepareContext(ctx, `INSERT INTO kv_meta (key, mkey, mval) VALUES (?, ?, ?)`)
-	if err != nil {
-		return fmt.Errorf("prepare insert meta: %w", err)
-	}
-
-	c.deleteMetaStmt, err = wdb.PrepareContext(ctx, `DELETE FROM kv_meta WHERE key = ?`)
-	if err != nil {
-		return fmt.Errorf("prepare delete meta: %w", err)
-	}
-
-	c.getMetaStmt, err = rdb.PrepareContext(ctx, `SELECT mkey, mval FROM kv_meta WHERE key = ?`)
+	c.getMetaStmt, err = rdb.PrepareContext(ctx, `SELECT meta FROM kv WHERE key = ? AND (expire_at IS NULL OR expire_at > ?) LIMIT 1`)
 	if err != nil {
 		return fmt.Errorf("prepare get meta: %w", err)
 	}
 
+	c.getCombinedStmt, err = rdb.PrepareContext(ctx, `SELECT data, meta FROM kv WHERE key = ? AND (expire_at IS NULL OR expire_at > ?) LIMIT 1`)
+	if err != nil {
+		return fmt.Errorf("prepare get combined: %w", err)
+	}
+
 	c.listStmt, err = rdb.PrepareContext(ctx, `
-		SELECT k.key
-		FROM kv k
+		SELECT key
+		FROM kv
 		WHERE (expire_at IS NULL OR expire_at > ?)
-		AND (SELECT COUNT(*) FROM json_each(?)) = (
-			SELECT COUNT(*)
-			FROM kv_meta km
-			WHERE km.key = k.key
-			AND (km.mkey, km.mval) IN (SELECT key, value FROM json_each(?))
+		AND (
+			? = '{}' OR
+			(SELECT COUNT(*) FROM json_each(?)) = (
+				SELECT COUNT(*)
+				FROM json_each(kv.meta) km
+				WHERE (km.key, km.value) IN (SELECT key, value FROM json_each(?))
+			)
 		)
 	`)
 	if err != nil {
@@ -206,27 +201,38 @@ func (c *KV) Get(ctx context.Context, key string) ([]byte, map[string]string, bo
 		return nil, nil, false, err
 	}
 
-	r, ok, err := c.Reader(ctx, key)
+	rows, err := c.getCombinedStmt.QueryContext(ctx, key, time.Now().Unix())
 	if err != nil {
 		return nil, nil, false, err
 	}
+	defer rows.Close()
 
-	if !ok {
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, nil, false, err
+		}
 		return nil, nil, false, nil
 	}
-	defer r.Close()
 
-	meta, _, err := c.GetMeta(ctx, key)
-	if err != nil {
+	var raw sql.RawBytes
+	var metaJSON sql.NullString
+	if err := rows.Scan(&raw, &metaJSON); err != nil {
 		return nil, nil, false, err
 	}
 
-	b, err := io.ReadAll(r)
-	if err != nil {
-		return nil, nil, false, err
+	data := make([]byte, len(raw))
+	copy(data, raw)
+
+	var meta map[string]string
+	if metaJSON.Valid {
+		if err := json.Unmarshal([]byte(metaJSON.String), &meta); err != nil {
+			return nil, nil, false, err
+		}
+	} else {
+		meta = make(map[string]string)
 	}
 
-	return b, meta, true, nil
+	return data, meta, true, nil
 }
 
 func (c *KV) GetMeta(ctx context.Context, key string) (map[string]string, bool, error) {
@@ -235,32 +241,19 @@ func (c *KV) GetMeta(ctx context.Context, key string) (map[string]string, bool, 
 		return nil, false, err
 	}
 
-	rows, err := c.getMetaStmt.QueryContext(ctx, key)
+	var metaJSON sql.NullString
+	err = c.getMetaStmt.QueryRowContext(ctx, key, time.Now().Unix()).Scan(&metaJSON)
 	if err != nil {
-		return nil, false, err
-	}
-	defer rows.Close()
-
-	meta := make(map[string]string)
-	for rows.Next() {
-		var k, v string
-		if err := rows.Scan(&k, &v); err != nil {
-			return nil, false, err
-		}
-		meta[k] = v
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, false, err
-	}
-
-	if len(meta) == 0 {
-		exists, err := c.Exists(ctx, key)
-		if err != nil {
-			return nil, false, err
-		}
-		if !exists {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
+		}
+		return nil, false, err
+	}
+
+	var meta map[string]string
+	if metaJSON.Valid {
+		if err := json.Unmarshal([]byte(metaJSON.String), &meta); err != nil {
+			return nil, false, err
 		}
 	}
 
@@ -332,7 +325,8 @@ func (c *KV) ListKeys(ctx context.Context, query map[string]string) iter.Seq2[st
 			}
 		}
 
-		rows, err := c.listStmt.QueryContext(ctx, time.Now().Unix(), queryJSON, queryJSON)
+		queryJSONSTR := string(queryJSON)
+		rows, err := c.listStmt.QueryContext(ctx, time.Now().Unix(), queryJSONSTR, queryJSONSTR, queryJSONSTR)
 		if err != nil {
 			yield("", err)
 			return
@@ -389,11 +383,8 @@ func (c *KV) Close() error {
 	if c.upsertStmt != nil {
 		errs = append(errs, c.upsertStmt.Close())
 	}
-	if c.insertMetaStmt != nil {
-		errs = append(errs, c.insertMetaStmt.Close())
-	}
-	if c.deleteMetaStmt != nil {
-		errs = append(errs, c.deleteMetaStmt.Close())
+	if c.getCombinedStmt != nil {
+		errs = append(errs, c.getCombinedStmt.Close())
 	}
 	if c.listStmt != nil {
 		errs = append(errs, c.listStmt.Close())

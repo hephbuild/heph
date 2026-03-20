@@ -2,6 +2,7 @@ package hkvsqlite
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
@@ -55,28 +56,21 @@ func (c *KV) writeEntry(ctx context.Context, key string, metadata map[string]str
 		expireAt = &t
 	}
 
+	var metaJSON []byte
+	if len(metadata) > 0 {
+		metaJSON, err = json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("writeEntry marshal meta: %w", err)
+		}
+	}
+
 	// Single UPSERT — write lock held for exactly one statement.
 	_, err = tx.StmtContext(ctx, c.upsertStmt).ExecContext(
 		ctx,
-		key, payload, expireAt,
+		key, payload, expireAt, metaJSON,
 	)
 	if err != nil {
 		return fmt.Errorf("writeEntry upsert: %w", err)
-	}
-
-	_, err = tx.StmtContext(ctx, c.deleteMetaStmt).ExecContext(ctx, key)
-	if err != nil {
-		return fmt.Errorf("writeEntry delete meta: %w", err)
-	}
-
-	if len(metadata) > 0 {
-		stmt := tx.StmtContext(ctx, c.insertMetaStmt)
-		for k, v := range metadata {
-			_, err = stmt.ExecContext(ctx, key, k, v)
-			if err != nil {
-				return fmt.Errorf("writeEntry insert meta: %w", err)
-			}
-		}
 	}
 
 	return tx.Commit()

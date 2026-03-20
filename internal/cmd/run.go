@@ -30,7 +30,7 @@ func init() {
 	var catOut bool
 	var hashOut bool
 
-	cmdArgs := parseTargetMatcherArgs{cmdName: "run"}
+	cmdArgs := parseTargetMatcherArgs{cmdName: "run", allowAll: true}
 
 	cmd := &cobra.Command{
 		Use:               cmdArgs.Use(),
