@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use pest::Parser;
 use pest_derive::Parser;
-use crate::taddr::addr::TAddr;
+use crate::htaddr::addr::Addr;
 
 #[derive(Parser)]
-#[grammar = "taddr/taddr.pest"]
+#[grammar = "htaddr/taddr.pest"]
 struct TAddrParser;
 
-pub fn parse_taddr(input: &str) -> Result<TAddr, String> {
+pub fn parse_taddr(input: &str) -> Result<Addr, String> {
     let pairs = TAddrParser::parse(Rule::taddr, input)
         .map_err(|e| format!("Parsing error: {}", e))?;
 
@@ -85,7 +85,7 @@ pub fn parse_taddr(input: &str) -> Result<TAddr, String> {
         }
     }
 
-    Ok(TAddr {
+    Ok(Addr {
         package,
         name,
         args,
