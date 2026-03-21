@@ -17,5 +17,8 @@ fn main() {
     info!(_logger, "Application starting"; "version" => env!("CARGO_PKG_VERSION"), "mode" => "cli");
 
     let cli = Cli::parse();
-    cli.command.execute();
+    match cli.command.execute() {
+        Ok(_) => (),
+        Err(e) => eprintln!("Error: {}", e),
+    }
 }

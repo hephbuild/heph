@@ -16,3 +16,8 @@ slog-stdlog = "4.1.1"
 rheph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
 pest = "2.7"
 pest_derive = "2.7"
+anyhow = "1.0.102"
+memoize = "0.6.0"
+
+[dev-dependencies]
+tempfile = "3.10"

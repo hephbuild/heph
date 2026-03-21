@@ -1,5 +1,7 @@
+use std::path::PathBuf;
 use clap::Args;
-use crate::htaddr;
+use crate::{engine, htaddr, htmatcher};
+use crate::commands::bootstrap;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
@@ -12,17 +14,28 @@ pub struct RunArgs {
     pub arg2: Option<String>,
 }
 
-pub fn execute(args: &RunArgs) {
-    if let Some(matcher) = &args.arg2 {
+pub fn execute(args: &RunArgs) -> anyhow::Result<()> {
+    if let Some(package_matcher) = &args.arg2 {
         let label = &args.arg1;
-        println!("Run with label: {}, package matcher: {}", label, matcher);
+        execute_matcher(htmatcher::Matcher::And(vec![
+            htmatcher::Matcher::Label(htaddr::parse_addr(label).map_err(anyhow::Error::msg)?),
+            htmatcher::Matcher::Package(package_matcher.clone()),
+        ]))
     } else {
         let address = &args.arg1;
         match htaddr::parse_addr(address) {
-            Ok(addr) => println!("Run with target address: {:?}", addr),
+            Ok(addr) => execute_matcher(htmatcher::Matcher::Addr(addr)),
             Err(e) => {
-                eprintln!("Error: '{}' is not a valid target address: {}", address, e);
+                anyhow::bail!("Error: '{}' is not a valid target address: {}", address, e);
             }
         }
     }
+}
+
+fn execute_matcher(m: htmatcher::Matcher) -> anyhow::Result<()> {
+   let e =  bootstrap::new_engine()?;
+
+    e.result(m);
+
+    Ok(())
 }

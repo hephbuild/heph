@@ -35,7 +35,7 @@ in
   scripts.gen.exec = "proto-gen";
 
   scripts.install-dev.exec = ''
-    sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < scripts/dev.sh > /tmp/heph
+    sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph
     chmod +x /tmp/heph
     mkdir -p $(dirname "${binLocation}")
     mv /tmp/heph "${binLocation}"

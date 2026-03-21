@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Addr {
     pub package: String,
     pub name: String,

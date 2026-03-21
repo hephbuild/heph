@@ -1,5 +1,6 @@
 pub mod run;
-pub mod user;
+pub mod inspect;
+mod bootstrap;
 
 use clap::Subcommand;
 
@@ -7,16 +8,16 @@ use clap::Subcommand;
 pub enum Commands {
     /// Run a command
     Run(run::RunArgs),
-    /// Manage users
+    /// Inspect
     #[command(arg_required_else_help = true)]
-    User(user::UserArgs),
+    Inspect(inspect::InspectArgs),
 }
 
 impl Commands {
-    pub fn execute(&self) {
+    pub fn execute(&self) -> anyhow::Result<()>  {
         match self {
             Commands::Run(args) => run::execute(args),
-            Commands::User(args) => args.execute(),
+            Commands::Inspect(args) => args.execute(),
         }
     }
 }
