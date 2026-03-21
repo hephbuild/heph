@@ -2,7 +2,7 @@
 
 {
   # https://devenv.sh/basics/
-  env.GREET = "devenv";
+  env.BIN_LOCATION = "~/.local/bin/rheph";
 
   # https://devenv.sh/packages/
   packages = [
@@ -28,6 +28,21 @@
   # https://devenv.sh/scripts/
   scripts.proto-gen.exec = "buf generate";
   scripts.gen.exec = "proto-gen";
+
+  scripts.install-dev.exec = ''
+    location=$BIN_LOCATION
+    sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < scripts/dev.sh > /tmp/heph
+    chmod +x /tmp/heph
+    mkdir -p $(dirname "$location")
+    mv /tmp/heph "$location"
+  '';
+
+  scripts.install-dev-build.exec = ''
+    location=$BIN_LOCATION
+    cargo build --target-dir /tmp/rheph
+    mkdir -p $(dirname "$location")
+    mv /tmp/rheph/debug/rheph "$location"
+  '';
 
 
   # https://devenv.sh/basics/
