@@ -1,6 +1,8 @@
 mod commands;
+mod log;
 
 use clap::Parser;
+use slog::info;
 
 #[derive(Parser)]
 #[command(name = "rheph")]
@@ -11,6 +13,9 @@ struct Cli {
 }
 
 fn main() {
+    let _logger = log::init();
+    info!(_logger, "Application starting"; "version" => env!("CARGO_PKG_VERSION"), "mode" => "cli");
+
     let cli = Cli::parse();
     cli.command.execute();
 }

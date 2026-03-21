@@ -5,3 +5,8 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.6.0", features = ["derive"] }
+slog = "2.7.0"
+slog-async = "2.8.0"
+slog-term = "2.9.1"
+log = "0.4.22"
+slog-stdlog = "4.1.1"
