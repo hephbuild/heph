@@ -1,2 +1,5 @@
-pub mod addr;
-pub mod parse;
+mod addr;
+pub use addr::Addr;
+
+mod parse;
+pub use parse::parse_addr;

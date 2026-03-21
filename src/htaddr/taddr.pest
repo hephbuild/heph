@@ -7,8 +7,8 @@ at = { "@" }
 comma = { "," }
 eq = { "=" }
 
-package_ident = { (!colon ~ ANY)+ }
-name_ident = { (!at ~ !space ~ !pipe ~ ANY)+ }
+package_ident = { (!(colon | space) ~ ANY)+ }
+name_ident = { (!(at | colon | space | pipe) ~ ANY)+ }
 pipe = { "|" }
 
 arg = { key ~ (eq ~ value)? }

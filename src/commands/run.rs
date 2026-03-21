@@ -1,5 +1,5 @@
 use clap::Args;
-use crate::htaddr::parse::parse_taddr;
+use crate::htaddr;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
@@ -18,7 +18,7 @@ pub fn execute(args: &RunArgs) {
         println!("Run with label: {}, package matcher: {}", label, matcher);
     } else {
         let address = &args.arg1;
-        match parse_taddr(address) {
+        match htaddr::parse_addr(address) {
             Ok(addr) => println!("Run with target address: {:?}", addr),
             Err(e) => {
                 eprintln!("Error: '{}' is not a valid target address: {}", address, e);
