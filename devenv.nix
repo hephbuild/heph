@@ -1,8 +1,13 @@
 { pkgs, lib, config, inputs, ... }:
 
+let
+  # 1. Define the location in one place here
+  # This is a literal string that will be injected into your scripts
+  binLocation = "$HOME/.local/bin/rheph";
+in
 {
   # https://devenv.sh/basics/
-  env.BIN_LOCATION = "~/.local/bin/rheph";
+  env.BIN_LOCATION = "$HOME/.local/bin/rheph";
 
   # https://devenv.sh/packages/
   packages = [
@@ -30,18 +35,16 @@
   scripts.gen.exec = "proto-gen";
 
   scripts.install-dev.exec = ''
-    location=$BIN_LOCATION
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < scripts/dev.sh > /tmp/heph
     chmod +x /tmp/heph
-    mkdir -p $(dirname "$location")
-    mv /tmp/heph "$location"
+    mkdir -p $(dirname "${binLocation}")
+    mv /tmp/heph "${binLocation}"
   '';
 
   scripts.install-dev-build.exec = ''
-    location=$BIN_LOCATION
     cargo build --target-dir /tmp/rheph
-    mkdir -p $(dirname "$location")
-    mv /tmp/rheph/debug/rheph "$location"
+    mkdir -p $(dirname "${binLocation}")
+    mv /tmp/rheph/debug/rheph "${binLocation}"
   '';
 
 
