@@ -3,9 +3,14 @@ name = "rheph"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["gen/proto"]
+
 [dependencies]
+serde_json = "1.0"
 clap = { version = "4.6.0", features = ["derive"] }
 slog = "2.7.0"
 slog-async = "2.8.0"
 slog-term = "2.9.1"
 slog-stdlog = "4.1.1"
+rheph-proto-gen = { path = "gen/proto", features = ["proto_full"] }

@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package rheph.v1;
+
+message User {
+  string id = 1;
+  string username = 2;
+  string email = 3;
+}

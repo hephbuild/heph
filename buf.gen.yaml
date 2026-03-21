@@ -1,0 +1,14 @@
+version: v2
+plugins:
+  - local: protoc-gen-prost
+    out: gen/proto/src
+    opt:
+      - bytes=.
+      - file_descriptor_set
+  - local: protoc-gen-prost-serde
+    out: gen/proto/src
+  - local: protoc-gen-prost-crate
+    out: gen/proto
+    strategy: all
+    opt:
+      - gen_crate=proto/Cargo.toml.tpl
