@@ -14,3 +14,5 @@ slog-async = "2.8.0"
 slog-term = "2.9.1"
 slog-stdlog = "4.1.1"
 rheph-proto-gen = { path = "gen/proto", features = ["proto_full"] }
+pest = "2.7"
+pest_derive = "2.7"

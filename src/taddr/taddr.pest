@@ -1,0 +1,23 @@
+taddr = { SOI ~ ss ~ package_ident ~ colon ~ name_ident ~ (at ~ args)? ~ EOI }
+args = { arg ~ (comma ~ arg)* }
+
+ss = { "//" }
+colon = { ":" }
+at = { "@" }
+comma = { "," }
+eq = { "=" }
+
+package_ident = { (!colon ~ ANY)+ }
+name_ident = { (!at ~ !space ~ !pipe ~ ANY)+ }
+pipe = { "|" }
+
+arg = { key ~ (eq ~ value)? }
+key = { (!eq ~ !comma ~ !at ~ !space ~ !pipe ~ !quote ~ ANY)+ }
+value = { quoted_string | bare_value }
+
+bare_value = { (!comma ~ !space ~ !pipe ~ !quote ~ ANY)+ }
+quoted_string = { quote ~ string_content ~ quote }
+quote = { "\"" }
+string_content = { (!quote ~ ANY)* }
+
+space = _{ " " }

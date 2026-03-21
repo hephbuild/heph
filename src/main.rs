@@ -1,5 +1,5 @@
-mod commands;
-mod log;
+use rheph::commands;
+use rheph::log;
 
 use clap::Parser;
 use slog::info;

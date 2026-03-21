@@ -1,15 +1,12 @@
-pub mod add;
-pub mod greet;
+pub mod run;
 pub mod user;
 
 use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Adds two numbers
-    Add(add::AddArgs),
-    /// Greets a person
-    Greet(greet::GreetArgs),
+    /// Run a command
+    Run(run::RunArgs),
     /// Manage users
     #[command(arg_required_else_help = true)]
     User(user::UserArgs),
@@ -18,8 +15,7 @@ pub enum Commands {
 impl Commands {
     pub fn execute(&self) {
         match self {
-            Commands::Add(args) => add::execute(args),
-            Commands::Greet(args) => greet::execute(args),
+            Commands::Run(args) => run::execute(args),
             Commands::User(args) => args.execute(),
         }
     }
