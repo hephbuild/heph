@@ -11,10 +11,8 @@ pub enum Commands {
     /// Greets a person
     Greet(greet::GreetArgs),
     /// Manage users
-    User {
-        #[command(subcommand)]
-        command: user::UserCommands,
-    },
+    #[command(arg_required_else_help = true)]
+    User(user::UserArgs),
 }
 
 impl Commands {
@@ -22,7 +20,7 @@ impl Commands {
         match self {
             Commands::Add(args) => add::execute(args),
             Commands::Greet(args) => greet::execute(args),
-            Commands::User { command } => command.execute(),
+            Commands::User(args) => args.execute(),
         }
     }
 }
