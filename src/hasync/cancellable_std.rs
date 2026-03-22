@@ -6,6 +6,7 @@ use std::task::{Context, Poll, Waker};
 use crate::hasync::Cancellable;
 
 /// A manual, std-only implementation of a cancellation signal.
+#[derive(Clone)]
 pub struct StdCancellationToken {
     inner: Arc<SharedState>,
 }

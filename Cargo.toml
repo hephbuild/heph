@@ -23,6 +23,7 @@ futures = "0.3.32"
 async-trait = "0.1.86"
 smart-default = "0.7.1"
 humantime = "2.3.0"
+tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3.10"

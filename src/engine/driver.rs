@@ -208,9 +208,9 @@ pub struct RunRequest<'a> {
     pub tree_root_path: String,
     pub inputs: Vec<RunInput>,
     pub hashin: &'a String,
-    pub stdin: &'a (dyn io::Read + Send + Sync),
-    pub stdout: &'a (dyn io::Write + Send + Sync),
-    pub stderr: &'a (dyn io::Write + Send + Sync),
+    pub stdin: Option<&'a mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
+    pub stdout: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    pub stderr: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
 }
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,

@@ -75,9 +75,9 @@ impl Engine {
             tree_root_path: self.cfg.root.to_str().unwrap().to_string(),
             inputs: vec![],
             hashin: &opts.hashin,
-            stdin: &io::empty(),
-            stdout: &io::sink(),
-            stderr: &io::sink(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
         }, &rs.ctoken).await?;
 
         Ok(res.artifacts)
