@@ -5,9 +5,12 @@ mod result;
 mod cwd;
 pub use cwd::get_cwd;
 mod root;
+pub use root::get_root;
 mod local_cache;
 mod local_cache_fs;
 mod query;
 mod packages;
-
-pub use root::get_root;
+mod provider;
+mod driver;
+pub mod request_state;
+pub use result::Result;

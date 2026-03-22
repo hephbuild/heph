@@ -21,7 +21,7 @@ impl<'a> Iterator for PackagesResult<'a> {
 }
 
 impl Engine {
-    pub fn packages<'a>(&'a self, m: &'a htmatcher::Matcher) -> PackagesResult<'a> {
+    pub fn packages<'a>(&'a self, _m: &'a htmatcher::Matcher) -> PackagesResult<'a> {
         PackagesResult {
             items: vec!["1", "2"],
             index: 0,

@@ -3,7 +3,7 @@ use crate::engine::packages::PackagesResult;
 use crate::htaddr::Addr;
 use crate::htmatcher;
 
-struct QueryResult<'a> {
+pub struct QueryResult<'a> {
     e: &'a Engine,
     m: &'a htmatcher::Matcher,
     it: PackagesResult<'a>,
@@ -23,6 +23,10 @@ impl Iterator for QueryResult<'_> {
 
 impl Engine {
     pub fn query<'a>(&'a self, m: &'a htmatcher::Matcher) -> QueryResult<'a> {
+        // for pkg in self.packages(&htmatcher::Matcher::Package(addr.package)) {
+        //
+        // }
+
         QueryResult{e: self, m, it: self.packages(m)}
     }
 }

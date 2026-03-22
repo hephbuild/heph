@@ -1,7 +1,8 @@
-use std::path::PathBuf;
 use clap::Args;
-use crate::{engine, htaddr, htmatcher};
 use crate::commands::bootstrap;
+use crate::{htaddr, htmatcher};
+use crate::hasync::{Cancellable, StdCancellationToken};
+use crate::htmatcher::Matcher;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
@@ -14,17 +15,18 @@ pub struct RunArgs {
     pub arg2: Option<String>,
 }
 
-pub fn execute(args: &RunArgs) -> anyhow::Result<()> {
+#[tokio::main]
+pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
     if let Some(package_matcher) = &args.arg2 {
         let label = &args.arg1;
-        execute_matcher(htmatcher::Matcher::And(vec![
-            htmatcher::Matcher::Label(htaddr::parse_addr(label).map_err(anyhow::Error::msg)?),
-            htmatcher::Matcher::Package(package_matcher.clone()),
-        ]))
+        execute_matcher(Matcher::And(vec![
+            Matcher::Label(htaddr::parse_addr(label).map_err(anyhow::Error::msg)?),
+            Matcher::Package(package_matcher.clone()),
+        ])).await
     } else {
         let address = &args.arg1;
         match htaddr::parse_addr(address) {
-            Ok(addr) => execute_matcher(htmatcher::Matcher::Addr(addr)),
+            Ok(addr) => execute_matcher(Matcher::Addr(addr)).await,
             Err(e) => {
                 anyhow::bail!("Error: '{}' is not a valid target address: {}", address, e);
             }
@@ -32,10 +34,17 @@ pub fn execute(args: &RunArgs) -> anyhow::Result<()> {
     }
 }
 
-fn execute_matcher(m: htmatcher::Matcher) -> anyhow::Result<()> {
+async fn execute_matcher(m: Matcher) -> anyhow::Result<()> {
    let e =  bootstrap::new_engine()?;
 
-    e.result(m);
+   let addr = match m {
+       Matcher::Addr(addr) => addr,
+       _ => anyhow::bail!("Matcher not supported yet"),
+   };
+
+    let result = e.result(e.new_state(), &addr).await?;
+
+    println!("{} artifacts", result.artifacts.len());
 
     Ok(())
 }

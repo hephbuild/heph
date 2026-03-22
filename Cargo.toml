@@ -18,6 +18,8 @@ pest = "2.7"
 pest_derive = "2.7"
 anyhow = "1.0.102"
 memoize = "0.6.0"
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util"] }
+futures = "0.3.32"
 
 [dev-dependencies]
 tempfile = "3.10"

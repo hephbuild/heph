@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use crate::engine;
 
-pub fn new_engine() -> anyhow::Result<engine::Engine> {
+pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let cwd = engine::get_cwd();
     let root = match engine::get_root() {
         Ok(r) => r,
