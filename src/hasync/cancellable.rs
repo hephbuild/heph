@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// The contract for any cancellation mechanism.
-pub trait Cancellable {
+pub trait Cancellable: Send + Sync {
     /// Non-blocking check for cancellation.
     fn is_cancelled(&self) -> bool;
 

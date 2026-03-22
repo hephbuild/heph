@@ -1,7 +1,6 @@
 use clap::Args;
 use crate::commands::bootstrap;
-use crate::{htaddr, htmatcher};
-use crate::hasync::{Cancellable, StdCancellationToken};
+use crate::htaddr;
 use crate::htmatcher::Matcher;
 
 #[derive(Args)]

@@ -47,6 +47,12 @@ in
     mv /tmp/rheph/debug/rheph "${binLocation}"
   '';
 
+  scripts.install-release-build.exec = ''
+    cargo build --release --target-dir /tmp/rheph
+    mkdir -p $(dirname "${binLocation}")
+    mv /tmp/rheph/release/rheph "${binLocation}"
+  '';
+
 
   # https://devenv.sh/basics/
 #  enterShell = ''

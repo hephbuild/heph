@@ -1,6 +1,6 @@
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::driver::RunRequest;
+use crate::engine::driver::{ParseRequest, RunRequest};
 use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
 use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
@@ -46,27 +46,6 @@ impl Engine {
         }).await
     }
 
-    async fn execute(&self, rs: Arc<RequestState>, opts: &ExecuteOptions<'_>) -> anyhow::Result<Vec<OutputArtifact>> {
-        let driver = match self.drivers_by_name.get(&opts.spec.driver) {
-            Some(driver) => driver,
-            None => anyhow::bail!("driver not found: {}", opts.spec.driver),
-        };
-
-        let res = driver.driver.run(RunRequest{
-            request_id: &rs.request_id,
-            target: &opts.def,
-            sandbox_path: "".to_string(),
-            tree_root_path: self.cfg.root.to_str().unwrap().to_string(),
-            inputs: vec![],
-            hashin: &opts.hashin,
-            stdin: &io::empty(),
-            stdout: &io::sink(),
-            stderr: &io::sink(),
-        }, &rs.ctoken)?;
-
-        Ok(res.artifacts)
-    }
-
     async fn execute_and_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<Result> {
         let artifacts = self.execute(rs.clone(), &opts).await?;
 
@@ -83,18 +62,50 @@ impl Engine {
         })
     }
 
+    async fn execute(&self, rs: Arc<RequestState>, opts: &ExecuteOptions<'_>) -> anyhow::Result<Vec<OutputArtifact>> {
+        let driver = match self.drivers_by_name.get(&opts.spec.driver) {
+            Some(driver) => driver,
+            None => anyhow::bail!("driver not found: {}", opts.spec.driver),
+        };
+
+        let res = driver.driver.run(RunRequest{
+            request_id: &rs.request_id,
+            target: &opts.def,
+            sandbox_path: "".to_string(),
+            tree_root_path: self.cfg.root.to_str().unwrap().to_string(),
+            inputs: vec![],
+            hashin: &opts.hashin,
+            stdin: &io::empty(),
+            stdout: &io::sink(),
+            stderr: &io::sink(),
+        }, &rs.ctoken).await?;
+
+        Ok(res.artifacts)
+    }
+
     pub async fn get_def(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetDef> {
-        let spec = self.get_spec(rs, addr).await?;
-        anyhow::bail!("get_def not implemented")
+        let spec = self.get_spec(rs.clone(), addr).await?;
+
+        let driver = match self.drivers_by_name.get(&spec.driver) {
+            Some(driver) => driver,
+            None => anyhow::bail!("driver not found: {}", spec.driver),
+        };
+
+        let res = driver.driver.parse(ParseRequest{
+            request_id: rs.request_id.clone(),
+            target_spec: spec,
+        }, &rs.ctoken).await?;
+
+        Ok(res.target_def)
     }
 
     pub async fn get_spec(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetSpec> {
         for provider in self.providers.iter() {
             let spec = match provider.provider.get(GetRequest{
-                request_id: &rs.request_id,
+                request_id: rs.request_id.clone(),
                 addr: addr.clone(),
                 states: vec![], // TODO
-            }, &rs.ctoken) {
+            }, &rs.ctoken).await {
                 Ok(GetResponse{target_spec}) => {
                     target_spec
                 }

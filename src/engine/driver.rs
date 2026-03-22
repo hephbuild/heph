@@ -1,7 +1,9 @@
 use std::io;
+use async_trait::async_trait;
 use crate::hasync;
 use crate::htaddr::Addr;
 
+#[derive(Default, Clone)]
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
@@ -9,14 +11,17 @@ pub struct TargetAddr {
 
 pub mod sandbox {
     use std::collections::HashMap;
+    use smart_default::SmartDefault;
     use crate::engine::driver::TargetAddr;
 
+    #[derive(Default, Clone)]
     pub struct Sandbox {
         pub tools: Vec<Tool>,
         pub deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
     }
 
+    #[derive(Default, Clone)]
     pub struct Tool {
         pub r#ref: TargetAddr,
         pub group: String,
@@ -24,6 +29,7 @@ pub mod sandbox {
         pub id: String,
     }
 
+    #[derive(Default, Clone)]
     pub struct Dep {
         pub r#ref: TargetAddr,
         pub mode: Mode,
@@ -33,12 +39,14 @@ pub mod sandbox {
         pub id: String,
     }
 
+    #[derive(Clone, SmartDefault)]
     pub enum Mode {
-        Unspecified,
-        Link,
+        #[default]
         None,
+        Link,
     }
 
+    #[derive(Clone)]
     pub struct Env {
         pub value: EnvValue,
         pub hash: bool,
@@ -46,6 +54,7 @@ pub mod sandbox {
         pub append_prefix: String,
     }
 
+    #[derive(Clone)]
     pub enum EnvValue {
         Literal(String),
         Pass(bool),
@@ -68,8 +77,8 @@ pub mod targetdef {
     use crate::htaddr::Addr;
 
     pub struct TargetDef {
-        pub r#ref: Addr,
-        pub raw_def: Box<dyn Any>,
+        pub addr: Addr,
+        pub raw_def: Box<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
@@ -138,8 +147,8 @@ pub struct ApplyTransitiveResponse {
 
 pub mod inputartifact {
     pub enum Type {
-        Output = 1,
-        SupportFile = 5,
+        Output,
+        SupportFile,
     }
 
     pub struct InputArtifact {
@@ -158,11 +167,11 @@ pub struct RunInput {
 
 pub mod outputartifact {
     pub enum Type {
-        Output = 1,
-        OutputListV1 = 2,
-        Log = 3,
-        SupportFile = 5,
-        SupportFileListV1 = 6,
+        Output,
+        OutputListV1,
+        Log,
+        SupportFile,
+        SupportFileListV1,
     }
 
     pub struct ContentRaw {
@@ -199,17 +208,18 @@ pub struct RunRequest<'a> {
     pub tree_root_path: String,
     pub inputs: Vec<RunInput>,
     pub hashin: &'a String,
-    pub stdin: &'a dyn io::Read,
-    pub stdout: &'a dyn io::Write,
-    pub stderr: &'a dyn io::Write,
+    pub stdin: &'a (dyn io::Read + Send + Sync),
+    pub stdout: &'a (dyn io::Write + Send + Sync),
+    pub stderr: &'a (dyn io::Write + Send + Sync),
 }
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
 }
 
-pub trait Driver {
-    fn config(&self, req: ConfigRequest, ctoken: &dyn hasync::Cancellable) -> anyhow::Result<ConfigResponse>;
-    fn parse(&self, req: ParseRequest, ctoken: &dyn hasync::Cancellable) -> anyhow::Result<ParseResponse>;
-    fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &dyn hasync::Cancellable) -> anyhow::Result<ApplyTransitiveResponse>;
-    fn run(&self, req: RunRequest, ctoken: &dyn hasync::Cancellable) -> anyhow::Result<RunResponse>;
+#[async_trait]
+pub trait Driver: Send + Sync {
+    fn config(&self, req: ConfigRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ConfigResponse>;
+    async fn parse(&self, req: ParseRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse>;
+    async fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse>;
+    async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<RunResponse>;
 }

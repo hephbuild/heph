@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 pub struct Memoizer<K, V> {
     cache: Mutex<HashMap<K, V>>,
@@ -7,8 +7,7 @@ pub struct Memoizer<K, V> {
 
 impl<K, V> Memoizer<K, V>
 where
-    K: std::hash::Hash + Eq + Clone,
-    V: Clone,
+    K: std::hash::Hash + Eq,
 {
     pub fn new() -> Self {
         Self {
@@ -19,6 +18,7 @@ where
     pub fn get_or_init<F>(&self, key: K, f: F) -> V
     where
         F: FnOnce() -> V,
+        V: Clone,
     {
         let mut cache = self.cache.lock().unwrap();
 
