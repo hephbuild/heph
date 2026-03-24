@@ -1,0 +1,15 @@
+[package]
+name = "heph-starlark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+starlark = "0.12"
+anyhow = "1.0"
+thiserror.workspace = true
+
+[dev-dependencies]
+indoc = "2.0"
+tempfile = "3.8"

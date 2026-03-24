@@ -1,0 +1,9 @@
+[package]
+name = "heph-uuid"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+uuid = { version = "1.6", features = ["v4", "fast-rng"] }

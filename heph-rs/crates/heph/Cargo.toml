@@ -1,0 +1,29 @@
+[package]
+name = "heph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+num_cpus = "1.16"
+
+# Heph workspace crates
+heph-uuid = { path = "../heph-uuid" }
+heph-tref = { path = "../heph-tref" }
+heph-kv = { path = "../heph-kv" }
+heph-dag = { path = "../heph-dag" }
+heph-pipe = { path = "../heph-pipe" }
+heph-fs = { path = "../heph-fs" }
+heph-engine = { path = "../heph-engine" }
+heph-plugins = { path = "../heph-plugins" }
+heph-starlark = { path = "../heph-starlark" }
+heph-cache = { path = "../heph-cache" }
+heph-observability = { path = "../heph-observability" }
+
+[dev-dependencies]
+tempfile = "3.8"

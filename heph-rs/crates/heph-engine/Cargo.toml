@@ -1,0 +1,15 @@
+[package]
+name = "heph-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+heph-dag = { path = "../heph-dag" }
+heph-kv = { path = "../heph-kv" }
+tokio = { version = "1.0", features = ["rt", "sync", "macros"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt", "sync", "macros", "rt-multi-thread"] }

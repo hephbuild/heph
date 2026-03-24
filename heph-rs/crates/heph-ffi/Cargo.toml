@@ -1,0 +1,14 @@
+[package]
+name = "heph-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+heph-uuid = { path = "../heph-uuid" }
+heph-tref = { path = "../heph-tref" }
+heph-kv = { path = "../heph-kv" }
