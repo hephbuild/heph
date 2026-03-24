@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/heph-uuid",
+    "crates/heph-tref",
+    "crates/heph-kv",
+    "crates/heph-pipe",
+    "crates/heph-dag",
+    "crates/heph-fs",
+    "crates/heph-engine",
+    "crates/heph-ffi",
+    "crates/heph-plugins",
+    "crates/heph-starlark",
+    "crates/heph-cache",
+    "crates/heph-cli",
+    "crates/heph-observability",
+    "crates/heph",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/hephbuild/heph"
+
+[workspace.dependencies]
+thiserror = "2.0"

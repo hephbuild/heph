@@ -1,0 +1,13 @@
+[package]
+name = "heph-tref"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nom = "7.1"
+thiserror.workspace = true
+
+[dev-dependencies]
+pretty_assertions = "1.4"
