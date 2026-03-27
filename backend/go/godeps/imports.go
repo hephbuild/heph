@@ -25,7 +25,11 @@ func listImports() {
 		panic(err)
 	}
 	fmt.Println("files origin:", hashBytes(b))
-	fmt.Println("src:", hashFile(os.Getenv("SRC_HEPH_DEPS")))
+	b, err = json.Marshal(Deps)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("src:", hashBytes(b))
 	modRoot := findGoModRoot(root)
 	fmt.Println("gomod:", hashFile(filepath.Join(modRoot, "go.mod")))
 	fmt.Println("gosum:", hashFile(filepath.Join(modRoot, "go.sum")))
