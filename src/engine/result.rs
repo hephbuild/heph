@@ -169,7 +169,7 @@ mod tests {
         assert!(result.artifacts.is_empty());
 
         // Test caching (second call)
-        let result2 = engine.result(rs, &addr).await?;
+        let result2 = engine.clone().result(rs, &addr).await?;
         assert!(result2.artifacts.is_empty());
 
         Ok(())
@@ -190,7 +190,7 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.result(rs, &addr).await;
+        let result = engine.clone().result(rs, &addr).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
 

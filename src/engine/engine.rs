@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::engine::driver::Driver as SDKDriver;
@@ -6,6 +6,7 @@ use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::local_cache::LocalCache;
 use crate::engine::local_cache_fs::LocalCacheFS;
 use crate::engine::provider::{Provider as SDKProvider, StaticProvider, TargetSpec};
+use crate::engine::request_state::RequestState;
 use crate::htaddr::Addr;
 use crate::pluginexec;
 
@@ -22,6 +23,8 @@ pub struct Engine {
     pub(crate) providers_by_name: HashMap<String, Arc<Provider>>,
     pub(crate) drivers: Vec<Arc<Driver>>,
     pub(crate) drivers_by_name: HashMap<String, Arc<Driver>>,
+
+    pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
 }
 
 pub struct Provider {
@@ -79,6 +82,7 @@ impl Engine {
             providers_by_name,
             drivers,
             drivers_by_name,
+            requests: Mutex::new(HashMap::new()),
         }))
     }
 }
