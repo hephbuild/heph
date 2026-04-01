@@ -8,9 +8,6 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
         Err(inner) => anyhow::bail!("Error: {}", inner)
     };
 
-    println!("cwd: {:?}", cwd);
-    println!("root: {:?}", root);
-
     engine::Engine::new(engine::Config{
         root: PathBuf::from(root),
     })

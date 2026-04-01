@@ -6,3 +6,9 @@ pub struct Addr {
     pub name: String,
     pub args: HashMap<String, String>,
 }
+
+impl Addr {
+    pub fn format(&self) -> String {
+        format!("//{}:{}", self.package, self.name)
+    }
+}

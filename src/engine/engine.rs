@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Weak;
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::local_cache::LocalCache;
@@ -17,7 +16,7 @@ pub struct Config {
 
 pub struct Engine {
     pub(crate) cfg: Config,
-    pub(crate) local_cache: Box<dyn LocalCache>,
+    pub(crate) local_cache: Arc<dyn LocalCache>,
 
     pub(crate) providers: Vec<Arc<Provider>>,
     pub(crate) providers_by_name: HashMap<String, Arc<Provider>>,
@@ -75,7 +74,7 @@ impl Engine {
 
         Ok(Arc::new(Engine {
             cfg: cfg.clone(),
-            local_cache: Box::new(LocalCacheFS::new(root.join(".heph3").join("cache"))?),
+            local_cache: Arc::new(LocalCacheFS::new(root.join(".heph3").join("cache"))?),
             providers,
             providers_by_name,
             drivers,

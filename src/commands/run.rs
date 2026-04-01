@@ -41,7 +41,7 @@ async fn execute_matcher(m: Matcher) -> anyhow::Result<()> {
        _ => anyhow::bail!("Matcher not supported yet"),
    };
 
-    let result = e.result(e.new_state(), &addr).await?;
+    let result = e.clone().result(e.new_state(), &addr).await?;
 
     println!("{} artifacts", result.artifacts.len());
 

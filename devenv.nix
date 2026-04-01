@@ -21,7 +21,10 @@ in
   # https://devenv.sh/languages/
    languages.rust = {
      enable = true;
+     channel = "stable";
+     mold.enable = true;
      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
+     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
    };
 
   # https://devenv.sh/processes/
@@ -59,12 +62,6 @@ in
 #    hello         # Run scripts directly
 #    git --version # Use packages
 #  '';
-
-  # https://devenv.sh/tasks/
-  tasks = {
-    "heph:generate".exec = "gen";
-    "devenv:enterShell".after = [ "heph:generate" ];
-  };
 
   # https://devenv.sh/tests/
   enterTest = ''

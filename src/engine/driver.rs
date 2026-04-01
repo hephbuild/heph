@@ -1,4 +1,3 @@
-use std::io;
 use async_trait::async_trait;
 use crate::hasync;
 use crate::htaddr::Addr;
@@ -73,12 +72,14 @@ pub struct ParseRequest {
 
 pub mod targetdef {
     use std::any::Any;
+    use std::sync::Arc;
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
 
+    #[derive(Clone)]
     pub struct TargetDef {
         pub addr: Addr,
-        pub raw_def: Box<dyn Any + Send + Sync>,
+        pub raw_def: Arc<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
@@ -94,36 +95,42 @@ pub mod targetdef {
         }
     }
 
+    #[derive(Clone)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
     }
 
+    #[derive(Clone)]
     pub enum InputMode {
         Unspecified,
         Link,
         None,
     }
 
+    #[derive(Clone)]
     pub struct Output {
         pub group: String,
         pub paths: Vec<path::Path>,
     }
 
     pub mod path {
+        #[derive(Clone)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
+        #[derive(Clone)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
             Glob(String),
         }
 
+        #[derive(Clone)]
         pub enum CodegenMode {
             Unspecified,
             Copy,
@@ -166,6 +173,7 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
+    #[derive(Clone)]
     pub enum Type {
         Output,
         OutputListV1,
@@ -174,18 +182,21 @@ pub mod outputartifact {
         SupportFileListV1,
     }
 
+    #[derive(Clone)]
     pub struct ContentRaw {
         pub data: Vec<u8>,
         pub path: String,
         pub x: bool,
     }
 
+    #[derive(Clone)]
     pub struct ContentFile {
         pub source_path: String,
         pub out_path: String,
         pub x: bool,
     }
 
+    #[derive(Clone)]
     pub enum Content {
         File(ContentFile),
         Raw(ContentRaw),
@@ -193,6 +204,7 @@ pub mod outputartifact {
         CpioPath(String),
     }
 
+    #[derive(Clone)]
     pub struct OutputArtifact {
         pub group: String,
         pub name: String,

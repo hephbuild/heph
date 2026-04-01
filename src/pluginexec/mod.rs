@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use tokio::io;
 use crate::engine;
 use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, RunRequest, RunResponse};
+use std::sync::Arc;
 use crate::engine::driver::targetdef::TargetDef as EngineTargetDef;
 use crate::hasync::Cancellable;
 
@@ -33,7 +34,7 @@ impl engine::driver::Driver for Driver {
         Ok(ParseResponse {
             target_def: EngineTargetDef{
                 addr: req.target_spec.addr,
-                raw_def: Box::new(TargetDef{
+                raw_def: Arc::new(TargetDef{
                     run: vec!["echo", "hello"].iter().map(|s| s.to_string()).collect(),
                     // run: vec!["sh", "-c", "exit 1"].iter().map(|s| s.to_string()).collect(),
                 }),
@@ -127,7 +128,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
-            raw_def: Box::new(TargetDef {
+            raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
             }),
             inputs: vec![],
@@ -169,7 +170,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
-            raw_def: Box::new(TargetDef {
+            raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
             }),
             inputs: vec![],
@@ -213,7 +214,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
-            raw_def: Box::new(TargetDef {
+            raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
             }),
             inputs: vec![],
