@@ -12,6 +12,9 @@ import (
 	"github.com/hephbuild/heph/utils/ads"
 	"github.com/hephbuild/heph/utils/sets"
 	"github.com/hephbuild/heph/worker2/poolwait"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
 var errHasExprDep = errors.New("has expr, bailing out")
@@ -261,4 +264,65 @@ func GenerateRRs(ctx context.Context, e *scheduler.Scheduler, m specs.Matcher, t
 	}
 
 	return generateRRs(ctx, e.Graph, m, targs, opts, false)
+}
+
+func GenerateRRsFromVerb(ctx context.Context, cwd, verb, arg string, e *scheduler.Scheduler, opts targetrun.RequestOpts, plain, gen bool) (targetrun.Requests, error) {
+	var pkgPath string
+	if filepath.IsAbs(arg) {
+		pkgPath = arg
+	} else {
+		pkgPath = filepath.Join(cwd, arg)
+	}
+
+	targ := ""
+
+	info, err := os.Stat(pkgPath)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		targ = filepath.Base(pkgPath)
+		pkgPath = filepath.Dir(pkgPath)
+	}
+
+	pkg, err := filepath.Rel(e.Root.Root.Abs(), pkgPath)
+	if err != nil {
+		return nil, err
+	}
+	if strings.Contains(pkg, "..") {
+		return nil, fmt.Errorf("not in repo")
+	}
+	if pkg == "." {
+		pkg = ""
+	}
+
+	matcher := specs.TargetAddr{
+		Package: pkg,
+		Name:    verb,
+	}
+
+	for {
+		log.Debugf("Attempting to find target %v, arg: %v ", matcher, targ)
+
+		rrs, err := GenerateRRs(ctx, e, matcher, []string{targ}, opts, plain, gen)
+		if err != nil {
+			var nferr specs.TargetNotFoundErr
+			if errors.As(err, &nferr) && nferr.String == matcher.String() {
+				if matcher.Package == "" {
+					return nil, fmt.Errorf("not target found for to %v in %v", verb, pkgPath)
+				}
+
+				targ = filepath.Join(filepath.Base(matcher.Package), targ)
+				matcher.Package = filepath.Dir(matcher.Package)
+				if matcher.Package == "." {
+					matcher.Package = ""
+				}
+				continue
+			}
+
+			return nil, err
+		}
+
+		return rrs, nil
+	}
 }
