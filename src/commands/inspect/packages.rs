@@ -13,7 +13,7 @@ pub fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
 
     let m = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
-        None => htmatcher::Matcher::PackagePrefix("".parse()?)
+        None => htmatcher::Matcher::PackagePrefix("".to_string())
     };
 
     for p in e.packages(&m) {

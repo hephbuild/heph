@@ -24,6 +24,7 @@ async-trait = "0.1.86"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }
+starlark = "0.13.0"
 
 [dev-dependencies]
 tempfile = "3.10"

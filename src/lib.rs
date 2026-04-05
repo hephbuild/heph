@@ -6,3 +6,4 @@ pub mod engine;
 pub mod hasync;
 pub mod hmemoizer;
 pub mod pluginexec;
+pub mod pluginbuildfile;

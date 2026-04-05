@@ -1,14 +1,12 @@
 use std::sync::{Arc, Mutex, Weak};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use crate::engine::driver::Driver as SDKDriver;
-use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::local_cache::LocalCache;
 use crate::engine::local_cache_fs::LocalCacheFS;
-use crate::engine::provider::{Provider as SDKProvider, StaticProvider, TargetSpec};
+use crate::engine::{driver, provider};
+use crate::engine::provider::{Provider as SDKProvider};
 use crate::engine::request_state::RequestState;
-use crate::htaddr::Addr;
-use crate::pluginexec;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
@@ -38,51 +36,47 @@ pub struct Driver {
 }
 
 impl Engine {
-    pub fn new(cfg: Config) -> anyhow::Result<Arc<Engine>> {
+    pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let root = cfg.root.clone();
 
-        let mut providers: Vec<Arc<Provider>> = vec![];
-        providers.push(Arc::new(Provider{
-            name: "static".to_string(),
-            provider: Box::new(StaticProvider {
-                targets: vec![
-                    TargetSpec {
-                        addr: Addr{
-                            package: "some".to_string(),
-                            name: "t".to_string(),
-                            args: Default::default(),
-                        },
-                        driver: "exec".to_string(),
-                        config: Default::default(),
-                        labels: vec![],
-                        transitive: Sandbox::default(),
-                    },
-                ],
-            }),
-        }));
-
-        let providers_by_name = HashMap::from_iter(providers
-            .iter()
-            .map(|p| (p.name.clone(), p.clone())));
-
-        let mut drivers: Vec<Arc<Driver>> = vec![];
-        drivers.push(Arc::new(Driver {
-            name: "exec".to_string(),
-            driver: Box::new(pluginexec::Driver::new()),
-        }));
-
-        let drivers_by_name = HashMap::from_iter(drivers
-            .iter()
-            .map(|p| (p.name.clone(), p.clone())));
-
-        Ok(Arc::new(Engine {
+        Ok(Engine {
             cfg: cfg.clone(),
             local_cache: Arc::new(LocalCacheFS::new(root.join(".heph3").join("cache"))?),
-            providers,
-            providers_by_name,
-            drivers,
-            drivers_by_name,
+            providers: vec![],
+            providers_by_name: HashMap::new(),
+            drivers: vec![],
+            drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
-        }))
+        })
+    }
+
+    pub fn register_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {
+        let driver = Arc::new(Driver {
+            name: driver.config(driver::ConfigRequest{})?.name,
+            driver,
+        });
+
+        if self.drivers_by_name.contains_key(&driver.name) {
+            return Err(anyhow::anyhow!("driver with name '{}' already registered", driver.name));
+        }
+        self.drivers.push(driver.clone());
+        self.drivers_by_name.insert(driver.name.clone(), driver);
+        Ok(())
+    }
+
+    pub fn register_provider(&mut self, provider_factory: fn(root: &Path) -> Box<dyn SDKProvider>) -> anyhow::Result<()> {
+        let provider = provider_factory(self.cfg.root.as_path());
+
+        let provider = Arc::new(Provider {
+            name: provider.config(provider::ConfigRequest{})?.name,
+            provider,
+        });
+
+        if self.providers_by_name.contains_key(&provider.name) {
+            return Err(anyhow::anyhow!("provider with name '{}' already registered", provider.name));
+        }
+        self.providers.push(provider.clone());
+        self.providers_by_name.insert(provider.name.clone(), provider);
+        Ok(())
     }
 }

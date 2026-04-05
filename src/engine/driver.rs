@@ -230,7 +230,7 @@ pub struct RunResponse {
 
 #[async_trait]
 pub trait Driver: Send + Sync {
-    fn config(&self, req: ConfigRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ConfigResponse>;
+    fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
     async fn parse(&self, req: ParseRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse>;
     async fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse>;
     async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<RunResponse>;
