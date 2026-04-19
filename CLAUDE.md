@@ -10,9 +10,6 @@ This project uses [devenv](https://devenv.sh) for reproducible development envir
 devenv shell        # enter the dev shell (provides Rust toolchain, buf, protoc plugins)
 ```
 
-Do **not** rely on system-installed Rust or protoc tooling — use the devenv-managed versions.
-Always use devenv shell -- <command> to run commands to ensure all tools and dependencies are available.
-
 ## Commands
 
 ```bash
