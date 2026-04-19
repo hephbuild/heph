@@ -87,6 +87,7 @@ impl engine::driver::Driver for Driver {
         Ok(ParseResponse {
             target_def: EngineTargetDef{
                 addr: req.target_spec.addr,
+                labels: req.target_spec.labels,
                 raw_def: Arc::new(TargetDef{
                     run: spec.run,
                 }),
@@ -186,6 +187,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
+            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
             }),
@@ -228,6 +230,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
+            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
             }),
@@ -272,6 +275,7 @@ mod tests {
 
         let target_def = EngineTargetDef {
             addr: Addr::default(),
+            labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
             }),
