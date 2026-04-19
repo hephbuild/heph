@@ -108,7 +108,17 @@ impl Provider {
     }
 
     fn run_pkg_inner(&self, pkg: &String) -> anyhow::Result<RunResult> {
-        self.run_file(pkg, &"BUILD".to_string())
+        for pattern in &self.build_file_patterns {
+            let path = self.root.join(pkg).join(pattern);
+            if path.exists() {
+                return self.run_file(pkg, pattern);
+            }
+        }
+
+        Ok(RunResult{
+            targets: vec![],
+            states: vec![],
+        })
     }
 
     pub(crate) fn run_file(&self, pkg: &String, filename: &String) -> anyhow::Result<RunResult> {
@@ -197,7 +207,7 @@ target(
 
         let provider = Provider {
             root: tmp_dir.path().to_path_buf(),
-            requests: Mutex::new(HashMap::new()),
+            ..Provider::default()
         };
 
         let result = provider.run_file(&pkg_name, &filename).unwrap();
@@ -247,5 +257,33 @@ target(
         } else {
             panic!("Expected list for config_list");
         }
+    }
+
+    #[test]
+    fn test_run_pkg_inner_multiple_patterns() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg".to_string();
+        let pkg_path = tmp_dir.path().join(&pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+
+        let build_content = r#"
+target(
+    name = "mytarget",
+    driver = "mydriver",
+)
+"#;
+        let filename = "BUILD.heph".to_string();
+        fs::write(pkg_path.join(&filename), build_content).unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec!["BUILD".to_string(), "BUILD.heph".to_string()],
+            ..Provider::default()
+        };
+
+        let result = provider.run_pkg(&pkg_name).unwrap();
+
+        assert_eq!(result.targets.len(), 1);
+        assert_eq!(result.targets[0].name, "mytarget");
     }
 }

@@ -12,6 +12,7 @@ pub struct RequestState {
 
 pub struct Provider {
     pub root: std::path::PathBuf,
+    pub build_file_patterns: Vec<String>,
     pub requests: Mutex<HashMap<String, RequestState>>,
 }
 
@@ -19,6 +20,7 @@ impl Default for Provider {
     fn default() -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
+            build_file_patterns: vec!["BUILD".to_string()],
             requests: Mutex::new(HashMap::new()),
         }
     }
@@ -30,7 +32,7 @@ impl Provider {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
-            if entry_path.is_file() && entry_path.file_name().and_then(|n| n.to_str()) == Some("BUILD") {
+            if entry_path.is_file() && entry_path.file_name().and_then(|n| n.to_str()).map(|n| self.build_file_patterns.iter().any(|p| p == n)).unwrap_or(false) {
                 has_build_file = true;
             } else if entry_path.is_dir() {
                 self.find_packages(&entry_path, packages)?;
@@ -141,6 +143,8 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+    use crate::hasync;
+    use crate::hasync::StdCancellationToken;
 
     #[tokio::test]
     async fn test_list_packages() {
@@ -167,18 +171,11 @@ mod tests {
 
         let provider = Provider {
             root: root.to_path_buf(),
-            requests: Mutex::new(HashMap::new()),
+            ..Provider::default()
         };
 
         let req = ListPackagesRequest { prefix: "".to_string() };
-        struct NoopCancellationToken;
-        impl crate::hasync::Cancellable for NoopCancellationToken {
-            fn is_cancelled(&self) -> bool { false }
-            fn cancelled(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-                Box::pin(std::future::pending())
-            }
-        }
-        let ctoken = NoopCancellationToken;
+        let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
 
@@ -187,5 +184,78 @@ mod tests {
         assert!(packages.contains(&"a/b".to_string()));
         assert!(packages.contains(&"a".to_string())); // parent of a/b
         assert!(packages.contains(&"c".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_packages_custom_pattern() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+
+        // Structure:
+        // root/
+        //   BUILD.heph
+        //   a/
+        //     BUILD.heph
+
+        fs::write(root.join("BUILD.heph"), "").unwrap();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("BUILD.heph"), "").unwrap();
+
+        // Should NOT be found
+        fs::write(root.join("BUILD"), "").unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec!["BUILD.heph".to_string()],
+            ..Provider::default()
+        };
+
+        let req = ListPackagesRequest { prefix: "".to_string() };
+        let ctoken = StdCancellationToken::new();
+        let res = provider.list_packages(req, &ctoken).await.unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
+
+        assert_eq!(packages.len(), 2);
+        assert!(packages.contains(&"".to_string()));
+        assert!(packages.contains(&"a".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_packages_multiple_patterns() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+
+        // Structure:
+        // root/
+        //   BUILD
+        //   a/
+        //     BUILD.heph
+        //   b/
+        //     BUILD.other
+
+        fs::write(root.join("BUILD"), "").unwrap();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("BUILD.heph"), "").unwrap();
+        let b = root.join("b");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("BUILD.other"), "").unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec!["BUILD".to_string(), "BUILD.heph".to_string(), "BUILD.other".to_string()],
+            ..Provider::default()
+        };
+
+        let req = ListPackagesRequest { prefix: "".to_string() };
+        let ctoken = StdCancellationToken::new();
+        let res = provider.list_packages(req, &ctoken).await.unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
+
+        assert_eq!(packages.len(), 3);
+        assert!(packages.contains(&"".to_string()));
+        assert!(packages.contains(&"a".to_string()));
+        assert!(packages.contains(&"b".to_string()));
     }
 }
