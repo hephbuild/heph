@@ -1,18 +1,16 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use crate::engine::Engine;
-use crate::engine::driver::ParseRequest;
-use crate::engine::provider::{GetError, GetRequest, GetResponse, ListRequest};
-use crate::hasync::Cancellable;
+use crate::engine::provider::ListRequest;
+use crate::engine::request_state::RequestState;
 use crate::htaddr::Addr;
 use crate::htmatcher::{self, MatchResult};
 use crate::htpkg::PkgBuf;
 
 impl Engine {
-    pub async fn query(&self, m: &htmatcher::Matcher, ctoken: &dyn Cancellable) -> anyhow::Result<Vec<Addr>> {
-        let request_id = "".to_string();
-
+    pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Vec<Addr>> {
         let pkg_list: Vec<String> = {
-            let it = self.packages(m, ctoken).await?;
+            let it = self.packages(m, &rs.ctoken).await?;
             let mut seen = HashSet::new();
             it.collect::<anyhow::Result<Vec<_>>>()?
                 .into_iter()
@@ -28,9 +26,9 @@ impl Engine {
             for provider in &self.providers {
                 let addr_list: Vec<Addr> = {
                     let it = provider.provider.list(ListRequest {
-                        request_id: request_id.clone(),
+                        request_id: rs.request_id.clone(),
                         package: pkg.clone(),
-                    }, ctoken).await?;
+                    }, &rs.ctoken).await?;
                     it.collect::<anyhow::Result<Vec<_>>>()?
                         .into_iter()
                         .map(|r| r.addr)
@@ -45,15 +43,7 @@ impl Engine {
                         }
                         MatchResult::MatchNo => {}
                         MatchResult::MatchShrug => {
-                            let spec = match provider.provider.get(GetRequest {
-                                request_id: request_id.clone(),
-                                addr: addr.clone(),
-                                states: vec![],
-                            }, ctoken).await {
-                                Ok(GetResponse { target_spec }) => target_spec,
-                                Err(GetError::NotFound) => continue,
-                                Err(GetError::Other(e)) => return Err(e),
-                            };
+                            let spec = self.get_spec(rs.clone(), &addr).await?;
 
                             match m.matches_spec(&spec) {
                                 MatchResult::MatchYes => {
@@ -61,15 +51,7 @@ impl Engine {
                                 }
                                 MatchResult::MatchNo => {}
                                 MatchResult::MatchShrug => {
-                                    let driver = match self.drivers_by_name.get(&spec.driver) {
-                                        Some(d) => d,
-                                        None => continue,
-                                    };
-
-                                    let def = driver.driver.parse(ParseRequest {
-                                        request_id: request_id.clone(),
-                                        target_spec: spec,
-                                    }, ctoken).await?.target_def;
+                                    let def = self.get_def(rs.clone(), &addr).await?;
 
                                     if m.matches(&def) == MatchResult::MatchYes {
                                         results.push(addr);
@@ -93,7 +75,6 @@ mod tests {
     use std::sync::OnceLock;
     use crate::engine::Config;
     use crate::engine::provider::{StaticProvider, TargetSpec};
-    use crate::hasync::StdCancellationToken;
     use crate::htmatcher::Matcher;
     use tempfile::tempdir;
 
@@ -124,8 +105,9 @@ mod tests {
             packages: OnceLock::new(),
         }))?;
 
-        let ctoken = StdCancellationToken::new();
-        let addrs = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), &ctoken).await?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+        let addrs = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).await?;
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
@@ -146,13 +128,14 @@ mod tests {
             packages: OnceLock::new(),
         }))?;
 
-        let ctoken = StdCancellationToken::new();
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
         let target_addr = Addr {
             package: PkgBuf::from("foo"),
             name: "a".to_string(),
             args: HashMap::new(),
         };
-        let addrs = engine.query(&Matcher::Addr(target_addr), &ctoken).await?;
+        let addrs = engine.query(&Matcher::Addr(target_addr), rs).await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -172,13 +155,14 @@ mod tests {
             packages: OnceLock::new(),
         }))?;
 
-        let ctoken = StdCancellationToken::new();
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
         let label_addr = Addr {
             package: PkgBuf::from("labels"),
             name: "lint".to_string(),
             args: HashMap::new(),
         };
-        let addrs = engine.query(&Matcher::Label(label_addr), &ctoken).await?;
+        let addrs = engine.query(&Matcher::Label(label_addr), rs).await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -195,8 +179,9 @@ mod tests {
             packages: OnceLock::new(),
         }))?;
 
-        let ctoken = StdCancellationToken::new();
-        let addrs = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), &ctoken).await?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+        let addrs = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).await?;
 
         assert!(addrs.is_empty());
         Ok(())

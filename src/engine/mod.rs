@@ -1,3 +1,4 @@
+#[path = "core.rs"]
 mod engine;
 pub use engine::Engine;
 pub use engine::Config;
