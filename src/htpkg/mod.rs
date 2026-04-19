@@ -1,3 +1,3 @@
 mod pkg;
 
-pub use pkg::{Pkg, PkgBuf};
+pub use pkg::PkgBuf;

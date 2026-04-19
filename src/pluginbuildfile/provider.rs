@@ -175,7 +175,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::default() };
+        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -212,7 +212,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::default() };
+        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -249,7 +249,7 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::default() };
+        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();

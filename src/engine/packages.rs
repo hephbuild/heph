@@ -9,7 +9,7 @@ impl Engine {
         let prefix = match m {
             htmatcher::Matcher::Package(p) => p.clone(),
             htmatcher::Matcher::PackagePrefix(p) => p.clone(),
-            _ => PkgBuf::default(),
+            _ => PkgBuf::from(""),
         };
 
         let mut all_packages = Vec::new();

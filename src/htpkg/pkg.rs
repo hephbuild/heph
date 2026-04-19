@@ -1,43 +1,20 @@
 use std::fmt;
-use std::ops::Deref;
 use std::path::Path;
 
-#[repr(transparent)]
-pub struct Pkg(str);
-
-#[derive(Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct PkgBuf(String);
 
-impl Pkg {
-    pub fn new(s: &str) -> &Pkg {
-        // SAFETY: Pkg is repr(transparent) over str
-        unsafe { &*(s as *const str as *const Pkg) }
-    }
-
+impl PkgBuf {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    pub fn has_prefix(&self, prefix: &Pkg) -> bool {
+    pub fn has_prefix(&self, prefix: &PkgBuf) -> bool {
         let p = prefix.as_str();
         if p.is_empty() {
             return true;
         }
-        self.0 == *p || self.0.starts_with(&format!("{}/", p))
-    }
-}
-
-impl PartialEq for Pkg {
-    fn eq(&self, other: &Pkg) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for Pkg {}
-
-impl fmt::Display for Pkg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        self.0 == p || self.0.starts_with(&format!("{}/", p))
     }
 }
 
@@ -47,35 +24,9 @@ impl fmt::Display for PkgBuf {
     }
 }
 
-impl fmt::Debug for PkgBuf {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PkgBuf({:?})", self.0)
-    }
-}
-
-impl Deref for PkgBuf {
-    type Target = Pkg;
-
-    fn deref(&self) -> &Pkg {
-        Pkg::new(&self.0)
-    }
-}
-
-impl AsRef<Pkg> for PkgBuf {
-    fn as_ref(&self) -> &Pkg {
-        self
-    }
-}
-
 impl AsRef<str> for PkgBuf {
     fn as_ref(&self) -> &str {
         &self.0
-    }
-}
-
-impl AsRef<Path> for Pkg {
-    fn as_ref(&self) -> &Path {
-        Path::new(&self.0)
     }
 }
 
@@ -125,24 +76,24 @@ mod tests {
 
     #[test]
     fn exact_match() {
-        assert!(pkg("foo/bar").has_prefix(pkg("foo/bar").as_ref()));
+        assert!(pkg("foo/bar").has_prefix(&pkg("foo/bar")));
     }
 
     #[test]
     fn child_match() {
-        assert!(pkg("foo/bar/baz").has_prefix(pkg("foo/bar").as_ref()));
-        assert!(pkg("foo/bar/baz").has_prefix(pkg("foo").as_ref()));
+        assert!(pkg("foo/bar/baz").has_prefix(&pkg("foo/bar")));
+        assert!(pkg("foo/bar/baz").has_prefix(&pkg("foo")));
     }
 
     #[test]
     fn no_partial_component_match() {
-        assert!(!pkg("foo/bar/baz").has_prefix(pkg("foo/ba").as_ref()));
+        assert!(!pkg("foo/bar/baz").has_prefix(&pkg("foo/ba")));
     }
 
     #[test]
     fn empty_prefix_matches_all() {
-        assert!(pkg("").has_prefix(pkg("").as_ref()));
-        assert!(pkg("foo/bar").has_prefix(pkg("").as_ref()));
-        assert!(pkg("foo/bar/baz").has_prefix(pkg("").as_ref()));
+        assert!(pkg("").has_prefix(&pkg("")));
+        assert!(pkg("foo/bar").has_prefix(&pkg("")));
+        assert!(pkg("foo/bar/baz").has_prefix(&pkg("")));
     }
 }

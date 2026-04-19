@@ -12,7 +12,7 @@ pub fn parse_addr(input: &str) -> Result<Addr, String> {
     let pairs = TAddrParser::parse(Rule::taddr, input)
         .map_err(|e| format!("Parsing error: {}", e))?;
 
-    let mut package = PkgBuf::default();
+    let mut package = PkgBuf::from("");
     let mut name = String::new();
     let mut args = HashMap::new();
 

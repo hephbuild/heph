@@ -15,7 +15,7 @@ pub async fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
 
     let m = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
-        None => htmatcher::Matcher::PackagePrefix(PkgBuf::default())
+        None => htmatcher::Matcher::PackagePrefix(PkgBuf::from(""))
     };
 
     let ctoken = crate::hasync::StdCancellationToken::new();
