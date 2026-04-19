@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use crate::htpkg::PkgBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Addr {
-    pub package: String,
+    pub package: PkgBuf,
     pub name: String,
     pub args: HashMap<String, String>,
 }

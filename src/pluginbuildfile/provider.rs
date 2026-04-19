@@ -5,6 +5,7 @@ use crate::engine::provider::{ConfigRequest, ConfigResponse, GetError, GetReques
 use crate::engine::provider::GetError::NotFound;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 
 pub struct RequestState {
 
@@ -66,7 +67,7 @@ impl EProvider for Provider {
 
     fn list<'a>(&'a self, req: ListRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
         Box::pin(async move {
-            let res = self.run_pkg(&req.package)?;
+            let res = self.run_pkg(req.package.as_str())?;
 
             let items: Vec<anyhow::Result<ListResponse>> = res.targets.into_iter().map(|p| {
                 Ok(ListResponse {
@@ -90,7 +91,7 @@ impl EProvider for Provider {
 
             let items: Vec<anyhow::Result<ListPackageResponse>> = packages.into_iter().map(|p| {
                 Ok(ListPackageResponse {
-                    pkg: p,
+                    pkg: PkgBuf::from(p.as_str()),
                 })
             }).collect();
 
@@ -100,7 +101,7 @@ impl EProvider for Provider {
 
     fn get<'a>(&'a self, req: GetRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            let res = self.run_pkg(&req.addr.package).map_err(|e: anyhow::Error| GetError::Other(e))?;
+            let res = self.run_pkg(req.addr.package.as_str()).map_err(|e: anyhow::Error| GetError::Other(e))?;
 
             for p in res.targets {
                 if p.name == req.addr.name {
@@ -122,7 +123,7 @@ impl EProvider for Provider {
 
     fn probe<'a>(&'a self, req: ProbeRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            let res = self.run_pkg(&req.package)?;
+            let res = self.run_pkg(req.package.as_str())?;
 
             Ok(ProbeResponse{
                 states: res.states.into_iter().map(|_p| {
@@ -174,10 +175,10 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: "".to_string() };
+        let req = ListPackagesRequest { prefix: PkgBuf::default() };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 4);
         assert!(packages.contains(&"".to_string()));
@@ -211,10 +212,10 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: "".to_string() };
+        let req = ListPackagesRequest { prefix: PkgBuf::default() };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 2);
         assert!(packages.contains(&"".to_string()));
@@ -248,10 +249,10 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: "".to_string() };
+        let req = ListPackagesRequest { prefix: PkgBuf::default() };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
-        let packages: Vec<String> = res.map(|r| r.unwrap().pkg).collect();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
 
         assert_eq!(packages.len(), 3);
         assert!(packages.contains(&"".to_string()));

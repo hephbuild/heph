@@ -4,6 +4,7 @@ use futures::future::BoxFuture;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 
 pub struct ConfigRequest {}
 pub struct ConfigResponse {
@@ -12,23 +13,22 @@ pub struct ConfigResponse {
 
 pub struct ListRequest {
     pub request_id: String,
-    pub package: String,
-
+    pub package: PkgBuf,
 }
 pub struct ListResponse {
     pub addr: Addr
 }
 
 pub struct ListPackagesRequest {
-    pub prefix: String,
+    pub prefix: PkgBuf,
 }
 #[derive(Clone)]
 pub struct ListPackageResponse {
-    pub pkg: String
+    pub pkg: PkgBuf,
 }
 
 pub struct State {
-    pub package: String,
+    pub package: PkgBuf,
     pub provider: String,
     pub state: HashMap<String, String>,
 }
@@ -65,7 +65,7 @@ pub struct GetResponse {
 
 pub struct ProbeRequest {
     pub request_id: String,
-    pub package: String,
+    pub package: PkgBuf,
 }
 pub struct ProbeResponse {
     pub states: Vec<State>,

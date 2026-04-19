@@ -103,11 +103,11 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 }
 
 impl Provider {
-    pub(crate) fn run_pkg(&self, pkg: &String) -> anyhow::Result<RunResult> {
+    pub(crate) fn run_pkg(&self, pkg: &str) -> anyhow::Result<RunResult> {
         self.run_pkg_inner(pkg) // TODO: memo
     }
 
-    fn run_pkg_inner(&self, pkg: &String) -> anyhow::Result<RunResult> {
+    fn run_pkg_inner(&self, pkg: &str) -> anyhow::Result<RunResult> {
         for pattern in &self.build_file_patterns {
             let path = self.root.join(pkg).join(pattern);
             if path.exists() {
@@ -121,11 +121,11 @@ impl Provider {
         })
     }
 
-    pub(crate) fn run_file(&self, pkg: &String, filename: &String) -> anyhow::Result<RunResult> {
+    pub(crate) fn run_file(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
         self.run_file_inner(pkg, filename) // TODO: memo
     }
 
-    fn run_file_inner(&self, pkg: &String, filename: &String) -> anyhow::Result<RunResult> {
+    fn run_file_inner(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
         let path_buf = self.root.join(pkg).join(filename);
         let path = path_buf.as_path();
         let ast: AstModule = AstModule::parse_file(path, &Dialect::Extended).map_err(|e| anyhow::anyhow!(e))?;

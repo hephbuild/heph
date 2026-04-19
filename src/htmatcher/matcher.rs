@@ -1,11 +1,12 @@
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Matcher {
     Addr(Addr),
     Label(Addr),
-    Package(String),
-    PackagePrefix(String),
+    Package(PkgBuf),
+    PackagePrefix(PkgBuf),
     Or(Vec<Matcher>),
     And(Vec<Matcher>),
     Not(Box<Matcher>),

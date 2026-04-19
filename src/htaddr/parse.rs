@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use pest::Parser;
 use pest_derive::Parser;
 use crate::htaddr::addr::Addr;
+use crate::htpkg::PkgBuf;
 
 #[derive(Parser)]
 #[grammar = "htaddr/taddr.pest"]
@@ -11,7 +12,7 @@ pub fn parse_addr(input: &str) -> Result<Addr, String> {
     let pairs = TAddrParser::parse(Rule::taddr, input)
         .map_err(|e| format!("Parsing error: {}", e))?;
 
-    let mut package = String::new();
+    let mut package = PkgBuf::default();
     let mut name = String::new();
     let mut args = HashMap::new();
 
@@ -20,7 +21,7 @@ pub fn parse_addr(input: &str) -> Result<Addr, String> {
             for inner_pair in pair.into_inner() {
                 match inner_pair.as_rule() {
                     Rule::package_ident => {
-                        package = inner_pair.as_str().to_string();
+                        package = PkgBuf::from(inner_pair.as_str());
                     }
                     Rule::name_ident => {
                         name = inner_pair.as_str().to_string();

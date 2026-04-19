@@ -1,8 +1,11 @@
+use std::fmt;
 use std::ops::Deref;
+use std::path::Path;
 
 #[repr(transparent)]
 pub struct Pkg(str);
 
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct PkgBuf(String);
 
 impl Pkg {
@@ -24,9 +27,29 @@ impl Pkg {
     }
 }
 
-impl PkgBuf {
-    pub fn new(s: String) -> PkgBuf {
-        PkgBuf(s)
+impl PartialEq for Pkg {
+    fn eq(&self, other: &Pkg) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Pkg {}
+
+impl fmt::Display for Pkg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for PkgBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for PkgBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PkgBuf({:?})", self.0)
     }
 }
 
@@ -35,6 +58,30 @@ impl Deref for PkgBuf {
 
     fn deref(&self) -> &Pkg {
         Pkg::new(&self.0)
+    }
+}
+
+impl AsRef<Pkg> for PkgBuf {
+    fn as_ref(&self) -> &Pkg {
+        self
+    }
+}
+
+impl AsRef<str> for PkgBuf {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Pkg {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
+    }
+}
+
+impl AsRef<Path> for PkgBuf {
+    fn as_ref(&self) -> &Path {
+        Path::new(&self.0)
     }
 }
 
@@ -50,9 +97,21 @@ impl From<&str> for PkgBuf {
     }
 }
 
-impl AsRef<Pkg> for PkgBuf {
-    fn as_ref(&self) -> &Pkg {
-        self
+impl PartialEq<str> for PkgBuf {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for PkgBuf {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for PkgBuf {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
     }
 }
 
