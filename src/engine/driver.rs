@@ -79,6 +79,7 @@ pub mod targetdef {
     #[derive(Clone)]
     pub struct TargetDef {
         pub addr: Addr,
+        pub labels: Vec<String>,
         pub raw_def: Arc<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,

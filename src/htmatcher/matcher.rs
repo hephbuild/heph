@@ -84,7 +84,48 @@ impl Matcher {
     }
 
     pub fn matches(&self, def: &TargetDef) -> MatchResult {
-        self.matches_addr(&def.addr)
+        match self {
+            Matcher::Addr(addr) => {
+                if def.addr == *addr { MatchResult::MatchYes } else { MatchResult::MatchNo }
+            }
+            Matcher::Label(addr) => {
+                let label = addr.format();
+                if def.labels.contains(&label) { MatchResult::MatchYes } else { MatchResult::MatchNo }
+            }
+            Matcher::Package(pkg) => {
+                if def.addr.package == *pkg { MatchResult::MatchYes } else { MatchResult::MatchNo }
+            }
+            Matcher::PackagePrefix(prefix) => {
+                if def.addr.package.has_prefix(prefix) { MatchResult::MatchYes } else { MatchResult::MatchNo }
+            }
+            Matcher::Or(matchers) => {
+                let mut has_shrug = false;
+                for m in matchers {
+                    match m.matches(def) {
+                        MatchResult::MatchYes => return MatchResult::MatchYes,
+                        MatchResult::MatchShrug => has_shrug = true,
+                        MatchResult::MatchNo => {}
+                    }
+                }
+                if has_shrug { MatchResult::MatchShrug } else { MatchResult::MatchNo }
+            }
+            Matcher::And(matchers) => {
+                let mut has_shrug = false;
+                for m in matchers {
+                    match m.matches(def) {
+                        MatchResult::MatchNo => return MatchResult::MatchNo,
+                        MatchResult::MatchShrug => has_shrug = true,
+                        MatchResult::MatchYes => {}
+                    }
+                }
+                if has_shrug { MatchResult::MatchShrug } else { MatchResult::MatchYes }
+            }
+            Matcher::Not(m) => match m.matches(def) {
+                MatchResult::MatchYes => MatchResult::MatchNo,
+                MatchResult::MatchNo => MatchResult::MatchYes,
+                MatchResult::MatchShrug => MatchResult::MatchShrug,
+            },
+        }
     }
 }
 
@@ -101,10 +142,11 @@ mod tests {
         }
     }
 
-    fn def(pkg: &str, name: &str) -> TargetDef {
+    fn def_with_labels(pkg: &str, name: &str, labels: &[&str]) -> TargetDef {
         use std::sync::Arc;
         TargetDef {
             addr: addr(pkg, name),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
             raw_def: Arc::new(()),
             inputs: vec![],
             outputs: vec![],
@@ -114,6 +156,10 @@ mod tests {
             pty: false,
             hash: vec![],
         }
+    }
+
+    fn def(pkg: &str, name: &str) -> TargetDef {
+        def_with_labels(pkg, name, &[])
     }
 
     // matches_addr tests
@@ -263,9 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn def_label_shrugs() {
-        let d = def("foo", "bar");
-        assert_eq!(Matcher::Label(addr("labels", "lint")).matches(&d), MatchResult::MatchShrug);
+    fn def_label_match() {
+        let d = def_with_labels("foo", "bar", &["//labels:lint"]);
+        assert_eq!(Matcher::Label(addr("labels", "lint")).matches(&d), MatchResult::MatchYes);
+        assert_eq!(Matcher::Label(addr("labels", "other")).matches(&d), MatchResult::MatchNo);
     }
 
     #[test]
@@ -294,15 +341,15 @@ mod tests {
 
     #[test]
     fn def_and_match() {
-        let d = def("foo", "bar");
+        let d = def_with_labels("foo", "bar", &["//labels:lint"]);
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::PackagePrefix(PkgBuf::from("foo")),
+            Matcher::Label(addr("labels", "lint")),
         ]);
         assert_eq!(m.matches(&d), MatchResult::MatchYes);
         let m2 = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Package(PkgBuf::from("other")),
+            Matcher::Label(addr("labels", "other")),
         ]);
         assert_eq!(m2.matches(&d), MatchResult::MatchNo);
     }
