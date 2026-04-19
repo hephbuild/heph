@@ -33,3 +33,6 @@ devenv.local.yaml
 .pre-commit-config.yaml
 
 gen
+
+# Worktrees
+.claude/worktrees/
