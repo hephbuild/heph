@@ -1,4 +1,4 @@
-use crate::engine::provider::TargetSpec;
+use crate::engine::driver::targetdef::TargetDef;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 
@@ -83,17 +83,8 @@ impl Matcher {
         }
     }
 
-    pub fn matches(&self, spec: &TargetSpec) -> MatchResult {
-        let yes = match self {
-            Matcher::Addr(addr) => spec.addr == *addr,
-            Matcher::Label(label) => spec.labels.iter().any(|l| l == &label.format()),
-            Matcher::Package(pkg) => spec.addr.package == *pkg,
-            Matcher::PackagePrefix(prefix) => spec.addr.package.has_prefix(prefix),
-            Matcher::Or(matchers) => matchers.iter().any(|m| m.matches(spec) == MatchResult::MatchYes),
-            Matcher::And(matchers) => matchers.iter().all(|m| m.matches(spec) == MatchResult::MatchYes),
-            Matcher::Not(m) => m.matches(spec) == MatchResult::MatchNo,
-        };
-        if yes { MatchResult::MatchYes } else { MatchResult::MatchNo }
+    pub fn matches(&self, def: &TargetDef) -> MatchResult {
+        self.matches_addr(&def.addr)
     }
 }
 
@@ -110,11 +101,18 @@ mod tests {
         }
     }
 
-    fn spec(pkg: &str, name: &str, labels: &[&str]) -> TargetSpec {
-        TargetSpec {
+    fn def(pkg: &str, name: &str) -> TargetDef {
+        use std::sync::Arc;
+        TargetDef {
             addr: addr(pkg, name),
-            labels: labels.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
+            raw_def: Arc::new(()),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: false,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
         }
     }
 
@@ -255,65 +253,64 @@ mod tests {
         );
     }
 
-    // matches (TargetSpec) tests
+    // matches (TargetDef) tests
 
     #[test]
-    fn spec_addr_match() {
-        let s = spec("foo/bar", "build", &[]);
-        assert_eq!(Matcher::Addr(addr("foo/bar", "build")).matches(&s), MatchResult::MatchYes);
-        assert_eq!(Matcher::Addr(addr("foo/bar", "test")).matches(&s), MatchResult::MatchNo);
+    fn def_addr_match() {
+        let d = def("foo/bar", "build");
+        assert_eq!(Matcher::Addr(addr("foo/bar", "build")).matches(&d), MatchResult::MatchYes);
+        assert_eq!(Matcher::Addr(addr("foo/bar", "test")).matches(&d), MatchResult::MatchNo);
     }
 
     #[test]
-    fn spec_label_match() {
-        let s = spec("foo", "bar", &["//labels:lint"]);
-        assert_eq!(Matcher::Label(addr("labels", "lint")).matches(&s), MatchResult::MatchYes);
-        assert_eq!(Matcher::Label(addr("labels", "other")).matches(&s), MatchResult::MatchNo);
+    fn def_label_shrugs() {
+        let d = def("foo", "bar");
+        assert_eq!(Matcher::Label(addr("labels", "lint")).matches(&d), MatchResult::MatchShrug);
     }
 
     #[test]
-    fn spec_package_match() {
-        let s = spec("foo/bar", "build", &[]);
-        assert_eq!(Matcher::Package(PkgBuf::from("foo/bar")).matches(&s), MatchResult::MatchYes);
-        assert_eq!(Matcher::Package(PkgBuf::from("foo")).matches(&s), MatchResult::MatchNo);
+    fn def_package_match() {
+        let d = def("foo/bar", "build");
+        assert_eq!(Matcher::Package(PkgBuf::from("foo/bar")).matches(&d), MatchResult::MatchYes);
+        assert_eq!(Matcher::Package(PkgBuf::from("foo")).matches(&d), MatchResult::MatchNo);
     }
 
     #[test]
-    fn spec_package_prefix_match() {
-        let s = spec("foo/bar/baz", "build", &[]);
-        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("foo/bar")).matches(&s), MatchResult::MatchYes);
-        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("other")).matches(&s), MatchResult::MatchNo);
+    fn def_package_prefix_match() {
+        let d = def("foo/bar/baz", "build");
+        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("foo/bar")).matches(&d), MatchResult::MatchYes);
+        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("other")).matches(&d), MatchResult::MatchNo);
     }
 
     #[test]
-    fn spec_or_match() {
-        let s = spec("foo", "bar", &[]);
+    fn def_or_match() {
+        let d = def("foo", "bar");
         let m = Matcher::Or(vec![
             Matcher::Package(PkgBuf::from("other")),
             Matcher::Package(PkgBuf::from("foo")),
         ]);
-        assert_eq!(m.matches(&s), MatchResult::MatchYes);
+        assert_eq!(m.matches(&d), MatchResult::MatchYes);
     }
 
     #[test]
-    fn spec_and_match() {
-        let s = spec("foo", "bar", &["//labels:lint"]);
+    fn def_and_match() {
+        let d = def("foo", "bar");
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label(addr("labels", "lint")),
+            Matcher::PackagePrefix(PkgBuf::from("foo")),
         ]);
-        assert_eq!(m.matches(&s), MatchResult::MatchYes);
+        assert_eq!(m.matches(&d), MatchResult::MatchYes);
         let m2 = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label(addr("labels", "other")),
+            Matcher::Package(PkgBuf::from("other")),
         ]);
-        assert_eq!(m2.matches(&s), MatchResult::MatchNo);
+        assert_eq!(m2.matches(&d), MatchResult::MatchNo);
     }
 
     #[test]
-    fn spec_not_match() {
-        let s = spec("foo", "bar", &[]);
-        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("other")))).matches(&s), MatchResult::MatchYes);
-        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("foo")))).matches(&s), MatchResult::MatchNo);
+    fn def_not_match() {
+        let d = def("foo", "bar");
+        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("other")))).matches(&d), MatchResult::MatchYes);
+        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("foo")))).matches(&d), MatchResult::MatchNo);
     }
 }
