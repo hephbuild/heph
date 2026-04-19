@@ -15,7 +15,7 @@ impl LocalCacheFS {
 
     fn get_path(&self, addr: &Addr, hashin: &str, name: &str) -> PathBuf {
         let mut path = self.root.clone();
-        path.push(&addr.package);
+        path.push(addr.package.as_ref() as &std::path::Path);
         path.push(&addr.name);
         path.push(hashin);
         path.push(name);
@@ -69,7 +69,7 @@ mod tests {
 
         let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
         let addr = Addr {
-            package: "test_pkg".to_string(),
+            package: crate::htpkg::PkgBuf::from("test_pkg"),
             name: "test_target".to_string(),
             ..Default::default()
         };

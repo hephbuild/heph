@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod log;
 pub mod htaddr;
+pub mod htpkg;
 pub mod htmatcher;
 pub mod engine;
 pub mod hasync;

@@ -3,6 +3,7 @@ use crate::{engine, pluginbuildfile, pluginexec};
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::provider::{StaticProvider, TargetSpec};
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let root = match engine::get_root() {
@@ -18,7 +19,7 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
         targets: vec![
             TargetSpec {
                 addr: Addr{
-                    package: "some".to_string(),
+                    package: PkgBuf::from("some"),
                     name: "t".to_string(),
                     args: Default::default(),
                 },

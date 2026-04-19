@@ -1,6 +1,7 @@
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::htmatcher;
+use crate::htpkg::PkgBuf;
 
 #[derive(Args)]
 pub struct PackagesArgs {
@@ -14,7 +15,7 @@ pub async fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
 
     let m = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
-        None => htmatcher::Matcher::PackagePrefix("".to_string())
+        None => htmatcher::Matcher::PackagePrefix(PkgBuf::from(""))
     };
 
     let ctoken = crate::hasync::StdCancellationToken::new();

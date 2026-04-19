@@ -2,6 +2,7 @@ use clap::Args;
 use crate::commands::bootstrap;
 use crate::htaddr;
 use crate::htmatcher::Matcher;
+use crate::htpkg::PkgBuf;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
@@ -20,7 +21,7 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
         let label = &args.arg1;
         execute_matcher(Matcher::And(vec![
             Matcher::Label(htaddr::parse_addr(label).map_err(anyhow::Error::msg)?),
-            Matcher::Package(package_matcher.clone()),
+            Matcher::Package(PkgBuf::from(package_matcher.as_str())),
         ])).await
     } else {
         let address = &args.arg1;

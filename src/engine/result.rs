@@ -6,6 +6,7 @@ use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 use crate::hmemoizer::WrappedError;
 use std::io;
 use std::sync::Arc;
@@ -162,7 +163,7 @@ mod tests {
             targets: vec![
                 TargetSpec {
                     addr: Addr {
-                        package: "some".to_string(),
+                        package: PkgBuf::from("some"),
                         name: "t".to_string(),
                         args: Default::default(),
                     },
@@ -179,7 +180,7 @@ mod tests {
         let engine = Arc::new(engine);
         let rs = engine.new_state();
         let addr = Addr {
-            package: "some".to_string(),
+            package: PkgBuf::from("some"),
             name: "t".to_string(),
             args: Default::default(),
         };
@@ -205,7 +206,7 @@ mod tests {
         let engine = Arc::new(Engine::new(cfg)?);
         let rs = engine.new_state();
         let addr = Addr {
-            package: "non".to_string(),
+            package: PkgBuf::from("non"),
             name: "existent".to_string(),
             args: Default::default(),
         };
