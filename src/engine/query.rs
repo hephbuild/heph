@@ -7,7 +7,7 @@ use crate::htmatcher::{self, MatchResult};
 use crate::htpkg::PkgBuf;
 
 impl Engine {
-    pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Vec<Addr>> {
+    pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Box<dyn Iterator<Item = Addr>>> {
         let mut results = Vec::new();
 
         for pkg_result in self.packages(m, &rs.ctoken).await? {
@@ -54,7 +54,7 @@ impl Engine {
             }
         }
 
-        Ok(results)
+        Ok(Box::new(results.into_iter()))
     }
 }
 
@@ -97,7 +97,7 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let addrs = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).await?;
+        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).await?.collect();
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
@@ -125,7 +125,7 @@ mod tests {
             name: "a".to_string(),
             args: HashMap::new(),
         };
-        let addrs = engine.query(&Matcher::Addr(target_addr), rs).await?;
+        let addrs: Vec<Addr> = engine.query(&Matcher::Addr(target_addr), rs).await?.collect();
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -152,7 +152,7 @@ mod tests {
             name: "lint".to_string(),
             args: HashMap::new(),
         };
-        let addrs = engine.query(&Matcher::Label(label_addr), rs).await?;
+        let addrs: Vec<Addr> = engine.query(&Matcher::Label(label_addr), rs).await?.collect();
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -171,9 +171,9 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let addrs = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).await?;
+        let mut addrs = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).await?;
 
-        assert!(addrs.is_empty());
+        assert!(addrs.next().is_none());
         Ok(())
     }
 }
