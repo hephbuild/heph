@@ -21,6 +21,7 @@ memoize = "0.6.0"
 tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util"] }
 futures = "0.3.32"
 async-trait = "0.1.86"
+async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
 tokio-util = { version = "0.7.18", features = ["io", "io-util"] }

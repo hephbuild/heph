@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use futures::Stream;
 use crate::engine::Engine;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
@@ -7,44 +8,39 @@ use crate::htmatcher::{self, MatchResult};
 use crate::htpkg::PkgBuf;
 
 impl Engine {
-    pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Box<dyn Iterator<Item = Addr>>> {
-        let mut results = Vec::new();
+    pub fn query<'a>(&'a self, m: &'a htmatcher::Matcher, rs: Arc<RequestState>) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+        async_stream::try_stream! {
+            for pkg_result in self.packages(m, &rs.ctoken).await? {
+                let pkg = PkgBuf::from(pkg_result?);
 
-        for pkg_result in self.packages(m, &rs.ctoken).await? {
-            let pkg = PkgBuf::from(pkg_result?);
-
-            for provider in &self.providers {
-                let addr_list: Vec<Addr> = {
+                for provider in &self.providers {
                     let it = provider.provider.list(ListRequest {
                         request_id: rs.request_id.clone(),
                         package: pkg.clone(),
                     }, &rs.ctoken).await?;
-                    it.collect::<anyhow::Result<Vec<_>>>()?
-                        .into_iter()
-                        .map(|r| r.addr)
-                        .filter(|a| a.package == pkg)
-                        .collect()
-                };
 
-                for addr in addr_list {
-                    match m.matches_addr(&addr) {
-                        MatchResult::MatchYes => {
-                            results.push(addr);
+                    for item in it {
+                        let addr = item?.addr;
+
+                        if addr.package != pkg {
+                            continue;
                         }
-                        MatchResult::MatchNo => {}
-                        MatchResult::MatchShrug => {
-                            let spec = self.get_spec(rs.clone(), &addr).await?;
 
-                            match m.matches_spec(&spec) {
-                                MatchResult::MatchYes => {
-                                    results.push(addr);
-                                }
-                                MatchResult::MatchNo => {}
-                                MatchResult::MatchShrug => {
-                                    let def = self.get_def(rs.clone(), &addr).await?;
+                        match m.matches_addr(&addr) {
+                            MatchResult::MatchYes => yield addr,
+                            MatchResult::MatchNo => {}
+                            MatchResult::MatchShrug => {
+                                let spec = self.get_spec(rs.clone(), &addr).await?;
 
-                                    if m.matches(&def) == MatchResult::MatchYes {
-                                        results.push(addr);
+                                match m.matches_spec(&spec) {
+                                    MatchResult::MatchYes => yield addr,
+                                    MatchResult::MatchNo => {}
+                                    MatchResult::MatchShrug => {
+                                        let def = self.get_def(rs.clone(), &addr).await?;
+
+                                        if m.matches(&def) == MatchResult::MatchYes {
+                                            yield addr;
+                                        }
                                     }
                                 }
                             }
@@ -53,8 +49,6 @@ impl Engine {
                 }
             }
         }
-
-        Ok(Box::new(results.into_iter()))
     }
 }
 
@@ -63,6 +57,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::OnceLock;
+    use futures::TryStreamExt;
     use crate::engine::Config;
     use crate::engine::provider::{StaticProvider, TargetSpec};
     use crate::htmatcher::Matcher;
@@ -97,7 +92,7 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).await?.collect();
+        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).try_collect().await?;
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
@@ -125,7 +120,7 @@ mod tests {
             name: "a".to_string(),
             args: HashMap::new(),
         };
-        let addrs: Vec<Addr> = engine.query(&Matcher::Addr(target_addr), rs).await?.collect();
+        let addrs: Vec<Addr> = engine.query(&Matcher::Addr(target_addr), rs).try_collect().await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -152,7 +147,7 @@ mod tests {
             name: "lint".to_string(),
             args: HashMap::new(),
         };
-        let addrs: Vec<Addr> = engine.query(&Matcher::Label(label_addr), rs).await?.collect();
+        let addrs: Vec<Addr> = engine.query(&Matcher::Label(label_addr), rs).try_collect().await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -171,9 +166,9 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let mut addrs = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).await?;
+        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).try_collect().await?;
 
-        assert!(addrs.next().is_none());
+        assert!(addrs.is_empty());
         Ok(())
     }
 }
