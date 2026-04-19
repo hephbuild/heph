@@ -1,5 +1,6 @@
 pub mod run;
 pub mod inspect;
+pub mod query;
 mod bootstrap;
 
 use clap::Subcommand;
@@ -11,6 +12,8 @@ pub enum Commands {
     /// Inspect
     #[command(arg_required_else_help = true)]
     Inspect(inspect::InspectArgs),
+    /// Query targets
+    Query(query::QueryArgs),
 }
 
 impl Commands {
@@ -18,6 +21,7 @@ impl Commands {
         match self {
             Commands::Run(args) => run::execute(args),
             Commands::Inspect(args) => args.execute(),
+            Commands::Query(args) => query::execute(args),
         }
     }
 }
