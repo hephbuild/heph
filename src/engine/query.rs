@@ -9,18 +9,14 @@ use crate::htpkg::PkgBuf;
 
 impl Engine {
     pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Vec<Addr>> {
-        let pkg_list: Vec<String> = {
-            let it = self.packages(m, &rs.ctoken).await?;
-            let mut seen = HashSet::new();
-            it.collect::<anyhow::Result<Vec<_>>>()?
-                .into_iter()
-                .filter(|p| seen.insert(p.clone()))
-                .collect()
-        };
-
         let mut results = Vec::new();
+        let mut seen = HashSet::new();
 
-        for pkg_str in pkg_list {
+        for pkg_result in self.packages(m, &rs.ctoken).await? {
+            let pkg_str = pkg_result?;
+            if !seen.insert(pkg_str.clone()) {
+                continue;
+            }
             let pkg = PkgBuf::from(pkg_str);
 
             for provider in &self.providers {
