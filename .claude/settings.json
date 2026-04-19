@@ -47,5 +47,20 @@
         ]
       }
     ]
+  },
+  "marketplaces": [
+    {
+      "name": "caveman",
+      "source": "https://github.com/JuliusBrussee/caveman"
+    }
+  ],
+  "plugins": [
+    "caveman@caveman"
+  ],
+  "plugin_config": {
+    "caveman": {
+      "autoActivate": true,
+      "defaultMode": "full" 
+    }
   }
 }
