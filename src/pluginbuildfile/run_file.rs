@@ -32,7 +32,7 @@ pub(crate) struct RunResult {
 
 #[derive(ProvidesStaticType)]
 pub(crate) struct Extra<'a> {
-    pub pkg: &'a String,
+    pub pkg: &'a str,
     pub on_state: Box<dyn Fn(OnStatePayload) -> anyhow::Result<()>>,
     pub on_target: Box<dyn Fn(OnTargetPayload) -> anyhow::Result<()>>,
 }
