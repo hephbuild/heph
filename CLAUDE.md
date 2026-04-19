@@ -21,7 +21,7 @@ cargo fmt                            # format
 gen                                  # regenerate protobuf bindings (runs buf generate)
 ```
 
-The `gen` script is a devenv-provided alias. It must be run after any `.proto` file changes before building.
+The `gen` script is a devenv-provided alias, assume its present. It must be run at the beginning of all sessions, or after any `.proto` file changes before building.
 
 ## Code Quality
 
