@@ -8,7 +8,8 @@ pub struct PackagesArgs {
     pub matcher: Option<String>,
 }
 
-pub fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
+#[tokio::main]
+pub async fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
     let e =  bootstrap::new_engine()?;
 
     let m = match &args.matcher {
@@ -16,7 +17,10 @@ pub fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
         None => htmatcher::Matcher::PackagePrefix("".to_string())
     };
 
-    for p in e.packages(&m) {
+    let ctoken = crate::hasync::StdCancellationToken::new();
+    let it = e.packages(&m, &ctoken).await?;
+    for res in it {
+        let p = res?;
         println!("{}", p);
     }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use futures::future::BoxFuture;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::hasync::Cancellable;
@@ -16,6 +17,14 @@ pub struct ListRequest {
 }
 pub struct ListResponse {
     pub addr: Addr
+}
+
+pub struct ListPackagesRequest {
+    pub prefix: String,
+}
+#[derive(Clone)]
+pub struct ListPackageResponse {
+    pub pkg: String
 }
 
 pub struct State {
@@ -69,13 +78,15 @@ pub enum GetError {
 
 pub trait Provider: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
-    fn list<'a>(&'a self, req: ListRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = ListResponse>>>>;
+    fn list<'a>(&'a self, req: ListRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>;
+    fn list_packages<'a>(&'a self, req: ListPackagesRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>;
     fn get<'a>(&'a self, req: GetRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, Result<GetResponse, GetError>>;
     fn probe<'a>(&'a self, req: ProbeRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
 }
 
 pub struct StaticProvider {
     pub targets: Vec<TargetSpec>,
+    pub packages: OnceLock<Vec<ListPackageResponse>>,
 }
 
 impl Provider for StaticProvider {
@@ -85,11 +96,22 @@ impl Provider for StaticProvider {
         })
     }
 
-    fn list<'a>(&'a self, _req: ListRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item=ListResponse>>>> {
+    fn list<'a>(&'a self, _req: ListRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
         Box::pin(async move {
-            let items: Vec<ListResponse> = self.targets.iter().map(|t| ListResponse{addr: t.addr.clone()}).collect();
+            let items: Vec<anyhow::Result<ListResponse>> = self.targets.iter().map(|t| Ok(ListResponse { addr: t.addr.clone() })).collect();
 
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = ListResponse>>)
+            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+        })
+    }
+
+    fn list_packages<'a>(&'a self, _req: ListPackagesRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>> {
+        let pkgs = self.packages.get_or_init(|| {
+            self.targets.iter().map(|t| ListPackageResponse { pkg: t.addr.package.clone() }).collect()
+        });
+
+        Box::pin(async move {
+            let items: Vec<anyhow::Result<ListPackageResponse>> = pkgs.iter().cloned().map(Ok).collect();
+            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>)
         })
     }
 

@@ -28,6 +28,7 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
                 transitive: Sandbox::default(),
             },
         ],
+        packages: Default::default(),
     }))?;
     e.register_provider(|root| Box::new(pluginbuildfile::Provider{
         root: root.to_path_buf(),

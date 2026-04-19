@@ -50,9 +50,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_request_state_tracking() -> anyhow::Result<()> {
-        let engine = Engine::new(Config {
+        let engine = Arc::new(Engine::new(Config {
             root: PathBuf::from("/tmp"),
-        })?;
+        })?);
 
         let rs = engine.new_state();
         let request_id = rs.request_id.clone();

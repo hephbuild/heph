@@ -147,6 +147,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use crate::engine::provider::StaticProvider;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -156,7 +157,26 @@ mod tests {
             root: root.path().to_path_buf(),
         };
 
-        let engine = Engine::new(cfg)?;
+        let mut engine = Engine::new(cfg)?;
+        engine.register_provider(|_root| Box::new(StaticProvider {
+            targets: vec![
+                TargetSpec {
+                    addr: Addr {
+                        package: "some".to_string(),
+                        name: "t".to_string(),
+                        args: Default::default(),
+                    },
+                    driver: "exec".to_string(),
+                    config: Default::default(),
+                    labels: vec![],
+                    transitive: Default::default(),
+                },
+            ],
+            packages: Default::default(),
+        }))?;
+        engine.register_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+
+        let engine = Arc::new(engine);
         let rs = engine.new_state();
         let addr = Addr {
             package: "some".to_string(),
@@ -182,7 +202,7 @@ mod tests {
             root: root.path().to_path_buf(),
         };
 
-        let engine = Engine::new(cfg)?;
+        let engine = Arc::new(Engine::new(cfg)?);
         let rs = engine.new_state();
         let addr = Addr {
             package: "non".to_string(),
