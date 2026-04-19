@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 use crate::engine::Engine;
 use crate::engine::provider::ListRequest;
@@ -10,14 +9,9 @@ use crate::htpkg::PkgBuf;
 impl Engine {
     pub async fn query(&self, m: &htmatcher::Matcher, rs: Arc<RequestState>) -> anyhow::Result<Vec<Addr>> {
         let mut results = Vec::new();
-        let mut seen = HashSet::new();
 
         for pkg_result in self.packages(m, &rs.ctoken).await? {
-            let pkg_str = pkg_result?;
-            if !seen.insert(pkg_str.clone()) {
-                continue;
-            }
-            let pkg = PkgBuf::from(pkg_str);
+            let pkg = PkgBuf::from(pkg_result?);
 
             for provider in &self.providers {
                 let addr_list: Vec<Addr> = {
