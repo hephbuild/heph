@@ -106,7 +106,11 @@ impl Provider for StaticProvider {
 
     fn list_packages<'a>(&'a self, _req: ListPackagesRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>> {
         let pkgs = self.packages.get_or_init(|| {
-            self.targets.iter().map(|t| ListPackageResponse { pkg: t.addr.package.clone() }).collect()
+            let mut seen = std::collections::HashSet::new();
+            self.targets.iter()
+                .filter(|t| seen.insert(t.addr.package.clone()))
+                .map(|t| ListPackageResponse { pkg: t.addr.package.clone() })
+                .collect()
         });
 
         Box::pin(async move {
