@@ -1,7 +1,8 @@
 use crate::engine::result::Artifact;
 use std::fs::File;
 use std::io;
-use crate::engine::driver::outputartifact::{Content, OutputArtifact};
+use crate::engine::driver::outputartifact::OutputArtifact;
+use crate::hartifactcontent::Content;
 use crate::engine::Engine;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
@@ -21,7 +22,6 @@ pub struct CacheArtifact {
     pub name: String,
     pub cache: Arc<dyn LocalCache>,
 }
-
 
 impl Artifact for CacheArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {

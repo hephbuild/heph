@@ -9,3 +9,4 @@ pub mod hmemoizer;
 pub mod pluginexec;
 pub mod pluginbuildfile;
 pub mod defer;
+pub mod hartifactcontent;

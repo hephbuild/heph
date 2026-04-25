@@ -133,7 +133,7 @@ pub mod targetdef {
 
         #[derive(Clone)]
         pub enum CodegenMode {
-            Unspecified,
+            None,
             Copy,
             Link,
         }
@@ -154,6 +154,8 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
+    use crate::hartifactcontent::Content;
+
     pub enum Type {
         Output,
         SupportFile,
@@ -164,9 +166,9 @@ pub mod inputartifact {
         pub name: String,
         pub r#type: Type,
         pub id: String,
+        pub content: Content,
     }
 }
-
 
 pub struct RunInput {
     pub artifact: inputartifact::InputArtifact,
@@ -174,6 +176,8 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
+    use crate::hartifactcontent::Content;
+
     #[derive(Clone)]
     pub enum Type {
         Output,
@@ -181,28 +185,6 @@ pub mod outputartifact {
         Log,
         SupportFile,
         SupportFileListV1,
-    }
-
-    #[derive(Clone)]
-    pub struct ContentRaw {
-        pub data: Vec<u8>,
-        pub path: String,
-        pub x: bool,
-    }
-
-    #[derive(Clone)]
-    pub struct ContentFile {
-        pub source_path: String,
-        pub out_path: String,
-        pub x: bool,
-    }
-
-    #[derive(Clone)]
-    pub enum Content {
-        File(ContentFile),
-        Raw(ContentRaw),
-        TarPath(String),
-        CpioPath(String),
     }
 
     #[derive(Clone)]
@@ -217,7 +199,6 @@ pub mod outputartifact {
 pub struct RunRequest<'a> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
-    pub sandbox_path: String,
     pub tree_root_path: String,
     pub inputs: Vec<RunInput>,
     pub hashin: &'a String,

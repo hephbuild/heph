@@ -34,8 +34,8 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
         root: root.to_path_buf(),
         ..pluginbuildfile::Provider::default()
     }))?;
-    e.register_driver(Box::new(pluginexec::Driver::new_exec()))?;
-    e.register_driver(Box::new(pluginexec::Driver::new_bash()))?;
+    e.register_managed_driver(Box::new(pluginexec::Driver::new_exec()))?;
+    e.register_managed_driver(Box::new(pluginexec::Driver::new_bash()))?;
 
     Ok(std::sync::Arc::new(e))
 }

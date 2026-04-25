@@ -11,7 +11,7 @@ pub fn matcher_from_args(arg1: &String, arg2: &Option<String>, base_pkg: &PkgBuf
                 anyhow::bail!("label `all` not allowed")
             }
 
-            return Ok(htpkg::parse(package_matcher, &engine::get_cwp()?)?);
+            return htpkg::parse(package_matcher, &engine::get_cwp()?);
         }
 
         Ok(Matcher::And(vec![

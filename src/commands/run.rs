@@ -1,11 +1,9 @@
 use std::io;
-use std::path::Path;
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::{get_cwd, get_cwp, get_root};
+use crate::engine::get_cwp;
 use crate::htmatcher::Matcher;
-use crate::htpkg::PkgBuf;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]

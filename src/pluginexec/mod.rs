@@ -5,14 +5,16 @@ use tokio::process::Command;
 use async_trait::async_trait;
 use tokio::io;
 use crate::engine;
-use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, RunRequest, RunResponse};
+use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse};
 use std::sync::Arc;
-use crate::engine::driver::targetdef::TargetDef as EngineTargetDef;
+use crate::engine::driver::targetdef::{Output, TargetDef as EngineTargetDef};
+use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 
 pub struct Driver {
     name: String,
-    wrap_run: fn(Vec<String>) -> Vec<String>,
+    wrap_run: fn(&Vec<String>) -> Vec<String>,
 }
 
 struct TargetDef {
@@ -55,14 +57,14 @@ pub fn bash_args_public(cmd: &str, termargs: Vec<String>) -> Vec<String> {
 }
 
 impl Driver {
-    pub fn new_exec() -> Driver {
-        Driver{
+    pub fn new_exec() -> Self {
+        Self{
             name: "exec".to_string(),
-            wrap_run: |run| run
+            wrap_run: |run| run.clone()
         }
     }
-    pub fn new_bash() -> Driver {
-        Driver{
+    pub fn new_bash() -> Self {
+        Self{
             name: "bash".to_string(),
             wrap_run: |run| {
                 bash_args_public(run.join("\n").as_str(), vec![])
@@ -72,7 +74,7 @@ impl Driver {
 }
 
 #[async_trait]
-impl engine::driver::Driver for Driver {
+impl engine::driver_managed::ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse{
             name: self.name.clone(),
@@ -90,7 +92,22 @@ impl engine::driver::Driver for Driver {
                     run: spec.run,
                 }),
                 inputs: vec![],
-                outputs: vec![],
+                outputs: spec.outputs.iter().map(|(k, v)| Output{
+                    group: k.clone(),
+                    paths: v.iter().map(|path| Path{
+                        content: {
+                            if let Ok(_) = glob::glob(path) {
+                                Content::Glob(path.clone())
+                            } else if path.ends_with("/") {
+                                Content::DirPath(path.clone())
+                            } else {
+                                Content::FilePath(path.clone())
+                            }
+                        },
+                        codegen_tree: CodegenMode::None,
+                        collect: true,
+                    }).collect(),
+                }).collect(),
                 support_files: vec![],
                 cache: spec.cache.local,
                 disable_remote_cache: !spec.cache.remote,
@@ -106,28 +123,40 @@ impl engine::driver::Driver for Driver {
         })
     }
 
-    async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
-        let def = req.target.def::<TargetDef>();
+    async fn run<'a>(&self, req: ManagedRunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ManagedRunResponse> {
+        let rreq = req.request;
+        let def = rreq.target.def::<TargetDef>();
 
-        let run = (self.wrap_run)(def.run.clone());
+        let run = (self.wrap_run)(&def.run);
 
-        if run.is_empty() {
-            return Ok(RunResponse {
-                artifacts: vec![],
+        let env: Vec<(String, String)> = rreq.target.outputs.iter()
+            .fold(std::collections::HashMap::<String, Vec<String>>::new(), |mut map, output| {
+                let key = if output.group.is_empty() {
+                    "OUT".to_string()
+                } else {
+                    format!("OUT_{}", output.group)
+                };
+                let entry = map.entry(key).or_default();
+                for path in &output.paths {
+                    match &path.content {
+                        Content::Glob(_) => {}
+                        Content::FilePath(p) | Content::DirPath(p) => entry.push(p.clone()),
+                    }
+                }
+                map
             })
-        }
-
-        let env: Vec<(&str, &str)> = vec![
-            // ("OUT", "out") // TODO
-        ];
+            .into_iter()
+            .map(|(k, v)| (k, v.join(" ")))
+            .collect();
 
         let mut child = Command::new(&run[0])
             .kill_on_drop(true)
             .args(&run[1..])
             .envs(env)
-            .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(if req.stdout.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stderr(if req.stderr.is_some() { Stdio::piped() } else { Stdio::null() })
+            .current_dir(req.sandbox_pkg_dir)
+            .stdin(if rreq.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(if rreq.stdout.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stderr(if rreq.stderr.is_some() { Stdio::piped() } else { Stdio::null() })
             .spawn()?;
 
         let child_stdin = child.stdin.take();
@@ -137,20 +166,20 @@ impl engine::driver::Driver for Driver {
         use tokio::io::AsyncWriteExt;
 
         let stdin_fut = async {
-            if let (Some(mut req_stdin), Some(mut child_stdin)) = (req.stdin, child_stdin) {
+            if let (Some(mut req_stdin), Some(mut child_stdin)) = (rreq.stdin, child_stdin) {
                 let _ = io::copy(&mut req_stdin, &mut child_stdin).await;
                 let _ = child_stdin.shutdown().await;
             }
         };
 
         let stdout_fut = async {
-            if let (Some(mut child_stdout), Some(mut req_stdout)) = (child_stdout, req.stdout) {
+            if let (Some(mut child_stdout), Some(mut req_stdout)) = (child_stdout, rreq.stdout) {
                 let _ = io::copy(&mut child_stdout, &mut req_stdout).await;
             }
         };
 
         let stderr_fut = async {
-            if let (Some(mut child_stderr), Some(mut req_stderr)) = (child_stderr, req.stderr) {
+            if let (Some(mut child_stderr), Some(mut req_stderr)) = (child_stderr, rreq.stderr) {
                 let _ = io::copy(&mut child_stderr, &mut req_stderr).await;
             }
         };
@@ -169,12 +198,12 @@ impl engine::driver::Driver for Driver {
                 if !status.success() {
                     anyhow::bail!("process exited with status: {}", status)
                 }
-
-                Ok(RunResponse {
-                    artifacts: vec![],
-                })
             }
         }
+
+        Ok(ManagedRunResponse{
+            artifacts: vec![],
+        })
     }
 }
 
@@ -182,6 +211,7 @@ impl engine::driver::Driver for Driver {
 mod tests {
     use super::*;
     use crate::engine::driver::{Driver as _, RunRequest};
+    use crate::engine::driver_managed::ManagedDriver;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::Addr;
 
@@ -211,7 +241,6 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            sandbox_path: "".to_string(),
             tree_root_path: "".to_string(),
             inputs: vec![],
             hashin: &"".to_string(),
@@ -220,7 +249,7 @@ mod tests {
             stderr: None,
         };
 
-        let _res = driver.run(req, &ctoken).await?;
+        let _res = driver.run(ManagedRunRequest{request: req}, &ctoken).await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output.trim(), "hello");
@@ -255,7 +284,6 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            sandbox_path: "".to_string(),
             tree_root_path: "".to_string(),
             inputs: vec![],
             hashin: &"".to_string(),
@@ -265,7 +293,7 @@ mod tests {
         };
 
         // Use a timeout to detect the hang
-        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(req, &ctoken)).await?;
+        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(ManagedRunRequest{request: req}, &ctoken)).await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output, "test data");
@@ -301,7 +329,6 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            sandbox_path: "".to_string(),
             tree_root_path: "".to_string(),
             inputs: vec![],
             hashin: &"".to_string(),
@@ -310,7 +337,7 @@ mod tests {
             stderr: None,
         };
 
-        let run_fut = driver.run(req, &ctoken);
+        let run_fut = driver.run(ManagedRunRequest{request: req}, &ctoken);
 
         tokio::spawn({
             let ctoken = ctoken.clone();

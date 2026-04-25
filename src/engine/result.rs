@@ -113,7 +113,6 @@ impl Engine {
             let res = driver.driver.run(RunRequest{
                 request_id: &rs.request_id,
                 target: &def,
-                sandbox_path: "".to_string(),
                 tree_root_path: root.to_str().unwrap().to_string(),
                 inputs: vec![],
                 hashin: &hashin,
@@ -199,7 +198,7 @@ mod tests {
             ],
             packages: Default::default(),
         }))?;
-        engine.register_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();

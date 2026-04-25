@@ -97,7 +97,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             config,
         };
 
-        let _ = (eval.extra.ok_or(starlark::Error::new_other(anyhow::anyhow!("Extra not found")))?.downcast_ref::<Extra>().unwrap().on_target)(p);
+        let _ = (eval.extra.unwrap().downcast_ref::<Extra>().unwrap().on_target)(p);
 
         Ok("".to_string())
     }

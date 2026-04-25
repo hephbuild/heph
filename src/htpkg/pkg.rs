@@ -5,8 +5,18 @@ use std::path::Path;
 pub struct PkgBuf(String);
 
 impl PkgBuf {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl PkgBuf {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/').filter(|s| !s.is_empty())
     }
 
     pub fn has_prefix(&self, prefix: &PkgBuf) -> bool {

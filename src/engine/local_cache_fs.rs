@@ -15,8 +15,12 @@ impl LocalCacheFS {
 
     fn get_path(&self, addr: &Addr, hashin: &str, name: &str) -> PathBuf {
         let mut path = self.root.clone();
-        path.push(addr.package.as_ref() as &std::path::Path);
+        path.push(addr.package.as_str());
+        if addr.args.is_empty() {
         path.push(&addr.name);
+        } else {
+            path.push(format!("{}_{}", addr.name, addr.hash_str()));
+        }
         path.push(hashin);
         path.push(name);
         path

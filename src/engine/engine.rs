@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use crate::engine::driver::Driver as SDKDriver;
+use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
 use crate::engine::local_cache_fs::LocalCacheFS;
 use crate::engine::{driver, provider};
@@ -23,6 +24,7 @@ pub struct Engine {
     pub(crate) drivers_by_name: HashMap<String, Arc<Driver>>,
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
+    pub home: PathBuf,
 }
 
 pub struct Provider {
@@ -38,16 +40,23 @@ pub struct Driver {
 impl Engine {
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let root = cfg.root.clone();
+        let home = root.join(".heph3");
 
         Ok(Engine {
             cfg: cfg.clone(),
-            local_cache: Arc::new(LocalCacheFS::new(root.join(".heph3").join("cache"))?),
+            home: home.clone(),
+            local_cache: Arc::new(LocalCacheFS::new(home.join("cache"))?),
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub fn register_managed_driver(&mut self, driver: Box<dyn SDKManagedDriver>) -> anyhow::Result<()> {
+        let driver = self.new_managed_driver(driver);
+        self.register_driver(Box::new(driver))
     }
 
     pub fn register_driver(&mut self, driver: Box<dyn SDKDriver>) -> anyhow::Result<()> {

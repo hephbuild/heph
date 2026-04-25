@@ -4,6 +4,7 @@ use crate::engine::provider::TargetSpecValue::Null;
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
+    pub outputs: HashMap<String, Vec<String>>,
     pub cache: TargetSpecCache,
 }
 
@@ -45,10 +46,11 @@ impl TargetSpec {
                 local: true,
                 remote: true,
             },
+            outputs: HashMap::new(),
         };
 
-        if let Some(v) = m.get("env") {
-            spec.run = parse_strings(v)?
+        if let Some(v) = m.get("run") {
+            spec.run = parse_strings(v)?;
         };
 
         if let Some(v) = m.get("cache")
@@ -58,6 +60,19 @@ impl TargetSpec {
                 remote: false,
             };
         }
+
+        if let Some(v) = m.get("out") {
+            if let Ok(ss) = parse_strings(v) {
+                spec.outputs = HashMap::from([("".to_string(), ss)]);
+            } else {
+                spec.outputs = match v {
+                    TargetSpecValue::Map(m) => m.iter()
+                        .map(|(k, v)| parse_strings(v).map(|ss| (k.clone(), ss)))
+                        .collect::<anyhow::Result<HashMap<_, _>>>(),
+                    v => Err(anyhow::anyhow!("invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {:?}", v)),
+                }?;
+            }
+        };
 
         Ok(spec)
     }
