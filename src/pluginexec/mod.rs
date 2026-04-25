@@ -7,6 +7,8 @@ use tokio::io;
 use crate::engine;
 use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse};
 use std::sync::Arc;
+use itertools::Itertools;
+use serde_json::json;
 use crate::engine::driver::targetdef::{Output, TargetDef as EngineTargetDef};
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
@@ -73,6 +75,27 @@ impl Driver {
     }
 }
 
+async fn tee_stream(
+    source: Option<impl tokio::io::AsyncRead + Unpin>,
+    log: Arc<tokio::sync::Mutex<tokio::fs::File>>,
+    mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let Some(mut source) = source else { return };
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match source.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let _ = log.lock().await.write_all(&buf[..n]).await;
+                if let Some(ref mut out) = sink {
+                    let _ = out.write_all(&buf[..n]).await;
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl engine::driver_managed::ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -96,7 +119,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                     group: k.clone(),
                     paths: v.iter().map(|path| Path{
                         content: {
-                            if let Ok(_) = glob::glob(path) {
+                            if ["*", "?", "["].iter().any(|&p| path.contains(p)) { // TODO: this sucks, but its easy for now
                                 Content::Glob(path.clone())
                             } else if path.ends_with("/") {
                                 Content::DirPath(path.clone())
@@ -146,17 +169,25 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 map
             })
             .into_iter()
+            .filter(|(_, v)| !v.is_empty())
             .map(|(k, v)| (k, v.join(" ")))
             .collect();
+
+        let output_log = tempfile::NamedTempFile::new()?;
+        let output_log_path = output_log.path().to_path_buf();
+        let output_log_file = Arc::new(tokio::sync::Mutex::new(
+            tokio::fs::File::from_std(output_log.reopen()?)
+        ));
 
         let mut child = Command::new(&run[0])
             .kill_on_drop(true)
             .args(&run[1..])
+            .env_clear()
             .envs(env)
             .current_dir(req.sandbox_pkg_dir)
             .stdin(if rreq.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stdout(if rreq.stdout.is_some() { Stdio::piped() } else { Stdio::null() })
-            .stderr(if rreq.stderr.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let child_stdin = child.stdin.take();
@@ -172,17 +203,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
             }
         };
 
-        let stdout_fut = async {
-            if let (Some(mut child_stdout), Some(mut req_stdout)) = (child_stdout, rreq.stdout) {
-                let _ = io::copy(&mut child_stdout, &mut req_stdout).await;
-            }
-        };
-
-        let stderr_fut = async {
-            if let (Some(mut child_stderr), Some(mut req_stderr)) = (child_stderr, rreq.stderr) {
-                let _ = io::copy(&mut child_stderr, &mut req_stderr).await;
-            }
-        };
+        let stdout_fut = tee_stream(child_stdout, Arc::clone(&output_log_file), rreq.stdout);
+        let stderr_fut = tee_stream(child_stderr, Arc::clone(&output_log_file), rreq.stderr);
 
         tokio::select! {
             _ = ctoken.cancelled() => {
@@ -196,7 +218,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 let status = res?;
 
                 if !status.success() {
-                    anyhow::bail!("process exited with status: {}", status)
+                    let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
+                    anyhow::bail!("process exited with status: {}\n{}", status, log)
                 }
             }
         }
@@ -210,10 +233,20 @@ impl engine::driver_managed::ManagedDriver for Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::{Driver as _, RunRequest};
+    use crate::engine::driver::RunRequest;
     use crate::engine::driver_managed::ManagedDriver;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::Addr;
+
+    fn make_req<'a>(request: RunRequest<'a>) -> ManagedRunRequest<'a> {
+        let cwd = std::env::current_dir().unwrap();
+        ManagedRunRequest {
+            request,
+            sandbox_dir: cwd.clone(),
+            sandbox_ws_dir: cwd.clone(),
+            sandbox_pkg_dir: cwd,
+        }
+    }
 
     #[tokio::test]
     async fn test_run_echo_hello() -> anyhow::Result<()> {
@@ -249,7 +282,7 @@ mod tests {
             stderr: None,
         };
 
-        let _res = driver.run(ManagedRunRequest{request: req}, &ctoken).await?;
+        let _res = driver.run(make_req(req), &ctoken).await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output.trim(), "hello");
@@ -293,7 +326,7 @@ mod tests {
         };
 
         // Use a timeout to detect the hang
-        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(ManagedRunRequest{request: req}, &ctoken)).await?;
+        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(make_req(req), &ctoken)).await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output, "test data");
@@ -337,7 +370,7 @@ mod tests {
             stderr: None,
         };
 
-        let run_fut = driver.run(ManagedRunRequest{request: req}, &ctoken);
+        let run_fut = driver.run(make_req(req), &ctoken);
 
         tokio::spawn({
             let ctoken = ctoken.clone();

@@ -119,7 +119,7 @@ impl Engine {
                 stdin: None,
                 stdout: None,
                 stderr: None,
-            }, &rs.ctoken).await.map_err(WrappedError::from)?;
+            }, &rs.ctoken).await.map_err(|err| anyhow::anyhow!("run: {}", err))?;
 
             Ok(res.artifacts)
         }).await?;

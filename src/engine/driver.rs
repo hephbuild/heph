@@ -117,6 +117,8 @@ pub mod targetdef {
     }
 
     pub mod path {
+        use std::fmt::Display;
+
         #[derive(Clone)]
         pub struct Path {
             pub content: Content,
@@ -129,6 +131,16 @@ pub mod targetdef {
             FilePath(String),
             DirPath(String),
             Glob(String),
+        }
+
+        impl Display for Content {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Content::FilePath(path) => write!(f, "FilePath({})", path),
+                    Content::DirPath(path) => write!(f, "DirPath({})", path),
+                    Content::Glob(pattern) => write!(f, "Glob({})", pattern),
+                }
+            }
         }
 
         #[derive(Clone)]

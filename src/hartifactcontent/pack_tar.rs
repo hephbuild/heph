@@ -15,6 +15,12 @@ pub struct TarPacker {
     entries: Vec<Entry>,
 }
 
+impl Default for TarPacker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TarPacker {
     pub fn new() -> Self {
         Self { entries: vec![] }
@@ -39,7 +45,7 @@ impl TarPacker {
         for entry in self.entries {
             match entry {
                 Entry::File { source, at } => {
-                    let mut src = File::open(&source)?;
+                    let mut src = File::open(&source).map_err(|err| anyhow::anyhow!("open: {}: {}", source, err))?;
                     let meta = src.metadata()?;
                     let x = is_executable(&meta);
                     let mut header = tar::Header::new_gnu();
@@ -56,7 +62,7 @@ impl TarPacker {
                     builder.append_data(&mut header, &at, Cursor::new(&data))?;
                 }
                 Entry::AppendTar { path } => {
-                    let src = File::open(&path)?;
+                    let src = File::open(&path).map_err(|err| anyhow::anyhow!("open: {}: {}", path, err))?;
                     let mut archive = tar::Archive::new(src);
                     for entry in archive.entries()? {
                         let mut entry = entry?;

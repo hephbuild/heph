@@ -77,13 +77,13 @@ impl Driver for ManagedDriverBridge {
         }?;
         fs::create_dir_all(&sandbox_dir)?;
         defer! {
-            // match fs::remove_dir_all(&sandbox_dir) {
-            //     Ok(_) => (),
-            //     Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-            //     Err(err) => {
-            //         eprintln!("failed to clean up sandbox: {err}")
-            //     },
-            // };
+            match fs::remove_dir_all(&sandbox_dir) {
+                Ok(_) => (),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => {
+                    eprintln!("failed to clean up sandbox: {err}")
+                },
+            };
         }
 
         let ws_dir = sandbox_dir.join("ws");
@@ -95,15 +95,15 @@ impl Driver for ManagedDriverBridge {
 
         let target = req.target;
 
-        let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
+        let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
         fs::create_dir_all(&sandbox_pkg_dir)?;
 
         let mut res = self.driver.run(ManagedRunRequest{
             sandbox_dir: sandbox_dir.clone(),
             sandbox_ws_dir: ws_dir.clone(),
-            sandbox_pkg_dir,
+            sandbox_pkg_dir: sandbox_pkg_dir.clone(),
             request: req,
-        }, ctoken).await?;
+        }, ctoken).await.map_err(|err| anyhow::anyhow!("aa: {}", err))?;
 
         for output in &target.outputs {
             if !output.paths.iter().any(|path| path.collect) {
@@ -119,11 +119,11 @@ impl Driver for ManagedDriverBridge {
 
                 match &path.content {
                     Content::FilePath(fp) => {
-                        let source = ws_dir.join(fp);
+                        let source = sandbox_pkg_dir.join(fp);
                         tar.create_file(source.to_string_lossy().into_owned(), fp.clone());
                     }
                     Content::DirPath(dir) => {
-                        let dir_full = ws_dir.join(dir);
+                        let dir_full = sandbox_pkg_dir.join(dir);
                         for entry in walkdir::WalkDir::new(&dir_full) {
                             let entry = entry?;
                             if entry.file_type().is_file() {
@@ -134,7 +134,7 @@ impl Driver for ManagedDriverBridge {
                         }
                     }
                     Content::Glob(pattern) => {
-                        let full_pattern = ws_dir.join(pattern).to_string_lossy().into_owned();
+                        let full_pattern = sandbox_pkg_dir.join(pattern).to_string_lossy().into_owned();
                         for matched in glob::glob(&full_pattern)? {
                             let matched = matched?;
                             if matched.is_file() {
@@ -148,7 +148,7 @@ impl Driver for ManagedDriverBridge {
             }
 
             let tarpath = String::from("/tmp/somepath");
-            tar.pack(std::path::Path::new(&tarpath))?;
+            tar.pack(std::path::Path::new(&tarpath)).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
 
             res.artifacts.push(outputartifact::OutputArtifact{
                 group: output.group.clone(),
