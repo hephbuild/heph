@@ -15,7 +15,7 @@ pub(crate) struct TargetSpecCache {
 fn parse_strings(v: &TargetSpecValue) -> anyhow::Result<Vec<String>> {
     match v {
         Null() => Ok(vec![]),
-        TargetSpecValue::List(v) => v.into_iter().try_fold(Vec::new(), |mut acc, v| match v {
+        TargetSpecValue::List(v) => v.iter().try_fold(Vec::new(), |mut acc, v| match v {
             Null() => Ok(acc),
             TargetSpecValue::String(s) => {
                 acc.push(s.clone());
@@ -51,14 +51,12 @@ impl TargetSpec {
             spec.run = parse_strings(v)?
         };
 
-        if let Some(v) = m.get("cache") {
-            match parse_bool(v)? {
-                false => spec.cache = TargetSpecCache{
-                    local: false,
-                    remote: false,
-                },
-                _ => {}
-            }
+        if let Some(v) = m.get("cache")
+            && !parse_bool(v)? {
+            spec.cache = TargetSpecCache{
+                local: false,
+                remote: false,
+            };
         }
 
         Ok(spec)

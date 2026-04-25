@@ -1,6 +1,5 @@
 mod spec;
 
-use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::process::Command;
 use async_trait::async_trait;
@@ -9,7 +8,6 @@ use crate::engine;
 use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, RunRequest, RunResponse};
 use std::sync::Arc;
 use crate::engine::driver::targetdef::TargetDef as EngineTargetDef;
-use crate::engine::provider::TargetSpec;
 use crate::hasync::Cancellable;
 
 pub struct Driver {
@@ -111,15 +109,22 @@ impl engine::driver::Driver for Driver {
     async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
         let def = req.target.def::<TargetDef>();
 
-        if def.run.is_empty() {
+        let run = (self.wrap_run)(def.run.clone());
+
+        if run.is_empty() {
             return Ok(RunResponse {
                 artifacts: vec![],
             })
         }
 
-        let mut child = Command::new(&def.run[0])
+        let env: Vec<(&str, &str)> = vec![
+            // ("OUT", "out") // TODO
+        ];
+
+        let mut child = Command::new(&run[0])
             .kill_on_drop(true)
-            .args(&def.run[1..])
+            .args(&run[1..])
+            .envs(env)
             .stdin(if req.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(if req.stdout.is_some() { Stdio::piped() } else { Stdio::null() })
             .stderr(if req.stderr.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -260,7 +265,7 @@ mod tests {
         };
 
         // Use a timeout to detect the hang
-        let res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(req, &ctoken)).await?;
+        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(req, &ctoken)).await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output, "test data");

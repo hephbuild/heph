@@ -6,12 +6,14 @@ use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
 use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
 use crate::hmemoizer::WrappedError;
 use std::io;
 use std::sync::Arc;
 
 use std::fmt;
+use futures::TryStreamExt;
+use tokio::task::JoinSet;
+use crate::htmatcher::Matcher;
 
 pub trait Artifact: Send + Sync {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>>;
@@ -41,16 +43,37 @@ impl Artifact for OutputArtifact {
 }
 
 impl Engine {
-    pub async fn result(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
+    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
         let key = addr.format();
         let res = rs.mem_result.process(key, (self, rs.clone(), addr.clone()), |(engine, rs, addr)| async move {
-            engine.inner_result(rs, &addr).await.map_err(WrappedError::from)
+            engine.inner_result_addr(rs, &addr).await.map_err(WrappedError::from)
         }).await?;
 
         Ok(res)
     }
 
-    async fn inner_result(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
+    pub async fn result(self: Arc<Self>, rs: Arc<RequestState>, matcher: &Matcher) -> anyhow::Result<Vec<EResult>> {
+        let mut set = JoinSet::new();
+
+        let stream = self.query(rs.clone(), matcher);
+        tokio::pin!(stream);
+        while let Some(addr) = stream.try_next().await? {
+            let engine = self.clone();
+            let rs = rs.clone();
+            set.spawn(async move {
+                engine.result_addr(rs, &addr).await
+            });
+        }
+
+        let mut all_res: Vec<EResult> = vec!();
+        while let Some(res) = set.join_next().await {
+            all_res.push(res??)
+        }
+
+        Ok(all_res)
+    }
+
+    async fn inner_result_addr(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
@@ -64,7 +87,7 @@ impl Engine {
     }
 
     async fn execute_and_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
-        let artifacts = self.execute(rs.clone(), &opts).await?;
+        let artifacts = self.execute(rs.clone(), opts).await?;
 
         if !opts.def.cache {
             return anyhow::Ok(EResult {
@@ -149,6 +172,7 @@ mod tests {
     use super::*;
     use crate::engine::Config;
     use crate::engine::provider::StaticProvider;
+    use crate::htpkg::PkgBuf;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -185,12 +209,12 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result(rs.clone(), &addr).await?;
+        let result = engine.clone().result_addr(rs.clone(), &addr).await?;
 
         assert!(result.artifacts.is_empty());
 
         // Test caching (second call)
-        let result2 = engine.clone().result(rs, &addr).await?;
+        let result2 = engine.clone().result_addr(rs, &addr).await?;
         assert!(result2.artifacts.is_empty());
 
         Ok(())
@@ -211,7 +235,7 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result(rs, &addr).await;
+        let result = engine.clone().result_addr(rs, &addr).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
 

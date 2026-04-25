@@ -10,7 +10,7 @@ pub struct LocalCacheFS {
 
 impl LocalCacheFS {
     pub fn new(root: PathBuf) -> Result<Self> {
-        Ok(Self { root: root })
+        Ok(Self { root })
     }
 
     fn get_path(&self, addr: &Addr, hashin: &str, name: &str) -> PathBuf {

@@ -144,7 +144,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-    use crate::hasync;
     use crate::hasync::StdCancellationToken;
 
     #[tokio::test]

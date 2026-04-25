@@ -15,10 +15,9 @@ pub struct RequestState {
 impl Drop for RequestState {
     fn drop(&mut self) {
         self.ctoken.cancel();
-        if let Some(engine) = self.engine.upgrade() {
-            if let Ok(mut requests) = engine.requests.lock() {
-                requests.remove(&self.request_id);
-            }
+        if let Some(engine) = self.engine.upgrade()
+            && let Ok(mut requests) = engine.requests.lock() {
+            requests.remove(&self.request_id);
         }
     }
 }

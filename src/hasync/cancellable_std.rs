@@ -17,6 +17,12 @@ struct SharedState {
     waker: Mutex<Option<Waker>>,
 }
 
+impl Default for StdCancellationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StdCancellationToken {
     pub fn new() -> Self {
         Self {
@@ -32,10 +38,9 @@ impl StdCancellationToken {
         self.inner.cancelled.store(true, Ordering::SeqCst);
 
         // 2. Wake the pending future if it's currently being awaited
-        if let Ok(mut guard) = self.inner.waker.lock() {
-            if let Some(waker) = guard.take() {
-                waker.wake();
-            }
+        if let Ok(mut guard) = self.inner.waker.lock()
+            && let Some(waker) = guard.take() {
+            waker.wake();
         }
     }
 

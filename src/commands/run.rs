@@ -1,6 +1,9 @@
+use std::io;
+use std::path::Path;
 use clap::Args;
 use crate::commands::bootstrap;
-use crate::htaddr;
+use crate::commands::utils::matcher_from_args;
+use crate::engine::{get_cwd, get_cwp, get_root};
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
 
@@ -13,38 +16,37 @@ pub struct RunArgs {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
+    /// Print output artifacts to stdout
+    #[arg(long = "cat-out")]
+    pub cat_out: bool,
 }
 
 #[tokio::main]
 pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
-    if let Some(package_matcher) = &args.arg2 {
-        let label = &args.arg1;
-        execute_matcher(Matcher::And(vec![
-            Matcher::Label(htaddr::parse_addr(label).map_err(anyhow::Error::msg)?),
-            Matcher::Package(PkgBuf::from(package_matcher.as_str())),
-        ])).await
-    } else {
-        let address = &args.arg1;
-        match htaddr::parse_addr(address) {
-            Ok(addr) => execute_matcher(Matcher::Addr(addr)).await,
-            Err(e) => {
-                anyhow::bail!("Error: '{}' is not a valid target address: {}", address, e);
-            }
-        }
-    }
-}
+    let base_pkg = get_cwp()?;
+    let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
 
-async fn execute_matcher(m: Matcher) -> anyhow::Result<()> {
    let e =  bootstrap::new_engine()?;
 
-   let addr = match m {
-       Matcher::Addr(addr) => addr,
-       _ => anyhow::bail!("Matcher not supported yet"),
-   };
+    let result = match m {
+        Matcher::Addr(addr) => {
+            vec![e.clone().result_addr(e.new_state(), &addr).await?]
+        },
+        _ => {
+            e.clone().result(e.new_state(), &m).await?
+        }
+    };
 
-    let result = e.clone().result(e.new_state(), &addr).await?;
-
-    println!("{} artifacts", result.artifacts.len());
+    if args.cat_out {
+        for r in result {
+            for a in r.artifacts {
+                let mut reader = a.reader()?;
+                io::copy(&mut reader, &mut io::stdout())?;
+            }
+        }
+    } else {
+        println!("{} matched", result.len());
+    }
 
     Ok(())
 }

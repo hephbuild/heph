@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use crate::{engine, pluginbuildfile, pluginexec};
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::provider::{StaticProvider, TargetSpec};
@@ -12,7 +11,7 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     };
 
     let mut e = engine::Engine::new(engine::Config{
-        root: PathBuf::from(root),
+        root,
     })?;
 
     e.register_provider(|_root| Box::new(StaticProvider {

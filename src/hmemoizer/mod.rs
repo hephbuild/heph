@@ -37,6 +37,16 @@ pub struct Memoizer<K, V> {
     cache: Mutex<HashMap<K, Shared<BoxFuture<'static, V>>>>,
 }
 
+impl<K, V> Default for Memoizer<K, V>
+where
+    K: std::hash::Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K, V> Memoizer<K, V>
 where
     K: std::hash::Hash + Eq + Send + Sync + 'static,

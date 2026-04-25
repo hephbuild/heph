@@ -5,8 +5,10 @@
       <sourceFolder url="file://$MODULE_DIR$/gen/proto/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/gen/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src/defer/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.devenv" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
+      <excludeFolder url="file://$MODULE_DIR$/.claude/worktrees" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

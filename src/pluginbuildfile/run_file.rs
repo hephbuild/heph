@@ -6,9 +6,8 @@ use starlark::eval::{Arguments, Evaluator};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::float::UnpackFloat;
 use starlark::values::list::UnpackList;
-use starlark::values::{UnpackValue, Value, ValueLike};
+use starlark::values::{UnpackValue, Value};
 use starlark::starlark_module;
-use std::any::Any;
 use std::collections::HashMap;
 
 #[derive(Debug)]
@@ -19,6 +18,7 @@ pub(crate) struct OnTargetPayload {
     pub config: HashMap<String, TargetSpecValue>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct OnStatePayload {
     pub name: String,
@@ -30,6 +30,7 @@ pub(crate) struct RunResult {
     pub states: Vec<OnStatePayload>,
 }
 
+#[allow(dead_code)]
 #[derive(ProvidesStaticType)]
 pub(crate) struct Extra<'a> {
     pub pkg: &'a str,
@@ -66,7 +67,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
     fn target<'v>(eval: &mut Evaluator<'v, '_, '_>, args: &Arguments<'v, '_>) -> starlark::Result<String> {
         args.no_positional_args(eval.heap())?;
 
-        let mut m = args.names_map()?;
+        let m = args.names_map()?;
 
         let mut name = String::new();
         let mut driver = String::new();
@@ -96,7 +97,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
             config,
         };
 
-        (eval.extra.ok_or(starlark::Error::new_other(anyhow::anyhow!("Extra not found")))?.downcast_ref::<Extra>().unwrap().on_target)(p);
+        let _ = (eval.extra.ok_or(starlark::Error::new_other(anyhow::anyhow!("Extra not found")))?.downcast_ref::<Extra>().unwrap().on_target)(p);
 
         Ok("".to_string())
     }
@@ -142,7 +143,7 @@ impl Provider {
 
         {
             let extra = Extra{
-                pkg: &pkg,
+                pkg,
                 on_target: {
                     let targets = targets.clone();
                     Box::new(move |p| {
@@ -180,7 +181,6 @@ impl Provider {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     #[test]

@@ -1,19 +1,24 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use anyhow::anyhow;
 use memoize::memoize;
 use crate::engine::get_cwd;
 
+pub fn get_root() -> anyhow::Result<PathBuf> {
+    get_root_inner().map_err(|e| anyhow!(e))
+}
+
 #[memoize]
-pub fn get_root() -> Result<String, String> {
-    let cwd = get_cwd()?;
-    let mut current = Path::new(&cwd);
+pub fn get_root_inner() -> Result<PathBuf, String> {
+    let cwd = get_cwd().map_err(|e| e.to_string())?;
+    let mut current = Path::new(&cwd).to_path_buf();
 
     loop {
         let config_file = current.join(".hephconfig2");
         if config_file.exists() {
-            return Ok(current.to_str().unwrap().to_string());
+            return Ok(current);
         }
 
-        match current.parent() {
+        match current.parent().map(|p| p.to_path_buf()) {
             Some(parent) => current = parent,
             None => break,
         }
@@ -21,6 +26,7 @@ pub fn get_root() -> Result<String, String> {
 
     Err("Could not find .hephconfig2 file in any parent directory".to_string())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,7 +49,7 @@ mod tests {
 
         let result = get_root();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), root_path.to_str().unwrap());
+        assert_eq!(result.unwrap().to_str().unwrap(), root_path.to_str().unwrap());
 
         unsafe {
             env::remove_var("HEPH_CWD");

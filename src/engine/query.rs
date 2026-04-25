@@ -4,11 +4,12 @@ use crate::engine::Engine;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
 use crate::htaddr::Addr;
-use crate::htmatcher::{self, MatchResult};
+use crate::htmatcher;
+use crate::htmatcher::{MatchResult};
 use crate::htpkg::PkgBuf;
 
 impl Engine {
-    pub fn query<'a>(&'a self, m: &'a htmatcher::Matcher, rs: Arc<RequestState>) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+    pub fn query<'a>(&'a self, rs: Arc<RequestState>, m: &'a htmatcher::Matcher) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         async_stream::try_stream! {
             for pkg_result in self.packages(m, &rs.ctoken).await? {
                 let pkg = PkgBuf::from(pkg_result?);
@@ -92,7 +93,7 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("foo/bar")), rs).try_collect().await?;
+        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("foo/bar"))).try_collect().await?;
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
@@ -120,7 +121,7 @@ mod tests {
             name: "a".to_string(),
             args: HashMap::new(),
         };
-        let addrs: Vec<Addr> = engine.query(&Matcher::Addr(target_addr), rs).try_collect().await?;
+        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Addr(target_addr)).try_collect().await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -147,7 +148,7 @@ mod tests {
             name: "lint".to_string(),
             args: HashMap::new(),
         };
-        let addrs: Vec<Addr> = engine.query(&Matcher::Label(label_addr), rs).try_collect().await?;
+        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Label(label_addr)).try_collect().await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -166,7 +167,7 @@ mod tests {
 
         let engine = Arc::new(engine);
         let rs = engine.new_state();
-        let addrs: Vec<Addr> = engine.query(&Matcher::Package(PkgBuf::from("nonexistent")), rs).try_collect().await?;
+        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("nonexistent"))).try_collect().await?;
 
         assert!(addrs.is_empty());
         Ok(())
