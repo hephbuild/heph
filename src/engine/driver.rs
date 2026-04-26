@@ -166,7 +166,7 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
-    use crate::hartifactcontent::Artifact;
+    use crate::hartifactcontent::Content;
 
     pub enum Type {
         Output,
@@ -178,7 +178,7 @@ pub mod inputartifact {
         pub name: String,
         pub r#type: Type,
         pub id: String,
-        pub content: Box<dyn Artifact>,
+        pub content: Box<dyn Content>,
     }
 }
 
@@ -189,12 +189,12 @@ pub struct RunInput {
 
 pub mod outputartifact {
     use std::fs::File;
-    use std::{fs, io};
+    use std::io;
     use std::io::Read;
     use std::path::PathBuf;
-    use crate::hartifactcontent::{Artifact, WalkEntry};
+    use crate::hartifactcontent::{Content as HContent, WalkEntry};
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub enum Type {
         Output,
         OutputListV1,
@@ -233,7 +233,7 @@ pub mod outputartifact {
         pub content: Content,
     }
     
-    impl Artifact for OutputArtifact {
+    impl HContent for OutputArtifact {
         fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
             Ok(match &self.content {
                 Content::Raw(raw) => Box::new(io::Cursor::new(raw.data.clone())),
@@ -257,15 +257,14 @@ pub mod outputartifact {
                 Content::Raw(raw) => {
                     Box::new(std::iter::once(Ok(WalkEntry {
                         path: PathBuf::from(&raw.path),
-                        data: raw.data.clone(),
+                        data: Box::new(io::Cursor::new(raw.data.clone())),
                         x: raw.x,
                     })))
                 },
                 Content::File(file) => {
-                    let data = fs::read(&file.source_path)?;
                     Box::new(std::iter::once(Ok(WalkEntry {
                         path: PathBuf::from(&file.out_path),
-                        data,
+                        data: Box::new(File::open(&file.source_path)?),
                         x: file.x,
                     })))
                 },

@@ -1,4 +1,4 @@
-use crate::hartifactcontent::{Artifact, Type, WalkEntry};
+use crate::hartifactcontent::{Content as HContent, Type, WalkEntry};
 use std::fs::File;
 use std::io;
 use crate::engine::driver::outputartifact::{Content, OutputArtifact};
@@ -6,6 +6,7 @@ use crate::engine::Engine;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use std::sync::Arc;
+use crate::engine::driver::outputartifact;
 use crate::hartifactcontent::tar::TarPacker;
 
 pub trait LocalCache: Send + Sync {
@@ -24,7 +25,7 @@ pub struct CacheArtifact {
     pub content_type: Type,
 }
 
-impl Artifact for CacheArtifact {
+impl HContent for CacheArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
         self.cache.reader(&self.addr, &self.hashin, &self.name)
     }
@@ -43,7 +44,13 @@ impl Artifact for CacheArtifact {
 
 impl Engine {
     pub async fn cache_artifact_locally(&self, _ctoken: &dyn Cancellable, addr: &Addr, hashin: &str, artifact: &OutputArtifact) -> anyhow::Result<CacheArtifact> {
-        let mut writer = self.local_cache.writer(addr, hashin, &artifact.name)?;
+        let name = format!("{}_{}", match artifact.r#type{
+            outputartifact::Type::Output => "out",
+            outputartifact::Type::Log => "log",
+            outputartifact::Type::SupportFile => "support",
+            _ => panic!("unsupported artifact {:?}", artifact.r#type),
+        }, artifact.name);
+        let mut writer = self.local_cache.writer(addr, hashin, &name)?;
 
         let mut src: Box<dyn io::Read> = match &artifact.content {
             Content::Raw(raw) => {
@@ -81,7 +88,7 @@ impl Engine {
         Ok(CacheArtifact{
             addr: addr.clone(),
             hashin: hashin.to_string(),
-            name: artifact.name.clone(),
+            name,
             cache: self.local_cache.clone(),
             content_type,
         })

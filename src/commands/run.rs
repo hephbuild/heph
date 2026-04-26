@@ -1,5 +1,4 @@
 use std::io;
-use std::io::Cursor;
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
@@ -43,7 +42,7 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
         for r in result {
             for a in r.artifacts {
                 for e in a.walk()? {
-                    io::copy(&mut Cursor::new(e?.data), &mut io::stdout())?;
+                    io::copy(&mut e?.data, &mut io::stdout())?;
                 }
             }
         }

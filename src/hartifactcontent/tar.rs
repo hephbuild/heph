@@ -2,16 +2,33 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
 use std::mem;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::hartifactcontent::WalkEntry;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+struct PoisonableReader {
+    inner: Box<dyn Read>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl Read for PoisonableReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::Other, "stale tar entry: next() advanced past this entry"));
+        }
+        self.inner.read(buf)
+    }
+}
 
 // entries must be declared before _archive: Rust drops fields in declaration order,
 // so entries (which borrows from archive's heap) is freed before _archive.
 pub struct TarWalker {
     entries: tar::Entries<'static, Box<dyn Read>>,
     _archive: Box<tar::Archive<Box<dyn Read>>>,
+    current_poison: Option<Arc<AtomicBool>>,
 }
 
 impl TarWalker {
@@ -25,7 +42,7 @@ impl TarWalker {
             let ptr: *mut tar::Archive<Box<dyn Read>> = &mut *archive;
             mem::transmute((*ptr).entries()?)
         };
-        Ok(Self { entries, _archive: archive })
+        Ok(Self { entries, _archive: archive, current_poison: None })
     }
 }
 
@@ -33,8 +50,11 @@ impl Iterator for TarWalker {
     type Item = anyhow::Result<WalkEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(poison) = self.current_poison.take() {
+            poison.store(true, Ordering::Release);
+        }
         loop {
-            let mut entry = match self.entries.next()? {
+            let entry = match self.entries.next()? {
                 Ok(e) => e,
                 Err(e) => return Some(Err(e.into())),
             };
@@ -50,11 +70,18 @@ impl Iterator for TarWalker {
                 Err(e) => return Some(Err(e.into())),
             };
             let x = mode & 0o111 != 0;
-            let mut data = Vec::new();
-            if let Err(e) = entry.read_to_end(&mut data) {
-                return Some(Err(e.into()));
-            }
-            return Some(Ok(WalkEntry { path, data, x }));
+            let poison = Arc::new(AtomicBool::new(false));
+            self.current_poison = Some(poison.clone());
+            // SAFETY: entry borrows from entries which borrows from archive's stable heap allocation.
+            // PoisonableReader poisons on next(), preventing reads after the stream advances.
+            let reader: Box<dyn Read> = unsafe {
+                let entry = mem::transmute::<
+                    tar::Entry<'_, Box<dyn Read>>,
+                    tar::Entry<'static, Box<dyn Read>>,
+                >(entry);
+                Box::new(PoisonableReader { inner: Box::new(entry), poisoned: poison })
+            };
+            return Some(Ok(WalkEntry { path, data: reader, x }));
         }
     }
 }

@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::fmt;
 use futures::TryStreamExt;
 use tokio::task::JoinSet;
-use crate::hartifactcontent::Artifact;
+use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
 
-impl fmt::Debug for dyn Artifact {
+impl fmt::Debug for dyn Content {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Artifact")
     }
@@ -23,7 +23,7 @@ impl fmt::Debug for dyn Artifact {
 
 #[derive(Clone)]
 pub struct EResult {
-    pub artifacts: Vec<Arc<dyn Artifact>>,
+    pub artifacts: Vec<Arc<dyn Content>>,
 }
 
 struct ExecuteOptions<'a> {
@@ -81,14 +81,14 @@ impl Engine {
 
         if !opts.def.cache {
             return anyhow::Ok(EResult {
-                artifacts: artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Artifact>).collect(),
+                artifacts: artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
             })
         }
 
         let cached_artifacts = self.cache_locally(&rs.ctoken, addr, opts.hashin.as_str(), artifacts).await?;
 
         anyhow::Ok(EResult {
-            artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Artifact>).collect(),
+            artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
         })
     }
 
