@@ -1,4 +1,5 @@
 use std::io;
+use std::io::Cursor;
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
@@ -17,6 +18,9 @@ pub struct RunArgs {
     /// Print output artifacts to stdout
     #[arg(long = "cat-out")]
     pub cat_out: bool,
+    /// Print output file list to stdout
+    #[arg(long = "list-out")]
+    pub list_out: bool,
 }
 
 #[tokio::main]
@@ -38,8 +42,17 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
     if args.cat_out {
         for r in result {
             for a in r.artifacts {
-                let mut reader = a.reader()?;
-                io::copy(&mut reader, &mut io::stdout())?;
+                for e in a.walk()? {
+                    io::copy(&mut Cursor::new(e?.data), &mut io::stdout())?;
+                }
+            }
+        }
+    } else if args.list_out {
+        for r in result {
+            for a in r.artifacts {
+                for e in a.walk()? {
+                    println!("{}", e?.path.display());
+                }
             }
         }
     } else {

@@ -1,14 +1,24 @@
+use std::fs;
 use std::path::Path;
-use crate::hartifactcontent::Content;
-use crate::hartifactcontent::unpack_file::unpack_file;
-use crate::hartifactcontent::unpack_raw::unpack_raw;
-use crate::hartifactcontent::unpack_tar::unpack_tar;
+use crate::hartifactcontent::{Artifact};
 
-pub fn unpack(content: &Content, to: &Path) -> anyhow::Result<()> {
-    match content {
-        Content::File(file) => unpack_file(file, to),
-        Content::Raw(raw) => unpack_raw(raw, to),
-        Content::TarPath(path) => unpack_tar(path, to),
-        Content::CpioPath(_) => unimplemented!("CpioPath unpack not yet implemented"),
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+pub fn unpack(content: &dyn Artifact, to: &Path) -> anyhow::Result<()> {
+    for entry in content.walk()? {
+        let entry = entry?;
+        let dest = to.join(&entry.path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, &entry.data)?;
+        #[cfg(unix)]
+        if entry.x {
+            let mut perms = fs::metadata(&dest)?.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            fs::set_permissions(&dest, perms)?;
+        }
     }
+    Ok(())
 }

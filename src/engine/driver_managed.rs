@@ -1,12 +1,13 @@
 use std::{fs, io};
+use std::fs::File;
 use std::path::PathBuf;
 use async_trait::async_trait;
 use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver, ParseRequest, ParseResponse, RunRequest, RunResponse};
 use crate::engine::Engine;
 use crate::{defer, hartifactcontent, hasync};
+use crate::engine::driver::outputartifact::Content::TarPath;
 use crate::engine::driver::outputartifact::Type::Output;
 use crate::engine::driver::targetdef::path::Content;
-use crate::hartifactcontent::Content::TarPath;
 use crate::hasync::Cancellable;
 
 pub struct ManagedRunRequest<'a> {
@@ -90,7 +91,7 @@ impl Driver for ManagedDriverBridge {
         fs::create_dir_all(&ws_dir)?;
 
         for input in &req.inputs {
-            hartifactcontent::unpack::unpack(&input.artifact.content, ws_dir.as_path())?;
+            hartifactcontent::unpack::unpack(input.artifact.content.as_ref(), ws_dir.as_path())?;
         }
 
         let target = req.target;
@@ -110,7 +111,7 @@ impl Driver for ManagedDriverBridge {
                 continue;
             }
 
-            let mut tar = hartifactcontent::pack_tar::TarPacker::new();
+            let mut tar = hartifactcontent::tar::TarPacker::new();
 
             for path in &output.paths {
                 if !path.collect {
@@ -148,7 +149,8 @@ impl Driver for ManagedDriverBridge {
             }
 
             let tarpath = String::from("/tmp/somepath");
-            tar.pack(std::path::Path::new(&tarpath)).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
+            let tarf = File::create(std::path::Path::new(&tarpath))?;
+            tar.pack(tarf).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
 
             res.artifacts.push(outputartifact::OutputArtifact{
                 group: output.group.clone(),

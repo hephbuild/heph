@@ -7,6 +7,6 @@ target(
 target(
     name = "hello_out",
     driver = "bash",
-    run = "echo hello > $OUT",
+    run = "env; echo 'hello world' > $OUT",
     out = "out",
 )

@@ -166,7 +166,7 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
-    use crate::hartifactcontent::Content;
+    use crate::hartifactcontent::Artifact;
 
     pub enum Type {
         Output,
@@ -178,7 +178,7 @@ pub mod inputartifact {
         pub name: String,
         pub r#type: Type,
         pub id: String,
-        pub content: Content,
+        pub content: Box<dyn Artifact>,
     }
 }
 
@@ -188,7 +188,11 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
-    use crate::hartifactcontent::Content;
+    use std::fs::File;
+    use std::{fs, io};
+    use std::io::Read;
+    use std::path::PathBuf;
+    use crate::hartifactcontent::{Artifact, WalkEntry};
 
     #[derive(Clone)]
     pub enum Type {
@@ -200,11 +204,75 @@ pub mod outputartifact {
     }
 
     #[derive(Clone)]
+    pub struct ContentRaw {
+        pub data: Vec<u8>,
+        pub path: String,
+        pub x: bool,
+    }
+
+    #[derive(Clone)]
+    pub struct ContentFile {
+        pub source_path: String,
+        pub out_path: String,
+        pub x: bool,
+    }
+
+    #[derive(Clone)]
+    pub enum Content {
+        File(ContentFile),
+        Raw(ContentRaw),
+        TarPath(String),
+        CpioPath(String),
+    }
+
+    #[derive(Clone)]
     pub struct OutputArtifact {
         pub group: String,
         pub name: String,
         pub r#type: Type,
         pub content: Content,
+    }
+    
+    impl Artifact for OutputArtifact {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            Ok(match &self.content {
+                Content::Raw(raw) => Box::new(io::Cursor::new(raw.data.clone())),
+                Content::File(file) => Box::new(File::open(&file.source_path)?),
+                Content::TarPath(path) => Box::new(File::open(path)?),
+                Content::CpioPath(path) => Box::new(File::open(path)?),
+            })
+        }
+
+        fn content_type(&self) -> anyhow::Result<crate::hartifactcontent::Type> {
+            Ok(match &self.content {
+                Content::Raw(_) => crate::hartifactcontent::Type::Tar,
+                Content::File(_) => crate::hartifactcontent::Type::Tar,
+                Content::TarPath(_) => crate::hartifactcontent::Type::Tar,
+                Content::CpioPath(_) => crate::hartifactcontent::Type::Cpio,
+            })
+        }
+
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item=anyhow::Result<WalkEntry>> + '_>> {
+            Ok(match &self.content {
+                Content::Raw(raw) => {
+                    Box::new(std::iter::once(Ok(WalkEntry {
+                        path: PathBuf::from(&raw.path),
+                        data: raw.data.clone(),
+                        x: raw.x,
+                    })))
+                },
+                Content::File(file) => {
+                    let data = fs::read(&file.source_path)?;
+                    Box::new(std::iter::once(Ok(WalkEntry {
+                        path: PathBuf::from(&file.out_path),
+                        data,
+                        x: file.x,
+                    })))
+                },
+                Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(File::open(path)?)?),
+                Content::CpioPath(path) => unimplemented!("cpio is not implemented"),
+            })
+        }
     }
 }
 

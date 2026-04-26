@@ -30,6 +30,7 @@ The `gen` script is a devenv-provided alias, assume its present. It must be run 
 - Prefer `async_trait` for async trait methods. Async closures passed to the engine's `Memoizer` must return `WrappedError`-wrapped results.
 - All new `Provider` and `Driver` implementations must be registered via `Engine::register_provider` / `Engine::register_driver` — the engine owns the registry.
 - Avoid `#[allow(unused_*)]` attributes in committed code. The `dev.sh` script sets these flags only for the interactive dev workflow.
+- Always think about performance, this is a high-performance system, allocation and CPU cycles are expensive (for ex: use iterator instead of Vec where it makes sense, try not to allocate where unecessary)
 
 ## Architecture
 

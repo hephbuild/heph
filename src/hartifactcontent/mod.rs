@@ -1,27 +1,23 @@
-mod unpack_file;
-mod unpack_raw;
-pub mod pack_tar;
-mod unpack_tar;
+pub mod tar;
 pub mod unpack;
 
-#[derive(Clone)]
-pub struct ContentRaw {
+use std::io;
+use std::path::PathBuf;
+
+pub struct WalkEntry {
+    pub path: PathBuf,
     pub data: Vec<u8>,
-    pub path: String,
     pub x: bool,
 }
 
 #[derive(Clone)]
-pub struct ContentFile {
-    pub source_path: String,
-    pub out_path: String,
-    pub x: bool,
+pub enum Type {
+    Tar,
+    Cpio,
 }
 
-#[derive(Clone)]
-pub enum Content {
-    File(ContentFile),
-    Raw(ContentRaw),
-    TarPath(String),
-    CpioPath(String),
+pub trait Artifact: Send + Sync {
+    fn reader(&self) -> anyhow::Result<Box<dyn io::Read>>;
+    fn content_type(&self) -> anyhow::Result<Type>;
+    fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>>;
 }

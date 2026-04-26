@@ -7,17 +7,13 @@ use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
 use crate::htaddr::Addr;
 use crate::hmemoizer::WrappedError;
-use std::io;
 use std::sync::Arc;
 
 use std::fmt;
 use futures::TryStreamExt;
 use tokio::task::JoinSet;
+use crate::hartifactcontent::Artifact;
 use crate::htmatcher::Matcher;
-
-pub trait Artifact: Send + Sync {
-    fn reader(&self) -> anyhow::Result<Box<dyn io::Read>>;
-}
 
 impl fmt::Debug for dyn Artifact {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -34,12 +30,6 @@ struct ExecuteOptions<'a> {
     hashin: &'a String,
     spec: &'a TargetSpec,
     def: &'a TargetDef
-}
-
-impl Artifact for OutputArtifact {
-    fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
-        anyhow::bail!("not implemented")
-    }
 }
 
 impl Engine {
