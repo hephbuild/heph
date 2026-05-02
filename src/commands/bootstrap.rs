@@ -1,8 +1,4 @@
 use crate::{engine, pluginbuildfile, pluginexec};
-use crate::engine::driver::sandbox::Sandbox;
-use crate::engine::provider::{StaticProvider, TargetSpec};
-use crate::htaddr::Addr;
-use crate::htpkg::PkgBuf;
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let root = match engine::get_root() {
@@ -14,22 +10,6 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
         root,
     })?;
 
-    e.register_provider(|_root| Box::new(StaticProvider {
-        targets: vec![
-            TargetSpec {
-                addr: Addr{
-                    package: PkgBuf::from("some"),
-                    name: "t".to_string(),
-                    args: Default::default(),
-                },
-                driver: "exec".to_string(),
-                config: Default::default(),
-                labels: vec![],
-                transitive: Sandbox::default(),
-            },
-        ],
-        packages: Default::default(),
-    }))?;
     e.register_provider(|root| Box::new(pluginbuildfile::Provider{
         root: root.to_path_buf(),
         ..pluginbuildfile::Provider::default()

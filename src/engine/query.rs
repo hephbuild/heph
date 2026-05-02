@@ -56,42 +56,38 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
     use futures::TryStreamExt;
     use crate::engine::Config;
-    use crate::engine::provider::{StaticProvider, TargetSpec};
     use crate::htmatcher::Matcher;
+    use crate::pluginstatictarget;
     use tempfile::tempdir;
 
-    fn make_spec(pkg: &str, name: &str, labels: &[&str]) -> TargetSpec {
-        TargetSpec {
-            addr: Addr {
-                package: PkgBuf::from(pkg),
-                name: name.to_string(),
-                args: HashMap::new(),
-            },
+    fn target(pkg: &str, name: &str, labels: &[&str]) -> pluginstatictarget::Target {
+        pluginstatictarget::Target {
+            addr: format!("//{pkg}:{name}"),
             driver: "exec".to_string(),
+            run: None,
+            out: None,
             labels: labels.iter().map(|s| s.to_string()).collect(),
-            ..Default::default()
         }
+    }
+
+    fn make_engine(targets: Vec<pluginstatictarget::Target>) -> anyhow::Result<Arc<Engine>> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok(Arc::new(engine))
     }
 
     #[tokio::test]
     async fn query_by_package() -> anyhow::Result<()> {
-        let root = tempdir()?;
-        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let engine = make_engine(vec![
+            target("foo/bar", "a", &[]),
+            target("foo/bar", "b", &[]),
+            target("other", "c", &[]),
+        ])?;
 
-        engine.register_provider(|_| Box::new(StaticProvider {
-            targets: vec![
-                make_spec("foo/bar", "a", &[]),
-                make_spec("foo/bar", "b", &[]),
-                make_spec("other", "c", &[]),
-            ],
-            packages: OnceLock::new(),
-        }))?;
-
-        let engine = Arc::new(engine);
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("foo/bar"))).try_collect().await?;
 
@@ -103,23 +99,16 @@ mod tests {
 
     #[tokio::test]
     async fn query_by_addr() -> anyhow::Result<()> {
-        let root = tempdir()?;
-        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let engine = make_engine(vec![
+            target("foo", "a", &[]),
+            target("foo", "b", &[]),
+        ])?;
 
-        engine.register_provider(|_| Box::new(StaticProvider {
-            targets: vec![
-                make_spec("foo", "a", &[]),
-                make_spec("foo", "b", &[]),
-            ],
-            packages: OnceLock::new(),
-        }))?;
-
-        let engine = Arc::new(engine);
         let rs = engine.new_state();
         let target_addr = Addr {
             package: PkgBuf::from("foo"),
             name: "a".to_string(),
-            args: HashMap::new(),
+            args: Default::default(),
         };
         let addrs: Vec<Addr> = engine.query(rs, &Matcher::Addr(target_addr)).try_collect().await?;
 
@@ -130,23 +119,16 @@ mod tests {
 
     #[tokio::test]
     async fn query_by_label_calls_get_spec() -> anyhow::Result<()> {
-        let root = tempdir()?;
-        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let engine = make_engine(vec![
+            target("foo", "a", &["//labels:lint"]),
+            target("foo", "b", &[]),
+        ])?;
 
-        engine.register_provider(|_| Box::new(StaticProvider {
-            targets: vec![
-                make_spec("foo", "a", &["//labels:lint"]),
-                make_spec("foo", "b", &[]),
-            ],
-            packages: OnceLock::new(),
-        }))?;
-
-        let engine = Arc::new(engine);
         let rs = engine.new_state();
         let label_addr = Addr {
             package: PkgBuf::from("labels"),
             name: "lint".to_string(),
-            args: HashMap::new(),
+            args: Default::default(),
         };
         let addrs: Vec<Addr> = engine.query(rs, &Matcher::Label(label_addr)).try_collect().await?;
 
@@ -157,15 +139,8 @@ mod tests {
 
     #[tokio::test]
     async fn query_empty_when_no_match() -> anyhow::Result<()> {
-        let root = tempdir()?;
-        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let engine = make_engine(vec![target("foo", "a", &[])])?;
 
-        engine.register_provider(|_| Box::new(StaticProvider {
-            targets: vec![make_spec("foo", "a", &[])],
-            packages: OnceLock::new(),
-        }))?;
-
-        let engine = Arc::new(engine);
         let rs = engine.new_state();
         let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("nonexistent"))).try_collect().await?;
 

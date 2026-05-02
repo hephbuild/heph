@@ -190,54 +190,8 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
-    use crate::engine::provider::StaticProvider;
     use crate::htpkg::PkgBuf;
     use tempfile::tempdir;
-
-    #[tokio::test]
-    async fn test_engine_result_static_provider() -> anyhow::Result<()> {
-        let root = tempdir()?;
-        let cfg = Config {
-            root: root.path().to_path_buf(),
-        };
-
-        let mut engine = Engine::new(cfg)?;
-        engine.register_provider(|_root| Box::new(StaticProvider {
-            targets: vec![
-                TargetSpec {
-                    addr: Addr {
-                        package: PkgBuf::from("some"),
-                        name: "t".to_string(),
-                        args: Default::default(),
-                    },
-                    driver: "exec".to_string(),
-                    config: Default::default(),
-                    labels: vec![],
-                    transitive: Default::default(),
-                },
-            ],
-            packages: Default::default(),
-        }))?;
-        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
-
-        let engine = Arc::new(engine);
-        let rs = engine.new_state();
-        let addr = Addr {
-            package: PkgBuf::from("some"),
-            name: "t".to_string(),
-            args: Default::default(),
-        };
-
-        let result = engine.clone().result_addr(rs.clone(), &addr, &ResultOptions::default()).await?;
-
-        assert!(result.artifacts.is_empty());
-
-        // Test caching (second call)
-        let result2 = engine.clone().result_addr(rs, &addr, &ResultOptions::default()).await?;
-        assert!(result2.artifacts.is_empty());
-
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_engine_result_not_found() -> anyhow::Result<()> {

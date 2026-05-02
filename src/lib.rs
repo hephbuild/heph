@@ -10,3 +10,4 @@ pub mod pluginexec;
 pub mod pluginbuildfile;
 pub mod defer;
 pub mod hartifactcontent;
+pub mod pluginstatictarget;

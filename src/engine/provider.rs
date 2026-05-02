@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use futures::future::BoxFuture;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::hasync::Cancellable;
@@ -84,56 +83,3 @@ pub trait Provider: Send + Sync {
     fn probe<'a>(&'a self, req: ProbeRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
 }
 
-pub struct StaticProvider {
-    pub targets: Vec<TargetSpec>,
-    pub packages: OnceLock<Vec<ListPackageResponse>>,
-}
-
-impl Provider for StaticProvider {
-    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse{
-            name: "static".to_string(),
-        })
-    }
-
-    fn list<'a>(&'a self, _req: ListRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
-        Box::pin(async move {
-            let items: Vec<anyhow::Result<ListResponse>> = self.targets.iter().map(|t| Ok(ListResponse { addr: t.addr.clone() })).collect();
-
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
-        })
-    }
-
-    fn list_packages<'a>(&'a self, _req: ListPackagesRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>> {
-        let pkgs = self.packages.get_or_init(|| {
-            let mut seen = std::collections::HashSet::new();
-            self.targets.iter()
-                .filter(|t| seen.insert(t.addr.package.clone()))
-                .map(|t| ListPackageResponse { pkg: t.addr.package.clone() })
-                .collect()
-        });
-
-        Box::pin(async move {
-            let items: Vec<anyhow::Result<ListPackageResponse>> = pkgs.iter().cloned().map(Ok).collect();
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>)
-        })
-    }
-
-    fn get<'a>(&'a self, req: GetRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async move {
-            for t in &self.targets {
-                if t.addr == req.addr {
-                    return Ok(GetResponse{target_spec: t.clone()});
-                }
-            }
-
-            Err(GetError::NotFound)
-        })
-    }
-
-    fn probe<'a>(&'a self, _req: ProbeRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
-        Box::pin(async move {
-            Ok(ProbeResponse{states: vec![]})
-        })
-    }
-}

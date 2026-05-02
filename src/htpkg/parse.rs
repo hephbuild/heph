@@ -22,6 +22,9 @@ pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
     // Absolute package reference
     if let Some(abs) = input.strip_prefix("//") {
         // Check for `...` suffix
+        if abs == "..." {
+            return Ok(Matcher::PackagePrefix(PkgBuf::from("")));
+        }
         if let Some(prefix) = abs.strip_suffix("/...") {
             return Ok(Matcher::PackagePrefix(PkgBuf::from(prefix)));
         }
@@ -39,10 +42,10 @@ pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
 
         let pkg = resolve_relative_pkg(base, path_part)?;
 
-        if has_ellipsis {
-            return Ok(Matcher::PackagePrefix(PkgBuf::from(pkg)));
+        return if has_ellipsis {
+            Ok(Matcher::PackagePrefix(PkgBuf::from(pkg)))
         } else {
-            return Ok(Matcher::Package(PkgBuf::from(pkg)));
+            Ok(Matcher::Package(PkgBuf::from(pkg)))
         }
     }
 

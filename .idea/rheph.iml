@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/gen/proto/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/gen/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/e2e/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/src/defer/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.devenv" />
       <excludeFolder url="file://$MODULE_DIR$/target" />

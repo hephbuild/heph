@@ -114,6 +114,7 @@ impl Driver for ManagedDriverBridge {
         }
 
         let target = req.target;
+        let hashin = req.hashin.clone();
 
         let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
         fs::create_dir_all(sandbox_pkg_dir)?;
@@ -167,7 +168,12 @@ impl Driver for ManagedDriverBridge {
                 }
             }
 
-            let tarpath = String::from("/tmp/somepath");
+            let artifacts_dir = self.home.join("artifacts");
+            fs::create_dir_all(&artifacts_dir)?;
+            let tarpath = artifacts_dir
+                .join(format!("{}-{}.tar", hashin, output.group))
+                .to_string_lossy()
+                .into_owned();
             let tarf = File::create(std::path::Path::new(&tarpath))?;
 
             let mut hw = HashingWriter { inner: tarf, hasher: Xxh3::new() };

@@ -73,7 +73,7 @@ impl Engine {
         Ok(())
     }
 
-    pub fn register_provider(&mut self, provider_factory: fn(root: &Path) -> Box<dyn SDKProvider>) -> anyhow::Result<()> {
+    pub fn register_provider(&mut self, provider_factory: impl FnOnce(&Path) -> Box<dyn SDKProvider>) -> anyhow::Result<()> {
         let provider = provider_factory(self.cfg.root.as_path());
 
         let provider = Arc::new(Provider {

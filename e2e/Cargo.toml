@@ -1,0 +1,11 @@
+[package]
+name = "e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dev-dependencies]
+rheph = { path = ".." }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+anyhow = "1"
+tempfile = "3"

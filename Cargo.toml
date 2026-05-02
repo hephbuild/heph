@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto"]
+members = ["gen/proto", "e2e"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
