@@ -28,7 +28,7 @@ fn main() -> ExitCode {
     match cli.command.execute() {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            error!(_logger, "Failed"; "error" => %e);
+            error!(_logger, "Failed"; "error" => %format!("{:#}", e));
 
             ExitCode::FAILURE
         },

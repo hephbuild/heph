@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::{fs, io};
 use std::fs::File;
 use std::path::PathBuf;
@@ -122,7 +123,7 @@ impl Driver for ManagedDriverBridge {
             sandbox_ws_dir: ws_dir.clone(),
             sandbox_pkg_dir: sandbox_pkg_dir.clone(),
             request: req,
-        }, ctoken).await.map_err(|err| anyhow::anyhow!("aa: {}", err))?;
+        }, ctoken).await.with_context(|| "driver run")?;
 
         for output in &target.outputs {
             if !output.paths.iter().any(|path| path.collect) {
@@ -171,7 +172,7 @@ impl Driver for ManagedDriverBridge {
 
             let mut hw = HashingWriter { inner: tarf, hasher: Xxh3::new() };
 
-            tar.pack(&mut hw).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
+            tar.pack(&mut hw).with_context(|| "pack")?;
 
             res.artifacts.push(outputartifact::OutputArtifact{
                 group: output.group.clone(),

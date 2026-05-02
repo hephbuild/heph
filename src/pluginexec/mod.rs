@@ -1,5 +1,6 @@
 mod spec;
 
+use std::hash::Hash;
 use std::process::Stdio;
 use tokio::process::Command;
 use async_trait::async_trait;
@@ -7,6 +8,7 @@ use tokio::io;
 use crate::engine;
 use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse};
 use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3Default;
 use crate::engine::driver::targetdef::{Output, TargetDef as EngineTargetDef};
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
@@ -17,6 +19,7 @@ pub struct Driver {
     wrap_run: fn(&Vec<String>) -> Vec<String>,
 }
 
+#[derive(Hash)]
 struct TargetDef {
     pub run: Vec<String>,
 }
@@ -104,14 +107,22 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
     async fn parse(&self, req: ParseRequest, _ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse> {
         let spec = spec::TargetSpec::from(req.target_spec.config)?;
+        let def = TargetDef{
+            run: spec.run,
+        };
+
+        let hash = {
+            let mut h = Xxh3Default::new();
+            def.hash(&mut h);
+
+            format!("{:x}", h.digest()).into_bytes()
+        };
 
         Ok(ParseResponse {
             target_def: EngineTargetDef{
                 addr: req.target_spec.addr,
                 labels: req.target_spec.labels,
-                raw_def: Arc::new(TargetDef{
-                    run: spec.run,
-                }),
+                raw_def: Arc::new(def),
                 inputs: vec![],
                 outputs: spec.outputs.iter().map(|(k, v)| Output{
                     group: k.clone(),
@@ -133,7 +144,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 cache: spec.cache.local,
                 disable_remote_cache: !spec.cache.remote,
                 pty: true,
-                hash: vec![],
+                hash,
             }
         })
     }

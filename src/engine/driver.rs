@@ -73,17 +73,13 @@ pub struct ParseRequest {
 pub mod targetdef {
     use std::any::Any;
     use std::sync::Arc;
-    use derivative::Derivative;
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
 
-    #[derive(Derivative)]
-    #[derivative(Hash)]
     #[derive(Clone)]
     pub struct TargetDef {
         pub addr: Addr,
         pub labels: Vec<String>,
-        #[derivative(Hash = "ignore")]
         pub raw_def: Arc<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
@@ -100,21 +96,21 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone, Hash)]
+    #[derive(Clone)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
     }
 
-    #[derive(Clone, Hash)]
+    #[derive(Clone)]
     pub enum InputMode {
         Unspecified,
         Link,
         None,
     }
 
-    #[derive(Clone, Hash)]
+    #[derive(Clone)]
     pub struct Output {
         pub group: String,
         pub paths: Vec<path::Path>,
@@ -123,14 +119,14 @@ pub mod targetdef {
     pub mod path {
         use std::fmt::Display;
 
-        #[derive(Clone, Hash)]
+        #[derive(Clone)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
-        #[derive(Clone, Hash)]
+        #[derive(Clone)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
@@ -147,7 +143,7 @@ pub mod targetdef {
             }
         }
 
-        #[derive(Clone, Hash)]
+        #[derive(Clone)]
         pub enum CodegenMode {
             None,
             Copy,

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::driver::{ParseRequest, RunRequest};
@@ -26,6 +27,11 @@ pub struct EResult {
     pub artifacts: Vec<Arc<dyn Content>>,
 }
 
+#[derive(Default, Clone, Copy)]
+pub struct ResultOptions {
+    pub force: bool,
+}
+
 struct ExecuteOptions<'a> {
     hashin: &'a String,
     spec: &'a TargetSpec,
@@ -34,17 +40,19 @@ struct ExecuteOptions<'a> {
 }
 
 impl Engine {
-    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
+    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ResultOptions) -> anyhow::Result<EResult> {
         let key = addr.format();
-        let res = rs.mem_result.process(key, (self, rs.clone(), addr.clone()), |(engine, rs, addr)| async move {
-            engine.inner_result_addr(rs, &addr).await.map_err(WrappedError::from)
+        let opts = *opts;
+        let res = rs.mem_result.process(key, (self, rs.clone(), addr.clone(), opts), |(engine, rs, addr, opts)| async move {
+            engine.inner_result_addr(rs, &addr, &opts).await.map_err(WrappedError::from)
         }).await?;
 
         Ok(res)
     }
 
-    pub async fn result(self: Arc<Self>, rs: Arc<RequestState>, matcher: &Matcher) -> anyhow::Result<Vec<EResult>> {
+    pub async fn result(self: Arc<Self>, rs: Arc<RequestState>, matcher: &Matcher, opts: &ResultOptions) -> anyhow::Result<Vec<EResult>> {
         let mut set = JoinSet::new();
+        let opts = *opts;
 
         let stream = self.query(rs.clone(), matcher);
         tokio::pin!(stream);
@@ -52,7 +60,7 @@ impl Engine {
             let engine = self.clone();
             let rs = rs.clone();
             set.spawn(async move {
-                engine.result_addr(rs, &addr).await
+                engine.result_addr(rs, &addr, &opts).await
             });
         }
 
@@ -64,7 +72,7 @@ impl Engine {
         Ok(all_res)
     }
 
-    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
+    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ResultOptions) -> anyhow::Result<EResult> {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
@@ -74,7 +82,7 @@ impl Engine {
             hashin: &meta.hashin,
             spec: &spec,
             def: &def,
-            force: false,
+            force: opts.force,
         }).await
     }
 
@@ -127,7 +135,7 @@ impl Engine {
                 stdin: None,
                 stdout: None,
                 stderr: None,
-            }, &rs.ctoken).await.map_err(|err| anyhow::anyhow!("run: {}", err))?;
+            }, &rs.ctoken).await.with_context(|| "run")?;
 
             Ok(res.artifacts)
         }).await?;
@@ -147,6 +155,10 @@ impl Engine {
             request_id: rs.request_id.clone(),
             target_spec: spec,
         }, &rs.ctoken).await?;
+
+        if res.target_def.hash.is_empty() {
+            anyhow::bail!("missing hash");
+        }
 
         Ok(res.target_def)
     }
@@ -216,12 +228,12 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result_addr(rs.clone(), &addr).await?;
+        let result = engine.clone().result_addr(rs.clone(), &addr, &ResultOptions::default()).await?;
 
         assert!(result.artifacts.is_empty());
 
         // Test caching (second call)
-        let result2 = engine.clone().result_addr(rs, &addr).await?;
+        let result2 = engine.clone().result_addr(rs, &addr, &ResultOptions::default()).await?;
         assert!(result2.artifacts.is_empty());
 
         Ok(())
@@ -242,7 +254,7 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result_addr(rs, &addr).await;
+        let result = engine.clone().result_addr(rs, &addr, &ResultOptions::default()).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
 

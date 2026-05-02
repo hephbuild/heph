@@ -2,7 +2,7 @@ use std::io;
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::get_cwp;
+use crate::engine::{get_cwp, ResultOptions};
 use crate::htmatcher::Matcher;
 
 #[derive(Args)]
@@ -14,6 +14,9 @@ pub struct RunArgs {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
+    /// Force execution
+    #[arg(long = "force")]
+    pub force: bool,
     /// Print output artifacts to stdout
     #[arg(long = "cat-out")]
     pub cat_out: bool,
@@ -29,12 +32,16 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
 
    let e =  bootstrap::new_engine()?;
 
+    let opts = ResultOptions{
+        force: args.force
+    };
+
     let result = match m {
         Matcher::Addr(addr) => {
-            vec![e.clone().result_addr(e.new_state(), &addr).await?]
+            vec![e.clone().result_addr(e.new_state(), &addr, &opts).await?]
         },
         _ => {
-            e.clone().result(e.new_state(), &m).await?
+            e.clone().result(e.new_state(), &m, &opts).await?
         }
     };
 

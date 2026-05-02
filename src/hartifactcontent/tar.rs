@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
 use std::mem;
@@ -126,7 +127,7 @@ impl TarPacker {
             match entry {
                 PackEntry::File { source, at } => {
                     let mut src = File::open(&source)
-                        .map_err(|err| anyhow::anyhow!("open: {}: {}", source, err))?;
+                        .with_context(|| format!("open: {}", source))?;
                     let meta = src.metadata()?;
                     let x = is_executable(&meta);
                     let mut header = tar::Header::new_gnu();
@@ -144,7 +145,7 @@ impl TarPacker {
                 }
                 PackEntry::AppendTar { path } => {
                     let src = File::open(&path)
-                        .map_err(|err| anyhow::anyhow!("open: {}: {}", path, err))?;
+                        .with_context(|| format!("open: {}", path))?;
                     let mut archive = tar::Archive::new(src);
                     for entry in archive.entries()? {
                         let mut entry = entry?;
