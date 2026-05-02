@@ -5,15 +5,25 @@ use xxhash_rust::xxh3::Xxh3Default;
 use crate::engine::driver::targetdef::Input;
 use crate::engine::{EResult, Engine};
 use crate::engine::request_state::RequestState;
+use crate::hmemoizer::WrappedError;
 use crate::htaddr::Addr;
 
+#[derive(Clone)]
 pub struct ResultMeta {
     pub hashin: String,
 }
 
 impl Engine {
-    #[async_recursion]
     pub async fn meta(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ResultMeta> {
+        let key = addr.format();
+        let res = rs.mem_meta.process_result(key, (self, rs.clone(), addr.clone()), |(engine, rs, addr)| async move {
+            engine.inner_meta(rs, &addr).await.map_err(WrappedError::from)
+        }).await?;
+        Ok(res)
+    }
+
+    #[async_recursion]
+    async fn inner_meta(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ResultMeta> {
         let def = self.get_def(rs.clone(), addr).await?;
         let results = self.clone().inputs_result_meta(rs.clone(), &def.inputs).await?;
 

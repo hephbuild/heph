@@ -1,4 +1,5 @@
 use crate::engine::driver::outputartifact::OutputArtifact;
+use crate::engine::meta::ResultMeta;
 use crate::engine::Engine;
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::{Memoizer, WrappedError};
@@ -10,6 +11,7 @@ pub struct RequestState {
     pub ctoken: StdCancellationToken,
     pub mem_result: Memoizer<String, Result<crate::engine::result::EResult, WrappedError>>,
     pub mem_execute: Memoizer<String, Result<Vec<OutputArtifact>, WrappedError>>,
+    pub mem_meta: Memoizer<String, Result<ResultMeta, WrappedError>>,
 }
 
 impl Drop for RequestState {
@@ -31,6 +33,7 @@ impl Engine {
             ctoken: StdCancellationToken::new(),
             mem_execute: Memoizer::new(),
             mem_result: Memoizer::new(),
+            mem_meta: Memoizer::new(),
         });
 
         if let Ok(mut requests) = self.requests.lock() {
