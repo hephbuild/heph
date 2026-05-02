@@ -9,6 +9,8 @@ use crate::engine::driver::outputartifact::Content::TarPath;
 use crate::engine::driver::outputartifact::Type::Output;
 use crate::engine::driver::targetdef::path::Content;
 use crate::hasync::Cancellable;
+use xxhash_rust::xxh3::Xxh3;
+use std::io::Write;
 
 pub struct ManagedRunRequest<'a> {
     pub request: RunRequest<'a>,
@@ -39,6 +41,22 @@ impl Engine {
             home: self.home.clone(),
             driver,
         }
+    }
+}
+
+struct HashingWriter<W: Write> {
+    inner: W,
+    hasher: Xxh3,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -97,7 +115,7 @@ impl Driver for ManagedDriverBridge {
         let target = req.target;
 
         let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
-        fs::create_dir_all(&sandbox_pkg_dir)?;
+        fs::create_dir_all(sandbox_pkg_dir)?;
 
         let mut res = self.driver.run(ManagedRunRequest{
             sandbox_dir: sandbox_dir.clone(),
@@ -150,13 +168,17 @@ impl Driver for ManagedDriverBridge {
 
             let tarpath = String::from("/tmp/somepath");
             let tarf = File::create(std::path::Path::new(&tarpath))?;
-            tar.pack(tarf).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
+
+            let mut hw = HashingWriter { inner: tarf, hasher: Xxh3::new() };
+
+            tar.pack(&mut hw).map_err(|err| anyhow::anyhow!("pack: {}", err))?;
 
             res.artifacts.push(outputartifact::OutputArtifact{
                 group: output.group.clone(),
                 name: format!("{}.tar", output.group),
                 r#type: Output,
                 content: TarPath(tarpath),
+                hashout: format!("{:x}", hw.hasher.digest())
             });
         }
 

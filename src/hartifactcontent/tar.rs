@@ -17,7 +17,7 @@ struct PoisonableReader {
 impl Read for PoisonableReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::new(io::ErrorKind::Other, "stale tar entry: next() advanced past this entry"));
+            return Err(io::Error::other("stale tar entry: next() advanced past this entry"));
         }
         self.inner.read(buf)
     }

@@ -7,7 +7,9 @@ edition = "2024"
 members = ["gen/proto"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6.0", features = ["derive"] }
 slog = "2.7.0"
 slog-async = "2.8.0"
@@ -21,6 +23,7 @@ memoize = "0.6.0"
 tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util"] }
 futures = "0.3.32"
 async-trait = "0.1.86"
+async-recursion = "1"
 async-stream = "0.3"
 smart-default = "0.7.1"
 humantime = "2.3.0"
@@ -33,5 +36,7 @@ tar = "0.4"
 glob = "0.3"
 walkdir = "2"
 tempfile = "3.10"
+thiserror = "1.0.69"
+derivative = "2.2.0"
 
 [dev-dependencies]

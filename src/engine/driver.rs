@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use crate::hasync;
 use crate::htaddr::Addr;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Hash)]
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
@@ -73,13 +73,17 @@ pub struct ParseRequest {
 pub mod targetdef {
     use std::any::Any;
     use std::sync::Arc;
+    use derivative::Derivative;
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
 
+    #[derive(Derivative)]
+    #[derivative(Hash)]
     #[derive(Clone)]
     pub struct TargetDef {
         pub addr: Addr,
         pub labels: Vec<String>,
+        #[derivative(Hash = "ignore")]
         pub raw_def: Arc<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
@@ -96,21 +100,21 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Hash)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Hash)]
     pub enum InputMode {
         Unspecified,
         Link,
         None,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Hash)]
     pub struct Output {
         pub group: String,
         pub paths: Vec<path::Path>,
@@ -119,14 +123,14 @@ pub mod targetdef {
     pub mod path {
         use std::fmt::Display;
 
-        #[derive(Clone)]
+        #[derive(Clone, Hash)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Hash)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
@@ -143,7 +147,7 @@ pub mod targetdef {
             }
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Hash)]
         pub enum CodegenMode {
             None,
             Copy,
@@ -231,6 +235,7 @@ pub mod outputartifact {
         pub name: String,
         pub r#type: Type,
         pub content: Content,
+        pub hashout: String,
     }
     
     impl HContent for OutputArtifact {
@@ -240,15 +245,6 @@ pub mod outputartifact {
                 Content::File(file) => Box::new(File::open(&file.source_path)?),
                 Content::TarPath(path) => Box::new(File::open(path)?),
                 Content::CpioPath(path) => Box::new(File::open(path)?),
-            })
-        }
-
-        fn content_type(&self) -> anyhow::Result<crate::hartifactcontent::Type> {
-            Ok(match &self.content {
-                Content::Raw(_) => crate::hartifactcontent::Type::Tar,
-                Content::File(_) => crate::hartifactcontent::Type::Tar,
-                Content::TarPath(_) => crate::hartifactcontent::Type::Tar,
-                Content::CpioPath(_) => crate::hartifactcontent::Type::Cpio,
             })
         }
 
@@ -269,8 +265,12 @@ pub mod outputartifact {
                     })))
                 },
                 Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(File::open(path)?)?),
-                Content::CpioPath(path) => unimplemented!("cpio is not implemented"),
+                Content::CpioPath(_) => unimplemented!("cpio is not implemented"),
             })
+        }
+
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok(self.hashout.clone())
         }
     }
 }

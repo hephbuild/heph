@@ -19,3 +19,4 @@ pub mod request_state;
 pub use result::EResult;
 mod matcher_spec;
 pub mod driver_managed;
+mod meta;

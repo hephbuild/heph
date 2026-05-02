@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use crate::htpkg::PkgBuf;
 use itertools::Itertools;
 use xxhash_rust::xxh3::Xxh3Default;
@@ -26,18 +26,20 @@ impl Addr {
         format!("//{}:{}", self.package, self.name)
     }
 
-    pub fn hash(&self) -> u64 {
-        let mut h = Xxh3Default::new();
-        Hasher::write(&mut h, self.package.as_bytes());
-        Hasher::write(&mut h, self.name.as_bytes());
-        for (k, v) in self.args.iter().sorted() {
-            Hasher::write(&mut h, k.as_bytes());
-            Hasher::write(&mut h, v.as_bytes());
-        }
-        h.digest()
-    }
-
     pub fn hash_str(&self) -> String {
-        format!("{:x}", self.hash())
+        let mut h = Xxh3Default::new();
+        self.hash(&mut h);
+        format!("{:x}", h.digest())
+    }
+}
+
+impl Hash for Addr {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        Hasher::write(h, self.package.as_bytes());
+        Hasher::write(h, self.name.as_bytes());
+        for (k, v) in self.args.iter().sorted() {
+            Hasher::write(h, k.as_bytes());
+            Hasher::write(h, v.as_bytes());
+        };
     }
 }

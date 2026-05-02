@@ -1,4 +1,4 @@
-use crate::engine::local_cache::LocalCache;
+use crate::engine::local_cache::{LocalCache, NotFoundError};
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -30,8 +30,11 @@ impl LocalCacheFS {
 impl LocalCache for LocalCacheFS {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Read>> {
         let path = self.get_path(addr, hashin, name);
-        let file = fs::File::open(&path)
-            .with_context(|| format!("Failed to open reader for cache path: {:?}", path))?;
+        let file = match fs::File::open(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(NotFoundError))?,
+            res => res.with_context(|| format!("Failed to open reader for cache path: {:?}", path))?,
+        };
+
         Ok(Box::new(file))
     }
 

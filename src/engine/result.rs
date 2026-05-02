@@ -29,7 +29,8 @@ pub struct EResult {
 struct ExecuteOptions<'a> {
     hashin: &'a String,
     spec: &'a TargetSpec,
-    def: &'a TargetDef
+    def: &'a TargetDef,
+    force: bool,
 }
 
 impl Engine {
@@ -63,33 +64,50 @@ impl Engine {
         Ok(all_res)
     }
 
-    async fn inner_result_addr(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
+    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<EResult> {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
-        let hashin = "".to_string();
+        let meta = self.clone().meta(rs.clone(), addr).await?;
 
         self.execute_and_cache(rs, addr, &ExecuteOptions{
-            hashin: &hashin,
+            hashin: &meta.hashin,
             spec: &spec,
             def: &def,
+            force: false,
         }).await
     }
 
     async fn execute_and_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
+        if !opts.force && opts.def.cache
+            && let Some(res) = self.result_from_cache(rs.clone(), addr, opts).await? {
+                return Ok(res)
+            }
+
         let artifacts = self.execute(rs.clone(), opts).await?;
 
         if !opts.def.cache {
-            return anyhow::Ok(EResult {
+            return Ok(EResult {
                 artifacts: artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
             })
         }
 
         let cached_artifacts = self.cache_locally(&rs.ctoken, addr, opts.hashin.as_str(), artifacts).await?;
 
-        anyhow::Ok(EResult {
+        Ok(EResult {
             artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
         })
+    }
+
+    async fn result_from_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<Option<EResult>> {
+        let cached_artifacts = self.artifacts_from_local_cache(&rs.ctoken, addr, opts.hashin.as_str()).await?;
+        if cached_artifacts.is_none() {
+            return Ok(None)
+        }
+
+        Ok(Some(EResult {
+            artifacts: cached_artifacts.unwrap().into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+        }))
     }
 
     async fn execute(&self, rs: Arc<RequestState>, opts: &ExecuteOptions<'_>) -> anyhow::Result<Vec<OutputArtifact>> {
