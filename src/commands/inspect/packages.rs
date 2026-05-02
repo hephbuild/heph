@@ -1,16 +1,15 @@
-use clap::Args;
 use crate::commands::bootstrap;
 use crate::htmatcher;
 use crate::htpkg::PkgBuf;
 
-#[derive(Args)]
-pub struct PackagesArgs {
+#[derive(clap::Args)]
+pub struct Args {
     /// Packages matcher
     pub matcher: Option<String>,
 }
 
 #[tokio::main]
-pub async fn execute(args: &PackagesArgs) -> anyhow::Result<()>  {
+pub async fn execute(args: &Args) -> anyhow::Result<()>  {
     let e =  bootstrap::new_engine()?;
 
     let m = match &args.matcher {

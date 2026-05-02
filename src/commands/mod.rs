@@ -12,7 +12,7 @@ pub enum Commands {
     #[command(visible_alias = "r")]
     Run(run::RunArgs),
     /// Inspect
-    #[command(arg_required_else_help = true)]
+    #[command(arg_required_else_help = true, visible_alias = "i")]
     Inspect(inspect::InspectArgs),
     /// Query targets
     #[command(visible_alias = "q")]

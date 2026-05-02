@@ -1,4 +1,6 @@
-pub mod packages;
+mod packages;
+mod hashin;
+mod hashout;
 
 use clap::{Args, Subcommand};
 
@@ -15,7 +17,11 @@ pub struct InspectArgs {
 #[derive(Subcommand)]
 pub enum InspectCommands {
     /// List packages
-    Packages(packages::PackagesArgs),
+    Packages(packages::Args),
+    /// Prints targets hashin
+    Hashin(hashin::Args),
+    /// Prints targets hashout
+    Hashout(hashout::Args),
 }
 
 impl InspectArgs {
@@ -35,6 +41,8 @@ impl InspectCommands {
     pub fn execute(&self) -> anyhow::Result<()>  {
         match self {
             InspectCommands::Packages(args) => packages::execute(args),
+            InspectCommands::Hashin(args) => hashin::execute(args),
+            InspectCommands::Hashout(args) => hashout::execute(args),
         }
     }
 }

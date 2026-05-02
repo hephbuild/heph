@@ -1,3 +1,4 @@
+use anyhow::Context;
 use crate::{engine, htaddr, htpkg};
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
@@ -19,12 +20,8 @@ pub fn matcher_from_args(arg1: &String, arg2: &Option<String>, base_pkg: &PkgBuf
             htpkg::parse(package_matcher, &engine::get_cwp()?)?,
         ]))
     } else {
-        let address = arg1;
-        match htaddr::parse_addr(address) {
-            Ok(addr) => Ok(Matcher::Addr(addr)),
-            Err(e) => {
-                anyhow::bail!("Error: '{}' is not a valid target address: {}", address, e);
-            }
-        }
+        let addr_str = arg1;
+        let addr = htaddr::parse_addr(addr_str).with_context(|| format!("parse {}", addr_str))?;
+        Ok(Matcher::Addr(addr))
     }
 }
