@@ -1,0 +1,244 @@
+name: CI
+
+on:
+  push:
+    branches: ["master", "rv1"]
+  pull_request:
+    branches: ["master", "rv1"]
+
+jobs:
+  gen:
+    name: Codegen
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      repo_artifact_id: ${{ steps.upload_repo.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
+
+      - name: Compute version
+        id: version
+        run: |
+          VERSION=$(.github/workflows/version.sh "${{github.run_number}}")
+          echo "$VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "::notice title=Build Version::$VERSION"
+
+      - name: Gen
+        shell: devenv shell bash -- -e {0}
+        run: gen
+
+      - name: Upload repo
+        id: upload_repo
+        uses: actions/upload-artifact@v6
+        with:
+          name: repo
+          path: |
+            .
+            !.devenv/
+          include-hidden-files: true
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 15
+    needs: gen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux AMD64 (Native)
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          # Linux ARM64 (Cross-compiled on AMD64 runner)
+          - os: linux
+            arch: arm64
+            runs-on: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+
+          # macOS AMD64 (Intel natively runs on macos-13)
+          - os: darwin
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-apple-darwin
+
+          # macOS ARM64 (Apple Silicon natively runs on macos-14)
+          - os: darwin
+            arch: arm64
+            runs-on: ubuntu-latest
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
+
+      - name: Build
+        id: build
+        shell: devenv shell bash -- -e {0}
+        env:
+          CARGO_TARGET_DIR: "/tmp/rheph-${{ matrix.target }}"
+          BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
+        run: |
+          echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
+          cargo zigbuild --release --target ${{ matrix.target }} --bin rheph
+          cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{steps.build.outputs.bin_name}}
+          path: ${{steps.build.outputs.bin_name}}
+
+  upload_artifacts:
+    name: Upload artifacts
+    needs: [gen, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_url: ${{ steps.create_release.outputs.url }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: "heph_*"
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lahR dist
+
+      - name: Create Release in artifacts repo
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: hephbuild/heph-artifacts-rust-v1
+          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          tag_name: ${{needs.gen.outputs.version}}
+          name: Build ${{needs.gen.outputs.version}}
+          body: "Artifacts automatically published from source-repo."
+          draft: false
+          prerelease: true
+          files: dist/*
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: gen
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+#      - name: Lint
+#        uses: golangci/golangci-lint-action@v9
+#        with:
+#          version: v2.5
+
+  test:
+    name: Test ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 30
+    needs: gen
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux AMD64 (Native)
+          - os: linux
+            arch: amd64
+            runs-on: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+
+          # macOS ARM64 (Apple Silicon natively runs on macos-14)
+          - os: darwin
+            arch: arm64
+            runs-on: macos-14
+            target: aarch64-apple-darwin
+    steps:
+      - name: Download repo
+        uses: actions/download-artifact@v7
+        with:
+          name: repo
+          path: .
+
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
+
+      - name: Test
+        shell: devenv shell bash -- -e {0}
+        run: cargo test --all
+
+  release:
+    name: Release
+    needs: [gen, upload_artifacts, lint, test]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/v1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Update Release to Production
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: hephbuild/heph-artifacts-rust-v1
+          token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
+          tag_name: ${{needs.gen.outputs.version}}
+          prerelease: false
+          make_latest: true
+
+  summary:
+    name: Summary
+    needs: [gen, upload_artifacts]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** \`${{needs.gen.outputs.version}}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.upload_artifacts.result }}" == "success" ]; then
+            echo "**Release:** [${{needs.gen.outputs.version}}](${{needs.upload_artifacts.outputs.release_url}})" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.upload_artifacts.result }}" == "skipped" ]; then
+            echo "**Release:** Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
+          fi
+      - name: Delete Repo Artifact
+        uses: actions/github-script@v8
+        with:
+          script: |
+            github.rest.actions.deleteArtifact({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              artifact_id: "${{ needs.gen.outputs.repo_artifact_id }}",
+            });

@@ -222,7 +222,7 @@ target(
     labels = ["label1", "label2"],
     config_str = "hello",
     config_int = 42,
-    config_bool = true,
+    config_bool = True,
     config_float = 1.5,
     config_list = ["a", 1],
 )

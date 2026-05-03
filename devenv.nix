@@ -16,6 +16,8 @@ in
     pkgs.protoc-gen-prost
     pkgs.protoc-gen-prost-serde
     pkgs.protoc-gen-prost-crate
+    pkgs.zig
+    pkgs.cargo-zigbuild
   ];
 
   # https://devenv.sh/languages/
