@@ -139,7 +139,7 @@ jobs:
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           tag_name: ${{needs.gen.outputs.version}}
           name: Build ${{needs.gen.outputs.version}}
-          body: "Artifacts automatically published from source-repo."
+          body: "Artifacts automatically published from source-repo (rust)."
           draft: false
           prerelease: true
           files: dist/*
