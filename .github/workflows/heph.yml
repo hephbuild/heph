@@ -20,7 +20,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
       - name: Install devenv.sh
@@ -89,7 +89,7 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
       - name: Install devenv.sh
@@ -135,7 +135,7 @@ jobs:
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
-          repository: hephbuild/heph-artifacts-rust-v1
+          repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           tag_name: ${{needs.gen.outputs.version}}
           name: Build ${{needs.gen.outputs.version}}
@@ -157,7 +157,7 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
       - name: Install devenv.sh
@@ -195,7 +195,7 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v16
+      - uses: cachix/cachix-action@v17
         with:
           name: devenv
       - name: Install devenv.sh
@@ -215,7 +215,7 @@ jobs:
       - name: Update Release to Production
         uses: softprops/action-gh-release@v2
         with:
-          repository: hephbuild/heph-artifacts-rust-v1
+          repository: hephbuild/heph-artifacts-v1
           token: ${{ secrets.HEPH_ARTIFACTS_PAT }}
           tag_name: ${{needs.gen.outputs.version}}
           prerelease: false
