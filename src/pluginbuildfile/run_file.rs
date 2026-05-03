@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpecValue;
 use crate::pluginbuildfile::provider::Provider;
 use starlark::any::ProvidesStaticType;
-use starlark::environment::{GlobalsBuilder, Module};
+use starlark::environment::{Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::float::UnpackFloat;
@@ -10,9 +10,21 @@ use starlark::values::list::UnpackList;
 use starlark::values::{UnpackValue, Value};
 use starlark::starlark_module;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use anyhow::Context;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
+
+static GLOBALS: OnceLock<Globals> = OnceLock::new();
+
+fn get_globals() -> &'static Globals {
+    GLOBALS.get_or_init(|| {
+        let mut builder = GlobalsBuilder::new().with(starlark_module);
+        builder.set("True", true);
+        builder.set("False", false);
+        builder.build()
+    })
+}
 
 #[derive(Debug)]
 pub(crate) struct OnTargetPayload {
@@ -147,10 +159,7 @@ impl Provider {
         let path = path_buf.as_path();
         let ast: AstModule = AstModule::parse_file(path, &Dialect::Extended).map_err(|e| anyhow::anyhow!(e))?;
 
-        let mut builder = GlobalsBuilder::new().with(starlark_module);
-        builder.set("true", true);
-        builder.set("false", false);
-        let globals = builder.build();
+        let globals = get_globals();
 
         let module = Module::new();
 

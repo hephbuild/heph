@@ -17,9 +17,9 @@ impl LocalCacheFS {
         let mut path = self.root.clone();
         path.push(addr.package.as_str());
         if addr.args.is_empty() {
-        path.push(&addr.name);
+        path.push(format!("__target_{}", addr.name));
         } else {
-            path.push(format!("{}_{}", addr.name, addr.hash_str()));
+            path.push(format!("__target_{}_{}", addr.name, addr.hash_str()));
         }
         path.push(hashin);
         path.push(name);

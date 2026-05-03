@@ -39,5 +39,5 @@ target(
         "d1": d1,
     },
     out = "result",
-    # cache = False,
+    cache = False,
 )
