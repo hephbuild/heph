@@ -18,6 +18,7 @@ pub mod driver;
 pub mod request_state;
 pub use result::EResult;
 pub use result::ResultOptions;
+pub use result::OutputMatcher;
 mod matcher_spec;
 pub mod driver_managed;
 mod meta;

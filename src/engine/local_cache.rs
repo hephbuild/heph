@@ -8,6 +8,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use crate::engine::driver::outputartifact;
 use serde::{Deserialize, Serialize};
+use crate::engine::link::LinkedTargetDef;
+use crate::engine::result::ArtifactMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ManifestArtifactContentType {
@@ -82,6 +84,7 @@ pub struct CacheArtifact {
     pub cache: Arc<dyn LocalCache>,
     pub content_type: hartifactcontent::Type,
     pub hashout: String,
+    pub group: String
 }
 
 impl hartifactcontent::Content for CacheArtifact {
@@ -149,6 +152,7 @@ impl Engine {
             cache: self.local_cache.clone(),
             hashout: artifact.hashout.clone(),
             content_type,
+            group: artifact.group.clone(),
         }, ManifestArtifact{
             hashout: artifact.hashout.clone(),
             group: artifact.group.clone(),
@@ -184,8 +188,8 @@ impl Engine {
         Ok(res_artifacts)
     }
 
-    pub async fn artifacts_from_local_cache(&self, _ctoken: &dyn Cancellable, addr: &Addr, hashin: &str) -> anyhow::Result<Option<Vec<CacheArtifact>>> {
-        let manifest_artifact = match self.local_cache.reader(addr, hashin, MANIFEST_V1_JSON) {
+    pub async fn artifacts_from_local_cache(&self, _ctoken: &dyn Cancellable, def: &LinkedTargetDef, hashin: &str, outputs: Vec<String>) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
+        let manifest_artifact = match self.local_cache.reader(&def.target.addr, hashin, MANIFEST_V1_JSON) {
             Err(e) if e.is::<NotFoundError>() => return Ok(None),
             Err(e) => return Err(e),
             Ok(artifact) => artifact,
@@ -194,13 +198,19 @@ impl Engine {
         let manifest: Manifest = serde_json::from_reader(manifest_artifact)?;
 
         let mut results: Vec<CacheArtifact> = vec![];
+        let mut result_meta: Vec<ArtifactMeta> = vec![];
+
         for artifact in manifest.artifacts {
-            if !self.local_cache.exists(addr, hashin, artifact.name.as_ref())? {
+            result_meta.push(ArtifactMeta{ hashout: artifact.hashout.clone() });
+
+            if !outputs.contains(&artifact.group) { continue }
+
+            if !self.local_cache.exists(&def.target.addr, hashin, artifact.name.as_ref())? {
                 return Ok(None)
             }
 
             results.push(CacheArtifact{
-                addr: addr.clone(),
+                addr: def.target.addr.clone(),
                 hashin: hashin.to_string(),
                 name: artifact.name.clone(),
                 cache: self.local_cache.clone(),
@@ -209,9 +219,10 @@ impl Engine {
                     ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
                 },
                 hashout: artifact.hashout,
+                group: artifact.group,
             });
         }
 
-        Ok(Some(results))
+        Ok(Some((results, result_meta)))
     }
 }

@@ -87,7 +87,7 @@ async fn test_cached_run() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_force_run() -> anyhow::Result<()> {
-    use rheph::engine::ResultOptions;
+    use rheph::engine::{OutputMatcher, ResultOptions};
     use rheph::htaddr::parse_addr;
 
     let ws = Workspace::new();
@@ -100,7 +100,7 @@ async fn test_force_run() -> anyhow::Result<()> {
     let e = ws.engine.clone();
     let rs = e.clone().new_state();
     let result = e
-        .result_addr(rs, &addr, &ResultOptions { force: true })
+        .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions { force: true })
         .await?;
 
     assert!(common::artifact_string(&result).contains("forced"));

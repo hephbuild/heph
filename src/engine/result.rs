@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::fmt;
 use anyhow::Context;
 use futures::TryStreamExt;
+use itertools::Itertools;
 use tokio::task::JoinSet;
 use crate::engine::link::LinkedTargetDef;
 use crate::hartifactcontent::Content;
@@ -24,13 +25,40 @@ impl fmt::Debug for dyn Content {
 }
 
 #[derive(Clone)]
+pub struct ArtifactMeta {
+    pub hashout: String,
+}
+
+#[derive(Clone)]
 pub struct EResult {
     pub artifacts: Vec<Arc<dyn Content>>,
+    pub artifacts_meta: Vec<ArtifactMeta>,
 }
 
 #[derive(Default, Clone, Copy)]
 pub struct ResultOptions {
     pub force: bool,
+}
+
+#[derive(Clone)]
+pub enum OutputMatcher {
+    None,
+    All,
+    Exact(Vec<String>),
+}
+
+impl OutputMatcher {
+    fn cache_key(&self) -> String {
+        match self {
+            OutputMatcher::None => "none".to_string(),
+            OutputMatcher::All => "all".to_string(),
+            OutputMatcher::Exact(names) => {
+                let mut sorted = names.clone();
+                sorted.sort();
+                format!("exact:{}", sorted.join(","))
+            }
+        }
+    }
 }
 
 struct ExecuteOptions<'a> {
@@ -41,11 +69,11 @@ struct ExecuteOptions<'a> {
 }
 
 impl Engine {
-    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ResultOptions) -> anyhow::Result<EResult> {
-        let key = addr.format();
+    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, outputs: OutputMatcher, opts: &ResultOptions) -> anyhow::Result<EResult> {
+        let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
-        let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr) move || async move {
-            engine.inner_result_addr(rs, &addr, &opts).await.map_err(WrappedError::from)
+        let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr, outputs) move || async move {
+            engine.inner_result_addr(rs, &addr, outputs, &opts).await.map_err(WrappedError::from)
         })).await?;
 
         Ok(res)
@@ -59,7 +87,7 @@ impl Engine {
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
             set.spawn(enclose!((self => engine, rs) async move {
-                engine.result_addr(rs, &addr, &opts).await
+                engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await
             }));
         }
 
@@ -71,15 +99,30 @@ impl Engine {
         Ok(all_res)
     }
 
-    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ResultOptions) -> anyhow::Result<EResult> {
+    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, outputs: OutputMatcher, opts: &ResultOptions) -> anyhow::Result<EResult> {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
         let def = self.clone().link(rs.clone(), def).await.with_context(|| "link")?;
 
+        let output_names = match outputs {
+            OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
+            OutputMatcher::All => Ok(def.target.outputs.iter().map(|o| o.group.clone()).unique().collect()),
+            OutputMatcher::Exact(names) => {
+                let mut all_output_names = def.target.outputs.iter().map(|o| o.group.clone()).unique();
+                for name in &names {
+                    if !all_output_names.contains(name) {
+                        anyhow::bail!("output not found: {}", name);
+                    }
+                }
+
+                Ok(names)
+            }
+        }?;
+
         let meta = self.clone().meta(rs.clone(), addr).await?;
 
-        self.execute_and_cache(rs, addr, &ExecuteOptions{
+        self.execute_and_cache(rs, &def, output_names, &ExecuteOptions{
             hashin: &meta.hashin,
             spec: &spec,
             def: &def,
@@ -87,35 +130,39 @@ impl Engine {
         }).await
     }
 
-    async fn execute_and_cache(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
+    async fn execute_and_cache(self: Arc<Self>, rs: Arc<RequestState>, def: &LinkedTargetDef, outputs: Vec<String>, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
         if !opts.force && opts.def.target.cache
-            && let Some(res) = self.result_from_cache(rs.clone(), addr, opts).await? {
+            && let Some(res) = self.result_from_cache(rs.clone(), def, opts, outputs.clone()).await? {
                 return Ok(res)
             }
 
-        let artifacts = self.clone().execute(rs.clone(), addr, opts.spec, opts.def, opts.hashin).await?;
+        let artifacts = self.clone().execute(rs.clone(), &def.target.addr, opts.spec, opts.def, opts.hashin).await?;
+        let artifacts_meta = artifacts.iter().map(|a| Ok(ArtifactMeta { hashout: a.hashout()? })).collect::<anyhow::Result<Vec<_>>>()?;
 
         if !opts.def.target.cache {
             return Ok(EResult {
-                artifacts: artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+                artifacts: artifacts.into_iter().filter(|a| outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+                artifacts_meta,
             })
         }
 
-        let cached_artifacts = self.cache_locally(&rs.ctoken, addr, opts.hashin.as_str(), artifacts).await?;
+        let cached_artifacts = self.cache_locally(&rs.ctoken, &def.target.addr, opts.hashin.as_str(), artifacts).await?;
 
         Ok(EResult {
-            artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts: cached_artifacts.into_iter().filter(|a| outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts_meta,
         })
     }
 
-    async fn result_from_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<Option<EResult>> {
-        let cached_artifacts = self.artifacts_from_local_cache(&rs.ctoken, addr, opts.hashin.as_str()).await?;
-        if cached_artifacts.is_none() {
-            return Ok(None)
-        }
+    async fn result_from_cache(&self, rs: Arc<RequestState>, def: &LinkedTargetDef, opts: &ExecuteOptions<'_>, outputs: Vec<String>) -> anyhow::Result<Option<EResult>> {
+        let (cached_artifacts, artifacts_meta) = match self.artifacts_from_local_cache(&rs.ctoken, def, opts.hashin.as_str(), outputs).await? {
+            Some(res) => res,
+            None => return Ok(None),
+        };
 
         Ok(Some(EResult {
-            artifacts: cached_artifacts.unwrap().into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts_meta,
         }))
     }
 
@@ -184,7 +231,7 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result_addr(rs, &addr, &ResultOptions::default()).await;
+        let result = engine.clone().result_addr(rs, &addr, OutputMatcher::None, &ResultOptions::default()).await;
         assert!(result.is_err());
         let err = result.err().unwrap();
 

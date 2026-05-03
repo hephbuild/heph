@@ -9,7 +9,6 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct LinkedTargetDefInput {
     pub target: TargetDef,
-    #[expect(dead_code)]
     pub output_names: Vec<String>,
     pub origin_id: String,
 }

@@ -10,7 +10,7 @@ use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::engine::Driver;
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
-use crate::engine::result::ResultOptions;
+use crate::engine::result::{OutputMatcher, ResultOptions};
 use crate::engine::Engine;
 use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
 use crate::hmemoizer::WrappedError;
@@ -66,7 +66,7 @@ impl Engine {
     async fn inputs_result_exec(self: Arc<Self>, rc: Arc<RequestState>, inputs: &[LinkedTargetDefInput]) -> anyhow::Result<Vec<RunInput>> {
         let futs = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
-                let res = engine.result_addr(rc, &input.target.addr, &ResultOptions::default()).await?;
+                let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
                 let run_inputs: Vec<RunInput> = res.artifacts.into_iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,

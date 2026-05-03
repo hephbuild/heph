@@ -12,6 +12,7 @@ fn bash(addr: &str, run: &str, out: &str) -> Target {
         driver: "bash".to_string(),
         run: Some(run.to_string()),
         out: Some(out.to_string()),
+        deps: Default::default(),
         labels: vec![],
     }
 }

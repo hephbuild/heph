@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use anyhow::Result;
 use tempfile::TempDir;
-use rheph::engine::{Config, Engine, EResult, ResultOptions};
+use rheph::engine::{Config, Engine, EResult, OutputMatcher, ResultOptions};
 use rheph::engine::provider::TargetSpec;
 use rheph::htaddr::{parse_addr, Addr};
 use rheph::pluginbuildfile;
@@ -85,7 +85,7 @@ impl Workspace {
     pub async fn run_addr(&self, addr: Addr) -> Result<EResult> {
         let e = self.engine.clone();
         let rs = e.new_state();
-        e.result_addr(rs, &addr, &ResultOptions::default()).await
+        e.result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default()).await
     }
 
     pub async fn get_spec(&self, addr_str: &str) -> Result<TargetSpec> {

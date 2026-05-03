@@ -2,7 +2,7 @@ use std::io;
 use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::{get_cwp, ResultOptions};
+use crate::engine::{get_cwp, OutputMatcher, ResultOptions};
 use crate::htmatcher::Matcher;
 
 #[derive(Args)]
@@ -38,7 +38,7 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
 
     let result = match m {
         Matcher::Addr(addr) => {
-            vec![e.clone().result_addr(e.new_state(), &addr, &opts).await?]
+            vec![e.clone().result_addr(e.new_state(), &addr, OutputMatcher::All, &opts).await?]
         },
         _ => {
             e.clone().result(e.new_state(), &m, &opts).await?
