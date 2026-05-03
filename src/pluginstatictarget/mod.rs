@@ -15,6 +15,7 @@ pub struct Target {
     pub driver: String,
     pub run: Option<String>,
     pub out: Option<String>,
+    pub deps: HashMap<String, Vec<String>>,
     pub labels: Vec<String>,
 }
 
@@ -34,6 +35,13 @@ impl Provider {
                 }
                 if let Some(out) = t.out {
                     config.insert("out".to_string(), TargetSpecValue::String(out));
+                }
+                if !t.deps.is_empty() {
+                    let map = t.deps.into_iter().map(|(k, vs)| {
+                        let list = vs.into_iter().map(TargetSpecValue::String).collect();
+                        (k, TargetSpecValue::List(list))
+                    }).collect();
+                    config.insert("deps".to_string(), TargetSpecValue::Map(map));
                 }
                 Ok(TargetSpec {
                     addr: parse_addr(&t.addr)?,

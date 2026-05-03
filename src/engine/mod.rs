@@ -21,3 +21,4 @@ pub use result::ResultOptions;
 mod matcher_spec;
 pub mod driver_managed;
 mod meta;
+mod execute;

@@ -1,15 +1,17 @@
 mod spec;
 
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
+use std::io::BufRead;
 use std::process::Stdio;
 use tokio::process::Command;
 use async_trait::async_trait;
 use tokio::io;
 use crate::engine;
-use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse};
+use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, TargetAddr};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
-use crate::engine::driver::targetdef::{Output, TargetDef as EngineTargetDef};
+use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
@@ -22,6 +24,7 @@ pub struct Driver {
 #[derive(Hash)]
 struct TargetDef {
     pub run: Vec<String>,
+    pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
 }
 
 fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
@@ -107,8 +110,27 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
     async fn parse(&self, req: ParseRequest, _ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse> {
         let spec = spec::TargetSpec::from(req.target_spec.config)?;
+
+        let pkg = req.target_spec.addr.package.clone();
+        let dep_inputs = spec.deps.into_iter().flat_map(|(k, v)| {
+            let pkg = pkg.clone();
+            v.into_iter().enumerate().map(move |(i, v)| -> anyhow::Result<(String, Input)> {
+                Ok((k.parse()?, Input{
+                    r#ref: TargetAddr::parse(&v, &pkg)?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("dep|{}|{}", k, i),
+                }))
+            })
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
+        for (group, input) in &dep_inputs {
+            dep_group_inputs.entry(group.clone()).or_default().push(input.clone());
+        }
+
         let def = TargetDef{
             run: spec.run,
+            dep_group_inputs,
         };
 
         let hash = {
@@ -120,10 +142,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         Ok(ParseResponse {
             target_def: EngineTargetDef{
-                addr: req.target_spec.addr,
+                addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels,
                 raw_def: Arc::new(def),
-                inputs: vec![],
+                inputs: dep_inputs.into_iter().map(|(_, v)| v).collect(),
                 outputs: spec.outputs.iter().map(|(k, v)| Output{
                     group: k.clone(),
                     paths: v.iter().map(|path| Path{
@@ -161,26 +183,50 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         let run = (self.wrap_run)(&def.run);
 
-        let env: Vec<(String, String)> = rreq.target.outputs.iter()
-            .fold(std::collections::HashMap::<String, Vec<String>>::new(), |mut map, output| {
-                let key = if output.group.is_empty() {
-                    "OUT".to_string()
-                } else {
-                    format!("OUT_{}", output.group)
-                };
-                let entry = map.entry(key).or_default();
-                for path in &output.paths {
-                    match &path.content {
-                        Content::Glob(_) => {}
-                        Content::FilePath(p) | Content::DirPath(p) => entry.push(p.clone()),
+        if run.is_empty() {
+            anyhow::bail!("`run` is empty")
+        }
+
+        let mut env = HashMap::<String, String>::new();
+
+        for output in &rreq.target.outputs {
+            let key = if output.group.is_empty() {
+                "OUT".to_string()
+            } else {
+                format!("OUT_{}", output.group.to_uppercase())
+            };
+            let entry = env.entry(key).or_default();
+            for path in &output.paths {
+                match &path.content {
+                    Content::Glob(_) => {}
+                    Content::FilePath(p) | Content::DirPath(p) => {
+                        if !entry.is_empty() { entry.push(' '); }
+                        entry.push_str(p);
                     }
                 }
-                map
-            })
-            .into_iter()
-            .filter(|(_, v)| !v.is_empty())
-            .map(|(k, v)| (k, v.join(" ")))
-            .collect();
+            }
+        }
+
+        for (group, inputs) in &def.dep_group_inputs {
+            let key = if group.is_empty() {
+                "SRC".to_string()
+            } else {
+                format!("SRC_{}", group.to_uppercase())
+            };
+            let entry = env.entry(key).or_default();
+            for input in inputs {
+                let Some(managed) = req.inputs.iter().find(|m| m.input.origin_id == input.origin_id) else { continue };
+                let file = std::fs::File::open(&managed.list_path)?;
+                for line in std::io::BufReader::new(file).lines() {
+                    let line = line?;
+                    if line.is_empty() { continue; }
+                    if !entry.is_empty() { entry.push(' '); }
+                    entry.push_str(&line);
+                }
+            }
+        }
+
+        env.retain(|_, v| !v.is_empty());
 
         let output_log = tempfile::NamedTempFile::new()?;
         let output_log_path = output_log.path().to_path_buf();
@@ -247,13 +293,14 @@ mod tests {
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::Addr;
 
-    fn make_req<'a>(request: RunRequest<'a>) -> ManagedRunRequest<'a> {
+    fn make_req(request: RunRequest) -> ManagedRunRequest {
         let cwd = std::env::current_dir().unwrap();
         ManagedRunRequest {
             request,
             sandbox_dir: cwd.clone(),
             sandbox_ws_dir: cwd.clone(),
             sandbox_pkg_dir: cwd,
+            inputs: vec![],
         }
     }
 
@@ -267,6 +314,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
+                dep_group_inputs: BTreeMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],
@@ -309,6 +357,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
+                dep_group_inputs: BTreeMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],
@@ -353,6 +402,7 @@ mod tests {
             labels: vec![],
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
+                dep_group_inputs: BTreeMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],

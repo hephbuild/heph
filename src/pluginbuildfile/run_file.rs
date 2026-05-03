@@ -5,10 +5,14 @@ use starlark::environment::{GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator};
 use starlark::syntax::{AstModule, Dialect};
 use starlark::values::float::UnpackFloat;
+use starlark::values::dict::DictRef;
 use starlark::values::list::UnpackList;
 use starlark::values::{UnpackValue, Value};
 use starlark::starlark_module;
 use std::collections::HashMap;
+use anyhow::Context;
+use crate::htaddr;
+use crate::htpkg::PkgBuf;
 
 #[derive(Debug)]
 pub(crate) struct OnTargetPayload {
@@ -59,7 +63,14 @@ fn starlark_to_rust(v: &Value) -> TargetSpecValue {
         return TargetSpecValue::List(l.items.iter().map(starlark_to_rust).collect());
     }
 
-    panic!("Unsupported starlark value type: {}", v.get_type());
+    if let Some(d) = DictRef::from_value(*v) {
+        let map = d.iter()
+            .filter_map(|(k, val)| k.unpack_str().map(|s| (s.to_string(), starlark_to_rust(&val))))
+            .collect();
+        return TargetSpecValue::Map(map);
+    }
+
+    panic!("starlark_to_rust: Unsupported starlark value type: {}", v.get_type());
 }
 
 #[starlark_module]
@@ -91,21 +102,26 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         }).collect();
 
         let p = OnTargetPayload{
-            name,
+            name: name.clone(),
             driver,
             labels,
             config,
         };
 
-        let _ = (eval.extra.unwrap().downcast_ref::<Extra>().unwrap().on_target)(p);
+        let extra = eval.extra.unwrap().downcast_ref::<Extra>().unwrap();
+        (extra.on_target)(p)?;
 
-        Ok("".to_string())
+        Ok(htaddr::Addr{
+            package: PkgBuf::from(extra.pkg),
+            name,
+            args: Default::default(),
+        }.format())
     }
 }
 
 impl Provider {
     pub(crate) fn run_pkg(&self, pkg: &str) -> anyhow::Result<RunResult> {
-        self.run_pkg_inner(pkg) // TODO: memo
+        self.run_pkg_inner(pkg).with_context(|| format!("pkg: `{}`", pkg)) // TODO: memo
     }
 
     fn run_pkg_inner(&self, pkg: &str) -> anyhow::Result<RunResult> {
@@ -123,7 +139,7 @@ impl Provider {
     }
 
     pub(crate) fn run_file(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
-        self.run_file_inner(pkg, filename) // TODO: memo
+        self.run_file_inner(pkg, filename).with_context(|| format!("file: {:?}", filename)) // TODO: memo
     }
 
     fn run_file_inner(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {

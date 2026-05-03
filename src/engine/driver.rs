@@ -1,11 +1,27 @@
 use async_trait::async_trait;
-use crate::hasync;
+use crate::{hasync, htaddr};
 use crate::htaddr::Addr;
+use crate::htpkg::PkgBuf;
 
 #[derive(Default, Clone, Hash)]
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
+}
+
+impl TargetAddr {
+    pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
+        let parts: Vec<&str> = v.split('|').collect();
+        match parts.len() {
+            1 => {
+                Ok(TargetAddr { r#ref: htaddr::parse_addr_with_base(v, base)?, output:  None })
+            }
+            2 => {
+                Ok(TargetAddr { r#ref: htaddr::parse_addr_with_base(parts[0], base)?, output: Some(parts[1].parse()?) })
+            }
+            _ => anyhow::bail!("invalid address")
+        }
+    }
 }
 
 pub mod sandbox {
@@ -96,18 +112,17 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Hash)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Hash)]
     pub enum InputMode {
-        Unspecified,
+        Standard,
         Link,
-        None,
     }
 
     #[derive(Clone)]
@@ -166,19 +181,18 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
+    use std::sync::Arc;
     use crate::hartifactcontent::Content;
 
     pub enum Type {
-        Output,
-        SupportFile,
+        Dep,
+        Support,
     }
 
     pub struct InputArtifact {
-        pub group: String,
-        pub name: String,
         pub r#type: Type,
-        pub id: String,
-        pub content: Box<dyn Content>,
+        pub origin_id: String,
+        pub content: Arc<dyn Content>,
     }
 }
 

@@ -56,6 +56,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use futures::TryStreamExt;
     use crate::engine::Config;
     use crate::htmatcher::Matcher;
@@ -68,6 +69,7 @@ mod tests {
             driver: "exec".to_string(),
             run: None,
             out: None,
+            deps: HashMap::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }
     }

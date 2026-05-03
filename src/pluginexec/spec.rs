@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use anyhow::Context;
 use crate::engine::provider::TargetSpecValue;
 use crate::engine::provider::TargetSpecValue::Null;
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
+    pub deps: HashMap<String, Vec<String>>,
     pub outputs: HashMap<String, Vec<String>>,
     pub cache: TargetSpecCache,
 }
@@ -30,6 +32,19 @@ fn parse_strings(v: &TargetSpecValue) -> anyhow::Result<Vec<String>> {
     }
 }
 
+fn parse_map_string_strings(v: &TargetSpecValue) -> anyhow::Result<HashMap<String, Vec<String>>> {
+    Ok(if let Ok(ss) = parse_strings(v) {
+        HashMap::from([("".to_string(), ss)])
+    } else {
+        match v {
+            TargetSpecValue::Map(m) => m.iter()
+                .map(|(k, v)| parse_strings(v).map(|ss| (k.clone(), ss)))
+                .collect::<anyhow::Result<HashMap<_, _>>>(),
+            v => Err(anyhow::anyhow!("invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {:?}", v)),
+        }?
+    })
+}
+
 fn parse_bool(v: &TargetSpecValue) -> anyhow::Result<bool> {
     match v {
         Null() => Ok(false),
@@ -47,10 +62,11 @@ impl TargetSpec {
                 remote: true,
             },
             outputs: HashMap::new(),
+            deps: HashMap::new(),
         };
 
         if let Some(v) = m.get("run") {
-            spec.run = parse_strings(v)?;
+            spec.run = parse_strings(v).with_context(|| "parse `run`")?;
         };
 
         if let Some(v) = m.get("cache")
@@ -62,16 +78,11 @@ impl TargetSpec {
         }
 
         if let Some(v) = m.get("out") {
-            if let Ok(ss) = parse_strings(v) {
-                spec.outputs = HashMap::from([("".to_string(), ss)]);
-            } else {
-                spec.outputs = match v {
-                    TargetSpecValue::Map(m) => m.iter()
-                        .map(|(k, v)| parse_strings(v).map(|ss| (k.clone(), ss)))
-                        .collect::<anyhow::Result<HashMap<_, _>>>(),
-                    v => Err(anyhow::anyhow!("invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {:?}", v)),
-                }?;
-            }
+            spec.outputs = parse_map_string_strings(v).with_context(|| "parse `out`")?;
+        };
+
+        if let Some(v) = m.get("deps") {
+            spec.deps = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
         };
 
         Ok(spec)

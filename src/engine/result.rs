@@ -1,7 +1,5 @@
-use anyhow::Context;
-use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::driver::{ParseRequest, RunRequest};
+use crate::engine::driver::ParseRequest;
 use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
@@ -86,13 +84,13 @@ impl Engine {
         }).await
     }
 
-    async fn execute_and_cache(&self, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
+    async fn execute_and_cache(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
         if !opts.force && opts.def.cache
             && let Some(res) = self.result_from_cache(rs.clone(), addr, opts).await? {
                 return Ok(res)
             }
 
-        let artifacts = self.execute(rs.clone(), opts).await?;
+        let artifacts = self.clone().execute(rs.clone(), addr, opts.spec, opts.def, opts.hashin).await?;
 
         if !opts.def.cache {
             return Ok(EResult {
@@ -116,31 +114,6 @@ impl Engine {
         Ok(Some(EResult {
             artifacts: cached_artifacts.unwrap().into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
         }))
-    }
-
-    async fn execute(&self, rs: Arc<RequestState>, opts: &ExecuteOptions<'_>) -> anyhow::Result<Vec<OutputArtifact>> {
-        let key = format!("{}:{}", opts.spec.addr.format(), opts.hashin);
-        let res = rs.mem_execute.process_result(key, (rs.clone(), self.drivers_by_name.get(&opts.spec.driver).cloned(), opts.def.clone(), self.cfg.root.clone(), opts.hashin.clone()), |(rs, driver, def, root, hashin)| async move {
-            let driver = match driver {
-                Some(driver) => driver,
-                None => return Err(WrappedError::from(anyhow::anyhow!("driver not found"))),
-            };
-
-            let res = driver.driver.run(RunRequest{
-                request_id: &rs.request_id,
-                target: &def,
-                tree_root_path: root.to_str().unwrap().to_string(),
-                inputs: vec![],
-                hashin: &hashin,
-                stdin: None,
-                stdout: None,
-                stderr: None,
-            }, &rs.ctoken).await.with_context(|| "run")?;
-
-            Ok(res.artifacts)
-        }).await?;
-
-        Ok(res)
     }
 
     pub async fn get_def(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetDef> {

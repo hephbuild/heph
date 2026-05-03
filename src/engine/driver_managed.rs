@@ -3,7 +3,7 @@ use std::{fs, io};
 use std::fs::File;
 use std::path::PathBuf;
 use async_trait::async_trait;
-use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver, ParseRequest, ParseResponse, RunRequest, RunResponse};
+use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver, ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse};
 use crate::engine::Engine;
 use crate::{defer, hartifactcontent, hasync};
 use crate::engine::driver::outputartifact::Content::TarPath;
@@ -13,11 +13,17 @@ use crate::hasync::Cancellable;
 use xxhash_rust::xxh3::Xxh3;
 use std::io::Write;
 
+pub struct ManagedRunInput {
+    pub input: RunInput,
+    pub list_path: PathBuf,
+}
+
 pub struct ManagedRunRequest<'a> {
     pub request: RunRequest<'a>,
     pub sandbox_dir: PathBuf,
     pub sandbox_ws_dir: PathBuf,
     pub sandbox_pkg_dir: PathBuf,
+    pub inputs: Vec<ManagedRunInput>,
 }
 pub struct ManagedRunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
@@ -75,7 +81,7 @@ impl Driver for ManagedDriverBridge {
         self.driver.apply_transitive(req, ctoken).await
     }
 
-    async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
+    async fn run<'a>(&self, mut req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
         let sandbox_dir = {
             let mut dir = self.home.join("sandbox");
 
@@ -109,8 +115,14 @@ impl Driver for ManagedDriverBridge {
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir)?;
 
-        for input in &req.inputs {
-            hartifactcontent::unpack::unpack(input.artifact.content.as_ref(), ws_dir.as_path())?;
+        let mut inputs = Vec::new();
+        for input in std::mem::take(&mut req.inputs) {
+            let input_list = ws_dir.join(format!("input_{}.list", input.origin_id));
+            hartifactcontent::unpack::unpack(input.artifact.content.as_ref(), ws_dir.as_path(), input_list.as_path())?;
+            inputs.push(ManagedRunInput {
+                input,
+                list_path: input_list,
+            });
         }
 
         let target = req.target;
@@ -124,6 +136,7 @@ impl Driver for ManagedDriverBridge {
             sandbox_ws_dir: ws_dir.clone(),
             sandbox_pkg_dir: sandbox_pkg_dir.clone(),
             request: req,
+            inputs,
         }, ctoken).await.with_context(|| "driver run")?;
 
         for output in &target.outputs {
