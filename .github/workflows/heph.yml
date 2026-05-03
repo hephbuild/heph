@@ -70,15 +70,16 @@ jobs:
             target: aarch64-unknown-linux-gnu
 
           # macOS AMD64 (Intel natively runs on macos-13)
-          - os: darwin
-            arch: amd64
-            runs-on: ubuntu-latest
-            target: x86_64-apple-darwin
+          # This costs money...
+#          - os: darwin
+#            arch: amd64
+#            runs-on: macos-latest-large
+#            target: x86_64-apple-darwin
 
-          # macOS ARM64 (Apple Silicon natively runs on macos-14)
+          # macOS ARM64 (Apple Silicon natively runs on macos-latest)
           - os: darwin
             arch: arm64
-            runs-on: ubuntu-latest
+            runs-on: macos-latest
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
@@ -114,6 +115,7 @@ jobs:
   upload_artifacts:
     name: Upload artifacts
     needs: [gen, build]
+    if: always() && needs.gen.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -174,10 +176,10 @@ jobs:
             runs-on: ubuntu-latest
             target: x86_64-unknown-linux-gnu
 
-          # macOS ARM64 (Apple Silicon natively runs on macos-14)
+          # macOS ARM64 (Apple Silicon natively runs on macos-latest)
           - os: darwin
             arch: arm64
-            runs-on: macos-14
+            runs-on: macos-latest
             target: aarch64-apple-darwin
     steps:
       - name: Download repo
