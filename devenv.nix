@@ -25,7 +25,8 @@ in
      enable = true;
      channel = "stable";
      components = [ "rustc" "cargo" "clippy" "rustfmt" "rust-analyzer" ];
-     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
+     targets = [ "x86_64-apple-darwin" "aarch64-apple-darwin" ]
+       ++ lib.optionals pkgs.stdenv.isLinux [ "x86_64-unknown-linux-gnu" "aarch64-unknown-linux-gnu" ];
    };
 
   # https://devenv.sh/processes/
