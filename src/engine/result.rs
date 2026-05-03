@@ -9,8 +9,10 @@ use crate::hmemoizer::WrappedError;
 use std::sync::Arc;
 
 use std::fmt;
+use anyhow::Context;
 use futures::TryStreamExt;
 use tokio::task::JoinSet;
+use crate::engine::link::LinkedTargetDef;
 use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
 
@@ -33,7 +35,7 @@ pub struct ResultOptions {
 struct ExecuteOptions<'a> {
     hashin: &'a String,
     spec: &'a TargetSpec,
-    def: &'a TargetDef,
+    def: &'a LinkedTargetDef,
     force: bool,
 }
 
@@ -74,6 +76,8 @@ impl Engine {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
+        let def = self.clone().link(rs.clone(), def).await.with_context(|| "link")?;
+
         let meta = self.clone().meta(rs.clone(), addr).await?;
 
         self.execute_and_cache(rs, addr, &ExecuteOptions{
@@ -85,14 +89,14 @@ impl Engine {
     }
 
     async fn execute_and_cache(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
-        if !opts.force && opts.def.cache
+        if !opts.force && opts.def.target.cache
             && let Some(res) = self.result_from_cache(rs.clone(), addr, opts).await? {
                 return Ok(res)
             }
 
         let artifacts = self.clone().execute(rs.clone(), addr, opts.spec, opts.def, opts.hashin).await?;
 
-        if !opts.def.cache {
+        if !opts.def.target.cache {
             return Ok(EResult {
                 artifacts: artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
             })
