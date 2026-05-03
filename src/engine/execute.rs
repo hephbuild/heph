@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::Context;
 use async_recursion::async_recursion;
+use enclose::enclose;
 use futures::future::try_join_all;
 use crate::engine::driver::{RunInput, RunRequest};
 use crate::engine::driver::inputartifact::{InputArtifact, Type};
@@ -29,9 +30,9 @@ impl Engine {
         let def = def.clone();
         let root = self.cfg.root.clone();
         let hashin = hashin.to_string();
-        let res = rs.mem_execute.process_result(key, (self, rs.clone(), driver, def, root, hashin), |(engine, rs, driver, def, root, hashin)| async move {
+        let res = rs.mem_execute.process_result(key, enclose!((self => engine, rs) move || async move {
             engine.execute_inner(rs, driver, def, root, hashin).await.map_err(WrappedError::from)
-        }).await?;
+        })).await?;
         Ok(res)
     }
 
@@ -62,12 +63,9 @@ impl Engine {
         Ok(res.artifacts)
     }
 
-    async fn inputs_result_exec(self: Arc<Self>, rc: Arc<RequestState>, inputs: &Vec<LinkedTargetDefInput>) -> anyhow::Result<Vec<RunInput>> {
+    async fn inputs_result_exec(self: Arc<Self>, rc: Arc<RequestState>, inputs: &[LinkedTargetDefInput]) -> anyhow::Result<Vec<RunInput>> {
         let futs = inputs.iter().map(|input| {
-            let engine = self.clone();
-            let rc = rc.clone();
-            let input = input.clone();
-            async move {
+            enclose!((self => engine, rc, input) async move {
                 let res = engine.result_addr(rc, &input.target.addr, &ResultOptions::default()).await?;
                 let run_inputs: Vec<RunInput> = res.artifacts.into_iter().map(|art| RunInput {
                     artifact: InputArtifact {
@@ -78,7 +76,7 @@ impl Engine {
                     origin_id: input.origin_id.clone(),
                 }).collect();
                 anyhow::Ok(run_inputs)
-            }
+            })
         });
 
         let results = try_join_all(futs).await?;

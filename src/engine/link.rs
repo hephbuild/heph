@@ -1,6 +1,7 @@
 use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
+use enclose::enclose;
 use futures::future::try_join_all;
 use itertools::Itertools;
 use std::sync::Arc;
@@ -8,6 +9,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct LinkedTargetDefInput {
     pub target: TargetDef,
+    #[expect(dead_code)]
     pub output_names: Vec<String>,
     pub origin_id: String,
 }
@@ -21,20 +23,14 @@ pub struct LinkedTargetDef {
 impl Engine {
     pub(crate) async fn link(self: Arc<Self>, rs: Arc<RequestState>, def: TargetDef) -> anyhow::Result<LinkedTargetDef> {
         let futures = def.inputs.iter().map(|input| {
-            let engine = self.clone();
-            let rs = rs.clone();
-            let input_ref = input.r#ref.r#ref.clone();
-            let input_output = input.r#ref.output.clone();
-            let origin_id = input.origin_id.clone();
+            enclose!((self => engine, rs, input) async move {
+                let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?;
 
-            async move {
-                let input_def = engine.get_def(rs, &input_ref).await?;
-
-                let output_names = if let Some(output_name) = input_output {
-                    if !input_def.outputs.iter().any(|output| output.group == output_name) {
-                        anyhow::bail!("Output '{output_name}' not found in target '{input_ref:?}'")
+                let output_names = if let Some(ref output_name) = input.r#ref.output {
+                    if !input_def.outputs.iter().any(|output| &output.group == output_name) {
+                        anyhow::bail!("Output '{output_name}' not found in target '{:?}'", input.r#ref.r#ref)
                     }
-                    vec![output_name]
+                    vec![output_name.clone()]
                 } else {
                     input_def.outputs.iter().map(|output| output.group.clone()).unique().collect()
                 };
@@ -42,9 +38,9 @@ impl Engine {
                 Ok(LinkedTargetDefInput {
                     target: input_def,
                     output_names,
-                    origin_id,
+                    origin_id: input.origin_id.clone(),
                 })
-            }
+            })
         });
 
         let inputs = try_join_all(futures).await?;

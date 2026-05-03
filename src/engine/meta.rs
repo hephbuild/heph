@@ -1,4 +1,5 @@
 use async_recursion::async_recursion;
+use enclose::enclose;
 use std::hash::Hasher;
 use std::sync::Arc;
 use anyhow::Context;
@@ -17,9 +18,9 @@ pub struct ResultMeta {
 impl Engine {
     pub async fn meta(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ResultMeta> {
         let key = addr.format();
-        let res = rs.mem_meta.process_result(key, (self, rs.clone(), addr.clone()), |(engine, rs, addr)| async move {
+        let res = rs.mem_meta.process_result(key, enclose!((self => engine, rs, addr) move || async move {
             engine.inner_meta(rs, &addr).await.map_err(WrappedError::from)
-        }).await?;
+        })).await?;
         Ok(res)
     }
 

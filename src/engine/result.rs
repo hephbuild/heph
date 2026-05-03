@@ -6,6 +6,7 @@ use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
 use crate::htaddr::Addr;
 use crate::hmemoizer::WrappedError;
+use enclose::enclose;
 use std::sync::Arc;
 
 use std::fmt;
@@ -43,9 +44,9 @@ impl Engine {
     pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, opts: &ResultOptions) -> anyhow::Result<EResult> {
         let key = addr.format();
         let opts = *opts;
-        let res = rs.mem_result.process(key, (self, rs.clone(), addr.clone(), opts), |(engine, rs, addr, opts)| async move {
+        let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr) move || async move {
             engine.inner_result_addr(rs, &addr, &opts).await.map_err(WrappedError::from)
-        }).await?;
+        })).await?;
 
         Ok(res)
     }
@@ -57,11 +58,9 @@ impl Engine {
         let stream = self.query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
-            let engine = self.clone();
-            let rs = rs.clone();
-            set.spawn(async move {
+            set.spawn(enclose!((self => engine, rs) async move {
                 engine.result_addr(rs, &addr, &opts).await
-            });
+            }));
         }
 
         let mut all_res: Vec<EResult> = vec!();

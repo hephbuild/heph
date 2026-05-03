@@ -292,6 +292,7 @@ mod tests {
     use crate::engine::driver_managed::ManagedDriver;
     use crate::hasync::StdCancellationToken;
     use crate::htaddr::Addr;
+    use enclose::enclose;
 
     fn make_req(request: RunRequest) -> ManagedRunRequest {
         let cwd = std::env::current_dir().unwrap();
@@ -431,13 +432,10 @@ mod tests {
 
         let run_fut = driver.run(make_req(req), &ctoken);
 
-        tokio::spawn({
-            let ctoken = ctoken.clone();
-            async move {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                ctoken.cancel();
-            }
-        });
+        tokio::spawn(enclose!((ctoken) async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ctoken.cancel();
+        }));
 
         let res = run_fut.await;
         assert!(res.is_err());
