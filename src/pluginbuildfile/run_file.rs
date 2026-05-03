@@ -189,7 +189,7 @@ impl Provider {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&extra);
 
-            eval.eval_module(ast, &globals).map_err(|e| anyhow::anyhow!(e))?;
+            eval.eval_module(ast, globals).map_err(|e| anyhow::anyhow!(e))?;
         }
 
         let targets = std::rc::Rc::try_unwrap(targets).unwrap().into_inner();

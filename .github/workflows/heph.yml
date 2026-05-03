@@ -156,10 +156,16 @@ jobs:
           name: repo
           path: .
 
-#      - name: Lint
-#        uses: golangci/golangci-lint-action@v9
-#        with:
-#          version: v2.5
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
+
+      - name: Lint
+        shell: devenv shell bash -- -e {0}
+        run: cargo clippy -- -D warnings
 
   test:
     name: Test ${{ matrix.os }}/${{ matrix.arch }}
