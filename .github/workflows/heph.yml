@@ -203,7 +203,7 @@ jobs:
 
       - name: Test
         shell: devenv shell bash -- -e {0}
-        run: test
+        run: tst
 
   release:
     name: Release

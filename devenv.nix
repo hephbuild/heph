@@ -39,7 +39,7 @@ in
   scripts.proto-gen.exec = "buf generate";
   scripts.gen.exec = "proto-gen";
   scripts.lint.exec = "cargo clippy -- -D warnings";
-  scripts.test.exec = "cargo test --all";
+  scripts.tst.exec = "cargo test --all";
 
   scripts.install-dev.exec = ''
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph
