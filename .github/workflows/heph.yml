@@ -20,9 +20,9 @@ jobs:
         with:
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v17
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: devenv
+          shared-key: x86_64-unknown-linux-gnu
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -89,9 +89,9 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v17
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: devenv
+          shared-key: ${{ matrix.target }}
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -99,7 +99,7 @@ jobs:
         id: build
         shell: devenv shell bash -- -e {0}
         env:
-          CARGO_TARGET_DIR: "/tmp/rheph-${{ matrix.target }}"
+          CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
         run: |
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
@@ -157,9 +157,9 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v17
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: devenv
+          shared-key: x86_64-unknown-linux-gnu
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
@@ -195,9 +195,9 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
-      - uses: cachix/cachix-action@v17
+      - uses: Swatinem/rust-cache@v2
         with:
-          name: devenv
+          shared-key: ${{ matrix.target }}
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
