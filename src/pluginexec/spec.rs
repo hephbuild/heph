@@ -36,12 +36,13 @@ impl TargetSpec {
             spec.run = parse_strings(v).with_context(|| "parse `run`")?;
         };
 
-        if let Some(v) = m.remove("cache")
-            && !parse_bool(v)? {
-            spec.cache = TargetSpecCache{
-                local: false,
-                remote: false,
-            };
+        if let Some(v) = m.remove("cache") {
+            if !parse_bool(v).with_context(|| "parse `cache`")? {
+                spec.cache = TargetSpecCache {
+                    local: false,
+                    remote: false,
+                };
+            }
         }
 
         if let Some(v) = m.remove("out") {

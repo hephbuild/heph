@@ -1,21 +1,21 @@
-use crate::pluginbuildfile::provider::Provider;
-use starlark::any::ProvidesStaticType;
-use starlark::environment::{Globals, GlobalsBuilder, Module};
-use starlark::eval::{Arguments, Evaluator};
-use starlark::syntax::{AstModule, Dialect};
-use starlark::values::float::UnpackFloat;
-use starlark::values::dict::DictRef;
-use starlark::values::list::UnpackList;
-use starlark::values::{UnpackValue, Value};
-use starlark::starlark_module;
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use anyhow::Context;
-use crate::engine::driver::sandbox::{Dep, Mode, Sandbox};
+use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use crate::engine::driver::TargetAddr;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{parse_map_string_strings, TargetSpecValue};
+use crate::loosespecparser::{parse_map_string_string, parse_map_string_strings, TargetSpecValue};
+use crate::pluginbuildfile::provider::Provider;
+use anyhow::Context;
+use starlark::any::ProvidesStaticType;
+use starlark::environment::{Globals, GlobalsBuilder, Module};
+use starlark::eval::{Arguments, Evaluator};
+use starlark::starlark_module;
+use starlark::syntax::{AstModule, Dialect};
+use starlark::values::dict::DictRef;
+use starlark::values::float::UnpackFloat;
+use starlark::values::list::UnpackList;
+use starlark::values::{UnpackValue, Value};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 static GLOBALS: OnceLock<Globals> = OnceLock::new();
 
@@ -43,6 +43,9 @@ impl Sandbox {
             TargetSpecValue::Map(m) => {
                 m
             },
+            TargetSpecValue::Null() => {
+                return Ok(Default::default());
+            }
             _ => anyhow::bail!("Expected map, got {:?}", m)
         };
 
@@ -56,7 +59,7 @@ impl Sandbox {
         };
 
         if let Some(v) = m.remove("deps") {
-            sandbox.deps = parse_map_string_strings(v)?.iter().enumerate().flat_map(|(i, (k, ss))| ss.iter().map(move |s| -> anyhow::Result<Dep> {
+            sandbox.deps = parse_map_string_strings(v)?.iter().enumerate().flat_map(|(i, (k, ss))| ss.iter().map(move |s| {
                 Ok(Dep {
                     r#ref: TargetAddr::parse(s, pkg)?,
                     mode: Mode::None,
@@ -66,6 +69,28 @@ impl Sandbox {
                     id: format!("dep|{}|{}", k, i),
                 })
             })).collect::<anyhow::Result<Vec<_>>>().with_context(|| "parse `deps`")?;
+        }
+
+        if let Some(v) = m.remove("env") {
+            sandbox.env = parse_map_string_string(v).with_context(|| "parse `env`")?.into_iter().map(|(k, v)| {
+                (k, Env {
+                    value: EnvValue::Literal(v.into()),
+                    hash: true,
+                    append: false,
+                    append_prefix: "".to_string(),
+                })
+            }).collect::<HashMap<_, _>>();
+        }
+
+        if let Some(v) = m.remove("tools") {
+            sandbox.tools = parse_map_string_strings(v)?.iter().enumerate().flat_map(|(i, (k, ss))| ss.iter().map(move |s| {
+                Ok(Tool {
+                    r#ref: TargetAddr::parse(s, pkg)?,
+                    group: k.to_string(),
+                    hash: true,
+                    id: format!("tool|{}|{}", k, i),
+                })
+            })).collect::<anyhow::Result<Vec<_>>>().with_context(|| "parse `tools`")?;
         }
 
         if !m.is_empty() {

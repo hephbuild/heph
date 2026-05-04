@@ -36,6 +36,12 @@ pub mod sandbox {
         pub env: HashMap<String, Env>,
     }
 
+    impl Sandbox {
+        pub fn empty(&self) -> bool {
+            self.tools.is_empty() && self.deps.is_empty() && self.env.is_empty()
+        }
+    }
+
     #[derive(Default, Clone, Debug)]
     pub struct Tool {
         pub r#ref: TargetAddr,
