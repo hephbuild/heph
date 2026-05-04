@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::meta::ResultMeta;
 use crate::engine::Engine;
@@ -10,7 +11,7 @@ pub struct RequestState {
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub mem_result: Memoizer<String, Result<crate::engine::result::EResult, WrappedError>>,
-    pub mem_execute: Memoizer<String, Result<Vec<OutputArtifact>, WrappedError>>,
+    pub mem_execute: Memoizer<String, Result<(Vec<OutputArtifact>, PathBuf), WrappedError>>,
     pub mem_meta: Memoizer<String, Result<ResultMeta, WrappedError>>,
 }
 

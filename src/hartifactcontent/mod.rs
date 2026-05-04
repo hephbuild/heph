@@ -10,7 +10,7 @@ pub struct WalkEntry {
     pub x: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum Type {
     Tar,
     Cpio,

@@ -1,5 +1,5 @@
 use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::driver::ParseRequest;
+use crate::engine::driver::{outputartifact, ParseRequest};
 use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
@@ -9,12 +9,14 @@ use crate::hmemoizer::WrappedError;
 use enclose::enclose;
 use std::sync::Arc;
 
-use std::fmt;
+use std::{fmt, fs, io};
 use anyhow::Context;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use tokio::task::JoinSet;
+use crate::defer;
 use crate::engine::link::LinkedTargetDef;
+use crate::engine::local_cache::ManifestArtifactType;
 use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
 
@@ -136,20 +138,23 @@ impl Engine {
                 return Ok(res)
             }
 
-        let artifacts = self.clone().execute(rs.clone(), &def.target.addr, opts.spec, opts.def, opts.hashin).await?;
-        let artifacts_meta = artifacts.iter().map(|a| Ok(ArtifactMeta { hashout: a.hashout()? })).collect::<anyhow::Result<Vec<_>>>()?;
+        let (artifacts, sandbox_dir) = self.clone().execute(rs.clone(), &def.target.addr, opts.spec, opts.def, opts.hashin).await?;
+        let artifacts_meta = artifacts.iter().filter(|a| a.r#type == outputartifact::Type::Output).map(|a| Ok(ArtifactMeta { hashout: a.hashout()? })).collect::<anyhow::Result<Vec<_>>>()?;
 
-        if !opts.def.target.cache {
-            return Ok(EResult {
-                artifacts: artifacts.into_iter().filter(|a| outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
-                artifacts_meta,
-            })
+        defer! {
+            match fs::remove_dir_all(&sandbox_dir) {
+                Ok(_) => (),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                Err(err) => {
+                    eprintln!("failed to clean up sandbox: {err}")
+                },
+            };
         }
 
-        let cached_artifacts = self.cache_locally(&rs.ctoken, &def.target.addr, opts.hashin.as_str(), artifacts).await?;
+        let cached_artifacts = self.cache_locally(&rs.ctoken, &def.target.addr, opts.hashin.as_str(), artifacts, !opts.def.target.cache).await?;
 
         Ok(EResult {
-            artifacts: cached_artifacts.into_iter().filter(|a| outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts: cached_artifacts.into_iter().filter(|a| a.r#type == ManifestArtifactType::Output && outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
             artifacts_meta,
         })
     }

@@ -2,13 +2,13 @@ mod spec;
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::process::Stdio;
 use tokio::process::Command;
 use async_trait::async_trait;
 use tokio::io;
 use crate::engine;
-use crate::engine::driver::{ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, TargetAddr};
+use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, TargetAddr};
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
@@ -208,30 +208,40 @@ impl engine::driver_managed::ManagedDriver for Driver {
         }
 
         for (group, inputs) in &def.dep_group_inputs {
-            let key = if group.is_empty() {
+            let src_key = if group.is_empty() {
                 "SRC".to_string()
             } else {
                 format!("SRC_{}", group.to_uppercase())
             };
-            let entry = env.entry(key).or_default();
+
+            let mut list_f = {
+                let path = req.sandbox_dir.join(format!("dep_{}.list", group));
+                env.entry(format!("LIST_{src_key}")).or_default().push_str(path.as_path().to_str().unwrap());
+                std::fs::File::create(path)?
+            };
+            let entry = env.entry(src_key).or_default();
+
             for input in inputs {
-                let Some(managed) = req.inputs.iter().find(|m| m.input.origin_id == input.origin_id) else { continue };
-                let file = std::fs::File::open(&managed.list_path)?;
-                for line in std::io::BufReader::new(file).lines() {
-                    let line = line?;
-                    if line.is_empty() { continue; }
-                    if !entry.is_empty() { entry.push(' '); }
-                    entry.push_str(&line);
+                for m in req.inputs.iter().filter(|m| m.input.origin_id == input.origin_id) {
+                    let managed_list_f = std::fs::File::open(&m.list_path)?;
+                    for line in std::io::BufReader::new(managed_list_f).lines() {
+                        let line = line?;
+                        if line.is_empty() { continue; }
+
+                        if !entry.is_empty() { entry.push(' '); }
+                        entry.push_str(&line);
+
+                        list_f.write_all(line.as_bytes())?;
+                        list_f.write_all("\n".as_bytes())?;
+                    }
                 }
             }
         }
 
-        env.retain(|_, v| !v.is_empty());
-
-        let output_log = tempfile::NamedTempFile::new()?;
-        let output_log_path = output_log.path().to_path_buf();
+        let output_log_path = req.sandbox_dir.join("log.txt");
+        let output_log = std::fs::File::create(&output_log_path)?;
         let output_log_file = Arc::new(tokio::sync::Mutex::new(
-            tokio::fs::File::from_std(output_log.reopen()?)
+            tokio::fs::File::from_std(output_log)
         ));
 
         let mut child = Command::new(&run[0])
@@ -280,7 +290,17 @@ impl engine::driver_managed::ManagedDriver for Driver {
         }
 
         Ok(ManagedRunResponse{
-            artifacts: vec![],
+            artifacts: vec![outputartifact::OutputArtifact{
+                group: "".to_string(),
+                name: "log.txt".to_string(),
+                r#type: outputartifact::Type::Log,
+                content: outputartifact::Content::File(outputartifact::ContentFile{
+                    source_path: output_log_path.to_str().unwrap().parse()?,
+                    out_path: "log.txt".to_string(),
+                    x: false,
+                }),
+                hashout: "".to_string(),
+            }],
         })
     }
 }
@@ -295,12 +315,12 @@ mod tests {
     use enclose::enclose;
 
     fn make_req(request: RunRequest) -> ManagedRunRequest {
-        let cwd = std::env::current_dir().unwrap();
+        let path = request.sandbox_dir.clone();
         ManagedRunRequest {
             request,
-            sandbox_dir: cwd.clone(),
-            sandbox_ws_dir: cwd.clone(),
-            sandbox_pkg_dir: cwd,
+            sandbox_dir: path.clone(),
+            sandbox_ws_dir: path.clone(),
+            sandbox_pkg_dir: path,
             inputs: vec![],
         }
     }
@@ -328,6 +348,7 @@ mod tests {
 
         let mut stdout = Vec::new();
         let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
 
         let req = RunRequest {
             request_id: &request_id,
@@ -338,6 +359,7 @@ mod tests {
             stdin: None,
             stdout: Some(&mut stdout),
             stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
         };
 
         let _res = driver.run(make_req(req), &ctoken).await?;
@@ -372,6 +394,7 @@ mod tests {
         let mut stdin = std::io::Cursor::new(b"test data");
         let mut stdout = Vec::new();
         let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
 
         let req = RunRequest {
             request_id: &request_id,
@@ -382,6 +405,7 @@ mod tests {
             stdin: Some(&mut stdin),
             stdout: Some(&mut stdout),
             stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
         };
 
         // Use a timeout to detect the hang
@@ -415,6 +439,7 @@ mod tests {
         };
 
         let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
 
         // Use a pipe that will never resolve to simulate a hang
         let (mut reader, _writer) = io::duplex(64);
@@ -428,6 +453,7 @@ mod tests {
             stdin: Some(&mut reader),
             stdout: None,
             stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
         };
 
         let run_fut = driver.run(make_req(req), &ctoken);

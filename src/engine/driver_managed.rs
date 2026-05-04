@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver, ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse};
 use crate::engine::Engine;
-use crate::{defer, hartifactcontent, hasync};
+use crate::{hartifactcontent, hasync};
 use crate::engine::driver::outputartifact::Content::TarPath;
 use crate::engine::driver::outputartifact::Type::Output;
 use crate::engine::driver::targetdef::path::Content;
@@ -82,36 +82,7 @@ impl Driver for ManagedDriverBridge {
     }
 
     async fn run<'a>(&self, mut req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
-        let sandbox_dir = {
-            let mut dir = self.home.join("sandbox");
-
-            for c in req.target.addr.package.components() {
-                dir = dir.join(c)
-            }
-
-            if req.target.addr.args.is_empty() {
-                dir.join(format!("__target_{}", req.target.addr.name))
-            } else {
-                dir.join(format!("__target_{}_{}",  req.target.addr.name, req.target.addr.hash_str()))
-            }
-        };
-
-        match fs::remove_dir_all(&sandbox_dir) {
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        }?;
-        fs::create_dir_all(&sandbox_dir)?;
-        defer! {
-            match fs::remove_dir_all(&sandbox_dir) {
-                Ok(_) => (),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                Err(err) => {
-                    eprintln!("failed to clean up sandbox: {err}")
-                },
-            };
-        }
-
+        let sandbox_dir = req.sandbox_dir.clone();
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir)?;
 
@@ -181,7 +152,7 @@ impl Driver for ManagedDriverBridge {
                 }
             }
 
-            let artifacts_dir = self.home.join("artifacts");
+            let artifacts_dir = sandbox_dir.join("heph-collect-artifacts");
             fs::create_dir_all(&artifacts_dir)?;
             let tarpath = artifacts_dir
                 .join(format!("{}-{}.tar", hashin, output.group))
@@ -203,7 +174,7 @@ impl Driver for ManagedDriverBridge {
         }
 
         Ok(RunResponse{
-            artifacts: res.artifacts
+            artifacts: res.artifacts,
         })
     }
 }

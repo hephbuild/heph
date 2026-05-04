@@ -1,3 +1,4 @@
+use std::{fs, io};
 use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::Context;
@@ -24,7 +25,7 @@ impl Engine {
         spec: &TargetSpec,
         def: &LinkedTargetDef,
         hashin: &str,
-    ) -> anyhow::Result<Vec<OutputArtifact>> {
+    ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
         let key = format!("{}:{}", addr.format(), hashin);
         let driver = self.drivers_by_name.get(&spec.driver).cloned();
         let def = def.clone();
@@ -44,10 +45,30 @@ impl Engine {
         def: LinkedTargetDef,
         root: PathBuf,
         hashin: String,
-    ) -> anyhow::Result<Vec<OutputArtifact>> {
+    ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
         let driver = driver.ok_or_else(|| anyhow::anyhow!("driver not found"))?;
 
         let deps_result = self.clone().inputs_result_exec(rs.clone(), &def.inputs).await?;
+
+        let sandbox_dir = {
+            let mut dir = self.home.join("sandbox");
+
+            for c in def.target.addr.package.components() {
+                dir = dir.join(c)
+            }
+
+            if def.target.addr.args.is_empty() {
+                dir.join(format!("__target_{}", def.target.addr.name))
+            } else {
+                dir.join(format!("__target_{}_{}",  def.target.addr.name, def.target.addr.hash_str()))
+            }
+        };
+        match fs::remove_dir_all(&sandbox_dir) {
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }?;
+        fs::create_dir_all(&sandbox_dir)?;
 
         let res = driver.driver.run(RunRequest {
             request_id: &rs.request_id,
@@ -58,9 +79,10 @@ impl Engine {
             stdin: None,
             stdout: None,
             stderr: None,
+            sandbox_dir: sandbox_dir.clone(),
         }, &rs.ctoken).await.with_context(|| "run")?;
 
-        Ok(res.artifacts)
+        Ok((res.artifacts, sandbox_dir))
     }
 
     async fn inputs_result_exec(self: Arc<Self>, rc: Arc<RequestState>, inputs: &[LinkedTargetDefInput]) -> anyhow::Result<Vec<RunInput>> {

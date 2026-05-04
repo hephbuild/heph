@@ -208,13 +208,11 @@ pub mod outputartifact {
     use std::path::PathBuf;
     use crate::hartifactcontent::{Content as HContent, WalkEntry};
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Type {
         Output,
-        OutputListV1,
         Log,
         SupportFile,
-        SupportFileListV1,
     }
 
     #[derive(Clone)]
@@ -294,6 +292,7 @@ pub struct RunRequest<'a> {
     pub stdin: Option<&'a mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
     pub stdout: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub stderr: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    pub sandbox_dir: std::path::PathBuf,
 }
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
