@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use anyhow::Context;
-use crate::engine::provider::TargetSpecValue;
-use crate::engine::provider::TargetSpecValue::Null;
+use crate::loosespecparser::{parse_bool, parse_map_string_strings, parse_strings, TargetSpecValue};
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
@@ -15,46 +14,13 @@ pub(crate) struct TargetSpecCache {
     pub remote: bool,
 }
 
-fn parse_strings(v: &TargetSpecValue) -> anyhow::Result<Vec<String>> {
-    match v {
-        Null() => Ok(vec![]),
-        TargetSpecValue::List(v) => v.iter().try_fold(Vec::new(), |mut acc, v| match v {
-            Null() => Ok(acc),
-            TargetSpecValue::String(s) => {
-                acc.push(s.clone());
-
-                Ok(acc)
-            },
-            v => Err(anyhow::anyhow!("invalid: {:?}", v)),
-        }),
-        TargetSpecValue::String(s) => Ok(vec![s.clone()]),
-        v => Err(anyhow::anyhow!("invalid: expected string or [string], got: {:?}", v)),
-    }
-}
-
-fn parse_map_string_strings(v: &TargetSpecValue) -> anyhow::Result<HashMap<String, Vec<String>>> {
-    Ok(if let Ok(ss) = parse_strings(v) {
-        HashMap::from([("".to_string(), ss)])
-    } else {
-        match v {
-            TargetSpecValue::Map(m) => m.iter()
-                .map(|(k, v)| parse_strings(v).map(|ss| (k.clone(), ss)))
-                .collect::<anyhow::Result<HashMap<_, _>>>(),
-            v => Err(anyhow::anyhow!("invalid: expected string, [string], {{string: string}} or {{string: [string]}} got: {:?}", v)),
-        }?
-    })
-}
-
-fn parse_bool(v: &TargetSpecValue) -> anyhow::Result<bool> {
-    match v {
-        Null() => Ok(false),
-        TargetSpecValue::Bool(b) => Ok(*b),
-        _ => Err(anyhow::anyhow!("invalid: expected bool, got: {:?}", v)),
-    }
-}
-
 impl TargetSpec {
     pub fn from(m: HashMap<String, TargetSpecValue>) -> anyhow::Result<TargetSpec> {
+        let mut m: HashMap<&str, &TargetSpecValue> = m
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
         let mut spec = TargetSpec{
             run: vec![],
             cache: TargetSpecCache{
@@ -65,11 +31,12 @@ impl TargetSpec {
             deps: HashMap::new(),
         };
 
-        if let Some(v) = m.get("run") {
+
+        if let Some(v) = m.remove("run") {
             spec.run = parse_strings(v).with_context(|| "parse `run`")?;
         };
 
-        if let Some(v) = m.get("cache")
+        if let Some(v) = m.remove("cache")
             && !parse_bool(v)? {
             spec.cache = TargetSpecCache{
                 local: false,
@@ -77,13 +44,18 @@ impl TargetSpec {
             };
         }
 
-        if let Some(v) = m.get("out") {
+        if let Some(v) = m.remove("out") {
             spec.outputs = parse_map_string_strings(v).with_context(|| "parse `out`")?;
         };
 
-        if let Some(v) = m.get("deps") {
+        if let Some(v) = m.remove("deps") {
             spec.deps = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
         };
+
+        if !m.is_empty() {
+            let unknown_keys: Vec<&str> = m.into_keys().collect();
+            anyhow::bail!("Unknown entries found: {:?}", unknown_keys)
+        }
 
         Ok(spec)
     }

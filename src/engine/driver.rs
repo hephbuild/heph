@@ -3,7 +3,7 @@ use crate::{hasync, htaddr};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 
-#[derive(Default, Clone, Hash)]
+#[derive(Default, Clone, Hash, Debug)]
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
@@ -29,14 +29,14 @@ pub mod sandbox {
     use smart_default::SmartDefault;
     use crate::engine::driver::TargetAddr;
 
-    #[derive(Default, Clone)]
+    #[derive(Default, Clone, Debug)]
     pub struct Sandbox {
         pub tools: Vec<Tool>,
         pub deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
     }
 
-    #[derive(Default, Clone)]
+    #[derive(Default, Clone, Debug)]
     pub struct Tool {
         pub r#ref: TargetAddr,
         pub group: String,
@@ -44,7 +44,7 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Default, Clone)]
+    #[derive(Default, Clone, Debug)]
     pub struct Dep {
         pub r#ref: TargetAddr,
         pub mode: Mode,
@@ -54,14 +54,14 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Clone, SmartDefault)]
+    #[derive(Clone, SmartDefault, Debug)]
     pub enum Mode {
         #[default]
         None,
         Link,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub struct Env {
         pub value: EnvValue,
         pub hash: bool,
@@ -69,7 +69,7 @@ pub mod sandbox {
         pub append_prefix: String,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub enum EnvValue {
         Literal(String),
         Pass(bool),

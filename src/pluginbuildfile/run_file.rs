@@ -1,4 +1,3 @@
-use crate::engine::provider::TargetSpecValue;
 use crate::pluginbuildfile::provider::Provider;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Globals, GlobalsBuilder, Module};
@@ -12,8 +11,11 @@ use starlark::starlark_module;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use anyhow::Context;
+use crate::engine::driver::sandbox::{Dep, Mode, Sandbox};
+use crate::engine::driver::TargetAddr;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
+use crate::loosespecparser::{parse_map_string_strings, TargetSpecValue};
 
 static GLOBALS: OnceLock<Globals> = OnceLock::new();
 
@@ -31,7 +33,48 @@ pub(crate) struct OnTargetPayload {
     pub name: String,
     pub driver: String,
     pub labels: Vec<String>,
+    pub transitive: Sandbox,
     pub config: HashMap<String, TargetSpecValue>,
+}
+
+impl Sandbox {
+    fn from(m: TargetSpecValue, pkg: &PkgBuf) -> anyhow::Result<Self> {
+        let m = match m {
+            TargetSpecValue::Map(m) => {
+                m
+            },
+            _ => anyhow::bail!("Expected map, got {:?}", m)
+        };
+
+        let mut m: HashMap<&str, &TargetSpecValue> = m
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+
+        let mut sandbox = Self {
+            ..Default::default()
+        };
+
+        if let Some(v) = m.remove("deps") {
+            sandbox.deps = parse_map_string_strings(v)?.iter().enumerate().flat_map(|(i, (k, ss))| ss.iter().map(move |s| -> anyhow::Result<Dep> {
+                Ok(Dep {
+                    r#ref: TargetAddr::parse(s, pkg)?,
+                    mode: Mode::None,
+                    group: k.to_string(),
+                    runtime: true,
+                    hash: true,
+                    id: format!("dep|{}|{}", k, i),
+                })
+            })).collect::<anyhow::Result<Vec<_>>>().with_context(|| "parse `deps`")?;
+        }
+
+        if !m.is_empty() {
+            let unknown_keys: Vec<&str> = m.into_keys().collect();
+            anyhow::bail!("Unknown entries found: {:?}", unknown_keys)
+        }
+
+        Ok(sandbox)
+    }
 }
 
 #[allow(dead_code)]
@@ -89,38 +132,48 @@ fn starlark_to_rust(v: &Value) -> TargetSpecValue {
 fn starlark_module(builder: &mut GlobalsBuilder) {
     fn target<'v>(eval: &mut Evaluator<'v, '_, '_>, args: &Arguments<'v, '_>) -> starlark::Result<String> {
         args.no_positional_args(eval.heap())?;
+        let extra = eval.extra.unwrap().downcast_ref::<Extra>().unwrap();
 
         let m = args.names_map()?;
 
         let mut name = String::new();
         let mut driver = String::new();
-        let mut labels: Vec<String>= vec![];
-        let config = m.iter().filter_map(|e| {
+        let mut labels: Vec<String> = vec![];
+        let mut transitive: Sandbox = Default::default();
+        let config = m.iter().map(|e| -> anyhow::Result<Option<(String, TargetSpecValue)>> {
             match e.0.as_str() {
                 "name" => {
-                    name = e.1.unpack_str()?.to_string();
-                    None
+                    if let Some(s) = e.1.unpack_str() { name = s.to_string(); }
+                    Ok(None)
                 },
                 "driver" => {
-                    driver = e.1.unpack_str()?.to_string();
-                    None
+                    if let Some(s) = e.1.unpack_str() { driver = s.to_string(); }
+                    Ok(None)
                 },
                 "labels" => {
-                    labels = UnpackList::<String>::unpack_value_err(*e.1).ok().map(|l| l.items).unwrap_or_default();
-                    None
+                    labels = UnpackList::<String>::unpack_value_err(*e.1)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?.items;
+                    Ok(None)
                 },
-                _ => Some((e.0.as_str().to_string(), starlark_to_rust(e.1)))
+                "transitive" => {
+                    transitive = Sandbox::from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))?;
+                    Ok(None)
+                },
+                _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1))))
             }
-        }).collect();
+        }).collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<HashMap<String, TargetSpecValue>>();
 
         let p = OnTargetPayload{
             name: name.clone(),
             driver,
             labels,
+            transitive,
             config,
         };
 
-        let extra = eval.extra.unwrap().downcast_ref::<Extra>().unwrap();
         (extra.on_target)(p)?;
 
         Ok(htaddr::Addr{

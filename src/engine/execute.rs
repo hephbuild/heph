@@ -27,7 +27,7 @@ impl Engine {
         hashin: &str,
     ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
         let key = format!("{}:{}", addr.format(), hashin);
-        let driver = self.drivers_by_name.get(&spec.driver).cloned();
+        let driver = self.drivers_by_name.get(&spec.driver).ok_or_else(|| anyhow::anyhow!("driver not found")).cloned()?;
         let def = def.clone();
         let root = self.cfg.root.clone();
         let hashin = hashin.to_string();
@@ -41,13 +41,11 @@ impl Engine {
     async fn execute_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        driver: Option<Arc<Driver>>,
+        driver: Arc<Driver>,
         def: LinkedTargetDef,
         root: PathBuf,
         hashin: String,
     ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
-        let driver = driver.ok_or_else(|| anyhow::anyhow!("driver not found"))?;
-
         let deps_result = self.clone().inputs_result_exec(rs.clone(), &def.inputs).await?;
 
         let sandbox_dir = {

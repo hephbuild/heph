@@ -1,8 +1,7 @@
 mod common;
 
 use common::Workspace;
-use rheph::engine::provider::TargetSpecValue;
-
+use rheph::loosespecparser::TargetSpecValue;
 // ── Discovery ────────────────────────────────────────────────────────────────
 
 #[tokio::test]

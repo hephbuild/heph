@@ -4,8 +4,9 @@ use futures::future::BoxFuture;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse,
     ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
-    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec, TargetSpecValue,
+    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
 };
+use crate::loosespecparser::TargetSpecValue;
 use crate::hasync::Cancellable;
 use crate::htaddr::parse_addr;
 use crate::htpkg::PkgBuf;

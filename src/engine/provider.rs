@@ -4,6 +4,7 @@ use crate::engine::driver::sandbox::Sandbox;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::loosespecparser::TargetSpecValue;
 
 pub struct ConfigRequest {}
 pub struct ConfigResponse {
@@ -30,18 +31,6 @@ pub struct State {
     pub package: PkgBuf,
     pub provider: String,
     pub state: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug)]
-pub enum TargetSpecValue {
-    String(String),
-    Bool(bool),
-    Float(f64),
-    Int(i64),
-    Uint(u64),
-    Null(),
-    Map(HashMap<String, TargetSpecValue>),
-    List(Vec<TargetSpecValue>),
 }
 
 #[derive(Default, Clone)]
