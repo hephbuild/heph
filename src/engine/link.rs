@@ -23,7 +23,7 @@ impl Engine {
     pub(crate) async fn link(self: Arc<Self>, rs: Arc<RequestState>, def: TargetDef) -> anyhow::Result<LinkedTargetDef> {
         let futures = def.inputs.iter().map(|input| {
             enclose!((self => engine, rs, input) async move {
-                let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?;
+                let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?.target_def;
 
                 let output_names = if let Some(ref output_name) = input.r#ref.output {
                     if !input_def.outputs.iter().any(|output| &output.group == output_name) {

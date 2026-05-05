@@ -1,3 +1,5 @@
+use core::fmt;
+use std::fmt::Display;
 use async_trait::async_trait;
 use crate::{hasync, htaddr};
 use crate::htaddr::Addr;
@@ -7,6 +9,16 @@ use crate::htpkg::PkgBuf;
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
+}
+
+impl Display for TargetAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(output) = &self.output {
+            write!(f, "{}|{}", self.r#ref, output)
+        } else {
+            write!(f, "{}", self.r#ref)
+        }
+    }
 }
 
 impl TargetAddr {
@@ -34,6 +46,26 @@ pub mod sandbox {
         pub tools: Vec<Tool>,
         pub deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
+    }
+
+    impl Sandbox {
+        pub(crate) fn merge_sandbox(&mut self, inbound: Sandbox, id: String) {
+            for t in inbound.tools {
+                self.tools.push(Tool {
+                    id: format!("{}_tool_{}", id, t.id),
+                    ..t.clone()
+                });
+            }
+
+            for d in inbound.deps {
+                self.deps.push(Dep{
+                    id: format!("{}_dep_{}", id, d.id),
+                    ..d.clone()
+                })
+            }
+
+            self.env.extend(inbound.env.into_iter().map(|(k, v)| (k, v.clone())));
+        }
     }
 
     impl Sandbox {

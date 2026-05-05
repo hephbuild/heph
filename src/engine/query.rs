@@ -39,7 +39,7 @@ impl Engine {
                                     MatchResult::MatchShrug => {
                                         let def = self.get_def(rs.clone(), &addr).await?;
 
-                                        if m.matches(&def) == MatchResult::MatchYes {
+                                        if m.matches(&def.target_def) == MatchResult::MatchYes {
                                             yield addr;
                                         }
                                     }

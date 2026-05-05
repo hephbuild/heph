@@ -1,5 +1,5 @@
-use crate::engine::driver::targetdef::TargetDef;
-use crate::engine::driver::{outputartifact, ParseRequest};
+use crate::engine::driver::targetdef::{Input, TargetDef};
+use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ParseRequest};
 use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::request_state::RequestState;
@@ -10,11 +10,15 @@ use enclose::enclose;
 use std::sync::Arc;
 
 use std::{fmt, fs, io};
+use std::fmt::format;
+use std::hash::Hash;
 use anyhow::Context;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use tokio::task::JoinSet;
+use xxhash_rust::xxh3::Xxh3Default;
 use crate::defer;
+use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::ManifestArtifactType;
 use crate::hartifactcontent::Content;
@@ -24,6 +28,11 @@ impl fmt::Debug for dyn Content {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Artifact")
     }
+}
+
+pub struct ExtendedTargetDef {
+    pub target_def: TargetDef,
+    pub applied_transitive: Sandbox,
 }
 
 #[derive(Clone)]
@@ -105,7 +114,7 @@ impl Engine {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
-        let def = self.clone().link(rs.clone(), def).await.with_context(|| "link")?;
+        let def = self.clone().link(rs.clone(), def.target_def).await.with_context(|| "link")?;
 
         let output_names = match outputs {
             OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
@@ -171,7 +180,7 @@ impl Engine {
         }))
     }
 
-    pub async fn get_def(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetDef> {
+    pub async fn get_def(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ExtendedTargetDef> {
         let spec = self.get_spec(rs.clone(), addr).await?;
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
@@ -182,13 +191,48 @@ impl Engine {
         let res = driver.driver.parse(ParseRequest{
             request_id: rs.request_id.clone(),
             target_spec: spec,
-        }, &rs.ctoken).await?;
+        }, &rs.ctoken).await.with_context(|| "parse")?;
+        let def = res.target_def;;
 
-        if res.target_def.hash.is_empty() {
+        let all_transitive = self.collect_transitive_deps(rs.clone(), &def.inputs).await?;
+
+        let res = driver.driver.apply_transitive(ApplyTransitiveRequest{
+            request_id: "".to_string(),
+            target_def: def,
+            sandbox: Default::default(),
+        }, &rs.ctoken).await.with_context(|| "apply transitive")?;
+        let def = res.target_def;
+
+        if def.hash.is_empty() {
             anyhow::bail!("missing hash");
         }
 
-        Ok(res.target_def)
+        Ok(ExtendedTargetDef{
+            target_def: def,
+            applied_transitive: all_transitive,
+        })
+    }
+
+    async fn collect_transitive_deps(&self, rs: Arc<RequestState>, inputs: &Vec<Input>) -> anyhow::Result<Sandbox> {
+        let mut sb = Sandbox::default();
+
+        for (i, input) in inputs.iter().enumerate() {
+            let spec = self.get_spec(rs.clone(), &input.r#ref.r#ref).await.with_context(|| format!("get spec: {:?}", input.r#ref))?;
+
+            let transitive = spec.transitive.clone();
+
+            // TODO: group inline
+
+            if transitive.empty() {
+                continue
+            }
+
+            let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+
+            sb.merge_sandbox(transitive, id);
+        }
+
+        Ok(sb)
     }
 
     pub async fn get_spec(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetSpec> {

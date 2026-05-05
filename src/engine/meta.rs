@@ -27,14 +27,14 @@ impl Engine {
     #[async_recursion]
     async fn inner_meta(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ResultMeta> {
         let def = self.get_def(rs.clone(), addr).await?;
-        let results = self.clone().inputs_result_meta(rs.clone(), &def.inputs).await?;
+        let results = self.clone().inputs_result_meta(rs.clone(), &def.target_def.inputs).await?;
 
         let hashouts: Vec<String> = results.iter()
             .flat_map(|res| res.artifacts_meta.iter().map(|m| m.hashout.clone()))
             .collect();
 
         let hashin = self.hashin(
-            def,
+            def.target_def,
             Box::new(hashouts.into_iter()),
         ).with_context(|| "hashin")?;
 

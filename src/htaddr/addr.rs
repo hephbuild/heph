@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use crate::htpkg::PkgBuf;
 use itertools::Itertools;
@@ -9,6 +10,16 @@ pub struct Addr {
     pub package: PkgBuf,
     pub name: String,
     pub args: HashMap<String, String>,
+}
+
+impl Display for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.args.is_empty() {
+            write!(f, "//{}:{}", self.package, self.name)
+        } else {
+            write!(f, "//{}:{} SOMEARGSTODO", self.package, self.name)
+        }
+    }
 }
 
 impl Default for Addr {
@@ -23,7 +34,7 @@ impl Default for Addr {
 
 impl Addr {
     pub fn format(&self) -> String {
-        format!("//{}:{}", self.package, self.name)
+        format!("{}", self)
     }
 
     pub fn hash_str(&self) -> String {
