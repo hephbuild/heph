@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use tokio::io;
 use crate::engine;
 use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, TargetAddr};
+use crate::engine::driver::sandbox::EnvValue;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
@@ -21,10 +22,22 @@ pub struct Driver {
     wrap_run: fn(&Vec<String>) -> Vec<String>,
 }
 
-#[derive(Clone, Hash)]
+#[derive(Clone)]
 struct TargetDef {
     pub run: Vec<String>,
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
+    pub pass_env: BTreeMap<String, String>,
+    pub runtime_pass_env: Vec<String>,
+    pub runtime_env: HashMap<String, String>,
+}
+
+impl Hash for TargetDef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.run.hash(state);
+        self.dep_group_inputs.hash(state);
+        self.pass_env.hash(state);
+        // runtime_pass_env and runtime_env intentionally excluded
+    }
 }
 
 fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
@@ -128,9 +141,16 @@ impl engine::driver_managed::ManagedDriver for Driver {
             dep_group_inputs.entry(group.clone()).or_default().push(input.clone());
         }
 
+        let pass_env: BTreeMap<String, String> = spec.pass_env.into_iter()
+            .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
+            .collect();
+
         let def = TargetDef{
             run: spec.run,
             dep_group_inputs,
+            pass_env,
+            runtime_pass_env: spec.runtime_pass_env,
+            runtime_env: spec.runtime_env,
         };
 
         let hash = {
@@ -190,9 +210,32 @@ impl engine::driver_managed::ManagedDriver for Driver {
             xdef.dep_group_inputs.entry(dep.group).or_default().push(input.clone());
             def.inputs.push(input);
         }
-        // for x in req.sandbox.env {
-        //
-        // }
+        for (name, env) in req.sandbox.env {
+            match env.value {
+                EnvValue::Pass => {
+                    if env.hash {
+                        if let Ok(value) = std::env::var(&name) {
+                            xdef.pass_env.insert(name, value);
+                        }
+                    } else {
+                        xdef.runtime_pass_env.push(name);
+                    }
+                }
+                EnvValue::Literal(v) => {
+                    if env.hash {
+                        xdef.pass_env.insert(name, v);
+                    } else {
+                        xdef.runtime_env.insert(name, v);
+                    }
+                }
+            }
+        }
+
+        def.hash = {
+            let mut h = Xxh3Default::new();
+            xdef.hash(&mut h);
+            format!("{:x}", h.digest()).into_bytes()
+        };
 
         def.set_def(xdef);
 
@@ -262,6 +305,16 @@ impl engine::driver_managed::ManagedDriver for Driver {
             }
         }
 
+        env.extend(def.pass_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
+        for name in &def.runtime_pass_env {
+            if let Ok(value) = std::env::var(name) {
+                env.insert(name.clone(), value);
+            }
+        }
+
+        env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log = std::fs::File::create(&output_log_path)?;
         let output_log_file = Arc::new(tokio::sync::Mutex::new(
@@ -269,8 +322,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
         ));
 
         let mut child = Command::new(&run[0])
-            .kill_on_drop(true)
             .args(&run[1..])
+            .kill_on_drop(true)
             .env_clear()
             .envs(env)
             .current_dir(req.sandbox_pkg_dir)
@@ -360,6 +413,9 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],
@@ -405,6 +461,9 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],
@@ -452,6 +511,9 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
             }),
             inputs: vec![],
             outputs: vec![],
@@ -492,6 +554,146 @@ mod tests {
         let err = res.err().unwrap();
         assert_eq!(err.to_string(), "cancelled");
 
+        Ok(())
+    }
+
+    async fn run_bash_env(run_cmd: &str, pass_env: BTreeMap<String, String>, runtime_pass_env: Vec<String>, runtime_env: HashMap<String, String>) -> anyhow::Result<String> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec![run_cmd.to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                pass_env,
+                runtime_pass_env,
+                runtime_env,
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+        };
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let tmp = tempfile::tempdir()?;
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string(),
+            inputs: vec![],
+            hashin: &"".to_string(),
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver.run(make_req(req), &ctoken).await?;
+        Ok(String::from_utf8(stdout)?.trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn test_run_pass_env_injected() -> anyhow::Result<()> {
+        let out = run_bash_env(
+            "echo $MY_PASS_VAR",
+            BTreeMap::from([("MY_PASS_VAR".to_string(), "pass_value".to_string())]),
+            vec![],
+            HashMap::new(),
+        ).await?;
+        assert_eq!(out, "pass_value");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_runtime_env_injected() -> anyhow::Result<()> {
+        let out = run_bash_env(
+            "echo $MY_RUNTIME_ENV",
+            BTreeMap::new(),
+            vec![],
+            HashMap::from([("MY_RUNTIME_ENV".to_string(), "runtime_env_value".to_string())]),
+        ).await?;
+        assert_eq!(out, "runtime_env_value");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_runtime_pass_env_injected() -> anyhow::Result<()> {
+        unsafe { std::env::set_var("RHEPH_TEST_RUNTIME_PASS", "runtime_pass_value"); }
+        let out = run_bash_env(
+            "echo $RHEPH_TEST_RUNTIME_PASS",
+            BTreeMap::new(),
+            vec!["RHEPH_TEST_RUNTIME_PASS".to_string()],
+            HashMap::new(),
+        ).await?;
+        assert_eq!(out, "runtime_pass_value");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_env_not_leaked_from_parent() -> anyhow::Result<()> {
+        unsafe { std::env::set_var("RHEPH_TEST_PARENT_ONLY", "should_not_see_this"); }
+        let out = run_bash_env(
+            "echo ${RHEPH_TEST_PARENT_ONLY:-absent}",
+            BTreeMap::new(),
+            vec![],
+            HashMap::new(),
+        ).await?;
+        assert_eq!(out, "absent");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
+        unsafe { std::env::set_var("RHEPH_TEST_PARSE_PASS", "resolved_value"); }
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let config = HashMap::from([
+            ("run".to_string(), crate::loosespecparser::TargetSpecValue::String("echo".to_string())),
+            ("pass_env".to_string(), crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("RHEPH_TEST_PARSE_PASS".to_string()),
+            ])),
+        ]);
+        let res = driver.parse(crate::engine::driver::ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: crate::engine::provider::TargetSpec {
+                addr: Addr::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            },
+        }, &ctoken).await?;
+        let def = res.target_def.def::<TargetDef>();
+        assert_eq!(def.pass_env.get("RHEPH_TEST_PARSE_PASS"), Some(&"resolved_value".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_pass_env_missing_var_skipped() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let config = HashMap::from([
+            ("run".to_string(), crate::loosespecparser::TargetSpecValue::String("echo".to_string())),
+            ("pass_env".to_string(), crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("RHEPH_TEST_DEFINITELY_UNSET_99999".to_string()),
+            ])),
+        ]);
+        let res = driver.parse(crate::engine::driver::ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: crate::engine::provider::TargetSpec {
+                addr: Addr::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            },
+        }, &ctoken).await?;
+        let def = res.target_def.def::<TargetDef>();
+        assert!(def.pass_env.is_empty());
         Ok(())
     }
 }

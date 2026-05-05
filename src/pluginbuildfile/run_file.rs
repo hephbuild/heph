@@ -2,7 +2,7 @@ use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
 use crate::engine::driver::TargetAddr;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
-use crate::loosespecparser::{parse_map_string_string, parse_map_string_strings, TargetSpecValue};
+use crate::loosespecparser::{parse_map_string_string, parse_map_string_strings, parse_strings, TargetSpecValue};
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
 use starlark::any::ProvidesStaticType;
@@ -74,7 +74,7 @@ impl Sandbox {
         if let Some(v) = m.remove("env") {
             sandbox.env = parse_map_string_string(v).with_context(|| "parse `env`")?.into_iter().map(|(k, v)| {
                 (k, Env {
-                    value: EnvValue::Literal(v.into()),
+                    value: EnvValue::Literal(v),
                     hash: true,
                     append: false,
                     append_prefix: "".to_string(),
@@ -91,6 +91,28 @@ impl Sandbox {
                     id: format!("tool|{}|{}", k, i),
                 })
             })).collect::<anyhow::Result<Vec<_>>>().with_context(|| "parse `tools`")?;
+        }
+
+        if let Some(v) = m.remove("pass_env") {
+            for name in parse_strings(v).with_context(|| "parse `pass_env`")? {
+                sandbox.env.insert(name, Env {
+                    value: EnvValue::Pass,
+                    hash: true,
+                    append: false,
+                    append_prefix: "".to_string(),
+                });
+            }
+        }
+
+        if let Some(v) = m.remove("runtime_pass_env") {
+            for name in parse_strings(v).with_context(|| "parse `runtime_pass_env`")? {
+                sandbox.env.insert(name, Env {
+                    value: EnvValue::Pass,
+                    hash: false,
+                    append: false,
+                    append_prefix: "".to_string(),
+                });
+            }
         }
 
         if !m.is_empty() {

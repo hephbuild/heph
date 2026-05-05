@@ -109,7 +109,7 @@ pub mod sandbox {
     #[derive(Clone, Debug)]
     pub enum EnvValue {
         Literal(String),
-        Pass(bool),
+        Pass,
     }
 }
 

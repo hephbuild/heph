@@ -215,7 +215,7 @@ impl Engine {
         })
     }
 
-    async fn collect_transitive_deps(&self, rs: Arc<RequestState>, inputs: &Vec<Input>) -> anyhow::Result<Sandbox> {
+    async fn collect_transitive_deps(&self, rs: Arc<RequestState>, inputs: &[Input]) -> anyhow::Result<Sandbox> {
         let mut sb = Sandbox::default();
 
         for (i, input) in inputs.iter().enumerate() {
