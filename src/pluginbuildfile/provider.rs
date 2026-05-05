@@ -111,7 +111,7 @@ impl EProvider for Provider {
                             driver: p.driver,
                             config: p.config,
                             labels: p.labels,
-                            transitive: Default::default(),
+                            transitive: p.transitive,
                         },
                     })
                 }

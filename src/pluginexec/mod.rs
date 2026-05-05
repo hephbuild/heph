@@ -21,7 +21,7 @@ pub struct Driver {
     wrap_run: fn(&Vec<String>) -> Vec<String>,
 }
 
-#[derive(Hash)]
+#[derive(Clone, Hash)]
 struct TargetDef {
     pub run: Vec<String>,
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
@@ -172,8 +172,32 @@ impl engine::driver_managed::ManagedDriver for Driver {
     }
 
     async fn apply_transitive(&self, req: ApplyTransitiveRequest, _ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse> {
+        let mut def = req.target_def.clone();
+        let mut xdef = def.def::<TargetDef>().clone();
+        // for tool in req.sandbox.tools {
+        //     xdef.tool_group_inputs.entry(tool.group).or_default().push(Input{
+        //         r#ref: tool.r#ref,
+        //         mode: InputMode::Standard,
+        //         origin_id: tool.id,
+        //     });
+        // }
+        for dep in req.sandbox.deps {
+            let input = Input {
+                r#ref: dep.r#ref.clone(),
+                mode: InputMode::Standard,
+                origin_id: dep.id.clone(),
+            };
+            xdef.dep_group_inputs.entry(dep.group).or_default().push(input.clone());
+            def.inputs.push(input);
+        }
+        // for x in req.sandbox.env {
+        //
+        // }
+
+        def.set_def(xdef);
+
         Ok(ApplyTransitiveResponse{
-            target_def: req.target_def,
+            target_def: def,
         })
     }
 

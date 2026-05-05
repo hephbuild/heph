@@ -10,13 +10,10 @@ use enclose::enclose;
 use std::sync::Arc;
 
 use std::{fmt, fs, io};
-use std::fmt::format;
-use std::hash::Hash;
 use anyhow::Context;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use tokio::task::JoinSet;
-use xxhash_rust::xxh3::Xxh3Default;
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
@@ -192,16 +189,21 @@ impl Engine {
             request_id: rs.request_id.clone(),
             target_spec: spec,
         }, &rs.ctoken).await.with_context(|| "parse")?;
-        let def = res.target_def;;
+        let def = res.target_def;
 
         let all_transitive = self.collect_transitive_deps(rs.clone(), &def.inputs).await?;
 
-        let res = driver.driver.apply_transitive(ApplyTransitiveRequest{
-            request_id: "".to_string(),
-            target_def: def,
-            sandbox: Default::default(),
-        }, &rs.ctoken).await.with_context(|| "apply transitive")?;
-        let def = res.target_def;
+        let def = if all_transitive.empty() {
+            def
+        } else {
+            let res = driver.driver.apply_transitive(ApplyTransitiveRequest {
+                request_id: rs.request_id.clone(),
+                target_def: def,
+                sandbox: all_transitive.clone(),
+            }, &rs.ctoken).await.with_context(|| "apply transitive")?;
+
+            res.target_def
+        };
 
         if def.hash.is_empty() {
             anyhow::bail!("missing hash");

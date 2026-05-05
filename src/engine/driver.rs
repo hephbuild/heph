@@ -1,4 +1,3 @@
-use core::fmt;
 use std::fmt::Display;
 use async_trait::async_trait;
 use crate::{hasync, htaddr};
@@ -147,6 +146,9 @@ pub mod targetdef {
     impl TargetDef {
         pub fn def<T: 'static>(&self) -> &T {
             self.raw_def.downcast_ref::<T>().unwrap()
+        }
+        pub fn set_def<T: Send + Sync + 'static>(&mut self, def: T) {
+            self.raw_def = Arc::new(def);
         }
     }
 

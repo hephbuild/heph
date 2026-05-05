@@ -138,3 +138,58 @@ async fn test_cross_package_dep() -> anyhow::Result<()> {
     assert!(content.contains("cross_pkg"), "got: {content:?}");
     Ok(())
 }
+
+// A has transitive deps = B; C depends on A → C sees both $SRC_A and $SRC_B
+#[tokio::test]
+async fn test_transitive_dep_available_in_consumer() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("trans", r#"
+target(name = "b", driver = "bash", run = "printf b_value > $OUT", out = "b.txt")
+target(
+    name = "a",
+    driver = "bash",
+    run = "printf a_value > $OUT",
+    out = "a.txt",
+    transitive = {"deps": {"b": ["//trans:b"]}},
+)
+target(
+    name = "c",
+    driver = "bash",
+    run = "printf '%s %s' \"$(cat $SRC_A)\" \"$(cat $SRC_B)\" > $OUT",
+    out = "c.txt",
+    deps = {"a": ["//trans:a"]},
+)
+"#);
+
+    let result = ws.run("//trans:c").await?;
+    let content = common::artifact_string(&result);
+    assert!(content.contains("a_value"), "missing a_value in transitive output, got: {content:?}");
+    assert!(content.contains("b_value"), "missing b_value from transitive dep, got: {content:?}");
+    Ok(())
+}
+
+// Transitive dep does not leak when not depending on the intermediary
+#[tokio::test]
+async fn test_transitive_dep_not_leaked_without_dep() -> anyhow::Result<()> {
+    let ws = Workspace::new();
+    ws.write_build_file("noleak", r#"
+target(name = "b", driver = "bash", run = "printf b_value > $OUT", out = "b.txt")
+target(
+    name = "a",
+    driver = "bash",
+    run = "printf a_value > $OUT",
+    out = "a.txt",
+    transitive = {"deps": {"b": ["//noleak:b"]}},
+)
+target(
+    name = "c",
+    driver = "bash",
+    run = "echo $SRC_B > $OUT",
+    out = "c.txt",
+)
+"#);
+
+    let err = ws.run("//noleak:c").await;
+    assert!(err.is_err(), "expected failure: $SRC_B should be unset when A is not a dep");
+    Ok(())
+}
