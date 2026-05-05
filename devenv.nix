@@ -1,9 +1,8 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
-  # 1. Define the location in one place here
-  # This is a literal string that will be injected into your scripts
   binLocation = "$HOME/.local/bin/rheph";
+  qualityCrates = "-p rheph -p e2e";
 in
 {
   # https://devenv.sh/basics/
@@ -36,10 +35,10 @@ in
   # services.postgres.enable = true;
 
   # https://devenv.sh/scripts/
-  scripts.proto-gen.exec = "buf generate && echo 'format_generated_files = false' > gen/proto/rustfmt.toml";
-  scripts.gen.exec = "proto-gen";
-  scripts.lint.exec = "echo '> clippy' && cargo clippy -- -D warnings && echo '> fmt' && cargo fmt --check";
-  scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt";
+  scripts.proto-gen.exec = "buf generate";
+  scripts.gen.exec = "rm -rf gen && proto-gen";
+  scripts.lint.exec = "echo '> clippy' && cargo clippy -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
+  scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   scripts.tst.exec = "cargo test --all";
 
   scripts.install-dev.exec = ''
