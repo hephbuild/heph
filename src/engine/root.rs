@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
+use crate::engine::get_cwd;
 use anyhow::anyhow;
 use memoize::memoize;
-use crate::engine::get_cwd;
+use std::path::{Path, PathBuf};
 
 pub fn get_root() -> anyhow::Result<PathBuf> {
     get_root_inner().map_err(|e| anyhow!(e))
@@ -30,9 +30,9 @@ pub fn get_root_inner() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::fs;
     use tempfile::tempdir;
-    use std::env;
 
     #[test]
     fn test_get_root_finds_config() {
@@ -49,7 +49,10 @@ mod tests {
 
         let result = get_root();
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().to_str().unwrap(), root_path.to_str().unwrap());
+        assert_eq!(
+            result.unwrap().to_str().unwrap(),
+            root_path.to_str().unwrap()
+        );
 
         unsafe {
             env::remove_var("HEPH_CWD");

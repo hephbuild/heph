@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::fmt;
-use tokio::sync::Mutex;
-use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
+use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct WrappedError(pub Arc<anyhow::Error>);
@@ -99,7 +99,7 @@ mod tests {
     use enclose::enclose;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     #[tokio::test]
     async fn test_memoizer() {

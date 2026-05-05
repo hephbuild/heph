@@ -1,6 +1,6 @@
+use crate::engine::Engine;
 use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::request_state::RequestState;
-use crate::engine::Engine;
 use enclose::enclose;
 use futures::future::try_join_all;
 use itertools::Itertools;
@@ -20,7 +20,11 @@ pub struct LinkedTargetDef {
 }
 
 impl Engine {
-    pub(crate) async fn link(self: Arc<Self>, rs: Arc<RequestState>, def: TargetDef) -> anyhow::Result<LinkedTargetDef> {
+    pub(crate) async fn link(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        def: TargetDef,
+    ) -> anyhow::Result<LinkedTargetDef> {
         let futures = def.inputs.iter().map(|input| {
             enclose!((self => engine, rs, input) async move {
                 let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?.target_def;

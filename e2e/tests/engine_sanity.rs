@@ -92,11 +92,7 @@ async fn test_static_matcher_package_all_targets() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_static_cached_run() -> anyhow::Result<()> {
-    let ws = Workspace::with_static(vec![bash(
-        "//cached:t",
-        "printf 'ok' > $OUT",
-        "out.txt",
-    )])?;
+    let ws = Workspace::with_static(vec![bash("//cached:t", "printf 'ok' > $OUT", "out.txt")])?;
 
     let r1 = ws.run("//cached:t").await?;
     let r1_content = common::artifact_string(&r1);

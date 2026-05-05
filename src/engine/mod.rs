@@ -1,26 +1,29 @@
-#[allow(clippy::module_inception)]
+#[expect(
+    clippy::module_inception,
+    reason = "module and struct share name by design"
+)]
 mod engine;
-pub use engine::Engine;
 pub use engine::Config;
-mod result;
+pub use engine::Engine;
 mod cwd;
+mod result;
 pub use cwd::get_cwd;
 pub use cwd::get_cwp;
 mod root;
 pub use root::get_root;
+pub mod driver;
+pub mod error;
 mod local_cache;
 mod local_cache_fs;
-mod query;
 mod packages;
-pub mod error;
 pub mod provider;
-pub mod driver;
+mod query;
 pub mod request_state;
 pub use result::EResult;
-pub use result::ResultOptions;
 pub use result::OutputMatcher;
-mod matcher_spec;
+pub use result::ResultOptions;
 pub mod driver_managed;
-mod meta;
 mod execute;
 mod link;
+mod matcher_spec;
+mod meta;

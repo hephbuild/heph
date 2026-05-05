@@ -1,6 +1,8 @@
-use std::collections::HashMap;
+use crate::loosespecparser::{
+    TargetSpecValue, parse_bool, parse_map_string_string, parse_map_string_strings, parse_strings,
+};
 use anyhow::Context;
-use crate::loosespecparser::{parse_bool, parse_map_string_string, parse_map_string_strings, parse_strings, TargetSpecValue};
+use std::collections::HashMap;
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
@@ -19,14 +21,12 @@ pub(crate) struct TargetSpecCache {
 
 impl TargetSpec {
     pub fn from(m: HashMap<String, TargetSpecValue>) -> anyhow::Result<TargetSpec> {
-        let mut m: HashMap<&str, &TargetSpecValue> = m
-            .iter()
-            .map(|(k, v)| (k.as_str(), v))
-            .collect();
+        let mut m: HashMap<&str, &TargetSpecValue> =
+            m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
-        let mut spec = TargetSpec{
+        let mut spec = TargetSpec {
             run: vec![],
-            cache: TargetSpecCache{
+            cache: TargetSpecCache {
                 local: true,
                 remote: true,
             },
@@ -37,13 +37,13 @@ impl TargetSpec {
             runtime_env: HashMap::new(),
         };
 
-
         if let Some(v) = m.remove("run") {
             spec.run = parse_strings(v).with_context(|| "parse `run`")?;
         };
 
         if let Some(v) = m.remove("cache")
-            && !parse_bool(v).with_context(|| "parse `cache`")? {
+            && !parse_bool(v).with_context(|| "parse `cache`")?
+        {
             spec.cache = TargetSpecCache {
                 local: false,
                 remote: false,
@@ -84,36 +84,50 @@ mod tests {
     use super::*;
     use crate::loosespecparser::TargetSpecValue;
 
-    fn make_spec(extra: impl IntoIterator<Item = (&'static str, TargetSpecValue)>) -> anyhow::Result<TargetSpec> {
-        let mut m = HashMap::from([
-            ("run".to_string(), TargetSpecValue::String("echo".to_string())),
-        ]);
+    fn make_spec(
+        extra: impl IntoIterator<Item = (&'static str, TargetSpecValue)>,
+    ) -> anyhow::Result<TargetSpec> {
+        let mut m = HashMap::from([(
+            "run".to_string(),
+            TargetSpecValue::String("echo".to_string()),
+        )]);
         m.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
         TargetSpec::from(m)
     }
 
     #[test]
     fn test_pass_env_parsed() {
-        let spec = make_spec([("pass_env", TargetSpecValue::List(vec![
-            TargetSpecValue::String("VAR1".to_string()),
-            TargetSpecValue::String("VAR2".to_string()),
-        ]))]).unwrap();
+        let spec = make_spec([(
+            "pass_env",
+            TargetSpecValue::List(vec![
+                TargetSpecValue::String("VAR1".to_string()),
+                TargetSpecValue::String("VAR2".to_string()),
+            ]),
+        )])
+        .unwrap();
         assert_eq!(spec.pass_env, vec!["VAR1", "VAR2"]);
     }
 
     #[test]
     fn test_runtime_pass_env_parsed() {
-        let spec = make_spec([("runtime_pass_env", TargetSpecValue::List(vec![
-            TargetSpecValue::String("HOME".to_string()),
-        ]))]).unwrap();
+        let spec = make_spec([(
+            "runtime_pass_env",
+            TargetSpecValue::List(vec![TargetSpecValue::String("HOME".to_string())]),
+        )])
+        .unwrap();
         assert_eq!(spec.runtime_pass_env, vec!["HOME"]);
     }
 
     #[test]
     fn test_runtime_env_parsed() {
-        let spec = make_spec([("runtime_env", TargetSpecValue::Map(HashMap::from([
-            ("KEY".to_string(), TargetSpecValue::String("value".to_string())),
-        ])))]).unwrap();
+        let spec = make_spec([(
+            "runtime_env",
+            TargetSpecValue::Map(HashMap::from([(
+                "KEY".to_string(),
+                TargetSpecValue::String("value".to_string()),
+            )])),
+        )])
+        .unwrap();
         assert_eq!(spec.runtime_env.get("KEY"), Some(&"value".to_string()));
     }
 

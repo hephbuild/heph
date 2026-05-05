@@ -9,12 +9,12 @@ pub struct Args {
 }
 
 #[tokio::main]
-pub async fn execute(args: &Args) -> anyhow::Result<()>  {
-    let e =  bootstrap::new_engine()?;
+pub async fn execute(args: &Args) -> anyhow::Result<()> {
+    let e = bootstrap::new_engine()?;
 
     let m = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
-        None => htmatcher::Matcher::PackagePrefix(PkgBuf::from(""))
+        None => htmatcher::Matcher::PackagePrefix(PkgBuf::from("")),
     };
 
     let ctoken = crate::hasync::StdCancellationToken::new();

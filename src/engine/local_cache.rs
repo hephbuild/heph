@@ -1,16 +1,16 @@
-use crate::hartifactcontent;
-use std::fs::File;
-use std::{io, time};
-use std::os::unix::fs::MetadataExt;
 use crate::engine::Engine;
-use crate::hasync::Cancellable;
-use crate::htaddr::Addr;
-use std::sync::Arc;
-use chrono::Utc;
 use crate::engine::driver::outputartifact;
-use serde::{Deserialize, Serialize};
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::result::ArtifactMeta;
+use crate::hartifactcontent;
+use crate::hasync::Cancellable;
+use crate::htaddr::Addr;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::sync::Arc;
+use std::{io, time};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ManifestArtifactContentType {
@@ -90,9 +90,15 @@ impl hartifactcontent::Content for CacheArtifact {
         self.cache.reader(&self.addr, &self.hashin, &self.name)
     }
 
-    fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item=anyhow::Result<hartifactcontent::WalkEntry>> + '_>> {
+    fn walk(
+        &self,
+    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<hartifactcontent::WalkEntry>> + '_>>
+    {
         Ok(match &self.content_type {
-            hartifactcontent::Type::Tar => Box::new(crate::hartifactcontent::tar::TarWalker::new(self.reader()?)?),
+            hartifactcontent::Type::Tar => Box::new(crate::hartifactcontent::tar::TarWalker::new(
+                self.reader()?,
+            )?),
+            #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
             hartifactcontent::Type::Cpio => unimplemented!("cpio is not implemented"),
         })
     }
@@ -103,8 +109,19 @@ impl hartifactcontent::Content for CacheArtifact {
 }
 
 impl Engine {
-    pub async fn cache_artifact_locally(&self, _ctoken: &dyn Cancellable, addr: &Addr, hashin: &str, artifact: &outputartifact::OutputArtifact) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
-        let (mut src, size, content_type, name_suffix): (Box<dyn io::Read>, u64, hartifactcontent::Type, &str) = match &artifact.content {
+    pub async fn cache_artifact_locally(
+        &self,
+        _ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        artifact: &outputartifact::OutputArtifact,
+    ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
+        let (mut src, size, content_type, name_suffix): (
+            Box<dyn io::Read>,
+            u64,
+            hartifactcontent::Type,
+            &str,
+        ) = match &artifact.content {
             outputartifact::Content::Raw(raw) => {
                 let mut p = hartifactcontent::tar::TarPacker::new();
 
@@ -114,8 +131,13 @@ impl Engine {
                 p.pack(&mut buf)?;
                 let len = buf.len();
 
-                (Box::new(io::Cursor::new(buf)), len as u64, hartifactcontent::Type::Tar, ".tar")
-            },
+                (
+                    Box::new(io::Cursor::new(buf)),
+                    len as u64,
+                    hartifactcontent::Type::Tar,
+                    ".tar",
+                )
+            }
             outputartifact::Content::File(file) => {
                 let mut p = hartifactcontent::tar::TarPacker::new();
 
@@ -125,15 +147,30 @@ impl Engine {
                 p.pack(&mut buf)?;
                 let len = buf.len();
 
-                (Box::new(io::Cursor::new(buf)), len as u64, hartifactcontent::Type::Tar, ".tar")
-            },
-            outputartifact::Content::TarPath(path) => (Box::new(File::open(path)?), File::open(path)?.metadata()?.size(), hartifactcontent::Type::Tar, ""),
-            outputartifact::Content::CpioPath(path) => (Box::new(File::open(path)?), File::open(path)?.metadata()?.size(), hartifactcontent::Type::Cpio, ""),
+                (
+                    Box::new(io::Cursor::new(buf)),
+                    len as u64,
+                    hartifactcontent::Type::Tar,
+                    ".tar",
+                )
+            }
+            outputartifact::Content::TarPath(path) => (
+                Box::new(File::open(path)?),
+                File::open(path)?.metadata()?.size(),
+                hartifactcontent::Type::Tar,
+                "",
+            ),
+            outputartifact::Content::CpioPath(path) => (
+                Box::new(File::open(path)?),
+                File::open(path)?.metadata()?.size(),
+                hartifactcontent::Type::Cpio,
+                "",
+            ),
         };
 
         let name = format!(
             "{}_{}{}",
-            match artifact.r#type{
+            match artifact.r#type {
                 outputartifact::Type::Output => "out",
                 outputartifact::Type::Log => "log",
                 outputartifact::Type::SupportFile => "support",
@@ -145,38 +182,48 @@ impl Engine {
         let mut writer = self.local_cache.writer(addr, hashin, &name)?;
         io::copy(&mut src, &mut writer)?;
 
-        Ok((CacheArtifact{
-            addr: addr.clone(),
-            hashin: hashin.to_string(),
-            name: name.clone(),
-            cache: self.local_cache.clone(),
-            hashout: artifact.hashout.clone(),
-            content_type,
-            group: artifact.group.clone(),
-            r#type: match artifact.r#type {
-                outputartifact::Type::Output => ManifestArtifactType::Output,
-                outputartifact::Type::Log => ManifestArtifactType::Log,
-                outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
-            }
-        }, ManifestArtifact{
-            hashout: artifact.hashout.clone(),
-            group: artifact.group.clone(),
-            name: name.clone(),
-            size,
-            r#type: match artifact.r#type {
-                outputartifact::Type::Output => ManifestArtifactType::Output,
-                outputartifact::Type::Log => ManifestArtifactType::Log,
-                outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+        Ok((
+            CacheArtifact {
+                addr: addr.clone(),
+                hashin: hashin.to_string(),
+                name: name.clone(),
+                cache: self.local_cache.clone(),
+                hashout: artifact.hashout.clone(),
+                content_type,
+                group: artifact.group.clone(),
+                r#type: match artifact.r#type {
+                    outputartifact::Type::Output => ManifestArtifactType::Output,
+                    outputartifact::Type::Log => ManifestArtifactType::Log,
+                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+                },
             },
-            content_type: match content_type {
-                hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
-                hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
+            ManifestArtifact {
+                hashout: artifact.hashout.clone(),
+                group: artifact.group.clone(),
+                name: name.clone(),
+                size,
+                r#type: match artifact.r#type {
+                    outputartifact::Type::Output => ManifestArtifactType::Output,
+                    outputartifact::Type::Log => ManifestArtifactType::Log,
+                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+                },
+                content_type: match content_type {
+                    hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
+                    hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
+                },
+                encoding: ManifestArtifactEncoding::None,
             },
-            encoding: ManifestArtifactEncoding::None,
-        }))
+        ))
     }
 
-    pub async fn cache_locally(&self, ctoken: &dyn Cancellable, addr: &Addr, hashin: &str, artifacts: Vec<outputartifact::OutputArtifact>, tmp: bool) -> anyhow::Result<Vec<CacheArtifact>> {
+    pub async fn cache_locally(
+        &self,
+        ctoken: &dyn Cancellable,
+        addr: &Addr,
+        hashin: &str,
+        artifacts: Vec<outputartifact::OutputArtifact>,
+        tmp: bool,
+    ) -> anyhow::Result<Vec<CacheArtifact>> {
         let mut res_artifacts = Vec::with_capacity(artifacts.len());
         let mut manifest_artifacts = Vec::with_capacity(artifacts.len());
 
@@ -191,12 +238,14 @@ impl Engine {
         };
 
         for artifact in artifacts {
-            let (cached_artifact, manifest_artifact) = self.cache_artifact_locally(ctoken, addr, &key, &artifact).await?;
+            let (cached_artifact, manifest_artifact) = self
+                .cache_artifact_locally(ctoken, addr, &key, &artifact)
+                .await?;
             res_artifacts.push(cached_artifact);
             manifest_artifacts.push(manifest_artifact);
         }
 
-        let manifest = Manifest{
+        let manifest = Manifest {
             version: "1.0.0".to_string(),
             target: addr.format(),
             created_at: Utc::now(),
@@ -210,12 +259,22 @@ impl Engine {
         Ok(res_artifacts)
     }
 
-    pub async fn artifacts_from_local_cache(&self, _ctoken: &dyn Cancellable, def: &LinkedTargetDef, hashin: &str, outputs: Vec<String>) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
-        let manifest_artifact = match self.local_cache.reader(&def.target.addr, hashin, MANIFEST_V1_JSON) {
-            Err(e) if e.is::<NotFoundError>() => return Ok(None),
-            Err(e) => return Err(e),
-            Ok(artifact) => artifact,
-        };
+    pub async fn artifacts_from_local_cache(
+        &self,
+        _ctoken: &dyn Cancellable,
+        def: &LinkedTargetDef,
+        hashin: &str,
+        outputs: Vec<String>,
+    ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
+        let manifest_artifact =
+            match self
+                .local_cache
+                .reader(&def.target.addr, hashin, MANIFEST_V1_JSON)
+            {
+                Err(e) if e.is::<NotFoundError>() => return Ok(None),
+                Err(e) => return Err(e),
+                Ok(artifact) => artifact,
+            };
 
         let manifest: Manifest = serde_json::from_reader(manifest_artifact)?;
 
@@ -224,18 +283,25 @@ impl Engine {
 
         for artifact in manifest.artifacts {
             if artifact.r#type != ManifestArtifactType::Output {
-                continue
+                continue;
             }
 
-            result_meta.push(ArtifactMeta{ hashout: artifact.hashout.clone() });
+            result_meta.push(ArtifactMeta {
+                hashout: artifact.hashout.clone(),
+            });
 
-            if !outputs.contains(&artifact.group) { continue }
-
-            if !self.local_cache.exists(&def.target.addr, hashin, artifact.name.as_ref())? {
-                return Ok(None)
+            if !outputs.contains(&artifact.group) {
+                continue;
             }
 
-            results.push(CacheArtifact{
+            if !self
+                .local_cache
+                .exists(&def.target.addr, hashin, artifact.name.as_ref())?
+            {
+                return Ok(None);
+            }
+
+            results.push(CacheArtifact {
                 addr: def.target.addr.clone(),
                 hashin: hashin.to_string(),
                 name: artifact.name.clone(),

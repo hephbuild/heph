@@ -1,25 +1,25 @@
-use crate::engine::driver::targetdef::{Input, TargetDef};
-use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ParseRequest};
-use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
-use crate::engine::error::TargetNotFoundError;
-use crate::engine::request_state::RequestState;
 use crate::engine::Engine;
-use crate::htaddr::Addr;
+use crate::engine::driver::targetdef::{Input, TargetDef};
+use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
+use crate::engine::error::TargetNotFoundError;
+use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
+use crate::engine::request_state::RequestState;
 use crate::hmemoizer::WrappedError;
+use crate::htaddr::Addr;
 use enclose::enclose;
 use std::sync::Arc;
 
-use std::{fmt, fs, io};
-use anyhow::Context;
-use futures::TryStreamExt;
-use itertools::Itertools;
-use tokio::task::JoinSet;
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
 use crate::engine::local_cache::ManifestArtifactType;
 use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
+use anyhow::Context;
+use futures::TryStreamExt;
+use itertools::Itertools;
+use std::{fmt, fs, io};
+use tokio::task::JoinSet;
 
 impl fmt::Debug for dyn Content {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -77,7 +77,13 @@ struct ExecuteOptions<'a> {
 }
 
 impl Engine {
-    pub async fn result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, outputs: OutputMatcher, opts: &ResultOptions) -> anyhow::Result<EResult> {
+    pub async fn result_addr(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+        outputs: OutputMatcher,
+        opts: &ResultOptions,
+    ) -> anyhow::Result<EResult> {
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
         let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr, outputs) move || async move {
@@ -87,7 +93,12 @@ impl Engine {
         Ok(res)
     }
 
-    pub async fn result(self: Arc<Self>, rs: Arc<RequestState>, matcher: &Matcher, opts: &ResultOptions) -> anyhow::Result<Vec<EResult>> {
+    pub async fn result(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        matcher: &Matcher,
+        opts: &ResultOptions,
+    ) -> anyhow::Result<Vec<EResult>> {
         let mut set = JoinSet::new();
         let opts = *opts;
 
@@ -99,7 +110,7 @@ impl Engine {
             }));
         }
 
-        let mut all_res: Vec<EResult> = vec!();
+        let mut all_res: Vec<EResult> = vec![];
         while let Some(res) = set.join_next().await {
             all_res.push(res??)
         }
@@ -107,17 +118,34 @@ impl Engine {
         Ok(all_res)
     }
 
-    async fn inner_result_addr(self: Arc<Self>, rs: Arc<RequestState>, addr: &Addr, outputs: OutputMatcher, opts: &ResultOptions) -> anyhow::Result<EResult> {
+    async fn inner_result_addr(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+        outputs: OutputMatcher,
+        opts: &ResultOptions,
+    ) -> anyhow::Result<EResult> {
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
-        let def = self.clone().link(rs.clone(), def.target_def).await.with_context(|| "link")?;
+        let def = self
+            .clone()
+            .link(rs.clone(), def.target_def)
+            .await
+            .with_context(|| "link")?;
 
         let output_names = match outputs {
             OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
-            OutputMatcher::All => Ok(def.target.outputs.iter().map(|o| o.group.clone()).unique().collect()),
+            OutputMatcher::All => Ok(def
+                .target
+                .outputs
+                .iter()
+                .map(|o| o.group.clone())
+                .unique()
+                .collect()),
             OutputMatcher::Exact(names) => {
-                let mut all_output_names = def.target.outputs.iter().map(|o| o.group.clone()).unique();
+                let mut all_output_names =
+                    def.target.outputs.iter().map(|o| o.group.clone()).unique();
                 for name in &names {
                     if !all_output_names.contains(name) {
                         anyhow::bail!("output not found: {}", name);
@@ -130,22 +158,55 @@ impl Engine {
 
         let meta = self.clone().meta(rs.clone(), addr).await?;
 
-        self.execute_and_cache(rs, &def, output_names, &ExecuteOptions{
-            hashin: &meta.hashin,
-            spec: &spec,
-            def: &def,
-            force: opts.force,
-        }).await
+        self.execute_and_cache(
+            rs,
+            &def,
+            output_names,
+            &ExecuteOptions {
+                hashin: &meta.hashin,
+                spec: &spec,
+                def: &def,
+                force: opts.force,
+            },
+        )
+        .await
     }
 
-    async fn execute_and_cache(self: Arc<Self>, rs: Arc<RequestState>, def: &LinkedTargetDef, outputs: Vec<String>, opts: &ExecuteOptions<'_>) -> anyhow::Result<EResult> {
-        if !opts.force && opts.def.target.cache
-            && let Some(res) = self.result_from_cache(rs.clone(), def, opts, outputs.clone()).await? {
-                return Ok(res)
-            }
+    async fn execute_and_cache(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        def: &LinkedTargetDef,
+        outputs: Vec<String>,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<EResult> {
+        if !opts.force
+            && opts.def.target.cache
+            && let Some(res) = self
+                .result_from_cache(rs.clone(), def, opts, outputs.clone())
+                .await?
+        {
+            return Ok(res);
+        }
 
-        let (artifacts, sandbox_dir) = self.clone().execute(rs.clone(), &def.target.addr, opts.spec, opts.def, opts.hashin).await?;
-        let artifacts_meta = artifacts.iter().filter(|a| a.r#type == outputartifact::Type::Output).map(|a| Ok(ArtifactMeta { hashout: a.hashout()? })).collect::<anyhow::Result<Vec<_>>>()?;
+        let (artifacts, sandbox_dir) = self
+            .clone()
+            .execute(
+                rs.clone(),
+                &def.target.addr,
+                opts.spec,
+                opts.def,
+                opts.hashin,
+            )
+            .await?;
+        let artifacts_meta = artifacts
+            .iter()
+            .filter(|a| a.r#type == outputartifact::Type::Output)
+            .map(|a| {
+                Ok(ArtifactMeta {
+                    hashout: a.hashout()?,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         defer! {
             match fs::remove_dir_all(&sandbox_dir) {
@@ -157,27 +218,55 @@ impl Engine {
             };
         }
 
-        let cached_artifacts = self.cache_locally(&rs.ctoken, &def.target.addr, opts.hashin.as_str(), artifacts, !opts.def.target.cache).await?;
+        let cached_artifacts = self
+            .cache_locally(
+                &rs.ctoken,
+                &def.target.addr,
+                opts.hashin.as_str(),
+                artifacts,
+                !opts.def.target.cache,
+            )
+            .await?;
 
         Ok(EResult {
-            artifacts: cached_artifacts.into_iter().filter(|a| a.r#type == ManifestArtifactType::Output && outputs.contains(&a.group)).map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts: cached_artifacts
+                .into_iter()
+                .filter(|a| a.r#type == ManifestArtifactType::Output && outputs.contains(&a.group))
+                .map(|a| Arc::new(a) as Arc<dyn Content>)
+                .collect(),
             artifacts_meta,
         })
     }
 
-    async fn result_from_cache(&self, rs: Arc<RequestState>, def: &LinkedTargetDef, opts: &ExecuteOptions<'_>, outputs: Vec<String>) -> anyhow::Result<Option<EResult>> {
-        let (cached_artifacts, artifacts_meta) = match self.artifacts_from_local_cache(&rs.ctoken, def, opts.hashin.as_str(), outputs).await? {
+    async fn result_from_cache(
+        &self,
+        rs: Arc<RequestState>,
+        def: &LinkedTargetDef,
+        opts: &ExecuteOptions<'_>,
+        outputs: Vec<String>,
+    ) -> anyhow::Result<Option<EResult>> {
+        let (cached_artifacts, artifacts_meta) = match self
+            .artifacts_from_local_cache(&rs.ctoken, def, opts.hashin.as_str(), outputs)
+            .await?
+        {
             Some(res) => res,
             None => return Ok(None),
         };
 
         Ok(Some(EResult {
-            artifacts: cached_artifacts.into_iter().map(|a| Arc::new(a) as Arc<dyn Content>).collect(),
+            artifacts: cached_artifacts
+                .into_iter()
+                .map(|a| Arc::new(a) as Arc<dyn Content>)
+                .collect(),
             artifacts_meta,
         }))
     }
 
-    pub async fn get_def(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<ExtendedTargetDef> {
+    pub async fn get_def(
+        &self,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<ExtendedTargetDef> {
         let spec = self.get_spec(rs.clone(), addr).await?;
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
@@ -185,22 +274,38 @@ impl Engine {
             None => anyhow::bail!("driver not found: {}", spec.driver),
         };
 
-        let res = driver.driver.parse(ParseRequest{
-            request_id: rs.request_id.clone(),
-            target_spec: spec,
-        }, &rs.ctoken).await.with_context(|| "parse")?;
+        let res = driver
+            .driver
+            .parse(
+                ParseRequest {
+                    request_id: rs.request_id.clone(),
+                    target_spec: spec,
+                },
+                &rs.ctoken,
+            )
+            .await
+            .with_context(|| "parse")?;
         let def = res.target_def;
 
-        let all_transitive = self.collect_transitive_deps(rs.clone(), &def.inputs).await?;
+        let all_transitive = self
+            .collect_transitive_deps(rs.clone(), &def.inputs)
+            .await?;
 
         let def = if all_transitive.empty() {
             def
         } else {
-            let res = driver.driver.apply_transitive(ApplyTransitiveRequest {
-                request_id: rs.request_id.clone(),
-                target_def: def,
-                sandbox: all_transitive.clone(),
-            }, &rs.ctoken).await.with_context(|| "apply transitive")?;
+            let res = driver
+                .driver
+                .apply_transitive(
+                    ApplyTransitiveRequest {
+                        request_id: rs.request_id.clone(),
+                        target_def: def,
+                        sandbox: all_transitive.clone(),
+                    },
+                    &rs.ctoken,
+                )
+                .await
+                .with_context(|| "apply transitive")?;
 
             res.target_def
         };
@@ -209,24 +314,31 @@ impl Engine {
             anyhow::bail!("missing hash");
         }
 
-        Ok(ExtendedTargetDef{
+        Ok(ExtendedTargetDef {
             target_def: def,
             applied_transitive: all_transitive,
         })
     }
 
-    async fn collect_transitive_deps(&self, rs: Arc<RequestState>, inputs: &[Input]) -> anyhow::Result<Sandbox> {
+    async fn collect_transitive_deps(
+        &self,
+        rs: Arc<RequestState>,
+        inputs: &[Input],
+    ) -> anyhow::Result<Sandbox> {
         let mut sb = Sandbox::default();
 
         for (i, input) in inputs.iter().enumerate() {
-            let spec = self.get_spec(rs.clone(), &input.r#ref.r#ref).await.with_context(|| format!("get spec: {:?}", input.r#ref))?;
+            let spec = self
+                .get_spec(rs.clone(), &input.r#ref.r#ref)
+                .await
+                .with_context(|| format!("get spec: {:?}", input.r#ref))?;
 
             let transitive = spec.transitive.clone();
 
             // TODO: group inline
 
             if transitive.empty() {
-                continue
+                continue;
             }
 
             let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
@@ -239,23 +351,26 @@ impl Engine {
 
     pub async fn get_spec(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetSpec> {
         for provider in self.providers.iter() {
-            let spec = match provider.provider.get(GetRequest{
-                request_id: rs.request_id.clone(),
-                addr: addr.clone(),
-                states: vec![], // TODO
-            }, &rs.ctoken).await {
-                Ok(GetResponse{target_spec}) => {
-                    target_spec
-                }
-                Err(GetError::NotFound) => {
-                    continue
-                },
-                Err(GetError::Other(e)) => anyhow::bail!(e)
+            let spec = match provider
+                .provider
+                .get(
+                    GetRequest {
+                        request_id: rs.request_id.clone(),
+                        addr: addr.clone(),
+                        states: vec![], // TODO
+                    },
+                    &rs.ctoken,
+                )
+                .await
+            {
+                Ok(GetResponse { target_spec }) => target_spec,
+                Err(GetError::NotFound) => continue,
+                Err(GetError::Other(e)) => anyhow::bail!(e),
             };
 
-            return anyhow::Ok(spec)
+            return anyhow::Ok(spec);
         }
-        
+
         Err(TargetNotFoundError { addr: addr.clone() }.into())
     }
 }
@@ -282,15 +397,21 @@ mod tests {
             args: Default::default(),
         };
 
-        let result = engine.clone().result_addr(rs, &addr, OutputMatcher::None, &ResultOptions::default()).await;
+        let result = engine
+            .clone()
+            .result_addr(rs, &addr, OutputMatcher::None, &ResultOptions::default())
+            .await;
         assert!(result.is_err());
         let err = result.err().unwrap();
 
         assert_eq!(err.to_string(), "target not found: //non:existent");
-        
+
         use crate::hmemoizer::WrappedError;
-        let is_target_not_found = err.downcast_ref::<TargetNotFoundError>().is_some() ||
-            err.downcast_ref::<WrappedError>().and_then(|w| w.0.downcast_ref::<TargetNotFoundError>()).is_some();
+        let is_target_not_found = err.downcast_ref::<TargetNotFoundError>().is_some()
+            || err
+                .downcast_ref::<WrappedError>()
+                .and_then(|w| w.0.downcast_ref::<TargetNotFoundError>())
+                .is_some();
         assert!(is_target_not_found);
 
         Ok(())

@@ -1,15 +1,17 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-use futures::future::BoxFuture;
-use crate::engine::provider::{ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse, Provider as EProvider, State, TargetSpec};
 use crate::engine::provider::GetError::NotFound;
+use crate::engine::provider::{
+    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    Provider as EProvider, State, TargetSpec,
+};
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use futures::future::BoxFuture;
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-pub struct RequestState {
-
-}
+pub struct RequestState {}
 
 pub struct Provider {
     pub root: std::path::PathBuf,
@@ -28,12 +30,22 @@ impl Default for Provider {
 }
 
 impl Provider {
-    fn find_packages(&self, path: &std::path::Path, packages: &mut std::collections::HashSet<String>) -> anyhow::Result<()> {
+    fn find_packages(
+        &self,
+        path: &std::path::Path,
+        packages: &mut std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
         let mut has_build_file = false;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let entry_path = entry.path();
-            if entry_path.is_file() && entry_path.file_name().and_then(|n| n.to_str()).map(|n| self.build_file_patterns.iter().any(|p| p == n)).unwrap_or(false) {
+            if entry_path.is_file()
+                && entry_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| self.build_file_patterns.iter().any(|p| p == n))
+                    .unwrap_or(false)
+            {
                 has_build_file = true;
             } else if entry_path.is_dir() {
                 self.find_packages(&entry_path, packages)?;
@@ -60,60 +72,86 @@ impl Provider {
 
 impl EProvider for Provider {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse{
+        Ok(ConfigResponse {
             name: "buildfile".to_string(),
         })
     }
 
-    fn list<'a>(&'a self, req: ListRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+    fn list<'a>(
+        &'a self,
+        req: ListRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
         Box::pin(async move {
             let res = self.run_pkg(req.package.as_str())?;
 
-            let items: Vec<anyhow::Result<ListResponse>> = res.targets.into_iter().map(|p| {
-                Ok(ListResponse {
-                    addr: Addr {
-                        package: req.package.clone(),
-                        name: p.name,
-                        args: Default::default(),
-                    },
+            let items: Vec<anyhow::Result<ListResponse>> = res
+                .targets
+                .into_iter()
+                .map(|p| {
+                    Ok(ListResponse {
+                        addr: Addr {
+                            package: req.package.clone(),
+                            name: p.name,
+                            args: Default::default(),
+                        },
+                    })
                 })
-            }).collect();
+                .collect();
 
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+            Ok(Box::new(items.into_iter())
+                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
         })
     }
 
-    fn list_packages<'a>(&'a self, _req: ListPackagesRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>> {
+    fn list_packages<'a>(
+        &'a self,
+        _req: ListPackagesRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
+    {
         Box::pin(async move {
             let mut packages = std::collections::HashSet::new();
 
             self.find_packages(&self.root, &mut packages)?;
 
-            let items: Vec<anyhow::Result<ListPackageResponse>> = packages.into_iter().map(|p| {
-                Ok(ListPackageResponse {
-                    pkg: PkgBuf::from(p.as_str()),
+            let items: Vec<anyhow::Result<ListPackageResponse>> = packages
+                .into_iter()
+                .map(|p| {
+                    Ok(ListPackageResponse {
+                        pkg: PkgBuf::from(p.as_str()),
+                    })
                 })
-            }).collect();
+                .collect();
 
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>)
+            Ok(Box::new(items.into_iter())
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                >)
         })
     }
 
-    fn get<'a>(&'a self, req: GetRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+    fn get<'a>(
+        &'a self,
+        req: GetRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
         Box::pin(async move {
-            let res = self.run_pkg(req.addr.package.as_str()).map_err(|e: anyhow::Error| GetError::Other(e))?;
+            let res = self
+                .run_pkg(req.addr.package.as_str())
+                .map_err(|e: anyhow::Error| GetError::Other(e))?;
 
             for p in res.targets {
                 if p.name == req.addr.name {
-                    return Ok(GetResponse{
-                        target_spec: TargetSpec{
+                    return Ok(GetResponse {
+                        target_spec: TargetSpec {
                             addr: req.addr.clone(),
                             driver: p.driver,
                             config: p.config,
                             labels: p.labels,
                             transitive: p.transitive,
                         },
-                    })
+                    });
                 }
             }
 
@@ -121,30 +159,37 @@ impl EProvider for Provider {
         })
     }
 
-    fn probe<'a>(&'a self, req: ProbeRequest, _ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+    fn probe<'a>(
+        &'a self,
+        req: ProbeRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
             let res = self.run_pkg(req.package.as_str())?;
 
-            Ok(ProbeResponse{
-                states: res.states.into_iter().map(|_p| {
-                    State{
-                        package: req.package.clone(),
-                        provider: "buildfile".to_string(), // TODO: move into engine
-                        state: Default::default(),
-                    }
-                }).collect(),
+            Ok(ProbeResponse {
+                states: res
+                    .states
+                    .into_iter()
+                    .map(|_p| {
+                        State {
+                            package: req.package.clone(),
+                            provider: "buildfile".to_string(), // TODO: move into engine
+                            state: Default::default(),
+                        }
+                    })
+                    .collect(),
             })
         })
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hasync::StdCancellationToken;
     use std::fs;
     use tempfile::tempdir;
-    use crate::hasync::StdCancellationToken;
 
     #[tokio::test]
     async fn test_list_packages() {
@@ -174,7 +219,9 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
+        let req = ListPackagesRequest {
+            prefix: PkgBuf::from(""),
+        };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -211,7 +258,9 @@ mod tests {
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
+        let req = ListPackagesRequest {
+            prefix: PkgBuf::from(""),
+        };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
@@ -244,11 +293,17 @@ mod tests {
 
         let provider = Provider {
             root: root.to_path_buf(),
-            build_file_patterns: vec!["BUILD".to_string(), "BUILD.heph".to_string(), "BUILD.other".to_string()],
+            build_file_patterns: vec![
+                "BUILD".to_string(),
+                "BUILD.heph".to_string(),
+                "BUILD.other".to_string(),
+            ],
             ..Provider::default()
         };
 
-        let req = ListPackagesRequest { prefix: PkgBuf::from("") };
+        let req = ListPackagesRequest {
+            prefix: PkgBuf::from(""),
+        };
         let ctoken = StdCancellationToken::new();
         let res = provider.list_packages(req, &ctoken).await.unwrap();
         let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();

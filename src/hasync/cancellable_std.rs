@@ -1,9 +1,9 @@
+use crate::hasync::Cancellable;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use crate::hasync::Cancellable;
 
 /// A manual, std-only implementation of a cancellation signal.
 #[derive(Clone)]
@@ -39,7 +39,8 @@ impl StdCancellationToken {
 
         // 2. Wake the pending future if it's currently being awaited
         if let Ok(mut guard) = self.inner.waker.lock()
-            && let Some(waker) = guard.take() {
+            && let Some(waker) = guard.take()
+        {
             waker.wake();
         }
     }
@@ -60,6 +61,11 @@ impl Future for StdCancellationToken {
         }
 
         // Otherwise, register the current task's waker
+        // The mutex is never poisoned: the only critical section just writes a Waker, no panics possible
+        #[expect(
+            clippy::unwrap_used,
+            reason = "mutex cannot be poisoned; lock only stores a Waker"
+        )]
         let mut guard = self.inner.waker.lock().unwrap();
         *guard = Some(cx.waker().clone());
 
@@ -75,7 +81,9 @@ impl Cancellable for StdCancellationToken {
 
     fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         // Since StdCancellationToken implements Future, we just clone and box it
-        let clone = StdCancellationToken { inner: self.inner.clone() };
+        let clone = StdCancellationToken {
+            inner: self.inner.clone(),
+        };
         Box::pin(clone)
     }
 }

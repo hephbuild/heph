@@ -1,17 +1,20 @@
-use anyhow::Context;
-use std::{fs, io};
-use std::fs::File;
-use std::path::PathBuf;
-use async_trait::async_trait;
-use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver, ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse};
 use crate::engine::Engine;
-use crate::{hartifactcontent, hasync};
 use crate::engine::driver::outputartifact::Content::TarPath;
 use crate::engine::driver::outputartifact::Type::Output;
 use crate::engine::driver::targetdef::path::Content;
+use crate::engine::driver::{
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, Driver,
+    ParseRequest, ParseResponse, RunInput, RunRequest, RunResponse, outputartifact,
+};
 use crate::hasync::Cancellable;
-use xxhash_rust::xxh3::Xxh3;
+use crate::{hartifactcontent, hasync};
+use anyhow::Context;
+use async_trait::async_trait;
+use std::fs::File;
 use std::io::Write;
+use std::path::PathBuf;
+use std::{fs, io};
+use xxhash_rust::xxh3::Xxh3;
 
 pub struct ManagedRunInput {
     pub input: RunInput,
@@ -32,19 +35,31 @@ pub struct ManagedRunResponse {
 #[async_trait]
 pub trait ManagedDriver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
-    async fn parse(&self, req: ParseRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse>;
-    async fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse>;
-    async fn run<'a>(&self, req: ManagedRunRequest<'a>, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ManagedRunResponse>;
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse>;
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse>;
+    async fn run<'a>(
+        &self,
+        req: ManagedRunRequest<'a>,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse>;
 }
 
 pub struct ManagedDriverBridge {
     pub home: PathBuf,
-    pub driver: Box<dyn ManagedDriver>
+    pub driver: Box<dyn ManagedDriver>,
 }
 
 impl Engine {
     pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
-        ManagedDriverBridge{
+        ManagedDriverBridge {
             home: self.home.clone(),
             driver,
         }
@@ -59,6 +74,11 @@ struct HashingWriter<W: Write> {
 impl<W: Write> Write for HashingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
+        // n is the return value of write(), guaranteed <= buf.len() by the Write contract
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "n is guaranteed <= buf.len() by the Write::write contract"
+        )]
         self.hasher.update(&buf[..n]);
         Ok(n)
     }
@@ -73,15 +93,27 @@ impl Driver for ManagedDriverBridge {
         self.driver.config(req)
     }
 
-    async fn parse(&self, req: ParseRequest, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse> {
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
         self.driver.parse(req, ctoken).await
     }
 
-    async fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse> {
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
         self.driver.apply_transitive(req, ctoken).await
     }
 
-    async fn run<'a>(&self, mut req: RunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<RunResponse> {
+    async fn run<'a>(
+        &self,
+        mut req: RunRequest<'a>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
         let sandbox_dir = req.sandbox_dir.clone();
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir)?;
@@ -89,7 +121,11 @@ impl Driver for ManagedDriverBridge {
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
             let input_list = ws_dir.join(format!("input_{}.list", input.origin_id));
-            hartifactcontent::unpack::unpack(input.artifact.content.as_ref(), ws_dir.as_path(), input_list.as_path())?;
+            hartifactcontent::unpack::unpack(
+                input.artifact.content.as_ref(),
+                ws_dir.as_path(),
+                input_list.as_path(),
+            )?;
             inputs.push(ManagedRunInput {
                 input,
                 list_path: input_list,
@@ -102,13 +138,20 @@ impl Driver for ManagedDriverBridge {
         let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
         fs::create_dir_all(sandbox_pkg_dir)?;
 
-        let mut res = self.driver.run(ManagedRunRequest{
-            sandbox_dir: sandbox_dir.clone(),
-            sandbox_ws_dir: ws_dir.clone(),
-            sandbox_pkg_dir: sandbox_pkg_dir.clone(),
-            request: req,
-            inputs,
-        }, ctoken).await.with_context(|| "driver run")?;
+        let mut res = self
+            .driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: sandbox_dir.clone(),
+                    sandbox_ws_dir: ws_dir.clone(),
+                    sandbox_pkg_dir: sandbox_pkg_dir.clone(),
+                    request: req,
+                    inputs,
+                },
+                ctoken,
+            )
+            .await
+            .with_context(|| "driver run")?;
 
         for output in &target.outputs {
             if !output.paths.iter().any(|path| path.collect) {
@@ -133,18 +176,26 @@ impl Driver for ManagedDriverBridge {
                             let entry = entry?;
                             if entry.file_type().is_file() {
                                 let source = entry.path().to_string_lossy().into_owned();
-                                let rel = entry.path().strip_prefix(&ws_dir)?.to_string_lossy().into_owned();
+                                let rel = entry
+                                    .path()
+                                    .strip_prefix(&ws_dir)?
+                                    .to_string_lossy()
+                                    .into_owned();
                                 tar.create_file(source, rel);
                             }
                         }
                     }
                     Content::Glob(pattern) => {
-                        let full_pattern = sandbox_pkg_dir.join(pattern).to_string_lossy().into_owned();
+                        let full_pattern =
+                            sandbox_pkg_dir.join(pattern).to_string_lossy().into_owned();
                         for matched in glob::glob(&full_pattern)? {
                             let matched = matched?;
                             if matched.is_file() {
                                 let source = matched.to_string_lossy().into_owned();
-                                let rel = matched.strip_prefix(&ws_dir)?.to_string_lossy().into_owned();
+                                let rel = matched
+                                    .strip_prefix(&ws_dir)?
+                                    .to_string_lossy()
+                                    .into_owned();
                                 tar.create_file(source, rel);
                             }
                         }
@@ -160,20 +211,23 @@ impl Driver for ManagedDriverBridge {
                 .into_owned();
             let tarf = File::create(std::path::Path::new(&tarpath))?;
 
-            let mut hw = HashingWriter { inner: tarf, hasher: Xxh3::new() };
+            let mut hw = HashingWriter {
+                inner: tarf,
+                hasher: Xxh3::new(),
+            };
 
             tar.pack(&mut hw).with_context(|| "pack")?;
 
-            res.artifacts.push(outputartifact::OutputArtifact{
+            res.artifacts.push(outputartifact::OutputArtifact {
                 group: output.group.clone(),
                 name: format!("{}.tar", output.group),
                 r#type: Output,
                 content: TarPath(tarpath),
-                hashout: format!("{:x}", hw.hasher.digest())
+                hashout: format!("{:x}", hw.hasher.digest()),
             });
         }
 
-        Ok(RunResponse{
+        Ok(RunResponse {
             artifacts: res.artifacts,
         })
     }

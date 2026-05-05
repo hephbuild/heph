@@ -1,21 +1,24 @@
 mod spec;
 
+use crate::engine;
+use crate::engine::driver::sandbox::EnvValue;
+use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
+use crate::engine::driver::{
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
+    ParseResponse, TargetAddr, outputartifact,
+};
+use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
+use crate::hasync::Cancellable;
+use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::io::{BufRead, Write};
 use std::process::Stdio;
-use tokio::process::Command;
-use async_trait::async_trait;
-use tokio::io;
-use crate::engine;
-use crate::engine::driver::{outputartifact, ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest, ParseResponse, TargetAddr};
-use crate::engine::driver::sandbox::EnvValue;
 use std::sync::Arc;
+use tokio::io;
+use tokio::process::Command;
 use xxhash_rust::xxh3::Xxh3Default;
-use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
-use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
-use crate::hasync::Cancellable;
 
 pub struct Driver {
     name: String,
@@ -61,7 +64,7 @@ pub fn bash_args_public(cmd: &str, termargs: Vec<String>) -> Vec<String> {
             "-c".to_string(),
             cmd.to_string(),
         ],
-        vec!["--norc".to_string()]
+        vec!["--norc".to_string()],
     );
 
     if termargs.is_empty() {
@@ -77,17 +80,15 @@ pub fn bash_args_public(cmd: &str, termargs: Vec<String>) -> Vec<String> {
 
 impl Driver {
     pub fn new_exec() -> Self {
-        Self{
+        Self {
             name: "exec".to_string(),
-            wrap_run: |run| run.clone()
+            wrap_run: |run| run.clone(),
         }
     }
     pub fn new_bash() -> Self {
-        Self{
+        Self {
             name: "bash".to_string(),
-            wrap_run: |run| {
-                bash_args_public(run.join("\n").as_str(), vec![])
-            }
+            wrap_run: |run| bash_args_public(run.join("\n").as_str(), vec![]),
         }
     }
 }
@@ -104,9 +105,16 @@ async fn tee_stream(
         match source.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let _ = log.lock().await.write_all(&buf[..n]).await;
+                // n is guaranteed <= buf.len() by AsyncRead::read contract
+                #[expect(
+                    clippy::indexing_slicing,
+                    reason = "n guaranteed <= buf.len() by AsyncRead contract"
+                )]
+                let slice = &buf[..n];
+                // Intentionally ignore write errors in the tee path; the process exit code is the authority
+                drop(log.lock().await.write_all(slice).await);
                 if let Some(ref mut out) = sink {
-                    let _ = out.write_all(&buf[..n]).await;
+                    drop(out.write_all(slice).await);
                 }
             }
         }
@@ -116,36 +124,54 @@ async fn tee_stream(
 #[async_trait]
 impl engine::driver_managed::ManagedDriver for Driver {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
-        Ok(ConfigResponse{
+        Ok(ConfigResponse {
             name: self.name.clone(),
         })
     }
 
-    async fn parse(&self, req: ParseRequest, _ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse> {
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
         let spec = spec::TargetSpec::from(req.target_spec.config)?;
 
         let pkg = req.target_spec.addr.package.clone();
-        let dep_inputs = spec.deps.into_iter().flat_map(|(k, v)| {
-            let pkg = pkg.clone();
-            v.into_iter().enumerate().map(move |(i, v)| -> anyhow::Result<(String, Input)> {
-                Ok((k.parse()?, Input{
-                    r#ref: TargetAddr::parse(&v, &pkg)?,
-                    mode: InputMode::Standard,
-                    origin_id: format!("dep|{}|{}", k, i),
-                }))
+        let dep_inputs = spec
+            .deps
+            .into_iter()
+            .flat_map(|(k, v)| {
+                let pkg = pkg.clone();
+                v.into_iter()
+                    .enumerate()
+                    .map(move |(i, v)| -> anyhow::Result<(String, Input)> {
+                        Ok((
+                            k.parse()?,
+                            Input {
+                                r#ref: TargetAddr::parse(&v, &pkg)?,
+                                mode: InputMode::Standard,
+                                origin_id: format!("dep|{}|{}", k, i),
+                            },
+                        ))
+                    })
             })
-        }).collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
         for (group, input) in &dep_inputs {
-            dep_group_inputs.entry(group.clone()).or_default().push(input.clone());
+            dep_group_inputs
+                .entry(group.clone())
+                .or_default()
+                .push(input.clone());
         }
 
-        let pass_env: BTreeMap<String, String> = spec.pass_env.into_iter()
+        let pass_env: BTreeMap<String, String> = spec
+            .pass_env
+            .into_iter()
             .filter_map(|name| std::env::var(&name).ok().map(|val| (name, val)))
             .collect();
 
-        let def = TargetDef{
+        let def = TargetDef {
             run: spec.run,
             dep_group_inputs,
             pass_env,
@@ -161,37 +187,49 @@ impl engine::driver_managed::ManagedDriver for Driver {
         };
 
         Ok(ParseResponse {
-            target_def: EngineTargetDef{
+            target_def: EngineTargetDef {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels,
                 raw_def: Arc::new(def),
                 inputs: dep_inputs.into_iter().map(|(_, v)| v).collect(),
-                outputs: spec.outputs.iter().map(|(k, v)| Output{
-                    group: k.clone(),
-                    paths: v.iter().map(|path| Path{
-                        content: {
-                            if ["*", "?", "["].iter().any(|&p| path.contains(p)) { // TODO: this sucks, but its easy for now
-                                Content::Glob(path.clone())
-                            } else if path.ends_with("/") {
-                                Content::DirPath(path.clone())
-                            } else {
-                                Content::FilePath(path.clone())
-                            }
-                        },
-                        codegen_tree: CodegenMode::None,
-                        collect: true,
-                    }).collect(),
-                }).collect(),
+                outputs: spec
+                    .outputs
+                    .iter()
+                    .map(|(k, v)| Output {
+                        group: k.clone(),
+                        paths: v
+                            .iter()
+                            .map(|path| Path {
+                                content: {
+                                    if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
+                                        // TODO: this sucks, but its easy for now
+                                        Content::Glob(path.clone())
+                                    } else if path.ends_with("/") {
+                                        Content::DirPath(path.clone())
+                                    } else {
+                                        Content::FilePath(path.clone())
+                                    }
+                                },
+                                codegen_tree: CodegenMode::None,
+                                collect: true,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
                 support_files: vec![],
                 cache: spec.cache.local,
                 disable_remote_cache: !spec.cache.remote,
                 pty: true,
                 hash,
-            }
+            },
         })
     }
 
-    async fn apply_transitive(&self, req: ApplyTransitiveRequest, _ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse> {
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
         // for tool in req.sandbox.tools {
@@ -207,7 +245,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 mode: InputMode::Standard,
                 origin_id: dep.id.clone(),
             };
-            xdef.dep_group_inputs.entry(dep.group).or_default().push(input.clone());
+            xdef.dep_group_inputs
+                .entry(dep.group)
+                .or_default()
+                .push(input.clone());
             def.inputs.push(input);
         }
         for (name, env) in req.sandbox.env {
@@ -239,12 +280,14 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         def.set_def(xdef);
 
-        Ok(ApplyTransitiveResponse{
-            target_def: def,
-        })
+        Ok(ApplyTransitiveResponse { target_def: def })
     }
 
-    async fn run<'a>(&self, req: ManagedRunRequest<'a>, ctoken: &(dyn Cancellable + Send + Sync)) -> anyhow::Result<ManagedRunResponse> {
+    async fn run<'a>(
+        &self,
+        req: ManagedRunRequest<'a>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 
@@ -267,7 +310,9 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 match &path.content {
                     Content::Glob(_) => {}
                     Content::FilePath(p) | Content::DirPath(p) => {
-                        if !entry.is_empty() { entry.push(' '); }
+                        if !entry.is_empty() {
+                            entry.push(' ');
+                        }
                         entry.push_str(p);
                     }
                 }
@@ -283,19 +328,31 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
             let mut list_f = {
                 let path = req.sandbox_dir.join(format!("dep_{}.list", group));
-                env.entry(format!("LIST_{src_key}")).or_default().push_str(path.as_path().to_str().unwrap());
+                env.entry(format!("LIST_{src_key}")).or_default().push_str(
+                    path.as_path()
+                        .to_str()
+                        .expect("sandbox dir path must be valid UTF-8"),
+                );
                 std::fs::File::create(path)?
             };
             let entry = env.entry(src_key).or_default();
 
             for input in inputs {
-                for m in req.inputs.iter().filter(|m| m.input.origin_id == input.origin_id) {
+                for m in req
+                    .inputs
+                    .iter()
+                    .filter(|m| m.input.origin_id == input.origin_id)
+                {
                     let managed_list_f = std::fs::File::open(&m.list_path)?;
                     for line in std::io::BufReader::new(managed_list_f).lines() {
                         let line = line?;
-                        if line.is_empty() { continue; }
+                        if line.is_empty() {
+                            continue;
+                        }
 
-                        if !entry.is_empty() { entry.push(' '); }
+                        if !entry.is_empty() {
+                            entry.push(' ');
+                        }
                         entry.push_str(&line);
 
                         list_f.write_all(line.as_bytes())?;
@@ -317,17 +374,26 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log = std::fs::File::create(&output_log_path)?;
-        let output_log_file = Arc::new(tokio::sync::Mutex::new(
-            tokio::fs::File::from_std(output_log)
-        ));
+        let output_log_file = Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(
+            output_log,
+        )));
 
+        // run is guaranteed non-empty by the bail! above, so [0] and [1..] are safe
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "run non-empty guaranteed by bail! check above"
+        )]
         let mut child = Command::new(&run[0])
             .args(&run[1..])
             .kill_on_drop(true)
             .env_clear()
             .envs(env)
             .current_dir(req.sandbox_pkg_dir)
-            .stdin(if rreq.stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdin(if rreq.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
@@ -340,8 +406,9 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         let stdin_fut = async {
             if let (Some(mut req_stdin), Some(mut child_stdin)) = (rreq.stdin, child_stdin) {
-                let _ = io::copy(&mut req_stdin, &mut child_stdin).await;
-                let _ = child_stdin.shutdown().await;
+                // Intentionally ignore errors: stdin copy failure is non-fatal; process exit code is authoritative
+                drop(io::copy(&mut req_stdin, &mut child_stdin).await);
+                drop(child_stdin.shutdown().await);
             }
         };
 
@@ -366,13 +433,16 @@ impl engine::driver_managed::ManagedDriver for Driver {
             }
         }
 
-        Ok(ManagedRunResponse{
-            artifacts: vec![outputartifact::OutputArtifact{
+        Ok(ManagedRunResponse {
+            artifacts: vec![outputartifact::OutputArtifact {
                 group: "".to_string(),
                 name: "log.txt".to_string(),
                 r#type: outputartifact::Type::Log,
-                content: outputartifact::Content::File(outputartifact::ContentFile{
-                    source_path: output_log_path.to_str().unwrap().parse()?,
+                content: outputartifact::Content::File(outputartifact::ContentFile {
+                    source_path: output_log_path
+                        .to_str()
+                        .ok_or_else(|| anyhow::anyhow!("log path is not valid UTF-8"))?
+                        .parse()?,
                     out_path: "log.txt".to_string(),
                     x: false,
                 }),
@@ -433,7 +503,7 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            tree_root_path: "".to_string(),
+            tree_root_path: "".to_string().into(),
             inputs: vec![],
             hashin: &"".to_string(),
             stdin: None,
@@ -482,7 +552,7 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            tree_root_path: "".to_string(),
+            tree_root_path: "".to_string().into(),
             inputs: vec![],
             hashin: &"".to_string(),
             stdin: Some(&mut stdin),
@@ -492,7 +562,11 @@ mod tests {
         };
 
         // Use a timeout to detect the hang
-        let _res = tokio::time::timeout(std::time::Duration::from_secs(1), driver.run(make_req(req), &ctoken)).await?;
+        let _res = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            driver.run(make_req(req), &ctoken),
+        )
+        .await?;
 
         let output = String::from_utf8(stdout)?;
         assert_eq!(output, "test data");
@@ -533,7 +607,7 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            tree_root_path: "".to_string(),
+            tree_root_path: "".to_string().into(),
             inputs: vec![],
             hashin: &"".to_string(),
             stdin: Some(&mut reader),
@@ -557,7 +631,12 @@ mod tests {
         Ok(())
     }
 
-    async fn run_bash_env(run_cmd: &str, pass_env: BTreeMap<String, String>, runtime_pass_env: Vec<String>, runtime_env: HashMap<String, String>) -> anyhow::Result<String> {
+    async fn run_bash_env(
+        run_cmd: &str,
+        pass_env: BTreeMap<String, String>,
+        runtime_pass_env: Vec<String>,
+        runtime_env: HashMap<String, String>,
+    ) -> anyhow::Result<String> {
         let driver = Driver::new_bash();
         let ctoken = StdCancellationToken::new();
         let target_def = EngineTargetDef {
@@ -584,7 +663,7 @@ mod tests {
         let req = RunRequest {
             request_id: &request_id,
             target: &target_def,
-            tree_root_path: "".to_string(),
+            tree_root_path: "".to_string().into(),
             inputs: vec![],
             hashin: &"".to_string(),
             stdin: None,
@@ -603,7 +682,8 @@ mod tests {
             BTreeMap::from([("MY_PASS_VAR".to_string(), "pass_value".to_string())]),
             vec![],
             HashMap::new(),
-        ).await?;
+        )
+        .await?;
         assert_eq!(out, "pass_value");
         Ok(())
     }
@@ -614,61 +694,89 @@ mod tests {
             "echo $MY_RUNTIME_ENV",
             BTreeMap::new(),
             vec![],
-            HashMap::from([("MY_RUNTIME_ENV".to_string(), "runtime_env_value".to_string())]),
-        ).await?;
+            HashMap::from([(
+                "MY_RUNTIME_ENV".to_string(),
+                "runtime_env_value".to_string(),
+            )]),
+        )
+        .await?;
         assert_eq!(out, "runtime_env_value");
         Ok(())
     }
 
     #[tokio::test]
     async fn test_run_runtime_pass_env_injected() -> anyhow::Result<()> {
-        unsafe { std::env::set_var("RHEPH_TEST_RUNTIME_PASS", "runtime_pass_value"); }
+        unsafe {
+            std::env::set_var("RHEPH_TEST_RUNTIME_PASS", "runtime_pass_value");
+        }
         let out = run_bash_env(
             "echo $RHEPH_TEST_RUNTIME_PASS",
             BTreeMap::new(),
             vec!["RHEPH_TEST_RUNTIME_PASS".to_string()],
             HashMap::new(),
-        ).await?;
+        )
+        .await?;
         assert_eq!(out, "runtime_pass_value");
         Ok(())
     }
 
     #[tokio::test]
     async fn test_run_env_not_leaked_from_parent() -> anyhow::Result<()> {
-        unsafe { std::env::set_var("RHEPH_TEST_PARENT_ONLY", "should_not_see_this"); }
+        unsafe {
+            std::env::set_var("RHEPH_TEST_PARENT_ONLY", "should_not_see_this");
+        }
         let out = run_bash_env(
             "echo ${RHEPH_TEST_PARENT_ONLY:-absent}",
             BTreeMap::new(),
             vec![],
             HashMap::new(),
-        ).await?;
+        )
+        .await?;
         assert_eq!(out, "absent");
         Ok(())
     }
 
     #[tokio::test]
     async fn test_parse_pass_env_resolves_value() -> anyhow::Result<()> {
-        unsafe { std::env::set_var("RHEPH_TEST_PARSE_PASS", "resolved_value"); }
+        unsafe {
+            std::env::set_var("RHEPH_TEST_PARSE_PASS", "resolved_value");
+        }
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let config = HashMap::from([
-            ("run".to_string(), crate::loosespecparser::TargetSpecValue::String("echo".to_string())),
-            ("pass_env".to_string(), crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("RHEPH_TEST_PARSE_PASS".to_string()),
-            ])),
+            (
+                "run".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+            ),
+            (
+                "pass_env".to_string(),
+                crate::loosespecparser::TargetSpecValue::List(vec![
+                    crate::loosespecparser::TargetSpecValue::String(
+                        "RHEPH_TEST_PARSE_PASS".to_string(),
+                    ),
+                ]),
+            ),
         ]);
-        let res = driver.parse(crate::engine::driver::ParseRequest {
-            request_id: "test".to_string(),
-            target_spec: crate::engine::provider::TargetSpec {
-                addr: Addr::default(),
-                driver: "exec".to_string(),
-                config,
-                labels: vec![],
-                transitive: Default::default(),
-            },
-        }, &ctoken).await?;
+        let res = driver
+            .parse(
+                crate::engine::driver::ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: crate::engine::provider::TargetSpec {
+                        addr: Addr::default(),
+                        driver: "exec".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                    },
+                },
+                &ctoken,
+            )
+            .await?;
         let def = res.target_def.def::<TargetDef>();
-        assert_eq!(def.pass_env.get("RHEPH_TEST_PARSE_PASS"), Some(&"resolved_value".to_string()));
+        assert_eq!(
+            def.pass_env.get("RHEPH_TEST_PARSE_PASS"),
+            Some(&"resolved_value".to_string())
+        );
         Ok(())
     }
 
@@ -677,21 +785,34 @@ mod tests {
         let driver = Driver::new_exec();
         let ctoken = StdCancellationToken::new();
         let config = HashMap::from([
-            ("run".to_string(), crate::loosespecparser::TargetSpecValue::String("echo".to_string())),
-            ("pass_env".to_string(), crate::loosespecparser::TargetSpecValue::List(vec![
-                crate::loosespecparser::TargetSpecValue::String("RHEPH_TEST_DEFINITELY_UNSET_99999".to_string()),
-            ])),
+            (
+                "run".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+            ),
+            (
+                "pass_env".to_string(),
+                crate::loosespecparser::TargetSpecValue::List(vec![
+                    crate::loosespecparser::TargetSpecValue::String(
+                        "RHEPH_TEST_DEFINITELY_UNSET_99999".to_string(),
+                    ),
+                ]),
+            ),
         ]);
-        let res = driver.parse(crate::engine::driver::ParseRequest {
-            request_id: "test".to_string(),
-            target_spec: crate::engine::provider::TargetSpec {
-                addr: Addr::default(),
-                driver: "exec".to_string(),
-                config,
-                labels: vec![],
-                transitive: Default::default(),
-            },
-        }, &ctoken).await?;
+        let res = driver
+            .parse(
+                crate::engine::driver::ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: crate::engine::provider::TargetSpec {
+                        addr: Addr::default(),
+                        driver: "exec".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                    },
+                },
+                &ctoken,
+            )
+            .await?;
         let def = res.target_def.def::<TargetDef>();
         assert!(def.pass_env.is_empty());
         Ok(())

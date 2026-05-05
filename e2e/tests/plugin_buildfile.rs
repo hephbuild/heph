@@ -7,7 +7,10 @@ use rheph::loosespecparser::TargetSpecValue;
 #[tokio::test]
 async fn test_nested_package_discovered() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    ws.write_build_file("a/b/c", r#"target(name = "deep", driver = "bash", run = "true")"#);
+    ws.write_build_file(
+        "a/b/c",
+        r#"target(name = "deep", driver = "bash", run = "true")"#,
+    );
 
     let spec = ws.get_spec("//a/b/c:deep").await?;
     assert_eq!(spec.addr.package.as_str(), "a/b/c");
@@ -28,7 +31,10 @@ async fn test_missing_build_file_not_found() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_spec_driver_field() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    ws.write_build_file("pkg", r#"target(name = "t", driver = "bash", run = "true")"#);
+    ws.write_build_file(
+        "pkg",
+        r#"target(name = "t", driver = "bash", run = "true")"#,
+    );
 
     let spec = ws.get_spec("//pkg:t").await?;
     assert_eq!(spec.driver, "bash");
@@ -38,7 +44,10 @@ async fn test_spec_driver_field() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_spec_run_string() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    ws.write_build_file("pkg", r#"target(name = "t", driver = "bash", run = "echo hello")"#);
+    ws.write_build_file(
+        "pkg",
+        r#"target(name = "t", driver = "bash", run = "echo hello")"#,
+    );
 
     let spec = ws.get_spec("//pkg:t").await?;
     match spec.config.get("run") {
@@ -93,15 +102,26 @@ async fn test_spec_labels() -> anyhow::Result<()> {
     );
 
     let spec = ws.get_spec("//pkg:t").await?;
-    assert!(spec.labels.contains(&"//team:foo".to_string()), "labels: {:?}", spec.labels);
-    assert!(spec.labels.contains(&"//ci:lint".to_string()), "labels: {:?}", spec.labels);
+    assert!(
+        spec.labels.contains(&"//team:foo".to_string()),
+        "labels: {:?}",
+        spec.labels
+    );
+    assert!(
+        spec.labels.contains(&"//ci:lint".to_string()),
+        "labels: {:?}",
+        spec.labels
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn test_spec_addr_matches_request() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    ws.write_build_file("mypkg", r#"target(name = "mytgt", driver = "bash", run = "true")"#);
+    ws.write_build_file(
+        "mypkg",
+        r#"target(name = "mytgt", driver = "bash", run = "true")"#,
+    );
 
     let spec = ws.get_spec("//mypkg:mytgt").await?;
     assert_eq!(spec.addr.package.as_str(), "mypkg");
@@ -131,7 +151,10 @@ target(name = "b", driver = "exec", run = "true")
 #[tokio::test]
 async fn test_spec_unknown_target_in_existing_package() -> anyhow::Result<()> {
     let ws = Workspace::new();
-    ws.write_build_file("pkg", r#"target(name = "real", driver = "bash", run = "true")"#);
+    ws.write_build_file(
+        "pkg",
+        r#"target(name = "real", driver = "bash", run = "true")"#,
+    );
 
     assert!(ws.get_spec("//pkg:ghost").await.is_err());
     Ok(())

@@ -9,7 +9,10 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 
 pub fn unpack(content: &dyn Content, dst: &Path, list_dst: &Path) -> anyhow::Result<()> {
-    let mut list_dst_f = OpenOptions::new().create(true).append(true).open(list_dst)?;
+    let mut list_dst_f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(list_dst)?;
 
     for entry in content.walk()? {
         let mut entry = entry?;

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use futures::future::BoxFuture;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::TargetSpecValue;
+use futures::future::BoxFuture;
+use std::collections::HashMap;
 
 pub struct ConfigRequest {}
 pub struct ConfigResponse {
@@ -16,7 +16,7 @@ pub struct ListRequest {
     pub package: PkgBuf,
 }
 pub struct ListResponse {
-    pub addr: Addr
+    pub addr: Addr,
 }
 
 pub struct ListPackagesRequest {
@@ -66,9 +66,24 @@ pub enum GetError {
 
 pub trait Provider: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
-    fn list<'a>(&'a self, req: ListRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>;
-    fn list_packages<'a>(&'a self, req: ListPackagesRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>;
-    fn get<'a>(&'a self, req: GetRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, Result<GetResponse, GetError>>;
-    fn probe<'a>(&'a self, req: ProbeRequest, ctoken: &'a (dyn Cancellable + Send + Sync)) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
+    fn list<'a>(
+        &'a self,
+        req: ListRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>;
+    fn list_packages<'a>(
+        &'a self,
+        req: ListPackagesRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>;
+    fn get<'a>(
+        &'a self,
+        req: GetRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, Result<GetResponse, GetError>>;
+    fn probe<'a>(
+        &'a self,
+        req: ProbeRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>>;
 }
-

@@ -17,7 +17,7 @@ impl LocalCacheFS {
         let mut path = self.root.clone();
         path.push(addr.package.as_str());
         if addr.args.is_empty() {
-        path.push(format!("__target_{}", addr.name));
+            path.push(format!("__target_{}", addr.name));
         } else {
             path.push(format!("__target_{}_{}", addr.name, addr.hash_str()));
         }
@@ -32,7 +32,9 @@ impl LocalCache for LocalCacheFS {
         let path = self.get_path(addr, hashin, name);
         let file = match fs::File::open(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(NotFoundError))?,
-            res => res.with_context(|| format!("Failed to open reader for cache path: {:?}", path))?,
+            res => {
+                res.with_context(|| format!("Failed to open reader for cache path: {:?}", path))?
+            }
         };
 
         Ok(Box::new(file))

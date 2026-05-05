@@ -38,7 +38,8 @@ in
   # https://devenv.sh/scripts/
   scripts.proto-gen.exec = "buf generate";
   scripts.gen.exec = "proto-gen";
-  scripts.lint.exec = "cargo clippy -- -D warnings";
+  scripts.lint.exec = "cargo clippy -- -D warnings && cargo fmt --check";
+  scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt";
   scripts.tst.exec = "cargo test --all";
 
   scripts.install-dev.exec = ''

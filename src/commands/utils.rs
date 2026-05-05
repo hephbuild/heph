@@ -1,9 +1,14 @@
-use anyhow::Context;
-use crate::{engine, htaddr, htpkg};
 use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
+use crate::{engine, htaddr, htpkg};
+use anyhow::Context;
 
-pub fn matcher_from_args(arg1: &String, arg2: &Option<String>, base_pkg: &PkgBuf, allow_all: bool) -> anyhow::Result<Matcher> {
+pub fn matcher_from_args(
+    arg1: &String,
+    arg2: &Option<String>,
+    base_pkg: &PkgBuf,
+    allow_all: bool,
+) -> anyhow::Result<Matcher> {
     if let Some(package_matcher) = &arg2 {
         let label = arg1;
 

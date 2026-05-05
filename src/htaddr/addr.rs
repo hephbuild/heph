@@ -1,8 +1,8 @@
+use crate::htpkg::PkgBuf;
+use itertools::Itertools;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use crate::htpkg::PkgBuf;
-use itertools::Itertools;
 use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -51,6 +51,6 @@ impl Hash for Addr {
         for (k, v) in self.args.iter().sorted() {
             Hasher::write(h, k.as_bytes());
             Hasher::write(h, v.as_bytes());
-        };
+        }
     }
 }

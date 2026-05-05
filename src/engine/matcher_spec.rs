@@ -74,11 +74,11 @@ impl Matcher {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use crate::engine::provider::TargetSpec;
     use crate::htaddr::Addr;
     use crate::htmatcher::{MatchResult, Matcher};
     use crate::htpkg::PkgBuf;
+    use std::collections::HashMap;
 
     fn spec(pkg: &str, name: &str, labels: &[&str]) -> TargetSpec {
         TargetSpec {

@@ -1,5 +1,5 @@
-use std::fmt;
 use crate::htaddr::Addr;
+use std::fmt;
 
 #[derive(Debug, Clone)]
 pub struct TargetNotFoundError {

@@ -46,10 +46,13 @@ pub fn parse(input: &str, base: &PkgBuf) -> anyhow::Result<Matcher> {
             Ok(Matcher::PackagePrefix(PkgBuf::from(pkg)))
         } else {
             Ok(Matcher::Package(PkgBuf::from(pkg)))
-        }
+        };
     }
 
-    Err(anyhow::anyhow!("invalid package reference: '{}' (must start with '//', './', or '../')", input))
+    Err(anyhow::anyhow!(
+        "invalid package reference: '{}' (must start with '//', './', or '../')",
+        input
+    ))
 }
 
 #[cfg(test)]

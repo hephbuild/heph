@@ -86,17 +86,33 @@ impl Matcher {
     pub fn matches(&self, def: &TargetDef) -> MatchResult {
         match self {
             Matcher::Addr(addr) => {
-                if def.addr == *addr { MatchResult::MatchYes } else { MatchResult::MatchNo }
+                if def.addr == *addr {
+                    MatchResult::MatchYes
+                } else {
+                    MatchResult::MatchNo
+                }
             }
             Matcher::Label(addr) => {
                 let label = addr.format();
-                if def.labels.contains(&label) { MatchResult::MatchYes } else { MatchResult::MatchNo }
+                if def.labels.contains(&label) {
+                    MatchResult::MatchYes
+                } else {
+                    MatchResult::MatchNo
+                }
             }
             Matcher::Package(pkg) => {
-                if def.addr.package == *pkg { MatchResult::MatchYes } else { MatchResult::MatchNo }
+                if def.addr.package == *pkg {
+                    MatchResult::MatchYes
+                } else {
+                    MatchResult::MatchNo
+                }
             }
             Matcher::PackagePrefix(prefix) => {
-                if def.addr.package.has_prefix(prefix) { MatchResult::MatchYes } else { MatchResult::MatchNo }
+                if def.addr.package.has_prefix(prefix) {
+                    MatchResult::MatchYes
+                } else {
+                    MatchResult::MatchNo
+                }
             }
             Matcher::Or(matchers) => {
                 let mut has_shrug = false;
@@ -107,7 +123,11 @@ impl Matcher {
                         MatchResult::MatchNo => {}
                     }
                 }
-                if has_shrug { MatchResult::MatchShrug } else { MatchResult::MatchNo }
+                if has_shrug {
+                    MatchResult::MatchShrug
+                } else {
+                    MatchResult::MatchNo
+                }
             }
             Matcher::And(matchers) => {
                 let mut has_shrug = false;
@@ -118,7 +138,11 @@ impl Matcher {
                         MatchResult::MatchYes => {}
                     }
                 }
-                if has_shrug { MatchResult::MatchShrug } else { MatchResult::MatchYes }
+                if has_shrug {
+                    MatchResult::MatchShrug
+                } else {
+                    MatchResult::MatchYes
+                }
             }
             Matcher::Not(m) => match m.matches(def) {
                 MatchResult::MatchYes => MatchResult::MatchNo,
@@ -167,7 +191,10 @@ mod tests {
     #[test]
     fn addr_exact_match() {
         let a = addr("foo/bar", "baz");
-        assert_eq!(Matcher::Addr(a.clone()).matches_addr(&a), MatchResult::MatchYes);
+        assert_eq!(
+            Matcher::Addr(a.clone()).matches_addr(&a),
+            MatchResult::MatchYes
+        );
     }
 
     #[test]
@@ -181,7 +208,10 @@ mod tests {
     fn label_always_shrugs() {
         let a = addr("foo/bar", "baz");
         let label = addr("", "my_label");
-        assert_eq!(Matcher::Label(label).matches_addr(&a), MatchResult::MatchShrug);
+        assert_eq!(
+            Matcher::Label(label).matches_addr(&a),
+            MatchResult::MatchShrug
+        );
     }
 
     #[test]
@@ -304,29 +334,53 @@ mod tests {
     #[test]
     fn def_addr_match() {
         let d = def("foo/bar", "build");
-        assert_eq!(Matcher::Addr(addr("foo/bar", "build")).matches(&d), MatchResult::MatchYes);
-        assert_eq!(Matcher::Addr(addr("foo/bar", "test")).matches(&d), MatchResult::MatchNo);
+        assert_eq!(
+            Matcher::Addr(addr("foo/bar", "build")).matches(&d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            Matcher::Addr(addr("foo/bar", "test")).matches(&d),
+            MatchResult::MatchNo
+        );
     }
 
     #[test]
     fn def_label_match() {
         let d = def_with_labels("foo", "bar", &["//labels:lint"]);
-        assert_eq!(Matcher::Label(addr("labels", "lint")).matches(&d), MatchResult::MatchYes);
-        assert_eq!(Matcher::Label(addr("labels", "other")).matches(&d), MatchResult::MatchNo);
+        assert_eq!(
+            Matcher::Label(addr("labels", "lint")).matches(&d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            Matcher::Label(addr("labels", "other")).matches(&d),
+            MatchResult::MatchNo
+        );
     }
 
     #[test]
     fn def_package_match() {
         let d = def("foo/bar", "build");
-        assert_eq!(Matcher::Package(PkgBuf::from("foo/bar")).matches(&d), MatchResult::MatchYes);
-        assert_eq!(Matcher::Package(PkgBuf::from("foo")).matches(&d), MatchResult::MatchNo);
+        assert_eq!(
+            Matcher::Package(PkgBuf::from("foo/bar")).matches(&d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            Matcher::Package(PkgBuf::from("foo")).matches(&d),
+            MatchResult::MatchNo
+        );
     }
 
     #[test]
     fn def_package_prefix_match() {
         let d = def("foo/bar/baz", "build");
-        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("foo/bar")).matches(&d), MatchResult::MatchYes);
-        assert_eq!(Matcher::PackagePrefix(PkgBuf::from("other")).matches(&d), MatchResult::MatchNo);
+        assert_eq!(
+            Matcher::PackagePrefix(PkgBuf::from("foo/bar")).matches(&d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            Matcher::PackagePrefix(PkgBuf::from("other")).matches(&d),
+            MatchResult::MatchNo
+        );
     }
 
     #[test]
@@ -357,7 +411,13 @@ mod tests {
     #[test]
     fn def_not_match() {
         let d = def("foo", "bar");
-        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("other")))).matches(&d), MatchResult::MatchYes);
-        assert_eq!(Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("foo")))).matches(&d), MatchResult::MatchNo);
+        assert_eq!(
+            Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("other")))).matches(&d),
+            MatchResult::MatchYes
+        );
+        assert_eq!(
+            Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("foo")))).matches(&d),
+            MatchResult::MatchNo
+        );
     }
 }

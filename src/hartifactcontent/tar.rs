@@ -1,3 +1,4 @@
+use crate::hartifactcontent::WalkEntry;
 use anyhow::Context;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Write};
@@ -5,7 +6,6 @@ use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use crate::hartifactcontent::WalkEntry;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -18,7 +18,9 @@ struct PoisonableReader {
 impl Read for PoisonableReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.poisoned.load(Ordering::Acquire) {
-            return Err(io::Error::other("stale tar entry: next() advanced past this entry"));
+            return Err(io::Error::other(
+                "stale tar entry: next() advanced past this entry",
+            ));
         }
         self.inner.read(buf)
     }
@@ -36,14 +38,19 @@ impl TarWalker {
     pub fn new<R: Read + 'static>(from: R) -> anyhow::Result<Self> {
         let boxed: Box<dyn Read> = Box::new(from);
         let mut archive = Box::new(tar::Archive::new(boxed));
-        // SAFETY: archive is Box-allocated so its heap address is stable across moves.
+        let ptr: *mut tar::Archive<Box<dyn Read>> = &mut *archive;
+        // SAFETY: ptr is derived from a Box-allocated archive whose heap address is stable across moves.
         // entries borrows from that heap allocation, not the Box pointer.
-        // Field order above guarantees entries is dropped before _archive.
-        let entries: tar::Entries<'static, Box<dyn Read>> = unsafe {
-            let ptr: *mut tar::Archive<Box<dyn Read>> = &mut *archive;
-            mem::transmute((*ptr).entries()?)
-        };
-        Ok(Self { entries, _archive: archive, current_poison: None })
+        // Field order in TarWalker guarantees entries is dropped before _archive.
+        let raw_entries = unsafe { (*ptr).entries()? };
+        // SAFETY: transmute extends the lifetime to 'static; safe because _archive (stored as a field)
+        // outlives entries due to TarWalker field declaration order and Rust drop order guarantees.
+        let entries: tar::Entries<'static, Box<dyn Read>> = unsafe { mem::transmute(raw_entries) };
+        Ok(Self {
+            entries,
+            _archive: archive,
+            current_poison: None,
+        })
     }
 }
 
@@ -80,9 +87,16 @@ impl Iterator for TarWalker {
                     tar::Entry<'_, Box<dyn Read>>,
                     tar::Entry<'static, Box<dyn Read>>,
                 >(entry);
-                Box::new(PoisonableReader { inner: Box::new(entry), poisoned: poison })
+                Box::new(PoisonableReader {
+                    inner: Box::new(entry),
+                    poisoned: poison,
+                })
             };
-            return Some(Ok(WalkEntry { path, data: reader, x }));
+            return Some(Ok(WalkEntry {
+                path,
+                data: reader,
+                x,
+            }));
         }
     }
 }
@@ -109,15 +123,23 @@ impl TarPacker {
     }
 
     pub fn create_file(&mut self, path: impl Into<String>, at: impl Into<String>) {
-        self.entries.push(PackEntry::File { source: path.into(), at: at.into() });
+        self.entries.push(PackEntry::File {
+            source: path.into(),
+            at: at.into(),
+        });
     }
 
     pub fn create_raw(&mut self, data: Vec<u8>, at: impl Into<String>, x: bool) {
-        self.entries.push(PackEntry::Raw { data, at: at.into(), x });
+        self.entries.push(PackEntry::Raw {
+            data,
+            at: at.into(),
+            x,
+        });
     }
 
     pub fn append_tar(&mut self, path: impl Into<String>) {
-        self.entries.push(PackEntry::AppendTar { path: path.into() });
+        self.entries
+            .push(PackEntry::AppendTar { path: path.into() });
     }
 
     pub fn pack<W: Write>(self, to: W) -> anyhow::Result<()> {
@@ -126,8 +148,8 @@ impl TarPacker {
         for entry in self.entries {
             match entry {
                 PackEntry::File { source, at } => {
-                    let mut src = File::open(&source)
-                        .with_context(|| format!("open: {}", source))?;
+                    let mut src =
+                        File::open(&source).with_context(|| format!("open: {}", source))?;
                     let meta = src.metadata()?;
                     let x = is_executable(&meta);
                     let mut header = tar::Header::new_gnu();
@@ -144,8 +166,7 @@ impl TarPacker {
                     builder.append_data(&mut header, &at, Cursor::new(&data))?;
                 }
                 PackEntry::AppendTar { path } => {
-                    let src = File::open(&path)
-                        .with_context(|| format!("open: {}", path))?;
+                    let src = File::open(&path).with_context(|| format!("open: {}", path))?;
                     let mut archive = tar::Archive::new(src);
                     for entry in archive.entries()? {
                         let mut entry = entry?;

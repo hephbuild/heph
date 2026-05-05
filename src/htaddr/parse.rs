@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-use pest::Parser;
-use pest_derive::Parser;
 use crate::htaddr::addr::Addr;
 use crate::htpkg::PkgBuf;
+use pest::Parser;
+use pest_derive::Parser;
+use std::collections::HashMap;
 
 #[derive(Parser)]
 #[grammar = "htaddr/taddr.pest"]
@@ -46,14 +46,27 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
             (None, Some(a)) => a,
             (None, None) => input.len(),
         };
+        // path_end is derived from find(':') / find('@') which are ASCII single-byte chars,
+        // so these indices are always on valid UTF-8 char boundaries.
+        #[expect(
+            clippy::string_slice,
+            reason = "indices derived from ASCII char positions, always valid boundaries"
+        )]
         let path_part = &input[..path_end];
+        #[expect(
+            clippy::string_slice,
+            reason = "indices derived from ASCII char positions, always valid boundaries"
+        )]
         let rest = &input[path_end..];
         let pkg = resolve_relative_pkg(base, path_part)?;
         let full = if rest.starts_with(':') || rest.is_empty() {
             if rest.is_empty() {
                 let name = pkg.rsplit('/').next().unwrap_or("");
                 if name.is_empty() {
-                    return Err(anyhow::anyhow!("cannot derive name from path '{}'", path_part));
+                    return Err(anyhow::anyhow!(
+                        "cannot derive name from path '{}'",
+                        path_part
+                    ));
                 }
                 format!("//{}:{}", pkg, name)
             } else {
@@ -63,7 +76,10 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
             // rest starts with '@', no explicit name — derive from pkg
             let name = pkg.rsplit('/').next().unwrap_or("");
             if name.is_empty() {
-                return Err(anyhow::anyhow!("cannot derive name from path '{}'", path_part));
+                return Err(anyhow::anyhow!(
+                    "cannot derive name from path '{}'",
+                    path_part
+                ));
             }
             format!("//{}:{}{}", pkg, name, rest)
         };
@@ -100,16 +116,17 @@ pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
                                     key = arg_inner.as_str().to_string();
                                 }
                                 Rule::value => {
-                                    let inner_val = arg_inner.into_inner().next().unwrap();
-                                    value = match inner_val.as_rule() {
-                                        Rule::quoted_string => {
-                                            inner_val.into_inner().find(|p| p.as_rule() == Rule::string_content)
+                                    if let Some(inner_val) = arg_inner.into_inner().next() {
+                                        value = match inner_val.as_rule() {
+                                            Rule::quoted_string => inner_val
+                                                .into_inner()
+                                                .find(|p| p.as_rule() == Rule::string_content)
                                                 .map(|p| p.as_str().to_string())
-                                                .unwrap_or_default()
-                                        }
-                                        Rule::bare_value => inner_val.as_str().to_string(),
-                                        _ => String::new(),
-                                    };
+                                                .unwrap_or_default(),
+                                            Rule::bare_value => inner_val.as_str().to_string(),
+                                            _ => String::new(),
+                                        };
+                                    }
                                 }
                                 _ => {}
                             }
@@ -127,16 +144,21 @@ pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
                                             key = arg_inner.as_str().to_string();
                                         }
                                         Rule::value => {
-                                            let inner_val = arg_inner.into_inner().next().unwrap();
-                                            value = match inner_val.as_rule() {
-                                                Rule::quoted_string => {
-                                                    inner_val.into_inner().find(|p| p.as_rule() == Rule::string_content)
+                                            if let Some(inner_val) = arg_inner.into_inner().next() {
+                                                value = match inner_val.as_rule() {
+                                                    Rule::quoted_string => inner_val
+                                                        .into_inner()
+                                                        .find(|p| {
+                                                            p.as_rule() == Rule::string_content
+                                                        })
                                                         .map(|p| p.as_str().to_string())
-                                                        .unwrap_or_default()
-                                                }
-                                                Rule::bare_value => inner_val.as_str().to_string(),
-                                                _ => String::new(),
-                                            };
+                                                        .unwrap_or_default(),
+                                                    Rule::bare_value => {
+                                                        inner_val.as_str().to_string()
+                                                    }
+                                                    _ => String::new(),
+                                                };
+                                            }
                                         }
                                         _ => {}
                                     }

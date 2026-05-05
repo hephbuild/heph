@@ -1,7 +1,7 @@
-pub mod run;
+mod bootstrap;
 pub mod inspect;
 pub mod query;
-mod bootstrap;
+pub mod run;
 mod utils;
 mod version;
 
@@ -23,7 +23,7 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn execute(&self) -> anyhow::Result<()>  {
+    pub fn execute(&self) -> anyhow::Result<()> {
         match self {
             Commands::Run(args) => run::execute(args),
             Commands::Inspect(args) => args.execute(),

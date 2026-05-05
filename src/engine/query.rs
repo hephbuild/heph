@@ -1,15 +1,19 @@
-use std::sync::Arc;
-use futures::Stream;
 use crate::engine::Engine;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
 use crate::htaddr::Addr;
 use crate::htmatcher;
-use crate::htmatcher::{MatchResult};
+use crate::htmatcher::MatchResult;
 use crate::htpkg::PkgBuf;
+use futures::Stream;
+use std::sync::Arc;
 
 impl Engine {
-    pub fn query<'a>(&'a self, rs: Arc<RequestState>, m: &'a htmatcher::Matcher) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
+    pub fn query<'a>(
+        &'a self,
+        rs: Arc<RequestState>,
+        m: &'a htmatcher::Matcher,
+    ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         async_stream::try_stream! {
             for pkg_result in self.packages(m, &rs.ctoken).await? {
                 let pkg = PkgBuf::from(pkg_result?);
@@ -56,11 +60,11 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use futures::TryStreamExt;
     use crate::engine::Config;
     use crate::htmatcher::Matcher;
     use crate::pluginstatictarget;
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     fn target(pkg: &str, name: &str, labels: &[&str]) -> pluginstatictarget::Target {
@@ -76,7 +80,9 @@ mod tests {
 
     fn make_engine(targets: Vec<pluginstatictarget::Target>) -> anyhow::Result<Arc<Engine>> {
         let root = tempdir()?;
-        let mut engine = Engine::new(Config { root: root.path().to_path_buf() })?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+        })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
         Ok(Arc::new(engine))
@@ -91,7 +97,10 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("foo/bar"))).try_collect().await?;
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::Package(PkgBuf::from("foo/bar")))
+            .try_collect()
+            .await?;
 
         assert_eq!(addrs.len(), 2);
         assert!(addrs.iter().any(|a| a.name == "a"));
@@ -101,10 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_by_addr() -> anyhow::Result<()> {
-        let engine = make_engine(vec![
-            target("foo", "a", &[]),
-            target("foo", "b", &[]),
-        ])?;
+        let engine = make_engine(vec![target("foo", "a", &[]), target("foo", "b", &[])])?;
 
         let rs = engine.new_state();
         let target_addr = Addr {
@@ -112,7 +118,10 @@ mod tests {
             name: "a".to_string(),
             args: Default::default(),
         };
-        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Addr(target_addr)).try_collect().await?;
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::Addr(target_addr))
+            .try_collect()
+            .await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -132,7 +141,10 @@ mod tests {
             name: "lint".to_string(),
             args: Default::default(),
         };
-        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Label(label_addr)).try_collect().await?;
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::Label(label_addr))
+            .try_collect()
+            .await?;
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
@@ -144,7 +156,10 @@ mod tests {
         let engine = make_engine(vec![target("foo", "a", &[])])?;
 
         let rs = engine.new_state();
-        let addrs: Vec<Addr> = engine.query(rs, &Matcher::Package(PkgBuf::from("nonexistent"))).try_collect().await?;
+        let addrs: Vec<Addr> = engine
+            .query(rs, &Matcher::Package(PkgBuf::from("nonexistent")))
+            .try_collect()
+            .await?;
 
         assert!(addrs.is_empty());
         Ok(())

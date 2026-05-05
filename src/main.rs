@@ -1,12 +1,12 @@
+use rheph::commands;
+use rheph::defer;
+use rheph::log;
 use std::process::ExitCode;
 use std::time::Instant;
-use rheph::commands;
-use rheph::log;
-use rheph::defer;
 
 use clap::Parser;
-use slog::{error, info};
 use humantime::format_duration;
+use slog::{error, info};
 
 #[derive(Parser)]
 #[command(name = "rheph")]
@@ -31,6 +31,6 @@ fn main() -> ExitCode {
             error!(_logger, "Failed"; "error" => %format!("{:#}", e));
 
             ExitCode::FAILURE
-        },
+        }
     }
 }

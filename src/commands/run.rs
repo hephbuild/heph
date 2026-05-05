@@ -1,9 +1,9 @@
-use std::io;
-use clap::Args;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::{get_cwp, OutputMatcher, ResultOptions};
+use crate::engine::{OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
+use clap::Args;
+use std::io;
 
 #[derive(Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
@@ -30,19 +30,19 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
 
-   let e =  bootstrap::new_engine()?;
+    let e = bootstrap::new_engine()?;
 
-    let opts = ResultOptions{
-        force: args.force
-    };
+    let opts = ResultOptions { force: args.force };
 
     let result = match m {
         Matcher::Addr(addr) => {
-            vec![e.clone().result_addr(e.new_state(), &addr, OutputMatcher::All, &opts).await?]
-        },
-        _ => {
-            e.clone().result(e.new_state(), &m, &opts).await?
+            vec![
+                e.clone()
+                    .result_addr(e.new_state(), &addr, OutputMatcher::All, &opts)
+                    .await?,
+            ]
         }
+        _ => e.clone().result(e.new_state(), &m, &opts).await?,
     };
 
     if args.cat_out {

@@ -1,6 +1,6 @@
-mod packages;
 mod hashin;
 mod hashout;
+mod packages;
 
 use clap::{Args, Subcommand};
 
@@ -30,7 +30,7 @@ impl InspectArgs {
             println!("Dedicated handler for user: {}", user);
         }
         if let Some(cmd) = &self.command {
-            return cmd.execute()
+            return cmd.execute();
         }
 
         Ok(())
@@ -38,7 +38,7 @@ impl InspectArgs {
 }
 
 impl InspectCommands {
-    pub fn execute(&self) -> anyhow::Result<()>  {
+    pub fn execute(&self) -> anyhow::Result<()> {
         match self {
             InspectCommands::Packages(args) => packages::execute(args),
             InspectCommands::Hashin(args) => hashin::execute(args),

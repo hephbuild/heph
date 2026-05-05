@@ -1,11 +1,15 @@
 use crate::engine::Engine;
-use crate::htmatcher;
-use crate::hasync::Cancellable;
 use crate::engine::provider::ListPackagesRequest;
+use crate::hasync::Cancellable;
+use crate::htmatcher;
 use crate::htpkg::PkgBuf;
 
 impl Engine {
-    pub async fn packages(&self, m: &htmatcher::Matcher, ctoken: &dyn Cancellable) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>>>> {
+    pub async fn packages(
+        &self,
+        m: &htmatcher::Matcher,
+        ctoken: &dyn Cancellable,
+    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>>>> {
         let prefix = match m {
             htmatcher::Matcher::Package(p) => p.clone(),
             htmatcher::Matcher::PackagePrefix(p) => p.clone(),

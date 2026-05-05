@@ -11,7 +11,10 @@ async fn test_bash_stdout_no_artifacts() -> anyhow::Result<()> {
     );
 
     let result = ws.run("//hello:greet").await?;
-    assert!(result.artifacts.is_empty(), "stdout-only target should produce no artifacts");
+    assert!(
+        result.artifacts.is_empty(),
+        "stdout-only target should produce no artifacts"
+    );
     Ok(())
 }
 
@@ -100,7 +103,12 @@ async fn test_force_run() -> anyhow::Result<()> {
     let e = ws.engine.clone();
     let rs = e.clone().new_state();
     let result = e
-        .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions { force: true })
+        .result_addr(
+            rs,
+            &addr,
+            OutputMatcher::All,
+            &ResultOptions { force: true },
+        )
         .await?;
 
     assert!(common::artifact_string(&result).contains("forced"));

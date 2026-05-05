@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use crate::engine::Engine;
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::meta::ResultMeta;
-use crate::engine::Engine;
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::{Memoizer, WrappedError};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 pub struct RequestState {
@@ -19,7 +19,8 @@ impl Drop for RequestState {
     fn drop(&mut self) {
         self.ctoken.cancel();
         if let Some(engine) = self.engine.upgrade()
-            && let Ok(mut requests) = engine.requests.lock() {
+            && let Ok(mut requests) = engine.requests.lock()
+        {
             requests.remove(&self.request_id);
         }
     }

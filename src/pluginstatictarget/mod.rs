@@ -1,15 +1,15 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-use futures::future::BoxFuture;
 use crate::engine::provider::{
-    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse,
-    ListPackageResponse, ListPackagesRequest, ListRequest, ListResponse,
-    ProbeRequest, ProbeResponse, Provider as EProvider, TargetSpec,
+    ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+    ListPackagesRequest, ListRequest, ListResponse, ProbeRequest, ProbeResponse,
+    Provider as EProvider, TargetSpec,
 };
-use crate::loosespecparser::TargetSpecValue;
 use crate::hasync::Cancellable;
 use crate::htaddr::parse_addr;
 use crate::htpkg::PkgBuf;
+use crate::loosespecparser::TargetSpecValue;
+use futures::future::BoxFuture;
+use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 pub struct Target {
     pub addr: String,
@@ -38,10 +38,14 @@ impl Provider {
                     config.insert("out".to_string(), TargetSpecValue::String(out));
                 }
                 if !t.deps.is_empty() {
-                    let map = t.deps.into_iter().map(|(k, vs)| {
-                        let list = vs.into_iter().map(TargetSpecValue::String).collect();
-                        (k, TargetSpecValue::List(list))
-                    }).collect();
+                    let map = t
+                        .deps
+                        .into_iter()
+                        .map(|(k, vs)| {
+                            let list = vs.into_iter().map(TargetSpecValue::String).collect();
+                            (k, TargetSpecValue::List(list))
+                        })
+                        .collect();
                     config.insert("deps".to_string(), TargetSpecValue::Map(map));
                 }
                 Ok(TargetSpec {
@@ -78,9 +82,14 @@ impl EProvider for Provider {
                 .targets
                 .iter()
                 .filter(|t| t.addr.package == req.package)
-                .map(|t| Ok(ListResponse { addr: t.addr.clone() }))
+                .map(|t| {
+                    Ok(ListResponse {
+                        addr: t.addr.clone(),
+                    })
+                })
                 .collect();
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+            Ok(Box::new(items.into_iter())
+                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
         })
     }
 
@@ -88,7 +97,8 @@ impl EProvider for Provider {
         &'a self,
         _req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>> {
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
+    {
         let pkgs = self.packages.get_or_init(|| {
             let mut seen = HashSet::new();
             self.targets
@@ -104,7 +114,10 @@ impl EProvider for Provider {
                 .cloned()
                 .map(|pkg| Ok(ListPackageResponse { pkg }))
                 .collect();
-            Ok(Box::new(items.into_iter()) as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>)
+            Ok(Box::new(items.into_iter())
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                >)
         })
     }
 
@@ -116,7 +129,9 @@ impl EProvider for Provider {
         Box::pin(async move {
             for t in &self.targets {
                 if t.addr == req.addr {
-                    return Ok(GetResponse { target_spec: t.clone() });
+                    return Ok(GetResponse {
+                        target_spec: t.clone(),
+                    });
                 }
             }
             Err(GetError::NotFound)

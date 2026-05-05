@@ -1,4 +1,4 @@
-use slog::{o, Drain, Logger};
+use slog::{Drain, Logger, o};
 use slog_term::{CompactFormat, TermDecorator};
 
 pub fn init() -> Logger {
@@ -12,8 +12,8 @@ pub fn init() -> Logger {
 
     let logger = Logger::root(drain, o!());
 
-    // Set slog as global log handler
-    let _ = slog_stdlog::init();
-    
+    // Set slog as global log handler; error means it was already initialized, which is fine
+    drop(slog_stdlog::init());
+
     logger
 }

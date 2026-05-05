@@ -1,8 +1,9 @@
-use std::fmt::Display;
-use async_trait::async_trait;
-use crate::{hasync, htaddr};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::{hasync, htaddr};
+use async_trait::async_trait;
+use std::fmt::Display;
+use std::path::PathBuf;
 
 #[derive(Default, Clone, Hash, Debug)]
 pub struct TargetAddr {
@@ -23,22 +24,24 @@ impl Display for TargetAddr {
 impl TargetAddr {
     pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
         let parts: Vec<&str> = v.split('|').collect();
-        match parts.len() {
-            1 => {
-                Ok(TargetAddr { r#ref: htaddr::parse_addr_with_base(v, base)?, output:  None })
-            }
-            2 => {
-                Ok(TargetAddr { r#ref: htaddr::parse_addr_with_base(parts[0], base)?, output: Some(parts[1].parse()?) })
-            }
-            _ => anyhow::bail!("invalid address")
+        match parts[..] {
+            [v] => Ok(TargetAddr {
+                r#ref: htaddr::parse_addr_with_base(v, base)?,
+                output: None,
+            }),
+            [addr, out] => Ok(TargetAddr {
+                r#ref: htaddr::parse_addr_with_base(addr, base)?,
+                output: Some(out.parse()?),
+            }),
+            _ => anyhow::bail!("invalid address"),
         }
     }
 }
 
 pub mod sandbox {
-    use std::collections::HashMap;
-    use smart_default::SmartDefault;
     use crate::engine::driver::TargetAddr;
+    use smart_default::SmartDefault;
+    use std::collections::HashMap;
 
     #[derive(Default, Clone, Debug)]
     pub struct Sandbox {
@@ -57,13 +60,14 @@ pub mod sandbox {
             }
 
             for d in inbound.deps {
-                self.deps.push(Dep{
+                self.deps.push(Dep {
                     id: format!("{}_dep_{}", id, d.id),
                     ..d.clone()
                 })
             }
 
-            self.env.extend(inbound.env.into_iter().map(|(k, v)| (k, v.clone())));
+            self.env
+                .extend(inbound.env.into_iter().map(|(k, v)| (k, v.clone())));
         }
     }
 
@@ -124,10 +128,10 @@ pub struct ParseRequest {
 }
 
 pub mod targetdef {
-    use std::any::Any;
-    use std::sync::Arc;
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
+    use std::any::Any;
+    use std::sync::Arc;
 
     #[derive(Clone)]
     pub struct TargetDef {
@@ -145,7 +149,9 @@ pub mod targetdef {
 
     impl TargetDef {
         pub fn def<T: 'static>(&self) -> &T {
-            self.raw_def.downcast_ref::<T>().unwrap()
+            self.raw_def
+                .downcast_ref::<T>()
+                .expect("TargetDef raw_def type mismatch: wrong type T requested")
         }
         pub fn set_def<T: Send + Sync + 'static>(&mut self, def: T) {
             self.raw_def = Arc::new(def);
@@ -221,8 +227,8 @@ pub struct ApplyTransitiveResponse {
 }
 
 pub mod inputartifact {
-    use std::sync::Arc;
     use crate::hartifactcontent::Content;
+    use std::sync::Arc;
 
     pub enum Type {
         Dep,
@@ -242,11 +248,11 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
+    use crate::hartifactcontent::{Content as HContent, WalkEntry};
     use std::fs::File;
     use std::io;
     use std::io::Read;
     use std::path::PathBuf;
-    use crate::hartifactcontent::{Content as HContent, WalkEntry};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Type {
@@ -285,7 +291,7 @@ pub mod outputartifact {
         pub content: Content,
         pub hashout: String,
     }
-    
+
     impl HContent for OutputArtifact {
         fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
             Ok(match &self.content {
@@ -296,23 +302,22 @@ pub mod outputartifact {
             })
         }
 
-        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item=anyhow::Result<WalkEntry>> + '_>> {
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             Ok(match &self.content {
-                Content::Raw(raw) => {
-                    Box::new(std::iter::once(Ok(WalkEntry {
-                        path: PathBuf::from(&raw.path),
-                        data: Box::new(io::Cursor::new(raw.data.clone())),
-                        x: raw.x,
-                    })))
-                },
-                Content::File(file) => {
-                    Box::new(std::iter::once(Ok(WalkEntry {
-                        path: PathBuf::from(&file.out_path),
-                        data: Box::new(File::open(&file.source_path)?),
-                        x: file.x,
-                    })))
-                },
-                Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(File::open(path)?)?),
+                Content::Raw(raw) => Box::new(std::iter::once(Ok(WalkEntry {
+                    path: PathBuf::from(&raw.path),
+                    data: Box::new(io::Cursor::new(raw.data.clone())),
+                    x: raw.x,
+                }))),
+                Content::File(file) => Box::new(std::iter::once(Ok(WalkEntry {
+                    path: PathBuf::from(&file.out_path),
+                    data: Box::new(File::open(&file.source_path)?),
+                    x: file.x,
+                }))),
+                Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(
+                    File::open(path)?,
+                )?),
+                #[expect(clippy::unimplemented, reason = "cpio format is not yet implemented")]
                 Content::CpioPath(_) => unimplemented!("cpio is not implemented"),
             })
         }
@@ -326,7 +331,7 @@ pub mod outputartifact {
 pub struct RunRequest<'a> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
-    pub tree_root_path: String,
+    pub tree_root_path: PathBuf,
     pub inputs: Vec<RunInput>,
     pub hashin: &'a String,
     pub stdin: Option<&'a mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
@@ -341,7 +346,19 @@ pub struct RunResponse {
 #[async_trait]
 pub trait Driver: Send + Sync {
     fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse>;
-    async fn parse(&self, req: ParseRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ParseResponse>;
-    async fn apply_transitive(&self, req: ApplyTransitiveRequest, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<ApplyTransitiveResponse>;
-    async fn run<'a>(&self, req: RunRequest<'a>, ctoken: &(dyn hasync::Cancellable + Send + Sync)) -> anyhow::Result<RunResponse>;
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse>;
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse>;
+    async fn run<'a>(
+        &self,
+        req: RunRequest<'a>,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse>;
 }
