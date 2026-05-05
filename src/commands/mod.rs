@@ -3,6 +3,7 @@ pub mod inspect;
 pub mod query;
 mod bootstrap;
 mod utils;
+mod version;
 
 use clap::Subcommand;
 
@@ -16,7 +17,9 @@ pub enum Commands {
     Inspect(inspect::InspectArgs),
     /// Query targets
     #[command(visible_alias = "q")]
-    Query(query::QueryArgs),
+    Query(query::Args),
+    /// Prints version
+    Version(version::Args),
 }
 
 impl Commands {
@@ -25,6 +28,7 @@ impl Commands {
             Commands::Run(args) => run::execute(args),
             Commands::Inspect(args) => args.execute(),
             Commands::Query(args) => query::execute(args),
+            Commands::Version(args) => version::execute(args),
         }
     }
 }

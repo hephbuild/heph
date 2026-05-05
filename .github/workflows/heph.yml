@@ -101,6 +101,7 @@ jobs:
         env:
           CARGO_TARGET_DIR: "./target"
           BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
+          HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
         run: |
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
           cargo zigbuild --release --target ${{ matrix.target }} --bin rheph

@@ -1,12 +1,11 @@
-use clap::Args;
 use futures::TryStreamExt;
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
 use crate::engine::get_cwp;
 
-#[derive(Args)]
+#[derive(clap::Args)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
-pub struct QueryArgs {
+pub struct Args {
     /// Target address (e.g., //pkg:name) OR Label
     #[arg(value_name = "TARGET_ADDRESS/LABEL")]
     pub arg1: String,
@@ -16,7 +15,7 @@ pub struct QueryArgs {
 }
 
 #[tokio::main]
-pub async fn execute(args: &QueryArgs) -> anyhow::Result<()> {
+pub async fn execute(args: &Args) -> anyhow::Result<()> {
     let e = bootstrap::new_engine()?;
 
     let cwp = get_cwp()?;
