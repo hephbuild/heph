@@ -362,6 +362,168 @@ target(
         }
     }
 
+    fn make_provider(tmp_dir: &tempfile::TempDir) -> Provider {
+        Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        }
+    }
+
+    fn run_transitive(build_content: &str) -> anyhow::Result<Sandbox> {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg";
+        let pkg_path = tmp_dir.path().join(pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+        let filename = "BUILD";
+        fs::write(pkg_path.join(filename), build_content).unwrap();
+        let provider = make_provider(&tmp_dir);
+        let result = provider.run_file(pkg_name, filename)?;
+        Ok(result.targets.into_iter().next().map(|t| t.transitive).unwrap_or_default())
+    }
+
+    #[test]
+    fn test_sandbox_empty_by_default() {
+        let sandbox = run_transitive(r#"target(name="t", driver="d")"#).unwrap();
+        assert!(sandbox.deps.is_empty());
+        assert!(sandbox.tools.is_empty());
+        assert!(sandbox.env.is_empty());
+    }
+
+    #[test]
+    fn test_sandbox_null_transitive() {
+        let sandbox = run_transitive(r#"target(name="t", driver="d", transitive=None)"#);
+        // None is not a valid starlark value here; expect error or default
+        // starlark doesn't have None by default in our globals, so this should error
+        assert!(sandbox.is_err() || sandbox.unwrap().empty());
+    }
+
+    #[test]
+    fn test_sandbox_deps_parsed() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "deps": {"group1": ["//mypkg:other"]},
+    },
+)
+"#;
+        let sandbox = run_transitive(content).unwrap();
+        assert_eq!(sandbox.deps.len(), 1);
+        let dep = &sandbox.deps[0];
+        assert_eq!(dep.group, "group1");
+        assert!(dep.runtime);
+        assert!(dep.hash);
+        assert_eq!(dep.r#ref.r#ref.name, "other");
+        assert_eq!(dep.id, "dep|group1|0");
+    }
+
+    #[test]
+    fn test_sandbox_multiple_deps() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "deps": {"g": ["//mypkg:a", "//mypkg:b"]},
+    },
+)
+"#;
+        let sandbox = run_transitive(content).unwrap();
+        assert_eq!(sandbox.deps.len(), 2);
+        let names: Vec<_> = sandbox.deps.iter().map(|d| d.r#ref.r#ref.name.as_str()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+    }
+
+    #[test]
+    fn test_sandbox_tools_parsed() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "tools": {"toolgroup": ["//mypkg:mytool"]},
+    },
+)
+"#;
+        let sandbox = run_transitive(content).unwrap();
+        assert_eq!(sandbox.tools.len(), 1);
+        let tool = &sandbox.tools[0];
+        assert_eq!(tool.group, "toolgroup");
+        assert!(tool.hash);
+        assert_eq!(tool.r#ref.r#ref.name, "mytool");
+        assert_eq!(tool.id, "tool|toolgroup|0");
+    }
+
+    #[test]
+    fn test_sandbox_env_parsed() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "env": {"MY_VAR": "my_value"},
+    },
+)
+"#;
+        let sandbox = run_transitive(content).unwrap();
+        assert_eq!(sandbox.env.len(), 1);
+        let env = sandbox.env.get("MY_VAR").unwrap();
+        assert!(env.hash);
+        assert!(!env.append);
+        assert!(env.append_prefix.is_empty());
+        match &env.value {
+            EnvValue::Literal(s) => assert_eq!(s, "my_value"),
+            _ => panic!("expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_sandbox_all_fields() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "deps": {"dg": ["//mypkg:dep1"]},
+        "tools": {"tg": ["//mypkg:tool1"]},
+        "env": {"K": "V"},
+    },
+)
+"#;
+        let sandbox = run_transitive(content).unwrap();
+        assert_eq!(sandbox.deps.len(), 1);
+        assert_eq!(sandbox.tools.len(), 1);
+        assert_eq!(sandbox.env.len(), 1);
+    }
+
+    #[test]
+    fn test_sandbox_unknown_key_errors() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = {
+        "unknown_key": "value",
+    },
+)
+"#;
+        assert!(run_transitive(content).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_not_map_errors() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    transitive = "bad",
+)
+"#;
+        assert!(run_transitive(content).is_err());
+    }
+
     #[test]
     fn test_run_pkg_inner_multiple_patterns() {
         let tmp_dir = tempdir().unwrap();
