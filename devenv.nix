@@ -36,9 +36,9 @@ in
   # services.postgres.enable = true;
 
   # https://devenv.sh/scripts/
-  scripts.proto-gen.exec = "buf generate";
+  scripts.proto-gen.exec = "buf generate && echo 'format_generated_files = false' > gen/proto/rustfmt.toml";
   scripts.gen.exec = "proto-gen";
-  scripts.lint.exec = "cargo clippy -- -D warnings && cargo fmt --check";
+  scripts.lint.exec = "echo '> clippy' && cargo clippy -- -D warnings && echo '> fmt' && cargo fmt --check";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt";
   scripts.tst.exec = "cargo test --all";
 
