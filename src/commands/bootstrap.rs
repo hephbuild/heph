@@ -1,4 +1,4 @@
-use crate::{engine, pluginbuildfile, pluginexec};
+use crate::{engine, pluginbuildfile, pluginexec, pluginhostbin};
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let root = match engine::get_root() {
@@ -16,6 +16,9 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     })?;
     e.register_managed_driver(Box::new(pluginexec::Driver::new_exec()))?;
     e.register_managed_driver(Box::new(pluginexec::Driver::new_bash()))?;
+
+    e.register_provider(|_root| Box::new(pluginhostbin::Provider))?;
+    e.register_driver(Box::new(pluginhostbin::Driver))?;
 
     Ok(std::sync::Arc::new(e))
 }

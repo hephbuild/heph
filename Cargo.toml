@@ -103,5 +103,6 @@ tempfile = "3.10"
 thiserror = "1.0.69"
 derivative = "2.2.0"
 enclose = "1"
+which = "8.0.2"
 
 [dev-dependencies]
