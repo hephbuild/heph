@@ -2,12 +2,11 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::provider::{GetError, GetRequest, GetResponse, TargetSpec};
+use crate::engine::provider::{GetError, GetRequest, GetResponse, ProviderExecutor, TargetSpec};
 use crate::engine::request_state::RequestState;
 use crate::hmemoizer::WrappedError;
 use crate::htaddr::Addr;
 use enclose::enclose;
-use std::sync::Arc;
 
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
@@ -18,8 +17,36 @@ use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use std::sync::{Arc, Weak};
 use std::{fmt, fs, io};
 use tokio::task::JoinSet;
+
+struct EngineProviderExecutor {
+    engine: Weak<Engine>,
+    rs: Arc<RequestState>,
+}
+
+impl ProviderExecutor for EngineProviderExecutor {
+    fn result<'a>(
+        &'a self,
+        addr: &'a Addr,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<EResult>> {
+        Box::pin(async move {
+            let engine = self
+                .engine
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+            engine
+                .result_addr(
+                    self.rs.clone(),
+                    addr,
+                    OutputMatcher::All,
+                    &ResultOptions::default(),
+                )
+                .await
+        })
+    }
+}
 
 impl fmt::Debug for dyn Content {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -350,6 +377,11 @@ impl Engine {
     }
 
     pub async fn get_spec(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetSpec> {
+        let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
+            engine: rs.engine.clone(),
+            rs: rs.clone(),
+        });
+
         for provider in self.providers.iter() {
             let spec = match provider
                 .provider
@@ -358,6 +390,7 @@ impl Engine {
                         request_id: rs.request_id.clone(),
                         addr: addr.clone(),
                         states: vec![], // TODO
+                        executor: Arc::clone(&executor),
                     },
                     &rs.ctoken,
                 )

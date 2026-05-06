@@ -1,10 +1,12 @@
 use crate::engine::driver::sandbox::Sandbox;
+use crate::engine::result::EResult;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::TargetSpecValue;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub struct ConfigRequest {}
 pub struct ConfigResponse {
@@ -42,10 +44,15 @@ pub struct TargetSpec {
     pub transitive: Sandbox,
 }
 
+pub trait ProviderExecutor: Send + Sync {
+    fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<EResult>>;
+}
+
 pub struct GetRequest {
     pub request_id: String,
     pub addr: Addr,
     pub states: Vec<State>,
+    pub executor: Arc<dyn ProviderExecutor>,
 }
 pub struct GetResponse {
     pub target_spec: TargetSpec,
@@ -62,6 +69,15 @@ pub struct ProbeResponse {
 pub enum GetError {
     NotFound,
     Other(anyhow::Error),
+}
+
+impl std::fmt::Debug for GetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GetError::NotFound => write!(f, "GetError::NotFound"),
+            GetError::Other(e) => write!(f, "GetError::Other({:#})", e),
+        }
+    }
 }
 
 pub trait Provider: Send + Sync {
