@@ -10,6 +10,7 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
+use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -29,6 +30,7 @@ pub struct Driver {
 struct TargetDef {
     pub run: Vec<String>,
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
+    pub tool_group_inputs: BTreeMap<String, Vec<Input>>,
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, String>,
@@ -38,6 +40,7 @@ impl Hash for TargetDef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.run.hash(state);
         self.dep_group_inputs.hash(state);
+        self.tool_group_inputs.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
     }
@@ -165,6 +168,34 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 .push(input.clone());
         }
 
+        let tool_inputs = spec
+            .tools
+            .into_iter()
+            .flat_map(|(k, v)| {
+                let pkg = pkg.clone();
+                v.into_iter()
+                    .enumerate()
+                    .map(move |(i, v)| -> anyhow::Result<(String, Input)> {
+                        Ok((
+                            k.parse()?,
+                            Input {
+                                r#ref: TargetAddr::parse(&v, &pkg)?,
+                                mode: InputMode::Tool,
+                                origin_id: format!("tool|{}|{}", k, i),
+                            },
+                        ))
+                    })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut tool_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
+        for (group, input) in &tool_inputs {
+            tool_group_inputs
+                .entry(group.clone())
+                .or_default()
+                .push(input.clone());
+        }
+
         let pass_env: BTreeMap<String, String> = spec
             .pass_env
             .into_iter()
@@ -174,6 +205,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
         let def = TargetDef {
             run: spec.run,
             dep_group_inputs,
+            tool_group_inputs,
             pass_env,
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
@@ -191,7 +223,11 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 addr: req.target_spec.addr.clone(),
                 labels: req.target_spec.labels,
                 raw_def: Arc::new(def),
-                inputs: dep_inputs.into_iter().map(|(_, v)| v).collect(),
+                inputs: dep_inputs
+                    .into_iter()
+                    .map(|(_, v)| v)
+                    .chain(tool_inputs.into_iter().map(|(_, v)| v))
+                    .collect(),
                 outputs: spec
                     .outputs
                     .iter()
@@ -232,13 +268,18 @@ impl engine::driver_managed::ManagedDriver for Driver {
     ) -> anyhow::Result<ApplyTransitiveResponse> {
         let mut def = req.target_def.clone();
         let mut xdef = def.def::<TargetDef>().clone();
-        // for tool in req.sandbox.tools {
-        //     xdef.tool_group_inputs.entry(tool.group).or_default().push(Input{
-        //         r#ref: tool.r#ref,
-        //         mode: InputMode::Standard,
-        //         origin_id: tool.id,
-        //     });
-        // }
+        for tool in req.sandbox.tools {
+            let input = Input {
+                r#ref: tool.r#ref.clone(),
+                mode: InputMode::Tool,
+                origin_id: tool.id.clone(),
+            };
+            xdef.tool_group_inputs
+                .entry(tool.group)
+                .or_default()
+                .push(input.clone());
+            def.inputs.push(input);
+        }
         for dep in req.sandbox.deps {
             let input = Input {
                 r#ref: dep.r#ref.clone(),
@@ -298,6 +339,16 @@ impl engine::driver_managed::ManagedDriver for Driver {
         }
 
         let mut env = HashMap::<String, String>::new();
+        env.insert(
+            "PATH".to_string(),
+            [
+                "/nix/var/nix/profiles/default/bin", // TODO: figure out how to make plugins provide that
+                "/usr/local/bin",
+                "/usr/bin",
+                "/bin",
+            ]
+            .join(":"),
+        );
 
         for output in &rreq.target.outputs {
             let key = if output.group.is_empty() {
@@ -343,7 +394,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                     .iter()
                     .filter(|m| m.input.origin_id == input.origin_id)
                 {
-                    let managed_list_f = std::fs::File::open(&m.list_path)?;
+                    let managed_list_f =
+                        std::fs::File::open(&m.list_path).with_context(|| "open dep list file")?;
                     for line in std::io::BufReader::new(managed_list_f).lines() {
                         let line = line?;
                         if line.is_empty() {
@@ -362,6 +414,45 @@ impl engine::driver_managed::ManagedDriver for Driver {
             }
         }
 
+        let tool_bin_dir = if !def.tool_group_inputs.is_empty() {
+            let bin_dir = req.sandbox_dir.join("bin");
+            std::fs::create_dir_all(&bin_dir)?;
+
+            for inputs in def.tool_group_inputs.values() {
+                for input in inputs {
+                    for m in req
+                        .inputs
+                        .iter()
+                        .filter(|m| m.input.origin_id == input.origin_id)
+                    {
+                        let list_f = std::fs::File::open(&m.list_path)?;
+                        let file_path = std::io::BufReader::new(list_f)
+                            .lines()
+                            .find(|l| l.as_ref().is_ok_and(|s| !s.is_empty()))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("tool '{}' produced no files", input.origin_id)
+                            })??;
+
+                        let filename =
+                            std::path::Path::new(&file_path)
+                                .file_name()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("tool file path has no filename: {}", file_path)
+                                })?;
+                        let bin_path = bin_dir.join(filename);
+                        #[cfg(unix)]
+                        std::os::unix::fs::symlink(&file_path, &bin_path)?;
+                        #[cfg(not(unix))]
+                        std::fs::copy(&file_path, &bin_path)?;
+                    }
+                }
+            }
+
+            Some(bin_dir)
+        } else {
+            None
+        };
+
         env.extend(def.pass_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
         for name in &def.runtime_pass_env {
@@ -372,8 +463,23 @@ impl engine::driver_managed::ManagedDriver for Driver {
 
         env.extend(def.runtime_env.iter().map(|(k, v)| (k.clone(), v.clone())));
 
+        if let Some(bin_dir) = tool_bin_dir {
+            let bin_dir_str = bin_dir
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("bin dir path is not valid UTF-8"))?
+                .to_string();
+            let path_entry = env.entry("PATH".to_string()).or_default();
+            if path_entry.is_empty() {
+                *path_entry = bin_dir_str;
+            } else {
+                let old = path_entry.clone();
+                *path_entry = format!("{}:{}", bin_dir_str, old);
+            }
+        }
+
         let output_log_path = req.sandbox_dir.join("log.txt");
-        let output_log = std::fs::File::create(&output_log_path)?;
+        let output_log =
+            std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
         let output_log_file = Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(
             output_log,
         )));
@@ -396,7 +502,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
+            .spawn()
+            .with_context(|| "spawn child process")?;
 
         let child_stdin = child.stdin.take();
         let child_stdout = child.stdout.take();
@@ -424,7 +531,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
             res = async {
                 tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait()).3
             } => {
-                let status = res?;
+                let status = res.with_context(|| "wait for child process")?;
 
                 if !status.success() {
                     let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
@@ -483,6 +590,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -531,6 +639,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -585,6 +694,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
                 runtime_env: HashMap::new(),
@@ -645,6 +755,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec![run_cmd.to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
                 pass_env,
                 runtime_pass_env,
                 runtime_env,
@@ -815,6 +926,292 @@ mod tests {
             .await?;
         let def = res.target_def.def::<TargetDef>();
         assert!(def.pass_env.is_empty());
+        Ok(())
+    }
+
+    fn make_tool_binary(
+        dir: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}"))?;
+        let mut perms = std::fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms)?;
+        Ok(path)
+    }
+
+    fn make_tool_managed_input(
+        origin_id: &str,
+        tool_path: &std::path::Path,
+        list_dir: &std::path::Path,
+    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
+        use crate::engine::driver::{RunInput, inputartifact, outputartifact};
+        let list_path = list_dir.join(format!("input_{origin_id}.list"));
+        std::fs::write(&list_path, format!("{}\n", tool_path.display()))?;
+        Ok(crate::engine::driver_managed::ManagedRunInput {
+            input: RunInput {
+                artifact: inputartifact::InputArtifact {
+                    r#type: inputartifact::Type::Dep,
+                    origin_id: origin_id.to_string(),
+                    content: Arc::new(outputartifact::OutputArtifact {
+                        group: "".to_string(),
+                        name: "".to_string(),
+                        r#type: outputartifact::Type::Output,
+                        content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                            data: vec![],
+                            path: "".to_string(),
+                            x: false,
+                        }),
+                        hashout: "".to_string(),
+                    }),
+                },
+                origin_id: origin_id.to_string(),
+            },
+            list_path,
+        })
+    }
+
+    fn make_tool_target_def(run: Vec<String>, origin_id: &str, group: &str) -> EngineTargetDef {
+        EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run,
+                dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([(
+                    group.to_string(),
+                    vec![Input {
+                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        mode: InputMode::Tool,
+                        origin_id: origin_id.to_string(),
+                    }],
+                )]),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_binary_symlinked_in_bin() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let tool_path = make_tool_binary(tmp.path(), "mytool", "echo mytool_output")?;
+        let origin_id = "tool||0";
+        let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
+        // exec driver: "mytool" is resolved via the child PATH which will be set to bin_dir
+        let target_def = make_tool_target_def(vec!["mytool".to_string()], origin_id, "");
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: &"".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![managed_input],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let bin_tool = tmp.path().join("bin").join("mytool");
+        assert!(bin_tool.exists(), "bin/mytool should exist");
+        assert!(
+            bin_tool.symlink_metadata()?.file_type().is_symlink(),
+            "bin/mytool should be a symlink"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_callable_by_name() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let tool_path = make_tool_binary(tmp.path(), "mytool", "echo tool_was_called")?;
+        let origin_id = "tool||0";
+        let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
+        let target_def = make_tool_target_def(vec!["mytool".to_string()], origin_id, "");
+
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: &"".to_string(),
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![managed_input],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert_eq!(String::from_utf8(stdout)?.trim(), "tool_was_called");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_tool_bin_prepended_to_existing_path() -> anyhow::Result<()> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let tool_path = make_tool_binary(tmp.path(), "mytool", "echo ok")?;
+        let origin_id = "tool||0";
+        let managed_input = make_tool_managed_input(origin_id, &tool_path, tmp.path())?;
+
+        let existing_path = "/usr/bin:/bin";
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["echo $PATH".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([(
+                    "".to_string(),
+                    vec![Input {
+                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        mode: InputMode::Tool,
+                        origin_id: origin_id.to_string(),
+                    }],
+                )]),
+                pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+        };
+
+        let mut stdout = Vec::new();
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: &"".to_string(),
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![managed_input],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let path_out = String::from_utf8(stdout)?;
+        let path_out = path_out.trim();
+        let bin_dir = tmp.path().join("bin").to_string_lossy().into_owned();
+        assert!(
+            path_out.starts_with(&bin_dir),
+            "PATH should start with bin dir; got: {path_out}"
+        );
+        assert!(
+            path_out.contains(existing_path),
+            "PATH should retain existing entries; got: {path_out}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_bin_dir_without_tools() -> anyhow::Result<()> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["true".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+        };
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: &"".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver.run(make_req(req), &ctoken).await?;
+
+        assert!(
+            !tmp.path().join("bin").exists(),
+            "bin/ should not be created when no tools"
+        );
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::engine::driver::targetdef::TargetDef;
+use crate::engine::driver::targetdef::{InputMode, TargetDef, path::Content};
 use crate::engine::request_state::RequestState;
 use enclose::enclose;
 use futures::future::try_join_all;
@@ -37,6 +37,23 @@ impl Engine {
                 } else {
                     input_def.outputs.iter().map(|output| output.group.clone()).unique().collect()
                 };
+
+                if input.mode == InputMode::Tool {
+                    let file_count = input_def
+                        .outputs
+                        .iter()
+                        .filter(|o| output_names.contains(&o.group))
+                        .flat_map(|o| &o.paths)
+                        .filter(|p| matches!(p.content, Content::FilePath(_)))
+                        .count();
+                    if file_count != 1 {
+                        anyhow::bail!(
+                            "tool target '{:?}' must produce exactly 1 FilePath output, found {}",
+                            input.r#ref.r#ref,
+                            file_count
+                        );
+                    }
+                }
 
                 Ok(LinkedTargetDefInput {
                     target: input_def,

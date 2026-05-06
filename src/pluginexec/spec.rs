@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
     pub deps: HashMap<String, Vec<String>>,
+    pub tools: HashMap<String, Vec<String>>,
     pub outputs: HashMap<String, Vec<String>>,
     pub cache: TargetSpecCache,
     pub pass_env: Vec<String>,
@@ -32,6 +33,7 @@ impl TargetSpec {
             },
             outputs: HashMap::new(),
             deps: HashMap::new(),
+            tools: HashMap::new(),
             pass_env: vec![],
             runtime_pass_env: vec![],
             runtime_env: HashMap::new(),
@@ -56,6 +58,10 @@ impl TargetSpec {
 
         if let Some(v) = m.remove("deps") {
             spec.deps = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
+        };
+
+        if let Some(v) = m.remove("tools") {
+            spec.tools = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
         };
 
         if let Some(v) = m.remove("pass_env") {
@@ -137,5 +143,37 @@ mod tests {
         assert!(spec.pass_env.is_empty());
         assert!(spec.runtime_pass_env.is_empty());
         assert!(spec.runtime_env.is_empty());
+    }
+
+    #[test]
+    fn test_tools_parsed() {
+        let spec = make_spec([(
+            "tools",
+            TargetSpecValue::List(vec![TargetSpecValue::String("//some:tool".to_string())]),
+        )])
+        .unwrap();
+        assert_eq!(spec.tools.get(""), Some(&vec!["//some:tool".to_string()]));
+    }
+
+    #[test]
+    fn test_tools_empty_by_default() {
+        let spec = make_spec([]).unwrap();
+        assert!(spec.tools.is_empty());
+    }
+
+    #[test]
+    fn test_tools_grouped() {
+        let spec = make_spec([(
+            "tools",
+            TargetSpecValue::Map(HashMap::from([(
+                "cc".to_string(),
+                TargetSpecValue::String("//toolchain:gcc".to_string()),
+            )])),
+        )])
+        .unwrap();
+        assert_eq!(
+            spec.tools.get("cc"),
+            Some(&vec!["//toolchain:gcc".to_string()])
+        );
     }
 }

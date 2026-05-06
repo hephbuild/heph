@@ -165,10 +165,11 @@ pub mod targetdef {
         pub origin_id: String,
     }
 
-    #[derive(Clone, Hash)]
+    #[derive(Clone, Hash, PartialEq)]
     pub enum InputMode {
         Standard,
         Link,
+        Tool,
     }
 
     #[derive(Clone)]
