@@ -38,6 +38,16 @@ impl Provider {
         let mut has_build_file = false;
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .unwrap_or("")
+                .starts_with(".heph")
+            {
+                // TODO: fix it better
+                continue;
+            }
+
             let entry_path = entry.path();
             if entry_path.is_file()
                 && entry_path

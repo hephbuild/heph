@@ -2,12 +2,10 @@ use crate::engine::Engine;
 use crate::engine::driver::inputartifact::{InputArtifact, Type};
 use crate::engine::driver::outputartifact::OutputArtifact;
 use crate::engine::driver::{RunInput, RunRequest};
-use crate::engine::engine::Driver;
 use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
-use crate::hmemoizer::WrappedError;
 use crate::htaddr::Addr;
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -18,6 +16,7 @@ use std::sync::Arc;
 use std::{fs, io};
 
 impl Engine {
+    #[async_recursion]
     pub(crate) async fn execute(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -26,30 +25,12 @@ impl Engine {
         def: &LinkedTargetDef,
         hashin: &str,
     ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
-        let key = format!("{}:{}", addr.format(), hashin);
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
             .ok_or_else(|| anyhow::anyhow!("driver not found"))
             .cloned()?;
-        let def = def.clone();
-        let root = self.cfg.root.clone();
-        let hashin = hashin.to_string();
-        let res = rs.mem_execute.process_result(key, enclose!((self => engine, rs) move || async move {
-            engine.execute_inner(rs, driver, def, root, hashin).await.map_err(WrappedError::from)
-        })).await?;
-        Ok(res)
-    }
 
-    #[async_recursion]
-    async fn execute_inner(
-        self: Arc<Self>,
-        rs: Arc<RequestState>,
-        driver: Arc<Driver>,
-        def: LinkedTargetDef,
-        root: PathBuf,
-        hashin: String,
-    ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
         let deps_result = self
             .clone()
             .inputs_result_exec(rs.clone(), &def.inputs)
@@ -57,19 +38,13 @@ impl Engine {
 
         let sandbox_dir = {
             let mut dir = self.home.join("sandbox");
-
-            for c in def.target.addr.package.components() {
-                dir = dir.join(c)
+            for c in addr.package.components() {
+                dir = dir.join(c);
             }
-
-            if def.target.addr.args.is_empty() {
-                dir.join(format!("__target_{}", def.target.addr.name))
+            if addr.args.is_empty() {
+                dir.join(format!("__target_{}", addr.name))
             } else {
-                dir.join(format!(
-                    "__target_{}_{}",
-                    def.target.addr.name,
-                    def.target.addr.hash_str()
-                ))
+                dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
             }
         };
         match fs::remove_dir_all(&sandbox_dir) {
@@ -79,15 +54,16 @@ impl Engine {
         }?;
         fs::create_dir_all(&sandbox_dir)?;
 
+        let hashin_owned = hashin.to_owned();
         let res = driver
             .driver
             .run(
                 RunRequest {
                     request_id: &rs.request_id,
                     target: &def.target,
-                    tree_root_path: root,
+                    tree_root_path: self.cfg.root.clone(),
                     inputs: deps_result,
-                    hashin: &hashin,
+                    hashin: &hashin_owned,
                     stdin: None,
                     stdout: None,
                     stderr: None,

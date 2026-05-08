@@ -11,9 +11,8 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            Matcher::Label(addr) => {
-                let label = addr.format();
-                if spec.labels.contains(&label) {
+            Matcher::Label(label) => {
+                if spec.labels.contains(label) {
                     MatchResult::MatchYes
                 } else {
                     MatchResult::MatchNo
@@ -141,22 +140,14 @@ mod tests {
     #[test]
     fn label_yes() {
         let s = spec("foo/bar", "baz", &["//tag:release"]);
-        let m = Matcher::Label(Addr {
-            package: PkgBuf::from("tag"),
-            name: "release".to_string(),
-            args: HashMap::new(),
-        });
+        let m = Matcher::Label("//tag:release".to_string());
         assert_eq!(m.matches_spec(&s), MatchResult::MatchYes);
     }
 
     #[test]
     fn label_no() {
         let s = spec("foo/bar", "baz", &[]);
-        let m = Matcher::Label(Addr {
-            package: PkgBuf::from("tag"),
-            name: "release".to_string(),
-            args: HashMap::new(),
-        });
+        let m = Matcher::Label("//tag:release".to_string());
         assert_eq!(m.matches_spec(&s), MatchResult::MatchNo);
     }
 

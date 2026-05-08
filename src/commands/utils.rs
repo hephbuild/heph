@@ -6,7 +6,7 @@ use anyhow::Context;
 pub fn matcher_from_args(
     arg1: &String,
     arg2: &Option<String>,
-    base_pkg: &PkgBuf,
+    _base_pkg: &PkgBuf,
     allow_all: bool,
 ) -> anyhow::Result<Matcher> {
     if let Some(package_matcher) = &arg2 {
@@ -21,7 +21,7 @@ pub fn matcher_from_args(
         }
 
         Ok(Matcher::And(vec![
-            Matcher::Label(htaddr::parse_addr_with_base(label, base_pkg)?),
+            Matcher::Label(label.into()),
             htpkg::parse(package_matcher, &engine::get_cwp()?)?,
         ]))
     } else {

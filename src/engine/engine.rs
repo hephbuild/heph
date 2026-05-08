@@ -8,6 +8,7 @@ use crate::engine::{driver, provider};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
@@ -25,6 +26,7 @@ pub struct Engine {
 
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
+    pub(crate) result_semaphore: Arc<Semaphore>,
 }
 
 pub struct Provider {
@@ -42,6 +44,10 @@ impl Engine {
         let root = cfg.root.clone();
         let home = root.join(".heph3");
 
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
         Ok(Engine {
             cfg: cfg.clone(),
             home: home.clone(),
@@ -51,6 +57,7 @@ impl Engine {
             drivers: vec![],
             drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
+            result_semaphore: Arc::new(Semaphore::new(2 * parallelism)),
         })
     }
 

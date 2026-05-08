@@ -116,7 +116,7 @@ impl Driver for ManagedDriverBridge {
     ) -> anyhow::Result<RunResponse> {
         let sandbox_dir = req.sandbox_dir.clone();
         let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir)?;
+        fs::create_dir_all(&ws_dir).with_context(|| "create ws dir")?;
 
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
@@ -125,7 +125,8 @@ impl Driver for ManagedDriverBridge {
                 input.artifact.content.as_ref(),
                 ws_dir.as_path(),
                 input_list.as_path(),
-            )?;
+            )
+            .with_context(|| "unpack")?;
             inputs.push(ManagedRunInput {
                 input,
                 list_path: input_list,
@@ -136,7 +137,8 @@ impl Driver for ManagedDriverBridge {
         let hashin = req.hashin.clone();
 
         let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
-        fs::create_dir_all(sandbox_pkg_dir)?;
+        fs::create_dir_all(sandbox_pkg_dir)
+            .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
         let mut res = self
             .driver

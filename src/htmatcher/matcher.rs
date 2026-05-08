@@ -12,7 +12,7 @@ pub enum MatchResult {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Matcher {
     Addr(Addr),
-    Label(Addr),
+    Label(String),
     Package(PkgBuf),
     PackagePrefix(PkgBuf),
     Or(Vec<Matcher>),
@@ -92,8 +92,7 @@ impl Matcher {
                     MatchResult::MatchNo
                 }
             }
-            Matcher::Label(addr) => {
-                let label = addr.format();
+            Matcher::Label(label) => {
                 if def.labels.contains(&label) {
                     MatchResult::MatchYes
                 } else {
@@ -207,9 +206,8 @@ mod tests {
     #[test]
     fn label_always_shrugs() {
         let a = addr("foo/bar", "baz");
-        let label = addr("", "my_label");
         assert_eq!(
-            Matcher::Label(label).matches_addr(&a),
+            Matcher::Label("my_label".to_string()).matches_addr(&a),
             MatchResult::MatchShrug
         );
     }
@@ -267,10 +265,9 @@ mod tests {
     #[test]
     fn or_shrug_if_no_yes_but_some_shrug() {
         let a = addr("foo/bar", "t");
-        let label = addr("", "lbl");
         let m = Matcher::Or(vec![
             Matcher::Package(PkgBuf::from("other")),
-            Matcher::Label(label),
+            Matcher::Label("lbl".to_string()),
         ]);
         assert_eq!(m.matches_addr(&a), MatchResult::MatchShrug);
     }
@@ -298,10 +295,9 @@ mod tests {
     #[test]
     fn and_shrug_if_no_no_but_some_shrug() {
         let a = addr("foo/bar", "t");
-        let label = addr("", "lbl");
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo/bar")),
-            Matcher::Label(label),
+            Matcher::Label("lbl".to_string()),
         ]);
         assert_eq!(m.matches_addr(&a), MatchResult::MatchShrug);
     }
@@ -322,9 +318,8 @@ mod tests {
     #[test]
     fn not_shrug_stays_shrug() {
         let a = addr("foo/bar", "t");
-        let label = addr("", "lbl");
         assert_eq!(
-            Matcher::Not(Box::new(Matcher::Label(label))).matches_addr(&a),
+            Matcher::Not(Box::new(Matcher::Label("lbl".to_string()))).matches_addr(&a),
             MatchResult::MatchShrug
         );
     }
@@ -348,11 +343,11 @@ mod tests {
     fn def_label_match() {
         let d = def_with_labels("foo", "bar", &["//labels:lint"]);
         assert_eq!(
-            Matcher::Label(addr("labels", "lint")).matches(&d),
+            Matcher::Label("//labels:lint".to_string()).matches(&d),
             MatchResult::MatchYes
         );
         assert_eq!(
-            Matcher::Label(addr("labels", "other")).matches(&d),
+            Matcher::Label("//labels:other".to_string()).matches(&d),
             MatchResult::MatchNo
         );
     }
@@ -398,12 +393,12 @@ mod tests {
         let d = def_with_labels("foo", "bar", &["//labels:lint"]);
         let m = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label(addr("labels", "lint")),
+            Matcher::Label("//labels:lint".to_string()),
         ]);
         assert_eq!(m.matches(&d), MatchResult::MatchYes);
         let m2 = Matcher::And(vec![
             Matcher::Package(PkgBuf::from("foo")),
-            Matcher::Label(addr("labels", "other")),
+            Matcher::Label("//labels:other".to_string()),
         ]);
         assert_eq!(m2.matches(&d), MatchResult::MatchNo);
     }

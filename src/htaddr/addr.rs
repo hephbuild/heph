@@ -1,5 +1,6 @@
 use crate::htpkg::PkgBuf;
 use itertools::Itertools;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -12,13 +13,33 @@ pub struct Addr {
     pub args: HashMap<String, String>,
 }
 
+impl Serialize for Addr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.format())
+    }
+}
+
 impl Display for Addr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.args.is_empty() {
-            write!(f, "//{}:{}", self.package, self.name)
-        } else {
-            write!(f, "//{}:{} SOMEARGSTODO", self.package, self.name)
+        write!(f, "//{}:{}", self.package, self.name)?;
+        if !self.args.is_empty() {
+            write!(f, "@")?;
+            for (i, (k, v)) in self.args.iter().sorted().enumerate() {
+                if i > 0 {
+                    write!(f, ",")?;
+                }
+                // Quote values that contain chars that would break bare_value parsing
+                if v.is_empty() || v.contains([' ', ',', '|', '"']) {
+                    write!(f, "{}=\"{}\"", k, v)?;
+                } else {
+                    write!(f, "{}={}", k, v)?;
+                }
+            }
         }
+        Ok(())
     }
 }
 

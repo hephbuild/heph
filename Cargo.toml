@@ -6,6 +6,10 @@ edition = "2024"
 [workspace]
 members = ["gen/proto", "e2e"]
 
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [workspace.lints.clippy]
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
 string_slice = "warn"
@@ -84,7 +88,8 @@ pest = "2.7"
 pest_derive = "2.7"
 anyhow = "1.0.102"
 memoize = "0.6.0"
-tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util"] }
+tokio = { version = "1.50.0", features = ["rt", "rt-multi-thread", "io-util", "io-std", "process", "macros", "sync", "signal", "fs", "test-util", "tracing"] }
+pprof = { version = "0.13", features = ["prost-codec"] }
 futures = "0.3.32"
 async-trait = "0.1.86"
 async-recursion = "1"
@@ -106,3 +111,5 @@ enclose = "1"
 which = "8.0.2"
 
 [dev-dependencies]
+serde-jsonlines = "0.7.0"
+

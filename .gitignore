@@ -32,7 +32,8 @@ devenv.local.yaml
 # pre-commit
 .pre-commit-config.yaml
 
-gen
-
 # Worktrees
 .claude/worktrees/
+
+gen
+example/go/large

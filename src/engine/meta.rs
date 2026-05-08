@@ -1,3 +1,4 @@
+use crate::debug_hash::DebugHasher;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::request_state::RequestState;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
@@ -63,7 +64,10 @@ impl Engine {
         def: TargetDef,
         results: Box<dyn Iterator<Item = String>>,
     ) -> anyhow::Result<String> {
-        let mut h = Xxh3Default::new();
+        let mut h = DebugHasher::new(
+            Xxh3Default::new(),
+            format!("hashin_{}", def.addr.format()).as_str(),
+        );
 
         Hasher::write(&mut h, &def.hash);
 
@@ -71,7 +75,7 @@ impl Engine {
             Hasher::write(&mut h, hashout.as_bytes());
         }
 
-        Ok(format!("{:x}", h.digest()))
+        Ok(format!("{:x}", h.finish()))
     }
 
     async fn inputs_result_meta(

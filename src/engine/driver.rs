@@ -2,6 +2,7 @@ use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::{hasync, htaddr};
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
 use std::path::PathBuf;
 
@@ -9,6 +10,25 @@ use std::path::PathBuf;
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
+}
+
+impl Serialize for TargetAddr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TargetAddr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        TargetAddr::parse(&s, &PkgBuf::from("")).map_err(serde::de::Error::custom)
+    }
 }
 
 impl Display for TargetAddr {
@@ -40,10 +60,11 @@ impl TargetAddr {
 
 pub mod sandbox {
     use crate::engine::driver::TargetAddr;
+    use serde::{Deserialize, Serialize};
     use smart_default::SmartDefault;
     use std::collections::HashMap;
 
-    #[derive(Default, Clone, Debug)]
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     pub struct Sandbox {
         pub tools: Vec<Tool>,
         pub deps: Vec<Dep>,
@@ -77,7 +98,7 @@ pub mod sandbox {
         }
     }
 
-    #[derive(Default, Clone, Debug)]
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     pub struct Tool {
         pub r#ref: TargetAddr,
         pub group: String,
@@ -85,7 +106,7 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Default, Clone, Debug)]
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     pub struct Dep {
         pub r#ref: TargetAddr,
         pub mode: Mode,
@@ -95,14 +116,14 @@ pub mod sandbox {
         pub id: String,
     }
 
-    #[derive(Clone, SmartDefault, Debug)]
+    #[derive(Clone, SmartDefault, Debug, Serialize, Deserialize)]
     pub enum Mode {
         #[default]
         None,
         Link,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub struct Env {
         pub value: EnvValue,
         pub hash: bool,
@@ -110,7 +131,7 @@ pub mod sandbox {
         pub append_prefix: String,
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum EnvValue {
         Literal(String),
         Pass,

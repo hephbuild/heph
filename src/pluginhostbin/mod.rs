@@ -132,7 +132,7 @@ impl crate::engine::driver::Driver for Driver {
                 outputs: vec![Output {
                     group: "".to_string(),
                     paths: vec![Path {
-                        content: Content::FilePath(bin_name),
+                        content: Content::FilePath(format!("__heph/hostbin/{}", bin_name)),
                         codegen_tree: CodegenMode::None,
                         collect: false,
                     }],
@@ -178,7 +178,7 @@ impl crate::engine::driver::Driver for Driver {
                 r#type: outputartifact::Type::Output,
                 content: outputartifact::Content::Raw(outputartifact::ContentRaw {
                     data,
-                    path: def.bin_name.clone(),
+                    path: format!("__heph/hostbin/{}", def.bin_name),
                     x: true,
                 }),
                 hashout,
@@ -364,7 +364,7 @@ mod tests {
         let script = match &artifact.content {
             outputartifact::Content::Raw(raw) => {
                 assert!(raw.x, "script must be executable");
-                assert_eq!(raw.path, "sh");
+                assert_eq!(raw.path, "__heph/hostbin/sh");
                 String::from_utf8(raw.data.clone()).unwrap()
             }
             _ => panic!("expected Raw content"),

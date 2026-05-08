@@ -1,4 +1,5 @@
 use crate::engine::Engine;
+use crate::engine::error::TargetNotFoundError;
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
 use crate::htaddr::Addr;
@@ -35,7 +36,11 @@ impl Engine {
                             MatchResult::MatchYes => yield addr,
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
-                                let spec = self.get_spec(rs.clone(), &addr).await?;
+                                let spec = match self.get_spec(rs.clone(), &addr).await {
+                                    Ok(spec) => Ok(spec),
+                                    Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => continue,
+                                    res => res,
+                                }?;
 
                                 match m.matches_spec(&spec) {
                                     MatchResult::MatchYes => yield addr,
@@ -136,13 +141,8 @@ mod tests {
         ])?;
 
         let rs = engine.new_state();
-        let label_addr = Addr {
-            package: PkgBuf::from("labels"),
-            name: "lint".to_string(),
-            args: Default::default(),
-        };
         let addrs: Vec<Addr> = engine
-            .query(rs, &Matcher::Label(label_addr))
+            .query(rs, &Matcher::Label("//labels:lint".to_string()))
             .try_collect()
             .await?;
 

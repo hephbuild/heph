@@ -17,6 +17,9 @@ in
     pkgs.protoc-gen-prost-crate
     pkgs.zig
     pkgs.cargo-zigbuild
+    pkgs.tokio-console
+  ] ++ lib.optionals pkgs.stdenv.isDarwin [
+    pkgs.samply
   ];
 
   # https://devenv.sh/languages/
@@ -35,11 +38,23 @@ in
   # services.postgres.enable = true;
 
   # https://devenv.sh/scripts/
-  scripts.proto-gen.exec = "buf generate";
-  scripts.gen.exec = "rm -rf gen && proto-gen";
+  scripts.gen-proto.exec = "buf generate";
+  scripts.gen.exec = "rm -rf gen && gen-proto";
+  scripts.gen-go-large.exec = ''
+    rm -rf $DEVENV_ROOT/example/go/large
+    cd $DEVENV_ROOT/tools/gorepogen
+    go run . -seed 42 -out $DEVENV_ROOT/example/go/large -module example.com/large -pkgs 200 -max-depth 7
+    cd $DEVENV_ROOT/example/go/large && go mod tidy
+  '';
   scripts.lint.exec = "echo '> clippy' && cargo clippy -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   scripts.tst.exec = "cargo test --all";
+  scripts.build-profile.exec = ''cargo build --profile profiling'';
+  scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
+  scripts.profile.exec = ''
+  build-profile
+  samply record $DEVENV_ROOT/target/profiling/rheph "''${@}"
+  '';
 
   scripts.install-dev.exec = ''
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph

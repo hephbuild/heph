@@ -11,14 +11,15 @@ use enclose::enclose;
 use crate::defer;
 use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::link::LinkedTargetDef;
-use crate::engine::local_cache::ManifestArtifactType;
+use crate::engine::local_cache::{CacheArtifact, ManifestArtifactType};
 use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
 use itertools::Itertools;
+use std::fmt;
 use std::sync::{Arc, Weak};
-use std::{fmt, fs, io};
+use std::{fs, io};
 use tokio::task::JoinSet;
 
 struct EngineProviderExecutor {
@@ -114,7 +115,7 @@ impl Engine {
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
         let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr, outputs) move || async move {
-            engine.inner_result_addr(rs, &addr, outputs, &opts).await.map_err(WrappedError::from)
+            engine.inner_result_addr(rs, &addr, outputs, &opts).await.with_context(|| format!("result: {}", addr)).map_err(WrappedError::from)
         })).await?;
 
         Ok(res)
@@ -152,6 +153,12 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
+        let semaphore = Arc::clone(&self.result_semaphore);
+        let _permit = semaphore
+            .acquire()
+            .await
+            .context("result semaphore closed")?;
+
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
@@ -215,44 +222,9 @@ impl Engine {
             return Ok(res);
         }
 
-        let (artifacts, sandbox_dir) = self
+        let (cached_artifacts, artifacts_meta) = self
             .clone()
-            .execute(
-                rs.clone(),
-                &def.target.addr,
-                opts.spec,
-                opts.def,
-                opts.hashin,
-            )
-            .await?;
-        let artifacts_meta = artifacts
-            .iter()
-            .filter(|a| a.r#type == outputartifact::Type::Output)
-            .map(|a| {
-                Ok(ArtifactMeta {
-                    hashout: a.hashout()?,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-
-        defer! {
-            match fs::remove_dir_all(&sandbox_dir) {
-                Ok(_) => (),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                Err(err) => {
-                    eprintln!("failed to clean up sandbox: {err}")
-                },
-            };
-        }
-
-        let cached_artifacts = self
-            .cache_locally(
-                &rs.ctoken,
-                &def.target.addr,
-                opts.hashin.as_str(),
-                artifacts,
-                !opts.def.target.cache,
-            )
+            .execute_and_cache_inner(rs.clone(), opts)
             .await?;
 
         Ok(EResult {
@@ -263,6 +235,56 @@ impl Engine {
                 .collect(),
             artifacts_meta,
         })
+    }
+
+    // Memoized by addr:hashin — at most one execute+cache cycle runs per target per request,
+    // preventing double-execute when the same target is requested with different output matchers.
+    async fn execute_and_cache_inner(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        opts: &ExecuteOptions<'_>,
+    ) -> anyhow::Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>)> {
+        let addr = opts.def.target.addr.clone();
+        let hashin = opts.hashin.clone();
+        let spec = opts.spec.clone();
+        let def = opts.def.clone();
+        let use_tmp_cache = !opts.def.target.cache;
+        let key = format!("{}:{}", addr.format(), hashin);
+
+        rs.mem_execute_cache
+            .process_result(
+                key,
+                enclose!((self => engine, rs) move || async move {
+                    let (artifacts, sandbox_dir) = engine
+                        .clone()
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin)
+                        .await
+                        .map_err(WrappedError::from)?;
+
+                    let artifacts_meta = artifacts
+                        .iter()
+                        .filter(|a| a.r#type == outputartifact::Type::Output)
+                        .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
+                        .collect::<anyhow::Result<Vec<_>>>()
+                        .map_err(WrappedError::from)?;
+
+                    defer! {
+                        match fs::remove_dir_all(&sandbox_dir) {
+                            Ok(_) => (),
+                            Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                            Err(err) => eprintln!("failed to clean up sandbox: {err}"),
+                        }
+                    }
+
+                    engine
+                        .cache_locally(&rs.ctoken, &addr, &hashin, artifacts, use_tmp_cache)
+                        .await
+                        .map(|cached| (cached, artifacts_meta))
+                        .map_err(WrappedError::from)
+                }),
+            )
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     async fn result_from_cache(
@@ -437,15 +459,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.err().unwrap();
 
-        assert_eq!(err.to_string(), "target not found: //non:existent");
-
-        use crate::hmemoizer::WrappedError;
-        let is_target_not_found = err.downcast_ref::<TargetNotFoundError>().is_some()
-            || err
-                .downcast_ref::<WrappedError>()
-                .and_then(|w| w.0.downcast_ref::<TargetNotFoundError>())
-                .is_some();
-        assert!(is_target_not_found);
+        // The full error chain must mention the address and the not-found cause.
+        let full_chain = format!("{:#}", err);
+        assert!(
+            full_chain.contains("non:existent"),
+            "expected addr in error chain: {full_chain}"
+        );
+        assert!(
+            full_chain.contains("target not found"),
+            "expected 'target not found' in error chain: {full_chain}"
+        );
 
         Ok(())
     }

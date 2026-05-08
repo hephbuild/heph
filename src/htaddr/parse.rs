@@ -1,8 +1,22 @@
 use crate::htaddr::addr::Addr;
 use crate::htpkg::PkgBuf;
+use anyhow::Context;
 use pest::Parser;
 use pest_derive::Parser;
+use serde::Deserialize;
 use std::collections::HashMap;
+
+impl<'de> Deserialize<'de> for Addr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        parse_addr(&s)
+            .with_context(|| format!("invalid address format: {}", s))
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Parser)]
 #[grammar = "htaddr/taddr.pest"]
@@ -284,11 +298,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_taddr_empty_package() {
+        let res = parse_addr("//:build_lib").unwrap();
+        assert_eq!(res.package.as_str(), "");
+        assert_eq!(res.name, "build_lib");
+        assert!(res.args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_taddr_empty_package_with_args() {
+        let res = parse_addr("//:build_lib@goos=linux,goarch=amd64").unwrap();
+        assert_eq!(res.package.as_str(), "");
+        assert_eq!(res.name, "build_lib");
+        assert_eq!(res.args.get("goos").unwrap(), "linux");
+        assert_eq!(res.args.get("goarch").unwrap(), "amd64");
+    }
+
+    #[test]
     fn test_parse_taddr_invalid() {
         let cases = vec![
             "pkg:name",           // Missing //
             "//pkg name",         // Missing :
-            "//:name",            // Empty package name
             "//pkg:",             // Empty name ident
             "//pkg:name@a=\"val", // Unclosed quote
             "//pkg:name@a=b c",   // Unexpected space/trailing content

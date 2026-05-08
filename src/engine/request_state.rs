@@ -1,17 +1,19 @@
 use crate::engine::Engine;
-use crate::engine::driver::outputartifact::OutputArtifact;
+use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
+use crate::engine::result::ArtifactMeta;
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::{Memoizer, WrappedError};
-use std::path::PathBuf;
 use std::sync::{Arc, Weak};
+
+type ExecuteCacheResult = Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>), WrappedError>;
 
 pub struct RequestState {
     pub engine: Weak<Engine>,
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub mem_result: Memoizer<String, Result<crate::engine::result::EResult, WrappedError>>,
-    pub mem_execute: Memoizer<String, Result<(Vec<OutputArtifact>, PathBuf), WrappedError>>,
+    pub mem_execute_cache: Memoizer<String, ExecuteCacheResult>,
     pub mem_meta: Memoizer<String, Result<ResultMeta, WrappedError>>,
 }
 
@@ -33,7 +35,7 @@ impl Engine {
             engine: Arc::downgrade(self),
             request_id: request_id.clone(),
             ctoken: StdCancellationToken::new(),
-            mem_execute: Memoizer::new(),
+            mem_execute_cache: Memoizer::new(),
             mem_result: Memoizer::new(),
             mem_meta: Memoizer::new(),
         });

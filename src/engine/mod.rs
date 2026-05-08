@@ -19,6 +19,7 @@ mod packages;
 pub mod provider;
 mod query;
 pub mod request_state;
+pub use result::ArtifactMeta;
 pub use result::EResult;
 pub use result::OutputMatcher;
 pub use result::ResultOptions;

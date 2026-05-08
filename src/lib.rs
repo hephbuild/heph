@@ -1,6 +1,7 @@
 extern crate core;
 
 pub mod commands;
+pub mod debug_hash;
 pub mod defer;
 pub mod engine;
 pub mod hartifactcontent;
@@ -13,5 +14,6 @@ pub mod log;
 pub mod loosespecparser;
 pub mod pluginbuildfile;
 pub mod pluginexec;
+pub mod plugingo;
 pub mod pluginhostbin;
 pub mod pluginstatictarget;

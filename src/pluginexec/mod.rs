@@ -1,5 +1,6 @@
 mod spec;
 
+use crate::debug_hash::DebugHasher;
 use crate::engine;
 use crate::engine::driver::sandbox::EnvValue;
 use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
@@ -13,7 +14,7 @@ use crate::hasync::Cancellable;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Write};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -212,10 +213,13 @@ impl engine::driver_managed::ManagedDriver for Driver {
         };
 
         let hash = {
-            let mut h = Xxh3Default::new();
+            let mut h = DebugHasher::new(
+                Xxh3Default::new(),
+                &format!("exec_def_{}", req.target_spec.addr.format()),
+            );
             def.hash(&mut h);
 
-            format!("{:x}", h.digest()).into_bytes()
+            format!("{:x}", h.finish()).into_bytes()
         };
 
         Ok(ParseResponse {
@@ -314,9 +318,12 @@ impl engine::driver_managed::ManagedDriver for Driver {
         }
 
         def.hash = {
-            let mut h = Xxh3Default::new();
+            let mut h = DebugHasher::new(
+                Xxh3Default::new(),
+                &format!("exec_def_tr_{}", def.addr.format()),
+            );
             xdef.hash(&mut h);
-            format!("{:x}", h.digest()).into_bytes()
+            format!("{:x}", h.finish()).into_bytes()
         };
 
         def.set_def(xdef);

@@ -5,6 +5,7 @@ use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::TargetSpecValue;
 use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub struct State {
     pub state: HashMap<String, String>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct TargetSpec {
     pub addr: Addr,
     pub driver: String,
