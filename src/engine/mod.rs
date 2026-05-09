@@ -14,7 +14,9 @@ pub use root::get_root;
 pub mod driver;
 pub mod error;
 mod local_cache;
+#[cfg(test)]
 mod local_cache_fs;
+mod local_cache_sqlite;
 mod packages;
 pub mod provider;
 mod query;

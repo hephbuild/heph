@@ -12,17 +12,17 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::embed;
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
-use crate::plugingo::pkg_analysis::{GoPackage, parse_go_list_output};
+use crate::plugingo::pkg_analysis::{GoPackage, parse_go_list_reader};
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
 use crate::plugingo::target_lib;
+use crate::plugingo::target_modfiles;
 use crate::plugingo::target_src;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
@@ -357,6 +357,21 @@ impl Provider {
             return self.get_stdlib(addr.clone(), import_path, &factors);
         }
 
+        // _go_mod — copy go.mod/go.sum; no go list needed
+        if addr.name == "_go_mod" {
+            let module_root = self.workspace_root.join(addr.package.as_str());
+            let mod_files: Vec<String> = ["go.mod", "go.sum"]
+                .iter()
+                .filter(|f| module_root.join(f).exists())
+                .map(|f| f.to_string())
+                .collect();
+            if mod_files.is_empty() {
+                return Err(GetError::NotFound);
+            }
+            let spec = target_modfiles::build_spec(addr.clone(), &mod_files, &module_root);
+            return Ok(GetResponse { target_spec: spec });
+        }
+
         // _golist — generate spec without executing go list
         if addr.name == "_golist" {
             return self
@@ -526,17 +541,28 @@ impl Provider {
             GoPackageKind::FirstParty {
                 import_path,
                 module_root,
-                src_dir,
                 ..
-            } => target_golist::build_spec_firstparty(
-                addr,
-                import_path,
-                module_root,
-                src_dir,
-                factors,
-                &self.go_bin_addr,
-                &self.goroot,
-            )?,
+            } => {
+                let module_root_rel = module_root
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(module_root);
+                let go_mod_addr = Addr {
+                    package: crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    name: "_go_mod".to_string(),
+                    args: Default::default(),
+                };
+                // let go_src_addr = self.make_addr_with_name(&addr.package, "_go_src", factors);
+                target_golist::build_spec_firstparty(
+                    addr,
+                    import_path,
+                    module_root,
+                    factors,
+                    &self.go_bin_addr,
+                    &self.goroot,
+                    &go_mod_addr,
+                    &go_mod_addr,
+                )?
+            }
             GoPackageKind::ThirdParty {
                 module,
                 subpath,
@@ -548,6 +574,14 @@ impl Provider {
                 } else {
                     format!("{}/{}", module, subpath)
                 };
+                let module_root_rel = module_root
+                    .strip_prefix(&self.workspace_root)
+                    .unwrap_or(module_root);
+                let go_mod_addr = Addr {
+                    package: crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    name: "_go_mod".to_string(),
+                    args: Default::default(),
+                };
                 target_golist::build_spec_thirdparty(
                     addr,
                     &import_path,
@@ -555,6 +589,7 @@ impl Provider {
                     factors,
                     &self.go_bin_addr,
                     &self.goroot,
+                    &go_mod_addr,
                 )?
             }
             GoPackageKind::Stdlib { .. } => {
@@ -595,14 +630,8 @@ impl Provider {
 
         for artifact in &result.artifacts {
             if let Some(entry_result) = artifact.walk()?.next() {
-                let mut entry = entry_result?;
-                let mut content = String::new();
-                entry.data.read_to_string(&mut content)?;
-                let packages = parse_go_list_output(&content)?;
-                return Ok(packages
-                    .into_iter()
-                    .map(|p| (p.import_path.clone(), p))
-                    .collect());
+                let entry = entry_result?;
+                return parse_go_list_reader(entry.data);
             }
         }
 
@@ -806,7 +835,7 @@ mod tests {
 
                 let packages = run_go_list(&import_path, &factors, &module_root).await?;
                 let mut buf = Vec::new();
-                serde_jsonlines::JsonLinesWriter::new(&mut buf).write_all(packages.iter())?;
+                serde_jsonlines::JsonLinesWriter::new(&mut buf).write_all(packages.values())?;
                 let json = String::from_utf8(buf).context("jsonl output is not utf-8")?;
 
                 Ok(EResult {
@@ -892,17 +921,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_simple_lib_build_lib_cache_true() {
-        let sandbox = copy_fixture("simple_lib");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
-    }
-
-    #[tokio::test]
     async fn test_simple_lib_no_build_target() {
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -926,10 +944,6 @@ mod tests {
         };
         let resp = p.get(req, &ctoken).await.unwrap();
         assert_eq!(resp.target_spec.driver, "bash");
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
@@ -995,10 +1009,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.target_spec.driver, "bash");
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[tokio::test]
@@ -1024,21 +1034,6 @@ mod tests {
             _ => panic!(),
         };
         assert!(out.contains_key("bin"));
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_with_test_test_cache_false() {
-        let sandbox = copy_fixture("with_test");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
     }
 
     #[tokio::test]
@@ -1124,10 +1119,6 @@ mod tests {
             _ => panic!(),
         };
         assert!(out.contains_key("a"));
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[tokio::test]
@@ -1163,19 +1154,6 @@ mod tests {
             run.contains("-embedcfg"),
             "build_lib run script must contain -embedcfg for embed package: {run}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_with_embed_embed_target_cache_false() {
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
     }
 
     #[tokio::test]
@@ -1438,10 +1416,6 @@ mod tests {
     async fn test_test_only_test_exists() {
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
-        assert!(matches!(
-            resp.target_spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
+        let _resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
     }
 }

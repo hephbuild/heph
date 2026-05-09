@@ -58,7 +58,6 @@ pub fn build_spec(
             TargetSpecValue::List(vec![TargetSpecValue::String(out_file)]),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(true));
     config.insert(
         "pass_env".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
@@ -131,21 +130,6 @@ mod tests {
             "/usr/local/go",
         );
         assert_eq!(spec.driver, "bash");
-    }
-
-    #[test]
-    fn test_build_spec_cache_true() {
-        let spec = build_spec(
-            test_addr(),
-            "fmt",
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[test]

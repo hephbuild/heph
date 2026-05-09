@@ -7,6 +7,7 @@ use crate::htaddr::Addr;
 use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
+use itertools::Itertools;
 use std::hash::Hasher;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
@@ -50,6 +51,7 @@ impl Engine {
         let hashouts: Vec<String> = results
             .iter()
             .flat_map(|res| res.artifacts_meta.iter().map(|m| m.hashout.clone()))
+            .sorted()
             .collect();
 
         let hashin = self

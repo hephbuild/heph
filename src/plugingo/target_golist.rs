@@ -4,28 +4,26 @@ use crate::loosespecparser::TargetSpecValue;
 use crate::plugingo::factors::Factors;
 use anyhow::Context;
 use std::collections::HashMap;
-use std::hash::Hasher;
 use std::path::Path;
-use xxhash_rust::xxh3::Xxh3Default;
 
 pub fn build_spec_firstparty(
     addr: Addr,
     import_path: &str,
     module_root: &Path,
-    src_dir: &Path,
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
+    go_mod_addr: &Addr,
+    go_src_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
-    let src_hash = compute_src_hash(module_root, Some(src_dir))?;
     build_spec_inner(
         addr,
         import_path,
         module_root,
-        src_hash,
         factors,
         go_bin_addr,
         goroot,
+        &[("modfiles", go_mod_addr), ("srcfiles", go_src_addr)],
     )
 }
 
@@ -36,16 +34,16 @@ pub fn build_spec_thirdparty(
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
+    go_mod_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
-    let src_hash = compute_src_hash(workspace_root, None)?;
     build_spec_inner(
         addr,
         import_path,
         workspace_root,
-        src_hash,
         factors,
         go_bin_addr,
         goroot,
+        &[("modfiles", go_mod_addr)],
     )
 }
 
@@ -53,21 +51,16 @@ fn build_spec_inner(
     addr: Addr,
     import_path: &str,
     module_root: &Path,
-    src_hash: String,
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
+    extra_deps: &[(&str, &Addr)],
 ) -> anyhow::Result<TargetSpec> {
     let module_root_str = module_root
         .to_str()
         .context("module_root must be valid UTF-8")?;
 
     let flags = factors.go_list_flags();
-    let tags_str = if factors.build_tags.is_empty() {
-        String::new()
-    } else {
-        format!(" tags:{}", factors.build_tags.join(","))
-    };
 
     let flags_part = if flags.is_empty() {
         String::new()
@@ -83,14 +76,9 @@ fn build_spec_inner(
     };
 
     let run = format!(
-        "# _golist hash:{src_hash} goos:{goos} goarch:{goarch}{tags_str}\n\
-         sandbox_dir=\"$PWD\"\n\
+        "sandbox_dir=\"$PWD\"\n\
          cd \"$GOLIST_MODULE_ROOT\"\n\
          \"$SRC_GO_BIN\" list -json -e -deps{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/deps.json\"\n",
-        src_hash = src_hash,
-        goos = factors.goos,
-        goarch = factors.goarch,
-        tags_str = tags_str,
         flags_part = flags_part,
     );
 
@@ -105,15 +93,20 @@ fn build_spec_inner(
     .map(|(k, v)| (k.to_string(), TargetSpecValue::String(v.to_string())))
     .collect();
 
+    let mut deps: HashMap<String, TargetSpecValue> = HashMap::from([(
+        "go_bin".to_string(),
+        TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+    )]);
+    for (group, dep_addr) in extra_deps {
+        deps.insert(
+            group.to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(dep_addr.format())]),
+        );
+    }
+
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "go_bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
-        )])),
-    );
+    config.insert("deps".to_string(), TargetSpecValue::Map(deps));
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(
@@ -121,7 +114,6 @@ fn build_spec_inner(
             TargetSpecValue::List(vec![TargetSpecValue::String("deps.json".to_string())]),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(true));
     config.insert("runtime_env".to_string(), TargetSpecValue::Map(runtime_env));
     config.insert(
         "runtime_pass_env".to_string(),
@@ -143,44 +135,6 @@ fn build_spec_inner(
         labels: vec![],
         transitive: Default::default(),
     })
-}
-
-/// Hash go.mod + go.sum from `module_root`, and optionally all .go files from `src_dir`.
-/// The hash is embedded in the run script so that file changes invalidate the target cache.
-fn compute_src_hash(module_root: &Path, src_dir: Option<&Path>) -> anyhow::Result<String> {
-    let mut h = Xxh3Default::new();
-
-    for file_name in &["go.mod", "go.sum"] {
-        let path = module_root.join(file_name);
-        if let Ok(content) = std::fs::read(&path) {
-            Hasher::write(&mut h, file_name.as_bytes());
-            Hasher::write(&mut h, &content);
-        }
-    }
-
-    if let Some(dir) = src_dir {
-        let mut files: Vec<_> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                let n = e.file_name();
-                n.to_string_lossy().ends_with(".go")
-                    && e.file_type().map(|t| t.is_file()).unwrap_or(false)
-            })
-            .collect();
-        files.sort_by_key(|e| e.file_name());
-
-        for entry in files {
-            let name = entry.file_name();
-            if let Ok(content) = std::fs::read(entry.path()) {
-                Hasher::write(&mut h, name.as_encoded_bytes());
-                Hasher::write(&mut h, &content);
-            }
-        }
-    }
-
-    Ok(format!("{:x}", h.digest()))
 }
 
 fn shell_quote(s: &str) -> String {
@@ -208,6 +162,22 @@ mod tests {
         }
     }
 
+    fn go_mod_addr() -> Addr {
+        Addr {
+            package: PkgBuf::from(""),
+            name: "_go_mod".to_string(),
+            args: Default::default(),
+        }
+    }
+
+    fn go_src_addr() -> Addr {
+        Addr {
+            package: PkgBuf::from("mylib"),
+            name: "_go_src".to_string(),
+            args: Default::default(),
+        }
+    }
+
     fn make_module_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -226,32 +196,14 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             tmp.path(),
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
         )
         .unwrap();
         assert_eq!(spec.driver, "bash");
-    }
-
-    #[test]
-    fn test_cache_true() {
-        let tmp = make_module_root();
-        let spec = build_spec_firstparty(
-            test_addr(),
-            "example.com/mylib",
-            tmp.path(),
-            tmp.path(),
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-        )
-        .unwrap();
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[test]
@@ -261,10 +213,11 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             tmp.path(),
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
@@ -281,10 +234,11 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             tmp.path(),
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
@@ -306,10 +260,11 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             tmp.path(),
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
@@ -327,63 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn test_src_hash_changes_when_file_changes() {
-        let tmp = make_module_root();
-
-        let spec1 = build_spec_firstparty(
-            test_addr(),
-            "example.com/mylib",
-            tmp.path(),
-            tmp.path(),
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-        )
-        .unwrap();
-
-        // Modify a file
-        std::fs::write(
-            tmp.path().join("lib.go"),
-            "package mylib\n\nfunc Foo() {}\n",
-        )
-        .unwrap();
-
-        let spec2 = build_spec_firstparty(
-            test_addr(),
-            "example.com/mylib",
-            tmp.path(),
-            tmp.path(),
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-        )
-        .unwrap();
-
-        let run1 = match spec1.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        let run2 = match spec2.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert_ne!(
-            run1, run2,
-            "run script should change when source file changes"
-        );
-    }
-
-    #[test]
     fn test_deps_has_go_bin() {
         let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
             tmp.path(),
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -394,7 +303,35 @@ mod tests {
     }
 
     #[test]
-    fn test_thirdparty_only_hashes_mod_files() {
+    fn test_firstparty_deps_has_modfiles_and_srcfiles() {
+        let tmp = make_module_root();
+        let spec = build_spec_firstparty(
+            test_addr(),
+            "example.com/mylib",
+            tmp.path(),
+            &test_factors(),
+            "//@heph/bin:go",
+            "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
+        )
+        .unwrap();
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            deps.contains_key("modfiles"),
+            "firstparty _golist must dep on modfiles"
+        );
+        assert!(
+            deps.contains_key("srcfiles"),
+            "firstparty _golist must dep on srcfiles"
+        );
+    }
+
+    #[test]
+    fn test_thirdparty_deps_has_modfiles_only() {
         let tmp = make_module_root();
         let spec = build_spec_thirdparty(
             test_addr(),
@@ -403,13 +340,51 @@ mod tests {
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
+            &go_mod_addr(),
         )
         .unwrap();
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            deps.contains_key("modfiles"),
+            "thirdparty _golist must dep on modfiles"
+        );
+        assert!(
+            !deps.contains_key("srcfiles"),
+            "thirdparty _golist must not dep on srcfiles"
+        );
         assert_eq!(spec.driver, "bash");
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
         };
         assert!(out.contains_key("json"));
+    }
+
+    #[test]
+    fn test_run_no_src_hash_comment() {
+        let tmp = make_module_root();
+        let spec = build_spec_firstparty(
+            test_addr(),
+            "example.com/mylib",
+            tmp.path(),
+            &test_factors(),
+            "//@heph/bin:go",
+            "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
+        )
+        .unwrap();
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!(),
+        };
+        assert!(
+            !run.contains("hash:"),
+            "run script must not embed a manual hash: {}",
+            run
+        );
     }
 }

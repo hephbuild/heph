@@ -1,7 +1,7 @@
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
-use crate::engine::local_cache_fs::LocalCacheFS;
+use crate::engine::local_cache_sqlite::LocalCacheSQLite;
 use crate::engine::provider::Provider as SDKProvider;
 use crate::engine::request_state::RequestState;
 use crate::engine::{driver, provider};
@@ -51,7 +51,7 @@ impl Engine {
         Ok(Engine {
             cfg: cfg.clone(),
             home: home.clone(),
-            local_cache: Arc::new(LocalCacheFS::new(home.join("cache"))?),
+            local_cache: Arc::new(LocalCacheSQLite::new(home.join("cache").join("cache.db"))?),
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],

@@ -72,7 +72,6 @@ pub fn build_spec(
             TargetSpecValue::List(vec![TargetSpecValue::String(out_file)]),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(true));
     config.insert(
         "runtime_env".to_string(),
         TargetSpecValue::Map(HashMap::from([
@@ -203,25 +202,6 @@ mod tests {
         );
         let out = spec.config.get("out").unwrap();
         assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
-    }
-
-    #[test]
-    fn test_cache_true() {
-        let spec = build_spec(
-            test_addr(),
-            "example.com/mylib",
-            "mylib",
-            &test_factors(),
-            &[],
-            &src_addr(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            None,
-        );
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[test]

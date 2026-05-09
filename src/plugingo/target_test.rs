@@ -37,7 +37,6 @@ pub fn build_test_spec(
             TargetSpecValue::List(vec![TargetSpecValue::String("test_binary".to_string())]),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(true));
     config.insert(
         "runtime_env".to_string(),
         TargetSpecValue::Map(HashMap::from([
@@ -103,8 +102,6 @@ pub fn test_spec(addr: Addr, build_test_addr: Addr) -> TargetSpec {
         )])),
     );
     config.insert("out".to_string(), TargetSpecValue::Map(HashMap::new()));
-    config.insert("cache".to_string(), TargetSpecValue::Bool(false));
-
     TargetSpec {
         addr,
         driver: "bash".to_string(),
@@ -169,25 +166,6 @@ mod tests {
             _ => panic!(),
         };
         assert!(out.contains_key("bin"));
-    }
-
-    #[test]
-    fn test_build_test_cache_true() {
-        let spec = build_test_spec(
-            mk_addr("mypkg", "build_test"),
-            &test_factors(),
-            Path::new("/src"),
-            "//@heph/bin:go",
-            &GoEnv {
-                gomodcache: "/go/pkg/mod",
-                gopath: "/go",
-                gocache: "/tmp/gocache",
-            },
-        );
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(true))
-        ));
     }
 
     #[test]
@@ -257,16 +235,6 @@ mod tests {
             "deps must have go_bin group: {:?}",
             deps.keys().collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn test_test_spec_cache_false() {
-        let build_addr = mk_addr("mypkg", "build_test");
-        let spec = test_spec(mk_addr("mypkg", "test"), build_addr);
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
     }
 
     #[test]

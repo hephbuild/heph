@@ -38,7 +38,6 @@ pub fn build_spec(addr: Addr, go_files: &[String], src_dir: &Path) -> TargetSpec
             ),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(false));
     config.insert(
         "runtime_env".to_string(),
         TargetSpecValue::Map(HashMap::from([(
@@ -94,15 +93,6 @@ mod tests {
         assert_eq!(group.len(), 2);
         assert!(matches!(&group[0], TargetSpecValue::String(s) if s == "foo.go"));
         assert!(matches!(&group[1], TargetSpecValue::String(s) if s == "bar.go"));
-    }
-
-    #[test]
-    fn test_cache_false() {
-        let spec = build_spec(test_addr(), &[], Path::new("/src"));
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
     }
 
     #[test]

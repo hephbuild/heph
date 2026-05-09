@@ -10,7 +10,7 @@ use std::time::Instant;
 
 #[derive(Args)]
 struct GlobalArgs {
-    /// Write CPU flamegraph to path on exit
+    /// Write CPU pprof on exit
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pprof_cpu: Option<PathBuf>,
 }

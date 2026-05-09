@@ -29,9 +29,6 @@ pub fn build_spec(
             TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
         )])),
     );
-    // cache:false mirrors _go_src — the output hash drives downstream invalidation.
-    config.insert("cache".to_string(), TargetSpecValue::Bool(false));
-
     Ok(TargetSpec {
         addr,
         driver: "bash".to_string(),
@@ -140,15 +137,6 @@ mod tests {
         let spec = make_spec_from_fixture();
         let out = spec.config.get("out").unwrap();
         assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("cfg")));
-    }
-
-    #[test]
-    fn test_embed_cache_false() {
-        let spec = make_spec_from_fixture();
-        assert!(matches!(
-            spec.config.get("cache"),
-            Some(TargetSpecValue::Bool(false))
-        ));
     }
 
     #[test]

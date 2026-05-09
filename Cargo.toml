@@ -109,6 +109,9 @@ thiserror = "1.0.69"
 derivative = "2.2.0"
 enclose = "1"
 which = "8.0.2"
+rusqlite = { version = "0.31", features = ["bundled", "blob"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

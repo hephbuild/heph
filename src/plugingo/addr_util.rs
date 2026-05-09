@@ -3,6 +3,7 @@ use crate::htpkg::PkgBuf;
 use crate::plugingo::factors::Factors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const STD_PREFIX: &str = "@heph/go/std/";
 const THIRD_PREFIX: &str = "@heph/go/thirdparty/";
@@ -77,19 +78,46 @@ pub fn decode_package(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPackageKi
     None
 }
 
+type GoModCache = Mutex<HashMap<PathBuf, Option<(PathBuf, String)>>>;
+
+static GO_MOD_CACHE: OnceLock<GoModCache> = OnceLock::new();
+
+fn go_mod_cache() -> &'static GoModCache {
+    GO_MOD_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Walk up from `start` looking for go.mod; return (module_root, module_path).
 pub fn find_go_mod(start: &Path) -> Option<(PathBuf, String)> {
+    {
+        let cache = go_mod_cache().lock().expect("go_mod_cache poisoned");
+        if let Some(cached) = cache.get(start) {
+            return cached.clone();
+        }
+    }
+
+    let mut visited: Vec<PathBuf> = Vec::new();
     let mut current = start;
-    loop {
+    let result = 'walk: loop {
+        visited.push(current.to_path_buf());
         let candidate = current.join("go.mod");
         if candidate.exists()
             && let Ok(content) = std::fs::read_to_string(&candidate)
             && let Some(path) = parse_module_path(&content)
         {
-            return Some((current.to_path_buf(), path));
+            break 'walk Some((current.to_path_buf(), path));
         }
-        current = current.parent()?;
+        match current.parent() {
+            Some(p) => current = p,
+            None => break 'walk None,
+        }
+    };
+
+    let mut cache = go_mod_cache().lock().expect("go_mod_cache poisoned");
+    for dir in visited {
+        cache.entry(dir).or_insert_with(|| result.clone());
     }
+
+    result
 }
 
 fn parse_module_path(content: &str) -> Option<String> {

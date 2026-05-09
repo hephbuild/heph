@@ -50,7 +50,6 @@ pub fn build_spec(
             TargetSpecValue::List(vec![TargetSpecValue::String(binary_name)]),
         )])),
     );
-    config.insert("cache".to_string(), TargetSpecValue::Bool(true));
     config.insert(
         "pass_env".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
