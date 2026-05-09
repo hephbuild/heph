@@ -58,6 +58,7 @@ bar(path).with_context(|| format!("reading {path}"))?;
 - Derive `Debug` on all public types. Derive `Clone` only when callers need it.
 - Use `Arc<T>` for shared ownership across async tasks; avoid `Mutex` unless truly needed (prefer message passing or lock-free structures).
 - Mark functions `#[inline]` only when profiling justifies it — not preemptively.
+- Use `enclose::enclose!` when passing closures into `spawn_blocking`, `spawn`, or combinators that need cloned captures. Prefer `enclose!((expr => alias, var) move || { … })` over manual pre-closure `let x = x.clone()` bindings. Convert `&str` to `String` manually before `enclose!` since `Clone` cannot change the type.
 
 ## Target model
 
