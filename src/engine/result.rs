@@ -153,12 +153,6 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
-        let semaphore = Arc::clone(&self.result_semaphore);
-        let _permit = semaphore
-            .acquire()
-            .await
-            .context("result semaphore closed")?;
-
         let spec = self.get_spec(rs.clone(), addr).await?;
         let def = self.get_def(rs.clone(), addr).await?;
 
@@ -221,6 +215,12 @@ impl Engine {
         {
             return Ok(res);
         }
+
+        let semaphore = Arc::clone(&self.result_semaphore);
+        let _permit = semaphore
+            .acquire()
+            .await
+            .context("result semaphore closed")?;
 
         let (cached_artifacts, artifacts_meta) = self
             .clone()

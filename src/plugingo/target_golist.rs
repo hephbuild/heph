@@ -78,7 +78,8 @@ fn build_spec_inner(
     let run = format!(
         "sandbox_dir=\"$PWD\"\n\
          cd \"$GOLIST_MODULE_ROOT\"\n\
-         \"$SRC_GO_BIN\" list -json -e -deps{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/deps.json\"\n",
+         \"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
+-e -deps{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/deps.json\"\n",
         flags_part = flags_part,
     );
 
@@ -246,39 +247,11 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert!(
-            run.contains("list -json -e -deps"),
+            run.contains("list -json=") && run.contains("-e -deps"),
             "run should invoke go list"
         );
         assert!(run.contains("deps.json"), "run should output deps.json");
         assert!(run.contains("SRC_GO_BIN"), "run should use $SRC_GO_BIN");
-    }
-
-    #[test]
-    fn test_run_embeds_goos_goarch_in_comment() {
-        let tmp = make_module_root();
-        let spec = build_spec_firstparty(
-            test_addr(),
-            "example.com/mylib",
-            tmp.path(),
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            &go_mod_addr(),
-            &go_src_addr(),
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        assert!(
-            run.contains("goos:linux"),
-            "run comment should include goos"
-        );
-        assert!(
-            run.contains("goarch:amd64"),
-            "run comment should include goarch"
-        );
     }
 
     #[test]

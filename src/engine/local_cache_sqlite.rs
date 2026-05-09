@@ -10,6 +10,7 @@ use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
 const READ_POOL_SIZE: u32 = 8;
+const INLINE_BLOB_THRESHOLD: usize = 10 * 1024;
 
 pub struct LocalCacheSQLite {
     read_pool: r2d2::Pool<SqliteConnectionManager>,
@@ -84,10 +85,10 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
 
-        let row_id: i64 = match conn.query_row(
-            "SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
+        let (row_id, blob_len): (i64, usize) = match conn.query_row(
+            "SELECT rowid, length(data) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
             rusqlite::params![key, hashin, name],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         ) {
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(anyhow::anyhow!(NotFoundError));
@@ -96,8 +97,18 @@ impl LocalCache for LocalCacheSQLite {
                 return Err(e)
                     .with_context(|| format!("looking up {name} hashin={hashin} in sqlite cache"));
             }
-            Ok(id) => id,
+            Ok(v) => v,
         };
+
+        if blob_len <= INLINE_BLOB_THRESHOLD {
+            let mut blob = conn
+                .blob_open(rusqlite::DatabaseName::Main, "artifacts", "data", row_id, true)
+                .with_context(|| format!("opening blob for {name}"))?;
+            let mut buf = Vec::with_capacity(blob_len);
+            io::copy(&mut blob, &mut buf)
+                .with_context(|| format!("reading small blob for {name}"))?;
+            return Ok(Box::new(io::Cursor::new(buf)));
+        }
 
         let (pipe_reader, mut pipe_writer) =
             io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
@@ -138,15 +149,19 @@ impl LocalCache for LocalCacheSQLite {
             .get()
             .context("acquiring read connection from pool")?;
 
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
-                rusqlite::params![key, hashin, name],
-                |row| row.get(0),
-            )
-            .context("checking artifact existence in sqlite cache")?;
+        let found = match conn.query_row(
+            "SELECT 1 FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3 LIMIT 1",
+            rusqlite::params![key, hashin, name],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => {
+                return Err(e).context("checking artifact existence in sqlite cache");
+            }
+        };
 
-        Ok(count > 0)
+        Ok(found)
     }
 
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> Result<()> {

@@ -1,4 +1,5 @@
 use crate::engine::EResult;
+use std::sync::Arc;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
@@ -24,6 +25,7 @@ use crate::plugingo::thirdparty;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 
@@ -46,6 +48,7 @@ pub struct Provider {
     gopath: String,
     gocache: String,
     go_bin_addr: String,
+    pkg_map_cache: RwLock<HashMap<String, Arc<HashMap<String, GoPackage>>>>,
 }
 
 impl Provider {
@@ -65,6 +68,7 @@ impl Provider {
             gopath,
             gocache,
             go_bin_addr: config.go_bin_addr,
+            pkg_map_cache: RwLock::new(HashMap::new()),
         })
     }
 }
@@ -621,21 +625,37 @@ impl Provider {
     }
 
     /// Read and parse all packages from a `_golist` target's output artifact.
+    /// Result is cached by golist addr — safe because _golist targets are content-addressed.
     async fn read_golist_packages(
         &self,
         executor: &dyn ProviderExecutor,
         golist_addr: &Addr,
-    ) -> anyhow::Result<HashMap<String, GoPackage>> {
-        let result: EResult = executor.result(golist_addr).await?;
+    ) -> anyhow::Result<Arc<HashMap<String, GoPackage>>> {
+        let key = golist_addr.format();
 
-        for artifact in &result.artifacts {
-            if let Some(entry_result) = artifact.walk()?.next() {
-                let entry = entry_result?;
-                return parse_go_list_reader(entry.data);
+        if let Ok(cache) = self.pkg_map_cache.read() {
+            if let Some(map) = cache.get(&key) {
+                return Ok(Arc::clone(map));
             }
         }
 
-        anyhow::bail!("_golist produced no output for {}", golist_addr.format())
+        let result: EResult = executor.result(golist_addr).await?;
+        let map = 'parse: {
+            for artifact in &result.artifacts {
+                if let Some(entry_result) = artifact.walk()?.next() {
+                    let entry = entry_result?;
+                    break 'parse parse_go_list_reader(entry.data)?;
+                }
+            }
+            anyhow::bail!("_golist produced no output for {}", key)
+        };
+        let map = Arc::new(map);
+
+        if let Ok(mut cache) = self.pkg_map_cache.write() {
+            cache.insert(key, Arc::clone(&map));
+        }
+
+        Ok(map)
     }
 
     fn build_lib_addr(&self, addr: &Addr, factors: &Factors) -> Addr {
