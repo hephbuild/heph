@@ -83,23 +83,22 @@ impl Engine {
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,
-        inputs: &Vec<Input>,
+        inputs: &[Input],
     ) -> anyhow::Result<Vec<EResult>> {
-        let mut result_metas = Vec::new();
+        let futures = inputs.iter().map(|input| {
+            enclose!((self => engine, rc, input) async move {
+                engine
+                    .clone()
+                    .result_addr(
+                        rc,
+                        &input.r#ref.r#ref,
+                        OutputMatcher::None,
+                        &ResultOptions::default(),
+                    )
+                    .await
+            })
+        });
 
-        for input in inputs {
-            let result_meta = self
-                .clone()
-                .result_addr(
-                    rc.clone(),
-                    &input.r#ref.r#ref,
-                    OutputMatcher::None,
-                    &ResultOptions::default(),
-                )
-                .await?;
-            result_metas.push(result_meta);
-        }
-
-        Ok(result_metas)
+        futures::future::try_join_all(futures).await
     }
 }

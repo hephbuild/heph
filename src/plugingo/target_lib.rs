@@ -16,7 +16,7 @@ pub fn build_spec(
     package_name: &str,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
-    src_addr: &Addr,
+    src_addrs: &[Addr],
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
@@ -46,7 +46,12 @@ pub fn build_spec(
         .collect();
     deps.insert(
         String::new(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(src_addr.format())]),
+        TargetSpecValue::List(
+            src_addrs
+                .iter()
+                .map(|a| TargetSpecValue::String(a.format()))
+                .collect(),
+        ),
     );
     deps.insert(
         "go_bin".to_string(),
@@ -146,6 +151,7 @@ fn generate_run_script(
 mod tests {
     use super::*;
     use crate::htpkg::PkgBuf;
+    use crate::pluginfs;
 
     fn test_addr() -> Addr {
         Addr {
@@ -155,12 +161,11 @@ mod tests {
         }
     }
 
-    fn src_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "_go_src".to_string(),
-            args: Default::default(),
-        }
+    fn src_addrs() -> Vec<Addr> {
+        vec![
+            pluginfs::file_addr("mylib/foo.go"),
+            pluginfs::file_addr("mylib/bar.go"),
+        ]
     }
 
     fn test_factors() -> Factors {
@@ -179,7 +184,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -195,7 +200,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -205,14 +210,15 @@ mod tests {
     }
 
     #[test]
-    fn test_deps_default_group_has_src_addr() {
+    fn test_deps_default_group_has_pluginfs_src_addrs() {
+        let addrs = src_addrs();
         let spec = build_spec(
             test_addr(),
             "example.com/mylib",
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &addrs,
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -229,11 +235,18 @@ mod tests {
             TargetSpecValue::List(v) => v,
             _ => panic!("expected list"),
         };
-        assert!(
-            matches!(&src_entry[0], TargetSpecValue::String(s) if s.contains("_go_src")),
-            "empty dep group should reference _go_src: {:?}",
-            src_entry
+        assert_eq!(
+            src_entry.len(),
+            addrs.len(),
+            "default dep group must have one entry per src addr"
         );
+        for (entry, addr) in src_entry.iter().zip(addrs.iter()) {
+            assert!(
+                matches!(entry, TargetSpecValue::String(s) if s == &addr.format()),
+                "dep entry must match pluginfs addr: {:?}",
+                entry
+            );
+        }
     }
 
     #[test]
@@ -244,7 +257,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -277,7 +290,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -312,7 +325,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -341,7 +354,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -350,7 +363,6 @@ mod tests {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!(),
         };
-        // Must not manually scan a directory for source files
         assert!(
             !run.contains("RHEPH_PKG_SRC_DIR"),
             "run script must not reference RHEPH_PKG_SRC_DIR: {}",
@@ -377,7 +389,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &transitive_libs,
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -404,7 +416,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &transitive_libs,
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -444,7 +456,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &addrs,
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -455,7 +467,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &addrs_rev,
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -480,7 +492,7 @@ mod tests {
             "main",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -509,7 +521,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,
@@ -541,7 +553,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             Some(&embed_addr()),
@@ -574,7 +586,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             Some(&embed_addr()),
@@ -601,7 +613,7 @@ mod tests {
             "mylib",
             &test_factors(),
             &[],
-            &src_addr(),
+            &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
             None,

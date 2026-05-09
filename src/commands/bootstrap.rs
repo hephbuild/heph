@@ -1,4 +1,4 @@
-use crate::{engine, pluginbuildfile, pluginexec, plugingo, pluginhostbin};
+use crate::{engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin};
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let root = match engine::get_root() {
@@ -22,6 +22,9 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
             plugingo::Provider::new(root.to_path_buf()).expect("failed to initialize Go plugin"),
         )
     })?;
+
+    e.register_provider(|_root| Box::new(pluginfs::Provider))?;
+    e.register_driver(Box::new(pluginfs::Driver))?;
 
     e.register_provider(|_root| Box::new(pluginhostbin::Provider))?;
     e.register_driver(Box::new(pluginhostbin::Driver))?;

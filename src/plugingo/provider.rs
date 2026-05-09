@@ -1,10 +1,10 @@
 use crate::engine::EResult;
-use std::sync::Arc;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
 };
 use crate::hasync::Cancellable;
+use crate::hmemoizer::{Memoizer, WrappedError};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::plugingo::addr_util::{
@@ -18,14 +18,14 @@ use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
 use crate::plugingo::target_lib;
 use crate::plugingo::target_modfiles;
-use crate::plugingo::target_src;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
+use crate::pluginfs;
 use futures::future::BoxFuture;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::Arc;
 
 const DEFAULT_GO_BIN_ADDR: &str = "//@heph/bin:go";
 
@@ -48,7 +48,7 @@ pub struct Provider {
     gopath: String,
     gocache: String,
     go_bin_addr: String,
-    pkg_map_cache: RwLock<HashMap<String, Arc<HashMap<String, GoPackage>>>>,
+    pkg_map_cache: Memoizer<String, Result<Arc<HashMap<String, GoPackage>>, WrappedError>>,
 }
 
 impl Provider {
@@ -68,7 +68,7 @@ impl Provider {
             gopath,
             gocache,
             go_bin_addr: config.go_bin_addr,
-            pkg_map_cache: RwLock::new(HashMap::new()),
+            pkg_map_cache: Memoizer::new(),
         })
     }
 }
@@ -246,11 +246,6 @@ impl ProviderTrait for Provider {
                         });
                         addrs.push(Addr {
                             package: req.package.clone(),
-                            name: "_go_src".to_string(),
-                            args: factors_to_args(&factors),
-                        });
-                        addrs.push(Addr {
-                            package: req.package.clone(),
                             name: "build_lib".to_string(),
                             args: factors_to_args(&factors),
                         });
@@ -346,6 +341,13 @@ impl ProviderTrait for Provider {
     }
 }
 
+struct TransitiveDeps {
+    /// `(import_path, build_lib_addr)` for every reachable dep (for importcfg).
+    libs: Vec<(String, Addr)>,
+    /// `(pkg_rel_path, go_files)` for firstparty-only deps (for `build_test` sandbox).
+    firstparty_src: Vec<(String, Vec<String>)>,
+}
+
 impl Provider {
     async fn handle_get(&self, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
@@ -372,7 +374,7 @@ impl Provider {
             if mod_files.is_empty() {
                 return Err(GetError::NotFound);
             }
-            let spec = target_modfiles::build_spec(addr.clone(), &mod_files, &module_root);
+            let spec = target_modfiles::build_spec(addr.clone(), &mod_files);
             return Ok(GetResponse { target_spec: spec });
         }
 
@@ -432,17 +434,15 @@ impl Provider {
         };
 
         match addr.name.as_str() {
-            "_go_src" => {
-                if pkg.go_files.is_empty() {
-                    return Err(GetError::NotFound);
-                }
-                let spec = target_src::build_spec(addr.clone(), &pkg.go_files, src_dir);
-                Ok(GetResponse { target_spec: spec })
-            }
             "build_lib" => {
-                let src_addr = self.make_addr_with_name(&addr.package, "_go_src", &factors);
-                let transitive =
-                    self.collect_transitive_libs(&pkg_map, &pkg, &factors, &module_root);
+                let transitive = self
+                    .collect_transitive_libs(
+                        &pkg_map,
+                        &pkg,
+                        &[],
+                        &factors,
+                        &module_root,
+                    );
 
                 let embed_addr = if !pkg.embed_patterns.is_empty() {
                     Some(self.make_addr_with_name(&addr.package, "embed", &factors))
@@ -455,22 +455,32 @@ impl Provider {
                         addr.clone(),
                         &pkg,
                         &factors,
-                        &transitive,
-                        &src_addr,
+                        &transitive.libs,
                         &self.go_bin_addr,
                         &self.goroot,
                     ),
-                    _ => target_lib::build_spec(
-                        addr.clone(),
-                        &import_path,
-                        pkg.name.as_deref().unwrap_or(""),
-                        &factors,
-                        &transitive,
-                        &src_addr,
-                        &self.go_bin_addr,
-                        &self.goroot,
-                        embed_addr.as_ref(),
-                    ),
+                    _ => {
+                        let pkg_str = addr.package.as_str();
+                        let src_addrs: Vec<Addr> = pkg.go_files.iter().map(|f| {
+                            let rel = if pkg_str.is_empty() {
+                                f.clone()
+                            } else {
+                                format!("{}/{}", pkg_str, f)
+                            };
+                            pluginfs::file_addr(&rel)
+                        }).collect();
+                        target_lib::build_spec(
+                            addr.clone(),
+                            &import_path,
+                            pkg.name.as_deref().unwrap_or(""),
+                            &factors,
+                            &transitive.libs,
+                            &src_addrs,
+                            &self.go_bin_addr,
+                            &self.goroot,
+                            embed_addr.as_ref(),
+                        )
+                    }
                 };
                 Ok(GetResponse { target_spec: spec })
             }
@@ -480,15 +490,21 @@ impl Provider {
                 }
 
                 let own_lib_addr = self.build_lib_addr(addr, &factors);
-                let mut transitive =
-                    self.collect_transitive_libs(&pkg_map, &pkg, &factors, &module_root);
-                transitive.insert(0, (import_path.clone(), own_lib_addr));
+                let mut transitive = self
+                    .collect_transitive_libs(
+                        &pkg_map,
+                        &pkg,
+                        &[],
+                        &factors,
+                        &module_root,
+                    );
+                transitive.libs.insert(0, (import_path.clone(), own_lib_addr));
 
                 let spec = target_bin::build_spec(
                     addr.clone(),
                     &import_path,
                     &factors,
-                    &transitive,
+                    &transitive.libs,
                     &self.go_bin_addr,
                     &self.goroot,
                 );
@@ -499,16 +515,42 @@ impl Provider {
                 if !has_tests {
                     return Err(GetError::NotFound);
                 }
+
+                // Collect all test imports so firstparty source is resolved transitively.
+                let test_extra: Vec<String> = pkg
+                    .test_imports
+                    .iter()
+                    .chain(&pkg.xtest_imports)
+                    .cloned()
+                    .collect();
+                let transitive = self
+                    .collect_transitive_libs(
+                        &pkg_map,
+                        &pkg,
+                        &test_extra,
+                        &factors,
+                        &module_root,
+                    );
+
+                let mod_files: Vec<String> = ["go.mod", "go.sum"]
+                    .iter()
+                    .filter(|f| module_root.join(f).exists())
+                    .map(|f| f.to_string())
+                    .collect();
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
-                    src_dir,
                     &self.go_bin_addr,
                     &target_test::GoEnv {
                         gomodcache: &self.gomodcache,
                         gopath: &self.gopath,
                         gocache: &self.gocache,
                     },
+                    &self.workspace_root,
+                    &module_root,
+                    &mod_files,
+                    &pkg.embed_files,
+                    &transitive.firstparty_src,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -555,7 +597,15 @@ impl Provider {
                     name: "_go_mod".to_string(),
                     args: Default::default(),
                 };
-                // let go_src_addr = self.make_addr_with_name(&addr.package, "_go_src", factors);
+                // Use a pluginfs glob directly instead of _go_src: _go_src spec
+                // generation calls executor.result(_golist), which would deadlock.
+                let pkg = addr.package.as_str();
+                let src_glob = if pkg.is_empty() {
+                    "*.go".to_string()
+                } else {
+                    format!("{}/*.go", pkg)
+                };
+                let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -564,7 +614,7 @@ impl Provider {
                     &self.go_bin_addr,
                     &self.goroot,
                     &go_mod_addr,
-                    &go_mod_addr,
+                    &go_src_glob_addr,
                 )?
             }
             GoPackageKind::ThirdParty {
@@ -625,37 +675,33 @@ impl Provider {
     }
 
     /// Read and parse all packages from a `_golist` target's output artifact.
-    /// Result is cached by golist addr — safe because _golist targets are content-addressed.
+    /// Result is memoized by golist addr — only one parse per addr, others wait.
     async fn read_golist_packages(
         &self,
         executor: &dyn ProviderExecutor,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<HashMap<String, GoPackage>>> {
         let key = golist_addr.format();
-
-        if let Ok(cache) = self.pkg_map_cache.read() {
-            if let Some(map) = cache.get(&key) {
-                return Ok(Arc::clone(map));
-            }
-        }
-
         let result: EResult = executor.result(golist_addr).await?;
-        let map = 'parse: {
-            for artifact in &result.artifacts {
-                if let Some(entry_result) = artifact.walk()?.next() {
-                    let entry = entry_result?;
-                    break 'parse parse_go_list_reader(entry.data)?;
-                }
-            }
-            anyhow::bail!("_golist produced no output for {}", key)
-        };
-        let map = Arc::new(map);
 
-        if let Ok(mut cache) = self.pkg_map_cache.write() {
-            cache.insert(key, Arc::clone(&map));
-        }
+        self.pkg_map_cache
+            .process_result(key, move || async move {
+                let map = tokio::task::spawn_blocking(move || {
+                    for artifact in &result.artifacts {
+                        if let Some(entry_result) = artifact.walk()?.next() {
+                            let entry = entry_result?;
+                            return parse_go_list_reader(entry.data);
+                        }
+                    }
+                    anyhow::bail!("_golist produced no output")
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("read_golist_packages task panicked: {e}"))??;
 
-        Ok(map)
+                Ok(Arc::new(map))
+            })
+            .await
+            .map_err(anyhow::Error::from)
     }
 
     fn build_lib_addr(&self, addr: &Addr, factors: &Factors) -> Addr {
@@ -676,23 +722,37 @@ impl Provider {
     }
 
     /// Collect all transitive lib addresses for a package's imports (excluding itself).
-    /// Uses the already-fetched pkg_map from a `_golist -deps` call.
-    /// `module_root` is the filesystem path of the go.mod that produced this pkg_map;
-    /// it is embedded in third-party addresses so their `_golist` runs from the right directory.
+    ///
+    /// Uses the seed `pkg_map` from a `_golist -deps` call. For firstparty packages that
+    /// failed to analyse (their source wasn't in the seed sandbox), their own `_golist`
+    /// target is requested on-demand so the dep graph is resolved transitively.
+    ///
+    /// `extra_imports` are added to the initial queue alongside `root_pkg.imports`; this
+    /// is used by `build_test` to include `test_imports` and `xtest_imports`.
+    ///
+    /// Returns:
+    ///  - `libs`:           `(import_path, build_lib_addr)` for every reachable dep
+    ///  - `firstparty_src`: `(pkg_rel_path, go_files)` for firstparty deps only, used
+    ///                       by `build_test` to make source available in the sandbox
+    ///
+    /// `_golist` runs `go list -deps` from the real host FS via `GOLIST_MODULE_ROOT`, so
+    /// every package in `seed_pkg_map` already has `Dir` and `GoFiles` populated.
+    /// Firstparty packages are identified by `Dir` being under `workspace_root`.
     fn collect_transitive_libs(
         &self,
-        pkg_map: &HashMap<String, GoPackage>,
+        seed_pkg_map: &Arc<HashMap<String, GoPackage>>,
         root_pkg: &GoPackage,
+        extra_imports: &[String],
         factors: &Factors,
         module_root: &Path,
-    ) -> Vec<(String, Addr)> {
+    ) -> TransitiveDeps {
         let mut visited: HashSet<String> = HashSet::new();
-        let mut result: Vec<(String, Addr)> = Vec::new();
+        let mut libs: Vec<(String, Addr)> = Vec::new();
+        let mut firstparty_src: Vec<(String, Vec<String>)> = Vec::new();
         let mut queue: VecDeque<String> = VecDeque::new();
 
-        for import in &root_pkg.imports {
-            if !visited.contains(import) {
-                visited.insert(import.clone());
+        for import in root_pkg.imports.iter().chain(extra_imports.iter()) {
+            if visited.insert(import.clone()) {
                 queue.push_back(import.clone());
             }
         }
@@ -702,29 +762,41 @@ impl Provider {
                 continue;
             }
 
-            let dep_pkg = match pkg_map.get(&import_path) {
-                Some(p) => p,
-                None => continue,
+            let dep_pkg = match seed_pkg_map.get(&import_path) {
+                Some(pkg) if !pkg.go_files.is_empty() || pkg.error.is_none() => pkg.clone(),
+                _ => continue,
             };
 
-            if dep_pkg.go_files.is_empty() && dep_pkg.error.is_some() {
+            let Some(dep_addr) = self.encode_pkg_addr(&dep_pkg, factors, module_root) else {
                 continue;
+            };
+            libs.push((import_path.clone(), dep_addr));
+
+            // Firstparty packages have `Dir` under the workspace root.
+            // `go list` ran from the real FS so `Dir` is always an absolute host path.
+            if let Some(dir) = &dep_pkg.dir {
+                if let Ok(rel) = Path::new(dir.as_str()).strip_prefix(&self.workspace_root) {
+                    let rel_str = rel.to_string_lossy().into_owned();
+                    // Combine go_files + embed_files so the sandbox has both source and assets.
+                    let mut files: Vec<String> = dep_pkg.go_files.clone();
+                    files.extend(dep_pkg.embed_files.iter().cloned());
+                    if !files.is_empty() {
+                        firstparty_src.push((rel_str, files));
+                    }
+                }
             }
 
-            let Some(dep_addr) = self.encode_pkg_addr(dep_pkg, factors, module_root) else {
-                continue;
-            };
-            result.push((import_path.clone(), dep_addr));
-
             for sub_import in &dep_pkg.imports {
-                if !visited.contains(sub_import) {
-                    visited.insert(sub_import.clone());
+                if visited.insert(sub_import.clone()) {
                     queue.push_back(sub_import.clone());
                 }
             }
         }
 
-        result
+        TransitiveDeps {
+            libs,
+            firstparty_src,
+        }
     }
 
     /// Encode a GoPackage into its rheph Addr for build_lib.
@@ -1213,6 +1285,53 @@ mod tests {
         assert!(
             !run.contains("-embedcfg"),
             "build_lib for non-embed package must not include -embedcfg: {run}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_simple_lib_build_lib_default_deps_are_pluginfs_addrs() {
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let src_list = match deps.get("").unwrap() {
+            TargetSpecValue::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(
+            !src_list.is_empty(),
+            "default dep group must not be empty for a package with go files"
+        );
+        for entry in src_list {
+            let s = match entry {
+                TargetSpecValue::String(s) => s,
+                _ => panic!("expected string"),
+            };
+            assert!(
+                s.contains("@heph/fs"),
+                "each src dep must be a pluginfs addr, got: {}",
+                s
+            );
+            assert!(
+                s.ends_with(".go") || s.contains(".go"),
+                "src dep must reference a .go file: {}",
+                s
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_simple_lib_no_go_src_target() {
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let names = provider_list(&p, "").await;
+        assert!(
+            !names.iter().any(|n| n == "_go_src"),
+            "_go_src must not appear in list output: {:?}",
+            names
         );
     }
 

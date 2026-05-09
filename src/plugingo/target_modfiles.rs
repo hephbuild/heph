@@ -1,27 +1,35 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::loosespecparser::TargetSpecValue;
+use crate::pluginfs;
 use std::collections::HashMap;
-use std::path::Path;
 
-/// Generates a `_go_mod` target that copies go.mod and go.sum into the sandbox.
-/// cache is false so the target always reruns; its output artifact hash then drives
-/// downstream cache invalidation automatically via dep hashes.
-pub fn build_spec(addr: Addr, mod_files: &[String], module_root: &Path) -> TargetSpec {
-    let module_root_str = module_root
-        .to_str()
-        .expect("module_root must be valid UTF-8")
-        .to_string();
+/// Generates a `_go_mod` target that declares go.mod / go.sum as pluginfs deps so the engine
+/// tracks them as proper inputs. Files land in the sandbox via dep unpacking; run is a no-op.
+pub fn build_spec(addr: Addr, mod_files: &[String]) -> TargetSpec {
+    let pkg = addr.package.as_str();
 
-    let mut run = String::new();
-    for f in mod_files {
-        run.push_str(&format!(
-            "[ \"$RHEPH_MOD_DIR/{f}\" -ef \"{f}\" ] || cp \"$RHEPH_MOD_DIR/{f}\" \"{f}\"\n"
-        ));
-    }
+    let file_deps: Vec<TargetSpecValue> = mod_files
+        .iter()
+        .map(|f| {
+            let rel = if pkg.is_empty() {
+                f.clone()
+            } else {
+                format!("{}/{}", pkg, f)
+            };
+            TargetSpecValue::String(pluginfs::file_addr(&rel).format())
+        })
+        .collect();
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
+    config.insert("run".to_string(), TargetSpecValue::String(":".to_string()));
+    config.insert(
+        "deps".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            String::new(),
+            TargetSpecValue::List(file_deps),
+        )])),
+    );
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(
@@ -32,13 +40,6 @@ pub fn build_spec(addr: Addr, mod_files: &[String], module_root: &Path) -> Targe
                     .map(|f| TargetSpecValue::String(f.clone()))
                     .collect(),
             ),
-        )])),
-    );
-    config.insert(
-        "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "RHEPH_MOD_DIR".to_string(),
-            TargetSpecValue::String(module_root_str),
         )])),
     );
 
@@ -64,18 +65,24 @@ mod tests {
         }
     }
 
+    fn nested_addr() -> Addr {
+        Addr {
+            package: PkgBuf::from("subdir"),
+            name: "_go_mod".to_string(),
+            args: Default::default(),
+        }
+    }
+
     #[test]
     fn test_driver_is_bash() {
-        let dir = tempfile::tempdir().unwrap();
-        let spec = build_spec(test_addr(), &["go.mod".to_string()], dir.path());
+        let spec = build_spec(test_addr(), &["go.mod".to_string()]);
         assert_eq!(spec.driver, "bash");
     }
 
     #[test]
     fn test_out_lists_mod_files() {
-        let dir = tempfile::tempdir().unwrap();
         let files = vec!["go.mod".to_string(), "go.sum".to_string()];
-        let spec = build_spec(test_addr(), &files, dir.path());
+        let spec = build_spec(test_addr(), &files);
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
@@ -90,31 +97,75 @@ mod tests {
     }
 
     #[test]
-    fn test_run_copies_files() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_deps_has_pluginfs_addrs_for_root_package() {
         let files = vec!["go.mod".to_string(), "go.sum".to_string()];
-        let spec = build_spec(test_addr(), &files, dir.path());
+        let spec = build_spec(test_addr(), &files);
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let group = match deps.get("").unwrap() {
+            TargetSpecValue::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert_eq!(group.len(), 2);
+        for (entry, file) in group.iter().zip(files.iter()) {
+            let addr_str = match entry {
+                TargetSpecValue::String(s) => s,
+                _ => panic!("expected string"),
+            };
+            assert!(
+                addr_str.contains("@heph/fs"),
+                "dep should be a pluginfs addr: {}",
+                addr_str
+            );
+            assert!(
+                addr_str.contains(file.as_str()),
+                "dep should reference the file: {}",
+                addr_str
+            );
+        }
+    }
+
+    #[test]
+    fn test_deps_has_package_prefix_for_nested_module() {
+        let files = vec!["go.mod".to_string()];
+        let spec = build_spec(nested_addr(), &files);
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let group = match deps.get("").unwrap() {
+            TargetSpecValue::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        let addr_str = match &group[0] {
+            TargetSpecValue::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        assert!(
+            addr_str.contains("subdir/go.mod"),
+            "nested module should include package prefix in path: {}",
+            addr_str
+        );
+    }
+
+    #[test]
+    fn test_run_is_noop() {
+        let spec = build_spec(test_addr(), &["go.mod".to_string()]);
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
-        assert!(run.contains("go.mod"));
-        assert!(run.contains("go.sum"));
-        assert!(run.contains("RHEPH_MOD_DIR"));
-        assert!(run.contains("cp"));
+        assert_eq!(run, ":", "run script should be the bash no-op");
     }
 
     #[test]
-    fn test_runtime_env_has_mod_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let spec = build_spec(test_addr(), &["go.mod".to_string()], dir.path());
-        let runtime_env = match spec.config.get("runtime_env").unwrap() {
-            TargetSpecValue::Map(m) => m,
-            _ => panic!(),
-        };
-        let dir_str = dir.path().to_str().unwrap();
+    fn test_no_runtime_env() {
+        let spec = build_spec(test_addr(), &["go.mod".to_string()]);
         assert!(
-            matches!(runtime_env.get("RHEPH_MOD_DIR"), Some(TargetSpecValue::String(s)) if s == dir_str)
+            !spec.config.contains_key("runtime_env"),
+            "target should not embed absolute host paths in runtime_env"
         );
     }
 }

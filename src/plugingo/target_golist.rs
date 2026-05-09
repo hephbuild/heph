@@ -6,6 +6,10 @@ use anyhow::Context;
 use std::collections::HashMap;
 use std::path::Path;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are required, no natural grouping"
+)]
 pub fn build_spec_firstparty(
     addr: Addr,
     import_path: &str,

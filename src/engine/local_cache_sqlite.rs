@@ -5,16 +5,71 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OpenFlags};
 use std::io::{self, Seek};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
-const READ_POOL_SIZE: u32 = 8;
 const INLINE_BLOB_THRESHOLD: usize = 10 * 1024;
+const MAX_CONCURRENT_PIPES: usize = 64;
+const READ_POOL_SIZE: u32 = MAX_CONCURRENT_PIPES as u32;
+
+struct PipeSemaphore {
+    count: Mutex<usize>,
+    condvar: Condvar,
+}
+
+impl PipeSemaphore {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            count: Mutex::new(limit),
+            condvar: Condvar::new(),
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> PipePermit {
+        let mut count = self.count.lock().expect("pipe semaphore mutex poisoned");
+        while *count == 0 {
+            count = self
+                .condvar
+                .wait(count)
+                .expect("pipe semaphore condvar wait failed");
+        }
+        *count -= 1;
+        PipePermit { sem: self.clone() }
+    }
+}
+
+struct PipePermit {
+    sem: Arc<PipeSemaphore>,
+}
+
+impl Drop for PipePermit {
+    fn drop(&mut self) {
+        let mut count = self
+            .sem
+            .count
+            .lock()
+            .expect("pipe semaphore mutex poisoned in drop");
+        *count += 1;
+        self.sem.condvar.notify_one();
+    }
+}
+
+struct GuardedReader<R: io::Read> {
+    inner: R,
+    _permit: PipePermit,
+}
+
+impl<R: io::Read> io::Read for GuardedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
 
 pub struct LocalCacheSQLite {
     read_pool: r2d2::Pool<SqliteConnectionManager>,
     write_conn: Arc<Mutex<Connection>>,
+    pipe_sem: Arc<PipeSemaphore>,
 }
 
 impl LocalCacheSQLite {
@@ -69,6 +124,7 @@ impl LocalCacheSQLite {
         Ok(Self {
             read_pool,
             write_conn: Arc::new(Mutex::new(write_conn)),
+            pipe_sem: PipeSemaphore::new(MAX_CONCURRENT_PIPES),
         })
     }
 
@@ -80,6 +136,7 @@ impl LocalCacheSQLite {
 impl LocalCache for LocalCacheSQLite {
     fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Read>> {
         let key = Self::key(addr);
+
         let conn = self
             .read_pool
             .get()
@@ -102,7 +159,13 @@ impl LocalCache for LocalCacheSQLite {
 
         if blob_len <= INLINE_BLOB_THRESHOLD {
             let mut blob = conn
-                .blob_open(rusqlite::DatabaseName::Main, "artifacts", "data", row_id, true)
+                .blob_open(
+                    rusqlite::DatabaseName::Main,
+                    "artifacts",
+                    "data",
+                    row_id,
+                    true,
+                )
                 .with_context(|| format!("opening blob for {name}"))?;
             let mut buf = Vec::with_capacity(blob_len);
             io::copy(&mut blob, &mut buf)
@@ -110,11 +173,21 @@ impl LocalCache for LocalCacheSQLite {
             return Ok(Box::new(io::Cursor::new(buf)));
         }
 
+        // Release the SELECT connection before acquiring semaphore + a fresh pipe connection.
+        drop(conn);
+
+        // Semaphore acquired before pool to bound concurrent open pipes (= open FDs).
+        let permit = self.pipe_sem.acquire();
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+
         let (pipe_reader, mut pipe_writer) =
             io::pipe().with_context(|| format!("creating pipe for sqlite blob read of {name}"))?;
 
-        // Move the pooled connection into the thread; returns to pool on drop.
-        std::thread::spawn(move || {
+        // Move the pooled connection into the rayon pool; returns to pool on drop.
+        rayon::spawn(move || {
             let mut blob = match conn.blob_open(
                 rusqlite::DatabaseName::Main,
                 "artifacts",
@@ -125,10 +198,13 @@ impl LocalCache for LocalCacheSQLite {
                 Ok(b) => b,
                 Err(_) => return,
             };
-            let _ = io::copy(&mut blob, &mut pipe_writer);
+            drop(io::copy(&mut blob, &mut pipe_writer));
         });
 
-        Ok(Box::new(pipe_reader))
+        Ok(Box::new(GuardedReader {
+            inner: pipe_reader,
+            _permit: permit,
+        }))
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
@@ -235,7 +311,7 @@ impl Drop for SqliteCacheWriter {
             Ok(b) => b,
             Err(_) => return,
         };
-        let _ = io::copy(&mut self.buf, &mut blob);
+        drop(io::copy(&mut self.buf, &mut blob));
     }
 }
 

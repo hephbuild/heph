@@ -93,7 +93,7 @@ impl Matcher {
                 }
             }
             Matcher::Label(label) => {
-                if def.labels.contains(&label) {
+                if def.labels.contains(label) {
                     MatchResult::MatchYes
                 } else {
                     MatchResult::MatchNo

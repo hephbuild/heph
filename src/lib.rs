@@ -14,6 +14,7 @@ pub mod log;
 pub mod loosespecparser;
 pub mod pluginbuildfile;
 pub mod pluginexec;
+pub mod pluginfs;
 pub mod plugingo;
 pub mod pluginhostbin;
 pub mod pluginstatictarget;
