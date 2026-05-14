@@ -1266,6 +1266,23 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn go_available() -> bool {
+        std::process::Command::new("go")
+            .arg("version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    macro_rules! require_go {
+        () => {
+            if !go_available() {
+                eprintln!("skipping: go not in PATH");
+                return;
+            }
+        };
+    }
+
     // --- Test executor that resolves _golist by running go list directly ---
 
     struct GoListTestExecutor {
@@ -1406,6 +1423,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_build_lib_driver() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
@@ -1414,6 +1432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_build_lib_out_has_a_group() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
@@ -1423,6 +1442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_no_build_target() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("", "build")).await;
@@ -1431,6 +1451,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_golist_target() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         // _golist should return a spec without calling executor
@@ -1456,6 +1477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_dep_lib_build_lib_driver() {
+        require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("lib", "build_lib"))
@@ -1466,6 +1488,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_dep_cmd_build_lib_has_dep_on_lib() {
+        require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build_lib"))
@@ -1485,6 +1508,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_with_dep_cmd_build_is_main() {
+        require_go!();
         let sandbox = copy_fixture("with_dep");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("cmd", "build")).await.unwrap();
@@ -1504,6 +1528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stdlib_build_lib_driver() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("@heph/go/std/fmt", "build_lib"))
@@ -1514,6 +1539,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_stdlib_build_returns_not_found() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("@heph/go/std/fmt", "build")).await;
@@ -1524,6 +1550,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_test_build_test_exists() {
+        require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
@@ -1539,6 +1566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_test_test_deps_on_build_test() {
+        require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
@@ -1566,6 +1594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_embed_has_embed_target() {
+        require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "embed"))
@@ -1583,6 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_factors_linux_amd64_runtime_env() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let mut addr = make_addr("", "build_lib");
@@ -1609,6 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_embed_build_lib_exists() {
+        require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "build_lib"))
@@ -1624,6 +1655,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_embed_build_lib_has_embed_dep() {
+        require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "build_lib"))
@@ -1642,6 +1674,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_embed_build_lib_run_has_embedcfg_flag() {
+        require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "build_lib"))
@@ -1659,6 +1692,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_embed_embed_target_run_contains_filename() {
+        require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "embed"))
@@ -1676,6 +1710,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_build_lib_no_embed_dep() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
@@ -1699,6 +1734,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_simple_lib_build_lib_default_deps_are_pluginfs_addrs() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
@@ -1734,6 +1770,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_simple_lib_no_go_src_target() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "").await;
@@ -1748,6 +1785,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_non_go_package_returns_not_found() {
+        require_go!();
         let sandbox = tempfile::tempdir().unwrap();
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("somepkg", "build_lib")).await;
@@ -1859,6 +1897,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_test_includes_build_test() {
+        require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1871,6 +1910,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_test_includes_test() {
+        require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1883,6 +1923,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_simple_lib_no_test_targets() {
+        require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "").await;
@@ -1900,6 +1941,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_with_test_includes_build_lib() {
+        require_go!();
         let sandbox = copy_fixture("with_test");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1912,6 +1954,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_test_only_pkg_includes_build_test() {
+        require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1924,6 +1967,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_test_only_pkg_includes_test() {
+        require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1936,6 +1980,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_test_only_pkg_no_build_lib() {
+        require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let names = provider_list(&p, "pkg").await;
@@ -1948,6 +1993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_only_build_test_exists() {
+        require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("pkg", "build_test"))
@@ -1963,6 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_test_only_test_exists() {
+        require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let _resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
