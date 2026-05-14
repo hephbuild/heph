@@ -4,7 +4,7 @@ use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact
 use crate::engine::error::TargetNotFoundError;
 use crate::engine::provider::{GetError, GetRequest, GetResponse, ProviderExecutor, TargetSpec};
 use crate::engine::request_state::RequestState;
-use crate::hmemoizer::WrappedError;
+use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
 use enclose::enclose;
 
@@ -16,12 +16,13 @@ use crate::hartifactcontent::Content;
 use crate::htmatcher::Matcher;
 use anyhow::Context;
 use futures::TryStreamExt;
-use itertools::Itertools;
 use std::fmt;
 use std::sync::{Arc, Weak};
 use std::{fs, io};
 use tokio::task::JoinSet;
 
+/// rs carries the parent addr (set by result_addr via with_parent) so the executor
+/// does not need to store it separately.
 struct EngineProviderExecutor {
     engine: Weak<Engine>,
     rs: Arc<RequestState>,
@@ -112,11 +113,24 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
+        // Cycle check: fires for every caller (including those awaiting an in-flight future)
+        // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
+        if let Some(ref parent) = rs.parent {
+            let mut dag = rs.data.dep_dag.lock().await;
+            dag.add_dep(parent, addr).map_err(|_e| {
+                anyhow::anyhow!("cyclic dependency detected: {} → {}", parent, addr)
+            })?;
+        }
+
+        // Set addr as parent so all sub-calls carry the right context for cycle detection.
+        // Done outside the memoizer so context setup isn't buried in the deduplication boundary.
+        let rs = rs.with_parent(addr.clone());
+
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
-        let res = rs.mem_result.process(key, enclose!((self => engine, rs, addr, outputs) move || async move {
-            engine.inner_result_addr(rs, &addr, outputs, &opts).await.with_context(|| format!("result: {}", addr)).map_err(WrappedError::from)
-        })).await?;
+        let res = rs.data.mem_result.once(key, enclose!((self => engine, rs, addr, outputs) move || async move {
+            engine.inner_result_addr(rs, &addr, outputs, &opts).await.with_context(|| format!("result: {}", addr))
+        })).await.map_err(unwrap_arc_err)?;
 
         Ok(res)
     }
@@ -158,22 +172,15 @@ impl Engine {
 
         let def = self
             .clone()
-            .link(rs.clone(), def.target_def)
+            .link(rs.clone(), def.target_def.clone())
             .await
             .with_context(|| "link")?;
 
         let output_names = match outputs {
             OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
-            OutputMatcher::All => Ok(def
-                .target
-                .outputs
-                .iter()
-                .map(|o| o.group.clone())
-                .unique()
-                .collect()),
+            OutputMatcher::All => Ok(def.target.output_names()),
             OutputMatcher::Exact(names) => {
-                let mut all_output_names =
-                    def.target.outputs.iter().map(|o| o.group.clone()).unique();
+                let all_output_names = def.target.output_names();
                 for name in &names {
                     if !all_output_names.contains(name) {
                         anyhow::bail!("output not found: {}", name);
@@ -216,12 +223,6 @@ impl Engine {
             return Ok(res);
         }
 
-        let semaphore = Arc::clone(&self.result_semaphore);
-        let _permit = semaphore
-            .acquire()
-            .await
-            .context("result semaphore closed")?;
-
         let (cached_artifacts, artifacts_meta) = self
             .clone()
             .execute_and_cache_inner(rs.clone(), opts)
@@ -251,22 +252,21 @@ impl Engine {
         let use_tmp_cache = !opts.def.target.cache;
         let key = format!("{}:{}", addr.format(), hashin);
 
-        rs.mem_execute_cache
-            .process_result(
+        rs.data
+            .mem_execute_cache
+            .once(
                 key,
                 enclose!((self => engine, rs) move || async move {
                     let (artifacts, sandbox_dir) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin)
-                        .await
-                        .map_err(WrappedError::from)?;
+                        .await?;
 
                     let artifacts_meta = artifacts
                         .iter()
                         .filter(|a| a.r#type == outputartifact::Type::Output)
                         .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
-                        .collect::<anyhow::Result<Vec<_>>>()
-                        .map_err(WrappedError::from)?;
+                        .collect::<anyhow::Result<Vec<_>>>()?;
 
                     defer! {
                         match fs::remove_dir_all(&sandbox_dir) {
@@ -280,11 +280,10 @@ impl Engine {
                         .cache_locally(&rs.ctoken, &addr, &hashin, artifacts, use_tmp_cache)
                         .await
                         .map(|cached| (cached, artifacts_meta))
-                        .map_err(WrappedError::from)
                 }),
             )
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(unwrap_arc_err)
     }
 
     async fn result_from_cache(
@@ -315,7 +314,29 @@ impl Engine {
         &self,
         rs: Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<ExtendedTargetDef> {
+    ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
+        let key = addr.format();
+        rs.data
+            .mem_def
+            .once(
+                key,
+                enclose!((rs, addr) move || async move {
+                    let engine = rs
+                        .engine
+                        .upgrade()
+                        .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+                    engine.get_def_inner(rs, &addr).await
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
+    async fn get_def_inner(
+        &self,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         let spec = self.get_spec(rs.clone(), addr).await?;
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
@@ -328,7 +349,7 @@ impl Engine {
             .parse(
                 ParseRequest {
                     request_id: rs.request_id.clone(),
-                    target_spec: spec,
+                    target_spec: (*spec).clone(),
                 },
                 &rs.ctoken,
             )
@@ -363,10 +384,10 @@ impl Engine {
             anyhow::bail!("missing hash");
         }
 
-        Ok(ExtendedTargetDef {
+        Ok(Arc::new(ExtendedTargetDef {
             target_def: def,
             applied_transitive: all_transitive,
-        })
+        }))
     }
 
     async fn collect_transitive_deps(
@@ -398,7 +419,41 @@ impl Engine {
         Ok(sb)
     }
 
-    pub async fn get_spec(&self, rs: Arc<RequestState>, addr: &Addr) -> anyhow::Result<TargetSpec> {
+    pub async fn get_spec(
+        &self,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<TargetSpec>> {
+        let key = addr.format();
+        rs.data
+            .mem_spec
+            .once(
+                key,
+                enclose!((rs, addr) move || async move {
+                    let engine = rs
+                        .engine
+                        .upgrade()
+                        .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+                    engine.get_spec_inner(&rs, &addr).await
+                }),
+            )
+            .await
+            .map_err(|arc| {
+                // Preserve TargetNotFoundError so callers can downcast_ref to it even when
+                // the Arc is shared across concurrent memoizer waiters.
+                if arc.downcast_ref::<TargetNotFoundError>().is_some() {
+                    TargetNotFoundError { addr: addr.clone() }.into()
+                } else {
+                    unwrap_arc_err(arc)
+                }
+            })
+    }
+
+    async fn get_spec_inner(
+        &self,
+        rs: &Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<TargetSpec>> {
         let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
             engine: rs.engine.clone(),
             rs: rs.clone(),
@@ -423,7 +478,7 @@ impl Engine {
                 Err(GetError::Other(e)) => anyhow::bail!(e),
             };
 
-            return anyhow::Ok(spec);
+            return anyhow::Ok(Arc::new(spec));
         }
 
         Err(TargetNotFoundError { addr: addr.clone() }.into())
@@ -442,6 +497,7 @@ mod tests {
         let root = tempdir()?;
         let cfg = Config {
             root: root.path().to_path_buf(),
+            parallelism: None,
         };
 
         let engine = Arc::new(Engine::new(cfg)?);

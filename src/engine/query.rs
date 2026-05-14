@@ -87,6 +87,7 @@ mod tests {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
             root: root.path().to_path_buf(),
+            parallelism: None,
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;

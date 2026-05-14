@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
-const INLINE_BLOB_THRESHOLD: usize = 10 * 1024;
+const INLINE_BLOB_THRESHOLD: usize = SPOOL_MEM_THRESHOLD;
 const MAX_CONCURRENT_PIPES: usize = 64;
 const READ_POOL_SIZE: u32 = MAX_CONCURRENT_PIPES as u32;
 
@@ -118,6 +118,7 @@ impl LocalCacheSQLite {
 
         let read_pool = r2d2::Pool::builder()
             .max_size(READ_POOL_SIZE)
+            .min_idle(Some(1))
             .build(manager)
             .context("building sqlite read connection pool")?;
 

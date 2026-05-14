@@ -83,7 +83,7 @@ fn build_spec_inner(
         "sandbox_dir=\"$PWD\"\n\
          cd \"$GOLIST_MODULE_ROOT\"\n\
          \"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
--e -deps{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/deps.json\"\n",
+-e{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/package.json\"\n",
         flags_part = flags_part,
     );
 
@@ -116,7 +116,7 @@ fn build_spec_inner(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(
             "json".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("deps.json".to_string())]),
+            TargetSpecValue::List(vec![TargetSpecValue::String("package.json".to_string())]),
         )])),
     );
     config.insert("runtime_env".to_string(), TargetSpecValue::Map(runtime_env));
@@ -251,10 +251,14 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert!(
-            run.contains("list -json=") && run.contains("-e -deps"),
+            run.contains("list -json=") && run.contains("-e "),
             "run should invoke go list"
         );
-        assert!(run.contains("deps.json"), "run should output deps.json");
+        assert!(!run.contains("-deps"), "run must not contain -deps flag");
+        assert!(
+            run.contains("package.json"),
+            "run should output package.json"
+        );
         assert!(run.contains("SRC_GO_BIN"), "run should use $SRC_GO_BIN");
     }
 

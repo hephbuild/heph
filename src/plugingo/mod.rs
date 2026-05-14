@@ -1,6 +1,7 @@
 mod addr_util;
 mod embed;
 mod factors;
+mod gen_testmain;
 mod pkg_analysis;
 mod provider;
 mod target_bin;

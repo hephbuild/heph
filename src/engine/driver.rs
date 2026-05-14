@@ -151,6 +151,7 @@ pub struct ParseRequest {
 pub mod targetdef {
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
+    use itertools::Itertools;
     use std::any::Any;
     use std::sync::Arc;
 
@@ -176,6 +177,14 @@ pub mod targetdef {
         }
         pub fn set_def<T: Send + Sync + 'static>(&mut self, def: T) {
             self.raw_def = Arc::new(def);
+        }
+        pub fn output_names(&self) -> Vec<String> {
+            self.outputs
+                .iter()
+                .map(|o| &o.group)
+                .unique()
+                .cloned()
+                .collect()
         }
     }
 

@@ -155,13 +155,13 @@ impl Matcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     fn addr(pkg: &str, name: &str) -> Addr {
         Addr {
             package: PkgBuf::from(pkg),
             name: name.to_string(),
-            args: HashMap::new(),
+            args: BTreeMap::new(),
         }
     }
 

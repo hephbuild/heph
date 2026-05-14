@@ -18,10 +18,15 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new() -> Self {
+        Self::with_parallelism(None)
+    }
+
+    pub fn with_parallelism(parallelism: impl Into<Option<usize>>) -> Self {
         let dir = tempfile::tempdir().unwrap();
 
         let mut e = Engine::new(Config {
             root: dir.path().to_path_buf(),
+            parallelism: parallelism.into(),
         })
         .unwrap();
 
@@ -49,6 +54,7 @@ impl Workspace {
 
         let mut e = Engine::new(Config {
             root: dir.path().to_path_buf(),
+            parallelism: None,
         })?;
 
         e.register_provider(move |_root| Box::new(provider))?;
@@ -89,7 +95,7 @@ impl Workspace {
             .await
     }
 
-    pub async fn get_spec(&self, addr_str: &str) -> Result<TargetSpec> {
+    pub async fn get_spec(&self, addr_str: &str) -> Result<Arc<TargetSpec>> {
         let addr = parse_addr(addr_str)?;
         let rs = self.engine.new_state();
         self.engine.get_spec(rs, &addr).await

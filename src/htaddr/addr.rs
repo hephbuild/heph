@@ -1,7 +1,6 @@
 use crate::htpkg::PkgBuf;
-use itertools::Itertools;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use xxhash_rust::xxh3::Xxh3Default;
@@ -10,7 +9,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 pub struct Addr {
     pub package: PkgBuf,
     pub name: String,
-    pub args: HashMap<String, String>,
+    pub args: BTreeMap<String, String>,
 }
 
 impl Serialize for Addr {
@@ -27,7 +26,7 @@ impl Display for Addr {
         write!(f, "//{}:{}", self.package, self.name)?;
         if !self.args.is_empty() {
             write!(f, "@")?;
-            for (i, (k, v)) in self.args.iter().sorted().enumerate() {
+            for (i, (k, v)) in self.args.iter().enumerate() {
                 if i > 0 {
                     write!(f, ",")?;
                 }
@@ -48,7 +47,7 @@ impl Default for Addr {
         Addr {
             package: PkgBuf::from(""),
             name: String::new(),
-            args: HashMap::new(),
+            args: BTreeMap::new(),
         }
     }
 }
@@ -69,7 +68,7 @@ impl Hash for Addr {
     fn hash<H: Hasher>(&self, h: &mut H) {
         Hasher::write(h, self.package.as_bytes());
         Hasher::write(h, self.name.as_bytes());
-        for (k, v) in self.args.iter().sorted() {
+        for (k, v) in &self.args {
             Hasher::write(h, k.as_bytes());
             Hasher::write(h, v.as_bytes());
         }

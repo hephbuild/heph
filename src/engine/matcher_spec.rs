@@ -77,14 +77,14 @@ mod tests {
     use crate::htaddr::Addr;
     use crate::htmatcher::{MatchResult, Matcher};
     use crate::htpkg::PkgBuf;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     fn spec(pkg: &str, name: &str, labels: &[&str]) -> TargetSpec {
         TargetSpec {
             addr: Addr {
                 package: PkgBuf::from(pkg),
                 name: name.to_string(),
-                args: HashMap::new(),
+                args: BTreeMap::new(),
             },
             labels: labels.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
@@ -104,7 +104,7 @@ mod tests {
         let m = Matcher::Addr(Addr {
             package: PkgBuf::from("foo/bar"),
             name: "other".to_string(),
-            args: HashMap::new(),
+            args: BTreeMap::new(),
         });
         assert_eq!(m.matches_spec(&s), MatchResult::MatchNo);
     }

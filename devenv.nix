@@ -51,7 +51,7 @@ in
   scripts.tst.exec = "cargo test --all";
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
-  scripts.run-samply-profile.exec = ''samply record $DEVENV_ROOT/target/profiling/rheph "''${@}"'';
+  scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/rheph "''${@}"'';
 
   scripts.install-dev.exec = ''
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph

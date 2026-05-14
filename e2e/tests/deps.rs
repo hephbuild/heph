@@ -226,3 +226,67 @@ target(
     );
     Ok(())
 }
+
+// Direct cycle A → B → A must be rejected
+#[tokio::test]
+async fn test_direct_cyclic_dep_detected() -> anyhow::Result<()> {
+    let ws = Workspace::with_static(vec![
+        target_with_deps("//cycle:a", "echo a", None, deps(&[("b", "//cycle:b")])),
+        target_with_deps("//cycle:b", "echo b", None, deps(&[("a", "//cycle:a")])),
+    ])?;
+
+    let err = ws.run("//cycle:a").await;
+    let e = err.err().expect("expected cyclic dep error");
+    let msg = format!("{:#}", e);
+    assert!(
+        msg.contains("cyclic"),
+        "expected 'cyclic' in error, got: {msg}"
+    );
+    Ok(())
+}
+
+// Diamond deps with cache=false should not deadlock when parallelism is constrained.
+// B1 and B2 both depend on the same leaf. With the old semaphore placement (acquired
+// before resolving deps), B1 and B2 each hold a permit while waiting for the leaf to
+// acquire one — deadlock. The fix moves the semaphore inside execute(), after dep
+// resolution, so no permit is held while waiting for deps.
+#[tokio::test]
+async fn test_no_deadlock_diamond_deps() -> anyhow::Result<()> {
+    // parallelism=1 → 2 semaphore permits, just enough to trigger the deadlock with 2
+    // concurrent mid-nodes each waiting for the leaf.
+    let ws = common::Workspace::with_parallelism(1);
+    ws.write_build_file(
+        "diamond",
+        r#"
+target(name = "leaf", driver = "bash", run = "echo leaf > $OUT", out = "leaf.txt", cache = False)
+target(name = "b1", driver = "bash", run = "cat $SRC_LEAF > $OUT", out = "b1.txt", cache = False, deps = {"leaf": ["//diamond:leaf"]})
+target(name = "b2", driver = "bash", run = "cat $SRC_LEAF > $OUT", out = "b2.txt", cache = False, deps = {"leaf": ["//diamond:leaf"]})
+target(name = "root", driver = "bash", run = "cat $SRC_B1 $SRC_B2 > $OUT", out = "root.txt", cache = False, deps = {"b1": ["//diamond:b1"], "b2": ["//diamond:b2"]})
+"#,
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), ws.run("//diamond:root"))
+        .await
+        .map_err(|_| anyhow::anyhow!("deadlock detected: test timed out after 30s"))??;
+
+    Ok(())
+}
+
+// Indirect cycle A → B → C → A must be rejected
+#[tokio::test]
+async fn test_indirect_cyclic_dep_detected() -> anyhow::Result<()> {
+    let ws = Workspace::with_static(vec![
+        target_with_deps("//icycle:a", "echo a", None, deps(&[("b", "//icycle:b")])),
+        target_with_deps("//icycle:b", "echo b", None, deps(&[("c", "//icycle:c")])),
+        target_with_deps("//icycle:c", "echo c", None, deps(&[("a", "//icycle:a")])),
+    ])?;
+
+    let err = ws.run("//icycle:a").await;
+    let e = err.err().expect("expected cyclic dep error");
+    let msg = format!("{:#}", e);
+    assert!(
+        msg.contains("cyclic"),
+        "expected 'cyclic' in error, got: {msg}"
+    );
+    Ok(())
+}

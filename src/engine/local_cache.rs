@@ -13,6 +13,33 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 use std::{io, time};
 
+struct CountingWriter<W: io::Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: io::Write> CountingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner, count: 0 }
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.count
+    }
+}
+
+impl<W: io::Write> io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ManifestArtifactContentType {
     #[serde(rename = "application/x-tar")]
@@ -120,71 +147,52 @@ impl Engine {
         let hashin = hashin.to_string();
         tokio::task::spawn_blocking(
             enclose!((self.local_cache => local_cache, addr, artifact) move || {
-                let (mut src, size, content_type, name_suffix): (
-                    Box<dyn io::Read>,
-                    u64,
-                    hartifactcontent::Type,
-                    &str,
-                ) = match &artifact.content {
-                    outputartifact::Content::Raw(raw) => {
-                        let mut p = hartifactcontent::tar::TarPacker::new();
-
-                        p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
-
-                        let mut buf = Vec::new();
-                        p.pack(&mut buf)?;
-                        let len = buf.len();
-
-                        (
-                            Box::new(io::Cursor::new(buf)),
-                            len as u64,
-                            hartifactcontent::Type::Tar,
-                            ".tar",
-                        )
-                    }
-                    outputartifact::Content::File(file) => {
-                        let mut p = hartifactcontent::tar::TarPacker::new();
-
-                        p.create_file(file.source_path.clone(), file.out_path.clone());
-
-                        let mut buf = Vec::new();
-                        p.pack(&mut buf)?;
-                        let len = buf.len();
-
-                        (
-                            Box::new(io::Cursor::new(buf)),
-                            len as u64,
-                            hartifactcontent::Type::Tar,
-                            ".tar",
-                        )
-                    }
-                    outputartifact::Content::TarPath(path) => (
-                        Box::new(File::open(path)?),
-                        File::open(path)?.metadata()?.size(),
-                        hartifactcontent::Type::Tar,
-                        "",
-                    ),
-                    outputartifact::Content::CpioPath(path) => (
-                        Box::new(File::open(path)?),
-                        File::open(path)?.metadata()?.size(),
-                        hartifactcontent::Type::Cpio,
-                        "",
-                    ),
+                let type_prefix = match artifact.r#type {
+                    outputartifact::Type::Output => "out",
+                    outputartifact::Type::Log => "log",
+                    outputartifact::Type::SupportFile => "support",
                 };
 
-                let name = format!(
-                    "{}_{}{}",
-                    match artifact.r#type {
-                        outputartifact::Type::Output => "out",
-                        outputartifact::Type::Log => "log",
-                        outputartifact::Type::SupportFile => "support",
-                    },
-                    artifact.name,
-                    name_suffix
-                );
+                let (size, content_type, name) = match &artifact.content {
+                    outputartifact::Content::Raw(raw) => {
+                        let name = format!("{}_{}.tar", type_prefix, artifact.name);
+                        let mut cw =
+                            CountingWriter::new(local_cache.writer(&addr, &hashin, &name)?);
+                        let mut p = hartifactcontent::tar::TarPacker::new();
+                        p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
+                        p.pack(&mut cw)?;
+                        (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                    }
+                    outputartifact::Content::File(file) => {
+                        let name = format!("{}_{}.tar", type_prefix, artifact.name);
+                        let mut cw =
+                            CountingWriter::new(local_cache.writer(&addr, &hashin, &name)?);
+                        let mut p = hartifactcontent::tar::TarPacker::new();
+                        p.create_file(file.source_path.clone(), file.out_path.clone());
+                        p.pack(&mut cw)?;
+                        (cw.bytes_written(), hartifactcontent::Type::Tar, name)
+                    }
+                    outputartifact::Content::TarPath(path) => {
+                        let name = format!("{}_{}", type_prefix, artifact.name);
+                        let mut f = File::open(path)?;
+                        let size = f.metadata()?.size();
+                        io::copy(&mut f, &mut local_cache.writer(&addr, &hashin, &name)?)?;
+                        (size, hartifactcontent::Type::Tar, name)
+                    }
+                    outputartifact::Content::CpioPath(path) => {
+                        let name = format!("{}_{}", type_prefix, artifact.name);
+                        let mut f = File::open(path)?;
+                        let size = f.metadata()?.size();
+                        io::copy(&mut f, &mut local_cache.writer(&addr, &hashin, &name)?)?;
+                        (size, hartifactcontent::Type::Cpio, name)
+                    }
+                };
 
-                let mut writer = local_cache.writer(&addr, &hashin, &name)?;
-                io::copy(&mut src, &mut writer)?;
+                let artifact_type = match artifact.r#type {
+                    outputartifact::Type::Output => ManifestArtifactType::Output,
+                    outputartifact::Type::Log => ManifestArtifactType::Log,
+                    outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
+                };
 
                 anyhow::Ok((
                     CacheArtifact {
@@ -195,22 +203,14 @@ impl Engine {
                         hashout: artifact.hashout.clone(),
                         content_type,
                         group: artifact.group.clone(),
-                        r#type: match artifact.r#type {
-                            outputartifact::Type::Output => ManifestArtifactType::Output,
-                            outputartifact::Type::Log => ManifestArtifactType::Log,
-                            outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
-                        },
+                        r#type: artifact_type.clone(),
                     },
                     ManifestArtifact {
                         hashout: artifact.hashout.clone(),
                         group: artifact.group.clone(),
                         name: name.clone(),
                         size,
-                        r#type: match artifact.r#type {
-                            outputartifact::Type::Output => ManifestArtifactType::Output,
-                            outputartifact::Type::Log => ManifestArtifactType::Log,
-                            outputartifact::Type::SupportFile => ManifestArtifactType::SupportFile,
-                        },
+                        r#type: artifact_type,
                         content_type: match content_type {
                             hartifactcontent::Type::Tar => ManifestArtifactContentType::Tar,
                             hartifactcontent::Type::Cpio => ManifestArtifactContentType::Cpio,
@@ -299,7 +299,10 @@ impl Engine {
                 continue;
             }
 
-            if !self.local_cache.exists(addr, hashin, artifact.name.as_ref())? {
+            if !self
+                .local_cache
+                .exists(addr, hashin, artifact.name.as_ref())?
+            {
                 return Ok(None);
             }
 

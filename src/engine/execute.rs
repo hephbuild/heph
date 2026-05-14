@@ -36,6 +36,15 @@ impl Engine {
             .inputs_result_exec(rs.clone(), &def.inputs)
             .await?;
 
+        // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
+        // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
+        // waiting for a leaf that also needs a permit.
+        let semaphore = Arc::clone(&self.result_semaphore);
+        let _permit = semaphore
+            .acquire()
+            .await
+            .context("result semaphore closed")?;
+
         let sandbox_dir = {
             let mut dir = self.home.join("sandbox");
             for c in addr.package.components() {

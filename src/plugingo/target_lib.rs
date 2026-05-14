@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::loosespecparser::TargetSpecValue;
-use crate::plugingo::addr_util::{dep_group_env_var, import_path_to_dep_group};
+use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use crate::plugingo::target_std::archive_filename;
 use std::collections::{BTreeMap, HashMap};
@@ -114,36 +114,15 @@ fn generate_run_script(
     out_file: &str,
     has_embed: bool,
 ) -> String {
-    let mut script = String::new();
-    script.push_str("importcfg=\"$PWD/importcfg\"\n");
-    script.push_str("> \"$importcfg\"\n");
-
-    // One printf per transitive dep (sorted by import path for deterministic output)
-    let mut sorted_libs: Vec<&(String, Addr)> = transitive_libs.iter().collect();
-    sorted_libs.sort_by_key(|(ip, _)| ip.as_str());
-
-    for (dep_import_path, _dep_addr) in &sorted_libs {
-        let group = import_path_to_dep_group(dep_import_path);
-        let env_var = dep_group_env_var(&group);
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"\n",
-            dep_import_path, env_var
-        ));
-    }
-
-    // -embedcfg is only emitted when the package has //go:embed directives.
+    let mut script = write_importcfg_script(transitive_libs, None);
     let embedcfg_flag = if has_embed {
         " -embedcfg \"$SRC_EMBED\""
     } else {
         ""
     };
-
-    // @${LIST_SRC} passes source files via a response file, safe for large packages.
-    // -p sets the package import path embedded in the archive so the linker can verify it.
     script.push_str(&format!(
         "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{embedcfg_flag} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
-
     script
 }
 

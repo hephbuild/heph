@@ -336,6 +336,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
         req: ManagedRunRequest<'a>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
+        eprintln!("[pluginexec] run: {}", req.request.target.addr);
+
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 

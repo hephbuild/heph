@@ -1,7 +1,7 @@
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::plugingo::factors::Factors;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -209,8 +209,8 @@ pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factor
     }
 }
 
-pub fn factors_to_args(factors: &Factors) -> HashMap<String, String> {
-    let mut args = HashMap::new();
+pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {
+    let mut args = BTreeMap::new();
     args.insert("goos".to_string(), factors.goos.clone());
     args.insert("goarch".to_string(), factors.goarch.clone());
     if !factors.build_tags.is_empty() {
@@ -239,6 +239,33 @@ pub fn import_path_to_dep_group(import_path: &str) -> String {
 /// e.g. "lib_fmt" → "SRC_LIB_FMT"
 pub fn dep_group_env_var(group: &str) -> String {
     format!("SRC_{}", group.to_uppercase())
+}
+
+/// Build the importcfg shell fragment for a set of transitive libs.
+///
+/// Emits `importcfg="$PWD/importcfg"`, clears the file, then appends one
+/// `packagefile` line per library, sorted by import path for determinism.
+/// An optional `skip` import path is excluded (used by the linker to omit
+/// the main package from importcfg).
+pub fn write_importcfg_script(transitive_libs: &[(String, Addr)], skip: Option<&str>) -> String {
+    let mut sorted: Vec<&(String, Addr)> = transitive_libs.iter().collect();
+    sorted.sort_by_key(|(ip, _)| ip.as_str());
+
+    let mut script = String::new();
+    script.push_str("importcfg=\"$PWD/importcfg\"\n");
+    script.push_str("> \"$importcfg\"\n");
+    for (import_path, _) in &sorted {
+        if skip.is_some_and(|s| *import_path == s) {
+            continue;
+        }
+        let group = import_path_to_dep_group(import_path);
+        let env_var = dep_group_env_var(&group);
+        script.push_str(&format!(
+            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"\n",
+            import_path, env_var
+        ));
+    }
+    script
 }
 
 #[cfg(test)]

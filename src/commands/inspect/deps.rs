@@ -17,7 +17,7 @@ pub async fn execute(args: &Args) -> anyhow::Result<()> {
 
     let def = e.clone().get_def(e.clone().new_state(), &addr).await?;
 
-    for input in def.target_def.inputs {
+    for input in &def.target_def.inputs {
         eprintln!("{}", input.r#ref);
     }
 

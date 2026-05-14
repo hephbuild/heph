@@ -1,7 +1,7 @@
 use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::loosespecparser::TargetSpecValue;
-use crate::plugingo::addr_util::{dep_group_env_var, import_path_to_dep_group};
+use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 
@@ -86,34 +86,14 @@ fn generate_link_script(
     binary_name: &str,
     transitive_libs: &[(String, Addr)],
 ) -> String {
-    let mut script = String::new();
-    script.push_str("importcfg=\"$PWD/importcfg\"\n");
-    script.push_str("> \"$importcfg\"\n");
-
-    let mut sorted_libs: Vec<&(String, Addr)> = transitive_libs.iter().collect();
-    sorted_libs.sort_by_key(|(ip, _)| ip.as_str());
-
-    for (dep_import_path, _) in &sorted_libs {
-        // The main package is not imported by anyone; pass it as the positional
-        // argument to the linker instead of an importcfg entry.
-        if dep_import_path == self_import_path {
-            continue;
-        }
-        let group = import_path_to_dep_group(dep_import_path);
-        let env_var = dep_group_env_var(&group);
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"${}\" >> \"$importcfg\"\n",
-            dep_import_path, env_var
-        ));
-    }
-
+    // The main package is passed as a positional arg to the linker, not via importcfg.
+    let mut script = write_importcfg_script(transitive_libs, Some(self_import_path));
     let self_group = import_path_to_dep_group(self_import_path);
-    let self_env_var = dep_group_env_var(&self_group);
+    let self_env_var = format!("SRC_{}", self_group.to_uppercase());
     script.push_str(&format!(
         "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -o {} \"${}\"\n",
         binary_name, self_env_var
     ));
-
     script
 }
 

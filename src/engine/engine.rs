@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     pub root: PathBuf,
+    pub parallelism: Option<usize>,
 }
 
 pub struct Engine {
@@ -44,9 +45,11 @@ impl Engine {
         let root = cfg.root.clone();
         let home = root.join(".heph3");
 
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let parallelism = cfg.parallelism.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        });
 
         Ok(Engine {
             cfg: cfg.clone(),

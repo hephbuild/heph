@@ -19,7 +19,7 @@ use crate::loosespecparser::TargetSpecValue;
 use anyhow::Context;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3;
 
@@ -32,14 +32,14 @@ pub fn file_addr(path: &str) -> Addr {
     Addr {
         package: PkgBuf::from(PKG),
         name: "file".to_string(),
-        args: HashMap::from([("f".to_string(), path.to_string())]),
+        args: BTreeMap::from([("f".to_string(), path.to_string())]),
     }
 }
 
 /// Returns the `Addr` for a glob fs target.
 /// `exclude` is a list of glob patterns to skip; pass `&[]` for none.
 pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
-    let mut args = HashMap::from([("p".to_string(), pattern.to_string())]);
+    let mut args = BTreeMap::from([("p".to_string(), pattern.to_string())]);
     if !exclude.is_empty() {
         args.insert("e".to_string(), exclude.join(","));
     }
@@ -825,7 +825,10 @@ mod tests {
     #[test]
     fn test_glob_addr_with_excludes() {
         let addr = glob_addr("**/*.go", &["vendor/**", "gen/**"]);
-        assert_eq!(addr.args.get("e").map(String::as_str), Some("vendor/**,gen/**"));
+        assert_eq!(
+            addr.args.get("e").map(String::as_str),
+            Some("vendor/**,gen/**")
+        );
     }
 
     #[test]

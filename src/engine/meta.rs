@@ -2,7 +2,7 @@ use crate::debug_hash::DebugHasher;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::request_state::RequestState;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
-use crate::hmemoizer::WrappedError;
+use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -25,14 +25,16 @@ impl Engine {
     ) -> anyhow::Result<ResultMeta> {
         let key = addr.format();
         let res = rs
+            .data
             .mem_meta
-            .process_result(
+            .once(
                 key,
                 enclose!((self => engine, rs, addr) move || async move {
-                    engine.inner_meta(rs, &addr).await.map_err(WrappedError::from)
+                    engine.inner_meta(rs, &addr).await
                 }),
             )
-            .await?;
+            .await
+            .map_err(unwrap_arc_err)?;
         Ok(res)
     }
 
@@ -55,7 +57,7 @@ impl Engine {
             .collect();
 
         let hashin = self
-            .hashin(def.target_def, Box::new(hashouts.into_iter()))
+            .hashin(&def.target_def, Box::new(hashouts.into_iter()))
             .with_context(|| "hashin")?;
 
         Ok(ResultMeta { hashin })
@@ -63,7 +65,7 @@ impl Engine {
 
     fn hashin(
         &self,
-        def: TargetDef,
+        def: &TargetDef,
         results: Box<dyn Iterator<Item = String>>,
     ) -> anyhow::Result<String> {
         let mut h = DebugHasher::new(

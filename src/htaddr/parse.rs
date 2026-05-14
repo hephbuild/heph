@@ -4,7 +4,7 @@ use anyhow::Context;
 use pest::Parser;
 use pest_derive::Parser;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 impl<'de> Deserialize<'de> for Addr {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -109,7 +109,7 @@ pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
 
     let mut package = PkgBuf::from("");
     let mut name = String::new();
-    let mut args = HashMap::new();
+    let mut args = BTreeMap::new();
 
     for pair in pairs {
         if pair.as_rule() == Rule::taddr {

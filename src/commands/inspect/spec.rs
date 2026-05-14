@@ -17,7 +17,7 @@ pub async fn execute(args: &Args) -> anyhow::Result<()> {
 
     let res = e.clone().get_spec(e.clone().new_state(), &addr).await?;
 
-    serde_json::to_writer_pretty(std::io::stdout(), &res)?;
+    serde_json::to_writer_pretty(std::io::stdout(), &*res)?;
 
     Ok(())
 }

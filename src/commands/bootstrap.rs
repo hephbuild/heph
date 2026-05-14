@@ -6,7 +6,10 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
         Err(inner) => anyhow::bail!("Error: {}", inner),
     };
 
-    let mut e = engine::Engine::new(engine::Config { root })?;
+    let mut e = engine::Engine::new(engine::Config {
+        root,
+        parallelism: None,
+    })?;
 
     e.register_provider(|root| {
         Box::new(pluginbuildfile::Provider {
