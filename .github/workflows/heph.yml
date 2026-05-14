@@ -242,6 +242,13 @@ jobs:
           else
             echo "**Release:** Failed or cancelled" >> $GITHUB_STEP_SUMMARY
           fi
+
+  cleanup:
+    name: Cleanup
+    needs: [gen, upload_artifacts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Delete Repo Artifact
         uses: actions/github-script@v8
         with:
