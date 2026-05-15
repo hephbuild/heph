@@ -8,8 +8,9 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use itertools::Itertools;
+use std::collections::HashSet;
 use std::hash::Hasher;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Clone)]
@@ -87,6 +88,15 @@ impl Engine {
         rc: Arc<RequestState>,
         inputs: &[Input],
     ) -> anyhow::Result<Vec<EResult>> {
+        let inputs = Arc::clone(&self)
+            .expand_inputs(
+                rc.clone(),
+                inputs.to_vec(),
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await?;
+
         let futures = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
                 engine

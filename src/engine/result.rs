@@ -6,6 +6,7 @@ use crate::engine::provider::{GetError, GetRequest, GetResponse, ProviderExecuto
 use crate::engine::request_state::RequestState;
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
+use async_recursion::async_recursion;
 use enclose::enclose;
 
 use crate::defer;
@@ -66,7 +67,7 @@ pub struct ArtifactMeta {
     pub hashout: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct EResult {
     pub artifacts: Vec<Arc<dyn Content>>,
     pub artifacts_meta: Vec<ArtifactMeta>,
@@ -106,6 +107,7 @@ struct ExecuteOptions<'a> {
 }
 
 impl Engine {
+    #[async_recursion]
     pub async fn result_addr(
         self: Arc<Self>,
         rs: Arc<RequestState>,
@@ -125,6 +127,35 @@ impl Engine {
         // Set addr as parent so all sub-calls carry the right context for cycle detection.
         // Done outside the memoizer so context setup isn't buried in the deduplication boundary.
         let rs = rs.with_parent(addr.clone());
+
+        // Transparent targets (groups) never execute — inline their deps' results.
+        // Handled before the memoizer: nothing to deduplicate for groups, and calling
+        // result_addr recursively here is safe because #[async_recursion] boxes the future,
+        // breaking the Send inference cycle that would occur inside the memoizer closure.
+        let def = self.get_def(rs.clone(), addr).await?;
+        if def.target_def.transparent {
+            let opts = *opts;
+            let futures: Vec<_> = def
+                .target_def
+                .inputs
+                .iter()
+                .map(|input| {
+                    let dep_addr = input.r#ref.r#ref.clone();
+                    enclose!((self => engine, rs) async move {
+                        engine
+                            .result_addr(rs, &dep_addr, OutputMatcher::All, &opts)
+                            .await
+                    })
+                })
+                .collect();
+            let results = futures::future::try_join_all(futures).await?;
+            let mut merged = EResult::default();
+            for r in results {
+                merged.artifacts.extend(r.artifacts);
+                merged.artifacts_meta.extend(r.artifacts_meta);
+            }
+            return Ok(merged);
+        }
 
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
@@ -310,6 +341,7 @@ impl Engine {
         }))
     }
 
+    #[async_recursion]
     pub async fn get_def(
         &self,
         rs: Arc<RequestState>,
@@ -403,9 +435,21 @@ impl Engine {
                 .await
                 .with_context(|| format!("get spec: {:?}", input.r#ref))?;
 
-            let transitive = spec.transitive.clone();
-
-            // TODO: group inline
+            // For transparent targets (groups), use the pre-computed applied_transitive
+            // which already recursively aggregates all nested deps' transitives.
+            // For all other targets, use spec.transitive directly.
+            // Important: avoid calling get_def on non-transparent targets here — get_def
+            // calls collect_transitive_deps which would re-enter the mem_def memoizer
+            // and deadlock on cyclic dep graphs.
+            let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
+                let dep_def = self
+                    .get_def(rs.clone(), &input.r#ref.r#ref)
+                    .await
+                    .with_context(|| format!("get def for group: {:?}", input.r#ref))?;
+                dep_def.applied_transitive.clone()
+            } else {
+                spec.transitive.clone()
+            };
 
             if transitive.empty() {
                 continue;

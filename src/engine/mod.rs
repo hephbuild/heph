@@ -27,6 +27,7 @@ pub use result::OutputMatcher;
 pub use result::ResultOptions;
 pub mod driver_managed;
 mod execute;
+mod expand;
 mod link;
 mod matcher_spec;
 mod meta;

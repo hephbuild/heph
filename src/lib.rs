@@ -16,5 +16,6 @@ pub mod pluginbuildfile;
 pub mod pluginexec;
 pub mod pluginfs;
 pub mod plugingo;
+pub mod plugingroup;
 pub mod pluginhostbin;
 pub mod pluginstatictarget;

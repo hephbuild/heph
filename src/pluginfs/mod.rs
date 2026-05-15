@@ -262,6 +262,7 @@ impl crate::engine::driver::Driver for Driver {
                 disable_remote_cache: true,
                 pty: false,
                 hash,
+                transparent: false,
             },
         })
     }

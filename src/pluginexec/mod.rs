@@ -261,6 +261,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 disable_remote_cache: !spec.cache.remote,
                 pty: true,
                 hash,
+                transparent: false,
             },
         })
     }
@@ -611,6 +612,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
 
         let mut stdout = Vec::new();
@@ -660,6 +662,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
 
         let mut stdin = std::io::Cursor::new(b"test data");
@@ -715,6 +718,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
 
         let request_id = "test-request".to_string();
@@ -776,6 +780,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
         let mut stdout = Vec::new();
         let request_id = "test".to_string();
@@ -1009,6 +1014,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         }
     }
 
@@ -1135,6 +1141,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
 
         let mut stdout = Vec::new();
@@ -1201,6 +1208,7 @@ mod tests {
             disable_remote_cache: false,
             pty: true,
             hash: vec![],
+            transparent: false,
         };
 
         let request_id = "test".to_string();

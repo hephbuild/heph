@@ -3,8 +3,8 @@ use crate::engine::driver::targetdef::{InputMode, TargetDef, path::Content};
 use crate::engine::request_state::RequestState;
 use enclose::enclose;
 use futures::future::try_join_all;
-use itertools::Itertools;
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub struct LinkedTargetDefInput {
@@ -25,7 +25,16 @@ impl Engine {
         rs: Arc<RequestState>,
         def: TargetDef,
     ) -> anyhow::Result<LinkedTargetDef> {
-        let futures = def.inputs.iter().map(|input| {
+        let expanded_inputs = Arc::clone(&self)
+            .expand_inputs(
+                rs.clone(),
+                def.inputs.clone(),
+                None,
+                Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await?;
+
+        let futures = expanded_inputs.iter().map(|input| {
             enclose!((self => engine, rs, input) async move {
                 let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?.target_def.clone();
 
@@ -35,7 +44,7 @@ impl Engine {
                     }
                     vec![output_name.clone()]
                 } else {
-                    input_def.outputs.iter().map(|output| output.group.clone()).unique().collect()
+                    input_def.output_names()
                 };
 
                 if input.mode == InputMode::Tool {

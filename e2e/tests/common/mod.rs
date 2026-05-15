@@ -6,6 +6,7 @@ use rheph::engine::{Config, EResult, Engine, OutputMatcher, ResultOptions};
 use rheph::htaddr::{Addr, parse_addr};
 use rheph::pluginbuildfile;
 use rheph::pluginexec;
+use rheph::plugingroup;
 use rheph::pluginstatictarget;
 use std::path::Path;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ impl Workspace {
             .unwrap();
         e.register_managed_driver(Box::new(pluginexec::Driver::new_bash()))
             .unwrap();
+        e.register_driver(Box::new(plugingroup::Driver)).unwrap();
 
         Self {
             dir,
@@ -60,6 +62,7 @@ impl Workspace {
         e.register_provider(move |_root| Box::new(provider))?;
         e.register_managed_driver(Box::new(pluginexec::Driver::new_exec()))?;
         e.register_managed_driver(Box::new(pluginexec::Driver::new_bash()))?;
+        e.register_driver(Box::new(plugingroup::Driver))?;
 
         Ok(Self {
             dir,

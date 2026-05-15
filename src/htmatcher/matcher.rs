@@ -178,6 +178,7 @@ mod tests {
             disable_remote_cache: false,
             pty: false,
             hash: vec![],
+            transparent: false,
         }
     }
 

@@ -167,6 +167,7 @@ pub mod targetdef {
         pub disable_remote_cache: bool,
         pub pty: bool,
         pub hash: Vec<u8>,
+        pub transparent: bool,
     }
 
     impl TargetDef {
