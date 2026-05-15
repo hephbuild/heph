@@ -20,6 +20,20 @@ impl Engine {
         parent_override: Option<(String, InputMode)>,
         visited: Arc<Mutex<HashSet<String>>>,
     ) -> anyhow::Result<Vec<Input>> {
+        if parent_override.is_none() {
+            let mut has_transparent = false;
+            for input in &inputs {
+                let def = self.get_def(rs.clone(), &input.r#ref.r#ref).await?;
+                if def.target_def.transparent {
+                    has_transparent = true;
+                    break;
+                }
+            }
+            if !has_transparent {
+                return Ok(inputs);
+            }
+        }
+
         let mut result = Vec::with_capacity(inputs.len());
 
         for input in inputs {
