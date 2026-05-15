@@ -27,7 +27,16 @@ pub fn build_spec(
         import_path.as_str()
     };
 
-    let run = generate_compile_script(p_flag, transitive_libs, &out_file, pkg_dir, &pkg.go_files);
+    let run = generate_compile_script(
+        p_flag,
+        transitive_libs,
+        &out_file,
+        pkg_dir,
+        &pkg.go_files,
+        &pkg.s_files,
+        &factors.goos,
+        &factors.goarch,
+    );
 
     let mut deps: BTreeMap<String, TargetSpecValue> = transitive_libs
         .iter()
@@ -94,6 +103,9 @@ fn generate_compile_script(
     out_file: &str,
     pkg_dir: &str,
     go_files: &[String],
+    s_files: &[String],
+    goos: &str,
+    goarch: &str,
 ) -> String {
     let mut script = write_importcfg_script(transitive_libs, None);
 
@@ -104,9 +116,30 @@ fn generate_compile_script(
         .collect::<Vec<_>>()
         .join(" ");
 
+    let has_asm = !s_files.is_empty();
+    let asmhdr_flag = if has_asm { " -asmhdr \"go_asm.h\"" } else { "" };
+
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\" -o \"{out_file}\" {src_args}\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{asmhdr_flag} -o \"{out_file}\" {src_args}\n",
     ));
+
+    if has_asm {
+        for s_file in s_files {
+            let obj_file = format!("{}.o", s_file.trim_end_matches(".s"));
+            script.push_str(&format!(
+                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath -I \"{pkg_dir}\" -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch} -o \"{obj_file}\" \"{pkg_dir}/{s_file}\"\n"
+            ));
+        }
+        let obj_args = s_files
+            .iter()
+            .map(|f| format!("\"{}\"", format!("{}.o", f.trim_end_matches(".s"))))
+            .collect::<Vec<_>>()
+            .join(" ");
+        script.push_str(&format!(
+            "\"$SRC_GO_BIN\" tool pack r \"{out_file}\" {obj_args}\n"
+        ));
+    }
+
     script
 }
 
@@ -133,11 +166,16 @@ mod tests {
     }
 
     fn test_pkg(go_files: Vec<String>) -> GoPackage {
+        test_pkg_with_asm(go_files, vec![])
+    }
+
+    fn test_pkg_with_asm(go_files: Vec<String>, s_files: Vec<String>) -> GoPackage {
         GoPackage {
             import_path: "github.com/go-logr/logr".to_string(),
             dir: Some("/home/user/go/pkg/mod/github.com/go-logr/logr@v1.4.2".to_string()),
             name: Some("logr".to_string()),
             go_files,
+            s_files,
             test_go_files: vec![],
             xtest_go_files: vec![],
             embed_patterns: vec![],
@@ -323,5 +361,125 @@ mod tests {
             _ => panic!("expected map"),
         };
         assert!(deps.contains_key("lib_fmt"), "deps must have lib_fmt group");
+    }
+
+    #[test]
+    fn test_no_s_files_no_asm_steps() {
+        let spec = build_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            !run.contains("tool asm"),
+            "no .s files → must not emit tool asm: {run}"
+        );
+        assert!(
+            !run.contains("tool pack"),
+            "no .s files → must not emit tool pack: {run}"
+        );
+        assert!(
+            !run.contains("-asmhdr"),
+            "no .s files → must not emit -asmhdr: {run}"
+        );
+    }
+
+    #[test]
+    fn test_s_files_run_contains_asm_and_pack() {
+        let pkg = test_pkg_with_asm(
+            vec!["impl.go".to_string()],
+            vec!["impl_amd64.s".to_string(), "util.s".to_string()],
+        );
+        let spec = build_spec(
+            test_addr(),
+            &pkg,
+            &test_factors(),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            run.contains("tool asm"),
+            "must invoke go tool asm for .s files: {run}"
+        );
+        assert!(
+            run.contains("tool pack r"),
+            "must pack .o files into archive: {run}"
+        );
+        assert!(
+            run.contains("-asmhdr \"go_asm.h\""),
+            "compile step must emit asm header: {run}"
+        );
+        assert!(
+            run.contains("impl_amd64.s"),
+            "must assemble impl_amd64.s: {run}"
+        );
+        assert!(run.contains("util.s"), "must assemble util.s: {run}");
+        assert!(
+            run.contains("impl_amd64.o"),
+            "must pack impl_amd64.o: {run}"
+        );
+        assert!(run.contains("util.o"), "must pack util.o: {run}");
+    }
+
+    #[test]
+    fn test_s_files_asm_uses_goroot_include() {
+        let pkg = test_pkg_with_asm(vec!["impl.go".to_string()], vec!["impl.s".to_string()]);
+        let spec = build_spec(
+            test_addr(),
+            &pkg,
+            &test_factors(),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            run.contains("$GOROOT/pkg/include"),
+            "asm step must include GOROOT/pkg/include: {run}"
+        );
+        assert!(
+            run.contains("GOOS_linux"),
+            "asm step must define GOOS_linux: {run}"
+        );
+        assert!(
+            run.contains("GOARCH_amd64"),
+            "asm step must define GOARCH_amd64: {run}"
+        );
+    }
+
+    #[test]
+    fn test_s_files_asm_uses_pkg_dir_include() {
+        let pkg = test_pkg_with_asm(vec!["impl.go".to_string()], vec!["impl.s".to_string()]);
+        let spec = build_spec(
+            test_addr(),
+            &pkg,
+            &test_factors(),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            run.contains("/home/user/go/pkg/mod/github.com/go-logr/logr@v1.4.2"),
+            "asm step must include the package dir: {run}"
+        );
     }
 }

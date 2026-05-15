@@ -13,6 +13,8 @@ pub struct GoPackage {
     pub name: Option<String>,
     #[serde(rename = "GoFiles", default)]
     pub go_files: Vec<String>,
+    #[serde(rename = "SFiles", default)]
+    pub s_files: Vec<String>,
     #[serde(rename = "TestGoFiles", default)]
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]

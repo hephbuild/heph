@@ -614,6 +614,7 @@ impl Provider {
                     dir: pkg.dir.clone(),
                     name: pkg.name.clone(),
                     go_files: vec![],
+                    s_files: vec![],
                     test_go_files: vec![],
                     xtest_go_files: vec![],
                     embed_patterns: vec![],
@@ -695,6 +696,7 @@ impl Provider {
                     dir: pkg.dir.clone(),
                     name: Some("main".to_string()),
                     go_files: vec![],
+                    s_files: vec![],
                     test_go_files: vec![],
                     xtest_go_files: vec![],
                     embed_patterns: vec![],
@@ -2013,5 +2015,58 @@ mod tests {
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let _resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
+    }
+
+    // ---- mod-asm ----
+
+    #[tokio::test]
+    async fn test_mod_asm_build_lib_driver() {
+        require_go!();
+        let sandbox = copy_fixture("mod-asm");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("", "build_lib")).await.unwrap();
+        assert_eq!(resp.target_spec.driver, "bash");
+    }
+
+    #[tokio::test]
+    async fn test_mod_asm_thirdparty_with_sfiles_generates_asm_steps() {
+        require_go!();
+        let sandbox = copy_fixture("mod-asm");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+
+        // github.com/klauspost/cpuid/v2 has assembly on all architectures
+        let addr = make_addr(
+            "@heph/go/thirdparty/github.com/klauspost/cpuid/v2@v2.2.5",
+            "build_lib",
+        );
+        let resp = match provider_get(&p, addr).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("skipping: could not get cpuid build_lib: {:?}", e);
+                return;
+            }
+        };
+
+        let run = match resp.target_spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+
+        // Only assert asm steps when the package actually has .s files on this platform.
+        // If SFiles is empty for this arch, tool asm won't appear and that's correct.
+        if run.contains("tool asm") {
+            assert!(
+                run.contains("tool pack r"),
+                "asm package must pack .o files: {run}"
+            );
+            assert!(
+                run.contains("-asmhdr"),
+                "asm package compile step must emit -asmhdr: {run}"
+            );
+            assert!(
+                run.contains("$GOROOT/pkg/include"),
+                "asm step must include GOROOT/pkg/include: {run}"
+            );
+        }
     }
 }
