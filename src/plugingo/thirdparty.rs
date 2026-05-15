@@ -17,7 +17,6 @@ pub fn build_spec(
 ) -> TargetSpec {
     let import_path = &pkg.import_path;
     let package_name = pkg.name.as_deref().unwrap_or("");
-    let pkg_dir = pkg.dir.as_deref().unwrap_or("");
 
     let out_file = archive_filename(import_path);
     // Go requires main packages to be compiled with -p "main".
@@ -27,16 +26,7 @@ pub fn build_spec(
         import_path.as_str()
     };
 
-    let run = generate_compile_script(
-        p_flag,
-        transitive_libs,
-        &out_file,
-        pkg_dir,
-        &pkg.go_files,
-        &pkg.s_files,
-        &factors.goos,
-        &factors.goarch,
-    );
+    let run = generate_compile_script(p_flag, transitive_libs, &out_file, pkg, factors);
 
     let mut deps: BTreeMap<String, TargetSpecValue> = transitive_libs
         .iter()
@@ -101,12 +91,15 @@ fn generate_compile_script(
     p_flag: &str,
     transitive_libs: &[(String, Addr)],
     out_file: &str,
-    pkg_dir: &str,
-    go_files: &[String],
-    s_files: &[String],
-    goos: &str,
-    goarch: &str,
+    pkg: &GoPackage,
+    factors: &Factors,
 ) -> String {
+    let pkg_dir = pkg.dir.as_deref().unwrap_or("");
+    let go_files = &pkg.go_files;
+    let s_files = &pkg.s_files;
+    let goos = &factors.goos;
+    let goarch = &factors.goarch;
+
     let mut script = write_importcfg_script(transitive_libs, None);
 
     // Source files live in GOMODCACHE (read-only, content-stable) — use absolute paths.
@@ -132,7 +125,7 @@ fn generate_compile_script(
         }
         let obj_args = s_files
             .iter()
-            .map(|f| format!("\"{}\"", format!("{}.o", f.trim_end_matches(".s"))))
+            .map(|f| format!("\"{}.o\"", f.trim_end_matches(".s")))
             .collect::<Vec<_>>()
             .join(" ");
         script.push_str(&format!(
