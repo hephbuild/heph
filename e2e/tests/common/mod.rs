@@ -7,6 +7,7 @@ use rheph::htaddr::{Addr, parse_addr};
 use rheph::pluginbuildfile;
 use rheph::pluginexec;
 use rheph::plugingroup;
+use rheph::pluginquery;
 use rheph::pluginstatictarget;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +44,8 @@ impl Workspace {
         e.register_managed_driver(Box::new(pluginexec::Driver::new_bash()))
             .unwrap();
         e.register_driver(Box::new(plugingroup::Driver)).unwrap();
+        e.register_provider(|_root| Box::new(pluginquery::Provider))
+            .unwrap();
 
         Self {
             dir,

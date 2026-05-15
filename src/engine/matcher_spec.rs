@@ -62,6 +62,7 @@ impl Matcher {
                     MatchResult::MatchYes
                 }
             }
+            Matcher::TreeOutputTo(_) => MatchResult::MatchShrug,
             Matcher::Not(m) => match m.matches_spec(spec) {
                 MatchResult::MatchYes => MatchResult::MatchNo,
                 MatchResult::MatchNo => MatchResult::MatchYes,
@@ -199,5 +200,14 @@ mod tests {
 
         let m2 = Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("other"))));
         assert_eq!(m2.matches_spec(&s), MatchResult::MatchYes);
+    }
+
+    #[test]
+    fn tree_output_to_shrugs_on_spec() {
+        let s = spec("foo/bar", "baz", &[]);
+        assert_eq!(
+            Matcher::TreeOutputTo("gen".to_string()).matches_spec(&s),
+            MatchResult::MatchShrug
+        );
     }
 }

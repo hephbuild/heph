@@ -15,6 +15,7 @@ pub enum Matcher {
     Label(String),
     Package(PkgBuf),
     PackagePrefix(PkgBuf),
+    TreeOutputTo(String),
     Or(Vec<Matcher>),
     And(Vec<Matcher>),
     Not(Box<Matcher>),
@@ -31,6 +32,7 @@ impl Matcher {
                 }
             }
             Matcher::Label(_) => MatchResult::MatchShrug,
+            Matcher::TreeOutputTo(_) => MatchResult::MatchShrug,
             Matcher::Package(pkg) => {
                 if &addr.package == pkg {
                     MatchResult::MatchYes
@@ -94,6 +96,20 @@ impl Matcher {
             }
             Matcher::Label(label) => {
                 if def.labels.contains(label) {
+                    MatchResult::MatchYes
+                } else {
+                    MatchResult::MatchNo
+                }
+            }
+            Matcher::TreeOutputTo(name) => {
+                use crate::engine::driver::targetdef::path::CodegenMode;
+                if def.outputs.iter().any(|output| {
+                    output.group == *name
+                        && output
+                            .paths
+                            .iter()
+                            .any(|p| !matches!(p.codegen_tree, CodegenMode::None))
+                }) {
                     MatchResult::MatchYes
                 } else {
                     MatchResult::MatchNo
@@ -413,6 +429,71 @@ mod tests {
         );
         assert_eq!(
             Matcher::Not(Box::new(Matcher::Package(PkgBuf::from("foo")))).matches(&d),
+            MatchResult::MatchNo
+        );
+    }
+
+    fn def_with_output(pkg: &str, name: &str, group: &str, codegen: bool) -> TargetDef {
+        use crate::engine::driver::targetdef::{Output, path};
+        use std::sync::Arc;
+        TargetDef {
+            addr: addr(pkg, name),
+            labels: vec![],
+            raw_def: Arc::new(()),
+            inputs: vec![],
+            outputs: vec![Output {
+                group: group.to_string(),
+                paths: vec![path::Path {
+                    content: path::Content::DirPath(group.to_string()),
+                    codegen_tree: if codegen {
+                        path::CodegenMode::Copy
+                    } else {
+                        path::CodegenMode::None
+                    },
+                    collect: false,
+                }],
+            }],
+            support_files: vec![],
+            cache: false,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        }
+    }
+
+    #[test]
+    fn tree_output_to_shrugs_on_addr() {
+        let a = addr("foo", "bar");
+        assert_eq!(
+            Matcher::TreeOutputTo("gen".to_string()).matches_addr(&a),
+            MatchResult::MatchShrug
+        );
+    }
+
+    #[test]
+    fn tree_output_to_yes_when_codegen_output_exists() {
+        let d = def_with_output("foo", "bar", "gen", true);
+        assert_eq!(
+            Matcher::TreeOutputTo("gen".to_string()).matches(&d),
+            MatchResult::MatchYes
+        );
+    }
+
+    #[test]
+    fn tree_output_to_no_when_output_group_has_no_codegen() {
+        let d = def_with_output("foo", "bar", "gen", false);
+        assert_eq!(
+            Matcher::TreeOutputTo("gen".to_string()).matches(&d),
+            MatchResult::MatchNo
+        );
+    }
+
+    #[test]
+    fn tree_output_to_no_when_output_group_missing() {
+        let d = def_with_output("foo", "bar", "other", true);
+        assert_eq!(
+            Matcher::TreeOutputTo("gen".to_string()).matches(&d),
             MatchResult::MatchNo
         );
     }

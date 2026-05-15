@@ -2,10 +2,14 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::TargetNotFoundError;
-use crate::engine::provider::{GetError, GetRequest, GetResponse, ProviderExecutor, TargetSpec};
+use crate::engine::provider::{
+    GetError, GetRequest, GetResponse, ListRequest, ProviderExecutor, TargetSpec,
+};
 use crate::engine::request_state::RequestState;
 use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
+use crate::htmatcher::MatchResult;
+use crate::htpkg::PkgBuf;
 use async_recursion::async_recursion;
 use enclose::enclose;
 
@@ -47,6 +51,78 @@ impl ProviderExecutor for EngineProviderExecutor {
                     &ResultOptions::default(),
                 )
                 .await
+        })
+    }
+
+    fn query<'a>(
+        &'a self,
+        m: &'a Matcher,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+        Box::pin(async move {
+            let engine = self
+                .engine
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+            let rs = self.rs.clone();
+
+            // Collect packages eagerly (non-Send iterator dropped before first await)
+            let pkg_iter = engine.packages(m, &rs.ctoken).await?;
+            let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
+
+            let mut result = Vec::new();
+
+            for pkg_str in pkgs {
+                let pkg = PkgBuf::from(pkg_str.as_str());
+
+                for provider in &engine.providers {
+                    // Collect list results eagerly (non-Send iterator dropped before next await)
+                    let list_iter = provider
+                        .provider
+                        .list(
+                            ListRequest {
+                                request_id: rs.request_id.clone(),
+                                package: pkg.clone(),
+                            },
+                            &rs.ctoken,
+                        )
+                        .await?;
+                    let raw: Vec<_> = list_iter.collect::<anyhow::Result<_>>()?;
+
+                    for item in raw {
+                        let addr = item.addr;
+                        if addr.package != pkg {
+                            continue;
+                        }
+
+                        match m.matches_addr(&addr) {
+                            MatchResult::MatchYes => result.push(addr),
+                            MatchResult::MatchNo => {}
+                            MatchResult::MatchShrug => {
+                                let spec = match engine.get_spec(rs.clone(), &addr).await {
+                                    Ok(spec) => Ok(spec),
+                                    Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => {
+                                        continue;
+                                    }
+                                    res => res,
+                                }?;
+
+                                match m.matches_spec(&spec) {
+                                    MatchResult::MatchYes => result.push(addr),
+                                    MatchResult::MatchNo => {}
+                                    MatchResult::MatchShrug => {
+                                        let def = engine.get_def(rs.clone(), &addr).await?;
+                                        if m.matches(&def.target_def) == MatchResult::MatchYes {
+                                            result.push(addr);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(result)
         })
     }
 }

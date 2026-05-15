@@ -2,6 +2,7 @@ use crate::engine::driver::sandbox::Sandbox;
 use crate::engine::result::EResult;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
+use crate::htmatcher::Matcher;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::TargetSpecValue;
 use futures::future::BoxFuture;
@@ -47,6 +48,7 @@ pub struct TargetSpec {
 
 pub trait ProviderExecutor: Send + Sync {
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<EResult>>;
+    fn query<'a>(&'a self, m: &'a Matcher) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 
 pub struct GetRequest {

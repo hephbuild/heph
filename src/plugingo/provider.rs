@@ -1366,6 +1366,13 @@ mod tests {
                 })
             })
         }
+
+        fn query<'a>(
+            &'a self,
+            _m: &'a crate::htmatcher::Matcher,
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+            Box::pin(async { Ok(vec![]) })
+        }
     }
 
     fn test_executor(workspace_root: &std::path::Path) -> Arc<dyn ProviderExecutor> {
