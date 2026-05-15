@@ -245,7 +245,7 @@ jobs:
 
   cleanup:
     name: Cleanup
-    needs: [gen, upload_artifacts]
+    needs: [gen, build, lint, test, upload_artifacts]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
