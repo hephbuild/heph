@@ -20,6 +20,8 @@ jobs:
         with:
           fetch-depth: 0
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: fallback = true
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: x86_64-unknown-linux-gnu
@@ -89,6 +91,8 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: fallback = true
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.target }}
@@ -158,6 +162,8 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: fallback = true
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: x86_64-unknown-linux-gnu
@@ -196,6 +202,8 @@ jobs:
           path: .
 
       - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: fallback = true
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ${{ matrix.target }}
