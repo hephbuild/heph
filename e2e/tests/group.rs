@@ -24,8 +24,14 @@ target(
 
     let result = ws.run("//grp:consumer").await?;
     let content = common::artifact_string(&result);
-    assert!(content.contains("t1_value"), "missing t1_value, got: {content:?}");
-    assert!(content.contains("t2_value"), "missing t2_value, got: {content:?}");
+    assert!(
+        content.contains("t1_value"),
+        "missing t1_value, got: {content:?}"
+    );
+    assert!(
+        content.contains("t2_value"),
+        "missing t2_value, got: {content:?}"
+    );
     Ok(())
 }
 
@@ -107,8 +113,14 @@ target(
 
     let result = ws.run("//transg:consumer").await?;
     let content = common::artifact_string(&result);
-    assert!(content.contains("lib_value"), "missing lib_value, got: {content:?}");
-    assert!(content.contains("tool_value"), "missing transitive tool_value, got: {content:?}");
+    assert!(
+        content.contains("lib_value"),
+        "missing lib_value, got: {content:?}"
+    );
+    assert!(
+        content.contains("tool_value"),
+        "missing transitive tool_value, got: {content:?}"
+    );
     Ok(())
 }
 
@@ -124,7 +136,10 @@ target(name = "g", driver = "group", deps = [])
     );
 
     let result = ws.run("//emptyg:g").await?;
-    assert!(result.artifacts.is_empty(), "expected no artifacts from empty group");
+    assert!(
+        result.artifacts.is_empty(),
+        "expected no artifacts from empty group"
+    );
     Ok(())
 }
 
@@ -142,7 +157,11 @@ target(name = "g", driver = "group", deps = ["//nocache:t"])
 
     let spec = ws.get_spec("//nocache:g").await?;
     let rs = ws.engine.new_state();
-    let def = ws.engine.clone().get_def(rs, &rheph::htaddr::parse_addr("//nocache:g")?).await?;
+    let def = ws
+        .engine
+        .clone()
+        .get_def(rs, &rheph::htaddr::parse_addr("//nocache:g")?)
+        .await?;
     assert!(!def.target_def.cache, "group must not be cached");
     assert!(def.target_def.transparent, "group must be transparent");
     drop(spec);
