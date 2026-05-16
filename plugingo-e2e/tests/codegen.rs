@@ -1,5 +1,6 @@
 mod common;
 
+use std::fs;
 use anyhow::Context as _;
 use common::{artifact_paths, artifact_string, fixture, make_workspace, require_go};
 
@@ -38,6 +39,7 @@ async fn test_codegen_build_produces_binary() -> anyhow::Result<()> {
     require_go!();
     let dir = fixture("codegen")?;
     let ws = make_workspace(dir)?;
+    let _ = fs::remove_file(ws.dir.path().join("gen.go"));
     let result = ws.run("//:build").await?;
     let paths = artifact_paths(&result);
     assert!(

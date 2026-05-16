@@ -1,14 +1,17 @@
 use crate::loosespecparser::{
-    TargetSpecValue, parse_bool, parse_map_string_string, parse_map_string_strings, parse_strings,
+    TargetSpecValue, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
+    parse_strings,
 };
 use anyhow::Context;
 use std::collections::HashMap;
+use crate::engine::driver::targetdef::path::CodegenMode;
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
     pub deps: HashMap<String, Vec<String>>,
     pub tools: HashMap<String, Vec<String>>,
     pub outputs: HashMap<String, Vec<String>>,
+    pub codegen: CodegenMode,
     pub cache: TargetSpecCache,
     pub pass_env: Vec<String>,
     pub runtime_pass_env: Vec<String>,
@@ -32,6 +35,7 @@ impl TargetSpec {
                 remote: true,
             },
             outputs: HashMap::new(),
+            codegen: CodegenMode::None,
             deps: HashMap::new(),
             tools: HashMap::new(),
             pass_env: vec![],
@@ -54,6 +58,17 @@ impl TargetSpec {
 
         if let Some(v) = m.remove("out") {
             spec.outputs = parse_map_string_strings(v).with_context(|| "parse `out`")?;
+        };
+
+        if let Some(v) = m.remove("codegen") {
+            spec.codegen = match parse_string(v)? {
+                Some(s) => match s.as_str() {
+                    "copy" => Ok(CodegenMode::Copy),
+                    "link" => Ok(CodegenMode::Link),
+                    _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s))
+                },
+                None => Ok(CodegenMode::None),
+            }.with_context(|| "parse `codegen`")?;
         };
 
         if let Some(v) = m.remove("deps") {

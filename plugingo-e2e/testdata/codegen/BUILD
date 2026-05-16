@@ -8,4 +8,5 @@ target(
     ],
     out = "gen.go",
     labels = ["go_src"],
+    codegen = "copy",
 )

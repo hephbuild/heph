@@ -250,7 +250,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                                         Content::FilePath(path.clone())
                                     }
                                 },
-                                codegen_tree: CodegenMode::None,
+                                codegen_tree: spec.codegen.clone(),
                                 collect: true,
                             })
                             .collect(),
