@@ -10,6 +10,7 @@ use crate::hasync::Cancellable;
 use crate::{hartifactcontent, hasync};
 use anyhow::Context;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -118,6 +119,10 @@ impl Driver for ManagedDriverBridge {
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir).with_context(|| "create ws dir")?;
 
+        let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
+        fs::create_dir_all(&sandbox_pkg_dir)
+            .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
+
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
             let input_list = ws_dir.join(format!("input_{}.list", input.origin_id));
@@ -133,12 +138,44 @@ impl Driver for ManagedDriverBridge {
             });
         }
 
+        // Apply filters and collect source_map entries.
+        let mut source_map: HashMap<String, String> = HashMap::new();
+        for managed_input in &mut inputs {
+            let filters = &managed_input.input.filters;
+            let source_addr_str = managed_input.input.source_addr.format();
+            let raw = fs::read_to_string(&managed_input.list_path)
+                .with_context(|| format!("read list {:?}", managed_input.list_path))?;
+
+            let mut kept: Vec<&str> = Vec::new();
+            for line in raw.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                let rel = std::path::Path::new(line)
+                    .strip_prefix(&ws_dir)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| line.to_string());
+                let include = filters.is_empty() || filters.iter().any(|f| f == &rel);
+                if include {
+                    source_map.insert(rel, source_addr_str.clone());
+                    kept.push(line);
+                }
+            }
+
+            if !filters.is_empty() {
+                let new_content = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
+                fs::write(&managed_input.list_path, new_content)
+                    .with_context(|| format!("rewrite list {:?}", managed_input.list_path))?;
+            }
+        }
+
+        let source_map_json =
+            serde_json::to_string(&source_map).with_context(|| "serialize source_map")?;
+        fs::write(sandbox_pkg_dir.join("source_map.json"), source_map_json)
+            .with_context(|| "write source_map.json")?;
+
         let target = req.target;
         let hashin = req.hashin.clone();
-
-        let sandbox_pkg_dir = &ws_dir.join(req.target.addr.package.as_str());
-        fs::create_dir_all(sandbox_pkg_dir)
-            .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
 
         let mut res = self
             .driver
@@ -232,5 +269,216 @@ impl Driver for ManagedDriverBridge {
         Ok(RunResponse {
             artifacts: res.artifacts,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::driver::targetdef::{Output, TargetDef, path};
+    use crate::engine::driver::{
+        ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
+        ParseRequest, ParseResponse, RunInput, inputartifact, outputartifact,
+    };
+    use crate::hartifactcontent::Content;
+    use crate::hasync;
+    use crate::htaddr::Addr;
+    use crate::htpkg::PkgBuf;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    struct NoopManagedDriver;
+
+    #[async_trait]
+    impl ManagedDriver for NoopManagedDriver {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "noop".to_string(),
+            })
+        }
+        async fn parse(
+            &self,
+            _req: ParseRequest,
+            _ctoken: &(dyn hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            unimplemented!()
+        }
+        async fn apply_transitive(
+            &self,
+            _req: ApplyTransitiveRequest,
+            _ctoken: &(dyn hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            unimplemented!()
+        }
+        async fn run<'a>(
+            &self,
+            _req: ManagedRunRequest<'a>,
+            _ctoken: &(dyn hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+    }
+
+    fn make_raw_input(
+        origin_id: &str,
+        rel_path: &str,
+        source_addr: Addr,
+        filters: Vec<String>,
+    ) -> RunInput {
+        RunInput {
+            artifact: inputartifact::InputArtifact {
+                r#type: inputartifact::Type::Dep,
+                origin_id: origin_id.to_string(),
+                content: Arc::new(outputartifact::OutputArtifact {
+                    group: "".to_string(),
+                    name: rel_path.to_string(),
+                    r#type: outputartifact::Type::Output,
+                    content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                        data: b"content".to_vec(),
+                        path: rel_path.to_string(),
+                        x: false,
+                    }),
+                    hashout: "hash".to_string(),
+                }),
+            },
+            origin_id: origin_id.to_string(),
+            source_addr,
+            filters,
+        }
+    }
+
+    fn make_target_def(pkg: &str) -> TargetDef {
+        TargetDef {
+            addr: Addr {
+                package: PkgBuf::from(pkg),
+                name: "t".to_string(),
+                args: BTreeMap::new(),
+            },
+            labels: vec![],
+            raw_def: Arc::new(()),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: false,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        }
+    }
+
+    fn bridge() -> ManagedDriverBridge {
+        ManagedDriverBridge {
+            home: std::path::PathBuf::from("/tmp"),
+            driver: Box::new(NoopManagedDriver),
+        }
+    }
+
+    fn ctoken() -> hasync::StdCancellationToken {
+        hasync::StdCancellationToken::new()
+    }
+
+    #[tokio::test]
+    async fn source_map_written_for_all_inputs() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let src_addr = Addr {
+            package: PkgBuf::from("pkg"),
+            name: "gen".to_string(),
+            args: BTreeMap::new(),
+        };
+        let input = make_raw_input("dep0", "pkg/foo.go", src_addr, vec![]);
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![input],
+            hashin: &"hash".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+
+        let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
+        let content = fs::read_to_string(&map_path)?;
+        let map: HashMap<String, String> = serde_json::from_str(&content)?;
+        assert_eq!(map.get("pkg/foo.go").map(|s| s.as_str()), Some("//pkg:gen"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn filter_prunes_list_file() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let src_addr = Addr {
+            package: PkgBuf::from("pkg"),
+            name: "gen".to_string(),
+            args: BTreeMap::new(),
+        };
+        // Input has file pkg/foo.go but filter only allows pkg/bar.go
+        let input = make_raw_input(
+            "dep0",
+            "pkg/foo.go",
+            src_addr,
+            vec!["pkg/bar.go".to_string()],
+        );
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![input],
+            hashin: &"hash".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+
+        let list_path = sandbox.join("ws").join("input_dep0.list");
+        let list_content = fs::read_to_string(&list_path)?;
+        assert!(
+            list_content.is_empty(),
+            "filtered file must be excluded from list: {list_content}"
+        );
+
+        // source_map must also be empty since nothing passed the filter
+        let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
+        let map: HashMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
+        assert!(map.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_source_map_when_no_inputs() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![],
+            hashin: &"hash".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+
+        let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
+        let map: HashMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
+        assert!(map.is_empty());
+        Ok(())
     }
 }

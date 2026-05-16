@@ -75,6 +75,9 @@ impl ProviderExecutor for EngineProviderExecutor {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
                 for provider in &engine.providers {
+                    if rs.skip_providers.contains(&provider.name) {
+                        continue;
+                    }
                     // Collect list results eagerly (non-Send iterator dropped before next await)
                     let list_iter = provider
                         .provider
@@ -574,12 +577,13 @@ impl Engine {
         rs: &Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<TargetSpec>> {
-        let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
-            engine: rs.engine.clone(),
-            rs: rs.clone(),
-        });
-
         for provider in self.providers.iter() {
+            let provider_rs = rs.with_skip_provider(&provider.name);
+            let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
+                engine: rs.engine.clone(),
+                rs: provider_rs,
+            });
+
             let spec = match provider
                 .provider
                 .get(
@@ -609,8 +613,99 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::Config;
+    use crate::engine::provider::{
+        ConfigRequest, ConfigResponse, ListPackageResponse, ListPackagesRequest, ListResponse,
+        ProbeRequest, ProbeResponse,
+    };
+    use crate::hasync::Cancellable;
+    use crate::htmatcher::Matcher;
     use crate::htpkg::PkgBuf;
+    use futures::future::BoxFuture;
+    use std::sync::Arc as SArc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+
+    struct CountingProvider {
+        name: String,
+        list_calls: SArc<AtomicUsize>,
+    }
+
+    impl crate::engine::provider::Provider for CountingProvider {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: self.name.clone(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
+        {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+        }
+        fn get<'a>(
+            &'a self,
+            _req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            Box::pin(async { Err(GetError::NotFound) })
+        }
+        fn probe<'a>(
+            &'a self,
+            _req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_providers_excludes_provider_from_query() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let list_calls = SArc::new(AtomicUsize::new(0));
+        let list_calls_clone = SArc::clone(&list_calls);
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            parallelism: None,
+        })?;
+        engine.register_provider(move |_| {
+            Box::new(CountingProvider {
+                name: "test_provider".to_string(),
+                list_calls: SArc::clone(&list_calls_clone),
+            })
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+        let skipped_rs = rs.with_skip_provider("test_provider");
+
+        let executor = EngineProviderExecutor {
+            engine: SArc::downgrade(&engine),
+            rs: skipped_rs,
+        };
+
+        let _addrs = executor
+            .query(&Matcher::Package(PkgBuf::from("any")))
+            .await?;
+
+        assert_eq!(
+            list_calls.load(Ordering::SeqCst),
+            0,
+            "skipped provider must not be called during query"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_engine_result_not_found() -> anyhow::Result<()> {

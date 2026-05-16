@@ -101,6 +101,8 @@ impl Engine {
                         content: art,
                     },
                     origin_id: input.origin_id.clone(),
+                    source_addr: input.target.addr.clone(),
+                    filters: input.filters.clone(),
                 }).collect();
                 anyhow::Ok(run_inputs)
             })

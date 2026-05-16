@@ -27,7 +27,7 @@ use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use futures::future::{BoxFuture, try_join_all};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -54,6 +54,12 @@ pub struct Provider {
     go_bin_addr: String,
     /// Cache: golist addr → GoPackage. Memoizes the full executor.result + parse across requests.
     pkg_cache: Memoizer<String, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
+    /// Cache: golist addr → source_map.json contents.
+    #[expect(
+        clippy::type_complexity,
+        reason = "memoizer type mirrors pkg_cache pattern"
+    )]
+    source_map_cache: Memoizer<String, Result<Arc<HashMap<String, String>>, Arc<anyhow::Error>>>,
     /// Cache: stdlib import path → direct imports.
     stdlib_imports_cache: Memoizer<String, Result<Arc<Vec<String>>, Arc<anyhow::Error>>>,
 }
@@ -76,6 +82,7 @@ impl Provider {
             gocache,
             go_bin_addr: config.go_bin_addr,
             pkg_cache: Memoizer::new(),
+            source_map_cache: Memoizer::new(),
             stdlib_imports_cache: Memoizer::new(),
         })
     }
@@ -459,7 +466,11 @@ impl Provider {
                     ),
                     _ => {
                         let pkg_str = addr.package.as_str();
-                        let src_addrs: Vec<Addr> = pkg
+                        let source_map = self
+                            .read_golist_source_map(Arc::clone(&req.executor), &golist_addr)
+                            .await
+                            .map_err(GetError::Other)?;
+                        let src_addrs: Vec<String> = pkg
                             .go_files
                             .iter()
                             .map(|f| {
@@ -468,7 +479,25 @@ impl Provider {
                                 } else {
                                     format!("{}/{}", pkg_str, f)
                                 };
-                                pluginfs::file_addr(&rel)
+                                if let Some(src_target) = source_map.get(&rel) {
+                                    // File came from a codegen target; dep on that target
+                                    // with a filter so only this specific file is exposed.
+                                    use crate::engine::driver::TargetAddr;
+                                    use crate::htpkg::PkgBuf;
+                                    let src_ref = crate::htaddr::parse_addr_with_base(
+                                        src_target,
+                                        &PkgBuf::from(""),
+                                    )
+                                    .unwrap_or_else(|_| crate::htaddr::Addr::default());
+                                    TargetAddr {
+                                        r#ref: src_ref,
+                                        output: None,
+                                        filters: vec![rel],
+                                    }
+                                    .to_string()
+                                } else {
+                                    pluginfs::file_addr(&rel).format()
+                                }
                             })
                             .collect();
                         target_lib::build_spec(
@@ -876,6 +905,16 @@ impl Provider {
                     format!("{}/*.go", pkg)
                 };
                 let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
+                let pkg_str = addr.package.as_str().to_string();
+                let go_src_query_addr = Addr {
+                    package: crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+                    name: "q".to_string(),
+                    args: BTreeMap::from([
+                        ("label".to_string(), "go_src".to_string()),
+                        ("package".to_string(), pkg_str.clone()),
+                        ("tree_output_to".to_string(), pkg_str),
+                    ]),
+                };
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -885,6 +924,7 @@ impl Provider {
                     &self.goroot,
                     &go_mod_addr,
                     &go_src_glob_addr,
+                    Some(&go_src_query_addr),
                 )?
             }
             GoPackageKind::ThirdParty {
@@ -993,8 +1033,13 @@ impl Provider {
                 let result: EResult = executor.result(&golist_addr).await?;
                 let pkg = tokio::task::spawn_blocking(move || {
                     for artifact in &result.artifacts {
-                        if let Some(entry_result) = artifact.walk()?.next() {
+                        for entry_result in artifact.walk()? {
                             let entry = entry_result?;
+                            if entry.path.file_name().and_then(|n| n.to_str())
+                                != Some("package.json")
+                            {
+                                continue;
+                            }
                             let map = parse_go_list_reader(entry.data)?;
                             return map
                                 .into_values()
@@ -1007,6 +1052,41 @@ impl Provider {
                 .await
                 .map_err(|e| anyhow::anyhow!("read_golist_package task panicked: {e}"))??;
                 Ok(Arc::new(pkg))
+            })
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
+    async fn read_golist_source_map(
+        &self,
+        executor: Arc<dyn ProviderExecutor>,
+        golist_addr: &Addr,
+    ) -> anyhow::Result<Arc<HashMap<String, String>>> {
+        let key = golist_addr.format();
+        let golist_addr = golist_addr.clone();
+
+        self.source_map_cache
+            .once(key, move || async move {
+                let result: EResult = executor.result(&golist_addr).await?;
+                let map = tokio::task::spawn_blocking(move || {
+                    for artifact in &result.artifacts {
+                        for entry_result in artifact.walk()? {
+                            let entry = entry_result?;
+                            if entry.path.file_name().and_then(|n| n.to_str())
+                                != Some("source_map.json")
+                            {
+                                continue;
+                            }
+                            let m: HashMap<String, String> = serde_json::from_reader(entry.data)
+                                .with_context(|| "parse source_map.json")?;
+                            return Ok::<HashMap<String, String>, anyhow::Error>(m);
+                        }
+                    }
+                    Ok(HashMap::new())
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("read_golist_source_map task panicked: {e}"))??;
+                Ok(Arc::new(map))
             })
             .await
             .map_err(unwrap_arc_err)
@@ -1289,6 +1369,8 @@ mod tests {
 
     struct GoListTestExecutor {
         workspace_root: PathBuf,
+        /// If non-empty, returned as a second artifact with `source_map.json` walk path.
+        source_map: HashMap<String, String>,
     }
 
     struct StringContent(String);
@@ -1309,6 +1391,25 @@ mod tests {
 
         fn hashout(&self) -> anyhow::Result<String> {
             Ok("test_hashout".to_string())
+        }
+    }
+
+    struct SourceMapContent(String);
+
+    impl Content for SourceMapContent {
+        fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
+            Ok(Box::new(io::Cursor::new(self.0.as_bytes().to_vec())))
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            let entry = WalkEntry {
+                path: PathBuf::from("source_map.json"),
+                data: Box::new(io::Cursor::new(self.0.as_bytes().to_vec())),
+                x: false,
+            };
+            Ok(Box::new(std::iter::once(Ok(entry))))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok("test_hashout_sm".to_string())
         }
     }
 
@@ -1358,11 +1459,22 @@ mod tests {
                 })?;
                 let json = serde_json::to_string(&pkg).context("serialize package")?;
 
+                let mut artifacts: Vec<Arc<dyn Content>> =
+                    vec![Arc::new(StringContent(json)) as Arc<dyn Content>];
+                if !self.source_map.is_empty() {
+                    let sm_json =
+                        serde_json::to_string(&self.source_map).context("serialize source_map")?;
+                    artifacts.push(Arc::new(SourceMapContent(sm_json)) as Arc<dyn Content>);
+                }
+
                 Ok(EResult {
-                    artifacts: vec![Arc::new(StringContent(json)) as Arc<dyn Content>],
-                    artifacts_meta: vec![ArtifactMeta {
-                        hashout: "test_hashout".to_string(),
-                    }],
+                    artifacts_meta: artifacts
+                        .iter()
+                        .map(|_| ArtifactMeta {
+                            hashout: "test_hashout".to_string(),
+                        })
+                        .collect(),
+                    artifacts,
                 })
             })
         }
@@ -1378,6 +1490,7 @@ mod tests {
     fn test_executor(workspace_root: &std::path::Path) -> Arc<dyn ProviderExecutor> {
         Arc::new(GoListTestExecutor {
             workspace_root: workspace_root.to_path_buf(),
+            source_map: HashMap::new(),
         })
     }
 
@@ -1471,6 +1584,7 @@ mod tests {
             states: vec![],
             executor: Arc::new(GoListTestExecutor {
                 workspace_root: sandbox.path().to_path_buf(),
+                source_map: HashMap::new(),
             }),
         };
         let resp = p.get(req, &ctoken).await.unwrap();

@@ -399,10 +399,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
             let entry = env.entry(src_key).or_default();
 
             for input in inputs {
-                for m in req
+                if let Some(m) = req
                     .inputs
                     .iter()
-                    .filter(|m| m.input.origin_id == input.origin_id)
+                    .find(|m| m.input.origin_id == input.origin_id)
                 {
                     let managed_list_f =
                         std::fs::File::open(&m.list_path).with_context(|| "open dep list file")?;
@@ -983,6 +983,8 @@ mod tests {
                     }),
                 },
                 origin_id: origin_id.to_string(),
+                source_addr: crate::htaddr::Addr::default(),
+                filters: vec![],
             },
             list_path,
         })

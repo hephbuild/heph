@@ -8,7 +8,7 @@ use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
 use daggy::petgraph::graph::NodeIndex;
 use daggy::{Dag, WouldCycle};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 
@@ -64,6 +64,8 @@ pub struct RequestState {
     pub data: Arc<RequestStateData>,
     /// The target that triggered this invocation, used for cycle detection in result_addr.
     pub parent: Option<Addr>,
+    /// Provider names excluded from query iteration for this request subtree.
+    pub skip_providers: Arc<HashSet<String>>,
 }
 
 impl RequestState {
@@ -75,6 +77,21 @@ impl RequestState {
             ctoken: self.ctoken.clone(),
             data: Arc::clone(&self.data),
             parent: Some(parent),
+            skip_providers: Arc::clone(&self.skip_providers),
+        })
+    }
+
+    /// Returns a child RequestState with the given provider name added to skip_providers.
+    pub fn with_skip_provider(&self, name: &str) -> Arc<RequestState> {
+        let mut set = (*self.skip_providers).clone();
+        set.insert(name.to_string());
+        Arc::new(RequestState {
+            engine: self.engine.clone(),
+            request_id: self.request_id.clone(),
+            ctoken: self.ctoken.clone(),
+            data: Arc::clone(&self.data),
+            parent: self.parent.clone(),
+            skip_providers: Arc::new(set),
         })
     }
 }
@@ -111,6 +128,7 @@ impl Engine {
                 mem_def: Memoizer::new(),
             }),
             parent: None,
+            skip_providers: Arc::new(HashSet::new()),
         });
 
         if let Ok(mut requests) = self.requests.lock() {

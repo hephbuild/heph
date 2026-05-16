@@ -10,6 +10,8 @@ use std::path::PathBuf;
 pub struct TargetAddr {
     pub r#ref: Addr,
     pub output: Option<String>,
+    /// If non-empty, only files matching these paths are exposed from the dep's outputs.
+    pub filters: Vec<String>,
 }
 
 impl Serialize for TargetAddr {
@@ -34,27 +36,116 @@ impl<'de> Deserialize<'de> for TargetAddr {
 impl Display for TargetAddr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(output) = &self.output {
-            write!(f, "{}|{}", self.r#ref, output)
+            write!(f, "{}|{}", self.r#ref, output)?;
         } else {
-            write!(f, "{}", self.r#ref)
+            write!(f, "{}", self.r#ref)?;
         }
+        if !self.filters.is_empty() {
+            write!(f, "[{}]", self.filters.join(","))?;
+        }
+        Ok(())
     }
 }
 
 impl TargetAddr {
     pub fn parse(v: &str, base: &PkgBuf) -> anyhow::Result<Self> {
+        // Strip optional trailing [filter1,filter2] suffix.
+        // bracket is a byte offset from rfind; '[' is ASCII so split_at is always on a char boundary.
+        let (v, filters) = if let Some(bracket) = v.rfind('[') {
+            let (addr_part, bracket_part) = v.split_at(bracket);
+            let rest = bracket_part
+                .strip_prefix('[')
+                .expect("split_at(rfind('[')) guarantees '['");
+            let rest = rest
+                .strip_suffix(']')
+                .ok_or_else(|| anyhow::anyhow!("unclosed '[' in target addr: {v}"))?;
+            let filters = if rest.is_empty() {
+                vec![]
+            } else {
+                rest.split(',').map(|s| s.to_string()).collect()
+            };
+            (addr_part, filters)
+        } else {
+            (v, vec![])
+        };
+
         let parts: Vec<&str> = v.split('|').collect();
         match parts[..] {
             [v] => Ok(TargetAddr {
                 r#ref: htaddr::parse_addr_with_base(v, base)?,
                 output: None,
+                filters,
             }),
             [addr, out] => Ok(TargetAddr {
                 r#ref: htaddr::parse_addr_with_base(addr, base)?,
                 output: Some(out.parse()?),
+                filters,
             }),
             _ => anyhow::bail!("invalid address"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::htpkg::PkgBuf;
+
+    fn base() -> PkgBuf {
+        PkgBuf::from("")
+    }
+
+    #[test]
+    fn parse_no_output_no_filters() {
+        let t = TargetAddr::parse("//foo/bar:baz", &base()).unwrap();
+        assert_eq!(t.r#ref.package.as_str(), "foo/bar");
+        assert_eq!(t.r#ref.name, "baz");
+        assert!(t.output.is_none());
+        assert!(t.filters.is_empty());
+    }
+
+    #[test]
+    fn parse_with_output_no_filters() {
+        let t = TargetAddr::parse("//foo:bar|out", &base()).unwrap();
+        assert_eq!(t.output.as_deref(), Some("out"));
+        assert!(t.filters.is_empty());
+    }
+
+    #[test]
+    fn parse_with_filters_no_output() {
+        let t = TargetAddr::parse("//foo:bar[a.go,b.go]", &base()).unwrap();
+        assert!(t.output.is_none());
+        assert_eq!(t.filters, vec!["a.go", "b.go"]);
+    }
+
+    #[test]
+    fn parse_with_output_and_filters() {
+        let t = TargetAddr::parse("//foo:bar|src[pkg/a.go]", &base()).unwrap();
+        assert_eq!(t.output.as_deref(), Some("src"));
+        assert_eq!(t.filters, vec!["pkg/a.go"]);
+    }
+
+    #[test]
+    fn parse_empty_filters() {
+        let t = TargetAddr::parse("//foo:bar[]", &base()).unwrap();
+        assert!(t.filters.is_empty());
+    }
+
+    #[test]
+    fn parse_unclosed_bracket_errors() {
+        assert!(TargetAddr::parse("//foo:bar[a.go", &base()).is_err());
+    }
+
+    #[test]
+    fn display_roundtrip_with_filters() {
+        let t = TargetAddr::parse("//foo:bar[a.go,b.go]", &base()).unwrap();
+        assert_eq!(t.to_string(), "//foo:bar[a.go,b.go]");
+    }
+
+    #[test]
+    fn display_roundtrip_output_and_filters() {
+        let t = TargetAddr::parse("//foo:bar|src[pkg/a.go]", &base()).unwrap();
+        assert_eq!(t.to_string(), "//foo:bar|src[pkg/a.go]");
     }
 }
 
@@ -277,6 +368,10 @@ pub mod inputartifact {
 pub struct RunInput {
     pub artifact: inputartifact::InputArtifact,
     pub origin_id: String,
+    /// The target that produced this artifact, used for source map generation.
+    pub source_addr: Addr,
+    /// If non-empty, only these file paths are exposed from this input's unpacked artifacts.
+    pub filters: Vec<String>,
 }
 
 pub mod outputartifact {

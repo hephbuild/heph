@@ -2,7 +2,7 @@
 
 let
   binLocation = "$HOME/.local/bin/rheph";
-  qualityCrates = "-p rheph -p e2e";
+  qualityCrates = "-p rheph -p e2e -p rheph-testkit -p plugingo-e2e";
 in
 {
   # https://devenv.sh/basics/

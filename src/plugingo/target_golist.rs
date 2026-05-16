@@ -19,7 +19,12 @@ pub fn build_spec_firstparty(
     goroot: &str,
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
+    go_src_query_addr: Option<&Addr>,
 ) -> anyhow::Result<TargetSpec> {
+    let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
+    if let Some(q) = go_src_query_addr {
+        srcfiles.push(q.format());
+    }
     build_spec_inner(
         addr,
         import_path,
@@ -27,7 +32,10 @@ pub fn build_spec_firstparty(
         factors,
         go_bin_addr,
         goroot,
-        &[("modfiles", go_mod_addr), ("srcfiles", go_src_addr)],
+        &[
+            ("modfiles", &[go_mod_addr.format()][..]),
+            ("srcfiles", &srcfiles),
+        ],
     )
 }
 
@@ -47,7 +55,7 @@ pub fn build_spec_thirdparty(
         factors,
         go_bin_addr,
         goroot,
-        &[("modfiles", go_mod_addr)],
+        &[("modfiles", &[go_mod_addr.format()][..])],
     )
 }
 
@@ -58,7 +66,7 @@ fn build_spec_inner(
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
-    extra_deps: &[(&str, &Addr)],
+    extra_deps: &[(&str, &[String])],
 ) -> anyhow::Result<TargetSpec> {
     let module_root_str = module_root
         .to_str()
@@ -102,10 +110,15 @@ fn build_spec_inner(
         "go_bin".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
     )]);
-    for (group, dep_addr) in extra_deps {
+    for (group, dep_addrs) in extra_deps {
         deps.insert(
             group.to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(dep_addr.format())]),
+            TargetSpecValue::List(
+                dep_addrs
+                    .iter()
+                    .map(|a| TargetSpecValue::String(a.clone()))
+                    .collect(),
+            ),
         );
     }
 
@@ -114,10 +127,16 @@ fn build_spec_inner(
     config.insert("deps".to_string(), TargetSpecValue::Map(deps));
     config.insert(
         "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "json".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("package.json".to_string())]),
-        )])),
+        TargetSpecValue::Map(HashMap::from([
+            (
+                "json".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("package.json".to_string())]),
+            ),
+            (
+                "source_map".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("source_map.json".to_string())]),
+            ),
+        ])),
     );
     config.insert("runtime_env".to_string(), TargetSpecValue::Map(runtime_env));
     config.insert(
@@ -206,6 +225,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         assert_eq!(spec.driver, "bash");
@@ -223,6 +243,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
@@ -244,6 +265,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
@@ -274,6 +296,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -295,6 +318,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -356,6 +380,7 @@ mod tests {
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
+            None,
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {

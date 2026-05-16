@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["gen/proto", "e2e"]
+members = ["gen/proto", "e2e", "testkit", "plugingo-e2e"]
 
 [profile.profiling]
 inherits = "release"

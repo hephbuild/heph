@@ -51,7 +51,7 @@ impl Engine {
                 .unwrap_or(1)
         });
 
-        Ok(Engine {
+        let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
             local_cache: Arc::new(LocalCacheSQLite::new(home.join("cache").join("cache.db"))?),
@@ -61,7 +61,10 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
             result_semaphore: Arc::new(Semaphore::new(2 * parallelism)),
-        })
+        };
+        engine.register_driver(Box::new(crate::plugingroup::Driver))?;
+        engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
+        Ok(engine)
     }
 
     pub fn register_managed_driver(

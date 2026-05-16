@@ -11,6 +11,7 @@ pub struct LinkedTargetDefInput {
     pub target: TargetDef,
     pub output_names: Vec<String>,
     pub origin_id: String,
+    pub filters: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -68,6 +69,7 @@ impl Engine {
                     target: input_def,
                     output_names,
                     origin_id: input.origin_id.clone(),
+                    filters: input.r#ref.filters.clone(),
                 })
             })
         });

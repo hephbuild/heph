@@ -120,7 +120,6 @@ impl EProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::provider::TargetSpec;
     use crate::engine::{Config, Engine};
     use crate::htaddr::parse_addr;
     use crate::pluginstatictarget;
@@ -146,8 +145,6 @@ mod tests {
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;
-        engine.register_driver(Box::new(crate::plugingroup::Driver))?;
-        engine.register_provider(|_| Box::new(Provider))?;
         Ok(Arc::new(engine))
     }
 

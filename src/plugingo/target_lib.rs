@@ -16,7 +16,7 @@ pub fn build_spec(
     package_name: &str,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
-    src_addrs: &[Addr],
+    src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
@@ -49,7 +49,7 @@ pub fn build_spec(
         TargetSpecValue::List(
             src_addrs
                 .iter()
-                .map(|a| TargetSpecValue::String(a.format()))
+                .map(|s| TargetSpecValue::String(s.clone()))
                 .collect(),
         ),
     );
@@ -140,10 +140,10 @@ mod tests {
         }
     }
 
-    fn src_addrs() -> Vec<Addr> {
+    fn src_addrs() -> Vec<String> {
         vec![
-            pluginfs::file_addr("mylib/foo.go"),
-            pluginfs::file_addr("mylib/bar.go"),
+            pluginfs::file_addr("mylib/foo.go").format(),
+            pluginfs::file_addr("mylib/bar.go").format(),
         ]
     }
 
@@ -221,7 +221,7 @@ mod tests {
         );
         for (entry, addr) in src_entry.iter().zip(addrs.iter()) {
             assert!(
-                matches!(entry, TargetSpecValue::String(s) if s == &addr.format()),
+                matches!(entry, TargetSpecValue::String(s) if s == addr),
                 "dep entry must match pluginfs addr: {:?}",
                 entry
             );
