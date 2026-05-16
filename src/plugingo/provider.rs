@@ -1918,35 +1918,17 @@ mod tests {
     // ---- integration test helpers ----
 
     fn build_test_engine(workspace: &std::path::Path) -> Arc<crate::engine::Engine> {
-        let goroot = std::process::Command::new("go")
-            .args(["env", "GOROOT"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .expect("go env GOROOT must succeed");
-        let go_bin_path = format!("{}/bin/go", goroot);
-
         let mut e = crate::engine::Engine::new(crate::engine::Config {
             root: workspace.to_path_buf(),
             parallelism: None,
         })
         .unwrap();
 
-        e.register_provider(|_| {
-            Box::new(
-                crate::pluginstatictarget::Provider::new(vec![crate::pluginstatictarget::Target {
-                    addr: "//@heph/bin:go".to_string(),
-                    driver: "bash".to_string(),
-                    run: Some(format!("cp -p \"{}\" go", go_bin_path)),
-                    out: Some("go".to_string()),
-                    deps: Default::default(),
-                    labels: vec![],
-                }])
-                .unwrap(),
-            )
-        })
-        .unwrap();
+        e.register_provider(|_| Box::new(crate::pluginhostbin::Provider))
+            .unwrap();
+
+        e.register_managed_driver(Box::new(crate::pluginhostbin::Driver))
+            .unwrap();
 
         e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))
             .unwrap();
