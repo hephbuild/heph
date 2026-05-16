@@ -66,7 +66,7 @@ impl ProviderExecutor for EngineProviderExecutor {
             let rs = self.rs.clone();
 
             // Collect packages eagerly (non-Send iterator dropped before first await)
-            let pkg_iter = engine.packages(m, rs.ctoken()).await?;
+            let pkg_iter = engine.packages(m, &rs).await?;
             let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
             let mut result = Vec::new();

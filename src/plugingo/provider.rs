@@ -26,6 +26,7 @@ use crate::plugingo::target_modfiles;
 use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
+use anyhow::Context;
 use futures::future::{BoxFuture, try_join_all};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -337,8 +338,14 @@ impl ProviderTrait for Provider {
                     as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>);
             }
 
-            let mut packages: Vec<anyhow::Result<ListPackageResponse>> = Vec::new();
-            collect_go_packages(&search_dir, &self.workspace_root, &mut packages);
+            let workspace_root = self.workspace_root.clone();
+            let packages = tokio::task::spawn_blocking(move || {
+                let mut packages = Vec::new();
+                collect_go_packages(&search_dir, &workspace_root, &mut packages);
+                packages
+            })
+            .await
+            .context("collect_go_packages panicked")?;
 
             Ok(Box::new(packages.into_iter())
                 as Box<
@@ -1314,7 +1321,6 @@ impl Provider {
 }
 
 use crate::engine::provider::{ProbeRequest, ProbeResponse};
-use anyhow::Context;
 
 #[cfg(test)]
 mod tests {

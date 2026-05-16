@@ -16,7 +16,7 @@ impl Engine {
         m: &'a htmatcher::Matcher,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         async_stream::try_stream! {
-            for pkg_result in self.packages(m, rs.ctoken()).await? {
+            for pkg_result in self.packages(m, &rs).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
                 for provider in &self.providers {

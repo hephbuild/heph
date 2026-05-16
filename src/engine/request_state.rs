@@ -57,6 +57,7 @@ pub struct RequestStateData {
     pub mem_meta: Memoizer<String, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<String, Result<Arc<TargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<String, Result<Arc<ExtendedTargetDef>, ArcErr>>,
+    pub mem_packages: Memoizer<String, Result<Arc<Vec<String>>, ArcErr>>,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -122,6 +123,7 @@ impl Engine {
             mem_meta: Memoizer::new(),
             mem_spec: Memoizer::new(),
             mem_def: Memoizer::new(),
+            mem_packages: Memoizer::new(),
         });
 
         let state = Arc::new(RequestState {

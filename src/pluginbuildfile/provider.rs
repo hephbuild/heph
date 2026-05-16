@@ -7,6 +7,7 @@ use crate::engine::provider::{
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use anyhow::Context;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,56 +30,60 @@ impl Default for Provider {
     }
 }
 
-impl Provider {
-    fn find_packages(
-        &self,
-        path: &std::path::Path,
-        packages: &mut std::collections::HashSet<String>,
-    ) -> anyhow::Result<()> {
-        let mut has_build_file = false;
-        for entry in std::fs::read_dir(path)? {
-            let entry = entry?;
-            if entry
-                .file_name()
-                .to_str()
-                .unwrap_or("")
-                .starts_with(".heph")
-            {
-                // TODO: fix it better
-                continue;
-            }
+fn find_packages_sync(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    patterns: &[String],
+    packages: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let mut has_build_file = false;
+    for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .unwrap_or("")
+            .starts_with(".heph")
+        {
+            // TODO: fix it better
+            continue;
+        }
 
-            let entry_path = entry.path();
-            if entry_path.is_file()
-                && entry_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| self.build_file_patterns.iter().any(|p| p == n))
-                    .unwrap_or(false)
+        let Ok(ft) = entry.file_type() else { continue };
+        let entry_path = entry.path();
+
+        if ft.is_file() {
+            if entry_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| patterns.iter().any(|p| p == n))
+                .unwrap_or(false)
             {
                 has_build_file = true;
-            } else if entry_path.is_dir() {
-                self.find_packages(&entry_path, packages)?;
             }
+        } else if ft.is_dir() {
+            find_packages_sync(&entry_path, root, patterns, packages)?;
         }
-
-        if has_build_file {
-            let mut current = path;
-            while let Ok(rel) = current.strip_prefix(&self.root) {
-                let pkg_name = rel.to_string_lossy().to_string();
-                packages.insert(pkg_name);
-
-                if let Some(parent) = current.parent() {
-                    current = parent;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        Ok(())
     }
+
+    if has_build_file {
+        let mut current = path;
+        while let Ok(rel) = current.strip_prefix(root) {
+            let pkg_name = rel.to_string_lossy().to_string();
+            packages.insert(pkg_name);
+
+            if let Some(parent) = current.parent() {
+                current = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
+
+impl Provider {}
 
 impl EProvider for Provider {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
@@ -121,9 +126,16 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
     {
         Box::pin(async move {
-            let mut packages = std::collections::HashSet::new();
+            let root = self.root.clone();
+            let patterns = self.build_file_patterns.clone();
 
-            self.find_packages(&self.root, &mut packages)?;
+            let packages = tokio::task::spawn_blocking(move || {
+                let mut packages = std::collections::HashSet::new();
+                find_packages_sync(&root, &root, &patterns, &mut packages)?;
+                Ok::<_, anyhow::Error>(packages)
+            })
+            .await
+            .context("find_packages panicked")??;
 
             let items: Vec<anyhow::Result<ListPackageResponse>> = packages
                 .into_iter()

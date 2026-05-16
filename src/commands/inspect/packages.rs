@@ -11,14 +11,14 @@ pub struct Args {
 #[tokio::main]
 pub async fn execute(args: &Args) -> anyhow::Result<()> {
     let e = bootstrap::new_engine()?;
+    let rs = e.new_state();
 
     let m = match &args.matcher {
         Some(s) => htmatcher::parse(s.as_str())?,
         None => htmatcher::Matcher::PackagePrefix(PkgBuf::from("")),
     };
 
-    let ctoken = crate::hasync::StdCancellationToken::new();
-    let it = e.packages(&m, &ctoken).await?;
+    let it = e.packages(&m, &rs).await?;
     for res in it {
         let p = res?;
         println!("{}", p);
