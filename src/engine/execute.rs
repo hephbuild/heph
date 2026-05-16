@@ -68,7 +68,7 @@ impl Engine {
             .driver
             .run(
                 RunRequest {
-                    request_id: &rs.request_id,
+                    request_id: rs.request_id(),
                     target: &def.target,
                     tree_root_path: self.cfg.root.clone(),
                     inputs: deps_result,
@@ -78,7 +78,7 @@ impl Engine {
                     stderr: None,
                     sandbox_dir: sandbox_dir.clone(),
                 },
-                &rs.ctoken,
+                rs.ctoken(),
             )
             .await
             .with_context(|| "run")?;

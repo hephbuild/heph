@@ -66,7 +66,7 @@ impl ProviderExecutor for EngineProviderExecutor {
             let rs = self.rs.clone();
 
             // Collect packages eagerly (non-Send iterator dropped before first await)
-            let pkg_iter = engine.packages(m, &rs.ctoken).await?;
+            let pkg_iter = engine.packages(m, rs.ctoken()).await?;
             let pkgs: Vec<String> = pkg_iter.collect::<anyhow::Result<_>>()?;
 
             let mut result = Vec::new();
@@ -83,10 +83,10 @@ impl ProviderExecutor for EngineProviderExecutor {
                         .provider
                         .list(
                             ListRequest {
-                                request_id: rs.request_id.clone(),
+                                request_id: rs.request_id().to_string(),
                                 package: pkg.clone(),
                             },
-                            &rs.ctoken,
+                            rs.ctoken(),
                         )
                         .await?;
                     let raw: Vec<_> = list_iter.collect::<anyhow::Result<_>>()?;
@@ -101,7 +101,10 @@ impl ProviderExecutor for EngineProviderExecutor {
                             MatchResult::MatchYes => result.push(addr),
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
-                                let spec = match engine.get_spec(rs.clone(), &addr).await {
+                                let spec = match Arc::clone(&engine)
+                                    .get_spec(rs.clone(), &addr)
+                                    .await
+                                {
                                     Ok(spec) => Ok(spec),
                                     Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => {
                                         continue;
@@ -113,7 +116,8 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     MatchResult::MatchYes => result.push(addr),
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def = engine.get_def(rs.clone(), &addr).await?;
+                                        let def =
+                                            Arc::clone(&engine).get_def(rs.clone(), &addr).await?;
                                         if m.matches(&def.target_def) == MatchResult::MatchYes {
                                             result.push(addr);
                                         }
@@ -211,7 +215,7 @@ impl Engine {
         // Handled before the memoizer: nothing to deduplicate for groups, and calling
         // result_addr recursively here is safe because #[async_recursion] boxes the future,
         // breaking the Send inference cycle that would occur inside the memoizer closure.
-        let def = self.get_def(rs.clone(), addr).await?;
+        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
         if def.target_def.transparent {
             let opts = *opts;
             let futures: Vec<_> = def
@@ -254,7 +258,7 @@ impl Engine {
         let mut set = JoinSet::new();
         let opts = *opts;
 
-        let stream = self.query(rs.clone(), matcher);
+        let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
             set.spawn(enclose!((self => engine, rs) async move {
@@ -277,8 +281,8 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
-        let spec = self.get_spec(rs.clone(), addr).await?;
-        let def = self.get_def(rs.clone(), addr).await?;
+        let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
+        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
 
         let def = self
             .clone()
@@ -387,7 +391,7 @@ impl Engine {
                     }
 
                     engine
-                        .cache_locally(&rs.ctoken, &addr, &hashin, artifacts, use_tmp_cache)
+                        .cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache)
                         .await
                         .map(|cached| (cached, artifacts_meta))
                 }),
@@ -404,7 +408,7 @@ impl Engine {
         outputs: Vec<String>,
     ) -> anyhow::Result<Option<EResult>> {
         let (cached_artifacts, artifacts_meta) = match self
-            .artifacts_from_local_cache(&rs.ctoken, def, opts.hashin.as_str(), outputs)
+            .artifacts_from_local_cache(rs.ctoken(), def, opts.hashin.as_str(), outputs)
             .await?
         {
             Some(res) => res,
@@ -422,7 +426,7 @@ impl Engine {
 
     #[async_recursion]
     pub async fn get_def(
-        &self,
+        self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
@@ -431,11 +435,7 @@ impl Engine {
             .mem_def
             .once(
                 key,
-                enclose!((rs, addr) move || async move {
-                    let engine = rs
-                        .engine
-                        .upgrade()
-                        .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+                enclose!((self => engine, rs, addr) move || async move {
                     engine.get_def_inner(rs, &addr).await
                 }),
             )
@@ -444,11 +444,11 @@ impl Engine {
     }
 
     async fn get_def_inner(
-        &self,
+        self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        let spec = self.get_spec(rs.clone(), addr).await?;
+        let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
@@ -459,16 +459,16 @@ impl Engine {
             .driver
             .parse(
                 ParseRequest {
-                    request_id: rs.request_id.clone(),
+                    request_id: rs.request_id().to_string(),
                     target_spec: (*spec).clone(),
                 },
-                &rs.ctoken,
+                rs.ctoken(),
             )
             .await
             .with_context(|| "parse")?;
         let def = res.target_def;
 
-        let all_transitive = self
+        let all_transitive = Arc::clone(&self)
             .collect_transitive_deps(rs.clone(), &def.inputs)
             .await?;
 
@@ -479,11 +479,11 @@ impl Engine {
                 .driver
                 .apply_transitive(
                     ApplyTransitiveRequest {
-                        request_id: rs.request_id.clone(),
+                        request_id: rs.request_id().to_string(),
                         target_def: def,
                         sandbox: all_transitive.clone(),
                     },
-                    &rs.ctoken,
+                    rs.ctoken(),
                 )
                 .await
                 .with_context(|| "apply transitive")?;
@@ -502,17 +502,17 @@ impl Engine {
     }
 
     async fn collect_transitive_deps(
-        &self,
+        self: Arc<Self>,
         rs: Arc<RequestState>,
         inputs: &[Input],
     ) -> anyhow::Result<Sandbox> {
         let mut sb = Sandbox::default();
 
         for (i, input) in inputs.iter().enumerate() {
-            let spec = self
+            let spec = Arc::clone(&self)
                 .get_spec(rs.clone(), &input.r#ref.r#ref)
                 .await
-                .with_context(|| format!("get spec: {:?}", input.r#ref))?;
+                .with_context(|| format!("get spec: {}", input.r#ref))?;
 
             // For transparent targets (groups), use the pre-computed applied_transitive
             // which already recursively aggregates all nested deps' transitives.
@@ -521,7 +521,7 @@ impl Engine {
             // calls collect_transitive_deps which would re-enter the mem_def memoizer
             // and deadlock on cyclic dep graphs.
             let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
-                let dep_def = self
+                let dep_def = Arc::clone(&self)
                     .get_def(rs.clone(), &input.r#ref.r#ref)
                     .await
                     .with_context(|| format!("get def for group: {:?}", input.r#ref))?;
@@ -543,7 +543,7 @@ impl Engine {
     }
 
     pub async fn get_spec(
-        &self,
+        self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<TargetSpec>> {
@@ -552,11 +552,7 @@ impl Engine {
             .mem_spec
             .once(
                 key,
-                enclose!((rs, addr) move || async move {
-                    let engine = rs
-                        .engine
-                        .upgrade()
-                        .ok_or_else(|| anyhow::anyhow!("engine dropped"))?;
+                enclose!((self => engine, rs, addr) move || async move {
                     engine.get_spec_inner(&rs, &addr).await
                 }),
             )
@@ -573,14 +569,14 @@ impl Engine {
     }
 
     async fn get_spec_inner(
-        &self,
+        self: Arc<Self>,
         rs: &Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<TargetSpec>> {
         for provider in self.providers.iter() {
             let provider_rs = rs.with_skip_provider(&provider.name);
             let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
-                engine: rs.engine.clone(),
+                engine: Arc::downgrade(&self),
                 rs: provider_rs,
             });
 
@@ -588,12 +584,12 @@ impl Engine {
                 .provider
                 .get(
                     GetRequest {
-                        request_id: rs.request_id.clone(),
+                        request_id: rs.request_id().to_string(),
                         addr: addr.clone(),
                         states: vec![], // TODO
                         executor: Arc::clone(&executor),
                     },
-                    &rs.ctoken,
+                    rs.ctoken(),
                 )
                 .await
             {

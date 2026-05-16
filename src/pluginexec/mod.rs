@@ -13,7 +13,6 @@ use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use anyhow::Context;
 use async_trait::async_trait;
-use itertools::Itertools;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Write};

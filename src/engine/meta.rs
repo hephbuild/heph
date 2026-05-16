@@ -45,7 +45,7 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
-        let def = self.get_def(rs.clone(), addr).await?;
+        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
         let results = self
             .clone()
             .inputs_result_meta(rs.clone(), &def.target_def.inputs)

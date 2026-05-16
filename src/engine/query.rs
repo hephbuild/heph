@@ -11,19 +11,19 @@ use std::sync::Arc;
 
 impl Engine {
     pub fn query<'a>(
-        &'a self,
+        self: Arc<Self>,
         rs: Arc<RequestState>,
         m: &'a htmatcher::Matcher,
     ) -> impl Stream<Item = anyhow::Result<Addr>> + 'a {
         async_stream::try_stream! {
-            for pkg_result in self.packages(m, &rs.ctoken).await? {
+            for pkg_result in self.packages(m, rs.ctoken()).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
                 for provider in &self.providers {
                     let it = provider.provider.list(ListRequest {
-                        request_id: rs.request_id.clone(),
+                        request_id: rs.request_id().to_string(),
                         package: pkg.clone(),
-                    }, &rs.ctoken).await?;
+                    }, rs.ctoken()).await?;
 
                     for item in it {
                         let addr = item?.addr;
@@ -36,7 +36,7 @@ impl Engine {
                             MatchResult::MatchYes => yield addr,
                             MatchResult::MatchNo => {}
                             MatchResult::MatchShrug => {
-                                let spec = match self.get_spec(rs.clone(), &addr).await {
+                                let spec = match Arc::clone(&self).get_spec(rs.clone(), &addr).await {
                                     Ok(spec) => Ok(spec),
                                     Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => continue,
                                     res => res,
@@ -46,7 +46,7 @@ impl Engine {
                                     MatchResult::MatchYes => yield addr,
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def = self.get_def(rs.clone(), &addr).await?;
+                                        let def = Arc::clone(&self).get_def(rs.clone(), &addr).await?;
 
                                         if m.matches(&def.target_def) == MatchResult::MatchYes {
                                             yield addr;

@@ -23,7 +23,9 @@ impl Engine {
         if parent_override.is_none() {
             let mut has_transparent = false;
             for input in &inputs {
-                let def = self.get_def(rs.clone(), &input.r#ref.r#ref).await?;
+                let def = Arc::clone(&self)
+                    .get_def(rs.clone(), &input.r#ref.r#ref)
+                    .await?;
                 if def.target_def.transparent {
                     has_transparent = true;
                     break;
@@ -37,7 +39,9 @@ impl Engine {
         let mut result = Vec::with_capacity(inputs.len());
 
         for input in inputs {
-            let def = self.get_def(rs.clone(), &input.r#ref.r#ref).await?;
+            let def = Arc::clone(&self)
+                .get_def(rs.clone(), &input.r#ref.r#ref)
+                .await?;
 
             if def.target_def.transparent {
                 let addr_str = input.r#ref.r#ref.format();

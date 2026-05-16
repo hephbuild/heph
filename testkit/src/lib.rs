@@ -113,7 +113,7 @@ impl Workspace {
     pub async fn get_spec(&self, addr_str: &str) -> anyhow::Result<Arc<TargetSpec>> {
         let addr = parse_addr(addr_str)?;
         let rs = self.engine.new_state();
-        self.engine.get_spec(rs, &addr).await
+        self.engine.clone().get_spec(rs, &addr).await
     }
 }
 

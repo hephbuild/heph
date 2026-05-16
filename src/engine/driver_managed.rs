@@ -274,12 +274,11 @@ impl Driver for ManagedDriverBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::driver::targetdef::{Output, TargetDef, path};
+    use crate::engine::driver::targetdef::TargetDef;
     use crate::engine::driver::{
         ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse,
         ParseRequest, ParseResponse, RunInput, inputartifact, outputartifact,
     };
-    use crate::hartifactcontent::Content;
     use crate::hasync;
     use crate::htaddr::Addr;
     use crate::htpkg::PkgBuf;

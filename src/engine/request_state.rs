@@ -48,6 +48,9 @@ impl DepDag {
 
 /// Shared mutable state for a request — common across all child RequestStates.
 pub struct RequestStateData {
+    pub engine: Weak<Engine>,
+    pub request_id: String,
+    pub ctoken: StdCancellationToken,
     pub dep_dag: Mutex<DepDag>,
     pub mem_result: Memoizer<String, Result<crate::engine::result::EResult, ArcErr>>,
     pub mem_execute_cache: Memoizer<String, ExecuteCacheResult>,
@@ -58,9 +61,6 @@ pub struct RequestStateData {
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
 pub struct RequestState {
-    pub engine: Weak<Engine>,
-    pub request_id: String,
-    pub ctoken: StdCancellationToken,
     pub data: Arc<RequestStateData>,
     /// The target that triggered this invocation, used for cycle detection in result_addr.
     pub parent: Option<Addr>,
@@ -69,12 +69,17 @@ pub struct RequestState {
 }
 
 impl RequestState {
+    pub fn request_id(&self) -> &String {
+        &self.data.request_id
+    }
+
+    pub fn ctoken(&self) -> &StdCancellationToken {
+        &self.data.ctoken
+    }
+
     /// Returns a child RequestState sharing the same data but with a new parent.
     pub fn with_parent(&self, parent: Addr) -> Arc<RequestState> {
         Arc::new(RequestState {
-            engine: self.engine.clone(),
-            request_id: self.request_id.clone(),
-            ctoken: self.ctoken.clone(),
             data: Arc::clone(&self.data),
             parent: Some(parent),
             skip_providers: Arc::clone(&self.skip_providers),
@@ -86,9 +91,6 @@ impl RequestState {
         let mut set = (*self.skip_providers).clone();
         set.insert(name.to_string());
         Arc::new(RequestState {
-            engine: self.engine.clone(),
-            request_id: self.request_id.clone(),
-            ctoken: self.ctoken.clone(),
             data: Arc::clone(&self.data),
             parent: self.parent.clone(),
             skip_providers: Arc::new(set),
@@ -96,13 +98,8 @@ impl RequestState {
     }
 }
 
-impl Drop for RequestState {
+impl Drop for RequestStateData {
     fn drop(&mut self) {
-        // Child states (parent.is_some()) share the root's ctoken and request entry —
-        // only the root state should perform cleanup.
-        if self.parent.is_some() {
-            return;
-        }
         self.ctoken.cancel();
         if let Some(engine) = self.engine.upgrade()
             && let Ok(mut requests) = engine.requests.lock()
@@ -115,18 +112,20 @@ impl Drop for RequestState {
 impl Engine {
     pub fn new_state(self: &Arc<Self>) -> Arc<RequestState> {
         let request_id = "".to_string();
-        let state = Arc::new(RequestState {
+        let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
             request_id: request_id.clone(),
             ctoken: StdCancellationToken::new(),
-            data: Arc::new(RequestStateData {
-                dep_dag: Mutex::new(DepDag::new()),
-                mem_execute_cache: Memoizer::new(),
-                mem_result: Memoizer::new(),
-                mem_meta: Memoizer::new(),
-                mem_spec: Memoizer::new(),
-                mem_def: Memoizer::new(),
-            }),
+            dep_dag: Mutex::new(DepDag::new()),
+            mem_execute_cache: Memoizer::new(),
+            mem_result: Memoizer::new(),
+            mem_meta: Memoizer::new(),
+            mem_spec: Memoizer::new(),
+            mem_def: Memoizer::new(),
+        });
+
+        let state = Arc::new(RequestState {
+            data: Arc::clone(&data),
             parent: None,
             skip_providers: Arc::new(HashSet::new()),
         });
@@ -184,7 +183,7 @@ mod tests {
         })?);
 
         let rs = engine.new_state();
-        let request_id = rs.request_id.clone();
+        let request_id = rs.request_id().to_string();
 
         {
             let requests = engine.requests.lock().unwrap();
@@ -199,6 +198,29 @@ mod tests {
             let requests = engine.requests.lock().unwrap();
             assert!(!requests.contains_key(&request_id));
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skip_provider_child_does_not_cancel_token() -> anyhow::Result<()> {
+        let engine = Arc::new(Engine::new(Config {
+            root: PathBuf::from("/tmp"),
+            parallelism: None,
+        })?);
+
+        let rs = engine.new_state();
+        assert!(!rs.ctoken().is_cancelled());
+
+        {
+            let child = rs.with_skip_provider("some_provider");
+            assert!(!child.ctoken().is_cancelled());
+        } // child drops here
+
+        assert!(
+            !rs.ctoken().is_cancelled(),
+            "child drop must not cancel parent token"
+        );
 
         Ok(())
     }
