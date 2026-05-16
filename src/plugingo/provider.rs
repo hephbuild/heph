@@ -60,8 +60,6 @@ pub struct Provider {
         reason = "memoizer type mirrors pkg_cache pattern"
     )]
     source_map_cache: Memoizer<String, Result<Arc<HashMap<String, String>>, Arc<anyhow::Error>>>,
-    /// Cache: stdlib import path → direct imports.
-    stdlib_imports_cache: Memoizer<String, Result<Arc<Vec<String>>, Arc<anyhow::Error>>>,
 }
 
 impl Provider {
@@ -83,7 +81,6 @@ impl Provider {
             go_bin_addr: config.go_bin_addr,
             pkg_cache: Memoizer::new(),
             source_map_cache: Memoizer::new(),
-            stdlib_imports_cache: Memoizer::new(),
         })
     }
 }
@@ -220,12 +217,23 @@ impl ProviderTrait for Provider {
 
             match kind {
                 GoPackageKind::Stdlib { .. } => {
-                    let addr = Addr {
-                        package: req.package,
-                        name: "build_lib".to_string(),
-                        args: factors_to_args(&factors),
-                    };
-                    Ok(Box::new(std::iter::once(Ok(ListResponse { addr })))
+                    let addrs = vec![
+                        Addr {
+                            package: req.package.clone(),
+                            name: "_golist".to_string(),
+                            args: factors_to_args(&factors),
+                        },
+                        Addr {
+                            package: req.package,
+                            name: "build_lib".to_string(),
+                            args: factors_to_args(&factors),
+                        },
+                    ];
+                    let responses: Vec<anyhow::Result<ListResponse>> = addrs
+                        .into_iter()
+                        .map(|addr| Ok(ListResponse { addr }))
+                        .collect();
+                    Ok(Box::new(responses.into_iter())
                         as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
                 }
                 GoPackageKind::ThirdParty { .. } => {
@@ -371,7 +379,15 @@ impl Provider {
             None => return Err(GetError::NotFound),
         };
 
-        // Stdlib — no go list needed
+        // _golist — generate spec without executing go list (before stdlib check so
+        // stdlib packages can also expose a _golist target for cached dep resolution)
+        if addr.name == "_golist" {
+            return self
+                .get_golist_spec(addr.clone(), &kind, &factors)
+                .map_err(GetError::Other);
+        }
+
+        // Stdlib — no go list needed for other targets
         if let GoPackageKind::Stdlib { import_path } = &kind {
             return self.get_stdlib(addr.clone(), import_path, &factors);
         }
@@ -389,13 +405,6 @@ impl Provider {
             }
             let spec = target_modfiles::build_spec(addr.clone(), &mod_files);
             return Ok(GetResponse { target_spec: spec });
-        }
-
-        // _golist — generate spec without executing go list
-        if addr.name == "_golist" {
-            return self
-                .get_golist_spec(addr.clone(), &kind, &factors)
-                .map_err(GetError::Other);
         }
 
         let import_path = match &kind {
@@ -954,9 +963,13 @@ impl Provider {
                     &go_mod_addr,
                 )?
             }
-            GoPackageKind::Stdlib { .. } => {
-                anyhow::bail!("_golist is not available for stdlib packages")
-            }
+            GoPackageKind::Stdlib { import_path } => target_golist::build_spec_stdlib(
+                addr,
+                import_path,
+                factors,
+                &self.go_bin_addr,
+                &self.goroot,
+            )?,
         };
         Ok(GetResponse { target_spec: spec })
     }
@@ -980,36 +993,6 @@ impl Provider {
             }
             _ => Err(GetError::NotFound),
         }
-    }
-
-    /// Fetch the direct imports of a stdlib package, memoized by import path.
-    /// Used to recurse into stdlib transitive deps when building the importcfg.
-    async fn get_stdlib_pkg_imports(&self, import_path: &str) -> anyhow::Result<Arc<Vec<String>>> {
-        let key = import_path.to_string();
-        let go_bin = format!("{}/bin/go", self.goroot);
-        let import_path_owned = import_path.to_string();
-
-        self.stdlib_imports_cache
-            .once(key, move || async move {
-                let output = tokio::process::Command::new(&go_bin)
-                    .args(["list", "-json", "-e", &import_path_owned])
-                    .env_remove("GOFLAGS")
-                    .output()
-                    .await
-                    .with_context(|| format!("go list -json -e {}", import_path_owned))?;
-
-                let pkgs = parse_go_list_reader(output.stdout.as_slice())?;
-
-                let imports = pkgs
-                    .into_values()
-                    .next()
-                    .map(|p| p.imports)
-                    .unwrap_or_default();
-
-                Ok(Arc::new(imports))
-            })
-            .await
-            .map_err(unwrap_arc_err)
     }
 
     /// Read and parse the single package from a `_golist` target's output artifact.
@@ -1238,10 +1221,15 @@ impl Provider {
     ) -> anyhow::Result<(String, Option<Addr>, Vec<String>)> {
         if is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, factors);
+            let golist_addr = Addr {
+                package: crate::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
+                name: "_golist".to_string(),
+                args: factors_to_args(factors),
+            };
             let sub_imports = self
-                .get_stdlib_pkg_imports(import_path)
+                .read_golist_package(Arc::clone(&executor), &golist_addr)
                 .await
-                .map(|v| v.as_ref().clone())
+                .map(|pkg| pkg.imports.clone())
                 .unwrap_or_default();
             return Ok((import_path.to_string(), Some(addr), sub_imports));
         }
@@ -1425,7 +1413,7 @@ mod tests {
                 let kind = decode_package(&addr.package, &self.workspace_root)
                     .ok_or_else(|| anyhow::anyhow!("unknown package: {}", addr.package))?;
 
-                let (import_path, module_root) = match &kind {
+                let (import_path, run_dir) = match &kind {
                     GoPackageKind::FirstParty {
                         import_path,
                         module_root,
@@ -1444,13 +1432,14 @@ mod tests {
                         };
                         (ip, module_root.clone())
                     }
-                    GoPackageKind::Stdlib { .. } => {
-                        anyhow::bail!("GoListTestExecutor: stdlib not supported")
+                    GoPackageKind::Stdlib { import_path } => {
+                        // Stdlib packages don't need a module root; run go list from workspace.
+                        (import_path.clone(), self.workspace_root.clone())
                     }
                 };
 
                 // Run go list (no -deps) for just this package
-                let packages = run_go_list(&import_path, &factors, &module_root).await?;
+                let packages = run_go_list(&import_path, &factors, &run_dir).await?;
                 // Return the single package as JSON
                 let pkg = packages.into_values().next().ok_or_else(|| {
                     anyhow::anyhow!("go list returned no packages for {}", import_path)

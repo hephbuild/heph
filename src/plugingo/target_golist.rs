@@ -35,6 +35,16 @@ pub fn build_spec_firstparty(
     )
 }
 
+pub fn build_spec_stdlib(
+    addr: Addr,
+    import_path: &str,
+    factors: &Factors,
+    go_bin_addr: &str,
+    goroot: &str,
+) -> anyhow::Result<TargetSpec> {
+    build_spec_inner(addr, import_path, factors, go_bin_addr, goroot, &[])
+}
+
 pub fn build_spec_thirdparty(
     addr: Addr,
     import_path: &str,
