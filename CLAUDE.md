@@ -79,6 +79,8 @@ When implementing a new `Driver`:
 - **Every feature and bug fix must have a test.** No exceptions. Tests freeze behavior — if it's not tested, it will regress.
 - For bugs: write the failing test first, then fix the code.
 - For features: tests define the contract. Write them alongside the implementation, not after.
+- Do not write absurd tests that assert something that was just set before, test business logic
+- Do not add tests that assert taht something is not there during refactoring
 
 ### Test isolation
 

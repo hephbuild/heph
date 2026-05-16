@@ -8,9 +8,11 @@ impl PkgBuf {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
-}
 
-impl PkgBuf {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

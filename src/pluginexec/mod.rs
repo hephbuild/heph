@@ -3,7 +3,7 @@ mod spec;
 use crate::debug_hash::DebugHasher;
 use crate::engine;
 use crate::engine::driver::sandbox::EnvValue;
-use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+use crate::engine::driver::targetdef::path::{Content, Path};
 use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
@@ -13,6 +13,7 @@ use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
 use anyhow::Context;
 use async_trait::async_trait;
+use itertools::Itertools;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Write};
@@ -239,19 +240,26 @@ impl engine::driver_managed::ManagedDriver for Driver {
                         group: k.clone(),
                         paths: v
                             .iter()
-                            .map(|path| Path {
-                                content: {
-                                    if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
-                                        // TODO: this sucks, but its easy for now
-                                        Content::Glob(path.clone())
-                                    } else if path.ends_with("/") {
-                                        Content::DirPath(path.clone())
-                                    } else {
-                                        Content::FilePath(path.clone())
-                                    }
-                                },
-                                codegen_tree: spec.codegen.clone(),
-                                collect: true,
+                            .map(|path| {
+                                let path = if pkg.is_empty() {
+                                    path.clone()
+                                } else {
+                                    format!("{}/{}", pkg, path)
+                                };
+                                Path {
+                                    content: {
+                                        if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
+                                            // TODO: this sucks, but its easy for now
+                                            Content::Glob(path.clone())
+                                        } else if path.ends_with("/") {
+                                            Content::DirPath(path.clone())
+                                        } else {
+                                            Content::FilePath(path.clone())
+                                        }
+                                    },
+                                    codegen_tree: spec.codegen.clone(),
+                                    collect: true,
+                                }
                             })
                             .collect(),
                     })
@@ -360,6 +368,14 @@ impl engine::driver_managed::ManagedDriver for Driver {
             .join(":"),
         );
 
+        let pkg_prefix = {
+            let pkg = rreq.target.addr.package.as_str();
+            if pkg.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", pkg)
+            }
+        };
         for output in &rreq.target.outputs {
             let key = if output.group.is_empty() {
                 "OUT".to_string()
@@ -374,7 +390,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                         if !entry.is_empty() {
                             entry.push(' ');
                         }
-                        entry.push_str(p);
+                        let rel = p.strip_prefix(&pkg_prefix).unwrap_or(p);
+                        entry.push_str(rel);
                     }
                 }
             }

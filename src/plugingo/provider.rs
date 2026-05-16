@@ -918,7 +918,6 @@ impl Provider {
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
-                    module_root,
                     factors,
                     &self.go_bin_addr,
                     &self.goroot,
@@ -949,7 +948,6 @@ impl Provider {
                 target_golist::build_spec_thirdparty(
                     addr,
                     &import_path,
-                    module_root,
                     factors,
                     &self.go_bin_addr,
                     &self.goroot,

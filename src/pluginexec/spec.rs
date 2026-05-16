@@ -1,10 +1,10 @@
+use crate::engine::driver::targetdef::path::CodegenMode;
 use crate::loosespecparser::{
     TargetSpecValue, parse_bool, parse_map_string_string, parse_map_string_strings, parse_string,
     parse_strings,
 };
 use anyhow::Context;
 use std::collections::HashMap;
-use crate::engine::driver::targetdef::path::CodegenMode;
 
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
@@ -65,10 +65,11 @@ impl TargetSpec {
                 Some(s) => match s.as_str() {
                     "copy" => Ok(CodegenMode::Copy),
                     "link" => Ok(CodegenMode::Link),
-                    _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s))
+                    _ => Err(anyhow::anyhow!("invalid codegen mode: {}", s)),
                 },
                 None => Ok(CodegenMode::None),
-            }.with_context(|| "parse `codegen`")?;
+            }
+            .with_context(|| "parse `codegen`")?;
         };
 
         if let Some(v) = m.remove("deps") {

@@ -2,9 +2,7 @@ use crate::engine::provider::TargetSpec;
 use crate::htaddr::Addr;
 use crate::loosespecparser::TargetSpecValue;
 use crate::plugingo::factors::Factors;
-use anyhow::Context;
 use std::collections::HashMap;
-use std::path::Path;
 
 #[expect(
     clippy::too_many_arguments,
@@ -13,7 +11,6 @@ use std::path::Path;
 pub fn build_spec_firstparty(
     addr: Addr,
     import_path: &str,
-    module_root: &Path,
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
@@ -28,7 +25,6 @@ pub fn build_spec_firstparty(
     build_spec_inner(
         addr,
         import_path,
-        module_root,
         factors,
         go_bin_addr,
         goroot,
@@ -42,7 +38,6 @@ pub fn build_spec_firstparty(
 pub fn build_spec_thirdparty(
     addr: Addr,
     import_path: &str,
-    workspace_root: &Path,
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
@@ -51,7 +46,6 @@ pub fn build_spec_thirdparty(
     build_spec_inner(
         addr,
         import_path,
-        workspace_root,
         factors,
         go_bin_addr,
         goroot,
@@ -62,16 +56,11 @@ pub fn build_spec_thirdparty(
 fn build_spec_inner(
     addr: Addr,
     import_path: &str,
-    module_root: &Path,
     factors: &Factors,
     go_bin_addr: &str,
     goroot: &str,
     extra_deps: &[(&str, &[String])],
 ) -> anyhow::Result<TargetSpec> {
-    let module_root_str = module_root
-        .to_str()
-        .context("module_root must be valid UTF-8")?;
-
     let flags = factors.go_list_flags();
 
     let flags_part = if flags.is_empty() {
@@ -87,11 +76,13 @@ fn build_spec_inner(
         )
     };
 
+    // Run go list from the sandbox package dir. Go traverses up to find go.mod
+    // (materialized via the modfiles dep), so no cd is needed. All inputs —
+    // including codegen-produced .go files from query deps — are already in the
+    // sandbox.
     let run = format!(
-        "sandbox_dir=\"$PWD\"\n\
-         cd \"$GOLIST_MODULE_ROOT\"\n\
-         \"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
--e{flags_part} \"$GOLIST_IMPORT_PATH\" > \"$sandbox_dir/package.json\"\n",
+        "\"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
+-e{flags_part} \"$GOLIST_IMPORT_PATH\" > package.json\n",
         flags_part = flags_part,
     );
 
@@ -99,7 +90,6 @@ fn build_spec_inner(
         ("GOOS", factors.goos.as_str()),
         ("GOARCH", factors.goarch.as_str()),
         ("GOROOT", goroot),
-        ("GOLIST_MODULE_ROOT", module_root_str),
         ("GOLIST_IMPORT_PATH", import_path),
     ]
     .into_iter()
@@ -202,24 +192,11 @@ mod tests {
         }
     }
 
-    fn make_module_root() -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("go.mod"),
-            "module example.com/mylib\n\ngo 1.21\n",
-        )
-        .unwrap();
-        std::fs::write(dir.path().join("lib.go"), "package mylib\n").unwrap();
-        dir
-    }
-
     #[test]
     fn test_driver_is_bash() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -233,11 +210,9 @@ mod tests {
 
     #[test]
     fn test_out_has_json_group() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -255,11 +230,9 @@ mod tests {
 
     #[test]
     fn test_run_contains_go_list() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -282,15 +255,17 @@ mod tests {
             "run should output package.json"
         );
         assert!(run.contains("SRC_GO_BIN"), "run should use $SRC_GO_BIN");
+        assert!(
+            !run.contains("cd "),
+            "run must not cd out of the sandbox cwd"
+        );
     }
 
     #[test]
     fn test_deps_has_go_bin() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -308,11 +283,9 @@ mod tests {
 
     #[test]
     fn test_firstparty_deps_has_modfiles_and_srcfiles() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -337,11 +310,9 @@ mod tests {
 
     #[test]
     fn test_thirdparty_deps_has_modfiles_only() {
-        let tmp = make_module_root();
         let spec = build_spec_thirdparty(
             test_addr(),
             "github.com/foo/bar",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",
@@ -370,11 +341,9 @@ mod tests {
 
     #[test]
     fn test_run_no_src_hash_comment() {
-        let tmp = make_module_root();
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
-            tmp.path(),
             &test_factors(),
             "//@heph/bin:go",
             "/usr/local/go",

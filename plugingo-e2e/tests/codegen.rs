@@ -1,8 +1,8 @@
 mod common;
 
-use std::fs;
 use anyhow::Context as _;
 use common::{artifact_paths, artifact_string, fixture, make_workspace, require_go};
+use std::fs;
 
 #[tokio::test]
 async fn test_codegen_gen_target_produces_go_file() -> anyhow::Result<()> {
