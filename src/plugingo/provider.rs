@@ -1927,7 +1927,7 @@ mod tests {
         e.register_provider(|_| Box::new(crate::pluginhostbin::Provider))
             .unwrap();
 
-        e.register_managed_driver(Box::new(crate::pluginhostbin::Driver))
+        e.register_driver(Box::new(crate::pluginhostbin::Driver))
             .unwrap();
 
         e.register_managed_driver(Box::new(crate::pluginexec::Driver::new_bash()))
