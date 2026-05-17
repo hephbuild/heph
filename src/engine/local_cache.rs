@@ -274,53 +274,57 @@ impl Engine {
         hashin: &str,
         outputs: Vec<String>,
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
-        let addr = &def.target.addr;
-        let manifest_artifact = match self.local_cache.reader(addr, hashin, MANIFEST_V1_JSON) {
-            Err(e) if e.is::<NotFoundError>() => return Ok(None),
-            Err(e) => return Err(e),
-            Ok(artifact) => artifact,
-        };
+        let addr = def.target.addr.clone();
+        let hashin = hashin.to_string();
+        tokio::task::spawn_blocking(
+            enclose!((self.local_cache => local_cache) move || {
+                let manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1_JSON) {
+                    Err(e) if e.is::<NotFoundError>() => return Ok(None),
+                    Err(e) => return Err(e),
+                    Ok(artifact) => artifact,
+                };
 
-        let manifest: Manifest = serde_json::from_reader(manifest_artifact)?;
+                let manifest: Manifest = serde_json::from_reader(manifest_artifact)?;
 
-        let mut results: Vec<CacheArtifact> = vec![];
-        let mut result_meta: Vec<ArtifactMeta> = vec![];
+                let mut results: Vec<CacheArtifact> = vec![];
+                let mut result_meta: Vec<ArtifactMeta> = vec![];
 
-        for artifact in manifest.artifacts {
-            if artifact.r#type != ManifestArtifactType::Output {
-                continue;
-            }
+                for artifact in manifest.artifacts {
+                    if artifact.r#type != ManifestArtifactType::Output {
+                        continue;
+                    }
 
-            result_meta.push(ArtifactMeta {
-                hashout: artifact.hashout.clone(),
-            });
+                    result_meta.push(ArtifactMeta {
+                        hashout: artifact.hashout.clone(),
+                    });
 
-            if !outputs.contains(&artifact.group) {
-                continue;
-            }
+                    if !outputs.contains(&artifact.group) {
+                        continue;
+                    }
 
-            if !self
-                .local_cache
-                .exists(addr, hashin, artifact.name.as_ref())?
-            {
-                return Ok(None);
-            }
+                    if !local_cache.exists(&addr, &hashin, artifact.name.as_ref())? {
+                        return Ok(None);
+                    }
 
-            results.push(CacheArtifact {
-                addr: addr.clone(),
-                hashin: hashin.to_string(),
-                name: artifact.name.clone(),
-                cache: self.local_cache.clone(),
-                content_type: match artifact.content_type {
-                    ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                    ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                },
-                r#type: artifact.r#type,
-                hashout: artifact.hashout,
-                group: artifact.group,
-            });
-        }
+                    results.push(CacheArtifact {
+                        addr: addr.clone(),
+                        hashin: hashin.clone(),
+                        name: artifact.name.clone(),
+                        cache: local_cache.clone(),
+                        content_type: match artifact.content_type {
+                            ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                            ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                        },
+                        r#type: artifact.r#type,
+                        hashout: artifact.hashout,
+                        group: artifact.group,
+                    });
+                }
 
-        Ok(Some((results, result_meta)))
+                anyhow::Ok(Some((results, result_meta)))
+            }),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("artifacts_from_local_cache task panicked: {e}"))?
     }
 }
