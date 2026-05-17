@@ -93,7 +93,7 @@ fn build_spec_inner(
     // including codegen-produced .go files from query deps — are already in the
     // sandbox.
     let run = format!(
-        "\"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
+        "\"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
 -e{flags_part} \"$GOLIST_IMPORT_PATH\" > package.json\n",
         flags_part = flags_part,
     );

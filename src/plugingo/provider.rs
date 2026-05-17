@@ -285,6 +285,11 @@ impl ProviderTrait for Provider {
                             name: "embed".to_string(),
                             args: factors_to_args(&factors),
                         });
+                        addrs.push(Addr {
+                            package: req.package.clone(),
+                            name: "embed#xtest".to_string(),
+                            args: factors_to_args(&factors),
+                        });
                     }
 
                     if has_test {
@@ -673,6 +678,10 @@ impl Provider {
                     xtest_go_files: vec![],
                     embed_patterns: vec![],
                     embed_files: vec![],
+                    test_embed_patterns: vec![],
+                    test_embed_files: vec![],
+                    xtest_embed_patterns: vec![],
+                    xtest_embed_files: vec![],
                     imports: pkg.xtest_imports.clone(),
                     test_imports: vec![],
                     xtest_imports: vec![],
@@ -724,6 +733,12 @@ impl Provider {
                     })
                     .collect();
 
+                let xtest_embed_addr = if !pkg.xtest_embed_patterns.is_empty() {
+                    Some(self.make_addr_with_name(&addr.package, "embed#xtest", &factors))
+                } else {
+                    None
+                };
+
                 let spec = target_test::build_lib_xtest_spec(
                     addr.clone(),
                     &import_path,
@@ -733,6 +748,7 @@ impl Provider {
                     &xtest_src_addrs,
                     &self.go_bin_addr,
                     &self.goroot,
+                    xtest_embed_addr.as_ref(),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -755,6 +771,10 @@ impl Provider {
                     xtest_go_files: vec![],
                     embed_patterns: vec![],
                     embed_files: vec![],
+                    test_embed_patterns: vec![],
+                    test_embed_files: vec![],
+                    xtest_embed_patterns: vec![],
+                    xtest_embed_files: vec![],
                     imports: testmain_imports.iter().map(|s| s.to_string()).collect(),
                     test_imports: vec![],
                     xtest_imports: vec![],
@@ -889,11 +909,29 @@ impl Provider {
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
-                if pkg.embed_patterns.is_empty() || pkg.embed_files.is_empty() {
+                if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let spec = embed::build_spec(addr.clone(), &pkg.embed_patterns, &host_src_dir)
-                    .map_err(GetError::Other)?;
+                let spec = embed::build_spec(
+                    addr.clone(),
+                    &pkg.embed_patterns,
+                    &pkg.embed_files,
+                    &host_src_dir,
+                )
+                .map_err(GetError::Other)?;
+                Ok(GetResponse { target_spec: spec })
+            }
+            "embed#xtest" => {
+                if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let spec = embed::build_spec(
+                    addr.clone(),
+                    &pkg.xtest_embed_patterns,
+                    &pkg.xtest_embed_files,
+                    &host_src_dir,
+                )
+                .map_err(GetError::Other)?;
                 Ok(GetResponse { target_spec: spec })
             }
             _ => Err(GetError::NotFound),
@@ -1257,7 +1295,10 @@ impl Provider {
         workspace_module_path: &str,
         module_root: &Path,
     ) -> anyhow::Result<(String, Option<Addr>, Vec<String>)> {
-        if is_stdlib_import_path(import_path) {
+        let is_workspace_module = !workspace_module_path.is_empty()
+            && (import_path == workspace_module_path
+                || import_path.starts_with(&format!("{}/", workspace_module_path)));
+        if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, factors);
             let golist_addr = Addr {
                 package: crate::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),

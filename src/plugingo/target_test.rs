@@ -111,11 +111,12 @@ pub fn build_lib_xtest_spec(
     xtest_src_addrs: &[Addr],
     go_bin_addr: &str,
     goroot: &str,
+    embed_addr: Option<&Addr>,
 ) -> TargetSpec {
     // xtest package import path is "<import_path>_test"
     let xtest_import_path = format!("{}_test", import_path);
     let out_file = format!("{}_xtest.a", package_name);
-    let run = compile_run_script(&xtest_import_path, transitive_libs, &out_file, false);
+    let run = compile_run_script(&xtest_import_path, transitive_libs, &out_file, embed_addr.is_some());
 
     build_lib_spec_inner(
         addr,
@@ -124,7 +125,7 @@ pub fn build_lib_xtest_spec(
         xtest_src_addrs.iter(),
         go_bin_addr,
         goroot,
-        None,
+        embed_addr,
         run,
         out_file,
     )
@@ -609,6 +610,7 @@ mod tests {
             &src_addrs("pkg"),
             "//@heph/bin:go",
             "/usr/local/go",
+            None,
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -640,6 +642,7 @@ mod tests {
             &src_addrs("pkg"),
             "//@heph/bin:go",
             "/usr/local/go",
+            None,
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),

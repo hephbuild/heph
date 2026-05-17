@@ -23,6 +23,14 @@ pub struct GoPackage {
     pub embed_patterns: Vec<String>,
     #[serde(rename = "EmbedFiles", default)]
     pub embed_files: Vec<String>,
+    #[serde(rename = "TestEmbedPatterns", default)]
+    pub test_embed_patterns: Vec<String>,
+    #[serde(rename = "TestEmbedFiles", default)]
+    pub test_embed_files: Vec<String>,
+    #[serde(rename = "XTestEmbedPatterns", default)]
+    pub xtest_embed_patterns: Vec<String>,
+    #[serde(rename = "XTestEmbedFiles", default)]
+    pub xtest_embed_files: Vec<String>,
     #[serde(rename = "Imports", default)]
     pub imports: Vec<String>,
     #[serde(rename = "TestImports", default)]
@@ -212,6 +220,15 @@ mod tests {
         assert!(!is_stdlib_import_path("github.com/foo/bar"));
         assert!(!is_stdlib_import_path("golang.org/x/net"));
         assert!(!is_stdlib_import_path("k8s.io/apimachinery"));
+    }
+
+    #[test]
+    fn test_is_stdlib_import_path_dotless_module_name() {
+        // A module named without a dot (e.g. "mod-embed") has no dot in its
+        // first path component, but it is NOT stdlib — the heuristic returns true
+        // here, which is why resolve_import must guard with workspace_module_path
+        // before calling this function.
+        assert!(is_stdlib_import_path("mod-embed/testutil"));
     }
 
     #[test]
