@@ -1,6 +1,6 @@
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::fmt;
 use std::future::Future;
 use std::hash::{Hash, Hasher};
@@ -156,7 +156,7 @@ pub fn downcast_chain_ref<T: std::error::Error + Send + Sync + 'static>(
 }
 
 pub struct Memoizer<K, V> {
-    cache: Mutex<HashMap<K, Shared<BoxFuture<'static, V>>>>,
+    cache: Mutex<FxHashMap<K, Shared<BoxFuture<'static, V>>>>,
     /// Tag used in stall warnings to identify which memoizer is stuck.
     tag: &'static str,
 }
@@ -204,7 +204,7 @@ where
 
     pub fn with_tag(tag: &'static str) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(FxHashMap::default()),
             tag,
         }
     }
@@ -222,6 +222,13 @@ where
         };
 
         if let Some(shared) = existing {
+            // Post-completion fast path: a Shared future that has already
+            // resolved exposes its output via `peek`. Cloning that directly
+            // skips the full `Shared::poll` path (waker registration, inner
+            // Mutex acquire) and the `take_or_clone_output` profile hotspot.
+            if let Some(v) = shared.peek() {
+                return v.clone();
+            }
             return await_with_stall_check(shared, &key, self.tag).await;
         }
 

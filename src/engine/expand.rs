@@ -5,7 +5,7 @@ use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr::Addr;
 use async_recursion::async_recursion;
 use enclose::enclose;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 impl Engine {
@@ -23,7 +23,7 @@ impl Engine {
                 addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
                     let def = Arc::clone(&engine).get_def(rs.clone(), &addr).await?;
-                    let mut visited = HashSet::new();
+                    let mut visited = FxHashSet::default();
                     let expanded = Arc::clone(&engine)
                         .expand_inputs(
                             rs,
@@ -62,7 +62,7 @@ impl Engine {
         rs: Arc<RequestState>,
         inputs: Vec<Input>,
         parent_override: Option<(String, InputMode)>,
-        visited: &mut HashSet<String>,
+        visited: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<Input>> {
         let mut result: Option<Vec<Input>> = parent_override
             .as_ref()

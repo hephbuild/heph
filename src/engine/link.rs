@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct LinkedTargetDefInput {
-    pub target: TargetDef,
+    pub target: Arc<TargetDef>,
     pub output_names: Vec<String>,
     pub origin_id: String,
     pub filters: Vec<String>,
@@ -15,7 +15,7 @@ pub struct LinkedTargetDefInput {
 
 #[derive(Clone)]
 pub struct LinkedTargetDef {
-    pub target: TargetDef,
+    pub target: Arc<TargetDef>,
     pub inputs: Vec<LinkedTargetDefInput>,
 }
 
@@ -23,7 +23,7 @@ impl Engine {
     pub(crate) async fn link(
         self: Arc<Self>,
         rs: Arc<RequestState>,
-        def: TargetDef,
+        def: Arc<TargetDef>,
     ) -> anyhow::Result<LinkedTargetDef> {
         let expanded_inputs = Arc::clone(&self)
             .expanded_inputs_for(rs.clone(), &def.addr)
@@ -31,7 +31,7 @@ impl Engine {
 
         let futures = expanded_inputs.iter().map(|input| {
             enclose!((self => engine, rs, input) async move {
-                let input_def = engine.get_def(rs, &input.r#ref.r#ref).await?.target_def.clone();
+                let input_def: Arc<TargetDef> = Arc::clone(&engine.get_def(rs, &input.r#ref.r#ref).await?.target_def);
 
                 let output_names = if let Some(ref output_name) = input.r#ref.output {
                     if !input_def.outputs.iter().any(|output| &output.group == output_name) {

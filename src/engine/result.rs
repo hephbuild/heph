@@ -163,7 +163,7 @@ impl fmt::Debug for dyn Content {
 }
 
 pub struct ExtendedTargetDef {
-    pub target_def: TargetDef,
+    pub target_def: Arc<TargetDef>,
     pub applied_transitive: Sandbox,
 }
 
@@ -311,11 +311,17 @@ impl Engine {
         let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
         let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
 
-        let def = self
-            .clone()
-            .link(rs.clone(), def.target_def.clone())
-            .await
-            .with_context(|| "link")?;
+        // `link` and `meta` operate on disjoint data once `def` is known: link
+        // resolves output names + filter checks across the input list; meta
+        // recursively walks inputs to compute hashin. Run them concurrently
+        // via `tokio::join!` so the shorter one isn't gated on the longer.
+        // Uses `join!` (stack-pinned futures, no per-branch boxing) rather
+        // than `try_join_all` — overhead is negligible on the hot path.
+        let link_fut = Arc::clone(&self).link(rs.clone(), def.target_def.clone());
+        let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
+        let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
+        let def = link_res.with_context(|| "link")?;
+        let meta = meta_res?;
 
         let output_names = match outputs {
             OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
@@ -331,8 +337,6 @@ impl Engine {
                 Ok(names)
             }
         }?;
-
-        let meta = self.clone().meta(rs.clone(), addr).await?;
 
         self.execute_and_cache(
             rs,
@@ -410,11 +414,14 @@ impl Engine {
                         .collect::<anyhow::Result<Vec<_>>>()?;
 
                     defer! {
-                        match fs::remove_dir_all(&sandbox_dir) {
-                            Ok(_) => (),
-                            Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                            Err(err) => eprintln!("failed to clean up sandbox: {err}"),
-                        }
+                        let sandbox_dir = sandbox_dir.clone();
+                        tokio::task::spawn_blocking(move || {
+                            match fs::remove_dir_all(&sandbox_dir) {
+                                Ok(_) => (),
+                                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+                                Err(err) => eprintln!("failed to clean up sandbox: {err}"),
+                            }
+                        });
                     }
 
                     engine
@@ -522,7 +529,7 @@ impl Engine {
         }
 
         Ok(Arc::new(ExtendedTargetDef {
-            target_def: def,
+            target_def: Arc::new(def),
             applied_transitive: all_transitive,
         }))
     }

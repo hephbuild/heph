@@ -25,8 +25,22 @@ pub struct RunArgs {
     pub list_out: bool,
 }
 
-#[tokio::main]
-pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
+pub fn execute(args: &RunArgs) -> anyhow::Result<()> {
+    // Cap worker_threads to physical parallelism. The default
+    // `#[tokio::main]` runtime spawns far more workers than needed for our
+    // workload (160+ on a 10-core box), and idle workers cost real park /
+    // unpark scheduling traffic.
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?;
+    rt.block_on(execute_inner(args))
+}
+
+async fn execute_inner(args: &RunArgs) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
 
