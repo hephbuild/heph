@@ -30,17 +30,20 @@ impl Engine {
             let pkgs = rs
                 .data
                 .mem_packages
-                .once(key, enclose!((provider, rs) move || async move {
-                    let it = provider
-                        .provider
-                        .list_packages(req, rs.ctoken())
-                        .await?;
-                    let mut pkgs = Vec::new();
-                    for res in it {
-                        pkgs.push(res?.pkg.to_string());
-                    }
-                    Ok(Arc::new(pkgs))
-                }))
+                .once(
+                    key,
+                    enclose!((provider, rs) move || async move {
+                        let it = provider
+                            .provider
+                            .list_packages(req, rs.ctoken())
+                            .await?;
+                        let mut pkgs = Vec::new();
+                        for res in it {
+                            pkgs.push(res?.pkg.to_string());
+                        }
+                        Ok(Arc::new(pkgs))
+                    }),
+                )
                 .await
                 .map_err(unwrap_arc_err)?;
 

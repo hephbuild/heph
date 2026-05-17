@@ -116,7 +116,12 @@ pub fn build_lib_xtest_spec(
     // xtest package import path is "<import_path>_test"
     let xtest_import_path = format!("{}_test", import_path);
     let out_file = format!("{}_xtest.a", package_name);
-    let run = compile_run_script(&xtest_import_path, transitive_libs, &out_file, embed_addr.is_some());
+    let run = compile_run_script(
+        &xtest_import_path,
+        transitive_libs,
+        &out_file,
+        embed_addr.is_some(),
+    );
 
     build_lib_spec_inner(
         addr,

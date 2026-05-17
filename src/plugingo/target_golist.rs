@@ -215,7 +215,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         assert_eq!(spec.driver, "bash");
@@ -232,7 +232,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
@@ -253,7 +253,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
@@ -287,7 +287,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -308,7 +308,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -367,7 +367,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
-        &[],
+            &[],
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {

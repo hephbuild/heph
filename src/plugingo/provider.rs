@@ -461,7 +461,9 @@ impl Provider {
         // that must access the real filesystem (embed file resolution, test file parsing)
         // rather than the sandbox path in pkg.dir.
         let host_src_dir = match &kind {
-            GoPackageKind::FirstParty { src_dir: host_dir, .. } => host_dir.clone(),
+            GoPackageKind::FirstParty {
+                src_dir: host_dir, ..
+            } => host_dir.clone(),
             GoPackageKind::ThirdParty { .. } => src_dir.to_path_buf(),
             GoPackageKind::Stdlib { .. } => src_dir.to_path_buf(),
         };
@@ -583,10 +585,14 @@ impl Provider {
                 }
                 let mut test_file_args: Vec<(&'static str, String)> = Vec::new();
                 for f in &pkg.test_go_files {
-                    test_file_args.push(("_test", host_src_dir.join(f).to_string_lossy().into_owned()));
+                    test_file_args
+                        .push(("_test", host_src_dir.join(f).to_string_lossy().into_owned()));
                 }
                 for f in &pkg.xtest_go_files {
-                    test_file_args.push(("_xtest", host_src_dir.join(f).to_string_lossy().into_owned()));
+                    test_file_args.push((
+                        "_xtest",
+                        host_src_dir.join(f).to_string_lossy().into_owned(),
+                    ));
                 }
                 let file_refs: Vec<(&str, &str)> = test_file_args
                     .iter()

@@ -16,9 +16,8 @@ pub fn build_spec(
     embed_files: &[String],
     src_dir: &Path,
 ) -> anyhow::Result<TargetSpec> {
-    let cfg_json =
-        compute_embed_cfg_json(embed_patterns, embed_files, src_dir)
-            .context("compute embed cfg json")?;
+    let cfg_json = compute_embed_cfg_json(embed_patterns, embed_files, src_dir)
+        .context("compute embed cfg json")?;
 
     // Escape single quotes so the JSON can be embedded in a bash single-quoted string.
     let escaped_json = cfg_json.replace('\'', "'\\''");
@@ -239,12 +238,8 @@ mod tests {
 
         // embed_files contains a file not covered by any pattern
         let embed_files = vec!["assets/extra.txt".to_string()];
-        let json = compute_embed_cfg_json(
-            &["assets/a.txt".to_string()],
-            &embed_files,
-            tmp.path(),
-        )
-        .unwrap();
+        let json = compute_embed_cfg_json(&["assets/a.txt".to_string()], &embed_files, tmp.path())
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert!(
@@ -266,17 +261,16 @@ mod tests {
 
         // same file in both embed_patterns (resolved) and embed_files
         let embed_files = vec!["assets/a.txt".to_string()];
-        let json = compute_embed_cfg_json(
-            &["assets/a.txt".to_string()],
-            &embed_files,
-            tmp.path(),
-        )
-        .unwrap();
+        let json = compute_embed_cfg_json(&["assets/a.txt".to_string()], &embed_files, tmp.path())
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         let files = v["Files"].as_object().unwrap();
         assert_eq!(
-            files.keys().filter(|k| k.as_str() == "assets/a.txt").count(),
+            files
+                .keys()
+                .filter(|k| k.as_str() == "assets/a.txt")
+                .count(),
             1,
             "file must appear exactly once in Files map"
         );
