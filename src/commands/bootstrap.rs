@@ -25,6 +25,8 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
             plugingo::Provider::new(root.to_path_buf()).expect("failed to initialize Go plugin"),
         )
     })?;
+    e.register_managed_driver(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))?;
+    e.register_managed_driver(Box::new(plugingo::GoEmbedDriver))?;
 
     e.register_provider(|_root| Box::new(pluginfs::Provider))?;
     e.register_driver(Box::new(pluginfs::Driver))?;

@@ -78,6 +78,8 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
         })
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
+        .with_managed_driver(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
+        .with_managed_driver(Box::new(plugingo::GoEmbedDriver))
         .with_driver(Box::new(pluginfs::Driver))
         .build()
         .context("build plugingo workspace")

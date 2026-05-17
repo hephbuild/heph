@@ -10,7 +10,7 @@ use crate::hasync::Cancellable;
 use crate::{hartifactcontent, hasync};
 use anyhow::Context;
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
@@ -139,7 +139,9 @@ impl Driver for ManagedDriverBridge {
         }
 
         // Apply filters and collect source_map entries.
-        let mut source_map: HashMap<String, String> = HashMap::new();
+        // BTreeMap so serialization to source_map.json is byte-deterministic across runs;
+        // HashMap iter order varies per-process and breaks downstream output hashing/caching.
+        let mut source_map: BTreeMap<String, String> = BTreeMap::new();
         for managed_input in &mut inputs {
             let filters = &managed_input.input.filters;
             let source_addr_str = managed_input.input.source_addr.format();
@@ -405,7 +407,7 @@ mod tests {
 
         let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
         let content = fs::read_to_string(&map_path)?;
-        let map: HashMap<String, String> = serde_json::from_str(&content)?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&content)?;
         assert_eq!(map.get("pkg/foo.go").map(|s| s.as_str()), Some("//pkg:gen"));
         Ok(())
     }
@@ -450,7 +452,7 @@ mod tests {
 
         // source_map must also be empty since nothing passed the filter
         let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
-        let map: HashMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
         assert!(map.is_empty());
         Ok(())
     }
@@ -475,8 +477,65 @@ mod tests {
         bridge().run(req, &ct).await?;
 
         let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
-        let map: HashMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(map_path)?)?;
         assert!(map.is_empty());
+        Ok(())
+    }
+
+    // Regression: source_map.json was serialized from a HashMap, so its byte
+    // representation varied across runs. Downstream targets hash the resulting
+    // output tar, so non-determinism here caused unstable hashouts and broke
+    // the local cache for targets like go_golist/go_embed.
+    #[tokio::test]
+    async fn source_map_json_bytes_are_deterministic_and_sorted() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let src_addr = Addr {
+            package: PkgBuf::from("pkg"),
+            name: "gen".to_string(),
+            args: BTreeMap::new(),
+        };
+        // Many keys with names that would scatter under HashMap's RandomState.
+        let inputs: Vec<RunInput> = ["c.go", "a.go", "b.go", "z.go", "m.go"]
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                make_raw_input(
+                    &format!("dep{i}"),
+                    &format!("pkg/{f}"),
+                    src_addr.clone(),
+                    vec![],
+                )
+            })
+            .collect();
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs,
+            hashin: &"hash".to_string(),
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+
+        let map_path = sandbox.join("ws").join("pkg").join("source_map.json");
+        let bytes = fs::read(&map_path)?;
+        // Keys must appear in sorted order.
+        let text = String::from_utf8(bytes.clone())?;
+        let pos_a = text.find("pkg/a.go").expect("a present");
+        let pos_b = text.find("pkg/b.go").expect("b present");
+        let pos_c = text.find("pkg/c.go").expect("c present");
+        let pos_m = text.find("pkg/m.go").expect("m present");
+        let pos_z = text.find("pkg/z.go").expect("z present");
+        assert!(
+            pos_a < pos_b && pos_b < pos_c && pos_c < pos_m && pos_m < pos_z,
+            "source_map.json keys must be sorted: {text}"
+        );
         Ok(())
     }
 }

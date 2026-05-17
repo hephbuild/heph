@@ -12,7 +12,6 @@ pub fn build_spec_firstparty(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    go_bin_addr: &str,
     goroot: &str,
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
@@ -28,7 +27,6 @@ pub fn build_spec_firstparty(
         addr,
         import_path,
         factors,
-        go_bin_addr,
         goroot,
         &[
             ("modfiles", &[go_mod_addr.format()][..]),
@@ -41,17 +39,15 @@ pub fn build_spec_stdlib(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    go_bin_addr: &str,
     goroot: &str,
 ) -> anyhow::Result<TargetSpec> {
-    build_spec_inner(addr, import_path, factors, go_bin_addr, goroot, &[])
+    build_spec_inner(addr, import_path, factors, goroot, &[])
 }
 
 pub fn build_spec_thirdparty(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    go_bin_addr: &str,
     goroot: &str,
     go_mod_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
@@ -59,7 +55,6 @@ pub fn build_spec_thirdparty(
         addr,
         import_path,
         factors,
-        go_bin_addr,
         goroot,
         &[("modfiles", &[go_mod_addr.format()][..])],
     )
@@ -69,49 +64,10 @@ fn build_spec_inner(
     addr: Addr,
     import_path: &str,
     factors: &Factors,
-    go_bin_addr: &str,
     goroot: &str,
     extra_deps: &[(&str, &[String])],
 ) -> anyhow::Result<TargetSpec> {
-    let flags = factors.go_list_flags();
-
-    let flags_part = if flags.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " {}",
-            flags
-                .iter()
-                .map(|f| shell_quote(f))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
-
-    // Run go list from the sandbox package dir. Go traverses up to find go.mod
-    // (materialized via the modfiles dep), so no cd is needed. All inputs —
-    // including codegen-produced .go files from query deps — are already in the
-    // sandbox.
-    let run = format!(
-        "\"$SRC_GO_BIN\" list -json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error \
--e{flags_part} \"$GOLIST_IMPORT_PATH\" > package.json\n",
-        flags_part = flags_part,
-    );
-
-    let runtime_env: HashMap<String, TargetSpecValue> = [
-        ("GOOS", factors.goos.as_str()),
-        ("GOARCH", factors.goarch.as_str()),
-        ("GOROOT", goroot),
-        ("GOLIST_IMPORT_PATH", import_path),
-    ]
-    .into_iter()
-    .map(|(k, v)| (k.to_string(), TargetSpecValue::String(v.to_string())))
-    .collect();
-
-    let mut deps: HashMap<String, TargetSpecValue> = HashMap::from([(
-        "go_bin".to_string(),
-        TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
-    )]);
+    let mut deps: HashMap<String, TargetSpecValue> = HashMap::new();
     for (group, dep_addrs) in extra_deps {
         deps.insert(
             group.to_string(),
@@ -125,8 +81,37 @@ fn build_spec_inner(
     }
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert("deps".to_string(), TargetSpecValue::Map(deps));
+    config.insert(
+        "import_path".to_string(),
+        TargetSpecValue::String(import_path.to_string()),
+    );
+    config.insert(
+        "goos".to_string(),
+        TargetSpecValue::String(factors.goos.to_string()),
+    );
+    config.insert(
+        "goarch".to_string(),
+        TargetSpecValue::String(factors.goarch.to_string()),
+    );
+    config.insert(
+        "goroot".to_string(),
+        TargetSpecValue::String(goroot.to_string()),
+    );
+    if !factors.build_tags.is_empty() {
+        config.insert(
+            "build_tags".to_string(),
+            TargetSpecValue::List(
+                factors
+                    .build_tags
+                    .iter()
+                    .map(|t| TargetSpecValue::String(t.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !deps.is_empty() {
+        config.insert("deps".to_string(), TargetSpecValue::Map(deps));
+    }
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([
@@ -140,31 +125,14 @@ fn build_spec_inner(
             ),
         ])),
     );
-    config.insert("runtime_env".to_string(), TargetSpecValue::Map(runtime_env));
-    config.insert(
-        "runtime_pass_env".to_string(),
-        TargetSpecValue::List(vec![
-            TargetSpecValue::String("GOPATH".to_string()),
-            TargetSpecValue::String("GOMODCACHE".to_string()),
-            TargetSpecValue::String("GOCACHE".to_string()),
-            TargetSpecValue::String("HOME".to_string()),
-            TargetSpecValue::String("GONOSUMDB".to_string()),
-            TargetSpecValue::String("GOFLAGS".to_string()),
-            TargetSpecValue::String("GOPRIVATE".to_string()),
-        ]),
-    );
 
     Ok(TargetSpec {
         addr,
-        driver: "bash".to_string(),
+        driver: "go_golist".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
     })
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -205,12 +173,11 @@ mod tests {
     }
 
     #[test]
-    fn test_driver_is_bash() {
+    fn test_driver_is_go_golist() {
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
@@ -218,7 +185,7 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "go_golist");
     }
 
     #[test]
@@ -227,7 +194,6 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
@@ -243,12 +209,11 @@ mod tests {
     }
 
     #[test]
-    fn test_run_contains_go_list() {
+    fn test_config_has_import_path() {
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
@@ -256,33 +221,21 @@ mod tests {
             &[],
         )
         .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
         assert!(
-            run.contains("list -json=") && run.contains("-e "),
-            "run should invoke go list"
-        );
-        assert!(!run.contains("-deps"), "run must not contain -deps flag");
-        assert!(
-            run.contains("package.json"),
-            "run should output package.json"
-        );
-        assert!(run.contains("SRC_GO_BIN"), "run should use $SRC_GO_BIN");
-        assert!(
-            !run.contains("cd "),
-            "run must not cd out of the sandbox cwd"
+            matches!(
+                spec.config.get("import_path"),
+                Some(TargetSpecValue::String(s)) if s == "example.com/mylib"
+            ),
+            "config must have import_path"
         );
     }
 
     #[test]
-    fn test_deps_has_go_bin() {
+    fn test_config_has_goos_goarch_goroot() {
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
@@ -290,11 +243,60 @@ mod tests {
             &[],
         )
         .unwrap();
-        let deps = match spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
-            _ => panic!("expected map"),
-        };
-        assert!(deps.contains_key("go_bin"));
+        assert!(matches!(
+            spec.config.get("goos"),
+            Some(TargetSpecValue::String(s)) if s == "linux"
+        ));
+        assert!(matches!(
+            spec.config.get("goarch"),
+            Some(TargetSpecValue::String(s)) if s == "amd64"
+        ));
+        assert!(matches!(
+            spec.config.get("goroot"),
+            Some(TargetSpecValue::String(s)) if s == "/usr/local/go"
+        ));
+    }
+
+    #[test]
+    fn test_config_no_run_key() {
+        let spec = build_spec_firstparty(
+            test_addr(),
+            "example.com/mylib",
+            &test_factors(),
+            "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(!spec.config.contains_key("run"), "spec must not have 'run'");
+        assert!(
+            !spec.config.contains_key("runtime_env"),
+            "spec must not have 'runtime_env'"
+        );
+        assert!(
+            !spec.config.contains_key("runtime_pass_env"),
+            "spec must not have 'runtime_pass_env'"
+        );
+    }
+
+    #[test]
+    fn test_config_no_go_bin_dep() {
+        let spec = build_spec_firstparty(
+            test_addr(),
+            "example.com/mylib",
+            &test_factors(),
+            "/usr/local/go",
+            &go_mod_addr(),
+            &go_src_addr(),
+            None,
+            &[],
+        )
+        .unwrap();
+        if let Some(TargetSpecValue::Map(deps)) = spec.config.get("deps") {
+            assert!(!deps.contains_key("go_bin"), "deps must not contain go_bin");
+        }
     }
 
     #[test]
@@ -303,7 +305,6 @@ mod tests {
             test_addr(),
             "example.com/mylib",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
             &go_src_addr(),
@@ -331,7 +332,6 @@ mod tests {
             test_addr(),
             "github.com/foo/bar",
             &test_factors(),
-            "//@heph/bin:go",
             "/usr/local/go",
             &go_mod_addr(),
         )
@@ -348,7 +348,7 @@ mod tests {
             !deps.contains_key("srcfiles"),
             "thirdparty _golist must not dep on srcfiles"
         );
-        assert_eq!(spec.driver, "bash");
+        assert_eq!(spec.driver, "go_golist");
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -357,27 +357,28 @@ mod tests {
     }
 
     #[test]
-    fn test_run_no_src_hash_comment() {
-        let spec = build_spec_firstparty(
-            test_addr(),
-            "example.com/mylib",
-            &test_factors(),
-            "//@heph/bin:go",
-            "/usr/local/go",
-            &go_mod_addr(),
-            &go_src_addr(),
-            None,
-            &[],
-        )
-        .unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!(),
+    fn test_build_tags_in_config() {
+        let factors = Factors {
+            goos: "linux".into(),
+            goarch: "amd64".into(),
+            build_tags: vec!["integration".to_string()],
         };
+        let spec = build_spec_stdlib(test_addr(), "fmt", &factors, "/usr/local/go").unwrap();
         assert!(
-            !run.contains("hash:"),
-            "run script must not embed a manual hash: {}",
-            run
+            matches!(
+                spec.config.get("build_tags"),
+                Some(TargetSpecValue::List(tags)) if tags.len() == 1
+            ),
+            "build_tags must be in config when non-empty"
+        );
+    }
+
+    #[test]
+    fn test_no_build_tags_key_when_empty() {
+        let spec = build_spec_stdlib(test_addr(), "fmt", &test_factors(), "/usr/local/go").unwrap();
+        assert!(
+            !spec.config.contains_key("build_tags"),
+            "build_tags must not appear when empty"
         );
     }
 }

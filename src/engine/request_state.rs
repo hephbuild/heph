@@ -118,12 +118,12 @@ impl Engine {
             request_id: request_id.clone(),
             ctoken: StdCancellationToken::new(),
             dep_dag: Mutex::new(DepDag::new()),
-            mem_execute_cache: Memoizer::new(),
-            mem_result: Memoizer::new(),
-            mem_meta: Memoizer::new(),
-            mem_spec: Memoizer::new(),
-            mem_def: Memoizer::new(),
-            mem_packages: Memoizer::new(),
+            mem_execute_cache: Memoizer::with_tag("execute_cache"),
+            mem_result: Memoizer::with_tag("result"),
+            mem_meta: Memoizer::with_tag("meta"),
+            mem_spec: Memoizer::with_tag("spec"),
+            mem_def: Memoizer::with_tag("def"),
+            mem_packages: Memoizer::with_tag("packages"),
         });
 
         let state = Arc::new(RequestState {

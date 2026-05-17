@@ -1,4 +1,6 @@
 mod addr_util;
+mod driver_embed;
+mod driver_golist;
 mod embed;
 mod factors;
 mod gen_testmain;
@@ -12,4 +14,6 @@ mod target_std;
 mod target_test;
 mod thirdparty;
 
+pub use driver_embed::GoEmbedDriver;
+pub use driver_golist::GoGolistDriver;
 pub use provider::Provider;

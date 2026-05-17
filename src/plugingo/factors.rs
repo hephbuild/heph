@@ -31,6 +31,7 @@ impl Factors {
         }
     }
 
+    #[cfg(test)]
     pub fn go_list_flags(&self) -> Vec<String> {
         if self.build_tags.is_empty() {
             vec![]

@@ -1,8 +1,13 @@
+#[cfg(test)]
 use crate::engine::provider::TargetSpec;
+#[cfg(test)]
 use crate::htaddr::Addr;
+#[cfg(test)]
 use crate::loosespecparser::TargetSpecValue;
 use anyhow::Context;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Build the `embed` target spec.
@@ -10,6 +15,7 @@ use std::path::Path;
 /// static embedcfg JSON written out at build time via `printf`.
 /// `embed_files` is Go's authoritative resolved file list from `go list`; it is
 /// merged into the `Files` map alongside pattern-resolved files.
+#[cfg(test)]
 pub fn build_spec(
     addr: Addr,
     embed_patterns: &[String],
@@ -43,7 +49,7 @@ pub fn build_spec(
 
 /// Walk a single glob pattern relative to src_dir and return all matched files
 /// as paths relative to src_dir.  Directories are expanded recursively.
-fn resolve_embed_pattern(src_dir: &Path, pattern: &str) -> anyhow::Result<Vec<String>> {
+pub(crate) fn resolve_embed_pattern(src_dir: &Path, pattern: &str) -> anyhow::Result<Vec<String>> {
     let full_pattern = src_dir.join(pattern);
     let pattern_str = full_pattern
         .to_str()
@@ -87,7 +93,7 @@ fn resolve_embed_pattern(src_dir: &Path, pattern: &str) -> anyhow::Result<Vec<St
 /// `embed_files` (from `go list EmbedFiles`) is Go's authoritative resolved
 /// file list and is merged into `Files` so we don't miss files that Go includes
 /// via its own exclusion rules (no `.`/`_` prefix, etc.).
-fn compute_embed_cfg_json(
+pub(crate) fn compute_embed_cfg_json(
     embed_patterns: &[String],
     embed_files: &[String],
     src_dir: &Path,

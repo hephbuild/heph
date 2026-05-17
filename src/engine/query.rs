@@ -1,7 +1,8 @@
 use crate::engine::Engine;
-use crate::engine::error::TargetNotFoundError;
+use crate::engine::error::{CycleError, TargetNotFoundError};
 use crate::engine::provider::ListRequest;
 use crate::engine::request_state::RequestState;
+use crate::hmemoizer::downcast_chain_ref;
 use crate::htaddr::Addr;
 use crate::htmatcher;
 use crate::htmatcher::MatchResult;
@@ -38,7 +39,8 @@ impl Engine {
                             MatchResult::MatchShrug => {
                                 let spec = match Arc::clone(&self).get_spec(rs.clone(), &addr).await {
                                     Ok(spec) => Ok(spec),
-                                    Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => continue,
+                                    Err(e) if downcast_chain_ref::<TargetNotFoundError>(&e).is_some() => continue,
+                                    Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
                                     res => res,
                                 }?;
 

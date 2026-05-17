@@ -12,7 +12,6 @@ use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     factors_to_args,
 };
-use crate::plugingo::embed;
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::gen_testmain::analyze_test_main;
 use crate::plugingo::pkg_analysis::{
@@ -80,8 +79,8 @@ impl Provider {
             gopath,
             gocache,
             go_bin_addr: config.go_bin_addr,
-            pkg_cache: Memoizer::new(),
-            source_map_cache: Memoizer::new(),
+            pkg_cache: Memoizer::with_tag("pkg_cache"),
+            source_map_cache: Memoizer::with_tag("source_map_cache"),
         })
     }
 }
@@ -918,27 +917,17 @@ impl Provider {
                 if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let spec = embed::build_spec(
-                    addr.clone(),
-                    &pkg.embed_patterns,
-                    &pkg.embed_files,
-                    &host_src_dir,
-                )
-                .map_err(GetError::Other)?;
-                Ok(GetResponse { target_spec: spec })
+                Ok(GetResponse {
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, false),
+                })
             }
             "embed#xtest" => {
                 if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let spec = embed::build_spec(
-                    addr.clone(),
-                    &pkg.xtest_embed_patterns,
-                    &pkg.xtest_embed_files,
-                    &host_src_dir,
-                )
-                .map_err(GetError::Other)?;
-                Ok(GetResponse { target_spec: spec })
+                Ok(GetResponse {
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, true),
+                })
             }
             _ => Err(GetError::NotFound),
         }
@@ -992,7 +981,6 @@ impl Provider {
                     format!("{}/**/*", pkg)
                 };
                 let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &[]);
-                // Also include codegen targets that output non-Go files to this package.
                 let non_go_codegen_query_addr = Addr {
                     package: crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
                     name: "q".to_string(),
@@ -1009,7 +997,6 @@ impl Provider {
                     addr,
                     import_path,
                     factors,
-                    &self.go_bin_addr,
                     &self.goroot,
                     &go_mod_addr,
                     &go_src_glob_addr,
@@ -1040,18 +1027,13 @@ impl Provider {
                     addr,
                     &import_path,
                     factors,
-                    &self.go_bin_addr,
                     &self.goroot,
                     &go_mod_addr,
                 )?
             }
-            GoPackageKind::Stdlib { import_path } => target_golist::build_spec_stdlib(
-                addr,
-                import_path,
-                factors,
-                &self.go_bin_addr,
-                &self.goroot,
-            )?,
+            GoPackageKind::Stdlib { import_path } => {
+                target_golist::build_spec_stdlib(addr, import_path, factors, &self.goroot)?
+            }
         };
         Ok(GetResponse { target_spec: spec })
     }
@@ -1398,6 +1380,46 @@ impl Provider {
     }
 }
 
+fn build_embed_spec(
+    addr: Addr,
+    golist_addr: &Addr,
+    xtest: bool,
+) -> crate::engine::provider::TargetSpec {
+    use crate::loosespecparser::TargetSpecValue;
+    use std::collections::HashMap;
+
+    let variant = if xtest { "xtest_embed" } else { "embed" };
+    let golist_dep = format!("{}|json", golist_addr.format());
+
+    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+    config.insert(
+        "variant".to_string(),
+        TargetSpecValue::String(variant.to_string()),
+    );
+    config.insert(
+        "deps".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "golist".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
+        )])),
+    );
+    config.insert(
+        "out".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "cfg".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+        )])),
+    );
+
+    crate::engine::provider::TargetSpec {
+        addr,
+        driver: "go_embed".to_string(),
+        config,
+        labels: vec![],
+        transitive: Default::default(),
+    }
+}
+
 use crate::engine::provider::{ProbeRequest, ProbeResponse};
 
 #[cfg(test)]
@@ -1659,7 +1681,7 @@ mod tests {
             }),
         };
         let resp = p.get(req, &ctoken).await.unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "go_golist");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
@@ -1794,7 +1816,7 @@ mod tests {
         let resp = provider_get(&p, make_addr("server", "embed"))
             .await
             .unwrap();
-        assert_eq!(resp.target_spec.driver, "bash");
+        assert_eq!(resp.target_spec.driver, "go_embed");
         let out = match resp.target_spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
@@ -1885,21 +1907,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_with_embed_embed_target_run_contains_filename() {
+    async fn test_with_embed_embed_target_has_golist_dep() {
         require_go!();
         let sandbox = copy_fixture("with_embed");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let resp = provider_get(&p, make_addr("server", "embed"))
             .await
             .unwrap();
-        let run = match resp.target_spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
+        assert_eq!(resp.target_spec.driver, "go_embed");
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected deps map"),
         };
         assert!(
-            run.contains("index.html"),
-            "embed target run must reference the embedded file: {run}"
+            deps.contains_key("golist"),
+            "embed spec must dep on golist output"
         );
+        let variant = match resp.target_spec.config.get("variant").unwrap() {
+            TargetSpecValue::String(s) => s.as_str(),
+            _ => panic!("expected string"),
+        };
+        assert_eq!(variant, "embed");
     }
 
     #[tokio::test]

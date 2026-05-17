@@ -1,12 +1,12 @@
 use crate::engine::Engine;
 use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
-use crate::engine::error::TargetNotFoundError;
+use crate::engine::error::{CycleError, TargetNotFoundError};
 use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProviderExecutor, TargetSpec,
 };
 use crate::engine::request_state::RequestState;
-use crate::hmemoizer::unwrap_arc_err;
+use crate::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htmatcher::MatchResult;
 use crate::htpkg::PkgBuf;
@@ -106,7 +106,16 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     .await
                                 {
                                     Ok(spec) => Ok(spec),
-                                    Err(e) if e.downcast_ref::<TargetNotFoundError>().is_some() => {
+                                    Err(e)
+                                        if downcast_chain_ref::<TargetNotFoundError>(&e)
+                                            .is_some() =>
+                                    {
+                                        continue;
+                                    }
+                                    // Cycle means this target depends (transitively) on the
+                                    // current query caller. It cannot be a dep of the caller
+                                    // — skip it from the query results rather than error.
+                                    Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => {
                                         continue;
                                     }
                                     res => res,
@@ -116,8 +125,21 @@ impl ProviderExecutor for EngineProviderExecutor {
                                     MatchResult::MatchYes => result.push(addr),
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def =
-                                            Arc::clone(&engine).get_def(rs.clone(), &addr).await?;
+                                        let def_res =
+                                            Arc::clone(&engine).get_def(rs.clone(), &addr).await;
+                                        let def = match def_res {
+                                            Ok(def) => def,
+                                            // Same as the get_spec branch: cycle means this
+                                            // target transitively depends on the query caller —
+                                            // it can't be a dep of the caller. Skip it.
+                                            Err(e)
+                                                if downcast_chain_ref::<CycleError>(&e)
+                                                    .is_some() =>
+                                            {
+                                                continue;
+                                            }
+                                            Err(e) => return Err(e),
+                                        };
                                         if m.matches(&def.target_def) == MatchResult::MatchYes {
                                             result.push(addr);
                                         }
@@ -203,7 +225,10 @@ impl Engine {
         if let Some(ref parent) = rs.parent {
             let mut dag = rs.data.dep_dag.lock().await;
             dag.add_dep(parent, addr).map_err(|_e| {
-                anyhow::anyhow!("cyclic dependency detected: {} → {}", parent, addr)
+                anyhow::Error::new(CycleError {
+                    from: parent.clone(),
+                    to: addr.clone(),
+                })
             })?;
         }
 
@@ -558,8 +583,11 @@ impl Engine {
             )
             .await
             .map_err(|arc| {
-                // Preserve TargetNotFoundError so callers can downcast_ref to it even when
+                // Preserve typed errors so callers can downcast_ref to them even when
                 // the Arc is shared across concurrent memoizer waiters.
+                // Reconstruct TargetNotFoundError here (rather than via the chain wrapper)
+                // because callers in deeper code use `e.downcast_ref::<TargetNotFoundError>()`
+                // at the top level.
                 if arc.downcast_ref::<TargetNotFoundError>().is_some() {
                     TargetNotFoundError { addr: addr.clone() }.into()
                 } else {
@@ -595,7 +623,9 @@ impl Engine {
             {
                 Ok(GetResponse { target_spec }) => target_spec,
                 Err(GetError::NotFound) => continue,
-                Err(GetError::Other(e)) => anyhow::bail!(e),
+                // Return e directly (not bail!(e)) to preserve typed-error downcast
+                // through the anyhow::Error chain — required for CycleError handling.
+                Err(GetError::Other(e)) => return Err(e),
             };
 
             return anyhow::Ok(Arc::new(spec));
@@ -737,6 +767,36 @@ mod tests {
             "expected 'target not found' in error chain: {full_chain}"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cycle_detection_returns_typed_cycle_error() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let engine = Arc::new(Engine::new(Config {
+            root: root.path().to_path_buf(),
+            parallelism: None,
+        })?);
+        let addr = Addr {
+            package: PkgBuf::from("p"),
+            name: "t".to_string(),
+            args: Default::default(),
+        };
+        // Pre-populate dag with addr→addr already there is overkill; just call result_addr
+        // twice with the same parent set, but result_addr sets parent via with_parent so the
+        // second invocation inside the same parent chain triggers cycle. Simulate by manually
+        // setting rs.parent = addr before calling result_addr(addr).
+        let rs = engine.new_state().with_parent(addr.clone());
+        let result = engine
+            .clone()
+            .result_addr(rs, &addr, OutputMatcher::None, &ResultOptions::default())
+            .await;
+        assert!(result.is_err(), "expected cycle error");
+        let err = result.err().unwrap();
+        assert!(
+            err.downcast_ref::<CycleError>().is_some(),
+            "expected CycleError, got: {err:#}"
+        );
         Ok(())
     }
 }

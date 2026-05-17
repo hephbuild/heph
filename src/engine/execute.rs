@@ -63,6 +63,10 @@ impl Engine {
         }?;
         fs::create_dir_all(&sandbox_dir)?;
 
+        if def.target.cache {
+            eprintln!("[{}] run: {}", driver.name, addr);
+        }
+
         let hashin_owned = hashin.to_owned();
         let res = driver
             .driver

@@ -1,0 +1,401 @@
+use crate::debug_hash::DebugHasher;
+use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
+use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef};
+use crate::engine::driver::{
+    ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
+    ParseResponse, TargetAddr,
+};
+use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRunResponse};
+use crate::hasync::Cancellable;
+use crate::loosespecparser::{parse_map_string_strings, parse_string};
+use crate::plugingo::embed;
+use crate::plugingo::pkg_analysis::parse_go_list_reader;
+use anyhow::Context;
+use async_trait::async_trait;
+use std::hash::{Hash, Hasher};
+use std::io::BufRead;
+use std::sync::Arc;
+use xxhash_rust::xxh3::Xxh3Default;
+
+pub struct GoEmbedDriver;
+
+#[derive(Clone, PartialEq, Debug)]
+enum EmbedVariant {
+    Embed,
+    XtestEmbed,
+}
+
+impl Hash for EmbedVariant {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            EmbedVariant::Embed => 0u8.hash(state),
+            EmbedVariant::XtestEmbed => 1u8.hash(state),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GoEmbedDef {
+    variant: EmbedVariant,
+    golist_origin_id: String,
+}
+
+impl Hash for GoEmbedDef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.variant.hash(state);
+        self.golist_origin_id.hash(state);
+    }
+}
+
+#[async_trait]
+impl ManagedDriver for GoEmbedDriver {
+    fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        Ok(ConfigResponse {
+            name: "go_embed".to_string(),
+        })
+    }
+
+    async fn parse(
+        &self,
+        req: ParseRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ParseResponse> {
+        let pkg = req.target_spec.addr.package.clone();
+        let pkg_str = pkg.as_str();
+        let config = &req.target_spec.config;
+
+        let variant_str = config
+            .get("variant")
+            .and_then(|v| parse_string(v).ok().flatten())
+            .ok_or_else(|| anyhow::anyhow!("go_embed: missing variant"))?;
+
+        let variant = match variant_str.as_str() {
+            "embed" => EmbedVariant::Embed,
+            "xtest_embed" => EmbedVariant::XtestEmbed,
+            other => anyhow::bail!("go_embed: unknown variant {other:?}"),
+        };
+
+        // Parse deps.golist
+        let deps = config
+            .get("deps")
+            .map(|v| parse_map_string_strings(v).context("parse deps"))
+            .transpose()?
+            .unwrap_or_default();
+
+        let golist_addrs = deps
+            .get("golist")
+            .ok_or_else(|| anyhow::anyhow!("go_embed: missing deps.golist"))?;
+
+        if golist_addrs.is_empty() {
+            anyhow::bail!("go_embed: deps.golist must have at least one entry");
+        }
+
+        let golist_origin_id = "dep|golist|0".to_string();
+
+        let mut inputs: Vec<Input> = Vec::new();
+        for (i, addr_str) in golist_addrs.iter().enumerate() {
+            inputs.push(Input {
+                r#ref: TargetAddr::parse(addr_str, &pkg)
+                    .with_context(|| format!("parse golist dep addr {addr_str}"))?,
+                mode: InputMode::Standard,
+                origin_id: format!("dep|golist|{i}"),
+            });
+        }
+
+        let def = GoEmbedDef {
+            variant,
+            golist_origin_id,
+        };
+
+        // Parse outputs
+        let out_strings = config
+            .get("out")
+            .map(|v| parse_map_string_strings(v).context("parse out"))
+            .transpose()?
+            .unwrap_or_default();
+
+        let outputs = out_strings
+            .iter()
+            .map(|(group, paths)| Output {
+                group: group.clone(),
+                paths: paths
+                    .iter()
+                    .map(|p| {
+                        let full_path = if pkg_str.is_empty() {
+                            p.clone()
+                        } else {
+                            format!("{pkg_str}/{p}")
+                        };
+                        Path {
+                            content: Content::FilePath(full_path),
+                            codegen_tree: CodegenMode::None,
+                            collect: true,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let hash = {
+            let mut h = DebugHasher::new(
+                Xxh3Default::new(),
+                &format!("go_embed_{}", req.target_spec.addr.format()),
+            );
+            def.hash(&mut h);
+            format!("{:x}", h.finish()).into_bytes()
+        };
+
+        Ok(ParseResponse {
+            target_def: TargetDef {
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels,
+                raw_def: Arc::new(def),
+                inputs,
+                outputs,
+                support_files: vec![],
+                cache: true,
+                disable_remote_cache: false,
+                pty: false,
+                hash,
+                transparent: false,
+            },
+        })
+    }
+
+    async fn apply_transitive(
+        &self,
+        req: ApplyTransitiveRequest,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ApplyTransitiveResponse> {
+        Ok(ApplyTransitiveResponse {
+            target_def: req.target_def,
+        })
+    }
+
+    async fn run<'a>(
+        &self,
+        req: ManagedRunRequest<'a>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        let def = req.request.target.def::<GoEmbedDef>();
+
+        // Find package.json from the golist input
+        let managed = req
+            .inputs
+            .iter()
+            .find(|m| m.input.origin_id == def.golist_origin_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("go_embed: golist input {} not found", def.golist_origin_id)
+            })?;
+
+        // Find the package.json file in the list
+        let list_f = std::fs::File::open(&managed.list_path)
+            .with_context(|| format!("open golist list {:?}", managed.list_path))?;
+        let pkg_json_path = std::io::BufReader::new(list_f)
+            .lines()
+            .find(|l| {
+                l.as_ref()
+                    .is_ok_and(|s| !s.is_empty() && s.ends_with("package.json"))
+            })
+            .ok_or_else(|| anyhow::anyhow!("go_embed: package.json not found in golist input"))??;
+
+        let pkg_json_file =
+            std::fs::File::open(&pkg_json_path).with_context(|| "open package.json")?;
+        let pkgs = parse_go_list_reader(pkg_json_file).context("parse package.json")?;
+
+        // Take the first (and typically only) package
+        let pkg = pkgs
+            .into_values()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("go_embed: package.json is empty"))?;
+
+        let (patterns, files) = match &def.variant {
+            EmbedVariant::Embed => (&pkg.embed_patterns, &pkg.embed_files),
+            EmbedVariant::XtestEmbed => (&pkg.xtest_embed_patterns, &pkg.xtest_embed_files),
+        };
+
+        if patterns.is_empty() && files.is_empty() {
+            // Write empty embedcfg
+            std::fs::write(
+                req.sandbox_pkg_dir.join("embedcfg"),
+                r#"{"Patterns":{},"Files":{}}"#,
+            )
+            .context("write empty embedcfg")?;
+            return Ok(ManagedRunResponse { artifacts: vec![] });
+        }
+
+        // Derive host src dir: pkg.dir is now repo-root-relative (normalized by go_golist driver)
+        let host_src_dir = req
+            .request
+            .tree_root_path
+            .join(pkg.dir.as_deref().unwrap_or_default());
+
+        let cfg_json = embed::compute_embed_cfg_json(patterns, files, &host_src_dir)
+            .context("compute embedcfg")?;
+
+        std::fs::write(req.sandbox_pkg_dir.join("embedcfg"), cfg_json).context("write embedcfg")?;
+
+        Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::provider::TargetSpec;
+    use crate::htaddr::Addr;
+    use crate::htpkg::PkgBuf;
+    use crate::loosespecparser::TargetSpecValue;
+    use std::collections::HashMap;
+
+    fn driver() -> GoEmbedDriver {
+        GoEmbedDriver
+    }
+
+    fn noop_ctoken() -> crate::hasync::StdCancellationToken {
+        crate::hasync::StdCancellationToken::new()
+    }
+
+    fn make_parse_request(pkg: &str, variant: &str, golist_addr: &str) -> ParseRequest {
+        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        config.insert(
+            "variant".to_string(),
+            TargetSpecValue::String(variant.to_string()),
+        );
+        config.insert(
+            "deps".to_string(),
+            TargetSpecValue::Map(HashMap::from([(
+                "golist".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String(golist_addr.to_string())]),
+            )])),
+        );
+        config.insert(
+            "out".to_string(),
+            TargetSpecValue::Map(HashMap::from([(
+                "cfg".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+            )])),
+        );
+
+        ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: TargetSpec {
+                addr: Addr {
+                    package: PkgBuf::from(pkg),
+                    name: "embed".to_string(),
+                    args: Default::default(),
+                },
+                driver: "go_embed".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_driver_name_is_go_embed() {
+        let resp = driver().config(ConfigRequest {}).unwrap();
+        assert_eq!(resp.name, "go_embed");
+    }
+
+    #[tokio::test]
+    async fn test_parse_embed_variant() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        assert_eq!(
+            resp.target_def.def::<GoEmbedDef>().variant,
+            EmbedVariant::Embed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_xtest_embed_variant() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "xtest_embed", "//mypkg:_golist|json");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        assert_eq!(
+            resp.target_def.def::<GoEmbedDef>().variant,
+            EmbedVariant::XtestEmbed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_invalid_variant_errors() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "invalid", "//mypkg:_golist|json");
+        assert!(driver().parse(req, &ct).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_missing_variant_errors() {
+        let ct = noop_ctoken();
+        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        config.insert(
+            "deps".to_string(),
+            TargetSpecValue::Map(HashMap::from([(
+                "golist".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String(
+                    "//mypkg:_golist|json".to_string(),
+                )]),
+            )])),
+        );
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: TargetSpec {
+                addr: Addr {
+                    package: PkgBuf::from("mypkg"),
+                    name: "embed".to_string(),
+                    args: Default::default(),
+                },
+                driver: "go_embed".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            },
+        };
+        assert!(driver().parse(req, &ct).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_parse_includes_golist_input() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        assert!(
+            resp.target_def
+                .inputs
+                .iter()
+                .any(|i| i.origin_id == "dep|golist|0"),
+            "golist input must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_out_prepends_package() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let cfg_out = resp
+            .target_def
+            .outputs
+            .iter()
+            .find(|o| o.group == "cfg")
+            .unwrap();
+        assert!(cfg_out.paths.iter().any(|p| matches!(
+            &p.content,
+            Content::FilePath(s) if s == "mypkg/embedcfg"
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_parse_no_host_src_dir_in_def() {
+        let ct = noop_ctoken();
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let resp = driver().parse(req, &ct).await.unwrap();
+        // Verify GoEmbedDef has no host path — only variant + origin_id
+        let def = resp.target_def.def::<GoEmbedDef>();
+        assert_eq!(def.golist_origin_id, "dep|golist|0");
+    }
+}
