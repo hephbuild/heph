@@ -452,6 +452,15 @@ impl Provider {
             GoPackageKind::Stdlib { .. } => return Err(GetError::NotFound),
         };
 
+        // Host filesystem path to the package source directory. Used for operations
+        // that must access the real filesystem (embed file resolution, test file parsing)
+        // rather than the sandbox path in pkg.dir.
+        let host_src_dir = match &kind {
+            GoPackageKind::FirstParty { src_dir: host_dir, .. } => host_dir.clone(),
+            GoPackageKind::ThirdParty { .. } => src_dir.to_path_buf(),
+            GoPackageKind::Stdlib { .. } => src_dir.to_path_buf(),
+        };
+
         match addr.name.as_str() {
             "build_lib" => {
                 let transitive = self
@@ -569,10 +578,10 @@ impl Provider {
                 }
                 let mut test_file_args: Vec<(&'static str, String)> = Vec::new();
                 for f in &pkg.test_go_files {
-                    test_file_args.push(("_test", src_dir.join(f).to_string_lossy().into_owned()));
+                    test_file_args.push(("_test", host_src_dir.join(f).to_string_lossy().into_owned()));
                 }
                 for f in &pkg.xtest_go_files {
-                    test_file_args.push(("_xtest", src_dir.join(f).to_string_lossy().into_owned()));
+                    test_file_args.push(("_xtest", host_src_dir.join(f).to_string_lossy().into_owned()));
                 }
                 let file_refs: Vec<(&str, &str)> = test_file_args
                     .iter()
@@ -880,10 +889,10 @@ impl Provider {
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
-                if pkg.embed_files.is_empty() {
+                if pkg.embed_patterns.is_empty() || pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let spec = embed::build_spec(addr.clone(), &pkg.embed_patterns, src_dir)
+                let spec = embed::build_spec(addr.clone(), &pkg.embed_patterns, &host_src_dir)
                     .map_err(GetError::Other)?;
                 Ok(GetResponse { target_spec: spec })
             }
@@ -928,9 +937,30 @@ impl Provider {
                     args: BTreeMap::from([
                         ("label".to_string(), "go_src".to_string()),
                         ("package".to_string(), pkg_str.clone()),
+                        ("tree_output_to".to_string(), pkg_str.clone()),
+                    ]),
+                };
+                // Include all non-Go files in the package directory so that go list
+                // can resolve //go:embed patterns and populate EmbedFiles.
+                let non_go_glob = if pkg.is_empty() {
+                    "**/*".to_string()
+                } else {
+                    format!("{}/**/*", pkg)
+                };
+                let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &[]);
+                // Also include codegen targets that output non-Go files to this package.
+                let non_go_codegen_query_addr = Addr {
+                    package: crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+                    name: "q".to_string(),
+                    args: BTreeMap::from([
+                        ("package".to_string(), pkg_str.clone()),
                         ("tree_output_to".to_string(), pkg_str),
                     ]),
                 };
+                let non_go_src_addrs = vec![
+                    non_go_glob_addr.format(),
+                    non_go_codegen_query_addr.format(),
+                ];
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -940,6 +970,7 @@ impl Provider {
                     &go_mod_addr,
                     &go_src_glob_addr,
                     Some(&go_src_query_addr),
+                    &non_go_src_addrs,
                 )?
             }
             GoPackageKind::ThirdParty {

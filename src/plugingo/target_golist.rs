@@ -17,11 +17,13 @@ pub fn build_spec_firstparty(
     go_mod_addr: &Addr,
     go_src_addr: &Addr,
     go_src_query_addr: Option<&Addr>,
+    non_go_src_addrs: &[String],
 ) -> anyhow::Result<TargetSpec> {
     let mut srcfiles: Vec<String> = vec![go_src_addr.format()];
     if let Some(q) = go_src_query_addr {
         srcfiles.push(q.format());
     }
+    srcfiles.extend_from_slice(non_go_src_addrs);
     build_spec_inner(
         addr,
         import_path,
@@ -213,6 +215,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         assert_eq!(spec.driver, "bash");
@@ -229,6 +232,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         let out = match spec.config.get("out").unwrap() {
@@ -249,6 +253,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
@@ -282,6 +287,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -302,6 +308,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -360,6 +367,7 @@ mod tests {
             &go_mod_addr(),
             &go_src_addr(),
             None,
+        &[],
         )
         .unwrap();
         let run = match spec.config.get("run").unwrap() {
