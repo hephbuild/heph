@@ -123,8 +123,8 @@ impl crate::engine::driver::Driver for Driver {
 
         Ok(ParseResponse {
             target_def: TargetDef {
-                addr: req.target_spec.addr,
-                labels: req.target_spec.labels,
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(HostBinDef {
                     bin_name: bin_name.clone(),
                 }),
@@ -282,13 +282,13 @@ mod tests {
     fn make_parse_request(bin_name: &str) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: parse_addr(&format!("//@heph/bin:{}", bin_name)).unwrap(),
                 driver: DRIVER_NAME.to_string(),
                 config: Default::default(),
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         }
     }
 
@@ -405,7 +405,8 @@ mod tests {
         fn result<'a>(
             &'a self,
             _addr: &'a crate::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::EResult>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<crate::engine::EResult>>>
+        {
             Box::pin(async { anyhow::bail!("noop") })
         }
 

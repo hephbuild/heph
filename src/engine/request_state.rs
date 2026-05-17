@@ -6,43 +6,66 @@ use crate::engine::result::{ArtifactMeta, ExtendedTargetDef};
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
-use daggy::petgraph::graph::NodeIndex;
-use daggy::{Dag, WouldCycle};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Weak};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 type ArcErr = Arc<anyhow::Error>;
 type ExecuteCacheResult = Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>), ArcErr>;
 
+/// Returned by [`DepDag::add_dep`] when adding the edge would form a cycle.
+#[derive(Debug)]
+pub struct WouldCycle;
+
+/// Per-request dep graph used for cross-task cycle detection.
+///
+/// Stored as adjacency list `from -> children` directly — much cheaper than the
+/// previous petgraph/daggy stack (which kept a NodeIndex side-table and grew its
+/// internal Graph buffers on every edge). The whole struct lives behind a single
+/// `std::sync::Mutex` rather than the previous `tokio::sync::Mutex`: every
+/// operation is sync + short, so the async mutex was paying for waker machinery
+/// it never used.
 pub struct DepDag {
-    dag: Dag<Addr, ()>,
-    nodes: HashMap<Addr, NodeIndex>,
+    edges: HashMap<Addr, Vec<Addr>>,
 }
 
 impl DepDag {
     fn new() -> Self {
         Self {
-            dag: Dag::new(),
-            nodes: HashMap::new(),
+            edges: HashMap::new(),
         }
     }
 
-    pub fn add_dep(&mut self, from: &Addr, to: &Addr) -> Result<(), WouldCycle<()>> {
-        let from_idx = self.get_or_insert(from);
-        let to_idx = self.get_or_insert(to);
-        self.dag.add_edge(from_idx, to_idx, ())?;
+    /// Adds `from -> to`. Returns [`WouldCycle`] if `to` already reaches `from`
+    /// (i.e. inserting the edge would close a cycle). The check and the insert
+    /// happen under the same lock so concurrent adders cannot both observe
+    /// "no cycle" and then race in two edges that together form one.
+    pub fn add_dep(&mut self, from: &Addr, to: &Addr) -> Result<(), WouldCycle> {
+        if from == to || self.reaches(to, from) {
+            return Err(WouldCycle);
+        }
+        self.edges.entry(from.clone()).or_default().push(to.clone());
         Ok(())
     }
 
-    fn get_or_insert(&mut self, addr: &Addr) -> NodeIndex {
-        if let Some(&idx) = self.nodes.get(addr) {
-            idx
-        } else {
-            let idx = self.dag.add_node(addr.clone());
-            self.nodes.insert(addr.clone(), idx);
-            idx
+    /// DFS: does `start` reach `target` via the recorded edges?
+    fn reaches(&self, start: &Addr, target: &Addr) -> bool {
+        let Some(initial) = self.edges.get(start) else {
+            return false;
+        };
+        let mut stack: Vec<&Addr> = initial.iter().collect();
+        let mut visited: HashSet<&Addr> = HashSet::new();
+        while let Some(node) = stack.pop() {
+            if node == target {
+                return true;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some(children) = self.edges.get(node) {
+                stack.extend(children.iter());
+            }
         }
+        false
     }
 }
 
@@ -52,11 +75,13 @@ pub struct RequestStateData {
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub dep_dag: Mutex<DepDag>,
-    pub mem_result: Memoizer<String, Result<crate::engine::result::EResult, ArcErr>>,
+    pub mem_result: Memoizer<String, Result<Arc<crate::engine::result::EResult>, ArcErr>>,
     pub mem_execute_cache: Memoizer<String, ExecuteCacheResult>,
-    pub mem_meta: Memoizer<String, Result<ResultMeta, ArcErr>>,
-    pub mem_spec: Memoizer<String, Result<Arc<TargetSpec>, ArcErr>>,
-    pub mem_def: Memoizer<String, Result<Arc<ExtendedTargetDef>, ArcErr>>,
+    pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
+    pub mem_spec: Memoizer<Addr, Result<Arc<TargetSpec>, ArcErr>>,
+    pub mem_def: Memoizer<Addr, Result<Arc<ExtendedTargetDef>, ArcErr>>,
+    pub mem_expanded_inputs:
+        Memoizer<Addr, Result<Arc<Vec<crate::engine::driver::targetdef::Input>>, ArcErr>>,
     pub mem_packages: Memoizer<String, Result<Arc<Vec<String>>, ArcErr>>,
 }
 
@@ -123,6 +148,7 @@ impl Engine {
             mem_meta: Memoizer::with_tag("meta"),
             mem_spec: Memoizer::with_tag("spec"),
             mem_def: Memoizer::with_tag("def"),
+            mem_expanded_inputs: Memoizer::with_tag("expanded_inputs"),
             mem_packages: Memoizer::with_tag("packages"),
         });
 

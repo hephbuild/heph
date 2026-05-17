@@ -1,5 +1,5 @@
 use crate::debug_hash::DebugHasher;
-use crate::engine::driver::targetdef::{Input, TargetDef};
+use crate::engine::driver::targetdef::TargetDef;
 use crate::engine::request_state::RequestState;
 use crate::engine::{EResult, Engine, OutputMatcher, ResultOptions};
 use crate::hmemoizer::unwrap_arc_err;
@@ -8,9 +8,8 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use itertools::Itertools;
-use std::collections::HashSet;
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Clone)]
@@ -24,12 +23,11 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
-        let key = addr.format();
         let res = rs
             .data
             .mem_meta
             .once(
-                key,
+                addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.inner_meta(rs, &addr).await
                 }),
@@ -46,10 +44,7 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
         let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
-        let results = self
-            .clone()
-            .inputs_result_meta(rs.clone(), &def.target_def.inputs)
-            .await?;
+        let results = self.clone().inputs_result_meta(rs.clone(), addr).await?;
 
         let hashouts: Vec<String> = results
             .iter()
@@ -86,15 +81,10 @@ impl Engine {
     async fn inputs_result_meta(
         self: Arc<Self>,
         rc: Arc<RequestState>,
-        inputs: &[Input],
-    ) -> anyhow::Result<Vec<EResult>> {
+        addr: &Addr,
+    ) -> anyhow::Result<Vec<Arc<EResult>>> {
         let inputs = Arc::clone(&self)
-            .expand_inputs(
-                rc.clone(),
-                inputs.to_vec(),
-                None,
-                Arc::new(Mutex::new(HashSet::new())),
-            )
+            .expanded_inputs_for(rc.clone(), addr)
             .await?;
 
         let futures = inputs.iter().map(|input| {

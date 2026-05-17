@@ -1,4 +1,3 @@
-use crate::engine::EResult;
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
@@ -53,13 +52,13 @@ pub struct Provider {
     gocache: String,
     go_bin_addr: String,
     /// Cache: golist addr → GoPackage. Memoizes the full executor.result + parse across requests.
-    pkg_cache: Memoizer<String, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
+    pkg_cache: Memoizer<Addr, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
     /// Cache: golist addr → source_map.json contents.
     #[expect(
         clippy::type_complexity,
         reason = "memoizer type mirrors pkg_cache pattern"
     )]
-    source_map_cache: Memoizer<String, Result<Arc<HashMap<String, String>>, Arc<anyhow::Error>>>,
+    source_map_cache: Memoizer<Addr, Result<Arc<HashMap<String, String>>, Arc<anyhow::Error>>>,
 }
 
 impl Provider {
@@ -1070,12 +1069,11 @@ impl Provider {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
-        let key = golist_addr.format();
         let golist_addr = golist_addr.clone();
 
         self.pkg_cache
-            .once(key, move || async move {
-                let result: EResult = executor.result(&golist_addr).await?;
+            .once(golist_addr.clone(), move || async move {
+                let result = executor.result(&golist_addr).await?;
                 let pkg = tokio::task::spawn_blocking(move || {
                     for artifact in &result.artifacts {
                         for entry_result in artifact.walk()? {
@@ -1107,12 +1105,11 @@ impl Provider {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<HashMap<String, String>>> {
-        let key = golist_addr.format();
         let golist_addr = golist_addr.clone();
 
         self.source_map_cache
-            .once(key, move || async move {
-                let result: EResult = executor.result(&golist_addr).await?;
+            .once(golist_addr.clone(), move || async move {
+                let result = executor.result(&golist_addr).await?;
                 let map = tokio::task::spawn_blocking(move || {
                     for artifact in &result.artifacts {
                         for entry_result in artifact.walk()? {
@@ -1506,7 +1503,7 @@ mod tests {
     }
 
     impl ProviderExecutor for GoListTestExecutor {
-        fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<EResult>> {
+        fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
             Box::pin(async move {
                 if addr.name != "_golist" {
                     anyhow::bail!(
@@ -1560,7 +1557,7 @@ mod tests {
                     artifacts.push(Arc::new(SourceMapContent(sm_json)) as Arc<dyn Content>);
                 }
 
-                Ok(EResult {
+                Ok(Arc::new(EResult {
                     artifacts_meta: artifacts
                         .iter()
                         .map(|_| ArtifactMeta {
@@ -1568,7 +1565,7 @@ mod tests {
                         })
                         .collect(),
                     artifacts,
-                })
+                }))
             })
         }
 

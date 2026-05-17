@@ -1,5 +1,6 @@
 use crate::engine::driver::TargetAddr;
 use crate::engine::driver::sandbox::{Dep, Env, EnvValue, Mode, Sandbox, Tool};
+use crate::hmemoizer::unwrap_arc_err;
 use crate::htaddr;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::{
@@ -7,6 +8,7 @@ use crate::loosespecparser::{
 };
 use crate::pluginbuildfile::provider::Provider;
 use anyhow::Context;
+use enclose::enclose;
 use starlark::any::ProvidesStaticType;
 use starlark::environment::{Globals, GlobalsBuilder, Module};
 use starlark::eval::{Arguments, Evaluator};
@@ -289,83 +291,95 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 }
 
 impl Provider {
-    pub(crate) fn run_pkg(&self, pkg: &str) -> anyhow::Result<RunResult> {
-        self.run_pkg_inner(pkg)
-            .with_context(|| format!("pkg: `{}`", pkg)) // TODO: memo
-    }
-
-    fn run_pkg_inner(&self, pkg: &str) -> anyhow::Result<RunResult> {
-        for pattern in &self.build_file_patterns {
-            let path = self.root.join(pkg).join(pattern);
-            if path.exists() {
-                return self.run_file(pkg, pattern);
-            }
-        }
-
-        Ok(RunResult {
-            targets: vec![],
-            states: vec![],
-        })
-    }
-
-    pub(crate) fn run_file(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
-        self.run_file_inner(pkg, filename)
-            .with_context(|| format!("file: {:?}", filename)) // TODO: memo
-    }
-
-    fn run_file_inner(&self, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
-        let path_buf = self.root.join(pkg).join(filename);
-        let path = path_buf.as_path();
-        let ast: AstModule =
-            AstModule::parse_file(path, &Dialect::Extended).map_err(|e| anyhow::anyhow!(e))?;
-
-        let globals = get_globals();
-
-        let module = Module::new();
-
-        let targets = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
-        let states = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
-
-        {
-            let extra = Extra {
-                pkg,
-                on_target: {
-                    let targets = targets.clone();
-                    Box::new(move |p| {
-                        targets.borrow_mut().push(p);
-
-                        Ok(())
+    pub(crate) async fn run_pkg(&self, pkg: &str) -> anyhow::Result<std::sync::Arc<RunResult>> {
+        let key = pkg.to_string();
+        let root = self.root.clone();
+        let patterns = self.build_file_patterns.clone();
+        self.pkg_cache
+            .once(
+                key.clone(),
+                enclose!((key) move || async move {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<std::sync::Arc<RunResult>> {
+                        let r = run_pkg_inner_owned(&root, &patterns, &key)
+                            .with_context(|| format!("pkg: `{}`", key))?;
+                        Ok(std::sync::Arc::new(r))
                     })
-                },
-                on_state: {
-                    let states = states.clone();
-                    Box::new(move |p| {
-                        states.borrow_mut().push(p);
-
-                        Ok(())
-                    })
-                },
-            };
-            let mut eval = Evaluator::new(&module);
-            eval.extra = Some(&extra);
-
-            eval.eval_module(ast, globals)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
-
-        let targets = std::rc::Rc::try_unwrap(targets)
-            .map_err(|_rc| {
-                anyhow::anyhow!("targets Rc still has outstanding references after eval")
-            })?
-            .into_inner();
-        let states = std::rc::Rc::try_unwrap(states)
-            .map_err(|_rc| {
-                anyhow::anyhow!("states Rc still has outstanding references after eval")
-            })?
-            .into_inner();
-
-        Ok(RunResult { targets, states })
+                    .await
+                    .context("run_pkg blocking task panicked")?
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
     }
+}
+
+fn run_pkg_inner_owned(
+    root: &std::path::Path,
+    patterns: &[String],
+    pkg: &str,
+) -> anyhow::Result<RunResult> {
+    for pattern in patterns {
+        let path = root.join(pkg).join(pattern);
+        if path.exists() {
+            return run_file_inner(root, pkg, pattern)
+                .with_context(|| format!("file: {:?}", pattern));
+        }
+    }
+
+    Ok(RunResult {
+        targets: vec![],
+        states: vec![],
+    })
+}
+
+fn run_file_inner(root: &std::path::Path, pkg: &str, filename: &str) -> anyhow::Result<RunResult> {
+    let path_buf = root.join(pkg).join(filename);
+    let path = path_buf.as_path();
+    let ast: AstModule =
+        AstModule::parse_file(path, &Dialect::Extended).map_err(|e| anyhow::anyhow!(e))?;
+
+    let globals = get_globals();
+
+    let module = Module::new();
+
+    let targets = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let states = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+
+    {
+        let extra = Extra {
+            pkg,
+            on_target: {
+                let targets = targets.clone();
+                Box::new(move |p| {
+                    targets.borrow_mut().push(p);
+
+                    Ok(())
+                })
+            },
+            on_state: {
+                let states = states.clone();
+                Box::new(move |p| {
+                    states.borrow_mut().push(p);
+
+                    Ok(())
+                })
+            },
+        };
+        let mut eval = Evaluator::new(&module);
+        eval.extra = Some(&extra);
+
+        eval.eval_module(ast, globals)
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+
+    let targets = std::rc::Rc::try_unwrap(targets)
+        .map_err(|_rc| anyhow::anyhow!("targets Rc still has outstanding references after eval"))?
+        .into_inner();
+    let states = std::rc::Rc::try_unwrap(states)
+        .map_err(|_rc| anyhow::anyhow!("states Rc still has outstanding references after eval"))?
+        .into_inner();
+
+    Ok(RunResult { targets, states })
 }
 
 #[cfg(test)]
@@ -401,7 +415,7 @@ target(
             ..Provider::default()
         };
 
-        let result = provider.run_file(&pkg_name, &filename).unwrap();
+        let result = run_file_inner(&provider.root, &pkg_name, &filename).unwrap();
 
         assert_eq!(result.targets.len(), 1);
         let target = &result.targets[0];
@@ -480,7 +494,7 @@ target(
         let filename = "BUILD";
         fs::write(pkg_path.join(filename), build_content).unwrap();
         let provider = make_provider(&tmp_dir);
-        let result = provider.run_file(pkg_name, filename)?;
+        let result = run_file_inner(&provider.root, pkg_name, filename)?;
         Ok(result
             .targets
             .into_iter()
@@ -636,8 +650,8 @@ target(
         assert!(run_transitive(content).is_err());
     }
 
-    #[test]
-    fn test_run_pkg_inner_multiple_patterns() {
+    #[tokio::test]
+    async fn test_run_pkg_inner_multiple_patterns() {
         let tmp_dir = tempdir().unwrap();
         let pkg_name = "mypkg".to_string();
         let pkg_path = tmp_dir.path().join(&pkg_name);
@@ -658,7 +672,7 @@ target(
             ..Provider::default()
         };
 
-        let result = provider.run_pkg(&pkg_name).unwrap();
+        let result = provider.run_pkg(&pkg_name).await.unwrap();
 
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "mytarget");

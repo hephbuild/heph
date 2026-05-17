@@ -73,8 +73,8 @@ impl crate::engine::driver::Driver for Driver {
 
         Ok(ParseResponse {
             target_def: TargetDef {
-                addr: req.target_spec.addr,
-                labels: req.target_spec.labels,
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(GroupDef),
                 inputs,
                 outputs: vec![],
@@ -126,13 +126,13 @@ mod tests {
     fn make_parse_req(addr_str: &str, config: HashMap<String, TargetSpecValue>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: parse_addr(addr_str).unwrap(),
                 driver: DRIVER_NAME.to_string(),
                 config,
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         }
     }
 
@@ -191,7 +191,9 @@ mod tests {
     async fn test_parse_labels_preserved() {
         let driver = Driver;
         let mut req = make_parse_req("//pkg:g", HashMap::new());
-        req.target_spec.labels = vec!["my_label".to_string()];
+        std::sync::Arc::get_mut(&mut req.target_spec)
+            .expect("spec uniquely owned in test")
+            .labels = vec!["my_label".to_string()];
         let res = driver.parse(req, &ctoken()).await.unwrap();
         assert_eq!(res.target_def.labels, vec!["my_label"]);
     }

@@ -5,12 +5,14 @@ use crate::engine::provider::{
     Provider as EProvider, State, TargetSpec,
 };
 use crate::hasync::Cancellable;
+use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct RequestState {}
 
@@ -18,6 +20,16 @@ pub struct Provider {
     pub root: std::path::PathBuf,
     pub build_file_patterns: Vec<String>,
     pub requests: Mutex<HashMap<String, RequestState>>,
+    /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
+    /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
+    /// pkg in a typical run), and dedupes concurrent in-flight parses on the same
+    /// pkg. Caches errors too — a failed parse stays failed for the lifetime of
+    /// the provider (BUILD file contents don't change mid-session).
+    pub(crate) pkg_cache: Memoizer<String, Result<Arc<RunResult>, Arc<anyhow::Error>>>,
+    /// Cache: full BUILD-file walk of `root`. `find_packages_sync` does a recursive
+    /// readdir of the workspace tree; once per provider lifetime is enough since the
+    /// layout doesn't change mid-session. `()` key — single global entry.
+    pub(crate) packages_cache: Memoizer<(), Result<Arc<Vec<String>>, Arc<anyhow::Error>>>,
 }
 
 impl Default for Provider {
@@ -26,6 +38,8 @@ impl Default for Provider {
             root: std::path::PathBuf::from("/"),
             build_file_patterns: vec!["BUILD".to_string()],
             requests: Mutex::new(HashMap::new()),
+            pkg_cache: Memoizer::with_tag("buildfile_pkg"),
+            packages_cache: Memoizer::with_tag("buildfile_packages"),
         }
     }
 }
@@ -98,16 +112,16 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
         Box::pin(async move {
-            let res = self.run_pkg(req.package.as_str())?;
+            let res = self.run_pkg(req.package.as_str()).await?;
 
             let items: Vec<anyhow::Result<ListResponse>> = res
                 .targets
-                .into_iter()
+                .iter()
                 .map(|p| {
                     Ok(ListResponse {
                         addr: Addr {
                             package: req.package.clone(),
-                            name: p.name,
+                            name: p.name.clone(),
                             args: Default::default(),
                         },
                     })
@@ -128,17 +142,23 @@ impl EProvider for Provider {
         Box::pin(async move {
             let root = self.root.clone();
             let patterns = self.build_file_patterns.clone();
-
-            let packages = tokio::task::spawn_blocking(move || {
-                let mut packages = std::collections::HashSet::new();
-                find_packages_sync(&root, &root, &patterns, &mut packages)?;
-                Ok::<_, anyhow::Error>(packages)
-            })
-            .await
-            .context("find_packages panicked")??;
+            let packages = self
+                .packages_cache
+                .once((), move || async move {
+                    let packages = tokio::task::spawn_blocking(move || {
+                        let mut packages = std::collections::HashSet::new();
+                        find_packages_sync(&root, &root, &patterns, &mut packages)?;
+                        Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
+                    })
+                    .await
+                    .context("find_packages panicked")??;
+                    Ok(Arc::new(packages))
+                })
+                .await
+                .map_err(crate::hmemoizer::unwrap_arc_err)?;
 
             let items: Vec<anyhow::Result<ListPackageResponse>> = packages
-                .into_iter()
+                .iter()
                 .map(|p| {
                     Ok(ListPackageResponse {
                         pkg: PkgBuf::from(p.as_str()),
@@ -161,17 +181,18 @@ impl EProvider for Provider {
         Box::pin(async move {
             let res = self
                 .run_pkg(req.addr.package.as_str())
+                .await
                 .map_err(|e: anyhow::Error| GetError::Other(e))?;
 
-            for p in res.targets {
+            for p in res.targets.iter() {
                 if p.name == req.addr.name {
                     return Ok(GetResponse {
                         target_spec: TargetSpec {
                             addr: req.addr.clone(),
-                            driver: p.driver,
-                            config: p.config,
-                            labels: p.labels,
-                            transitive: p.transitive,
+                            driver: p.driver.clone(),
+                            config: p.config.clone(),
+                            labels: p.labels.clone(),
+                            transitive: p.transitive.clone(),
                         },
                     });
                 }
@@ -187,12 +208,12 @@ impl EProvider for Provider {
         _ctoken: &'a (dyn Cancellable + Send + Sync),
     ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            let res = self.run_pkg(req.package.as_str())?;
+            let res = self.run_pkg(req.package.as_str()).await?;
 
             Ok(ProbeResponse {
                 states: res
                     .states
-                    .into_iter()
+                    .iter()
                     .map(|_p| {
                         State {
                             package: req.package.clone(),

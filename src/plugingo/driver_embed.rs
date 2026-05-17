@@ -148,7 +148,7 @@ impl ManagedDriver for GoEmbedDriver {
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
-                labels: req.target_spec.labels,
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs,
                 outputs,
@@ -279,7 +279,7 @@ mod tests {
 
         ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: Addr {
                     package: PkgBuf::from(pkg),
                     name: "embed".to_string(),
@@ -289,7 +289,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         }
     }
 
@@ -343,7 +343,7 @@ mod tests {
         );
         let req = ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: Addr {
                     package: PkgBuf::from("mypkg"),
                     name: "embed".to_string(),
@@ -353,7 +353,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         };
         assert!(driver().parse(req, &ct).await.is_err());
     }

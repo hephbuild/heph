@@ -26,7 +26,7 @@ pub async fn execute(args: &Args) -> anyhow::Result<()> {
         )
         .await?;
 
-    for art in res.artifacts_meta {
+    for art in &res.artifacts_meta {
         println!("{}", art.hashout);
     }
 

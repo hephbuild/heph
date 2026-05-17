@@ -98,11 +98,11 @@ impl Engine {
         let futs = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
                 let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
-                let run_inputs: Vec<RunInput> = res.artifacts.into_iter().map(|art| RunInput {
+                let run_inputs: Vec<RunInput> = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,
                         origin_id: input.origin_id.clone(),
-                        content: art,
+                        content: Arc::clone(art),
                     },
                     origin_id: input.origin_id.clone(),
                     source_addr: input.target.addr.clone(),

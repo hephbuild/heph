@@ -1,11 +1,31 @@
 use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+use xxhash_rust::xxh3::Xxh3Default;
+
+/// Cycle detection (the per-task IN_FLIGHT frame stack, key hashing, and the
+/// `tokio::task_local::scope` wrap around every `once` call) costs real CPU on
+/// every memoizer call. It is only needed to surface dependency cycles as a
+/// typed [`MemoizerCycleError`] rather than letting a self-await deadlock the
+/// runtime — useful when iterating on the engine, dead weight in steady state.
+///
+/// Opt in by setting `HEPH_DEBUG_MEMOIZER_CYCLE=1`. Anything else (unset, `0`,
+/// empty) leaves cycle detection off. Checked once on first use and cached.
+fn cycle_detection_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("HEPH_DEBUG_MEMOIZER_CYCLE").as_deref(),
+            Ok("1")
+        )
+    })
+}
 
 /// Returned when `Memoizer::once` detects same-task self-recursion on the same key —
 /// the in-flight future would await itself, deadlocking the runtime. Callers should
@@ -29,22 +49,53 @@ impl fmt::Display for MemoizerCycleError {
 
 impl std::error::Error for MemoizerCycleError {}
 
+/// One frame in the per-call-chain stack of (tag, key_hash) currently being computed.
+/// Stored as an Arc cons-list so child scopes share parent state without cloning a
+/// HashSet on every `once` call — pushing a frame is just one Arc allocation, and
+/// inheriting the parent chain is a refcount bump.
+struct Frame {
+    parent: Option<Arc<Frame>>,
+    tag: &'static str,
+    key_hash: u64,
+}
+
 tokio::task_local! {
-    /// Per-call-chain set of (tag, key) currently being computed. Scoped via
+    /// Top of the per-call-chain frame stack. Scoped via
     /// `tokio::task_local::scope` so sibling futures in `try_join_all` don't see
-    /// each other's keys — only the *recursive* descendants of a given `once`
-    /// inherit the parent's set. Re-entry on a key already in scope = cycle.
-    static IN_FLIGHT: HashSet<(&'static str, String)>;
+    /// each other's frames — only the *recursive* descendants of a given `once`
+    /// inherit the parent's chain. Re-entry on a (tag, key_hash) already in the
+    /// chain = cycle.
+    static IN_FLIGHT: Option<Arc<Frame>>;
 }
 
-fn check_recursion(entry: &(&'static str, String)) -> bool {
-    IN_FLIGHT.try_with(|s| s.contains(entry)).unwrap_or(false)
+fn compute_key_hash<K: Hash + ?Sized>(k: &K) -> u64 {
+    let mut h = Xxh3Default::new();
+    k.hash(&mut h);
+    h.finish()
 }
 
-fn scope_with_entry(entry: (&'static str, String)) -> HashSet<(&'static str, String)> {
-    let mut new_set = IN_FLIGHT.try_with(|s| s.clone()).unwrap_or_default();
-    new_set.insert(entry);
-    new_set
+fn check_recursion(tag: &'static str, key_hash: u64) -> bool {
+    IN_FLIGHT
+        .try_with(|f| {
+            let mut cur = f.clone();
+            while let Some(node) = cur {
+                if node.tag == tag && node.key_hash == key_hash {
+                    return true;
+                }
+                cur = node.parent.clone();
+            }
+            false
+        })
+        .unwrap_or(false)
+}
+
+fn push_frame(tag: &'static str, key_hash: u64) -> Option<Arc<Frame>> {
+    let parent = IN_FLIGHT.try_with(|f| f.clone()).unwrap_or(None);
+    Some(Arc::new(Frame {
+        parent,
+        tag,
+        key_hash,
+    }))
 }
 
 /// Transparent wrapper that lets multiple memoizer waiters share an anyhow::Error
@@ -122,18 +173,24 @@ where
 
 /// If a memoizer await takes longer than this, we panic with the key info to
 /// surface a likely deadlock instead of hanging forever. Off by default — set
-/// `RHEPH_MEMOIZER_STALL_SECS=<seconds>` to enable when debugging.
+/// `HEPH_MEMOIZER_STALL_SECS=<seconds>` to enable when debugging.
+///
+/// Cached in a `OnceLock` because `std::env::var` takes a global libc mutex; the
+/// previous per-call lookup serialized every memoizer waiter on env access.
 fn stall_threshold() -> Option<Duration> {
-    let secs: u64 = std::env::var("RHEPH_MEMOIZER_STALL_SECS")
-        .ok()
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if secs == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(secs))
-    }
+    static THRESHOLD: OnceLock<Option<Duration>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let secs: u64 = std::env::var("HEPH_MEMOIZER_STALL_SECS")
+            .ok()
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(secs))
+        }
+    })
 }
 
 impl<K, V> Memoizer<K, V>
@@ -199,7 +256,7 @@ where
     match tokio::time::timeout(threshold, shared).await {
         Ok(v) => v,
         Err(_) => {
-            // Debug-only: opt-in via RHEPH_MEMOIZER_STALL_SECS. Panic surfaces a
+            // Debug-only: opt-in via HEPH_MEMOIZER_STALL_SECS. Panic surfaces a
             // suspected deadlock (silent self-recursion past the cycle detector)
             // with the offending key so it can be diagnosed.
             #[expect(
@@ -209,7 +266,7 @@ where
             {
                 panic!(
                     "[memoizer:{tag}] STALLED for {:?} on key={key:?} — likely self-recursion on same key. \
-                     Unset RHEPH_MEMOIZER_STALL_SECS to disable this check.",
+                     Unset HEPH_MEMOIZER_STALL_SECS to disable this check.",
                     threshold
                 );
             }
@@ -241,21 +298,33 @@ where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = anyhow::Result<T>> + Send + 'static,
     {
-        let key_str = format!("{:?}", key);
-        let entry = (self.tag, key_str);
+        let tag = self.tag;
 
-        if check_recursion(&entry) {
+        // Fast path: cycle detection disabled. Skip key hashing, the frame
+        // push, and the task_local::scope wrap entirely — these only exist to
+        // turn self-recursion into a typed error instead of a deadlock, and
+        // most runs don't have cycles. Opt back in with
+        // `HEPH_DEBUG_MEMOIZER_CYCLE=1`.
+        if !cycle_detection_enabled() {
+            return self
+                .process(key, || async move { f().await.map_err(Arc::new) })
+                .await;
+        }
+
+        let key_hash = compute_key_hash(&key);
+
+        if check_recursion(tag, key_hash) {
             return Err(Arc::new(anyhow::Error::new(MemoizerCycleError {
-                tag: entry.0,
-                key: entry.1,
+                tag,
+                key: format!("{:?}", key),
             })));
         }
 
-        let new_scope = scope_with_entry(entry);
+        let frame = push_frame(tag, key_hash);
         let key_for_evict = key.clone();
         let result = IN_FLIGHT
             .scope(
-                new_scope,
+                frame,
                 self.process(key, || async move { f().await.map_err(Arc::new) }),
             )
             .await;

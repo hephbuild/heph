@@ -37,7 +37,7 @@ impl ProviderExecutor for EngineProviderExecutor {
     fn result<'a>(
         &'a self,
         addr: &'a Addr,
-    ) -> futures::future::BoxFuture<'a, anyhow::Result<EResult>> {
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
         Box::pin(async move {
             let engine = self
                 .engine
@@ -219,11 +219,11 @@ impl Engine {
         addr: &Addr,
         outputs: OutputMatcher,
         opts: &ResultOptions,
-    ) -> anyhow::Result<EResult> {
+    ) -> anyhow::Result<Arc<EResult>> {
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock().await;
+            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
             dag.add_dep(parent, addr).map_err(|_e| {
                 anyhow::Error::new(CycleError {
                     from: parent.clone(),
@@ -259,16 +259,18 @@ impl Engine {
             let results = futures::future::try_join_all(futures).await?;
             let mut merged = EResult::default();
             for r in results {
-                merged.artifacts.extend(r.artifacts);
-                merged.artifacts_meta.extend(r.artifacts_meta);
+                merged.artifacts.extend(r.artifacts.iter().cloned());
+                merged
+                    .artifacts_meta
+                    .extend(r.artifacts_meta.iter().cloned());
             }
-            return Ok(merged);
+            return Ok(Arc::new(merged));
         }
 
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
         let opts = *opts;
         let res = rs.data.mem_result.once(key, enclose!((self => engine, rs, addr, outputs) move || async move {
-            engine.inner_result_addr(rs, &addr, outputs, &opts).await.with_context(|| format!("result: {}", addr))
+            engine.inner_result_addr(rs, &addr, outputs, &opts).await.map(Arc::new).with_context(|| format!("result: {}", addr))
         })).await.map_err(unwrap_arc_err)?;
 
         Ok(res)
@@ -279,7 +281,7 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
         opts: &ResultOptions,
-    ) -> anyhow::Result<Vec<EResult>> {
+    ) -> anyhow::Result<Vec<Arc<EResult>>> {
         let mut set = JoinSet::new();
         let opts = *opts;
 
@@ -291,7 +293,7 @@ impl Engine {
             }));
         }
 
-        let mut all_res: Vec<EResult> = vec![];
+        let mut all_res: Vec<Arc<EResult>> = vec![];
         while let Some(res) = set.join_next().await {
             all_res.push(res??)
         }
@@ -455,11 +457,10 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        let key = addr.format();
         rs.data
             .mem_def
             .once(
-                key,
+                addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.get_def_inner(rs, &addr).await
                 }),
@@ -485,7 +486,7 @@ impl Engine {
             .parse(
                 ParseRequest {
                     request_id: rs.request_id().to_string(),
-                    target_spec: (*spec).clone(),
+                    target_spec: Arc::clone(&spec),
                 },
                 rs.ctoken(),
             )
@@ -572,11 +573,10 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<TargetSpec>> {
-        let key = addr.format();
         rs.data
             .mem_spec
             .once(
-                key,
+                addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
                     engine.get_spec_inner(&rs, &addr).await
                 }),

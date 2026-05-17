@@ -252,8 +252,8 @@ impl crate::engine::driver::Driver for Driver {
 
         Ok(ParseResponse {
             target_def: TargetDef {
-                addr: req.target_spec.addr,
-                labels: req.target_spec.labels,
+                addr: req.target_spec.addr.clone(),
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs: vec![],
                 outputs,
@@ -413,7 +413,8 @@ mod tests {
         fn result<'a>(
             &'a self,
             _addr: &'a crate::htaddr::Addr,
-        ) -> futures::future::BoxFuture<'a, anyhow::Result<crate::engine::EResult>> {
+        ) -> futures::future::BoxFuture<'a, anyhow::Result<std::sync::Arc<crate::engine::EResult>>>
+        {
             Box::pin(async { anyhow::bail!("noop") })
         }
 
@@ -492,13 +493,13 @@ mod tests {
     fn make_parse_req(config: std::collections::HashMap<String, TargetSpecValue>) -> ParseRequest {
         ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: parse_addr(&format!("//{PKG}:file")).unwrap(),
                 driver: DRIVER_NAME.to_string(),
                 config,
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         }
     }
 

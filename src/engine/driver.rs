@@ -236,7 +236,7 @@ pub struct ConfigResponse {
 
 pub struct ParseRequest {
     pub request_id: String,
-    pub target_spec: crate::engine::provider::TargetSpec,
+    pub target_spec: std::sync::Arc<crate::engine::provider::TargetSpec>,
 }
 
 pub mod targetdef {

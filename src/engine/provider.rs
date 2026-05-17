@@ -47,7 +47,7 @@ pub struct TargetSpec {
 }
 
 pub trait ProviderExecutor: Send + Sync {
-    fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<EResult>>;
+    fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>>;
     fn query<'a>(&'a self, m: &'a Matcher) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 

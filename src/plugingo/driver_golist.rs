@@ -177,7 +177,7 @@ impl ManagedDriver for GoGolistDriver {
         Ok(ParseResponse {
             target_def: TargetDef {
                 addr: req.target_spec.addr.clone(),
-                labels: req.target_spec.labels,
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs: all_inputs,
                 outputs,
@@ -391,7 +391,7 @@ mod tests {
 
         ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: Addr {
                     package: PkgBuf::from(pkg),
                     name: "_golist".to_string(),
@@ -401,7 +401,7 @@ mod tests {
                 config,
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         }
     }
 
@@ -424,7 +424,7 @@ mod tests {
         let ct = noop_ctoken();
         let req = ParseRequest {
             request_id: "test".to_string(),
-            target_spec: TargetSpec {
+            target_spec: std::sync::Arc::new(TargetSpec {
                 addr: Addr {
                     package: PkgBuf::from("mylib"),
                     name: "_golist".to_string(),
@@ -434,7 +434,7 @@ mod tests {
                 config: HashMap::new(),
                 labels: vec![],
                 transitive: Default::default(),
-            },
+            }),
         };
         assert!(driver().parse(req, &ct).await.is_err());
     }

@@ -46,16 +46,16 @@ pub async fn execute(args: &RunArgs) -> anyhow::Result<()> {
     };
 
     if args.cat_out {
-        for r in result {
-            for a in r.artifacts {
+        for r in &result {
+            for a in &r.artifacts {
                 for e in a.walk()? {
                     io::copy(&mut e?.data, &mut io::stdout())?;
                 }
             }
         }
     } else if args.list_out {
-        for r in result {
-            for a in r.artifacts {
+        for r in &result {
+            for a in &r.artifacts {
                 for e in a.walk()? {
                     println!("{}", e?.path.display());
                 }

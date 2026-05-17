@@ -3,8 +3,7 @@ use crate::engine::driver::targetdef::{InputMode, TargetDef, path::Content};
 use crate::engine::request_state::RequestState;
 use enclose::enclose;
 use futures::future::try_join_all;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct LinkedTargetDefInput {
@@ -27,12 +26,7 @@ impl Engine {
         def: TargetDef,
     ) -> anyhow::Result<LinkedTargetDef> {
         let expanded_inputs = Arc::clone(&self)
-            .expand_inputs(
-                rs.clone(),
-                def.inputs.clone(),
-                None,
-                Arc::new(Mutex::new(HashSet::new())),
-            )
+            .expanded_inputs_for(rs.clone(), &def.addr)
             .await?;
 
         let futures = expanded_inputs.iter().map(|input| {

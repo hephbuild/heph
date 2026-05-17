@@ -138,7 +138,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
         req: ParseRequest,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ParseResponse> {
-        let spec = spec::TargetSpec::from(req.target_spec.config)?;
+        let spec = spec::TargetSpec::from(req.target_spec.config.clone())?;
 
         let pkg = req.target_spec.addr.package.clone();
         let dep_inputs = spec
@@ -225,7 +225,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
         Ok(ParseResponse {
             target_def: EngineTargetDef {
                 addr: req.target_spec.addr.clone(),
-                labels: req.target_spec.labels,
+                labels: req.target_spec.labels.clone(),
                 raw_def: Arc::new(def),
                 inputs: dep_inputs
                     .into_iter()
@@ -900,13 +900,13 @@ mod tests {
             .parse(
                 crate::engine::driver::ParseRequest {
                     request_id: "test".to_string(),
-                    target_spec: crate::engine::provider::TargetSpec {
+                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
                         labels: vec![],
                         transitive: Default::default(),
-                    },
+                    }),
                 },
                 &ctoken,
             )
@@ -941,13 +941,13 @@ mod tests {
             .parse(
                 crate::engine::driver::ParseRequest {
                     request_id: "test".to_string(),
-                    target_spec: crate::engine::provider::TargetSpec {
+                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
                         addr: Addr::default(),
                         driver: "exec".to_string(),
                         config,
                         labels: vec![],
                         transitive: Default::default(),
-                    },
+                    }),
                 },
                 &ctoken,
             )
