@@ -105,11 +105,11 @@ mod tests {
     use crate::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("@heph/go/std/fmt"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("@heph/go/std/fmt"),
+            "build_lib".to_string(),
+            Default::default(),
+        )
     }
 
     fn test_factors() -> Factors {

@@ -29,11 +29,11 @@ const DRIVER_NAME: &str = "fs";
 /// Returns the `Addr` for a single-file fs target.
 /// Consumers use this to reference a file without knowing the internal address format.
 pub fn file_addr(path: &str) -> Addr {
-    Addr {
-        package: PkgBuf::from(PKG),
-        name: "file".to_string(),
-        args: BTreeMap::from([("f".to_string(), path.to_string())]),
-    }
+    Addr::new(
+        PkgBuf::from(PKG),
+        "file".to_string(),
+        BTreeMap::from([("f".to_string(), path.to_string())]),
+    )
 }
 
 /// Returns the `Addr` for a glob fs target.
@@ -43,11 +43,7 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     if !exclude.is_empty() {
         args.insert("e".to_string(), exclude.join(","));
     }
-    Addr {
-        package: PkgBuf::from(PKG),
-        name: "glob".to_string(),
-        args,
-    }
+    Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
 }
 
 // ─── Provider ────────────────────────────────────────────────────────────────

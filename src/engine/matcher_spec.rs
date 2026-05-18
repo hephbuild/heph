@@ -82,11 +82,7 @@ mod tests {
 
     fn spec(pkg: &str, name: &str, labels: &[&str]) -> TargetSpec {
         TargetSpec {
-            addr: Addr {
-                package: PkgBuf::from(pkg),
-                name: name.to_string(),
-                args: BTreeMap::new(),
-            },
+            addr: Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new()),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
@@ -102,11 +98,11 @@ mod tests {
     #[test]
     fn addr_no() {
         let s = spec("foo/bar", "baz", &[]);
-        let m = Matcher::Addr(Addr {
-            package: PkgBuf::from("foo/bar"),
-            name: "other".to_string(),
-            args: BTreeMap::new(),
-        });
+        let m = Matcher::Addr(Addr::new(
+            PkgBuf::from("foo/bar"),
+            "other".to_string(),
+            BTreeMap::new(),
+        ));
         assert_eq!(m.matches_spec(&s), MatchResult::MatchNo);
     }
 

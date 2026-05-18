@@ -133,11 +133,11 @@ mod tests {
     use crate::pluginfs;
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("mylib"),
+            "build_lib".to_string(),
+            Default::default(),
+        )
     }
 
     fn src_addrs() -> Vec<String> {
@@ -356,11 +356,11 @@ mod tests {
 
     #[test]
     fn test_run_contains_importcfg_printf_for_dep() {
-        let dep_addr = Addr {
-            package: PkgBuf::from("@heph/go/std/fmt"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        };
+        let dep_addr = Addr::new(
+            PkgBuf::from("@heph/go/std/fmt"),
+            "build_lib".to_string(),
+            Default::default(),
+        );
         let transitive_libs = vec![("fmt".to_string(), dep_addr)];
         let spec = build_spec(
             test_addr(),
@@ -383,11 +383,11 @@ mod tests {
 
     #[test]
     fn test_deps_map_contains_dep_group() {
-        let dep_addr = Addr {
-            package: PkgBuf::from("@heph/go/std/fmt"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        };
+        let dep_addr = Addr::new(
+            PkgBuf::from("@heph/go/std/fmt"),
+            "build_lib".to_string(),
+            Default::default(),
+        );
         let transitive_libs = vec![("fmt".to_string(), dep_addr)];
         let spec = build_spec(
             test_addr(),
@@ -412,19 +412,19 @@ mod tests {
         let addrs: Vec<(String, Addr)> = vec![
             (
                 "fmt".to_string(),
-                Addr {
-                    package: PkgBuf::from("@heph/go/std/fmt"),
-                    name: "build_lib".to_string(),
-                    args: Default::default(),
-                },
+                Addr::new(
+                    PkgBuf::from("@heph/go/std/fmt"),
+                    "build_lib".to_string(),
+                    Default::default(),
+                ),
             ),
             (
                 "io".to_string(),
-                Addr {
-                    package: PkgBuf::from("@heph/go/std/io"),
-                    name: "build_lib".to_string(),
-                    args: Default::default(),
-                },
+                Addr::new(
+                    PkgBuf::from("@heph/go/std/io"),
+                    "build_lib".to_string(),
+                    Default::default(),
+                ),
             ),
         ];
         let addrs_rev: Vec<(String, Addr)> = addrs.iter().cloned().rev().collect();
@@ -517,11 +517,11 @@ mod tests {
     }
 
     fn embed_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "embed".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("mylib"),
+            "embed".to_string(),
+            Default::default(),
+        )
     }
 
     #[test]

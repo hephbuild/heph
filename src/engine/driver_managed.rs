@@ -351,11 +351,7 @@ mod tests {
 
     fn make_target_def(pkg: &str) -> TargetDef {
         TargetDef {
-            addr: Addr {
-                package: PkgBuf::from(pkg),
-                name: "t".to_string(),
-                args: BTreeMap::new(),
-            },
+            addr: Addr::new(PkgBuf::from(pkg), "t".to_string(), BTreeMap::new()),
             labels: vec![],
             raw_def: Arc::new(()),
             inputs: vec![],
@@ -384,11 +380,7 @@ mod tests {
     async fn source_map_written_for_all_inputs() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let sandbox = dir.path().to_path_buf();
-        let src_addr = Addr {
-            package: PkgBuf::from("pkg"),
-            name: "gen".to_string(),
-            args: BTreeMap::new(),
-        };
+        let src_addr = Addr::new(PkgBuf::from("pkg"), "gen".to_string(), BTreeMap::new());
         let input = make_raw_input("dep0", "pkg/foo.go", src_addr, vec![]);
         let def = make_target_def("pkg");
         let ct = ctoken();
@@ -416,11 +408,7 @@ mod tests {
     async fn filter_prunes_list_file() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let sandbox = dir.path().to_path_buf();
-        let src_addr = Addr {
-            package: PkgBuf::from("pkg"),
-            name: "gen".to_string(),
-            args: BTreeMap::new(),
-        };
+        let src_addr = Addr::new(PkgBuf::from("pkg"), "gen".to_string(), BTreeMap::new());
         // Input has file pkg/foo.go but filter only allows pkg/bar.go
         let input = make_raw_input(
             "dep0",
@@ -490,11 +478,7 @@ mod tests {
     async fn source_map_json_bytes_are_deterministic_and_sorted() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let sandbox = dir.path().to_path_buf();
-        let src_addr = Addr {
-            package: PkgBuf::from("pkg"),
-            name: "gen".to_string(),
-            args: BTreeMap::new(),
-        };
+        let src_addr = Addr::new(PkgBuf::from("pkg"), "gen".to_string(), BTreeMap::new());
         // Many keys with names that would scatter under HashMap's RandomState.
         let inputs: Vec<RunInput> = ["c.go", "a.go", "b.go", "z.go", "m.go"]
             .iter()

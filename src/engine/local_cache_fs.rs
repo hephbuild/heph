@@ -77,11 +77,11 @@ mod tests {
         let dir = tempdir()?;
 
         let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
-        let addr = Addr {
-            package: crate::htpkg::PkgBuf::from("test_pkg"),
-            name: "test_target".to_string(),
-            ..Default::default()
-        };
+        let addr = Addr::new(
+            crate::htpkg::PkgBuf::from("test_pkg"),
+            "test_target".to_string(),
+            Default::default(),
+        );
         let hashin = "abc123hash";
         let name = "output.txt";
 

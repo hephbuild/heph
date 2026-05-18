@@ -1,5 +1,5 @@
 mod addr;
-pub use addr::Addr;
+pub use addr::{Addr, AddrInner};
 
 mod parse;
 pub use parse::parse_addr;

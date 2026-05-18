@@ -121,11 +121,7 @@ mod tests {
         let engine = make_engine(vec![target("foo", "a", &[]), target("foo", "b", &[])])?;
 
         let rs = engine.new_state();
-        let target_addr = Addr {
-            package: PkgBuf::from("foo"),
-            name: "a".to_string(),
-            args: Default::default(),
-        };
+        let target_addr = Addr::new(PkgBuf::from("foo"), "a".to_string(), Default::default());
         let addrs: Vec<Addr> = engine
             .query(rs, &Matcher::Addr(target_addr))
             .try_collect()

@@ -217,16 +217,16 @@ impl ProviderTrait for Provider {
             match kind {
                 GoPackageKind::Stdlib { .. } => {
                     let addrs = vec![
-                        Addr {
-                            package: req.package.clone(),
-                            name: "_golist".to_string(),
-                            args: factors_to_args(&factors),
-                        },
-                        Addr {
-                            package: req.package,
-                            name: "build_lib".to_string(),
-                            args: factors_to_args(&factors),
-                        },
+                        Addr::new(
+                            req.package.clone(),
+                            "_golist".to_string(),
+                            factors_to_args(&factors),
+                        ),
+                        Addr::new(
+                            req.package,
+                            "build_lib".to_string(),
+                            factors_to_args(&factors),
+                        ),
                     ];
                     let responses: Vec<anyhow::Result<ListResponse>> = addrs
                         .into_iter()
@@ -237,16 +237,16 @@ impl ProviderTrait for Provider {
                 }
                 GoPackageKind::ThirdParty { .. } => {
                     let addrs = vec![
-                        Addr {
-                            package: req.package.clone(),
-                            name: "_golist".to_string(),
-                            args: factors_to_args(&factors),
-                        },
-                        Addr {
-                            package: req.package,
-                            name: "build_lib".to_string(),
-                            args: factors_to_args(&factors),
-                        },
+                        Addr::new(
+                            req.package.clone(),
+                            "_golist".to_string(),
+                            factors_to_args(&factors),
+                        ),
+                        Addr::new(
+                            req.package,
+                            "build_lib".to_string(),
+                            factors_to_args(&factors),
+                        ),
                     ];
                     let responses: Vec<anyhow::Result<ListResponse>> = addrs
                         .into_iter()
@@ -261,46 +261,46 @@ impl ProviderTrait for Provider {
                     let mut addrs: Vec<Addr> = Vec::new();
 
                     if has_non_test {
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "_golist".to_string(),
-                            args: factors_to_args(&factors),
-                        });
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "build_lib".to_string(),
-                            args: factors_to_args(&factors),
-                        });
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "_golist".to_string(),
+                            factors_to_args(&factors),
+                        ));
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "build_lib".to_string(),
+                            factors_to_args(&factors),
+                        ));
                         // Always list build; get() returns NotFound for non-main
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "build".to_string(),
-                            args: factors_to_args(&factors),
-                        });
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "build".to_string(),
+                            factors_to_args(&factors),
+                        ));
                         // Always list embed; get() returns NotFound if no embed files
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "embed".to_string(),
-                            args: factors_to_args(&factors),
-                        });
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "embed#xtest".to_string(),
-                            args: factors_to_args(&factors),
-                        });
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "embed".to_string(),
+                            factors_to_args(&factors),
+                        ));
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "embed#xtest".to_string(),
+                            factors_to_args(&factors),
+                        ));
                     }
 
                     if has_test {
-                        addrs.push(Addr {
-                            package: req.package.clone(),
-                            name: "build_test".to_string(),
-                            args: factors_to_args(&factors),
-                        });
-                        addrs.push(Addr {
-                            package: req.package,
-                            name: "test".to_string(),
-                            args: factors_to_args(&factors),
-                        });
+                        addrs.push(Addr::new(
+                            req.package.clone(),
+                            "build_test".to_string(),
+                            factors_to_args(&factors),
+                        ));
+                        addrs.push(Addr::new(
+                            req.package,
+                            "test".to_string(),
+                            factors_to_args(&factors),
+                        ));
                     }
 
                     let responses: Vec<anyhow::Result<ListResponse>> = addrs
@@ -815,11 +815,11 @@ impl Provider {
                 }
 
                 // The testmain source comes from the "testmain" target
-                let testmain_src_addr = Addr {
-                    package: addr.package.clone(),
-                    name: "testmain".to_string(),
-                    args: factors_to_args(&factors),
-                };
+                let testmain_src_addr = Addr::new(
+                    addr.package.clone(),
+                    "testmain".to_string(),
+                    factors_to_args(&factors),
+                );
 
                 let spec = target_test::build_testmain_lib_spec(
                     addr.clone(),
@@ -948,11 +948,11 @@ impl Provider {
                 let module_root_rel = module_root
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(module_root);
-                let go_mod_addr = Addr {
-                    package: crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
-                    name: "_go_mod".to_string(),
-                    args: Default::default(),
-                };
+                let go_mod_addr = Addr::new(
+                    crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    "_go_mod".to_string(),
+                    Default::default(),
+                );
                 // Use a pluginfs glob directly instead of _go_src: _go_src spec
                 // generation calls executor.result(_golist), which would deadlock.
                 let pkg = addr.package.as_str();
@@ -963,15 +963,15 @@ impl Provider {
                 };
                 let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
                 let pkg_str = addr.package.as_str().to_string();
-                let go_src_query_addr = Addr {
-                    package: crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
-                    name: "q".to_string(),
-                    args: BTreeMap::from([
+                let go_src_query_addr = Addr::new(
+                    crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+                    "q".to_string(),
+                    BTreeMap::from([
                         ("label".to_string(), "go_src".to_string()),
                         ("package".to_string(), pkg_str.clone()),
                         ("tree_output_to".to_string(), pkg_str.clone()),
                     ]),
-                };
+                );
                 // Include all non-Go files in the package directory so that go list
                 // can resolve //go:embed patterns and populate EmbedFiles.
                 let non_go_glob = if pkg.is_empty() {
@@ -980,14 +980,14 @@ impl Provider {
                     format!("{}/**/*", pkg)
                 };
                 let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &[]);
-                let non_go_codegen_query_addr = Addr {
-                    package: crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
-                    name: "q".to_string(),
-                    args: BTreeMap::from([
+                let non_go_codegen_query_addr = Addr::new(
+                    crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+                    "q".to_string(),
+                    BTreeMap::from([
                         ("package".to_string(), pkg_str.clone()),
                         ("tree_output_to".to_string(), pkg_str),
                     ]),
-                };
+                );
                 let non_go_src_addrs = vec![
                     non_go_glob_addr.format(),
                     non_go_codegen_query_addr.format(),
@@ -1017,11 +1017,11 @@ impl Provider {
                 let module_root_rel = module_root
                     .strip_prefix(&self.workspace_root)
                     .unwrap_or(module_root);
-                let go_mod_addr = Addr {
-                    package: crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
-                    name: "_go_mod".to_string(),
-                    args: Default::default(),
-                };
+                let go_mod_addr = Addr::new(
+                    crate::htpkg::PkgBuf::from(module_root_rel.to_string_lossy().as_ref()),
+                    "_go_mod".to_string(),
+                    Default::default(),
+                );
                 target_golist::build_spec_thirdparty(
                     addr,
                     &import_path,
@@ -1144,11 +1144,7 @@ impl Provider {
         name: &str,
         factors: &Factors,
     ) -> Addr {
-        Addr {
-            package: package.clone(),
-            name: name.to_string(),
-            args: factors_to_args(factors),
-        }
+        Addr::new(package.clone(), name.to_string(), factors_to_args(factors))
     }
 
     /// Collect all transitive lib addresses for a package's imports, recursively.
@@ -1285,11 +1281,11 @@ impl Provider {
                 || import_path.starts_with(&format!("{}/", workspace_module_path)));
         if !is_workspace_module && is_stdlib_import_path(import_path) {
             let addr = encode_stdlib(import_path, factors);
-            let golist_addr = Addr {
-                package: crate::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
-                name: "_golist".to_string(),
-                args: factors_to_args(factors),
-            };
+            let golist_addr = Addr::new(
+                crate::htpkg::PkgBuf::from(format!("@heph/go/std/{}", import_path)),
+                "_golist".to_string(),
+                factors_to_args(factors),
+            );
             let sub_imports = self
                 .read_golist_package(Arc::clone(&executor), &golist_addr)
                 .await
@@ -1309,11 +1305,11 @@ impl Provider {
             None => return Ok((import_path.to_string(), None, vec![])),
         };
 
-        let golist_addr = Addr {
-            package: dep_addr.package.clone(),
-            name: "_golist".to_string(),
-            args: dep_addr.args.clone(),
-        };
+        let golist_addr = Addr::new(
+            dep_addr.package.clone(),
+            "_golist".to_string(),
+            dep_addr.args.clone(),
+        );
 
         let sub_imports = self
             .read_golist_package(executor, &golist_addr)
@@ -1609,11 +1605,7 @@ mod tests {
     }
 
     fn make_addr(package: &str, name: &str) -> Addr {
-        Addr {
-            package: PkgBuf::from(package),
-            name: name.to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from(package), name.to_string(), Default::default())
     }
 
     fn make_get_req(addr: Addr, workspace_root: &std::path::Path) -> GetRequest {
@@ -1829,8 +1821,11 @@ mod tests {
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let mut addr = make_addr("", "build_lib");
-        addr.args.insert("goos".to_string(), "linux".to_string());
-        addr.args.insert("goarch".to_string(), "amd64".to_string());
+        {
+            let inner = addr.make_mut();
+            inner.args.insert("goos".to_string(), "linux".to_string());
+            inner.args.insert("goarch".to_string(), "amd64".to_string());
+        }
         let resp = provider_get(&p, addr).await.unwrap();
         let runtime_env = match resp.target_spec.config.get("runtime_env").unwrap() {
             TargetSpecValue::Map(m) => m,

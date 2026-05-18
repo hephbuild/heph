@@ -539,36 +539,43 @@ impl Engine {
         rs: Arc<RequestState>,
         inputs: &[Input],
     ) -> anyhow::Result<Sandbox> {
-        let mut sb = Sandbox::default();
-
-        for (i, input) in inputs.iter().enumerate() {
-            let spec = Arc::clone(&self)
-                .get_spec(rs.clone(), &input.r#ref.r#ref)
-                .await
-                .with_context(|| format!("get spec: {}", input.r#ref))?;
-
-            // For transparent targets (groups), use the pre-computed applied_transitive
-            // which already recursively aggregates all nested deps' transitives.
-            // For all other targets, use spec.transitive directly.
-            // Important: avoid calling get_def on non-transparent targets here — get_def
-            // calls collect_transitive_deps which would re-enter the mem_def memoizer
-            // and deadlock on cyclic dep graphs.
-            let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
-                let dep_def = Arc::clone(&self)
-                    .get_def(rs.clone(), &input.r#ref.r#ref)
+        let futures = inputs.iter().enumerate().map(|(i, input)| {
+            let input_ref = input.r#ref.clone();
+            enclose!((self => engine, rs) async move {
+                let spec = Arc::clone(&engine)
+                    .get_spec(rs.clone(), &input_ref.r#ref)
                     .await
-                    .with_context(|| format!("get def for group: {:?}", input.r#ref))?;
-                dep_def.applied_transitive.clone()
-            } else {
-                spec.transitive.clone()
-            };
+                    .with_context(|| format!("get spec: {}", input_ref))?;
 
-            if transitive.empty() {
-                continue;
-            }
+                // For transparent targets (groups), use the pre-computed applied_transitive
+                // which already recursively aggregates all nested deps' transitives.
+                // For all other targets, use spec.transitive directly.
+                // Important: avoid calling get_def on non-transparent targets here — get_def
+                // calls collect_transitive_deps which would re-enter the mem_def memoizer
+                // and deadlock on cyclic dep graphs.
+                let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
+                    let dep_def = Arc::clone(&engine)
+                        .get_def(rs.clone(), &input_ref.r#ref)
+                        .await
+                        .with_context(|| format!("get def for group: {:?}", input_ref))?;
+                    dep_def.applied_transitive.clone()
+                } else {
+                    spec.transitive.clone()
+                };
 
-            let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+                if transitive.empty() {
+                    return anyhow::Ok(None);
+                }
 
+                let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+                Ok(Some((id, transitive)))
+            })
+        });
+
+        let results = futures::future::try_join_all(futures).await?;
+
+        let mut sb = Sandbox::default();
+        for (id, transitive) in results.into_iter().flatten() {
             sb.merge_sandbox(transitive, id);
         }
 
@@ -750,11 +757,11 @@ mod tests {
 
         let engine = Arc::new(Engine::new(cfg)?);
         let rs = engine.new_state();
-        let addr = Addr {
-            package: PkgBuf::from("non"),
-            name: "existent".to_string(),
-            args: Default::default(),
-        };
+        let addr = Addr::new(
+            PkgBuf::from("non"),
+            "existent".to_string(),
+            Default::default(),
+        );
 
         let result = engine
             .clone()
@@ -784,11 +791,7 @@ mod tests {
             root: root.path().to_path_buf(),
             parallelism: None,
         })?);
-        let addr = Addr {
-            package: PkgBuf::from("p"),
-            name: "t".to_string(),
-            args: Default::default(),
-        };
+        let addr = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());
         // Pre-populate dag with addr→addr already there is overkill; just call result_addr
         // twice with the same parent set, but result_addr sets parent via with_parent so the
         // second invocation inside the same parent chain triggers cycle. Simulate by manually

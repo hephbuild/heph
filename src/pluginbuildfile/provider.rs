@@ -119,11 +119,7 @@ impl EProvider for Provider {
                 .iter()
                 .map(|p| {
                     Ok(ListResponse {
-                        addr: Addr {
-                            package: req.package.clone(),
-                            name: p.name.clone(),
-                            args: Default::default(),
-                        },
+                        addr: Addr::new(req.package.clone(), p.name.clone(), Default::default()),
                     })
                 })
                 .collect();

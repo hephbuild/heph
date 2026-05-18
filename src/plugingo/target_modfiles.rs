@@ -39,19 +39,15 @@ mod tests {
     use crate::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from(""),
-            name: "_go_mod".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from(""), "_go_mod".to_string(), Default::default())
     }
 
     fn nested_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("subdir"),
-            name: "_go_mod".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("subdir"),
+            "_go_mod".to_string(),
+            Default::default(),
+        )
     }
 
     #[test]

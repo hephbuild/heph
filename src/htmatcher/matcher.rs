@@ -174,11 +174,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn addr(pkg: &str, name: &str) -> Addr {
-        Addr {
-            package: PkgBuf::from(pkg),
-            name: name.to_string(),
-            args: BTreeMap::new(),
-        }
+        Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new())
     }
 
     fn def_with_labels(pkg: &str, name: &str, labels: &[&str]) -> TargetDef {

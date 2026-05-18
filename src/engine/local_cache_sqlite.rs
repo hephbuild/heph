@@ -256,11 +256,7 @@ impl Drop for LocalCacheSQLite {
     }
 }
 
-fn writer_loop(
-    conn: &mut Connection,
-    rx: &mpsc::Receiver<WriterCmd>,
-    pending: &PendingTracker,
-) {
+fn writer_loop(conn: &mut Connection, rx: &mpsc::Receiver<WriterCmd>, pending: &PendingTracker) {
     loop {
         let first = match rx.recv() {
             Ok(cmd) => cmd,
@@ -497,10 +493,7 @@ impl io::Write for SqliteCacheWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.buf
-            .as_mut()
-            .expect("writer buffer missing")
-            .flush()
+        self.buf.as_mut().expect("writer buffer missing").flush()
     }
 }
 
@@ -541,11 +534,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_addr(pkg: &str, name: &str) -> crate::htaddr::Addr {
-        crate::htaddr::Addr {
-            package: crate::htpkg::PkgBuf::from(pkg),
-            name: name.to_string(),
-            ..Default::default()
-        }
+        crate::htaddr::Addr::new(
+            crate::htpkg::PkgBuf::from(pkg),
+            name.to_string(),
+            Default::default(),
+        )
     }
 
     #[test]

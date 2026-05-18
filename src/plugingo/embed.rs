@@ -131,11 +131,11 @@ mod tests {
     use std::fs;
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "embed".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("mylib"),
+            "embed".to_string(),
+            Default::default(),
+        )
     }
 
     fn fixture_dir() -> std::path::PathBuf {

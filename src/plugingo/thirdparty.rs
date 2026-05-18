@@ -151,11 +151,11 @@ mod tests {
     }
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
+            "build_lib".to_string(),
+            Default::default(),
+        )
     }
 
     fn test_pkg(go_files: Vec<String>) -> GoPackage {
@@ -331,11 +331,11 @@ mod tests {
 
     #[test]
     fn test_transitive_dep_in_importcfg() {
-        let dep_addr = Addr {
-            package: PkgBuf::from("@heph/go/std/fmt"),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        };
+        let dep_addr = Addr::new(
+            PkgBuf::from("@heph/go/std/fmt"),
+            "build_lib".to_string(),
+            Default::default(),
+        );
         let transitive_libs = vec![("fmt".to_string(), dep_addr)];
         let spec = build_spec(
             test_addr(),

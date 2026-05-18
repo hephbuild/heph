@@ -73,14 +73,13 @@ mod tests {
     use crate::htpkg::PkgBuf;
 
     fn addr_with_args(args: &[(&str, &str)]) -> Addr {
-        Addr {
-            package: PkgBuf::from(""),
-            name: String::new(),
-            args: args
-                .iter()
+        Addr::new(
+            PkgBuf::from(""),
+            String::new(),
+            args.iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-        }
+        )
     }
 
     #[test]

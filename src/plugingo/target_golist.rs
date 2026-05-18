@@ -141,11 +141,11 @@ mod tests {
     use crate::htpkg::PkgBuf;
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "_golist".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("mylib"),
+            "_golist".to_string(),
+            Default::default(),
+        )
     }
 
     fn test_factors() -> Factors {
@@ -157,19 +157,15 @@ mod tests {
     }
 
     fn go_mod_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from(""),
-            name: "_go_mod".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from(""), "_go_mod".to_string(), Default::default())
     }
 
     fn go_src_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("mylib"),
-            name: "_go_src".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from("mylib"),
+            "_go_src".to_string(),
+            Default::default(),
+        )
     }
 
     #[test]

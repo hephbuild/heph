@@ -163,11 +163,11 @@ fn parse_thirdparty(rest: &str, module_root: PathBuf) -> Option<GoPackageKind> {
 
 /// Encode a stdlib import path as a rheph Addr for build_lib.
 pub fn encode_stdlib(import_path: &str, factors: &Factors) -> Addr {
-    Addr {
-        package: PkgBuf::from(format!("{}{}", STD_PREFIX, import_path)),
-        name: "build_lib".to_string(),
-        args: factors_to_args(factors),
-    }
+    Addr::new(
+        PkgBuf::from(format!("{}{}", STD_PREFIX, import_path)),
+        "build_lib".to_string(),
+        factors_to_args(factors),
+    )
 }
 
 /// Encode a third-party package as a rheph Addr for build_lib.
@@ -192,21 +192,21 @@ pub fn encode_thirdparty(
         format!("{}/{}", base_pkg, thirdparty_part)
     };
 
-    Addr {
-        package: PkgBuf::from(pkg),
-        name: "build_lib".to_string(),
-        args: factors_to_args(factors),
-    }
+    Addr::new(
+        PkgBuf::from(pkg),
+        "build_lib".to_string(),
+        factors_to_args(factors),
+    )
 }
 
 /// Encode a first-party package (relative to workspace root) as a rheph Addr for build_lib.
 pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factors) -> Addr {
     let rel = src_dir.strip_prefix(workspace_root).unwrap_or(src_dir);
-    Addr {
-        package: PkgBuf::from(rel.to_string_lossy().as_ref()),
-        name: "build_lib".to_string(),
-        args: factors_to_args(factors),
-    }
+    Addr::new(
+        PkgBuf::from(rel.to_string_lossy().as_ref()),
+        "build_lib".to_string(),
+        factors_to_args(factors),
+    )
 }
 
 pub fn factors_to_args(factors: &Factors) -> BTreeMap<String, String> {

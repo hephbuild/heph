@@ -187,11 +187,7 @@ pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
         }
     }
 
-    Ok(Addr {
-        package,
-        name,
-        args,
-    })
+    Ok(Addr::new(package, name, args))
 }
 
 #[cfg(test)]

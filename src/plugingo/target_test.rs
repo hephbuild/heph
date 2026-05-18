@@ -430,11 +430,7 @@ mod tests {
     use crate::pluginfs;
 
     fn mk_addr(pkg: &str, name: &str) -> Addr {
-        Addr {
-            package: PkgBuf::from(pkg),
-            name: name.to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from(pkg), name.to_string(), Default::default())
     }
 
     fn test_factors() -> Factors {

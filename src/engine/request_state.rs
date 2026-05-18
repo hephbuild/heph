@@ -151,11 +151,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn addr(name: &str) -> Addr {
-        Addr {
-            package: PkgBuf::from("pkg"),
-            name: name.to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from("pkg"), name.to_string(), Default::default())
     }
 
     #[test]

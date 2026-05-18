@@ -392,11 +392,7 @@ mod tests {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
-                addr: Addr {
-                    package: PkgBuf::from(pkg),
-                    name: "_golist".to_string(),
-                    args: Default::default(),
-                },
+                addr: Addr::new(PkgBuf::from(pkg), "_golist".to_string(), Default::default()),
                 driver: "go_golist".to_string(),
                 config,
                 labels: vec![],
@@ -425,11 +421,11 @@ mod tests {
         let req = ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
-                addr: Addr {
-                    package: PkgBuf::from("mylib"),
-                    name: "_golist".to_string(),
-                    args: Default::default(),
-                },
+                addr: Addr::new(
+                    PkgBuf::from("mylib"),
+                    "_golist".to_string(),
+                    Default::default(),
+                ),
                 driver: "go_golist".to_string(),
                 config: HashMap::new(),
                 labels: vec![],

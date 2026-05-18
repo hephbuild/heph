@@ -280,11 +280,7 @@ mod tests {
         ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
-                addr: Addr {
-                    package: PkgBuf::from(pkg),
-                    name: "embed".to_string(),
-                    args: Default::default(),
-                },
+                addr: Addr::new(PkgBuf::from(pkg), "embed".to_string(), Default::default()),
                 driver: "go_embed".to_string(),
                 config,
                 labels: vec![],
@@ -344,11 +340,11 @@ mod tests {
         let req = ParseRequest {
             request_id: "test".to_string(),
             target_spec: std::sync::Arc::new(TargetSpec {
-                addr: Addr {
-                    package: PkgBuf::from("mypkg"),
-                    name: "embed".to_string(),
-                    args: Default::default(),
-                },
+                addr: Addr::new(
+                    PkgBuf::from("mypkg"),
+                    "embed".to_string(),
+                    Default::default(),
+                ),
                 driver: "go_embed".to_string(),
                 config,
                 labels: vec![],

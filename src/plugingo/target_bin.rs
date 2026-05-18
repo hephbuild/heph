@@ -111,19 +111,15 @@ mod tests {
     }
 
     fn test_addr() -> Addr {
-        Addr {
-            package: PkgBuf::from("cmd"),
-            name: "build".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(PkgBuf::from("cmd"), "build".to_string(), Default::default())
     }
 
     fn lib_addr(pkg: &str) -> Addr {
-        Addr {
-            package: PkgBuf::from(pkg),
-            name: "build_lib".to_string(),
-            args: Default::default(),
-        }
+        Addr::new(
+            PkgBuf::from(pkg),
+            "build_lib".to_string(),
+            Default::default(),
+        )
     }
 
     #[test]

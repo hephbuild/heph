@@ -281,12 +281,7 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 
         (extra.on_target)(p)?;
 
-        Ok(htaddr::Addr {
-            package: PkgBuf::from(extra.pkg),
-            name,
-            args: Default::default(),
-        }
-        .format())
+        Ok(htaddr::Addr::new(PkgBuf::from(extra.pkg), name, Default::default()).format())
     }
 }
 

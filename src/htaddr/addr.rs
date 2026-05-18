@@ -3,13 +3,76 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Addr {
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddrInner {
     pub package: PkgBuf,
     pub name: String,
     pub args: BTreeMap<String, String>,
+}
+
+#[derive(Clone)]
+pub struct Addr(Arc<AddrInner>);
+
+impl Addr {
+    pub fn new(package: PkgBuf, name: String, args: BTreeMap<String, String>) -> Self {
+        Self(Arc::new(AddrInner {
+            package,
+            name,
+            args,
+        }))
+    }
+
+    /// Mutably access the inner addr, cloning if shared.
+    pub fn make_mut(&mut self) -> &mut AddrInner {
+        Arc::make_mut(&mut self.0)
+    }
+
+    pub fn format(&self) -> String {
+        format!("{}", self)
+    }
+
+    pub fn hash_str(&self) -> String {
+        let mut h = Xxh3Default::new();
+        self.hash(&mut h);
+        format!("{:x}", h.digest())
+    }
+}
+
+impl Deref for Addr {
+    type Target = AddrInner;
+
+    #[inline]
+    fn deref(&self) -> &AddrInner {
+        &self.0
+    }
+}
+
+impl Debug for Addr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&*self.0, f)
+    }
+}
+
+impl PartialEq for Addr {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl Eq for Addr {}
+
+impl Clone for AddrInner {
+    fn clone(&self) -> Self {
+        Self {
+            package: self.package.clone(),
+            name: self.name.clone(),
+            args: self.args.clone(),
+        }
+    }
 }
 
 impl Serialize for Addr {
@@ -44,23 +107,7 @@ impl Display for Addr {
 
 impl Default for Addr {
     fn default() -> Self {
-        Addr {
-            package: PkgBuf::from(""),
-            name: String::new(),
-            args: BTreeMap::new(),
-        }
-    }
-}
-
-impl Addr {
-    pub fn format(&self) -> String {
-        format!("{}", self)
-    }
-
-    pub fn hash_str(&self) -> String {
-        let mut h = Xxh3Default::new();
-        self.hash(&mut h);
-        format!("{:x}", h.digest())
+        Addr::new(PkgBuf::from(""), String::new(), BTreeMap::new())
     }
 }
 
