@@ -1,11 +1,11 @@
 use crate::htpkg::PkgBuf;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashSet, FxHasher};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -29,19 +29,40 @@ impl Hash for AddrInner {
 #[derive(Clone)]
 pub struct Addr(Arc<AddrInner>);
 
-static INTERNED: OnceLock<Mutex<FxHashSet<Arc<AddrInner>>>> = OnceLock::new();
+// Sharded intern table. Pre-hash the inner once, route to one of `SHARDS`
+// `RwLock<FxHashSet>` shards by the low bits of the hash. Reads take the
+// shard's read lock; insertions take its write lock with a double-check.
+// Eliminates the global-mutex contention that dominated `Addr::new` under
+// many workers.
+const SHARDS: usize = 64;
 
-fn intern_table() -> &'static Mutex<FxHashSet<Arc<AddrInner>>> {
-    INTERNED.get_or_init(|| Mutex::new(FxHashSet::default()))
+static INTERNED: OnceLock<[RwLock<FxHashSet<Arc<AddrInner>>>; SHARDS]> = OnceLock::new();
+
+fn intern_shards() -> &'static [RwLock<FxHashSet<Arc<AddrInner>>>; SHARDS] {
+    INTERNED.get_or_init(|| std::array::from_fn(|_| RwLock::new(FxHashSet::default())))
 }
 
 fn intern(inner: AddrInner) -> Arc<AddrInner> {
-    let mut t = intern_table().lock().expect("addr intern table poisoned");
-    if let Some(existing) = t.get(&inner) {
+    let mut h = FxHasher::default();
+    inner.hash(&mut h);
+    let hash = h.finish();
+    let shard = intern_shards()
+        .get((hash as usize) & (SHARDS - 1))
+        .expect("shard index masked to SHARDS range");
+
+    {
+        let r = shard.read().expect("addr intern shard poisoned");
+        if let Some(existing) = r.get(&inner) {
+            return existing.clone();
+        }
+    }
+
+    let mut w = shard.write().expect("addr intern shard poisoned");
+    if let Some(existing) = w.get(&inner) {
         return existing.clone();
     }
     let arc = Arc::new(inner);
-    t.insert(arc.clone());
+    w.insert(arc.clone());
     arc
 }
 
@@ -133,5 +154,52 @@ impl Display for Addr {
 impl Default for Addr {
     fn default() -> Self {
         Addr::new(PkgBuf::from(""), String::new(), BTreeMap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_returns_same_arc_for_equal_addrs() {
+        let a = Addr::new(
+            PkgBuf::from("foo/bar"),
+            "baz".to_string(),
+            BTreeMap::new(),
+        );
+        let b = Addr::new(
+            PkgBuf::from("foo/bar"),
+            "baz".to_string(),
+            BTreeMap::new(),
+        );
+        assert!(Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn intern_distinguishes_different_addrs() {
+        let a = Addr::new(PkgBuf::from("foo"), "a".to_string(), BTreeMap::new());
+        let b = Addr::new(PkgBuf::from("foo"), "b".to_string(), BTreeMap::new());
+        assert!(!Arc::ptr_eq(&a.0, &b.0));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn intern_concurrent_inserts_share_arc() {
+        let pkg = "concurrent/pkg";
+        let name = "tgt";
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    Addr::new(PkgBuf::from(pkg), name.to_string(), BTreeMap::new())
+                })
+            })
+            .collect();
+        let addrs: Vec<Addr> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let first = &addrs[0];
+        for a in &addrs[1..] {
+            assert!(Arc::ptr_eq(&first.0, &a.0));
+        }
     }
 }
