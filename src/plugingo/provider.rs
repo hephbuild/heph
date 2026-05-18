@@ -1820,12 +1820,12 @@ mod tests {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let mut addr = make_addr("", "build_lib");
-        {
-            let inner = addr.make_mut();
-            inner.args.insert("goos".to_string(), "linux".to_string());
-            inner.args.insert("goarch".to_string(), "amd64".to_string());
-        }
+        let addr = {
+            let mut args = std::collections::BTreeMap::new();
+            args.insert("goos".to_string(), "linux".to_string());
+            args.insert("goarch".to_string(), "amd64".to_string());
+            Addr::new(PkgBuf::from(""), "build_lib".to_string(), args)
+        };
         let resp = provider_get(&p, addr).await.unwrap();
         let runtime_env = match resp.target_spec.config.get("runtime_env").unwrap() {
             TargetSpecValue::Map(m) => m,

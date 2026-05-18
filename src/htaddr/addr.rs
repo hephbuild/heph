@@ -1,10 +1,11 @@
 use crate::htpkg::PkgBuf;
+use rustc_hash::FxHashSet;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use xxhash_rust::xxh3::Xxh3Default;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -14,21 +15,43 @@ pub struct AddrInner {
     pub args: BTreeMap<String, String>,
 }
 
+impl Hash for AddrInner {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        Hasher::write(h, self.package.as_bytes());
+        Hasher::write(h, self.name.as_bytes());
+        for (k, v) in &self.args {
+            Hasher::write(h, k.as_bytes());
+            Hasher::write(h, v.as_bytes());
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Addr(Arc<AddrInner>);
 
+static INTERNED: OnceLock<Mutex<FxHashSet<Arc<AddrInner>>>> = OnceLock::new();
+
+fn intern_table() -> &'static Mutex<FxHashSet<Arc<AddrInner>>> {
+    INTERNED.get_or_init(|| Mutex::new(FxHashSet::default()))
+}
+
+fn intern(inner: AddrInner) -> Arc<AddrInner> {
+    let mut t = intern_table().lock().expect("addr intern table poisoned");
+    if let Some(existing) = t.get(&inner) {
+        return existing.clone();
+    }
+    let arc = Arc::new(inner);
+    t.insert(arc.clone());
+    arc
+}
+
 impl Addr {
     pub fn new(package: PkgBuf, name: String, args: BTreeMap<String, String>) -> Self {
-        Self(Arc::new(AddrInner {
+        Self(intern(AddrInner {
             package,
             name,
             args,
         }))
-    }
-
-    /// Mutably access the inner addr, cloning if shared.
-    pub fn make_mut(&mut self) -> &mut AddrInner {
-        Arc::make_mut(&mut self.0)
     }
 
     pub fn format(&self) -> String {
@@ -58,20 +81,22 @@ impl Debug for Addr {
 }
 
 impl PartialEq for Addr {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+        // Interning guarantees content-equal Addrs share the same Arc.
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
 impl Eq for Addr {}
 
-impl Clone for AddrInner {
-    fn clone(&self) -> Self {
-        Self {
-            package: self.package.clone(),
-            name: self.name.clone(),
-            args: self.args.clone(),
-        }
+impl Hash for Addr {
+    #[inline]
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        // Content-based hash — Addr hashes flow into target def.hash which is
+        // persisted as a cache key, so the hash must be stable across runs.
+        // Pointer hash would change between processes and break the disk cache.
+        self.0.hash(h);
     }
 }
 
@@ -108,16 +133,5 @@ impl Display for Addr {
 impl Default for Addr {
     fn default() -> Self {
         Addr::new(PkgBuf::from(""), String::new(), BTreeMap::new())
-    }
-}
-
-impl Hash for Addr {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        Hasher::write(h, self.package.as_bytes());
-        Hasher::write(h, self.name.as_bytes());
-        for (k, v) in &self.args {
-            Hasher::write(h, k.as_bytes());
-            Hasher::write(h, v.as_bytes());
-        }
     }
 }
