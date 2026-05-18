@@ -8,7 +8,12 @@ use std::path::Path;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-pub fn unpack(content: &dyn Content, dst: &Path, list_dst: &Path) -> anyhow::Result<()> {
+pub fn unpack(
+    content: &dyn Content,
+    dst: &Path,
+    list_dst: &Path,
+    should_unpack: Option<&dyn Fn(&Path) -> bool>,
+) -> anyhow::Result<()> {
     let mut list_dst_f = io::BufWriter::new(
         OpenOptions::new()
             .create(true)
@@ -18,6 +23,11 @@ pub fn unpack(content: &dyn Content, dst: &Path, list_dst: &Path) -> anyhow::Res
 
     for entry in content.walk()? {
         let mut entry = entry?;
+        if let Some(pred) = should_unpack
+            && !pred(&entry.path)
+        {
+            continue;
+        }
         let dest = dst.join(&entry.path);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;

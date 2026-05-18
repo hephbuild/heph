@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 use xxhash_rust::xxh3::Xxh3;
 
@@ -126,10 +126,17 @@ impl Driver for ManagedDriverBridge {
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
             let input_list = ws_dir.join(format!("input_{}.list", input.origin_id));
+            let filters = &input.filters;
+            let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
+                None
+            } else {
+                Some(&|rel: &Path| filters.iter().any(|f| Path::new(f) == rel))
+            };
             hartifactcontent::unpack::unpack(
                 input.artifact.content.as_ref(),
                 ws_dir.as_path(),
                 input_list.as_path(),
+                predicate,
             )
             .with_context(|| "unpack")?;
             inputs.push(ManagedRunInput {
@@ -138,36 +145,23 @@ impl Driver for ManagedDriverBridge {
             });
         }
 
-        // Apply filters and collect source_map entries.
         // BTreeMap so serialization to source_map.json is byte-deterministic across runs;
         // HashMap iter order varies per-process and breaks downstream output hashing/caching.
         let mut source_map: BTreeMap<String, String> = BTreeMap::new();
-        for managed_input in &mut inputs {
-            let filters = &managed_input.input.filters;
+        for managed_input in &inputs {
             let source_addr_str = managed_input.input.source_addr.format();
             let raw = fs::read_to_string(&managed_input.list_path)
                 .with_context(|| format!("read list {:?}", managed_input.list_path))?;
 
-            let mut kept: Vec<&str> = Vec::new();
             for line in raw.lines() {
                 if line.is_empty() {
                     continue;
                 }
-                let rel = std::path::Path::new(line)
+                let rel = Path::new(line)
                     .strip_prefix(&ws_dir)
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_else(|_| line.to_string());
-                let include = filters.is_empty() || filters.iter().any(|f| f == &rel);
-                if include {
-                    source_map.insert(rel, source_addr_str.clone());
-                    kept.push(line);
-                }
-            }
-
-            if !filters.is_empty() {
-                let new_content = kept.join("\n") + if kept.is_empty() { "" } else { "\n" };
-                fs::write(&managed_input.list_path, new_content)
-                    .with_context(|| format!("rewrite list {:?}", managed_input.list_path))?;
+                source_map.insert(rel, source_addr_str.clone());
             }
         }
 
