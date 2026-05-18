@@ -13,8 +13,8 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
-    GoPackage, PackageAddrs, find_module_for_import, is_stdlib_import_path, parse_go_list_reader,
-    parse_go_mod_module_path, parse_go_mod_requires,
+    GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
+    is_stdlib_import_path, parse_go_mod_module_path, parse_go_mod_requires,
 };
 use crate::plugingo::target_bin;
 use crate::plugingo::target_golist;
@@ -24,6 +24,7 @@ use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use anyhow::Context;
+use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -43,7 +44,14 @@ impl Default for Config {
     }
 }
 
+/// Public façade: thin wrapper around `Arc<ProviderInner>` so trait-method
+/// closures (e.g. `Memoizer::once` in `collect_*_libs`) can capture `Arc<Self>`
+/// without dragging `&self` lifetimes through `'static` future bounds.
 pub struct Provider {
+    inner: Arc<ProviderInner>,
+}
+
+pub(crate) struct ProviderInner {
     workspace_root: PathBuf,
     goroot: String,
     gomodcache: String,
@@ -54,6 +62,19 @@ pub struct Provider {
     pkg_cache: Memoizer<Addr, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
     /// Cache: golist addr → driver-resolved per-file addresses.
     pkg_addrs_cache: Memoizer<Addr, Result<Arc<PackageAddrs>, Arc<anyhow::Error>>>,
+    /// Cache: dedup `collect_direct_libs` / `collect_transitive_libs` BFS across
+    /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_lib#test`,
+    /// `build_lib#xtest`, `build_testmain_lib`) that share the same root pkg + factors.
+    libs_cache: Memoizer<LibsKey, Result<Arc<TransitiveDeps>, Arc<anyhow::Error>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LibsKey {
+    imports: Vec<String>,
+    extra: Vec<String>,
+    factors: Factors,
+    module_root: PathBuf,
+    transitive: bool,
 }
 
 impl Provider {
@@ -67,14 +88,17 @@ impl Provider {
         let gopath = resolve_go_env_var("GOPATH")?;
         let gocache = resolve_go_env_var("GOCACHE")?;
         Ok(Self {
-            workspace_root,
-            goroot,
-            gomodcache,
-            gopath,
-            gocache,
-            go_bin_addr: config.go_bin_addr,
-            pkg_cache: Memoizer::with_tag("pkg_cache"),
-            pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
+            inner: Arc::new(ProviderInner {
+                workspace_root,
+                goroot,
+                gomodcache,
+                gopath,
+                gocache,
+                go_bin_addr: config.go_bin_addr,
+                pkg_cache: Memoizer::with_tag("pkg_cache"),
+                pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
+                libs_cache: Memoizer::with_tag("libs_cache"),
+            }),
         })
     }
 }
@@ -183,6 +207,46 @@ fn scan_go_files(src_dir: &Path) -> (bool, bool) {
 }
 
 impl ProviderTrait for Provider {
+    fn config(&self, req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+        self.inner.config(req)
+    }
+
+    fn list<'a>(
+        &'a self,
+        req: ListRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+        self.inner.list(req, ctoken)
+    }
+
+    fn list_packages<'a>(
+        &'a self,
+        req: ListPackagesRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
+    {
+        self.inner.list_packages(req, ctoken)
+    }
+
+    fn get<'a>(
+        &'a self,
+        req: GetRequest,
+        _ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move { inner.handle_get(req).await })
+    }
+
+    fn probe<'a>(
+        &'a self,
+        req: ProbeRequest,
+        ctoken: &'a (dyn Cancellable + Send + Sync),
+    ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+        self.inner.probe(req, ctoken)
+    }
+}
+
+impl ProviderInner {
     fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
         Ok(ConfigResponse {
             name: "go".to_string(),
@@ -209,7 +273,7 @@ impl ProviderTrait for Provider {
                 }
             };
 
-            match kind {
+            match &*kind {
                 GoPackageKind::Stdlib { .. } => {
                     let addrs = vec![
                         Addr::new(
@@ -251,7 +315,7 @@ impl ProviderTrait for Provider {
                         as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
                 }
                 GoPackageKind::FirstParty { src_dir, .. } => {
-                    let (has_non_test, has_test) = scan_go_files(&src_dir);
+                    let (has_non_test, has_test) = scan_go_files(src_dir);
 
                     let mut addrs: Vec<Addr> = Vec::new();
 
@@ -336,12 +400,13 @@ impl ProviderTrait for Provider {
                     as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>);
             }
 
-            let workspace_root = self.workspace_root.clone();
-            let packages = tokio::task::spawn_blocking(move || {
-                let mut packages = Vec::new();
-                collect_go_packages(&search_dir, &workspace_root, &mut packages);
-                packages
-            })
+            let packages = tokio::task::spawn_blocking(
+                enclose!((self.workspace_root => workspace_root) move || {
+                    let mut packages = Vec::new();
+                    collect_go_packages(&search_dir, &workspace_root, &mut packages);
+                    packages
+                }),
+            )
             .await
             .context("collect_go_packages panicked")?;
 
@@ -350,14 +415,6 @@ impl ProviderTrait for Provider {
                     dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
                 >)
         })
-    }
-
-    fn get<'a>(
-        &'a self,
-        req: GetRequest,
-        _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
-        Box::pin(async move { self.handle_get(req).await })
     }
 
     fn probe<'a>(
@@ -369,13 +426,14 @@ impl ProviderTrait for Provider {
     }
 }
 
+#[derive(Clone)]
 struct TransitiveDeps {
     /// `(import_path, build_lib_addr)` for every reachable dep (for importcfg).
     libs: Vec<(String, Addr)>,
 }
 
-impl Provider {
-    async fn handle_get(&self, req: GetRequest) -> Result<GetResponse, GetError> {
+impl ProviderInner {
+    async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
         let factors = Factors::from_addr(addr);
 
@@ -393,7 +451,7 @@ impl Provider {
         }
 
         // Stdlib — no go list needed for other targets
-        if let GoPackageKind::Stdlib { import_path } = &kind {
+        if let GoPackageKind::Stdlib { import_path } = &*kind {
             return self.get_stdlib(addr.clone(), import_path, &factors);
         }
 
@@ -412,7 +470,7 @@ impl Provider {
             return Ok(GetResponse { target_spec: spec });
         }
 
-        let import_path = match &kind {
+        let import_path = match &*kind {
             GoPackageKind::FirstParty { import_path, .. } => import_path.clone(),
             GoPackageKind::ThirdParty {
                 module, subpath, ..
@@ -446,7 +504,7 @@ impl Provider {
         }
 
         // The module root drives which directory `go list` runs from for transitive deps.
-        let module_root = match &kind {
+        let module_root = match &*kind {
             GoPackageKind::FirstParty { module_root, .. } => module_root.clone(),
             GoPackageKind::ThirdParty { module_root, .. } => module_root.clone(),
             GoPackageKind::Stdlib { .. } => return Err(GetError::NotFound),
@@ -454,7 +512,7 @@ impl Provider {
 
         match addr.name.as_str() {
             "build_lib" => {
-                let transitive = self
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -471,7 +529,7 @@ impl Provider {
                     None
                 };
 
-                let spec = match &kind {
+                let spec = match &*kind {
                     GoPackageKind::ThirdParty { .. } => thirdparty::build_spec(
                         addr.clone(),
                         &pkg,
@@ -507,7 +565,7 @@ impl Provider {
                 }
 
                 let own_lib_addr = self.build_lib_addr(addr, &factors);
-                let mut transitive = self
+                let mut transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -549,7 +607,7 @@ impl Provider {
                     return Err(GetError::NotFound);
                 }
                 let test_extra: Vec<String> = pkg.test_imports.clone();
-                let transitive = self
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -620,7 +678,7 @@ impl Provider {
                     incomplete: false,
                     error: None,
                 };
-                let mut transitive = self
+                let mut transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &xtest_imports_pkg,
@@ -706,7 +764,7 @@ impl Provider {
                     incomplete: false,
                     error: None,
                 };
-                let mut transitive = self
+                let mut transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &testmain_pkg,
@@ -770,7 +828,7 @@ impl Provider {
                     )
                     .cloned()
                     .collect();
-                let transitive = self
+                let transitive = Arc::clone(&self)
                     .collect_transitive_libs(
                         Arc::clone(&req.executor),
                         &pkg,
@@ -1023,33 +1081,30 @@ impl Provider {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
-        let golist_addr = golist_addr.clone();
-
         self.pkg_cache
-            .once(golist_addr.clone(), move || async move {
-                let result = executor.result(&golist_addr).await?;
-                let pkg = tokio::task::spawn_blocking(move || {
-                    for artifact in &result.artifacts {
-                        for entry_result in artifact.walk()? {
-                            let entry = entry_result?;
-                            if entry.path.file_name().and_then(|n| n.to_str())
-                                != Some("package.json")
-                            {
-                                continue;
+            .once(
+                golist_addr.clone(),
+                enclose!((golist_addr, executor) move || async move {
+                    let result = executor.result(&golist_addr).await?;
+                    let pkg = tokio::task::spawn_blocking(move || {
+                        for artifact in &result.artifacts {
+                            for entry_result in artifact.walk()? {
+                                let entry = entry_result?;
+                                if entry.path.file_name().and_then(|n| n.to_str())
+                                    != Some("package.bin")
+                                {
+                                    continue;
+                                }
+                                return decode_go_package(entry.data);
                             }
-                            let map = parse_go_list_reader(entry.data)?;
-                            return map
-                                .into_values()
-                                .next()
-                                .ok_or_else(|| anyhow::anyhow!("_golist produced empty output"));
                         }
-                    }
-                    anyhow::bail!("_golist produced no output")
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("read_golist_package task panicked: {e}"))??;
-                Ok(Arc::new(pkg))
-            })
+                        anyhow::bail!("_golist produced no package.bin")
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read_golist_package task panicked: {e}"))??;
+                    Ok(Arc::new(pkg))
+                }),
+            )
             .await
             .map_err(unwrap_arc_err)
     }
@@ -1059,31 +1114,30 @@ impl Provider {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<PackageAddrs>> {
-        let golist_addr = golist_addr.clone();
-
         self.pkg_addrs_cache
-            .once(golist_addr.clone(), move || async move {
-                let result = executor.result(&golist_addr).await?;
-                let addrs = tokio::task::spawn_blocking(move || {
-                    for artifact in &result.artifacts {
-                        for entry_result in artifact.walk()? {
-                            let entry = entry_result?;
-                            if entry.path.file_name().and_then(|n| n.to_str())
-                                != Some("package_addrs.json")
-                            {
-                                continue;
+            .once(
+                golist_addr.clone(),
+                enclose!((golist_addr, executor) move || async move {
+                    let result = executor.result(&golist_addr).await?;
+                    let addrs = tokio::task::spawn_blocking(move || {
+                        for artifact in &result.artifacts {
+                            for entry_result in artifact.walk()? {
+                                let entry = entry_result?;
+                                if entry.path.file_name().and_then(|n| n.to_str())
+                                    != Some("package_addrs.bin")
+                                {
+                                    continue;
+                                }
+                                return decode_package_addrs(entry.data);
                             }
-                            let a: PackageAddrs = serde_json::from_reader(entry.data)
-                                .with_context(|| "parse package_addrs.json")?;
-                            return Ok::<PackageAddrs, anyhow::Error>(a);
                         }
-                    }
-                    anyhow::bail!("_golist produced no package_addrs.json")
-                })
-                .await
-                .map_err(|e| anyhow::anyhow!("read_golist_package_addrs task panicked: {e}"))??;
-                Ok(Arc::new(addrs))
-            })
+                        anyhow::bail!("_golist produced no package_addrs.bin")
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read_golist_package_addrs task panicked: {e}"))??;
+                    Ok(Arc::new(addrs))
+                }),
+            )
             .await
             .map_err(unwrap_arc_err)
     }
@@ -1101,81 +1155,107 @@ impl Provider {
         Addr::new(package.clone(), name.to_string(), factors_to_args(factors))
     }
 
+    /// Build the cache key for `collect_*_libs`. Imports are sorted+deduped so
+    /// distinct caller-side orderings of the same logical input set hash to one entry.
+    fn libs_key(
+        root_pkg: &GoPackage,
+        extra_imports: &[String],
+        factors: &Factors,
+        module_root: &Path,
+        transitive: bool,
+    ) -> LibsKey {
+        let mut imports: Vec<String> = root_pkg.imports.clone();
+        imports.sort();
+        imports.dedup();
+        let mut extra: Vec<String> = extra_imports.to_vec();
+        extra.sort();
+        extra.dedup();
+        LibsKey {
+            imports,
+            extra,
+            factors: factors.clone(),
+            module_root: module_root.to_path_buf(),
+            transitive,
+        }
+    }
+
     /// Collect all transitive lib addresses for a package's imports, recursively.
     ///
     /// Each BFS frontier is processed concurrently via `try_join_all`. Each dep's
     /// `_golist` target is fetched via `executor.result` (engine pipeline with disk
     /// cache), memoized in `pkg_cache` for the Provider lifetime so repeated calls
     /// for the same dep cost nothing after the first resolution.
+    ///
+    /// The full BFS result is itself memoized via `libs_cache`, deduping calls
+    /// across `build_lib`/`build`/`build_test`/`build_lib#test` etc. for the same
+    /// root pkg + factors within a single Provider lifetime.
     async fn collect_transitive_libs(
-        &self,
+        self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
         factors: &Factors,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut libs: Vec<(String, Addr)> = Vec::new();
-
-        let go_mod_path = module_root.join("go.mod");
-        let (go_mod_requires, workspace_module_path) = if go_mod_path.exists() {
-            let content = tokio::fs::read_to_string(&go_mod_path)
-                .await
-                .with_context(|| format!("reading {}", go_mod_path.display()))?;
-            (
-                parse_go_mod_requires(&content),
-                parse_go_mod_module_path(&content).unwrap_or_default(),
-            )
-        } else {
-            (vec![], String::new())
-        };
-
-        let mut frontier: Vec<String> = root_pkg
-            .imports
-            .iter()
-            .chain(extra_imports.iter())
-            .filter(|i| *i != "unsafe" && *i != "C" && visited.insert((*i).clone()))
-            .cloned()
-            .collect();
-
-        while !frontier.is_empty() {
-            let results = try_join_all(frontier.iter().map(|ip| {
-                self.resolve_import(
-                    Arc::clone(&executor),
-                    ip,
-                    factors,
-                    &go_mod_requires,
-                    &workspace_module_path,
-                    module_root,
-                )
-            }))
-            .await?;
-
-            frontier.clear();
-            for (import_path, dep_addr_opt, sub_imports) in results {
-                if let Some(dep_addr) = dep_addr_opt {
-                    libs.push((import_path, dep_addr));
-                }
-                for sub in sub_imports {
-                    if sub != "unsafe" && sub != "C" && visited.insert(sub.clone()) {
-                        frontier.push(sub);
-                    }
-                }
-            }
-        }
-
-        Ok(TransitiveDeps { libs })
+        self.collect_libs(executor, root_pkg, extra_imports, factors, module_root, true)
+            .await
     }
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
     async fn collect_direct_libs(
-        &self,
+        self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
         root_pkg: &GoPackage,
         extra_imports: &[String],
         factors: &Factors,
         module_root: &Path,
+    ) -> anyhow::Result<TransitiveDeps> {
+        self.collect_libs(executor, root_pkg, extra_imports, factors, module_root, false)
+            .await
+    }
+
+    async fn collect_libs(
+        self: Arc<Self>,
+        executor: Arc<dyn ProviderExecutor>,
+        root_pkg: &GoPackage,
+        extra_imports: &[String],
+        factors: &Factors,
+        module_root: &Path,
+        transitive: bool,
+    ) -> anyhow::Result<TransitiveDeps> {
+        let key = Self::libs_key(root_pkg, extra_imports, factors, module_root, transitive);
+        let extra = extra_imports.to_vec();
+        let module_root = module_root.to_path_buf();
+        let arc = self
+            .libs_cache
+            .once(
+                key,
+                enclose!((self => me, executor, factors, root_pkg.imports => root_imports) move || async move {
+                    me.collect_libs_inner(
+                        executor,
+                        &root_imports,
+                        &extra,
+                        &factors,
+                        &module_root,
+                        transitive,
+                    )
+                    .await
+                    .map(Arc::new)
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)?;
+        Ok((*arc).clone())
+    }
+
+    async fn collect_libs_inner(
+        &self,
+        executor: Arc<dyn ProviderExecutor>,
+        root_imports: &[String],
+        extra_imports: &[String],
+        factors: &Factors,
+        module_root: &Path,
+        transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
         let go_mod_path = module_root.join("go.mod");
         let (go_mod_requires, workspace_module_path) = if go_mod_path.exists() {
@@ -1190,13 +1270,52 @@ impl Provider {
             (vec![], String::new())
         };
 
-        let imports: Vec<String> = root_pkg
-            .imports
+        if transitive {
+            let mut visited: HashSet<String> = HashSet::new();
+            let mut libs: Vec<(String, Addr)> = Vec::new();
+
+            let mut frontier: Vec<String> = root_imports
+                .iter()
+                .chain(extra_imports.iter())
+                .filter(|i| *i != "unsafe" && *i != "C" && visited.insert((*i).clone()))
+                .cloned()
+                .collect();
+
+            while !frontier.is_empty() {
+                let results = try_join_all(frontier.iter().map(|ip| {
+                    self.resolve_import(
+                        Arc::clone(&executor),
+                        ip,
+                        factors,
+                        &go_mod_requires,
+                        &workspace_module_path,
+                        module_root,
+                    )
+                }))
+                .await?;
+
+                frontier.clear();
+                for (import_path, dep_addr_opt, sub_imports) in results {
+                    if let Some(dep_addr) = dep_addr_opt {
+                        libs.push((import_path, dep_addr));
+                    }
+                    for sub in sub_imports {
+                        if sub != "unsafe" && sub != "C" && visited.insert(sub.clone()) {
+                            frontier.push(sub);
+                        }
+                    }
+                }
+            }
+
+            return Ok(TransitiveDeps { libs });
+        }
+
+        let imports: Vec<String> = root_imports
             .iter()
             .chain(extra_imports.iter())
             .filter(|i| *i != "unsafe" && *i != "C")
             .cloned()
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 
@@ -1336,7 +1455,7 @@ fn build_embed_spec(
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
 
-    let golist_dep = format!("{}|json", golist_addr.format());
+    let golist_dep = format!("{}|pkg", golist_addr.format());
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert(
@@ -1381,7 +1500,7 @@ fn build_testmain_spec(addr: Addr, golist_addr: &Addr) -> crate::engine::provide
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
 
-    let golist_dep = format!("{}|json", golist_addr.format());
+    let golist_dep = format!("{}|pkg", golist_addr.format());
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert(
@@ -1449,47 +1568,32 @@ mod tests {
 
     struct GoListTestExecutor {
         workspace_root: PathBuf,
-        /// If non-empty, returned as a second artifact with `source_map.json` walk path.
+        /// Source map applied when generating `package_addrs.bin`.
         source_map: HashMap<String, String>,
     }
 
-    struct StringContent(String);
-
-    impl Content for StringContent {
-        fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
-            Ok(Box::new(io::Cursor::new(self.0.as_bytes().to_vec())))
-        }
-
-        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
-            let entry = WalkEntry {
-                path: PathBuf::from("package.json"),
-                data: Box::new(io::Cursor::new(self.0.as_bytes().to_vec())),
-                x: false,
-            };
-            Ok(Box::new(std::iter::once(Ok(entry))))
-        }
-
-        fn hashout(&self) -> anyhow::Result<String> {
-            Ok("test_hashout".to_string())
-        }
+    struct BinaryArtifact {
+        path: PathBuf,
+        bytes: Vec<u8>,
+        hashout: String,
     }
 
-    struct PackageAddrsContent(String);
-
-    impl Content for PackageAddrsContent {
+    impl Content for BinaryArtifact {
         fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
-            Ok(Box::new(io::Cursor::new(self.0.as_bytes().to_vec())))
+            Ok(Box::new(io::Cursor::new(self.bytes.clone())))
         }
+
         fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             let entry = WalkEntry {
-                path: PathBuf::from("package_addrs.json"),
-                data: Box::new(io::Cursor::new(self.0.as_bytes().to_vec())),
+                path: self.path.clone(),
+                data: Box::new(io::Cursor::new(self.bytes.clone())),
                 x: false,
             };
             Ok(Box::new(std::iter::once(Ok(entry))))
         }
+
         fn hashout(&self) -> anyhow::Result<String> {
-            Ok("test_hashout_addrs".to_string())
+            Ok(self.hashout.clone())
         }
     }
 
@@ -1507,7 +1611,7 @@ mod tests {
                 let kind = decode_package(&addr.package, &self.workspace_root)
                     .ok_or_else(|| anyhow::anyhow!("unknown package: {}", addr.package))?;
 
-                let (import_path, run_dir) = match &kind {
+                let (import_path, run_dir) = match &*kind {
                     GoPackageKind::FirstParty {
                         import_path,
                         module_root,
@@ -1539,21 +1643,30 @@ mod tests {
                 let pkg = packages.get(&import_path).cloned().ok_or_else(|| {
                     anyhow::anyhow!("go list returned no entry for {}", import_path)
                 })?;
-                let json = serde_json::to_string(&pkg).context("serialize package")?;
+                let pkg_bin = crate::plugingo::pkg_analysis::encode_go_package(&pkg)
+                    .context("encode package.bin")?;
 
-                // Mirror the real driver: also emit package_addrs.json so the provider
+                // Mirror the real driver: also emit package_addrs.bin so the provider
                 // can resolve per-file addrs without re-running the driver.
                 let addrs = crate::plugingo::pkg_analysis::resolve_package_addrs(
                     &pkg,
                     addr.package.as_str(),
                     &self.source_map,
                 );
-                let addrs_json =
-                    serde_json::to_string(&addrs).context("serialize package_addrs")?;
+                let addrs_bin = crate::plugingo::pkg_analysis::encode_package_addrs(&addrs)
+                    .context("encode package_addrs.bin")?;
 
                 let artifacts: Vec<Arc<dyn Content>> = vec![
-                    Arc::new(StringContent(json)) as Arc<dyn Content>,
-                    Arc::new(PackageAddrsContent(addrs_json)) as Arc<dyn Content>,
+                    Arc::new(BinaryArtifact {
+                        path: PathBuf::from("package.bin"),
+                        bytes: pkg_bin,
+                        hashout: "test_hashout".to_string(),
+                    }) as Arc<dyn Content>,
+                    Arc::new(BinaryArtifact {
+                        path: PathBuf::from("package_addrs.bin"),
+                        bytes: addrs_bin,
+                        hashout: "test_hashout_addrs".to_string(),
+                    }) as Arc<dyn Content>,
                 ];
 
                 Ok(Arc::new(EResult {
@@ -1622,7 +1735,7 @@ mod tests {
 
     async fn provider_get(p: &Provider, addr: Addr) -> Result<GetResponse, GetError> {
         let ctoken = StdCancellationToken::new();
-        let workspace = p.workspace_root.clone();
+        let workspace = p.inner.workspace_root.clone();
         p.get(make_get_req(addr, &workspace), &ctoken).await
     }
 
@@ -1678,7 +1791,7 @@ mod tests {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(out.contains_key("json"));
+        assert!(out.contains_key("pkg"));
     }
 
     // ---- with_dep ----

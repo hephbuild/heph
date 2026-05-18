@@ -24,12 +24,7 @@ impl Workspace {
         let p = parallelism.into();
         let builder = WorkspaceBuilder::new()
             .expect("workspace tempdir")
-            .with_provider(|root| {
-                Box::new(pluginbuildfile::Provider {
-                    root: root.to_path_buf(),
-                    ..Default::default()
-                })
-            })
+            .with_provider(|root| Box::new(pluginbuildfile::Provider::new(root.to_path_buf())))
             .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
             .with_managed_driver(Box::new(pluginexec::Driver::new_bash()));
         let builder = if let Some(p) = p {

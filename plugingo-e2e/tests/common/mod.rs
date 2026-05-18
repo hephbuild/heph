@@ -53,12 +53,7 @@ fn go_bin_path() -> String {
 pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
     let go_bin = go_bin_path();
     WorkspaceBuilder::from_dir(dir)
-        .with_provider(|root| {
-            Box::new(pluginbuildfile::Provider {
-                root: root.to_path_buf(),
-                ..Default::default()
-            })
-        })
+        .with_provider(|root| Box::new(pluginbuildfile::Provider::new(root.to_path_buf())))
         .with_provider(|_root| Box::new(pluginfs::Provider))
         .with_provider(move |_| {
             Box::new(

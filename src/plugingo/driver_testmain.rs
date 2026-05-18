@@ -9,7 +9,7 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::loosespecparser::parse_map_string_strings;
 use crate::plugingo::gen_testmain::{analyze_test_main, generate_testmain};
-use crate::plugingo::pkg_analysis::parse_go_list_reader;
+use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::hash::{Hash, Hasher};
@@ -159,24 +159,19 @@ impl ManagedDriver for GoTestmainDriver {
 
         let list_f = std::fs::File::open(&managed.list_path)
             .with_context(|| format!("open golist list {:?}", managed.list_path))?;
-        let pkg_json_path = std::io::BufReader::new(list_f)
+        let pkg_bin_path = std::io::BufReader::new(list_f)
             .lines()
             .find(|l| {
                 l.as_ref()
-                    .is_ok_and(|s| !s.is_empty() && s.ends_with("package.json"))
+                    .is_ok_and(|s| !s.is_empty() && s.ends_with("package.bin"))
             })
             .ok_or_else(|| {
-                anyhow::anyhow!("go_testmain: package.json not found in golist input")
+                anyhow::anyhow!("go_testmain: package.bin not found in golist input")
             })??;
 
-        let pkg_json_file =
-            std::fs::File::open(&pkg_json_path).with_context(|| "open package.json")?;
-        let pkgs = parse_go_list_reader(pkg_json_file).context("parse package.json")?;
-
-        let pkg = pkgs
-            .into_values()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("go_testmain: package.json is empty"))?;
+        let pkg_bin_file =
+            std::fs::File::open(&pkg_bin_path).with_context(|| "open package.bin")?;
+        let pkg = decode_go_package(pkg_bin_file).context("decode package.bin")?;
 
         let host_src_dir = req
             .request
@@ -268,7 +263,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_includes_golist_input() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         assert!(
             resp.target_def
@@ -304,7 +299,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_out_prepends_package() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         let go_out = resp
             .target_def

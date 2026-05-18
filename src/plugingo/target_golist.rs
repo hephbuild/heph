@@ -116,13 +116,13 @@ fn build_spec_inner(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([
             (
-                "json".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("package.json".to_string())]),
+                "pkg".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("package.bin".to_string())]),
             ),
             (
                 "addrs".to_string(),
                 TargetSpecValue::List(vec![TargetSpecValue::String(
-                    "package_addrs.json".to_string(),
+                    "package_addrs.bin".to_string(),
                 )]),
             ),
         ])),
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_out_has_json_group() {
+    fn test_out_has_pkg_and_addrs_groups() {
         let spec = build_spec_firstparty(
             test_addr(),
             "example.com/mylib",
@@ -203,7 +203,8 @@ mod tests {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(out.contains_key("json"), "out should have 'json' group");
+        assert!(out.contains_key("pkg"), "out should have 'pkg' group");
+        assert!(out.contains_key("addrs"), "out should have 'addrs' group");
     }
 
     #[test]
@@ -351,7 +352,7 @@ mod tests {
             TargetSpecValue::Map(m) => m,
             _ => panic!(),
         };
-        assert!(out.contains_key("json"));
+        assert!(out.contains_key("pkg"));
     }
 
     #[test]

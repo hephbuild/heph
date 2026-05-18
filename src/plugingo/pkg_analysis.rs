@@ -3,11 +3,12 @@ use crate::htaddr::{Addr, parse_addr_with_base};
 use crate::htpkg::PkgBuf;
 use crate::pluginfs;
 use anyhow::Context;
+use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
+use std::io::Read;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct GoPackage {
     #[serde(rename = "ImportPath")]
     pub import_path: String,
@@ -55,7 +56,7 @@ pub struct GoPackage {
 
 /// Per-file Addr strings derived from a `GoPackage` by the golist driver.
 /// Each entry mirrors the same-name field in `GoPackage`, preserving order.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct PackageAddrs {
     #[serde(rename = "GoFiles", default)]
     pub go_files: Vec<String>,
@@ -115,7 +116,7 @@ pub fn resolve_package_addrs(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct GoModule {
     #[serde(rename = "Path")]
     pub path: String,
@@ -125,7 +126,7 @@ pub struct GoModule {
     pub dir: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 pub struct GoPackageError {
     #[serde(rename = "Err")]
     pub err: String,
@@ -133,14 +134,43 @@ pub struct GoPackageError {
 
 /// Parse packages from a reader, streaming without loading the full content.
 /// Returns a map from import_path → GoPackage built in a single pass.
+#[cfg(test)]
 pub fn parse_go_list_reader(reader: impl Read) -> anyhow::Result<HashMap<String, GoPackage>> {
-    serde_json::Deserializer::from_reader(BufReader::with_capacity(64 * 1024, reader))
+    serde_json::Deserializer::from_reader(std::io::BufReader::with_capacity(64 * 1024, reader))
         .into_iter::<GoPackage>()
         .map(|r| {
             r.context("parse go list json")
                 .map(|p| (p.import_path.clone(), p))
         })
         .collect()
+}
+
+/// Encode a `GoPackage` to borsh bytes for the `_golist` driver's `package.bin` output.
+pub fn encode_go_package(pkg: &GoPackage) -> anyhow::Result<Vec<u8>> {
+    borsh::to_vec(pkg).context("borsh encode GoPackage")
+}
+
+/// Decode a `GoPackage` from borsh bytes (e.g. `package.bin` artifact).
+pub fn decode_go_package(mut reader: impl Read) -> anyhow::Result<GoPackage> {
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .context("read package.bin")?;
+    GoPackage::try_from_slice(&buf).context("borsh decode GoPackage")
+}
+
+/// Encode `PackageAddrs` to borsh bytes for the `_golist` driver's `package_addrs.bin` output.
+pub fn encode_package_addrs(addrs: &PackageAddrs) -> anyhow::Result<Vec<u8>> {
+    borsh::to_vec(addrs).context("borsh encode PackageAddrs")
+}
+
+/// Decode `PackageAddrs` from borsh bytes.
+pub fn decode_package_addrs(mut reader: impl Read) -> anyhow::Result<PackageAddrs> {
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .context("read package_addrs.bin")?;
+    PackageAddrs::try_from_slice(&buf).context("borsh decode PackageAddrs")
 }
 
 /// Returns `true` if `import_path` is a Go standard-library import path.

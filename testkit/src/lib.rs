@@ -98,12 +98,12 @@ impl Workspace {
         std::fs::write(full, content).expect("write file");
     }
 
-    pub async fn run(&self, addr_str: &str) -> anyhow::Result<EResult> {
+    pub async fn run(&self, addr_str: &str) -> anyhow::Result<Arc<EResult>> {
         let addr = parse_addr(addr_str)?;
         self.run_addr(addr).await
     }
 
-    pub async fn run_addr(&self, addr: Addr) -> anyhow::Result<EResult> {
+    pub async fn run_addr(&self, addr: Addr) -> anyhow::Result<Arc<EResult>> {
         let e = self.engine.clone();
         let rs = e.new_state();
         e.result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())

@@ -9,7 +9,9 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::{parse_map_string_strings, parse_string, parse_strings};
-use crate::plugingo::pkg_analysis::{GoPackage, resolve_package_addrs};
+use crate::plugingo::pkg_analysis::{
+    GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -41,8 +43,8 @@ struct GoGolistDef {
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
-/// output format (package.json layout, package_addrs.json schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 4;
+/// output format (package.bin layout, package_addrs.bin schema, …) changes.
+const GO_GOLIST_FORMAT_VERSION: u32 = 5;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -292,7 +294,7 @@ impl ManagedDriver for GoGolistDriver {
             anyhow::bail!("go list failed for {}: {}", def.import_path, stderr);
         }
 
-        // Parse once, normalize Dir on the struct, then serialize package.json and
+        // Parse once, normalize Dir on the struct, then serialize package.bin and
         // reuse the same value for addr resolution below.
         //
         // `-test` makes go list emit synthetic variants (`pkg.test`, `pkg [pkg.test]`,
@@ -310,17 +312,14 @@ impl ManagedDriver for GoGolistDriver {
                 p.dir = Some(normalize_dir(dir, &ws_prefix));
             }
         }
-        let mut package_json: Vec<u8> = Vec::new();
-        for p in &pkgs {
-            serde_json::to_writer(&mut package_json, p).context("serialize package")?;
-            package_json.push(b'\n');
-        }
-        std::fs::write(req.sandbox_pkg_dir.join("package.json"), &package_json)
-            .context("write package.json")?;
 
         let pkg = pkgs.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("go list returned no entry matching {}", def.import_path)
         })?;
+
+        let package_bin = encode_go_package(&pkg).context("encode package.bin")?;
+        std::fs::write(req.sandbox_pkg_dir.join("package.bin"), &package_bin)
+            .context("write package.bin")?;
 
         let source_map_path = req.sandbox_pkg_dir.join("source_map.json");
         let source_map: HashMap<String, String> = if source_map_path.exists() {
@@ -333,9 +332,9 @@ impl ManagedDriver for GoGolistDriver {
 
         let pkg_str = req.request.target.addr.package.as_str();
         let addrs = resolve_package_addrs(&pkg, pkg_str, &source_map);
-        let addrs_json = serde_json::to_string(&addrs).context("serialize package_addrs")?;
-        std::fs::write(req.sandbox_pkg_dir.join("package_addrs.json"), addrs_json)
-            .context("write package_addrs.json")?;
+        let addrs_bin = encode_package_addrs(&addrs).context("encode package_addrs.bin")?;
+        std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
+            .context("write package_addrs.bin")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
@@ -393,15 +392,13 @@ mod tests {
             "out".to_string(),
             TargetSpecValue::Map(HashMap::from([
                 (
-                    "json".to_string(),
-                    TargetSpecValue::List(vec![TargetSpecValue::String(
-                        "package.json".to_string(),
-                    )]),
+                    "pkg".to_string(),
+                    TargetSpecValue::List(vec![TargetSpecValue::String("package.bin".to_string())]),
                 ),
                 (
-                    "source_map".to_string(),
+                    "addrs".to_string(),
                     TargetSpecValue::List(vec![TargetSpecValue::String(
-                        "source_map.json".to_string(),
+                        "package_addrs.bin".to_string(),
                     )]),
                 ),
             ])),
@@ -564,15 +561,15 @@ mod tests {
         let ct = noop_ctoken();
         let req = make_parse_request("mylib", "example.com/mylib", vec![]);
         let resp = driver().parse(req, &ct).await.unwrap();
-        let json_out = resp
+        let pkg_out = resp
             .target_def
             .outputs
             .iter()
-            .find(|o| o.group == "json")
+            .find(|o| o.group == "pkg")
             .unwrap();
-        assert!(json_out.paths.iter().any(|p| matches!(
+        assert!(pkg_out.paths.iter().any(|p| matches!(
             &p.content,
-            Content::FilePath(s) if s == "mylib/package.json"
+            Content::FilePath(s) if s == "mylib/package.bin"
         )));
     }
 
@@ -581,15 +578,15 @@ mod tests {
         let ct = noop_ctoken();
         let req = make_parse_request("", "example.com/mylib", vec![]);
         let resp = driver().parse(req, &ct).await.unwrap();
-        let json_out = resp
+        let pkg_out = resp
             .target_def
             .outputs
             .iter()
-            .find(|o| o.group == "json")
+            .find(|o| o.group == "pkg")
             .unwrap();
-        assert!(json_out.paths.iter().any(|p| matches!(
+        assert!(pkg_out.paths.iter().any(|p| matches!(
             &p.content,
-            Content::FilePath(s) if s == "package.json"
+            Content::FilePath(s) if s == "package.bin"
         )));
     }
 

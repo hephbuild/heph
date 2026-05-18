@@ -10,6 +10,7 @@ use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
 use crate::pluginbuildfile::run_file::RunResult;
 use anyhow::Context;
+use enclose::enclose;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,15 @@ impl Default for Provider {
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
             packages_cache: Memoizer::with_tag("buildfile_packages"),
+        }
+    }
+}
+
+impl Provider {
+    pub fn new(root: std::path::PathBuf) -> Self {
+        Self {
+            root,
+            ..Self::default()
         }
     }
 }
@@ -136,20 +146,21 @@ impl EProvider for Provider {
     ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
     {
         Box::pin(async move {
-            let root = self.root.clone();
-            let patterns = self.build_file_patterns.clone();
             let packages = self
                 .packages_cache
-                .once((), move || async move {
-                    let packages = tokio::task::spawn_blocking(move || {
-                        let mut packages = std::collections::HashSet::new();
-                        find_packages_sync(&root, &root, &patterns, &mut packages)?;
-                        Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
-                    })
-                    .await
-                    .context("find_packages panicked")??;
-                    Ok(Arc::new(packages))
-                })
+                .once(
+                    (),
+                    enclose!((self.root => root, self.build_file_patterns => patterns) move || async move {
+                        let packages = tokio::task::spawn_blocking(move || {
+                            let mut packages = std::collections::HashSet::new();
+                            find_packages_sync(&root, &root, &patterns, &mut packages)?;
+                            Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
+                        })
+                        .await
+                        .context("find_packages panicked")??;
+                        Ok(Arc::new(packages))
+                    }),
+                )
                 .await
                 .map_err(crate::hmemoizer::unwrap_arc_err)?;
 

@@ -260,7 +260,6 @@ fn compile_run_script(
     clippy::too_many_arguments,
     reason = "all parameters are required, no natural grouping"
 )]
-#[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 fn build_lib_spec_inner(
     addr: Addr,
     factors: &Factors,

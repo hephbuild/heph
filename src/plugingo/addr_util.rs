@@ -3,7 +3,7 @@ use crate::htpkg::PkgBuf;
 use crate::plugingo::factors::Factors;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const STD_PREFIX: &str = "@heph/go/std/";
 const THIRD_PREFIX: &str = "@heph/go/thirdparty/";
@@ -31,9 +31,37 @@ pub enum GoPackageKind {
     },
 }
 
+type DecodeCache = Mutex<HashMap<(PkgBuf, PathBuf), Option<Arc<GoPackageKind>>>>;
+
+static DECODE_CACHE: OnceLock<DecodeCache> = OnceLock::new();
+
+fn decode_cache() -> &'static DecodeCache {
+    DECODE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Decode a rheph package address into its Go package kind.
 /// Returns None if the address doesn't correspond to a Go package.
-pub fn decode_package(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPackageKind> {
+///
+/// Results are memoized in a process-wide cache keyed by `(pkg, workspace_root)`
+/// since the mapping is a pure function of those inputs plus filesystem state
+/// that is stable for the duration of a build.
+pub fn decode_package(pkg: &PkgBuf, workspace_root: &Path) -> Option<Arc<GoPackageKind>> {
+    let key = (pkg.clone(), workspace_root.to_path_buf());
+    {
+        let cache = decode_cache().lock().expect("decode_cache poisoned");
+        if let Some(cached) = cache.get(&key) {
+            return cached.clone();
+        }
+    }
+
+    let result = decode_package_uncached(pkg, workspace_root).map(Arc::new);
+
+    let mut cache = decode_cache().lock().expect("decode_cache poisoned");
+    cache.entry(key).or_insert_with(|| result.clone());
+    result
+}
+
+fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPackageKind> {
     let s = pkg.as_str();
 
     if let Some(rest) = s.strip_prefix(STD_PREFIX) {
@@ -289,7 +317,7 @@ mod tests {
         let ws = Path::new("/tmp");
         let kind = decode_package(&pkg, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::Stdlib {
                 import_path: "fmt".to_string()
             }
@@ -302,7 +330,7 @@ mod tests {
         let ws = Path::new("/tmp");
         let kind = decode_package(&pkg, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::Stdlib {
                 import_path: "net/http".to_string()
             }
@@ -315,7 +343,7 @@ mod tests {
         let ws = Path::new("/tmp");
         let kind = decode_package(&pkg, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::ThirdParty {
                 module: "github.com/foo/bar".to_string(),
                 version: "v1.2.3".to_string(),
@@ -331,7 +359,7 @@ mod tests {
         let ws = Path::new("/tmp");
         let kind = decode_package(&pkg, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::ThirdParty {
                 module: "github.com/foo/bar".to_string(),
                 version: "v1.0.0".to_string(),
@@ -347,7 +375,7 @@ mod tests {
         let ws = Path::new("/tmp");
         let kind = decode_package(&pkg, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::ThirdParty {
                 module: "github.com/foo/bar".to_string(),
                 version: "v1.2.3".to_string(),
@@ -367,7 +395,7 @@ mod tests {
         let pkg = PkgBuf::from("mylib");
         let kind = decode_package(&pkg, ws.path()).unwrap();
         assert!(
-            matches!(kind, GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/myrepo/mylib")
+            matches!(&*kind, GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/myrepo/mylib")
         );
     }
 
@@ -498,7 +526,7 @@ mod tests {
         let ws = Path::new("/workspace");
         let kind = decode_package(&addr.package, ws).unwrap();
         assert_eq!(
-            kind,
+            *kind,
             GoPackageKind::ThirdParty {
                 module: "k8s.io/apimachinery".to_string(),
                 version: "v0.32.1".to_string(),

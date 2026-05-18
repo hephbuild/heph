@@ -9,7 +9,7 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::loosespecparser::{parse_map_string_strings, parse_string};
 use crate::plugingo::embed;
-use crate::plugingo::pkg_analysis::parse_go_list_reader;
+use crate::plugingo::pkg_analysis::decode_go_package;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::hash::{Hash, Hasher};
@@ -204,7 +204,7 @@ impl ManagedDriver for GoEmbedDriver {
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def::<GoEmbedDef>();
 
-        // Find package.json from the golist input
+        // Find package.bin from the golist input
         let managed = req
             .inputs
             .iter()
@@ -213,26 +213,19 @@ impl ManagedDriver for GoEmbedDriver {
                 anyhow::anyhow!("go_embed: golist input {} not found", def.golist_origin_id)
             })?;
 
-        // Find the package.json file in the list
         let list_f = std::fs::File::open(&managed.list_path)
             .with_context(|| format!("open golist list {:?}", managed.list_path))?;
-        let pkg_json_path = std::io::BufReader::new(list_f)
+        let pkg_bin_path = std::io::BufReader::new(list_f)
             .lines()
             .find(|l| {
                 l.as_ref()
-                    .is_ok_and(|s| !s.is_empty() && s.ends_with("package.json"))
+                    .is_ok_and(|s| !s.is_empty() && s.ends_with("package.bin"))
             })
-            .ok_or_else(|| anyhow::anyhow!("go_embed: package.json not found in golist input"))??;
+            .ok_or_else(|| anyhow::anyhow!("go_embed: package.bin not found in golist input"))??;
 
-        let pkg_json_file =
-            std::fs::File::open(&pkg_json_path).with_context(|| "open package.json")?;
-        let pkgs = parse_go_list_reader(pkg_json_file).context("parse package.json")?;
-
-        // Take the first (and typically only) package
-        let pkg = pkgs
-            .into_values()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("go_embed: package.json is empty"))?;
+        let pkg_bin_file =
+            std::fs::File::open(&pkg_bin_path).with_context(|| "open package.bin")?;
+        let pkg = decode_go_package(pkg_bin_file).context("decode package.bin")?;
 
         let (patterns_owned, files_owned): (Vec<String>, Vec<String>) = match &def.variant {
             EmbedVariant::Embed => (pkg.embed_patterns.clone(), pkg.embed_files.clone()),
@@ -338,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_embed_variant() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         assert_eq!(
             resp.target_def.def::<GoEmbedDef>().variant,
@@ -349,7 +342,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_xtest_embed_variant() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "xtest_embed", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "xtest_embed", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         assert_eq!(
             resp.target_def.def::<GoEmbedDef>().variant,
@@ -360,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_invalid_variant_errors() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "invalid", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "invalid", "//mypkg:_golist|pkg");
         assert!(driver().parse(req, &ct).await.is_err());
     }
 
@@ -373,7 +366,7 @@ mod tests {
             TargetSpecValue::Map(HashMap::from([(
                 "golist".to_string(),
                 TargetSpecValue::List(vec![TargetSpecValue::String(
-                    "//mypkg:_golist|json".to_string(),
+                    "//mypkg:_golist|pkg".to_string(),
                 )]),
             )])),
         );
@@ -397,7 +390,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_includes_golist_input() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         assert!(
             resp.target_def
@@ -411,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_out_prepends_package() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         let cfg_out = resp
             .target_def
@@ -428,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_no_host_src_dir_in_def() {
         let ct = noop_ctoken();
-        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|json");
+        let req = make_parse_request("mypkg", "embed", "//mypkg:_golist|pkg");
         let resp = driver().parse(req, &ct).await.unwrap();
         // Verify GoEmbedDef has no host path — only variant + origin_id
         let def = resp.target_def.def::<GoEmbedDef>();

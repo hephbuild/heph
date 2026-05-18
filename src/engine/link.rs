@@ -35,7 +35,7 @@ impl Engine {
 
                 let output_names = if let Some(ref output_name) = input.r#ref.output {
                     if !input_def.outputs.iter().any(|output| &output.group == output_name) {
-                        anyhow::bail!("Output '{output_name}' not found in target '{:?}'", input.r#ref.r#ref)
+                        anyhow::bail!("Output '{output_name}' not found in target '{}'", input.r#ref.r#ref)
                     }
                     vec![output_name.clone()]
                 } else {
