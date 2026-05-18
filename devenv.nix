@@ -49,9 +49,18 @@ in
   scripts.lint.exec = "echo '> clippy' && cargo clippy -- -D warnings && echo '> fmt' && cargo fmt --check ${qualityCrates}";
   scripts.fix.exec = "cargo fix --allow-dirty && cargo fmt ${qualityCrates}";
   scripts.tst.exec = "cargo test --all";
+
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
   scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/rheph "''${@}"'';
+  scripts.pheph.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
+
+  scripts.build-release.exec = ''cargo build --profile release'';
+  scripts.run-release.exec = ''$DEVENV_ROOT/target/release/rheph "''${@}"'';
+  scripts.rheph.exec = ''$DEVENV_ROOT/target/release/rheph "''${@}"'';
+
+  scripts.dheph.exec = ''cargo run -q -- "''${@}"'';
+
   scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz  --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
 
   scripts.install-dev.exec = ''
