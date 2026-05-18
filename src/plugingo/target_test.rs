@@ -21,8 +21,8 @@ pub fn build_lib_test_spec(
     package_name: &str,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
-    src_addrs: &[Addr],
-    test_src_addrs: &[Addr],
+    src_addrs: &[String],
+    test_src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
@@ -39,7 +39,7 @@ pub fn build_lib_test_spec(
         addr,
         factors,
         transitive_libs,
-        src_addrs.iter().chain(test_src_addrs.iter()),
+        src_addrs.iter().chain(test_src_addrs.iter()).cloned(),
         go_bin_addr,
         goroot,
         embed_addr,
@@ -58,7 +58,7 @@ pub fn build_lib_xtest_spec(
     package_name: &str,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
-    xtest_src_addrs: &[Addr],
+    xtest_src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
@@ -77,7 +77,7 @@ pub fn build_lib_xtest_spec(
         addr,
         factors,
         transitive_libs,
-        xtest_src_addrs.iter(),
+        xtest_src_addrs.iter().cloned(),
         go_bin_addr,
         goroot,
         embed_addr,
@@ -104,7 +104,7 @@ pub fn build_testmain_lib_spec(
         addr,
         factors,
         testmain_libs,
-        std::iter::once(testmain_src_addr),
+        std::iter::once(testmain_src_addr.format()),
         go_bin_addr,
         goroot,
         None,
@@ -255,11 +255,11 @@ fn compile_run_script(
     clippy::too_many_arguments,
     reason = "all parameters are required, no natural grouping"
 )]
-fn build_lib_spec_inner<'a>(
+fn build_lib_spec_inner(
     addr: Addr,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
-    src_addrs: impl Iterator<Item = &'a Addr>,
+    src_addrs: impl Iterator<Item = String>,
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
@@ -279,11 +279,7 @@ fn build_lib_spec_inner<'a>(
 
     deps.insert(
         String::new(),
-        TargetSpecValue::List(
-            src_addrs
-                .map(|a| TargetSpecValue::String(a.format()))
-                .collect(),
-        ),
+        TargetSpecValue::List(src_addrs.map(TargetSpecValue::String).collect()),
     );
     deps.insert(
         "go_bin".to_string(),
@@ -366,8 +362,8 @@ mod tests {
         }
     }
 
-    fn src_addrs(pkg: &str) -> Vec<Addr> {
-        vec![pluginfs::file_addr(&format!("{}/foo.go", pkg))]
+    fn src_addrs(pkg: &str) -> Vec<String> {
+        vec![pluginfs::file_addr(&format!("{}/foo.go", pkg)).format()]
     }
 
     // ---- build_lib_test_spec ----

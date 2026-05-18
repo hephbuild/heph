@@ -13,7 +13,7 @@ use crate::plugingo::addr_util::{
 };
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
-    GoPackage, find_module_for_import, is_stdlib_import_path, parse_go_list_reader,
+    GoPackage, PackageAddrs, find_module_for_import, is_stdlib_import_path, parse_go_list_reader,
     parse_go_mod_module_path, parse_go_mod_requires,
 };
 use crate::plugingo::target_bin;
@@ -52,12 +52,8 @@ pub struct Provider {
     go_bin_addr: String,
     /// Cache: golist addr → GoPackage. Memoizes the full executor.result + parse across requests.
     pkg_cache: Memoizer<Addr, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
-    /// Cache: golist addr → source_map.json contents.
-    #[expect(
-        clippy::type_complexity,
-        reason = "memoizer type mirrors pkg_cache pattern"
-    )]
-    source_map_cache: Memoizer<Addr, Result<Arc<HashMap<String, String>>, Arc<anyhow::Error>>>,
+    /// Cache: golist addr → driver-resolved per-file addresses.
+    pkg_addrs_cache: Memoizer<Addr, Result<Arc<PackageAddrs>, Arc<anyhow::Error>>>,
 }
 
 impl Provider {
@@ -78,7 +74,7 @@ impl Provider {
             gocache,
             go_bin_addr: config.go_bin_addr,
             pkg_cache: Memoizer::with_tag("pkg_cache"),
-            source_map_cache: Memoizer::with_tag("source_map_cache"),
+            pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
         })
     }
 }
@@ -485,48 +481,17 @@ impl Provider {
                         &self.goroot,
                     ),
                     _ => {
-                        let pkg_str = addr.package.as_str();
-                        let source_map = self
-                            .read_golist_source_map(Arc::clone(&req.executor), &golist_addr)
+                        let pkg_addrs = self
+                            .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                             .await
                             .map_err(GetError::Other)?;
-                        let src_addrs: Vec<String> = pkg
-                            .go_files
-                            .iter()
-                            .map(|f| {
-                                let rel = if pkg_str.is_empty() {
-                                    f.clone()
-                                } else {
-                                    format!("{}/{}", pkg_str, f)
-                                };
-                                if let Some(src_target) = source_map.get(&rel) {
-                                    // File came from a codegen target; dep on that target
-                                    // with a filter so only this specific file is exposed.
-                                    use crate::engine::driver::TargetAddr;
-                                    use crate::htpkg::PkgBuf;
-                                    let src_ref = crate::htaddr::parse_addr_with_base(
-                                        src_target,
-                                        &PkgBuf::from(""),
-                                    )
-                                    .unwrap_or_else(|_| crate::htaddr::Addr::default());
-                                    TargetAddr {
-                                        r#ref: src_ref,
-                                        output: None,
-                                        filters: vec![rel],
-                                    }
-                                    .to_string()
-                                } else {
-                                    pluginfs::file_addr(&rel).format()
-                                }
-                            })
-                            .collect();
                         target_lib::build_spec(
                             addr.clone(),
                             &import_path,
                             pkg.name.as_deref().unwrap_or(""),
                             &factors,
                             &transitive.libs,
-                            &src_addrs,
+                            &pkg_addrs.go_files,
                             &self.go_bin_addr,
                             &self.goroot,
                             embed_addr.as_ref(),
@@ -594,31 +559,10 @@ impl Provider {
                     .await
                     .map_err(GetError::Other)?;
 
-                let pkg_str = addr.package.as_str();
-                let src_addrs: Vec<Addr> = pkg
-                    .go_files
-                    .iter()
-                    .map(|f| {
-                        let rel = if pkg_str.is_empty() {
-                            f.clone()
-                        } else {
-                            format!("{}/{}", pkg_str, f)
-                        };
-                        pluginfs::file_addr(&rel)
-                    })
-                    .collect();
-                let test_src_addrs: Vec<Addr> = pkg
-                    .test_go_files
-                    .iter()
-                    .map(|f| {
-                        let rel = if pkg_str.is_empty() {
-                            f.clone()
-                        } else {
-                            format!("{}/{}", pkg_str, f)
-                        };
-                        pluginfs::file_addr(&rel)
-                    })
-                    .collect();
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
 
                 let embed_addr = if !pkg.embed_patterns.is_empty() {
                     Some(self.make_addr_with_name(&addr.package, "embed", &factors))
@@ -632,8 +576,8 @@ impl Provider {
                     pkg.name.as_deref().unwrap_or(""),
                     &factors,
                     &transitive.libs,
-                    &src_addrs,
-                    &test_src_addrs,
+                    &pkg_addrs.go_files,
+                    &pkg_addrs.test_go_files,
                     &self.go_bin_addr,
                     &self.goroot,
                     embed_addr.as_ref(),
@@ -696,19 +640,10 @@ impl Provider {
                     transitive.libs.push((import_path.clone(), test_lib_addr));
                 }
 
-                let pkg_str = addr.package.as_str();
-                let xtest_src_addrs: Vec<Addr> = pkg
-                    .xtest_go_files
-                    .iter()
-                    .map(|f| {
-                        let rel = if pkg_str.is_empty() {
-                            f.clone()
-                        } else {
-                            format!("{}/{}", pkg_str, f)
-                        };
-                        pluginfs::file_addr(&rel)
-                    })
-                    .collect();
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
 
                 let xtest_embed_addr = if !pkg.xtest_embed_patterns.is_empty() {
                     Some(self.make_addr_with_name(&addr.package, "embed#xtest", &factors))
@@ -722,7 +657,7 @@ impl Provider {
                     pkg.name.as_deref().unwrap_or(""),
                     &factors,
                     &transitive.libs,
-                    &xtest_src_addrs,
+                    &pkg_addrs.xtest_go_files,
                     &self.go_bin_addr,
                     &self.goroot,
                     xtest_embed_addr.as_ref(),
@@ -1073,35 +1008,35 @@ impl Provider {
             .map_err(unwrap_arc_err)
     }
 
-    async fn read_golist_source_map(
+    async fn read_golist_package_addrs(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
-    ) -> anyhow::Result<Arc<HashMap<String, String>>> {
+    ) -> anyhow::Result<Arc<PackageAddrs>> {
         let golist_addr = golist_addr.clone();
 
-        self.source_map_cache
+        self.pkg_addrs_cache
             .once(golist_addr.clone(), move || async move {
                 let result = executor.result(&golist_addr).await?;
-                let map = tokio::task::spawn_blocking(move || {
+                let addrs = tokio::task::spawn_blocking(move || {
                     for artifact in &result.artifacts {
                         for entry_result in artifact.walk()? {
                             let entry = entry_result?;
                             if entry.path.file_name().and_then(|n| n.to_str())
-                                != Some("source_map.json")
+                                != Some("package_addrs.json")
                             {
                                 continue;
                             }
-                            let m: HashMap<String, String> = serde_json::from_reader(entry.data)
-                                .with_context(|| "parse source_map.json")?;
-                            return Ok::<HashMap<String, String>, anyhow::Error>(m);
+                            let a: PackageAddrs = serde_json::from_reader(entry.data)
+                                .with_context(|| "parse package_addrs.json")?;
+                            return Ok::<PackageAddrs, anyhow::Error>(a);
                         }
                     }
-                    Ok(HashMap::new())
+                    anyhow::bail!("_golist produced no package_addrs.json")
                 })
                 .await
-                .map_err(|e| anyhow::anyhow!("read_golist_source_map task panicked: {e}"))??;
-                Ok(Arc::new(map))
+                .map_err(|e| anyhow::anyhow!("read_golist_package_addrs task panicked: {e}"))??;
+                Ok(Arc::new(addrs))
             })
             .await
             .map_err(unwrap_arc_err)
@@ -1483,22 +1418,22 @@ mod tests {
         }
     }
 
-    struct SourceMapContent(String);
+    struct PackageAddrsContent(String);
 
-    impl Content for SourceMapContent {
+    impl Content for PackageAddrsContent {
         fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
             Ok(Box::new(io::Cursor::new(self.0.as_bytes().to_vec())))
         }
         fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             let entry = WalkEntry {
-                path: PathBuf::from("source_map.json"),
+                path: PathBuf::from("package_addrs.json"),
                 data: Box::new(io::Cursor::new(self.0.as_bytes().to_vec())),
                 x: false,
             };
             Ok(Box::new(std::iter::once(Ok(entry))))
         }
         fn hashout(&self) -> anyhow::Result<String> {
-            Ok("test_hashout_sm".to_string())
+            Ok("test_hashout_addrs".to_string())
         }
     }
 
@@ -1549,13 +1484,20 @@ mod tests {
                 })?;
                 let json = serde_json::to_string(&pkg).context("serialize package")?;
 
-                let mut artifacts: Vec<Arc<dyn Content>> =
-                    vec![Arc::new(StringContent(json)) as Arc<dyn Content>];
-                if !self.source_map.is_empty() {
-                    let sm_json =
-                        serde_json::to_string(&self.source_map).context("serialize source_map")?;
-                    artifacts.push(Arc::new(SourceMapContent(sm_json)) as Arc<dyn Content>);
-                }
+                // Mirror the real driver: also emit package_addrs.json so the provider
+                // can resolve per-file addrs without re-running the driver.
+                let addrs = crate::plugingo::pkg_analysis::resolve_package_addrs(
+                    &pkg,
+                    addr.package.as_str(),
+                    &self.source_map,
+                );
+                let addrs_json =
+                    serde_json::to_string(&addrs).context("serialize package_addrs")?;
+
+                let artifacts: Vec<Arc<dyn Content>> = vec![
+                    Arc::new(StringContent(json)) as Arc<dyn Content>,
+                    Arc::new(PackageAddrsContent(addrs_json)) as Arc<dyn Content>,
+                ];
 
                 Ok(Arc::new(EResult {
                     artifacts_meta: artifacts

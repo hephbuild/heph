@@ -120,8 +120,10 @@ fn build_spec_inner(
                 TargetSpecValue::List(vec![TargetSpecValue::String("package.json".to_string())]),
             ),
             (
-                "source_map".to_string(),
-                TargetSpecValue::List(vec![TargetSpecValue::String("source_map.json".to_string())]),
+                "addrs".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String(
+                    "package_addrs.json".to_string(),
+                )]),
             ),
         ])),
     );

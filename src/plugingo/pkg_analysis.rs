@@ -1,3 +1,7 @@
+use crate::engine::driver::TargetAddr;
+use crate::htaddr::{Addr, parse_addr_with_base};
+use crate::htpkg::PkgBuf;
+use crate::pluginfs;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -47,6 +51,59 @@ pub struct GoPackage {
     pub incomplete: bool,
     #[serde(rename = "Error")]
     pub error: Option<GoPackageError>,
+}
+
+/// Per-file Addr strings derived from a `GoPackage` by the golist driver.
+/// Each entry mirrors the same-name field in `GoPackage`, preserving order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackageAddrs {
+    #[serde(rename = "GoFiles", default)]
+    pub go_files: Vec<String>,
+    #[serde(rename = "TestGoFiles", default)]
+    pub test_go_files: Vec<String>,
+    #[serde(rename = "XTestGoFiles", default)]
+    pub xtest_go_files: Vec<String>,
+}
+
+/// Resolve each Go source file in `pkg` to a target-address string.
+///
+/// Codegen-produced files (those present in `source_map`, keyed by `pkg/file`) become
+/// `TargetAddr` strings with a filter pinning the specific file; the rest fall back to
+/// `pluginfs::file_addr` references.
+pub fn resolve_package_addrs(
+    pkg: &GoPackage,
+    pkg_str: &str,
+    source_map: &HashMap<String, String>,
+) -> PackageAddrs {
+    let resolve = |files: &[String]| -> Vec<String> {
+        files
+            .iter()
+            .map(|f| {
+                let rel = if pkg_str.is_empty() {
+                    f.clone()
+                } else {
+                    format!("{pkg_str}/{f}")
+                };
+                if let Some(src_target) = source_map.get(&rel) {
+                    let src_ref = parse_addr_with_base(src_target, &PkgBuf::from(""))
+                        .unwrap_or_else(|_| Addr::default());
+                    TargetAddr {
+                        r#ref: src_ref,
+                        output: None,
+                        filters: vec![rel],
+                    }
+                    .to_string()
+                } else {
+                    pluginfs::file_addr(&rel).format()
+                }
+            })
+            .collect()
+    };
+    PackageAddrs {
+        go_files: resolve(&pkg.go_files),
+        test_go_files: resolve(&pkg.test_go_files),
+        xtest_go_files: resolve(&pkg.xtest_go_files),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

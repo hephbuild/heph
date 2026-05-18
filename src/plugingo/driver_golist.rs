@@ -9,6 +9,7 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::{parse_map_string_strings, parse_string, parse_strings};
+use crate::plugingo::pkg_analysis::{GoPackage, resolve_package_addrs};
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -39,8 +40,13 @@ struct GoGolistDef {
     dep_inputs: Vec<Input>,
 }
 
+/// Bump to invalidate every cached `_golist` artifact whenever the driver's
+/// output format (package.json layout, package_addrs.json schema, …) changes.
+const GO_GOLIST_FORMAT_VERSION: u32 = 2;
+
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        GO_GOLIST_FORMAT_VERSION.hash(state);
         self.import_path.hash(state);
         self.goos.hash(state);
         self.goarch.hash(state);
@@ -279,43 +285,60 @@ impl ManagedDriver for GoGolistDriver {
             anyhow::bail!("go list failed for {}: {}", def.import_path, stderr);
         }
 
-        // Normalize Dir fields: strip sandbox_ws_dir prefix → repo-root-relative
+        // Parse once, normalize Dir on the struct, then serialize package.json and
+        // reuse the same value for addr resolution below.
         let ws_prefix = req.sandbox_ws_dir.to_string_lossy();
-        let normalized =
-            normalize_go_list_json(&output.stdout, &ws_prefix).context("normalize go list JSON")?;
-
-        std::fs::write(req.sandbox_pkg_dir.join("package.json"), &normalized)
+        let mut pkgs: Vec<GoPackage> = serde_json::Deserializer::from_slice(&output.stdout)
+            .into_iter::<GoPackage>()
+            .collect::<Result<_, _>>()
+            .context("parse go list output")?;
+        for p in &mut pkgs {
+            if let Some(dir) = &p.dir {
+                p.dir = Some(normalize_dir(dir, &ws_prefix));
+            }
+        }
+        let mut package_json: Vec<u8> = Vec::new();
+        for p in &pkgs {
+            serde_json::to_writer(&mut package_json, p).context("serialize package")?;
+            package_json.push(b'\n');
+        }
+        std::fs::write(req.sandbox_pkg_dir.join("package.json"), &package_json)
             .context("write package.json")?;
+
+        let pkg = pkgs
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("go list returned no packages"))?;
+
+        let source_map_path = req.sandbox_pkg_dir.join("source_map.json");
+        let source_map: HashMap<String, String> = if source_map_path.exists() {
+            let raw = std::fs::read_to_string(&source_map_path)
+                .with_context(|| format!("read {source_map_path:?}"))?;
+            serde_json::from_str(&raw).with_context(|| "parse source_map.json")?
+        } else {
+            HashMap::new()
+        };
+
+        let pkg_str = req.request.target.addr.package.as_str();
+        let addrs = resolve_package_addrs(&pkg, pkg_str, &source_map);
+        let addrs_json = serde_json::to_string(&addrs).context("serialize package_addrs")?;
+        std::fs::write(req.sandbox_pkg_dir.join("package_addrs.json"), addrs_json)
+            .context("write package_addrs.json")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
 }
 
-/// Strip `ws_prefix/` from `Dir` fields in concatenated go list JSON objects,
-/// making paths repo-root-relative.
-fn normalize_go_list_json(raw: &[u8], ws_prefix: &str) -> anyhow::Result<Vec<u8>> {
+/// Strip `ws_prefix/` from a go list `Dir` path so it becomes repo-root-relative.
+fn normalize_dir(dir: &str, ws_prefix: &str) -> String {
     let prefix_slash = format!("{ws_prefix}/");
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
-    let de = serde_json::Deserializer::from_slice(raw);
-    let iter = de.into_iter::<serde_json::Value>();
-    for item in iter {
-        let mut obj = item.context("parse go list JSON object")?;
-        if let Some(dir_val) = obj.get_mut("Dir")
-            && let Some(dir) = dir_val.as_str()
-        {
-            let normalized = if let Some(rel) = dir.strip_prefix(&prefix_slash) {
-                rel.to_string()
-            } else if dir == ws_prefix {
-                String::new()
-            } else {
-                dir.to_string()
-            };
-            *dir_val = serde_json::Value::String(normalized);
-        }
-        serde_json::to_writer(&mut out, &obj).context("serialize normalized JSON")?;
-        out.push(b'\n');
+    if let Some(rel) = dir.strip_prefix(&prefix_slash) {
+        rel.to_string()
+    } else if dir == ws_prefix {
+        String::new()
+    } else {
+        dir.to_string()
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -559,58 +582,18 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_strips_ws_prefix() {
-        let raw = serde_json::json!({
-            "Dir": "/sandbox/ws/mylib",
-            "ImportPath": "example.com/mylib"
-        })
-        .to_string();
-        let normalized = normalize_go_list_json(raw.as_bytes(), "/sandbox/ws").unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
-        assert_eq!(v["Dir"].as_str(), Some("mylib"));
+    fn test_normalize_dir_strips_ws_prefix() {
+        assert_eq!(normalize_dir("/sandbox/ws/mylib", "/sandbox/ws"), "mylib");
     }
 
     #[test]
-    fn test_normalize_leaves_third_party_dir_unchanged() {
-        let raw = serde_json::json!({
-            "Dir": "/home/user/go/pkg/mod/github.com/foo/bar@v1.0.0",
-            "ImportPath": "github.com/foo/bar"
-        })
-        .to_string();
-        let normalized = normalize_go_list_json(raw.as_bytes(), "/sandbox/ws").unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
-        assert_eq!(
-            v["Dir"].as_str(),
-            Some("/home/user/go/pkg/mod/github.com/foo/bar@v1.0.0")
-        );
+    fn test_normalize_dir_equals_ws_prefix_yields_empty() {
+        assert_eq!(normalize_dir("/sandbox/ws", "/sandbox/ws"), "");
     }
 
     #[test]
-    fn test_normalize_multiple_json_objects() {
-        let raw = format!(
-            "{}\n{}",
-            serde_json::json!({"Dir": "/ws/foo", "ImportPath": "example.com/foo"}),
-            serde_json::json!({"Dir": "/ws/bar", "ImportPath": "example.com/bar"}),
-        );
-        let normalized = normalize_go_list_json(raw.as_bytes(), "/ws").unwrap();
-        let text = String::from_utf8(normalized).unwrap();
-        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
-        assert_eq!(lines.len(), 2);
-        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(v0["Dir"].as_str(), Some("foo"));
-        assert_eq!(v1["Dir"].as_str(), Some("bar"));
-    }
-
-    #[test]
-    fn test_normalize_no_dir_field() {
-        let raw = serde_json::json!({
-            "ImportPath": "fmt",
-            "Standard": true
-        })
-        .to_string();
-        let normalized = normalize_go_list_json(raw.as_bytes(), "/sandbox/ws").unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&normalized).unwrap();
-        assert!(v.get("Dir").is_none() || v["Dir"].is_null());
+    fn test_normalize_dir_leaves_third_party_unchanged() {
+        let dir = "/home/user/go/pkg/mod/github.com/foo/bar@v1.0.0";
+        assert_eq!(normalize_dir(dir, "/sandbox/ws"), dir);
     }
 }

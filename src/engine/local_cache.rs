@@ -5,9 +5,9 @@ use crate::engine::result::ArtifactMeta;
 use crate::hartifactcontent;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
+use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use enclose::enclose;
-use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
@@ -40,35 +40,27 @@ impl<W: io::Write> io::Write for CountingWriter<W> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
 pub enum ManifestArtifactContentType {
-    #[serde(rename = "application/x-tar")]
     Tar,
-    #[serde(rename = "application/x-cpio")]
     Cpio,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
 pub enum ManifestArtifactEncoding {
-    #[serde(rename = "none")]
     None,
-    #[serde(rename = "gzip")]
     Gzip,
-    #[serde(rename = "ztsd")]
     Zstd,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq, Eq)]
 pub enum ManifestArtifactType {
-    #[serde(rename = "output")]
     Output,
-    #[serde(rename = "log")]
     Log,
-    #[serde(rename = "support_file")]
     SupportFile,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct ManifestArtifact {
     pub hashout: String,
     pub group: String,
@@ -79,11 +71,11 @@ pub struct ManifestArtifact {
     pub encoding: ManifestArtifactEncoding,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
 pub struct Manifest {
     pub version: String,
     pub target: String,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_at_nanos: i64,
     pub hashin: String,
     pub artifacts: Vec<ManifestArtifact>,
 }
@@ -99,7 +91,7 @@ pub trait LocalCache: Send + Sync {
 #[error("not found")]
 pub struct NotFoundError;
 
-const MANIFEST_V1_JSON: &str = "manifest-v1.json";
+const MANIFEST_V1: &str = "manifest-v1.borsh";
 
 #[derive(Clone)]
 pub struct CacheArtifact {
@@ -256,13 +248,13 @@ impl Engine {
         let manifest = Manifest {
             version: "1.0.0".to_string(),
             target: addr.format(),
-            created_at: Utc::now(),
+            created_at_nanos: Utc::now().timestamp_nanos_opt().unwrap_or(0),
             hashin: hashin.to_string(),
             artifacts: manifest_artifacts,
         };
 
-        let manifest_writer = self.local_cache.writer(addr, &key, MANIFEST_V1_JSON)?;
-        serde_json::to_writer(manifest_writer, &manifest)?;
+        let mut manifest_writer = self.local_cache.writer(addr, &key, MANIFEST_V1)?;
+        borsh::to_writer(&mut manifest_writer, &manifest)?;
 
         Ok(res_artifacts)
     }
@@ -277,13 +269,15 @@ impl Engine {
         let addr = def.target.addr.clone();
         let hashin = hashin.to_string();
         tokio::task::spawn_blocking(enclose!((self.local_cache => local_cache) move || {
-            let manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1_JSON) {
+            let mut manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
                 Err(e) if e.is::<NotFoundError>() => return Ok(None),
                 Err(e) => return Err(e),
                 Ok(artifact) => artifact,
             };
 
-            let manifest: Manifest = serde_json::from_reader(manifest_artifact)?;
+            let mut buf = Vec::new();
+            io::Read::read_to_end(&mut manifest_artifact, &mut buf)?;
+            let manifest: Manifest = borsh::from_slice(&buf)?;
 
             let mut results: Vec<CacheArtifact> = vec![];
             let mut result_meta: Vec<ArtifactMeta> = vec![];
