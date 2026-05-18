@@ -63,6 +63,12 @@ pub struct PackageAddrs {
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]
     pub xtest_go_files: Vec<String>,
+    #[serde(rename = "EmbedFiles", default)]
+    pub embed_files: Vec<String>,
+    #[serde(rename = "TestEmbedFiles", default)]
+    pub test_embed_files: Vec<String>,
+    #[serde(rename = "XTestEmbedFiles", default)]
+    pub xtest_embed_files: Vec<String>,
 }
 
 /// Resolve each Go source file in `pkg` to a target-address string.
@@ -103,6 +109,9 @@ pub fn resolve_package_addrs(
         go_files: resolve(&pkg.go_files),
         test_go_files: resolve(&pkg.test_go_files),
         xtest_go_files: resolve(&pkg.xtest_go_files),
+        embed_files: resolve(&pkg.embed_files),
+        test_embed_files: resolve(&pkg.test_embed_files),
+        xtest_embed_files: resolve(&pkg.xtest_embed_files),
     }
 }
 
@@ -235,6 +244,7 @@ pub(crate) async fn run_go_list(
     cmd.arg("list")
         .arg("-json")
         .arg("-e")
+        .arg("-test")
         .args(factors.go_list_flags())
         .arg(import_path)
         .current_dir(module_root)

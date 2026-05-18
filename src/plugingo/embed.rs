@@ -90,9 +90,15 @@ pub(crate) fn resolve_embed_pattern(src_dir: &Path, pattern: &str) -> anyhow::Re
 }
 
 /// Produce the JSON string expected by `go tool compile -embedcfg`.
+///
 /// `embed_files` (from `go list EmbedFiles`) is Go's authoritative resolved
 /// file list and is merged into `Files` so we don't miss files that Go includes
 /// via its own exclusion rules (no `.`/`_` prefix, etc.).
+///
+/// `src_dir` is only used for pattern resolution (globbing). Paths recorded in
+/// `Files` are kept relative to `src_dir` so the cfg can be consumed inside any
+/// sandbox where those files appear at the same relative location — never bake
+/// host-absolute paths into the cfg.
 pub(crate) fn compute_embed_cfg_json(
     embed_patterns: &[String],
     embed_files: &[String],
@@ -105,8 +111,7 @@ pub(crate) fn compute_embed_cfg_json(
         let resolved = resolve_embed_pattern(src_dir, pattern)
             .with_context(|| format!("resolving embed pattern {pattern}"))?;
         for file in &resolved {
-            let abs_path = src_dir.join(file);
-            files_map.insert(file.clone(), abs_path.to_string_lossy().into_owned());
+            files_map.insert(file.clone(), file.clone());
         }
         patterns_map.insert(pattern.as_str(), resolved);
     }
@@ -114,7 +119,7 @@ pub(crate) fn compute_embed_cfg_json(
     for file in embed_files {
         files_map
             .entry(file.clone())
-            .or_insert_with(|| src_dir.join(file).to_string_lossy().into_owned());
+            .or_insert_with(|| file.clone());
     }
 
     Ok(serde_json::json!({
@@ -188,18 +193,18 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_run_contains_absolute_path() {
+    fn test_embed_files_paths_are_relative_to_src_dir() {
         let dir = fixture_dir();
-        let spec = build_spec(test_addr(), &["static/index.html".to_string()], &[], &dir).unwrap();
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!(),
-        };
-        let abs = dir.join("static/index.html");
+        let json = compute_embed_cfg_json(&["static/index.html".to_string()], &[], &dir).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // Files map value must NOT be host-absolute — it must stay rel so the cfg
+        // is portable across sandboxes.
+        let val = v["Files"]["static/index.html"].as_str().unwrap();
         assert!(
-            run.contains(abs.to_str().unwrap()),
-            "run must contain the absolute path to embed files: {run}"
+            !std::path::Path::new(val).is_absolute(),
+            "expected rel: {val}"
         );
+        assert_eq!(val, "static/index.html");
     }
 
     #[test]

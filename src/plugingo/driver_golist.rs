@@ -42,7 +42,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.json layout, package_addrs.json schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 2;
+const GO_GOLIST_FORMAT_VERSION: u32 = 4;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -252,6 +252,13 @@ impl ManagedDriver for GoGolistDriver {
             "list".to_string(),
             "-json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error".to_string(),
             "-e".to_string(),
+            // -test populates TestEmbedFiles / XTestEmbedFiles (and resolves test
+            // imports). Without it go list reports test embed patterns but never
+            // resolves them, so the test embedcfg path globs against an empty
+            // staged-file set. The flag also adds synthetic `pkg.test` / `pkg
+            // [pkg.test]` / `pkg_test [pkg.test]` entries — we discard them
+            // below and keep only the plain `pkg` entry.
+            "-test".to_string(),
         ];
 
         if !def.build_tags.is_empty() {
@@ -287,11 +294,17 @@ impl ManagedDriver for GoGolistDriver {
 
         // Parse once, normalize Dir on the struct, then serialize package.json and
         // reuse the same value for addr resolution below.
+        //
+        // `-test` makes go list emit synthetic variants (`pkg.test`, `pkg [pkg.test]`,
+        // `pkg_test [pkg.test]`); we keep only the canonical entry whose ImportPath
+        // matches the request — that one has the resolved TestEmbedFiles /
+        // XTestEmbedFiles we actually need downstream.
         let ws_prefix = req.sandbox_ws_dir.to_string_lossy();
         let mut pkgs: Vec<GoPackage> = serde_json::Deserializer::from_slice(&output.stdout)
             .into_iter::<GoPackage>()
             .collect::<Result<_, _>>()
             .context("parse go list output")?;
+        pkgs.retain(|p| p.import_path == def.import_path);
         for p in &mut pkgs {
             if let Some(dir) = &p.dir {
                 p.dir = Some(normalize_dir(dir, &ws_prefix));
@@ -305,10 +318,9 @@ impl ManagedDriver for GoGolistDriver {
         std::fs::write(req.sandbox_pkg_dir.join("package.json"), &package_json)
             .context("write package.json")?;
 
-        let pkg = pkgs
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("go list returned no packages"))?;
+        let pkg = pkgs.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("go list returned no entry matching {}", def.import_path)
+        })?;
 
         let source_map_path = req.sandbox_pkg_dir.join("source_map.json");
         let source_map: HashMap<String, String> = if source_map_path.exists() {

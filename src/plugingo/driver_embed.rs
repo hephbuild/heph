@@ -22,6 +22,10 @@ pub struct GoEmbedDriver;
 #[derive(Clone, PartialEq, Debug)]
 enum EmbedVariant {
     Embed,
+    /// embed_patterns ∪ test_embed_patterns / embed_files ∪ test_embed_files —
+    /// used by `build_lib#test`, which compiles GoFiles+TestGoFiles together and
+    /// so must see embeds from both sides.
+    TestEmbed,
     XtestEmbed,
 }
 
@@ -30,9 +34,14 @@ impl Hash for EmbedVariant {
         match self {
             EmbedVariant::Embed => 0u8.hash(state),
             EmbedVariant::XtestEmbed => 1u8.hash(state),
+            EmbedVariant::TestEmbed => 2u8.hash(state),
         }
     }
 }
+
+/// Bump to invalidate every cached embed cfg whenever the embed cfg layout
+/// (paths, file resolution semantics) changes.
+const GO_EMBED_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone)]
 struct GoEmbedDef {
@@ -42,6 +51,7 @@ struct GoEmbedDef {
 
 impl Hash for GoEmbedDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        GO_EMBED_FORMAT_VERSION.hash(state);
         self.variant.hash(state);
         self.golist_origin_id.hash(state);
     }
@@ -71,6 +81,7 @@ impl ManagedDriver for GoEmbedDriver {
 
         let variant = match variant_str.as_str() {
             "embed" => EmbedVariant::Embed,
+            "test_embed" => EmbedVariant::TestEmbed,
             "xtest_embed" => EmbedVariant::XtestEmbed,
             other => anyhow::bail!("go_embed: unknown variant {other:?}"),
         };
@@ -100,6 +111,20 @@ impl ManagedDriver for GoEmbedDriver {
                 mode: InputMode::Standard,
                 origin_id: format!("dep|golist|{i}"),
             });
+        }
+
+        // Embed source files: sandboxed inputs so the driver never reaches outside
+        // the sandbox. Each addr is a pluginfs file or a codegen TargetAddr resolved
+        // by the golist driver — already present in deps.files at spec build time.
+        if let Some(file_addrs) = deps.get("files") {
+            for (i, addr_str) in file_addrs.iter().enumerate() {
+                inputs.push(Input {
+                    r#ref: TargetAddr::parse(addr_str, &pkg)
+                        .with_context(|| format!("parse embed file dep addr {addr_str}"))?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("dep|files|{i}"),
+                });
+            }
         }
 
         let def = GoEmbedDef {
@@ -209,10 +234,27 @@ impl ManagedDriver for GoEmbedDriver {
             .next()
             .ok_or_else(|| anyhow::anyhow!("go_embed: package.json is empty"))?;
 
-        let (patterns, files) = match &def.variant {
-            EmbedVariant::Embed => (&pkg.embed_patterns, &pkg.embed_files),
-            EmbedVariant::XtestEmbed => (&pkg.xtest_embed_patterns, &pkg.xtest_embed_files),
+        let (patterns_owned, files_owned): (Vec<String>, Vec<String>) = match &def.variant {
+            EmbedVariant::Embed => (pkg.embed_patterns.clone(), pkg.embed_files.clone()),
+            EmbedVariant::TestEmbed => (
+                pkg.embed_patterns
+                    .iter()
+                    .chain(pkg.test_embed_patterns.iter())
+                    .cloned()
+                    .collect(),
+                pkg.embed_files
+                    .iter()
+                    .chain(pkg.test_embed_files.iter())
+                    .cloned()
+                    .collect(),
+            ),
+            EmbedVariant::XtestEmbed => (
+                pkg.xtest_embed_patterns.clone(),
+                pkg.xtest_embed_files.clone(),
+            ),
         };
+        let patterns = &patterns_owned;
+        let files = &files_owned;
 
         if patterns.is_empty() && files.is_empty() {
             // Write empty embedcfg
@@ -224,13 +266,11 @@ impl ManagedDriver for GoEmbedDriver {
             return Ok(ManagedRunResponse { artifacts: vec![] });
         }
 
-        // Derive host src dir: pkg.dir is now repo-root-relative (normalized by go_golist driver)
-        let host_src_dir = req
-            .request
-            .tree_root_path
-            .join(pkg.dir.as_deref().unwrap_or_default());
-
-        let cfg_json = embed::compute_embed_cfg_json(patterns, files, &host_src_dir)
+        // Glob against the sandbox package dir — embed file inputs were unpacked
+        // there by the engine, so this stays hermetic. Path values emitted into
+        // embedcfg are relative to the pkg dir, valid in any downstream sandbox
+        // that receives the same file inputs.
+        let cfg_json = embed::compute_embed_cfg_json(patterns, files, &req.sandbox_pkg_dir)
             .context("compute embedcfg")?;
 
         std::fs::write(req.sandbox_pkg_dir.join("embedcfg"), cfg_json).context("write embedcfg")?;

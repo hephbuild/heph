@@ -26,6 +26,7 @@ pub fn build_lib_test_spec(
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
+    embed_file_addrs: &[String],
 ) -> TargetSpec {
     let out_file = format!("{}_test.a", package_name);
     let run = compile_run_script(
@@ -43,6 +44,7 @@ pub fn build_lib_test_spec(
         go_bin_addr,
         goroot,
         embed_addr,
+        embed_file_addrs,
         run,
         out_file,
     )
@@ -62,6 +64,7 @@ pub fn build_lib_xtest_spec(
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
+    embed_file_addrs: &[String],
 ) -> TargetSpec {
     // xtest package import path is "<import_path>_test"
     let xtest_import_path = format!("{}_test", import_path);
@@ -81,6 +84,7 @@ pub fn build_lib_xtest_spec(
         go_bin_addr,
         goroot,
         embed_addr,
+        embed_file_addrs,
         run,
         out_file,
     )
@@ -108,6 +112,7 @@ pub fn build_testmain_lib_spec(
         go_bin_addr,
         goroot,
         None,
+        &[],
         run,
         out_file,
     )
@@ -255,6 +260,7 @@ fn compile_run_script(
     clippy::too_many_arguments,
     reason = "all parameters are required, no natural grouping"
 )]
+#[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 fn build_lib_spec_inner(
     addr: Addr,
     factors: &Factors,
@@ -263,6 +269,7 @@ fn build_lib_spec_inner(
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
+    embed_file_addrs: &[String],
     run: String,
     out_file: String,
 ) -> TargetSpec {
@@ -289,6 +296,19 @@ fn build_lib_spec_inner(
         deps.insert(
             "embed".to_string(),
             TargetSpecValue::List(vec![TargetSpecValue::String(e.format())]),
+        );
+    }
+    // Embed files travel as inputs so the engine stages them into the sandbox
+    // alongside sources — embedcfg paths are pkg-relative and must resolve here.
+    if !embed_file_addrs.is_empty() {
+        deps.insert(
+            "embed_files".to_string(),
+            TargetSpecValue::List(
+                embed_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
         );
     }
 
@@ -381,6 +401,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         assert_eq!(spec.driver, "bash");
     }
@@ -398,6 +419,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -431,6 +453,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -460,6 +483,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -492,6 +516,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),

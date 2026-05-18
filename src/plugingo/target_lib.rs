@@ -20,6 +20,7 @@ pub fn build_spec(
     go_bin_addr: &str,
     goroot: &str,
     embed_addr: Option<&Addr>,
+    embed_file_addrs: &[String],
 ) -> TargetSpec {
     let out_file = archive_filename(import_path);
     // Go requires the main package to be compiled with -p "main" so the linker
@@ -61,6 +62,21 @@ pub fn build_spec(
         deps.insert(
             "embed".to_string(),
             TargetSpecValue::List(vec![TargetSpecValue::String(e.format())]),
+        );
+    }
+    // Embed files travel as inputs in their own group so the engine stages them
+    // into the sandbox at their pkg-relative paths (matching the embedcfg Files
+    // map entries). Compile reads them via -embedcfg, not as compile sources, so
+    // they must NOT land in the default ("") group.
+    if !embed_file_addrs.is_empty() {
+        deps.insert(
+            "embed_files".to_string(),
+            TargetSpecValue::List(
+                embed_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
         );
     }
 
@@ -167,6 +183,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         assert_eq!(spec.driver, "bash");
     }
@@ -183,6 +200,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let out = spec.config.get("out").unwrap();
         assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
@@ -201,6 +219,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -240,6 +259,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -273,6 +293,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -308,6 +329,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -337,6 +359,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -372,6 +395,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -399,6 +423,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -439,6 +464,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let s2 = build_spec(
             test_addr(),
@@ -450,6 +476,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
 
         let run1 = match s1.config.get("run").unwrap() {
@@ -475,6 +502,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -504,6 +532,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -536,6 +565,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             Some(&embed_addr()),
+            &[],
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -569,6 +599,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             Some(&embed_addr()),
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -596,6 +627,7 @@ mod tests {
             "//@heph/bin:go",
             "/usr/local/go",
             None,
+            &[],
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),

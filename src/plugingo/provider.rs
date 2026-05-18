@@ -465,7 +465,7 @@ impl Provider {
                     .await
                     .map_err(GetError::Other)?;
 
-                let embed_addr = if !pkg.embed_patterns.is_empty() {
+                let embed_addr = if !pkg.embed_patterns.is_empty() || !pkg.embed_files.is_empty() {
                     Some(self.make_addr_with_name(&addr.package, "embed", &factors))
                 } else {
                     None
@@ -495,6 +495,7 @@ impl Provider {
                             &self.go_bin_addr,
                             &self.goroot,
                             embed_addr.as_ref(),
+                            &pkg_addrs.embed_files,
                         )
                     }
                 };
@@ -564,12 +565,18 @@ impl Provider {
                     .await
                     .map_err(GetError::Other)?;
 
-                let embed_addr = if !pkg.embed_patterns.is_empty() {
-                    Some(self.make_addr_with_name(&addr.package, "embed", &factors))
+                let has_any_embed = !pkg.embed_patterns.is_empty()
+                    || !pkg.embed_files.is_empty()
+                    || !pkg.test_embed_patterns.is_empty()
+                    || !pkg.test_embed_files.is_empty();
+                let embed_addr = if has_any_embed {
+                    Some(self.make_addr_with_name(&addr.package, "embed#test", &factors))
                 } else {
                     None
                 };
 
+                let mut test_embed_files = pkg_addrs.embed_files.clone();
+                test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
                 let spec = target_test::build_lib_test_spec(
                     addr.clone(),
                     &import_path,
@@ -581,6 +588,7 @@ impl Provider {
                     &self.go_bin_addr,
                     &self.goroot,
                     embed_addr.as_ref(),
+                    &test_embed_files,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -645,11 +653,12 @@ impl Provider {
                     .await
                     .map_err(GetError::Other)?;
 
-                let xtest_embed_addr = if !pkg.xtest_embed_patterns.is_empty() {
-                    Some(self.make_addr_with_name(&addr.package, "embed#xtest", &factors))
-                } else {
-                    None
-                };
+                let xtest_embed_addr =
+                    if !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty() {
+                        Some(self.make_addr_with_name(&addr.package, "embed#xtest", &factors))
+                    } else {
+                        None
+                    };
 
                 let spec = target_test::build_lib_xtest_spec(
                     addr.clone(),
@@ -661,6 +670,7 @@ impl Provider {
                     &self.go_bin_addr,
                     &self.goroot,
                     xtest_embed_addr.as_ref(),
+                    &pkg_addrs.xtest_embed_files,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -824,16 +834,52 @@ impl Provider {
                 if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, false),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "embed",
+                        &pkg_addrs.embed_files,
+                    ),
+                })
+            }
+            "embed#test" => {
+                let has_any = !pkg.embed_patterns.is_empty()
+                    || !pkg.embed_files.is_empty()
+                    || !pkg.test_embed_patterns.is_empty()
+                    || !pkg.test_embed_files.is_empty();
+                if !has_any {
+                    return Err(GetError::NotFound);
+                }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                let mut files = pkg_addrs.embed_files.clone();
+                files.extend(pkg_addrs.test_embed_files.iter().cloned());
+                Ok(GetResponse {
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed", &files),
                 })
             }
             "embed#xtest" => {
                 if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, true),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "xtest_embed",
+                        &pkg_addrs.xtest_embed_files,
+                    ),
                 })
             }
             _ => Err(GetError::NotFound),
@@ -1284,12 +1330,12 @@ impl Provider {
 fn build_embed_spec(
     addr: Addr,
     golist_addr: &Addr,
-    xtest: bool,
+    variant: &str,
+    embed_file_addrs: &[String],
 ) -> crate::engine::provider::TargetSpec {
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
 
-    let variant = if xtest { "xtest_embed" } else { "embed" };
     let golist_dep = format!("{}|json", golist_addr.format());
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
@@ -1297,13 +1343,23 @@ fn build_embed_spec(
         "variant".to_string(),
         TargetSpecValue::String(variant.to_string()),
     );
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "golist".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
-        )])),
+    let mut deps_map: HashMap<String, TargetSpecValue> = HashMap::new();
+    deps_map.insert(
+        "golist".to_string(),
+        TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
     );
+    if !embed_file_addrs.is_empty() {
+        deps_map.insert(
+            "files".to_string(),
+            TargetSpecValue::List(
+                embed_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(
@@ -1478,9 +1534,10 @@ mod tests {
 
                 // Run go list (no -deps) for just this package
                 let packages = run_go_list(&import_path, &factors, &run_dir).await?;
-                // Return the single package as JSON
-                let pkg = packages.into_values().next().ok_or_else(|| {
-                    anyhow::anyhow!("go list returned no packages for {}", import_path)
+                // `-test` returns multiple variants; pick the canonical entry whose
+                // ImportPath matches the request.
+                let pkg = packages.get(&import_path).cloned().ok_or_else(|| {
+                    anyhow::anyhow!("go list returned no entry for {}", import_path)
                 })?;
                 let json = serde_json::to_string(&pkg).context("serialize package")?;
 
