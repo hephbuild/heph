@@ -153,9 +153,7 @@ pub fn encode_go_package(pkg: &GoPackage) -> anyhow::Result<Vec<u8>> {
 /// Decode a `GoPackage` from borsh bytes (e.g. `package.bin` artifact).
 pub fn decode_go_package(mut reader: impl Read) -> anyhow::Result<GoPackage> {
     let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .context("read package.bin")?;
+    reader.read_to_end(&mut buf).context("read package.bin")?;
     GoPackage::try_from_slice(&buf).context("borsh decode GoPackage")
 }
 

@@ -595,8 +595,17 @@ impl ProviderInner {
                 if !has_tests {
                     return Err(GetError::NotFound);
                 }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_testmain_spec(addr.clone(), &golist_addr),
+                    target_spec: build_testmain_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        &pkg_addrs.test_go_files,
+                        &pkg_addrs.xtest_go_files,
+                    ),
                 })
             }
             // Intermediate test target: compile GoFiles + TestGoFiles in test mode.
@@ -1197,8 +1206,15 @@ impl ProviderInner {
         factors: &Factors,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, factors, module_root, true)
-            .await
+        self.collect_libs(
+            executor,
+            root_pkg,
+            extra_imports,
+            factors,
+            module_root,
+            true,
+        )
+        .await
     }
 
     /// Resolve direct imports only (no recursion) — correct for compile steps.
@@ -1210,8 +1226,15 @@ impl ProviderInner {
         factors: &Factors,
         module_root: &Path,
     ) -> anyhow::Result<TransitiveDeps> {
-        self.collect_libs(executor, root_pkg, extra_imports, factors, module_root, false)
-            .await
+        self.collect_libs(
+            executor,
+            root_pkg,
+            extra_imports,
+            factors,
+            module_root,
+            false,
+        )
+        .await
     }
 
     async fn collect_libs(
@@ -1496,20 +1519,47 @@ fn build_embed_spec(
     }
 }
 
-fn build_testmain_spec(addr: Addr, golist_addr: &Addr) -> crate::engine::provider::TargetSpec {
+fn build_testmain_spec(
+    addr: Addr,
+    golist_addr: &Addr,
+    test_file_addrs: &[String],
+    xtest_file_addrs: &[String],
+) -> crate::engine::provider::TargetSpec {
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
 
     let golist_dep = format!("{}|pkg", golist_addr.format());
 
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "golist".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
-        )])),
+    let mut deps_map: HashMap<String, TargetSpecValue> = HashMap::new();
+    deps_map.insert(
+        "golist".to_string(),
+        TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
     );
+    if !test_file_addrs.is_empty() {
+        deps_map.insert(
+            "test".to_string(),
+            TargetSpecValue::List(
+                test_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !xtest_file_addrs.is_empty() {
+        deps_map.insert(
+            "xtest".to_string(),
+            TargetSpecValue::List(
+                xtest_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(

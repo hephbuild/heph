@@ -3,6 +3,7 @@
 /// Parses Go test source files using a simple line-by-line approach (no full AST),
 /// then generates the `testmain.go` bootstrap file that the Go test framework requires.
 use anyhow::Context;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,15 +37,6 @@ pub struct Analysis {
     pub is_go1_18: bool,
 }
 
-/// Parse a single Go test file and return extracted test functions.
-///
-/// `pkg_label` must be either `"_test"` (internal tests) or `"_xtest"` (external tests).
-fn process_file(pkg_label: &str, path: &Path) -> anyhow::Result<PartialAnalysis> {
-    let content =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(process_source(pkg_label, &content))
-}
-
 #[derive(Debug, Default)]
 struct PartialAnalysis {
     tests: Vec<TestFunc>,
@@ -56,78 +48,25 @@ struct PartialAnalysis {
     need_xtest: bool,
 }
 
-/// Parse Go source text for test functions using a line-by-line heuristic.
+/// Parse Go source for test functions using a line-by-line heuristic.
 ///
-/// The approach matches lines that begin with `func ` at column 0 (no leading
-/// whitespace) and inspects the function name and parameter type.  This correctly
-/// ignores method declarations (they have a receiver between `func` and the name)
-/// and nested/indented functions.
-fn process_source(pkg_label: &str, content: &str) -> PartialAnalysis {
+/// Matches lines that begin with `func ` at column 0 (no leading whitespace) and
+/// inspects the function name and parameter type. Correctly ignores method
+/// declarations (receiver between `func` and the name) and nested/indented funcs.
+///
+/// Streams lines from `reader` so file content never has to be held in full.
+fn process_reader<R: BufRead>(pkg_label: &str, reader: R) -> std::io::Result<PartialAnalysis> {
     let mut result = PartialAnalysis::default();
 
-    for line in content.lines() {
-        // Only top-level (non-indented) `func` declarations.
-        let Some(rest) = line.strip_prefix("func ") else {
-            continue;
-        };
-
-        // Receiver check: `func (r *T) Name(` → skip (method)
-        if rest.starts_with('(') {
-            continue;
-        }
-
-        // Extract function name (everything up to '(').
-        let Some((name_raw, params)) = rest.split_once('(') else {
-            continue;
-        };
-        let name = name_raw.trim();
-        if name.is_empty() {
-            continue;
-        }
-        // Reconstruct params with the '(' prefix so existing helpers work.
-        let params = &format!("({}", params);
-
-        // Match TestMain first (special case).
-        if name == "TestMain" {
-            if params_match_type(params, "M") {
-                result.test_main = Some(TestFunc {
-                    name: name.to_string(),
-                    package: pkg_label.to_string(),
-                });
-            } else if params_match_type(params, "T") {
-                // TestMain(t *testing.T) — treated as a normal test
-                result.tests.push(TestFunc {
-                    name: name.to_string(),
-                    package: pkg_label.to_string(),
-                });
-            }
-            continue;
-        }
-
-        if is_test_name(name, "Test") && params_match_type(params, "T") {
-            result.tests.push(TestFunc {
-                name: name.to_string(),
-                package: pkg_label.to_string(),
-            });
-        } else if is_test_name(name, "Benchmark") && params_match_type(params, "B") {
-            result.benchmarks.push(TestFunc {
-                name: name.to_string(),
-                package: pkg_label.to_string(),
-            });
-        } else if is_test_name(name, "Fuzz") && params_match_type(params, "F") {
-            result.fuzz_targets.push(TestFunc {
-                name: name.to_string(),
-                package: pkg_label.to_string(),
-            });
-        }
+    for line in reader.lines() {
+        let line = line?;
+        process_line(pkg_label, &line, &mut result);
     }
 
-    // Determine whether this set of findings belongs to test or xtest.
     let has_findings = !result.tests.is_empty()
         || !result.benchmarks.is_empty()
         || !result.fuzz_targets.is_empty()
         || result.test_main.is_some();
-
     if has_findings {
         match pkg_label {
             "_test" => result.need_test = true,
@@ -135,8 +74,57 @@ fn process_source(pkg_label: &str, content: &str) -> PartialAnalysis {
             _ => {}
         }
     }
+    Ok(result)
+}
 
-    result
+fn process_line(pkg_label: &str, line: &str, result: &mut PartialAnalysis) {
+    let Some(rest) = line.strip_prefix("func ") else {
+        return;
+    };
+    // Receiver check: `func (r *T) Name(` → skip (method)
+    if rest.starts_with('(') {
+        return;
+    }
+    let Some((name_raw, params)) = rest.split_once('(') else {
+        return;
+    };
+    let name = name_raw.trim();
+    if name.is_empty() {
+        return;
+    }
+    let params = &format!("({}", params);
+
+    if name == "TestMain" {
+        if params_match_type(params, "M") {
+            result.test_main = Some(TestFunc {
+                name: name.to_string(),
+                package: pkg_label.to_string(),
+            });
+        } else if params_match_type(params, "T") {
+            result.tests.push(TestFunc {
+                name: name.to_string(),
+                package: pkg_label.to_string(),
+            });
+        }
+        return;
+    }
+
+    if is_test_name(name, "Test") && params_match_type(params, "T") {
+        result.tests.push(TestFunc {
+            name: name.to_string(),
+            package: pkg_label.to_string(),
+        });
+    } else if is_test_name(name, "Benchmark") && params_match_type(params, "B") {
+        result.benchmarks.push(TestFunc {
+            name: name.to_string(),
+            package: pkg_label.to_string(),
+        });
+    } else if is_test_name(name, "Fuzz") && params_match_type(params, "F") {
+        result.fuzz_targets.push(TestFunc {
+            name: name.to_string(),
+            package: pkg_label.to_string(),
+        });
+    }
 }
 
 /// Returns true if `name` looks like a test/benchmark/fuzz function with the given prefix.
@@ -164,26 +152,35 @@ fn params_match_type(params: &str, type_char: &str) -> bool {
         || params.contains(&format!("*{}", type_char))
 }
 
-/// Analyse a set of test files and produce a combined [`Analysis`].
+/// Analyse a set of test files (streamed line-by-line) and produce a combined [`Analysis`].
 ///
-/// `files` is a slice of `(prefix, absolute_path)` where `prefix` is `"_test"` (internal)
-/// or `"_xtest"` (external).
-pub fn analyze_test_main(import_path: &str, files: &[(&str, &str)]) -> anyhow::Result<Analysis> {
+/// `files` is a slice of `(prefix, rel_name)` where `prefix` is `"_test"` (internal) or
+/// `"_xtest"` (external) and `rel_name` is the source file name relative to `base_dir`.
+/// `base_dir` is where the engine staged the inputs (e.g. `sandbox_pkg_dir`) — it is used
+/// only to locate files on disk and is never recorded in the returned `Analysis`, so
+/// caching downstream of this output remains hermetic.
+pub fn analyze_test_main(
+    import_path: &str,
+    base_dir: &Path,
+    files: &[(&str, &str)],
+) -> anyhow::Result<Analysis> {
     let mut analysis = Analysis {
         import_path: import_path.to_string(),
         is_go1_18: true, // always assume modern Go
         ..Default::default()
     };
 
-    for (prefix, path) in files {
+    for (prefix, name) in files {
         match *prefix {
             "_test" => analysis.import_test = true,
             "_xtest" => analysis.import_xtest = true,
             other => anyhow::bail!("unknown package prefix: {:?}", other),
         }
 
-        let partial = process_file(prefix, Path::new(path))
-            .with_context(|| format!("processing {}", path))?;
+        let f = std::fs::File::open(base_dir.join(name))
+            .with_context(|| format!("open {prefix} source {name}"))?;
+        let partial = process_reader(prefix, BufReader::new(f))
+            .with_context(|| format!("read {prefix} source {name}"))?;
 
         analysis.tests.extend(partial.tests);
         analysis.benchmarks.extend(partial.benchmarks);
@@ -192,7 +189,7 @@ pub fn analyze_test_main(import_path: &str, files: &[(&str, &str)]) -> anyhow::R
         if let Some(tm) = partial.test_main {
             anyhow::ensure!(
                 analysis.test_main.is_none(),
-                "multiple definitions of TestMain"
+                "multiple definitions of TestMain in {name}"
             );
             analysis.test_main = Some(tm);
         }
@@ -311,20 +308,11 @@ pub fn generate_testmain(analysis: &Analysis) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    fn write_temp_file(content: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("file_test.go");
-        let mut f = std::fs::File::create(&path).unwrap();
-        f.write_all(content.as_bytes()).unwrap();
-        (dir, path)
-    }
 
     #[test]
     fn test_process_source_finds_test() {
         let source = "package pkg\n\nfunc TestFoo(t *testing.T) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert_eq!(partial.tests.len(), 1);
         assert_eq!(partial.tests[0].name, "TestFoo");
         assert_eq!(partial.tests[0].package, "_test");
@@ -334,14 +322,14 @@ mod tests {
     fn test_process_source_ignores_testify_match() {
         // "Testify" starts with "Test" but next char is 'i' (lowercase) → skip
         let source = "package pkg\n\nfunc Testify(t *testing.T) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert!(partial.tests.is_empty());
     }
 
     #[test]
     fn test_process_source_finds_benchmark() {
         let source = "package pkg\n\nfunc BenchmarkFoo(b *testing.B) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert_eq!(partial.benchmarks.len(), 1);
         assert_eq!(partial.benchmarks[0].name, "BenchmarkFoo");
     }
@@ -349,7 +337,7 @@ mod tests {
     #[test]
     fn test_process_source_finds_fuzz() {
         let source = "package pkg\n\nfunc FuzzFoo(f *testing.F) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert_eq!(partial.fuzz_targets.len(), 1);
         assert_eq!(partial.fuzz_targets[0].name, "FuzzFoo");
     }
@@ -357,7 +345,7 @@ mod tests {
     #[test]
     fn test_process_source_finds_test_main() {
         let source = "package pkg\n\nfunc TestMain(m *testing.M) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert!(partial.test_main.is_some());
         assert_eq!(partial.test_main.as_ref().unwrap().name, "TestMain");
     }
@@ -366,7 +354,7 @@ mod tests {
     fn test_process_source_method_ignored() {
         // Method with receiver should be skipped
         let source = "package pkg\n\nfunc (s *Suite) TestFoo(t *testing.T) {}\n";
-        let partial = process_source("_test", source);
+        let partial = process_reader("_test", source.as_bytes()).unwrap();
         assert!(partial.tests.is_empty());
     }
 
@@ -391,27 +379,24 @@ mod tests {
 
     #[test]
     fn test_analyze_test_main_empty() {
-        let analysis = analyze_test_main("example.com/pkg", &[]).unwrap();
+        let analysis = analyze_test_main("example.com/pkg", Path::new("/tmp"), &[]).unwrap();
         assert!(analysis.tests.is_empty());
         assert!(!analysis.import_test);
         assert!(!analysis.import_xtest);
     }
 
     #[test]
-    fn test_analyze_test_main_from_file() {
-        let source = "package pkg\n\nfunc TestAdd(t *testing.T) {}\n";
-        let (dir, path) = write_temp_file(source);
-        let path_str = path.to_str().unwrap().to_string();
-        drop(dir); // keep dir alive via path
-        let _ = &path_str; // used below
+    fn test_analyze_test_main_streams_from_base_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "pkg_test.go";
+        std::fs::write(
+            dir.path().join(name),
+            "package pkg\n\nfunc TestAdd(t *testing.T) {}\n",
+        )
+        .unwrap();
 
-        let source = "package pkg\n\nfunc TestAdd(t *testing.T) {}\n";
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("pkg_test.go");
-        std::fs::write(&p, source).unwrap();
-
-        let files = vec![("_test", p.to_str().unwrap())];
-        let analysis = analyze_test_main("example.com/pkg", &files).unwrap();
+        let files = vec![("_test", name)];
+        let analysis = analyze_test_main("example.com/pkg", dir.path(), &files).unwrap();
         assert_eq!(analysis.tests.len(), 1);
         assert_eq!(analysis.tests[0].name, "TestAdd");
         assert!(analysis.import_test);

@@ -163,16 +163,8 @@ mod tests {
 
     #[test]
     fn intern_returns_same_arc_for_equal_addrs() {
-        let a = Addr::new(
-            PkgBuf::from("foo/bar"),
-            "baz".to_string(),
-            BTreeMap::new(),
-        );
-        let b = Addr::new(
-            PkgBuf::from("foo/bar"),
-            "baz".to_string(),
-            BTreeMap::new(),
-        );
+        let a = Addr::new(PkgBuf::from("foo/bar"), "baz".to_string(), BTreeMap::new());
+        let b = Addr::new(PkgBuf::from("foo/bar"), "baz".to_string(), BTreeMap::new());
         assert!(Arc::ptr_eq(&a.0, &b.0));
         assert_eq!(a, b);
     }

@@ -73,6 +73,22 @@ impl ManagedDriver for GoTestmainDriver {
             });
         }
 
+        // Test source files: sandboxed inputs so the driver never reaches outside
+        // the sandbox. Each addr is a pluginfs file or a codegen TargetAddr resolved
+        // by the provider — already present in deps.test / deps.xtest at spec build time.
+        for group in ["test", "xtest"] {
+            if let Some(file_addrs) = deps.get(group) {
+                for (i, addr_str) in file_addrs.iter().enumerate() {
+                    inputs.push(Input {
+                        r#ref: TargetAddr::parse(addr_str, &pkg)
+                            .with_context(|| format!("parse {group} src dep addr {addr_str}"))?,
+                        mode: InputMode::Standard,
+                        origin_id: format!("dep|{group}|{i}"),
+                    });
+                }
+            }
+        }
+
         let def = GoTestmainDef { golist_origin_id };
 
         let out_strings = config
@@ -173,28 +189,21 @@ impl ManagedDriver for GoTestmainDriver {
             std::fs::File::open(&pkg_bin_path).with_context(|| "open package.bin")?;
         let pkg = decode_go_package(pkg_bin_file).context("decode package.bin")?;
 
-        let host_src_dir = req
-            .request
-            .tree_root_path
-            .join(pkg.dir.as_deref().unwrap_or_default());
-
-        let mut file_args: Vec<(&'static str, String)> = Vec::new();
+        // Test sources are declared inputs (deps.test / deps.xtest), staged by the
+        // engine into the sandbox package dir. Pass only relative names so absolute
+        // sandbox paths never leak into the cached analysis; analyzer streams files
+        // line-by-line out of `sandbox_pkg_dir`.
+        let mut file_refs: Vec<(&str, &str)> =
+            Vec::with_capacity(pkg.test_go_files.len() + pkg.xtest_go_files.len());
         for f in &pkg.test_go_files {
-            file_args.push(("_test", host_src_dir.join(f).to_string_lossy().into_owned()));
+            file_refs.push(("_test", f.as_str()));
         }
         for f in &pkg.xtest_go_files {
-            file_args.push((
-                "_xtest",
-                host_src_dir.join(f).to_string_lossy().into_owned(),
-            ));
+            file_refs.push(("_xtest", f.as_str()));
         }
-        let file_refs: Vec<(&str, &str)> = file_args
-            .iter()
-            .map(|(prefix, path)| (*prefix, path.as_str()))
-            .collect();
 
-        let analysis =
-            analyze_test_main(&pkg.import_path, &file_refs).context("analyze test files")?;
+        let analysis = analyze_test_main(&pkg.import_path, &req.sandbox_pkg_dir, &file_refs)
+            .context("analyze test files")?;
         let content = generate_testmain(&analysis);
 
         std::fs::write(req.sandbox_pkg_dir.join("testmain.go"), content)
@@ -271,6 +280,74 @@ mod tests {
                 .iter()
                 .any(|i| i.origin_id == "dep|golist|0"),
             "golist input must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_includes_test_and_xtest_file_inputs() {
+        let ct = noop_ctoken();
+        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        config.insert(
+            "deps".to_string(),
+            TargetSpecValue::Map(HashMap::from([
+                (
+                    "golist".to_string(),
+                    TargetSpecValue::List(vec![TargetSpecValue::String(
+                        "//mypkg:_golist|pkg".to_string(),
+                    )]),
+                ),
+                (
+                    "test".to_string(),
+                    TargetSpecValue::List(vec![
+                        TargetSpecValue::String(
+                            "//@heph/fs:.read?path=mypkg/a_test.go".to_string(),
+                        ),
+                        TargetSpecValue::String(
+                            "//@heph/fs:.read?path=mypkg/b_test.go".to_string(),
+                        ),
+                    ]),
+                ),
+                (
+                    "xtest".to_string(),
+                    TargetSpecValue::List(vec![TargetSpecValue::String(
+                        "//@heph/fs:.read?path=mypkg/c_test.go".to_string(),
+                    )]),
+                ),
+            ])),
+        );
+        config.insert(
+            "out".to_string(),
+            TargetSpecValue::Map(HashMap::from([(
+                "go".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
+            )])),
+        );
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: std::sync::Arc::new(TargetSpec {
+                addr: Addr::new(
+                    PkgBuf::from("mypkg"),
+                    "testmain".to_string(),
+                    Default::default(),
+                ),
+                driver: "go_testmain".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        };
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let ids: Vec<&str> = resp
+            .target_def
+            .inputs
+            .iter()
+            .map(|i| i.origin_id.as_str())
+            .collect();
+        assert!(ids.contains(&"dep|test|0"), "missing dep|test|0 in {ids:?}");
+        assert!(ids.contains(&"dep|test|1"), "missing dep|test|1 in {ids:?}");
+        assert!(
+            ids.contains(&"dep|xtest|0"),
+            "missing dep|xtest|0 in {ids:?}"
         );
     }
 
