@@ -1,19 +1,19 @@
-use slog::{Drain, Logger, o};
-use slog_term::{CompactFormat, TermDecorator};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-pub fn init() -> Logger {
-    let decorator = TermDecorator::new().stdout().build();
-    let drain = CompactFormat::new(decorator)
-        .use_custom_timestamp(|_: &mut dyn std::io::Write| Ok(()))
-        .build()
-        .fuse();
+pub fn init() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    let drain = slog_async::Async::new(drain).build().fuse();
+    let fmt_layer = fmt::layer().with_target(false).without_time();
 
-    let logger = Logger::root(drain, o!());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .init();
 
-    // Set slog as global log handler; error means it was already initialized, which is fine
-    drop(slog_stdlog::init());
-
-    logger
+    // Bridge `log` crate records into the tracing subscriber so dependencies
+    // that emit via `log` are captured. Error means it was already initialized.
+    drop(tracing_log::LogTracer::init());
 }

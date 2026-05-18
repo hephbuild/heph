@@ -273,7 +273,7 @@ fn writer_loop(conn: &mut Connection, rx: &mpsc::Receiver<WriterCmd>, pending: &
         }
 
         if let Err(e) = process_batch(conn, &mut batch) {
-            eprintln!("sqlite cache writer: batch failed: {e:#}");
+            tracing::error!(error = %format!("{e:#}"), "sqlite cache writer: batch failed");
         }
 
         // Whether the batch succeeded or not, the pending slots must be released so that

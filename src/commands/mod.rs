@@ -3,7 +3,7 @@ pub mod inspect;
 pub mod query;
 pub mod run;
 mod utils;
-mod version;
+pub mod version;
 
 use clap::Subcommand;
 

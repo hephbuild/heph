@@ -419,7 +419,7 @@ impl Engine {
                             match fs::remove_dir_all(&sandbox_dir) {
                                 Ok(_) => (),
                                 Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                                Err(err) => eprintln!("failed to clean up sandbox: {err}"),
+                                Err(err) => tracing::error!(error = %err, "failed to clean up sandbox"),
                             }
                         });
                     }

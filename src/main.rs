@@ -1,12 +1,13 @@
 use clap::{Args, Parser};
 use humantime::format_duration;
 use rheph::commands;
+use rheph::version::VERSION;
 use rheph::defer;
 use rheph::log;
-use slog::{error, info, warn};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
+use tracing::{error, info, warn};
 
 #[derive(Args)]
 struct GlobalArgs {
@@ -27,10 +28,13 @@ struct Cli {
 
 fn main() -> ExitCode {
     let start = Instant::now();
-    let _logger = log::init();
-    info!(_logger, "Application starting"; "version" => env!("CARGO_PKG_VERSION"), "mode" => "cli");
+    log::init();
+    info!(
+        version = VERSION,
+        "Application starting"
+    );
     defer! {
-        info!(_logger, "Application finished"; "duration" => %format_duration(start.elapsed()));
+        info!(duration = %format_duration(start.elapsed()), "Application finished");
     }
 
     let cli = Cli::parse();
@@ -42,7 +46,7 @@ fn main() -> ExitCode {
         {
             Ok(guard) => Some(guard),
             Err(e) => {
-                error!(_logger, "Failed to start CPU profiler"; "error" => %e);
+                error!(error = %e, "Failed to start CPU profiler");
                 return ExitCode::FAILURE;
             }
         }
@@ -53,7 +57,7 @@ fn main() -> ExitCode {
     let result = match cli.command.execute() {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
-            error!(_logger, "Failed"; "error" => %format!("{:#}", e));
+            error!(error = %format!("{:#}", e), "Failed");
             ExitCode::FAILURE
         }
     };
@@ -79,23 +83,23 @@ fn main() -> ExitCode {
             })
             .build()
         {
-            Err(e) => warn!(_logger, "Failed to build CPU profile report"; "error" => %e),
+            Err(e) => warn!(error = %e, "Failed to build CPU profile report"),
             Ok(report) => {
                 use pprof::protos::Message;
                 match report.pprof() {
-                    Err(e) => warn!(_logger, "Failed to build pprof profile"; "error" => %e),
+                    Err(e) => warn!(error = %e, "Failed to build pprof profile"),
                     Ok(profile) => {
                         let mut content = Vec::new();
                         match profile.encode(&mut content) {
                             Err(e) => {
-                                warn!(_logger, "Failed to encode pprof profile"; "error" => %e)
+                                warn!(error = %e, "Failed to encode pprof profile")
                             }
                             Ok(()) => match std::fs::write(&path, &content) {
                                 Err(e) => {
-                                    warn!(_logger, "Failed to write pprof file"; "path" => %path.display(), "error" => %e)
+                                    warn!(path = %path.display(), error = %e, "Failed to write pprof file")
                                 }
                                 Ok(()) => {
-                                    info!(_logger, "CPU profile written"; "path" => %path.display())
+                                    info!(path = %path.display(), "CPU profile written")
                                 }
                             },
                         }

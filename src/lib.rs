@@ -20,3 +20,4 @@ pub mod plugingroup;
 pub mod pluginhostbin;
 pub mod pluginquery;
 pub mod pluginstatictarget;
+pub mod version;
