@@ -3,62 +3,12 @@ use crate::htaddr::Addr;
 use crate::loosespecparser::TargetSpecValue;
 use crate::plugingo::addr_util::{import_path_to_dep_group, write_importcfg_script};
 use crate::plugingo::factors::Factors;
-use crate::plugingo::gen_testmain::{Analysis, generate_testmain};
 use std::collections::{BTreeMap, HashMap};
 
 pub struct GoEnv<'a> {
     pub gomodcache: &'a str,
     pub gopath: &'a str,
     pub gocache: &'a str,
-}
-
-/// Generate the `testmain` target spec.
-///
-/// This target writes a generated `testmain.go` file (base64-encoded) to disk.
-/// No dependencies on other targets — the content is fully determined at describe time.
-pub fn testmain_spec(
-    addr: Addr,
-    _import_path: &str,
-    analysis: &Analysis,
-    factors: &Factors,
-) -> TargetSpec {
-    let content = generate_testmain(analysis);
-    // Base64-encode so the shell script can embed it safely.
-    let b64 = base64_encode(content.as_bytes());
-
-    let run = format!("printf '%s' '{}' | base64 -d > testmain.go\n", b64);
-
-    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-    config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert("deps".to_string(), TargetSpecValue::Map(HashMap::new()));
-    config.insert(
-        "out".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "go".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
-        )])),
-    );
-    config.insert(
-        "runtime_env".to_string(),
-        TargetSpecValue::Map(HashMap::from([
-            (
-                "GOOS".to_string(),
-                TargetSpecValue::String(factors.goos.clone()),
-            ),
-            (
-                "GOARCH".to_string(),
-                TargetSpecValue::String(factors.goarch.clone()),
-            ),
-        ])),
-    );
-
-    TargetSpec {
-        addr,
-        driver: "bash".to_string(),
-        config,
-        labels: vec![],
-        transitive: Default::default(),
-    }
 }
 
 /// Compile the test package (GoFiles + TestGoFiles) with `go tool compile` in test mode.
@@ -390,39 +340,6 @@ fn build_lib_spec_inner<'a>(
     }
 }
 
-/// Look up a base64 character by its 6-bit index.
-fn b64_char(idx: u8) -> char {
-    // The index is produced by masking with 0x3f (range 0..=63) so the array is always in bounds.
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-        .get(idx as usize)
-        .copied()
-        .unwrap_or(b'=') as char
-}
-
-/// Simple base64 encoding without external dependency.
-fn base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk.first().copied().unwrap_or(0) as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(b64_char(((n >> 18) & 0x3f) as u8));
-        out.push(b64_char(((n >> 12) & 0x3f) as u8));
-        out.push(if chunk.len() > 1 {
-            b64_char(((n >> 6) & 0x3f) as u8)
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            b64_char((n & 0x3f) as u8)
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,71 +368,6 @@ mod tests {
 
     fn src_addrs(pkg: &str) -> Vec<Addr> {
         vec![pluginfs::file_addr(&format!("{}/foo.go", pkg))]
-    }
-
-    // ---- testmain_spec ----
-
-    #[test]
-    fn test_testmain_spec_driver_is_bash() {
-        let analysis = Analysis {
-            import_path: "example.com/pkg".to_string(),
-            is_go1_18: true,
-            ..Default::default()
-        };
-        let spec = testmain_spec(
-            mk_addr("pkg", "testmain"),
-            "example.com/pkg",
-            &analysis,
-            &test_factors(),
-        );
-        assert_eq!(spec.driver, "bash");
-    }
-
-    #[test]
-    fn test_testmain_spec_out_has_go_group() {
-        let analysis = Analysis {
-            import_path: "example.com/pkg".to_string(),
-            is_go1_18: true,
-            ..Default::default()
-        };
-        let spec = testmain_spec(
-            mk_addr("pkg", "testmain"),
-            "example.com/pkg",
-            &analysis,
-            &test_factors(),
-        );
-        let out = match spec.config.get("out").unwrap() {
-            TargetSpecValue::Map(m) => m,
-            _ => panic!("expected map"),
-        };
-        assert!(out.contains_key("go"), "testmain out must have 'go' group");
-    }
-
-    #[test]
-    fn test_testmain_spec_run_uses_base64() {
-        let analysis = Analysis {
-            import_path: "example.com/pkg".to_string(),
-            is_go1_18: true,
-            ..Default::default()
-        };
-        let spec = testmain_spec(
-            mk_addr("pkg", "testmain"),
-            "example.com/pkg",
-            &analysis,
-            &test_factors(),
-        );
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert!(
-            run.contains("base64"),
-            "testmain run must use base64 decoding: {run}"
-        );
-        assert!(
-            run.contains("testmain.go"),
-            "run must produce testmain.go: {run}"
-        );
     }
 
     // ---- build_lib_test_spec ----
@@ -833,33 +685,5 @@ mod tests {
         let spec = test_spec(mk_addr("mypkg", "test"), mk_addr("mypkg", "build_test"));
         assert!(spec.labels.contains(&"test".to_string()));
         assert!(spec.labels.contains(&"go-test".to_string()));
-    }
-
-    // ---- base64_encode ----
-
-    #[test]
-    fn test_base64_encode_hello() {
-        let encoded = base64_encode(b"Hello");
-        assert_eq!(encoded, "SGVsbG8=");
-    }
-
-    #[test]
-    fn test_base64_encode_empty() {
-        let encoded = base64_encode(b"");
-        assert_eq!(encoded, "");
-    }
-
-    #[test]
-    fn test_base64_encode_roundtrip_via_shell_decode() {
-        // Just ensure it's valid base64 characters
-        let data = b"package main\nfunc main() {}";
-        let encoded = base64_encode(data);
-        assert!(
-            encoded
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '='),
-            "base64 output must only contain valid chars: {}",
-            encoded
-        );
     }
 }

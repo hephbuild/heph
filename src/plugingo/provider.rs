@@ -12,7 +12,6 @@ use crate::plugingo::addr_util::{
     factors_to_args,
 };
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
-use crate::plugingo::gen_testmain::analyze_test_main;
 use crate::plugingo::pkg_analysis::{
     GoPackage, find_module_for_import, is_stdlib_import_path, parse_go_list_reader,
     parse_go_mod_module_path, parse_go_mod_requires,
@@ -443,27 +442,18 @@ impl Provider {
             return Err(GetError::NotFound);
         }
 
-        let dir = pkg.dir.as_deref().ok_or_else(|| {
-            GetError::Other(anyhow::anyhow!("package '{}' has no Dir", import_path))
-        })?;
-        let src_dir = Path::new(dir);
+        if pkg.dir.is_none() {
+            return Err(GetError::Other(anyhow::anyhow!(
+                "package '{}' has no Dir",
+                import_path
+            )));
+        }
 
         // The module root drives which directory `go list` runs from for transitive deps.
         let module_root = match &kind {
             GoPackageKind::FirstParty { module_root, .. } => module_root.clone(),
             GoPackageKind::ThirdParty { module_root, .. } => module_root.clone(),
             GoPackageKind::Stdlib { .. } => return Err(GetError::NotFound),
-        };
-
-        // Host filesystem path to the package source directory. Used for operations
-        // that must access the real filesystem (embed file resolution, test file parsing)
-        // rather than the sandbox path in pkg.dir.
-        let host_src_dir = match &kind {
-            GoPackageKind::FirstParty {
-                src_dir: host_dir, ..
-            } => host_dir.clone(),
-            GoPackageKind::ThirdParty { .. } => src_dir.to_path_buf(),
-            GoPackageKind::Stdlib { .. } => src_dir.to_path_buf(),
         };
 
         match addr.name.as_str() {
@@ -581,26 +571,9 @@ impl Provider {
                 if !has_tests {
                     return Err(GetError::NotFound);
                 }
-                let mut test_file_args: Vec<(&'static str, String)> = Vec::new();
-                for f in &pkg.test_go_files {
-                    test_file_args
-                        .push(("_test", host_src_dir.join(f).to_string_lossy().into_owned()));
-                }
-                for f in &pkg.xtest_go_files {
-                    test_file_args.push((
-                        "_xtest",
-                        host_src_dir.join(f).to_string_lossy().into_owned(),
-                    ));
-                }
-                let file_refs: Vec<(&str, &str)> = test_file_args
-                    .iter()
-                    .map(|(prefix, path)| (*prefix, path.as_str()))
-                    .collect();
-                let analysis =
-                    analyze_test_main(&import_path, &file_refs).map_err(GetError::Other)?;
-                let spec =
-                    target_test::testmain_spec(addr.clone(), &import_path, &analysis, &factors);
-                Ok(GetResponse { target_spec: spec })
+                Ok(GetResponse {
+                    target_spec: build_testmain_spec(addr.clone(), &golist_addr),
+                })
             }
             // Intermediate test target: compile GoFiles + TestGoFiles in test mode.
             "build_lib#test" => {
@@ -1407,6 +1380,37 @@ fn build_embed_spec(
     crate::engine::provider::TargetSpec {
         addr,
         driver: "go_embed".to_string(),
+        config,
+        labels: vec![],
+        transitive: Default::default(),
+    }
+}
+
+fn build_testmain_spec(addr: Addr, golist_addr: &Addr) -> crate::engine::provider::TargetSpec {
+    use crate::loosespecparser::TargetSpecValue;
+    use std::collections::HashMap;
+
+    let golist_dep = format!("{}|json", golist_addr.format());
+
+    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+    config.insert(
+        "deps".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "golist".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
+        )])),
+    );
+    config.insert(
+        "out".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "go".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("testmain.go".to_string())]),
+        )])),
+    );
+
+    crate::engine::provider::TargetSpec {
+        addr,
+        driver: "go_testmain".to_string(),
         config,
         labels: vec![],
         transitive: Default::default(),
