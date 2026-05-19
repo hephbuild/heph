@@ -64,8 +64,7 @@ impl Provider {
         let compiled = patterns
             .into_iter()
             .map(|p| {
-                glob::Pattern::new(&p)
-                    .with_context(|| format!("invalid buildfile pattern `{p}`"))
+                glob::Pattern::new(&p).with_context(|| format!("invalid buildfile pattern `{p}`"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {

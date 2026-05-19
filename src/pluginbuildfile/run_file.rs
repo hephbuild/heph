@@ -283,6 +283,16 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
 
         Ok(htaddr::Addr::new(PkgBuf::from(extra.pkg), name, Default::default()).format())
     }
+
+    fn file(path: &str) -> starlark::Result<String> {
+        Ok(crate::pluginfs::file_addr(path).format())
+    }
+
+    fn glob<'v>(pattern: &str, exclude: Option<UnpackList<String>>) -> starlark::Result<String> {
+        let excludes: Vec<String> = exclude.map(|l| l.items).unwrap_or_default();
+        let excludes_ref: Vec<&str> = excludes.iter().map(String::as_str).collect();
+        Ok(crate::pluginfs::glob_addr(pattern, &excludes_ref).format())
+    }
 }
 
 impl Provider {
@@ -335,8 +345,7 @@ fn run_pkg_inner_owned(
 
     for pattern in patterns {
         if let Some(name) = names.iter().find(|n| pattern.matches(n)) {
-            return run_file_inner(root, pkg, name)
-                .with_context(|| format!("file: {:?}", name));
+            return run_file_inner(root, pkg, name).with_context(|| format!("file: {:?}", name));
         }
     }
 
@@ -693,5 +702,68 @@ target(
 
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "mytarget");
+    }
+
+    fn run_target_config(build_content: &str) -> HashMap<String, TargetSpecValue> {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg";
+        let pkg_path = tmp_dir.path().join(pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+        let filename = "BUILD";
+        fs::write(pkg_path.join(filename), build_content).unwrap();
+        let provider = make_provider(&tmp_dir);
+        let result = run_file_inner(&provider.root, pkg_name, filename).unwrap();
+        result.targets.into_iter().next().unwrap().config
+    }
+
+    #[test]
+    fn test_starlark_file_returns_fs_file_addr() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    src = file("src/main.rs"),
+)
+"#;
+        let config = run_target_config(content);
+        let expected = crate::pluginfs::file_addr("src/main.rs").format();
+        match config.get("src") {
+            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected file addr string, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_starlark_glob_no_exclude() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("src/**/*.rs"),
+)
+"#;
+        let config = run_target_config(content);
+        let expected = crate::pluginfs::glob_addr("src/**/*.rs", &[]).format();
+        match config.get("srcs") {
+            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected glob addr string, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_starlark_glob_with_exclude() {
+        let content = r#"
+target(
+    name = "t",
+    driver = "d",
+    srcs = glob("**/*.go", exclude = ["vendor/**", "gen/**"]),
+)
+"#;
+        let config = run_target_config(content);
+        let expected = crate::pluginfs::glob_addr("**/*.go", &["vendor/**", "gen/**"]).format();
+        match config.get("srcs") {
+            Some(TargetSpecValue::String(s)) => assert_eq!(s, &expected),
+            other => panic!("expected glob addr string, got {:?}", other),
+        }
     }
 }
