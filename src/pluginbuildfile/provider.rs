@@ -19,7 +19,7 @@ pub struct RequestState {}
 
 pub struct Provider {
     pub root: std::path::PathBuf,
-    pub build_file_patterns: Vec<String>,
+    pub build_file_patterns: Vec<glob::Pattern>,
     pub requests: Mutex<HashMap<String, RequestState>>,
     /// Cache: pkg name → parsed BUILD file result. Avoids re-parsing the Starlark
     /// AST on every `list`/`get`/`probe` call for the same package (3+ calls per
@@ -37,7 +37,7 @@ impl Default for Provider {
     fn default() -> Self {
         Self {
             root: std::path::PathBuf::from("/"),
-            build_file_patterns: vec!["BUILD".to_string()],
+            build_file_patterns: vec![glob::Pattern::new("BUILD").expect("BUILD literal")],
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
             packages_cache: Memoizer::with_tag("buildfile_packages"),
@@ -61,9 +61,16 @@ impl Provider {
         let patterns: Vec<String> =
             crate::engine::config_file::decode_opt(opts, "buildfile provider", "patterns")?
                 .unwrap_or_else(|| vec!["BUILD".to_string()]);
+        let compiled = patterns
+            .into_iter()
+            .map(|p| {
+                glob::Pattern::new(&p)
+                    .with_context(|| format!("invalid buildfile pattern `{p}`"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Self {
             root,
-            build_file_patterns: patterns,
+            build_file_patterns: compiled,
             ..Self::default()
         })
     }
@@ -72,7 +79,7 @@ impl Provider {
 fn find_packages_sync(
     path: &std::path::Path,
     root: &std::path::Path,
-    patterns: &[String],
+    patterns: &[glob::Pattern],
     packages: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let mut has_build_file = false;
@@ -95,7 +102,7 @@ fn find_packages_sync(
             if entry_path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| patterns.iter().any(|p| p == n))
+                .map(|n| patterns.iter().any(|p| p.matches(n)))
                 .unwrap_or(false)
             {
                 has_build_file = true;
@@ -262,7 +269,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let p = Provider::from_options(dir.path().to_path_buf(), &Options::new())
             .expect("from_options");
-        assert_eq!(p.build_file_patterns, vec!["BUILD".to_string()]);
+        let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD"]);
     }
 
     #[test]
@@ -274,7 +282,22 @@ mod tests {
             serde_yaml::from_str("[BUILD2, \"*.BUILD2\"]").expect("yaml"),
         );
         let p = Provider::from_options(dir.path().to_path_buf(), &opts).expect("from_options");
-        assert_eq!(p.build_file_patterns, vec!["BUILD2", "*.BUILD2"]);
+        let names: Vec<&str> = p.build_file_patterns.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, vec!["BUILD2", "*.BUILD2"]);
+    }
+
+    #[test]
+    fn from_options_rejects_invalid_glob() {
+        let dir = tempdir().expect("tempdir");
+        let mut opts = Options::new();
+        opts.insert(
+            "patterns".to_string(),
+            serde_yaml::from_str("[\"[bad\"]").expect("yaml"),
+        );
+        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+            .err()
+            .expect("must error");
+        assert!(err.to_string().contains("[bad"), "{err}");
     }
 
     #[test]
@@ -365,7 +388,7 @@ mod tests {
 
         let provider = Provider {
             root: root.to_path_buf(),
-            build_file_patterns: vec!["BUILD.heph".to_string()],
+            build_file_patterns: vec![glob::Pattern::new("BUILD.heph").unwrap()],
             ..Provider::default()
         };
 
@@ -405,9 +428,9 @@ mod tests {
         let provider = Provider {
             root: root.to_path_buf(),
             build_file_patterns: vec![
-                "BUILD".to_string(),
-                "BUILD.heph".to_string(),
-                "BUILD.other".to_string(),
+                glob::Pattern::new("BUILD").unwrap(),
+                glob::Pattern::new("BUILD.heph").unwrap(),
+                glob::Pattern::new("BUILD.other").unwrap(),
             ],
             ..Provider::default()
         };
@@ -423,5 +446,71 @@ mod tests {
         assert!(packages.contains(&"".to_string()));
         assert!(packages.contains(&"a".to_string()));
         assert!(packages.contains(&"b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_packages_glob_pattern() {
+        let tmp_dir = tempdir().unwrap();
+        let root = tmp_dir.path();
+
+        // Structure:
+        // root/
+        //   foo.BUILD
+        //   a/
+        //     bar.BUILD
+        //   b/
+        //     notabuild.txt   (must NOT match)
+
+        fs::write(root.join("foo.BUILD"), "").unwrap();
+        let a = root.join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("bar.BUILD"), "").unwrap();
+        let b = root.join("b");
+        fs::create_dir_all(&b).unwrap();
+        fs::write(b.join("notabuild.txt"), "").unwrap();
+
+        let provider = Provider {
+            root: root.to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("*.BUILD").unwrap()],
+            ..Provider::default()
+        };
+
+        let req = ListPackagesRequest {
+            prefix: PkgBuf::from(""),
+        };
+        let ctoken = StdCancellationToken::new();
+        let res = provider.list_packages(req, &ctoken).await.unwrap();
+        let packages: Vec<String> = res.map(|r| r.unwrap().pkg.to_string()).collect();
+
+        assert_eq!(packages.len(), 2);
+        assert!(packages.contains(&"".to_string()));
+        assert!(packages.contains(&"a".to_string()));
+        assert!(!packages.contains(&"b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_run_pkg_glob_pattern() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "mypkg".to_string();
+        let pkg_path = tmp_dir.path().join(&pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+
+        let build_content = r#"
+target(
+    name = "globtarget",
+    driver = "mydriver",
+)
+"#;
+        fs::write(pkg_path.join("my.BUILD"), build_content).unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            build_file_patterns: vec![glob::Pattern::new("*.BUILD").unwrap()],
+            ..Provider::default()
+        };
+
+        let result = provider.run_pkg(&pkg_name).await.unwrap();
+        assert_eq!(result.targets.len(), 1);
+        assert_eq!(result.targets[0].name, "globtarget");
     }
 }

@@ -310,14 +310,33 @@ impl Provider {
 
 fn run_pkg_inner_owned(
     root: &std::path::Path,
-    patterns: &[String],
+    patterns: &[glob::Pattern],
     pkg: &str,
 ) -> anyhow::Result<RunResult> {
+    let dir = root.join(pkg);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RunResult {
+                targets: vec![],
+                states: vec![],
+            });
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", dir.display()));
+        }
+    };
+
+    let names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|f| f.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+
     for pattern in patterns {
-        let path = root.join(pkg).join(pattern);
-        if path.exists() {
-            return run_file_inner(root, pkg, pattern)
-                .with_context(|| format!("file: {:?}", pattern));
+        if let Some(name) = names.iter().find(|n| pattern.matches(n)) {
+            return run_file_inner(root, pkg, name)
+                .with_context(|| format!("file: {:?}", name));
         }
     }
 
@@ -663,7 +682,10 @@ target(
 
         let provider = Provider {
             root: tmp_dir.path().to_path_buf(),
-            build_file_patterns: vec!["BUILD".to_string(), "BUILD.heph".to_string()],
+            build_file_patterns: vec![
+                glob::Pattern::new("BUILD").unwrap(),
+                glob::Pattern::new("BUILD.heph").unwrap(),
+            ],
             ..Provider::default()
         };
 
