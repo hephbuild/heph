@@ -13,6 +13,7 @@ use anyhow::Context;
 use enclose::enclose;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct RequestState {}
@@ -31,6 +32,13 @@ pub struct Provider {
     /// readdir of the workspace tree; once per provider lifetime is enough since the
     /// layout doesn't change mid-session. `()` key — single global entry.
     pub(crate) packages_cache: Memoizer<(), Result<Arc<Vec<String>>, Arc<anyhow::Error>>>,
+    /// Sync cache: resolved BUILD-file path → parsed result. Populated during Starlark
+    /// evaluation (both top-level `run_pkg` and transitive `load(...)` resolution share
+    /// the same cache, so a file is parsed at most once per provider lifetime).
+    pub(crate) file_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
+    /// Sync cache: package directory → merged result across every matching BUILD file
+    /// in that dir. Loaded once and reused by both `run_pkg` and `load("//pkg", ...)`.
+    pub(crate) dir_cache: Arc<Mutex<HashMap<PathBuf, Arc<RunResult>>>>,
 }
 
 impl Default for Provider {
@@ -41,6 +49,8 @@ impl Default for Provider {
             requests: Mutex::new(HashMap::new()),
             pkg_cache: Memoizer::with_tag("buildfile_pkg"),
             packages_cache: Memoizer::with_tag("buildfile_packages"),
+            file_cache: Arc::new(Mutex::new(HashMap::new())),
+            dir_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

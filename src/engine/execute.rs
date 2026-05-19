@@ -34,7 +34,7 @@ impl Engine {
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
-            .ok_or_else(|| anyhow::anyhow!("driver not found"))
+            .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
 
         let deps_result = self
