@@ -9,6 +9,7 @@ members = ["gen/proto", "e2e", "testkit", "plugingo-e2e"]
 [profile.profiling]
 inherits = "release"
 debug = true
+strip = "none"
 
 [profile.release]
 codegen-units = 1 # Allows compiler to perform better optimization.

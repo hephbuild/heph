@@ -11,9 +11,9 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use futures::future::try_join_all;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{fs, io};
 
 impl Engine {
     #[async_recursion]
@@ -62,12 +62,12 @@ impl Engine {
                 dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
             }
         };
-        match fs::remove_dir_all(&sandbox_dir) {
+        match tokio::fs::remove_dir_all(&sandbox_dir).await {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(err) => Err(err),
         }?;
-        fs::create_dir_all(&sandbox_dir)?;
+        tokio::fs::create_dir_all(&sandbox_dir).await?;
 
         if def.target.cache {
             tracing::info!(driver = %driver.name, %addr, "run");
