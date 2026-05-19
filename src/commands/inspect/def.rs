@@ -15,17 +15,21 @@ use crate::tui::{self, App, AppContext, LogSink};
 pub struct Args {
     /// Target address
     pub addr: String,
+    /// Skip applying transitive deps
+    #[arg(long)]
+    pub no_transitive: bool,
 }
 
 #[derive(Serialize)]
 struct DefView<'a> {
     target_def: &'a TargetDef,
-    applied_transitive: &'a Sandbox,
+    applied_transitive: Option<&'a Sandbox>,
 }
 
 struct DefApp {
     engine: Arc<Engine>,
     addr: Addr,
+    no_transitive: bool,
 }
 
 #[async_trait(?Send)]
@@ -37,15 +41,16 @@ impl App for DefApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
-        let res = self
-            .engine
-            .clone()
-            .get_def(self.engine.new_state(), &self.addr)
-            .await?;
+        let rs = self.engine.new_state();
+        let res = if self.no_transitive {
+            self.engine.clone().get_direct_def(rs, &self.addr).await?
+        } else {
+            self.engine.clone().get_def(rs, &self.addr).await?
+        };
 
         let view = DefView {
             target_def: &res.target_def,
-            applied_transitive: &res.applied_transitive,
+            applied_transitive: res.applied_transitive.as_ref(),
         };
         let json = serde_json::to_string_pretty(&view).context("serialize def")?;
 
@@ -66,7 +71,11 @@ async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Resul
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
     let engine = bootstrap::new_engine()?;
-    let app = DefApp { engine, addr };
+    let app = DefApp {
+        engine,
+        addr,
+        no_transitive: args.no_transitive,
+    };
     let interactive = tui::should_use_tui(no_tui);
     tui::run_app(app, sink, interactive).await
 }

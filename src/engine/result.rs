@@ -164,7 +164,7 @@ impl fmt::Debug for dyn Content {
 
 pub struct ExtendedTargetDef {
     pub target_def: Arc<TargetDef>,
-    pub applied_transitive: Sandbox,
+    pub applied_transitive: Option<Sandbox>,
 }
 
 #[derive(Clone)]
@@ -505,17 +505,26 @@ impl Engine {
             .once(
                 addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
-                    engine.get_def_inner(rs, &addr).await
+                    engine.get_def_inner(rs, &addr, true).await
                 }),
             )
             .await
             .map_err(unwrap_arc_err)
     }
 
+    pub async fn get_direct_def(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
+        self.get_def_inner(rs, addr, false).await
+    }
+
     async fn get_def_inner(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
+        apply_transitive: bool,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
 
@@ -537,27 +546,34 @@ impl Engine {
             .with_context(|| "parse")?;
         let def = res.target_def;
 
-        let all_transitive = Arc::clone(&self)
-            .collect_transitive_deps(rs.clone(), &def.inputs)
-            .await?;
+        let all_transitive = if apply_transitive {
+            let sb = Arc::clone(&self)
+                .collect_transitive_deps(rs.clone(), &def.inputs)
+                .await?;
 
-        let def = if all_transitive.empty() {
-            def
+            if sb.empty() { None } else { Some(sb) }
         } else {
-            let res = driver
-                .driver
-                .apply_transitive(
-                    ApplyTransitiveRequest {
-                        request_id: rs.request_id().to_string(),
-                        target_def: def,
-                        sandbox: all_transitive.clone(),
-                    },
-                    rs.ctoken(),
-                )
-                .await
-                .with_context(|| "apply transitive")?;
+            None
+        };
 
-            res.target_def
+        let def = match &all_transitive {
+            Some(sb) if !sb.empty() => {
+                let res = driver
+                    .driver
+                    .apply_transitive(
+                        ApplyTransitiveRequest {
+                            request_id: rs.request_id().to_string(),
+                            target_def: def,
+                            sandbox: sb.clone(),
+                        },
+                        rs.ctoken(),
+                    )
+                    .await
+                    .with_context(|| "apply transitive")?;
+
+                res.target_def
+            }
+            _ => def,
         };
 
         if def.hash.is_empty() {
@@ -596,15 +612,15 @@ impl Engine {
                         .with_context(|| format!("get def for group: {:?}", input_ref))?;
                     dep_def.applied_transitive.clone()
                 } else {
-                    spec.transitive.clone()
+                    Some(spec.transitive.clone())
                 };
 
-                if transitive.empty() {
-                    return anyhow::Ok(None);
+                if let Some(transitive) = transitive {
+                    let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+                    anyhow::Ok(Some((id, transitive)))
+                } else {
+                    anyhow::Ok(None)
                 }
-
-                let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
-                Ok(Some((id, transitive)))
             })
         });
 
