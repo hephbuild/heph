@@ -17,6 +17,10 @@ use std::{fs, io};
 
 impl Engine {
     #[async_recursion]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "execute orchestrates per-request state plus driver/exec wrapping"
+    )]
     pub(crate) async fn execute(
         self: Arc<Self>,
         rs: Arc<RequestState>,

@@ -41,11 +41,10 @@ impl TtyReader {
         if unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags | libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error());
         }
-        let inner = AsyncFd::with_interest(fd, Interest::READABLE).map_err(|e| {
+        let inner = AsyncFd::with_interest(fd, Interest::READABLE).inspect_err(|_| {
             // Restore the flags before bubbling the error.
             // SAFETY: same fd, restoring its previous flags.
             unsafe { libc::fcntl(fd, libc::F_SETFL, original_flags) };
-            e
         })?;
         Ok(Self {
             inner,

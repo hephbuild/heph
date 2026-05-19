@@ -27,8 +27,8 @@ const SHELL_INIT_SH: &str = include_str!("./init.sh");
 
 pub struct Driver {
     name: String,
-    wrap_run: fn(&Vec<String>) -> Vec<String>,
-    wrap_run_shell: fn(&std::path::PathBuf, &Vec<String>) -> anyhow::Result<Vec<String>>,
+    wrap_run: fn(&[String]) -> Vec<String>,
+    wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -77,11 +77,8 @@ fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
         .context("render init.sh template")
 }
 
-fn bash_args_shell(
-    sandbox_dir: &std::path::PathBuf,
-    run: &Vec<String>,
-) -> anyhow::Result<Vec<String>> {
-    let rendered = render_shell_init(&run)?;
+fn bash_args_shell(sandbox_dir: &std::path::Path, run: &[String]) -> anyhow::Result<Vec<String>> {
+    let rendered = render_shell_init(run)?;
     let init_path = sandbox_dir.join("init.sh");
     std::fs::write(&init_path, rendered).context("write init.sh")?;
 
@@ -120,8 +117,8 @@ impl Driver {
     pub fn new_exec() -> Self {
         Self {
             name: "exec".to_string(),
-            wrap_run: |run| run.clone(),
-            wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &vec![run.join(" ")]),
+            wrap_run: |run| run.to_vec(),
+            wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &[run.join(" ")]),
         }
     }
     pub fn new_bash() -> Self {
