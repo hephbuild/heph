@@ -123,6 +123,7 @@ rustc-hash = "2"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"
 libc = "0.2"
+templi = "0.1.2"
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

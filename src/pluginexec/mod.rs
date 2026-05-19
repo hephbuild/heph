@@ -28,7 +28,7 @@ const SHELL_INIT_SH: &str = include_str!("./init.sh");
 pub struct Driver {
     name: String,
     wrap_run: fn(&Vec<String>) -> Vec<String>,
-    wrap_run_shell: fn(&std::path::PathBuf, Vec<String>) -> anyhow::Result<Vec<String>>,
+    wrap_run_shell: fn(&std::path::PathBuf, &Vec<String>) -> anyhow::Result<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -64,12 +64,23 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
     args
 }
 
+fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
+    let mut ctx = serde_json::Map::new();
+    if !run.is_empty() {
+        ctx.insert("cmds".to_string(), serde_json::Value::String(run.join("\n")));
+    }
+    templi::render(SHELL_INIT_SH, &serde_json::Value::Object(ctx))
+        .map_err(anyhow::Error::from)
+        .context("render init.sh template")
+}
+
 fn bash_args_shell(
     sandbox_dir: &std::path::PathBuf,
-    _run: Vec<String>,
+    run: &Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
+    let rendered = render_shell_init(&run)?;
     let init_path = sandbox_dir.join("init.sh");
-    std::fs::write(&init_path, SHELL_INIT_SH).context("write init.sh")?;
+    std::fs::write(&init_path, rendered).context("write init.sh")?;
 
     Ok(bash_args(
         vec![
@@ -109,7 +120,7 @@ impl Driver {
         Self {
             name: "exec".to_string(),
             wrap_run: |run| run.clone(),
-            wrap_run_shell: bash_args_shell,
+            wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &vec![run.join(" ")]),
         }
     }
     pub fn new_bash() -> Self {
@@ -404,11 +415,10 @@ impl Driver {
         let def = rreq.target.def::<TargetDef>();
 
         let run = {
-            let run = (self.wrap_run)(&def.run);
             if shell {
-                (self.wrap_run_shell)(&rreq.sandbox_dir, run)?
+                (self.wrap_run_shell)(&rreq.sandbox_dir, &def.run)?
             } else {
-                run
+                (self.wrap_run)(&def.run)
             }
         };
 
@@ -792,6 +802,24 @@ mod tests {
             sandbox_pkg_dir: path,
             inputs: vec![],
         }
+    }
+
+    #[test]
+    fn test_render_shell_init_with_cmds() {
+        let run = vec!["echo hi".to_string(), "ls -la".to_string()];
+        let out = render_shell_init(&run).expect("render");
+        assert!(out.contains("run()"), "missing run() definition: {out}");
+        assert!(out.contains("xrun()"), "missing xrun() definition: {out}");
+        assert!(out.contains("echo hi\nls -la"), "cmds not joined: {out}");
+        assert!(!out.contains("{{"), "template tokens left: {out}");
+    }
+
+    #[test]
+    fn test_render_shell_init_without_cmds() {
+        let out = render_shell_init(&[]).expect("render");
+        assert!(!out.contains("run()"), "should not have run() block: {out}");
+        assert!(!out.contains("HEPH_EOF"), "should not have show() block: {out}");
+        assert!(!out.contains("{{"), "template tokens left: {out}");
     }
 
     #[tokio::test]
