@@ -181,6 +181,7 @@ mod tests {
     async fn test_request_state_tracking() -> anyhow::Result<()> {
         let engine = Arc::new(Engine::new(Config {
             root: PathBuf::from("/tmp"),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })?);
 
@@ -208,6 +209,7 @@ mod tests {
     async fn test_skip_provider_child_does_not_cancel_token() -> anyhow::Result<()> {
         let engine = Arc::new(Engine::new(Config {
             root: PathBuf::from("/tmp"),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })?);
 

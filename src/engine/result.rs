@@ -762,6 +762,7 @@ mod tests {
         let list_calls_clone = SArc::clone(&list_calls);
         let mut engine = Engine::new(Config {
             root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })?;
         engine.register_provider(move |_| {
@@ -796,6 +797,7 @@ mod tests {
         let root = tempdir()?;
         let cfg = Config {
             root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         };
 
@@ -833,6 +835,7 @@ mod tests {
         let root = tempdir()?;
         let engine = Arc::new(Engine::new(Config {
             root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })?);
         let addr = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());

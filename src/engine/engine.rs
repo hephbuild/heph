@@ -1,3 +1,4 @@
+use crate::engine::config_file::{Options, PluginEntry};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
@@ -13,8 +14,17 @@ use tokio::sync::Semaphore;
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
     pub root: PathBuf,
+    /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
+    pub home_dir: PathBuf,
     pub parallelism: Option<usize>,
 }
+
+pub type ProviderFactory =
+    Box<dyn FnOnce(&Path, &Options) -> anyhow::Result<Box<dyn SDKProvider>> + Send + Sync>;
+pub type DriverFactory =
+    Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync>;
+pub type ManagedDriverFactory =
+    Box<dyn FnOnce(&Options) -> anyhow::Result<Box<dyn SDKManagedDriver>> + Send + Sync>;
 
 pub struct Engine {
     pub(crate) cfg: Config,
@@ -28,6 +38,10 @@ pub struct Engine {
     pub requests: Mutex<HashMap<String, Weak<RequestState>>>,
     pub home: PathBuf,
     pub(crate) result_semaphore: Arc<Semaphore>,
+
+    pub(crate) provider_factories: HashMap<String, ProviderFactory>,
+    pub(crate) driver_factories: HashMap<String, DriverFactory>,
+    pub(crate) managed_driver_factories: HashMap<String, ManagedDriverFactory>,
 }
 
 pub struct Provider {
@@ -43,7 +57,11 @@ pub struct Driver {
 impl Engine {
     pub fn new(cfg: Config) -> anyhow::Result<Engine> {
         let root = cfg.root.clone();
-        let home = root.join(".heph3");
+        let home = if cfg.home_dir.as_os_str().is_empty() {
+            root.join(".heph3")
+        } else {
+            cfg.home_dir.clone()
+        };
 
         let parallelism = cfg.parallelism.unwrap_or_else(|| {
             std::thread::available_parallelism()
@@ -61,6 +79,9 @@ impl Engine {
             drivers_by_name: HashMap::new(),
             requests: Mutex::new(HashMap::new()),
             result_semaphore: Arc::new(Semaphore::new(2 * parallelism)),
+            provider_factories: HashMap::new(),
+            driver_factories: HashMap::new(),
+            managed_driver_factories: HashMap::new(),
         };
         engine.register_driver(Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;
@@ -112,6 +133,108 @@ impl Engine {
         self.providers.push(provider.clone());
         self.providers_by_name
             .insert(provider.name.clone(), provider);
+        Ok(())
+    }
+
+    pub fn register_provider_factory(
+        &mut self,
+        name: &str,
+        factory: impl FnOnce(&Path, &Options) -> anyhow::Result<Box<dyn SDKProvider>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> anyhow::Result<()> {
+        if self.provider_factories.contains_key(name) {
+            return Err(anyhow::anyhow!(
+                "provider factory '{name}' already registered"
+            ));
+        }
+        self.provider_factories
+            .insert(name.to_string(), Box::new(factory));
+        Ok(())
+    }
+
+    pub fn register_driver_factory(
+        &mut self,
+        name: &str,
+        factory: impl FnOnce(&Options) -> anyhow::Result<Box<dyn SDKDriver>> + Send + Sync + 'static,
+    ) -> anyhow::Result<()> {
+        if self.driver_factories.contains_key(name)
+            || self.managed_driver_factories.contains_key(name)
+        {
+            return Err(anyhow::anyhow!(
+                "driver factory '{name}' already registered"
+            ));
+        }
+        self.driver_factories
+            .insert(name.to_string(), Box::new(factory));
+        Ok(())
+    }
+
+    pub fn register_managed_driver_factory(
+        &mut self,
+        name: &str,
+        factory: impl FnOnce(&Options) -> anyhow::Result<Box<dyn SDKManagedDriver>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> anyhow::Result<()> {
+        if self.driver_factories.contains_key(name)
+            || self.managed_driver_factories.contains_key(name)
+        {
+            return Err(anyhow::anyhow!(
+                "driver factory '{name}' already registered"
+            ));
+        }
+        self.managed_driver_factories
+            .insert(name.to_string(), Box::new(factory));
+        Ok(())
+    }
+
+    /// Instantiates every provider/driver listed in the entries by looking up the
+    /// matching factory by name. Errors if any name has no registered factory.
+    /// Factories are consumed — calling twice on the same name will error.
+    pub fn apply_config(
+        &mut self,
+        providers: &[PluginEntry],
+        drivers: &[PluginEntry],
+    ) -> anyhow::Result<()> {
+        let root = self.cfg.root.clone();
+        for entry in providers {
+            let factory = self
+                .provider_factories
+                .remove(&entry.name)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider '{}'", entry.name))?;
+            let provider = factory(&root, &entry.options)?;
+            let resolved_name = provider.config(provider::ConfigRequest {})?.name;
+            if resolved_name != entry.name {
+                return Err(anyhow::anyhow!(
+                    "provider '{}' reported name '{}'; config/factory name mismatch",
+                    entry.name,
+                    resolved_name
+                ));
+            }
+            self.register_provider(|_| provider)?;
+        }
+        for entry in drivers {
+            if let Some(factory) = self.driver_factories.remove(&entry.name) {
+                let driver = factory(&entry.options)?;
+                let resolved_name = driver.config(driver::ConfigRequest {})?.name;
+                if resolved_name != entry.name {
+                    return Err(anyhow::anyhow!(
+                        "driver '{}' reported name '{}'; config/factory name mismatch",
+                        entry.name,
+                        resolved_name
+                    ));
+                }
+                self.register_driver(driver)?;
+            } else if let Some(factory) = self.managed_driver_factories.remove(&entry.name) {
+                let driver = factory(&entry.options)?;
+                self.register_managed_driver(driver)?;
+            } else {
+                return Err(anyhow::anyhow!("unknown driver '{}'", entry.name));
+            }
+        }
         Ok(())
     }
 }

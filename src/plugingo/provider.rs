@@ -82,6 +82,21 @@ impl Provider {
         Self::with_config(workspace_root, Config::default())
     }
 
+    pub fn from_options(
+        workspace_root: PathBuf,
+        opts: &crate::engine::config_file::Options,
+    ) -> anyhow::Result<Self> {
+        crate::engine::config_file::deny_unknown("go provider", opts, &["gotool"])?;
+        let go_bin_addr: String =
+            crate::engine::config_file::decode_opt(opts, "go provider", "gotool")?
+                .unwrap_or_else(|| DEFAULT_GO_BIN_ADDR.to_string());
+        Self::with_config(workspace_root, Config { go_bin_addr })
+    }
+
+    pub fn go_bin_addr(&self) -> &str {
+        &self.inner.go_bin_addr
+    }
+
     pub fn with_config(workspace_root: PathBuf, config: Config) -> anyhow::Result<Self> {
         let goroot = resolve_goroot()?;
         let gomodcache = resolve_go_env_var("GOMODCACHE")?;
@@ -2177,6 +2192,7 @@ mod tests {
     fn build_test_engine(workspace: &std::path::Path) -> Arc<crate::engine::Engine> {
         let mut e = crate::engine::Engine::new(crate::engine::Config {
             root: workspace.to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })
         .unwrap();

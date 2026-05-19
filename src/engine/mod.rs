@@ -5,6 +5,7 @@
 mod engine;
 pub use engine::Config;
 pub use engine::Engine;
+pub mod config_file;
 mod cwd;
 mod result;
 pub use cwd::get_cwd;

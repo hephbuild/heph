@@ -27,6 +27,8 @@ const SHELL_INIT_SH: &str = include_str!("./init.sh");
 
 pub struct Driver {
     name: String,
+    /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
+    search_path: Vec<String>,
     wrap_run: fn(&[String]) -> Vec<String>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
@@ -117,6 +119,7 @@ impl Driver {
     pub fn new_exec() -> Self {
         Self {
             name: "exec".to_string(),
+            search_path: vec![],
             wrap_run: |run| run.to_vec(),
             wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &[run.join(" ")]),
         }
@@ -124,10 +127,33 @@ impl Driver {
     pub fn new_bash() -> Self {
         Self {
             name: "bash".to_string(),
+            search_path: vec![],
             wrap_run: |run| bash_args_public(run.join("\n").as_str(), vec![]),
             wrap_run_shell: bash_args_shell,
         }
     }
+
+    pub fn from_options_exec(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+        Ok(Self {
+            search_path: decode_path(opts)?,
+            ..Self::new_exec()
+        })
+    }
+
+    pub fn from_options_bash(opts: &crate::engine::config_file::Options) -> anyhow::Result<Self> {
+        Ok(Self {
+            search_path: decode_path(opts)?,
+            ..Self::new_bash()
+        })
+    }
+}
+
+fn decode_path(opts: &crate::engine::config_file::Options) -> anyhow::Result<Vec<String>> {
+    crate::engine::config_file::deny_unknown("exec/bash driver", opts, &["path"])?;
+    Ok(
+        crate::engine::config_file::decode_opt(opts, "exec/bash driver", "path")?
+            .unwrap_or_default(),
+    )
 }
 
 /// RAII guard that restores the parent terminal's cooked mode when dropped.
@@ -428,16 +454,18 @@ impl Driver {
         if shell && let Ok(term) = std::env::var("TERM") {
             env.insert("TERM".to_string(), term);
         }
-        env.insert(
-            "PATH".to_string(),
+        let path_value = if self.search_path.is_empty() {
             [
                 "/nix/var/nix/profiles/default/bin", // TODO: figure out how to make plugins provide that
                 "/usr/local/bin",
                 "/usr/bin",
                 "/bin",
             ]
-            .join(":"),
-        );
+            .join(":")
+        } else {
+            self.search_path.join(":")
+        };
+        env.insert("PATH".to_string(), path_value);
 
         let pkg_prefix = {
             let pkg = rreq.target.addr.package.as_str();
@@ -806,6 +834,33 @@ mod tests {
             sandbox_pkg_dir: path,
             inputs: vec![],
         }
+    }
+
+    #[test]
+    fn from_options_exec_no_path() {
+        let opts = crate::engine::config_file::Options::new();
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert_eq!(d.name, "exec");
+        assert!(d.search_path.is_empty());
+    }
+
+    #[test]
+    fn from_options_exec_reads_path() {
+        let mut opts = crate::engine::config_file::Options::new();
+        opts.insert(
+            "path".to_string(),
+            serde_yaml::from_str("[/usr/bin, /bin]").expect("yaml"),
+        );
+        let d = Driver::from_options_exec(&opts).expect("from_options");
+        assert_eq!(d.search_path, vec!["/usr/bin", "/bin"]);
+    }
+
+    #[test]
+    fn from_options_bash_rejects_unknown_key() {
+        let mut opts = crate::engine::config_file::Options::new();
+        opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
+        let err = Driver::from_options_bash(&opts).err().expect("must error");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 
     #[test]

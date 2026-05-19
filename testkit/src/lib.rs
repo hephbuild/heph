@@ -64,6 +64,7 @@ impl WorkspaceBuilder {
     pub fn build(self) -> anyhow::Result<Workspace> {
         let mut e = Engine::new(Config {
             root: self.dir.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
         })?;
         for setup in self.setups {

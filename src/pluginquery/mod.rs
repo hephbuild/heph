@@ -141,6 +141,7 @@ mod tests {
         let root = tempdir()?;
         let mut engine = Engine::new(Config {
             root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
             parallelism: None,
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;

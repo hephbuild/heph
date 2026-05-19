@@ -1,0 +1,12 @@
+providers:
+  - name: buildfile
+    options:
+      patterns:
+        - BUILD
+  - name: go
+drivers:
+  - name: exec
+  - name: bash
+  - name: go_golist
+  - name: go_embed
+  - name: go_testmain

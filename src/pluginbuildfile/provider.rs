@@ -52,6 +52,21 @@ impl Provider {
             ..Self::default()
         }
     }
+
+    pub fn from_options(
+        root: std::path::PathBuf,
+        opts: &crate::engine::config_file::Options,
+    ) -> anyhow::Result<Self> {
+        crate::engine::config_file::deny_unknown("buildfile provider", opts, &["patterns"])?;
+        let patterns: Vec<String> =
+            crate::engine::config_file::decode_opt(opts, "buildfile provider", "patterns")?
+                .unwrap_or_else(|| vec!["BUILD".to_string()]);
+        Ok(Self {
+            root,
+            build_file_patterns: patterns,
+            ..Self::default()
+        })
+    }
 }
 
 fn find_packages_sync(
@@ -237,9 +252,55 @@ impl EProvider for Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::config_file::Options;
     use crate::hasync::StdCancellationToken;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn from_options_defaults_to_build() {
+        let dir = tempdir().expect("tempdir");
+        let p = Provider::from_options(dir.path().to_path_buf(), &Options::new())
+            .expect("from_options");
+        assert_eq!(p.build_file_patterns, vec!["BUILD".to_string()]);
+    }
+
+    #[test]
+    fn from_options_reads_patterns() {
+        let dir = tempdir().expect("tempdir");
+        let mut opts = Options::new();
+        opts.insert(
+            "patterns".to_string(),
+            serde_yaml::from_str("[BUILD2, \"*.BUILD2\"]").expect("yaml"),
+        );
+        let p = Provider::from_options(dir.path().to_path_buf(), &opts).expect("from_options");
+        assert_eq!(p.build_file_patterns, vec!["BUILD2", "*.BUILD2"]);
+    }
+
+    #[test]
+    fn from_options_rejects_unknown_key() {
+        let dir = tempdir().expect("tempdir");
+        let mut opts = Options::new();
+        opts.insert("bogus".to_string(), serde_yaml::Value::Bool(true));
+        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+            .err()
+            .expect("must error");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn from_options_rejects_wrong_type() {
+        let dir = tempdir().expect("tempdir");
+        let mut opts = Options::new();
+        opts.insert(
+            "patterns".to_string(),
+            serde_yaml::Value::String("not a list".to_string()),
+        );
+        let err = Provider::from_options(dir.path().to_path_buf(), &opts)
+            .err()
+            .expect("must error");
+        assert!(err.to_string().contains("patterns"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_list_packages() {
