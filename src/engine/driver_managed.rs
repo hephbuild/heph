@@ -210,13 +210,12 @@ impl ManagedDriverBridge {
             } else {
                 self.driver.run(req, ctoken)
             }
-        }.await
-            .with_context(|| "driver run")?;
+        }
+        .await
+        .with_context(|| "driver run")?;
 
         if shell {
-            return Ok(RunResponse {
-                artifacts: vec![],
-            })
+            return Ok(RunResponse { artifacts: vec![] });
         }
 
         for output in &target.outputs {

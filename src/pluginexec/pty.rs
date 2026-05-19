@@ -126,9 +126,7 @@ impl AsyncRead for AsyncPty {
                 let fd = inner.get_ref().as_raw_fd();
                 let unfilled = buf.initialize_unfilled();
                 // SAFETY: fd is valid (held by AsyncFd); buf points to writable bytes.
-                let n = unsafe {
-                    libc::read(fd, unfilled.as_mut_ptr().cast(), unfilled.len())
-                };
+                let n = unsafe { libc::read(fd, unfilled.as_mut_ptr().cast(), unfilled.len()) };
                 if n < 0 {
                     let err = io::Error::last_os_error();
                     // PTY masters return EIO (not EOF) when the slave closes;

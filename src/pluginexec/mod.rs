@@ -67,7 +67,10 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
 fn render_shell_init(run: &[String]) -> anyhow::Result<String> {
     let mut ctx = serde_json::Map::new();
     if !run.is_empty() {
-        ctx.insert("cmds".to_string(), serde_json::Value::String(run.join("\n")));
+        ctx.insert(
+            "cmds".to_string(),
+            serde_json::Value::String(run.join("\n")),
+        );
     }
     templi::render(SHELL_INIT_SH, &serde_json::Value::Object(ctx))
         .map_err(anyhow::Error::from)
@@ -83,9 +86,7 @@ fn bash_args_shell(
     std::fs::write(&init_path, rendered).context("write init.sh")?;
 
     Ok(bash_args(
-        vec![
-            "-i".to_string(),
-        ],
+        vec!["-i".to_string()],
         vec![
             "--rcfile".to_string(),
             init_path.to_string_lossy().into_owned(),
@@ -664,7 +665,9 @@ impl Driver {
         // byte-by-byte to the child PTY without local echo or line buffering.
         // The child's PTY slave owns line discipline and echo.
         let _raw_guard = if shell {
-            crossterm::terminal::enable_raw_mode().ok().map(|()| RawModeGuard)
+            crossterm::terminal::enable_raw_mode()
+                .ok()
+                .map(|()| RawModeGuard)
         } else {
             None
         };
@@ -699,8 +702,12 @@ impl Driver {
         let (stdin_cancel_tx, stdin_cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
         let stdin_fut = async move {
-            let Some(mut child_stdin) = child_stdin else { return };
-            let Some(mut req_stdin) = rreq.stdin else { return };
+            let Some(mut child_stdin) = child_stdin else {
+                return;
+            };
+            let Some(mut req_stdin) = rreq.stdin else {
+                return;
+            };
             tokio::select! {
                 _ = stdin_cancel_rx => {}
                 // Intentionally ignore errors: stdin copy failure is non-fatal; process exit code is authoritative
@@ -818,7 +825,10 @@ mod tests {
     fn test_render_shell_init_without_cmds() {
         let out = render_shell_init(&[]).expect("render");
         assert!(!out.contains("run()"), "should not have run() block: {out}");
-        assert!(!out.contains("HEPH_EOF"), "should not have show() block: {out}");
+        assert!(
+            !out.contains("HEPH_EOF"),
+            "should not have show() block: {out}"
+        );
         assert!(!out.contains("{{"), "template tokens left: {out}");
     }
 
