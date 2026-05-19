@@ -58,7 +58,7 @@ in
 
   scripts.rheph.exec = ''cargo run -q --profile release -- "''${@}"'';
   scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
-  scripts.dheph.exec = ''cargo run -q --profile debug -- "''${@}"'';
+  scripts.dheph.exec = ''cargo run -q --profile dev -- "''${@}"'';
 
   scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
 

@@ -32,6 +32,10 @@ impl AppContext {
         &self.sink
     }
 
+    pub fn interactive(&self) -> bool {
+        self.control.is_some()
+    }
+
     /// Suspend the TUI for the lifetime of the returned guard. The renderer
     /// drains pending log lines, restores the terminal, and switches the
     /// log sink to direct passthrough. On guard drop the renderer resumes.

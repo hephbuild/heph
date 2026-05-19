@@ -273,9 +273,9 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: RunRequest<'a>,
+        req: RunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
         let def = req.target.def::<FsDef>();
@@ -385,6 +385,14 @@ impl crate::engine::driver::Driver for Driver {
                 Ok(RunResponse { artifacts })
             }
         }
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: RunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
+        anyhow::bail!("run_shell not implemented for pluginfs")
     }
 }
 
@@ -504,7 +512,7 @@ mod tests {
         request_id: &'a String,
         root: std::path::PathBuf,
         hashin: &'a String,
-    ) -> RunRequest<'a> {
+    ) -> RunRequest<'a, 'static> {
         RunRequest {
             request_id,
             target,

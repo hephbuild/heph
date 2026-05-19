@@ -107,7 +107,10 @@ async fn test_force_run() -> anyhow::Result<()> {
             rs,
             &addr,
             OutputMatcher::All,
-            &ResultOptions { force: true },
+            &ResultOptions {
+                force: true,
+                ..Default::default()
+            },
         )
         .await?;
 

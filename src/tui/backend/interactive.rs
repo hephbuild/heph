@@ -51,6 +51,7 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
                         if !paused {
                             drain_logs_to_terminal(&mut terminal, &mut rx);
                             drop(terminal.clear());
+                            drop(terminal.show_cursor());
                             drop(disable_raw_mode());
                             sink.switch_to_direct();
                             paused = true;
@@ -84,6 +85,7 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
     if !paused {
         drain_logs_to_terminal(&mut terminal, &mut rx);
         drop(terminal.clear());
+        drop(terminal.show_cursor());
         drop(disable_raw_mode());
     }
     sink.switch_to_direct();

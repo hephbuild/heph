@@ -197,9 +197,9 @@ impl ManagedDriver for GoEmbedDriver {
         })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a>,
+        req: ManagedRunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def::<GoEmbedDef>();
@@ -269,6 +269,14 @@ impl ManagedDriver for GoEmbedDriver {
         std::fs::write(req.sandbox_pkg_dir.join("embedcfg"), cfg_json).context("write embedcfg")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        anyhow::bail!("run_shell not implemented for go_embed")
     }
 }
 

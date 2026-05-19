@@ -1,3 +1,4 @@
+mod pty;
 mod spec;
 
 use crate::debug_hash::DebugHasher;
@@ -22,9 +23,12 @@ use tokio::io;
 use tokio::process::Command;
 use xxhash_rust::xxh3::Xxh3Default;
 
+const SHELL_INIT_SH: &str = include_str!("./init.sh");
+
 pub struct Driver {
     name: String,
     wrap_run: fn(&Vec<String>) -> Vec<String>,
+    wrap_run_shell: fn(&std::path::PathBuf, Vec<String>) -> anyhow::Result<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -60,6 +64,24 @@ fn bash_args(so: Vec<String>, lo: Vec<String>) -> Vec<String> {
     args
 }
 
+fn bash_args_shell(
+    sandbox_dir: &std::path::PathBuf,
+    _run: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    let init_path = sandbox_dir.join("init.sh");
+    std::fs::write(&init_path, SHELL_INIT_SH).context("write init.sh")?;
+
+    Ok(bash_args(
+        vec![
+            "-i".to_string(),
+        ],
+        vec![
+            "--rcfile".to_string(),
+            init_path.to_string_lossy().into_owned(),
+        ],
+    ))
+}
+
 pub fn bash_args_public(cmd: &str, termargs: Vec<String>) -> Vec<String> {
     let mut args = bash_args(
         vec![
@@ -87,13 +109,24 @@ impl Driver {
         Self {
             name: "exec".to_string(),
             wrap_run: |run| run.clone(),
+            wrap_run_shell: bash_args_shell,
         }
     }
     pub fn new_bash() -> Self {
         Self {
             name: "bash".to_string(),
             wrap_run: |run| bash_args_public(run.join("\n").as_str(), vec![]),
+            wrap_run_shell: bash_args_shell,
         }
+    }
+}
+
+/// RAII guard that restores the parent terminal's cooked mode when dropped.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
@@ -119,6 +152,10 @@ async fn tee_stream(
                 drop(log.lock().await.write_all(slice).await);
                 if let Some(ref mut out) = sink {
                     drop(out.write_all(slice).await);
+                    // Flush immediately so interactive shells see each byte
+                    // appear as it's typed (tokio::io::stdout is line-buffered
+                    // when wired to a tty).
+                    drop(out.flush().await);
                 }
             }
         }
@@ -339,21 +376,50 @@ impl engine::driver_managed::ManagedDriver for Driver {
         Ok(ApplyTransitiveResponse { target_def: def })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a>,
+        req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        self.run_inner(req, ctoken, false).await
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        self.run_inner(req, ctoken, true).await
+    }
+}
+
+impl Driver {
+    async fn run_inner<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+        shell: bool,
     ) -> anyhow::Result<ManagedRunResponse> {
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 
-        let run = (self.wrap_run)(&def.run);
+        let run = {
+            let run = (self.wrap_run)(&def.run);
+            if shell {
+                (self.wrap_run_shell)(&rreq.sandbox_dir, run)?
+            } else {
+                run
+            }
+        };
 
         if run.is_empty() {
             anyhow::bail!("`run` is empty")
         }
 
         let mut env = HashMap::<String, String>::new();
+        if shell && let Ok(term) = std::env::var("TERM") {
+            env.insert("TERM".to_string(), term);
+        }
         env.insert(
             "PATH".to_string(),
             [
@@ -508,39 +574,129 @@ impl engine::driver_managed::ManagedDriver for Driver {
             output_log,
         )));
 
+        // Shell mode runs the child attached to a freshly-allocated PTY so bash
+        // sees a real terminal and runs interactively. The parent forwards
+        // stdin/stdout via the PTY master through the same tee_stream paths
+        // used by the non-shell path.
+        let pty_pair = if shell {
+            Some(pty::open_pty().context("openpty")?)
+        } else {
+            None
+        };
+
         // run is guaranteed non-empty by the bail! above, so [0] and [1..] are safe
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "run non-empty guaranteed by bail! check above"
-        )]
-        let mut child = Command::new(&run[0])
-            .args(&run[1..])
+        let (program, args) = {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "run non-empty guaranteed by bail! check above"
+            )]
+            (&run[0], &run[1..])
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .kill_on_drop(true)
             .env_clear()
             .envs(env)
-            .current_dir(req.sandbox_pkg_dir)
-            .stdin(if rreq.stdin.is_some() {
+            .current_dir(req.sandbox_pkg_dir);
+
+        if let Some((master, slave)) = &pty_pair {
+            // Inherit the parent's terminal size so bash can wrap and place the
+            // prompt correctly. Falls back to 80x24 if the parent has no tty.
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            pty::set_winsize(master, rows, cols).context("set pty winsize")?;
+
+            // Copy the parent's line discipline (ICRNL/ONLCR/etc.) onto the
+            // slave so bash sees a standard cooked terminal. Must run BEFORE
+            // we put the parent into raw mode below.
+            pty::inherit_termios(slave).context("copy parent termios to pty slave")?;
+
+            let stdin_fd = slave.try_clone().context("dup pty slave for stdin")?;
+            let stdout_fd = slave.try_clone().context("dup pty slave for stdout")?;
+            let stderr_fd = slave.try_clone().context("dup pty slave for stderr")?;
+            cmd.stdin(Stdio::from(stdin_fd))
+                .stdout(Stdio::from(stdout_fd))
+                .stderr(Stdio::from(stderr_fd));
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "pre_exec + setsid + ioctl must all run inside the same unsafe context"
+            )]
+            // SAFETY: pre_exec runs between fork and exec; the closure body
+            // only invokes async-signal-safe syscalls (setsid + ioctl) — both
+            // documented as safe to call in that window.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        } else {
+            cmd.stdin(if rreq.stdin.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
             })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| "spawn child process")?;
+            .stderr(Stdio::piped());
+        }
 
-        let child_stdin = child.stdin.take();
-        let child_stdout = child.stdout.take();
-        let child_stderr = child.stderr.take();
+        let mut child = cmd.spawn().with_context(|| "spawn child process")?;
+
+        // Drop the parent's copy of the slave so the master sees EOF when the
+        // child exits.
+        let pty_master = pty_pair.map(|(master, _slave)| master);
+
+        // Put the parent terminal into raw mode so keystrokes are forwarded
+        // byte-by-byte to the child PTY without local echo or line buffering.
+        // The child's PTY slave owns line discipline and echo.
+        let _raw_guard = if shell {
+            crossterm::terminal::enable_raw_mode().ok().map(|()| RawModeGuard)
+        } else {
+            None
+        };
+
+        type BoxedReader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+        type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+        let (child_stdin, child_stdout, child_stderr): (
+            Option<BoxedWriter>,
+            Option<BoxedReader>,
+            Option<BoxedReader>,
+        ) = if let Some(master) = pty_master {
+            let read_fd = master.try_clone().context("dup pty master for read")?;
+            let reader = pty::AsyncPty::new(read_fd).context("async pty reader")?;
+            let writer = pty::AsyncPty::new(master).context("async pty writer")?;
+            (Some(Box::new(writer)), Some(Box::new(reader)), None)
+        } else {
+            (
+                child.stdin.take().map(|x| Box::new(x) as BoxedWriter),
+                child.stdout.take().map(|x| Box::new(x) as BoxedReader),
+                child.stderr.take().map(|x| Box::new(x) as BoxedReader),
+            )
+        };
 
         use tokio::io::AsyncWriteExt;
 
-        let stdin_fut = async {
-            if let (Some(mut req_stdin), Some(mut child_stdin)) = (rreq.stdin, child_stdin) {
+        // Signal that cancels the stdin pump once the child has exited. Without
+        // it, shell mode would deadlock waiting on a parent-stdin read that
+        // nothing intends to satisfy. The client is expected to provide a
+        // cancellable stdin (e.g. a TtyReader), but we cancel here too in case
+        // the source is `tokio::io::stdin()`-like and the runtime would
+        // otherwise wait on a parked blocking thread.
+        let (stdin_cancel_tx, stdin_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let stdin_fut = async move {
+            let Some(mut child_stdin) = child_stdin else { return };
+            let Some(mut req_stdin) = rreq.stdin else { return };
+            tokio::select! {
+                _ = stdin_cancel_rx => {}
                 // Intentionally ignore errors: stdin copy failure is non-fatal; process exit code is authoritative
-                drop(io::copy(&mut req_stdin, &mut child_stdin).await);
-                drop(child_stdin.shutdown().await);
+                _ = io::copy(&mut req_stdin, &mut child_stdin) => {}
             }
+            drop(child_stdin.shutdown().await);
         };
 
         let stdout_fut = tee_stream(child_stdout, Arc::clone(&output_log_file), rreq.stdout);
@@ -553,7 +709,42 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 anyhow::bail!("cancelled")
             },
             res = async {
-                tokio::join!(stdin_fut, stdout_fut, stderr_fut, child.wait()).3
+                let io = async { tokio::join!(stdin_fut, stdout_fut, stderr_fut) };
+                // Poll the child status on a tick instead of relying on
+                // `child.wait()`'s SIGCHLD waker, which doesn't always fire
+                // when the child has called setsid + TIOCSCTTY (PTY session
+                // leader). 25ms keeps shell-exit latency invisible.
+                let wait_fut = async {
+                    let status = loop {
+                        match child.try_wait() {
+                            Ok(Some(s)) => break Ok(s),
+                            Ok(None) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            Err(e) => break Err(e),
+                        }
+                    };
+                    // Cancel the stdin pump as soon as the child is reaped so
+                    // the io join can finish in the io-wins arm below.
+                    _ = stdin_cancel_tx.send(());
+                    status
+                };
+                tokio::pin!(io, wait_fut);
+                tokio::select! {
+                    s = &mut wait_fut => {
+                        // Race the io pumps to drain whatever's still buffered.
+                        // PTY master EOF detection through kqueue is unreliable
+                        // on macOS, so cap the wait — anything left will be lost,
+                        // but in shell mode the user has already seen the output
+                        // streamed live.
+                        _ = tokio::time::timeout(
+                            std::time::Duration::from_millis(50),
+                            &mut io,
+                        ).await;
+                        s
+                    }
+                    _ = &mut io => (&mut wait_fut).await,
+                }
             } => {
                 let status = res.with_context(|| "wait for child process")?;
 
@@ -592,7 +783,7 @@ mod tests {
     use crate::htaddr::Addr;
     use enclose::enclose;
 
-    fn make_req(request: RunRequest) -> ManagedRunRequest {
+    fn make_req<'a, 'io>(request: RunRequest<'a, 'io>) -> ManagedRunRequest<'a, 'io> {
         let path = request.sandbox_dir.clone();
         ManagedRunRequest {
             request,
@@ -638,7 +829,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: Some(&mut stdout),
             stderr: None,
@@ -689,7 +880,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: Some(&mut stdin),
             stdout: Some(&mut stdout),
             stderr: None,
@@ -746,7 +937,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: Some(&mut reader),
             stdout: None,
             stderr: None,
@@ -804,7 +995,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: Some(&mut stdout),
             stderr: None,
@@ -1052,7 +1243,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: None,
             stderr: None,
@@ -1098,7 +1289,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: Some(&mut stdout),
             stderr: None,
@@ -1167,7 +1358,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: Some(&mut stdout),
             stderr: None,
@@ -1233,7 +1424,7 @@ mod tests {
             target: &target_def,
             tree_root_path: "".to_string().into(),
             inputs: vec![],
-            hashin: &"".to_string(),
+            hashin: "",
             stdin: None,
             stdout: None,
             stderr: None,

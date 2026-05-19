@@ -455,15 +455,15 @@ pub mod outputartifact {
     }
 }
 
-pub struct RunRequest<'a> {
+pub struct RunRequest<'a, 'io> {
     pub request_id: &'a String,
     pub target: &'a targetdef::TargetDef,
     pub tree_root_path: PathBuf,
     pub inputs: Vec<RunInput>,
-    pub hashin: &'a String,
-    pub stdin: Option<&'a mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
-    pub stdout: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
-    pub stderr: Option<&'a mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    pub hashin: &'a str,
+    pub stdin: Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
+    pub stdout: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+    pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
 }
 pub struct RunResponse {
@@ -483,9 +483,14 @@ pub trait Driver: Send + Sync {
         req: ApplyTransitiveRequest,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<ApplyTransitiveResponse>;
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: RunRequest<'a>,
+        req: RunRequest<'a, 'io>,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse>;
+    async fn run_shell<'a, 'io>(
+        &self,
+        req: RunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse>;
 }

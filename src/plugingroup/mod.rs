@@ -98,14 +98,22 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        _req: RunRequest<'a>,
+        _req: RunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
         anyhow::bail!(
             "group driver run() must never be called — groups are inlined before execution"
         )
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: RunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
+        anyhow::bail!("run_shell not implemented for group driver")
     }
 }
 

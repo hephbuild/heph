@@ -157,9 +157,9 @@ impl crate::engine::driver::Driver for Driver {
         })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: RunRequest<'a>,
+        req: RunRequest<'a, 'io>,
         _ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<RunResponse> {
         let def = req.target.def::<HostBinDef>();
@@ -185,6 +185,14 @@ impl crate::engine::driver::Driver for Driver {
                 hashout,
             }],
         })
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: RunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
+        anyhow::bail!("run_shell not implemented for hostbin")
     }
 }
 
@@ -297,7 +305,7 @@ mod tests {
         request_id: &'a String,
         sandbox_dir: &std::path::Path,
         hashin: &'a String,
-    ) -> RunRequest<'a> {
+    ) -> RunRequest<'a, 'static> {
         RunRequest {
             request_id,
             target,

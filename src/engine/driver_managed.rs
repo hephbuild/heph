@@ -22,8 +22,8 @@ pub struct ManagedRunInput {
     pub list_path: PathBuf,
 }
 
-pub struct ManagedRunRequest<'a> {
-    pub request: RunRequest<'a>,
+pub struct ManagedRunRequest<'a, 'io> {
+    pub request: RunRequest<'a, 'io>,
     pub sandbox_dir: PathBuf,
     pub sandbox_ws_dir: PathBuf,
     pub sandbox_pkg_dir: PathBuf,
@@ -46,9 +46,14 @@ pub trait ManagedDriver: Send + Sync {
         req: ApplyTransitiveRequest,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<ApplyTransitiveResponse>;
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a>,
+        req: ManagedRunRequest<'a, 'io>,
+        ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse>;
+    async fn run_shell<'a, 'io>(
+        &self,
+        req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse>;
 }
@@ -110,10 +115,28 @@ impl Driver for ManagedDriverBridge {
         self.driver.apply_transitive(req, ctoken).await
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        mut req: RunRequest<'a>,
+        req: RunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
+        self.run_inner(req, ctoken, false).await
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        req: RunRequest<'a, 'io>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<RunResponse> {
+        self.run_inner(req, ctoken, true).await
+    }
+}
+impl ManagedDriverBridge {
+    async fn run_inner<'a, 'io>(
+        &self,
+        mut req: RunRequest<'a, 'io>,
+        ctoken: &(dyn Cancellable + Send + Sync),
+        shell: bool,
     ) -> anyhow::Result<RunResponse> {
         let sandbox_dir = req.sandbox_dir.clone();
         let ws_dir = sandbox_dir.join("ws");
@@ -171,22 +194,30 @@ impl Driver for ManagedDriverBridge {
             .with_context(|| "write source_map.json")?;
 
         let target = req.target;
-        let hashin = req.hashin.clone();
+        let hashin = req.hashin;
 
-        let mut res = self
-            .driver
-            .run(
-                ManagedRunRequest {
-                    sandbox_dir: sandbox_dir.clone(),
-                    sandbox_ws_dir: ws_dir.clone(),
-                    sandbox_pkg_dir: sandbox_pkg_dir.clone(),
-                    request: req,
-                    inputs,
-                },
-                ctoken,
-            )
-            .await
+        let mut res = {
+            let req = ManagedRunRequest {
+                sandbox_dir: sandbox_dir.clone(),
+                sandbox_ws_dir: ws_dir.clone(),
+                sandbox_pkg_dir: sandbox_pkg_dir.clone(),
+                request: req,
+                inputs,
+            };
+
+            if shell {
+                self.driver.run_shell(req, ctoken)
+            } else {
+                self.driver.run(req, ctoken)
+            }
+        }.await
             .with_context(|| "driver run")?;
+
+        if shell {
+            return Ok(RunResponse {
+                artifacts: vec![],
+            })
+        }
 
         for output in &target.outputs {
             if !output.paths.iter().any(|path| path.collect) {
@@ -306,12 +337,19 @@ mod tests {
         ) -> anyhow::Result<ApplyTransitiveResponse> {
             unimplemented!()
         }
-        async fn run<'a>(
+        async fn run<'a, 'io>(
             &self,
-            _req: ManagedRunRequest<'a>,
+            _req: ManagedRunRequest<'a, 'io>,
             _ctoken: &(dyn hasync::Cancellable + Send + Sync),
         ) -> anyhow::Result<ManagedRunResponse> {
             Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _req: ManagedRunRequest<'a, 'io>,
+            _ctoken: &(dyn hasync::Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            anyhow::bail!("run_shell not implemented for NoopManagedDriver")
         }
     }
 
@@ -383,7 +421,7 @@ mod tests {
             target: &def,
             tree_root_path: dir.path().to_path_buf(),
             inputs: vec![input],
-            hashin: &"hash".to_string(),
+            hashin: "hash",
             stdin: None,
             stdout: None,
             stderr: None,
@@ -417,7 +455,7 @@ mod tests {
             target: &def,
             tree_root_path: dir.path().to_path_buf(),
             inputs: vec![input],
-            hashin: &"hash".to_string(),
+            hashin: "hash",
             stdin: None,
             stdout: None,
             stderr: None,
@@ -450,7 +488,7 @@ mod tests {
             target: &def,
             tree_root_path: dir.path().to_path_buf(),
             inputs: vec![],
-            hashin: &"hash".to_string(),
+            hashin: "hash",
             stdin: None,
             stdout: None,
             stderr: None,
@@ -493,7 +531,7 @@ mod tests {
             target: &def,
             tree_root_path: dir.path().to_path_buf(),
             inputs,
-            hashin: &"hash".to_string(),
+            hashin: "hash",
             stdin: None,
             stdout: None,
             stderr: None,

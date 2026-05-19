@@ -6,7 +6,7 @@ use clap::Args;
 
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::{Engine, OutputMatcher, ResultOptions, get_cwp};
+use crate::engine::{Engine, InteractiveWrapper, OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
 use crate::tui::{self, App, AppContext, LogSink};
 
@@ -22,6 +22,9 @@ pub struct RunArgs {
     /// Force execution
     #[arg(long = "force")]
     pub force: bool,
+    /// Interactive shell
+    #[arg(long = "shell", num_args = 0..=1, require_equals = true, default_missing_value = "", value_name = "TARGET",)]
+    pub shell: Option<String>,
     /// Print output artifacts to stdout
     #[arg(long = "cat-out")]
     pub cat_out: bool,
@@ -48,8 +51,40 @@ impl App for RunApp {
     }
 
     async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        let interactive: Option<InteractiveWrapper> = if ctx.interactive() {
+            let pauser = ctx.pauser();
+            Some(Arc::new(move |inner| {
+                let pauser = pauser.clone();
+                Box::pin(async move {
+                    let _guard = pauser.pause().await;
+                    // Source stdin from the client's /dev/tty via a TtyReader
+                    // rather than tokio::io::stdin(): tokio's stdin spawns a
+                    // global blocking thread parked on read(0, …) that cannot
+                    // be cancelled, keeping the runtime alive past target exit
+                    // until the user produces another keystroke. TtyReader
+                    // also works on macOS PTY-slave fds where mio's AsyncFd
+                    // rejects the registration with EINVAL.
+                    let mut stdin = tui::tty::TtyReader::from_stdin().ok();
+                    let mut stdout = tokio::io::stdout();
+                    let mut stderr = tokio::io::stderr();
+                    inner(
+                        stdin
+                            .as_mut()
+                            .map(|s| s as &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)),
+                        Some(&mut stdout),
+                        Some(&mut stderr),
+                    )
+                    .await
+                })
+            }))
+        } else {
+            None
+        };
+
         let opts = ResultOptions {
             force: self.args.force,
+            shell: self.args.shell.is_some(),
+            interactive,
         };
         let rs = self.engine.new_state();
 

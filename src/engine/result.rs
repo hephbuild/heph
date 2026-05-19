@@ -178,9 +178,26 @@ pub struct EResult {
     pub artifacts_meta: Vec<ArtifactMeta>,
 }
 
-#[derive(Default, Clone, Copy)]
+pub type InteractiveInner = Box<
+    dyn for<'io> FnOnce(
+            Option<&'io mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin)>,
+            Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+            Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+        ) -> futures::future::BoxFuture<'io, anyhow::Result<()>>
+        + Send,
+>;
+
+pub type InteractiveWrapper = Arc<
+    dyn Fn(InteractiveInner) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Default, Clone)]
 pub struct ResultOptions {
     pub force: bool,
+    pub shell: bool,
+    pub interactive: Option<InteractiveWrapper>,
 }
 
 #[derive(Clone)]
@@ -209,6 +226,8 @@ struct ExecuteOptions<'a> {
     spec: &'a TargetSpec,
     def: &'a LinkedTargetDef,
     force: bool,
+    interactive: Option<InteractiveWrapper>,
+    shell: bool,
 }
 
 impl Engine {
@@ -220,6 +239,10 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<Arc<EResult>> {
+        if opts.shell && opts.interactive.is_none() {
+            anyhow::bail!("cannot use --shell in non-interactive mode");
+        }
+
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
@@ -242,14 +265,18 @@ impl Engine {
         // breaking the Send inference cycle that would occur inside the memoizer closure.
         let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
         if def.target_def.transparent {
-            let opts = *opts;
+            let mut opts = opts.clone();
+            if opts.shell {
+                opts.interactive = None;
+            }
+
             let futures: Vec<_> = def
                 .target_def
                 .inputs
                 .iter()
                 .map(|input| {
                     let dep_addr = input.r#ref.r#ref.clone();
-                    enclose!((self => engine, rs) async move {
+                    enclose!((self => engine, rs, opts) async move {
                         engine
                             .result_addr(rs, &dep_addr, OutputMatcher::All, &opts)
                             .await
@@ -268,7 +295,7 @@ impl Engine {
         }
 
         let key = format!("{}:{}", addr.format(), outputs.cache_key());
-        let opts = *opts;
+        let opts = opts.clone();
         let res = rs.data.mem_result.once(key, enclose!((self => engine, rs, addr, outputs) move || async move {
             engine.inner_result_addr(rs, &addr, outputs, &opts).await.map(Arc::new).with_context(|| format!("result: {}", addr))
         })).await.map_err(unwrap_arc_err)?;
@@ -282,13 +309,17 @@ impl Engine {
         matcher: &Matcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<Vec<Arc<EResult>>> {
+        let mut opts = opts.clone();
+        if !matches!(matcher, Matcher::Addr(_)) {
+            opts.interactive = None;
+        }
+
         let mut set = JoinSet::new();
-        let opts = *opts;
 
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
-            set.spawn(enclose!((self => engine, rs) async move {
+            set.spawn(enclose!((self => engine, rs, opts) async move {
                 engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await
             }));
         }
@@ -321,7 +352,7 @@ impl Engine {
         let meta_fut = Arc::clone(&self).meta(rs.clone(), addr);
         let (link_res, meta_res) = tokio::join!(link_fut, meta_fut);
         let def = link_res.with_context(|| "link")?;
-        let meta = meta_res?;
+        let meta = meta_res.with_context(|| "meta")?;
 
         let output_names = match outputs {
             OutputMatcher::None => anyhow::Ok(Vec::<String>::new()),
@@ -347,6 +378,8 @@ impl Engine {
                 spec: &spec,
                 def: &def,
                 force: opts.force,
+                interactive: opts.interactive.clone(),
+                shell: opts.shell,
             },
         )
         .await
@@ -361,6 +394,7 @@ impl Engine {
     ) -> anyhow::Result<EResult> {
         if !opts.force
             && opts.def.target.cache
+            && !opts.shell
             && let Some(res) = self
                 .result_from_cache(rs.clone(), def, opts, outputs.clone())
                 .await?
@@ -394,7 +428,9 @@ impl Engine {
         let hashin = opts.hashin.clone();
         let spec = opts.spec.clone();
         let def = opts.def.clone();
-        let use_tmp_cache = !opts.def.target.cache;
+        let use_tmp_cache = !opts.def.target.cache || opts.shell;
+        let interactive = opts.interactive.clone();
+        let shell = opts.shell;
         let key = format!("{}:{}", addr.format(), hashin);
 
         rs.data
@@ -404,7 +440,7 @@ impl Engine {
                 enclose!((self => engine, rs) move || async move {
                     let (artifacts, sandbox_dir) = engine
                         .clone()
-                        .execute(rs.clone(), &addr, &spec, &def, &hashin)
+                        .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
                         .await?;
 
                     let artifacts_meta = artifacts

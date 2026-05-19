@@ -1,11 +1,11 @@
-use crate::engine::Engine;
 use crate::engine::driver::inputartifact::{InputArtifact, Type};
 use crate::engine::driver::outputartifact::OutputArtifact;
-use crate::engine::driver::{RunInput, RunRequest};
+use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::link::{LinkedTargetDef, LinkedTargetDefInput};
 use crate::engine::provider::TargetSpec;
 use crate::engine::request_state::RequestState;
 use crate::engine::result::{OutputMatcher, ResultOptions};
+use crate::engine::{Engine, InteractiveInner, InteractiveWrapper};
 use crate::htaddr::Addr;
 use anyhow::Context;
 use async_recursion::async_recursion;
@@ -24,6 +24,8 @@ impl Engine {
         spec: &TargetSpec,
         def: &LinkedTargetDef,
         hashin: &str,
+        exec_wrapper: Option<InteractiveWrapper>,
+        shell: bool,
     ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
         let driver = self
             .drivers_by_name
@@ -67,25 +69,47 @@ impl Engine {
             tracing::info!(driver = %driver.name, %addr, "run");
         }
 
-        let hashin_owned = hashin.to_owned();
-        let res = driver
-            .driver
-            .run(
-                RunRequest {
-                    request_id: rs.request_id(),
-                    target: &def.target,
-                    tree_root_path: self.cfg.root.clone(),
-                    inputs: deps_result,
-                    hashin: &hashin_owned,
-                    stdin: None,
-                    stdout: None,
-                    stderr: None,
-                    sandbox_dir: sandbox_dir.clone(),
-                },
-                rs.ctoken(),
-            )
+        let exec_wrapper: InteractiveWrapper = exec_wrapper.unwrap_or_else(|| {
+            Arc::new(|inner: InteractiveInner| {
+                Box::pin(async move { inner(None, None, None).await })
+            })
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<RunResponse>();
+
+        let hashin = hashin.to_owned();
+
+        let inner: InteractiveInner = Box::new(enclose!(
+            (driver, def, rs, self => engine, sandbox_dir)
+            move |stdin, stdout, stderr| {
+                Box::pin(async move {
+                    let req = RunRequest {
+                        request_id: rs.request_id(),
+                        target: &def.target,
+                        tree_root_path: engine.cfg.root.clone(),
+                        inputs: deps_result,
+                        hashin: &hashin,
+                        stdin,
+                        stdout,
+                        stderr,
+                        sandbox_dir,
+                    };
+                    let res = if shell {
+                        driver.driver.run_shell(req, rs.ctoken()).await?
+                    } else {
+                        driver.driver.run(req, rs.ctoken()).await?
+                    };
+                    drop(tx.send(res));
+                    Ok(())
+                })
+            }
+        ));
+
+        exec_wrapper(inner).await.with_context(|| "run")?;
+
+        let res = rx
             .await
-            .with_context(|| "run")?;
+            .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
 
         Ok((res.artifacts, sandbox_dir))
     }

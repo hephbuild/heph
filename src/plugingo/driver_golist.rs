@@ -209,9 +209,9 @@ impl ManagedDriver for GoGolistDriver {
         })
     }
 
-    async fn run<'a>(
+    async fn run<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a>,
+        req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse> {
         let def = req.request.target.def::<GoGolistDef>();
@@ -337,6 +337,14 @@ impl ManagedDriver for GoGolistDriver {
             .context("write package_addrs.bin")?;
 
         Ok(ManagedRunResponse { artifacts: vec![] })
+    }
+
+    async fn run_shell<'a, 'io>(
+        &self,
+        _req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        anyhow::bail!("run_shell not implemented for go_golist")
     }
 }
 

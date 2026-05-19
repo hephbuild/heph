@@ -3,6 +3,7 @@ mod backend;
 pub mod log_sink;
 pub mod panic;
 pub mod stdout_buffer;
+pub mod tty;
 
 use std::io::{self, IsTerminal};
 
