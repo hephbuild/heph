@@ -2,6 +2,7 @@ pub mod app;
 mod backend;
 pub mod log_sink;
 pub mod panic;
+pub mod paused;
 pub mod stdout_buffer;
 pub mod tty;
 
@@ -9,6 +10,7 @@ use std::io::{self, IsTerminal};
 
 pub use app::{App, AppContext, PauseGuard};
 pub use log_sink::LogSink;
+pub use paused::paused;
 pub use stdout_buffer::BufferedStdout;
 
 pub fn should_use_tui(force_off: bool) -> bool {

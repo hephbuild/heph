@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
 use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -36,9 +36,9 @@ impl App for SpecApp {
 
         let json = serde_json::to_string_pretty(&*res).context("serialize spec")?;
 
-        let out = BufferedStdout::new(&ctx);
-        out.println(json);
-        out.close().await;
+        tui::paused!(ctx, {
+            println!("{json}");
+        });
 
         Ok(())
     }

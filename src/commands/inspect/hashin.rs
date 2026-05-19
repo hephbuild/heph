@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
 use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -34,9 +34,9 @@ impl App for HashinApp {
             .meta(self.engine.new_state(), &self.addr)
             .await?;
 
-        let out = BufferedStdout::new(&ctx);
-        out.println(&res.hashin);
-        out.close().await;
+        tui::paused!(ctx, {
+            println!("{}", res.hashin);
+        });
 
         Ok(())
     }

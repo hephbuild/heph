@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::commands::bootstrap;
 use crate::engine::{Engine, OutputMatcher, ResultOptions};
 use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -39,11 +39,11 @@ impl App for HashoutApp {
             )
             .await?;
 
-        let out = BufferedStdout::new(&ctx);
-        for art in &res.artifacts_meta {
-            out.println(&art.hashout);
-        }
-        out.close().await;
+        tui::paused!(ctx, {
+            for art in &res.artifacts_meta {
+                println!("{}", art.hashout);
+            }
+        });
 
         Ok(())
     }

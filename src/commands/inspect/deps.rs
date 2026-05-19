@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use crate::commands::bootstrap;
 use crate::engine::Engine;
 use crate::htaddr::{self, Addr};
-use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+use crate::tui::{self, App, AppContext, LogSink};
 
 #[derive(clap::Args, Clone)]
 pub struct Args {
@@ -34,11 +34,11 @@ impl App for DepsApp {
             .get_def(self.engine.new_state(), &self.addr)
             .await?;
 
-        let out = BufferedStdout::new(&ctx);
-        for input in &def.target_def.inputs {
-            out.println(input.r#ref.to_string());
-        }
-        out.close().await;
+        tui::paused!(ctx, {
+            for input in &def.target_def.inputs {
+                println!("{}", input.r#ref);
+            }
+        });
 
         Ok(())
     }
