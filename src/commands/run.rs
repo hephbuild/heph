@@ -1,11 +1,16 @@
+use std::io;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use clap::Args;
+
 use crate::commands::bootstrap;
 use crate::commands::utils::matcher_from_args;
-use crate::engine::{OutputMatcher, ResultOptions, get_cwp};
+use crate::engine::{Engine, OutputMatcher, ResultOptions, get_cwp};
 use crate::htmatcher::Matcher;
-use clap::Args;
-use std::io;
+use crate::tui::{self, App, AppContext, LogSink};
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 #[command(override_usage = "run <TARGET_ADDRESS>\n       run <LABEL> <PACKAGE_MATCHER>")]
 pub struct RunArgs {
     /// Target address (e.g., //pkg:name) OR Label
@@ -25,59 +30,80 @@ pub struct RunArgs {
     pub list_out: bool,
 }
 
-pub fn execute(args: &RunArgs) -> anyhow::Result<()> {
-    // Cap worker_threads to physical parallelism. The default
-    // `#[tokio::main]` runtime spawns far more workers than needed for our
-    // workload (160+ on a 10-core box), and idle workers cost real park /
-    // unpark scheduling traffic.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
-        .enable_all()
-        .build()?;
-    rt.block_on(execute_inner(args))
+struct RunApp {
+    args: RunArgs,
+    engine: Arc<Engine>,
+    matcher: Matcher,
 }
 
-async fn execute_inner(args: &RunArgs) -> anyhow::Result<()> {
-    let base_pkg = get_cwp()?;
-    let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
+#[async_trait(?Send)]
+impl App for RunApp {
+    type Output = ();
 
-    let e = bootstrap::new_engine()?;
-
-    let opts = ResultOptions { force: args.force };
-
-    let result = match m {
-        Matcher::Addr(addr) => {
-            vec![
-                e.clone()
-                    .result_addr(e.new_state(), &addr, OutputMatcher::All, &opts)
-                    .await?,
-            ]
+    fn label(&self) -> String {
+        match &self.matcher {
+            Matcher::Addr(a) => format!("Running {}", a.format()),
+            other => format!("Running {other:?}"),
         }
-        _ => e.clone().result(e.new_state(), &m, &opts).await?,
-    };
-
-    if args.cat_out {
-        for r in &result {
-            for a in &r.artifacts {
-                for e in a.walk()? {
-                    io::copy(&mut e?.data, &mut io::stdout())?;
-                }
-            }
-        }
-    } else if args.list_out {
-        for r in &result {
-            for a in &r.artifacts {
-                for e in a.walk()? {
-                    println!("{}", e?.path.display());
-                }
-            }
-        }
-    } else {
-        println!("{} matched", result.len());
     }
 
-    Ok(())
+    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        let opts = ResultOptions {
+            force: self.args.force,
+        };
+        let rs = self.engine.new_state();
+
+        let result = match self.matcher {
+            Matcher::Addr(addr) => {
+                vec![
+                    self.engine
+                        .clone()
+                        .result_addr(rs, &addr, OutputMatcher::All, &opts)
+                        .await?,
+                ]
+            }
+            m => self.engine.clone().result(rs, &m, &opts).await?,
+        };
+
+        let _guard = ctx.pause().await;
+        if self.args.cat_out {
+            for r in &result {
+                for a in &r.artifacts {
+                    for e in a.walk()? {
+                        io::copy(&mut e?.data, &mut io::stdout())?;
+                    }
+                }
+            }
+        } else if self.args.list_out {
+            for r in &result {
+                for a in &r.artifacts {
+                    for e in a.walk()? {
+                        println!("{}", e?.path.display());
+                    }
+                }
+            }
+        } else {
+            println!("{} matched", result.len());
+        }
+
+        Ok(())
+    }
+}
+
+pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, no_tui)
+}
+
+#[tokio::main]
+async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    let base_pkg = get_cwp()?;
+    let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
+    let engine = bootstrap::new_engine()?;
+    let app = RunApp {
+        args,
+        engine,
+        matcher: m,
+    };
+    let interactive = tui::should_use_tui(no_tui);
+    tui::run_app(app, sink, interactive).await
 }

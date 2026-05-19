@@ -1,9 +1,9 @@
 use clap::{Args, Parser};
 use humantime::format_duration;
 use rheph::commands;
-use rheph::version::VERSION;
 use rheph::defer;
 use rheph::log;
+use rheph::version::VERSION;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -14,6 +14,9 @@ struct GlobalArgs {
     /// Write CPU pprof on exit
     #[arg(long = "pprof-cpu", value_name = "PATH", global = true)]
     pprof_cpu: Option<PathBuf>,
+    /// Disable the interactive TUI (force CI/log-only output)
+    #[arg(long = "no-tui", global = true)]
+    no_tui: bool,
 }
 
 #[derive(Parser)]
@@ -28,11 +31,9 @@ struct Cli {
 
 fn main() -> ExitCode {
     let start = Instant::now();
-    log::init();
-    info!(
-        version = VERSION,
-        "Application starting"
-    );
+    let sink = log::init();
+    rheph::tui::panic::install(sink.clone());
+    info!(version = VERSION, "Application starting");
     defer! {
         info!(duration = %format_duration(start.elapsed()), "Application finished");
     }
@@ -54,7 +55,7 @@ fn main() -> ExitCode {
         None
     };
 
-    let result = match cli.command.execute() {
+    let result = match cli.command.execute(sink, cli.global.no_tui) {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             error!(error = %format!("{:#}", e), "Failed");

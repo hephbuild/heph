@@ -7,6 +7,8 @@ pub mod version;
 
 use clap::Subcommand;
 
+use crate::tui::LogSink;
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Run a command
@@ -23,11 +25,11 @@ pub enum Commands {
 }
 
 impl Commands {
-    pub fn execute(&self) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
         match self {
-            Commands::Run(args) => run::execute(args),
+            Commands::Run(args) => run::execute(args, sink, no_tui),
             Commands::Inspect(args) => args.execute(),
-            Commands::Query(args) => query::execute(args),
+            Commands::Query(args) => query::execute(args, sink, no_tui),
             Commands::Version(args) => version::execute(args),
         }
     }

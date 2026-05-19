@@ -1,12 +1,11 @@
 { pkgs, lib, config, inputs, ... }:
 
 let
-  binLocation = "$HOME/.local/bin/rheph";
+  binLocation = "$HOME/.local/bin/heph3";
   qualityCrates = "-p rheph -p e2e -p rheph-testkit -p plugingo-e2e";
 in
 {
   # https://devenv.sh/basics/
-  env.BIN_LOCATION = "$HOME/.local/bin/rheph";
 
   # https://devenv.sh/packages/
   packages = [
@@ -53,15 +52,15 @@ in
   scripts.build-profile.exec = ''cargo build --profile profiling'';
   scripts.run-profile.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
   scripts.run-samply-profile.exec = ''samply record --unstable-presymbolicate $DEVENV_ROOT/target/profiling/rheph "''${@}"'';
-  scripts.pheph.exec = ''$DEVENV_ROOT/target/profiling/rheph "''${@}"'';
 
   scripts.build-release.exec = ''cargo build --profile release'';
   scripts.run-release.exec = ''$DEVENV_ROOT/target/release/rheph "''${@}"'';
-  scripts.rheph.exec = ''$DEVENV_ROOT/target/release/rheph "''${@}"'';
 
-  scripts.dheph.exec = ''cargo run -q -- "''${@}"'';
+  scripts.rheph.exec = ''cargo run -q --profile release -- "''${@}"'';
+  scripts.pheph.exec = ''cargo run -q --profile profiling -- "''${@}"'';
+  scripts.dheph.exec = ''cargo run -q --profile debug -- "''${@}"'';
 
-  scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz  --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
+  scripts.rsync-to.exec = ''cd $DEVENV_ROOT && rsync -avz --exclude='.heph3/' --exclude='.claude/' --exclude='**/.claude/' --exclude='target/' --exclude='.devenv/' --exclude='.git/' $DEVENV_ROOT/ "''${@}"'';
 
   scripts.install-dev.exec = ''
     sed "s|<HEPH_SRC_ROOT>|$(pwd)|g" < $DEVENV_ROOT/scripts/dev.sh > /tmp/heph
@@ -71,15 +70,15 @@ in
   '';
 
   scripts.install-dev-build.exec = ''
-    cargo build --target-dir /tmp/rheph
+    cargo build
     mkdir -p $(dirname "${binLocation}")
-    mv /tmp/rheph/debug/rheph "${binLocation}"
+    cp $DEVENV_ROOT/target/debug/rheph "${binLocation}"
   '';
 
   scripts.install-release-build.exec = ''
-    cargo build --release --target-dir /tmp/rheph
+    cargo build --release
     mkdir -p $(dirname "${binLocation}")
-    mv /tmp/rheph/release/rheph "${binLocation}"
+    cp $DEVENV_ROOT/target/release/rheph "${binLocation}"
   '';
 
 
