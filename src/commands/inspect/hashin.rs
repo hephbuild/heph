@@ -1,23 +1,57 @@
-use crate::commands::bootstrap;
-use crate::htaddr;
-use anyhow::Context;
+use std::sync::Arc;
 
-#[derive(clap::Args)]
+use anyhow::Context;
+use async_trait::async_trait;
+
+use crate::commands::bootstrap;
+use crate::engine::Engine;
+use crate::htaddr::{self, Addr};
+use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+
+#[derive(clap::Args, Clone)]
 pub struct Args {
     /// Target address
     pub addr: String,
 }
 
-#[tokio::main]
-pub async fn execute(args: &Args) -> anyhow::Result<()> {
-    let e = bootstrap::new_engine()?;
+struct HashinApp {
+    engine: Arc<Engine>,
+    addr: Addr,
+}
 
+#[async_trait(?Send)]
+impl App for HashinApp {
+    type Output = ();
+
+    fn label(&self) -> String {
+        format!("Hashin {}", self.addr.format())
+    }
+
+    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        let res = self
+            .engine
+            .clone()
+            .meta(self.engine.new_state(), &self.addr)
+            .await?;
+
+        let out = BufferedStdout::new(&ctx);
+        out.println(&res.hashin);
+        out.close().await;
+
+        Ok(())
+    }
+}
+
+pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, no_tui)
+}
+
+#[tokio::main]
+async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
-
-    let res = e.clone().meta(e.clone().new_state(), &addr).await?;
-
-    println!("{}", res.hashin);
-
-    Ok(())
+    let engine = bootstrap::new_engine()?;
+    let app = HashinApp { engine, addr };
+    let interactive = tui::should_use_tui(no_tui);
+    tui::run_app(app, sink, interactive).await
 }

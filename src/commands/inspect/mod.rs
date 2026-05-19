@@ -6,6 +6,8 @@ mod spec;
 
 use clap::{Args, Subcommand};
 
+use crate::tui::LogSink;
+
 #[derive(Args)]
 pub struct InspectArgs {
     /// Subcommand to execute
@@ -28,9 +30,9 @@ pub enum InspectCommands {
 }
 
 impl InspectArgs {
-    pub fn execute(&self) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
         if let Some(cmd) = &self.command {
-            return cmd.execute();
+            return cmd.execute(sink, no_tui);
         }
 
         Ok(())
@@ -38,13 +40,13 @@ impl InspectArgs {
 }
 
 impl InspectCommands {
-    pub fn execute(&self) -> anyhow::Result<()> {
+    pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
         match self {
             InspectCommands::Packages(args) => packages::execute(args),
-            InspectCommands::Hashin(args) => hashin::execute(args),
-            InspectCommands::Hashout(args) => hashout::execute(args),
-            InspectCommands::Spec(args) => spec::execute(args),
-            InspectCommands::Deps(args) => deps::execute(args),
+            InspectCommands::Hashin(args) => hashin::execute(args, sink, no_tui),
+            InspectCommands::Hashout(args) => hashout::execute(args, sink, no_tui),
+            InspectCommands::Spec(args) => spec::execute(args, sink, no_tui),
+            InspectCommands::Deps(args) => deps::execute(args, sink, no_tui),
         }
     }
 }

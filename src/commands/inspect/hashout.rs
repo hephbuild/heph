@@ -1,34 +1,64 @@
-use crate::commands::bootstrap;
-use crate::engine::{OutputMatcher, ResultOptions};
-use crate::htaddr;
-use anyhow::Context;
+use std::sync::Arc;
 
-#[derive(clap::Args)]
+use anyhow::Context;
+use async_trait::async_trait;
+
+use crate::commands::bootstrap;
+use crate::engine::{Engine, OutputMatcher, ResultOptions};
+use crate::htaddr::{self, Addr};
+use crate::tui::{self, App, AppContext, BufferedStdout, LogSink};
+
+#[derive(clap::Args, Clone)]
 pub struct Args {
     /// Target address
     pub addr: String,
 }
 
-#[tokio::main]
-pub async fn execute(args: &Args) -> anyhow::Result<()> {
-    let e = bootstrap::new_engine()?;
+struct HashoutApp {
+    engine: Arc<Engine>,
+    addr: Addr,
+}
 
-    let addr =
-        htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
+#[async_trait(?Send)]
+impl App for HashoutApp {
+    type Output = ();
 
-    let res = e
-        .clone()
-        .result_addr(
-            e.clone().new_state(),
-            &addr,
-            OutputMatcher::None,
-            &ResultOptions::default(),
-        )
-        .await?;
-
-    for art in &res.artifacts_meta {
-        println!("{}", art.hashout);
+    fn label(&self) -> String {
+        format!("Hashout {}", self.addr.format())
     }
 
-    Ok(())
+    async fn run(self, ctx: AppContext) -> anyhow::Result<()> {
+        let res = self
+            .engine
+            .clone()
+            .result_addr(
+                self.engine.new_state(),
+                &self.addr,
+                OutputMatcher::None,
+                &ResultOptions::default(),
+            )
+            .await?;
+
+        let out = BufferedStdout::new(&ctx);
+        for art in &res.artifacts_meta {
+            out.println(&art.hashout);
+        }
+        out.close().await;
+
+        Ok(())
+    }
+}
+
+pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    execute_async(args.clone(), sink, no_tui)
+}
+
+#[tokio::main]
+async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
+    let addr =
+        htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
+    let engine = bootstrap::new_engine()?;
+    let app = HashoutApp { engine, addr };
+    let interactive = tui::should_use_tui(no_tui);
+    tui::run_app(app, sink, interactive).await
 }

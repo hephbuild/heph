@@ -28,7 +28,7 @@ impl Commands {
     pub fn execute(&self, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
         match self {
             Commands::Run(args) => run::execute(args, sink, no_tui),
-            Commands::Inspect(args) => args.execute(),
+            Commands::Inspect(args) => args.execute(sink, no_tui),
             Commands::Query(args) => query::execute(args, sink, no_tui),
             Commands::Version(args) => version::execute(args),
         }
