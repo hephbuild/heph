@@ -243,13 +243,24 @@ pub mod targetdef {
     use crate::engine::driver::TargetAddr;
     use crate::htaddr::Addr;
     use itertools::Itertools;
+    use serde::Serialize;
     use std::any::Any;
     use std::sync::Arc;
 
-    #[derive(Clone)]
+    fn serialize_hash<S: serde::Serializer>(h: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(h.len() * 2);
+        for b in h {
+            write!(out, "{:02x}", b).map_err(serde::ser::Error::custom)?;
+        }
+        s.serialize_str(&out)
+    }
+
+    #[derive(Clone, Serialize)]
     pub struct TargetDef {
         pub addr: Addr,
         pub labels: Vec<String>,
+        #[serde(skip)]
         pub raw_def: Arc<dyn Any + Send + Sync>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
@@ -257,6 +268,7 @@ pub mod targetdef {
         pub cache: bool,
         pub disable_remote_cache: bool,
         pub pty: bool,
+        #[serde(serialize_with = "serialize_hash")]
         pub hash: Vec<u8>,
         pub transparent: bool,
     }
@@ -280,37 +292,38 @@ pub mod targetdef {
         }
     }
 
-    #[derive(Clone, Hash)]
+    #[derive(Clone, Hash, Serialize)]
     pub struct Input {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
     }
 
-    #[derive(Clone, Hash, PartialEq)]
+    #[derive(Clone, Hash, PartialEq, Serialize)]
     pub enum InputMode {
         Standard,
         Link,
         Tool,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Serialize)]
     pub struct Output {
         pub group: String,
         pub paths: Vec<path::Path>,
     }
 
     pub mod path {
+        use serde::Serialize;
         use std::fmt::Display;
 
-        #[derive(Clone)]
+        #[derive(Clone, Serialize)]
         pub struct Path {
             pub content: Content,
             pub codegen_tree: CodegenMode,
             pub collect: bool,
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Serialize)]
         pub enum Content {
             FilePath(String),
             DirPath(String),
@@ -327,7 +340,7 @@ pub mod targetdef {
             }
         }
 
-        #[derive(Clone)]
+        #[derive(Clone, Serialize)]
         pub enum CodegenMode {
             None,
             Copy,

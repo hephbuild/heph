@@ -1,3 +1,4 @@
+mod def;
 mod deps;
 mod hashin;
 mod hashout;
@@ -25,6 +26,8 @@ pub enum InspectCommands {
     Hashout(hashout::Args),
     /// Prints target spec
     Spec(spec::Args),
+    /// Prints target def
+    Def(def::Args),
     /// Prints target spec
     Deps(deps::Args),
 }
@@ -46,6 +49,7 @@ impl InspectCommands {
             InspectCommands::Hashin(args) => hashin::execute(args, sink, no_tui),
             InspectCommands::Hashout(args) => hashout::execute(args, sink, no_tui),
             InspectCommands::Spec(args) => spec::execute(args, sink, no_tui),
+            InspectCommands::Def(args) => def::execute(args, sink, no_tui),
             InspectCommands::Deps(args) => deps::execute(args, sink, no_tui),
         }
     }
