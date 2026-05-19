@@ -200,25 +200,11 @@ pub struct ResultOptions {
     pub interactive: Option<InteractiveWrapper>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OutputMatcher {
     None,
     All,
     Exact(Vec<String>),
-}
-
-impl OutputMatcher {
-    fn cache_key(&self) -> String {
-        match self {
-            OutputMatcher::None => "none".to_string(),
-            OutputMatcher::All => "all".to_string(),
-            OutputMatcher::Exact(names) => {
-                let mut sorted = names.clone();
-                sorted.sort();
-                format!("exact:{}", sorted.join(","))
-            }
-        }
-    }
 }
 
 struct ExecuteOptions<'a> {
@@ -294,7 +280,13 @@ impl Engine {
             return Ok(Arc::new(merged));
         }
 
-        let key = format!("{}:{}", addr.format(), outputs.cache_key());
+        // Sort Exact output names so distinct caller-side orderings of the same
+        // logical output set share one memoizer entry.
+        let mut key_outputs = outputs.clone();
+        if let OutputMatcher::Exact(names) = &mut key_outputs {
+            names.sort();
+        }
+        let key = (addr.clone(), key_outputs);
         let opts = opts.clone();
         let res = rs.data.mem_result.once(key, enclose!((self => engine, rs, addr, outputs) move || async move {
             engine.inner_result_addr(rs, &addr, outputs, &opts).await.map(Arc::new).with_context(|| format!("result: {}", addr))
@@ -431,7 +423,7 @@ impl Engine {
         let use_tmp_cache = !opts.def.target.cache || opts.shell;
         let interactive = opts.interactive.clone();
         let shell = opts.shell;
-        let key = format!("{}:{}", addr.format(), hashin);
+        let key = (addr.clone(), hashin.clone());
 
         rs.data
             .mem_execute_cache

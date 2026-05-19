@@ -2,7 +2,7 @@ use crate::engine::Engine;
 use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
 use crate::engine::provider::TargetSpec;
-use crate::engine::result::{ArtifactMeta, ExtendedTargetDef};
+use crate::engine::result::{ArtifactMeta, ExtendedTargetDef, OutputMatcher};
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::Addr;
@@ -52,8 +52,9 @@ pub struct RequestStateData {
     pub request_id: String,
     pub ctoken: StdCancellationToken,
     pub dep_dag: Mutex<DepDag>,
-    pub mem_result: Memoizer<String, Result<Arc<crate::engine::result::EResult>, ArcErr>>,
-    pub mem_execute_cache: Memoizer<String, ExecuteCacheResult>,
+    pub mem_result:
+        Memoizer<(Addr, OutputMatcher), Result<Arc<crate::engine::result::EResult>, ArcErr>>,
+    pub mem_execute_cache: Memoizer<(Addr, String), ExecuteCacheResult>,
     pub mem_meta: Memoizer<Addr, Result<ResultMeta, ArcErr>>,
     pub mem_spec: Memoizer<Addr, Result<Arc<TargetSpec>, ArcErr>>,
     pub mem_def: Memoizer<Addr, Result<Arc<ExtendedTargetDef>, ArcErr>>,

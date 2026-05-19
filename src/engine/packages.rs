@@ -25,7 +25,7 @@ impl Engine {
             let req = ListPackagesRequest {
                 prefix: prefix.clone(),
             };
-            let key = format!("{}:{:}", provider.name, prefix);
+            let key = format!("{}:{}", provider.name, prefix);
 
             let pkgs = rs
                 .data
