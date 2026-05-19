@@ -19,7 +19,7 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoEmbedDriver;
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, serde::Serialize)]
 enum EmbedVariant {
     Embed,
     /// embed_patterns ∪ test_embed_patterns / embed_files ∪ test_embed_files —
@@ -43,7 +43,7 @@ impl Hash for EmbedVariant {
 /// (paths, file resolution semantics) changes.
 const GO_EMBED_FORMAT_VERSION: u32 = 3;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct GoEmbedDef {
     variant: EmbedVariant,
     golist_origin_id: String,

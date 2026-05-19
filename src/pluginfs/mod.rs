@@ -131,6 +131,7 @@ impl EProvider for Provider {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 enum FsDef {
     File {
         path: String,

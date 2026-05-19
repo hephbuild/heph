@@ -13,6 +13,7 @@ use xxhash_rust::xxh3::Xxh3;
 
 pub const DRIVER_NAME: &str = "group";
 
+#[derive(serde::Serialize)]
 struct GroupDef;
 
 pub struct Driver;

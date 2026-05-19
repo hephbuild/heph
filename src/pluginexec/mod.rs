@@ -31,7 +31,7 @@ pub struct Driver {
     wrap_run_shell: fn(&std::path::PathBuf, &Vec<String>) -> anyhow::Result<Vec<String>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct TargetDef {
     pub run: Vec<String>,
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,

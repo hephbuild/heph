@@ -256,12 +256,31 @@ pub mod targetdef {
         s.serialize_str(&out)
     }
 
+    pub trait RawDef: erased_serde::Serialize + Any + Send + Sync {
+        fn as_any(&self) -> &(dyn Any + Send + Sync);
+    }
+
+    impl<T: erased_serde::Serialize + Any + Send + Sync> RawDef for T {
+        fn as_any(&self) -> &(dyn Any + Send + Sync) {
+            self
+        }
+    }
+
+    erased_serde::serialize_trait_object!(RawDef);
+
+    fn serialize_raw_def<S: serde::Serializer>(
+        d: &Arc<dyn RawDef>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        erased_serde::serialize(&**d, s)
+    }
+
     #[derive(Clone, Serialize)]
     pub struct TargetDef {
         pub addr: Addr,
         pub labels: Vec<String>,
-        #[serde(skip)]
-        pub raw_def: Arc<dyn Any + Send + Sync>,
+        #[serde(serialize_with = "serialize_raw_def")]
+        pub raw_def: Arc<dyn RawDef>,
         pub inputs: Vec<Input>,
         pub outputs: Vec<Output>,
         pub support_files: Vec<path::Path>,
@@ -276,10 +295,11 @@ pub mod targetdef {
     impl TargetDef {
         pub fn def<T: 'static>(&self) -> &T {
             self.raw_def
+                .as_any()
                 .downcast_ref::<T>()
                 .expect("TargetDef raw_def type mismatch: wrong type T requested")
         }
-        pub fn set_def<T: Send + Sync + 'static>(&mut self, def: T) {
+        pub fn set_def<T: serde::Serialize + Send + Sync + 'static>(&mut self, def: T) {
             self.raw_def = Arc::new(def);
         }
         pub fn output_names(&self) -> Vec<String> {

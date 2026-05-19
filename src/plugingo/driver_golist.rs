@@ -32,7 +32,7 @@ impl GoGolistDriver {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize)]
 struct GoGolistDef {
     import_path: String,
     goos: String,

@@ -96,6 +96,7 @@ impl EProvider for Provider {
     }
 }
 
+#[derive(serde::Serialize)]
 struct HostBinDef {
     bin_name: String,
 }
