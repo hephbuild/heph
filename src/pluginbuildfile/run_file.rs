@@ -147,7 +147,7 @@ impl Sandbox {
 
         if !m.is_empty() {
             let unknown_keys: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!("Unknown entries found: {:?}", unknown_keys)
+            anyhow::bail!("unknown entries found: {:?}", unknown_keys)
         }
 
         Ok(sandbox)
@@ -334,8 +334,8 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
                         Ok(None)
                     }
                     "transitive" => {
-                        transitive =
-                            Sandbox::from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))?;
+                        transitive = Sandbox::from(starlark_to_rust(e.1), &PkgBuf::from(extra.pkg))
+                            .with_context(|| "transitive")?;
                         Ok(None)
                     }
                     _ => Ok(Some((e.0.as_str().to_string(), starlark_to_rust(e.1)))),

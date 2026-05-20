@@ -22,7 +22,12 @@ impl Engine {
             .once(
                 addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
-                    let def = Arc::clone(&engine).get_def(rs.clone(), &addr).await?;
+                    // _no_track: result_addr (the upstream entry point) already set
+                    // parent=addr before getting here, so tracked get_def would
+                    // record addr→addr (spurious self-cycle).
+                    let def = Arc::clone(&engine)
+                        .get_def_no_track(rs.clone(), &addr)
+                        .await?;
                     let mut visited = FxHashSet::default();
                     let expanded = Arc::clone(&engine)
                         .expand_inputs(

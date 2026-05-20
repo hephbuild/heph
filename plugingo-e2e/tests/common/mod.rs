@@ -61,7 +61,8 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
                     addr: "//@heph/bin:go".to_string(),
                     driver: "bash".to_string(),
                     run: Some(format!("cp -p \"{go_bin}\" go")),
-                    out: Some("go".to_string()),
+                    out: std::collections::HashMap::from([(String::new(), vec!["go".to_string()])]),
+                    codegen: None,
                     deps: Default::default(),
                     labels: vec![],
                 }])

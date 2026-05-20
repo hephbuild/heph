@@ -14,6 +14,10 @@ pub const PACKAGE: &str = "@heph/query";
 
 pub struct Provider;
 
+// `_origin` is stamped on query input addrs by the engine's `rewrite_query_inputs`
+// so each requesting target gets its own `mem_spec` cell. `build_matcher` reads
+// no `_` prefixed keys — they exist purely to differentiate addr identity and
+// are intentionally ignored here.
 fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyhow::Result<Matcher> {
     let mut matchers: Vec<Matcher> = vec![];
 
@@ -131,7 +135,8 @@ mod tests {
             addr: format!("//{pkg}:{name}"),
             driver: "exec".to_string(),
             run: None,
-            out: None,
+            out: HashMap::new(),
+            codegen: None,
             deps: HashMap::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }

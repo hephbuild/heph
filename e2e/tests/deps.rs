@@ -4,12 +4,20 @@ use common::Workspace;
 use rheph::pluginstatictarget::Target;
 use std::collections::HashMap;
 
+fn out_map(out: Option<&str>) -> HashMap<String, Vec<String>> {
+    match out {
+        Some(o) => HashMap::from([(String::new(), vec![o.to_string()])]),
+        None => HashMap::new(),
+    }
+}
+
 fn target(addr: &str, run: &str, out: Option<&str>) -> Target {
     Target {
         addr: addr.to_string(),
         driver: "bash".to_string(),
         run: Some(run.to_string()),
-        out: out.map(|s| s.to_string()),
+        out: out_map(out),
+        codegen: None,
         deps: HashMap::new(),
         labels: vec![],
     }
@@ -25,7 +33,8 @@ fn target_with_deps(
         addr: addr.to_string(),
         driver: "bash".to_string(),
         run: Some(run.to_string()),
-        out: out.map(|s| s.to_string()),
+        out: out_map(out),
+        codegen: None,
         deps,
         labels: vec![],
     }

@@ -15,7 +15,10 @@ pub struct Target {
     pub addr: String,
     pub driver: String,
     pub run: Option<String>,
-    pub out: Option<String>,
+    /// Output groups keyed by name. Empty = no outputs. Use the empty string
+    /// as a key to mirror the buildfile-side default group.
+    pub out: HashMap<String, Vec<String>>,
+    pub codegen: Option<String>,
     pub deps: HashMap<String, Vec<String>>,
     pub labels: Vec<String>,
 }
@@ -34,8 +37,19 @@ impl Provider {
                 if let Some(run) = t.run {
                     config.insert("run".to_string(), TargetSpecValue::String(run));
                 }
-                if let Some(out) = t.out {
-                    config.insert("out".to_string(), TargetSpecValue::String(out));
+                if !t.out.is_empty() {
+                    let map = t
+                        .out
+                        .into_iter()
+                        .map(|(k, vs)| {
+                            let list = vs.into_iter().map(TargetSpecValue::String).collect();
+                            (k, TargetSpecValue::List(list))
+                        })
+                        .collect();
+                    config.insert("out".to_string(), TargetSpecValue::Map(map));
+                }
+                if let Some(codegen) = t.codegen {
+                    config.insert("codegen".to_string(), TargetSpecValue::String(codegen));
                 }
                 if !t.deps.is_empty() {
                     let map = t

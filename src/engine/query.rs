@@ -48,7 +48,13 @@ impl Engine {
                                     MatchResult::MatchYes => yield addr,
                                     MatchResult::MatchNo => {}
                                     MatchResult::MatchShrug => {
-                                        let def = Arc::clone(&self).get_def(rs.clone(), &addr).await?;
+                                        let def = match Arc::clone(&self).get_def(rs.clone(), &addr).await {
+                                            Ok(def) => def,
+                                            // Cycle means this candidate transitively depends on the
+                                            // query caller — it cannot be a result. Skip it.
+                                            Err(e) if downcast_chain_ref::<CycleError>(&e).is_some() => continue,
+                                            Err(e) => Err(e)?,
+                                        };
 
                                         if m.matches(&def.target_def) == MatchResult::MatchYes {
                                             yield addr;
@@ -79,7 +85,8 @@ mod tests {
             addr: format!("//{pkg}:{name}"),
             driver: "exec".to_string(),
             run: None,
-            out: None,
+            out: HashMap::new(),
+            codegen: None,
             deps: HashMap::new(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
         }

@@ -7,11 +7,14 @@ use rheph::htpkg::PkgBuf;
 use rheph::pluginstatictarget::Target;
 
 fn bash(addr: &str, run: &str, out: &str) -> Target {
+    let mut out_map = std::collections::HashMap::new();
+    out_map.insert(String::new(), vec![out.to_string()]);
     Target {
         addr: addr.to_string(),
         driver: "bash".to_string(),
         run: Some(run.to_string()),
-        out: Some(out.to_string()),
+        out: out_map,
+        codegen: None,
         deps: Default::default(),
         labels: vec![],
     }

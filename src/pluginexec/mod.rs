@@ -38,6 +38,7 @@ struct TargetDef {
     pub run: Vec<String>,
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
     pub tool_group_inputs: BTreeMap<String, Vec<Input>>,
+    pub env: BTreeMap<String, String>,
     pub pass_env: BTreeMap<String, String>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, String>,
@@ -279,6 +280,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
             run: spec.run,
             dep_group_inputs,
             tool_group_inputs,
+            env: spec.env.into_iter().collect(),
             pass_env,
             runtime_pass_env: spec.runtime_pass_env,
             runtime_env: spec.runtime_env,
@@ -466,6 +468,10 @@ impl Driver {
             self.search_path.join(":")
         };
         env.insert("PATH".to_string(), path_value);
+
+        for (k, v) in &def.env {
+            env.insert(k.clone(), v.clone());
+        }
 
         let pkg_prefix = {
             let pkg = rreq.target.addr.package.as_str();
@@ -895,6 +901,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
@@ -945,6 +952,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
@@ -1001,6 +1009,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],
@@ -1063,6 +1072,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec![run_cmd.to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env,
                 runtime_pass_env,
@@ -1292,6 +1302,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run,
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     group.to_string(),
                     vec![Input {
@@ -1419,6 +1430,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo $PATH".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
                     vec![Input {
@@ -1493,6 +1505,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
                 runtime_pass_env: vec![],

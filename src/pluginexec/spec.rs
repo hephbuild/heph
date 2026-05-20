@@ -13,6 +13,7 @@ pub(crate) struct TargetSpec {
     pub outputs: HashMap<String, Vec<String>>,
     pub codegen: CodegenMode,
     pub cache: TargetSpecCache,
+    pub env: HashMap<String, String>,
     pub pass_env: Vec<String>,
     pub runtime_pass_env: Vec<String>,
     pub runtime_env: HashMap<String, String>,
@@ -38,6 +39,7 @@ impl TargetSpec {
             codegen: CodegenMode::None,
             deps: HashMap::new(),
             tools: HashMap::new(),
+            env: HashMap::new(),
             pass_env: vec![],
             runtime_pass_env: vec![],
             runtime_env: HashMap::new(),
@@ -80,6 +82,10 @@ impl TargetSpec {
             spec.tools = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
         };
 
+        if let Some(v) = m.remove("env") {
+            spec.env = parse_map_string_string(v).with_context(|| "parse `env`")?;
+        };
+
         if let Some(v) = m.remove("pass_env") {
             spec.pass_env = parse_strings(v).with_context(|| "parse `pass_env`")?;
         };
@@ -94,7 +100,7 @@ impl TargetSpec {
 
         if !m.is_empty() {
             let unknown_keys: Vec<&str> = m.into_keys().collect();
-            anyhow::bail!("Unknown entries found: {:?}", unknown_keys)
+            anyhow::bail!("unknown entries found: {:?}", unknown_keys)
         }
 
         Ok(spec)

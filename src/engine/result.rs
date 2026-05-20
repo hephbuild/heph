@@ -249,7 +249,10 @@ impl Engine {
         // Handled before the memoizer: nothing to deduplicate for groups, and calling
         // result_addr recursively here is safe because #[async_recursion] boxes the future,
         // breaking the Send inference cycle that would occur inside the memoizer closure.
-        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
+        //
+        // Use _no_track: result_addr just updated `parent → addr` above and set parent=addr;
+        // calling tracked get_def would try to record addr→addr (spurious self-cycle).
+        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
         if def.target_def.transparent {
             let mut opts = opts.clone();
             if opts.shell {
@@ -331,8 +334,12 @@ impl Engine {
         outputs: OutputMatcher,
         opts: &ResultOptions,
     ) -> anyhow::Result<EResult> {
-        let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
-        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
+        // Use _no_track: result_addr set parent=addr before entering the memoizer,
+        // so tracked variants would record addr→addr.
+        let spec = Arc::clone(&self)
+            .get_spec_no_track(rs.clone(), addr)
+            .await?;
+        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
 
         // `link` and `meta` operate on disjoint data once `def` is known: link
         // resolves output names + filter checks across the input list; meta
@@ -486,8 +493,34 @@ impl Engine {
         }))
     }
 
+    /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
+    /// before delegating to the memoizer. External callers (provider executor,
+    /// query stream, `collect_transitive_deps`) use this.
+    ///
+    /// Internal callers that have already done their own cycle tracking + parent
+    /// update (e.g. `result_addr`, `inner_result_addr`, `get_def_inner` resolving
+    /// its own spec) must call `get_def_no_track` instead to avoid a spurious
+    /// self-edge.
     #[async_recursion]
     pub async fn get_def(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
+        if let Some(ref parent) = rs.parent {
+            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
+            dag.add_dep(parent, addr).map_err(|_e| {
+                anyhow::Error::new(CycleError {
+                    from: parent.clone(),
+                    to: addr.clone(),
+                })
+            })?;
+        }
+        let rs = rs.with_parent(addr.clone());
+        self.get_def_no_track(rs, addr).await
+    }
+
+    pub async fn get_def_no_track(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
@@ -497,7 +530,7 @@ impl Engine {
             .once(
                 addr.clone(),
                 enclose!((self => engine, rs, addr) move || async move {
-                    engine.get_def_inner(rs, &addr, true).await
+                    engine.get_def_inner(rs, &addr, true).await.with_context(|| format!("get_def: {}", addr))
                 }),
             )
             .await
@@ -509,7 +542,19 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        self.get_def_inner(rs, addr, false).await
+        if let Some(ref parent) = rs.parent {
+            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
+            dag.add_dep(parent, addr).map_err(|_e| {
+                anyhow::Error::new(CycleError {
+                    from: parent.clone(),
+                    to: addr.clone(),
+                })
+            })?;
+        }
+        let rs = rs.with_parent(addr.clone());
+        self.get_def_inner(rs, addr, false)
+            .await
+            .with_context(|| format!("get_def: {}", addr))
     }
 
     async fn get_def_inner(
@@ -518,7 +563,11 @@ impl Engine {
         addr: &Addr,
         apply_transitive: bool,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
-        let spec = Arc::clone(&self).get_spec(rs.clone(), addr).await?;
+        // Use _no_track: get_def (or get_direct_def) already updated parent=addr
+        // before invoking us. Tracked get_spec here would record addr→addr.
+        let spec = Arc::clone(&self)
+            .get_spec_no_track(rs.clone(), addr)
+            .await?;
 
         let driver = match self.drivers_by_name.get(&spec.driver) {
             Some(driver) => driver,
@@ -535,8 +584,8 @@ impl Engine {
                 rs.ctoken(),
             )
             .await
-            .with_context(|| "parse")?;
-        let def = res.target_def;
+            .with_context(|| format!("{} parse", driver.name))?;
+        let def = rewrite_query_inputs(res.target_def, addr);
 
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
@@ -626,7 +675,30 @@ impl Engine {
         Ok(sb)
     }
 
+    /// Public, tracked. Records `parent → addr` in `dep_dag` and updates `parent`
+    /// before delegating to the memoizer. External callers use this.
+    ///
+    /// Internal callers that have already done their own cycle tracking + parent
+    /// update must call `get_spec_no_track` instead.
     pub async fn get_spec(
+        self: Arc<Self>,
+        rs: Arc<RequestState>,
+        addr: &Addr,
+    ) -> anyhow::Result<Arc<TargetSpec>> {
+        if let Some(ref parent) = rs.parent {
+            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
+            dag.add_dep(parent, addr).map_err(|_e| {
+                anyhow::Error::new(CycleError {
+                    from: parent.clone(),
+                    to: addr.clone(),
+                })
+            })?;
+        }
+        let rs = rs.with_parent(addr.clone());
+        self.get_spec_no_track(rs, addr).await
+    }
+
+    pub async fn get_spec_no_track(
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
@@ -691,6 +763,31 @@ impl Engine {
 
         Err(TargetNotFoundError { addr: addr.clone() }.into())
     }
+}
+
+/// Stamp `_origin = dest.hash_str()` onto any input whose ref points at a
+/// query target. Each requesting target gets its own per-dest variant of the
+/// query addr, so distinct `mem_spec` cells are computed per dest — the
+/// engine-level cycle detector then trips per dest (excluding only the
+/// requesting target from its own query) instead of poisoning a shared cell.
+///
+/// Hash stability: `def.hash` already covers `def.addr`, and the annotation
+/// is a pure function of `def.addr`. Same dest ⇒ same annotation; different
+/// dests live in distinct `mem_def` cells already keyed by addr. No re-hash.
+fn rewrite_query_inputs(
+    mut def: crate::engine::driver::targetdef::TargetDef,
+    dest: &Addr,
+) -> crate::engine::driver::targetdef::TargetDef {
+    let origin = dest.hash_str();
+    for input in &mut def.inputs {
+        let r = &input.r#ref.r#ref;
+        if r.package.as_str() == crate::pluginquery::PACKAGE {
+            let mut args = r.args.clone();
+            args.insert("_origin".to_string(), origin.clone());
+            input.r#ref.r#ref = Addr::new(r.package.clone(), r.name.clone(), args);
+        }
+    }
+    def
 }
 
 #[cfg(test)]
@@ -827,6 +924,294 @@ mod tests {
             "expected 'target not found' in error chain: {full_chain}"
         );
 
+        Ok(())
+    }
+
+    use crate::pluginstatictarget;
+    use std::collections::HashMap;
+
+    fn static_target(addr: &str, labels: &[&str], deps: &[&str]) -> pluginstatictarget::Target {
+        let mut deps_map = HashMap::new();
+        if !deps.is_empty() {
+            deps_map.insert("".to_string(), deps.iter().map(|s| s.to_string()).collect());
+        }
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some("true".to_string()),
+            out: HashMap::new(),
+            codegen: None,
+            deps: deps_map,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Target with a named codegen-tree output. Used to exercise matchers
+    /// (like `TreeOutputTo`) that only resolve at def level — those force the
+    /// executor's query to call `get_def(candidate)`, which is the path the
+    /// dep_dag cycle detector guards.
+    fn codegen_target(
+        addr: &str,
+        labels: &[&str],
+        out_group: &str,
+        deps: &[&str],
+    ) -> pluginstatictarget::Target {
+        let mut deps_map = HashMap::new();
+        if !deps.is_empty() {
+            deps_map.insert("".to_string(), deps.iter().map(|s| s.to_string()).collect());
+        }
+        let mut out = HashMap::new();
+        out.insert(out_group.to_string(), vec![format!("{out_group}/")]);
+        pluginstatictarget::Target {
+            addr: addr.to_string(),
+            driver: "exec".to_string(),
+            run: Some("true".to_string()),
+            out,
+            codegen: Some("copy".to_string()),
+            deps: deps_map,
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn engine_with(targets: Vec<pluginstatictarget::Target>) -> anyhow::Result<Arc<Engine>> {
+        let root = tempdir()?;
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+        })?;
+        engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
+        let provider = pluginstatictarget::Provider::new(targets)?;
+        engine.register_provider(move |_| Box::new(provider))?;
+        Ok(Arc::new(engine))
+    }
+
+    #[tokio::test]
+    async fn get_spec_cross_target_cycle_returns_typed_error() -> anyhow::Result<()> {
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &[]),
+            static_target("//pkg:b", &[], &[]),
+        ])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let addr_b = crate::htaddr::parse_addr("//pkg:b")?;
+        let rs = engine.new_state();
+
+        // a→b: succeeds, records edge.
+        engine
+            .clone()
+            .get_spec(rs.with_parent(addr_a.clone()), &addr_b)
+            .await?;
+
+        // b→a: would close the cycle. Cycle check fires before memoizer.
+        let err = engine
+            .clone()
+            .get_spec(rs.with_parent(addr_b.clone()), &addr_a)
+            .await
+            .err()
+            .expect("expected cycle error");
+        assert!(
+            err.downcast_ref::<CycleError>().is_some(),
+            "expected CycleError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_def_cross_target_cycle_returns_typed_error() -> anyhow::Result<()> {
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &[]),
+            static_target("//pkg:b", &[], &[]),
+        ])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let addr_b = crate::htaddr::parse_addr("//pkg:b")?;
+        let rs = engine.new_state();
+
+        engine
+            .clone()
+            .get_def(rs.with_parent(addr_a.clone()), &addr_b)
+            .await?;
+
+        let err = engine
+            .clone()
+            .get_def(rs.with_parent(addr_b.clone()), &addr_a)
+            .await
+            .err()
+            .expect("expected cycle error");
+        assert!(
+            err.downcast_ref::<CycleError>().is_some(),
+            "expected CycleError, got: {err:#}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_input_annotated_with_origin_hash() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target(
+            "//pkg:a",
+            &[],
+            &["//@heph/query:q@label=foo"],
+        )])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let rs = engine.new_state();
+
+        let def = engine.clone().get_def(rs, &addr_a).await?;
+        let input = def
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("expected query input");
+        let origin = input
+            .r#ref
+            .r#ref
+            .args
+            .get("_origin")
+            .expect("query input must be annotated with _origin");
+        assert_eq!(*origin, addr_a.hash_str());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_with_cyclic_candidate_skips_and_completes() -> anyhow::Result<()> {
+        // //pkg:a is a codegen target whose output tree matches the query's
+        // tree_output_to. The matcher resolves only at def level, so the
+        // executor's query must call get_def(a). a's def transitively re-asks
+        // for the same (per-dest annotated) query → cycle → a must be skipped
+        // from its own query result. b is a sibling codegen target with no
+        // query dep, so it has no cycle and is included.
+        let q = "//@heph/query:q@tree_output_to=gen";
+        let engine = engine_with(vec![
+            codegen_target("//pkg:a", &[], "gen", &[q]),
+            codegen_target("//pkg:b", &[], "gen", &[]),
+        ])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let rs = engine.new_state();
+
+        // Must not hang. Pre-fix this either deadlocked or surfaced
+        // MemoizerCycleError (when HEPH_DEBUG_MEMOIZER_CYCLE=1).
+        let def_a = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.clone().get_def(rs.clone(), &addr_a),
+        )
+        .await
+        .expect("get_def hung — cycle detection failed")?;
+
+        // Pull the annotated query input out of a's def, then call get_spec on it
+        // and assert a is excluded from the query result.
+        let q_addr = def_a
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("annotated query input")
+            .r#ref
+            .r#ref
+            .clone();
+        let q_spec = engine.clone().get_spec(engine.new_state(), &q_addr).await?;
+        let deps = match q_spec.config.get("deps") {
+            Some(crate::loosespecparser::TargetSpecValue::List(l)) => l,
+            other => panic!("expected deps list, got {other:?}"),
+        };
+        let dep_strs: Vec<String> = deps
+            .iter()
+            .map(|v| match v {
+                crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                other => panic!("expected string dep, got {other:?}"),
+            })
+            .collect();
+        assert!(
+            !dep_strs.iter().any(|s| s.starts_with("//pkg:a")),
+            "cyclic candidate //pkg:a must be excluded from query result, got {dep_strs:?}"
+        );
+        assert!(
+            dep_strs.iter().any(|s| s.starts_with("//pkg:b")),
+            "non-cyclic candidate //pkg:b must be present, got {dep_strs:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_with_two_dests_returns_per_target_results() -> anyhow::Result<()> {
+        // Two codegen targets both depending on the tree_output_to query. Per-
+        // dest _origin annotation gives each its own mem_spec cell — a's query
+        // excludes a but includes b, b's excludes b but includes a. Pre-fix
+        // (shared cell) the first to compute would cache a result missing
+        // itself, and the second target would see wrong data.
+        let q = "//@heph/query:q@tree_output_to=gen";
+        let engine = engine_with(vec![
+            codegen_target("//pkg:a", &[], "gen", &[q]),
+            codegen_target("//pkg:b", &[], "gen", &[q]),
+        ])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let addr_b = crate::htaddr::parse_addr("//pkg:b")?;
+        let rs = engine.new_state();
+
+        let def_a = engine.clone().get_def(rs.clone(), &addr_a).await?;
+        let def_b = engine.clone().get_def(rs.clone(), &addr_b).await?;
+
+        let q_addr_a = def_a
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("a's query input")
+            .r#ref
+            .r#ref
+            .clone();
+        let q_addr_b = def_b
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("b's query input")
+            .r#ref
+            .r#ref
+            .clone();
+        assert_ne!(
+            q_addr_a, q_addr_b,
+            "per-dest annotation must produce distinct query addrs"
+        );
+
+        let extract_deps = |spec: &TargetSpec| -> Vec<String> {
+            match spec.config.get("deps") {
+                Some(crate::loosespecparser::TargetSpecValue::List(l)) => l
+                    .iter()
+                    .map(|v| match v {
+                        crate::loosespecparser::TargetSpecValue::String(s) => s.clone(),
+                        other => panic!("expected string, got {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("expected deps list, got {other:?}"),
+            }
+        };
+
+        let spec_a = engine
+            .clone()
+            .get_spec(engine.new_state(), &q_addr_a)
+            .await?;
+        let spec_b = engine
+            .clone()
+            .get_spec(engine.new_state(), &q_addr_b)
+            .await?;
+        let deps_a = extract_deps(&spec_a);
+        let deps_b = extract_deps(&spec_b);
+
+        assert!(
+            !deps_a.iter().any(|s| s.starts_with("//pkg:a")),
+            "a's query must exclude a, got {deps_a:?}"
+        );
+        assert!(
+            deps_a.iter().any(|s| s.starts_with("//pkg:b")),
+            "a's query must include b, got {deps_a:?}"
+        );
+        assert!(
+            !deps_b.iter().any(|s| s.starts_with("//pkg:b")),
+            "b's query must exclude b, got {deps_b:?}"
+        );
+        assert!(
+            deps_b.iter().any(|s| s.starts_with("//pkg:a")),
+            "b's query must include a, got {deps_b:?}"
+        );
         Ok(())
     }
 

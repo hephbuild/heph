@@ -43,7 +43,9 @@ impl Engine {
         rs: Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<ResultMeta> {
-        let def = Arc::clone(&self).get_def(rs.clone(), addr).await?;
+        // _no_track: meta is invoked from inner_result_addr after parent was
+        // already set to addr — tracked get_def would record addr→addr.
+        let def = Arc::clone(&self).get_def_no_track(rs.clone(), addr).await?;
         let results = self.clone().inputs_result_meta(rs.clone(), addr).await?;
 
         let hashouts: Vec<String> = results
