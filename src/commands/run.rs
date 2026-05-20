@@ -100,26 +100,27 @@ impl App for RunApp {
             m => self.engine.clone().result(rs, &m, &opts).await?,
         };
 
-        let _guard = ctx.pause().await;
-        if self.args.cat_out {
-            for r in &result {
-                for a in &r.artifacts {
-                    for e in a.walk()? {
-                        io::copy(&mut e?.data, &mut io::stdout())?;
+        tui::paused!(ctx, {
+            if self.args.cat_out {
+                for r in &result {
+                    for a in &r.artifacts {
+                        for e in a.walk()? {
+                            io::copy(&mut e?.data, &mut io::stdout())?;
+                        }
                     }
                 }
-            }
-        } else if self.args.list_out {
-            for r in &result {
-                for a in &r.artifacts {
-                    for e in a.walk()? {
-                        println!("{}", e?.path.display());
+            } else if self.args.list_out {
+                for r in &result {
+                    for a in &r.artifacts {
+                        for e in a.walk()? {
+                            println!("{}", e?.path.display());
+                        }
                     }
                 }
+            } else {
+                println!("{} matched", result.len());
             }
-        } else {
-            println!("{} matched", result.len());
-        }
+        });
 
         Ok(())
     }
