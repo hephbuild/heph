@@ -31,6 +31,7 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
         },
     )
     .context("building inline terminal")?;
+    terminal.autoresize()?;
 
     let ctx = AppContext::with_control(sink.clone(), control_tx);
     let app_fut = app.run(ctx);

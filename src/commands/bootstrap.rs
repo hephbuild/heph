@@ -1,5 +1,7 @@
 use crate::engine::config_file;
-use crate::{engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin};
+use crate::{
+    engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, plugintextfile,
+};
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     let root = match engine::get_root() {
@@ -27,6 +29,7 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     e.register_driver(Box::new(pluginfs::Driver))?;
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
     e.register_driver(Box::new(pluginhostbin::Driver))?;
+    e.register_driver(Box::new(plugintextfile::Driver))?;
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
     e.register_provider_factory("buildfile", |root, opts| {
@@ -89,6 +92,7 @@ mod tests {
         e.register_driver(Box::new(pluginfs::Driver))?;
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
         e.register_driver(Box::new(pluginhostbin::Driver))?;
+        e.register_driver(Box::new(plugintextfile::Driver))?;
 
         e.register_provider_factory("buildfile", |root, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(

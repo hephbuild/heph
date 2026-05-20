@@ -20,5 +20,6 @@ pub mod plugingroup;
 pub mod pluginhostbin;
 pub mod pluginquery;
 pub mod pluginstatictarget;
+pub mod plugintextfile;
 pub mod tui;
 pub mod version;
