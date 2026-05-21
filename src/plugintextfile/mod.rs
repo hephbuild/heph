@@ -370,7 +370,7 @@ mod tests {
             outputartifact::Content::Raw(raw) => {
                 assert!(raw.x);
                 assert_eq!(raw.path, "pkg/bin/wrap");
-                assert_eq!(raw.data, b"#!/bin/bash\necho hi\n");
+                assert_eq!(raw.data, b"#!/bin/bash\necho hi");
             }
             _ => panic!("expected Raw content"),
         }

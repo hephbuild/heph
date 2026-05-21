@@ -30,12 +30,26 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // Hidden re-exec for the process supervisor sidecar. Must run BEFORE any
+    // logging, tokio runtime, or clap parsing so the supervisor stays small
+    // and predictable. Format: `rheph __supervisor --ipc-fd <N>`.
+    if let Some(fd) = parse_supervisor_args() {
+        rheph::process_supervisor::run_supervisor_main(fd);
+    }
+
     let start = Instant::now();
     let sink = log::init();
     rheph::tui::panic::install(sink.clone());
     info!(version = VERSION, "Application starting");
     defer! {
         info!(duration = %format_duration(start.elapsed()), "Application finished");
+    }
+
+    // Fork the supervisor sidecar that will SIGKILL every tracked child
+    // process group when this binary exits — including hard-kill scenarios.
+    if let Err(e) = rheph::process_supervisor::init() {
+        error!(error = %format!("{e:#}"), "Failed to start process supervisor");
+        return ExitCode::FAILURE;
     }
 
     let cli = Cli::parse();
@@ -111,4 +125,18 @@ fn main() -> ExitCode {
     }
 
     result
+}
+
+/// Detect the hidden `__supervisor --ipc-fd <N>` invocation without dragging
+/// clap into a hot path that runs at every startup.
+fn parse_supervisor_args() -> Option<i32> {
+    let mut args = std::env::args().skip(1);
+    if args.next()? != "__supervisor" {
+        return None;
+    }
+    let flag = args.next()?;
+    if flag != "--ipc-fd" {
+        return None;
+    }
+    args.next()?.parse::<i32>().ok()
 }

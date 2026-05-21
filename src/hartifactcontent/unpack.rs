@@ -155,9 +155,7 @@ mod tests {
         fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
             Ok(Box::new(Cursor::new(self.0.clone())))
         }
-        fn walk(
-            &self,
-        ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             Ok(Box::new(TarWalker::new(Cursor::new(self.0.clone()))?))
         }
         fn hashout(&self) -> anyhow::Result<String> {

@@ -12,6 +12,7 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
+use crate::process_supervisor;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -749,6 +750,8 @@ impl Driver {
                     Ok(())
                 });
             }
+            // setsid is already done above (PTY mode); just chain pdeathsig.
+            process_supervisor::apply_pdeathsig(&mut cmd);
         } else {
             cmd.stdin(if rreq.stdin.is_some() {
                 Stdio::piped()
@@ -757,9 +760,20 @@ impl Driver {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+            // Put the child in its own session/process group so the supervisor
+            // can reap the whole tree (incl. grandchildren) with killpg.
+            process_supervisor::apply_isolation(&mut cmd);
         }
 
         let mut child = cmd.spawn().with_context(|| "spawn child process")?;
+        // Pid == pgid because of setsid in pre_exec; register with supervisor
+        // so a hard-kill of rheph still reaps the whole process tree.
+        let child_pid: i32 = child
+            .id()
+            .context("spawned child has no pid")?
+            .try_into()
+            .context("child pid does not fit in i32")?;
+        let _track_guard = process_supervisor::register_child(child_pid);
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -825,7 +839,10 @@ impl Driver {
 
         tokio::select! {
             _ = ctoken.cancelled() => {
-                child.start_kill()?;
+                // SIGKILL the whole process group, not just the direct child,
+                // so a target that itself forked (e.g. bash with `&` jobs)
+                // doesn't leave grandchildren behind.
+                process_supervisor::kill_pgid(child_pid);
                 child.wait().await?;
                 anyhow::bail!("cancelled")
             },

@@ -10,13 +10,8 @@ pub struct WalkEntry {
 }
 
 pub enum WalkEntryKind {
-    File {
-        data: Box<dyn io::Read>,
-        x: bool,
-    },
-    Symlink {
-        target: PathBuf,
-    },
+    File { data: Box<dyn io::Read>, x: bool },
+    Symlink { target: PathBuf },
 }
 
 #[derive(Clone, Copy)]

@@ -22,5 +22,6 @@ pub mod pluginnix;
 pub mod pluginquery;
 pub mod pluginstatictarget;
 pub mod plugintextfile;
+pub mod process_supervisor;
 pub mod tui;
 pub mod version;

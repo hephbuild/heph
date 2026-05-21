@@ -8,6 +8,7 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::{TargetSpecValue, parse_string, parse_strings};
+use crate::process_supervisor;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -151,9 +152,19 @@ async fn lock_flake_url(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     passthrough_nix_env(&mut cmd);
+    process_supervisor::apply_isolation(&mut cmd);
     let child = cmd.spawn().context("spawn nix flake metadata")?;
+    let child_pid: i32 = child
+        .id()
+        .context("nix flake metadata child has no pid")?
+        .try_into()
+        .context("nix flake metadata pid does not fit in i32")?;
+    let _track_guard = process_supervisor::register_child(child_pid);
     let output = tokio::select! {
-        _ = ctoken.cancelled() => anyhow::bail!("nix flake metadata cancelled"),
+        _ = ctoken.cancelled() => {
+            process_supervisor::kill_pgid(child_pid);
+            anyhow::bail!("nix flake metadata cancelled");
+        }
         res = child.wait_with_output() => res.context("wait for nix flake metadata")?,
     };
     if !output.status.success() {
@@ -401,13 +412,23 @@ impl ManagedDriver for Driver {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         passthrough_nix_env(&mut cmd);
+        process_supervisor::apply_isolation(&mut cmd);
 
         let child = cmd
             .spawn()
             .with_context(|| format!("spawn nix build for {addr_str}"))?;
+        let child_pid: i32 = child
+            .id()
+            .context("nix build child has no pid")?
+            .try_into()
+            .context("nix build pid does not fit in i32")?;
+        let _track_guard = process_supervisor::register_child(child_pid);
 
         let output = tokio::select! {
-            _ = ctoken.cancelled() => anyhow::bail!("nix build cancelled"),
+            _ = ctoken.cancelled() => {
+                process_supervisor::kill_pgid(child_pid);
+                anyhow::bail!("nix build cancelled");
+            }
             res = child.wait_with_output() => res.context("wait for nix build")?,
         };
 

@@ -130,4 +130,5 @@ erased-serde = "0.4"
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"
+tempfile = "3"
 

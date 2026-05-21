@@ -1076,18 +1076,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn read_tar_entries(buf: &[u8]) -> Vec<(std::path::PathBuf, tar::EntryType, Option<std::path::PathBuf>)> {
+    fn read_tar_entries(
+        buf: &[u8],
+    ) -> Vec<(
+        std::path::PathBuf,
+        tar::EntryType,
+        Option<std::path::PathBuf>,
+    )> {
         let mut archive = tar::Archive::new(std::io::Cursor::new(buf));
         let mut out = Vec::new();
         for entry in archive.entries().expect("entries") {
             let entry = entry.expect("entry");
             let path = entry.path().expect("path").into_owned();
             let et = entry.header().entry_type();
-            let link = entry
-                .link_name()
-                .ok()
-                .flatten()
-                .map(|p| p.into_owned());
+            let link = entry.link_name().ok().flatten().map(|p| p.into_owned());
             out.push((path, et, link));
         }
         out
@@ -1122,7 +1124,11 @@ mod tests {
             .expect("link.txt entry");
         assert_eq!(link.1, tar::EntryType::Symlink);
         assert_eq!(link.2.as_deref(), Some(std::path::Path::new("real.txt")));
-        assert!(entries.iter().any(|(p, et, _)| p.ends_with("real.txt") && et.is_file()));
+        assert!(
+            entries
+                .iter()
+                .any(|(p, et, _)| p.ends_with("real.txt") && et.is_file())
+        );
     }
 
     #[cfg(unix)]

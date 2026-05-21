@@ -12,6 +12,7 @@ use crate::loosespecparser::{parse_map_string_strings, parse_string, parse_strin
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
+use crate::process_supervisor;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -275,19 +276,28 @@ impl ManagedDriver for GoGolistDriver {
 
         cmd_args.push(def.import_path.clone());
 
-        let child = tokio::process::Command::new(&go_bin)
-            .args(&cmd_args)
+        let mut cmd = tokio::process::Command::new(&go_bin);
+        cmd.args(&cmd_args)
             .current_dir(&req.sandbox_pkg_dir)
             .env_clear()
             .envs(&env)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        process_supervisor::apply_isolation(&mut cmd);
+        let child = cmd
             .spawn()
             .with_context(|| format!("spawn go list for {}", def.import_path))?;
+        let child_pid: i32 = child
+            .id()
+            .context("go list child has no pid")?
+            .try_into()
+            .context("go list pid does not fit in i32")?;
+        let _track_guard = process_supervisor::register_child(child_pid);
 
         let output = tokio::select! {
             _ = ctoken.cancelled() => {
+                process_supervisor::kill_pgid(child_pid);
                 anyhow::bail!("go list cancelled");
             }
             res = child.wait_with_output() => {
