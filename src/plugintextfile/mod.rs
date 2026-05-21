@@ -65,7 +65,9 @@ impl crate::engine::driver::Driver for Driver {
             .collect();
 
         let text = take_string(&mut m, "text")?
-            .ok_or_else(|| anyhow::anyhow!("textfile driver requires `text`"))?;
+            .ok_or_else(|| anyhow::anyhow!("textfile driver requires `text`"))?
+            .trim()
+            .to_string();
         let out_rel =
             take_string(&mut m, "out")?.unwrap_or_else(|| req.target_spec.addr.name.clone());
         let executable = take_bool(&mut m, "executable")?.unwrap_or(false);

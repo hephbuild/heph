@@ -57,28 +57,22 @@ impl Sandbox {
         let mut m: HashMap<&str, &TargetSpecValue> =
             m.iter().map(|(k, v)| (k.as_str(), v)).collect();
 
-        let mut sandbox = Self {
-            ..Default::default()
-        };
+        let mut sandbox = Self::default();
 
         if let Some(v) = m.remove("deps") {
-            sandbox.deps = parse_map_string_strings(v)?
-                .iter()
-                .enumerate()
-                .flat_map(|(i, (k, ss))| {
-                    ss.iter().map(move |s| {
-                        Ok(Dep {
-                            r#ref: TargetAddr::parse(s, pkg)?,
-                            mode: Mode::None,
-                            group: k.to_string(),
-                            runtime: true,
-                            hash: true,
-                            id: format!("dep|{}|{}", k, i),
-                        })
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-                .with_context(|| "parse `deps`")?;
+            let parsed = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
+            for (i, (k, ss)) in parsed.iter().enumerate() {
+                for s in ss {
+                    sandbox.push_dep(Dep {
+                        r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `deps`")?,
+                        mode: Mode::None,
+                        group: k.to_string(),
+                        runtime: true,
+                        hash: true,
+                        id: format!("dep|{}|{}", k, i),
+                    });
+                }
+            }
         }
 
         if let Some(v) = m.remove("env") {
@@ -100,21 +94,17 @@ impl Sandbox {
         }
 
         if let Some(v) = m.remove("tools") {
-            sandbox.tools = parse_map_string_strings(v)?
-                .iter()
-                .enumerate()
-                .flat_map(|(i, (k, ss))| {
-                    ss.iter().map(move |s| {
-                        Ok(Tool {
-                            r#ref: TargetAddr::parse(s, pkg)?,
-                            group: k.to_string(),
-                            hash: true,
-                            id: format!("tool|{}|{}", k, i),
-                        })
-                    })
-                })
-                .collect::<anyhow::Result<Vec<_>>>()
-                .with_context(|| "parse `tools`")?;
+            let parsed = parse_map_string_strings(v).with_context(|| "parse `tools`")?;
+            for (i, (k, ss)) in parsed.iter().enumerate() {
+                for s in ss {
+                    sandbox.push_tool(Tool {
+                        r#ref: TargetAddr::parse(s, pkg).with_context(|| "parse `tools`")?,
+                        group: k.to_string(),
+                        hash: true,
+                        id: format!("tool|{}|{}", k, i),
+                    });
+                }
+            }
         }
 
         if let Some(v) = m.remove("pass_env") {

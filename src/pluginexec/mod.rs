@@ -475,6 +475,10 @@ impl Driver {
             self.search_path.join(":")
         };
         env.insert("PATH".to_string(), path_value);
+        env.insert(
+            "WORKSPACE_ROOT".to_string(),
+            req.sandbox_ws_dir.to_string_lossy().to_string(),
+        );
 
         for (k, v) in &def.env {
             env.insert(k.clone(), v.clone());
@@ -517,7 +521,10 @@ impl Driver {
             };
 
             let mut list_f = {
-                let path = req.sandbox_dir.join(format!("dep_{}.list", group));
+                let path = req
+                    .sandbox_dir
+                    .join("list")
+                    .join(format!("dep_{}.list", group));
                 env.entry(format!("LIST_{src_key}")).or_default().push_str(
                     path.as_path()
                         .to_str()
@@ -569,14 +576,22 @@ impl Driver {
             std::fs::create_dir_all(&bin_dir)
                 .with_context(|| format!("create tool bin dir {:?}", bin_dir))?;
 
+            // Symlink each unique `bin/<filename>` exactly once. Two tool
+            // inputs producing the same filename — whether from the same
+            // source target referenced through multiple groups, or from
+            // distinct fs:* wrappers around the same on-disk binary — are
+            // treated as the same logical entry. The address-level
+            // invariant (no two engine inputs share `(r#ref, group)`) is
+            // enforced upstream by `Sandbox::merge_sandbox`; here we just
+            // skip the redundant symlink to avoid EEXIST.
+            //
+            // Multi-output tool refs produce N RunInputs sharing one
+            // origin_id; the bridge appends every output's file path to the
+            // same list file. engine/link.rs validates 1 FilePath per output.
+            let mut linked: std::collections::HashSet<std::ffi::OsString> =
+                std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
                 for input in inputs {
-                    // Multi-output tool refs produce N RunInputs sharing one
-                    // origin_id; the bridge appends every output's file path
-                    // to the same `input_<origin_id>.list`. Read that list
-                    // exactly once and symlink each entry into bin/. Validated
-                    // by engine/link.rs to be 1 FilePath per output, so all
-                    // entries here are distinct binaries.
                     let Some(m) = req
                         .inputs
                         .iter()
@@ -599,27 +614,19 @@ impl Driver {
                             continue;
                         }
                         any = true;
-                        let filename =
-                            std::path::Path::new(&file_path)
-                                .file_name()
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!("tool file path has no filename: {}", file_path)
-                                })?;
-                        let bin_path = bin_dir.join(filename);
+                        let filename = std::path::Path::new(&file_path)
+                            .file_name()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("tool file path has no filename: {}", file_path)
+                            })?
+                            .to_os_string();
+                        if !linked.insert(filename.clone()) {
+                            continue;
+                        }
+                        let bin_path = bin_dir.join(&filename);
                         #[cfg(unix)]
                         std::os::unix::fs::symlink(&file_path, &bin_path).with_context(|| {
-                            let existing = std::fs::read_link(&bin_path)
-                                .map(|p| format!("symlink->{:?}", p))
-                                .or_else(|_| {
-                                    std::fs::symlink_metadata(&bin_path)
-                                        .map(|m| format!("{:?}", m.file_type()))
-                                })
-                                .unwrap_or_else(|_| "<unreadable>".to_string());
-                            format!(
-                                "symlink tool {file_path:?} -> {bin_path:?} (group={group}, \
-                                 origin_id={}, existing_at_dest={existing})",
-                                input.origin_id
-                            )
+                            format!("symlink tool {file_path:?} -> {bin_path:?}")
                         })?;
                         #[cfg(not(unix))]
                         std::fs::copy(&file_path, &bin_path)
@@ -1318,6 +1325,31 @@ mod tests {
         tool_path: &std::path::Path,
         list_dir: &std::path::Path,
     ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
+        make_tool_managed_input_full(
+            origin_id,
+            tool_path,
+            list_dir,
+            crate::htaddr::Addr::default(),
+            "",
+        )
+    }
+
+    fn make_tool_managed_input_with_source(
+        origin_id: &str,
+        tool_path: &std::path::Path,
+        list_dir: &std::path::Path,
+        source_addr: crate::htaddr::Addr,
+    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
+        make_tool_managed_input_full(origin_id, tool_path, list_dir, source_addr, "")
+    }
+
+    fn make_tool_managed_input_full(
+        origin_id: &str,
+        tool_path: &std::path::Path,
+        list_dir: &std::path::Path,
+        source_addr: crate::htaddr::Addr,
+        hashout: &str,
+    ) -> anyhow::Result<crate::engine::driver_managed::ManagedRunInput> {
         use crate::engine::driver::{RunInput, inputartifact, outputartifact};
         let list_path = list_dir.join(format!("input_{origin_id}.list"));
         std::fs::write(&list_path, format!("{}\n", tool_path.display()))?;
@@ -1335,11 +1367,11 @@ mod tests {
                             path: "".to_string(),
                             x: false,
                         }),
-                        hashout: "".to_string(),
+                        hashout: hashout.to_string(),
                     }),
                 },
                 origin_id: origin_id.to_string(),
-                source_addr: crate::htaddr::Addr::default(),
+                source_addr,
                 filters: vec![],
                 annotations: BTreeMap::new(),
             },
@@ -1847,6 +1879,191 @@ mod tests {
         assert!(
             !tmp.path().join("bin").exists(),
             "bin/ should not be created when no tools"
+        );
+        Ok(())
+    }
+
+    /// Two tool inputs producing the same `bin/<filename>` are silently
+    /// deduped at symlink time — first wins, second is skipped. Address-level
+    /// uniqueness (no two engine inputs share `(r#ref, group)`) is enforced
+    /// upstream by `Sandbox::merge_sandbox`; here we just avoid EEXIST.
+    #[tokio::test]
+    async fn overlapping_tool_filenames_dedupe_silently() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let dir_a = tmp.path().join("a");
+        let dir_b = tmp.path().join("b");
+        std::fs::create_dir_all(&dir_a)?;
+        std::fs::create_dir_all(&dir_b)?;
+        let tool_a = make_tool_binary(&dir_a, "node", "echo a")?;
+        let tool_b = make_tool_binary(&dir_b, "node", "echo b")?;
+
+        let mi_a = make_tool_managed_input("tool|a|0", &tool_a, tmp.path())?;
+        let mi_b = make_tool_managed_input("tool|b|0", &tool_b, tmp.path())?;
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["true".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([(
+                    "".to_string(),
+                    vec![
+                        Input {
+                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            mode: InputMode::Tool,
+                            origin_id: "tool|a|0".to_string(),
+                            annotations: BTreeMap::new(),
+                        },
+                        Input {
+                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            mode: InputMode::Tool,
+                            origin_id: "tool|b|0".to_string(),
+                            annotations: BTreeMap::new(),
+                        },
+                    ],
+                )]),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![mi_a, mi_b],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert!(
+            tmp.path().join("bin").join("node").exists(),
+            "bin/node must exist after dedup"
+        );
+        Ok(())
+    }
+
+    /// Same source target referenced via two tool groups (e.g. `tools = [t]`
+    /// in two different groups) must not surface an overlap — symlink the
+    /// destination once and continue.
+    #[tokio::test]
+    async fn same_source_tool_filename_dedupes_silently() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        let tool_path = make_tool_binary(tmp.path(), "node", "echo ok")?;
+        let src = Addr::new(
+            crate::htpkg::PkgBuf::from("pkg"),
+            "node_tool".to_string(),
+            BTreeMap::new(),
+        );
+
+        // Two ManagedRunInputs from the same source target, distinct
+        // origin_ids (different tool groups).
+        let mi_a =
+            make_tool_managed_input_with_source("tool|g1|0", &tool_path, tmp.path(), src.clone())?;
+        let mi_b = make_tool_managed_input_with_source("tool|g2|0", &tool_path, tmp.path(), src)?;
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["true".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([
+                    (
+                        "g1".to_string(),
+                        vec![Input {
+                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            mode: InputMode::Tool,
+                            origin_id: "tool|g1|0".to_string(),
+                            annotations: BTreeMap::new(),
+                        }],
+                    ),
+                    (
+                        "g2".to_string(),
+                        vec![Input {
+                            r#ref: crate::engine::driver::TargetAddr::default(),
+                            mode: InputMode::Tool,
+                            origin_id: "tool|g2|0".to_string(),
+                            annotations: BTreeMap::new(),
+                        }],
+                    ),
+                ]),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: vec![mi_a, mi_b],
+                },
+                &ctoken,
+            )
+            .await?;
+
+        assert!(
+            tmp.path().join("bin").join("node").exists(),
+            "bin/node must exist after dedup",
         );
         Ok(())
     }

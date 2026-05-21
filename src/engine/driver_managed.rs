@@ -143,6 +143,9 @@ impl ManagedDriverBridge {
         let ws_dir = sandbox_dir.join("ws");
         fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
+        let list_dir = sandbox_dir.join("list");
+        fs::create_dir_all(&list_dir).with_context(|| format!("create list dir {:?}", list_dir))?;
+
         let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
         fs::create_dir_all(&sandbox_pkg_dir)
             .with_context(|| format!("create pkg dir: {:?}", sandbox_pkg_dir))?;
@@ -150,13 +153,13 @@ impl ManagedDriverBridge {
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
             let unpack_root = if let Some(unpack_root) = input.annotations.get("unpack_root") {
-                &req.sandbox_dir.join(unpack_root)
+                &req.sandbox_dir.join(format!("exec_{}", unpack_root))
             } else {
                 &ws_dir
             };
             fs::create_dir_all(unpack_root)
                 .with_context(|| format!("create unpack root {:?}", unpack_root))?;
-            let input_list = unpack_root.join(format!("input_{}.list", input.origin_id));
+            let input_list = list_dir.join(format!("input_{}.list", input.origin_id));
             let filters = &input.filters;
             let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
                 None
@@ -184,6 +187,16 @@ impl ManagedDriverBridge {
             });
         }
 
+        // No path-level overlap check here. Two inputs landing at the same
+        // unpacked path is a legitimate user pattern (e.g.
+        // `deps = {"root": file(x), "_": glob(...)}` where the glob expands
+        // to include the root file; the dep groups are split for env-var
+        // routing — `$SRC_ROOT` vs `$SRC_`). Targets are deterministic, so
+        // `fs::File::create`'s truncate semantics produce the right bytes
+        // regardless of write order. The address-level invariant — no two
+        // engine inputs share the same `(r#ref, group[, mode])` — is
+        // enforced upstream by `Sandbox::merge_sandbox`.
+        //
         // BTreeMap so serialization to source_map.json is byte-deterministic across runs;
         // HashMap iter order varies per-process and breaks downstream output hashing/caching.
         // Only inputs unpacked into ws_dir contribute to source_map; tool/other-root inputs
@@ -399,7 +412,14 @@ mod tests {
         source_addr: Addr,
         filters: Vec<String>,
     ) -> RunInput {
-        make_raw_input_with_annotations(origin_id, rel_path, source_addr, filters, BTreeMap::new())
+        make_raw_input_full(
+            origin_id,
+            rel_path,
+            source_addr,
+            filters,
+            BTreeMap::new(),
+            "hash",
+        )
     }
 
     fn make_raw_input_with_annotations(
@@ -408,6 +428,24 @@ mod tests {
         source_addr: Addr,
         filters: Vec<String>,
         annotations: BTreeMap<String, String>,
+    ) -> RunInput {
+        make_raw_input_full(
+            origin_id,
+            rel_path,
+            source_addr,
+            filters,
+            annotations,
+            "hash",
+        )
+    }
+
+    fn make_raw_input_full(
+        origin_id: &str,
+        rel_path: &str,
+        source_addr: Addr,
+        filters: Vec<String>,
+        annotations: BTreeMap<String, String>,
+        hashout: &str,
     ) -> RunInput {
         RunInput {
             artifact: inputartifact::InputArtifact {
@@ -422,7 +460,7 @@ mod tests {
                         path: rel_path.to_string(),
                         x: false,
                     }),
-                    hashout: "hash".to_string(),
+                    hashout: hashout.to_string(),
                 }),
             },
             origin_id: origin_id.to_string(),
@@ -514,7 +552,7 @@ mod tests {
         };
         bridge().run(req, &ct).await?;
 
-        let list_path = sandbox.join("ws").join("input_dep0.list");
+        let list_path = sandbox.join("list").join("input_dep0.list");
         let list_content = fs::read_to_string(&list_path)?;
         assert!(
             list_content.is_empty(),
@@ -641,17 +679,17 @@ mod tests {
         bridge().run(req, &ct).await?;
 
         assert!(sandbox.join("ws").join("pkg").join("foo.go").exists());
-        assert!(sandbox.join("ws").join("input_dep0.list").exists());
+        assert!(sandbox.join("list").join("input_dep0.list").exists());
 
         assert!(
             sandbox
-                .join("tools")
+                .join("exec_tools")
                 .join("pkg")
                 .join("bin")
                 .join("cc")
                 .exists()
         );
-        assert!(sandbox.join("tools").join("input_tool|cc|0.list").exists());
+        assert!(sandbox.join("list").join("input_tool|cc|0.list").exists());
 
         // Tools must not bleed into ws/, and source deps must not leak into tools/.
         assert!(
@@ -662,7 +700,13 @@ mod tests {
                 .join("cc")
                 .exists()
         );
-        assert!(!sandbox.join("tools").join("pkg").join("foo.go").exists());
+        assert!(
+            !sandbox
+                .join("exec_tools")
+                .join("pkg")
+                .join("foo.go")
+                .exists()
+        );
 
         // Tool input is omitted from source_map (out-of-workspace).
         let map: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(
@@ -670,6 +714,88 @@ mod tests {
         )?)?;
         assert_eq!(map.get("pkg/foo.go").map(|s| s.as_str()), Some("//pkg:gen"));
         assert!(!map.keys().any(|k| k.contains("cc")));
+        Ok(())
+    }
+
+    // Path-level overlap across inputs is legitimate (e.g. user splits deps
+    // into env-routed groups: `deps = {"root": f, "_": glob_including_f}`).
+    // Bridge must silently accept it — targets are deterministic so the
+    // truncating second write produces the right bytes regardless. Engine
+    // invariants on input addresses live upstream in `Sandbox::merge_sandbox`.
+    #[tokio::test]
+    async fn overlapping_inputs_at_same_path_succeed() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        // Distinct source targets, same dest path — the `fs:file` + `fs:glob`
+        // pattern. Must not bail.
+        let src_file = Addr::new(
+            PkgBuf::from("@heph/fs"),
+            "file".to_string(),
+            BTreeMap::new(),
+        );
+        let src_glob = Addr::new(
+            PkgBuf::from("@heph/fs"),
+            "glob".to_string(),
+            BTreeMap::new(),
+        );
+        let a = make_raw_input("dep|root|0", "pkg/foo.yaml", src_file, vec![]);
+        let b = make_raw_input("dep|_|0", "pkg/foo.yaml", src_glob, vec![]);
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![a, b],
+            hashin: "hash",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+        assert!(sandbox.join("ws").join("pkg").join("foo.yaml").exists());
+        Ok(())
+    }
+
+    // Multi-output tool refs intentionally share one origin_id across N
+    // RunInputs (the bridge merges them into one list file). Must not trip
+    // any check.
+    #[tokio::test]
+    async fn shared_origin_multi_output_succeeds() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let src_addr = Addr::new(PkgBuf::from("pkg"), "t".to_string(), BTreeMap::new());
+
+        // Two RunInputs sharing one origin_id, distinct paths.
+        let a = make_raw_input_with_annotations(
+            "tool||0",
+            "pkg/bin/node",
+            src_addr.clone(),
+            vec![],
+            BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+        );
+        let b = make_raw_input_with_annotations(
+            "tool||0",
+            "pkg/bin/npm",
+            src_addr,
+            vec![],
+            BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+        );
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![a, b],
+            hashin: "hash",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?; // must not bail
         Ok(())
     }
 }

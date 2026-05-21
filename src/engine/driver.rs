@@ -153,33 +153,76 @@ pub mod sandbox {
     use crate::engine::driver::TargetAddr;
     use serde::{Deserialize, Serialize};
     use smart_default::SmartDefault;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     #[derive(Default, Clone, Debug, Serialize, Deserialize)]
     pub struct Sandbox {
-        pub tools: Vec<Tool>,
-        pub deps: Vec<Dep>,
+        pub(crate) tools: Vec<Tool>,
+        pub(crate) deps: Vec<Dep>,
         pub env: HashMap<String, Env>,
+        // Membership indexes for O(log n) dedup. Derived from tools/deps; not
+        // serialized so wire format and hashin bytes are unchanged.
+        #[serde(skip)]
+        tool_keys: BTreeSet<String>,
+        #[serde(skip)]
+        dep_keys: BTreeSet<String>,
+    }
+
+    fn tool_key(t: &Tool) -> String {
+        // \x1f (unit separator) keeps fields unambiguous even if a value
+        // contains characters from the other field.
+        format!("{}\x1f{}", t.r#ref, t.group)
+    }
+
+    fn dep_key(d: &Dep) -> String {
+        format!("{}\x1f{}\x1f{:?}", d.r#ref, d.group, d.mode)
     }
 
     impl Sandbox {
+        /// Append a tool, deduped by `(r#ref, group)`. Returns true if inserted.
+        pub fn push_tool(&mut self, t: Tool) -> bool {
+            if self.tool_keys.insert(tool_key(&t)) {
+                self.tools.push(t);
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Append a dep, deduped by `(r#ref, group, mode)`. Returns true if inserted.
+        pub fn push_dep(&mut self, d: Dep) -> bool {
+            if self.dep_keys.insert(dep_key(&d)) {
+                self.deps.push(d);
+                true
+            } else {
+                false
+            }
+        }
+
+        pub fn tools(&self) -> &[Tool] {
+            &self.tools
+        }
+
+        pub fn deps(&self) -> &[Dep] {
+            &self.deps
+        }
+
         pub(crate) fn merge_sandbox(&mut self, inbound: Sandbox, id: String) {
             for t in inbound.tools {
-                self.tools.push(Tool {
+                self.push_tool(Tool {
                     id: format!("{}_tool_{}", id, t.id),
-                    ..t.clone()
+                    ..t
                 });
             }
 
             for d in inbound.deps {
-                self.deps.push(Dep {
+                self.push_dep(Dep {
                     id: format!("{}_dep_{}", id, d.id),
-                    ..d.clone()
-                })
+                    ..d
+                });
             }
 
-            self.env
-                .extend(inbound.env.into_iter().map(|(k, v)| (k, v.clone())));
+            self.env.extend(inbound.env);
         }
     }
 
@@ -226,6 +269,106 @@ pub mod sandbox {
     pub enum EnvValue {
         Literal(String),
         Pass,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::htpkg::PkgBuf;
+
+        fn tool(addr: &str, group: &str, id: &str) -> Tool {
+            Tool {
+                r#ref: TargetAddr::parse(addr, &PkgBuf::from("")).expect("parse addr"),
+                group: group.to_string(),
+                hash: true,
+                id: id.to_string(),
+            }
+        }
+
+        fn dep(addr: &str, group: &str, mode: Mode, id: &str) -> Dep {
+            Dep {
+                r#ref: TargetAddr::parse(addr, &PkgBuf::from("")).expect("parse addr"),
+                mode,
+                group: group.to_string(),
+                runtime: true,
+                hash: true,
+                id: id.to_string(),
+            }
+        }
+
+        #[test]
+        fn push_tool_dedupes_by_ref_and_group() {
+            let mut sb = Sandbox::default();
+            assert!(sb.push_tool(tool("//pkg:t", "", "a")));
+            assert!(!sb.push_tool(tool("//pkg:t", "", "b")));
+            assert_eq!(sb.tools().len(), 1);
+            // The first push wins (id "a" preserved).
+            assert_eq!(sb.tools()[0].id, "a");
+        }
+
+        #[test]
+        fn push_tool_allows_same_ref_different_group() {
+            let mut sb = Sandbox::default();
+            assert!(sb.push_tool(tool("//pkg:t", "g1", "a")));
+            assert!(sb.push_tool(tool("//pkg:t", "g2", "b")));
+            assert_eq!(sb.tools().len(), 2);
+        }
+
+        #[test]
+        fn push_dep_dedupes_by_ref_group_mode() {
+            let mut sb = Sandbox::default();
+            assert!(sb.push_dep(dep("//pkg:d", "", Mode::None, "a")));
+            assert!(!sb.push_dep(dep("//pkg:d", "", Mode::None, "b")));
+            assert_eq!(sb.deps().len(), 1);
+        }
+
+        #[test]
+        fn push_dep_allows_same_ref_different_mode() {
+            let mut sb = Sandbox::default();
+            assert!(sb.push_dep(dep("//pkg:d", "", Mode::None, "a")));
+            assert!(sb.push_dep(dep("//pkg:d", "", Mode::Link, "b")));
+            assert_eq!(sb.deps().len(), 2);
+        }
+
+        // Regression: two direct deps each declaring the same transitive tool
+        // produced duplicate `Input`s downstream, which then unpacked twice
+        // and trip EEXIST in pluginexec's symlink loop.
+        #[test]
+        fn merge_sandbox_dedupes_same_tool_across_transitives() {
+            let mut sb = Sandbox::default();
+
+            let mut from_a = Sandbox::default();
+            from_a.push_tool(tool("//heph:node", "", "tool||0"));
+
+            let mut from_b = Sandbox::default();
+            from_b.push_tool(tool("//heph:node", "", "tool||0"));
+
+            sb.merge_sandbox(from_a, "_transitive_aaaa_0".to_string());
+            sb.merge_sandbox(from_b, "_transitive_bbbb_1".to_string());
+
+            assert_eq!(
+                sb.tools().len(),
+                1,
+                "same (ref, group) must appear once across merges; got: {:?}",
+                sb.tools()
+            );
+            // The first merger's prefixed id wins.
+            assert_eq!(sb.tools()[0].id, "_transitive_aaaa_0_tool_tool||0");
+        }
+
+        #[test]
+        fn merge_sandbox_dedupes_same_dep_across_transitives() {
+            let mut sb = Sandbox::default();
+            let mut a = Sandbox::default();
+            a.push_dep(dep("//lib:l", "", Mode::None, "dep||0"));
+            let mut b = Sandbox::default();
+            b.push_dep(dep("//lib:l", "", Mode::None, "dep||0"));
+
+            sb.merge_sandbox(a, "x".to_string());
+            sb.merge_sandbox(b, "y".to_string());
+
+            assert_eq!(sb.deps().len(), 1);
+        }
     }
 }
 
