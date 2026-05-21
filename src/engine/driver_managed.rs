@@ -20,6 +20,7 @@ use xxhash_rust::xxh3::Xxh3;
 pub struct ManagedRunInput {
     pub input: RunInput,
     pub list_path: PathBuf,
+    pub unpack_root: PathBuf,
 }
 
 pub struct ManagedRunRequest<'a, 'io> {
@@ -140,7 +141,7 @@ impl ManagedDriverBridge {
     ) -> anyhow::Result<RunResponse> {
         let sandbox_dir = req.sandbox_dir.clone();
         let ws_dir = sandbox_dir.join("ws");
-        fs::create_dir_all(&ws_dir).with_context(|| "create ws dir")?;
+        fs::create_dir_all(&ws_dir).with_context(|| format!("create ws dir {:?}", ws_dir))?;
 
         let sandbox_pkg_dir = ws_dir.join(req.target.addr.package.as_str());
         fs::create_dir_all(&sandbox_pkg_dir)
@@ -148,7 +149,14 @@ impl ManagedDriverBridge {
 
         let mut inputs = Vec::new();
         for input in std::mem::take(&mut req.inputs) {
-            let input_list = ws_dir.join(format!("input_{}.list", input.origin_id));
+            let unpack_root = if let Some(unpack_root) = input.annotations.get("unpack_root") {
+                &req.sandbox_dir.join(unpack_root)
+            } else {
+                &ws_dir
+            };
+            fs::create_dir_all(unpack_root)
+                .with_context(|| format!("create unpack root {:?}", unpack_root))?;
+            let input_list = unpack_root.join(format!("input_{}.list", input.origin_id));
             let filters = &input.filters;
             let predicate: Option<&dyn Fn(&Path) -> bool> = if filters.is_empty() {
                 None
@@ -157,21 +165,34 @@ impl ManagedDriverBridge {
             };
             hartifactcontent::unpack::unpack(
                 input.artifact.content.as_ref(),
-                ws_dir.as_path(),
+                unpack_root.as_path(),
                 input_list.as_path(),
                 predicate,
             )
-            .with_context(|| "unpack")?;
+            .with_context(|| {
+                format!(
+                    "unpack input origin_id={} source_addr={} into {:?}",
+                    input.origin_id,
+                    input.source_addr.format(),
+                    unpack_root,
+                )
+            })?;
             inputs.push(ManagedRunInput {
                 input,
                 list_path: input_list,
+                unpack_root: unpack_root.clone(),
             });
         }
 
         // BTreeMap so serialization to source_map.json is byte-deterministic across runs;
         // HashMap iter order varies per-process and breaks downstream output hashing/caching.
+        // Only inputs unpacked into ws_dir contribute to source_map; tool/other-root inputs
+        // are out-of-workspace and have no place on a source path → addr mapping.
         let mut source_map: BTreeMap<String, String> = BTreeMap::new();
         for managed_input in &inputs {
+            if managed_input.unpack_root != ws_dir {
+                continue;
+            }
             let source_addr_str = managed_input.input.source_addr.format();
             let raw = fs::read_to_string(&managed_input.list_path)
                 .with_context(|| format!("read list {:?}", managed_input.list_path))?;
@@ -238,12 +259,21 @@ impl ManagedDriverBridge {
                     Content::DirPath(dir) => {
                         let dir_full = ws_dir.join(dir);
                         for entry in walkdir::WalkDir::new(&dir_full) {
-                            let entry = entry?;
+                            let entry = entry.with_context(|| {
+                                format!("walk output dir {:?} (group={})", dir_full, output.group)
+                            })?;
                             if entry.file_type().is_file() {
                                 let source = entry.path().to_string_lossy().into_owned();
                                 let rel = entry
                                     .path()
-                                    .strip_prefix(&ws_dir)?
+                                    .strip_prefix(&ws_dir)
+                                    .with_context(|| {
+                                        format!(
+                                            "strip ws prefix from {:?} (ws={:?})",
+                                            entry.path(),
+                                            ws_dir
+                                        )
+                                    })?
                                     .to_string_lossy()
                                     .into_owned();
                                 tar.create_file(source, rel);
@@ -252,12 +282,21 @@ impl ManagedDriverBridge {
                     }
                     Content::Glob(pattern) => {
                         let full_pattern = ws_dir.join(pattern).to_string_lossy().into_owned();
-                        for matched in glob::glob(&full_pattern)? {
-                            let matched = matched?;
+                        for matched in glob::glob(&full_pattern)
+                            .with_context(|| format!("compile output glob {full_pattern:?}"))?
+                        {
+                            let matched = matched
+                                .with_context(|| format!("glob entry from {full_pattern:?}"))?;
                             if matched.is_file() {
                                 let source = matched.to_string_lossy().into_owned();
                                 let rel = matched
-                                    .strip_prefix(&ws_dir)?
+                                    .strip_prefix(&ws_dir)
+                                    .with_context(|| {
+                                        format!(
+                                            "strip ws prefix from glob match {:?} (ws={:?})",
+                                            matched, ws_dir
+                                        )
+                                    })?
                                     .to_string_lossy()
                                     .into_owned();
                                 tar.create_file(source, rel);
@@ -268,12 +307,14 @@ impl ManagedDriverBridge {
             }
 
             let artifacts_dir = sandbox_dir.join("heph-collect-artifacts");
-            fs::create_dir_all(&artifacts_dir)?;
+            fs::create_dir_all(&artifacts_dir)
+                .with_context(|| format!("create artifacts dir {:?}", artifacts_dir))?;
             let tarpath = artifacts_dir
                 .join(format!("{}-{}.tar", hashin, output.group))
                 .to_string_lossy()
                 .into_owned();
-            let tarf = File::create(std::path::Path::new(&tarpath))?;
+            let tarf = File::create(std::path::Path::new(&tarpath))
+                .with_context(|| format!("create output tar {tarpath:?}"))?;
 
             let mut hw = HashingWriter {
                 inner: tarf,
@@ -358,6 +399,16 @@ mod tests {
         source_addr: Addr,
         filters: Vec<String>,
     ) -> RunInput {
+        make_raw_input_with_annotations(origin_id, rel_path, source_addr, filters, BTreeMap::new())
+    }
+
+    fn make_raw_input_with_annotations(
+        origin_id: &str,
+        rel_path: &str,
+        source_addr: Addr,
+        filters: Vec<String>,
+        annotations: BTreeMap<String, String>,
+    ) -> RunInput {
         RunInput {
             artifact: inputartifact::InputArtifact {
                 r#type: inputartifact::Type::Dep,
@@ -377,6 +428,7 @@ mod tests {
             origin_id: origin_id.to_string(),
             source_addr,
             filters,
+            annotations,
         }
     }
 
@@ -551,6 +603,73 @@ mod tests {
             pos_a < pos_b && pos_b < pos_c && pos_c < pos_m && pos_m < pos_z,
             "source_map.json keys must be sorted: {text}"
         );
+        Ok(())
+    }
+
+    // Per-input `unpack_root` annotation routes each input under a distinct
+    // sandbox subdir. Default → ws/, `unpack_root=tools` → tools/. Only the
+    // ws/-rooted inputs contribute to source_map (tools are not "source").
+    #[tokio::test]
+    async fn unpack_root_annotation_overrides_destination() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let sandbox = dir.path().to_path_buf();
+        let src_addr = Addr::new(PkgBuf::from("pkg"), "gen".to_string(), BTreeMap::new());
+        let tool_addr = Addr::new(PkgBuf::from("pkg"), "t".to_string(), BTreeMap::new());
+
+        let ws_input = make_raw_input("dep0", "pkg/foo.go", src_addr, vec![]);
+        let tool_input = make_raw_input_with_annotations(
+            "tool|cc|0",
+            "pkg/bin/cc",
+            tool_addr,
+            vec![],
+            BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+        );
+
+        let def = make_target_def("pkg");
+        let ct = ctoken();
+        let req = RunRequest {
+            request_id: &"rid".to_string(),
+            target: &def,
+            tree_root_path: dir.path().to_path_buf(),
+            inputs: vec![ws_input, tool_input],
+            hashin: "hash",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+        bridge().run(req, &ct).await?;
+
+        assert!(sandbox.join("ws").join("pkg").join("foo.go").exists());
+        assert!(sandbox.join("ws").join("input_dep0.list").exists());
+
+        assert!(
+            sandbox
+                .join("tools")
+                .join("pkg")
+                .join("bin")
+                .join("cc")
+                .exists()
+        );
+        assert!(sandbox.join("tools").join("input_tool|cc|0.list").exists());
+
+        // Tools must not bleed into ws/, and source deps must not leak into tools/.
+        assert!(
+            !sandbox
+                .join("ws")
+                .join("pkg")
+                .join("bin")
+                .join("cc")
+                .exists()
+        );
+        assert!(!sandbox.join("tools").join("pkg").join("foo.go").exists());
+
+        // Tool input is omitted from source_map (out-of-workspace).
+        let map: BTreeMap<String, String> = serde_json::from_str(&fs::read_to_string(
+            sandbox.join("ws").join("pkg").join("source_map.json"),
+        )?)?;
+        assert_eq!(map.get("pkg/foo.go").map(|s| s.as_str()), Some("//pkg:gen"));
+        assert!(!map.keys().any(|k| k.contains("cc")));
         Ok(())
     }
 }

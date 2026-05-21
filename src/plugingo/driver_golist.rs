@@ -120,6 +120,7 @@ impl ManagedDriver for GoGolistDriver {
                         .with_context(|| format!("parse dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
+                    annotations: std::collections::BTreeMap::new(),
                 });
             }
         }
@@ -130,6 +131,10 @@ impl ManagedDriver for GoGolistDriver {
                 .with_context(|| format!("parse go_bin_addr {}", self.go_bin_addr))?,
             mode: InputMode::Tool,
             origin_id: "go_bin".to_string(),
+            annotations: std::collections::BTreeMap::from([(
+                "unpack_root".to_string(),
+                "tools".to_string(),
+            )]),
         };
 
         let def = GoGolistDef {

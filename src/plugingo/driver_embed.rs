@@ -110,6 +110,7 @@ impl ManagedDriver for GoEmbedDriver {
                     .with_context(|| format!("parse golist dep addr {addr_str}"))?,
                 mode: InputMode::Standard,
                 origin_id: format!("dep|golist|{i}"),
+                annotations: std::collections::BTreeMap::new(),
             });
         }
 
@@ -123,6 +124,7 @@ impl ManagedDriver for GoEmbedDriver {
                         .with_context(|| format!("parse embed file dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|files|{i}"),
+                    annotations: std::collections::BTreeMap::new(),
                 });
             }
         }

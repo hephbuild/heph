@@ -122,6 +122,7 @@ impl Engine {
                         r#ref: input.r#ref.clone(),
                         origin_id: oid.clone(),
                         mode: mode.clone(),
+                        annotations: input.annotations.clone(),
                     });
             } else if let Some(out) = result.as_mut() {
                 // Top-level, but an earlier transparent input already triggered

@@ -135,6 +135,7 @@ impl Engine {
                     origin_id: input.origin_id.clone(),
                     source_addr: input.target.addr.clone(),
                     filters: input.filters.clone(),
+                    annotations: input.annotations.clone(),
                 }).collect();
                 anyhow::Ok(run_inputs)
             })

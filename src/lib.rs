@@ -18,6 +18,7 @@ pub mod pluginfs;
 pub mod plugingo;
 pub mod plugingroup;
 pub mod pluginhostbin;
+pub mod pluginnix;
 pub mod pluginquery;
 pub mod pluginstatictarget;
 pub mod plugintextfile;

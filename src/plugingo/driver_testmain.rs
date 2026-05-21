@@ -70,6 +70,7 @@ impl ManagedDriver for GoTestmainDriver {
                     .with_context(|| format!("parse golist dep addr {addr_str}"))?,
                 mode: InputMode::Standard,
                 origin_id: format!("dep|golist|{i}"),
+                annotations: std::collections::BTreeMap::new(),
             });
         }
 
@@ -84,6 +85,7 @@ impl ManagedDriver for GoTestmainDriver {
                             .with_context(|| format!("parse {group} src dep addr {addr_str}"))?,
                         mode: InputMode::Standard,
                         origin_id: format!("dep|{group}|{i}"),
+                        annotations: std::collections::BTreeMap::new(),
                     });
                 }
             }

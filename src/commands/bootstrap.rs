@@ -1,6 +1,7 @@
 use crate::engine::config_file;
 use crate::{
-    engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, plugintextfile,
+    engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, pluginnix,
+    plugintextfile,
 };
 
 pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
@@ -20,7 +21,7 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
 
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
-        home_dir,
+        home_dir: home_dir.clone(),
         parallelism: None,
     })?;
 
@@ -30,6 +31,9 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
     e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
     e.register_driver(Box::new(pluginhostbin::Driver))?;
     e.register_driver(Box::new(plugintextfile::Driver))?;
+    e.register_managed_driver(Box::new(pluginnix::Driver::new(
+        home_dir.join("nix-driver"),
+    )))?;
 
     // Opt-in factories — instantiated by `apply_config` if listed in the YAML.
     e.register_provider_factory("buildfile", |root, opts| {
@@ -84,7 +88,7 @@ mod tests {
             .unwrap_or_else(|| root.join(".heph3"));
         let mut e = engine::Engine::new(engine::Config {
             root,
-            home_dir,
+            home_dir: home_dir.clone(),
             parallelism: None,
         })?;
 
@@ -93,6 +97,9 @@ mod tests {
         e.register_provider(|_| Box::new(pluginhostbin::Provider))?;
         e.register_driver(Box::new(pluginhostbin::Driver))?;
         e.register_driver(Box::new(plugintextfile::Driver))?;
+        e.register_managed_driver(Box::new(pluginnix::Driver::new(
+            home_dir.join("nix-driver"),
+        )))?;
 
         e.register_provider_factory("buildfile", |root, opts| {
             Ok(Box::new(pluginbuildfile::Provider::from_options(

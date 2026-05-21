@@ -317,6 +317,7 @@ pub mod targetdef {
         pub r#ref: TargetAddr,
         pub mode: InputMode,
         pub origin_id: String,
+        pub annotations: std::collections::BTreeMap<String, String>,
     }
 
     #[derive(Clone, Hash, PartialEq, Serialize)]
@@ -405,6 +406,7 @@ pub struct RunInput {
     pub source_addr: Addr,
     /// If non-empty, only these file paths are exposed from this input's unpacked artifacts.
     pub filters: Vec<String>,
+    pub annotations: std::collections::BTreeMap<String, String>,
 }
 
 pub mod outputartifact {

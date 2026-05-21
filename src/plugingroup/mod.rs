@@ -61,6 +61,7 @@ impl crate::engine::driver::Driver for Driver {
                     r#ref,
                     mode: InputMode::Standard,
                     origin_id: format!("group:{i}"),
+                    annotations: std::collections::BTreeMap::new(),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;

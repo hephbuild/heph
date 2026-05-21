@@ -228,6 +228,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                                 r#ref: TargetAddr::parse(&v, &pkg)?,
                                 mode: InputMode::Standard,
                                 origin_id: format!("dep|{}|{}", k, i),
+                                annotations: BTreeMap::new(),
                             },
                         ))
                     })
@@ -256,6 +257,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
                                 r#ref: TargetAddr::parse(&v, &pkg)?,
                                 mode: InputMode::Tool,
                                 origin_id: format!("tool|{}|{}", k, i),
+                                annotations: BTreeMap::from([(
+                                    "unpack_root".to_string(),
+                                    "tools".to_string(),
+                                )]),
                             },
                         ))
                     })
@@ -359,6 +364,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 r#ref: tool.r#ref.clone(),
                 mode: InputMode::Tool,
                 origin_id: tool.id.clone(),
+                annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
             };
             xdef.tool_group_inputs
                 .entry(tool.group)
@@ -371,6 +377,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 r#ref: dep.r#ref.clone(),
                 mode: InputMode::Standard,
                 origin_id: dep.id.clone(),
+                annotations: BTreeMap::new(),
             };
             xdef.dep_group_inputs
                 .entry(dep.group)
@@ -516,7 +523,8 @@ impl Driver {
                         .to_str()
                         .expect("sandbox dir path must be valid UTF-8"),
                 );
-                std::fs::File::create(path)?
+                std::fs::File::create(&path)
+                    .with_context(|| format!("create dep list file {:?}", path))?
             };
             let entry = env.entry(src_key).or_default();
 
@@ -526,10 +534,16 @@ impl Driver {
                     .iter()
                     .find(|m| m.input.origin_id == input.origin_id)
                 {
-                    let managed_list_f =
-                        std::fs::File::open(&m.list_path).with_context(|| "open dep list file")?;
+                    let managed_list_f = std::fs::File::open(&m.list_path).with_context(|| {
+                        format!(
+                            "open dep list file {:?} (origin_id={})",
+                            m.list_path, input.origin_id
+                        )
+                    })?;
                     for line in std::io::BufReader::new(managed_list_f).lines() {
-                        let line = line?;
+                        let line = line.with_context(|| {
+                            format!("read line from dep list {:?}", m.list_path)
+                        })?;
                         if line.is_empty() {
                             continue;
                         }
@@ -539,8 +553,12 @@ impl Driver {
                         }
                         entry.push_str(&line);
 
-                        list_f.write_all(line.as_bytes())?;
-                        list_f.write_all("\n".as_bytes())?;
+                        list_f
+                            .write_all(line.as_bytes())
+                            .with_context(|| format!("write to dep list (group={group})"))?;
+                        list_f.write_all("\n".as_bytes()).with_context(|| {
+                            format!("write newline to dep list (group={group})")
+                        })?;
                     }
                 }
             }
@@ -548,23 +566,39 @@ impl Driver {
 
         let tool_bin_dir = if !def.tool_group_inputs.is_empty() {
             let bin_dir = req.sandbox_dir.join("bin");
-            std::fs::create_dir_all(&bin_dir)?;
+            std::fs::create_dir_all(&bin_dir)
+                .with_context(|| format!("create tool bin dir {:?}", bin_dir))?;
 
-            for inputs in def.tool_group_inputs.values() {
+            for (group, inputs) in &def.tool_group_inputs {
                 for input in inputs {
-                    for m in req
+                    // Multi-output tool refs produce N RunInputs sharing one
+                    // origin_id; the bridge appends every output's file path
+                    // to the same `input_<origin_id>.list`. Read that list
+                    // exactly once and symlink each entry into bin/. Validated
+                    // by engine/link.rs to be 1 FilePath per output, so all
+                    // entries here are distinct binaries.
+                    let Some(m) = req
                         .inputs
                         .iter()
-                        .filter(|m| m.input.origin_id == input.origin_id)
-                    {
-                        let list_f = std::fs::File::open(&m.list_path)?;
-                        let file_path = std::io::BufReader::new(list_f)
-                            .lines()
-                            .find(|l| l.as_ref().is_ok_and(|s| !s.is_empty()))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("tool '{}' produced no files", input.origin_id)
-                            })??;
-
+                        .find(|m| m.input.origin_id == input.origin_id)
+                    else {
+                        continue;
+                    };
+                    let list_f = std::fs::File::open(&m.list_path).with_context(|| {
+                        format!(
+                            "open tool list {:?} (group={group}, origin_id={})",
+                            m.list_path, input.origin_id
+                        )
+                    })?;
+                    let mut any = false;
+                    for line in std::io::BufReader::new(list_f).lines() {
+                        let file_path = line.with_context(|| {
+                            format!("read line from tool list {:?}", m.list_path)
+                        })?;
+                        if file_path.is_empty() {
+                            continue;
+                        }
+                        any = true;
                         let filename =
                             std::path::Path::new(&file_path)
                                 .file_name()
@@ -573,9 +607,26 @@ impl Driver {
                                 })?;
                         let bin_path = bin_dir.join(filename);
                         #[cfg(unix)]
-                        std::os::unix::fs::symlink(&file_path, &bin_path)?;
+                        std::os::unix::fs::symlink(&file_path, &bin_path).with_context(|| {
+                            let existing = std::fs::read_link(&bin_path)
+                                .map(|p| format!("symlink->{:?}", p))
+                                .or_else(|_| {
+                                    std::fs::symlink_metadata(&bin_path)
+                                        .map(|m| format!("{:?}", m.file_type()))
+                                })
+                                .unwrap_or_else(|_| "<unreadable>".to_string());
+                            format!(
+                                "symlink tool {file_path:?} -> {bin_path:?} (group={group}, \
+                                 origin_id={}, existing_at_dest={existing})",
+                                input.origin_id
+                            )
+                        })?;
                         #[cfg(not(unix))]
-                        std::fs::copy(&file_path, &bin_path)?;
+                        std::fs::copy(&file_path, &bin_path)
+                            .with_context(|| format!("copy tool {file_path:?} -> {bin_path:?}"))?;
+                    }
+                    if !any {
+                        anyhow::bail!("tool '{}' produced no files", input.origin_id);
                     }
                 }
             }
@@ -1290,8 +1341,10 @@ mod tests {
                 origin_id: origin_id.to_string(),
                 source_addr: crate::htaddr::Addr::default(),
                 filters: vec![],
+                annotations: BTreeMap::new(),
             },
-            list_path,
+            list_path: list_path.clone(),
+            unpack_root: list_dir.to_path_buf(),
         })
     }
 
@@ -1309,6 +1362,10 @@ mod tests {
                         r#ref: crate::engine::driver::TargetAddr::default(),
                         mode: InputMode::Tool,
                         origin_id: origin_id.to_string(),
+                        annotations: BTreeMap::from([(
+                            "unpack_root".to_string(),
+                            "tools".to_string(),
+                        )]),
                     }],
                 )]),
                 pass_env: BTreeMap::new(),
@@ -1437,6 +1494,10 @@ mod tests {
                         r#ref: crate::engine::driver::TargetAddr::default(),
                         mode: InputMode::Tool,
                         origin_id: origin_id.to_string(),
+                        annotations: BTreeMap::from([(
+                            "unpack_root".to_string(),
+                            "tools".to_string(),
+                        )]),
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
@@ -1490,6 +1551,254 @@ mod tests {
             path_out.contains(existing_path),
             "PATH should retain existing entries; got: {path_out}"
         );
+        Ok(())
+    }
+
+    /// End-to-end regression for multi-output tool refs.
+    ///
+    /// A multi-output tool target (one Output group per program, each with
+    /// 1 FilePath) resolves to N `RunInput`s that share one `origin_id`.
+    /// `inputs_result_exec` (engine/execute.rs) creates one `RunInput` per
+    /// output artifact; the managed bridge then unpacks each one and APPENDS
+    /// the produced paths to the same `input_<origin_id>.list`. The tool
+    /// symlinker must end up with one symlink per binary in bin/.
+    ///
+    /// This goes through `ManagedDriverBridge::run` (the real path) with N
+    /// real tar artifacts, not pre-built list files, so it exercises the
+    /// unpack-then-symlink flow that production hits.
+    #[tokio::test]
+    async fn test_multi_output_tool_via_bridge() -> anyhow::Result<()> {
+        use crate::engine::driver::{Driver as _, RunInput, inputartifact, outputartifact};
+        use crate::engine::driver_managed::ManagedDriverBridge;
+
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        // Pretend nix produced 4 wrapper scripts; each output group ships one.
+        let store_dir = tmp.path().join("store");
+        std::fs::create_dir_all(&store_dir)?;
+        let names = ["node", "npm", "npx", "yarn"];
+
+        // Build 4 tar artifacts, each containing one file at `pkg/bin/<name>`.
+        // Mirrors what ManagedDriverBridge::run_inner packs at the end of run.
+        let tar_dir = tmp.path().join("tars");
+        std::fs::create_dir_all(&tar_dir)?;
+        let origin_id = "tool||0";
+        let mut artifacts: Vec<RunInput> = Vec::new();
+        for name in names {
+            let src = make_tool_binary(&store_dir, name, "echo ok")?;
+            let mut tp = crate::hartifactcontent::tar::TarPacker::new();
+            tp.create_file(
+                src.to_string_lossy().into_owned(),
+                format!("pkg/bin/{name}"),
+            );
+            let tar_path = tar_dir.join(format!("{name}.tar"));
+            let f = std::fs::File::create(&tar_path)?;
+            tp.pack(f)?;
+
+            artifacts.push(RunInput {
+                artifact: inputartifact::InputArtifact {
+                    r#type: inputartifact::Type::Dep,
+                    origin_id: origin_id.to_string(),
+                    content: Arc::new(outputartifact::OutputArtifact {
+                        group: name.to_string(),
+                        name: format!("{name}.tar"),
+                        r#type: outputartifact::Type::Output,
+                        content: outputartifact::Content::TarPath(
+                            tar_path.to_string_lossy().into_owned(),
+                        ),
+                        hashout: format!("h_{name}"),
+                    }),
+                },
+                origin_id: origin_id.to_string(),
+                source_addr: crate::htaddr::Addr::default(),
+                filters: vec![],
+                annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+            });
+        }
+
+        // Exec target with one declared tool input matching the shared origin_id.
+        let target_def = EngineTargetDef {
+            addr: Addr::new(
+                crate::htpkg::PkgBuf::from("pkg"),
+                "consumer".to_string(),
+                BTreeMap::new(),
+            ),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["true".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::from([(
+                    "".to_string(),
+                    vec![Input {
+                        r#ref: crate::engine::driver::TargetAddr::default(),
+                        mode: InputMode::Tool,
+                        origin_id: origin_id.to_string(),
+                        annotations: BTreeMap::from([(
+                            "unpack_root".to_string(),
+                            "tools".to_string(),
+                        )]),
+                    }],
+                )]),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let sandbox = tmp.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox)?;
+
+        let bridge = ManagedDriverBridge {
+            home: tmp.path().to_path_buf(),
+            driver: Box::new(Driver::new_bash()),
+        };
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: tmp.path().to_path_buf(),
+            inputs: artifacts,
+            hashin: "h",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+
+        bridge.run(req, &ctoken).await?;
+
+        let bin_dir = sandbox.join("bin");
+        let listed: Vec<_> = std::fs::read_dir(&bin_dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in names {
+            assert!(
+                bin_dir.join(name).exists(),
+                "bin/{name} missing; bin/ contents: {:?}",
+                listed
+            );
+        }
+        Ok(())
+    }
+
+    /// Same shape but at the driver level, bypassing the bridge (the bridge
+    /// merges N inputs into one list file; this asserts the symlink loop is
+    /// correct given that already-merged state).
+    #[tokio::test]
+    async fn test_multi_output_tool_symlinks_all_binaries() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+
+        // Four real binary files on disk.
+        let tool_dir = tmp.path().join("store");
+        std::fs::create_dir_all(&tool_dir)?;
+        let names = ["node", "npm", "npx", "yarn"];
+        let tool_paths: Vec<std::path::PathBuf> = names
+            .iter()
+            .map(|n| make_tool_binary(&tool_dir, n, "echo ok").expect("make tool"))
+            .collect();
+
+        // One shared list file with all 4 paths (mirrors the bridge's append
+        // behavior when N RunInputs share an origin_id).
+        let origin_id = "tool||0";
+        let list_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&list_dir)?;
+        let list_path = list_dir.join(format!("input_{origin_id}.list"));
+        let mut contents = String::new();
+        for p in &tool_paths {
+            contents.push_str(&format!("{}\n", p.display()));
+        }
+        std::fs::write(&list_path, contents)?;
+
+        // N ManagedRunInput, all sharing the same origin_id and list_path —
+        // exactly what `inputs_result_exec` + the managed bridge produce for
+        // an N-output tool ref.
+        use crate::engine::driver::{RunInput, inputartifact, outputartifact};
+        let make_managed = || crate::engine::driver_managed::ManagedRunInput {
+            input: RunInput {
+                artifact: inputartifact::InputArtifact {
+                    r#type: inputartifact::Type::Dep,
+                    origin_id: origin_id.to_string(),
+                    content: Arc::new(outputartifact::OutputArtifact {
+                        group: "".to_string(),
+                        name: "".to_string(),
+                        r#type: outputartifact::Type::Output,
+                        content: outputartifact::Content::Raw(outputartifact::ContentRaw {
+                            data: vec![],
+                            path: "".to_string(),
+                            x: false,
+                        }),
+                        hashout: "".to_string(),
+                    }),
+                },
+                origin_id: origin_id.to_string(),
+                source_addr: crate::htaddr::Addr::default(),
+                filters: vec![],
+                annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+            },
+            list_path: list_path.clone(),
+            unpack_root: list_dir.clone(),
+        };
+        let managed_inputs: Vec<_> = (0..names.len()).map(|_| make_managed()).collect();
+
+        let target_def = make_tool_target_def(vec!["true".to_string()], origin_id, "");
+
+        let request_id = "test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+        driver
+            .run(
+                ManagedRunRequest {
+                    sandbox_dir: tmp.path().to_path_buf(),
+                    sandbox_ws_dir: tmp.path().to_path_buf(),
+                    sandbox_pkg_dir: tmp.path().to_path_buf(),
+                    request: req,
+                    inputs: managed_inputs,
+                },
+                &ctoken,
+            )
+            .await?;
+
+        let bin_dir = tmp.path().join("bin");
+        for name in names {
+            let bin = bin_dir.join(name);
+            assert!(
+                bin.exists(),
+                "bin/{name} must exist (multi-output tool); got dir: {:?}",
+                std::fs::read_dir(&bin_dir)
+                    .map(|rd| rd.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            );
+            assert!(
+                bin.symlink_metadata()?.file_type().is_symlink(),
+                "bin/{name} must be a symlink"
+            );
+        }
         Ok(())
     }
 

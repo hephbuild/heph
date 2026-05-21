@@ -66,8 +66,8 @@ impl crate::engine::driver::Driver for Driver {
 
         let text = take_string(&mut m, "text")?
             .ok_or_else(|| anyhow::anyhow!("textfile driver requires `text`"))?;
-        let out = take_string(&mut m, "out")?
-            .unwrap_or_else(|| req.target_spec.addr.name.clone());
+        let out_rel =
+            take_string(&mut m, "out")?.unwrap_or_else(|| req.target_spec.addr.name.clone());
         let executable = take_bool(&mut m, "executable")?.unwrap_or(false);
 
         if !m.is_empty() {
@@ -77,6 +77,13 @@ impl crate::engine::driver::Driver for Driver {
                 unknown
             );
         }
+
+        let pkg = req.target_spec.addr.package.as_str();
+        let out = if pkg.is_empty() {
+            out_rel
+        } else {
+            format!("{pkg}/{out_rel}")
+        };
 
         let mut h = Xxh3::new();
         h.update(req.target_spec.addr.format().as_bytes());
@@ -247,9 +254,9 @@ mod tests {
             .await
             .unwrap();
         let def = res.target_def.def::<TextFileDef>();
-        assert_eq!(def.out, "wrapper");
+        assert_eq!(def.out, "pkg/wrapper");
         match &res.target_def.outputs[0].paths[0].content {
-            Content::FilePath(p) => assert_eq!(p, "wrapper"),
+            Content::FilePath(p) => assert_eq!(p, "pkg/wrapper"),
             other => panic!("expected FilePath, got {other}"),
         }
     }
@@ -281,12 +288,12 @@ mod tests {
         assert_eq!(res.target_def.outputs.len(), 1);
         let path = &res.target_def.outputs[0].paths[0];
         match &path.content {
-            Content::FilePath(p) => assert_eq!(p, "bin/wrap"),
+            Content::FilePath(p) => assert_eq!(p, "pkg/bin/wrap"),
             other => panic!("expected FilePath, got {other}"),
         }
         let def = res.target_def.def::<TextFileDef>();
         assert_eq!(def.text, "hello");
-        assert_eq!(def.out, "bin/wrap");
+        assert_eq!(def.out, "pkg/bin/wrap");
         assert!(!def.executable);
     }
 
@@ -360,7 +367,7 @@ mod tests {
         match &a.content {
             outputartifact::Content::Raw(raw) => {
                 assert!(raw.x);
-                assert_eq!(raw.path, "bin/wrap");
+                assert_eq!(raw.path, "pkg/bin/wrap");
                 assert_eq!(raw.data, b"#!/bin/bash\necho hi\n");
             }
             _ => panic!("expected Raw content"),

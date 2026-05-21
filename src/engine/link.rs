@@ -11,6 +11,7 @@ pub struct LinkedTargetDefInput {
     pub output_names: Vec<String>,
     pub origin_id: String,
     pub filters: Vec<String>,
+    pub annotations: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -43,19 +44,29 @@ impl Engine {
                 };
 
                 if input.mode == InputMode::Tool {
-                    let file_count = input_def
+                    // Each selected output must resolve to exactly 1 FilePath.
+                    // Multi-output tool targets (e.g. a `nix` env exposing
+                    // `node`/`npm`/`npx`/`yarn` as 4 separate outputs) are fine:
+                    // pluginexec symlinks every produced file into the bin dir,
+                    // so each output's single file becomes one entry on PATH.
+                    for output in input_def
                         .outputs
                         .iter()
                         .filter(|o| output_names.contains(&o.group))
-                        .flat_map(|o| &o.paths)
-                        .filter(|p| matches!(p.content, Content::FilePath(_)))
-                        .count();
-                    if file_count != 1 {
-                        anyhow::bail!(
-                            "tool target '{:?}' must produce exactly 1 FilePath output, found {}",
-                            input.r#ref.r#ref,
-                            file_count
-                        );
+                    {
+                        let file_count = output
+                            .paths
+                            .iter()
+                            .filter(|p| matches!(p.content, Content::FilePath(_)))
+                            .count();
+                        if file_count != 1 {
+                            anyhow::bail!(
+                                "tool target '{}' output '{}' must produce exactly 1 FilePath, found {}",
+                                input.r#ref.r#ref,
+                                output.group,
+                                file_count
+                            );
+                        }
                     }
                 }
 
@@ -64,6 +75,7 @@ impl Engine {
                     output_names,
                     origin_id: input.origin_id.clone(),
                     filters: input.r#ref.filters.clone(),
+                    annotations: input.annotations.clone(),
                 })
             })
         });
