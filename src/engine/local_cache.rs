@@ -283,15 +283,24 @@ impl Engine {
             let mut result_meta: Vec<ArtifactMeta> = vec![];
 
             for artifact in manifest.artifacts {
-                if artifact.r#type != ManifestArtifactType::Output {
-                    continue;
+                // Outputs and SupportFiles both flow back to dependents — Output
+                // populates SRC/list, SupportFile only materializes into the
+                // sandbox. Logs and other types are kept in the cache but not
+                // surfaced to callers here.
+                match artifact.r#type {
+                    ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
+                    ManifestArtifactType::Log => continue,
                 }
 
                 result_meta.push(ArtifactMeta {
                     hashout: artifact.hashout.clone(),
                 });
 
-                if !outputs.contains(&artifact.group) {
+                // Outputs are gated on the caller's requested output groups.
+                // SupportFiles travel with the target wherever it's referenced.
+                if artifact.r#type == ManifestArtifactType::Output
+                    && !outputs.contains(&artifact.group)
+                {
                     continue;
                 }
 

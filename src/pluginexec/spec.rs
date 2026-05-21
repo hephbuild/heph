@@ -11,6 +11,7 @@ pub(crate) struct TargetSpec {
     pub deps: HashMap<String, Vec<String>>,
     pub tools: HashMap<String, Vec<String>>,
     pub outputs: HashMap<String, Vec<String>>,
+    pub support_files: Vec<String>,
     pub codegen: CodegenMode,
     pub cache: TargetSpecCache,
     pub env: HashMap<String, String>,
@@ -36,6 +37,7 @@ impl TargetSpec {
                 remote: true,
             },
             outputs: HashMap::new(),
+            support_files: vec![],
             codegen: CodegenMode::None,
             deps: HashMap::new(),
             tools: HashMap::new(),
@@ -60,6 +62,10 @@ impl TargetSpec {
 
         if let Some(v) = m.remove("out") {
             spec.outputs = parse_map_string_strings(v).with_context(|| "parse `out`")?;
+        };
+
+        if let Some(v) = m.remove("support_files") {
+            spec.support_files = parse_strings(v).with_context(|| "parse `support_files`")?;
         };
 
         if let Some(v) = m.remove("codegen") {
@@ -181,6 +187,29 @@ mod tests {
     fn test_tools_empty_by_default() {
         let spec = make_spec([]).unwrap();
         assert!(spec.tools.is_empty());
+    }
+
+    #[test]
+    fn test_support_files_parsed() {
+        let spec = make_spec([(
+            "support_files",
+            TargetSpecValue::List(vec![
+                TargetSpecValue::String("foo.txt".to_string()),
+                TargetSpecValue::String("data/*.json".to_string()),
+                TargetSpecValue::String("subdir/".to_string()),
+            ]),
+        )])
+        .unwrap();
+        assert_eq!(
+            spec.support_files,
+            vec!["foo.txt", "data/*.json", "subdir/"]
+        );
+    }
+
+    #[test]
+    fn test_support_files_empty_by_default() {
+        let spec = make_spec([]).unwrap();
+        assert!(spec.support_files.is_empty());
     }
 
     #[test]

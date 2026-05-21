@@ -126,7 +126,7 @@ impl Engine {
         let futs = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
                 let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
-                let run_inputs: Vec<RunInput> = res.artifacts.iter().map(|art| RunInput {
+                let dep_inputs = res.artifacts.iter().map(|art| RunInput {
                     artifact: InputArtifact {
                         r#type: Type::Dep,
                         origin_id: input.origin_id.clone(),
@@ -136,7 +136,24 @@ impl Engine {
                     source_addr: input.target.addr.clone(),
                     filters: input.filters.clone(),
                     annotations: input.annotations.clone(),
-                }).collect();
+                });
+                // Support artifacts share the dep's origin_id/source_addr/
+                // annotations but are routed as Type::Support so the managed
+                // bridge materializes them into the sandbox without a list
+                // file. Filters don't apply — support files are an all-or-
+                // nothing per-dep set.
+                let support_inputs = res.support_artifacts.iter().map(|art| RunInput {
+                    artifact: InputArtifact {
+                        r#type: Type::Support,
+                        origin_id: input.origin_id.clone(),
+                        content: Arc::clone(art),
+                    },
+                    origin_id: input.origin_id.clone(),
+                    source_addr: input.target.addr.clone(),
+                    filters: vec![],
+                    annotations: input.annotations.clone(),
+                });
+                let run_inputs: Vec<RunInput> = dep_inputs.chain(support_inputs).collect();
                 anyhow::Ok(run_inputs)
             })
         });

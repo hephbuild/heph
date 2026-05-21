@@ -105,7 +105,13 @@ impl App for RunApp {
                 for r in &result {
                     for a in &r.artifacts {
                         for e in a.walk()? {
-                            io::copy(&mut e?.data, &mut io::stdout())?;
+                            let e = e?;
+                            if let crate::hartifactcontent::WalkEntryKind::File {
+                                mut data, ..
+                            } = e.kind
+                            {
+                                io::copy(&mut data, &mut io::stdout())?;
+                            }
                         }
                     }
                 }

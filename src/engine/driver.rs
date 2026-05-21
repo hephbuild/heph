@@ -553,7 +553,7 @@ pub struct RunInput {
 }
 
 pub mod outputartifact {
-    use crate::hartifactcontent::{Content as HContent, WalkEntry};
+    use crate::hartifactcontent::{Content as HContent, WalkEntry, WalkEntryKind};
     use std::fs::File;
     use std::io;
     use std::io::Read;
@@ -611,13 +611,17 @@ pub mod outputartifact {
             Ok(match &self.content {
                 Content::Raw(raw) => Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from(&raw.path),
-                    data: Box::new(io::Cursor::new(raw.data.clone())),
-                    x: raw.x,
+                    kind: WalkEntryKind::File {
+                        data: Box::new(io::Cursor::new(raw.data.clone())),
+                        x: raw.x,
+                    },
                 }))),
                 Content::File(file) => Box::new(std::iter::once(Ok(WalkEntry {
                     path: PathBuf::from(&file.out_path),
-                    data: Box::new(File::open(&file.source_path)?),
-                    x: file.x,
+                    kind: WalkEntryKind::File {
+                        data: Box::new(File::open(&file.source_path)?),
+                        x: file.x,
+                    },
                 }))),
                 Content::TarPath(path) => Box::new(crate::hartifactcontent::tar::TarWalker::new(
                     File::open(path)?,

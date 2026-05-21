@@ -4,7 +4,7 @@ mod spec;
 use crate::debug_hash::DebugHasher;
 use crate::engine;
 use crate::engine::driver::sandbox::EnvValue;
-use crate::engine::driver::targetdef::path::{Content, Path};
+use crate::engine::driver::targetdef::path::{CodegenMode, Content, Path};
 use crate::engine::driver::targetdef::{Input, InputMode, Output, TargetDef as EngineTargetDef};
 use crate::engine::driver::{
     ApplyTransitiveRequest, ApplyTransitiveResponse, ConfigRequest, ConfigResponse, ParseRequest,
@@ -146,6 +146,26 @@ impl Driver {
             search_path: decode_path(opts)?,
             ..Self::new_bash()
         })
+    }
+}
+
+fn spec_path_to_target_path(raw: &str, pkg: &crate::htpkg::PkgBuf, codegen: &CodegenMode) -> Path {
+    let path = if pkg.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{}/{}", pkg, raw)
+    };
+    let content = if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
+        Content::Glob(path)
+    } else if path.ends_with('/') {
+        Content::DirPath(path)
+    } else {
+        Content::FilePath(path)
+    };
+    Path {
+        content,
+        codegen_tree: codegen.clone(),
+        collect: true,
     }
 }
 
@@ -318,31 +338,15 @@ impl engine::driver_managed::ManagedDriver for Driver {
                         group: k.clone(),
                         paths: v
                             .iter()
-                            .map(|path| {
-                                let path = if pkg.is_empty() {
-                                    path.clone()
-                                } else {
-                                    format!("{}/{}", pkg, path)
-                                };
-                                Path {
-                                    content: {
-                                        if ["*", "?", "["].iter().any(|&p| path.contains(p)) {
-                                            // TODO: this sucks, but its easy for now
-                                            Content::Glob(path.clone())
-                                        } else if path.ends_with("/") {
-                                            Content::DirPath(path.clone())
-                                        } else {
-                                            Content::FilePath(path.clone())
-                                        }
-                                    },
-                                    codegen_tree: spec.codegen.clone(),
-                                    collect: true,
-                                }
-                            })
+                            .map(|p| spec_path_to_target_path(p, &pkg, &spec.codegen))
                             .collect(),
                     })
                     .collect(),
-                support_files: vec![],
+                support_files: spec
+                    .support_files
+                    .iter()
+                    .map(|p| spec_path_to_target_path(p, &pkg, &CodegenMode::None))
+                    .collect(),
                 cache: spec.cache.local,
                 disable_remote_cache: !spec.cache.remote,
                 pty: true,
@@ -536,21 +540,27 @@ impl Driver {
             let entry = env.entry(src_key).or_default();
 
             for input in inputs {
-                if let Some(m) = req
-                    .inputs
-                    .iter()
-                    .find(|m| m.input.origin_id == input.origin_id)
-                {
-                    let managed_list_f = std::fs::File::open(&m.list_path).with_context(|| {
+                // Filter to Dep-type ManagedRunInputs only. A target may have
+                // both Dep outputs and Support files sharing the same
+                // origin_id; the support input has no list file and must not
+                // leak into SRC_/LIST_ env routing.
+                if let Some(m) = req.inputs.iter().find(|m| {
+                    m.input.origin_id == input.origin_id
+                        && matches!(
+                            m.input.artifact.r#type,
+                            crate::engine::driver::inputartifact::Type::Dep
+                        )
+                }) {
+                    let list_path = m.require_list_path()?;
+                    let managed_list_f = std::fs::File::open(list_path).with_context(|| {
                         format!(
                             "open dep list file {:?} (origin_id={})",
-                            m.list_path, input.origin_id
+                            list_path, input.origin_id
                         )
                     })?;
                     for line in std::io::BufReader::new(managed_list_f).lines() {
-                        let line = line.with_context(|| {
-                            format!("read line from dep list {:?}", m.list_path)
-                        })?;
+                        let line = line
+                            .with_context(|| format!("read line from dep list {:?}", list_path))?;
                         if line.is_empty() {
                             continue;
                         }
@@ -592,24 +602,29 @@ impl Driver {
                 std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
                 for input in inputs {
-                    let Some(m) = req
-                        .inputs
-                        .iter()
-                        .find(|m| m.input.origin_id == input.origin_id)
-                    else {
+                    // Filter to Dep-type — Support inputs that travel with the
+                    // tool target's deps share its origin_id but must not be
+                    // symlinked into bin/.
+                    let Some(m) = req.inputs.iter().find(|m| {
+                        m.input.origin_id == input.origin_id
+                            && matches!(
+                                m.input.artifact.r#type,
+                                crate::engine::driver::inputartifact::Type::Dep
+                            )
+                    }) else {
                         continue;
                     };
-                    let list_f = std::fs::File::open(&m.list_path).with_context(|| {
+                    let list_path = m.require_list_path()?;
+                    let list_f = std::fs::File::open(list_path).with_context(|| {
                         format!(
                             "open tool list {:?} (group={group}, origin_id={})",
-                            m.list_path, input.origin_id
+                            list_path, input.origin_id
                         )
                     })?;
                     let mut any = false;
                     for line in std::io::BufReader::new(list_f).lines() {
-                        let file_path = line.with_context(|| {
-                            format!("read line from tool list {:?}", m.list_path)
-                        })?;
+                        let file_path = line
+                            .with_context(|| format!("read line from tool list {:?}", list_path))?;
                         if file_path.is_empty() {
                             continue;
                         }
@@ -1375,7 +1390,7 @@ mod tests {
                 filters: vec![],
                 annotations: BTreeMap::new(),
             },
-            list_path: list_path.clone(),
+            list_path: Some(list_path.clone()),
             unpack_root: list_dir.to_path_buf(),
         })
     }
@@ -1784,7 +1799,7 @@ mod tests {
                 filters: vec![],
                 annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
             },
-            list_path: list_path.clone(),
+            list_path: Some(list_path.clone()),
             unpack_root: list_dir.clone(),
         };
         let managed_inputs: Vec<_> = (0..names.len()).map(|_| make_managed()).collect();

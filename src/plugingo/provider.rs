@@ -1119,7 +1119,11 @@ impl ProviderInner {
                                 {
                                     continue;
                                 }
-                                return decode_go_package(entry.data);
+                                let data = match entry.kind {
+                                    crate::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                                    crate::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                                };
+                                return decode_go_package(data);
                             }
                         }
                         anyhow::bail!("_golist produced no package.bin")
@@ -1152,7 +1156,11 @@ impl ProviderInner {
                                 {
                                     continue;
                                 }
-                                return decode_package_addrs(entry.data);
+                                let data = match entry.kind {
+                                    crate::hartifactcontent::WalkEntryKind::File { data, .. } => data,
+                                    crate::hartifactcontent::WalkEntryKind::Symlink { .. } => continue,
+                                };
+                                return decode_package_addrs(data);
                             }
                         }
                         anyhow::bail!("_golist produced no package_addrs.bin")
@@ -1599,7 +1607,7 @@ mod tests {
     use super::*;
     use crate::engine::provider::{GetError, GetRequest, Provider as ProviderTrait};
     use crate::engine::{ArtifactMeta, EResult};
-    use crate::hartifactcontent::{Content, WalkEntry};
+    use crate::hartifactcontent::{Content, WalkEntry, WalkEntryKind};
     use crate::hasync::StdCancellationToken;
     use crate::htpkg::PkgBuf;
     use crate::loosespecparser::TargetSpecValue;
@@ -1651,8 +1659,10 @@ mod tests {
         fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
             let entry = WalkEntry {
                 path: self.path.clone(),
-                data: Box::new(io::Cursor::new(self.bytes.clone())),
-                x: false,
+                kind: WalkEntryKind::File {
+                    data: Box::new(io::Cursor::new(self.bytes.clone())),
+                    x: false,
+                },
             };
             Ok(Box::new(std::iter::once(Ok(entry))))
         }
@@ -1742,6 +1752,7 @@ mod tests {
                         })
                         .collect(),
                     artifacts,
+                    support_artifacts: vec![],
                 }))
             })
         }

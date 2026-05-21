@@ -215,8 +215,9 @@ impl ManagedDriver for GoEmbedDriver {
                 anyhow::anyhow!("go_embed: golist input {} not found", def.golist_origin_id)
             })?;
 
-        let list_f = std::fs::File::open(&managed.list_path)
-            .with_context(|| format!("open golist list {:?}", managed.list_path))?;
+        let list_path = managed.require_list_path()?;
+        let list_f = std::fs::File::open(list_path)
+            .with_context(|| format!("open golist list {:?}", list_path))?;
         let pkg_bin_path = std::io::BufReader::new(list_f)
             .lines()
             .find(|l| {

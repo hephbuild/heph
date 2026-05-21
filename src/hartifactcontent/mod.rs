@@ -6,8 +6,17 @@ use std::path::PathBuf;
 
 pub struct WalkEntry {
     pub path: PathBuf,
-    pub data: Box<dyn io::Read>,
-    pub x: bool,
+    pub kind: WalkEntryKind,
+}
+
+pub enum WalkEntryKind {
+    File {
+        data: Box<dyn io::Read>,
+        x: bool,
+    },
+    Symlink {
+        target: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy)]

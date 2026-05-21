@@ -228,8 +228,9 @@ impl ManagedDriver for GoGolistDriver {
                 .iter()
                 .find(|m| m.input.origin_id == "go_bin")
                 .ok_or_else(|| anyhow::anyhow!("go_golist: go_bin input not found"))?;
-            let f = std::fs::File::open(&managed.list_path)
-                .with_context(|| format!("open go_bin list {:?}", managed.list_path))?;
+            let list_path = managed.require_list_path()?;
+            let f = std::fs::File::open(list_path)
+                .with_context(|| format!("open go_bin list {:?}", list_path))?;
             std::io::BufReader::new(f)
                 .lines()
                 .find(|l| l.as_ref().is_ok_and(|s| !s.is_empty()))

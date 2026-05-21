@@ -175,6 +175,10 @@ pub struct ArtifactMeta {
 #[derive(Clone, Default)]
 pub struct EResult {
     pub artifacts: Vec<Arc<dyn Content>>,
+    /// Auxiliary artifacts a dependent target materializes into its sandbox
+    /// without surfacing in SRC/list env routing. Sourced from the producing
+    /// target's `support_files` declaration; never filtered by output group.
+    pub support_artifacts: Vec<Arc<dyn Content>>,
     pub artifacts_meta: Vec<ArtifactMeta>,
 }
 
@@ -276,6 +280,9 @@ impl Engine {
             let mut merged = EResult::default();
             for r in results {
                 merged.artifacts.extend(r.artifacts.iter().cloned());
+                merged
+                    .support_artifacts
+                    .extend(r.support_artifacts.iter().cloned());
                 merged
                     .artifacts_meta
                     .extend(r.artifacts_meta.iter().cloned());
@@ -406,12 +413,22 @@ impl Engine {
             .execute_and_cache_inner(rs.clone(), opts)
             .await?;
 
+        let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
+        let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
+        for a in cached_artifacts {
+            match a.r#type {
+                ManifestArtifactType::Output if outputs.contains(&a.group) => {
+                    artifacts.push(Arc::new(a) as Arc<dyn Content>);
+                }
+                ManifestArtifactType::SupportFile => {
+                    support_artifacts.push(Arc::new(a) as Arc<dyn Content>);
+                }
+                _ => {}
+            }
+        }
         Ok(EResult {
-            artifacts: cached_artifacts
-                .into_iter()
-                .filter(|a| a.r#type == ManifestArtifactType::Output && outputs.contains(&a.group))
-                .map(|a| Arc::new(a) as Arc<dyn Content>)
-                .collect(),
+            artifacts,
+            support_artifacts,
             artifacts_meta,
         })
     }
@@ -444,7 +461,10 @@ impl Engine {
 
                     let artifacts_meta = artifacts
                         .iter()
-                        .filter(|a| a.r#type == outputartifact::Type::Output)
+                        .filter(|a| matches!(
+                            a.r#type,
+                            outputartifact::Type::Output | outputartifact::Type::SupportFile
+                        ))
                         .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
                         .collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -484,11 +504,22 @@ impl Engine {
             None => return Ok(None),
         };
 
+        let mut artifacts: Vec<Arc<dyn Content>> = Vec::new();
+        let mut support_artifacts: Vec<Arc<dyn Content>> = Vec::new();
+        for a in cached_artifacts {
+            match a.r#type {
+                ManifestArtifactType::Output => {
+                    artifacts.push(Arc::new(a) as Arc<dyn Content>);
+                }
+                ManifestArtifactType::SupportFile => {
+                    support_artifacts.push(Arc::new(a) as Arc<dyn Content>);
+                }
+                ManifestArtifactType::Log => {}
+            }
+        }
         Ok(Some(EResult {
-            artifacts: cached_artifacts
-                .into_iter()
-                .map(|a| Arc::new(a) as Arc<dyn Content>)
-                .collect(),
+            artifacts,
+            support_artifacts,
             artifacts_meta,
         }))
     }

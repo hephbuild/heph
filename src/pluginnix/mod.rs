@@ -342,8 +342,9 @@ impl ManagedDriver for Driver {
                 .iter()
                 .find(|m| m.input.origin_id == "nix")
                 .ok_or_else(|| anyhow::anyhow!("nix driver: `nix` tool input not found"))?;
-            let f = std::fs::File::open(&managed.list_path)
-                .with_context(|| format!("open nix tool list {:?}", managed.list_path))?;
+            let list_path = managed.require_list_path()?;
+            let f = std::fs::File::open(list_path)
+                .with_context(|| format!("open nix tool list {:?}", list_path))?;
             std::io::BufReader::new(f)
                 .lines()
                 .find(|l| l.as_ref().is_ok_and(|s| !s.is_empty()))
