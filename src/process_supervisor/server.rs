@@ -45,11 +45,24 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
     }
 
     // Parent died (EOF) or socket errored. Reap everything we know about.
-    for pgid in &tracked {
-        // SAFETY: killpg with SIGKILL on a pgid we recorded; kernel rejects
-        // unknown pgids cleanly.
+    // Issue BOTH killpg and kill for each tracked pid:
+    //   - killpg only does anything if `id` is a session/group leader (i.e.
+    //     the child called setsid). For pluginexec shell mode this reaps
+    //     the entire descendant tree.
+    //   - kill targets the direct pid for drivers that did NOT setsid
+    //     (plugingo, pluginnix — single-process invocations).
+    // PIDs are unique system-wide and a foreign pgid==our_pid is impossible
+    // (pgids are pids of group leaders), so this is safe.
+    for id in &tracked {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "killpg and kill are a paired best-effort reap"
+        )]
+        // SAFETY: SIGKILL via killpg/kill on ids we recorded; ESRCH for
+        // already-dead targets is ignored.
         unsafe {
-            libc::killpg(*pgid, libc::SIGKILL);
+            libc::killpg(*id, libc::SIGKILL);
+            libc::kill(*id, libc::SIGKILL);
         }
     }
     std::process::exit(0);

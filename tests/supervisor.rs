@@ -197,6 +197,32 @@ fn supervisor_does_not_kill_untracked_pgid_on_eof() {
 }
 
 #[test]
+fn supervisor_reaps_non_setsid_child_via_direct_kill() {
+    // Drivers that do not setsid (plugingo, pluginnix) register the direct
+    // pid. Supervisor must SIGKILL the pid even though it is not a group
+    // leader.
+    let mut cmd = Command::new("sleep");
+    cmd.arg("120")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut sleep_child = cmd.spawn().expect("spawn sleep without setsid");
+    let sleep_pid = sleep_child.id();
+
+    let (mut parent, mut supervisor) = spawn_supervisor();
+    writeln!(parent, "TRACK {sleep_pid}").expect("write TRACK");
+    parent.flush().expect("flush");
+    std::thread::sleep(Duration::from_millis(100));
+    drop(parent);
+
+    assert!(
+        await_child_exit(&mut sleep_child, Duration::from_secs(3)),
+        "supervisor must kill non-setsid pid {sleep_pid}"
+    );
+    drop(supervisor.wait());
+}
+
+#[test]
 fn supervisor_reaps_grandchildren_via_pgid_kill() {
     // Spawn an sh that itself forks another sleep, all in one session.
     // Killing the pgid must reap both the sh and the inner sleep.

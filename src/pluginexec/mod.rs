@@ -750,8 +750,8 @@ impl Driver {
                     Ok(())
                 });
             }
-            // setsid is already done above (PTY mode); just chain pdeathsig.
-            process_supervisor::apply_pdeathsig(&mut cmd);
+            // setsid already done above (PTY mode); pgid == pid so the
+            // supervisor's killpg reaps the whole tree.
         } else {
             cmd.stdin(if rreq.stdin.is_some() {
                 Stdio::piped()
@@ -760,9 +760,11 @@ impl Driver {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-            // Put the child in its own session/process group so the supervisor
-            // can reap the whole tree (incl. grandchildren) with killpg.
-            process_supervisor::apply_isolation(&mut cmd);
+            // No setsid here: tokio's `Child::wait` SIGCHLD/kqueue waker is
+            // flaky on macOS once the child is a session leader (see the
+            // PTY-mode polling workaround below). For non-PTY targets we
+            // accept losing whole-tree reap on hard-kill and rely on the
+            // direct-pid `kill` the supervisor also issues.
         }
 
         let mut child = cmd.spawn().with_context(|| "spawn child process")?;
@@ -839,29 +841,24 @@ impl Driver {
 
         tokio::select! {
             _ = ctoken.cancelled() => {
-                // SIGKILL the whole process group, not just the direct child,
-                // so a target that itself forked (e.g. bash with `&` jobs)
-                // doesn't leave grandchildren behind.
-                process_supervisor::kill_pgid(child_pid);
-                child.wait().await?;
+                // killpg covers grandchildren in PTY/shell mode where the
+                // child is a session leader; kill backstops non-setsid mode.
+                process_supervisor::kill_child(child_pid);
+                // try_wait polling instead of `child.wait()` — tokio's
+                // SIGCHLD-based waker is unreliable on macOS, see comment
+                // on wait_fut below.
+                process_supervisor::wait_polling(&mut child).await?;
                 anyhow::bail!("cancelled")
             },
             res = async {
                 let io = async { tokio::join!(stdin_fut, stdout_fut, stderr_fut) };
-                // Poll the child status on a tick instead of relying on
-                // `child.wait()`'s SIGCHLD waker, which doesn't always fire
-                // when the child has called setsid + TIOCSCTTY (PTY session
-                // leader). 25ms keeps shell-exit latency invisible.
+                // Use blocking waitpid via spawn_blocking instead of tokio's
+                // SIGCHLD waker: the waker is unreliable when the child is a
+                // session leader (PTY/shell mode) and under heavy build load
+                // tokio's own try_wait polling gets starved, leaving zombies
+                // by the hundreds.
                 let wait_fut = async {
-                    let status = loop {
-                        match child.try_wait() {
-                            Ok(Some(s)) => break Ok(s),
-                            Ok(None) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                            }
-                            Err(e) => break Err(e),
-                        }
-                    };
+                    let status = process_supervisor::wait_polling(&mut child).await;
                     // Cancel the stdin pump as soon as the child is reaped so
                     // the io join can finish in the io-wins arm below.
                     _ = stdin_cancel_tx.send(());

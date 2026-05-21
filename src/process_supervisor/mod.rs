@@ -114,75 +114,120 @@ pub fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Apply per-child isolation in [`tokio::process::Command::pre_exec`]:
+/// Wait for `child` to exit and reap the zombie.
 ///
-/// - `setsid()` so the child becomes a new session leader with `pid == pgid`.
-///   This is what lets the supervisor reap the *whole tree* via
-///   `killpg(pgid, SIGKILL)`.
-/// - On Linux only, `prctl(PR_SET_PDEATHSIG, SIGKILL)` as a defense-in-depth
-///   backstop — if the supervisor itself is bypassed for any reason, the
-///   kernel still kills the direct child when its parent (main) dies.
+/// Spawns a dedicated `std::thread` that calls blocking `waitpid(pid, 0)` and
+/// sends the result back via a oneshot. We avoid `tokio::task::spawn_blocking`
+/// because each in-flight build child would occupy a slot in tokio's blocking
+/// pool (default 512) — under heavy build load that exhausts the pool and
+/// starves every other blocking op (file I/O, TUI render flush, etc.) so the
+/// UI appears to freeze.
 ///
-/// Do **not** call this on a command that already invokes `setsid()` in its
-/// own `pre_exec` (e.g. `pluginexec` shell mode): the second `setsid()` will
-/// return `EPERM`. Use [`apply_pdeathsig`] instead in that case.
-pub fn apply_isolation(cmd: &mut tokio::process::Command) {
+/// macOS background: we need this because tokio's `Child::wait` SIGCHLD-based
+/// waker is unreliable when children call `setsid` (PTY/shell mode), and
+/// `try_wait`-with-`tokio::sleep` polling gets starved by a busy runtime
+/// — both leave zombies stuck in `Z` state.
+///
+/// If `tokio::process::Child`'s own reaper races us and `waitpid` returns
+/// `ECHILD`, we fall back to `child.try_wait()` to pull tokio's cached status.
+pub async fn wait_polling(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let pid = child
+        .id()
+        .ok_or_else(|| std::io::Error::other("child has no pid (already waited)"))?
+        as i32;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<Option<i32>>>();
+    std::thread::Builder::new()
+        .name(format!("waitpid-{pid}"))
+        .spawn(move || {
+            let mut status: libc::c_int = 0;
+            // SAFETY: blocking waitpid on a pid we own; status is initialised.
+            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+            let out = if r < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::ECHILD) {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            } else {
+                Ok(Some(status))
+            };
+            let _ = tx.send(out);
+        })
+        .map_err(|e| std::io::Error::other(format!("spawn waitpid thread: {e}")))?;
+
+    let raw = rx.await.map_err(std::io::Error::other)??;
+    if let Some(s) = raw {
+        return Ok(std::process::ExitStatus::from_raw(s));
+    }
+
+    // Fall back to tokio's cached status (its internal reaper beat us to it).
+    match child.try_wait()? {
+        Some(s) => Ok(s),
+        None => Err(std::io::Error::other(
+            "waitpid returned ECHILD but tokio has no cached status",
+        )),
+    }
+}
+
+/// Polling-based replacement for `tokio::process::Child::wait_with_output`.
+/// Drains piped stdout/stderr while polling `try_wait` for exit. Avoids
+/// tokio's SIGCHLD-based waker (see [`wait_polling`]).
+///
+/// Borrows the child by `&mut` so callers in a `tokio::select!` can fall back
+/// to [`wait_polling`] on cancellation — owning the child here would mean the
+/// dropped future takes the Child with it without ever calling `waitpid`,
+/// leaving a `Z` entry in the kernel process table.
+pub async fn wait_with_output_polling(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt as _;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_fut = async {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            s.read_to_end(&mut buf).await?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    };
+    let stderr_fut = async {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            s.read_to_end(&mut buf).await?;
+        }
+        Ok::<_, std::io::Error>(buf)
+    };
+    let wait_fut = wait_polling(child);
+    let (status, stdout_buf, stderr_buf) = tokio::try_join!(wait_fut, stdout_fut, stderr_fut)?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
+    })
+}
+
+/// Send `SIGKILL` to a child by id. Always issues both `killpg` and `kill`:
+///   - `killpg` reaps the whole tree if the child is a session leader
+///     (i.e. it called `setsid` in `pre_exec` — e.g. pluginexec shell mode).
+///   - `kill` covers drivers that did not `setsid` (plugingo, pluginnix).
+///
+/// PIDs are unique system-wide, so `killpg(pid)` is a safe no-op when `pid`
+/// is not a group leader. `ESRCH` from either call is ignored.
+pub fn kill_child(pid: i32) {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
-        reason = "pre_exec installer + setsid must share one unsafe context"
+        reason = "killpg + kill are paired best-effort reap of the same pid"
     )]
-    // SAFETY: pre_exec runs between fork and exec; setsid and prctl are
-    // documented async-signal-safe.
+    // SAFETY: SIGKILL via killpg/kill on a pid we spawned and own.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            apply_pdeathsig_inline()?;
-            Ok(())
-        });
-    }
-}
-
-/// Just the `PR_SET_PDEATHSIG` half of [`apply_isolation`]. Use this for
-/// commands that already manage their own session (e.g. PTY-attached shells).
-pub fn apply_pdeathsig(cmd: &mut tokio::process::Command) {
-    // SAFETY: pre_exec runs between fork and exec; prctl is async-signal-safe.
-    unsafe {
-        cmd.pre_exec(|| {
-            apply_pdeathsig_inline()?;
-            Ok(())
-        });
-    }
-}
-
-#[inline]
-fn apply_pdeathsig_inline() -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: prctl with PR_SET_PDEATHSIG is async-signal-safe.
-        let r = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) };
-        if r < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // macOS has no equivalent; rely on the supervisor socket EOF path.
-    }
-    Ok(())
-}
-
-/// Send `SIGKILL` to a whole process group. Used on cancellation so that
-/// grandchildren (e.g. processes a bash target itself forked) are reaped, not
-/// just the direct child PID.
-///
-/// Safe to call with a pgid whose group has already exited — `killpg` returns
-/// `ESRCH` which we ignore.
-pub fn kill_pgid(pgid: i32) {
-    // SAFETY: killpg with SIGKILL; kernel rejects unknown pgids cleanly.
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+        libc::killpg(pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
     }
 }
 

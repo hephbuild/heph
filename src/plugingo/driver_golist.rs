@@ -284,8 +284,11 @@ impl ManagedDriver for GoGolistDriver {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        process_supervisor::apply_isolation(&mut cmd);
-        let child = cmd
+        // No setsid: tokio's wait_with_output SIGCHLD/kqueue waker is unreliable
+        // once the child is a session leader on macOS, which would leave
+        // exited `go list` processes as zombies. `go list` is single-process
+        // anyway; the supervisor's direct-pid kill covers hard-shutdown.
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn go list for {}", def.import_path))?;
         let child_pid: i32 = child
@@ -297,10 +300,14 @@ impl ManagedDriver for GoGolistDriver {
 
         let output = tokio::select! {
             _ = ctoken.cancelled() => {
-                process_supervisor::kill_pgid(child_pid);
+                process_supervisor::kill_child(child_pid);
+                process_supervisor::wait_polling(&mut child).await
+                    .context("wait for cancelled go list")?;
                 anyhow::bail!("go list cancelled");
             }
-            res = child.wait_with_output() => {
+            // Polling-based wait_with_output to avoid macOS SIGCHLD-waker
+            // zombies.
+            res = process_supervisor::wait_with_output_polling(&mut child) => {
                 res.context("wait for go list")?
             }
         };

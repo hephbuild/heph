@@ -152,8 +152,11 @@ async fn lock_flake_url(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     passthrough_nix_env(&mut cmd);
-    process_supervisor::apply_isolation(&mut cmd);
-    let child = cmd.spawn().context("spawn nix flake metadata")?;
+    // No setsid: tokio's wait_with_output relies on a SIGCHLD/kqueue waker
+    // that is unreliable once the child is a session leader on macOS.
+    // Nix is a single-process invocation so we only need the direct-pid
+    // kill the supervisor will issue.
+    let mut child = cmd.spawn().context("spawn nix flake metadata")?;
     let child_pid: i32 = child
         .id()
         .context("nix flake metadata child has no pid")?
@@ -162,10 +165,17 @@ async fn lock_flake_url(
     let _track_guard = process_supervisor::register_child(child_pid);
     let output = tokio::select! {
         _ = ctoken.cancelled() => {
-            process_supervisor::kill_pgid(child_pid);
+            process_supervisor::kill_child(child_pid);
+            // Reap before bailing — without this the Child dropping does NOT
+            // run waitpid on macOS (tokio's SIGCHLD waker is unreliable),
+            // leaving a Z entry in the process table.
+            process_supervisor::wait_polling(&mut child).await
+                .context("wait for cancelled nix flake metadata")?;
             anyhow::bail!("nix flake metadata cancelled");
         }
-        res = child.wait_with_output() => res.context("wait for nix flake metadata")?,
+        // Polling-based wait_with_output: tokio's wait_with_output uses a
+        // SIGCHLD-based waker that is unreliable on macOS and leaves zombies.
+        res = process_supervisor::wait_with_output_polling(&mut child) => res.context("wait for nix flake metadata")?,
     };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -412,9 +422,9 @@ impl ManagedDriver for Driver {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         passthrough_nix_env(&mut cmd);
-        process_supervisor::apply_isolation(&mut cmd);
+        // No setsid: see comment in lock_flake_url for the rationale.
 
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn nix build for {addr_str}"))?;
         let child_pid: i32 = child
@@ -426,10 +436,12 @@ impl ManagedDriver for Driver {
 
         let output = tokio::select! {
             _ = ctoken.cancelled() => {
-                process_supervisor::kill_pgid(child_pid);
+                process_supervisor::kill_child(child_pid);
+                process_supervisor::wait_polling(&mut child).await
+                    .context("wait for cancelled nix build")?;
                 anyhow::bail!("nix build cancelled");
             }
-            res = child.wait_with_output() => res.context("wait for nix build")?,
+            res = process_supervisor::wait_with_output_polling(&mut child) => res.context("wait for nix build")?,
         };
 
         if !output.status.success() {
