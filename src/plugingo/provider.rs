@@ -421,15 +421,13 @@ impl ProviderInner {
                     as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>);
             }
 
-            let packages = tokio::task::spawn_blocking(
+            let packages = crate::process_supervisor::block_or_inline(
                 enclose!((self.workspace_root => workspace_root) move || {
                     let mut packages = Vec::new();
                     collect_go_packages(&search_dir, &workspace_root, &mut packages);
                     packages
                 }),
-            )
-            .await
-            .context("collect_go_packages panicked")?;
+            );
 
             Ok(Box::new(packages.into_iter())
                 as Box<
@@ -1129,7 +1127,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let pkg = tokio::task::spawn_blocking(move || {
+                    let pkg = crate::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -1146,9 +1144,7 @@ impl ProviderInner {
                             }
                         }
                         anyhow::bail!("_golist produced no package.bin")
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("read_golist_package task panicked: {e}"))??;
+                    })?;
                     Ok(Arc::new(pkg))
                 }),
             )
@@ -1169,7 +1165,7 @@ impl ProviderInner {
             .once(
                 golist_addr.clone(),
                 enclose!((result) move || async move {
-                    let addrs = tokio::task::spawn_blocking(move || {
+                    let addrs = crate::process_supervisor::block_or_inline(move || -> anyhow::Result<_> {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
                                 let entry = entry_result?;
@@ -1186,9 +1182,7 @@ impl ProviderInner {
                             }
                         }
                         anyhow::bail!("_golist produced no package_addrs.bin")
-                    })
-                    .await
-                    .map_err(|e| anyhow::anyhow!("read_golist_package_addrs task panicked: {e}"))??;
+                    })?;
                     Ok(Arc::new(addrs))
                 }),
             )
@@ -1327,9 +1321,10 @@ impl ProviderInner {
     ) -> anyhow::Result<TransitiveDeps> {
         let go_mod_path = module_root.join("go.mod");
         let (go_mod_requires, workspace_module_path) = if go_mod_path.exists() {
-            let content = tokio::fs::read_to_string(&go_mod_path)
-                .await
-                .with_context(|| format!("reading {}", go_mod_path.display()))?;
+            let content = crate::process_supervisor::block_or_inline(
+                enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
+            )
+            .with_context(|| format!("reading {}", go_mod_path.display()))?;
             (
                 parse_go_mod_requires(&content),
                 parse_go_mod_module_path(&content).unwrap_or_default(),

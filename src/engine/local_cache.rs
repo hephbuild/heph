@@ -137,7 +137,12 @@ impl Engine {
         artifact: &outputartifact::OutputArtifact,
     ) -> anyhow::Result<(CacheArtifact, ManifestArtifact)> {
         let hashin = hashin.to_string();
-        tokio::task::spawn_blocking(
+        // `block_or_inline` runs on the current worker via `block_in_place`
+        // (multi-thread) or inline (current-thread). Avoids `spawn_blocking`
+        // whose JoinHandle wake-up uses tokio's cross-thread waker, which
+        // is observed to drop wakeups on macOS under heavy load — see
+        // `RCA_MACOS_WAKER.md`.
+        crate::process_supervisor::block_or_inline(
             enclose!((self.local_cache => local_cache, addr, artifact) move || {
                 let type_prefix = match artifact.r#type {
                     outputartifact::Type::Output => "out",
@@ -212,8 +217,6 @@ impl Engine {
                 ))
             }),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("cache_artifact_locally task panicked: {e}"))?
     }
 
     pub async fn cache_locally(
@@ -268,7 +271,9 @@ impl Engine {
     ) -> anyhow::Result<Option<(Vec<CacheArtifact>, Vec<ArtifactMeta>)>> {
         let addr = def.target.addr.clone();
         let hashin = hashin.to_string();
-        tokio::task::spawn_blocking(enclose!((self.local_cache => local_cache) move || {
+        // See `cache_artifact_locally` for why this is `block_or_inline`
+        // and not `spawn_blocking`.
+        crate::process_supervisor::block_or_inline(enclose!((self.local_cache => local_cache) move || {
             let mut manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
                 Err(e) if e.is::<NotFoundError>() => return Ok(None),
                 Err(e) => return Err(e),
@@ -325,7 +330,5 @@ impl Engine {
 
             anyhow::Ok(Some((results, result_meta)))
         }))
-        .await
-        .map_err(|e| anyhow::anyhow!("artifacts_from_local_cache task panicked: {e}"))?
     }
 }

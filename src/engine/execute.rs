@@ -177,11 +177,10 @@ impl Engine {
 
 /// Run a synchronous `std::fs` operation on the current tokio worker
 /// thread via `block_in_place` (on multi-thread runtime) or directly (on
-/// current-thread, e.g. tests). macOS tokio cross-thread waker delivery
-/// is broken under heavy spawn/spawn_blocking load; doing the fs op
-/// directly on the worker is the only path that surely makes progress.
-/// The multi-thread runtime tolerates one blocked worker — others keep
-/// scheduling tasks.
+/// current-thread, e.g. tests). `tokio::fs::*` routes through
+/// `spawn_blocking` and has been observed to lose wake-ups on macOS
+/// under heavy load; doing the fs op on the worker is the path that
+/// surely makes progress.
 async fn sync_fs_op_on_thread<F>(f: F) -> std::io::Result<()>
 where
     F: FnOnce() -> std::io::Result<()> + Send + 'static,

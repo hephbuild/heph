@@ -182,13 +182,11 @@ impl EProvider for Provider {
                 .once(
                     (),
                     enclose!((self.root => root, self.build_file_patterns => patterns) move || async move {
-                        let packages = tokio::task::spawn_blocking(move || {
+                        let packages = crate::process_supervisor::block_or_inline(move || {
                             let mut packages = std::collections::HashSet::new();
                             find_packages_sync(&root, &root, &patterns, &mut packages)?;
                             Ok::<_, anyhow::Error>(packages.into_iter().collect::<Vec<String>>())
-                        })
-                        .await
-                        .context("find_packages panicked")??;
+                        })?;
                         Ok(Arc::new(packages))
                     }),
                 )

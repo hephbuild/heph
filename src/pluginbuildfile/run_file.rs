@@ -514,15 +514,13 @@ impl Provider {
             .once(
                 key.clone(),
                 enclose!((key) move || async move {
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<RunResult>> {
+                    crate::process_supervisor::block_or_inline(move || -> anyhow::Result<Arc<RunResult>> {
                         let loader =
                             BuildFileLoader::new(root, patterns, file_cache, dir_cache);
                         loader
                             .load_pkg(&key)
                             .with_context(|| format!("pkg: `{}`", key))
                     })
-                    .await
-                    .context("run_pkg blocking task panicked")?
                 }),
             )
             .await

@@ -135,38 +135,18 @@ pub fn init() -> anyhow::Result<()> {
 
 /// Wait for `child` to exit and reap the zombie.
 ///
-/// **Implementation**: `std::thread` running a WNOHANG poll loop with
-/// `std::thread::sleep` for backoff, signaling completion via a
-/// `tokio::sync::oneshot`. The async caller only awaits the oneshot.
-///
-/// Why this design (after iterating through several alternatives that
-/// each broke in specific macOS edge cases):
-///   1. `tokio::process::Child::wait().await` — SIGCHLD-based, unreliable
-///      on macOS once the child is a session leader (PTY/shell mode) and
-///      under heavy runtime load even for non-setsid children.
-///   2. `std::thread` running blocking `waitpid(pid, 0)` — suffers the
-///      macOS waitpid race: when tokio's internal `waitpid(-1, WNOHANG)`
-///      reaps the same pid first, the kernel does NOT wake other threads
-///      parked in `waitpid(pid, 0)`. Parked forever.
-///   3. Pure async WNOHANG polling with `tokio::time::sleep` — under
-///      heavy concurrent spawn/spawn_blocking load on macOS, tokio's
-///      timer driver and blocking-pool JoinHandle wake-up stop firing
-///      (worker threads stay parked in `__psynch_cvwait`/`kevent`); even
-///      `tokio::time::sleep` doesn't wake.
-///   4. `child.try_wait()` polling — reads tokio's internal reaper cache
-///      which is updated by the same starved task; never surfaces status.
-///
-/// This design uses three primitives that survive the macOS pathologies:
-///   - `std::thread` for the wait loop — kernel-scheduled, not blocked
-///     by tokio runtime sickness.
-///   - `WNOHANG waitpid` — non-blocking; either reaps the zombie (real
-///     status), sees the child still running (sleep + retry), or hits
-///     ECHILD (already reaped by tokio; we synthesize success since
-///     status is lost).
-///   - `std::thread::sleep` — kernel sleep, independent of tokio timer.
-///   - `tokio::sync::oneshot` — the most fundamental tokio wake-up;
-///     uses task notification, not timer/IO driver/signal driver. If
-///     this is broken the runtime is unrecoverable.
+/// Two layers:
+///   1. [`crate::process_watcher`] — dedicated OS thread driving a
+///      `kqueue EVFILT_PROC` (macOS) or `pidfd + epoll` (Linux) loop.
+///      Reaps via `waitpid(WNOHANG)` and signals completion through a
+///      `tokio::sync::oneshot`.
+///   2. `block_in_place` + `Receiver::blocking_recv` — synchronously
+///      blocks the calling worker on the oneshot. Crucially this uses
+///      kernel `thread::park`, NOT tokio's cross-thread waker
+///      (`mio::Waker` → `EVFILT_USER`), which is observed to silently
+///      drop wakeups on macOS under heavy concurrent spawn load. The
+///      multi-thread runtime tolerates one blocked worker; tokio
+///      compensates by growing the blocking pool.
 pub async fn wait_polling(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
@@ -179,23 +159,32 @@ pub async fn wait_polling(
         as i32;
 
     crate::hmemoizer::set_phase("wait_polling:rx_await");
+    let rx = crate::process_watcher::register(pid);
     if is_multi_thread_runtime() {
-        // Production: block one worker, others keep scheduling tasks.
-        // macOS waker delivery is broken; we cannot reliably yield and
-        // be polled back.
-        tokio::task::block_in_place(|| sync_wait_poll(pid))
+        // Multi-thread (production): block on the oneshot synchronously
+        // via `block_in_place` + `blocking_recv`. Uses kernel `thread::park`
+        // wake — bypasses tokio's broken cross-thread waker.
+        tokio::task::block_in_place(move || rx.blocking_recv()).map_err(|recv_err| {
+            std::io::Error::other(format!("process watcher dropped sender: {recv_err}"))
+        })?
     } else {
-        // Tests (current_thread runtime): low concurrency, tokio's
-        // native `child.wait()` is reliable here. block_in_place would
-        // panic on current_thread.
-        child.wait().await
+        // Current-thread (tests): `blocking_recv` panics inside a runtime
+        // and `block_in_place` panics on current-thread. Plain `.await`
+        // is fine — the waker bug only manifests under high concurrency
+        // which tests don't reach.
+        rx.await
+            .map_err(|recv_err| {
+                std::io::Error::other(format!("process watcher dropped sender: {recv_err}"))
+            })?
     }
 }
 
 /// Run `f` synchronously, using `block_in_place` when the current tokio
 /// runtime is multi-threaded (so other workers keep progressing) and a
-/// direct call otherwise. Tests run under the current-thread runtime
-/// where block_in_place panics; production uses multi-thread.
+/// direct call otherwise. Used for filesystem ops on the hot path where
+/// `tokio::fs::*` (which routes through `spawn_blocking`) has been
+/// observed to lose wake-ups on macOS under heavy load. Process waits
+/// use `process_watcher` instead.
 pub fn block_or_inline<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
@@ -211,34 +200,6 @@ fn is_multi_thread_runtime() -> bool {
     tokio::runtime::Handle::try_current()
         .map(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread))
         .unwrap_or(false)
-}
-
-fn sync_wait_poll(pid: i32) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::ExitStatusExt as _;
-    let mut delay_ms: u64 = 1;
-    loop {
-        let mut status: libc::c_int = 0;
-        // SAFETY: WNOHANG waitpid is non-blocking; side-effect is
-        // reaping the zombie (intentional).
-        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if r > 0 {
-            return Ok(std::process::ExitStatus::from_raw(status));
-        }
-        if r < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ECHILD) {
-                tracing::debug!(
-                    pid,
-                    "wait_polling: ECHILD — child reaped by tokio; \
-                     synthesizing successful exit (real status lost)"
-                );
-                return Ok(std::process::ExitStatus::from_raw(0));
-            }
-            return Err(err);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        delay_ms = (delay_ms * 2).min(100);
-    }
 }
 
 /// Polling-based replacement for `tokio::process::Child::wait_with_output`.
