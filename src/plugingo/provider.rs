@@ -58,9 +58,15 @@ pub(crate) struct ProviderInner {
     gopath: String,
     gocache: String,
     go_bin_addr: String,
-    /// Cache: golist addr → GoPackage. Memoizes the full executor.result + parse across requests.
+    /// Cache: golist addr → parsed GoPackage. Memoizes the artifact parse only;
+    /// the underlying `executor.result(golist_addr)` is always called outside
+    /// the `once` closure so every caller (owner + waiter) registers the
+    /// `parent → golist_addr` edge in the engine's `DepDag`. Caching the
+    /// executor call here would let a waiter skip dep registration and hide a
+    /// target-dep cycle as a memoizer deadlock.
     pkg_cache: Memoizer<Addr, Result<Arc<GoPackage>, Arc<anyhow::Error>>>,
-    /// Cache: golist addr → driver-resolved per-file addresses.
+    /// Cache: golist addr → driver-resolved per-file addresses. Same constraint
+    /// as `pkg_cache` — caches the parse, not the executor call.
     pkg_addrs_cache: Memoizer<Addr, Result<Arc<PackageAddrs>, Arc<anyhow::Error>>>,
     /// Cache: dedup `collect_direct_libs` / `collect_transitive_libs` BFS across
     /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_lib#test`,
@@ -1096,20 +1102,23 @@ impl ProviderInner {
 
     /// Read and parse the single package from a `_golist` target's output artifact.
     ///
-    /// The full executor.result call is inside the once closure so the engine pipeline
-    /// (including disk cache lookup) runs at most once per golist addr per Provider lifetime.
-    /// Concurrent callers for the same addr share one future; subsequent callers get the
-    /// cached result immediately without hitting the engine at all.
+    /// `executor.result(golist_addr)` is called OUTSIDE the `once` closure so
+    /// every caller (owner + cache-hit waiters) routes through
+    /// `Engine::result_addr`, which registers the `parent → golist_addr` edge
+    /// in the request's `DepDag`. Memoizing the executor call inside the
+    /// closure would let waiters skip dep registration, hiding a real target-
+    /// dep cycle as a memoizer deadlock. The cache only memoizes the artifact
+    /// parse, which is the expensive part.
     async fn read_golist_package(
         &self,
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<GoPackage>> {
+        let result = executor.result(golist_addr).await?;
         self.pkg_cache
             .once(
                 golist_addr.clone(),
-                enclose!((golist_addr, executor) move || async move {
-                    let result = executor.result(&golist_addr).await?;
+                enclose!((result) move || async move {
                     let pkg = tokio::task::spawn_blocking(move || {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
@@ -1142,11 +1151,14 @@ impl ProviderInner {
         executor: Arc<dyn ProviderExecutor>,
         golist_addr: &Addr,
     ) -> anyhow::Result<Arc<PackageAddrs>> {
+        // executor.result is called outside the once closure for the same
+        // reason as in `read_golist_package`: waiters must register the dep
+        // edge, not just the cache owner.
+        let result = executor.result(golist_addr).await?;
         self.pkg_addrs_cache
             .once(
                 golist_addr.clone(),
-                enclose!((golist_addr, executor) move || async move {
-                    let result = executor.result(&golist_addr).await?;
+                enclose!((result) move || async move {
                     let addrs = tokio::task::spawn_blocking(move || {
                         for artifact in &result.artifacts {
                             for entry_result in artifact.walk()? {
@@ -1868,6 +1880,65 @@ mod tests {
             _ => panic!("expected map"),
         };
         assert!(out.contains_key("pkg"));
+    }
+
+    // Regression: pkg_cache used to wrap executor.result inside the once
+    // closure, so cache-hit waiters bypassed the executor entirely. A target-
+    // dep cycle could then hide as a memoizer deadlock instead of surfacing
+    // as a synchronous CycleError. The fix hoists executor.result out of the
+    // closure; every caller must route through it so result_addr's
+    // dep_dag.add_dep runs for waiters too.
+    #[tokio::test]
+    async fn read_golist_package_calls_executor_for_every_caller() {
+        require_go!();
+
+        struct CountingExecutor {
+            inner: Arc<dyn ProviderExecutor>,
+            result_calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl ProviderExecutor for CountingExecutor {
+            fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>> {
+                self.result_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.result(addr)
+            }
+            fn query<'a>(
+                &'a self,
+                m: &'a crate::htmatcher::Matcher,
+            ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
+                self.inner.query(m)
+            }
+        }
+
+        let sandbox = copy_fixture("simple_lib");
+        let inner: Arc<dyn ProviderExecutor> = Arc::new(GoListTestExecutor {
+            workspace_root: sandbox.path().to_path_buf(),
+            source_map: HashMap::new(),
+        });
+        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor: Arc<dyn ProviderExecutor> = Arc::new(CountingExecutor {
+            inner,
+            result_calls: Arc::clone(&counter),
+        });
+
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let golist = make_addr("", "_golist");
+
+        p.inner
+            .read_golist_package(Arc::clone(&executor), &golist)
+            .await
+            .unwrap();
+        p.inner
+            .read_golist_package(Arc::clone(&executor), &golist)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every read_golist_package must call executor.result so all \
+             callers register the parent → golist edge in DepDag"
+        );
     }
 
     // ---- with_dep ----

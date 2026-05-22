@@ -47,7 +47,26 @@ pub struct TargetSpec {
 }
 
 pub trait ProviderExecutor: Send + Sync {
+    /// Resolve a target's result.
+    ///
+    /// Each call routes through `Engine::result_addr`, which adds a
+    /// `parent → addr` edge to the request's `DepDag` before any await. That
+    /// edge is the engine's sole synchronous cycle check — `daggy` returns
+    /// `WouldCycle`, surfaced as `CycleError`, the moment a closing edge is
+    /// inserted.
+    ///
+    /// **Do not wrap this call in a provider-internal memoizer keyed on the
+    /// `addr`.** A waiter that hits the cache would skip this call, never
+    /// register its dep edge, and let a real target-dep cycle silently turn
+    /// into a memoizer deadlock instead of a typed `CycleError`. Cache the
+    /// parsed/derived output if needed; never the executor call itself.
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>>;
+    /// Resolve all targets matching `m`.
+    ///
+    /// Same caveat as `result`: each call resolves matched addrs through
+    /// `Engine::get_spec`, which registers `parent → addr` in the `DepDag`.
+    /// Do not memoize this on the matcher in a provider — waiters would bypass
+    /// the dep registration and a target-dep cycle would hide as a deadlock.
     fn query<'a>(&'a self, m: &'a Matcher) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 
