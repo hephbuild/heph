@@ -449,6 +449,7 @@ impl Driver {
         ctoken: &(dyn Cancellable + Send + Sync),
         shell: bool,
     ) -> anyhow::Result<ManagedRunResponse> {
+        crate::hmemoizer::set_phase("pluginexec:sandbox_setup");
         let rreq = req.request;
         let def = rreq.target.def::<TargetDef>();
 
@@ -602,6 +603,17 @@ impl Driver {
             let mut linked: std::collections::HashSet<std::ffi::OsString> =
                 std::collections::HashSet::new();
             for (group, inputs) in &def.tool_group_inputs {
+                let tool_key = if group.is_empty() {
+                    "TOOL".to_string()
+                } else {
+                    format!("TOOL_{}", group.to_uppercase())
+                };
+                // Per-group dedup for $TOOL_<G> values. `linked` is process-wide
+                // (avoids EEXIST on symlink); `group_seen` is per-group so each
+                // TOOL_<G> reflects that group's references without duplicates
+                // when one group lists the same filename via multiple inputs.
+                let mut group_seen: std::collections::HashSet<std::ffi::OsString> =
+                    std::collections::HashSet::new();
                 for input in inputs {
                     // Filter to Dep-type — Support inputs that travel with the
                     // tool target's deps share its origin_id but must not be
@@ -636,10 +648,22 @@ impl Driver {
                                 anyhow::anyhow!("tool file path has no filename: {}", file_path)
                             })?
                             .to_os_string();
+                        let bin_path = bin_dir.join(&filename);
+
+                        if group_seen.insert(filename.clone()) {
+                            let bin_path_str = bin_path.to_str().ok_or_else(|| {
+                                anyhow::anyhow!("bin path is not valid UTF-8: {:?}", bin_path)
+                            })?;
+                            let entry = env.entry(tool_key.clone()).or_default();
+                            if !entry.is_empty() {
+                                entry.push(' ');
+                            }
+                            entry.push_str(bin_path_str);
+                        }
+
                         if !linked.insert(filename.clone()) {
                             continue;
                         }
-                        let bin_path = bin_dir.join(&filename);
                         #[cfg(unix)]
                         std::os::unix::fs::symlink(&file_path, &bin_path).with_context(|| {
                             format!("symlink tool {file_path:?} -> {bin_path:?}")
@@ -767,6 +791,7 @@ impl Driver {
             // direct-pid `kill` the supervisor also issues.
         }
 
+        crate::hmemoizer::set_phase("pluginexec:spawn");
         let mut child = cmd.spawn().with_context(|| "spawn child process")?;
         // Pid == pgid because of setsid in pre_exec; register with supervisor
         // so a hard-kill of rheph still reaps the whole process tree.
@@ -839,6 +864,7 @@ impl Driver {
         let stdout_fut = tee_stream(child_stdout, Arc::clone(&output_log_file), rreq.stdout);
         let stderr_fut = tee_stream(child_stderr, Arc::clone(&output_log_file), rreq.stderr);
 
+        crate::hmemoizer::set_phase("pluginexec:wait_subprocess");
         tokio::select! {
             _ = ctoken.cancelled() => {
                 // killpg covers grandchildren in PTY/shell mode where the
@@ -872,15 +898,20 @@ impl Driver {
                         // on macOS, so cap the wait — anything left will be lost,
                         // but in shell mode the user has already seen the output
                         // streamed live.
+                        crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
                         _ = tokio::time::timeout(
                             std::time::Duration::from_millis(50),
                             &mut io,
                         ).await;
                         s
                     }
-                    _ = &mut io => (&mut wait_fut).await,
+                    _ = &mut io => {
+                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                        (&mut wait_fut).await
+                    },
                 }
             } => {
+                crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
                 let status = res.with_context(|| "wait for child process")?;
 
                 if !status.success() {
@@ -889,6 +920,7 @@ impl Driver {
                 }
             }
         }
+        crate::hmemoizer::set_phase("pluginexec:post_wait_done");
 
         Ok(ManagedRunResponse {
             artifacts: vec![outputartifact::OutputArtifact {

@@ -37,6 +37,21 @@ fn main() -> ExitCode {
         rheph::process_supervisor::run_supervisor_main(fd);
     }
 
+    // Ignore SIGTTOU/SIGTTIN so terminal-control syscalls (tcsetattr,
+    // tcgetattr, tcsetpgrp …) from a background process group fail with
+    // EIO instead of stopping the process. Test subprocesses can move the
+    // foreground process group off heph3 (e.g. Go test runners that grab
+    // the terminal) and exit without restoring; the next TUI raw-mode
+    // toggle in `crossterm::terminal::enable_raw_mode` would otherwise
+    // freeze the entire process (observed as a deadlock — every thread
+    // stopped, tokio runtime appears hung). With these signals ignored,
+    // the call returns an error that the TUI can surface.
+    // SAFETY: signal(2) at process startup, before any thread spawns.
+    unsafe {
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+
     let start = Instant::now();
     let sink = log::init();
     rheph::tui::panic::install(sink.clone());

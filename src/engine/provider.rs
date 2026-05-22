@@ -61,13 +61,20 @@ pub trait ProviderExecutor: Send + Sync {
     /// into a memoizer deadlock instead of a typed `CycleError`. Cache the
     /// parsed/derived output if needed; never the executor call itself.
     fn result<'a>(&'a self, addr: &'a Addr) -> BoxFuture<'a, anyhow::Result<Arc<EResult>>>;
-    /// Resolve all targets matching `m`.
+    /// Resolve all targets matching `m`. `extra_skip` is unioned with the
+    /// request's `skip_providers` for this iteration only — used to keep a
+    /// provider-emitted target from re-entering its own provider while
+    /// resolving query inputs (see `rewrite_query_inputs`).
     ///
     /// Same caveat as `result`: each call resolves matched addrs through
     /// `Engine::get_spec`, which registers `parent → addr` in the `DepDag`.
     /// Do not memoize this on the matcher in a provider — waiters would bypass
     /// the dep registration and a target-dep cycle would hide as a deadlock.
-    fn query<'a>(&'a self, m: &'a Matcher) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
+    fn query<'a>(
+        &'a self,
+        m: &'a Matcher,
+        extra_skip: &'a [String],
+    ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>>;
 }
 
 pub struct GetRequest {

@@ -422,6 +422,7 @@ mod tests {
         fn query<'a>(
             &'a self,
             _m: &'a crate::htmatcher::Matcher,
+            _extra_skip: &'a [String],
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<crate::htaddr::Addr>>> {
             Box::pin(async { anyhow::bail!("noop") })
         }

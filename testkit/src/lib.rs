@@ -2,8 +2,7 @@ use anyhow::Context as _;
 use rheph::engine::driver::Driver as SDKDriver;
 use rheph::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use rheph::engine::provider::Provider as SDKProvider;
-use rheph::engine::provider::TargetSpec;
-use rheph::engine::{Config, EResult, Engine, OutputMatcher, ResultOptions};
+use rheph::engine::{Config, EResult, Engine, EngineTargetSpec, OutputMatcher, ResultOptions};
 use rheph::htaddr::{Addr, parse_addr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,7 +110,7 @@ impl Workspace {
             .await
     }
 
-    pub async fn get_spec(&self, addr_str: &str) -> anyhow::Result<Arc<TargetSpec>> {
+    pub async fn get_spec(&self, addr_str: &str) -> anyhow::Result<Arc<EngineTargetSpec>> {
         let addr = parse_addr(addr_str)?;
         let rs = self.engine.new_state();
         self.engine.clone().get_spec(rs, &addr).await
@@ -119,15 +118,15 @@ impl Workspace {
 }
 
 pub fn artifact_bytes(result: &EResult) -> Vec<u8> {
+    use rheph::hartifactcontent::WalkEntryKind;
     use std::io::Read as _;
     let mut out = Vec::new();
     for artifact in &result.artifacts {
         for entry in artifact.walk().expect("walk artifacts") {
-            entry
-                .expect("artifact entry")
-                .data
-                .read_to_end(&mut out)
-                .expect("read artifact");
+            let entry = entry.expect("artifact entry");
+            if let WalkEntryKind::File { mut data, .. } = entry.kind {
+                data.read_to_end(&mut out).expect("read artifact");
+            }
         }
     }
     out

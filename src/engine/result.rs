@@ -6,6 +6,7 @@ use crate::engine::provider::{
     GetError, GetRequest, GetResponse, ListRequest, ProviderExecutor, TargetSpec,
 };
 use crate::engine::request_state::RequestState;
+use crate::engine::spec::EngineTargetSpec;
 use crate::hmemoizer::{downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htmatcher::MatchResult;
@@ -57,6 +58,7 @@ impl ProviderExecutor for EngineProviderExecutor {
     fn query<'a>(
         &'a self,
         m: &'a Matcher,
+        extra_skip: &'a [String],
     ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
         Box::pin(async move {
             let engine = self
@@ -75,7 +77,9 @@ impl ProviderExecutor for EngineProviderExecutor {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
                 for provider in &engine.providers {
-                    if rs.skip_providers.contains(&provider.name) {
+                    if rs.skip_providers.contains(&provider.name)
+                        || extra_skip.iter().any(|n| n == &provider.name)
+                    {
                         continue;
                     }
                     // Collect list results eagerly (non-Send iterator dropped before next await)
@@ -321,9 +325,12 @@ impl Engine {
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
-            set.spawn(enclose!((self => engine, rs, opts) async move {
-                engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await
-            }));
+            crate::hmemoizer::join_set_spawn(
+                &mut set,
+                enclose!((self => engine, rs, opts) async move {
+                    engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await
+                }),
+            );
         }
 
         let mut all_res: Vec<Arc<EResult>> = vec![];
@@ -454,6 +461,7 @@ impl Engine {
             .once(
                 key,
                 enclose!((self => engine, rs) move || async move {
+                    crate::hmemoizer::set_phase("execute_cache:engine_execute");
                     let (artifacts, sandbox_dir) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
@@ -479,10 +487,13 @@ impl Engine {
                         });
                     }
 
-                    engine
+                    crate::hmemoizer::set_phase("execute_cache:cache_locally");
+                    let out = engine
                         .cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache)
                         .await
-                        .map(|cached| (cached, artifacts_meta))
+                        .map(|cached| (cached, artifacts_meta));
+                    crate::hmemoizer::clear_phase();
+                    out
                 }),
             )
             .await
@@ -610,13 +621,13 @@ impl Engine {
             .parse(
                 ParseRequest {
                     request_id: rs.request_id().to_string(),
-                    target_spec: Arc::clone(&spec),
+                    target_spec: Arc::clone(&spec.spec),
                 },
                 rs.ctoken(),
             )
             .await
             .with_context(|| format!("{} parse", driver.name))?;
-        let def = rewrite_query_inputs(res.target_def, addr);
+        let def = rewrite_query_inputs(res.target_def, addr, &spec.provider);
 
         let all_transitive = if apply_transitive {
             let sb = Arc::clone(&self)
@@ -715,7 +726,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<Arc<TargetSpec>> {
+    ) -> anyhow::Result<Arc<EngineTargetSpec>> {
         if let Some(ref parent) = rs.parent {
             let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
             dag.add_dep(parent, addr).map_err(|_e| {
@@ -733,7 +744,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<Arc<TargetSpec>> {
+    ) -> anyhow::Result<Arc<EngineTargetSpec>> {
         rs.data
             .mem_spec
             .once(
@@ -761,7 +772,7 @@ impl Engine {
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         addr: &Addr,
-    ) -> anyhow::Result<Arc<TargetSpec>> {
+    ) -> anyhow::Result<Arc<EngineTargetSpec>> {
         for provider in self.providers.iter() {
             let provider_rs = rs.with_skip_provider(&provider.name);
             let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
@@ -789,25 +800,40 @@ impl Engine {
                 Err(GetError::Other(e)) => return Err(e),
             };
 
-            return anyhow::Ok(Arc::new(spec));
+            return anyhow::Ok(Arc::new(EngineTargetSpec {
+                spec: Arc::new(spec),
+                provider: provider.name.clone(),
+            }));
         }
 
         Err(TargetNotFoundError { addr: addr.clone() }.into())
     }
 }
 
-/// Stamp `_origin = dest.hash_str()` onto any input whose ref points at a
-/// query target. Each requesting target gets its own per-dest variant of the
-/// query addr, so distinct `mem_spec` cells are computed per dest — the
-/// engine-level cycle detector then trips per dest (excluding only the
-/// requesting target from its own query) instead of poisoning a shared cell.
+/// Stamp `_origin = dest.hash_str()` (and, when known, `exclude_provider =
+/// dest_provider`) onto any input whose ref points at a query target.
 ///
-/// Hash stability: `def.hash` already covers `def.addr`, and the annotation
-/// is a pure function of `def.addr`. Same dest ⇒ same annotation; different
-/// dests live in distinct `mem_def` cells already keyed by addr. No re-hash.
+/// `_origin` makes each requesting target get its own per-dest variant of the
+/// query addr so distinct `mem_spec` cells are computed per dest — the
+/// engine-level cycle detector then trips per dest instead of poisoning a
+/// shared cell.
+///
+/// `exclude_provider` ensures the query resolution skips the dest's own
+/// provider when iterating candidates. Without it, a provider-emitted target
+/// carrying a query input would force the engine to re-iterate the same
+/// provider's `list(pkg)` during query resolution, dragging unrelated targets'
+/// spec computations into the call stack and opening the door to same-task
+/// memoizer re-entrance deadlocks (see `pluginquery::PACKAGE`). User-supplied
+/// `exclude_provider` values are not overwritten.
+///
+/// Hash stability: `def.hash` already covers `def.addr` and these stamps are
+/// pure functions of `def.addr` + `dest_provider`. Same dest ⇒ same stamp;
+/// different dests live in distinct `mem_def` cells already keyed by addr.
+/// No re-hash.
 fn rewrite_query_inputs(
     mut def: crate::engine::driver::targetdef::TargetDef,
     dest: &Addr,
+    dest_provider: &str,
 ) -> crate::engine::driver::targetdef::TargetDef {
     let origin = dest.hash_str();
     for input in &mut def.inputs {
@@ -815,6 +841,9 @@ fn rewrite_query_inputs(
         if r.package.as_str() == crate::pluginquery::PACKAGE {
             let mut args = r.args.clone();
             args.insert("_origin".to_string(), origin.clone());
+            if !dest_provider.is_empty() && !args.contains_key("exclude_provider") {
+                args.insert("exclude_provider".to_string(), dest_provider.to_string());
+            }
             input.r#ref.r#ref = Addr::new(r.package.clone(), r.name.clone(), args);
         }
     }
@@ -909,7 +938,7 @@ mod tests {
         };
 
         let _addrs = executor
-            .query(&Matcher::Package(PkgBuf::from("any")))
+            .query(&Matcher::Package(PkgBuf::from("any")), &[])
             .await?;
 
         assert_eq!(
@@ -1103,6 +1132,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_input_annotated_with_exclude_provider() -> anyhow::Result<()> {
+        // Auto-injection: the dest's producing provider must be stamped onto
+        // query inputs so they can't re-iterate that provider's targets.
+        let engine = engine_with(vec![static_target(
+            "//pkg:a",
+            &[],
+            &["//@heph/query:q@label=foo"],
+        )])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let def = engine.clone().get_def(engine.new_state(), &addr_a).await?;
+        let input = def
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("expected query input");
+        let stamped = input
+            .r#ref
+            .r#ref
+            .args
+            .get("exclude_provider")
+            .expect("query input must be annotated with exclude_provider");
+        // engine_with registers pluginstatictarget under that name.
+        assert_eq!(stamped, "pluginstatictarget");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn query_input_user_exclude_provider_not_clobbered() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target(
+            "//pkg:a",
+            &[],
+            &["//@heph/query:q@label=foo,exclude_provider=__user__"],
+        )])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let def = engine.clone().get_def(engine.new_state(), &addr_a).await?;
+        let input = def
+            .target_def
+            .inputs
+            .iter()
+            .find(|i| i.r#ref.r#ref.package.as_str() == crate::pluginquery::PACKAGE)
+            .expect("expected query input");
+        let stamped = input.r#ref.r#ref.args.get("exclude_provider").unwrap();
+        assert_eq!(
+            stamped, "__user__",
+            "user-supplied exclude_provider must not be overwritten"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_spec_returns_engine_target_spec_with_provider_name() -> anyhow::Result<()> {
+        let engine = engine_with(vec![static_target("//pkg:a", &[], &[])])?;
+        let addr_a = crate::htaddr::parse_addr("//pkg:a")?;
+        let spec = engine.clone().get_spec(engine.new_state(), &addr_a).await?;
+        assert_eq!(
+            spec.provider, "pluginstatictarget",
+            "EngineTargetSpec must carry the producing provider's name"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn query_with_cyclic_candidate_skips_and_completes() -> anyhow::Result<()> {
         // //pkg:a is a codegen target whose output tree matches the query's
         // tree_output_to. The matcher resolves only at def level, so the
@@ -1110,7 +1202,13 @@ mod tests {
         // for the same (per-dest annotated) query → cycle → a must be skipped
         // from its own query result. b is a sibling codegen target with no
         // query dep, so it has no cycle and is included.
-        let q = "//@heph/query:q@tree_output_to=gen";
+        //
+        // `exclude_provider=__none__` opts out of the auto-injected
+        // exclusion of the dest's own provider — we want intra-provider
+        // candidate enumeration here.
+        // Matcher pkg is `pkg/gen` because the codegen output of a target at
+        // `//pkg:*` with DirPath `gen/` lands in package `pkg/gen`.
+        let q = "//@heph/query:q@tree_output_to=pkg/gen,exclude_provider=__none__";
         let engine = engine_with(vec![
             codegen_target("//pkg:a", &[], "gen", &[q]),
             codegen_target("//pkg:b", &[], "gen", &[]),
@@ -1168,7 +1266,10 @@ mod tests {
         // excludes a but includes b, b's excludes b but includes a. Pre-fix
         // (shared cell) the first to compute would cache a result missing
         // itself, and the second target would see wrong data.
-        let q = "//@heph/query:q@tree_output_to=gen";
+        //
+        // `exclude_provider=__none__` opts out of the auto-injected exclusion
+        // — we want both same-provider candidates to be enumerable.
+        let q = "//@heph/query:q@tree_output_to=pkg/gen,exclude_provider=__none__";
         let engine = engine_with(vec![
             codegen_target("//pkg:a", &[], "gen", &[q]),
             codegen_target("//pkg:b", &[], "gen", &[q]),

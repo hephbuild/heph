@@ -915,7 +915,17 @@ impl ProviderInner {
                 }
                 let build_test_addr =
                     self.make_addr_with_name(&addr.package, "build_test", &factors);
-                let spec = target_test::test_spec(addr.clone(), build_test_addr);
+                // Add a query dep that pulls in any sibling target labeled
+                // `go_test_data`. The engine resolves the query lazily via the
+                // `@heph/query` provider — no eager scan of the package here.
+                let data_query_addr = crate::htaddr::parse_addr(&format!(
+                    "//{}:q@package={},label=go_test_data",
+                    crate::pluginquery::PACKAGE,
+                    addr.package.as_str(),
+                ))
+                .context("build go_test_data query addr")
+                .map_err(GetError::Other)?;
+                let spec = target_test::test_spec(addr.clone(), build_test_addr, &data_query_addr);
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
@@ -1772,6 +1782,7 @@ mod tests {
         fn query<'a>(
             &'a self,
             _m: &'a crate::htmatcher::Matcher,
+            _extra_skip: &'a [String],
         ) -> futures::future::BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
             Box::pin(async { Ok(vec![]) })
         }
@@ -1905,8 +1916,9 @@ mod tests {
             fn query<'a>(
                 &'a self,
                 m: &'a crate::htmatcher::Matcher,
+                extra_skip: &'a [String],
             ) -> BoxFuture<'a, anyhow::Result<Vec<Addr>>> {
-                self.inner.query(m)
+                self.inner.query(m, extra_skip)
             }
         }
 

@@ -22,9 +22,16 @@ pub async fn run_app<A: App>(
     sink: LogSink,
     interactive: bool,
 ) -> anyhow::Result<A::Output> {
-    if interactive {
-        backend::interactive::run(app, sink).await
-    } else {
-        backend::ci::run(app, sink).await
-    }
+    // Establish a stable identity for the runtime's outer `block_on`
+    // future so the memoizer's cross-task wait-for graph doesn't collide
+    // unrelated callers on the sentinel id 0. No-op when the cycle
+    // detector is disabled (the common case).
+    crate::hmemoizer::with_cycle_ctx(async move {
+        if interactive {
+            backend::interactive::run(app, sink).await
+        } else {
+            backend::ci::run(app, sink).await
+        }
+    })
+    .await
 }

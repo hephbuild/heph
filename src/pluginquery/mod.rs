@@ -14,10 +14,18 @@ pub const PACKAGE: &str = "@heph/query";
 
 pub struct Provider;
 
-// `_origin` is stamped on query input addrs by the engine's `rewrite_query_inputs`
-// so each requesting target gets its own `mem_spec` cell. `build_matcher` reads
-// no `_` prefixed keys — they exist purely to differentiate addr identity and
-// are intentionally ignored here.
+/// Args that don't contribute to matching but are still valid on a query addr.
+/// `_origin` and `exclude_provider` are both stamped by the engine's
+/// `rewrite_query_inputs` (the former gives each dest its own mem_spec cell;
+/// the latter is consumed below to limit which providers the engine iterates).
+/// `_`-prefixed keys are also ignored as a convention for addr-identity-only
+/// fields.
+const RESERVED_ARG_KEYS: &[&str] = &["exclude_provider"];
+
+fn is_reserved_key(k: &str) -> bool {
+    k.starts_with('_') || RESERVED_ARG_KEYS.contains(&k)
+}
+
 fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyhow::Result<Matcher> {
     let mut matchers: Vec<Matcher> = vec![];
 
@@ -31,16 +39,39 @@ fn build_matcher(args: &std::collections::BTreeMap<String, String>) -> anyhow::R
         matchers.push(Matcher::PackagePrefix(PkgBuf::from(prefix.as_str())));
     }
     if let Some(out) = args.get("tree_output_to") {
-        matchers.push(Matcher::TreeOutputTo(out.clone()));
+        matchers.push(Matcher::TreeOutputTo(PkgBuf::from(out.as_str())));
     }
 
-    match matchers.len() {
-        0 => anyhow::bail!(
+    if matchers.is_empty() {
+        // Sanity-check the args: an arg with no recognised key + no reserved
+        // key is a typo we should surface, not silently match everything.
+        let unknown: Vec<&String> = args.keys().filter(|k| !is_reserved_key(k)).collect();
+        if !unknown.is_empty() {
+            anyhow::bail!("query target has unknown args: {:?}", unknown);
+        }
+        anyhow::bail!(
             "query target requires at least one matcher arg (label, package, package_prefix, tree_output_to)"
-        ),
-        1 => Ok(matchers.remove(0)),
-        _ => Ok(Matcher::And(matchers)),
+        );
     }
+
+    if matchers.len() == 1 {
+        Ok(matchers.remove(0))
+    } else {
+        Ok(Matcher::And(matchers))
+    }
+}
+
+/// Parse `exclude_provider=a;b;c` into a `Vec<String>`. Empty when the arg is
+/// absent. Empty fragments (e.g. `a;;b`) are dropped.
+fn parse_exclude_providers(args: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    args.get("exclude_provider")
+        .map(|s| {
+            s.split(';')
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl EProvider for Provider {
@@ -86,10 +117,11 @@ impl EProvider for Provider {
             }
 
             let matcher = build_matcher(&req.addr.args).map_err(GetError::Other)?;
+            let exclude = parse_exclude_providers(&req.addr.args);
 
             let addrs = req
                 .executor
-                .query(&matcher)
+                .query(&matcher, &exclude)
                 .await
                 .map_err(GetError::Other)?;
 
@@ -268,6 +300,90 @@ mod tests {
         let addr = parse_addr("//some/other:target")?;
         let result = engine.get_spec(rs, &addr).await;
         assert!(result.is_err());
+        Ok(())
+    }
+
+    // ---- exclude_provider arg handling ----
+
+    #[test]
+    fn parse_exclude_providers_empty_when_arg_absent() {
+        let args = std::collections::BTreeMap::new();
+        assert!(parse_exclude_providers(&args).is_empty());
+    }
+
+    #[test]
+    fn parse_exclude_providers_single() {
+        let args =
+            std::collections::BTreeMap::from([("exclude_provider".to_string(), "go".to_string())]);
+        assert_eq!(parse_exclude_providers(&args), vec!["go".to_string()]);
+    }
+
+    #[test]
+    fn parse_exclude_providers_multi_semicolon_separated() {
+        let args = std::collections::BTreeMap::from([(
+            "exclude_provider".to_string(),
+            "go;buildfile".to_string(),
+        )]);
+        assert_eq!(
+            parse_exclude_providers(&args),
+            vec!["go".to_string(), "buildfile".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_exclude_providers_drops_empty_fragments() {
+        let args = std::collections::BTreeMap::from([(
+            "exclude_provider".to_string(),
+            ";;a;;".to_string(),
+        )]);
+        assert_eq!(parse_exclude_providers(&args), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn build_matcher_ignores_exclude_provider() {
+        // exclude_provider is a reserved key and must not contribute to matching.
+        let args = std::collections::BTreeMap::from([
+            ("label".to_string(), "x".to_string()),
+            ("exclude_provider".to_string(), "go".to_string()),
+        ]);
+        let m = build_matcher(&args).expect("matcher should build");
+        // Single matcher arm — Label only.
+        assert!(matches!(m, Matcher::Label(_)));
+    }
+
+    #[test]
+    fn build_matcher_rejects_unknown_keys() {
+        let args =
+            std::collections::BTreeMap::from([("totally_unknown".to_string(), "x".to_string())]);
+        let result = build_matcher(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown args"));
+    }
+
+    #[tokio::test]
+    async fn query_excludes_named_provider_via_exclude_arg() -> anyhow::Result<()> {
+        // Single provider registered: pluginstatictarget. exclude_provider=
+        // pluginstatictarget should yield an empty result.
+        let engine = make_engine(vec![
+            labeled_target("foo", "a", &["//labels:lint"]),
+            labeled_target("foo", "b", &["//labels:lint"]),
+        ])?;
+
+        let rs = engine.new_state();
+        let addr = parse_addr(&format!(
+            "//{PACKAGE}:q@label=//labels:lint,exclude_provider=pluginstatictarget"
+        ))?;
+        let spec = engine.get_spec(rs, &addr).await?;
+
+        let deps = match spec.config.get("deps") {
+            Some(TargetSpecValue::List(l)) => l,
+            _ => panic!("expected deps list"),
+        };
+        assert_eq!(
+            deps.len(),
+            0,
+            "excluding the only producing provider must yield zero deps"
+        );
         Ok(())
     }
 }

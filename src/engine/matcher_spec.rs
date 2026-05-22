@@ -202,7 +202,7 @@ mod tests {
     fn tree_output_to_shrugs_on_spec() {
         let s = spec("foo/bar", "baz", &[]);
         assert_eq!(
-            Matcher::TreeOutputTo("gen".to_string()).matches_spec(&s),
+            Matcher::TreeOutputTo(PkgBuf::from("foo/bar/gen")).matches_spec(&s),
             MatchResult::MatchShrug
         );
     }

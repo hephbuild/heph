@@ -212,18 +212,27 @@ pub fn build_test_spec(
 }
 
 /// The `test` target: runs the linked test binary.
-pub fn test_spec(addr: Addr, build_test_addr: Addr) -> TargetSpec {
+///
+/// `data_query_addr` is a `@heph/query` addr selecting sibling targets labeled
+/// `go_test_data`. The engine expands the query lazily, so this provider does
+/// not need to scan the package itself.
+pub fn test_spec(addr: Addr, build_test_addr: Addr, data_query_addr: &Addr) -> TargetSpec {
     let run = "\"$SRC_BIN\" -test.v".to_string();
+
+    let deps_map: HashMap<String, TargetSpecValue> = HashMap::from([
+        (
+            "bin".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(build_test_addr.format())]),
+        ),
+        (
+            "data".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(data_query_addr.format())]),
+        ),
+    ]);
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert("run".to_string(), TargetSpecValue::String(run));
-    config.insert(
-        "deps".to_string(),
-        TargetSpecValue::Map(HashMap::from([(
-            "bin".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(build_test_addr.format())]),
-        )])),
-    );
+    config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
     config.insert("out".to_string(), TargetSpecValue::Map(HashMap::new()));
     TargetSpec {
         addr,
@@ -684,10 +693,23 @@ mod tests {
 
     // ---- test_spec ----
 
+    fn query_addr(pkg: &str) -> Addr {
+        crate::htaddr::parse_addr(&format!(
+            "//{}:q@package={},label=go_test_data",
+            crate::pluginquery::PACKAGE,
+            pkg,
+        ))
+        .expect("parse query addr")
+    }
+
     #[test]
     fn test_test_spec_deps_on_build_test() {
         let build_addr = mk_addr("mypkg", "build_test");
-        let spec = test_spec(mk_addr("mypkg", "test"), build_addr.clone());
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            build_addr.clone(),
+            &query_addr("mypkg"),
+        );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m.clone(),
             _ => panic!(),
@@ -702,8 +724,45 @@ mod tests {
 
     #[test]
     fn test_test_spec_has_test_labels() {
-        let spec = test_spec(mk_addr("mypkg", "test"), mk_addr("mypkg", "build_test"));
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &query_addr("mypkg"),
+        );
         assert!(spec.labels.contains(&"test".to_string()));
         assert!(spec.labels.contains(&"go-test".to_string()));
+    }
+
+    #[test]
+    fn test_test_spec_data_group_is_query_addr() {
+        let qa = query_addr("mypkg");
+        let spec = test_spec(
+            mk_addr("mypkg", "test"),
+            mk_addr("mypkg", "build_test"),
+            &qa,
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m.clone(),
+            _ => panic!(),
+        };
+        let data_dep = match deps.get("data").expect("data group present") {
+            TargetSpecValue::List(v) => v.clone(),
+            _ => panic!("data group must be a list"),
+        };
+        assert_eq!(data_dep.len(), 1);
+        let s = match &data_dep[0] {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            s.contains("@heph/query"),
+            "data dep must be query addr: {s}"
+        );
+        assert!(
+            s.contains("label=go_test_data"),
+            "must filter by label: {s}"
+        );
+        assert!(s.contains("package=mypkg"), "must filter by package: {s}");
+        assert_eq!(s, qa.format());
     }
 }

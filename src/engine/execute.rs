@@ -37,6 +37,7 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("driver not found: {}", spec.driver))
             .cloned()?;
 
+        crate::hmemoizer::set_phase("execute:inputs_result_exec");
         let deps_result = self
             .clone()
             .inputs_result_exec(rs.clone(), &def.inputs)
@@ -45,6 +46,7 @@ impl Engine {
         // Acquire semaphore AFTER dep resolution so no permit is held while waiting for
         // deps — prevents the classic diamond deadlock where mid-nodes hold permits while
         // waiting for a leaf that also needs a permit.
+        crate::hmemoizer::set_phase("execute:semaphore_acquire");
         let semaphore = Arc::clone(&self.result_semaphore);
         let _permit = semaphore
             .acquire()
@@ -62,12 +64,20 @@ impl Engine {
                 dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
             }
         };
-        match tokio::fs::remove_dir_all(&sandbox_dir).await {
-            Ok(_) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err),
-        }?;
-        tokio::fs::create_dir_all(&sandbox_dir).await?;
+        crate::hmemoizer::set_phase("execute:sandbox_remove");
+        sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
+            match std::fs::remove_dir_all(&sandbox_dir) {
+                Ok(_) => Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err),
+            }
+        }))
+        .await?;
+        crate::hmemoizer::set_phase("execute:sandbox_create");
+        sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
+            std::fs::create_dir_all(&sandbox_dir)
+        }))
+        .await?;
 
         if def.target.cache {
             tracing::info!(driver = %driver.name, %addr, "run");
@@ -109,8 +119,10 @@ impl Engine {
             }
         ));
 
+        crate::hmemoizer::set_phase("execute:driver_run");
         exec_wrapper(inner).await.with_context(|| "run")?;
 
+        crate::hmemoizer::set_phase("execute:oneshot_rx");
         let res = rx
             .await
             .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
@@ -161,4 +173,18 @@ impl Engine {
         let results = try_join_all(futs).await?;
         Ok(results.into_iter().flatten().collect())
     }
+}
+
+/// Run a synchronous `std::fs` operation on the current tokio worker
+/// thread via `block_in_place` (on multi-thread runtime) or directly (on
+/// current-thread, e.g. tests). macOS tokio cross-thread waker delivery
+/// is broken under heavy spawn/spawn_blocking load; doing the fs op
+/// directly on the worker is the only path that surely makes progress.
+/// The multi-thread runtime tolerates one blocked worker — others keep
+/// scheduling tasks.
+async fn sync_fs_op_on_thread<F>(f: F) -> std::io::Result<()>
+where
+    F: FnOnce() -> std::io::Result<()> + Send + 'static,
+{
+    crate::process_supervisor::block_or_inline(f)
 }

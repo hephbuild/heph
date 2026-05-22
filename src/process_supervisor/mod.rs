@@ -14,6 +14,12 @@
 //! process leaves that one child unreaped. The window is microseconds; closing
 //! it would require writing the pid from inside `pre_exec` over the inherited
 //! socket. Deferred.
+//!
+//! Set `RHEPH_DISABLE_REAPER=1` to bypass the sidecar and the polling
+//! `waitpid` thread — [`init`] becomes a no-op, [`register_child`] returns
+//! `None`, and [`wait_polling`] (plus [`wait_with_output_polling`] via it)
+//! delegates to `tokio::process::Child::wait().await`. Use for bisecting
+//! whether a hang lives in this layer.
 
 use anyhow::Context;
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
@@ -29,6 +35,16 @@ pub use client::{ProcessTracker, TrackGuard};
 pub use server::run_supervisor_main;
 
 static TRACKER: OnceLock<Arc<ProcessTracker>> = OnceLock::new();
+
+/// `RHEPH_DISABLE_REAPER=1` short-circuits every supervisor entry point so
+/// subprocess execution falls through to tokio's built-in waker. Cached in
+/// a `OnceLock` because `std::env::var` takes a global libc mutex; consistent
+/// with the `stall_threshold` / `cycle_detection_enabled` pattern in
+/// `src/hmemoizer/mod.rs`.
+fn reaper_disabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| matches!(std::env::var("RHEPH_DISABLE_REAPER").as_deref(), Ok("1")))
+}
 
 /// Returns the process-global tracker handle. If [`init`] has not been called
 /// (e.g. inside the supervisor child itself, or in unit tests) a no-op
@@ -47,6 +63,9 @@ pub fn tracker() -> Arc<ProcessTracker> {
 /// Must be called early — before any thread spawns its own children — so that
 /// every later `Command::spawn` can register its pgid with a live supervisor.
 pub fn init() -> anyhow::Result<()> {
+    if reaper_disabled() {
+        return Ok(());
+    }
     if TRACKER.get().is_some() {
         return Ok(());
     }
@@ -116,61 +135,109 @@ pub fn init() -> anyhow::Result<()> {
 
 /// Wait for `child` to exit and reap the zombie.
 ///
-/// Spawns a dedicated `std::thread` that calls blocking `waitpid(pid, 0)` and
-/// sends the result back via a oneshot. We avoid `tokio::task::spawn_blocking`
-/// because each in-flight build child would occupy a slot in tokio's blocking
-/// pool (default 512) — under heavy build load that exhausts the pool and
-/// starves every other blocking op (file I/O, TUI render flush, etc.) so the
-/// UI appears to freeze.
+/// **Implementation**: `std::thread` running a WNOHANG poll loop with
+/// `std::thread::sleep` for backoff, signaling completion via a
+/// `tokio::sync::oneshot`. The async caller only awaits the oneshot.
 ///
-/// macOS background: we need this because tokio's `Child::wait` SIGCHLD-based
-/// waker is unreliable when children call `setsid` (PTY/shell mode), and
-/// `try_wait`-with-`tokio::sleep` polling gets starved by a busy runtime
-/// — both leave zombies stuck in `Z` state.
+/// Why this design (after iterating through several alternatives that
+/// each broke in specific macOS edge cases):
+///   1. `tokio::process::Child::wait().await` — SIGCHLD-based, unreliable
+///      on macOS once the child is a session leader (PTY/shell mode) and
+///      under heavy runtime load even for non-setsid children.
+///   2. `std::thread` running blocking `waitpid(pid, 0)` — suffers the
+///      macOS waitpid race: when tokio's internal `waitpid(-1, WNOHANG)`
+///      reaps the same pid first, the kernel does NOT wake other threads
+///      parked in `waitpid(pid, 0)`. Parked forever.
+///   3. Pure async WNOHANG polling with `tokio::time::sleep` — under
+///      heavy concurrent spawn/spawn_blocking load on macOS, tokio's
+///      timer driver and blocking-pool JoinHandle wake-up stop firing
+///      (worker threads stay parked in `__psynch_cvwait`/`kevent`); even
+///      `tokio::time::sleep` doesn't wake.
+///   4. `child.try_wait()` polling — reads tokio's internal reaper cache
+///      which is updated by the same starved task; never surfaces status.
 ///
-/// If `tokio::process::Child`'s own reaper races us and `waitpid` returns
-/// `ECHILD`, we fall back to `child.try_wait()` to pull tokio's cached status.
+/// This design uses three primitives that survive the macOS pathologies:
+///   - `std::thread` for the wait loop — kernel-scheduled, not blocked
+///     by tokio runtime sickness.
+///   - `WNOHANG waitpid` — non-blocking; either reaps the zombie (real
+///     status), sees the child still running (sleep + retry), or hits
+///     ECHILD (already reaped by tokio; we synthesize success since
+///     status is lost).
+///   - `std::thread::sleep` — kernel sleep, independent of tokio timer.
+///   - `tokio::sync::oneshot` — the most fundamental tokio wake-up;
+///     uses task notification, not timer/IO driver/signal driver. If
+///     this is broken the runtime is unrecoverable.
 pub async fn wait_polling(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::ExitStatusExt as _;
+    if reaper_disabled() {
+        return child.wait().await;
+    }
     let pid = child
         .id()
         .ok_or_else(|| std::io::Error::other("child has no pid (already waited)"))?
         as i32;
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<std::io::Result<Option<i32>>>();
-    std::thread::Builder::new()
-        .name(format!("waitpid-{pid}"))
-        .spawn(move || {
-            let mut status: libc::c_int = 0;
-            // SAFETY: blocking waitpid on a pid we own; status is initialised.
-            let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-            let out = if r < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::ECHILD) {
-                    Ok(None)
-                } else {
-                    Err(err)
-                }
-            } else {
-                Ok(Some(status))
-            };
-            let _ = tx.send(out);
-        })
-        .map_err(|e| std::io::Error::other(format!("spawn waitpid thread: {e}")))?;
-
-    let raw = rx.await.map_err(std::io::Error::other)??;
-    if let Some(s) = raw {
-        return Ok(std::process::ExitStatus::from_raw(s));
+    crate::hmemoizer::set_phase("wait_polling:rx_await");
+    if is_multi_thread_runtime() {
+        // Production: block one worker, others keep scheduling tasks.
+        // macOS waker delivery is broken; we cannot reliably yield and
+        // be polled back.
+        tokio::task::block_in_place(|| sync_wait_poll(pid))
+    } else {
+        // Tests (current_thread runtime): low concurrency, tokio's
+        // native `child.wait()` is reliable here. block_in_place would
+        // panic on current_thread.
+        child.wait().await
     }
+}
 
-    // Fall back to tokio's cached status (its internal reaper beat us to it).
-    match child.try_wait()? {
-        Some(s) => Ok(s),
-        None => Err(std::io::Error::other(
-            "waitpid returned ECHILD but tokio has no cached status",
-        )),
+/// Run `f` synchronously, using `block_in_place` when the current tokio
+/// runtime is multi-threaded (so other workers keep progressing) and a
+/// direct call otherwise. Tests run under the current-thread runtime
+/// where block_in_place panics; production uses multi-thread.
+pub fn block_or_inline<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    if is_multi_thread_runtime() {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
+fn is_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .map(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread))
+        .unwrap_or(false)
+}
+
+fn sync_wait_poll(pid: i32) -> std::io::Result<std::process::ExitStatus> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut delay_ms: u64 = 1;
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: WNOHANG waitpid is non-blocking; side-effect is
+        // reaping the zombie (intentional).
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return Ok(std::process::ExitStatus::from_raw(status));
+        }
+        if r < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                tracing::debug!(
+                    pid,
+                    "wait_polling: ECHILD — child reaped by tokio; \
+                     synthesizing successful exit (real status lost)"
+                );
+                return Ok(std::process::ExitStatus::from_raw(0));
+            }
+            return Err(err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        delay_ms = (delay_ms * 2).min(100);
     }
 }
 
@@ -237,6 +304,9 @@ pub fn kill_child(pid: i32) {
 /// rather than failing the build — the caller still benefits from `kill_on_drop`
 /// as a fallback.
 pub fn register_child(pgid: i32) -> Option<TrackGuard> {
+    if reaper_disabled() {
+        return None;
+    }
     let tracker = tracker();
     if let Err(e) = tracker.track(pgid) {
         tracing::warn!(pgid, error = %format!("{e:#}"), "child not registered with process supervisor");
