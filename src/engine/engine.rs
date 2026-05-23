@@ -88,6 +88,19 @@ impl Engine {
         Ok(engine)
     }
 
+    /// Cancel every in-flight request's cancellation token. Used to broadcast
+    /// graceful shutdown (e.g. on SIGINT). Idempotent.
+    pub fn cancel_all_requests(&self) {
+        let Ok(requests) = self.requests.lock() else {
+            return;
+        };
+        for weak in requests.values() {
+            if let Some(rs) = weak.upgrade() {
+                rs.ctoken().cancel();
+            }
+        }
+    }
+
     pub fn register_managed_driver(
         &mut self,
         driver: Box<dyn SDKManagedDriver>,

@@ -273,62 +273,64 @@ impl Engine {
         let hashin = hashin.to_string();
         // See `cache_artifact_locally` for why this is `block_or_inline`
         // and not `spawn_blocking`.
-        crate::process_supervisor::block_or_inline(enclose!((self.local_cache => local_cache) move || {
-            let mut manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
-                Err(e) if e.is::<NotFoundError>() => return Ok(None),
-                Err(e) => return Err(e),
-                Ok(artifact) => artifact,
-            };
+        crate::process_supervisor::block_or_inline(
+            enclose!((self.local_cache => local_cache) move || {
+                let mut manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
+                    Err(e) if e.is::<NotFoundError>() => return Ok(None),
+                    Err(e) => return Err(e),
+                    Ok(artifact) => artifact,
+                };
 
-            let mut buf = Vec::new();
-            io::Read::read_to_end(&mut manifest_artifact, &mut buf)?;
-            let manifest: Manifest = borsh::from_slice(&buf)?;
+                let mut buf = Vec::new();
+                io::Read::read_to_end(&mut manifest_artifact, &mut buf)?;
+                let manifest: Manifest = borsh::from_slice(&buf)?;
 
-            let mut results: Vec<CacheArtifact> = vec![];
-            let mut result_meta: Vec<ArtifactMeta> = vec![];
+                let mut results: Vec<CacheArtifact> = vec![];
+                let mut result_meta: Vec<ArtifactMeta> = vec![];
 
-            for artifact in manifest.artifacts {
-                // Outputs and SupportFiles both flow back to dependents — Output
-                // populates SRC/list, SupportFile only materializes into the
-                // sandbox. Logs and other types are kept in the cache but not
-                // surfaced to callers here.
-                match artifact.r#type {
-                    ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
-                    ManifestArtifactType::Log => continue,
+                for artifact in manifest.artifacts {
+                    // Outputs and SupportFiles both flow back to dependents — Output
+                    // populates SRC/list, SupportFile only materializes into the
+                    // sandbox. Logs and other types are kept in the cache but not
+                    // surfaced to callers here.
+                    match artifact.r#type {
+                        ManifestArtifactType::Output | ManifestArtifactType::SupportFile => {}
+                        ManifestArtifactType::Log => continue,
+                    }
+
+                    result_meta.push(ArtifactMeta {
+                        hashout: artifact.hashout.clone(),
+                    });
+
+                    // Outputs are gated on the caller's requested output groups.
+                    // SupportFiles travel with the target wherever it's referenced.
+                    if artifact.r#type == ManifestArtifactType::Output
+                        && !outputs.contains(&artifact.group)
+                    {
+                        continue;
+                    }
+
+                    if !local_cache.exists(&addr, &hashin, artifact.name.as_ref())? {
+                        return Ok(None);
+                    }
+
+                    results.push(CacheArtifact {
+                        addr: addr.clone(),
+                        hashin: hashin.clone(),
+                        name: artifact.name.clone(),
+                        cache: local_cache.clone(),
+                        content_type: match artifact.content_type {
+                            ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
+                            ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
+                        },
+                        r#type: artifact.r#type,
+                        hashout: artifact.hashout,
+                        group: artifact.group,
+                    });
                 }
 
-                result_meta.push(ArtifactMeta {
-                    hashout: artifact.hashout.clone(),
-                });
-
-                // Outputs are gated on the caller's requested output groups.
-                // SupportFiles travel with the target wherever it's referenced.
-                if artifact.r#type == ManifestArtifactType::Output
-                    && !outputs.contains(&artifact.group)
-                {
-                    continue;
-                }
-
-                if !local_cache.exists(&addr, &hashin, artifact.name.as_ref())? {
-                    return Ok(None);
-                }
-
-                results.push(CacheArtifact {
-                    addr: addr.clone(),
-                    hashin: hashin.clone(),
-                    name: artifact.name.clone(),
-                    cache: local_cache.clone(),
-                    content_type: match artifact.content_type {
-                        ManifestArtifactContentType::Tar => hartifactcontent::Type::Tar,
-                        ManifestArtifactContentType::Cpio => hartifactcontent::Type::Cpio,
-                    },
-                    r#type: artifact.r#type,
-                    hashout: artifact.hashout,
-                    group: artifact.group,
-                });
-            }
-
-            anyhow::Ok(Some((results, result_meta)))
-        }))
+                anyhow::Ok(Some((results, result_meta)))
+            }),
+        )
     }
 }

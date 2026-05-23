@@ -172,10 +172,9 @@ pub async fn wait_polling(
         // and `block_in_place` panics on current-thread. Plain `.await`
         // is fine — the waker bug only manifests under high concurrency
         // which tests don't reach.
-        rx.await
-            .map_err(|recv_err| {
-                std::io::Error::other(format!("process watcher dropped sender: {recv_err}"))
-            })?
+        rx.await.map_err(|recv_err| {
+            std::io::Error::other(format!("process watcher dropped sender: {recv_err}"))
+        })?
     }
 }
 
@@ -198,7 +197,12 @@ where
 
 fn is_multi_thread_runtime() -> bool {
     tokio::runtime::Handle::try_current()
-        .map(|h| matches!(h.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread))
+        .map(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        })
         .unwrap_or(false)
 }
 

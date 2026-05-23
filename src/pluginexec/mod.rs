@@ -514,6 +514,17 @@ impl Driver {
                         }
                         let rel = p.strip_prefix(&pkg_prefix).unwrap_or(p);
                         entry.push_str(rel);
+
+                        let abs = req.sandbox_ws_dir.join(p);
+                        let dir_to_create = match &path.content {
+                            Content::FilePath(_) => abs.parent(),
+                            Content::DirPath(_) => Some(abs.as_path()),
+                            Content::Glob(_) => None,
+                        };
+                        if let Some(d) = dir_to_create {
+                            std::fs::create_dir_all(d)
+                                .with_context(|| format!("create output dir {}", d.display()))?;
+                        }
                     }
                 }
             }
@@ -865,34 +876,42 @@ impl Driver {
         let stderr_fut = tee_stream(child_stderr, Arc::clone(&output_log_file), rreq.stderr);
 
         crate::hmemoizer::set_phase("pluginexec:wait_subprocess");
+        // `wait_polling` internally uses `tokio::task::block_in_place` to park
+        // on the watcher oneshot (kernel `thread::park` — bypasses tokio's
+        // macOS-flaky cross-thread waker, see RCA_MACOS_WAKER.md). That blocks
+        // the polling task entirely, so it MUST NOT share a task with the IO
+        // pumps below:
+        //   - shell mode: the stdin pump forwards keystrokes from the parent
+        //     TTY into the child PTY; without polling, the interactive shell
+        //     hangs on its first read.
+        //   - non-shell: the stdout/stderr pumps drain child pipes; without
+        //     polling, the child blocks on write once the kernel pipe buffer
+        //     (16-64 KiB on macOS) fills.
+        // Move ownership of `child` into a dedicated wait task and race its
+        // JoinHandle against the io pumps and the cancellation token instead.
+        let mut wait_handle: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>> =
+            tokio::spawn(async move {
+                let status = process_supervisor::wait_polling(&mut child).await;
+                // Cancel the stdin pump as soon as the child is reaped so the
+                // io join can finish in the io-wins arm below.
+                _ = stdin_cancel_tx.send(());
+                status
+            });
+
         tokio::select! {
             _ = ctoken.cancelled() => {
                 // killpg covers grandchildren in PTY/shell mode where the
                 // child is a session leader; kill backstops non-setsid mode.
                 process_supervisor::kill_child(child_pid);
-                // try_wait polling instead of `child.wait()` — tokio's
-                // SIGCHLD-based waker is unreliable on macOS, see comment
-                // on wait_fut below.
-                process_supervisor::wait_polling(&mut child).await?;
+                // Let the spawned wait task observe the exit and reap.
+                _ = (&mut wait_handle).await;
                 anyhow::bail!("cancelled")
             },
             res = async {
                 let io = async { tokio::join!(stdin_fut, stdout_fut, stderr_fut) };
-                // Use blocking waitpid via spawn_blocking instead of tokio's
-                // SIGCHLD waker: the waker is unreliable when the child is a
-                // session leader (PTY/shell mode) and under heavy build load
-                // tokio's own try_wait polling gets starved, leaving zombies
-                // by the hundreds.
-                let wait_fut = async {
-                    let status = process_supervisor::wait_polling(&mut child).await;
-                    // Cancel the stdin pump as soon as the child is reaped so
-                    // the io join can finish in the io-wins arm below.
-                    _ = stdin_cancel_tx.send(());
-                    status
-                };
-                tokio::pin!(io, wait_fut);
+                tokio::pin!(io);
                 tokio::select! {
-                    s = &mut wait_fut => {
+                    wait_res = &mut wait_handle => {
                         // Race the io pumps to drain whatever's still buffered.
                         // PTY master EOF detection through kqueue is unreliable
                         // on macOS, so cap the wait — anything left will be lost,
@@ -903,16 +922,18 @@ impl Driver {
                             std::time::Duration::from_millis(50),
                             &mut io,
                         ).await;
-                        s
+                        wait_res
                     }
                     _ = &mut io => {
                         crate::hmemoizer::set_phase("pluginexec:post_io_wait");
-                        (&mut wait_fut).await
+                        (&mut wait_handle).await
                     },
                 }
             } => {
                 crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
-                let status = res.with_context(|| "wait for child process")?;
+                let status = res
+                    .context("wait task panicked")?
+                    .context("wait for child process")?;
 
                 if !status.success() {
                     let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
@@ -1174,6 +1195,71 @@ mod tests {
         let err = res.err().unwrap();
         assert_eq!(err.to_string(), "cancelled");
 
+        Ok(())
+    }
+
+    /// Regression for shell/build deadlock when the child needs concurrent
+    /// IO pump progress while `wait_polling` is parked. Multi-thread flavor
+    /// is required: on current-thread the wait_polling fast path uses plain
+    /// `.await` and never blocks the task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_large_output_does_not_deadlock_multi_thread() -> anyhow::Result<()> {
+        let driver = Driver::new_bash();
+        let ctoken = StdCancellationToken::new();
+        // 256 KiB — bigger than macOS pipe buffers (16-64 KiB), so without
+        // a draining stdout pump the child would block on write forever.
+        let payload_bytes: usize = 256 * 1024;
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec![format!("head -c {payload_bytes} /dev/urandom | base64")],
+                dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let mut stdout = Vec::new();
+        let request_id = "test-request".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: Some(&mut stdout),
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            driver.run(make_req(req), &ctoken),
+        )
+        .await
+        .context("driver.run deadlocked under multi-thread runtime")?;
+        res?;
+
+        assert!(
+            stdout.len() >= payload_bytes,
+            "expected >= {payload_bytes} bytes, got {}",
+            stdout.len()
+        );
         Ok(())
     }
 
@@ -2125,6 +2211,91 @@ mod tests {
         assert!(
             tmp.path().join("bin").join("node").exists(),
             "bin/node must exist after dedup",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_run_creates_output_dirs() -> anyhow::Result<()> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+
+        let target_def = EngineTargetDef {
+            addr: Addr::default(),
+            labels: vec![],
+            raw_def: Arc::new(TargetDef {
+                run: vec!["true".to_string()],
+                dep_group_inputs: BTreeMap::new(),
+                env: BTreeMap::new(),
+                tool_group_inputs: BTreeMap::new(),
+                pass_env: BTreeMap::new(),
+                runtime_pass_env: vec![],
+                runtime_env: HashMap::new(),
+            }),
+            inputs: vec![],
+            outputs: vec![
+                Output {
+                    group: "file".to_string(),
+                    paths: vec![Path {
+                        content: Content::FilePath("nested/dir/out.txt".to_string()),
+                        codegen_tree: CodegenMode::None,
+                        collect: false,
+                    }],
+                },
+                Output {
+                    group: "dir".to_string(),
+                    paths: vec![Path {
+                        content: Content::DirPath("a/b/c".to_string()),
+                        codegen_tree: CodegenMode::None,
+                        collect: false,
+                    }],
+                },
+                Output {
+                    group: "glob".to_string(),
+                    paths: vec![Path {
+                        content: Content::Glob("never/created/**/*.txt".to_string()),
+                        codegen_tree: CodegenMode::None,
+                        collect: false,
+                    }],
+                },
+            ],
+            support_files: vec![],
+            cache: true,
+            disable_remote_cache: false,
+            pty: true,
+            hash: vec![],
+            transparent: false,
+        };
+
+        let request_id = "test".to_string();
+        let tmp = tempfile::tempdir()?;
+
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: "".to_string().into(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: tmp.path().to_path_buf(),
+        };
+
+        driver.run(make_req(req), &ctoken).await?;
+
+        assert!(
+            tmp.path().join("nested/dir").is_dir(),
+            "FilePath parent must be created",
+        );
+        assert!(
+            !tmp.path().join("nested/dir/out.txt").exists(),
+            "FilePath itself must not be created",
+        );
+        assert!(tmp.path().join("a/b/c").is_dir(), "DirPath must be created",);
+        assert!(
+            !tmp.path().join("never").exists(),
+            "Glob must not trigger dir creation",
         );
         Ok(())
     }

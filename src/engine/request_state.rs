@@ -206,6 +206,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cancel_all_requests_cancels_live_tokens() -> anyhow::Result<()> {
+        let engine = Arc::new(Engine::new(Config {
+            root: PathBuf::from("/tmp"),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+        })?);
+
+        let rs = engine.new_state();
+        assert!(!rs.ctoken().is_cancelled());
+
+        engine.cancel_all_requests();
+        assert!(rs.ctoken().is_cancelled());
+
+        // Idempotent — second call must not panic or change state.
+        engine.cancel_all_requests();
+        assert!(rs.ctoken().is_cancelled());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_skip_provider_child_does_not_cancel_token() -> anyhow::Result<()> {
         let engine = Arc::new(Engine::new(Config {
             root: PathBuf::from("/tmp"),

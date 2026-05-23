@@ -70,7 +70,36 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
 
     e.apply_config(&file.providers, &file.drivers)?;
 
-    Ok(std::sync::Arc::new(e))
+    let engine = std::sync::Arc::new(e);
+    spawn_ctrlc_handler(std::sync::Arc::downgrade(&engine));
+    Ok(engine)
+}
+
+/// Spawn a SIGINT handler tied to the lifetime of `engine`. First ctrl-c
+/// broadcasts cancellation to every in-flight request, letting drivers
+/// kill+reap their children and the TUI restore the terminal before
+/// unwinding naturally. Second ctrl-c hard-exits with code 130 — the
+/// process supervisor sidecar reaps any remaining tracked process groups.
+///
+/// Held as a `Weak` so the spawned task can't keep the engine alive past
+/// the command's natural lifetime. Must be called from inside a tokio
+/// runtime; `bootstrap::new_engine` is only invoked from `#[tokio::main]`
+/// command entry points, so `Handle::current()` is always available there.
+fn spawn_ctrlc_handler(engine: std::sync::Weak<engine::Engine>) {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::warn!("ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)");
+        if let Some(e) = engine.upgrade() {
+            e.cancel_all_requests();
+        }
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        tracing::error!("second ctrl-c, aborting");
+        std::process::exit(130);
+    });
 }
 
 #[cfg(test)]
