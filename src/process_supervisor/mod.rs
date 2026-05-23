@@ -22,7 +22,7 @@
 //! whether a hang lives in this layer.
 
 use anyhow::Context;
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::sync::{Arc, OnceLock};
@@ -207,8 +207,21 @@ fn is_multi_thread_runtime() -> bool {
 }
 
 /// Polling-based replacement for `tokio::process::Child::wait_with_output`.
-/// Drains piped stdout/stderr while polling `try_wait` for exit. Avoids
-/// tokio's SIGCHLD-based waker (see [`wait_polling`]).
+/// Drains piped stdout/stderr on dedicated OS threads while polling for exit.
+///
+/// Why OS threads, not `tokio::io::AsyncReadExt::read_to_end` joined with the
+/// wait future: [`wait_polling`] enters `block_in_place(|| blocking_recv())`,
+/// which parks the worker synchronously inside the calling task's `poll()`.
+/// Any sibling future joined on the same task (`try_join!`, `select!`) never
+/// gets polled while that block is active — so the child's stdout pipe fills
+/// (64KiB on macOS), the child blocks on `write()`, and the wait never
+/// resolves. Draining on threads decouples the two completely.
+///
+/// Why dup the pipe fds: `tokio::process::ChildStdout` owns its fd via a
+/// `PollEvented` and only exposes `AsRawFd`. We dup to get an independent
+/// `OwnedFd` for the reader thread, then drop the tokio wrapper. Both ends
+/// point at the same pipe; tokio's drop closes its copy, our copy keeps the
+/// read end open until the thread finishes.
 ///
 /// Borrows the child by `&mut` so callers in a `tokio::select!` can fall back
 /// to [`wait_polling`] on cancellation — owning the child here would mean the
@@ -217,31 +230,87 @@ fn is_multi_thread_runtime() -> bool {
 pub async fn wait_with_output_polling(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::Output> {
-    use tokio::io::AsyncReadExt as _;
+    let stdout_thread = spawn_pipe_drain(child.stdout.take().as_ref())?;
+    let stderr_thread = spawn_pipe_drain(child.stderr.take().as_ref())?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let stdout_fut = async {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stdout {
-            s.read_to_end(&mut buf).await?;
-        }
-        Ok::<_, std::io::Error>(buf)
-    };
-    let stderr_fut = async {
-        let mut buf = Vec::new();
-        if let Some(mut s) = stderr {
-            s.read_to_end(&mut buf).await?;
-        }
-        Ok::<_, std::io::Error>(buf)
-    };
-    let wait_fut = wait_polling(child);
-    let (status, stdout_buf, stderr_buf) = tokio::try_join!(wait_fut, stdout_fut, stderr_fut)?;
+    let status = wait_polling(child).await?;
+
+    let (stdout_res, stderr_res) = tokio::task::block_in_place(|| {
+        // `unwrap` on `join`: the drain closure cannot panic — `Read` errors
+        // are propagated via `io::Result`. A panic here would indicate a bug
+        // in `std::io` or the kernel returning something `File::read_to_end`
+        // refuses to handle; propagating it is the correct behavior.
+        #[expect(
+            clippy::unwrap_used,
+            reason = "drain thread cannot panic; surfaces real bugs"
+        )]
+        let stdout = stdout_thread.join().unwrap();
+        #[expect(clippy::unwrap_used, reason = "same as above")]
+        let stderr = stderr_thread.join().unwrap();
+        (stdout, stderr)
+    });
+
     Ok(std::process::Output {
         status,
-        stdout: stdout_buf,
-        stderr: stderr_buf,
+        stdout: stdout_res?,
+        stderr: stderr_res?,
     })
+}
+
+/// Dup a tokio pipe handle's fd into an `OwnedFd` and spawn an OS thread that
+/// reads it to EOF. Returns a `JoinHandle` even when the input is `None` (the
+/// closure short-circuits with an empty buffer) so the caller doesn't branch.
+///
+/// Tokio sets `O_NONBLOCK` on its pipe fds. `dup` shares the open file
+/// description, so the flag is shared too — clear it before reading or
+/// `File::read` returns `EAGAIN` immediately. Clearing also affects tokio's
+/// view, but the caller drops the tokio wrapper before the thread starts
+/// reading, so nothing else cares.
+fn spawn_pipe_drain<F: AsRawFd>(
+    pipe: Option<&F>,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
+    use std::io::Read as _;
+
+    let owned_fd: Option<OwnedFd> = match pipe {
+        Some(p) => {
+            // SAFETY: dup of a valid fd we hold via the tokio wrapper. The
+            // returned fd is independent and owned exclusively by us.
+            let raw = unsafe { libc::dup(p.as_raw_fd()) };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            clear_nonblocking(raw)?;
+            // SAFETY: dup just produced this fd; we own it.
+            Some(unsafe { OwnedFd::from_raw_fd(raw) })
+        }
+        None => None,
+    };
+
+    Ok(std::thread::spawn(move || -> std::io::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        if let Some(fd) = owned_fd {
+            std::fs::File::from(fd).read_to_end(&mut buf)?;
+        }
+        Ok(buf)
+    }))
+}
+
+fn clear_nonblocking(fd: RawFd) -> std::io::Result<()> {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "F_GETFL and F_SETFL must share one unsafe context"
+    )]
+    // SAFETY: fcntl(F_GETFL/F_SETFL) on a fd we just dup'd and own.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Send `SIGKILL` to a child by id. Always issues both `killpg` and `kill`:

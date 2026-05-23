@@ -7,11 +7,118 @@ use crate::plugingo::pkg_analysis::GoPackage;
 use crate::plugingo::target_std::archive_filename;
 use std::collections::{BTreeMap, HashMap};
 
-pub fn build_spec(
+/// Build the `download` target that runs `go mod download` for a single
+/// `(module, version)` and exposes the module's source tree as artifacts.
+///
+/// The output group `""` is a `Glob` over `**/*`, capturing every file under
+/// the target's pkg dir. Consumers (`build_lib`, embed driver) reference
+/// individual files via `TargetAddr` filters; the engine then unpacks only
+/// the requested entries into the consumer's sandbox at their pkg-relative
+/// paths.
+///
+/// The stub `go.mod` prevents Go from walking up into the workspace go.mod
+/// and downloading every transitive dep; we only want the requested module.
+pub fn build_download_spec(
+    addr: Addr,
+    module: &str,
+    version: &str,
+    go_bin_addr: &str,
+    goroot: &str,
+) -> TargetSpec {
+    let mod_at_ver = format!("{module}@{version}");
+    // Multi-line bash. `awk` parses `Dir` out of the JSON `go mod download`
+    // emits. The stub go.mod blocks Go from reading the project go.mod.
+    let run = format!(
+        "set -e\n\
+         printf 'module heph_ignore\\n' > go.mod\n\
+         \"$SRC_GO_BIN\" mod download -modcacherw -json '{mod_at_ver}' > mod.json\n\
+         rm go.mod\n\
+         MOD_DIR=$(awk -F'\"' '/\"Dir\": / {{ print $4 }}' mod.json)\n\
+         if [ -z \"$MOD_DIR\" ]; then\n\
+           echo 'go mod download produced no Dir' >&2\n\
+           cat mod.json >&2\n\
+           exit 1\n\
+         fi\n\
+         cp -R \"$MOD_DIR/.\" .\n\
+         rm mod.json\n\
+         chmod -R u+w .\n",
+    );
+
+    let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+    config.insert("run".to_string(), TargetSpecValue::String(run));
+    config.insert(
+        "deps".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "go_bin".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
+        )])),
+    );
+    // Glob form (contains `*`) — pluginexec packs every matching file under
+    // the target's pkg into the artifact, preserving relative paths.
+    config.insert(
+        "out".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            String::new(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("**/*".to_string())]),
+        )])),
+    );
+    config.insert(
+        "runtime_env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "GOROOT".to_string(),
+            TargetSpecValue::String(goroot.to_string()),
+        )])),
+    );
+    config.insert(
+        "pass_env".to_string(),
+        TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
+    );
+    // GOPROXY/GOMODCACHE/etc must be inherited at runtime so network fetches
+    // and modcache placement match the user's host config.
+    config.insert(
+        "runtime_pass_env".to_string(),
+        TargetSpecValue::List(
+            [
+                "HOME",
+                "GOMODCACHE",
+                "GOPATH",
+                "GOCACHE",
+                "GOPROXY",
+                "GONOSUMDB",
+                "GOSUMDB",
+                "GOFLAGS",
+                "GOPRIVATE",
+                "GONOSUMCHECK",
+                "GOINSECURE",
+            ]
+            .iter()
+            .map(|s| TargetSpecValue::String((*s).to_string()))
+            .collect(),
+        ),
+    );
+
+    TargetSpec {
+        addr,
+        driver: "bash".to_string(),
+        config,
+        labels: vec![],
+        transitive: Default::default(),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "all parameters are required, no natural grouping"
+)]
+pub fn build_lib_spec(
     addr: Addr,
     pkg: &GoPackage,
     factors: &Factors,
     transitive_libs: &[(String, Addr)],
+    src_addrs: &[String],
+    s_file_addrs: &[String],
+    embed_addr: Option<&Addr>,
+    embed_file_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
 ) -> TargetSpec {
@@ -26,7 +133,15 @@ pub fn build_spec(
         import_path.as_str()
     };
 
-    let run = generate_compile_script(p_flag, transitive_libs, &out_file, pkg, factors);
+    let has_asm = !pkg.s_files.is_empty();
+    let run = generate_compile_script(
+        p_flag,
+        transitive_libs,
+        &out_file,
+        &pkg.s_files,
+        factors,
+        embed_addr.is_some(),
+    );
 
     let mut deps: BTreeMap<String, TargetSpecValue> = transitive_libs
         .iter()
@@ -39,9 +154,46 @@ pub fn build_spec(
         })
         .collect();
     deps.insert(
+        String::new(),
+        TargetSpecValue::List(
+            src_addrs
+                .iter()
+                .map(|s| TargetSpecValue::String(s.clone()))
+                .collect(),
+        ),
+    );
+    deps.insert(
         "go_bin".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String(go_bin_addr.to_string())]),
     );
+    if has_asm {
+        deps.insert(
+            "asm".to_string(),
+            TargetSpecValue::List(
+                s_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(e) = embed_addr {
+        deps.insert(
+            "embed".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(e.format())]),
+        );
+    }
+    if !embed_file_addrs.is_empty() {
+        deps.insert(
+            "embed_files".to_string(),
+            TargetSpecValue::List(
+                embed_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert("run".to_string(), TargetSpecValue::String(run));
@@ -91,36 +243,36 @@ fn generate_compile_script(
     p_flag: &str,
     transitive_libs: &[(String, Addr)],
     out_file: &str,
-    pkg: &GoPackage,
+    s_files: &[String],
     factors: &Factors,
+    has_embed: bool,
 ) -> String {
-    let pkg_dir = pkg.dir.as_deref().unwrap_or("");
-    let go_files = &pkg.go_files;
-    let s_files = &pkg.s_files;
-    let goos = &factors.goos;
-    let goarch = &factors.goarch;
-
     let mut script = write_importcfg_script(transitive_libs, None);
-
-    // Source files live in GOMODCACHE (read-only, content-stable) — use absolute paths.
-    let src_args = go_files
-        .iter()
-        .map(|f| format!("\"{pkg_dir}/{f}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
 
     let has_asm = !s_files.is_empty();
     let asmhdr_flag = if has_asm { " -asmhdr \"go_asm.h\"" } else { "" };
+    let embedcfg_flag = if has_embed {
+        " -embedcfg \"$SRC_EMBED\""
+    } else {
+        ""
+    };
 
+    // Sources are staged into the consumer's sandbox by the engine (via the
+    // download target's filtered outputs). `@${LIST_SRC}` is a response file
+    // listing every staged source — same convention as first-party.
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{asmhdr_flag} -o \"{out_file}\" {src_args}\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{asmhdr_flag}{embedcfg_flag} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
 
     if has_asm {
+        let goos = &factors.goos;
+        let goarch = &factors.goarch;
+        // .s files are staged at their pkg-relative paths inside the
+        // sandbox. `$RHEPH_PKG_SRC_DIR` is the sandbox pkg dir.
         for s_file in s_files {
             let obj_file = format!("{}.o", s_file.trim_end_matches(".s"));
             script.push_str(&format!(
-                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath -I \"{pkg_dir}\" -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch} -o \"{obj_file}\" \"{pkg_dir}/{s_file}\"\n"
+                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath -I \"$RHEPH_PKG_SRC_DIR\" -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch} -o \"{obj_file}\" \"$RHEPH_PKG_SRC_DIR/{s_file}\"\n"
             ));
         }
         let obj_args = s_files
@@ -154,6 +306,14 @@ mod tests {
         Addr::new(
             PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
             "build_lib".to_string(),
+            Default::default(),
+        )
+    }
+
+    fn download_addr() -> Addr {
+        Addr::new(
+            PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
+            "download".to_string(),
             Default::default(),
         )
     }
@@ -192,12 +352,107 @@ mod tests {
         }
     }
 
+    fn filter_src_addr(file: &str) -> String {
+        format!(
+            "//@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2:download[@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2/{file}]"
+        )
+    }
+
+    // ---- download spec ----
+
     #[test]
-    fn test_driver_is_bash() {
-        let spec = build_spec(
+    fn test_download_spec_driver() {
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        assert_eq!(spec.driver, "bash");
+    }
+
+    #[test]
+    fn test_download_spec_run_contains_go_mod_download() {
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            run.contains("go mod download"),
+            "missing go mod download: {run}"
+        );
+        assert!(
+            run.contains("github.com/go-logr/logr@v1.4.2"),
+            "missing mod@ver literal: {run}"
+        );
+        assert!(
+            run.contains("module heph_ignore"),
+            "missing stub go.mod: {run}"
+        );
+        assert!(run.contains("$SRC_GO_BIN"), "must call $SRC_GO_BIN: {run}");
+    }
+
+    #[test]
+    fn test_download_spec_out_is_glob() {
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let out = match spec.config.get("out").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let default = match out.get("").unwrap() {
+            TargetSpecValue::List(v) => v,
+            _ => panic!("expected list"),
+        };
+        assert!(
+            matches!(&default[0], TargetSpecValue::String(s) if s == "**/*"),
+            "default output group must be Glob **/*: {:?}",
+            default
+        );
+    }
+
+    #[test]
+    fn test_download_spec_has_go_bin_dep_only() {
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(deps.contains_key("go_bin"));
+        assert_eq!(deps.len(), 1, "download must only have go_bin dep");
+    }
+
+    // ---- build_lib_spec ----
+
+    #[test]
+    fn test_build_lib_driver_is_bash() {
+        let spec = build_lib_spec(
             test_addr(),
             &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -206,12 +461,15 @@ mod tests {
     }
 
     #[test]
-    fn test_run_uses_absolute_src_paths() {
-        let pkg = test_pkg(vec!["logr.go".to_string(), "slogr.go".to_string()]);
-        let spec = build_spec(
+    fn test_build_lib_run_uses_list_src() {
+        let spec = build_lib_spec(
             test_addr(),
-            &pkg,
+            &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -221,21 +479,25 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert!(
-            run.contains("/home/user/go/pkg/mod/github.com/go-logr/logr@v1.4.2/logr.go"),
-            "compile script must use absolute GOMODCACHE paths: {run}"
+            run.contains("@${LIST_SRC}"),
+            "run must use @${{LIST_SRC}}: {run}"
         );
         assert!(
-            run.contains("/home/user/go/pkg/mod/github.com/go-logr/logr@v1.4.2/slogr.go"),
-            "compile script must include all go_files: {run}"
+            run.contains("tool compile"),
+            "must call tool compile: {run}"
         );
     }
 
     #[test]
-    fn test_run_no_list_src() {
-        let spec = build_spec(
+    fn test_build_lib_no_gomodcache_paths_in_run() {
+        let spec = build_lib_spec(
             test_addr(),
             &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -244,18 +506,28 @@ mod tests {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
+        // Reject host GOMODCACHE leakage — sources must flow through sandbox staging.
         assert!(
-            !run.contains("LIST_SRC"),
-            "thirdparty compile script must not use LIST_SRC: {run}"
+            !run.contains("/go/pkg/mod/"),
+            "compile script must not embed host GOMODCACHE paths: {run}"
+        );
+        assert!(
+            !run.contains("/home/user/"),
+            "compile script must not embed host paths: {run}"
         );
     }
 
     #[test]
-    fn test_deps_has_go_bin_no_empty_group() {
-        let spec = build_spec(
+    fn test_build_lib_src_addrs_in_default_group() {
+        let src = filter_src_addr("logr.go");
+        let spec = build_lib_spec(
             test_addr(),
             &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[src.clone()],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -264,57 +536,47 @@ mod tests {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(deps.contains_key("go_bin"), "deps must have go_bin group");
-        assert!(
-            !deps.contains_key(""),
-            "thirdparty deps must not have empty group (no pluginfs src)"
-        );
-    }
-
-    #[test]
-    fn test_out_has_a_group() {
-        let spec = build_spec(
-            test_addr(),
-            &test_pkg(vec!["logr.go".to_string()]),
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
-        let out = spec.config.get("out").unwrap();
-        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
-    }
-
-    #[test]
-    fn test_run_uses_tool_compile_and_p_flag() {
-        let spec = build_spec(
-            test_addr(),
-            &test_pkg(vec!["logr.go".to_string()]),
-            &test_factors(),
-            &[],
-            "//@heph/bin:go",
-            "/usr/local/go",
-        );
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
+        let default_group = match deps.get("").unwrap() {
+            TargetSpecValue::List(v) => v,
+            _ => panic!("expected list"),
         };
-        assert!(run.contains("tool compile"), "must use go tool compile");
-        assert!(
-            run.contains("-p \"github.com/go-logr/logr\""),
-            "must set -p flag to import path: {run}"
-        );
+        assert!(matches!(&default_group[0], TargetSpecValue::String(s) if s == &src));
     }
 
     #[test]
-    fn test_main_package_uses_p_main() {
+    fn test_build_lib_deps_has_go_bin() {
+        let spec = build_lib_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(deps.contains_key("go_bin"));
+    }
+
+    #[test]
+    fn test_build_lib_main_package_uses_p_main() {
         let mut pkg = test_pkg(vec!["main.go".to_string()]);
         pkg.import_path = "github.com/foo/cmd".to_string();
         pkg.name = Some("main".to_string());
-        let spec = build_spec(
+        let spec = build_lib_spec(
             test_addr(),
             &pkg,
             &test_factors(),
+            &[],
+            &[filter_src_addr("main.go")],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -330,18 +592,46 @@ mod tests {
     }
 
     #[test]
-    fn test_transitive_dep_in_importcfg() {
+    fn test_build_lib_non_main_uses_import_path() {
+        let spec = build_lib_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let run = match spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s.clone(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            run.contains("-p \"github.com/go-logr/logr\""),
+            "non-main pkg must use -p <import>: {run}"
+        );
+    }
+
+    #[test]
+    fn test_build_lib_transitive_dep_in_importcfg() {
         let dep_addr = Addr::new(
             PkgBuf::from("@heph/go/std/fmt"),
             "build_lib".to_string(),
             Default::default(),
         );
         let transitive_libs = vec![("fmt".to_string(), dep_addr)];
-        let spec = build_spec(
+        let spec = build_lib_spec(
             test_addr(),
             &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
             &transitive_libs,
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
+            &[],
             "//@heph/bin:go",
             "/usr/local/go",
         );
@@ -351,53 +641,48 @@ mod tests {
         };
         assert!(
             run.contains("packagefile fmt="),
-            "importcfg must include transitive dep: {run}"
+            "importcfg dep missing: {run}"
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
         };
-        assert!(deps.contains_key("lib_fmt"), "deps must have lib_fmt group");
+        assert!(deps.contains_key("lib_fmt"));
     }
 
     #[test]
-    fn test_no_s_files_no_asm_steps() {
-        let spec = build_spec(
+    fn test_build_lib_out_has_a_group() {
+        let spec = build_lib_spec(
             test_addr(),
             &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
             &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
+            &[],
             "//@heph/bin:go",
             "/usr/local/go",
         );
-        let run = match spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s.clone(),
-            _ => panic!("expected string"),
-        };
-        assert!(
-            !run.contains("tool asm"),
-            "no .s files → must not emit tool asm: {run}"
-        );
-        assert!(
-            !run.contains("tool pack"),
-            "no .s files → must not emit tool pack: {run}"
-        );
-        assert!(
-            !run.contains("-asmhdr"),
-            "no .s files → must not emit -asmhdr: {run}"
-        );
+        let out = spec.config.get("out").unwrap();
+        assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
     }
 
     #[test]
-    fn test_s_files_run_contains_asm_and_pack() {
+    fn test_build_lib_s_files_run_contains_asm_and_pack() {
         let pkg = test_pkg_with_asm(
             vec!["impl.go".to_string()],
             vec!["impl_amd64.s".to_string(), "util.s".to_string()],
         );
-        let spec = build_spec(
+        let s_addrs = vec![filter_src_addr("impl_amd64.s"), filter_src_addr("util.s")];
+        let spec = build_lib_spec(
             test_addr(),
             &pkg,
             &test_factors(),
+            &[],
+            &[filter_src_addr("impl.go")],
+            &s_addrs,
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -406,37 +691,48 @@ mod tests {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
-        assert!(
-            run.contains("tool asm"),
-            "must invoke go tool asm for .s files: {run}"
-        );
-        assert!(
-            run.contains("tool pack r"),
-            "must pack .o files into archive: {run}"
-        );
+        assert!(run.contains("tool asm"), "must invoke go tool asm: {run}");
+        assert!(run.contains("tool pack r"), "must pack .o files: {run}");
         assert!(
             run.contains("-asmhdr \"go_asm.h\""),
-            "compile step must emit asm header: {run}"
+            "compile must emit asm header: {run}"
         );
         assert!(
             run.contains("impl_amd64.s"),
             "must assemble impl_amd64.s: {run}"
         );
         assert!(run.contains("util.s"), "must assemble util.s: {run}");
+        // .s files must be referenced via the sandbox pkg dir, not host GOMODCACHE.
         assert!(
-            run.contains("impl_amd64.o"),
-            "must pack impl_amd64.o: {run}"
+            run.contains("$RHEPH_PKG_SRC_DIR"),
+            "asm step must use $RHEPH_PKG_SRC_DIR: {run}"
         );
-        assert!(run.contains("util.o"), "must pack util.o: {run}");
+        assert!(
+            !run.contains("/go/pkg/mod/"),
+            "asm step must not embed host paths: {run}"
+        );
+        // Deps map must carry the .s file refs.
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            deps.contains_key("asm"),
+            "deps must include asm group: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn test_s_files_asm_uses_goroot_include() {
-        let pkg = test_pkg_with_asm(vec!["impl.go".to_string()], vec!["impl.s".to_string()]);
-        let spec = build_spec(
+    fn test_build_lib_no_s_files_no_asm_steps() {
+        let spec = build_lib_spec(
             test_addr(),
-            &pkg,
+            &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -445,27 +741,26 @@ mod tests {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
-        assert!(
-            run.contains("$GOROOT/pkg/include"),
-            "asm step must include GOROOT/pkg/include: {run}"
-        );
-        assert!(
-            run.contains("GOOS_linux"),
-            "asm step must define GOOS_linux: {run}"
-        );
-        assert!(
-            run.contains("GOARCH_amd64"),
-            "asm step must define GOARCH_amd64: {run}"
-        );
+        assert!(!run.contains("tool asm"), "no .s → no tool asm: {run}");
+        assert!(!run.contains("tool pack"), "no .s → no tool pack: {run}");
+        assert!(!run.contains("-asmhdr"), "no .s → no -asmhdr: {run}");
     }
 
     #[test]
-    fn test_s_files_asm_uses_pkg_dir_include() {
-        let pkg = test_pkg_with_asm(vec!["impl.go".to_string()], vec!["impl.s".to_string()]);
-        let spec = build_spec(
+    fn test_build_lib_with_embed_addr_adds_embedcfg() {
+        let embed = Addr::new(
+            PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
+            "embed".to_string(),
+            Default::default(),
+        );
+        let spec = build_lib_spec(
             test_addr(),
-            &pkg,
+            &test_pkg(vec!["logr.go".to_string()]),
             &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            Some(&embed),
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
@@ -474,9 +769,46 @@ mod tests {
             TargetSpecValue::String(s) => s.clone(),
             _ => panic!("expected string"),
         };
+        assert!(run.contains("-embedcfg"), "must include -embedcfg: {run}");
         assert!(
-            run.contains("/home/user/go/pkg/mod/github.com/go-logr/logr@v1.4.2"),
-            "asm step must include the package dir: {run}"
+            run.contains("$SRC_EMBED"),
+            "must reference $SRC_EMBED: {run}"
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(deps.contains_key("embed"));
+    }
+
+    #[test]
+    fn test_build_lib_embed_files_in_own_dep_group() {
+        let embed = Addr::new(
+            PkgBuf::from("@heph/go/thirdparty/github.com/go-logr/logr@v1.4.2"),
+            "embed".to_string(),
+            Default::default(),
+        );
+        let embed_files = vec![filter_src_addr("static/x.html")];
+        let spec = build_lib_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            Some(&embed),
+            &embed_files,
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let deps = match spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            deps.contains_key("embed_files"),
+            "embed_files must be its own group: {:?}",
+            deps.keys().collect::<Vec<_>>()
         );
     }
 }

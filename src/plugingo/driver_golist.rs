@@ -41,11 +41,16 @@ struct GoGolistDef {
     goroot: String,
     build_tags: Vec<String>,
     dep_inputs: Vec<Input>,
+    /// For thirdparty packages: the `download` target whose filtered outputs
+    /// will be staged into consumers' sandboxes. Threaded through so
+    /// `resolve_package_addrs` emits download-filter refs instead of pluginfs
+    /// file refs for per-file addresses.
+    thirdparty_download_addr: Option<String>,
 }
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 5;
+const GO_GOLIST_FORMAT_VERSION: u32 = 6;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -56,6 +61,7 @@ impl Hash for GoGolistDef {
         self.goroot.hash(state);
         self.build_tags.hash(state);
         self.dep_inputs.hash(state);
+        self.thirdparty_download_addr.hash(state);
         // go_bin input excluded (added at runtime, not hashed here — engine hashes content)
     }
 }
@@ -103,6 +109,12 @@ impl ManagedDriver for GoGolistDriver {
             .transpose()?
             .unwrap_or_default();
 
+        let thirdparty_download_addr = config
+            .get("thirdparty_download_addr")
+            .map(|v| parse_string(v).context("parse thirdparty_download_addr"))
+            .transpose()?
+            .flatten();
+
         // Parse deps (srcfiles, modfiles) — no go_bin here
         let dep_strings = config
             .get("deps")
@@ -145,6 +157,7 @@ impl ManagedDriver for GoGolistDriver {
             goroot,
             build_tags,
             dep_inputs: dep_inputs.clone(),
+            thirdparty_download_addr,
         };
 
         let hash = {
@@ -354,7 +367,15 @@ impl ManagedDriver for GoGolistDriver {
         };
 
         let pkg_str = req.request.target.addr.package.as_str();
-        let addrs = resolve_package_addrs(&pkg, pkg_str, &source_map);
+        let download_addr = match &def.thirdparty_download_addr {
+            Some(s) => Some(
+                crate::engine::driver::TargetAddr::parse(s, &crate::htpkg::PkgBuf::from(""))
+                    .with_context(|| format!("parse thirdparty_download_addr {s:?}"))?
+                    .r#ref,
+            ),
+            None => None,
+        };
+        let addrs = resolve_package_addrs(&pkg, pkg_str, &source_map, download_addr.as_ref());
         let addrs_bin = encode_package_addrs(&addrs).context("encode package_addrs.bin")?;
         std::fs::write(req.sandbox_pkg_dir.join("package_addrs.bin"), &addrs_bin)
             .context("write package_addrs.bin")?;

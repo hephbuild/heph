@@ -9,7 +9,7 @@ use crate::htpkg::PkgBuf;
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
-    factors_to_args,
+    encode_thirdparty_download, factors_to_args,
 };
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
@@ -315,19 +315,28 @@ impl ProviderInner {
                     Ok(Box::new(responses.into_iter())
                         as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
                 }
-                GoPackageKind::ThirdParty { .. } => {
-                    let addrs = vec![
+                GoPackageKind::ThirdParty { subpath, .. } => {
+                    let mut addrs = vec![
                         Addr::new(
                             req.package.clone(),
                             "_golist".to_string(),
                             factors_to_args(&factors),
                         ),
                         Addr::new(
-                            req.package,
+                            req.package.clone(),
                             "build_lib".to_string(),
                             factors_to_args(&factors),
                         ),
                     ];
+                    // The `download` target lives at the module root only and
+                    // is factor-independent (one per module@version).
+                    if subpath.is_empty() {
+                        addrs.push(Addr::new(
+                            req.package,
+                            "download".to_string(),
+                            Default::default(),
+                        ));
+                    }
                     let responses: Vec<anyhow::Result<ListResponse>> = addrs
                         .into_iter()
                         .map(|addr| Ok(ListResponse { addr }))
@@ -489,6 +498,32 @@ impl ProviderInner {
             return Ok(GetResponse { target_spec: spec });
         }
 
+        // download — module-root only, factor-independent. Runs `go mod download`
+        // and exposes the module source tree as artifacts so downstream build_lib
+        // / embed targets get fully sandboxed sources instead of host GOMODCACHE.
+        if addr.name == "download" {
+            if let GoPackageKind::ThirdParty {
+                module,
+                version,
+                subpath,
+                ..
+            } = &*kind
+            {
+                if !subpath.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let spec = thirdparty::build_download_spec(
+                    addr.clone(),
+                    module,
+                    version,
+                    &self.go_bin_addr,
+                    &self.goroot,
+                );
+                return Ok(GetResponse { target_spec: spec });
+            }
+            return Err(GetError::NotFound);
+        }
+
         let import_path = match &*kind {
             GoPackageKind::FirstParty { import_path, .. } => import_path.clone(),
             GoPackageKind::ThirdParty {
@@ -548,33 +583,35 @@ impl ProviderInner {
                     None
                 };
 
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
                 let spec = match &*kind {
-                    GoPackageKind::ThirdParty { .. } => thirdparty::build_spec(
+                    GoPackageKind::ThirdParty { .. } => thirdparty::build_lib_spec(
                         addr.clone(),
                         &pkg,
                         &factors,
                         &transitive.libs,
+                        &pkg_addrs.go_files,
+                        &pkg_addrs.s_files,
+                        embed_addr.as_ref(),
+                        &pkg_addrs.embed_files,
                         &self.go_bin_addr,
                         &self.goroot,
                     ),
-                    _ => {
-                        let pkg_addrs = self
-                            .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                            .await
-                            .map_err(GetError::Other)?;
-                        target_lib::build_spec(
-                            addr.clone(),
-                            &import_path,
-                            pkg.name.as_deref().unwrap_or(""),
-                            &factors,
-                            &transitive.libs,
-                            &pkg_addrs.go_files,
-                            &self.go_bin_addr,
-                            &self.goroot,
-                            embed_addr.as_ref(),
-                            &pkg_addrs.embed_files,
-                        )
-                    }
+                    _ => target_lib::build_spec(
+                        addr.clone(),
+                        &import_path,
+                        pkg.name.as_deref().unwrap_or(""),
+                        &factors,
+                        &transitive.libs,
+                        &pkg_addrs.go_files,
+                        &self.go_bin_addr,
+                        &self.goroot,
+                        embed_addr.as_ref(),
+                        &pkg_addrs.embed_files,
+                    ),
                 };
                 Ok(GetResponse { target_spec: spec })
             }
@@ -1055,9 +1092,9 @@ impl ProviderInner {
             }
             GoPackageKind::ThirdParty {
                 module,
+                version,
                 subpath,
                 module_root,
-                ..
             } => {
                 let import_path = if subpath.is_empty() {
                     module.clone()
@@ -1072,12 +1109,15 @@ impl ProviderInner {
                     "_go_mod".to_string(),
                     Default::default(),
                 );
+                let base_pkg = module_root_rel.to_string_lossy();
+                let download_addr = encode_thirdparty_download(module, version, &base_pkg);
                 target_golist::build_spec_thirdparty(
                     addr,
                     &import_path,
                     factors,
                     &self.goroot,
                     &go_mod_addr,
+                    &download_addr,
                 )?
             }
             GoPackageKind::Stdlib { import_path } => {
@@ -1744,6 +1784,7 @@ mod tests {
                     &pkg,
                     addr.package.as_str(),
                     &self.source_map,
+                    None,
                 );
                 let addrs_bin = crate::plugingo::pkg_analysis::encode_package_addrs(&addrs)
                     .context("encode package_addrs.bin")?;

@@ -50,14 +50,23 @@ pub fn build_spec_thirdparty(
     factors: &Factors,
     goroot: &str,
     go_mod_addr: &Addr,
+    download_addr: &Addr,
 ) -> anyhow::Result<TargetSpec> {
-    build_spec_inner(
+    let mut spec = build_spec_inner(
         addr,
         import_path,
         factors,
         goroot,
         &[("modfiles", &[go_mod_addr.format()][..])],
-    )
+    )?;
+    // Threaded through to the driver so `resolve_package_addrs` can emit
+    // `download`-filter refs for thirdparty per-file addresses. NOT a runtime
+    // dep — `go list` still queries metadata via the host GOMODCACHE.
+    spec.config.insert(
+        "thirdparty_download_addr".to_string(),
+        TargetSpecValue::String(download_addr.format()),
+    );
+    Ok(spec)
 }
 
 fn build_spec_inner(
@@ -325,6 +334,14 @@ mod tests {
         );
     }
 
+    fn tp_download_addr() -> Addr {
+        Addr::new(
+            PkgBuf::from("@heph/go/thirdparty/github.com/foo/bar@v1.2.3"),
+            "download".to_string(),
+            Default::default(),
+        )
+    }
+
     #[test]
     fn test_thirdparty_deps_has_modfiles_only() {
         let spec = build_spec_thirdparty(
@@ -333,6 +350,7 @@ mod tests {
             &test_factors(),
             "/usr/local/go",
             &go_mod_addr(),
+            &tp_download_addr(),
         )
         .unwrap();
         let deps = match spec.config.get("deps").unwrap() {
@@ -353,6 +371,31 @@ mod tests {
             _ => panic!(),
         };
         assert!(out.contains_key("pkg"));
+    }
+
+    #[test]
+    fn test_thirdparty_spec_includes_download_addr_config_key() {
+        let spec = build_spec_thirdparty(
+            test_addr(),
+            "github.com/foo/bar",
+            &test_factors(),
+            "/usr/local/go",
+            &go_mod_addr(),
+            &tp_download_addr(),
+        )
+        .unwrap();
+        let addr_str = match spec.config.get("thirdparty_download_addr").unwrap() {
+            TargetSpecValue::String(s) => s.as_str(),
+            _ => panic!("expected string"),
+        };
+        assert!(
+            addr_str.contains("@heph/go/thirdparty/github.com/foo/bar@v1.2.3"),
+            "config must carry download addr: {addr_str}"
+        );
+        assert!(
+            addr_str.contains(":download"),
+            "addr name must be download: {addr_str}"
+        );
     }
 
     #[test]

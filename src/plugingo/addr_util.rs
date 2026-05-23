@@ -227,6 +227,22 @@ pub fn encode_thirdparty(
     )
 }
 
+/// Encode the module-root `download` target Addr for a thirdparty module.
+///
+/// Address format: `[<base_pkg>/]@heph/go/thirdparty/<module>@<version>:download`.
+/// The download target is factor-independent (module bytes don't depend on goos/goarch),
+/// so `args` is empty. One target per `(base_pkg, module, version)` — shared across
+/// every consumer of any package under that module.
+pub fn encode_thirdparty_download(module: &str, version: &str, base_pkg: &str) -> Addr {
+    let thirdparty_part = format!("{}{}@{}", THIRD_PREFIX, module, version);
+    let pkg = if base_pkg.is_empty() {
+        thirdparty_part
+    } else {
+        format!("{}/{}", base_pkg, thirdparty_part)
+    };
+    Addr::new(PkgBuf::from(pkg), "download".to_string(), BTreeMap::new())
+}
+
 /// Encode a first-party package (relative to workspace root) as a rheph Addr for build_lib.
 pub fn encode_firstparty(src_dir: &Path, workspace_root: &Path, factors: &Factors) -> Addr {
     let rel = src_dir.strip_prefix(workspace_root).unwrap_or(src_dir);
@@ -506,6 +522,43 @@ mod tests {
         assert_eq!(
             addr.package.as_str(),
             "go/@heph/go/thirdparty/github.com/foo/bar@v1.2.3/pkg"
+        );
+    }
+
+    #[test]
+    fn test_encode_thirdparty_download_root_base() {
+        let addr = encode_thirdparty_download("github.com/foo/bar", "v1.2.3", "");
+        assert_eq!(
+            addr.package.as_str(),
+            "@heph/go/thirdparty/github.com/foo/bar@v1.2.3"
+        );
+        assert_eq!(addr.name, "download");
+        assert!(addr.args.is_empty(), "download addr must be factor-less");
+    }
+
+    #[test]
+    fn test_encode_thirdparty_download_with_base_pkg() {
+        let addr = encode_thirdparty_download("github.com/foo/bar", "v1.2.3", "go");
+        assert_eq!(
+            addr.package.as_str(),
+            "go/@heph/go/thirdparty/github.com/foo/bar@v1.2.3"
+        );
+        assert_eq!(addr.name, "download");
+    }
+
+    #[test]
+    fn test_encode_thirdparty_download_decodes_as_module_root() {
+        let addr = encode_thirdparty_download("k8s.io/apimachinery", "v0.32.1", "go");
+        let ws = Path::new("/workspace");
+        let kind = decode_package(&addr.package, ws).unwrap();
+        assert_eq!(
+            *kind,
+            GoPackageKind::ThirdParty {
+                module: "k8s.io/apimachinery".to_string(),
+                version: "v0.32.1".to_string(),
+                subpath: String::new(),
+                module_root: PathBuf::from("/workspace/go"),
+            }
         );
     }
 

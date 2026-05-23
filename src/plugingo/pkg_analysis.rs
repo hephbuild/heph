@@ -60,6 +60,8 @@ pub struct GoPackage {
 pub struct PackageAddrs {
     #[serde(rename = "GoFiles", default)]
     pub go_files: Vec<String>,
+    #[serde(rename = "SFiles", default)]
+    pub s_files: Vec<String>,
     #[serde(rename = "TestGoFiles", default)]
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]
@@ -74,13 +76,21 @@ pub struct PackageAddrs {
 
 /// Resolve each Go source file in `pkg` to a target-address string.
 ///
-/// Codegen-produced files (those present in `source_map`, keyed by `pkg/file`) become
-/// `TargetAddr` strings with a filter pinning the specific file; the rest fall back to
-/// `pluginfs::file_addr` references.
+/// First-party: codegen-produced files (those present in `source_map`, keyed by
+/// `pkg/file`) become `TargetAddr` strings with a filter pinning the specific
+/// file; the rest fall back to `pluginfs::file_addr` references.
+///
+/// Thirdparty: when `download_addr` is `Some`, every file becomes a `TargetAddr`
+/// against the module-root `download` target filtered to the `pkg_str/file`
+/// path. The download target's artifact entries are keyed by ws-relative paths
+/// (the bash driver prefixes outputs with the target's package), so the filter
+/// string `pkg_str/file` matches verbatim. `source_map` is ignored for
+/// thirdparty — codegen never lands inside a vendored module.
 pub fn resolve_package_addrs(
     pkg: &GoPackage,
     pkg_str: &str,
     source_map: &HashMap<String, String>,
+    download_addr: Option<&Addr>,
 ) -> PackageAddrs {
     let resolve = |files: &[String]| -> Vec<String> {
         files
@@ -91,7 +101,14 @@ pub fn resolve_package_addrs(
                 } else {
                     format!("{pkg_str}/{f}")
                 };
-                if let Some(src_target) = source_map.get(&rel) {
+                if let Some(dl) = download_addr {
+                    TargetAddr {
+                        r#ref: dl.clone(),
+                        output: None,
+                        filters: vec![rel],
+                    }
+                    .to_string()
+                } else if let Some(src_target) = source_map.get(&rel) {
                     let src_ref = parse_addr_with_base(src_target, &PkgBuf::from(""))
                         .unwrap_or_else(|_| Addr::default());
                     TargetAddr {
@@ -108,6 +125,7 @@ pub fn resolve_package_addrs(
     };
     PackageAddrs {
         go_files: resolve(&pkg.go_files),
+        s_files: resolve(&pkg.s_files),
         test_go_files: resolve(&pkg.test_go_files),
         xtest_go_files: resolve(&pkg.xtest_go_files),
         embed_files: resolve(&pkg.embed_files),
