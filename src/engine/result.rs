@@ -240,13 +240,8 @@ impl Engine {
         // Cycle check: fires for every caller (including those awaiting an in-flight future)
         // before the memoizer blocks, preventing memoizer deadlocks on dependency cycles.
         if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
-            dag.add_dep(parent, addr).map_err(|_e| {
-                anyhow::Error::new(CycleError {
-                    from: parent.clone(),
-                    to: addr.clone(),
-                })
-            })?;
+            let mut dag = rs.data.dep_dag.lock();
+            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
         }
 
         // Set addr as parent so all sub-calls carry the right context for cycle detection.
@@ -550,13 +545,8 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
-            dag.add_dep(parent, addr).map_err(|_e| {
-                anyhow::Error::new(CycleError {
-                    from: parent.clone(),
-                    to: addr.clone(),
-                })
-            })?;
+            let mut dag = rs.data.dep_dag.lock();
+            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
         }
         let rs = rs.with_parent(addr.clone());
         self.get_def_no_track(rs, addr).await
@@ -585,13 +575,8 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<Arc<ExtendedTargetDef>> {
         if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
-            dag.add_dep(parent, addr).map_err(|_e| {
-                anyhow::Error::new(CycleError {
-                    from: parent.clone(),
-                    to: addr.clone(),
-                })
-            })?;
+            let mut dag = rs.data.dep_dag.lock();
+            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
         }
         let rs = rs.with_parent(addr.clone());
         self.get_def_inner(rs, addr, false)
@@ -728,13 +713,8 @@ impl Engine {
         addr: &Addr,
     ) -> anyhow::Result<Arc<EngineTargetSpec>> {
         if let Some(ref parent) = rs.parent {
-            let mut dag = rs.data.dep_dag.lock().expect("dep_dag mutex poisoned");
-            dag.add_dep(parent, addr).map_err(|_e| {
-                anyhow::Error::new(CycleError {
-                    from: parent.clone(),
-                    to: addr.clone(),
-                })
-            })?;
+            let mut dag = rs.data.dep_dag.lock();
+            dag.add_dep(parent, addr).map_err(anyhow::Error::new)?;
         }
         let rs = rs.with_parent(addr.clone());
         self.get_spec_no_track(rs, addr).await

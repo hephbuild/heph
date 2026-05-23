@@ -51,9 +51,8 @@ pub trait ProviderExecutor: Send + Sync {
     ///
     /// Each call routes through `Engine::result_addr`, which adds a
     /// `parent → addr` edge to the request's `DepDag` before any await. That
-    /// edge is the engine's sole synchronous cycle check — `daggy` returns
-    /// `WouldCycle`, surfaced as `CycleError`, the moment a closing edge is
-    /// inserted.
+    /// edge is the engine's sole synchronous cycle check — `DepDag::add_dep`
+    /// returns `CycleError` the moment a closing edge is inserted.
     ///
     /// **Do not wrap this call in a provider-internal memoizer keyed on the
     /// `addr`.** A waiter that hits the cache would skip this call, never
