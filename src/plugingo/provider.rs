@@ -26,7 +26,7 @@ use crate::plugingo::thirdparty;
 use anyhow::Context;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,8 +69,8 @@ pub(crate) struct ProviderInner {
     /// as `pkg_cache` — caches the parse, not the executor call.
     pkg_addrs_cache: Memoizer<Addr, Result<Arc<PackageAddrs>, Arc<anyhow::Error>>>,
     /// Cache: dedup `collect_direct_libs` / `collect_transitive_libs` BFS across
-    /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_lib#test`,
-    /// `build_lib#xtest`, `build_testmain_lib`) that share the same root pkg + factors.
+    /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_test_lib`,
+    /// `build_xtest_lib`, `build_testmain_lib`) that share the same root pkg + factors.
     libs_cache: Memoizer<LibsKey, Result<Arc<TransitiveDeps>, Arc<anyhow::Error>>>,
 }
 
@@ -374,7 +374,7 @@ impl ProviderInner {
                         ));
                         addrs.push(Addr::new(
                             req.package.clone(),
-                            "embed#xtest".to_string(),
+                            "embed_xtest".to_string(),
                             factors_to_args(&factors),
                         ));
                     }
@@ -665,7 +665,7 @@ impl ProviderInner {
                 })
             }
             // Intermediate test target: compile GoFiles + TestGoFiles in test mode.
-            "build_lib#test" => {
+            "build_test_lib" => {
                 let has_tests = !pkg.test_go_files.is_empty();
                 let has_go = !pkg.go_files.is_empty();
                 if !has_tests && !has_go {
@@ -693,14 +693,14 @@ impl ProviderInner {
                     || !pkg.test_embed_patterns.is_empty()
                     || !pkg.test_embed_files.is_empty();
                 let embed_addr = if has_any_embed {
-                    Some(self.make_addr_with_name(&addr.package, "embed#test", &factors))
+                    Some(self.make_addr_with_name(&addr.package, "embed_test", &factors))
                 } else {
                     None
                 };
 
                 let mut test_embed_files = pkg_addrs.embed_files.clone();
                 test_embed_files.extend(pkg_addrs.test_embed_files.iter().cloned());
-                let spec = target_test::build_lib_test_spec(
+                let spec = target_test::build_test_lib_spec(
                     addr.clone(),
                     &import_path,
                     pkg.name.as_deref().unwrap_or(""),
@@ -716,7 +716,7 @@ impl ProviderInner {
                 Ok(GetResponse { target_spec: spec })
             }
             // Intermediate test target: compile XTestGoFiles.
-            "build_lib#xtest" => {
+            "build_xtest_lib" => {
                 if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -754,11 +754,13 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                // xtest imports the package under test as `import_path`, but the linker
-                // gets `build_lib#test` (not `build_lib`) for that path — substitute here
-                // so the importcfg fingerprints match.
+                // xtest (`package P_test`) imports P. The test bin links P as the
+                // test variant (`build_test_lib`), so xtest_lib's importcfg must
+                // record the same variant — otherwise xtest_lib.a's embedded
+                // fingerprint for P doesn't match what the linker provides.
+                // Heph-legacy applies the same rule in get_lib.go:98-101.
                 let test_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_lib#test", &factors);
+                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
                 let mut found = false;
                 for (ip, a) in &mut transitive.libs {
                     if ip == &import_path {
@@ -778,12 +780,12 @@ impl ProviderInner {
 
                 let xtest_embed_addr =
                     if !pkg.xtest_embed_patterns.is_empty() || !pkg.xtest_embed_files.is_empty() {
-                        Some(self.make_addr_with_name(&addr.package, "embed#xtest", &factors))
+                        Some(self.make_addr_with_name(&addr.package, "embed_xtest", &factors))
                     } else {
                         None
                     };
 
-                let spec = target_test::build_lib_xtest_spec(
+                let spec = target_test::build_xtest_lib_spec(
                     addr.clone(),
                     &import_path,
                     pkg.name.as_deref().unwrap_or(""),
@@ -842,14 +844,14 @@ impl ProviderInner {
 
                 // Add test lib and xtest lib as transitive libs for the testmain
                 let test_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_lib#test", &factors);
+                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
                 let has_test_files = !pkg.test_go_files.is_empty() || !pkg.go_files.is_empty();
                 if has_test_files {
                     transitive.libs.push((import_path.clone(), test_lib_addr));
                 }
                 if !pkg.xtest_go_files.is_empty() {
                     let xtest_lib_addr =
-                        self.make_addr_with_name(&addr.package, "build_lib#xtest", &factors);
+                        self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
                     transitive
                         .libs
                         .push((format!("{}_test", import_path), xtest_lib_addr));
@@ -904,28 +906,37 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                // Build the all_libs list for the linker
-                let mut all_libs_map: HashMap<String, Addr> = HashMap::new();
-
-                // Add test lib
-                let has_test_files = !pkg.test_go_files.is_empty() || !pkg.go_files.is_empty();
-                if has_test_files {
-                    let test_lib_addr =
-                        self.make_addr_with_name(&addr.package, "build_lib#test", &factors);
-                    all_libs_map.insert(import_path.clone(), test_lib_addr);
-                }
-                // Add xtest lib
-                if !pkg.xtest_go_files.is_empty() {
-                    let xtest_lib_addr =
-                        self.make_addr_with_name(&addr.package, "build_lib#xtest", &factors);
-                    all_libs_map.insert(format!("{}_test", import_path), xtest_lib_addr);
-                }
-                // Add transitive libs
+                // Dedup transitive libs by import_path (normal-variant only). The
+                // test/xtest libs of P are passed separately so the importcfg can
+                // emit BOTH `packagefile P=normal.a` AND `packagefile P=test_lib.a`
+                // (linker takes last-wins) — required for the cycle case where a
+                // transitive importer of P holds the normal-variant fingerprint.
+                let mut transitive_libs: Vec<(String, Addr)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
                 for (ip, a) in transitive.libs {
-                    all_libs_map.entry(ip).or_insert(a);
+                    if seen.insert(ip.clone()) {
+                        transitive_libs.push((ip, a));
+                    }
                 }
 
-                let all_libs: Vec<(String, Addr)> = all_libs_map.into_iter().collect();
+                let has_test_files = !pkg.test_go_files.is_empty() || !pkg.go_files.is_empty();
+                let test_lib_addr = if has_test_files {
+                    Some((
+                        import_path.clone(),
+                        self.make_addr_with_name(&addr.package, "build_test_lib", &factors),
+                    ))
+                } else {
+                    None
+                };
+                let xtest_lib_addr = if !pkg.xtest_go_files.is_empty() {
+                    Some((
+                        format!("{}_test", import_path),
+                        self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors),
+                    ))
+                } else {
+                    None
+                };
+
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_testmain_lib", &factors);
 
@@ -939,7 +950,9 @@ impl ProviderInner {
                         gocache: &self.gocache,
                     },
                     &testmain_lib_addr,
-                    &all_libs,
+                    &transitive_libs,
+                    test_lib_addr.as_ref(),
+                    xtest_lib_addr.as_ref(),
                 );
                 Ok(GetResponse { target_spec: spec })
             }
@@ -980,7 +993,7 @@ impl ProviderInner {
                     ),
                 })
             }
-            "embed#test" => {
+            "embed_test" => {
                 let has_any = !pkg.embed_patterns.is_empty()
                     || !pkg.embed_files.is_empty()
                     || !pkg.test_embed_patterns.is_empty()
@@ -998,7 +1011,7 @@ impl ProviderInner {
                     target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed", &files),
                 })
             }
-            "embed#xtest" => {
+            "embed_xtest" => {
                 if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
@@ -1275,7 +1288,7 @@ impl ProviderInner {
     /// for the same dep cost nothing after the first resolution.
     ///
     /// The full BFS result is itself memoized via `libs_cache`, deduping calls
-    /// across `build_lib`/`build`/`build_test`/`build_lib#test` etc. for the same
+    /// across `build_lib`/`build`/`build_test`/`build_test_lib` etc. for the same
     /// root pkg + factors within a single Provider lifetime.
     async fn collect_transitive_libs(
         self: Arc<Self>,
@@ -1673,6 +1686,7 @@ mod tests {
     use crate::plugingo::pkg_analysis::run_go_list;
     use anyhow::Context;
     use futures::future::BoxFuture;
+    use std::collections::HashMap;
     use std::io;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2103,6 +2117,66 @@ mod tests {
             dep_str.contains("build_test"),
             "dep should reference build_test: {}",
             dep_str
+        );
+    }
+
+    // ---- with_test_cycle ----
+    // pkgb has internal _test.go that imports pkga, pkga imports pkgb (cycle).
+    // Without the importcfg override pass at the link step, this would yield a
+    // Go linker fingerprint mismatch — see Plan: "Fix Go test build_test
+    // fingerprint mismatch".
+
+    #[tokio::test]
+    async fn test_with_test_cycle_build_test_spec_emits_test_lib_override() {
+        require_go!();
+        let sandbox = copy_fixture("with_test_cycle");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkgb", "build_test"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        // test_lib (override for pkg-under-test) must be a distinct dep group
+        // from the normal-variant lib so the importcfg generator can emit BOTH
+        // `packagefile pkgb=normal.a` and `packagefile pkgb=test_lib.a`.
+        assert!(
+            deps.contains_key("test_lib"),
+            "build_test deps must have test_lib group when pkg has test files: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+        let test_lib_dep = match deps.get("test_lib").unwrap() {
+            TargetSpecValue::List(v) => &v[0],
+            _ => panic!("expected list"),
+        };
+        let test_lib_str = match test_lib_dep {
+            TargetSpecValue::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        assert!(
+            test_lib_str.contains("build_test_lib"),
+            "test_lib must reference build_test_lib target: {}",
+            test_lib_str
+        );
+
+        let run = match resp.target_spec.config.get("run").unwrap() {
+            TargetSpecValue::String(s) => s,
+            _ => panic!("expected string"),
+        };
+        // Linker importcfg must include the override line, AFTER the sorted
+        // transitive entries (last-wins for pkgb's importpath).
+        let override_marker = "packagefile example.com/with_test_cycle/pkgb=";
+        let last_pos = run
+            .rfind(override_marker)
+            .expect("expected importcfg override line for pkgb");
+        let after = &run[last_pos..];
+        let nl = after.find('\n').unwrap_or(after.len());
+        let line = &after[..nl];
+        assert!(
+            line.contains("$SRC_TEST_LIB"),
+            "override line must use $SRC_TEST_LIB: {}",
+            line
         );
     }
 

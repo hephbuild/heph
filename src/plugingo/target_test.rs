@@ -15,7 +15,7 @@ pub struct GoEnv<'a> {
 ///
 /// Output: `<pkgname>_test.a`
 #[expect(clippy::too_many_arguments, reason = "all parameters are required")]
-pub fn build_lib_test_spec(
+pub fn build_test_lib_spec(
     addr: Addr,
     import_path: &str,
     package_name: &str,
@@ -54,7 +54,7 @@ pub fn build_lib_test_spec(
 ///
 /// Output: `<pkgname>_xtest.a`
 #[expect(clippy::too_many_arguments, reason = "all parameters are required")]
-pub fn build_lib_xtest_spec(
+pub fn build_xtest_lib_spec(
     addr: Addr,
     import_path: &str,
     package_name: &str,
@@ -120,24 +120,51 @@ pub fn build_testmain_lib_spec(
 
 /// Link the test binary with `go tool link`.
 ///
-/// Depends on the `build_testmain_lib` output (as main package) plus all transitive
-/// lib archives for importcfg generation.
+/// Depends on the `build_testmain_lib` output (as main package) plus the transitive
+/// lib archives for importcfg generation, plus the test/xtest lib of the
+/// pkg-under-test (P) when present.
+///
+/// The importcfg is generated in two phases. First, one `packagefile` line per
+/// transitive lib (normal `build_lib` variants). Second, override lines for P's
+/// `build_test_lib` (importpath P) and `build_xtest_lib` (importpath P_test).
+/// `go tool link` reads importcfg sequentially with last-wins semantics, so the
+/// test variant of P supersedes the normal variant a transitive importer of P
+/// (cycle case) brought in.
 ///
 /// Output: `test_binary`
+#[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 pub fn build_test_spec(
     addr: Addr,
     factors: &Factors,
     go_bin_addr: &str,
     go_env: &GoEnv<'_>,
     testmain_lib_addr: &Addr,
-    all_libs: &[(String, Addr)],
+    transitive_libs: &[(String, Addr)],
+    test_lib: Option<&(String, Addr)>,
+    xtest_lib: Option<&(String, Addr)>,
 ) -> TargetSpec {
-    let mut script = write_importcfg_script(all_libs, None);
+    let mut script = write_importcfg_script(transitive_libs, None);
+    // Append override lines for the test/xtest variants AFTER the sorted
+    // transitive entries — linker last-wins picks these for P / P_test.
+    if let Some((import_path, _)) = test_lib {
+        script.push_str(&format!(
+            "printf \"packagefile {}=%s\\n\" \"$SRC_TEST_LIB\" >> \"$importcfg\"\n",
+            import_path
+        ));
+    }
+    if let Some((import_path, _)) = xtest_lib {
+        script.push_str(&format!(
+            "printf \"packagefile {}=%s\\n\" \"$SRC_XTEST_LIB\" >> \"$importcfg\"\n",
+            import_path
+        ));
+    }
     script.push_str(
         "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -o test_binary \"$SRC_TESTMAIN\"\n",
     );
 
-    // Build deps map: testmain lib gets its own group, all transitive libs get lib_* groups
+    // Build deps map: testmain lib + transitive libs (lib_* groups) + test/xtest libs
+    // in distinct groups so the run script can disambiguate via $SRC_TEST_LIB /
+    // $SRC_XTEST_LIB / $SRC_LIB_<importpath>.
     let mut deps: BTreeMap<String, TargetSpecValue> = BTreeMap::new();
     deps.insert(
         "go_bin".to_string(),
@@ -147,11 +174,23 @@ pub fn build_test_spec(
         "testmain".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String(testmain_lib_addr.format())]),
     );
-    for (import_path, lib_addr) in all_libs {
+    for (import_path, lib_addr) in transitive_libs {
         let group = import_path_to_dep_group(import_path);
         deps.insert(
             group,
             TargetSpecValue::List(vec![TargetSpecValue::String(lib_addr.format())]),
+        );
+    }
+    if let Some((_, addr)) = test_lib {
+        deps.insert(
+            "test_lib".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(addr.format())]),
+        );
+    }
+    if let Some((_, addr)) = xtest_lib {
+        deps.insert(
+            "xtest_lib".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String(addr.format())]),
         );
     }
 
@@ -394,11 +433,11 @@ mod tests {
         vec![pluginfs::file_addr(&format!("{}/foo.go", pkg)).format()]
     }
 
-    // ---- build_lib_test_spec ----
+    // ---- build_test_lib_spec ----
 
     #[test]
-    fn test_build_lib_test_spec_driver_is_bash() {
-        let spec = build_lib_test_spec(
+    fn test_build_test_lib_spec_driver_is_bash() {
+        let spec = build_test_lib_spec(
             mk_addr("pkg", "build_lib"),
             "example.com/pkg",
             "mypkg",
@@ -415,8 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_lib_test_spec_out_is_test_a() {
-        let spec = build_lib_test_spec(
+    fn test_build_test_lib_spec_out_is_test_a() {
+        let spec = build_test_lib_spec(
             mk_addr("pkg", "build_lib"),
             "example.com/pkg",
             "mypkg",
@@ -449,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_lib_test_spec_run_uses_compile() {
-        let spec = build_lib_test_spec(
+    fn test_build_test_lib_spec_run_uses_compile() {
+        let spec = build_test_lib_spec(
             mk_addr("pkg", "build_lib"),
             "example.com/pkg",
             "mypkg",
@@ -477,11 +516,11 @@ mod tests {
         );
     }
 
-    // ---- build_lib_xtest_spec ----
+    // ---- build_xtest_lib_spec ----
 
     #[test]
-    fn test_build_lib_xtest_spec_out_is_xtest_a() {
-        let spec = build_lib_xtest_spec(
+    fn test_build_xtest_lib_spec_out_is_xtest_a() {
+        let spec = build_xtest_lib_spec(
             mk_addr("pkg", "build_lib"),
             "example.com/pkg",
             "mypkg",
@@ -513,8 +552,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_lib_xtest_spec_uses_xtest_import_path() {
-        let spec = build_lib_xtest_spec(
+    fn test_build_xtest_lib_spec_uses_xtest_import_path() {
+        let spec = build_xtest_lib_spec(
             mk_addr("pkg", "build_lib"),
             "example.com/pkg",
             "mypkg",
@@ -597,6 +636,8 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
+            None,
+            None,
         );
         assert_eq!(spec.driver, "bash");
     }
@@ -611,6 +652,8 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
+            None,
+            None,
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -632,6 +675,8 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
+            None,
+            None,
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -657,6 +702,8 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
+            None,
+            None,
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -679,6 +726,8 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
+            None,
+            None,
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,

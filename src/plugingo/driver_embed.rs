@@ -23,7 +23,7 @@ pub struct GoEmbedDriver;
 enum EmbedVariant {
     Embed,
     /// embed_patterns ∪ test_embed_patterns / embed_files ∪ test_embed_files —
-    /// used by `build_lib#test`, which compiles GoFiles+TestGoFiles together and
+    /// used by `build_test_lib`, which compiles GoFiles+TestGoFiles together and
     /// so must see embeds from both sides.
     TestEmbed,
     XtestEmbed,
