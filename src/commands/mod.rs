@@ -1,4 +1,4 @@
-mod bootstrap;
+pub mod bootstrap;
 pub mod inspect;
 pub mod query;
 pub mod run;

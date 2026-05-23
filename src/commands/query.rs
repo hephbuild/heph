@@ -56,8 +56,8 @@ pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
 async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &cwp, true)?;
-    let engine = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = QueryApp { engine, matcher: m };
     let interactive = tui::should_use_tui(no_tui);
-    tui::run_app(app, sink, interactive).await
+    tui::run_app(app, sink, interactive, shutdown).await
 }

@@ -1084,8 +1084,7 @@ impl ProviderInner {
                 ))
                 .context("build go_test_data query addr")
                 .map_err(GetError::Other)?;
-                let spec =
-                    target_test::test_spec(addr.clone(), build_xtest_addr, &data_query_addr);
+                let spec = target_test::test_spec(addr.clone(), build_xtest_addr, &data_query_addr);
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
@@ -1734,7 +1733,7 @@ fn make_testmain_pkg(pkg: &GoPackage, imports: &[&str]) -> GoPackage {
         name: Some("main".to_string()),
         go_files: vec![],
         s_files: vec![],
-                    h_files: vec![],
+        h_files: vec![],
         test_go_files: vec![],
         xtest_go_files: vec![],
         embed_patterns: vec![],
@@ -2311,9 +2310,7 @@ mod tests {
         // build_test_lib (not normal build_lib).
         let pkgb_group = deps
             .iter()
-            .find(|(k, _)| {
-                k.as_str() == "lib_example_com_with_test_cycle_pkgb"
-            })
+            .find(|(k, _)| k.as_str() == "lib_example_com_with_test_cycle_pkgb")
             .map(|(_, v)| v)
             .expect("build_test deps must include pkgb's lib group");
         let pkgb_addr = match pkgb_group {

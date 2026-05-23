@@ -140,12 +140,12 @@ pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()
 async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
-    let engine = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,
         engine,
         matcher: m,
     };
     let interactive = tui::should_use_tui(no_tui);
-    tui::run_app(app, sink, interactive).await
+    tui::run_app(app, sink, interactive, shutdown).await
 }

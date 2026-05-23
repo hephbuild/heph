@@ -21,6 +21,7 @@ pub async fn run_app<A: App>(
     app: A,
     sink: LogSink,
     interactive: bool,
+    shutdown: crate::commands::bootstrap::ShutdownTrigger,
 ) -> anyhow::Result<A::Output> {
     // Establish a stable identity for the runtime's outer `block_on`
     // future so the memoizer's cross-task wait-for graph doesn't collide
@@ -28,9 +29,9 @@ pub async fn run_app<A: App>(
     // detector is disabled (the common case).
     crate::hmemoizer::with_cycle_ctx(async move {
         if interactive {
-            backend::interactive::run(app, sink).await
+            backend::interactive::run(app, sink, shutdown).await
         } else {
-            backend::ci::run(app, sink).await
+            backend::ci::run(app, sink, shutdown).await
         }
     })
     .await

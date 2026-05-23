@@ -11,7 +11,7 @@ pub struct Args {
 #[tokio::main]
 pub async fn execute(args: &Args) -> anyhow::Result<()> {
     crate::hmemoizer::with_cycle_ctx(async move {
-        let e = bootstrap::new_engine()?;
+        let (e, _shutdown) = bootstrap::new_engine()?;
         let rs = e.new_state();
 
         let m = match &args.matcher {

@@ -2,7 +2,9 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use anyhow::Context;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::prelude::Widget;
@@ -10,6 +12,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
+use crate::commands::bootstrap::ShutdownTrigger;
 use crate::tui::app::{App, AppContext, Control};
 use crate::tui::log_sink::LogSink;
 
@@ -18,7 +21,11 @@ const TICK: Duration = Duration::from_millis(80);
 
 type StderrTerminal = Terminal<CrosstermBackend<io::Stderr>>;
 
-pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
+pub async fn run<A: App>(
+    app: A,
+    sink: LogSink,
+    shutdown: ShutdownTrigger,
+) -> anyhow::Result<A::Output> {
     let label = app.label();
     let mut rx = sink.switch_to_buffered();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
@@ -32,6 +39,9 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
     )
     .context("building inline terminal")?;
     terminal.autoresize()?;
+
+    let mut events = EventStream::new();
+    let suppression = shutdown.suppression();
 
     let ctx = AppContext::with_control(sink.clone(), control_tx);
     let app_fut = app.run(ctx);
@@ -50,6 +60,10 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
                 match ctrl {
                     Some(Control::Pause(ack)) => {
                         if !paused {
+                            // Suppress shutdown trigger before releasing raw mode so
+                            // a Ctrl+C delivered to the cooked-mode prompt can't
+                            // race past us and cancel engine work.
+                            suppression.set(true);
                             drain_logs_to_terminal(&mut terminal, &mut rx);
                             drop(terminal.clear());
                             drop(terminal.show_cursor());
@@ -65,9 +79,22 @@ pub async fn run<A: App>(app: A, sink: LogSink) -> anyhow::Result<A::Output> {
                         drop(enable_raw_mode());
                         rx = sink.switch_to_buffered();
                         paused = false;
+                        suppression.set(false);
                     }
                     Some(Control::Resume) => {}
                     None => {}
+                }
+            }
+            maybe_evt = events.next(), if !paused => {
+                if let Some(Ok(Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    kind: KeyEventKind::Press,
+                    ..
+                }))) = maybe_evt
+                    && modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    shutdown.trigger();
                 }
             }
             _ = ticker.tick(), if !paused => {

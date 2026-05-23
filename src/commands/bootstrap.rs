@@ -1,10 +1,54 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+
+use tokio::sync::mpsc;
+
 use crate::engine::config_file;
 use crate::{
     engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, pluginnix,
     plugintextfile,
 };
 
-pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
+/// Producer-side handle for the in-process shutdown signal. Both the SIGINT
+/// listener and the TUI's Ctrl+C key handler call `trigger()` on this; the
+/// state machine in `spawn_shutdown_handler` is the single consumer.
+///
+/// While `SuppressionHandle::set(true)` is in effect (e.g. the TUI is paused
+/// for an interactive prompt), `trigger()` silently drops presses — neither
+/// kernel SIGINT nor TUI Ctrl+C cancels engine work in that window.
+#[derive(Clone)]
+pub struct ShutdownTrigger {
+    tx: mpsc::UnboundedSender<()>,
+    suppressed: Arc<AtomicBool>,
+}
+
+impl ShutdownTrigger {
+    pub fn trigger(&self) {
+        if self.suppressed.load(Ordering::Acquire) {
+            return;
+        }
+        _ = self.tx.send(());
+    }
+
+    pub fn suppression(&self) -> SuppressionHandle {
+        SuppressionHandle {
+            flag: Arc::clone(&self.suppressed),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SuppressionHandle {
+    flag: Arc<AtomicBool>,
+}
+
+impl SuppressionHandle {
+    pub fn set(&self, suppressed: bool) {
+        self.flag.store(suppressed, Ordering::Release);
+    }
+}
+
+pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
     let root = match engine::get_root() {
         Ok(r) => r,
         Err(inner) => anyhow::bail!("Error: {}", inner),
@@ -70,31 +114,52 @@ pub fn new_engine() -> anyhow::Result<std::sync::Arc<engine::Engine>> {
 
     e.apply_config(&file.providers, &file.drivers)?;
 
-    let engine = std::sync::Arc::new(e);
-    spawn_ctrlc_handler(std::sync::Arc::downgrade(&engine));
-    Ok(engine)
+    let engine = Arc::new(e);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let trigger = ShutdownTrigger {
+        tx,
+        suppressed: Arc::new(AtomicBool::new(false)),
+    };
+    spawn_sigint_producer(trigger.clone());
+    spawn_shutdown_handler(Arc::downgrade(&engine), rx);
+    Ok((engine, trigger))
 }
 
-/// Spawn a SIGINT handler tied to the lifetime of `engine`. First ctrl-c
-/// broadcasts cancellation to every in-flight request, letting drivers
-/// kill+reap their children and the TUI restore the terminal before
-/// unwinding naturally. Second ctrl-c hard-exits with code 130 — the
-/// process supervisor sidecar reaps any remaining tracked process groups.
-///
-/// Held as a `Weak` so the spawned task can't keep the engine alive past
-/// the command's natural lifetime. Must be called from inside a tokio
-/// runtime; `bootstrap::new_engine` is only invoked from `#[tokio::main]`
-/// command entry points, so `Handle::current()` is always available there.
-fn spawn_ctrlc_handler(engine: std::sync::Weak<engine::Engine>) {
+/// Bridge OS SIGINT into the shutdown trigger. The terminal may swallow
+/// Ctrl-C while the TUI is in raw mode (ISIG cleared), in which case this
+/// task never fires and the TUI's key handler drives the trigger instead.
+/// Both producers are gated by the same `SuppressionHandle`.
+fn spawn_sigint_producer(trigger: ShutdownTrigger) {
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_err() {
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                return;
+            }
+            trigger.trigger();
+        }
+    });
+}
+
+/// Single consumer for the shutdown trigger. First press broadcasts
+/// cancellation to every in-flight request, letting drivers kill+reap their
+/// children and the TUI restore the terminal before unwinding naturally.
+/// Second press hard-exits with code 130 — the process supervisor sidecar
+/// reaps any remaining tracked process groups.
+///
+/// Engine is held as a `Weak` so the spawned task can't keep the engine
+/// alive past the command's natural lifetime. Must be called from inside a
+/// tokio runtime; `bootstrap::new_engine` is only invoked from
+/// `#[tokio::main]` command entry points.
+fn spawn_shutdown_handler(engine: Weak<engine::Engine>, mut rx: mpsc::UnboundedReceiver<()>) {
+    tokio::spawn(async move {
+        if rx.recv().await.is_none() {
             return;
         }
         tracing::warn!("ctrl-c received, cancelling in-flight work (press ctrl-c again to abort)");
         if let Some(e) = engine.upgrade() {
             e.cancel_all_requests();
         }
-        if tokio::signal::ctrl_c().await.is_err() {
+        if rx.recv().await.is_none() {
             return;
         }
         tracing::error!("second ctrl-c, aborting");
@@ -192,5 +257,76 @@ drivers:
         assert!(!e.drivers_by_name.contains_key("exec"));
         assert!(e.providers_by_name.contains_key("fs"));
         assert!(e.drivers_by_name.contains_key("fs"));
+    }
+
+    /// Build an engine + a shutdown trigger wired to the consumer state
+    /// machine, but skip the SIGINT producer — tests drive the trigger
+    /// directly to keep the path hermetic (no real signals).
+    fn build_engine_with_trigger() -> (tempfile::TempDir, Arc<engine::Engine>, ShutdownTrigger) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let engine = Arc::new(
+            engine::Engine::new(engine::Config {
+                root: root.clone(),
+                home_dir: root.join(".heph3"),
+                parallelism: None,
+            })
+            .expect("engine"),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let trigger = ShutdownTrigger {
+            tx,
+            suppressed: Arc::new(AtomicBool::new(false)),
+        };
+        spawn_shutdown_handler(Arc::downgrade(&engine), rx);
+        (dir, engine, trigger)
+    }
+
+    async fn await_cancelled(token: &crate::hasync::StdCancellationToken) -> bool {
+        for _ in 0..100 {
+            if token.is_cancelled() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        token.is_cancelled()
+    }
+
+    #[tokio::test]
+    async fn trigger_cancels_in_flight_requests() {
+        let (_dir, engine, trigger) = build_engine_with_trigger();
+        let rs = engine.new_state();
+        assert!(!rs.ctoken().is_cancelled());
+
+        trigger.trigger();
+
+        assert!(
+            await_cancelled(rs.ctoken()).await,
+            "trigger must propagate to in-flight request tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn suppression_drops_trigger_then_resumes() {
+        let (_dir, engine, trigger) = build_engine_with_trigger();
+        let rs = engine.new_state();
+        let suppression = trigger.suppression();
+
+        // Suppressed: trigger must be a no-op.
+        suppression.set(true);
+        trigger.trigger();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !rs.ctoken().is_cancelled(),
+            "suppressed trigger must not cancel"
+        );
+
+        // Resumed: trigger must take effect.
+        suppression.set(false);
+        trigger.trigger();
+        assert!(
+            await_cancelled(rs.ctoken()).await,
+            "trigger after resume must cancel"
+        );
     }
 }

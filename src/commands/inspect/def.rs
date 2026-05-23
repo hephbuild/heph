@@ -70,12 +70,12 @@ pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
 async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let addr =
         htaddr::parse_addr(args.addr.as_ref()).with_context(|| format!("parse {}", args.addr))?;
-    let engine = bootstrap::new_engine()?;
+    let (engine, shutdown) = bootstrap::new_engine()?;
     let app = DefApp {
         engine,
         addr,
         no_transitive: args.no_transitive,
     };
     let interactive = tui::should_use_tui(no_tui);
-    tui::run_app(app, sink, interactive).await
+    tui::run_app(app, sink, interactive, shutdown).await
 }
