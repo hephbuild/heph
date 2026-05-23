@@ -1,6 +1,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+use ansi_to_tui::IntoText;
 use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -8,7 +9,8 @@ use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::prelude::Widget;
-use ratatui::widgets::Paragraph;
+use ratatui::text::Text;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
@@ -126,24 +128,68 @@ fn drain_logs_to_terminal(
     terminal: &mut StderrTerminal,
     rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
+    let cols = terminal.size().map(|r| r.width).unwrap_or(80).max(1);
     while let Ok(bytes) = rx.try_recv() {
-        let text = String::from_utf8_lossy(&bytes);
-        for line in text.lines() {
-            if line.is_empty() {
+        let text = bytes
+            .into_text()
+            .unwrap_or_else(|_| Text::raw(String::from_utf8_lossy(&bytes).into_owned()));
+        for line in text.lines {
+            let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+            if width == 0 {
                 continue;
             }
-            let owned = line.to_string();
-            drop(terminal.insert_before(1, |buf: &mut Buffer| {
+            let rows = rows_needed(width, cols);
+            drop(terminal.insert_before(rows, move |buf: &mut Buffer| {
                 let area = buf.area;
-                Paragraph::new(owned.clone()).render(area, buf);
+                Paragraph::new(line)
+                    .wrap(Wrap { trim: false })
+                    .render(area, buf);
             }));
         }
     }
+}
+
+fn rows_needed(width: u16, cols: u16) -> u16 {
+    let cols = cols.max(1);
+    if width == 0 {
+        return 1;
+    }
+    let rows = u32::from(width).div_ceil(u32::from(cols));
+    u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
 
 fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
     let mut stderr = io::stderr().lock();
     while let Ok(bytes) = rx.try_recv() {
         drop(stderr.write_all(&bytes));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IntoText, rows_needed};
+
+    #[test]
+    fn rows_needed_handles_boundaries() {
+        assert_eq!(rows_needed(0, 80), 1);
+        assert_eq!(rows_needed(1, 80), 1);
+        assert_eq!(rows_needed(80, 80), 1);
+        assert_eq!(rows_needed(81, 80), 2);
+        assert_eq!(rows_needed(160, 80), 2);
+        assert_eq!(rows_needed(161, 80), 3);
+    }
+
+    #[test]
+    fn rows_needed_handles_zero_cols() {
+        // cols clamped to 1
+        assert_eq!(rows_needed(5, 0), 5);
+    }
+
+    #[test]
+    fn ansi_escapes_do_not_inflate_width() {
+        let bytes = b"\x1b[31mfoo\x1b[0m".to_vec();
+        let text = bytes.into_text().expect("parse ansi");
+        let total: usize = text.lines.iter().map(|l| l.width()).sum();
+        assert_eq!(total, 3, "width should count visible chars only");
     }
 }
