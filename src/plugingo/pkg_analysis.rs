@@ -20,6 +20,11 @@ pub struct GoPackage {
     pub go_files: Vec<String>,
     #[serde(rename = "SFiles", default)]
     pub s_files: Vec<String>,
+    /// .h files. Required as inputs whenever asm `.s` files `#include` them
+    /// (e.g. `purego/fakecgo` ships its own `abi_arm64.h`). Without staging
+    /// the asm step fails to resolve the include.
+    #[serde(rename = "HFiles", default)]
+    pub h_files: Vec<String>,
     #[serde(rename = "TestGoFiles", default)]
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]
@@ -62,6 +67,10 @@ pub struct PackageAddrs {
     pub go_files: Vec<String>,
     #[serde(rename = "SFiles", default)]
     pub s_files: Vec<String>,
+    /// Per-file Addrs for .h headers staged into the sandbox so asm can resolve
+    /// `#include` directives.
+    #[serde(rename = "HFiles", default)]
+    pub h_files: Vec<String>,
     #[serde(rename = "TestGoFiles", default)]
     pub test_go_files: Vec<String>,
     #[serde(rename = "XTestGoFiles", default)]
@@ -126,6 +135,7 @@ pub fn resolve_package_addrs(
     PackageAddrs {
         go_files: resolve(&pkg.go_files),
         s_files: resolve(&pkg.s_files),
+        h_files: resolve(&pkg.h_files),
         test_go_files: resolve(&pkg.test_go_files),
         xtest_go_files: resolve(&pkg.xtest_go_files),
         embed_files: resolve(&pkg.embed_files),

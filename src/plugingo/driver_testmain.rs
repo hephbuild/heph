@@ -19,14 +19,30 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 pub struct GoTestmainDriver;
 
+#[derive(Clone, serde::Serialize, PartialEq, Eq)]
+enum TestmainMode {
+    /// Internal tests only (pkg.test_go_files). testmain.go imports `_test "P"`.
+    Internal,
+    /// External xtests only (pkg.xtest_go_files). testmain.go imports `_xtest "P_test"`.
+    Xtest,
+    /// Both (legacy/combined). Kept for callers that haven't split yet.
+    Both,
+}
+
 #[derive(Clone, serde::Serialize)]
 struct GoTestmainDef {
     golist_origin_id: String,
+    mode: TestmainMode,
 }
 
 impl Hash for GoTestmainDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.golist_origin_id.hash(state);
+        match self.mode {
+            TestmainMode::Internal => 0u8.hash(state),
+            TestmainMode::Xtest => 1u8.hash(state),
+            TestmainMode::Both => 2u8.hash(state),
+        }
     }
 }
 
@@ -91,7 +107,24 @@ impl ManagedDriver for GoTestmainDriver {
             }
         }
 
-        let def = GoTestmainDef { golist_origin_id };
+        let mode = match config.get("mode") {
+            Some(crate::loosespecparser::TargetSpecValue::String(s)) => match s.as_str() {
+                "internal" => TestmainMode::Internal,
+                "xtest" => TestmainMode::Xtest,
+                "both" => TestmainMode::Both,
+                other => anyhow::bail!("go_testmain: unknown mode {:?}", other),
+            },
+            // No mode = back-compat with combined-bin callers.
+            None => TestmainMode::Both,
+            Some(other) => {
+                anyhow::bail!("go_testmain: mode must be string, got {:?}", other)
+            }
+        };
+
+        let def = GoTestmainDef {
+            golist_origin_id,
+            mode,
+        };
 
         let out_strings = config
             .get("out")
@@ -196,13 +229,22 @@ impl ManagedDriver for GoTestmainDriver {
         // engine into the sandbox package dir. Pass only relative names so absolute
         // sandbox paths never leak into the cached analysis; analyzer streams files
         // line-by-line out of `sandbox_pkg_dir`.
+        //
+        // `mode` gates which sets are analyzed so the internal testmain doesn't
+        // try to open xtest files (and vice versa). The split-bin design relies
+        // on this: internal bin's testmain only sees `_test "P"`, xtest bin's
+        // testmain only sees `_xtest "P_test"`.
         let mut file_refs: Vec<(&str, &str)> =
             Vec::with_capacity(pkg.test_go_files.len() + pkg.xtest_go_files.len());
-        for f in &pkg.test_go_files {
-            file_refs.push(("_test", f.as_str()));
+        if matches!(def.mode, TestmainMode::Internal | TestmainMode::Both) {
+            for f in &pkg.test_go_files {
+                file_refs.push(("_test", f.as_str()));
+            }
         }
-        for f in &pkg.xtest_go_files {
-            file_refs.push(("_xtest", f.as_str()));
+        if matches!(def.mode, TestmainMode::Xtest | TestmainMode::Both) {
+            for f in &pkg.xtest_go_files {
+                file_refs.push(("_xtest", f.as_str()));
+            }
         }
 
         let analysis = analyze_test_main(&pkg.import_path, &req.sandbox_pkg_dir, &file_refs)

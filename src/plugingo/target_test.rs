@@ -25,6 +25,7 @@ pub fn build_test_lib_spec(
     test_src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
 ) -> TargetSpec {
@@ -43,6 +44,7 @@ pub fn build_test_lib_spec(
         src_addrs.iter().chain(test_src_addrs.iter()).cloned(),
         go_bin_addr,
         goroot,
+        gocache,
         embed_addr,
         embed_file_addrs,
         run,
@@ -63,6 +65,7 @@ pub fn build_xtest_lib_spec(
     xtest_src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
 ) -> TargetSpec {
@@ -83,6 +86,7 @@ pub fn build_xtest_lib_spec(
         xtest_src_addrs.iter().cloned(),
         go_bin_addr,
         goroot,
+        gocache,
         embed_addr,
         embed_file_addrs,
         run,
@@ -100,6 +104,7 @@ pub fn build_testmain_lib_spec(
     testmain_libs: &[(String, Addr)],
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
 ) -> TargetSpec {
     let out_file = "testmain_main.a".to_string();
     let run = compile_run_script("main", testmain_libs, &out_file, false);
@@ -111,6 +116,7 @@ pub fn build_testmain_lib_spec(
         std::iter::once(testmain_src_addr.format()),
         go_bin_addr,
         goroot,
+        gocache,
         None,
         &[],
         run,
@@ -120,51 +126,35 @@ pub fn build_testmain_lib_spec(
 
 /// Link the test binary with `go tool link`.
 ///
-/// Depends on the `build_testmain_lib` output (as main package) plus the transitive
-/// lib archives for importcfg generation, plus the test/xtest lib of the
-/// pkg-under-test (P) when present.
+/// Depends on the testmain lib (as main package) plus a flat list of lib
+/// archives — one per importpath needed by the link. Caller is responsible
+/// for constructing `all_libs` so each importpath appears exactly once.
 ///
-/// The importcfg is generated in two phases. First, one `packagefile` line per
-/// transitive lib (normal `build_lib` variants). Second, override lines for P's
-/// `build_test_lib` (importpath P) and `build_xtest_lib` (importpath P_test).
-/// `go tool link` reads importcfg sequentially with last-wins semantics, so the
-/// test variant of P supersedes the normal variant a transitive importer of P
-/// (cycle case) brought in.
+/// Internal vs xtest are linked as SEPARATE binaries (heph-legacy mirror) so
+/// each importcfg is constraint-free:
+/// - internal bin: P → build_test_lib, transitive(P.imports ∪ P.test_imports) → build_lib
+/// - xtest bin:    P → build_lib (normal), P_test → build_xtest_lib, transitive(P.xtest_imports ∪ P.imports) → build_lib
+///
+/// Mixing both in one bin requires per-test recompile of every transitive
+/// importer of P (Option X) — much higher cache pressure. The split avoids
+/// it because Go itself rejects internal-test cycles (so internal bin can't
+/// have a transitive importer of P), and xtest's compile uses P=normal (so
+/// the xtest cycle stays fingerprint-consistent).
 ///
 /// Output: `test_binary`
-#[expect(clippy::too_many_arguments, reason = "all parameters are required")]
 pub fn build_test_spec(
     addr: Addr,
     factors: &Factors,
     go_bin_addr: &str,
     go_env: &GoEnv<'_>,
     testmain_lib_addr: &Addr,
-    transitive_libs: &[(String, Addr)],
-    test_lib: Option<&(String, Addr)>,
-    xtest_lib: Option<&(String, Addr)>,
+    all_libs: &[(String, Addr)],
 ) -> TargetSpec {
-    let mut script = write_importcfg_script(transitive_libs, None);
-    // Append override lines for the test/xtest variants AFTER the sorted
-    // transitive entries — linker last-wins picks these for P / P_test.
-    if let Some((import_path, _)) = test_lib {
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"$SRC_TEST_LIB\" >> \"$importcfg\"\n",
-            import_path
-        ));
-    }
-    if let Some((import_path, _)) = xtest_lib {
-        script.push_str(&format!(
-            "printf \"packagefile {}=%s\\n\" \"$SRC_XTEST_LIB\" >> \"$importcfg\"\n",
-            import_path
-        ));
-    }
+    let mut script = write_importcfg_script(all_libs, None);
     script.push_str(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -o test_binary \"$SRC_TESTMAIN\"\n",
+        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o test_binary \"$SRC_TESTMAIN\"\n",
     );
 
-    // Build deps map: testmain lib + transitive libs (lib_* groups) + test/xtest libs
-    // in distinct groups so the run script can disambiguate via $SRC_TEST_LIB /
-    // $SRC_XTEST_LIB / $SRC_LIB_<importpath>.
     let mut deps: BTreeMap<String, TargetSpecValue> = BTreeMap::new();
     deps.insert(
         "go_bin".to_string(),
@@ -174,23 +164,11 @@ pub fn build_test_spec(
         "testmain".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String(testmain_lib_addr.format())]),
     );
-    for (import_path, lib_addr) in transitive_libs {
+    for (import_path, lib_addr) in all_libs {
         let group = import_path_to_dep_group(import_path);
         deps.insert(
             group,
             TargetSpecValue::List(vec![TargetSpecValue::String(lib_addr.format())]),
-        );
-    }
-    if let Some((_, addr)) = test_lib {
-        deps.insert(
-            "test_lib".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(addr.format())]),
-        );
-    }
-    if let Some((_, addr)) = xtest_lib {
-        deps.insert(
-            "xtest_lib".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String(addr.format())]),
         );
     }
 
@@ -298,7 +276,7 @@ fn compile_run_script(
     };
 
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{embedcfg_flag} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
 
     script
@@ -315,6 +293,7 @@ fn build_lib_spec_inner(
     src_addrs: impl Iterator<Item = String>,
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     run: String,
@@ -387,6 +366,10 @@ fn build_lib_spec_inner(
                 "GOROOT".to_string(),
                 TargetSpecValue::String(goroot.to_string()),
             ),
+            (
+                "GOCACHE".to_string(),
+                TargetSpecValue::String(gocache.to_string()),
+            ),
         ])),
     );
     config.insert(
@@ -447,6 +430,7 @@ mod tests {
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -465,6 +449,7 @@ mod tests {
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -499,6 +484,7 @@ mod tests {
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -529,6 +515,7 @@ mod tests {
             &src_addrs("pkg"),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -562,6 +549,7 @@ mod tests {
             &src_addrs("pkg"),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -587,6 +575,7 @@ mod tests {
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -613,6 +602,7 @@ mod tests {
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -636,8 +626,6 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
-            None,
-            None,
         );
         assert_eq!(spec.driver, "bash");
     }
@@ -652,8 +640,6 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
-            None,
-            None,
         );
         let out = match spec.config.get("out").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -675,8 +661,6 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
-            None,
-            None,
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -702,8 +686,6 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
-            None,
-            None,
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -726,8 +708,6 @@ mod tests {
             &go_env(),
             &testmain_lib,
             &[],
-            None,
-            None,
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,

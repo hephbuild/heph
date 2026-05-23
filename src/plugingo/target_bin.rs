@@ -90,8 +90,11 @@ fn generate_link_script(
     let mut script = write_importcfg_script(transitive_libs, Some(self_import_path));
     let self_group = import_path_to_dep_group(self_import_path);
     let self_env_var = format!("SRC_{}", self_group.to_uppercase());
+    // -buildmode=pie matches Go's default on darwin/arm64 (and most modern
+    // platforms). Libs were compiled with -shared, so the link must agree on
+    // PIE — otherwise asm relocations from transitive deps fail to resolve.
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -o {} \"${}\"\n",
+        "\"$SRC_GO_BIN\" tool link -importcfg \"$importcfg\" -buildmode=pie -o {} \"${}\"\n",
         binary_name, self_env_var
     ));
     script

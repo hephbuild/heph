@@ -117,10 +117,12 @@ pub fn build_lib_spec(
     transitive_libs: &[(String, Addr)],
     src_addrs: &[String],
     s_file_addrs: &[String],
+    h_file_addrs: &[String],
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
 ) -> TargetSpec {
     let import_path = &pkg.import_path;
     let package_name = pkg.name.as_deref().unwrap_or("");
@@ -176,6 +178,19 @@ pub fn build_lib_spec(
                     .collect(),
             ),
         );
+        // .h headers next to .s files (e.g. purego ships its own abi_arm64.h).
+        // Staged so asm `-I .` can resolve `#include "abi_arm64.h"`.
+        if !h_file_addrs.is_empty() {
+            deps.insert(
+                "hdr".to_string(),
+                TargetSpecValue::List(
+                    h_file_addrs
+                        .iter()
+                        .map(|s| TargetSpecValue::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
     }
     if let Some(e) = embed_addr {
         deps.insert(
@@ -223,6 +238,13 @@ pub fn build_lib_spec(
                 "GOROOT".to_string(),
                 TargetSpecValue::String(goroot.to_string()),
             ),
+            // go tool {compile,asm,link} initialize Go's build cache layer on
+            // startup (for build IDs). Without GOCACHE or $HOME they error
+            // with "build cache is required, but could not be located".
+            (
+                "GOCACHE".to_string(),
+                TargetSpecValue::String(gocache.to_string()),
+            ),
         ])),
     );
     config.insert(
@@ -251,30 +273,65 @@ fn generate_compile_script(
 
     let has_asm = !s_files.is_empty();
     let asmhdr_flag = if has_asm { " -asmhdr \"go_asm.h\"" } else { "" };
+    // Go 1.17+ uses ABIInternal for Go-defined funcs but asm TEXT directives
+    // emit ABI0 symbols. Without -symabis the compiler emits ABIInternal calls
+    // to asm-defined funcs, producing "relocation target X not defined" at
+    // link time. -gensymabis declares the ABI of asm symbols so the compiler
+    // can match them.
+    let symabis_flag = if has_asm { " -symabis \"symabis\"" } else { "" };
     let embedcfg_flag = if has_embed {
         " -embedcfg \"$SRC_EMBED\""
     } else {
         ""
     };
 
+    let goos = &factors.goos;
+    let goarch = &factors.goarch;
+
+    // -shared = position-independent code. macOS arm64 binaries default to
+    // PIE, so Go's own build pipeline passes -shared to BOTH compile and asm.
+    // Without it, asm symbols may use wrong relocation modes and link fails
+    // with "relocation target X not defined".
+    let shared = " -shared";
+
+    if has_asm {
+        // Step 0: create empty go_asm.h so gensymabis can parse .s files that
+        // `#include "go_asm.h"` (chacha20, runtime helpers, etc.). Go's own
+        // build pipeline does the same (`echo -n > go_asm.h` before
+        // -gensymabis). Without this the asm parse silently emits an empty
+        // symabis file → compiler uses ABIInternal for asm-defined funcs →
+        // linker fails with "relocation target X not defined".
+        script.push_str("touch go_asm.h\n");
+
+        // Step 1: generate symabis from all .s files (one invocation).
+        let s_files_list = s_files
+            .iter()
+            .map(|f| format!("\"./{}\"", f))
+            .collect::<Vec<_>>()
+            .join(" ");
+        script.push_str(&format!(
+            "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -gensymabis -o \"symabis\" {s_files_list}\n"
+        ));
+    }
+
+    // Step 2: compile .go files. With -symabis the compiler learns asm ABIs;
+    // -asmhdr writes go_asm.h into CWD for the asm step to pick up via `-I .`.
     // Sources are staged into the consumer's sandbox by the engine (via the
     // download target's filtered outputs). `@${LIST_SRC}` is a response file
     // listing every staged source — same convention as first-party.
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{asmhdr_flag}{embedcfg_flag} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"\" -pack -importcfg \"$importcfg\"{symabis_flag}{asmhdr_flag}{embedcfg_flag}{shared} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
 
     if has_asm {
-        let goos = &factors.goos;
-        let goarch = &factors.goarch;
-        // .s files are staged at their pkg-relative paths inside the
-        // sandbox. `$RHEPH_PKG_SRC_DIR` is the sandbox pkg dir.
+        // Step 3: assemble each .s file. -I . finds go_asm.h written above.
         for s_file in s_files {
             let obj_file = format!("{}.o", s_file.trim_end_matches(".s"));
             script.push_str(&format!(
-                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath -I \"$RHEPH_PKG_SRC_DIR\" -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch} -o \"{obj_file}\" \"$RHEPH_PKG_SRC_DIR/{s_file}\"\n"
+                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -o \"{obj_file}\" \"./{s_file}\"\n"
             ));
         }
+        // Step 4: pack asm objs into the archive.
         let obj_args = s_files
             .iter()
             .map(|f| format!("\"{}.o\"", f.trim_end_matches(".s")))
@@ -329,6 +386,7 @@ mod tests {
             name: Some("logr".to_string()),
             go_files,
             s_files,
+            h_files: vec![],
             test_go_files: vec![],
             xtest_go_files: vec![],
             embed_patterns: vec![],
@@ -452,10 +510,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         assert_eq!(spec.driver, "bash");
     }
@@ -469,10 +529,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -497,10 +559,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -527,10 +591,12 @@ mod tests {
             &[],
             &[src.clone()],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -552,10 +618,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,
@@ -576,10 +644,12 @@ mod tests {
             &[],
             &[filter_src_addr("main.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -600,10 +670,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -630,10 +702,12 @@ mod tests {
             &transitive_libs,
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -659,10 +733,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let out = spec.config.get("out").unwrap();
         assert!(matches!(out, TargetSpecValue::Map(m) if m.contains_key("a")));
@@ -682,10 +758,12 @@ mod tests {
             &[],
             &[filter_src_addr("impl.go")],
             &s_addrs,
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -697,15 +775,26 @@ mod tests {
             run.contains("-asmhdr \"go_asm.h\""),
             "compile must emit asm header: {run}"
         );
+        // -gensymabis + -symabis are required so the Go compiler (ABIInternal)
+        // can resolve calls to asm-defined funcs (ABI0). Without them, linker
+        // fails with "relocation target X not defined".
+        assert!(
+            run.contains("-gensymabis"),
+            "must run asm -gensymabis to declare asm symbol ABIs: {run}"
+        );
+        assert!(
+            run.contains("-symabis \"symabis\""),
+            "compile must consume symabis file: {run}"
+        );
         assert!(
             run.contains("impl_amd64.s"),
             "must assemble impl_amd64.s: {run}"
         );
         assert!(run.contains("util.s"), "must assemble util.s: {run}");
-        // .s files must be referenced via the sandbox pkg dir, not host GOMODCACHE.
+        // .s files must be referenced via CWD (sandbox_pkg_dir), not host GOMODCACHE.
         assert!(
-            run.contains("$RHEPH_PKG_SRC_DIR"),
-            "asm step must use $RHEPH_PKG_SRC_DIR: {run}"
+            run.contains("\"./impl_amd64.s\""),
+            "asm step must use ./<file> (CWD-relative): {run}"
         );
         assert!(
             !run.contains("/go/pkg/mod/"),
@@ -732,10 +821,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             None,
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -760,10 +851,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             Some(&embed),
             &[],
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let run = match spec.config.get("run").unwrap() {
             TargetSpecValue::String(s) => s.clone(),
@@ -796,10 +889,12 @@ mod tests {
             &[],
             &[filter_src_addr("logr.go")],
             &[],
+            &[],
             Some(&embed),
             &embed_files,
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
         );
         let deps = match spec.config.get("deps").unwrap() {
             TargetSpecValue::Map(m) => m,

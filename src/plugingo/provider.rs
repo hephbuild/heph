@@ -380,16 +380,18 @@ impl ProviderInner {
                     }
 
                     if has_test {
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "build_test".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                        addrs.push(Addr::new(
-                            req.package,
-                            "test".to_string(),
-                            factors_to_args(&factors),
-                        ));
+                        // Emit both internal and xtest variants. The `get`
+                        // handler returns NotFound for whichever doesn't apply
+                        // based on actual pkg.test_go_files / pkg.xtest_go_files
+                        // — `scan_go_files` only sees `*_test.go` collectively
+                        // without parsing `package` declarations.
+                        for name in ["build_test", "test", "build_xtest", "xtest"] {
+                            addrs.push(Addr::new(
+                                req.package.clone(),
+                                name.to_string(),
+                                factors_to_args(&factors),
+                            ));
+                        }
                     }
 
                     let responses: Vec<anyhow::Result<ListResponse>> = addrs
@@ -595,10 +597,12 @@ impl ProviderInner {
                         &transitive.libs,
                         &pkg_addrs.go_files,
                         &pkg_addrs.s_files,
+                        &pkg_addrs.h_files,
                         embed_addr.as_ref(),
                         &pkg_addrs.embed_files,
                         &self.go_bin_addr,
                         &self.goroot,
+                        &self.gocache,
                     ),
                     _ => target_lib::build_spec(
                         addr.clone(),
@@ -609,6 +613,7 @@ impl ProviderInner {
                         &pkg_addrs.go_files,
                         &self.go_bin_addr,
                         &self.goroot,
+                        &self.gocache,
                         embed_addr.as_ref(),
                         &pkg_addrs.embed_files,
                     ),
@@ -645,10 +650,13 @@ impl ProviderInner {
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            // Intermediate test target: generates testmain.go from test file analysis.
+            // Generates testmain.go for the INTERNAL test bin (only `_test` imports).
+            // Internal and external (xtest) testmains are emitted separately so each
+            // test bin's importcfg is consistent: internal needs P=build_test_lib,
+            // xtest needs P=build_lib (normal) — combining them in one bin is what
+            // creates the fingerprint mismatch on cycle cases.
             "testmain" => {
-                let has_tests = !pkg.test_go_files.is_empty() || !pkg.xtest_go_files.is_empty();
-                if !has_tests {
+                if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
                 let pkg_addrs = self
@@ -660,6 +668,25 @@ impl ProviderInner {
                         addr.clone(),
                         &golist_addr,
                         &pkg_addrs.test_go_files,
+                        &[],
+                    ),
+                })
+            }
+            // Generates testmain.go for the EXTERNAL (xtest) test bin (only
+            // `_xtest` imports). See `testmain` arm for the split rationale.
+            "xtestmain" => {
+                if pkg.xtest_go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let pkg_addrs = self
+                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
+                    .await
+                    .map_err(GetError::Other)?;
+                Ok(GetResponse {
+                    target_spec: build_testmain_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        &[],
                         &pkg_addrs.xtest_go_files,
                     ),
                 })
@@ -710,6 +737,7 @@ impl ProviderInner {
                     &pkg_addrs.test_go_files,
                     &self.go_bin_addr,
                     &self.goroot,
+                    &self.gocache,
                     embed_addr.as_ref(),
                     &test_embed_files,
                 );
@@ -726,6 +754,7 @@ impl ProviderInner {
                     name: pkg.name.clone(),
                     go_files: vec![],
                     s_files: vec![],
+                    h_files: vec![],
                     test_go_files: vec![],
                     xtest_go_files: vec![],
                     embed_patterns: vec![],
@@ -743,7 +772,14 @@ impl ProviderInner {
                     incomplete: false,
                     error: None,
                 };
-                let mut transitive = Arc::clone(&self)
+                // xtest (`package P_test`) imports P as a normal external import.
+                // xtest_lib's compile uses P=normal build_lib so its embedded
+                // fingerprint matches the xtest bin's link-time view (which
+                // also uses P=normal — xtest doesn't need P's test variant).
+                // This is what makes the xtest cycle (Q→P) work without
+                // recompile flavoring: all consumers of P agree on the normal
+                // variant.
+                let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
                         &xtest_imports_pkg,
@@ -753,25 +789,6 @@ impl ProviderInner {
                     )
                     .await
                     .map_err(GetError::Other)?;
-
-                // xtest (`package P_test`) imports P. The test bin links P as the
-                // test variant (`build_test_lib`), so xtest_lib's importcfg must
-                // record the same variant — otherwise xtest_lib.a's embedded
-                // fingerprint for P doesn't match what the linker provides.
-                // Heph-legacy applies the same rule in get_lib.go:98-101.
-                let test_lib_addr =
-                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
-                let mut found = false;
-                for (ip, a) in &mut transitive.libs {
-                    if ip == &import_path {
-                        *a = test_lib_addr.clone();
-                        found = true;
-                        break;
-                    }
-                }
-                if !found && (!pkg.go_files.is_empty() || !pkg.test_go_files.is_empty()) {
-                    transitive.libs.push((import_path.clone(), test_lib_addr));
-                }
 
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
@@ -794,43 +811,20 @@ impl ProviderInner {
                     &pkg_addrs.xtest_go_files,
                     &self.go_bin_addr,
                     &self.goroot,
+                    &self.gocache,
                     xtest_embed_addr.as_ref(),
                     &pkg_addrs.xtest_embed_files,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            // Intermediate test target: compile the generated testmain.go.
+            // Compile the INTERNAL testmain.go (imports `_test "P"` only).
+            // Direct imports: testmain stdlib + P (via test_lib).
             "build_testmain_lib" => {
-                let has_tests = !pkg.test_go_files.is_empty() || !pkg.xtest_go_files.is_empty();
-                if !has_tests {
+                if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                // testmain package imports: os, reflect, testing, testing/internal/testdeps
-                // plus the test/xtest libs themselves
                 let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
-                let testmain_pkg = GoPackage {
-                    import_path: "main".to_string(),
-                    dir: pkg.dir.clone(),
-                    name: Some("main".to_string()),
-                    go_files: vec![],
-                    s_files: vec![],
-                    test_go_files: vec![],
-                    xtest_go_files: vec![],
-                    embed_patterns: vec![],
-                    embed_files: vec![],
-                    test_embed_patterns: vec![],
-                    test_embed_files: vec![],
-                    xtest_embed_patterns: vec![],
-                    xtest_embed_files: vec![],
-                    imports: testmain_imports.iter().map(|s| s.to_string()).collect(),
-                    test_imports: vec![],
-                    xtest_imports: vec![],
-                    standard: false,
-                    module: pkg.module.clone(),
-                    match_: vec![],
-                    incomplete: false,
-                    error: None,
-                };
+                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
                 let mut transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
@@ -841,29 +835,16 @@ impl ProviderInner {
                     )
                     .await
                     .map_err(GetError::Other)?;
-
-                // Add test lib and xtest lib as transitive libs for the testmain
+                // testmain imports `_test "P"` → importcfg needs P→test_lib.
                 let test_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
-                let has_test_files = !pkg.test_go_files.is_empty() || !pkg.go_files.is_empty();
-                if has_test_files {
-                    transitive.libs.push((import_path.clone(), test_lib_addr));
-                }
-                if !pkg.xtest_go_files.is_empty() {
-                    let xtest_lib_addr =
-                        self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
-                    transitive
-                        .libs
-                        .push((format!("{}_test", import_path), xtest_lib_addr));
-                }
+                transitive.libs.push((import_path.clone(), test_lib_addr));
 
-                // The testmain source comes from the "testmain" target
                 let testmain_src_addr = Addr::new(
                     addr.package.clone(),
                     "testmain".to_string(),
                     factors_to_args(&factors),
                 );
-
                 let spec = target_test::build_testmain_lib_spec(
                     addr.clone(),
                     &factors,
@@ -871,25 +852,65 @@ impl ProviderInner {
                     &transitive.libs,
                     &self.go_bin_addr,
                     &self.goroot,
+                    &self.gocache,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
-            "build_test" => {
-                let has_tests = !pkg.test_go_files.is_empty() || !pkg.xtest_go_files.is_empty();
-                if !has_tests {
+            // Compile the EXTERNAL (xtest) testmain.go (imports `_xtest "P_test"` only).
+            // Direct imports: testmain stdlib + P_test (via xtest_lib).
+            "build_xtestmain_lib" => {
+                if pkg.xtest_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
+                let testmain_imports = ["os", "reflect", "testing", "testing/internal/testdeps"];
+                let testmain_pkg = make_testmain_pkg(&pkg, &testmain_imports);
+                let mut transitive = Arc::clone(&self)
+                    .collect_direct_libs(
+                        Arc::clone(&req.executor),
+                        &testmain_pkg,
+                        &[],
+                        &factors,
+                        &module_root,
+                    )
+                    .await
+                    .map_err(GetError::Other)?;
+                // testmain imports `_xtest "P_test"` → importcfg needs P_test→xtest_lib.
+                let xtest_lib_addr =
+                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
+                transitive
+                    .libs
+                    .push((format!("{}_test", import_path), xtest_lib_addr));
 
-                // Collect all transitive libs for the linker importcfg
+                let testmain_src_addr = Addr::new(
+                    addr.package.clone(),
+                    "xtestmain".to_string(),
+                    factors_to_args(&factors),
+                );
+                let spec = target_test::build_testmain_lib_spec(
+                    addr.clone(),
+                    &factors,
+                    &testmain_src_addr,
+                    &transitive.libs,
+                    &self.go_bin_addr,
+                    &self.goroot,
+                    &self.gocache,
+                );
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Link the INTERNAL test bin.
+            // importcfg: P=build_test_lib, transitive(P.imports ∪ P.test_imports)=build_lib.
+            // Go rejects internal-test cycles, so no transitive importer of P appears here.
+            "build_test" => {
+                if pkg.test_go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
                 let test_extra: Vec<String> = pkg
                     .test_imports
                     .iter()
-                    .chain(&pkg.xtest_imports)
                     .chain(
                         ["os", "reflect", "testing", "testing/internal/testdeps"]
                             .iter()
-                            .map(|s| &**s as &str)
-                            .map(String::from)
+                            .map(|s| (*s).to_string())
                             .collect::<Vec<_>>()
                             .iter(),
                     )
@@ -906,40 +927,23 @@ impl ProviderInner {
                     .await
                     .map_err(GetError::Other)?;
 
-                // Dedup transitive libs by import_path (normal-variant only). The
-                // test/xtest libs of P are passed separately so the importcfg can
-                // emit BOTH `packagefile P=normal.a` AND `packagefile P=test_lib.a`
-                // (linker takes last-wins) — required for the cycle case where a
-                // transitive importer of P holds the normal-variant fingerprint.
-                let mut transitive_libs: Vec<(String, Addr)> = Vec::new();
+                // Assemble flat importcfg list: dedup by importpath, then add P→test_lib.
+                let mut all_libs: Vec<(String, Addr)> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
                 for (ip, a) in transitive.libs {
+                    if ip == import_path {
+                        continue; // P slot reserved for test_lib below
+                    }
                     if seen.insert(ip.clone()) {
-                        transitive_libs.push((ip, a));
+                        all_libs.push((ip, a));
                     }
                 }
-
-                let has_test_files = !pkg.test_go_files.is_empty() || !pkg.go_files.is_empty();
-                let test_lib_addr = if has_test_files {
-                    Some((
-                        import_path.clone(),
-                        self.make_addr_with_name(&addr.package, "build_test_lib", &factors),
-                    ))
-                } else {
-                    None
-                };
-                let xtest_lib_addr = if !pkg.xtest_go_files.is_empty() {
-                    Some((
-                        format!("{}_test", import_path),
-                        self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors),
-                    ))
-                } else {
-                    None
-                };
+                let test_lib_addr =
+                    self.make_addr_with_name(&addr.package, "build_test_lib", &factors);
+                all_libs.push((import_path.clone(), test_lib_addr));
 
                 let testmain_lib_addr =
                     self.make_addr_with_name(&addr.package, "build_testmain_lib", &factors);
-
                 let spec = target_test::build_test_spec(
                     addr.clone(),
                     &factors,
@@ -950,22 +954,112 @@ impl ProviderInner {
                         gocache: &self.gocache,
                     },
                     &testmain_lib_addr,
-                    &transitive_libs,
-                    test_lib_addr.as_ref(),
-                    xtest_lib_addr.as_ref(),
+                    &all_libs,
                 );
                 Ok(GetResponse { target_spec: spec })
             }
+            // Link the EXTERNAL (xtest) test bin.
+            // importcfg: P=build_lib (NORMAL — xtest_lib was compiled against
+            // normal P too, so all consumers of P agree on the same .a),
+            // P_test=build_xtest_lib, transitive(P.xtest_imports ∪ P.imports)=build_lib.
+            // Allows xtest cycle (bsfilter→bsquery) because every reference to P
+            // resolves to the SAME normal .a.
+            "build_xtest" => {
+                if pkg.xtest_go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let xtest_extra: Vec<String> = pkg
+                    .xtest_imports
+                    .iter()
+                    .chain(&pkg.imports)
+                    .chain(
+                        ["os", "reflect", "testing", "testing/internal/testdeps"]
+                            .iter()
+                            .map(|s| (*s).to_string())
+                            .collect::<Vec<_>>()
+                            .iter(),
+                    )
+                    .cloned()
+                    .collect();
+                // Walk from a synthetic pkg whose imports are xtest_extra; pkg.imports
+                // are already in there, so the transitive closure covers everything
+                // both P (normal) and P_test (xtest_lib) need.
+                let xtest_root = GoPackage {
+                    import_path: format!("{}_test", import_path),
+                    dir: pkg.dir.clone(),
+                    name: pkg.name.clone(),
+                    go_files: vec![],
+                    s_files: vec![],
+                    h_files: vec![],
+                    test_go_files: vec![],
+                    xtest_go_files: vec![],
+                    embed_patterns: vec![],
+                    embed_files: vec![],
+                    test_embed_patterns: vec![],
+                    test_embed_files: vec![],
+                    xtest_embed_patterns: vec![],
+                    xtest_embed_files: vec![],
+                    imports: xtest_extra.clone(),
+                    test_imports: vec![],
+                    xtest_imports: vec![],
+                    standard: false,
+                    module: pkg.module.clone(),
+                    match_: vec![],
+                    incomplete: false,
+                    error: None,
+                };
+                let transitive = Arc::clone(&self)
+                    .collect_transitive_libs(
+                        Arc::clone(&req.executor),
+                        &xtest_root,
+                        &[],
+                        &factors,
+                        &module_root,
+                    )
+                    .await
+                    .map_err(GetError::Other)?;
+
+                let mut all_libs: Vec<(String, Addr)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                // P uses normal build_lib in the xtest bin. Reserve its slot
+                // and add it first so other entries don't accidentally claim it.
+                let p_normal = self.build_lib_addr(addr, &factors);
+                all_libs.push((import_path.clone(), p_normal));
+                seen.insert(import_path.clone());
+                let p_test = format!("{}_test", import_path);
+                seen.insert(p_test.clone()); // reserve for xtest_lib below
+                for (ip, a) in transitive.libs {
+                    if seen.insert(ip.clone()) {
+                        all_libs.push((ip, a));
+                    }
+                }
+                let xtest_lib_addr =
+                    self.make_addr_with_name(&addr.package, "build_xtest_lib", &factors);
+                all_libs.push((p_test, xtest_lib_addr));
+
+                let testmain_lib_addr =
+                    self.make_addr_with_name(&addr.package, "build_xtestmain_lib", &factors);
+                let spec = target_test::build_test_spec(
+                    addr.clone(),
+                    &factors,
+                    &self.go_bin_addr,
+                    &target_test::GoEnv {
+                        gomodcache: &self.gomodcache,
+                        gopath: &self.gopath,
+                        gocache: &self.gocache,
+                    },
+                    &testmain_lib_addr,
+                    &all_libs,
+                );
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Run the INTERNAL test bin.
             "test" => {
-                let has_tests = !pkg.test_go_files.is_empty() || !pkg.xtest_go_files.is_empty();
-                if !has_tests {
+                if pkg.test_go_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
                 let build_test_addr =
                     self.make_addr_with_name(&addr.package, "build_test", &factors);
-                // Add a query dep that pulls in any sibling target labeled
-                // `go_test_data`. The engine resolves the query lazily via the
-                // `@heph/query` provider — no eager scan of the package here.
                 let data_query_addr = crate::htaddr::parse_addr(&format!(
                     "//{}:q@package={},label=go_test_data",
                     crate::pluginquery::PACKAGE,
@@ -974,6 +1068,24 @@ impl ProviderInner {
                 .context("build go_test_data query addr")
                 .map_err(GetError::Other)?;
                 let spec = target_test::test_spec(addr.clone(), build_test_addr, &data_query_addr);
+                Ok(GetResponse { target_spec: spec })
+            }
+            // Run the EXTERNAL (xtest) test bin.
+            "xtest" => {
+                if pkg.xtest_go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
+                let build_xtest_addr =
+                    self.make_addr_with_name(&addr.package, "build_xtest", &factors);
+                let data_query_addr = crate::htaddr::parse_addr(&format!(
+                    "//{}:q@package={},label=go_test_data",
+                    crate::pluginquery::PACKAGE,
+                    addr.package.as_str(),
+                ))
+                .context("build go_test_data query addr")
+                .map_err(GetError::Other)?;
+                let spec =
+                    target_test::test_spec(addr.clone(), build_xtest_addr, &data_query_addr);
                 Ok(GetResponse { target_spec: spec })
             }
             "embed" => {
@@ -1455,7 +1567,7 @@ impl ProviderInner {
         Ok(TransitiveDeps { libs })
     }
 
-    /// Resolve one import path: returns `(import_path, Option<build_lib Addr>, sub_imports)`.
+    /// Resolve one import path: returns `(import_path, Option<lib Addr>, sub_imports)`.
     async fn resolve_import(
         &self,
         executor: Arc<dyn ProviderExecutor>,
@@ -1612,6 +1724,36 @@ fn build_embed_spec(
     }
 }
 
+/// Build a synthetic `GoPackage` representing the `main` package of a
+/// testmain.go file. Only `imports` is set — used to drive
+/// `collect_direct_libs` resolution.
+fn make_testmain_pkg(pkg: &GoPackage, imports: &[&str]) -> GoPackage {
+    GoPackage {
+        import_path: "main".to_string(),
+        dir: pkg.dir.clone(),
+        name: Some("main".to_string()),
+        go_files: vec![],
+        s_files: vec![],
+                    h_files: vec![],
+        test_go_files: vec![],
+        xtest_go_files: vec![],
+        embed_patterns: vec![],
+        embed_files: vec![],
+        test_embed_patterns: vec![],
+        test_embed_files: vec![],
+        xtest_embed_patterns: vec![],
+        xtest_embed_files: vec![],
+        imports: imports.iter().map(|s| (*s).to_string()).collect(),
+        test_imports: vec![],
+        xtest_imports: vec![],
+        standard: false,
+        module: pkg.module.clone(),
+        match_: vec![],
+        incomplete: false,
+        error: None,
+    }
+}
+
 fn build_testmain_spec(
     addr: Addr,
     golist_addr: &Addr,
@@ -1651,8 +1793,24 @@ fn build_testmain_spec(
         );
     }
 
+    // Tell the `go_testmain` driver which file set to analyze. Without `mode`
+    // it analyzes BOTH test_go_files and xtest_go_files from the golist, which
+    // breaks the split-bin design (xtestmain tries to open internal test files
+    // that weren't staged → "No such file or directory").
+    let mode = if !test_file_addrs.is_empty() && !xtest_file_addrs.is_empty() {
+        "both"
+    } else if !xtest_file_addrs.is_empty() {
+        "xtest"
+    } else {
+        "internal"
+    };
+
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
+    config.insert(
+        "mode".to_string(),
+        TargetSpecValue::String(mode.to_string()),
+    );
     config.insert(
         "out".to_string(),
         TargetSpecValue::Map(HashMap::from([(
@@ -2121,13 +2279,24 @@ mod tests {
     }
 
     // ---- with_test_cycle ----
-    // pkgb has internal _test.go that imports pkga, pkga imports pkgb (cycle).
-    // Without the importcfg override pass at the link step, this would yield a
-    // Go linker fingerprint mismatch — see Plan: "Fix Go test build_test
-    // fingerprint mismatch".
+    // pkgb has internal _test.go (no cycle: internal tests can't import pkga
+    // because pkga imports pkgb — Go rejects). pkgb also has xtest
+    // (`package pkgb_test`) that DOES import pkga — Go allows this because
+    // pkgb_test is a distinct package.
+    //
+    // The bug was: combining internal and xtest into one `build_test` bin
+    // forced testmain to reference both P=build_test_lib (for internal tests)
+    // AND P_test=build_xtest_lib (for xtest). xtest_lib was compiled against
+    // P=normal build_lib, so the linker (providing P=build_test_lib) found a
+    // fingerprint mismatch on pkga (which imports P=normal).
+    //
+    // Fix: split into separate `build_test` (internal) and `build_xtest`
+    // (xtest) bins. Internal bin doesn't include pkga at all (Go rejects
+    // cycle there). Xtest bin uses P=normal everywhere — testmain_xtest
+    // imports `_xtest "P_test"` only, never P directly.
 
     #[tokio::test]
-    async fn test_with_test_cycle_build_test_spec_emits_test_lib_override() {
+    async fn test_with_test_cycle_build_test_uses_test_lib_for_p() {
         require_go!();
         let sandbox = copy_fixture("with_test_cycle");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
@@ -2138,45 +2307,103 @@ mod tests {
             TargetSpecValue::Map(m) => m,
             _ => panic!("expected map"),
         };
-        // test_lib (override for pkg-under-test) must be a distinct dep group
-        // from the normal-variant lib so the importcfg generator can emit BOTH
-        // `packagefile pkgb=normal.a` and `packagefile pkgb=test_lib.a`.
-        assert!(
-            deps.contains_key("test_lib"),
-            "build_test deps must have test_lib group when pkg has test files: {:?}",
-            deps.keys().collect::<Vec<_>>()
-        );
-        let test_lib_dep = match deps.get("test_lib").unwrap() {
-            TargetSpecValue::List(v) => &v[0],
+        // Internal bin's importcfg entry for pkgb's import path must point at
+        // build_test_lib (not normal build_lib).
+        let pkgb_group = deps
+            .iter()
+            .find(|(k, _)| {
+                k.as_str() == "lib_example_com_with_test_cycle_pkgb"
+            })
+            .map(|(_, v)| v)
+            .expect("build_test deps must include pkgb's lib group");
+        let pkgb_addr = match pkgb_group {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.as_str(),
+                _ => panic!("expected string"),
+            },
             _ => panic!("expected list"),
         };
-        let test_lib_str = match test_lib_dep {
-            TargetSpecValue::String(s) => s,
-            _ => panic!("expected string"),
+        assert!(
+            pkgb_addr.contains("build_test_lib"),
+            "pkgb in internal build_test must reference build_test_lib: got {}",
+            pkgb_addr
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_test_cycle_build_xtest_uses_normal_p_and_xtest_lib() {
+        require_go!();
+        let sandbox = copy_fixture("with_test_cycle");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkgb", "build_xtest"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        // pkgb (P) must be NORMAL build_lib — xtest_lib was compiled against
+        // it; mismatch would occur if xtest bin substituted test_lib here.
+        let pkgb_group = deps
+            .get("lib_example_com_with_test_cycle_pkgb")
+            .expect("xtest bin must include pkgb's lib group");
+        let pkgb_addr = match pkgb_group {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.as_str(),
+                _ => panic!(),
+            },
+            _ => panic!(),
         };
         assert!(
-            test_lib_str.contains("build_test_lib"),
-            "test_lib must reference build_test_lib target: {}",
-            test_lib_str
+            pkgb_addr.contains("build_lib"),
+            "pkgb in xtest bin must use build_lib (normal): got {}",
+            pkgb_addr
+        );
+        assert!(
+            !pkgb_addr.contains("build_test_lib"),
+            "pkgb in xtest bin must NOT use build_test_lib: got {}",
+            pkgb_addr
         );
 
-        let run = match resp.target_spec.config.get("run").unwrap() {
-            TargetSpecValue::String(s) => s,
-            _ => panic!("expected string"),
+        // P_test must point at build_xtest_lib.
+        let pkgb_test_group = deps
+            .get("lib_example_com_with_test_cycle_pkgb_test")
+            .expect("xtest bin must include pkgb_test (xtest_lib) group");
+        let pkgb_test_addr = match pkgb_test_group {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.as_str(),
+                _ => panic!(),
+            },
+            _ => panic!(),
         };
-        // Linker importcfg must include the override line, AFTER the sorted
-        // transitive entries (last-wins for pkgb's importpath).
-        let override_marker = "packagefile example.com/with_test_cycle/pkgb=";
-        let last_pos = run
-            .rfind(override_marker)
-            .expect("expected importcfg override line for pkgb");
-        let after = &run[last_pos..];
-        let nl = after.find('\n').unwrap_or(after.len());
-        let line = &after[..nl];
         assert!(
-            line.contains("$SRC_TEST_LIB"),
-            "override line must use $SRC_TEST_LIB: {}",
-            line
+            pkgb_test_addr.contains("build_xtest_lib"),
+            "pkgb_test must reference build_xtest_lib: got {}",
+            pkgb_test_addr
+        );
+
+        // pkga (the cycle dep) must be normal build_lib — no `for_test_of` flavoring.
+        let pkga_group = deps
+            .iter()
+            .find(|(k, _)| k.contains("pkga"))
+            .map(|(_, v)| v)
+            .expect("xtest bin must include pkga");
+        let pkga_addr = match pkga_group {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.as_str(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        assert!(
+            !pkga_addr.contains("for_test_of"),
+            "pkga must NOT carry for_test_of arg (split bin design): got {}",
+            pkga_addr
+        );
+        assert!(
+            !pkga_addr.contains("build_test_lib"),
+            "pkga must use normal build_lib: got {}",
+            pkga_addr
         );
     }
 
@@ -2573,12 +2800,15 @@ mod tests {
         );
     }
 
+    // test_only fixture has ONLY xtest_go_files (package pkg_test) — no
+    // internal _test.go and no go.go. So `build_test`/`test` (internal-only
+    // since the split) return NotFound; the xtest variant exists.
     #[tokio::test]
-    async fn test_test_only_build_test_exists() {
+    async fn test_test_only_build_xtest_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("pkg", "build_test"))
+        let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
             .await
             .unwrap();
         assert_eq!(resp.target_spec.driver, "bash");
@@ -2590,11 +2820,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_test_only_test_exists() {
+    async fn test_test_only_xtest_exists() {
         require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let _resp = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
+        let _resp = provider_get(&p, make_addr("pkg", "xtest")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_test_only_internal_build_test_not_found() {
+        require_go!();
+        let sandbox = copy_fixture("test_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let result = provider_get(&p, make_addr("pkg", "build_test")).await;
+        assert!(matches!(result, Err(GetError::NotFound)));
     }
 
     // ---- mod-asm ----

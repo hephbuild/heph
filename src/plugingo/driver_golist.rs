@@ -52,7 +52,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 6;
+const GO_GOLIST_FORMAT_VERSION: u32 = 8;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -274,7 +274,7 @@ impl ManagedDriver for GoGolistDriver {
 
         let mut cmd_args = vec![
             "list".to_string(),
-            "-json=Dir,ImportPath,Name,GoFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error".to_string(),
+            "-json=Dir,ImportPath,Name,GoFiles,SFiles,HFiles,TestGoFiles,XTestGoFiles,EmbedPatterns,EmbedFiles,TestEmbedPatterns,TestEmbedFiles,XTestEmbedPatterns,XTestEmbedFiles,Imports,TestImports,XTestImports,Standard,Module,Match,Incomplete,Error".to_string(),
             "-e".to_string(),
             // -test populates TestEmbedFiles / XTestEmbedFiles (and resolves test
             // imports). Without it go list reports test embed patterns but never

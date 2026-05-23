@@ -19,6 +19,7 @@ pub fn build_spec(
     src_addrs: &[String],
     go_bin_addr: &str,
     goroot: &str,
+    gocache: &str,
     embed_addr: Option<&Addr>,
     embed_file_addrs: &[String],
 ) -> TargetSpec {
@@ -108,6 +109,11 @@ pub fn build_spec(
                 "GOROOT".to_string(),
                 TargetSpecValue::String(goroot.to_string()),
             ),
+            // go tool {compile,asm,link} need GOCACHE on startup for build IDs.
+            (
+                "GOCACHE".to_string(),
+                TargetSpecValue::String(gocache.to_string()),
+            ),
         ])),
     );
     config.insert(
@@ -136,8 +142,12 @@ fn generate_run_script(
     } else {
         ""
     };
+    // -shared: PIE-compatible code. Required on platforms where Go's default
+    // buildmode is PIE (darwin/arm64, recent linux/amd64). Without it, asm
+    // helpers in transitive deps may fail to link with "relocation target X
+    // not defined". Cheap to set unconditionally — Go's own build does so.
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath -pack -importcfg \"$importcfg\"{embedcfg_flag} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"\" -pack -importcfg \"$importcfg\"{embedcfg_flag} -shared -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
     script
 }
@@ -182,6 +192,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -199,6 +210,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -218,6 +230,7 @@ mod tests {
             &addrs,
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -258,6 +271,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -292,6 +306,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -328,6 +343,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -358,6 +374,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -394,6 +411,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -422,6 +440,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -463,6 +482,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -475,6 +495,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -501,6 +522,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -531,6 +553,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
@@ -564,6 +587,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             Some(&embed_addr()),
             &[],
         );
@@ -598,6 +622,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             Some(&embed_addr()),
             &[],
         );
@@ -626,6 +651,7 @@ mod tests {
             &src_addrs(),
             "//@heph/bin:go",
             "/usr/local/go",
+            "/tmp/gocache",
             None,
             &[],
         );
