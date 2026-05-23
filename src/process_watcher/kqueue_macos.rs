@@ -16,7 +16,6 @@ use std::io;
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 use std::sync::mpsc;
-use tokio::sync::oneshot;
 
 use super::Registration;
 
@@ -54,7 +53,7 @@ pub(super) fn start(rx: mpsc::Receiver<Registration>) -> io::Result<super::WakeF
 }
 
 fn run_loop(kq: i32, rx: mpsc::Receiver<Registration>) {
-    let mut pending: HashMap<i32, oneshot::Sender<io::Result<ExitStatus>>> = HashMap::new();
+    let mut pending: HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>> = HashMap::new();
     // SAFETY: kevent is plain-data; zero-init is a valid representation.
     let mut events: [libc::kevent; EVENT_BATCH] = unsafe { std::mem::zeroed() };
 
@@ -107,7 +106,7 @@ fn run_loop(kq: i32, rx: mpsc::Receiver<Registration>) {
 /// Backstop poll: probe every pending pid with `waitpid(WNOHANG)` and
 /// resolve those that have already exited. Catches `NOTE_EXIT` events
 /// that the kernel silently dropped under load.
-fn poll_pending(pending: &mut HashMap<i32, oneshot::Sender<io::Result<ExitStatus>>>) {
+fn poll_pending(pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>) {
     if pending.is_empty() {
         return;
     }
@@ -151,7 +150,7 @@ fn poll_pending(pending: &mut HashMap<i32, oneshot::Sender<io::Result<ExitStatus
 fn drain_registrations(
     kq: i32,
     rx: &mpsc::Receiver<Registration>,
-    pending: &mut HashMap<i32, oneshot::Sender<io::Result<ExitStatus>>>,
+    pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>,
 ) {
     while let Ok(reg) = rx.try_recv() {
         // pid is a positive i32 from a freshly-spawned child; treat as

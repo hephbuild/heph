@@ -12,12 +12,14 @@ use crate::loosespecparser::{parse_map_string_strings, parse_string, parse_strin
 use crate::plugingo::pkg_analysis::{
     GoPackage, encode_go_package, encode_package_addrs, resolve_package_addrs,
 };
-use crate::process_supervisor;
+use crate::proc_exec;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::sync::Arc;
 use xxhash_rust::xxh3::Xxh3Default;
 
@@ -289,41 +291,29 @@ impl ManagedDriver for GoGolistDriver {
 
         cmd_args.push(def.import_path.clone());
 
-        let mut cmd = tokio::process::Command::new(&go_bin);
-        cmd.args(&cmd_args)
-            .current_dir(&req.sandbox_pkg_dir)
-            .env_clear()
-            .envs(&env)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        // No setsid: tokio's wait_with_output SIGCHLD/kqueue waker is unreliable
-        // once the child is a session leader on macOS, which would leave
-        // exited `go list` processes as zombies. `go list` is single-process
-        // anyway; the supervisor's direct-pid kill covers hard-shutdown.
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn go list for {}", def.import_path))?;
-        let child_pid: i32 = child
-            .id()
-            .context("go list child has no pid")?
-            .try_into()
-            .context("go list pid does not fit in i32")?;
-        let _track_guard = process_supervisor::register_child(child_pid);
+        let args: Vec<OsString> = cmd_args.iter().map(OsString::from).collect();
+        let env_pairs: Vec<(OsString, OsString)> = env
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
 
-        let output = tokio::select! {
-            _ = ctoken.cancelled() => {
-                process_supervisor::kill_child(child_pid);
-                process_supervisor::wait_polling(&mut child).await
-                    .context("wait for cancelled go list")?;
-                anyhow::bail!("go list cancelled");
-            }
-            // Polling-based wait_with_output to avoid macOS SIGCHLD-waker
-            // zombies.
-            res = process_supervisor::wait_with_output_polling(&mut child) => {
-                res.context("wait for go list")?
-            }
+        // setsid=false: `go list` is single-process; the supervisor's
+        // direct-pid kill is sufficient on hard-shutdown.
+        let spec = proc_exec::Spec {
+            program: PathBuf::from(&go_bin),
+            args,
+            env: env_pairs,
+            cwd: req.sandbox_pkg_dir.clone(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
         };
+
+        let output = proc_exec::output(spec, ctoken)
+            .await
+            .with_context(|| format!("wait for go list for {}", def.import_path))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -8,10 +8,11 @@ use crate::engine::driver_managed::{ManagedDriver, ManagedRunRequest, ManagedRun
 use crate::hasync::Cancellable;
 use crate::htpkg::PkgBuf;
 use crate::loosespecparser::{TargetSpecValue, parse_string, parse_strings};
-use crate::process_supervisor;
+use crate::proc_exec;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,7 +107,8 @@ fn host_nix_system() -> anyhow::Result<String> {
 ///   non-default CA bundle (corporate MITM proxy, nixos system cert path, …)
 /// - route through corporate proxies (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`
 ///   + lowercase variants; curl honors both)
-fn passthrough_nix_env(cmd: &mut tokio::process::Command) {
+fn passthrough_nix_env() -> Vec<(OsString, OsString)> {
+    let mut out = Vec::new();
     for name in &[
         "HOME",
         "USER",
@@ -125,9 +127,10 @@ fn passthrough_nix_env(cmd: &mut tokio::process::Command) {
         "no_proxy",
     ] {
         if let Ok(v) = std::env::var(name) {
-            cmd.env(name, v);
+            out.push((OsString::from(name), OsString::from(v)));
         }
     }
+    out
 }
 
 /// Resolve a (possibly mutable) flake URL to its locked form via
@@ -138,45 +141,37 @@ async fn lock_flake_url(
     url: &str,
     ctoken: &(dyn Cancellable + Send + Sync),
 ) -> anyhow::Result<String> {
-    let mut cmd = tokio::process::Command::new(nix_bin);
-    cmd.arg("--extra-experimental-features")
-        .arg("nix-command flakes")
-        .arg("flake")
-        .arg("metadata")
-        .arg("--json")
-        .arg("--no-update-lock-file")
-        .arg("--no-write-lock-file")
-        .arg(url)
-        .env_clear()
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    passthrough_nix_env(&mut cmd);
-    // No setsid: tokio's wait_with_output relies on a SIGCHLD/kqueue waker
-    // that is unreliable once the child is a session leader on macOS.
-    // Nix is a single-process invocation so we only need the direct-pid
-    // kill the supervisor will issue.
-    let mut child = cmd.spawn().context("spawn nix flake metadata")?;
-    let child_pid: i32 = child
-        .id()
-        .context("nix flake metadata child has no pid")?
-        .try_into()
-        .context("nix flake metadata pid does not fit in i32")?;
-    let _track_guard = process_supervisor::register_child(child_pid);
-    let output = tokio::select! {
-        _ = ctoken.cancelled() => {
-            process_supervisor::kill_child(child_pid);
-            // Reap before bailing — without this the Child dropping does NOT
-            // run waitpid on macOS (tokio's SIGCHLD waker is unreliable),
-            // leaving a Z entry in the process table.
-            process_supervisor::wait_polling(&mut child).await
-                .context("wait for cancelled nix flake metadata")?;
-            anyhow::bail!("nix flake metadata cancelled");
-        }
-        // Polling-based wait_with_output: tokio's wait_with_output uses a
-        // SIGCHLD-based waker that is unreliable on macOS and leaves zombies.
-        res = process_supervisor::wait_with_output_polling(&mut child) => res.context("wait for nix flake metadata")?,
+    let args: Vec<OsString> = [
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "flake",
+        "metadata",
+        "--json",
+        "--no-update-lock-file",
+        "--no-write-lock-file",
+        url,
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+
+    // setsid=false: nix is a single-process invocation; the supervisor's
+    // direct-pid kill is sufficient on hard-shutdown.
+    let spec = proc_exec::Spec {
+        program: PathBuf::from(nix_bin),
+        args,
+        env: passthrough_nix_env(),
+        cwd: std::env::current_dir().context("current_dir for nix flake metadata")?,
+        stdin: proc_exec::StdioSpec::Null,
+        stdout: proc_exec::StdioSpec::Piped,
+        stderr: proc_exec::StdioSpec::Piped,
+        setsid: false,
+        ctty: false,
     };
+
+    let output = proc_exec::output(spec, ctoken)
+        .await
+        .context("wait for nix flake metadata")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("nix flake metadata failed for {url}: {stderr}");
@@ -402,47 +397,38 @@ impl ManagedDriver for Driver {
         let env_name = sanitize_env_name(&addr_str);
         let expr = build_nix_expr(&locked_flake_url, &def.system, &def.packages, &env_name);
 
-        let mut cmd = tokio::process::Command::new(&nix_bin);
-        cmd.arg("--extra-experimental-features")
-            .arg("nix-command flakes")
-            .arg("build")
-            .arg("--expr")
-            .arg(&expr)
-            .arg("--out-link")
-            .arg(&gcroot_path)
-            .arg("--print-out-paths")
+        let args: Vec<OsString> = [
+            OsString::from("--extra-experimental-features"),
+            OsString::from("nix-command flakes"),
+            OsString::from("build"),
+            OsString::from("--expr"),
+            OsString::from(&expr),
+            OsString::from("--out-link"),
+            gcroot_path.clone().into_os_string(),
+            OsString::from("--print-out-paths"),
             // jvns: skip lock-file churn when iterating locally.
-            .arg("--no-update-lock-file")
-            .arg("--no-write-lock-file")
-            // Deliberately NOT `--impure`: that disables the flake eval cache
-            // and is the single biggest avoidable eval cost.
-            .current_dir(&req.sandbox_pkg_dir)
-            .env_clear()
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        passthrough_nix_env(&mut cmd);
-        // No setsid: see comment in lock_flake_url for the rationale.
+            OsString::from("--no-update-lock-file"),
+            OsString::from("--no-write-lock-file"),
+            // Deliberately NOT `--impure`: disables the flake eval cache.
+        ]
+        .to_vec();
 
-        let mut child = cmd
-            .spawn()
-            .with_context(|| format!("spawn nix build for {addr_str}"))?;
-        let child_pid: i32 = child
-            .id()
-            .context("nix build child has no pid")?
-            .try_into()
-            .context("nix build pid does not fit in i32")?;
-        let _track_guard = process_supervisor::register_child(child_pid);
-
-        let output = tokio::select! {
-            _ = ctoken.cancelled() => {
-                process_supervisor::kill_child(child_pid);
-                process_supervisor::wait_polling(&mut child).await
-                    .context("wait for cancelled nix build")?;
-                anyhow::bail!("nix build cancelled");
-            }
-            res = process_supervisor::wait_with_output_polling(&mut child) => res.context("wait for nix build")?,
+        // setsid=false: see comment in lock_flake_url for the rationale.
+        let spec = proc_exec::Spec {
+            program: PathBuf::from(&nix_bin),
+            args,
+            env: passthrough_nix_env(),
+            cwd: req.sandbox_pkg_dir.clone(),
+            stdin: proc_exec::StdioSpec::Null,
+            stdout: proc_exec::StdioSpec::Piped,
+            stderr: proc_exec::StdioSpec::Piped,
+            setsid: false,
+            ctty: false,
         };
+
+        let output = proc_exec::output(spec, ctoken)
+            .await
+            .with_context(|| format!("wait for nix build for {addr_str}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

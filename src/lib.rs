@@ -22,7 +22,9 @@ pub mod pluginnix;
 pub mod pluginquery;
 pub mod pluginstatictarget;
 pub mod plugintextfile;
+pub mod proc_exec;
 pub mod process_supervisor;
+#[cfg(target_os = "macos")]
 pub mod process_watcher;
 pub mod tui;
 pub mod version;

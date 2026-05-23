@@ -12,16 +12,17 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed::{ManagedRunRequest, ManagedRunResponse};
 use crate::hasync::Cancellable;
+use crate::proc_exec;
 use crate::process_supervisor;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, Write};
-use std::process::Stdio;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io;
-use tokio::process::Command;
 use xxhash_rust::xxh3::Xxh3Default;
 
 const SHELL_INIT_SH: &str = include_str!("./init.sh");
@@ -189,7 +190,7 @@ impl Drop for RawModeGuard {
 
 async fn tee_stream(
     source: Option<impl tokio::io::AsyncRead + Unpin>,
-    log: Arc<tokio::sync::Mutex<tokio::fs::File>>,
+    log: Arc<std::sync::Mutex<std::fs::File>>,
     mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -199,14 +200,14 @@ async fn tee_stream(
         match source.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                // n is guaranteed <= buf.len() by AsyncRead::read contract
                 #[expect(
                     clippy::indexing_slicing,
                     reason = "n guaranteed <= buf.len() by AsyncRead contract"
                 )]
                 let slice = &buf[..n];
-                // Intentionally ignore write errors in the tee path; the process exit code is the authority
-                drop(log.lock().await.write_all(slice).await);
+                if let Ok(mut g) = log.lock() {
+                    drop(g.write_all(slice));
+                }
                 if let Some(ref mut out) = sink {
                     drop(out.write_all(slice).await);
                     // Flush immediately so interactive shells see each byte
@@ -217,6 +218,85 @@ async fn tee_stream(
             }
         }
     }
+}
+
+/// Tee chunks from a [`proc_exec::ChunkReader`] into the log file and the
+/// optional TUI sink. Used in non-PTY mode where the child stdout/stderr
+/// pipes are drained on a dedicated `std::thread` (inside `proc_exec`) and
+/// surfaced to async-land via `std::sync::mpsc` — `ChunkReader::recv`
+/// internally uses `block_in_place` on a kernel condvar, bypassing tokio's
+/// macOS-flaky cross-thread waker.
+async fn tee_chunks(
+    reader: Option<proc_exec::ChunkReader>,
+    log: Arc<std::sync::Mutex<std::fs::File>>,
+    mut sink: Option<&mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let Some(mut reader) = reader else { return };
+    loop {
+        let chunk = match reader.recv().await {
+            Ok(Some(c)) => c,
+            _ => break,
+        };
+        if let Ok(mut g) = log.lock() {
+            drop(g.write_all(&chunk));
+        }
+        if let Some(ref mut out) = sink {
+            drop(out.write_all(&chunk).await);
+            drop(out.flush().await);
+        }
+    }
+}
+
+/// PTY-mode stdin pump: copies bytes from the parent's stdin (TtyReader or
+/// similar) into the PTY master via `AsyncPty`. Uses tokio `io::copy` since
+/// `AsyncPty` is a normal tokio AsyncWrite over an `AsyncFd` — `EVFILT_READ`
+/// / `EVFILT_WRITE` wake reliability is fine on macOS.
+async fn pump_stdin_pty(
+    mut src: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin),
+    mut sink: pty::AsyncPty,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::AsyncWriteExt;
+    tokio::select! {
+        _ = cancel => {}
+        _ = io::copy(&mut src, &mut sink) => {}
+    }
+    drop(sink.shutdown().await);
+}
+
+/// Pump bytes from an async source into a [`proc_exec::StdinPump`]. Mirrors
+/// the existing tokio `io::copy` path but writes through the platform-aware
+/// stdin pump (sync `write_all` under `block_in_place` on macOS, native
+/// tokio AsyncWrite on Linux).
+async fn pump_stdin(
+    src: &mut (dyn tokio::io::AsyncRead + Send + Sync + Unpin),
+    mut sink: proc_exec::StdinPump,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+) {
+    use tokio::io::AsyncReadExt;
+    let copy = async {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            let n = match src.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "n <= buf.len() by AsyncRead::read contract"
+            )]
+            let chunk = &buf[..n];
+            if sink.write_all(chunk).await.is_err() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        _ = cancel => {}
+        _ = copy => {}
+    }
+    drop(sink.shutdown().await);
 }
 
 #[async_trait]
@@ -721,14 +801,13 @@ impl Driver {
         let output_log_path = req.sandbox_dir.join("log.txt");
         let output_log =
             std::fs::File::create(&output_log_path).with_context(|| "create log file")?;
-        let output_log_file = Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(
-            output_log,
-        )));
+        let output_log_file = Arc::new(std::sync::Mutex::new(output_log));
 
         // Shell mode runs the child attached to a freshly-allocated PTY so bash
         // sees a real terminal and runs interactively. The parent forwards
-        // stdin/stdout via the PTY master through the same tee_stream paths
-        // used by the non-shell path.
+        // stdin/stdout via the PTY master through the same tee paths used by
+        // the non-shell case (`tee_stream` on AsyncPty for PTY; `tee_chunks`
+        // on ChunkReader for piped stdio).
         let pty_pair = if shell {
             Some(pty::open_pty().context("openpty")?)
         } else {
@@ -741,16 +820,16 @@ impl Driver {
                 clippy::indexing_slicing,
                 reason = "run non-empty guaranteed by bail! check above"
             )]
-            (&run[0], &run[1..])
+            (run[0].clone(), run[1..].to_vec())
         };
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env_clear()
-            .envs(env)
-            .current_dir(req.sandbox_pkg_dir);
 
-        if let Some((master, slave)) = &pty_pair {
+        let env_pairs: Vec<(OsString, OsString)> = env
+            .into_iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect();
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+
+        let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
             // prompt correctly. Falls back to 80x24 if the parent has no tty.
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -764,54 +843,47 @@ impl Driver {
             let stdin_fd = slave.try_clone().context("dup pty slave for stdin")?;
             let stdout_fd = slave.try_clone().context("dup pty slave for stdout")?;
             let stderr_fd = slave.try_clone().context("dup pty slave for stderr")?;
-            cmd.stdin(Stdio::from(stdin_fd))
-                .stdout(Stdio::from(stdout_fd))
-                .stderr(Stdio::from(stderr_fd));
-            #[expect(
-                clippy::multiple_unsafe_ops_per_block,
-                reason = "pre_exec + setsid + ioctl must all run inside the same unsafe context"
-            )]
-            // SAFETY: pre_exec runs between fork and exec; the closure body
-            // only invokes async-signal-safe syscalls (setsid + ioctl) — both
-            // documented as safe to call in that window.
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+            // setsid+ctty: child becomes session leader and the inherited fd 0
+            // becomes its controlling terminal. The supervisor's `killpg`
+            // reaps the whole tree on hard-shutdown.
+            proc_exec::Spec {
+                program: PathBuf::from(program),
+                args: args_os,
+                env: env_pairs,
+                cwd: req.sandbox_pkg_dir.clone(),
+                stdin: proc_exec::StdioSpec::Fd(stdin_fd),
+                stdout: proc_exec::StdioSpec::Fd(stdout_fd),
+                stderr: proc_exec::StdioSpec::Fd(stderr_fd),
+                setsid: true,
+                ctty: true,
             }
-            // setsid already done above (PTY mode); pgid == pid so the
-            // supervisor's killpg reaps the whole tree.
         } else {
-            cmd.stdin(if rreq.stdin.is_some() {
-                Stdio::piped()
+            // No setsid for non-PTY: tokio's previous Child::wait waker
+            // flakiness no longer affects us (we use proc_exec's watcher
+            // path), but we still avoid setsid because nothing downstream
+            // requires session-leader semantics and the supervisor's
+            // direct-pid kill covers hard-shutdown.
+            let stdin = if rreq.stdin.is_some() {
+                proc_exec::StdioSpec::Piped
             } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-            // No setsid here: tokio's `Child::wait` SIGCHLD/kqueue waker is
-            // flaky on macOS once the child is a session leader (see the
-            // PTY-mode polling workaround below). For non-PTY targets we
-            // accept losing whole-tree reap on hard-kill and rely on the
-            // direct-pid `kill` the supervisor also issues.
-        }
+                proc_exec::StdioSpec::Null
+            };
+            proc_exec::Spec {
+                program: PathBuf::from(program),
+                args: args_os,
+                env: env_pairs,
+                cwd: req.sandbox_pkg_dir.clone(),
+                stdin,
+                stdout: proc_exec::StdioSpec::Piped,
+                stderr: proc_exec::StdioSpec::Piped,
+                setsid: false,
+                ctty: false,
+            }
+        };
 
         crate::hmemoizer::set_phase("pluginexec:spawn");
-        let mut child = cmd.spawn().with_context(|| "spawn child process")?;
-        // Pid == pgid because of setsid in pre_exec; register with supervisor
-        // so a hard-kill of rheph still reaps the whole process tree.
-        let child_pid: i32 = child
-            .id()
-            .context("spawned child has no pid")?
-            .try_into()
-            .context("child pid does not fit in i32")?;
-        let _track_guard = process_supervisor::register_child(child_pid);
+        let mut handle = proc_exec::spawn(spec).with_context(|| "spawn child process")?;
+        let child_pid = handle.pid();
 
         // Drop the parent's copy of the slave so the master sees EOF when the
         // child exits.
@@ -828,116 +900,167 @@ impl Driver {
             None
         };
 
-        type BoxedReader = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
-        type BoxedWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
-        let (child_stdin, child_stdout, child_stderr): (
-            Option<BoxedWriter>,
-            Option<BoxedReader>,
-            Option<BoxedReader>,
-        ) = if let Some(master) = pty_master {
+        // Signal that cancels the stdin pump once the child has exited. Without
+        // it, shell mode would deadlock waiting on a parent-stdin read that
+        // nothing intends to satisfy.
+        let (stdin_cancel_tx, stdin_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Build futures for stdin pump and stdout/stderr tee. The two modes
+        // differ in plumbing — PTY uses AsyncPty over the master fd (tokio
+        // IO driver, EVFILT_READ — reliable on macOS), pipe mode uses the
+        // off-tokio ChunkReader / StdinPump from proc_exec.
+        enum IoFutures<'r> {
+            Pty {
+                stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+                stdout: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+            },
+            Pipes {
+                stdin: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+                stdout: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+                stderr: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'r>>,
+            },
+        }
+
+        let io_futures: IoFutures<'_> = if let Some(master) = pty_master {
             let read_fd = master.try_clone().context("dup pty master for read")?;
             let reader = pty::AsyncPty::new(read_fd).context("async pty reader")?;
             let writer = pty::AsyncPty::new(master).context("async pty writer")?;
-            (Some(Box::new(writer)), Some(Box::new(reader)), None)
-        } else {
-            (
-                child.stdin.take().map(|x| Box::new(x) as BoxedWriter),
-                child.stdout.take().map(|x| Box::new(x) as BoxedReader),
-                child.stderr.take().map(|x| Box::new(x) as BoxedReader),
-            )
-        };
 
-        use tokio::io::AsyncWriteExt;
+            let log_for_out = Arc::clone(&output_log_file);
+            let stdout_fut = Box::pin(tee_stream(Some(reader), log_for_out, rreq.stdout));
 
-        // Signal that cancels the stdin pump once the child has exited. Without
-        // it, shell mode would deadlock waiting on a parent-stdin read that
-        // nothing intends to satisfy. The client is expected to provide a
-        // cancellable stdin (e.g. a TtyReader), but we cancel here too in case
-        // the source is `tokio::io::stdin()`-like and the runtime would
-        // otherwise wait on a parked blocking thread.
-        let (stdin_cancel_tx, stdin_cancel_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let stdin_fut = async move {
-            let Some(mut child_stdin) = child_stdin else {
-                return;
-            };
-            let Some(mut req_stdin) = rreq.stdin else {
-                return;
-            };
-            tokio::select! {
-                _ = stdin_cancel_rx => {}
-                // Intentionally ignore errors: stdin copy failure is non-fatal; process exit code is authoritative
-                _ = io::copy(&mut req_stdin, &mut child_stdin) => {}
+            let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
+                if let Some(src) = rreq.stdin {
+                    Box::pin(pump_stdin_pty(src, writer, stdin_cancel_rx))
+                } else {
+                    drop(writer);
+                    Box::pin(async {})
+                };
+            IoFutures::Pty {
+                stdin: stdin_fut,
+                stdout: stdout_fut,
             }
-            drop(child_stdin.shutdown().await);
+        } else {
+            let stdin_pump = handle.take_stdin();
+            let stdout_reader = handle.take_stdout();
+            let stderr_reader = handle.take_stderr();
+            let log_for_out = Arc::clone(&output_log_file);
+            let log_for_err = Arc::clone(&output_log_file);
+            let stdout_fut = Box::pin(tee_chunks(stdout_reader, log_for_out, rreq.stdout));
+            let stderr_fut = Box::pin(tee_chunks(stderr_reader, log_for_err, rreq.stderr));
+            let stdin_fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> =
+                match (rreq.stdin, stdin_pump) {
+                    (Some(src), Some(pump)) => Box::pin(pump_stdin(src, pump, stdin_cancel_rx)),
+                    _ => Box::pin(async {}),
+                };
+            IoFutures::Pipes {
+                stdin: stdin_fut,
+                stdout: stdout_fut,
+                stderr: stderr_fut,
+            }
         };
-
-        let stdout_fut = tee_stream(child_stdout, Arc::clone(&output_log_file), rreq.stdout);
-        let stderr_fut = tee_stream(child_stderr, Arc::clone(&output_log_file), rreq.stderr);
 
         crate::hmemoizer::set_phase("pluginexec:wait_subprocess");
-        // `wait_polling` internally uses `tokio::task::block_in_place` to park
-        // on the watcher oneshot (kernel `thread::park` — bypasses tokio's
-        // macOS-flaky cross-thread waker, see RCA_MACOS_WAKER.md). That blocks
-        // the polling task entirely, so it MUST NOT share a task with the IO
-        // pumps below:
-        //   - shell mode: the stdin pump forwards keystrokes from the parent
-        //     TTY into the child PTY; without polling, the interactive shell
-        //     hangs on its first read.
-        //   - non-shell: the stdout/stderr pumps drain child pipes; without
-        //     polling, the child blocks on write once the kernel pipe buffer
-        //     (16-64 KiB on macOS) fills.
-        // Move ownership of `child` into a dedicated wait task and race its
-        // JoinHandle against the io pumps and the cancellation token instead.
-        let mut wait_handle: tokio::task::JoinHandle<std::io::Result<std::process::ExitStatus>> =
+        // The wait happens in a spawned task. `Handle::wait_or_cancel` uses
+        // `block_in_place` internally to park on a `std::sync::mpsc` from the
+        // kqueue watcher — kernel condvar wake, no tokio waker on the wait
+        // path itself. We `tokio::spawn` so the wait doesn't share a worker
+        // with the IO pumps (which would deadlock when the child's pipe
+        // buffer fills behind a parked worker).
+        //
+        // Awaiting the spawned task's JoinHandle is the single residual
+        // exposure to the macOS waker bug (`RCA_MACOS_WAKER.md`): the wake
+        // fires post-exit and tokio's work-stealing re-polls eventually, so
+        // a dropped wake produces at most a small scheduling delay, not a
+        // deadlock. Same shape as the previously-verified design.
+        let wait_handle: tokio::task::JoinHandle<anyhow::Result<std::process::ExitStatus>> =
             tokio::spawn(async move {
-                let status = process_supervisor::wait_polling(&mut child).await;
-                // Cancel the stdin pump as soon as the child is reaped so the
-                // io join can finish in the io-wins arm below.
+                // Take ownership of `ctoken` indirectly: we observe its state
+                // from this task via a freshly cloned `cancellable_token`
+                // already captured by closure. ctoken itself is a trait
+                // object outside, which is not Send-friendly to move here —
+                // route cancellation through the outer select! below instead.
+                let status = handle.wait().await.context("wait for child process")?;
                 _ = stdin_cancel_tx.send(());
-                status
+                Ok(status)
             });
+        tokio::pin!(wait_handle);
 
-        tokio::select! {
-            _ = ctoken.cancelled() => {
-                // killpg covers grandchildren in PTY/shell mode where the
-                // child is a session leader; kill backstops non-setsid mode.
-                process_supervisor::kill_child(child_pid);
-                // Let the spawned wait task observe the exit and reap.
-                _ = (&mut wait_handle).await;
-                anyhow::bail!("cancelled")
-            },
-            res = async {
-                let io = async { tokio::join!(stdin_fut, stdout_fut, stderr_fut) };
-                tokio::pin!(io);
+        match io_futures {
+            IoFutures::Pty { stdin, stdout } => {
                 tokio::select! {
-                    wait_res = &mut wait_handle => {
-                        // Race the io pumps to drain whatever's still buffered.
-                        // PTY master EOF detection through kqueue is unreliable
-                        // on macOS, so cap the wait — anything left will be lost,
-                        // but in shell mode the user has already seen the output
-                        // streamed live.
-                        crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
-                        _ = tokio::time::timeout(
-                            std::time::Duration::from_millis(50),
-                            &mut io,
-                        ).await;
-                        wait_res
-                    }
-                    _ = &mut io => {
-                        crate::hmemoizer::set_phase("pluginexec:post_io_wait");
-                        (&mut wait_handle).await
+                    _ = ctoken.cancelled() => {
+                        process_supervisor::kill_child(child_pid);
+                        _ = (&mut wait_handle).await;
+                        anyhow::bail!("cancelled")
                     },
+                    res = async {
+                        let io = async { tokio::join!(stdin, stdout) };
+                        tokio::pin!(io);
+                        tokio::select! {
+                            wait_res = &mut wait_handle => {
+                                crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                                _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    &mut io,
+                                ).await;
+                                wait_res
+                            }
+                            _ = &mut io => {
+                                crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                                (&mut wait_handle).await
+                            },
+                        }
+                    } => {
+                        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
+                        let status = res
+                            .context("wait task panicked")?
+                            .context("wait for child process")?;
+                        if !status.success() {
+                            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
+                            anyhow::bail!("process exited with status: {}\n{}", status, log)
+                        }
+                    }
                 }
+            }
+            IoFutures::Pipes {
+                stdin,
+                stdout,
+                stderr,
             } => {
-                crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
-                let status = res
-                    .context("wait task panicked")?
-                    .context("wait for child process")?;
-
-                if !status.success() {
-                    let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
-                    anyhow::bail!("process exited with status: {}\n{}", status, log)
+                tokio::select! {
+                    _ = ctoken.cancelled() => {
+                        process_supervisor::kill_child(child_pid);
+                        _ = (&mut wait_handle).await;
+                        anyhow::bail!("cancelled")
+                    },
+                    res = async {
+                        let io = async { tokio::join!(stdin, stdout, stderr) };
+                        tokio::pin!(io);
+                        tokio::select! {
+                            wait_res = &mut wait_handle => {
+                                crate::hmemoizer::set_phase("pluginexec:post_wait_io_drain");
+                                _ = tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    &mut io,
+                                ).await;
+                                wait_res
+                            }
+                            _ = &mut io => {
+                                crate::hmemoizer::set_phase("pluginexec:post_io_wait");
+                                (&mut wait_handle).await
+                            },
+                        }
+                    } => {
+                        crate::hmemoizer::set_phase("pluginexec:post_wait_status_check");
+                        let status = res
+                            .context("wait task panicked")?
+                            .context("wait for child process")?;
+                        if !status.success() {
+                            let log = std::fs::read_to_string(&output_log_path).unwrap_or_default();
+                            anyhow::bail!("process exited with status: {}\n{}", status, log)
+                        }
+                    }
                 }
             }
         }
@@ -1199,9 +1322,10 @@ mod tests {
     }
 
     /// Regression for shell/build deadlock when the child needs concurrent
-    /// IO pump progress while `wait_polling` is parked. Multi-thread flavor
-    /// is required: on current-thread the wait_polling fast path uses plain
-    /// `.await` and never blocks the task.
+    /// IO pump progress while the spawned wait task parks a worker. The
+    /// stdout drain on a dedicated `std::thread` (inside `proc_exec`) plus
+    /// the wait poll on a separate spawn must keep the pipe buffer
+    /// draining; without that, the child blocks on `write` and never exits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_run_large_output_does_not_deadlock_multi_thread() -> anyhow::Result<()> {
         let driver = Driver::new_bash();

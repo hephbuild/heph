@@ -1,40 +1,34 @@
-//! Cross-platform child-exit watcher.
+//! macOS child-exit watcher.
 //!
-//! macOS: one shared `kqueue` fd + `EVFILT_PROC` / `NOTE_EXIT` per child.
-//! Linux: one shared `epoll` fd + `pidfd_open` per child.
+//! A single dedicated OS thread owns one `kqueue` fd with `EVFILT_PROC` /
+//! `NOTE_EXIT` filters per registered pid plus a 1-second `waitpid(WNOHANG)`
+//! backstop for events the kernel silently dropped under load.
 //!
-//! A single dedicated OS thread owns the kernel-level event loop and
-//! dispatches per-pid exit notifications onto `tokio::sync::oneshot`
-//! channels handed back to callers. Compared to `tokio::process::Child::wait`
-//! this bypasses tokio's SIGCHLD-based reaper, which is unreliable on macOS
-//! for session leaders and starves under heavy runtime load (see
-//! `RCA_MACOS_WAKER.md`).
+//! Compared to `tokio::process::Child::wait` this bypasses tokio's
+//! SIGCHLD-based reaper, which is unreliable on macOS for session leaders
+//! and starves under heavy runtime load (see `RCA_MACOS_WAKER.md`).
 //!
 //! Registration ordering: callers must register the pid **immediately**
 //! after `Command::spawn` and before any other code can race-reap it.
-//! If the child has already exited by the time the watcher's `EV_ADD` /
-//! `pidfd_open` runs, the backend reaps it inline with `waitpid(WNOHANG)`
-//! and resolves the oneshot synchronously.
+//! If the child has already exited by the time the watcher's `EV_ADD`
+//! runs, the backend reaps it inline with `waitpid(WNOHANG)` and resolves
+//! the std mpsc receiver synchronously.
+//!
+//! This module is macOS-only. Linux uses vanilla `tokio::process` via
+//! `proc_exec::imp_linux`; the `EVFILT_USER` reliability bug that motivates
+//! this watcher does not exist on Linux.
 
 use std::io;
 use std::process::ExitStatus;
 use std::sync::OnceLock;
 use std::sync::mpsc;
-use tokio::sync::oneshot;
 
-#[cfg(target_os = "macos")]
 mod kqueue_macos;
-#[cfg(target_os = "macos")]
 use kqueue_macos as backend;
-
-#[cfg(target_os = "linux")]
-mod pidfd_linux;
-#[cfg(target_os = "linux")]
-use pidfd_linux as backend;
 
 pub(crate) struct Registration {
     pub pid: i32,
-    pub sender: oneshot::Sender<io::Result<ExitStatus>>,
+    pub sender: mpsc::Sender<io::Result<ExitStatus>>,
 }
 
 type WakeFn = Box<dyn Fn() + Send + Sync + 'static>;
@@ -57,11 +51,14 @@ fn get_or_init() -> &'static Watcher {
 /// Register `pid` for exit notification. The returned receiver resolves
 /// when the kernel reports the child has exited. Must be called before
 /// anyone else attempts `waitpid` on `pid`.
-pub fn register(pid: i32) -> oneshot::Receiver<io::Result<ExitStatus>> {
+///
+/// The returned channel is `std::sync::mpsc` — `recv` blocks on a kernel
+/// condvar, bypassing tokio's cross-thread waker entirely.
+pub fn register(pid: i32) -> mpsc::Receiver<io::Result<ExitStatus>> {
     let w = get_or_init();
-    let (tx, rx) = oneshot::channel();
+    let (tx, rx) = mpsc::channel();
     if w.tx.send(Registration { pid, sender: tx }).is_err() {
-        let (tx2, rx2) = oneshot::channel();
+        let (tx2, rx2) = mpsc::channel();
         drop(tx2.send(Err(io::Error::other("process watcher thread died"))));
         return rx2;
     }

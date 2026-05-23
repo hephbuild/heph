@@ -1,13 +1,16 @@
-//! Stress test for `process_watcher` — spawns many concurrent
-//! short-lived children and verifies every one resolves with the real
-//! exit status. This is the load profile that triggered the macOS
+//! Stress test for `proc_exec` — spawns many concurrent short-lived
+//! children and verifies every one resolves with the real exit status.
+//! This is the load profile that triggered the macOS
 //! `tokio::process::Child::wait` starvation documented in
 //! `RCA_MACOS_WAKER.md`.
 
 #![cfg(unix)]
 
+use rheph::hasync::StdCancellationToken;
+use rheph::proc_exec;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::process::Command;
 
 const N: usize = 500;
 
@@ -17,15 +20,25 @@ async fn many_short_lived_children_all_resolve_with_status() {
     for i in 0..N {
         let exit_code = (i % 3) as i32;
         handles.push(tokio::spawn(async move {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c")
-                .arg(format!("exit {exit_code}"))
-                .kill_on_drop(true);
-            let mut child = cmd.spawn().expect("spawn sh");
-            let status = rheph::process_supervisor::wait_polling(&mut child)
+            let spec = proc_exec::Spec {
+                program: PathBuf::from("sh"),
+                args: vec![
+                    OsString::from("-c"),
+                    OsString::from(format!("exit {exit_code}")),
+                ],
+                env: Vec::new(),
+                cwd: std::env::current_dir().expect("cwd"),
+                stdin: proc_exec::StdioSpec::Null,
+                stdout: proc_exec::StdioSpec::Null,
+                stderr: proc_exec::StdioSpec::Null,
+                setsid: false,
+                ctty: false,
+            };
+            let ctoken = StdCancellationToken::new();
+            let output = proc_exec::output(spec, &ctoken)
                 .await
-                .expect("wait_polling");
-            (status, exit_code)
+                .expect("proc_exec::output");
+            (output.status, exit_code)
         }));
     }
 
