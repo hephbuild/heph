@@ -24,6 +24,7 @@ use crate::plugingo::target_std;
 use crate::plugingo::target_test;
 use crate::plugingo::thirdparty;
 use anyhow::Context;
+use async_recursion::async_recursion;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
 use parking_lot::RwLock;
@@ -73,6 +74,14 @@ pub(crate) struct ProviderInner {
     /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_test_lib`,
     /// `build_xtest_lib`, `build_testmain_lib`) that share the same root pkg + factors.
     libs_cache: Memoizer<LibsKey, Result<Arc<TransitiveDeps>, Arc<anyhow::Error>>>,
+    /// Cache: per-`(import_path, factors, module_root)` transitive closure. Used by the
+    /// `transitive=true` path of `collect_libs_inner`: each top-level walk recursively
+    /// composes per-import sub-closures from this cache instead of BFS-walking the
+    /// full subtree itself. Subtree-sharing across all consumers — e.g. if 200
+    /// top-level targets all transitively depend on `fmt`, `fmt`'s closure is computed
+    /// once total, not 200 times.
+    import_closure_cache:
+        Memoizer<ImportClosureKey, Result<Arc<ImportClosure>, Arc<anyhow::Error>>>,
     /// Cache: parsed `go.mod` per `module_root`. `collect_libs_inner` is invoked
     /// per `LibsKey` (≥ K×N for K target variants × N root pkgs in module), so
     /// the same `go.mod` is otherwise read+parsed hundreds of times per build.
@@ -93,6 +102,22 @@ struct LibsKey {
     factors: Factors,
     module_root: PathBuf,
     transitive: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImportClosureKey {
+    import_path: String,
+    factors: Factors,
+    module_root: PathBuf,
+}
+
+/// Result of `import_closure(ip)`: the import_path's lib (if any) plus its full
+/// transitive closure, in topological order (deps before dependents). Composing
+/// multiple `ImportClosure`s requires de-duplication by `import_path` at the
+/// composition site (see `compose_closures`).
+#[derive(Debug, Clone, Default)]
+struct ImportClosure {
+    libs: Vec<(String, Addr)>,
 }
 
 impl Provider {
@@ -131,6 +156,7 @@ impl Provider {
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
                 libs_cache: Memoizer::with_tag("libs_cache"),
+                import_closure_cache: Memoizer::with_tag("import_closure_cache"),
                 go_mod_cache: RwLock::new(HashMap::new()),
             }),
         })
@@ -1513,8 +1539,86 @@ impl ProviderInner {
         ))
     }
 
+    /// Memoized per-import_path transitive closure.
+    ///
+    /// Returns `import_path`'s lib (if any) plus the transitive closure of its
+    /// sub-imports, in deps-first order with import_paths deduped. Cached by
+    /// `(import_path, factors, module_root)` — so a hot dep like `fmt` is walked
+    /// once per request even if hundreds of top-level targets reach it.
+    ///
+    /// Recurses via `try_join_all` over each sub-import; each recursive call
+    /// hits the same cache, so the work for any subtree is amortized.
+    #[async_recursion]
+    async fn import_closure(
+        self: Arc<Self>,
+        executor: Arc<dyn ProviderExecutor>,
+        import_path: String,
+        factors: Factors,
+        go_mod: Arc<GoModData>,
+        module_root: PathBuf,
+    ) -> anyhow::Result<Arc<ImportClosure>> {
+        let key = ImportClosureKey {
+            import_path: import_path.clone(),
+            factors: factors.clone(),
+            module_root: module_root.clone(),
+        };
+        self.import_closure_cache
+            .once(
+                key,
+                enclose!((self => me, executor, import_path, factors, go_mod, module_root) move || async move {
+                    let (resolved_path, dep_addr_opt, sub_imports) = me
+                        .resolve_import(
+                            Arc::clone(&executor),
+                            &import_path,
+                            &factors,
+                            &go_mod.requires,
+                            &go_mod.module_path,
+                            &module_root,
+                        )
+                        .await?;
+
+                    let sub_closures = try_join_all(
+                        sub_imports
+                            .into_iter()
+                            .filter(|s| s != "unsafe" && s != "C")
+                            .map(|sub| {
+                                Arc::clone(&me).import_closure(
+                                    Arc::clone(&executor),
+                                    sub,
+                                    factors.clone(),
+                                    Arc::clone(&go_mod),
+                                    module_root.clone(),
+                                )
+                            }),
+                    )
+                    .await?;
+
+                    // Deps first, then self. Dedup by import_path across all
+                    // sub-closures so a diamond dependency only shows once.
+                    let mut seen: HashSet<String> = HashSet::new();
+                    let mut libs: Vec<(String, Addr)> = Vec::new();
+                    for sub in &sub_closures {
+                        for (ip, addr) in &sub.libs {
+                            if seen.insert(ip.clone()) {
+                                libs.push((ip.clone(), addr.clone()));
+                            }
+                        }
+                    }
+                    if let Some(addr) = dep_addr_opt
+                        && seen.insert(resolved_path.clone())
+                    {
+                        libs.push((resolved_path, addr));
+                    }
+
+                    anyhow::Ok(Arc::new(ImportClosure { libs }))
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
     async fn collect_libs_inner(
-        &self,
+        self: Arc<Self>,
         executor: Arc<dyn ProviderExecutor>,
         root_imports: &[String],
         extra_imports: &[String],
@@ -1523,48 +1627,48 @@ impl ProviderInner {
         transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
         let go_mod = self.load_go_mod(module_root)?;
-        let go_mod_requires = &go_mod.requires;
-        let workspace_module_path = go_mod.module_path.as_str();
 
         if transitive {
-            let mut visited: HashSet<String> = HashSet::new();
-            let mut libs: Vec<(String, Addr)> = Vec::new();
-
-            let mut frontier: Vec<String> = root_imports
+            // Pre-dedupe the top-level set so we don't fan out the same
+            // import_path twice (also halves cache lookups for repeated entries
+            // between `root_imports` and `extra_imports`).
+            let unique_imports: Vec<String> = root_imports
                 .iter()
                 .chain(extra_imports.iter())
-                .filter(|i| *i != "unsafe" && *i != "C" && visited.insert((*i).clone()))
+                .filter(|i| *i != "unsafe" && *i != "C")
                 .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect();
 
-            while !frontier.is_empty() {
-                let results = try_join_all(frontier.iter().map(|ip| {
-                    self.resolve_import(
-                        Arc::clone(&executor),
-                        ip,
-                        factors,
-                        go_mod_requires,
-                        workspace_module_path,
-                        module_root,
-                    )
-                }))
-                .await?;
+            let module_root_buf = module_root.to_path_buf();
+            let sub_closures = try_join_all(unique_imports.into_iter().map(|ip| {
+                Arc::clone(&self).import_closure(
+                    Arc::clone(&executor),
+                    ip,
+                    factors.clone(),
+                    Arc::clone(&go_mod),
+                    module_root_buf.clone(),
+                )
+            }))
+            .await?;
 
-                frontier.clear();
-                for (import_path, dep_addr_opt, sub_imports) in results {
-                    if let Some(dep_addr) = dep_addr_opt {
-                        libs.push((import_path, dep_addr));
-                    }
-                    for sub in sub_imports {
-                        if sub != "unsafe" && sub != "C" && visited.insert(sub.clone()) {
-                            frontier.push(sub);
-                        }
+            // Compose: deps-first order, dedup by import_path across all
+            // sub-closures (each sub-closure is itself deps-first deduped).
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut libs: Vec<(String, Addr)> = Vec::new();
+            for sub in &sub_closures {
+                for (ip, addr) in &sub.libs {
+                    if seen.insert(ip.clone()) {
+                        libs.push((ip.clone(), addr.clone()));
                     }
                 }
             }
-
             return Ok(TransitiveDeps { libs });
         }
+
+        let go_mod_requires = &go_mod.requires;
+        let workspace_module_path = go_mod.module_path.as_str();
 
         let imports: Vec<String> = root_imports
             .iter()
