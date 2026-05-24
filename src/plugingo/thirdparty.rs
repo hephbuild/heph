@@ -310,7 +310,7 @@ fn generate_compile_script(
             .collect::<Vec<_>>()
             .join(" ");
         script.push_str(&format!(
-            "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -gensymabis -o \"symabis\" {s_files_list}\n"
+            "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -gensymabis -o \"symabis\" {s_files_list}\n"
         ));
     }
 
@@ -320,7 +320,7 @@ fn generate_compile_script(
     // download target's filtered outputs). `@${LIST_SRC}` is a response file
     // listing every staged source — same convention as first-party.
     script.push_str(&format!(
-        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"\" -pack -importcfg \"$importcfg\"{symabis_flag}{asmhdr_flag}{embedcfg_flag}{shared} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
+        "\"$SRC_GO_BIN\" tool compile -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -pack -importcfg \"$importcfg\"{symabis_flag}{asmhdr_flag}{embedcfg_flag}{shared} -o \"{out_file}\" \"@${{LIST_SRC}}\"\n",
     ));
 
     if has_asm {
@@ -328,7 +328,7 @@ fn generate_compile_script(
         for s_file in s_files {
             let obj_file = format!("{}.o", s_file.trim_end_matches(".s"));
             script.push_str(&format!(
-                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -o \"{obj_file}\" \"./{s_file}\"\n"
+                "\"$SRC_GO_BIN\" tool asm -p \"{p_flag}\" -trimpath=\"$WORKSPACE_ROOT\" -I . -I \"$GOROOT/pkg/include\" -D GOOS_{goos} -D GOARCH_{goarch}{shared} -o \"{obj_file}\" \"./{s_file}\"\n"
             ));
         }
         // Step 4: pack asm objs into the archive.
