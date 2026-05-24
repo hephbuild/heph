@@ -145,7 +145,9 @@ target(name = "skip", driver = "bash", run = "echo skip_val > $OUT", out = "skip
     Ok(())
 }
 
-// Query target used as dep: consumer sees all matched artifacts via $SRC_<KEY>
+// Query target used as dep: consumer sees all matched artifacts via $SRC_<KEY>.
+// `exclude_provider=__none__` opts out of the auto-injected exclusion of the
+// dest's producing provider — required to enumerate sibling buildfile targets.
 #[tokio::test]
 async fn test_query_as_dep_in_consumer() -> anyhow::Result<()> {
     let ws = Workspace::new();
@@ -159,7 +161,7 @@ target(
     driver = "bash",
     run = "cat $SRC_LIBS > $OUT",
     out = "result.txt",
-    deps = {"libs": ["//@heph/query:q@label=lib"]},
+    deps = {"libs": ["//@heph/query:q@label=lib,exclude_provider=__none__"]},
 )
 "#,
     );
