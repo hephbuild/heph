@@ -588,7 +588,10 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?);
+        let cache = Arc::new(LocalCacheSQLite::new(
+            dir.path().join("cache.db"),
+            16 * 1024,
+        )?);
 
         let addr = make_addr("test_pkg", "concurrent");
         let hashin = "hashcon";
@@ -625,7 +628,10 @@ mod tests {
         // Reader started before the writer Drop returns from enqueue must still observe
         // the write once it lands. This exercises the PendingTracker wait path.
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?);
+        let cache = Arc::new(LocalCacheSQLite::new(
+            dir.path().join("cache.db"),
+            16 * 1024,
+        )?);
         let addr = make_addr("pkg", "tgt");
         let hashin = "h1";
         let name = "out.bin";

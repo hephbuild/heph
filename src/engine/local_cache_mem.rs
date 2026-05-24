@@ -307,10 +307,7 @@ mod tests {
         // First read: miss path with bytes=Some → cache the inner Arc directly.
         let r1 = dec.reader(&addr, "h1", "k").expect("r1");
         let b1 = r1.bytes.expect("bytes set by inner");
-        assert!(
-            Arc::ptr_eq(&b1, &arc),
-            "miss path must reuse the inner Arc"
-        );
+        assert!(Arc::ptr_eq(&b1, &arc), "miss path must reuse the inner Arc");
 
         // Second read: hit → same Arc.
         let r2 = dec.reader(&addr, "h1", "k").expect("r2");

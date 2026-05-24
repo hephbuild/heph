@@ -1,8 +1,14 @@
 use crate::htaddr::addr::Addr;
 use crate::htpkg::PkgBuf;
 use anyhow::Context;
-use pest::Parser;
-use pest_derive::Parser;
+use nom::IResult;
+use nom::branch::alt;
+use nom::bytes::complete::{tag, take_till, take_till1};
+use nom::character::complete::char as nchar;
+use nom::combinator::{all_consuming, opt};
+use nom::error::VerboseError;
+use nom::multi::separated_list1;
+use nom::sequence::{delimited, preceded};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -18,9 +24,54 @@ impl<'de> Deserialize<'de> for Addr {
     }
 }
 
-#[derive(Parser)]
-#[grammar = "htaddr/taddr.pest"]
-struct TAddrParser;
+type R<'a, T> = IResult<&'a str, T, VerboseError<&'a str>>;
+
+fn pkg(i: &str) -> R<'_, &str> {
+    take_till(|c: char| c == ':' || c == ' ')(i)
+}
+
+fn name(i: &str) -> R<'_, &str> {
+    take_till1(|c: char| matches!(c, '@' | ':' | ' ' | '|'))(i)
+}
+
+fn key(i: &str) -> R<'_, &str> {
+    take_till1(|c: char| matches!(c, '=' | ',' | '@' | ' ' | '|' | '"'))(i)
+}
+
+fn bare_value(i: &str) -> R<'_, &str> {
+    take_till1(|c: char| matches!(c, ',' | ' ' | '|' | '"'))(i)
+}
+
+fn quoted_value(i: &str) -> R<'_, &str> {
+    delimited(nchar('"'), take_till(|c| c == '"'), nchar('"'))(i)
+}
+
+fn value(i: &str) -> R<'_, &str> {
+    alt((quoted_value, bare_value))(i)
+}
+
+fn arg(i: &str) -> R<'_, (&str, &str)> {
+    let (i, k) = key(i)?;
+    let (i, v) = opt(preceded(nchar('='), value))(i)?;
+    Ok((i, (k, v.unwrap_or(""))))
+}
+
+fn args(i: &str) -> R<'_, Vec<(&str, &str)>> {
+    separated_list1(nchar(','), arg)(i)
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "tuple return mirrors grammar productions; refactoring into a struct would obscure the parser"
+)]
+fn addr_parser(i: &str) -> R<'_, (&str, &str, Vec<(&str, &str)>)> {
+    let (i, _) = tag("//")(i)?;
+    let (i, p) = pkg(i)?;
+    let (i, _) = nchar(':')(i)?;
+    let (i, n) = name(i)?;
+    let (i, a) = opt(preceded(nchar('@'), args))(i)?;
+    Ok((i, (p, n, a.unwrap_or_default())))
+}
 
 fn resolve_relative_pkg(base: &PkgBuf, rel: &str) -> anyhow::Result<String> {
     let mut components: Vec<&str> = base.as_str().split('/').filter(|s| !s.is_empty()).collect();
@@ -105,89 +156,15 @@ pub fn parse_addr_with_base(input: &str, base: &PkgBuf) -> anyhow::Result<Addr> 
 }
 
 pub fn parse_addr(input: &str) -> anyhow::Result<Addr> {
-    let pairs = TAddrParser::parse(Rule::taddr, input)?;
+    let (_, (p, n, kvs)) = all_consuming(addr_parser)(input)
+        .map_err(|e| anyhow::anyhow!("invalid address {:?}: {}", input, e))?;
 
-    let mut package = PkgBuf::from("");
-    let mut name = String::new();
     let mut args = BTreeMap::new();
-
-    for pair in pairs {
-        if pair.as_rule() == Rule::taddr {
-            for inner_pair in pair.into_inner() {
-                match inner_pair.as_rule() {
-                    Rule::package_ident => {
-                        package = PkgBuf::from(inner_pair.as_str());
-                    }
-                    Rule::name_ident => {
-                        name = inner_pair.as_str().to_string();
-                    }
-                    Rule::arg => {
-                        let mut key = String::new();
-                        let mut value = String::new();
-                        for arg_inner in inner_pair.into_inner() {
-                            match arg_inner.as_rule() {
-                                Rule::key => {
-                                    key = arg_inner.as_str().to_string();
-                                }
-                                Rule::value => {
-                                    if let Some(inner_val) = arg_inner.into_inner().next() {
-                                        value = match inner_val.as_rule() {
-                                            Rule::quoted_string => inner_val
-                                                .into_inner()
-                                                .find(|p| p.as_rule() == Rule::string_content)
-                                                .map(|p| p.as_str().to_string())
-                                                .unwrap_or_default(),
-                                            Rule::bare_value => inner_val.as_str().to_string(),
-                                            _ => String::new(),
-                                        };
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        args.insert(key, value);
-                    }
-                    Rule::args => {
-                        for arg_pair in inner_pair.into_inner() {
-                            if arg_pair.as_rule() == Rule::arg {
-                                let mut key = String::new();
-                                let mut value = String::new();
-                                for arg_inner in arg_pair.into_inner() {
-                                    match arg_inner.as_rule() {
-                                        Rule::key => {
-                                            key = arg_inner.as_str().to_string();
-                                        }
-                                        Rule::value => {
-                                            if let Some(inner_val) = arg_inner.into_inner().next() {
-                                                value = match inner_val.as_rule() {
-                                                    Rule::quoted_string => inner_val
-                                                        .into_inner()
-                                                        .find(|p| {
-                                                            p.as_rule() == Rule::string_content
-                                                        })
-                                                        .map(|p| p.as_str().to_string())
-                                                        .unwrap_or_default(),
-                                                    Rule::bare_value => {
-                                                        inner_val.as_str().to_string()
-                                                    }
-                                                    _ => String::new(),
-                                                };
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                args.insert(key, value);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+    for (k, v) in kvs {
+        args.insert(k.to_string(), v.to_string());
     }
 
-    Ok(Addr::new(package, name, args))
+    Ok(Addr::new(PkgBuf::from(p), n.to_string(), args))
 }
 
 #[cfg(test)]
