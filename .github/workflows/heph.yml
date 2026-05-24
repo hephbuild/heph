@@ -108,7 +108,7 @@ jobs:
           HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
         run: |
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
-          cargo zigbuild --release --target ${{ matrix.target }} --bin rheph
+          cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rheph
           cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
 
       - name: Upload artifact
