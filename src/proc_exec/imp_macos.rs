@@ -146,6 +146,13 @@ pub struct Handle {
     stderr: Option<ChunkReader>,
     drains: Vec<JoinHandle<()>>,
     reaped: bool,
+    /// Receiver registered with `process_watcher` at spawn time. The matching
+    /// sender lives in the watcher's `pending` map; that registration is what
+    /// guarantees `waitpid` runs even when the Handle is dropped without
+    /// `wait*` being called (e.g. caller returns Err between spawn and wait).
+    /// Without this, Drop's `kill_child` would SIGKILL the pid but nobody
+    /// would reap it — permanent zombie.
+    exit_rx: Option<mpsc::Receiver<io::Result<ExitStatus>>>,
     /// Auto-untracks the pid on the supervisor sidecar when the Handle is
     /// dropped. `None` if the supervisor was not initialized (e.g. tests).
     _track_guard: Option<process_supervisor::TrackGuard>,
@@ -173,7 +180,7 @@ impl Handle {
     /// backstop). Joins drain threads before returning so callers can rely on
     /// all chunks having been delivered.
     pub async fn wait(mut self) -> io::Result<ExitStatus> {
-        let mut rx = process_watcher::register(self.pid);
+        let mut rx = self.exit_rx.take().expect("exit_rx must be set by spawn()");
         // The std::process::Child drop would call waitpid blocking; we want
         // the watcher to own the reap. Forget the Child wrapper so its Drop
         // doesn't try to wait. We still close pipe fds (stdin/stdout/stderr)
@@ -205,7 +212,7 @@ impl Handle {
         mut self,
         cancel: &(dyn Cancellable + Send + Sync),
     ) -> io::Result<ExitStatus> {
-        let rx = process_watcher::register(self.pid);
+        let rx = self.exit_rx.take().expect("exit_rx must be set by spawn()");
         let pid = self.pid;
         drop(self.child.take());
         // Multi-thread: block_in_place + recv_timeout poll; no tokio waker.
@@ -268,9 +275,12 @@ impl Drop for Handle {
         if self.reaped {
             return;
         }
-        // Killed-without-wait path: SIGKILL the child and let the watcher's
-        // backstop poll reap it. We can't synchronously block here without
-        // risking a deadlock on a runtime worker, so this is best-effort.
+        // Killed-without-wait path: SIGKILL the child. The pid was registered
+        // with `process_watcher` at spawn time, so the watcher's NOTE_EXIT
+        // handler (or the 1s WNOHANG backstop) will call `waitpid` and reap
+        // the zombie. We do NOT block on the exit_rx here — that would risk a
+        // deadlock on a runtime worker — but dropping it is safe because the
+        // watcher reaps before it tries to send on the sender.
         process_supervisor::kill_child(self.pid);
     }
 }
@@ -351,6 +361,13 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
     drains.extend(stderr_drain);
 
     let track_guard = process_supervisor::register_child(pid);
+    // Register with the kqueue watcher *before* returning the Handle. This
+    // guarantees `waitpid` will eventually run on this pid even if the caller
+    // drops the Handle without calling `wait*` (e.g. an error path between
+    // spawn and wait in pluginexec). Without this registration, Drop's
+    // `kill_child` would SIGKILL the pid but nobody would reap it → permanent
+    // zombie observed under PPID of main rheph.
+    let exit_rx = process_watcher::register(pid);
 
     Ok(Handle {
         pid,
@@ -360,6 +377,7 @@ pub(super) fn spawn(spec: Spec) -> io::Result<Handle> {
         stderr: stderr_reader,
         drains,
         reaped: false,
+        exit_rx: Some(exit_rx),
         _track_guard: track_guard,
     })
 }

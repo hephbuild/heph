@@ -26,7 +26,8 @@ use crate::plugingo::thirdparty;
 use anyhow::Context;
 use enclose::enclose;
 use futures::future::{BoxFuture, try_join_all};
-use std::collections::{BTreeMap, HashSet};
+use parking_lot::RwLock;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -72,6 +73,17 @@ pub(crate) struct ProviderInner {
     /// `handle_get` calls (`build_lib`, `build`, `build_test`, `build_test_lib`,
     /// `build_xtest_lib`, `build_testmain_lib`) that share the same root pkg + factors.
     libs_cache: Memoizer<LibsKey, Result<Arc<TransitiveDeps>, Arc<anyhow::Error>>>,
+    /// Cache: parsed `go.mod` per `module_root`. `collect_libs_inner` is invoked
+    /// per `LibsKey` (≥ K×N for K target variants × N root pkgs in module), so
+    /// the same `go.mod` is otherwise read+parsed hundreds of times per build.
+    /// Race-tolerant; parse is sync, idempotent, µs-scale — no Memoizer needed.
+    go_mod_cache: RwLock<HashMap<PathBuf, Arc<GoModData>>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct GoModData {
+    pub requires: Vec<(String, String)>,
+    pub module_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,6 +131,7 @@ impl Provider {
                 pkg_cache: Memoizer::with_tag("pkg_cache"),
                 pkg_addrs_cache: Memoizer::with_tag("pkg_addrs_cache"),
                 libs_cache: Memoizer::with_tag("libs_cache"),
+                go_mod_cache: RwLock::new(HashMap::new()),
             }),
         })
     }
@@ -1474,6 +1487,32 @@ impl ProviderInner {
         Ok((*arc).clone())
     }
 
+    fn load_go_mod(&self, module_root: &Path) -> anyhow::Result<Arc<GoModData>> {
+        let go_mod_path = module_root.join("go.mod");
+        if let Some(hit) = self.go_mod_cache.read().get(&go_mod_path) {
+            return Ok(Arc::clone(hit));
+        }
+        let data = if go_mod_path.exists() {
+            let content = crate::process_supervisor::block_or_inline(
+                enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
+            )
+            .with_context(|| format!("reading {}", go_mod_path.display()))?;
+            Arc::new(GoModData {
+                requires: parse_go_mod_requires(&content),
+                module_path: parse_go_mod_module_path(&content).unwrap_or_default(),
+            })
+        } else {
+            Arc::new(GoModData {
+                requires: Vec::new(),
+                module_path: String::new(),
+            })
+        };
+        let mut w = self.go_mod_cache.write();
+        Ok(Arc::clone(
+            w.entry(go_mod_path).or_insert_with(|| Arc::clone(&data)),
+        ))
+    }
+
     async fn collect_libs_inner(
         &self,
         executor: Arc<dyn ProviderExecutor>,
@@ -1483,19 +1522,9 @@ impl ProviderInner {
         module_root: &Path,
         transitive: bool,
     ) -> anyhow::Result<TransitiveDeps> {
-        let go_mod_path = module_root.join("go.mod");
-        let (go_mod_requires, workspace_module_path) = if go_mod_path.exists() {
-            let content = crate::process_supervisor::block_or_inline(
-                enclose!((go_mod_path) move || std::fs::read_to_string(&go_mod_path)),
-            )
-            .with_context(|| format!("reading {}", go_mod_path.display()))?;
-            (
-                parse_go_mod_requires(&content),
-                parse_go_mod_module_path(&content).unwrap_or_default(),
-            )
-        } else {
-            (vec![], String::new())
-        };
+        let go_mod = self.load_go_mod(module_root)?;
+        let go_mod_requires = &go_mod.requires;
+        let workspace_module_path = go_mod.module_path.as_str();
 
         if transitive {
             let mut visited: HashSet<String> = HashSet::new();
@@ -1514,8 +1543,8 @@ impl ProviderInner {
                         Arc::clone(&executor),
                         ip,
                         factors,
-                        &go_mod_requires,
-                        &workspace_module_path,
+                        go_mod_requires,
+                        workspace_module_path,
                         module_root,
                     )
                 }))
@@ -1551,8 +1580,8 @@ impl ProviderInner {
                 Arc::clone(&executor),
                 ip,
                 factors,
-                &go_mod_requires,
-                &workspace_module_path,
+                go_mod_requires,
+                workspace_module_path,
                 module_root,
             )
         }))
