@@ -31,6 +31,12 @@ pub struct RunArgs {
     /// Print output file list to stdout
     #[arg(long = "list-out")]
     pub list_out: bool,
+    /// Exclude target address (repeatable, e.g. -e //pkg:target)
+    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
+    pub exclude: Vec<String>,
+    /// Disable fail-fast: run every matched target and report all failures at the end
+    #[arg(long = "no-fail-fast", action = clap::ArgAction::SetTrue)]
+    pub no_fail_fast: bool,
 }
 
 struct RunApp {
@@ -86,18 +92,23 @@ impl App for RunApp {
             shell: self.args.shell.is_some(),
             interactive,
         };
-        let rs = self.engine.new_state();
+        let rs = self
+            .engine
+            .new_state_with_fail_fast(!self.args.no_fail_fast);
 
-        let result = match self.matcher {
+        let (result, failures) = match self.matcher {
             Matcher::Addr(addr) => {
-                vec![
-                    self.engine
-                        .clone()
-                        .result_addr(rs, &addr, OutputMatcher::All, &opts)
-                        .await?,
-                ]
+                let r = self
+                    .engine
+                    .clone()
+                    .result_addr(rs, &addr, OutputMatcher::All, &opts)
+                    .await?;
+                (vec![r], Vec::new())
             }
-            m => self.engine.clone().result(rs, &m, &opts).await?,
+            m => {
+                let batch = self.engine.clone().result(rs, &m, &opts).await?;
+                (batch.ok, batch.errors)
+            }
         };
 
         tui::paused!(ctx, {
@@ -126,8 +137,17 @@ impl App for RunApp {
             } else {
                 println!("{} matched", result.len());
             }
+            if !failures.is_empty() {
+                eprintln!("{} target(s) failed:", failures.len());
+                for (addr, err) in &failures {
+                    eprintln!("  {}: {:#}", addr.format(), err);
+                }
+            }
         });
 
+        if !failures.is_empty() {
+            anyhow::bail!("{} target(s) failed", failures.len());
+        }
         Ok(())
     }
 }
@@ -139,7 +159,7 @@ pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()
 #[tokio::main]
 async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
-    let m = matcher_from_args(&args.arg1, &args.arg2, &base_pkg, false)?;
+    let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &base_pkg, false)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = RunApp {
         args,

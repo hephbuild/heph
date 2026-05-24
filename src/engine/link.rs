@@ -2,7 +2,6 @@ use crate::engine::Engine;
 use crate::engine::driver::targetdef::{InputMode, TargetDef, path::Content};
 use crate::engine::request_state::RequestState;
 use enclose::enclose;
-use futures::future::try_join_all;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -30,6 +29,7 @@ impl Engine {
             .expanded_inputs_for(rs.clone(), &def.addr)
             .await?;
 
+        let fail_fast = rs.fail_fast();
         let futures = expanded_inputs.iter().map(|input| {
             enclose!((self => engine, rs, input) async move {
                 let input_def: Arc<TargetDef> = Arc::clone(&engine.get_def(rs, &input.r#ref.r#ref).await?.target_def);
@@ -80,7 +80,7 @@ impl Engine {
             })
         });
 
-        let inputs = try_join_all(futures).await?;
+        let inputs = crate::engine::fanout::join_all_failable(futures, fail_fast).await?;
 
         Ok(LinkedTargetDef {
             target: def,

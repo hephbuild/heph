@@ -543,6 +543,25 @@ mod tests {
     }
 
     #[test]
+    fn exclude_composition_drops_specific_addr_in_package() {
+        // Mirrors the CLI -e contract: `And([Package(p), Not(Addr(a))])`
+        // includes targets in p but excludes a specifically.
+        let pkg = PkgBuf::from("foo");
+        let bad = addr("foo", "bad");
+        let good = addr("foo", "good");
+        let outside = addr("other", "good");
+
+        let m = Matcher::And(vec![
+            Matcher::Package(pkg),
+            Matcher::Not(Box::new(Matcher::Addr(bad.clone()))),
+        ]);
+
+        assert_eq!(m.matches_addr(&bad), MatchResult::MatchNo);
+        assert_eq!(m.matches_addr(&good), MatchResult::MatchYes);
+        assert_eq!(m.matches_addr(&outside), MatchResult::MatchNo);
+    }
+
+    #[test]
     fn def_not_match() {
         let d = def("foo", "bar");
         assert_eq!(

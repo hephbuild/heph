@@ -18,6 +18,9 @@ pub struct Args {
     /// Package matcher (only if first argument is a Label)
     #[arg(value_name = "PACKAGE_MATCHER")]
     pub arg2: Option<String>,
+    /// Exclude target address (repeatable, e.g. -e //pkg:target)
+    #[arg(short = 'e', long = "exclude", value_name = "TARGET_ADDRESS")]
+    pub exclude: Vec<String>,
 }
 
 struct QueryApp {
@@ -55,7 +58,7 @@ pub fn execute(args: &Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
 #[tokio::main]
 async fn execute_async(args: Args, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let cwp = get_cwp()?;
-    let m = matcher_from_args(&args.arg1, &args.arg2, &cwp, true)?;
+    let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &cwp, true)?;
     let (engine, shutdown) = bootstrap::new_engine()?;
     let app = QueryApp { engine, matcher: m };
     let interactive = tui::should_use_tui(no_tui);

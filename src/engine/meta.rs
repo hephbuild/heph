@@ -89,6 +89,7 @@ impl Engine {
             .expanded_inputs_for(rc.clone(), addr)
             .await?;
 
+        let fail_fast = rc.fail_fast();
         let futures = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
                 engine
@@ -103,6 +104,6 @@ impl Engine {
             })
         });
 
-        futures::future::try_join_all(futures).await
+        crate::engine::fanout::join_all_failable(futures, fail_fast).await
     }
 }

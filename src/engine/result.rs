@@ -175,6 +175,16 @@ pub struct ArtifactMeta {
     pub hashout: String,
 }
 
+/// Aggregate of a multi-target fanout. `errors` is non-empty only when the
+/// request was started with `Engine::new_state_with_fail_fast(false)`; with
+/// fail-fast (default), the first error short-circuits `Engine::result` and
+/// `errors` stays empty.
+#[derive(Default)]
+pub struct BatchResult {
+    pub ok: Vec<Arc<EResult>>,
+    pub errors: Vec<(Addr, anyhow::Error)>,
+}
+
 #[derive(Clone, Default)]
 pub struct EResult {
     pub artifacts: Vec<Arc<dyn Content>>,
@@ -274,7 +284,7 @@ impl Engine {
                     })
                 })
                 .collect();
-            let results = futures::future::try_join_all(futures).await?;
+            let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
             let mut merged = EResult::default();
             for r in results {
                 merged.artifacts.extend(r.artifacts.iter().cloned());
@@ -308,31 +318,39 @@ impl Engine {
         rs: Arc<RequestState>,
         matcher: &Matcher,
         opts: &ResultOptions,
-    ) -> anyhow::Result<Vec<Arc<EResult>>> {
+    ) -> anyhow::Result<BatchResult> {
         let mut opts = opts.clone();
         if !matches!(matcher, Matcher::Addr(_)) {
             opts.interactive = None;
         }
 
-        let mut set = JoinSet::new();
+        let fail_fast = rs.fail_fast();
+        let mut set: JoinSet<(Addr, anyhow::Result<Arc<EResult>>)> = JoinSet::new();
 
         let stream = Arc::clone(&self).query(rs.clone(), matcher);
         tokio::pin!(stream);
         while let Some(addr) = stream.try_next().await? {
             crate::hmemoizer::join_set_spawn(
                 &mut set,
-                enclose!((self => engine, rs, opts) async move {
-                    engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await
+                enclose!((self => engine, rs, opts, addr) async move {
+                    let r = engine.result_addr(rs, &addr, OutputMatcher::All, &opts).await;
+                    (addr, r)
                 }),
             );
         }
 
-        let mut all_res: Vec<Arc<EResult>> = vec![];
-        while let Some(res) = set.join_next().await {
-            all_res.push(res??)
+        let mut ok: Vec<Arc<EResult>> = vec![];
+        let mut errors: Vec<(Addr, anyhow::Error)> = vec![];
+        while let Some(joined) = set.join_next().await {
+            let (addr, res) = joined?;
+            match res {
+                Ok(v) => ok.push(v),
+                Err(e) if !fail_fast => errors.push((addr, e)),
+                Err(e) => return Err(e),
+            }
         }
 
-        Ok(all_res)
+        Ok(BatchResult { ok, errors })
     }
 
     async fn inner_result_addr(
@@ -687,7 +705,7 @@ impl Engine {
             })
         });
 
-        let results = futures::future::try_join_all(futures).await?;
+        let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
 
         let mut sb = Sandbox::default();
         for (id, transitive) in results.into_iter().flatten() {
@@ -1321,6 +1339,93 @@ mod tests {
         assert!(
             deps_b.iter().any(|s| s.starts_with("//pkg:a")),
             "b's query must include a, got {deps_b:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn result_fail_fast_on_bails_on_first_failure() -> anyhow::Result<()> {
+        // Three targets in `pkg` each depending on a missing target. With
+        // fail_fast=true (default), Engine::result must surface Err — no
+        // BatchResult is returned.
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &["//missing:x"]),
+            static_target("//pkg:b", &[], &["//missing:y"]),
+            static_target("//pkg:c", &[], &["//missing:z"]),
+        ])?;
+        let rs = engine.new_state();
+        let res = engine
+            .clone()
+            .result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await;
+        assert!(res.is_err(), "fail_fast=true must surface Err");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn result_fail_fast_off_collects_all_target_failures() -> anyhow::Result<()> {
+        // Same setup, fail_fast=false. Every target must be attempted and
+        // every per-target error must surface in BatchResult.errors keyed by
+        // its own addr — no error is dropped, no early bail.
+        let engine = engine_with(vec![
+            static_target("//pkg:a", &[], &["//missing:x"]),
+            static_target("//pkg:b", &[], &["//missing:y"]),
+            static_target("//pkg:c", &[], &["//missing:z"]),
+        ])?;
+        let rs = engine.new_state_with_fail_fast(false);
+        let batch = engine
+            .clone()
+            .result(
+                rs,
+                &Matcher::Package(PkgBuf::from("pkg")),
+                &ResultOptions::default(),
+            )
+            .await?;
+        assert!(batch.ok.is_empty(), "no targets should have succeeded");
+        assert_eq!(batch.errors.len(), 3, "expected 3 per-target errors");
+
+        let mut addr_names: Vec<String> =
+            batch.errors.iter().map(|(a, _)| a.name.clone()).collect();
+        addr_names.sort();
+        assert_eq!(addr_names, vec!["a", "b", "c"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nested_fail_fast_off_aggregates_input_errors() -> anyhow::Result<()> {
+        // A parent target with multiple bad inputs (each referencing a missing
+        // target). The nested fanout sites (link / inputs_result_meta /
+        // collect_transitive_deps) must aggregate all input failures into a
+        // single MultiError instead of short-circuiting on the first one — so
+        // the user sees every broken dep in one go.
+        use crate::engine::error::MultiError;
+
+        let engine = engine_with(vec![static_target(
+            "//pkg:parent",
+            &[],
+            &["//missing:a", "//missing:b"],
+        )])?;
+        let addr = crate::htaddr::parse_addr("//pkg:parent")?;
+        let rs = engine.new_state_with_fail_fast(false);
+        let res = engine
+            .clone()
+            .result_addr(rs, &addr, OutputMatcher::All, &ResultOptions::default())
+            .await;
+        let err = res.err().expect("parent must fail");
+        // Memoizer routing wraps errors in SharedAnyhow; use downcast_chain_ref
+        // (the helper that traverses past SharedAnyhow nodes) to recover the
+        // concrete MultiError type.
+        let multi =
+            downcast_chain_ref::<MultiError>(&err).expect("expected MultiError in error chain");
+        let rendered = format!("{:#}", err);
+        assert!(multi.0.len() >= 2, "expected >=2 aggregated errors");
+        assert!(
+            rendered.contains("missing:a") && rendered.contains("missing:b"),
+            "MultiError must surface both input failures, got: {rendered}"
         );
         Ok(())
     }

@@ -10,7 +10,6 @@ use crate::htaddr::Addr;
 use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
-use futures::future::try_join_all;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -137,6 +136,7 @@ impl Engine {
         rc: Arc<RequestState>,
         inputs: &[LinkedTargetDefInput],
     ) -> anyhow::Result<Vec<RunInput>> {
+        let fail_fast = rc.fail_fast();
         let futs = inputs.iter().map(|input| {
             enclose!((self => engine, rc, input) async move {
                 let res = engine.result_addr(rc, &input.target.addr, OutputMatcher::Exact(input.output_names), &ResultOptions::default()).await?;
@@ -172,7 +172,7 @@ impl Engine {
             })
         });
 
-        let results = try_join_all(futs).await?;
+        let results = crate::engine::fanout::join_all_failable(futs, fail_fast).await?;
         Ok(results.into_iter().flatten().collect())
     }
 }

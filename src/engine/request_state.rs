@@ -171,6 +171,10 @@ pub struct RequestStateData {
     pub mem_expanded_inputs:
         Memoizer<Addr, Result<Arc<Vec<crate::engine::driver::targetdef::Input>>, ArcErr>>,
     pub mem_packages: Memoizer<String, Result<Arc<Vec<String>>, ArcErr>>,
+    /// When false, fanout sites await every concurrent child instead of
+    /// short-circuiting on the first error; errors are aggregated into a
+    /// `MultiError`. Defaults to true (current behavior).
+    pub fail_fast: bool,
 }
 
 /// Per-invocation state. Cheap to clone via with_parent — shares the same RequestStateData.
@@ -189,6 +193,10 @@ impl RequestState {
 
     pub fn ctoken(&self) -> &StdCancellationToken {
         &self.data.ctoken
+    }
+
+    pub fn fail_fast(&self) -> bool {
+        self.data.fail_fast
     }
 
     /// Returns a child RequestState sharing the same data but with a new parent.
@@ -225,6 +233,10 @@ impl Drop for RequestStateData {
 
 impl Engine {
     pub fn new_state(self: &Arc<Self>) -> Arc<RequestState> {
+        self.new_state_with_fail_fast(true)
+    }
+
+    pub fn new_state_with_fail_fast(self: &Arc<Self>, fail_fast: bool) -> Arc<RequestState> {
         let request_id = "".to_string();
         let data = Arc::new(RequestStateData {
             engine: Arc::downgrade(self),
@@ -238,6 +250,7 @@ impl Engine {
             mem_def: Memoizer::with_tag("def"),
             mem_expanded_inputs: Memoizer::with_tag("expanded_inputs"),
             mem_packages: Memoizer::with_tag("packages"),
+            fail_fast,
         });
 
         let state = Arc::new(RequestState {
@@ -430,6 +443,21 @@ mod tests {
         engine.cancel_all_requests();
         assert!(rs.ctoken().is_cancelled());
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_fast_defaults_true_overridable() -> anyhow::Result<()> {
+        let engine = Arc::new(Engine::new(Config {
+            root: PathBuf::from("/tmp"),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?);
+
+        assert!(engine.new_state().fail_fast());
+        assert!(engine.new_state_with_fail_fast(true).fail_fast());
+        assert!(!engine.new_state_with_fail_fast(false).fail_fast());
         Ok(())
     }
 
