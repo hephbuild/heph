@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use anyhow::Result;
 use rheph::pluginbuildfile;
 use rheph::pluginexec;

@@ -64,19 +64,24 @@ async fn test_codegen_build_binary_outputs_hello() -> anyhow::Result<()> {
 
     for artifact in &result.artifacts {
         for entry in artifact.walk()? {
-            let mut entry = entry?;
+            let entry = entry?;
             let name = entry
                 .path
                 .file_name()
                 .unwrap_or(entry.path.as_os_str())
                 .to_owned();
             let dest = tmp.path().join(&name);
-            let mut buf = Vec::new();
-            entry.data.read_to_end(&mut buf)?;
-            std::fs::write(&dest, &buf)?;
-            if entry.x {
-                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-                binary_path = Some(dest);
+            match entry.kind {
+                rheph::hartifactcontent::WalkEntryKind::File { mut data, x } => {
+                    let mut buf = Vec::new();
+                    data.read_to_end(&mut buf)?;
+                    std::fs::write(&dest, &buf)?;
+                    if x {
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
+                        binary_path = Some(dest);
+                    }
+                }
+                rheph::hartifactcontent::WalkEntryKind::Symlink { .. } => {}
             }
         }
     }
