@@ -7,7 +7,6 @@
 use crate::hasync::Cancellable;
 use crate::process_supervisor;
 use std::io;
-use std::os::unix::process::CommandExt as _;
 use std::process::{ExitStatus, Output};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::{Child, ChildStdin, Command};
@@ -98,7 +97,7 @@ impl Handle {
             res = self.child.wait() => res,
             _ = cancel.cancelled() => {
                 process_supervisor::kill_child(self.pid);
-                let _ = self.child.wait().await;
+                drop(self.child.wait().await);
                 Err(io::Error::other("cancelled"))
             }
         }
