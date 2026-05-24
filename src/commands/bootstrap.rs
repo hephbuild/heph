@@ -63,10 +63,19 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         .map(|p| root.join(p))
         .unwrap_or_else(|| root.join(".heph3"));
 
+    let mem_cache = file
+        .mem_cache
+        .map(|c| engine::MemCacheOptions {
+            per_entry_bytes: c.per_entry_bytes,
+            capacity_bytes: c.capacity_bytes,
+        })
+        .unwrap_or_default();
+
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
         parallelism: None,
+        mem_cache,
     })?;
 
     // Auto-registered built-ins (no options).
@@ -184,6 +193,7 @@ mod tests {
             root,
             home_dir: home_dir.clone(),
             parallelism: None,
+            ..Default::default()
         })?;
 
         e.register_provider(|_| Box::new(pluginfs::Provider))?;
@@ -270,6 +280,7 @@ drivers:
                 root: root.clone(),
                 home_dir: root.join(".heph3"),
                 parallelism: None,
+                ..Default::default()
             })
             .expect("engine"),
         );

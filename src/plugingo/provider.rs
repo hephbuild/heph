@@ -2755,6 +2755,7 @@ mod tests {
             root: workspace.to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })
         .unwrap();
 

@@ -130,6 +130,7 @@ libc = "0.2"
 templi = "0.1.2"
 erased-serde = "0.4"
 crossbeam-channel = "0.5"
+quick_cache = "0.6"
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

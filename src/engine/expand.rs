@@ -272,6 +272,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?;
         // group driver is registered by Engine::new; only the exec driver
         // needs adding here.

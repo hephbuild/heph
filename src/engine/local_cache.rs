@@ -81,8 +81,16 @@ pub struct Manifest {
     pub artifacts: Vec<ManifestArtifact>,
 }
 
+pub struct SizedReader {
+    pub size: u64,
+    pub reader: Box<dyn io::Read>,
+    /// Set when `reader` is already backed by an in-memory buffer. Lets a
+    /// caching layer skip the drain step and store the buffer directly.
+    pub bytes: Option<Arc<[u8]>>,
+}
+
 pub trait LocalCache: Send + Sync {
-    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Read>>;
+    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<SizedReader>;
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>>;
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
@@ -108,7 +116,10 @@ pub struct CacheArtifact {
 
 impl hartifactcontent::Content for CacheArtifact {
     fn reader(&self) -> anyhow::Result<Box<dyn io::Read>> {
-        self.cache.reader(&self.addr, &self.hashin, &self.name)
+        Ok(self
+            .cache
+            .reader(&self.addr, &self.hashin, &self.name)?
+            .reader)
     }
 
     fn walk(
@@ -312,13 +323,14 @@ impl Engine {
         // and not `spawn_blocking`.
         crate::process_supervisor::block_or_inline(
             enclose!((self.local_cache => local_cache) move || {
-                let mut manifest_artifact = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
+                let sized = match local_cache.reader(&addr, &hashin, MANIFEST_V1) {
                     Err(e) if e.is::<NotFoundError>() => return Ok(None),
                     Err(e) => return Err(e),
                     Ok(artifact) => artifact,
                 };
 
-                let mut buf = Vec::new();
+                let mut manifest_artifact = sized.reader;
+                let mut buf = Vec::with_capacity(sized.size as usize);
                 io::Read::read_to_end(&mut manifest_artifact, &mut buf)?;
                 let manifest: Manifest = borsh::from_slice(&buf)?;
 

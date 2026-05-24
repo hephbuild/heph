@@ -2,6 +2,7 @@ use crate::engine::config_file::{Options, PluginEntry};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
+use crate::engine::local_cache_mem::LocalCacheMem;
 use crate::engine::local_cache_sqlite::LocalCacheSQLite;
 use crate::engine::provider::Provider as SDKProvider;
 use crate::engine::request_state::RequestState;
@@ -17,6 +18,23 @@ pub struct Config {
     /// Workspace state/cache directory. If empty, defaults to `root/.heph3`.
     pub home_dir: PathBuf,
     pub parallelism: Option<usize>,
+    pub mem_cache: MemCacheOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemCacheOptions {
+    pub per_entry_bytes: usize,
+    /// Total byte budget. `0` disables the in-memory layer entirely.
+    pub capacity_bytes: u64,
+}
+
+impl Default for MemCacheOptions {
+    fn default() -> Self {
+        Self {
+            per_entry_bytes: 16 * 1024,
+            capacity_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 
 pub type ProviderFactory =
@@ -69,10 +87,24 @@ impl Engine {
                 .unwrap_or(1)
         });
 
+        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::new(
+            home.join("cache").join("cache.db"),
+            cfg.mem_cache.per_entry_bytes,
+        )?);
+        let local_cache: Arc<dyn LocalCache> = if cfg.mem_cache.capacity_bytes == 0 {
+            sqlite
+        } else {
+            Arc::new(LocalCacheMem::new(
+                sqlite,
+                cfg.mem_cache.per_entry_bytes,
+                cfg.mem_cache.capacity_bytes,
+            ))
+        };
+
         let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
-            local_cache: Arc::new(LocalCacheSQLite::new(home.join("cache").join("cache.db"))?),
+            local_cache,
             providers: vec![],
             providers_by_name: HashMap::new(),
             drivers: vec![],

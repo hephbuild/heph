@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{LocalCache, NotFoundError};
+use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ impl LocalCacheFS {
 }
 
 impl LocalCache for LocalCacheFS {
-    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Read>> {
+    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<SizedReader> {
         let path = self.get_path(addr, hashin, name);
         let file = match fs::File::open(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(NotFoundError))?,
@@ -37,7 +37,16 @@ impl LocalCache for LocalCacheFS {
             }
         };
 
-        Ok(Box::new(file))
+        let size = file
+            .metadata()
+            .with_context(|| format!("stat cache file: {:?}", path))?
+            .len();
+
+        Ok(SizedReader {
+            size,
+            reader: Box::new(file),
+            bytes: None,
+        })
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
@@ -97,7 +106,9 @@ mod tests {
         assert!(cache.exists(&addr, hashin, name)?);
 
         // Test reader
-        let mut reader = cache.reader(&addr, hashin, name)?;
+        let sized = cache.reader(&addr, hashin, name)?;
+        assert_eq!(sized.size, b"hello cache".len() as u64);
+        let mut reader = sized.reader;
         let mut content = String::new();
         reader.read_to_string(&mut content)?;
         assert_eq!(content, "hello cache");

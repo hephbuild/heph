@@ -65,6 +65,7 @@ impl WorkspaceBuilder {
             root: self.dir.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: self.parallelism,
+            ..Default::default()
         })?;
         for setup in self.setups {
             setup(&mut e)?;

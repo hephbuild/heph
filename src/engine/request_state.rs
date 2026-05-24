@@ -388,6 +388,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?);
 
         let rs = engine.new_state();
@@ -416,6 +417,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?);
 
         let rs = engine.new_state();
@@ -437,6 +439,7 @@ mod tests {
             root: PathBuf::from("/tmp"),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?);
 
         let rs = engine.new_state();

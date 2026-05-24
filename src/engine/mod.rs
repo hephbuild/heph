@@ -5,6 +5,7 @@
 mod engine;
 pub use engine::Config;
 pub use engine::Engine;
+pub use engine::MemCacheOptions;
 pub mod config_file;
 mod cwd;
 mod result;
@@ -17,6 +18,7 @@ pub mod error;
 mod local_cache;
 #[cfg(test)]
 mod local_cache_fs;
+mod local_cache_mem;
 mod local_cache_sqlite;
 mod packages;
 pub mod provider;

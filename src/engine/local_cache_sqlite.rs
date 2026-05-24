@@ -1,4 +1,4 @@
-use crate::engine::local_cache::{LocalCache, NotFoundError};
+use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -12,7 +12,6 @@ use std::thread::JoinHandle;
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
-const INLINE_BLOB_THRESHOLD: usize = SPOOL_MEM_THRESHOLD;
 const MAX_CONCURRENT_PIPES: usize = 64;
 const READ_POOL_SIZE: u32 = MAX_CONCURRENT_PIPES as u32;
 const WRITE_BATCH_MAX: usize = 64;
@@ -165,10 +164,11 @@ pub struct LocalCacheSQLite {
     writer_handle: Option<JoinHandle<()>>,
     pending: Arc<PendingTracker>,
     pipe_sem: Arc<PipeSemaphore>,
+    inline_threshold: usize,
 }
 
 impl LocalCacheSQLite {
-    pub fn new(db_path: PathBuf) -> Result<Self> {
+    pub fn new(db_path: PathBuf, inline_threshold: usize) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating sqlite cache dir {parent:?}"))?;
@@ -231,6 +231,7 @@ impl LocalCacheSQLite {
             writer_handle: Some(writer_handle),
             pending,
             pipe_sem: PipeSemaphore::new(MAX_CONCURRENT_PIPES),
+            inline_threshold,
         })
     }
 
@@ -347,7 +348,7 @@ fn process_batch(conn: &mut Connection, batch: &mut [WriterCmd]) -> Result<()> {
 }
 
 impl LocalCache for LocalCacheSQLite {
-    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Read>> {
+    fn reader(&self, addr: &Addr, hashin: &str, name: &str) -> Result<SizedReader> {
         let key = (Self::key(addr), hashin.to_string(), name.to_string());
         self.pending.wait_if_pending(&key);
 
@@ -371,7 +372,9 @@ impl LocalCache for LocalCacheSQLite {
             Ok(v) => v,
         };
 
-        if blob_len <= INLINE_BLOB_THRESHOLD {
+        let size = blob_len as u64;
+
+        if blob_len <= self.inline_threshold {
             let mut blob = conn
                 .blob_open(
                     rusqlite::DatabaseName::Main,
@@ -384,7 +387,12 @@ impl LocalCache for LocalCacheSQLite {
             let mut buf = Vec::with_capacity(blob_len);
             io::copy(&mut blob, &mut buf)
                 .with_context(|| format!("reading small blob for {name}"))?;
-            return Ok(Box::new(io::Cursor::new(buf)));
+            let arc: Arc<[u8]> = Arc::from(buf);
+            return Ok(SizedReader {
+                size,
+                reader: Box::new(io::Cursor::new(arc.clone())),
+                bytes: Some(arc),
+            });
         }
 
         // Release the SELECT connection before acquiring semaphore + a fresh pipe connection.
@@ -415,10 +423,14 @@ impl LocalCache for LocalCacheSQLite {
             drop(io::copy(&mut blob, &mut pipe_writer));
         });
 
-        Ok(Box::new(GuardedReader {
-            inner: pipe_reader,
-            _permit: permit,
-        }))
+        Ok(SizedReader {
+            size,
+            reader: Box::new(GuardedReader {
+                inner: pipe_reader,
+                _permit: permit,
+            }),
+            bytes: None,
+        })
     }
 
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> Result<Box<dyn io::Write>> {
@@ -544,7 +556,7 @@ mod tests {
     #[test]
     fn test_local_cache_sqlite() -> Result<()> {
         let dir = tempdir()?;
-        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"))?;
+        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?;
 
         let addr = make_addr("test_pkg", "test_target");
         let hashin = "abc123hash";
@@ -558,7 +570,9 @@ mod tests {
 
         assert!(cache.exists(&addr, hashin, name)?);
 
-        let mut reader = cache.reader(&addr, hashin, name)?;
+        let sized = cache.reader(&addr, hashin, name)?;
+        assert_eq!(sized.size, b"hello sqlite cache".len() as u64);
+        let mut reader = sized.reader;
         let mut content = String::new();
         reader.read_to_string(&mut content)?;
         assert_eq!(content, "hello sqlite cache");
@@ -574,7 +588,7 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"))?);
+        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?);
 
         let addr = make_addr("test_pkg", "concurrent");
         let hashin = "hashcon";
@@ -589,7 +603,7 @@ mod tests {
                 let c = cache.clone();
                 let a = addr.clone();
                 std::thread::spawn(move || {
-                    let mut reader = c.reader(&a, hashin, name).expect("reader");
+                    let mut reader = c.reader(&a, hashin, name).expect("reader").reader;
                     let mut buf = String::new();
                     reader.read_to_string(&mut buf).expect("read");
                     assert_eq!(buf, "concurrent read data")
@@ -611,7 +625,7 @@ mod tests {
         // Reader started before the writer Drop returns from enqueue must still observe
         // the write once it lands. This exercises the PendingTracker wait path.
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"))?);
+        let cache = Arc::new(LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?);
         let addr = make_addr("pkg", "tgt");
         let hashin = "h1";
         let name = "out.bin";
@@ -625,7 +639,7 @@ mod tests {
             // exists() must wait until the bg thread completes the slot.
             assert!(cache.exists(&addr, hashin, name)?);
 
-            let mut reader = cache.reader(&addr, hashin, name)?;
+            let mut reader = cache.reader(&addr, hashin, name)?.reader;
             let mut got = String::new();
             reader.read_to_string(&mut got)?;
             assert_eq!(got, format!("iter-{i}"));

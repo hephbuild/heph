@@ -49,6 +49,9 @@ fn main() -> ExitCode {
     // SAFETY: signal(2) at process startup, before any thread spawns.
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
+    // SAFETY: signal(2) at process startup, before any thread spawns.
+    unsafe {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
     }
 

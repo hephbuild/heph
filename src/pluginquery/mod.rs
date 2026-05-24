@@ -180,6 +180,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?;
         let provider = pluginstatictarget::Provider::new(targets)?;
         engine.register_provider(move |_| Box::new(provider))?;

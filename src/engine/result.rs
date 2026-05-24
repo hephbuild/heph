@@ -896,6 +896,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?;
         engine.register_provider(move |_| {
             Box::new(CountingProvider {
@@ -931,6 +932,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         };
 
         let engine = Arc::new(Engine::new(cfg)?);
@@ -1014,6 +1016,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?;
         engine.register_managed_driver(Box::new(crate::pluginexec::Driver::new_exec()))?;
         let provider = pluginstatictarget::Provider::new(targets)?;
@@ -1329,6 +1332,7 @@ mod tests {
             root: root.path().to_path_buf(),
             home_dir: std::path::PathBuf::new(),
             parallelism: None,
+            ..Default::default()
         })?);
         let addr = Addr::new(PkgBuf::from("p"), "t".to_string(), Default::default());
         // Pre-populate dag with addr→addr already there is overkill; just call result_addr
