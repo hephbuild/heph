@@ -35,3 +35,4 @@ mod expand;
 mod link;
 mod matcher_spec;
 mod meta;
+mod sandbox_cleaner;

@@ -72,12 +72,14 @@ impl Engine {
                 Err(err) => Err(err),
             }
         }))
-        .await?;
+        .await
+        .with_context(|| format!("remove stale sandbox dir {}", sandbox_dir.display()))?;
         crate::hmemoizer::set_phase("execute:sandbox_create");
         sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
             std::fs::create_dir_all(&sandbox_dir)
         }))
-        .await?;
+        .await
+        .with_context(|| format!("create sandbox dir {}", sandbox_dir.display()))?;
 
         if def.target.cache {
             tracing::info!(driver = %driver.name, %addr, "run");

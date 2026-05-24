@@ -129,6 +129,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 libc = "0.2"
 templi = "0.1.2"
 erased-serde = "0.4"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 serde-jsonlines = "0.7.0"

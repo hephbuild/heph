@@ -5,6 +5,7 @@ use crate::engine::result::ArtifactMeta;
 use crate::hartifactcontent;
 use crate::hasync::Cancellable;
 use crate::htaddr::Addr;
+use anyhow::Context;
 use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use enclose::enclose;
@@ -153,34 +154,64 @@ impl Engine {
                 let (size, content_type, name) = match &artifact.content {
                     outputartifact::Content::Raw(raw) => {
                         let name = format!("{}_{}.tar", type_prefix, artifact.name);
-                        let mut cw =
-                            CountingWriter::new(local_cache.writer(&addr, &hashin, &name)?);
+                        let mut cw = CountingWriter::new(
+                            local_cache.writer(&addr, &hashin, &name).with_context(|| {
+                                format!("open cache writer for {addr} {name}")
+                            })?,
+                        );
                         let mut p = hartifactcontent::tar::TarPacker::new();
                         p.create_raw(raw.data.clone(), raw.path.clone(), raw.x);
-                        p.pack(&mut cw)?;
+                        p.pack(&mut cw)
+                            .with_context(|| format!("pack raw artifact into {addr} {name}"))?;
                         (cw.bytes_written(), hartifactcontent::Type::Tar, name)
                     }
                     outputartifact::Content::File(file) => {
                         let name = format!("{}_{}.tar", type_prefix, artifact.name);
-                        let mut cw =
-                            CountingWriter::new(local_cache.writer(&addr, &hashin, &name)?);
+                        let mut cw = CountingWriter::new(
+                            local_cache.writer(&addr, &hashin, &name).with_context(|| {
+                                format!("open cache writer for {addr} {name}")
+                            })?,
+                        );
                         let mut p = hartifactcontent::tar::TarPacker::new();
                         p.create_file(file.source_path.clone(), file.out_path.clone());
-                        p.pack(&mut cw)?;
+                        p.pack(&mut cw).with_context(|| {
+                            format!(
+                                "pack file artifact {} into {addr} {name}",
+                                file.source_path
+                            )
+                        })?;
                         (cw.bytes_written(), hartifactcontent::Type::Tar, name)
                     }
                     outputartifact::Content::TarPath(path) => {
                         let name = format!("{}_{}", type_prefix, artifact.name);
-                        let mut f = File::open(path)?;
-                        let size = f.metadata()?.size();
-                        io::copy(&mut f, &mut local_cache.writer(&addr, &hashin, &name)?)?;
+                        let mut f = File::open(path)
+                            .with_context(|| format!("open tar artifact {path}"))?;
+                        let size = f
+                            .metadata()
+                            .with_context(|| format!("stat tar artifact {path}"))?
+                            .size();
+                        let mut w = local_cache
+                            .writer(&addr, &hashin, &name)
+                            .with_context(|| format!("open cache writer for {addr} {name}"))?;
+                        io::copy(&mut f, &mut w).with_context(|| {
+                            format!("copy tar artifact {path} into {addr} {name}")
+                        })?;
                         (size, hartifactcontent::Type::Tar, name)
                     }
                     outputartifact::Content::CpioPath(path) => {
                         let name = format!("{}_{}", type_prefix, artifact.name);
-                        let mut f = File::open(path)?;
-                        let size = f.metadata()?.size();
-                        io::copy(&mut f, &mut local_cache.writer(&addr, &hashin, &name)?)?;
+                        let mut f = File::open(path)
+                            .with_context(|| format!("open cpio artifact {path}"))?;
+                        let size = f
+                            .metadata()
+                            .with_context(|| format!("stat cpio artifact {path}"))?
+                            .size();
+                        let mut w = local_cache
+                            .writer(&addr, &hashin, &name)
+                            .with_context(|| format!("open cache writer for {addr} {name}"))?;
+                        io::copy(&mut f, &mut w).with_context(|| {
+                            format!("copy cpio artifact {path} into {addr} {name}")
+                        })?;
                         (size, hartifactcontent::Type::Cpio, name)
                     }
                 };
@@ -241,9 +272,11 @@ impl Engine {
         };
 
         for artifact in artifacts {
+            let artifact_name = artifact.name.clone();
             let (cached_artifact, manifest_artifact) = self
                 .cache_artifact_locally(ctoken, addr, &key, &artifact)
-                .await?;
+                .await
+                .with_context(|| format!("cache artifact {artifact_name} for {addr}"))?;
             res_artifacts.push(cached_artifact);
             manifest_artifacts.push(manifest_artifact);
         }
@@ -256,8 +289,12 @@ impl Engine {
             artifacts: manifest_artifacts,
         };
 
-        let mut manifest_writer = self.local_cache.writer(addr, &key, MANIFEST_V1)?;
-        borsh::to_writer(&mut manifest_writer, &manifest)?;
+        let mut manifest_writer = self
+            .local_cache
+            .writer(addr, &key, MANIFEST_V1)
+            .with_context(|| format!("open manifest writer for {addr}"))?;
+        borsh::to_writer(&mut manifest_writer, &manifest)
+            .with_context(|| format!("write manifest for {addr}"))?;
 
         Ok(res_artifacts)
     }

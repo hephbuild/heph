@@ -24,7 +24,6 @@ use anyhow::Context;
 use futures::TryStreamExt;
 use std::fmt;
 use std::sync::{Arc, Weak};
-use std::{fs, io};
 use tokio::task::JoinSet;
 
 /// rs carries the parent addr (set by result_addr via with_parent) so the executor
@@ -460,7 +459,8 @@ impl Engine {
                     let (artifacts, sandbox_dir) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
-                        .await?;
+                        .await
+                        .with_context(|| format!("execute {addr}"))?;
 
                     let artifacts_meta = artifacts
                         .iter()
@@ -469,24 +469,19 @@ impl Engine {
                             outputartifact::Type::Output | outputartifact::Type::SupportFile
                         ))
                         .map(|a| Ok(ArtifactMeta { hashout: a.hashout()? }))
-                        .collect::<anyhow::Result<Vec<_>>>()?;
+                        .collect::<anyhow::Result<Vec<_>>>()
+                        .with_context(|| format!("read artifact metas for {addr}"))?;
 
                     defer! {
-                        let sandbox_dir = sandbox_dir.clone();
-                        tokio::task::spawn_blocking(move || {
-                            match fs::remove_dir_all(&sandbox_dir) {
-                                Ok(_) => (),
-                                Err(err) if err.kind() == io::ErrorKind::NotFound => (),
-                                Err(err) => tracing::error!(error = %err, "failed to clean up sandbox"),
-                            }
-                        });
+                        crate::engine::sandbox_cleaner::enqueue(sandbox_dir.clone());
                     }
 
                     crate::hmemoizer::set_phase("execute_cache:cache_locally");
                     let out = engine
                         .cache_locally(rs.ctoken(), &addr, &hashin, artifacts, use_tmp_cache)
                         .await
-                        .map(|cached| (cached, artifacts_meta));
+                        .map(|cached| (cached, artifacts_meta))
+                        .with_context(|| format!("cache_locally {addr}"));
                     crate::hmemoizer::clear_phase();
                     out
                 }),

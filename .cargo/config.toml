@@ -1,0 +1,6 @@
+[build]
+# Unlocks `tokio::task::try_id()` and `tokio::task::Id` for the memoizer's
+# cross-task wait-for cycle detection (see `src/hmemoizer/mod.rs`). Other
+# `tokio_unstable` APIs (Builder::name, runtime metrics, …) are not used by
+# this crate but become available when the flag is set.
+rustflags = ["--cfg", "tokio_unstable"]
