@@ -16,6 +16,8 @@ pub struct ConfigFile {
     pub drivers: Vec<PluginEntry>,
     #[serde(default)]
     pub mem_cache: Option<MemCacheConfig>,
+    #[serde(default)]
+    pub fuse: Option<FuseConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -24,6 +26,47 @@ pub struct MemCacheConfig {
     pub per_entry_bytes: usize,
     /// Total byte budget for the in-memory cache. `0` disables it entirely.
     pub capacity_bytes: u64,
+}
+
+/// Sandbox FUSE-overlay mode. `fuse: { enabled: true|false }` forces on/off.
+/// Omit `enabled` (or the entire `fuse:` block) for auto mode, where the
+/// engine inspects each target's inputs to decide per-target.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FuseConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// Resolved decision used by Engine + bridge. Independent of YAML shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseMode {
+    /// Forced on. Probe must succeed; mount errors propagate.
+    On,
+    /// Forced off.
+    Off,
+    /// Engine decides per-target by walking inputs.
+    Auto,
+}
+
+impl FuseConfig {
+    pub fn mode(&self) -> FuseMode {
+        match self.enabled {
+            Some(true) => FuseMode::On,
+            Some(false) => FuseMode::Off,
+            None => FuseMode::Auto,
+        }
+    }
+
+    /// Convenience: is FUSE forced off by config?
+    pub fn is_off(&self) -> bool {
+        matches!(self.enabled, Some(false))
+    }
+
+    /// Convenience: is FUSE forced on by config?
+    pub fn is_on(&self) -> bool {
+        matches!(self.enabled, Some(true))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,8 +83,9 @@ pub fn load(path: &Path) -> anyhow::Result<ConfigFile> {
     if bytes.is_empty() {
         return Ok(ConfigFile::default());
     }
-    serde_yaml::from_slice(&bytes)
-        .with_context(|| format!("parsing YAML config {}", path.display()))
+    let cfg: ConfigFile = serde_yaml::from_slice(&bytes)
+        .with_context(|| format!("parsing YAML config {}", path.display()))?;
+    Ok(cfg)
 }
 
 /// Decode a single option value into `T`. Returns the default if the key is absent.
@@ -150,5 +194,36 @@ drivers:
         let mut opts = Options::new();
         opts.insert("bar".to_string(), serde_yaml::Value::Bool(true));
         deny_unknown("test", &opts, &["bar", "baz"]).expect("ok");
+    }
+
+    #[test]
+    fn fuse_config_enabled_true() {
+        let yaml = "fuse:\n  enabled: true\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.mode(), FuseMode::On);
+    }
+
+    #[test]
+    fn fuse_config_enabled_false() {
+        let yaml = "fuse:\n  enabled: false\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.mode(), FuseMode::Off);
+    }
+
+    #[test]
+    fn fuse_config_defaults_when_omitted() {
+        let yaml = "fuse: {}\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.mode(), FuseMode::Auto);
+    }
+
+    #[test]
+    fn fuse_config_rejects_unknown_field() {
+        let yaml = "fuse:\n  bogus: 1\n";
+        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("bogus"), "{err}");
     }
 }

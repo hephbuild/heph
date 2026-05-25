@@ -2,12 +2,15 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::os::fd::FromRawFd;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 
 use crate::process_supervisor::protocol::Msg;
 
-/// Supervisor entry point. Reads `TRACK`/`UNTRACK` lines from `ipc_fd` until
-/// EOF (parent process died) or read error, then SIGKILLs every tracked
-/// process group and exits.
+/// Supervisor entry point. Reads `TRACK`/`UNTRACK`/`FUSEROOT` lines from
+/// `ipc_fd` until EOF (parent process died) or read error, then:
+///   1. SIGKILLs every tracked process group (so no surviving child holds
+///      an FD into the FUSE mount).
+///   2. Force-unmounts every registered sandboxfuse root.
 ///
 /// Intentionally synchronous and tokio-free so the supervisor stays small and
 /// has no surprise dependencies that could fail under memory pressure.
@@ -24,6 +27,7 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
     let sock = unsafe { UnixStream::from_raw_fd(ipc_fd) };
     let reader = BufReader::new(sock);
     let mut tracked: HashSet<i32> = HashSet::new();
+    let mut fuse_roots: HashSet<PathBuf> = HashSet::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -36,6 +40,9 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
             }
             Ok(Msg::Untrack(p)) => {
                 tracked.remove(&p);
+            }
+            Ok(Msg::FuseRoot(p)) => {
+                fuse_roots.insert(p);
             }
             Err(_) => {
                 // Malformed line — ignore. Parent and supervisor share a
@@ -65,5 +72,32 @@ pub fn run_supervisor_main(ipc_fd: i32) -> ! {
             libc::kill(*id, libc::SIGKILL);
         }
     }
+
+    // Force-umount sandboxfuse mounts so a parent crash doesn't leave the
+    // kext wedged. Done after killing children so no held FD blocks
+    // unmount. Best-effort; ignore errors (already unmounted, doesn't
+    // exist, etc.).
+    for root in &fuse_roots {
+        let lower = root.join("lower");
+        #[cfg(target_os = "linux")]
+        {
+            drop(
+                std::process::Command::new("fusermount3")
+                    .arg("-uz")
+                    .arg(&lower)
+                    .output(),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            drop(
+                std::process::Command::new("umount")
+                    .arg("-f")
+                    .arg(&lower)
+                    .output(),
+            );
+        }
+    }
+
     std::process::exit(0);
 }

@@ -10,3 +10,5 @@ drivers:
   - name: go_golist
   - name: go_embed
   - name: go_testmain
+fuse:
+  enabled: true

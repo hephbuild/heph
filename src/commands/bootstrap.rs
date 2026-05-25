@@ -71,11 +71,14 @@ pub fn new_engine() -> anyhow::Result<(Arc<engine::Engine>, ShutdownTrigger)> {
         })
         .unwrap_or_default();
 
+    let fuse = file.fuse.unwrap_or_default();
+
     let mut e = engine::Engine::new(engine::Config {
         root: root.clone(),
         home_dir: home_dir.clone(),
         parallelism: None,
         mem_cache,
+        fuse,
     })?;
 
     // Auto-registered built-ins (no options).

@@ -40,7 +40,13 @@ pub fn build_spec(
         import_path
     ));
     run.push_str("  exit 1\nfi\n");
-    run.push_str(&format!("cp \"$export_path\" \"{}\"\n", out_file));
+    // BSD/macOS cp copies extended attributes by default
+    // (com.apple.quarantine from Go's build cache) and fails with EPERM
+    // on filesystems that reject xattr writes (e.g. our FUSE overlay).
+    // `cp -X` on macOS suppresses that; on GNU cp `-X` means
+    // `--one-file-system`, so branch on `uname`.
+    run.push_str("if [ \"$(uname)\" = Darwin ]; then CP=\"cp -X\"; else CP=\"cp\"; fi\n");
+    run.push_str(&format!("$CP \"$export_path\" \"{}\"\n", out_file));
 
     let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
     config.insert("run".to_string(), TargetSpecValue::String(run));

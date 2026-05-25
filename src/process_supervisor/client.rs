@@ -46,6 +46,14 @@ impl ProcessTracker {
         self.send(Msg::Untrack(pgid))
     }
 
+    /// Register a sandboxfuse root with the supervisor. On parent EOF the
+    /// supervisor will `umount -f <root>/lower` so a crash doesn't leave
+    /// the FUSE kext wedged. One-shot: registrations accumulate; there
+    /// is no unregister verb (the dir is per-pid and reaped on exit).
+    pub fn register_fuse_root(&self, root: std::path::PathBuf) -> anyhow::Result<()> {
+        self.send(Msg::FuseRoot(root))
+    }
+
     fn send(&self, msg: Msg) -> anyhow::Result<()> {
         if !self.is_alive() {
             anyhow::bail!("process supervisor unavailable");

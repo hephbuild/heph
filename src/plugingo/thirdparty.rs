@@ -28,9 +28,14 @@ pub fn build_download_spec(
     let mod_at_ver = format!("{module}@{version}");
     // Multi-line bash. `awk` parses `Dir` out of the JSON `go mod download`
     // emits. The stub go.mod blocks Go from reading the project go.mod.
+    //
+    // `cp` choice: BSD/macOS cp copies xattrs (com.apple.quarantine on
+    // Go's mod cache files) by default, which fails with EPERM on FUSE
+    // overlays that reject xattr writes. `cp -X` on macOS suppresses
+    // xattr copy; on GNU cp `-X` means `--one-file-system`, so branch
+    // on `uname`.
     let run = format!(
-        "set -e\n\
-         printf 'module heph_ignore\\n' > go.mod\n\
+        "printf 'module heph_ignore\\n' > go.mod\n\
          \"$SRC_GO_BIN\" mod download -modcacherw -json '{mod_at_ver}' > mod.json\n\
          rm go.mod\n\
          MOD_DIR=$(awk -F'\"' '/\"Dir\": / {{ print $4 }}' mod.json)\n\
@@ -39,7 +44,8 @@ pub fn build_download_spec(
            cat mod.json >&2\n\
            exit 1\n\
          fi\n\
-         cp -R \"$MOD_DIR/.\" .\n\
+         if [ \"$(uname)\" = Darwin ]; then CP=\"cp -RX\"; else CP=\"cp -R\"; fi\n\
+         $CP \"$MOD_DIR/.\" .\n\
          rm mod.json\n\
          chmod -R u+w .\n",
     );

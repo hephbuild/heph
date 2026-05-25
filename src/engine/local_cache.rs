@@ -94,6 +94,18 @@ pub trait LocalCache: Send + Sync {
     fn writer(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<Box<dyn io::Write>>;
     fn exists(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<bool>;
     fn delete(&self, addr: &Addr, hashin: &str, name: &str) -> anyhow::Result<()>;
+    /// Returns a seekable reader when the cache backend supports `O(1)`
+    /// pread (sqlite blob, on-disk file). Defaults to `Ok(None)` so backends
+    /// can opt in. Used by the FUSE sandbox path to index and read tar
+    /// artifacts without copying their bytes to disk first.
+    fn seekable_reader(
+        &self,
+        _addr: &Addr,
+        _hashin: &str,
+        _name: &str,
+    ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +124,9 @@ pub struct CacheArtifact {
     pub hashout: String,
     pub group: String,
     pub r#type: ManifestArtifactType,
+    /// Stored byte size from the manifest. Used by the engine auto-mode
+    /// router to size FUSE vs unpack-copy decisions cheaply.
+    pub size: u64,
 }
 
 impl hartifactcontent::Content for CacheArtifact {
@@ -137,6 +152,17 @@ impl hartifactcontent::Content for CacheArtifact {
 
     fn hashout(&self) -> anyhow::Result<String> {
         Ok(self.hashout.clone())
+    }
+
+    fn seekable_reader(
+        &self,
+    ) -> anyhow::Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        self.cache
+            .seekable_reader(&self.addr, &self.hashin, &self.name)
+    }
+
+    fn byte_size(&self) -> Option<u64> {
+        Some(self.size)
     }
 }
 
@@ -243,6 +269,7 @@ impl Engine {
                         content_type,
                         group: artifact.group.clone(),
                         r#type: artifact_type.clone(),
+                        size,
                     },
                     ManifestArtifact {
                         hashout: artifact.hashout.clone(),
@@ -375,6 +402,7 @@ impl Engine {
                         r#type: artifact.r#type,
                         hashout: artifact.hashout,
                         group: artifact.group,
+                        size: artifact.size,
                     });
                 }
 

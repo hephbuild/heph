@@ -26,5 +26,6 @@ pub mod proc_exec;
 pub mod process_supervisor;
 #[cfg(target_os = "macos")]
 pub mod process_watcher;
+pub mod sandboxfuse;
 pub mod tui;
 pub mod version;

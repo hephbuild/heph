@@ -1719,11 +1719,15 @@ impl ProviderInner {
                 "_golist".to_string(),
                 factors_to_args(factors),
             );
+            // Propagate golist errors instead of swallowing them: a missing or
+            // partial closure here turns into a broken link step downstream
+            // ("cannot find package errors (using -importcfg)") that's
+            // impossible to root-cause from the user's side.
             let sub_imports = self
                 .read_golist_package(Arc::clone(&executor), &golist_addr)
                 .await
                 .map(|pkg| pkg.imports.clone())
-                .unwrap_or_default();
+                .with_context(|| format!("read _golist for stdlib {}", import_path))?;
             return Ok((import_path.to_string(), Some(addr), sub_imports));
         }
 
@@ -1748,7 +1752,7 @@ impl ProviderInner {
             .read_golist_package(executor, &golist_addr)
             .await
             .map(|p| p.imports.clone())
-            .unwrap_or_default();
+            .with_context(|| format!("read _golist for {}", import_path))?;
 
         Ok((import_path.to_string(), Some(dep_addr), sub_imports))
     }

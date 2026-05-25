@@ -315,6 +315,7 @@ impl crate::engine::driver::Driver for Driver {
                         }),
                         hashout,
                     }],
+                    ..Default::default()
                 })
             }
 
@@ -383,7 +384,10 @@ impl crate::engine::driver::Driver for Driver {
                     });
                 }
 
-                Ok(RunResponse { artifacts })
+                Ok(RunResponse {
+                    artifacts,
+                    ..Default::default()
+                })
             }
         }
     }

@@ -197,6 +197,24 @@ pub fn register_child(pgid: i32) -> Option<TrackGuard> {
     Some(TrackGuard::new(tracker, pgid))
 }
 
+/// Tell the supervisor about a sandboxfuse root so it can force-umount on
+/// parent death. Best-effort: if the supervisor isn't running (reaper
+/// disabled, init never called), this is a no-op. The mount still has the
+/// in-process drop watchdog as a fallback.
+pub fn register_fuse_root(root: std::path::PathBuf) {
+    if reaper_disabled() {
+        return;
+    }
+    let tracker = tracker();
+    if let Err(e) = tracker.register_fuse_root(root.clone()) {
+        tracing::warn!(
+            root = ?root,
+            error = %format!("{e:#}"),
+            "fuse root not registered with process supervisor"
+        );
+    }
+}
+
 fn set_cloexec(fd: RawFd, on: bool) -> std::io::Result<()> {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,

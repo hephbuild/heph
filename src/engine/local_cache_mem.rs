@@ -1,4 +1,5 @@
 use crate::engine::local_cache::{LocalCache, SizedReader};
+use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use quick_cache::Weighter;
@@ -105,6 +106,26 @@ impl LocalCache for LocalCacheMem {
         self.cache.remove(&key);
         self.inner.delete(addr, hashin, name)
     }
+
+    fn seekable_reader(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        let key = Self::key(addr, hashin, name);
+        // Cache hit: serve a Cursor over the cached Arc<[u8]>. Read+Seek+Send.
+        if let Some(buf) = self.cache.get(&key) {
+            return Ok(Some(Box::new(io::Cursor::new(buf))));
+        }
+        // Miss: delegate. Inner cache (SQLite) returns a connection-bound
+        // blob; FS cache returns a File. We don't populate the mem cache
+        // here — FUSE reads are random-access and may target only a
+        // fraction of the artifact, so draining the whole blob would waste
+        // memory. The next `reader()` call will populate the cache for
+        // streaming consumers.
+        self.inner.seekable_reader(addr, hashin, name)
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +219,20 @@ mod tests {
             self.store.lock().remove(&key);
             Ok(())
         }
+
+        fn seekable_reader(
+            &self,
+            addr: &Addr,
+            hashin: &str,
+            name: &str,
+        ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+            let key = CountingCache::key(addr, hashin, name);
+            let g = self.store.lock();
+            match g.get(&key) {
+                None => Err(anyhow::anyhow!(NotFoundError)),
+                Some(v) => Ok(Some(Box::new(io::Cursor::new(v.clone())))),
+            }
+        }
     }
 
     fn make_addr() -> Addr {
@@ -253,6 +288,54 @@ mod tests {
 
         // Both reads fall through to inner — no caching.
         assert_eq!(inner.reader_calls.load(Ordering::Relaxed), 2);
+    }
+
+    // FUSE sandbox path needs random-access reads; LocalCacheMem must
+    // expose seekable_reader for both cache hits (Cursor over the cached
+    // Arc<[u8]>) and misses (passthrough to inner). Regression: if it
+    // defaults to None, the bridge can't mount and `fuse: on` errors with
+    // "no seekable reader" even when the underlying backend supports it.
+    #[test]
+    fn seekable_reader_serves_cache_hit() {
+        use std::io::{Read, Seek, SeekFrom};
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        let addr = make_addr();
+
+        write_blob(&dec, &addr, "k", b"0123456789");
+        // Prime the mem cache with a regular read.
+        let _ = drain(dec.reader(&addr, "h1", "k").expect("r1").reader);
+        let inner_before = inner.reader_calls.load(Ordering::Relaxed);
+
+        let mut sk = dec
+            .seekable_reader(&addr, "h1", "k")
+            .expect("ok")
+            .expect("some");
+        sk.seek(SeekFrom::Start(4)).expect("seek");
+        let mut buf = [0u8; 3];
+        sk.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"456");
+        // Hit: inner not consulted.
+        assert_eq!(inner.reader_calls.load(Ordering::Relaxed), inner_before);
+    }
+
+    #[test]
+    fn seekable_reader_delegates_on_miss() {
+        use std::io::{Read, Seek, SeekFrom};
+        let inner = Arc::new(CountingCache::default());
+        let dec = LocalCacheMem::new(inner.clone(), 1024, 64 * 1024);
+        let addr = make_addr();
+
+        write_blob(&dec, &addr, "k", b"abcdef");
+        // No prior reader() call — cache cold.
+        let mut sk = dec
+            .seekable_reader(&addr, "h1", "k")
+            .expect("ok")
+            .expect("some");
+        sk.seek(SeekFrom::Start(3)).expect("seek");
+        let mut buf = [0u8; 3];
+        sk.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf, b"def");
     }
 
     #[test]

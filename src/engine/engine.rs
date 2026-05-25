@@ -1,4 +1,4 @@
-use crate::engine::config_file::{Options, PluginEntry};
+use crate::engine::config_file::{FuseConfig, Options, PluginEntry};
 use crate::engine::driver::Driver as SDKDriver;
 use crate::engine::driver_managed::ManagedDriver as SDKManagedDriver;
 use crate::engine::local_cache::LocalCache;
@@ -7,10 +7,13 @@ use crate::engine::local_cache_sqlite::LocalCacheSQLite;
 use crate::engine::provider::Provider as SDKProvider;
 use crate::engine::request_state::RequestState;
 use crate::engine::{driver, provider};
+use crate::sandboxfuse;
+use anyhow::Context;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::Semaphore;
+use tracing::warn;
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Config {
@@ -19,6 +22,7 @@ pub struct Config {
     pub home_dir: PathBuf,
     pub parallelism: Option<usize>,
     pub mem_cache: MemCacheOptions,
+    pub fuse: FuseConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,186 @@ pub struct Engine {
     pub(crate) provider_factories: HashMap<String, ProviderFactory>,
     pub(crate) driver_factories: HashMap<String, DriverFactory>,
     pub(crate) managed_driver_factories: HashMap<String, ManagedDriverFactory>,
+
+    /// Process-wide FUSE sandbox state. Mount is eager — attempted in
+    /// `Engine::new` so the bridge gets a ready `LayeredFs` at
+    /// construction (or `None` when unsupported in Auto mode).
+    pub(crate) fuse: Arc<EngineFuse>,
+}
+
+/// Per-process FUSE sandbox state. Owns the `<home>/sandboxfuse<pid>/`
+/// hierarchy and eagerly mounts a single FUSE filesystem at `lower/` if
+/// support is present and config doesn't disable it. `upper/` is a real
+/// disk dir backing passthrough writes + copy-up bytes.
+pub struct EngineFuse {
+    pub(crate) root: PathBuf,
+    pub(crate) lower: PathBuf,
+    pub(crate) upper: PathBuf,
+    pub(crate) mount: Option<EngineMount>,
+}
+
+pub struct EngineMount {
+    pub(crate) _mount: sandboxfuse::Mount,
+    pub(crate) fs: Arc<sandboxfuse::LayeredFs>,
+}
+
+impl EngineFuse {
+    /// Construct + (when not disabled) mount eagerly. Errors only when
+    /// `cfg.enabled == Some(true)` and the mount cannot be brought up.
+    pub fn new(cfg: FuseConfig, home: &Path) -> anyhow::Result<Self> {
+        let pid = std::process::id();
+        let root = home.join(format!("sandboxfuse{pid}"));
+        let lower = root.join("lower");
+        let upper = root.join("upper");
+
+        if cfg.is_off() {
+            return Ok(Self {
+                root,
+                lower,
+                upper,
+                mount: None,
+            });
+        }
+
+        let support = sandboxfuse::support_check();
+        if !support.is_available() {
+            if cfg.is_on() {
+                anyhow::bail!("FUSE forced on but unsupported: {support:?}");
+            }
+            return Ok(Self {
+                root,
+                lower,
+                upper,
+                mount: None,
+            });
+        }
+
+        std::fs::create_dir_all(&lower)
+            .with_context(|| format!("create FUSE lower dir {:?}", lower))?;
+        std::fs::create_dir_all(&upper)
+            .with_context(|| format!("create FUSE upper dir {:?}", upper))?;
+        let fs = Arc::new(sandboxfuse::LayeredFs::new_empty(upper.clone()));
+        match sandboxfuse::Mount::mount(&lower, fs.clone()) {
+            Ok(m) => {
+                // Tell the supervisor about this mount so a crashed
+                // parent doesn't leak the FUSE mount into the next run.
+                // The supervisor will `umount -f <root>/lower` on EOF.
+                crate::process_supervisor::register_fuse_root(root.clone());
+                Ok(Self {
+                    root,
+                    lower,
+                    upper,
+                    mount: Some(EngineMount { _mount: m, fs }),
+                })
+            }
+            Err(e) => {
+                if cfg.is_on() {
+                    return Err(e).context("FUSE forced on but mount failed");
+                }
+                warn!(error = ?e, "FUSE mount failed; falling back to unpack-copy");
+                Ok(Self {
+                    root,
+                    lower,
+                    upper,
+                    mount: None,
+                })
+            }
+        }
+    }
+
+    /// Returns the shared `LayeredFs` when FUSE was successfully mounted.
+    pub fn layered_fs(&self) -> Option<Arc<sandboxfuse::LayeredFs>> {
+        self.mount.as_ref().map(|m| m.fs.clone())
+    }
+}
+
+impl Drop for EngineFuse {
+    fn drop(&mut self) {
+        // Drop the mount on a worker thread with a bounded wait. The
+        // FUSE unmount path can hang in the kernel (macFUSE umount
+        // blocks if any FD into the device is still open, and bugs in
+        // userspace teardown have wedged the process in `?E+` for
+        // minutes). The watchdog upgrades to a forced umount + leaks
+        // the worker thread so the process can still exit.
+        if let Some(mount) = self.mount.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("rheph-fuse-unmount".into())
+                .spawn(move || {
+                    drop(mount);
+                    _ = tx.send(());
+                })
+                .expect("spawn fuse unmount thread");
+            if rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+                warn!(
+                    lower = ?self.lower,
+                    "FUSE unmount exceeded 5s; issuing force umount and leaking session"
+                );
+                force_umount(&self.lower);
+            }
+        }
+        if self.root.exists() {
+            drop(std::fs::remove_dir_all(&self.root));
+        }
+    }
+}
+
+/// Force-unmount a FUSE mountpoint. Bounded, idempotent — safe to call
+/// against an already-unmounted path. Used by the EngineFuse drop
+/// watchdog and by stale-dir sweep on next startup.
+pub(crate) fn force_umount(path: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        drop(
+            std::process::Command::new("fusermount3")
+                .arg("-uz")
+                .arg(path)
+                .output(),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        drop(
+            std::process::Command::new("umount")
+                .arg("-f")
+                .arg(path)
+                .output(),
+        );
+    }
+}
+
+/// Walk `<home>/` for `sandboxfuse<pid>` directories whose pid is no
+/// longer alive (via `kill(pid, 0)` returning ESRCH). For each: best-
+/// effort umount of `<dir>/lower` (idempotent — works whether stale or
+/// not), then `remove_dir_all(<dir>)`. Silent on any error.
+fn sweep_stale_sandboxfuse_dirs(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(home) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid_str) = name.strip_prefix("sandboxfuse") else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+            continue;
+        };
+        // SAFETY: kill(pid, 0) is a probe-only syscall; sig=0 doesn't deliver.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if alive {
+            continue;
+        }
+        let dir = entry.path();
+        let lower = dir.join("lower");
+        // Best-effort force umount. The previous process crashed; any
+        // mount it left is unowned and may have dangling kernel state.
+        // Plain `umount` blocks indefinitely on macFUSE if the kext
+        // still has refs (which is exactly why we're sweeping), so
+        // force is required to make sweep idempotent + bounded.
+        force_umount(&lower);
+        drop(std::fs::remove_dir_all(&dir));
+    }
 }
 
 pub struct Provider {
@@ -101,6 +285,11 @@ impl Engine {
             ))
         };
 
+        // Best-effort sweep of stale `sandboxfuse<pid>` dirs from crashed runs.
+        sweep_stale_sandboxfuse_dirs(&home);
+
+        let fuse = Arc::new(EngineFuse::new(cfg.fuse, &home)?);
+
         let mut engine = Engine {
             cfg: cfg.clone(),
             home: home.clone(),
@@ -114,6 +303,7 @@ impl Engine {
             provider_factories: HashMap::new(),
             driver_factories: HashMap::new(),
             managed_driver_factories: HashMap::new(),
+            fuse,
         };
         engine.register_driver(Box::new(crate::plugingroup::Driver))?;
         engine.register_provider(|_| Box::new(crate::pluginquery::Provider))?;

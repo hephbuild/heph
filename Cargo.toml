@@ -131,6 +131,13 @@ erased-serde = "0.4"
 crossbeam-channel = "0.5"
 quick_cache = "0.6"
 
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.17", optional = true, features = ["libfuse"] }
+
+[features]
+default = ["fuse-sandbox"]
+fuse-sandbox = ["dep:fuser"]
+
 [dev-dependencies]
 serde-jsonlines = "0.7.0"
 tempfile = "3"

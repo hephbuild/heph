@@ -474,7 +474,7 @@ impl Engine {
                 key,
                 enclose!((self => engine, rs) move || async move {
                     crate::hmemoizer::set_phase("execute_cache:engine_execute");
-                    let (artifacts, sandbox_dir) = engine
+                    let (artifacts, sandbox_cleanup, fuse_slot_guards) = engine
                         .clone()
                         .execute(rs.clone(), &addr, &spec, &def, &hashin, interactive, shell)
                         .await
@@ -490,8 +490,18 @@ impl Engine {
                         .collect::<anyhow::Result<Vec<_>>>()
                         .with_context(|| format!("read artifact metas for {addr}"))?;
 
+                    // SlotGuards drop here too — moved into the defer so
+                    // they live across cache_locally (which reads from
+                    // the FUSE-side sandbox) and only deregister after
+                    // cleanup is enqueued. The cleanup closure is owned
+                    // by the bridge that built the sandbox; it knows
+                    // whether to rm the plain dir or the FUSE upper.
+                    let cleanup_label = format!("{addr}");
                     defer! {
-                        crate::engine::sandbox_cleaner::enqueue(sandbox_dir.clone());
+                        drop(fuse_slot_guards);
+                        if let Some(job) = sandbox_cleanup {
+                            crate::engine::sandbox_cleaner::enqueue(cleanup_label, job);
+                        }
                     }
 
                     crate::hmemoizer::set_phase("execute_cache:cache_locally");

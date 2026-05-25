@@ -648,8 +648,22 @@ pub struct RunRequest<'a, 'io> {
     pub stderr: Option<&'io mut (dyn tokio::io::AsyncWrite + Send + Sync + Unpin)>,
     pub sandbox_dir: std::path::PathBuf,
 }
+#[derive(Default)]
 pub struct RunResponse {
     pub artifacts: Vec<outputartifact::OutputArtifact>,
+    /// Cleanup closure owned by the layer that built the sandbox. The
+    /// FUSE bridge rms its upper-side dir directly (bypassing the live
+    /// mount, which has an orphan-on-upper bug for `unlink` of dirs);
+    /// the OS bridge rms the plain sandbox dir. Result.rs hands this
+    /// to `sandbox_cleaner::enqueue` after `cache_locally` finishes,
+    /// so the cleaner thread never has to branch on FUSE vs OS.
+    pub sandbox_cleanup: Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
+    /// FUSE slot guards held open until the result lifecycle ends
+    /// (alongside the cleanup `defer!` in result.rs). Dropping a guard
+    /// deregisters the slot from the shared `LayeredFs`. Result.rs
+    /// holds them across `cache_locally` and drops in the same defer
+    /// that enqueues the sandbox-dir cleanup.
+    pub fuse_slot_guards: Vec<crate::sandboxfuse::SlotGuard>,
 }
 
 #[async_trait]

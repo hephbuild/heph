@@ -1,4 +1,5 @@
 use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
+use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -73,6 +74,22 @@ impl LocalCache for LocalCacheFS {
         }
         Ok(())
     }
+
+    fn seekable_reader(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        let path = self.get_path(addr, hashin, name);
+        match fs::File::open(&path) {
+            Ok(f) => Ok(Some(Box::new(f))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(anyhow::anyhow!(NotFoundError)),
+            Err(e) => {
+                Err(e).with_context(|| format!("open seekable reader for cache path: {:?}", path))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +134,31 @@ mod tests {
         cache.delete(&addr, hashin, name)?;
         assert!(!cache.exists(&addr, hashin, name)?);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_seekable_reader_fs() -> Result<()> {
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        let dir = tempdir()?;
+        let cache = LocalCacheFS::new(PathBuf::from(dir.path()))?;
+        let addr = crate::htaddr::Addr::new(
+            crate::htpkg::PkgBuf::from("p"),
+            "t".to_string(),
+            Default::default(),
+        );
+        let mut w = cache.writer(&addr, "h", "blob")?;
+        w.write_all(b"0123456789abcdef")?;
+        drop(w);
+
+        let mut r = cache
+            .seekable_reader(&addr, "h", "blob")?
+            .expect("fs cache must support seekable_reader");
+        r.seek(SeekFrom::Start(4))?;
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf)?;
+        assert_eq!(&buf, b"4567");
         Ok(())
     }
 }

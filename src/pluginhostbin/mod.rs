@@ -185,6 +185,7 @@ impl crate::engine::driver::Driver for Driver {
                 }),
                 hashout,
             }],
+            ..Default::default()
         })
     }
 

@@ -11,7 +11,6 @@ use anyhow::Context;
 use async_recursion::async_recursion;
 use enclose::enclose;
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 impl Engine {
@@ -29,7 +28,11 @@ impl Engine {
         hashin: &str,
         exec_wrapper: Option<InteractiveWrapper>,
         shell: bool,
-    ) -> anyhow::Result<(Vec<OutputArtifact>, PathBuf)> {
+    ) -> anyhow::Result<(
+        Vec<OutputArtifact>,
+        Option<crate::engine::sandbox_cleaner::SandboxCleanupJob>,
+        Vec<crate::sandboxfuse::SlotGuard>,
+    )> {
         let driver = self
             .drivers_by_name
             .get(&spec.driver)
@@ -63,6 +66,10 @@ impl Engine {
                 dir.join(format!("__target_{}_{}", addr.name, addr.hash_str()))
             }
         };
+        // Stale cleanup only — the driver bridge owns the create step
+        // because it may redirect this path into a FUSE mount (v2 single-
+        // mount mode). Creating here would waste an inode + leave an
+        // orphan empty dir when the bridge picks the FUSE side.
         crate::hmemoizer::set_phase("execute:sandbox_remove");
         sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
             match std::fs::remove_dir_all(&sandbox_dir) {
@@ -73,12 +80,6 @@ impl Engine {
         }))
         .await
         .with_context(|| format!("remove stale sandbox dir {}", sandbox_dir.display()))?;
-        crate::hmemoizer::set_phase("execute:sandbox_create");
-        sync_fs_op_on_thread(enclose!((sandbox_dir) move || {
-            std::fs::create_dir_all(&sandbox_dir)
-        }))
-        .await
-        .with_context(|| format!("create sandbox dir {}", sandbox_dir.display()))?;
 
         if def.target.cache {
             tracing::info!(driver = %driver.name, %addr, "run");
@@ -128,7 +129,12 @@ impl Engine {
             .await
             .map_err(|_recv_err| anyhow::anyhow!("wrapper never invoked inner"))?;
 
-        Ok((res.artifacts, sandbox_dir))
+        // Bridge owns the cleanup closure (knows whether the sandbox
+        // lives in the plain `<home>/sandbox/...` tree or under the
+        // FUSE upper-side dir). Slot guards travel with the response
+        // so result.rs can drop them in the same defer that fires
+        // sandbox cleanup.
+        Ok((res.artifacts, res.sandbox_cleanup, res.fuse_slot_guards))
     }
 
     async fn inputs_result_exec(

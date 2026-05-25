@@ -1,4 +1,5 @@
 use crate::engine::local_cache::{LocalCache, NotFoundError, SizedReader};
+use crate::hartifactcontent;
 use crate::htaddr::Addr;
 use anyhow::{Context, Result};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -482,6 +483,90 @@ impl LocalCache for LocalCacheSQLite {
         slot.wait();
         Ok(())
     }
+
+    fn seekable_reader(
+        &self,
+        addr: &Addr,
+        hashin: &str,
+        name: &str,
+    ) -> Result<Option<Box<dyn hartifactcontent::ReadSeek + Send>>> {
+        let key = (Self::key(addr), hashin.to_string(), name.to_string());
+        self.pending.wait_if_pending(&key);
+
+        let conn = self
+            .read_pool
+            .get()
+            .context("acquiring read connection from pool")?;
+
+        let row_id: i64 = match conn.query_row(
+            "SELECT rowid FROM artifacts WHERE addr=?1 AND hashin=?2 AND name=?3",
+            rusqlite::params![key.0, key.1, key.2],
+            |row| row.get(0),
+        ) {
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(anyhow::anyhow!(NotFoundError));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("looking up {name} hashin={hashin} for seekable read")
+                });
+            }
+            Ok(v) => v,
+        };
+
+        Ok(Some(Box::new(OwnedBlob::new(conn, row_id)?)))
+    }
+}
+
+/// Owns both a pooled sqlite connection and a `Blob` opened against it.
+///
+/// `rusqlite::blob::Blob<'conn>` borrows its connection; lifetime extension
+/// to `'static` is sound because the blob is dropped before `_conn` (Rust
+/// drops struct fields in declaration order).
+struct OwnedBlob {
+    blob: rusqlite::blob::Blob<'static>,
+    _conn: r2d2::PooledConnection<SqliteConnectionManager>,
+}
+
+// SAFETY: rusqlite::Connection is Send. The blob holds a raw sqlite3
+// statement pointer whose ownership transfers with the connection. Both
+// fields are Send-compatible; the borrow we extended to 'static is local
+// to this struct and never observed externally.
+unsafe impl Send for OwnedBlob {}
+
+impl OwnedBlob {
+    fn new(conn: r2d2::PooledConnection<SqliteConnectionManager>, row_id: i64) -> Result<Self> {
+        let conn_ref: &Connection = &conn;
+        let blob = conn_ref
+            .blob_open(
+                rusqlite::DatabaseName::Main,
+                "artifacts",
+                "data",
+                row_id,
+                true,
+            )
+            .context("opening seekable sqlite blob")?;
+        // SAFETY: `blob` borrows from `conn` which is owned alongside it in
+        // the returned struct; struct field drop order (blob before _conn)
+        // guarantees the borrow outlives no longer than the connection.
+        let blob_static: rusqlite::blob::Blob<'static> = unsafe { std::mem::transmute(blob) };
+        Ok(Self {
+            blob: blob_static,
+            _conn: conn,
+        })
+    }
+}
+
+impl io::Read for OwnedBlob {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.blob.read(buf)
+    }
+}
+
+impl io::Seek for OwnedBlob {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.blob.seek(pos)
+    }
 }
 
 struct SqliteCacheWriter {
@@ -581,6 +666,45 @@ mod tests {
         assert!(!cache.exists(&addr, hashin, name)?);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_seekable_reader_pread_in_middle() -> Result<()> {
+        use io::{Read, Seek, SeekFrom};
+        let dir = tempdir()?;
+        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?;
+
+        let addr = make_addr("pkg", "t");
+        let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
+        let mut w = cache.writer(&addr, "h", "blob")?;
+        w.write_all(&payload)?;
+        drop(w);
+
+        let mut r = cache
+            .seekable_reader(&addr, "h", "blob")?
+            .expect("sqlite must support seekable_reader");
+        r.seek(SeekFrom::Start(100))?;
+        let mut buf = vec![0u8; 50];
+        r.read_exact(&mut buf)?;
+        assert_eq!(buf, payload[100..150]);
+
+        r.seek(SeekFrom::Start(0))?;
+        let mut head = vec![0u8; 4];
+        r.read_exact(&mut head)?;
+        assert_eq!(head, payload[..4]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_seekable_reader_missing_returns_not_found() {
+        let dir = tempdir().expect("tempdir");
+        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024).expect("cache");
+        let addr = make_addr("pkg", "t");
+        let err = match cache.seekable_reader(&addr, "missing", "blob") {
+            Ok(_) => panic!("must error"),
+            Err(e) => e,
+        };
+        assert!(err.is::<NotFoundError>(), "{err:#}");
     }
 
     #[test]

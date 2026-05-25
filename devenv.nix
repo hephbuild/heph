@@ -17,8 +17,17 @@ in
     pkgs.zig
     pkgs.cargo-zigbuild
     pkgs.tokio-console
+    # pkg-config + libfuse for the `fuse-sandbox` feature.
+    # - Linux: `fuse3` ships headers/pc files fuser links against.
+    # - macOS: `macfuse-stubs` provides the build-time `osxfuse.pc` per
+    #   fuser's README (https://github.com/cberner/fuser). The kext
+    #   itself still needs the macFUSE installer at runtime.
+    pkgs.pkg-config
   ] ++ lib.optionals pkgs.stdenv.isDarwin [
     pkgs.samply
+    pkgs.macfuse-stubs
+  ] ++ lib.optionals pkgs.stdenv.isLinux [
+    pkgs.fuse3
   ];
 
   # https://devenv.sh/languages/

@@ -2,9 +2,10 @@
     clippy::module_inception,
     reason = "module and struct share name by design"
 )]
-mod engine;
+pub mod engine;
 pub use engine::Config;
 pub use engine::Engine;
+pub use engine::EngineFuse;
 pub use engine::MemCacheOptions;
 pub mod config_file;
 mod cwd;
@@ -33,10 +34,12 @@ pub use result::ResultOptions;
 pub use result::{InteractiveInner, InteractiveWrapper};
 pub use spec::EngineTargetSpec;
 pub mod driver_managed;
+pub mod driver_managed_fuse;
+pub mod driver_managed_os;
 mod execute;
 mod expand;
 pub mod fanout;
 mod link;
 mod matcher_spec;
 mod meta;
-mod sandbox_cleaner;
+pub mod sandbox_cleaner;

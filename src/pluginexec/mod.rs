@@ -1961,10 +1961,7 @@ mod tests {
         let sandbox = tmp.path().join("sandbox");
         std::fs::create_dir_all(&sandbox)?;
 
-        let bridge = ManagedDriverBridge {
-            home: tmp.path().to_path_buf(),
-            driver: Box::new(Driver::new_bash()),
-        };
+        let bridge = ManagedDriverBridge::new_os_for_test(Box::new(Driver::new_bash()));
 
         let request_id = "test".to_string();
         let req = RunRequest {
