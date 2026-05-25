@@ -1,3 +1,4 @@
+mod filterenv;
 mod pty;
 mod spec;
 
@@ -889,11 +890,19 @@ impl Driver {
             (run[0].clone(), run[1..].to_vec())
         };
 
-        let env_pairs: Vec<(OsString, OsString)> = env
+        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
+
+        // execve caps total argv+envp at ARG_MAX and each entry at MAX_ARG_STRLEN.
+        // Drop overlong entries and evict longest until under the limit.
+        let env_vec: Vec<(String, String)> = env.into_iter().collect();
+        let mut argv_for_filter: Vec<OsString> = Vec::with_capacity(1 + args_os.len());
+        argv_for_filter.push(OsString::from(&program));
+        argv_for_filter.extend(args_os.iter().cloned());
+        let env_vec = filterenv::filter_long_env(env_vec, &argv_for_filter);
+        let env_pairs: Vec<(OsString, OsString)> = env_vec
             .into_iter()
             .map(|(k, v)| (OsString::from(k), OsString::from(v)))
             .collect();
-        let args_os: Vec<OsString> = args.iter().map(OsString::from).collect();
 
         let spec = if let Some((master, slave)) = &pty_pair {
             // Inherit the parent's terminal size so bash can wrap and place the
