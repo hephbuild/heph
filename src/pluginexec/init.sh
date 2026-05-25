@@ -13,19 +13,14 @@ echo "=========== Help ==========="
 echo 'Shell mode, to exit; run exit or ctrl-d'
 
 {{@if cmds exists}}
-traceoff() {
-  { set +x; } 2>/dev/null
-}
-
-run() {
-	{{cmds}}
-}
-xrun() {
-  trap traceoff ERR
-  set -x
+run() (
+  set -euo pipefail
   {{cmds}}
-  traceoff
-}
+)
+xrun() (
+  set -euxo pipefail
+  {{cmds}}
+)
 show() {
   cat << 'HEPH_EOF'
 {{cmds}}
