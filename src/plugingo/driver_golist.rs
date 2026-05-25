@@ -136,6 +136,8 @@ impl ManagedDriver for GoGolistDriver {
                     mode: InputMode::Standard,
                     origin_id: format!("dep|{group}|{i}"),
                     annotations: std::collections::BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
                 });
             }
         }
@@ -150,6 +152,8 @@ impl ManagedDriver for GoGolistDriver {
                 "unpack_root".to_string(),
                 "tools".to_string(),
             )]),
+            hashed: true,
+            runtime: true,
         };
 
         let def = GoGolistDef {

@@ -272,6 +272,8 @@ impl ManagedDriver for Driver {
                 "unpack_root".to_string(),
                 "tools".to_string(),
             )]),
+            hashed: true,
+            runtime: true,
         };
 
         // One Output group per program (group name = program name). Each output

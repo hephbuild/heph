@@ -131,6 +131,13 @@ impl EProvider for Provider {
 
 // ─── Driver ──────────────────────────────────────────────────────────────────
 
+const BUILT_IN_GLOB_EXCLUDES: &[&str] = &["**/.git/**", "**/.heph3/**", "**/.heph/**"];
+
+struct CompiledGlob {
+    glob: wax::Glob<'static>,
+    not: wax::Any<'static>,
+}
+
 #[derive(serde::Serialize)]
 enum FsDef {
     File {
@@ -139,7 +146,30 @@ enum FsDef {
     Glob {
         pattern: String,
         exclude: Vec<String>,
+        #[serde(skip)]
+        compiled: Arc<CompiledGlob>,
     },
+}
+
+fn compile_glob(pattern: &str, exclude: &[String]) -> anyhow::Result<CompiledGlob> {
+    let glob = wax::Glob::new(pattern)
+        .map(wax::Glob::into_owned)
+        .with_context(|| format!("invalid glob pattern '{pattern}'"))?;
+
+    let exclude_globs: Vec<wax::Glob<'static>> = BUILT_IN_GLOB_EXCLUDES
+        .iter()
+        .copied()
+        .chain(exclude.iter().map(String::as_str))
+        .map(|s| {
+            wax::Glob::new(s)
+                .map(wax::Glob::into_owned)
+                .with_context(|| format!("invalid exclude pattern '{s}'"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let not = wax::any(exclude_globs).context("compiling exclude patterns")?;
+
+    Ok(CompiledGlob { glob, not })
 }
 
 pub struct Driver;
@@ -228,9 +258,11 @@ impl crate::engine::driver::Driver for Driver {
                 }
                 let hash = format!("{:x}", h.digest()).into_bytes();
 
+                let compiled = Arc::new(compile_glob(&pattern, &exclude)?);
                 let def = FsDef::Glob {
                     pattern: pattern.clone(),
                     exclude,
+                    compiled,
                 };
                 let outputs = vec![Output {
                     group: "".to_string(),
@@ -319,34 +351,37 @@ impl crate::engine::driver::Driver for Driver {
                 })
             }
 
-            FsDef::Glob { pattern, exclude } => {
-                let built_in_excludes = [".git/**/*", ".heph3/**/*", ".heph/**/*"];
+            FsDef::Glob { compiled, .. } => {
+                use wax::walk::{Entry as _, FileIterator as _};
 
-                let exclude_patterns = built_in_excludes
-                    .iter()
-                    .map(|s| s.to_string())
-                    .chain(exclude.iter().cloned())
-                    .map(|s| {
-                        glob::Pattern::new(&s)
-                            .with_context(|| format!("invalid exclude pattern: {}", s))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-
-                let abs_pattern = root.join(pattern);
-                let abs_pattern_str = abs_pattern
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("glob pattern path is not valid UTF-8"))?;
+                let walker = compiled
+                    .glob
+                    .walk(root.clone())
+                    .not(compiled.not.clone())
+                    .context("applying exclude filter")?;
 
                 let mut artifacts = vec![];
 
-                for entry in glob::glob(abs_pattern_str).with_context(|| "expand glob pattern")? {
-                    let entry_path = entry.with_context(|| "error reading glob entry")?;
+                for entry in walker {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            // Treat missing paths as empty matches rather than errors.
+                            let io_err: std::io::Error = e.into();
+                            if io_err.kind() == std::io::ErrorKind::NotFound {
+                                continue;
+                            }
+                            return Err(anyhow::Error::from(io_err))
+                                .context("walking glob entries");
+                        }
+                    };
 
-                    if entry_path.is_dir() {
+                    if entry.file_type().is_dir() {
                         continue;
                     }
 
-                    let rel = entry_path
+                    let abs_path = entry.path();
+                    let rel = abs_path
                         .strip_prefix(root)
                         .with_context(|| "strip root prefix from glob entry")?;
 
@@ -354,17 +389,14 @@ impl crate::engine::driver::Driver for Driver {
                         anyhow::anyhow!("glob entry path is not valid UTF-8: {}", rel.display())
                     })?;
 
-                    if exclude_patterns.iter().any(|p| p.matches_path(rel)) {
-                        continue;
-                    }
-
-                    let meta = std::fs::metadata(&entry_path)
-                        .with_context(|| format!("stat glob entry '{}'", entry_path.display()))?;
+                    let meta = entry
+                        .metadata()
+                        .with_context(|| format!("stat glob entry '{}'", abs_path.display()))?;
 
                     let x = is_exec(&meta);
                     let hashout = file_hashout(&meta);
 
-                    let source_path = entry_path
+                    let source_path = abs_path
                         .to_str()
                         .ok_or_else(|| anyhow::anyhow!("glob entry path is not valid UTF-8"))?
                         .to_string();
@@ -544,6 +576,46 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("requires 'f' (file path) or 'p'"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_parse_invalid_glob_fails() {
+        let driver = Driver;
+        // Unmatched alternation — wax rejects at parse time.
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("ogen.{yml,yaml".to_string()),
+        )]);
+        let result = driver.parse(make_parse_req(config), &ctoken()).await;
+        let Err(err) = result else {
+            panic!("expected parse error")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid glob pattern"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_parse_invalid_exclude_fails() {
+        let driver = Driver;
+        let config = std::collections::HashMap::from([
+            ("p".to_string(), TargetSpecValue::String("*.rs".to_string())),
+            (
+                "e".to_string(),
+                TargetSpecValue::String("good/**,bad.{yml".to_string()),
+            ),
+        ]);
+        let result = driver.parse(make_parse_req(config), &ctoken()).await;
+        let Err(err) = result else {
+            panic!("expected parse error")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid exclude pattern"),
             "unexpected error: {msg}"
         );
     }
@@ -877,6 +949,120 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.target_spec.driver, DRIVER_NAME);
+    }
+
+    #[test]
+    fn test_glob_addr_brace_pattern_roundtrips() {
+        let pattern = "dir/ogen.{yml,yaml}";
+        let input = format!("//{PKG}:glob@p=\"{pattern}\"");
+
+        let parsed = parse_addr(&input).unwrap();
+        assert_eq!(parsed.package.as_str(), PKG);
+        assert_eq!(parsed.name, "glob");
+        assert_eq!(parsed.args.get("p").map(String::as_str), Some(pattern));
+
+        // Pattern contains ',' → format must quote.
+        let formatted = parsed.format();
+        assert_eq!(formatted, input);
+
+        // Roundtrip again to confirm format output is itself parseable.
+        let reparsed = parse_addr(&formatted).unwrap();
+        assert_eq!(reparsed, parsed);
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_missing_path_is_empty() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+
+        let pattern = "does/not/exist/*.rs";
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String(pattern.to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+        assert!(res.artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_missing_root_is_empty() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let missing_root = tmp.path().join("nonexistent");
+
+        let pattern = "*.rs";
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String(pattern.to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(&parse_res.target_def, &request_id, missing_root, &hashin);
+        let res = driver.run(req, &ctoken()).await.unwrap();
+        assert!(res.artifacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_brace_pattern() {
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let sub = tmp.path().join("dir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("ogen.yml"), b"").unwrap();
+        fs::write(sub.join("ogen.yaml"), b"").unwrap();
+        fs::write(sub.join("other.txt"), b"").unwrap();
+
+        let pattern = "dir/ogen.{yml,yaml}";
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String(pattern.to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let mut out_paths: Vec<String> = res
+            .artifacts
+            .iter()
+            .map(|a| match &a.content {
+                Content::File(f) => f.out_path.clone(),
+                _ => panic!("expected File"),
+            })
+            .collect();
+        out_paths.sort();
+        assert_eq!(
+            out_paths,
+            vec!["dir/ogen.yaml".to_string(), "dir/ogen.yml".to_string(),]
+        );
     }
 
     #[tokio::test]

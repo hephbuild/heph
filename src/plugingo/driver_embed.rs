@@ -111,6 +111,8 @@ impl ManagedDriver for GoEmbedDriver {
                 mode: InputMode::Standard,
                 origin_id: format!("dep|golist|{i}"),
                 annotations: std::collections::BTreeMap::new(),
+                hashed: true,
+                runtime: true,
             });
         }
 
@@ -125,6 +127,8 @@ impl ManagedDriver for GoEmbedDriver {
                     mode: InputMode::Standard,
                     origin_id: format!("dep|files|{i}"),
                     annotations: std::collections::BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
                 });
             }
         }

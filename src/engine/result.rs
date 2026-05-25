@@ -682,38 +682,44 @@ impl Engine {
         rs: Arc<RequestState>,
         inputs: &[Input],
     ) -> anyhow::Result<Sandbox> {
-        let futures = inputs.iter().enumerate().map(|(i, input)| {
-            let input_ref = input.r#ref.clone();
-            enclose!((self => engine, rs) async move {
-                let spec = Arc::clone(&engine)
-                    .get_spec(rs.clone(), &input_ref.r#ref)
-                    .await
-                    .with_context(|| format!("get spec: {}", input_ref))?;
-
-                // For transparent targets (groups), use the pre-computed applied_transitive
-                // which already recursively aggregates all nested deps' transitives.
-                // For all other targets, use spec.transitive directly.
-                // Important: avoid calling get_def on non-transparent targets here — get_def
-                // calls collect_transitive_deps which would re-enter the mem_def memoizer
-                // and deadlock on cyclic dep graphs.
-                let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
-                    let dep_def = Arc::clone(&engine)
-                        .get_def(rs.clone(), &input_ref.r#ref)
+        // Hash-only inputs (`hash_deps`) don't participate in the runtime
+        // sandbox, so their transitive sandbox state must not leak in either.
+        let futures = inputs
+            .iter()
+            .filter(|i| i.runtime)
+            .enumerate()
+            .map(|(i, input)| {
+                let input_ref = input.r#ref.clone();
+                enclose!((self => engine, rs) async move {
+                    let spec = Arc::clone(&engine)
+                        .get_spec(rs.clone(), &input_ref.r#ref)
                         .await
-                        .with_context(|| format!("get def for group: {:?}", input_ref))?;
-                    dep_def.applied_transitive.clone()
-                } else {
-                    Some(spec.transitive.clone())
-                };
+                        .with_context(|| format!("get spec: {}", input_ref))?;
 
-                if let Some(transitive) = transitive {
-                    let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
-                    anyhow::Ok(Some((id, transitive)))
-                } else {
-                    anyhow::Ok(None)
-                }
-            })
-        });
+                    // For transparent targets (groups), use the pre-computed applied_transitive
+                    // which already recursively aggregates all nested deps' transitives.
+                    // For all other targets, use spec.transitive directly.
+                    // Important: avoid calling get_def on non-transparent targets here — get_def
+                    // calls collect_transitive_deps which would re-enter the mem_def memoizer
+                    // and deadlock on cyclic dep graphs.
+                    let transitive = if spec.driver == crate::plugingroup::DRIVER_NAME {
+                        let dep_def = Arc::clone(&engine)
+                            .get_def(rs.clone(), &input_ref.r#ref)
+                            .await
+                            .with_context(|| format!("get def for group: {:?}", input_ref))?;
+                        dep_def.applied_transitive.clone()
+                    } else {
+                        Some(spec.transitive.clone())
+                    };
+
+                    if let Some(transitive) = transitive {
+                        let id = format!("_transitive_{}_{}", spec.addr.hash_str(), i);
+                        anyhow::Ok(Some((id, transitive)))
+                    } else {
+                        anyhow::Ok(None)
+                    }
+                })
+            });
 
         let results = crate::engine::fanout::join_all_failable(futures, rs.fail_fast()).await?;
 

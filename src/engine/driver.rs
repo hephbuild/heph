@@ -461,6 +461,33 @@ pub mod targetdef {
         pub mode: InputMode,
         pub origin_id: String,
         pub annotations: std::collections::BTreeMap<String, String>,
+        /// Contributes its hashout to the parent's hashin. Default true.
+        /// Set false for inputs that materialize at runtime but must not
+        /// alter the parent's cache key (e.g. `runtime_deps`).
+        pub hashed: bool,
+        /// Materialized into the sandbox and surfaced through link routing
+        /// (SRC_*/LIST_*/tools/etc). Default true. Set false for inputs that
+        /// only contribute their hashout to the parent (e.g. `hash_deps`).
+        pub runtime: bool,
+    }
+
+    impl Input {
+        /// Default flags: contributes to both hash and runtime.
+        pub fn standard(
+            r#ref: TargetAddr,
+            mode: InputMode,
+            origin_id: String,
+            annotations: std::collections::BTreeMap<String, String>,
+        ) -> Self {
+            Self {
+                r#ref,
+                mode,
+                origin_id,
+                annotations,
+                hashed: true,
+                runtime: true,
+            }
+        }
     }
 
     #[derive(Clone, Hash, PartialEq, Serialize)]

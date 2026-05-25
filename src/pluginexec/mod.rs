@@ -38,7 +38,15 @@ pub struct Driver {
 #[derive(Clone, serde::Serialize)]
 struct TargetDef {
     pub run: Vec<String>,
+    /// Deps wired into SRC_*/LIST_* at runtime AND folded into the def hash
+    /// (their structure invalidates cache when group membership changes).
+    /// Built from `deps` and from transitive Deps with `hash=true, runtime=true`.
     pub dep_group_inputs: BTreeMap<String, Vec<Input>>,
+    /// Deps wired into SRC_*/LIST_* at runtime but intentionally excluded
+    /// from the def hash. Built from `runtime_deps` and from transitive
+    /// Deps with `hash=false, runtime=true`. Changing their addresses must
+    /// not invalidate the cache — that's the whole point of `runtime_deps`.
+    pub runtime_dep_group_inputs: BTreeMap<String, Vec<Input>>,
     pub tool_group_inputs: BTreeMap<String, Vec<Input>>,
     pub env: BTreeMap<String, String>,
     pub pass_env: BTreeMap<String, String>,
@@ -50,6 +58,8 @@ impl Hash for TargetDef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.run.hash(state);
         self.dep_group_inputs.hash(state);
+        // runtime_dep_group_inputs intentionally excluded — runtime_deps
+        // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
@@ -315,30 +325,49 @@ impl engine::driver_managed::ManagedDriver for Driver {
         let spec = spec::TargetSpec::from(req.target_spec.config.clone())?;
 
         let pkg = req.target_spec.addr.package.clone();
-        let dep_inputs = spec
-            .deps
-            .into_iter()
-            .flat_map(|(k, v)| {
-                let pkg = pkg.clone();
-                v.into_iter()
-                    .enumerate()
-                    .map(move |(i, v)| -> anyhow::Result<(String, Input)> {
-                        Ok((
-                            k.parse()?,
-                            Input {
-                                r#ref: TargetAddr::parse(&v, &pkg)?,
-                                mode: InputMode::Standard,
-                                origin_id: format!("dep|{}|{}", k, i),
-                                annotations: BTreeMap::new(),
-                            },
-                        ))
-                    })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let build_dep_inputs = |deps: HashMap<String, Vec<String>>,
+                                origin_prefix: &'static str,
+                                hashed: bool,
+                                runtime: bool|
+         -> anyhow::Result<Vec<(String, Input)>> {
+            deps.into_iter()
+                .flat_map(|(k, v)| {
+                    let pkg = pkg.clone();
+                    v.into_iter().enumerate().map(
+                        move |(i, v)| -> anyhow::Result<(String, Input)> {
+                            Ok((
+                                k.parse()?,
+                                Input {
+                                    r#ref: TargetAddr::parse(&v, &pkg)?,
+                                    mode: InputMode::Standard,
+                                    origin_id: format!("{}|{}|{}", origin_prefix, k, i),
+                                    annotations: BTreeMap::new(),
+                                    hashed,
+                                    runtime,
+                                },
+                            ))
+                        },
+                    )
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+        };
+
+        let dep_inputs = build_dep_inputs(spec.deps, "dep", true, true)?;
+        let hash_dep_inputs = build_dep_inputs(spec.hash_deps, "hash_dep", true, false)?;
+        let runtime_dep_inputs = build_dep_inputs(spec.runtime_deps, "runtime_dep", false, true)?;
 
         let mut dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
         for (group, input) in &dep_inputs {
             dep_group_inputs
+                .entry(group.clone())
+                .or_default()
+                .push(input.clone());
+        }
+
+        let mut runtime_dep_group_inputs: BTreeMap<String, Vec<Input>> = BTreeMap::new();
+        for (group, input) in &runtime_dep_inputs {
+            runtime_dep_group_inputs
                 .entry(group.clone())
                 .or_default()
                 .push(input.clone());
@@ -362,6 +391,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                                     "unpack_root".to_string(),
                                     "tools".to_string(),
                                 )]),
+                                hashed: true,
+                                runtime: true,
                             },
                         ))
                     })
@@ -385,6 +416,7 @@ impl engine::driver_managed::ManagedDriver for Driver {
         let def = TargetDef {
             run: spec.run,
             dep_group_inputs,
+            runtime_dep_group_inputs,
             tool_group_inputs,
             env: spec.env.into_iter().collect(),
             pass_env,
@@ -410,6 +442,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 inputs: dep_inputs
                     .into_iter()
                     .map(|(_, v)| v)
+                    .chain(hash_dep_inputs.into_iter().map(|(_, v)| v))
+                    .chain(runtime_dep_inputs.into_iter().map(|(_, v)| v))
                     .chain(tool_inputs.into_iter().map(|(_, v)| v))
                     .collect(),
                 outputs: spec
@@ -450,6 +484,8 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 mode: InputMode::Tool,
                 origin_id: tool.id.clone(),
                 annotations: BTreeMap::from([("unpack_root".to_string(), "tools".to_string())]),
+                hashed: tool.hash,
+                runtime: true,
             };
             xdef.tool_group_inputs
                 .entry(tool.group)
@@ -463,11 +499,22 @@ impl engine::driver_managed::ManagedDriver for Driver {
                 mode: InputMode::Standard,
                 origin_id: dep.id.clone(),
                 annotations: BTreeMap::new(),
+                hashed: dep.hash,
+                runtime: dep.runtime,
             };
-            xdef.dep_group_inputs
-                .entry(dep.group)
-                .or_default()
-                .push(input.clone());
+            // Route into runtime wiring only when the dep is meant to be
+            // available at runtime. Hash-only transitive deps still need to
+            // appear in `def.inputs` so the engine resolves them and folds
+            // their hashout into hashin, but they must not be wired into
+            // SRC_*/LIST_*.
+            if dep.runtime {
+                let target_map = if dep.hash {
+                    &mut xdef.dep_group_inputs
+                } else {
+                    &mut xdef.runtime_dep_group_inputs
+                };
+                target_map.entry(dep.group).or_default().push(input.clone());
+            }
             def.inputs.push(input);
         }
         for (name, env) in req.sandbox.env {
@@ -610,7 +657,26 @@ impl Driver {
             }
         }
 
+        // Merge hashed and runtime-only dep groups so each group ends up
+        // with a single SRC_*/LIST_* env entry covering both sources.
+        // `deps` come first to preserve their established input ordering;
+        // `runtime_deps` (also `runtime=true` transitives with `hash=false`)
+        // append after.
+        let mut merged_dep_groups: BTreeMap<&str, Vec<&Input>> = BTreeMap::new();
         for (group, inputs) in &def.dep_group_inputs {
+            merged_dep_groups
+                .entry(group.as_str())
+                .or_default()
+                .extend(inputs.iter());
+        }
+        for (group, inputs) in &def.runtime_dep_group_inputs {
+            merged_dep_groups
+                .entry(group.as_str())
+                .or_default()
+                .extend(inputs.iter());
+        }
+
+        for (group, inputs) in &merged_dep_groups {
             let src_key = if group.is_empty() {
                 "SRC".to_string()
             } else {
@@ -1164,6 +1230,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo".to_string(), "hello".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
@@ -1215,6 +1282,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
@@ -1272,6 +1340,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["cat".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
@@ -1339,6 +1408,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec![format!("head -c {payload_bytes} /dev/urandom | base64")],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
@@ -1401,6 +1471,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec![run_cmd.to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env,
@@ -1577,6 +1648,139 @@ mod tests {
         Ok(())
     }
 
+    /// Drives `parse()` with the given `extra` config keys merged on top of a
+    /// minimal exec spec (just `run`). Returns the resulting EngineTargetDef.
+    async fn parse_with(
+        extra: HashMap<String, crate::loosespecparser::TargetSpecValue>,
+    ) -> anyhow::Result<crate::engine::driver::targetdef::TargetDef> {
+        let driver = Driver::new_exec();
+        let ctoken = StdCancellationToken::new();
+        let mut config = HashMap::from([(
+            "run".to_string(),
+            crate::loosespecparser::TargetSpecValue::String("echo".to_string()),
+        )]);
+        config.extend(extra);
+        let res = driver
+            .parse(
+                crate::engine::driver::ParseRequest {
+                    request_id: "test".to_string(),
+                    target_spec: std::sync::Arc::new(crate::engine::provider::TargetSpec {
+                        addr: Addr::default(),
+                        driver: "exec".to_string(),
+                        config,
+                        labels: vec![],
+                        transitive: Default::default(),
+                    }),
+                },
+                &ctoken,
+            )
+            .await?;
+        Ok(res.target_def)
+    }
+
+    #[tokio::test]
+    async fn test_parse_hash_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
+        let extra = HashMap::from([(
+            "hash_deps".to_string(),
+            crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
+            ]),
+        )]);
+        let td = parse_with(extra).await?;
+        let def = td.def::<TargetDef>();
+
+        // hash_deps must not appear in any pluginexec runtime wiring map.
+        assert!(def.dep_group_inputs.is_empty());
+        assert!(def.runtime_dep_group_inputs.is_empty());
+
+        // They DO show up as engine inputs (so engine resolves them and folds
+        // their hashout into hashin) with hashed=true / runtime=false.
+        let hash_dep_input = td
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("hash_dep|"))
+            .expect("hash_dep input present");
+        assert!(hash_dep_input.hashed);
+        assert!(!hash_dep_input.runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_runtime_deps_routes_inputs_with_flags() -> anyhow::Result<()> {
+        let extra = HashMap::from([(
+            "runtime_deps".to_string(),
+            crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
+            ]),
+        )]);
+        let td = parse_with(extra).await?;
+        let def = td.def::<TargetDef>();
+
+        // runtime_deps wire into the runtime-only SRC_*/LIST_* map (excluded
+        // from def.hash), and are NOT in the hashed dep_group_inputs map.
+        assert!(def.dep_group_inputs.is_empty());
+        assert_eq!(def.runtime_dep_group_inputs.len(), 1);
+
+        let runtime_dep_input = td
+            .inputs
+            .iter()
+            .find(|i| i.origin_id.starts_with("runtime_dep|"))
+            .expect("runtime_dep input present");
+        assert!(!runtime_dep_input.hashed);
+        assert!(runtime_dep_input.runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_runtime_deps_excluded_from_def_hash() -> anyhow::Result<()> {
+        let base = parse_with(HashMap::new()).await?;
+        let with_runtime = parse_with(HashMap::from([(
+            "runtime_deps".to_string(),
+            crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
+            ]),
+        )]))
+        .await?;
+        // Adding a `runtime_deps` entry must NOT change the per-target def
+        // hash; otherwise the cache key would depend on runtime-only state.
+        assert_eq!(base.hash, with_runtime.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_hash_deps_excluded_from_def_hash() -> anyhow::Result<()> {
+        // hash_deps are tracked via their hashout (flows into hashin via the
+        // engine), not via the per-target def hash. So adding/changing a
+        // hash_dep does not change `def.hash` either — invalidation happens
+        // through the engine's input-result mixing.
+        let base = parse_with(HashMap::new()).await?;
+        let with_hash = parse_with(HashMap::from([(
+            "hash_deps".to_string(),
+            crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
+            ]),
+        )]))
+        .await?;
+        assert_eq!(base.hash, with_hash.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_deps_change_def_hash() -> anyhow::Result<()> {
+        // Plain `deps` are structural — they must invalidate the per-target
+        // def hash. (This is the property `runtime_deps` deliberately lacks.)
+        let base = parse_with(HashMap::new()).await?;
+        let with_deps = parse_with(HashMap::from([(
+            "deps".to_string(),
+            crate::loosespecparser::TargetSpecValue::List(vec![
+                crate::loosespecparser::TargetSpecValue::String("//some:dep".to_string()),
+            ]),
+        )]))
+        .await?;
+        assert_ne!(base.hash, with_deps.hash);
+        Ok(())
+    }
+
     fn make_tool_binary(
         dir: &std::path::Path,
         name: &str,
@@ -1658,6 +1862,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run,
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     group.to_string(),
@@ -1669,6 +1874,8 @@ mod tests {
                             "unpack_root".to_string(),
                             "tools".to_string(),
                         )]),
+                        hashed: true,
+                        runtime: true,
                     }],
                 )]),
                 pass_env: BTreeMap::new(),
@@ -1790,6 +1997,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["echo $PATH".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
@@ -1801,6 +2009,8 @@ mod tests {
                             "unpack_root".to_string(),
                             "tools".to_string(),
                         )]),
+                        hashed: true,
+                        runtime: true,
                     }],
                 )]),
                 pass_env: BTreeMap::from([("PATH".to_string(), existing_path.to_string())]),
@@ -1931,6 +2141,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
@@ -1942,6 +2153,8 @@ mod tests {
                             "unpack_root".to_string(),
                             "tools".to_string(),
                         )]),
+                        hashed: true,
+                        runtime: true,
                     }],
                 )]),
                 pass_env: BTreeMap::new(),
@@ -2114,6 +2327,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),
@@ -2177,6 +2391,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([(
                     "".to_string(),
@@ -2186,12 +2401,16 @@ mod tests {
                             mode: InputMode::Tool,
                             origin_id: "tool|a|0".to_string(),
                             annotations: BTreeMap::new(),
+                            hashed: true,
+                            runtime: true,
                         },
                         Input {
                             r#ref: crate::engine::driver::TargetAddr::default(),
                             mode: InputMode::Tool,
                             origin_id: "tool|b|0".to_string(),
                             annotations: BTreeMap::new(),
+                            hashed: true,
+                            runtime: true,
                         },
                     ],
                 )]),
@@ -2269,6 +2488,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::from([
                     (
@@ -2278,6 +2498,8 @@ mod tests {
                             mode: InputMode::Tool,
                             origin_id: "tool|g1|0".to_string(),
                             annotations: BTreeMap::new(),
+                            hashed: true,
+                            runtime: true,
                         }],
                     ),
                     (
@@ -2287,6 +2509,8 @@ mod tests {
                             mode: InputMode::Tool,
                             origin_id: "tool|g2|0".to_string(),
                             annotations: BTreeMap::new(),
+                            hashed: true,
+                            runtime: true,
                         }],
                     ),
                 ]),
@@ -2347,6 +2571,7 @@ mod tests {
             raw_def: Arc::new(TargetDef {
                 run: vec!["true".to_string()],
                 dep_group_inputs: BTreeMap::new(),
+                runtime_dep_group_inputs: BTreeMap::new(),
                 env: BTreeMap::new(),
                 tool_group_inputs: BTreeMap::new(),
                 pass_env: BTreeMap::new(),

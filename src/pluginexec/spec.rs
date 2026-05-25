@@ -9,6 +9,8 @@ use std::collections::HashMap;
 pub(crate) struct TargetSpec {
     pub run: Vec<String>,
     pub deps: HashMap<String, Vec<String>>,
+    pub hash_deps: HashMap<String, Vec<String>>,
+    pub runtime_deps: HashMap<String, Vec<String>>,
     pub tools: HashMap<String, Vec<String>>,
     pub outputs: HashMap<String, Vec<String>>,
     pub support_files: Vec<String>,
@@ -40,6 +42,8 @@ impl TargetSpec {
             support_files: vec![],
             codegen: CodegenMode::None,
             deps: HashMap::new(),
+            hash_deps: HashMap::new(),
+            runtime_deps: HashMap::new(),
             tools: HashMap::new(),
             env: HashMap::new(),
             pass_env: vec![],
@@ -82,6 +86,15 @@ impl TargetSpec {
 
         if let Some(v) = m.remove("deps") {
             spec.deps = parse_map_string_strings(v).with_context(|| "parse `deps`")?;
+        };
+
+        if let Some(v) = m.remove("hash_deps") {
+            spec.hash_deps = parse_map_string_strings(v).with_context(|| "parse `hash_deps`")?;
+        };
+
+        if let Some(v) = m.remove("runtime_deps") {
+            spec.runtime_deps =
+                parse_map_string_strings(v).with_context(|| "parse `runtime_deps`")?;
         };
 
         if let Some(v) = m.remove("tools") {
@@ -210,6 +223,42 @@ mod tests {
     fn test_support_files_empty_by_default() {
         let spec = make_spec([]).unwrap();
         assert!(spec.support_files.is_empty());
+    }
+
+    #[test]
+    fn test_hash_deps_parsed() {
+        let spec = make_spec([(
+            "hash_deps",
+            TargetSpecValue::List(vec![TargetSpecValue::String("//some:hash".to_string())]),
+        )])
+        .unwrap();
+        assert_eq!(
+            spec.hash_deps.get(""),
+            Some(&vec!["//some:hash".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_runtime_deps_parsed() {
+        let spec = make_spec([(
+            "runtime_deps",
+            TargetSpecValue::Map(HashMap::from([(
+                "rt".to_string(),
+                TargetSpecValue::String("//some:rt".to_string()),
+            )])),
+        )])
+        .unwrap();
+        assert_eq!(
+            spec.runtime_deps.get("rt"),
+            Some(&vec!["//some:rt".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_hash_runtime_deps_empty_by_default() {
+        let spec = make_spec([]).unwrap();
+        assert!(spec.hash_deps.is_empty());
+        assert!(spec.runtime_deps.is_empty());
     }
 
     #[test]

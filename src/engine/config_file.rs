@@ -54,7 +54,7 @@ impl FuseConfig {
         match self.enabled {
             Some(true) => FuseMode::On,
             Some(false) => FuseMode::Off,
-            None => FuseMode::Auto,
+            None => FuseMode::Off,
         }
     }
 

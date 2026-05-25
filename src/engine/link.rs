@@ -30,7 +30,10 @@ impl Engine {
             .await?;
 
         let fail_fast = rs.fail_fast();
-        let futures = expanded_inputs.iter().map(|input| {
+        // Only `runtime=true` inputs get materialized into the sandbox.
+        // `hash_deps` (runtime=false) are resolved for their hashout via meta
+        // but are not extracted nor wired through SRC_*/LIST_*.
+        let futures = expanded_inputs.iter().filter(|input| input.runtime).map(|input| {
             enclose!((self => engine, rs, input) async move {
                 let input_def: Arc<TargetDef> = Arc::clone(&engine.get_def(rs, &input.r#ref.r#ref).await?.target_def);
 

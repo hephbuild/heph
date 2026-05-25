@@ -90,7 +90,10 @@ impl Engine {
             .await?;
 
         let fail_fast = rc.fail_fast();
-        let futures = inputs.iter().map(|input| {
+        // Only `hashed=true` inputs contribute their hashout to the parent's
+        // hashin. `runtime_deps` (hashed=false) are still materialized via
+        // the link/execute path, but must not alter the cache key.
+        let futures = inputs.iter().filter(|input| input.hashed).map(|input| {
             enclose!((self => engine, rc, input) async move {
                 engine
                     .clone()

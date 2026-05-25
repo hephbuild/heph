@@ -9,6 +9,19 @@ use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Routing context inherited from a parent transparent-group input. Carries
+/// origin_id/mode/annotations plus the parent's `hashed`/`runtime` flags so
+/// children of a `hash_deps` (or `runtime_deps`) group expansion inherit
+/// the parent's intent.
+#[derive(Clone)]
+pub(crate) struct ParentOverride {
+    pub origin_id: String,
+    pub mode: InputMode,
+    pub annotations: BTreeMap<String, String>,
+    pub hashed: bool,
+    pub runtime: bool,
+}
+
 impl Engine {
     /// Memoized expansion of `addr`'s inputs. Called from both `link` and `meta`
     /// for every result — without memoization the whole transparent-group walk
@@ -69,7 +82,7 @@ impl Engine {
         self: Arc<Self>,
         rs: Arc<RequestState>,
         inputs: Vec<Input>,
-        parent_override: Option<(String, InputMode, BTreeMap<String, String>)>,
+        parent_override: Option<ParentOverride>,
         visited: &mut FxHashSet<String>,
     ) -> anyhow::Result<Vec<Input>> {
         let mut result: Option<Vec<Input>> = parent_override
@@ -97,29 +110,38 @@ impl Engine {
 
                 // Effective routing context for the group's children: take the
                 // parent override if recursing, otherwise the input's own
-                // origin_id/mode/annotations. Either way, the parent context
-                // wins over the group's interior child annotations only on
-                // keys the child does not set (merge happens below per child).
-                let (eff_origin, eff_mode, eff_ann) = match parent_override.as_ref() {
-                    Some((oid, mode, ann)) => {
-                        let mut merged = ann.clone();
+                // origin_id/mode/annotations/flags. Either way, the parent
+                // context wins over the group's interior child annotations
+                // only on keys the child does not set (merge happens below
+                // per child).
+                let eff = match parent_override.as_ref() {
+                    Some(p) => {
+                        let mut merged = p.annotations.clone();
                         for (k, v) in &input.annotations {
                             merged.insert(k.clone(), v.clone());
                         }
-                        (oid.clone(), mode.clone(), merged)
+                        ParentOverride {
+                            origin_id: p.origin_id.clone(),
+                            mode: p.mode.clone(),
+                            annotations: merged,
+                            hashed: p.hashed,
+                            runtime: p.runtime,
+                        }
                     }
-                    None => (
-                        input.origin_id.clone(),
-                        input.mode.clone(),
-                        input.annotations.clone(),
-                    ),
+                    None => ParentOverride {
+                        origin_id: input.origin_id.clone(),
+                        mode: input.mode.clone(),
+                        annotations: input.annotations.clone(),
+                        hashed: input.hashed,
+                        runtime: input.runtime,
+                    },
                 };
 
                 let nested = Arc::clone(&self)
                     .expand_inputs(
                         rs.clone(),
                         def.target_def.inputs.clone(),
-                        Some((eff_origin, eff_mode, eff_ann)),
+                        Some(eff),
                         visited,
                     )
                     .await?;
@@ -127,10 +149,10 @@ impl Engine {
                 visited.remove(&addr_str);
 
                 out.extend(nested);
-            } else if let Some((oid, mode, parent_ann)) = parent_override.as_ref() {
+            } else if let Some(p) = parent_override.as_ref() {
                 // Recursive call: result Vec was allocated up front.
                 // Parent annotations form the base; child overrides on conflict.
-                let mut merged = parent_ann.clone();
+                let mut merged = p.annotations.clone();
                 for (k, v) in &input.annotations {
                     merged.insert(k.clone(), v.clone());
                 }
@@ -139,9 +161,11 @@ impl Engine {
                     .expect("recursive call allocated result up front")
                     .push(Input {
                         r#ref: input.r#ref.clone(),
-                        origin_id: oid.clone(),
-                        mode: mode.clone(),
+                        origin_id: p.origin_id.clone(),
+                        mode: p.mode.clone(),
                         annotations: merged,
+                        hashed: p.hashed,
+                        runtime: p.runtime,
                     });
             } else if let Some(out) = result.as_mut() {
                 // Top-level, but an earlier transparent input already triggered
@@ -290,6 +314,8 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect(),
+            hashed: true,
+            runtime: true,
         }
     }
 

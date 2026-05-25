@@ -87,6 +87,8 @@ impl ManagedDriver for GoTestmainDriver {
                 mode: InputMode::Standard,
                 origin_id: format!("dep|golist|{i}"),
                 annotations: std::collections::BTreeMap::new(),
+                hashed: true,
+                runtime: true,
             });
         }
 
@@ -102,6 +104,8 @@ impl ManagedDriver for GoTestmainDriver {
                         mode: InputMode::Standard,
                         origin_id: format!("dep|{group}|{i}"),
                         annotations: std::collections::BTreeMap::new(),
+                        hashed: true,
+                        runtime: true,
                     });
                 }
             }
