@@ -53,6 +53,7 @@ pub async fn run<A: App>(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut spinner_idx: usize = 0;
     let mut paused = false;
+    let mut cols = terminal_cols(&terminal);
 
     let result: anyhow::Result<A::Output> = loop {
         tokio::select! {
@@ -66,7 +67,7 @@ pub async fn run<A: App>(
                             // a Ctrl+C delivered to the cooked-mode prompt can't
                             // race past us and cancel engine work.
                             suppression.set(true);
-                            drain_logs_to_terminal(&mut terminal, &mut rx);
+                            drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                             drop(terminal.clear());
                             drop(terminal.show_cursor());
                             drop(disable_raw_mode());
@@ -80,6 +81,7 @@ pub async fn run<A: App>(
                     Some(Control::Resume) if paused => {
                         drop(enable_raw_mode());
                         rx = sink.switch_to_buffered();
+                        cols = terminal_cols(&terminal);
                         paused = false;
                         suppression.set(false);
                     }
@@ -88,19 +90,23 @@ pub async fn run<A: App>(
                 }
             }
             maybe_evt = events.next(), if !paused => {
-                if let Some(Ok(Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers,
-                    kind: KeyEventKind::Press,
-                    ..
-                }))) = maybe_evt
-                    && modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    shutdown.trigger();
+                match maybe_evt {
+                    Some(Ok(Event::Key(KeyEvent {
+                        code: KeyCode::Char('c'),
+                        modifiers,
+                        kind: KeyEventKind::Press,
+                        ..
+                    }))) if modifiers.contains(KeyModifiers::CONTROL) => {
+                        shutdown.trigger();
+                    }
+                    Some(Ok(Event::Resize(w, _))) => {
+                        cols = w.max(1);
+                    }
+                    _ => {}
                 }
             }
             _ = ticker.tick(), if !paused => {
-                drain_logs_to_terminal(&mut terminal, &mut rx);
+                drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                 spinner_idx = (spinner_idx + 1) % SPINNER_FRAMES.len();
                 let frame = SPINNER_FRAMES.get(spinner_idx).copied().unwrap_or("");
                 let line = format!("{frame} {label}");
@@ -113,7 +119,7 @@ pub async fn run<A: App>(
     };
 
     if !paused {
-        drain_logs_to_terminal(&mut terminal, &mut rx);
+        drain_logs_to_terminal(&mut terminal, &mut rx, cols);
         drop(terminal.clear());
         drop(terminal.show_cursor());
         drop(disable_raw_mode());
@@ -124,11 +130,16 @@ pub async fn run<A: App>(
     result
 }
 
+fn terminal_cols(terminal: &StderrTerminal) -> u16 {
+    terminal.size().map(|r| r.width).unwrap_or(80).max(1)
+}
+
 fn drain_logs_to_terminal(
     terminal: &mut StderrTerminal,
     rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+    cols: u16,
 ) {
-    let cols = terminal.size().map(|r| r.width).unwrap_or(80).max(1);
+    let cols = cols.max(1);
     while let Ok(bytes) = rx.try_recv() {
         let text = bytes
             .into_text()
