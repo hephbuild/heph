@@ -126,10 +126,7 @@ impl ShellFallback {
     /// `bash_args_shell` + `init.sh`.
     pub fn default_exec() -> Arc<Self> {
         let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
-        config.insert(
-            "run".to_string(),
-            TargetSpecValue::List(vec![]),
-        );
+        config.insert("run".to_string(), TargetSpecValue::List(vec![]));
         Arc::new(Self {
             driver: Arc::new(crate::pluginexec::Driver::new_exec()),
             spec_template: Arc::new(TargetSpec {
@@ -474,11 +471,9 @@ pub(crate) fn build_source_map(
             .walk()
             .with_context(|| format!("walk content for source_map (source={source_addr_str})"))?
         {
-            let entry = entry.with_context(|| {
-                format!("read entry for source_map (source={source_addr_str})")
-            })?;
-            if !filters.is_empty()
-                && !filters.iter().any(|f| Path::new(f) == entry.path.as_path())
+            let entry = entry
+                .with_context(|| format!("read entry for source_map (source={source_addr_str})"))?;
+            if !filters.is_empty() && !filters.iter().any(|f| Path::new(f) == entry.path.as_path())
             {
                 continue;
             }

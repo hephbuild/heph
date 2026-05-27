@@ -1228,20 +1228,8 @@ impl ProviderInner {
                 if pkg.embed_patterns.is_empty() && pkg.embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "embed",
-                        &pkg_addrs.embed_files,
-                        &srcfiles,
-                    ),
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "embed"),
                 })
             }
             "embed_test" => {
@@ -1252,42 +1240,16 @@ impl ProviderInner {
                 if !has_any {
                     return Err(GetError::NotFound);
                 }
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let mut files = pkg_addrs.embed_files.clone();
-                files.extend(pkg_addrs.test_embed_files.iter().cloned());
-                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "test_embed",
-                        &files,
-                        &srcfiles,
-                    ),
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed"),
                 })
             }
             "embed_xtest" => {
                 if pkg.xtest_embed_patterns.is_empty() && pkg.xtest_embed_files.is_empty() {
                     return Err(GetError::NotFound);
                 }
-                let pkg_addrs = self
-                    .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
-                    .await
-                    .map_err(GetError::Other)?;
-                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
-                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(
-                        addr.clone(),
-                        &golist_addr,
-                        "xtest_embed",
-                        &pkg_addrs.xtest_embed_files,
-                        &srcfiles,
-                    ),
+                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "xtest_embed"),
                 })
             }
             _ => Err(GetError::NotFound),
@@ -1916,8 +1878,6 @@ fn build_embed_spec(
     addr: Addr,
     golist_addr: &Addr,
     variant: &str,
-    embed_file_addrs: &[String],
-    srcfile_addrs: &[String],
 ) -> crate::engine::provider::TargetSpec {
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
@@ -1934,28 +1894,6 @@ fn build_embed_spec(
         "golist".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String(golist_dep)]),
     );
-    if !embed_file_addrs.is_empty() {
-        deps_map.insert(
-            "files".to_string(),
-            TargetSpecValue::List(
-                embed_file_addrs
-                    .iter()
-                    .map(|s| TargetSpecValue::String(s.clone()))
-                    .collect(),
-            ),
-        );
-    }
-    if !srcfile_addrs.is_empty() {
-        deps_map.insert(
-            "srcfiles".to_string(),
-            TargetSpecValue::List(
-                srcfile_addrs
-                    .iter()
-                    .map(|s| TargetSpecValue::String(s.clone()))
-                    .collect(),
-            ),
-        );
-    }
     config.insert("deps".to_string(), TargetSpecValue::Map(deps_map));
     config.insert(
         "out".to_string(),
@@ -2780,47 +2718,6 @@ mod tests {
             _ => panic!("expected string"),
         };
         assert_eq!(variant, "embed");
-    }
-
-    /// `embed` spec must declare a `srcfiles` deps group so the embed driver's
-    /// sandbox sees the same non-Go source tree `_golist` did when resolving
-    /// `//go:embed` patterns — otherwise codegen-produced embed files (e.g.
-    /// `resources/foo.wasm.br`) are missing at runtime and the driver's
-    /// pattern re-glob in `compute_embed_cfg_json` returns nothing.
-    #[tokio::test]
-    async fn test_with_embed_embed_target_has_srcfiles_dep() {
-        require_go!();
-        let sandbox = copy_fixture("with_embed");
-        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let resp = provider_get(&p, make_addr("server", "embed"))
-            .await
-            .unwrap();
-        let deps = match resp.target_spec.config.get("deps").unwrap() {
-            TargetSpecValue::Map(m) => m,
-            _ => panic!("expected deps map"),
-        };
-        let srcfiles = match deps.get("srcfiles") {
-            Some(TargetSpecValue::List(v)) => v,
-            other => panic!("embed spec must have srcfiles deps list, got: {:?}", other),
-        };
-        let has_glob = srcfiles.iter().any(|v| match v {
-            TargetSpecValue::String(s) => s.contains("server/**/*"),
-            _ => false,
-        });
-        assert!(
-            has_glob,
-            "embed srcfiles must include the non-go `**/*` glob mirroring _golist: {:?}",
-            srcfiles
-        );
-        let has_go_src_query = srcfiles.iter().any(|v| match v {
-            TargetSpecValue::String(s) => s.contains("label=go_src") && s.contains("tree_output_to"),
-            _ => false,
-        });
-        assert!(
-            has_go_src_query,
-            "embed srcfiles must include q@label=go_src,tree_output_to so codegen targets unpack into pkg dir: {:?}",
-            srcfiles
-        );
     }
 
     #[tokio::test]
