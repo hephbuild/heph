@@ -2,8 +2,11 @@
 //!
 //! Single dedicated thread owns one kqueue fd. Each registered pid is
 //! added as an `EVFILT_PROC` filter with `NOTE_EXIT | EV_ONESHOT`. New
-//! registrations arrive over an `mpsc` channel and are picked up when the
-//! main loop is woken via an `EVFILT_USER` trigger.
+//! registrations arrive over an `mpsc` channel; the loop drains them
+//! once per iteration (unconditionally, before each `kevent` call) and
+//! again whenever an `EVFILT_USER` wake-up arrives. The wake-up is a
+//! latency optimisation only — a dropped user-event delays a
+//! registration by at most the 1s `kevent` timeout, never strands it.
 //!
 //! `EV_RECEIPT` is used on `EV_ADD` so we synchronously detect `ESRCH`
 //! (child already exited before we could register). In that case we reap
@@ -68,6 +71,15 @@ fn run_loop(kq: i32, rx: mpsc::Receiver<Registration>) {
     };
 
     loop {
+        // Drain pending registrations unconditionally each iteration. The
+        // EVFILT_USER trigger from `wake()` is a latency optimisation only —
+        // macOS occasionally drops user-events under load, and a dropped
+        // trigger must not strand a registration in the mpsc forever (no
+        // NOTE_EXIT filter armed → no exit notification → `Handle::wait`
+        // blocks forever). The 1s `kevent` timeout caps the worst-case
+        // registration latency.
+        drain_registrations(kq, &rx, &mut pending);
+
         // SAFETY: kq is a live fd we own; events buffer is owned and sized
         // to EVENT_BATCH; timeout points to a valid stack-local timespec.
         let n = unsafe {
@@ -91,6 +103,8 @@ fn run_loop(kq: i32, rx: mpsc::Receiver<Registration>) {
         let count = usize::try_from(n).unwrap_or(0).min(EVENT_BATCH);
         for ev in events.iter().take(count) {
             if ev.filter == libc::EVFILT_USER {
+                // Low-latency path for the common case. Idempotent with the
+                // pre-kevent drain above.
                 drain_registrations(kq, &rx, &mut pending);
             } else if ev.filter == libc::EVFILT_PROC {
                 let pid = ev.ident as i32;

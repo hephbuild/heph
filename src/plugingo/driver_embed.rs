@@ -41,7 +41,7 @@ impl Hash for EmbedVariant {
 
 /// Bump to invalidate every cached embed cfg whenever the embed cfg layout
 /// (paths, file resolution semantics) changes.
-const GO_EMBED_FORMAT_VERSION: u32 = 3;
+const GO_EMBED_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, serde::Serialize)]
 struct GoEmbedDef {
@@ -126,6 +126,23 @@ impl ManagedDriver for GoEmbedDriver {
                         .with_context(|| format!("parse embed file dep addr {addr_str}"))?,
                     mode: InputMode::Standard,
                     origin_id: format!("dep|files|{i}"),
+                    annotations: std::collections::BTreeMap::new(),
+                    hashed: true,
+                    runtime: true,
+                });
+            }
+        }
+
+        // Non-Go source tree (filesystem `**/*` glob + go_codegen_deps), mirroring
+        // _golist's srcfiles. Needed so `compute_embed_cfg_json` can re-glob each
+        // pattern against `sandbox_pkg_dir` and get the same files Go saw.
+        if let Some(src_addrs) = deps.get("srcfiles") {
+            for (i, addr_str) in src_addrs.iter().enumerate() {
+                inputs.push(Input {
+                    r#ref: TargetAddr::parse(addr_str, &pkg)
+                        .with_context(|| format!("parse embed srcfile dep addr {addr_str}"))?,
+                    mode: InputMode::Standard,
+                    origin_id: format!("dep|srcfiles|{i}"),
                     annotations: std::collections::BTreeMap::new(),
                     hashed: true,
                     runtime: true,
@@ -405,6 +422,73 @@ mod tests {
                 .iter()
                 .any(|i| i.origin_id == "dep|golist|0"),
             "golist input must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_includes_srcfiles_inputs() {
+        let ct = noop_ctoken();
+        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        config.insert(
+            "variant".to_string(),
+            TargetSpecValue::String("embed".to_string()),
+        );
+        config.insert(
+            "deps".to_string(),
+            TargetSpecValue::Map(HashMap::from([
+                (
+                    "golist".to_string(),
+                    TargetSpecValue::List(vec![TargetSpecValue::String(
+                        "//mypkg:_golist|pkg".to_string(),
+                    )]),
+                ),
+                (
+                    "srcfiles".to_string(),
+                    TargetSpecValue::List(vec![
+                        TargetSpecValue::String("//mypkg:_glob".to_string()),
+                        TargetSpecValue::String("//codegen:gen_assets".to_string()),
+                    ]),
+                ),
+            ])),
+        );
+        config.insert(
+            "out".to_string(),
+            TargetSpecValue::Map(HashMap::from([(
+                "cfg".to_string(),
+                TargetSpecValue::List(vec![TargetSpecValue::String("embedcfg".to_string())]),
+            )])),
+        );
+        let req = ParseRequest {
+            request_id: "test".to_string(),
+            target_spec: std::sync::Arc::new(TargetSpec {
+                addr: Addr::new(
+                    PkgBuf::from("mypkg"),
+                    "embed".to_string(),
+                    Default::default(),
+                ),
+                driver: "go_embed".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        };
+        let resp = driver().parse(req, &ct).await.unwrap();
+        let srcfile_ids: Vec<&str> = resp
+            .target_def
+            .inputs
+            .iter()
+            .filter_map(|i| {
+                if i.origin_id.starts_with("dep|srcfiles|") {
+                    Some(i.origin_id.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            srcfile_ids,
+            vec!["dep|srcfiles|0", "dep|srcfiles|1"],
+            "both srcfiles entries must be staged as inputs"
         );
     }
 

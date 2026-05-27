@@ -65,3 +65,76 @@ pub fn register(pid: i32) -> mpsc::Receiver<io::Result<ExitStatus>> {
     (w.wake)();
     rx
 }
+
+/// Test-only register variant that intentionally does NOT call `wake()`.
+/// Simulates the macOS bug where the kqueue `EVFILT_USER` trigger is
+/// silently dropped. The watcher must still pick up the registration via
+/// its unconditional per-iteration drain (within the 1s kevent timeout).
+#[cfg(test)]
+pub(crate) fn register_no_wake(pid: i32) -> mpsc::Receiver<io::Result<ExitStatus>> {
+    let w = get_or_init();
+    let (tx, rx) = mpsc::channel();
+    if w.tx.send(Registration { pid, sender: tx }).is_err() {
+        let (tx2, rx2) = mpsc::channel();
+        drop(tx2.send(Err(io::Error::other("process watcher thread died"))));
+        return rx2;
+    }
+    rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// Regression: a dropped EVFILT_USER wake must not strand a
+    /// registration. The pre-kevent unconditional drain in
+    /// `kqueue_macos::run_loop` should pick it up within ~1s (the kevent
+    /// timeout) and arm NOTE_EXIT before — or `poll_pending` should reap
+    /// it inline if it has already exited.
+    #[test]
+    fn register_no_wake_still_resolves() {
+        // Long-running child so the watcher gets a chance to arm
+        // EVFILT_PROC NOTE_EXIT *after* the registration is drained
+        // (rather than going through the inline `ESRCH` path).
+        let mut child = Command::new("sleep")
+            .arg("0.3")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id() as i32;
+
+        let rx = register_no_wake(pid);
+
+        // Generous deadline: must exceed the kevent timeout (1s) plus
+        // the child's own sleep (300ms) plus scheduling slack.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(status)) => {
+                    // sleep 0.3 exits cleanly.
+                    assert!(
+                        status.success() || status.code() == Some(0),
+                        "unexpected exit: {status:?}"
+                    );
+                    break;
+                }
+                Ok(Err(e)) => panic!("watcher reported error: {e}"),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "watcher did not resolve dropped-trigger registration before deadline"
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("watcher sender disconnected without sending status")
+                }
+            }
+        }
+
+        // Watcher already reaped via waitpid; `try_wait` here will most
+        // likely return ECHILD. We just want to make sure we don't leave
+        // a dangling Child handle that tries to wait on Drop.
+        drop(child.try_wait());
+    }
+}

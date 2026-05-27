@@ -28,6 +28,8 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 const SHELL_INIT_SH: &str = include_str!("./init.sh");
 
+const EXEC_DEF_FORMAT_VERSION: u32 = 1;
+
 pub struct Driver {
     name: String,
     /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
@@ -57,11 +59,13 @@ struct TargetDef {
 
 impl Hash for TargetDef {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        EXEC_DEF_FORMAT_VERSION.hash(state);
         self.run.hash(state);
         self.dep_group_inputs.hash(state);
         // runtime_dep_group_inputs intentionally excluded — runtime_deps
         // (and runtime-only transitives) must not affect the cache key.
         self.tool_group_inputs.hash(state);
+        self.env.hash(state);
         self.pass_env.hash(state);
         // runtime_pass_env and runtime_env intentionally excluded
     }
@@ -966,11 +970,18 @@ impl Driver {
                 ctty: true,
             }
         } else {
-            // No setsid for non-PTY: tokio's previous Child::wait waker
-            // flakiness no longer affects us (we use proc_exec's watcher
-            // path), but we still avoid setsid because nothing downstream
-            // requires session-leader semantics and the supervisor's
-            // direct-pid kill covers hard-shutdown.
+            // setsid: true so the child becomes its own process-group
+            // leader (pid == pgid). Without this, any descendant that
+            // double-forks (e.g. Go test runners spawning helper daemons)
+            // gets reparented to launchd on the immediate child's exit
+            // and keeps holding the stdout/stderr pipe write ends — the
+            // drain threads' `read()` then never returns 0 and
+            // `Handle::wait` blocks indefinitely waiting for EOF. With a
+            // pgid, the supervisor sidecar's `killpg(pid, SIGKILL)` on
+            // cancel/parent-death reaps the whole tree, and the bounded
+            // drain-join in `Handle::wait` can kill stragglers with the
+            // same call. No controlling terminal (ctty: false) since
+            // these are non-interactive children.
             let stdin = if rreq.stdin.is_some() {
                 proc_exec::StdioSpec::Piped
             } else {
@@ -984,7 +995,7 @@ impl Driver {
                 stdin,
                 stdout: proc_exec::StdioSpec::Piped,
                 stderr: proc_exec::StdioSpec::Piped,
-                setsid: false,
+                setsid: true,
                 ctty: false,
             }
         };
@@ -1842,6 +1853,70 @@ mod tests {
         )]))
         .await?;
         assert_ne!(base.hash, with_deps.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_env_value_change_def_hash() -> anyhow::Result<()> {
+        // Literal `env` values must invalidate the per-target def hash —
+        // changing an env value is a semantic change to the target's input.
+        let with_v1 = parse_with(HashMap::from([(
+            "env".to_string(),
+            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+                "FOO".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("v1".to_string()),
+            )])),
+        )]))
+        .await?;
+        let with_v2 = parse_with(HashMap::from([(
+            "env".to_string(),
+            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+                "FOO".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("v2".to_string()),
+            )])),
+        )]))
+        .await?;
+        assert_ne!(with_v1.hash, with_v2.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_env_key_change_def_hash() -> anyhow::Result<()> {
+        // Changing an env key (not just its value) must also invalidate the
+        // def hash.
+        let with_foo = parse_with(HashMap::from([(
+            "env".to_string(),
+            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+                "FOO".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+            )])),
+        )]))
+        .await?;
+        let with_bar = parse_with(HashMap::from([(
+            "env".to_string(),
+            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+                "BAR".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+            )])),
+        )]))
+        .await?;
+        assert_ne!(with_foo.hash, with_bar.hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parse_env_added_changes_def_hash() -> anyhow::Result<()> {
+        // Adding any env entry where there was none must change the def hash.
+        let base = parse_with(HashMap::new()).await?;
+        let with_env = parse_with(HashMap::from([(
+            "env".to_string(),
+            crate::loosespecparser::TargetSpecValue::Map(HashMap::from([(
+                "FOO".to_string(),
+                crate::loosespecparser::TargetSpecValue::String("v".to_string()),
+            )])),
+        )]))
+        .await?;
+        assert_ne!(base.hash, with_env.hash);
         Ok(())
     }
 

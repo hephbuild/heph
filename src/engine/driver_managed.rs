@@ -456,20 +456,33 @@ pub(crate) fn build_source_map(
         if managed_input.unpack_root != ws_dir {
             continue;
         }
-        let Some(ref list_path) = managed_input.list_path else {
+        if matches!(
+            managed_input.input.artifact.r#type,
+            inputartifact::Type::Support
+        ) {
             continue;
-        };
+        }
         let source_addr_str = managed_input.input.source_addr.format();
-        let raw =
-            fs::read_to_string(list_path).with_context(|| format!("read list {:?}", list_path))?;
-        for line in raw.lines() {
-            if line.is_empty() {
+        let filters = &managed_input.input.filters;
+        // Walk artifact directly instead of reading list_path: after group
+        // expansion, multiple inputs share parent origin_id → list_path_for
+        // gives them one shared file (opened append). Reading that shared
+        // list per-input would let the last-iterated input's source_addr
+        // overwrite earlier ones for paths only the earlier inputs produced.
+        let content = managed_input.input.artifact.content.as_ref();
+        for entry in content
+            .walk()
+            .with_context(|| format!("walk content for source_map (source={source_addr_str})"))?
+        {
+            let entry = entry.with_context(|| {
+                format!("read entry for source_map (source={source_addr_str})")
+            })?;
+            if !filters.is_empty()
+                && !filters.iter().any(|f| Path::new(f) == entry.path.as_path())
+            {
                 continue;
             }
-            let rel = Path::new(line)
-                .strip_prefix(ws_dir)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| line.to_string());
+            let rel = entry.path.to_string_lossy().into_owned();
             source_map.insert(rel, source_addr_str.clone());
         }
     }
@@ -771,5 +784,131 @@ mod shell_fallback_tests {
             "fallback driver's run_shell must be called",
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::*;
+    use crate::engine::driver::inputartifact::{InputArtifact, Type};
+    use crate::hartifactcontent::tar::{TarPacker, TarWalker};
+    use crate::hartifactcontent::{Content, WalkEntry};
+    use crate::htaddr::parse_addr;
+    use std::io::{Cursor, Read};
+
+    struct TarBytes(Vec<u8>);
+
+    impl Content for TarBytes {
+        fn reader(&self) -> anyhow::Result<Box<dyn Read>> {
+            Ok(Box::new(Cursor::new(self.0.clone())))
+        }
+        fn walk(&self) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<WalkEntry>> + '_>> {
+            Ok(Box::new(TarWalker::new(Cursor::new(self.0.clone()))?))
+        }
+        fn hashout(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn pack_files(files: &[(&str, &str)]) -> Vec<u8> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut packer = TarPacker::new();
+        for (rel, body) in files {
+            let abs = dir.path().join(rel);
+            if let Some(p) = abs.parent() {
+                fs::create_dir_all(p).expect("mkdir");
+            }
+            fs::write(&abs, body).expect("write");
+            packer.create_file(abs.to_str().unwrap().to_string(), rel.to_string());
+        }
+        let mut buf = Vec::new();
+        packer.pack(&mut buf).expect("pack tar");
+        buf
+    }
+
+    fn make_input(origin_id: &str, source_addr: &str, files: &[(&str, &str)]) -> ManagedRunInput {
+        let tar = pack_files(files);
+        ManagedRunInput {
+            input: RunInput {
+                artifact: InputArtifact {
+                    r#type: Type::Dep,
+                    origin_id: origin_id.to_string(),
+                    content: Arc::new(TarBytes(tar)),
+                },
+                origin_id: origin_id.to_string(),
+                source_addr: parse_addr(source_addr).expect("parse addr"),
+                filters: vec![],
+                annotations: BTreeMap::new(),
+            },
+            list_path: Some(PathBuf::from("/dev/null")),
+            unpack_root: PathBuf::from("/ws"),
+        }
+    }
+
+    // Regression: when group expansion (engine/expand.rs) inlines multiple
+    // child inputs under one parent origin_id, list_path_for assigns them all
+    // the same list file (opened with append=true at unpack). The old
+    // build_source_map read that shared file per-input and let the
+    // last-iterated input's source_addr overwrite the correct mapping for
+    // paths only the earlier input actually produced. Now we walk each
+    // artifact directly, so each file is mapped to the input that really
+    // contributed it.
+    #[test]
+    fn build_source_map_distinguishes_inputs_sharing_origin_id() {
+        let ws_dir = PathBuf::from("/ws");
+        let inputs = vec![
+            make_input(
+                "dep|srcfiles|0",
+                "//pkg:_wasm",
+                &[("pkg/resources/ajv.wasm.br", "wasm")],
+            ),
+            make_input(
+                "dep|srcfiles|0",
+                "//pkg:_schemas",
+                &[("pkg/resources/mock-data/x.json", "{}")],
+            ),
+        ];
+        let m = build_source_map(&inputs, &ws_dir).expect("build_source_map");
+        assert_eq!(
+            m.get("pkg/resources/ajv.wasm.br").map(String::as_str),
+            Some("//pkg:_wasm"),
+            "ajv.wasm.br must map to _wasm, not _schemas (last-write-wins bug): {:?}",
+            m
+        );
+        assert_eq!(
+            m.get("pkg/resources/mock-data/x.json").map(String::as_str),
+            Some("//pkg:_schemas"),
+        );
+    }
+
+    #[test]
+    fn build_source_map_respects_filters() {
+        let ws_dir = PathBuf::from("/ws");
+        let mut input = make_input(
+            "dep|f|0",
+            "//pkg:_t",
+            &[("pkg/a.txt", "a"), ("pkg/b.txt", "b")],
+        );
+        input.input.filters = vec!["pkg/a.txt".to_string()];
+        let m = build_source_map(&[input], &ws_dir).expect("build_source_map");
+        assert!(m.contains_key("pkg/a.txt"));
+        assert!(
+            !m.contains_key("pkg/b.txt"),
+            "filtered paths must not appear in source_map: {:?}",
+            m
+        );
+    }
+
+    #[test]
+    fn build_source_map_skips_non_ws_unpack_root() {
+        let ws_dir = PathBuf::from("/ws");
+        let mut input = make_input("dep|t|0", "//pkg:_t", &[("pkg/a.txt", "a")]);
+        input.unpack_root = PathBuf::from("/sandbox/exec_tools");
+        let m = build_source_map(&[input], &ws_dir).expect("build_source_map");
+        assert!(
+            m.is_empty(),
+            "inputs unpacked outside ws_dir must not contribute: {:?}",
+            m
+        );
     }
 }

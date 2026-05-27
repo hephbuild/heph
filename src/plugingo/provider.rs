@@ -362,17 +362,22 @@ impl ProviderInner {
                     // under a go.mod (decode_package guarantees that). Each
                     // variant is filtered at `get` time by inspecting the
                     // `_golist` result — no filesystem scan needed.
-                    let names = [
-                        "_golist",
-                        "build_lib",
-                        "build",
-                        "embed",
-                        "embed_xtest",
-                        "build_test",
-                        "test",
-                        "build_xtest",
-                        "xtest",
-                    ];
+                    let skip_tests = pick_test_skip(&req.states);
+                    let names: &[&str] = if skip_tests {
+                        &["_golist", "build_lib", "build", "embed"]
+                    } else {
+                        &[
+                            "_golist",
+                            "build_lib",
+                            "build",
+                            "embed",
+                            "embed_xtest",
+                            "build_test",
+                            "test",
+                            "build_xtest",
+                            "xtest",
+                        ]
+                    };
                     let responses: Vec<anyhow::Result<ListResponse>> = names
                         .iter()
                         .map(|name| {
@@ -465,6 +470,46 @@ fn pick_codegen_root(states: &[State]) -> Option<&State> {
         .max_by_key(|s| s.package.as_str().len())
 }
 
+/// Go test-target name set. Every variant the provider may emit (list) or
+/// resolve (get) that exists solely to support `go test`. Used by
+/// `pick_test_skip` to gate both endpoints from a single source of truth.
+const TEST_TARGET_NAMES: &[&str] = &[
+    "test",
+    "xtest",
+    "build_test",
+    "build_xtest",
+    "build_test_lib",
+    "build_xtest_lib",
+    "build_testmain_lib",
+    "build_xtestmain_lib",
+    "testmain",
+    "xtestmain",
+    "embed_test",
+    "embed_xtest",
+];
+
+fn is_test_target_name(name: &str) -> bool {
+    TEST_TARGET_NAMES.contains(&name)
+}
+
+/// Return true if the closest (deepest) ancestor `provider_state(provider="go", ...)`
+/// that carries a `test = {...}` map sets `skip = True`. Deeper states fully
+/// override shallower ones — a `test = {"skip": False}` closer to the target
+/// re-enables tests even if a root-level state disabled them.
+fn pick_test_skip(states: &[State]) -> bool {
+    let Some(state) = states
+        .iter()
+        .filter(|s| s.state.contains_key("test"))
+        .max_by_key(|s| s.package.as_str().len())
+    else {
+        return false;
+    };
+    let Some(TargetSpecValue::Map(test_map)) = state.state.get("test") else {
+        return false;
+    };
+    matches!(test_map.get("skip"), Some(TargetSpecValue::Bool(true)))
+}
+
 /// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
 /// Independent of `go_codegen_root` — a BUILD file declaring only
 /// `go_codegen_deps` must still inject those deps into descendant `_golist`
@@ -476,6 +521,62 @@ fn pick_codegen_deps(states: &[State]) -> Option<&State> {
         .iter()
         .filter(|s| s.state.contains_key("go_codegen_deps"))
         .max_by_key(|s| s.package.as_str().len())
+}
+
+/// Source addrs the package sandbox needs beyond the canonical `*.go` filesystem
+/// glob. Includes:
+/// 1. `**/*` filesystem glob (excluding `.go` files) — picks up checked-in
+///    non-Go sources (e.g. embed targets).
+/// 2. `q@label=go_src,tree_output_to=pkg` query — unpacks the full output tree
+///    of any codegen target labelled `go_src` into the pkg dir, so both
+///    generated `.go` files and any sibling non-go outputs (e.g. `.wasm.br`)
+///    land in the sandbox.
+/// 3. `go_codegen_deps` from the closest ancestor BUILD state — explicit
+///    codegen targets that don't carry the `go_src` label.
+///
+/// Shared between `_golist` (so `go list` can resolve `//go:embed` patterns
+/// into `EmbedFiles`) and `embed` (so the driver's runtime re-glob of
+/// `embed_patterns` against `sandbox_pkg_dir` matches Go's resolution).
+fn compute_pkg_src_addrs(pkg_str: &str, states: &[State]) -> anyhow::Result<Vec<String>> {
+    let non_go_glob = if pkg_str.is_empty() {
+        "**/*".to_string()
+    } else {
+        format!("{}/**/*", pkg_str)
+    };
+    let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &["**/*.go"]);
+    let mut addrs = vec![non_go_glob_addr.format()];
+
+    let codegen_root = pick_codegen_root(states);
+    let mut q_args = BTreeMap::from([
+        ("label".to_string(), "go_src".to_string()),
+        ("tree_output_to".to_string(), pkg_str.to_string()),
+    ]);
+    match codegen_root {
+        Some(root) => {
+            q_args.insert(
+                "package_prefix".to_string(),
+                root.package.as_str().to_string(),
+            );
+        }
+        None => {
+            q_args.insert("package".to_string(), pkg_str.to_string());
+        }
+    }
+    let go_src_query_addr = Addr::new(
+        crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+        "q".to_string(),
+        q_args,
+    );
+    addrs.push(go_src_query_addr.format());
+
+    if let Some(deps_state) = pick_codegen_deps(states)
+        && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
+    {
+        let deps =
+            parse_strings(deps_val).context("parsing go_codegen_deps from go provider_state")?;
+        addrs.extend(deps);
+    }
+    Ok(addrs)
 }
 
 impl ProviderInner {
@@ -539,6 +640,14 @@ impl ProviderInner {
                 );
                 return Ok(GetResponse { target_spec: spec });
             }
+            return Err(GetError::NotFound);
+        }
+
+        // provider_state(provider="go", test={"skip": True}) opts the package
+        // (and all descendants) out of test-target generation. Gate every test
+        // variant before the `_golist` resolve below so a skipped pkg never
+        // forces a `go list` round-trip purely to learn there are no tests.
+        if is_test_target_name(&addr.name) && pick_test_skip(&req.states) {
             return Err(GetError::NotFound);
         }
 
@@ -1123,12 +1232,15 @@ impl ProviderInner {
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
                     .map_err(GetError::Other)?;
+                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
                     target_spec: build_embed_spec(
                         addr.clone(),
                         &golist_addr,
                         "embed",
                         &pkg_addrs.embed_files,
+                        &srcfiles,
                     ),
                 })
             }
@@ -1146,8 +1258,16 @@ impl ProviderInner {
                     .map_err(GetError::Other)?;
                 let mut files = pkg_addrs.embed_files.clone();
                 files.extend(pkg_addrs.test_embed_files.iter().cloned());
+                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
-                    target_spec: build_embed_spec(addr.clone(), &golist_addr, "test_embed", &files),
+                    target_spec: build_embed_spec(
+                        addr.clone(),
+                        &golist_addr,
+                        "test_embed",
+                        &files,
+                        &srcfiles,
+                    ),
                 })
             }
             "embed_xtest" => {
@@ -1158,12 +1278,15 @@ impl ProviderInner {
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
                     .await
                     .map_err(GetError::Other)?;
+                let srcfiles = compute_pkg_src_addrs(addr.package.as_str(), &req.states)
+                    .map_err(GetError::Other)?;
                 Ok(GetResponse {
                     target_spec: build_embed_spec(
                         addr.clone(),
                         &golist_addr,
                         "xtest_embed",
                         &pkg_addrs.xtest_embed_files,
+                        &srcfiles,
                     ),
                 })
             }
@@ -1202,48 +1325,10 @@ impl ProviderInner {
                     format!("{}/*.go", pkg)
                 };
                 let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
-                let pkg_str = addr.package.as_str().to_string();
-                let codegen_root = pick_codegen_root(states);
-                let go_src_query_addr = {
-                    let mut args = BTreeMap::from([
-                        ("label".to_string(), "go_src".to_string()),
-                        ("tree_output_to".to_string(), pkg_str.clone()),
-                    ]);
-                    match codegen_root {
-                        Some(root) => {
-                            args.insert(
-                                "package_prefix".to_string(),
-                                root.package.as_str().to_string(),
-                            );
-                        }
-                        None => {
-                            args.insert("package".to_string(), pkg_str.clone());
-                        }
-                    }
-                    Addr::new(
-                        crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
-                        "q".to_string(),
-                        args,
-                    )
-                };
-                // Include all non-Go files in the package directory so that go list
-                // can resolve //go:embed patterns and populate EmbedFiles.
-                let non_go_glob = if pkg.is_empty() {
-                    "**/*".to_string()
-                } else {
-                    format!("{}/**/*", pkg)
-                };
-                let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &["**/*.go"]);
-                let mut non_go_src_addrs = vec![
-                    non_go_glob_addr.format(),
-                ];
-                if let Some(deps_state) = pick_codegen_deps(states)
-                    && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
-                {
-                    let deps = parse_strings(deps_val)
-                        .context("parsing go_codegen_deps from go provider_state")?;
-                    non_go_src_addrs.extend(deps);
-                }
+                // Non-Go src tree + go_src codegen query + go_codegen_deps — needed
+                // so `go list` can resolve //go:embed patterns into EmbedFiles, and
+                // shared with the downstream `embed` target.
+                let extra_src_addrs = compute_pkg_src_addrs(pkg, states)?;
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -1251,8 +1336,8 @@ impl ProviderInner {
                     &self.goroot,
                     &go_mod_addr,
                     &go_src_glob_addr,
-                    Some(&go_src_query_addr),
-                    &non_go_src_addrs,
+                    None,
+                    &extra_src_addrs,
                 )?
             }
             GoPackageKind::ThirdParty {
@@ -1832,6 +1917,7 @@ fn build_embed_spec(
     golist_addr: &Addr,
     variant: &str,
     embed_file_addrs: &[String],
+    srcfile_addrs: &[String],
 ) -> crate::engine::provider::TargetSpec {
     use crate::loosespecparser::TargetSpecValue;
     use std::collections::HashMap;
@@ -1853,6 +1939,17 @@ fn build_embed_spec(
             "files".to_string(),
             TargetSpecValue::List(
                 embed_file_addrs
+                    .iter()
+                    .map(|s| TargetSpecValue::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !srcfile_addrs.is_empty() {
+        deps_map.insert(
+            "srcfiles".to_string(),
+            TargetSpecValue::List(
+                srcfile_addrs
                     .iter()
                     .map(|s| TargetSpecValue::String(s.clone()))
                     .collect(),
@@ -2685,6 +2782,47 @@ mod tests {
         assert_eq!(variant, "embed");
     }
 
+    /// `embed` spec must declare a `srcfiles` deps group so the embed driver's
+    /// sandbox sees the same non-Go source tree `_golist` did when resolving
+    /// `//go:embed` patterns — otherwise codegen-produced embed files (e.g.
+    /// `resources/foo.wasm.br`) are missing at runtime and the driver's
+    /// pattern re-glob in `compute_embed_cfg_json` returns nothing.
+    #[tokio::test]
+    async fn test_with_embed_embed_target_has_srcfiles_dep() {
+        require_go!();
+        let sandbox = copy_fixture("with_embed");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("server", "embed"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected deps map"),
+        };
+        let srcfiles = match deps.get("srcfiles") {
+            Some(TargetSpecValue::List(v)) => v,
+            other => panic!("embed spec must have srcfiles deps list, got: {:?}", other),
+        };
+        let has_glob = srcfiles.iter().any(|v| match v {
+            TargetSpecValue::String(s) => s.contains("server/**/*"),
+            _ => false,
+        });
+        assert!(
+            has_glob,
+            "embed srcfiles must include the non-go `**/*` glob mirroring _golist: {:?}",
+            srcfiles
+        );
+        let has_go_src_query = srcfiles.iter().any(|v| match v {
+            TargetSpecValue::String(s) => s.contains("label=go_src") && s.contains("tree_output_to"),
+            _ => false,
+        });
+        assert!(
+            has_go_src_query,
+            "embed srcfiles must include q@label=go_src,tree_output_to so codegen targets unpack into pkg dir: {:?}",
+            srcfiles
+        );
+    }
+
     #[tokio::test]
     async fn test_simple_lib_build_lib_no_embed_dep() {
         require_go!();
@@ -3083,6 +3221,119 @@ mod tests {
         let states = vec![state_with_root("", true)];
         let picked = pick_codegen_root(&states).unwrap();
         assert_eq!(picked.package.as_str(), "");
+    }
+
+    fn state_with_test_skip(pkg: &str, skip: bool) -> State {
+        let mut test_map = HashMap::new();
+        test_map.insert("skip".to_string(), TargetSpecValue::Bool(skip));
+        let mut m = HashMap::new();
+        m.insert("test".to_string(), TargetSpecValue::Map(test_map));
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "go".to_string(),
+            state: m,
+        }
+    }
+
+    #[test]
+    fn pick_test_skip_false_when_no_states() {
+        assert!(!pick_test_skip(&[]));
+    }
+
+    #[test]
+    fn pick_test_skip_true_when_root_state_sets_skip() {
+        let states = vec![state_with_test_skip("", true)];
+        assert!(pick_test_skip(&states));
+    }
+
+    #[test]
+    fn pick_test_skip_deeper_state_overrides_shallower() {
+        // Root says skip=True; deeper pkg says skip=False → tests must run.
+        let states = vec![
+            state_with_test_skip("", true),
+            state_with_test_skip("src/foo", false),
+        ];
+        assert!(!pick_test_skip(&states));
+    }
+
+    #[test]
+    fn pick_test_skip_state_without_test_key_returns_false() {
+        let mut m = HashMap::new();
+        m.insert("other".to_string(), TargetSpecValue::Bool(true));
+        let states = vec![State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: m,
+        }];
+        assert!(!pick_test_skip(&states));
+    }
+
+    #[tokio::test]
+    async fn list_excludes_test_targets_when_test_skip_set() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let ctoken = StdCancellationToken::new();
+        let req = ListRequest {
+            request_id: "test".to_string(),
+            package: PkgBuf::from("pkg"),
+            states: vec![state_with_test_skip("", true)],
+        };
+        let names: Vec<String> = p
+            .list(req, &ctoken)
+            .await
+            .unwrap()
+            .map(|r| r.unwrap().addr.name.clone())
+            .collect();
+        for name in TEST_TARGET_NAMES {
+            assert!(
+                !names.iter().any(|n| n == name),
+                "test target {name} must not appear in list when test.skip=True: {names:?}"
+            );
+        }
+        // Non-test targets still emitted.
+        assert!(names.iter().any(|n| n == "build_lib"));
+        assert!(names.iter().any(|n| n == "_golist"));
+    }
+
+    #[tokio::test]
+    async fn get_returns_not_found_for_test_targets_when_test_skip_set() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let ctoken = StdCancellationToken::new();
+        for name in ["test", "build_test", "xtest", "build_xtest"] {
+            let req = GetRequest {
+                request_id: "test".to_string(),
+                addr: make_addr("pkg", name),
+                states: vec![state_with_test_skip("", true)],
+                executor: test_executor(sandbox.path()),
+            };
+            let res = p.get(req, &ctoken).await;
+            assert!(
+                matches!(res, Err(GetError::NotFound)),
+                "get({name}) must return NotFound when test.skip=True"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn get_build_test_still_works_when_test_skip_false_overrides() {
+        require_go!();
+        let sandbox = copy_fixture("with_test");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let ctoken = StdCancellationToken::new();
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: make_addr("pkg", "build_test"),
+            states: vec![
+                state_with_test_skip("", true),
+                state_with_test_skip("pkg", false),
+            ],
+            executor: test_executor(sandbox.path()),
+        };
+        let res = p.get(req, &ctoken).await;
+        assert!(res.is_ok(), "deeper test.skip=False must override");
     }
 
     fn extract_srcfiles(resp: &GetResponse) -> Vec<String> {
