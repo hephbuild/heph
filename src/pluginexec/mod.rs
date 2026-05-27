@@ -155,7 +155,14 @@ impl Driver {
             name: "exec".to_string(),
             search_path: vec![],
             wrap_run: |_, run| Ok(run.to_vec()),
-            wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &[run.join(" ")]),
+            wrap_run_shell: |sandbox_dir, run| {
+                let joined: Vec<String> = if run.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![run.join(" ")]
+                };
+                bash_args_shell(sandbox_dir, &joined)
+            },
         }
     }
     pub fn new_bash() -> Self {

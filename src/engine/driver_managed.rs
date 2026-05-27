@@ -121,14 +121,14 @@ pub struct ShellFallback {
 }
 
 impl ShellFallback {
-    /// Default: pluginexec with `run = ["bash"]`. `wrap_run_shell` turns
+    /// Default: pluginexec with `run = []`. `wrap_run_shell` turns
     /// the single `bash` command into an interactive bash session via
     /// `bash_args_shell` + `init.sh`.
     pub fn default_exec() -> Arc<Self> {
         let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
         config.insert(
             "run".to_string(),
-            TargetSpecValue::List(vec![TargetSpecValue::String("bash".to_string())]),
+            TargetSpecValue::List(vec![]),
         );
         Arc::new(Self {
             driver: Arc::new(crate::pluginexec::Driver::new_exec()),
