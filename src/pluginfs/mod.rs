@@ -46,6 +46,16 @@ pub fn glob_addr(pattern: &str, exclude: &[&str]) -> Addr {
     Addr::new(PkgBuf::from(PKG), "glob".to_string(), args)
 }
 
+/// Returns `true` if `addr` refers to a single-file fs target.
+pub fn is_file_addr(addr: &Addr) -> bool {
+    addr.package.as_str() == PKG && addr.name == "file"
+}
+
+/// Returns `true` if `addr` refers to a glob fs target.
+pub fn is_glob_addr(addr: &Addr) -> bool {
+    addr.package.as_str() == PKG && addr.name == "glob"
+}
+
 // ─── Provider ────────────────────────────────────────────────────────────────
 
 pub struct Provider;

@@ -87,7 +87,11 @@ pub struct PackageAddrs {
 ///
 /// First-party: codegen-produced files (those present in `source_map`, keyed by
 /// `pkg/file`) become `TargetAddr` strings with a filter pinning the specific
-/// file; the rest fall back to `pluginfs::file_addr` references.
+/// file. As an optimization, when the source addr is itself an `@heph/fs`
+/// glob, the output collapses to a plain `pluginfs::file_addr(rel)` — same
+/// artifact without the glob walk + filter; when it is already an `@heph/fs`
+/// file the filter is dropped (single-file target). The rest fall back to
+/// `pluginfs::file_addr` references.
 ///
 /// Thirdparty: when `download_addr` is `Some`, every file becomes a `TargetAddr`
 /// against the module-root `download` target filtered to the `pkg_str/file`
@@ -120,12 +124,22 @@ pub fn resolve_package_addrs(
                 } else if let Some(src_target) = source_map.get(&rel) {
                     let src_ref = parse_addr_with_base(src_target, &PkgBuf::from(""))
                         .unwrap_or_else(|_| Addr::default());
-                    TargetAddr {
-                        r#ref: src_ref,
-                        output: None,
-                        filters: vec![rel],
+                    // fs glob filtered to a single file is equivalent to a fs
+                    // file target for `rel`; skip the glob walk + downstream
+                    // filter. fs file already produces exactly one artifact,
+                    // so the filter is a no-op.
+                    if pluginfs::is_glob_addr(&src_ref) {
+                        pluginfs::file_addr(&rel).format()
+                    } else if pluginfs::is_file_addr(&src_ref) {
+                        src_target.clone()
+                    } else {
+                        TargetAddr {
+                            r#ref: src_ref,
+                            output: None,
+                            filters: vec![rel],
+                        }
+                        .to_string()
                     }
-                    .to_string()
                 } else {
                     pluginfs::file_addr(&rel).format()
                 }
@@ -327,6 +341,91 @@ pub(crate) async fn run_go_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pkg_with_one_go_file(name: &str) -> GoPackage {
+        GoPackage {
+            import_path: "example.com/mod/mypkg".to_string(),
+            dir: None,
+            name: None,
+            go_files: vec![name.to_string()],
+            s_files: vec![],
+            h_files: vec![],
+            test_go_files: vec![],
+            xtest_go_files: vec![],
+            embed_patterns: vec![],
+            embed_files: vec![],
+            test_embed_patterns: vec![],
+            test_embed_files: vec![],
+            xtest_embed_patterns: vec![],
+            xtest_embed_files: vec![],
+            imports: vec![],
+            test_imports: vec![],
+            xtest_imports: vec![],
+            standard: false,
+            module: None,
+            match_: vec![],
+            incomplete: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_package_addrs_source_map_fs_glob_collapses_to_file() {
+        // Source addr is an fs glob — output should drop glob+filter for a
+        // direct fs file addr at `pkg/file`.
+        let pkg = pkg_with_one_go_file("foo.go");
+        let mut sm = HashMap::new();
+        sm.insert(
+            "mypkg/foo.go".to_string(),
+            crate::pluginfs::glob_addr("mypkg/*.go", &[]).format(),
+        );
+        let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
+        assert_eq!(addrs.go_files.len(), 1);
+        let expected = crate::pluginfs::file_addr("mypkg/foo.go").format();
+        let got = addrs.go_files.first().expect("one entry");
+        assert_eq!(got, &expected);
+        assert!(
+            !got.contains(":glob"),
+            "glob source must collapse to file addr, got: {got}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_package_addrs_source_map_fs_file_drops_filter() {
+        // Source addr is already an fs file — filter is a no-op, drop it.
+        let pkg = pkg_with_one_go_file("foo.go");
+        let src = crate::pluginfs::file_addr("mypkg/foo.go").format();
+        let mut sm = HashMap::new();
+        sm.insert("mypkg/foo.go".to_string(), src.clone());
+        let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
+        assert_eq!(addrs.go_files, vec![src]);
+    }
+
+    #[test]
+    fn test_resolve_package_addrs_source_map_non_fs_keeps_filter() {
+        // Non-fs codegen source: must still wrap in TargetAddr with filter.
+        let pkg = pkg_with_one_go_file("gen.go");
+        let mut sm = HashMap::new();
+        sm.insert("mypkg/gen.go".to_string(), "//mypkg:gen".to_string());
+        let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
+        assert_eq!(addrs.go_files.len(), 1);
+        let got = addrs.go_files.first().expect("one entry");
+        assert!(
+            got.contains("mypkg:gen") && got.contains("mypkg/gen.go"),
+            "non-fs source must keep TargetAddr+filter, got: {got}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_package_addrs_no_source_map_uses_file_addr() {
+        let pkg = pkg_with_one_go_file("foo.go");
+        let sm = HashMap::new();
+        let addrs = resolve_package_addrs(&pkg, "mypkg", &sm, None);
+        assert_eq!(
+            addrs.go_files,
+            vec![crate::pluginfs::file_addr("mypkg/foo.go").format()]
+        );
+    }
 
     #[test]
     fn test_is_stdlib_import_path_simple() {

@@ -52,7 +52,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 8;
+const GO_GOLIST_FORMAT_VERSION: u32 = 9;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
