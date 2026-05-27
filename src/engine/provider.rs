@@ -18,6 +18,7 @@ pub struct ConfigResponse {
 pub struct ListRequest {
     pub request_id: String,
     pub package: PkgBuf,
+    pub states: Vec<State>,
 }
 pub struct ListResponse {
     pub addr: Addr,
@@ -31,10 +32,11 @@ pub struct ListPackageResponse {
     pub pkg: PkgBuf,
 }
 
+#[derive(Clone, Debug)]
 pub struct State {
     pub package: PkgBuf,
     pub provider: String,
-    pub state: HashMap<String, String>,
+    pub state: HashMap<String, TargetSpecValue>,
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]

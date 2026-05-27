@@ -3,7 +3,8 @@ use crate::engine::driver::targetdef::{Input, TargetDef};
 use crate::engine::driver::{ApplyTransitiveRequest, ParseRequest, outputartifact};
 use crate::engine::error::{CycleError, TargetNotFoundError};
 use crate::engine::provider::{
-    GetError, GetRequest, GetResponse, ListRequest, ProviderExecutor, TargetSpec,
+    GetError, GetRequest, GetResponse, ListRequest, ProbeRequest, ProviderExecutor, State,
+    TargetSpec,
 };
 use crate::engine::request_state::RequestState;
 use crate::engine::spec::EngineTargetSpec;
@@ -75,6 +76,8 @@ impl ProviderExecutor for EngineProviderExecutor {
             for pkg_str in pkgs {
                 let pkg = PkgBuf::from(pkg_str.as_str());
 
+                let states = Arc::clone(&engine).probe_segments(&rs, &pkg).await?;
+
                 for provider in &engine.providers {
                     if rs.skip_providers.contains(&provider.name)
                         || extra_skip.iter().any(|n| n == &provider.name)
@@ -88,6 +91,11 @@ impl ProviderExecutor for EngineProviderExecutor {
                             ListRequest {
                                 request_id: rs.request_id().to_string(),
                                 package: pkg.clone(),
+                                states: states
+                                    .iter()
+                                    .filter(|s| s.provider == provider.name)
+                                    .cloned()
+                                    .collect(),
                             },
                             rs.ctoken(),
                         )
@@ -777,11 +785,62 @@ impl Engine {
             })
     }
 
+    /// Probe every registered provider for every parent package of `pkg`, accumulating
+    /// the returned `State`s. Mirrors the Go `ProbeSegments` flow.
+    ///
+    /// Outer memoize per `pkg` (so repeat callers within a request share the result),
+    /// inner memoize per `(provider_name, probe_pkg)` so a given provider is probed at
+    /// most once per package per request.
+    pub async fn probe_segments(
+        self: Arc<Self>,
+        rs: &Arc<RequestState>,
+        pkg: &PkgBuf,
+    ) -> anyhow::Result<Arc<Vec<State>>> {
+        rs.data
+            .mem_probe
+            .once(
+                pkg.clone(),
+                enclose!((self => engine, rs, pkg) move || async move {
+                    let mut acc: Vec<State> = Vec::new();
+                    for probe_pkg in pkg.parent_packages() {
+                        for provider in engine.providers.iter() {
+                            let inner = rs
+                                .data
+                                .mem_probe_inner
+                                .once(
+                                    (provider.name.clone(), probe_pkg.clone()),
+                                    enclose!((provider, rs, probe_pkg) move || async move {
+                                        let res = provider
+                                            .provider
+                                            .probe(
+                                                ProbeRequest {
+                                                    request_id: rs.request_id().to_string(),
+                                                    package: probe_pkg,
+                                                },
+                                                rs.ctoken(),
+                                            )
+                                            .await?;
+                                        Ok(Arc::new(res.states))
+                                    }),
+                                )
+                                .await
+                                .map_err(unwrap_arc_err)?;
+                            acc.extend(inner.iter().cloned());
+                        }
+                    }
+                    Ok(Arc::new(acc))
+                }),
+            )
+            .await
+            .map_err(unwrap_arc_err)
+    }
+
     async fn get_spec_inner(
         self: Arc<Self>,
         rs: &Arc<RequestState>,
         addr: &Addr,
     ) -> anyhow::Result<Arc<EngineTargetSpec>> {
+        let states = Arc::clone(&self).probe_segments(rs, &addr.package).await?;
         for provider in self.providers.iter() {
             let provider_rs = rs.with_skip_provider(&provider.name);
             let executor: Arc<dyn ProviderExecutor> = Arc::new(EngineProviderExecutor {
@@ -795,7 +854,11 @@ impl Engine {
                     GetRequest {
                         request_id: rs.request_id().to_string(),
                         addr: addr.clone(),
-                        states: vec![], // TODO
+                        states: states
+                            .iter()
+                            .filter(|s| s.provider == provider.name)
+                            .cloned()
+                            .collect(),
                         executor: Arc::clone(&executor),
                     },
                     rs.ctoken(),
@@ -919,6 +982,115 @@ mod tests {
         ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
             Box::pin(async { Ok(ProbeResponse { states: vec![] }) })
         }
+    }
+
+    /// Provider that emits a `State` from every package it's probed for, and
+    /// records every `GetRequest.states` it observes. Used to verify
+    /// `probe_segments` walks parent packages and feeds the result into `get`.
+    struct ProbeRecorder {
+        name: String,
+        get_states: SArc<std::sync::Mutex<Vec<Vec<State>>>>,
+    }
+
+    impl crate::engine::provider::Provider for ProbeRecorder {
+        fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: self.name.clone(),
+            })
+        }
+        fn list<'a>(
+            &'a self,
+            _req: ListRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
+        {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+        }
+        fn list_packages<'a>(
+            &'a self,
+            _req: ListPackagesRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+        > {
+            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+        }
+        fn get<'a>(
+            &'a self,
+            req: GetRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+            let states = req.states.clone();
+            let recorder = SArc::clone(&self.get_states);
+            Box::pin(async move {
+                recorder.lock().expect("get_states lock").push(states);
+                Err(GetError::NotFound)
+            })
+        }
+        fn probe<'a>(
+            &'a self,
+            req: ProbeRequest,
+            _ctoken: &'a (dyn Cancellable + Send + Sync),
+        ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+            let name = self.name.clone();
+            let pkg = req.package.clone();
+            Box::pin(async move {
+                Ok(ProbeResponse {
+                    states: vec![State {
+                        package: pkg,
+                        provider: name,
+                        state: Default::default(),
+                    }],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_segments_walks_parent_packages() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let get_states = SArc::new(std::sync::Mutex::new(Vec::<Vec<State>>::new()));
+        let get_states_clone = SArc::clone(&get_states);
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(move |_| {
+            Box::new(ProbeRecorder {
+                name: "rec".to_string(),
+                get_states: SArc::clone(&get_states_clone),
+            })
+        })?;
+        let engine = SArc::new(engine);
+        let rs = engine.new_state();
+
+        let states = SArc::clone(&engine)
+            .probe_segments(&rs, &PkgBuf::from("a/b/c"))
+            .await?;
+
+        let pkgs: Vec<String> = states
+            .iter()
+            .map(|s| s.package.as_str().to_string())
+            .collect();
+        assert_eq!(pkgs, vec!["a/b/c", "a/b", "a", ""]);
+        for s in states.iter() {
+            assert_eq!(s.provider, "rec");
+        }
+
+        // get_spec should also forward the accumulated states.
+        let addr = Addr::new(PkgBuf::from("a/b/c"), "t".to_string(), Default::default());
+        let _ = SArc::clone(&engine).get_spec(rs, &addr).await;
+        let recorded = get_states.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "get called once");
+        let recorded_pkgs: Vec<String> = recorded[0]
+            .iter()
+            .map(|s| s.package.as_str().to_string())
+            .collect();
+        assert_eq!(recorded_pkgs, vec!["a/b/c", "a/b", "a", ""]);
+        Ok(())
     }
 
     #[tokio::test]

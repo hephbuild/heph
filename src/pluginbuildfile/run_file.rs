@@ -144,11 +144,10 @@ impl Sandbox {
     }
 }
 
-#[expect(dead_code, reason = "fields read via pattern matching or future use")]
 #[derive(Debug, Clone)]
 pub(crate) struct OnStatePayload {
-    pub name: String,
-    pub labels: Vec<String>,
+    pub provider: String,
+    pub args: HashMap<String, TargetSpecValue>,
 }
 
 #[derive(Debug)]
@@ -200,10 +199,6 @@ fn merge_pkg_results(parts: &[Arc<RunResult>]) -> anyhow::Result<RunResult> {
     })
 }
 
-#[expect(
-    dead_code,
-    reason = "fields accessed via downcast_ref in starlark evaluator context"
-)]
 #[derive(ProvidesStaticType)]
 pub(crate) struct Extra<'a> {
     pub pkg: &'a str,
@@ -402,12 +397,44 @@ fn starlark_module(builder: &mut GlobalsBuilder) {
         Ok(eval.heap().alloc(starlark::values::dict::AllocDict(pairs)))
     }
 
-    // TODO: wire provider_state into the engine's state registry (currently a no-op so
-    // BUILD files can declare it without errors).
     fn provider_state<'v>(
-        _eval: &mut Evaluator<'v, '_, '_>,
-        _args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+        args: &Arguments<'v, '_>,
     ) -> starlark::Result<starlark::values::none::NoneType> {
+        args.no_positional_args(eval.heap())?;
+        let extra = eval
+            .extra
+            .expect("evaluator extra must be set before calling provider_state()")
+            .downcast_ref::<Extra>()
+            .expect("evaluator extra must be of type Extra");
+
+        let m = args.names_map()?;
+
+        let mut provider = String::new();
+        let kwargs = m
+            .iter()
+            .filter_map(|e| match e.0.as_str() {
+                "provider" => {
+                    if let Some(s) = e.1.unpack_str() {
+                        provider = s.to_string();
+                    }
+                    None
+                }
+                _ => Some((e.0.as_str().to_string(), starlark_to_rust(e.1))),
+            })
+            .collect::<HashMap<String, TargetSpecValue>>();
+
+        if provider.is_empty() {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "provider_state: missing provider"
+            )));
+        }
+
+        (extra.on_state)(OnStatePayload {
+            provider,
+            args: kwargs,
+        })?;
+
         Ok(starlark::values::none::NoneType)
     }
 
@@ -1606,14 +1633,14 @@ target(name = "t", driver = "d", loaded_from = WHERE, here = get_pkg())
     }
 
     #[test]
-    fn test_provider_state_noop() {
+    fn test_provider_state_records_payload() {
         let tmp_dir = tempdir().unwrap();
         let pkg = tmp_dir.path().join("p");
         fs::create_dir_all(&pkg).unwrap();
         fs::write(
             pkg.join("BUILD"),
             r#"
-provider_state(name = "s", labels = ["a"])
+provider_state(provider = "go", root = "src", strict = True)
 target(name = "t", driver = "d")
 "#,
         )
@@ -1621,7 +1648,26 @@ target(name = "t", driver = "d")
         let provider = make_provider(&tmp_dir);
         let result = run_pkg_blocking(&provider, "p").unwrap();
         assert_eq!(result.targets.len(), 1);
-        assert!(result.states.is_empty());
+        assert_eq!(result.states.len(), 1);
+        let s = &result.states[0];
+        assert_eq!(s.provider, "go");
+        assert_eq!(
+            s.args.get("root"),
+            Some(&TargetSpecValue::String("src".to_string()))
+        );
+        assert_eq!(s.args.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert!(!s.args.contains_key("provider"));
+    }
+
+    #[test]
+    fn test_provider_state_requires_provider_kwarg() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg = tmp_dir.path().join("p");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("BUILD"), "provider_state(root = \"x\")\n").unwrap();
+        let provider = make_provider(&tmp_dir);
+        let err = run_pkg_blocking(&provider, "p").expect_err("must error");
+        assert!(format!("{err:#}").contains("missing provider"), "{err:#}");
     }
 
     #[test]

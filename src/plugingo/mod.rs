@@ -3,6 +3,7 @@ mod driver_embed;
 mod driver_golist;
 mod driver_testmain;
 mod embed;
+mod errors;
 mod factors;
 mod gen_testmain;
 mod pkg_analysis;

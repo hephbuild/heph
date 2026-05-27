@@ -250,12 +250,10 @@ impl EProvider for Provider {
                 states: res
                     .states
                     .iter()
-                    .map(|_p| {
-                        State {
-                            package: req.package.clone(),
-                            provider: "buildfile".to_string(), // TODO: move into engine
-                            state: Default::default(),
-                        }
+                    .map(|p| State {
+                        package: req.package.clone(),
+                        provider: p.provider.clone(),
+                        state: p.args.clone(),
                     })
                     .collect(),
             })
@@ -519,5 +517,78 @@ target(
         let result = provider.run_pkg(&pkg_name).await.unwrap();
         assert_eq!(result.targets.len(), 1);
         assert_eq!(result.targets[0].name, "globtarget");
+    }
+
+    #[tokio::test]
+    async fn probe_returns_provider_states_from_build_file() {
+        use crate::loosespecparser::TargetSpecValue;
+
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "p";
+        let pkg_path = tmp_dir.path().join(pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+
+        let build_content = r#"
+provider_state(provider = "go", root = "src", strict = True)
+"#;
+        fs::write(pkg_path.join("BUILD"), build_content).unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+
+        let ctoken = StdCancellationToken::new();
+        let res = provider
+            .probe(
+                ProbeRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from(pkg_name),
+                },
+                &ctoken,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.states.len(), 1);
+        let s = &res.states[0];
+        assert_eq!(s.package, PkgBuf::from(pkg_name));
+        assert_eq!(s.provider, "go");
+        assert_eq!(
+            s.state.get("root"),
+            Some(&TargetSpecValue::String("src".to_string()))
+        );
+        assert_eq!(s.state.get("strict"), Some(&TargetSpecValue::Bool(true)));
+        assert!(!s.state.contains_key("provider"));
+    }
+
+    #[tokio::test]
+    async fn probe_missing_provider_kwarg_errors() {
+        let tmp_dir = tempdir().unwrap();
+        let pkg_name = "p";
+        let pkg_path = tmp_dir.path().join(pkg_name);
+        fs::create_dir_all(&pkg_path).unwrap();
+        fs::write(pkg_path.join("BUILD"), "provider_state(root=\"x\")").unwrap();
+
+        let provider = Provider {
+            root: tmp_dir.path().to_path_buf(),
+            ..Provider::default()
+        };
+        let ctoken = StdCancellationToken::new();
+        let err = match provider
+            .probe(
+                ProbeRequest {
+                    request_id: "test".to_string(),
+                    package: PkgBuf::from(pkg_name),
+                },
+                &ctoken,
+            )
+            .await
+        {
+            Ok(_) => panic!("missing provider must error"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing provider"), "{msg}");
     }
 }

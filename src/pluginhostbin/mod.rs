@@ -279,6 +279,7 @@ mod tests {
                 ListRequest {
                     request_id: "test".to_string(),
                     package: PkgBuf::from(PKG),
+                    states: vec![],
                 },
                 &ctoken,
             )

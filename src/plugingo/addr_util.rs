@@ -82,10 +82,17 @@ fn decode_package_uncached(pkg: &PkgBuf, workspace_root: &Path) -> Option<GoPack
         return parse_thirdparty(rest, module_root);
     }
 
-    // First-party: check if src_dir exists under workspace and has go.mod ancestry
+    // First-party: any dir under a go.mod ancestor is a candidate, even if the
+    // dir doesn't exist on disk yet — generated subpackages (codegen output)
+    // are materialized inside the `_golist` sandbox by the codegen target wired
+    // via `go_codegen_deps`. `find_go_mod` walks parent paths via string ops,
+    // so it works on non-existent leaves as long as some ancestor has go.mod.
+    //
+    // Bound the result to `workspace_root` to avoid picking up an unrelated
+    // go.mod above the workspace when no in-workspace go.mod exists.
     let src_dir = workspace_root.join(s);
-    if src_dir.exists()
-        && let Some((module_root, module_path)) = find_go_mod(&src_dir)
+    if let Some((module_root, module_path)) = find_go_mod(&src_dir)
+        && module_root.starts_with(workspace_root)
     {
         let rel = src_dir
             .strip_prefix(&module_root)
@@ -443,6 +450,21 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let pkg = PkgBuf::from("doesnotexist");
         assert!(decode_package(&pkg, ws.path()).is_none());
+    }
+
+    // Regression: a non-existent dir UNDER a workspace go.mod must decode as
+    // FirstParty so codegen-generated subpackages (e.g. `some/pkg/gen/deep`
+    // produced by a codegen target wired via go_codegen_deps) resolve before
+    // the dir exists on disk.
+    #[test]
+    fn test_decode_nonexistent_dir_under_gomod_returns_firstparty() {
+        let ws = make_workspace_with_go_mod("example.com/myrepo");
+        let pkg = PkgBuf::from("gen/deep");
+        let kind = decode_package(&pkg, ws.path()).expect("must decode as FirstParty");
+        assert!(matches!(
+            &*kind,
+            GoPackageKind::FirstParty { import_path, .. } if import_path == "example.com/myrepo/gen/deep"
+        ));
     }
 
     #[test]

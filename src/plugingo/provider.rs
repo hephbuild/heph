@@ -1,16 +1,19 @@
 use crate::engine::provider::{
     ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
     ListPackagesRequest, ListRequest, ListResponse, Provider as ProviderTrait, ProviderExecutor,
+    State,
 };
 use crate::hasync::Cancellable;
-use crate::hmemoizer::{Memoizer, unwrap_arc_err};
+use crate::hmemoizer::{Memoizer, downcast_chain_ref, unwrap_arc_err};
 use crate::htaddr::Addr;
 use crate::htpkg::PkgBuf;
+use crate::loosespecparser::{TargetSpecValue, parse_strings};
 use crate::pluginfs;
 use crate::plugingo::addr_util::{
     GoPackageKind, decode_package, encode_firstparty, encode_stdlib, encode_thirdparty,
     encode_thirdparty_download, factors_to_args,
 };
+use crate::plugingo::errors::NoGoFilesError;
 use crate::plugingo::factors::{Factors, current_goarch, current_goos};
 use crate::plugingo::pkg_analysis::{
     GoPackage, PackageAddrs, decode_go_package, decode_package_addrs, find_module_for_import,
@@ -187,11 +190,30 @@ fn resolve_goroot() -> anyhow::Result<String> {
     resolve_go_env_var("GOROOT")
 }
 
+/// Recursively enumerate directories at or below `dir` that live under a
+/// `go.mod` ancestor. Replaces the prior `.go`-file-based detection: any dir
+/// under a Go module is a candidate package, and `_golist` decides what is real
+/// when the engine actually queries it.
+///
+/// `under_gomod` is the inherited flag from the parent walk — once we've found
+/// a `go.mod` at or above the current dir, every descendant inherits it and we
+/// skip the per-dir `find_go_mod` lookup. The `find_go_mod` cache absorbs the
+/// cost when the flag is unset.
 fn collect_go_packages(
     dir: &Path,
     workspace_root: &Path,
+    under_gomod: bool,
     result: &mut Vec<anyhow::Result<ListPackageResponse>>,
 ) {
+    let is_under = under_gomod || crate::plugingo::addr_util::find_go_mod(dir).is_some();
+
+    if is_under {
+        let rel = dir.strip_prefix(workspace_root).unwrap_or(dir);
+        result.push(Ok(ListPackageResponse {
+            pkg: PkgBuf::from(rel.to_string_lossy().as_ref()),
+        }));
+    }
+
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -200,70 +222,22 @@ fn collect_go_packages(
         }
     };
 
-    let mut has_go_files = false;
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if let Ok(ft) = entry.file_type() {
-            if ft.is_dir() {
-                if !name_str.starts_with('.')
-                    && !name_str.starts_with('_')
-                    && name_str != "vendor"
-                    && name_str != "testdata"
-                {
-                    subdirs.push(entry.path());
-                }
-            } else if ft.is_file() && name_str.ends_with(".go") {
-                has_go_files = true;
-            }
-        }
-    }
-
-    if has_go_files {
-        let rel = dir.strip_prefix(workspace_root).unwrap_or(dir);
-        result.push(Ok(ListPackageResponse {
-            pkg: PkgBuf::from(rel.to_string_lossy().as_ref()),
-        }));
-    }
-
-    for subdir in subdirs {
-        collect_go_packages(&subdir, workspace_root, result);
-    }
-}
-
-/// Scan a directory for .go files and return (has_non_test, has_test).
-fn scan_go_files(src_dir: &Path) -> (bool, bool) {
-    let entries = match std::fs::read_dir(src_dir) {
-        Ok(e) => e,
-        Err(_) => return (false, false),
-    };
-
-    let mut has_non_test = false;
-    let mut has_test = false;
-
-    for entry in entries.flatten() {
         let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_file() {
+        if !ft.is_dir() {
             continue;
         }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".go") {
+        if name_str.starts_with('.')
+            || name_str.starts_with('_')
+            || name_str == "vendor"
+            || name_str == "testdata"
+        {
             continue;
         }
-        if name_str.ends_with("_test.go") {
-            has_test = true;
-        } else {
-            has_non_test = true;
-        }
-        if has_non_test && has_test {
-            break;
-        }
+        collect_go_packages(&entry.path(), workspace_root, is_under, result);
     }
-
-    (has_non_test, has_test)
 }
 
 impl ProviderTrait for Provider {
@@ -383,59 +357,33 @@ impl ProviderInner {
                     Ok(Box::new(responses.into_iter())
                         as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
                 }
-                GoPackageKind::FirstParty { src_dir, .. } => {
-                    let (has_non_test, has_test) = scan_go_files(src_dir);
-
-                    let mut addrs: Vec<Addr> = Vec::new();
-
-                    if has_non_test {
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "_golist".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "build_lib".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                        // Always list build; get() returns NotFound for non-main
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "build".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                        // Always list embed; get() returns NotFound if no embed files
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "embed".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                        addrs.push(Addr::new(
-                            req.package.clone(),
-                            "embed_xtest".to_string(),
-                            factors_to_args(&factors),
-                        ));
-                    }
-
-                    if has_test {
-                        // Emit both internal and xtest variants. The `get`
-                        // handler returns NotFound for whichever doesn't apply
-                        // based on actual pkg.test_go_files / pkg.xtest_go_files
-                        // — `scan_go_files` only sees `*_test.go` collectively
-                        // without parsing `package` declarations.
-                        for name in ["build_test", "test", "build_xtest", "xtest"] {
-                            addrs.push(Addr::new(
-                                req.package.clone(),
-                                name.to_string(),
-                                factors_to_args(&factors),
-                            ));
-                        }
-                    }
-
-                    let responses: Vec<anyhow::Result<ListResponse>> = addrs
-                        .into_iter()
-                        .map(|addr| Ok(ListResponse { addr }))
+                GoPackageKind::FirstParty { .. } => {
+                    // Emit the full candidate set unconditionally for any dir
+                    // under a go.mod (decode_package guarantees that). Each
+                    // variant is filtered at `get` time by inspecting the
+                    // `_golist` result — no filesystem scan needed.
+                    let names = [
+                        "_golist",
+                        "build_lib",
+                        "build",
+                        "embed",
+                        "embed_xtest",
+                        "build_test",
+                        "test",
+                        "build_xtest",
+                        "xtest",
+                    ];
+                    let responses: Vec<anyhow::Result<ListResponse>> = names
+                        .iter()
+                        .map(|name| {
+                            Ok(ListResponse {
+                                addr: Addr::new(
+                                    req.package.clone(),
+                                    (*name).to_string(),
+                                    factors_to_args(&factors),
+                                ),
+                            })
+                        })
                         .collect();
 
                     Ok(Box::new(responses.into_iter())
@@ -474,7 +422,7 @@ impl ProviderInner {
             let packages = crate::process_supervisor::block_or_inline(
                 enclose!((self.workspace_root => workspace_root) move || {
                     let mut packages = Vec::new();
-                    collect_go_packages(&search_dir, &workspace_root, &mut packages);
+                    collect_go_packages(&search_dir, &workspace_root, false, &mut packages);
                     packages
                 }),
             );
@@ -501,6 +449,35 @@ struct TransitiveDeps {
     libs: Vec<(String, Addr)>,
 }
 
+/// Pick the closest (deepest) ancestor `provider_state(provider="go", ...)` that
+/// has `go_codegen_root=True` and whose package is a prefix of `addr_pkg`.
+///
+/// Engine pre-filters states by provider name, so callers only see Go states.
+fn pick_codegen_root(states: &[State]) -> Option<&State> {
+    states
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.state.get("go_codegen_root"),
+                Some(TargetSpecValue::Bool(true))
+            )
+        })
+        .max_by_key(|s| s.package.as_str().len())
+}
+
+/// Pick the closest (deepest) ancestor state carrying `go_codegen_deps`.
+/// Independent of `go_codegen_root` — a BUILD file declaring only
+/// `go_codegen_deps` must still inject those deps into descendant `_golist`
+/// targets so generated `.go` files reach the sandbox. Mirrors `getCodegenDeps`
+/// in the Go reference impl (`heph/plugin/plugingo/plugin.go:184-200`), which
+/// scans for deps independently of the root marker.
+fn pick_codegen_deps(states: &[State]) -> Option<&State> {
+    states
+        .iter()
+        .filter(|s| s.state.contains_key("go_codegen_deps"))
+        .max_by_key(|s| s.package.as_str().len())
+}
+
 impl ProviderInner {
     async fn handle_get(self: Arc<Self>, req: GetRequest) -> Result<GetResponse, GetError> {
         let addr = &req.addr;
@@ -515,7 +492,7 @@ impl ProviderInner {
         // stdlib packages can also expose a _golist target for cached dep resolution)
         if addr.name == "_golist" {
             return self
-                .get_golist_spec(addr.clone(), &kind, &factors)
+                .get_golist_spec(addr.clone(), &kind, &factors, &req.states)
                 .map_err(GetError::Other);
         }
 
@@ -580,16 +557,20 @@ impl ProviderInner {
         };
 
         // Resolve package info via _golist target (cached by the engine).
+        // `NoGoFilesError` (raised by `read_golist_package` when `go list -e`
+        // reports the package has no buildable Go files) maps uniformly to
+        // `NotFound` for every variant — no per-arm duck-typed check needed.
         let golist_addr = self.make_addr_with_name(&addr.package, "_golist", &factors);
-        let pkg = self
+        let pkg = match self
             .read_golist_package(Arc::clone(&req.executor), &golist_addr)
             .await
-            .map_err(GetError::Other)?;
-
-        // Package excluded by build constraints or has errors with no files
-        if pkg.go_files.is_empty() && pkg.error.is_some() {
-            return Err(GetError::NotFound);
-        }
+        {
+            Ok(p) => p,
+            Err(e) if downcast_chain_ref::<NoGoFilesError>(&e).is_some() => {
+                return Err(GetError::NotFound);
+            }
+            Err(e) => return Err(GetError::Other(e)),
+        };
 
         if pkg.dir.is_none() {
             return Err(GetError::Other(anyhow::anyhow!(
@@ -607,6 +588,14 @@ impl ProviderInner {
 
         match addr.name.as_str() {
             "build_lib" => {
+                // A library with no Go source files isn't buildable. Previously
+                // caught by a shared `go_files.is_empty() && error.is_some()`
+                // guard above; now the sentinel only fires on the NOGO case
+                // (`error.is_some()`), so the no-source-but-test-files case
+                // (e.g. test-only packages) needs its own guard here.
+                if pkg.go_files.is_empty() {
+                    return Err(GetError::NotFound);
+                }
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
@@ -1188,6 +1177,7 @@ impl ProviderInner {
         addr: Addr,
         kind: &GoPackageKind,
         factors: &Factors,
+        states: &[State],
     ) -> anyhow::Result<GetResponse> {
         let spec = match kind {
             GoPackageKind::FirstParty {
@@ -1213,15 +1203,29 @@ impl ProviderInner {
                 };
                 let go_src_glob_addr = pluginfs::glob_addr(&src_glob, &[]);
                 let pkg_str = addr.package.as_str().to_string();
-                let go_src_query_addr = Addr::new(
-                    crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
-                    "q".to_string(),
-                    BTreeMap::from([
+                let codegen_root = pick_codegen_root(states);
+                let go_src_query_addr = {
+                    let mut args = BTreeMap::from([
                         ("label".to_string(), "go_src".to_string()),
-                        ("package".to_string(), pkg_str.clone()),
                         ("tree_output_to".to_string(), pkg_str.clone()),
-                    ]),
-                );
+                    ]);
+                    match codegen_root {
+                        Some(root) => {
+                            args.insert(
+                                "package_prefix".to_string(),
+                                root.package.as_str().to_string(),
+                            );
+                        }
+                        None => {
+                            args.insert("package".to_string(), pkg_str.clone());
+                        }
+                    }
+                    Addr::new(
+                        crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
+                        "q".to_string(),
+                        args,
+                    )
+                };
                 // Include all non-Go files in the package directory so that go list
                 // can resolve //go:embed patterns and populate EmbedFiles.
                 let non_go_glob = if pkg.is_empty() {
@@ -1238,10 +1242,17 @@ impl ProviderInner {
                         ("tree_output_to".to_string(), pkg_str),
                     ]),
                 );
-                let non_go_src_addrs = vec![
+                let mut non_go_src_addrs = vec![
                     non_go_glob_addr.format(),
                     non_go_codegen_query_addr.format(),
                 ];
+                if let Some(deps_state) = pick_codegen_deps(states)
+                    && let Some(deps_val) = deps_state.state.get("go_codegen_deps")
+                {
+                    let deps = parse_strings(deps_val)
+                        .context("parsing go_codegen_deps from go provider_state")?;
+                    non_go_src_addrs.extend(deps);
+                }
                 target_golist::build_spec_firstparty(
                     addr,
                     import_path,
@@ -1348,6 +1359,21 @@ impl ProviderInner {
                         }
                         anyhow::bail!("_golist produced no package.bin")
                     })?;
+                    // `go list -e` reports no-buildable-files cases as a JSON
+                    // entry with the Error field populated and empty GoFiles.
+                    // Surface that as a typed sentinel so consumers can map it
+                    // to NotFound uniformly (mirrors errNoGoFiles in the Go
+                    // reference impl: heph/plugin/plugingo/pkg_analysis.go:34).
+                    //
+                    // Test-only packages (only `package pkg_test` xtest files)
+                    // are NOT NOGO — go list -test reports a synthetic primary
+                    // entry without an Error in that case, so xtest variants
+                    // remain reachable.
+                    if pkg.go_files.is_empty() && pkg.error.is_some() {
+                        return Err(anyhow::Error::new(NoGoFilesError {
+                            import_path: pkg.import_path.clone(),
+                        }));
+                    }
                     Ok(Arc::new(pkg))
                 }),
             )
@@ -2831,6 +2857,7 @@ mod tests {
         let req = ListRequest {
             request_id: "test".to_string(),
             package: PkgBuf::from(package),
+            states: vec![],
         };
         p.list(req, &ctoken)
             .await
@@ -2865,22 +2892,23 @@ mod tests {
         );
     }
 
+    // `list` now emits the full candidate set unconditionally for any dir
+    // under a go.mod; `get` is what filters by inspecting the `_golist` result.
+    // For a package with no `_test.go` files, build_test/test must resolve to
+    // NotFound via the per-arm `pkg.test_go_files.is_empty()` guard.
     #[tokio::test]
-    async fn test_list_simple_lib_no_test_targets() {
+    async fn test_simple_lib_no_test_targets_via_get() {
         require_go!();
         let sandbox = copy_fixture("simple_lib");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let names = provider_list(&p, "").await;
-        assert!(
-            !names.iter().any(|n| n == "build_test"),
-            "expected no build_test in list: {:?}",
-            names
-        );
-        assert!(
-            !names.iter().any(|n| n == "test"),
-            "expected no test in list: {:?}",
-            names
-        );
+        assert!(matches!(
+            provider_get(&p, make_addr("", "build_test")).await,
+            Err(GetError::NotFound)
+        ));
+        assert!(matches!(
+            provider_get(&p, make_addr("", "test")).await,
+            Err(GetError::NotFound)
+        ));
     }
 
     #[tokio::test]
@@ -2922,17 +2950,18 @@ mod tests {
         );
     }
 
+    // A test-only package (only `package pkg_test` xtest files) has empty
+    // GoFiles, so `build_lib` must resolve to NotFound via the per-arm
+    // `pkg.go_files.is_empty()` guard.
     #[tokio::test]
-    async fn test_list_test_only_pkg_no_build_lib() {
+    async fn test_test_only_pkg_build_lib_not_found_via_get() {
         require_go!();
         let sandbox = copy_fixture("test_only");
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
-        let names = provider_list(&p, "pkg").await;
-        assert!(
-            !names.iter().any(|n| n == "build_lib"),
-            "test-only package should not have build_lib: {:?}",
-            names
-        );
+        assert!(matches!(
+            provider_get(&p, make_addr("pkg", "build_lib")).await,
+            Err(GetError::NotFound)
+        ));
     }
 
     // test_only fixture has ONLY xtest_go_files (package pkg_test) — no
@@ -3022,5 +3051,176 @@ mod tests {
                 "asm step must include GOROOT/pkg/include: {run}"
             );
         }
+    }
+
+    fn state_with_root(pkg: &str, root: bool) -> State {
+        let mut m = HashMap::new();
+        m.insert("go_codegen_root".to_string(), TargetSpecValue::Bool(root));
+        State {
+            package: PkgBuf::from(pkg),
+            provider: "go".to_string(),
+            state: m,
+        }
+    }
+
+    #[test]
+    fn pick_codegen_root_picks_deepest_matching_state() {
+        let states = vec![
+            state_with_root("src", true),
+            state_with_root("src/foo", true),
+            state_with_root("other", true),
+        ];
+        let picked = pick_codegen_root(&states).unwrap();
+        assert_eq!(picked.package.as_str(), "src/foo");
+    }
+
+    #[test]
+    fn pick_codegen_root_ignores_states_with_root_false() {
+        let states = vec![state_with_root("src", false)];
+        let picked = pick_codegen_root(&states);
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_codegen_root_returns_none_when_no_states() {
+        let picked = pick_codegen_root(&[]);
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn pick_codegen_root_matches_root_state_at_empty_pkg() {
+        let states = vec![state_with_root("", true)];
+        let picked = pick_codegen_root(&states).unwrap();
+        assert_eq!(picked.package.as_str(), "");
+    }
+
+    fn extract_srcfiles(resp: &GetResponse) -> Vec<String> {
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("deps not a map"),
+        };
+        match deps.get("srcfiles").unwrap() {
+            TargetSpecValue::List(l) => l
+                .iter()
+                .map(|v| match v {
+                    TargetSpecValue::String(s) => s.clone(),
+                    _ => panic!("srcfiles entry not a string"),
+                })
+                .collect(),
+            _ => panic!("srcfiles not a list"),
+        }
+    }
+
+    #[tokio::test]
+    async fn golist_default_uses_package_matcher_for_go_src_query() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: make_addr("", "_golist"),
+            states: vec![],
+            executor: Arc::new(GoListTestExecutor {
+                workspace_root: sandbox.path().to_path_buf(),
+                source_map: HashMap::new(),
+            }),
+        };
+        let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
+        let srcfiles = extract_srcfiles(&resp);
+        let go_src_query = srcfiles
+            .iter()
+            .find(|s| s.contains("label=go_src"))
+            .expect("go_src query addr present");
+        assert!(
+            go_src_query.contains("package="),
+            "default must use package= matcher, got: {go_src_query}"
+        );
+        assert!(
+            !go_src_query.contains("package_prefix="),
+            "default must not use package_prefix, got: {go_src_query}"
+        );
+    }
+
+    #[tokio::test]
+    async fn golist_codegen_root_widens_go_src_query_and_appends_deps() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let mut state_map = HashMap::new();
+        state_map.insert("go_codegen_root".to_string(), TargetSpecValue::Bool(true));
+        state_map.insert(
+            "go_codegen_deps".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("//codegen:gen".to_string())]),
+        );
+        let state = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: state_map,
+        };
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: make_addr("", "_golist"),
+            states: vec![state],
+            executor: Arc::new(GoListTestExecutor {
+                workspace_root: sandbox.path().to_path_buf(),
+                source_map: HashMap::new(),
+            }),
+        };
+        let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
+        let srcfiles = extract_srcfiles(&resp);
+        let go_src_query = srcfiles
+            .iter()
+            .find(|s| s.contains("label=go_src"))
+            .expect("go_src query addr present");
+        assert!(
+            go_src_query.contains("package_prefix="),
+            "codegen_root must use package_prefix matcher, got: {go_src_query}"
+        );
+        assert!(
+            !go_src_query.contains(",package="),
+            "codegen_root must drop package= matcher, got: {go_src_query}"
+        );
+        assert!(
+            srcfiles.iter().any(|s| s == "//codegen:gen"),
+            "go_codegen_deps must be appended to srcfiles, got: {srcfiles:?}"
+        );
+    }
+
+    // Regression: a BUILD file declaring only `go_codegen_deps` (no
+    // `go_codegen_root=true`) on an ancestor package must still inject those
+    // deps into a descendant `_golist` sandbox. Previously the deps lookup was
+    // nested inside the root-marker check, so without the marker the codegen
+    // target never ran and `_golist` for an empty (codegen-only) directory
+    // hit NoGoFilesError.
+    #[tokio::test]
+    async fn golist_appends_codegen_deps_without_root_marker() {
+        require_go!();
+        let sandbox = copy_fixture("simple_lib");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let mut state_map = HashMap::new();
+        state_map.insert(
+            "go_codegen_deps".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("//codegen:gen".to_string())]),
+        );
+        let state = State {
+            package: PkgBuf::from(""),
+            provider: "go".to_string(),
+            state: state_map,
+        };
+        let req = GetRequest {
+            request_id: "test".to_string(),
+            addr: make_addr("", "_golist"),
+            states: vec![state],
+            executor: Arc::new(GoListTestExecutor {
+                workspace_root: sandbox.path().to_path_buf(),
+                source_map: HashMap::new(),
+            }),
+        };
+        let resp = p.get(req, &StdCancellationToken::new()).await.unwrap();
+        let srcfiles = extract_srcfiles(&resp);
+        assert!(
+            srcfiles.iter().any(|s| s == "//codegen:gen"),
+            "go_codegen_deps must be appended even without go_codegen_root, got: {srcfiles:?}"
+        );
     }
 }

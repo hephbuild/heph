@@ -20,10 +20,17 @@ impl Engine {
             for pkg_result in self.packages(m, &rs).await? {
                 let pkg = PkgBuf::from(pkg_result?);
 
+                let states = Arc::clone(&self).probe_segments(&rs, &pkg).await?;
+
                 for provider in &self.providers {
                     let it = provider.provider.list(ListRequest {
                         request_id: rs.request_id().to_string(),
                         package: pkg.clone(),
+                        states: states
+                            .iter()
+                            .filter(|s| s.provider == provider.name)
+                            .cloned()
+                            .collect(),
                     }, rs.ctoken()).await?;
 
                     for item in it {
@@ -156,6 +163,114 @@ mod tests {
 
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].name, "a");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_request_receives_probed_states() -> anyhow::Result<()> {
+        use crate::engine::provider::{
+            ConfigRequest, ConfigResponse, GetError, GetRequest, GetResponse, ListPackageResponse,
+            ListPackagesRequest, ListResponse, ProbeRequest, ProbeResponse, State,
+        };
+        use crate::hasync::Cancellable;
+        use futures::future::BoxFuture;
+        use std::sync::Mutex;
+
+        struct Recorder {
+            list_states: Arc<Mutex<Vec<Vec<State>>>>,
+        }
+        impl crate::engine::provider::Provider for Recorder {
+            fn config(&self, _req: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+                Ok(ConfigResponse {
+                    name: "rec".to_string(),
+                })
+            }
+            fn list<'a>(
+                &'a self,
+                req: ListRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
+            {
+                let states = req.states.clone();
+                let rec = Arc::clone(&self.list_states);
+                Box::pin(async move {
+                    rec.lock().unwrap().push(states);
+                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>)
+                })
+            }
+            fn list_packages<'a>(
+                &'a self,
+                _req: ListPackagesRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+            > {
+                Box::pin(async {
+                    let items: Vec<anyhow::Result<ListPackageResponse>> =
+                        vec![Ok(ListPackageResponse {
+                            pkg: PkgBuf::from("a/b/c"),
+                        })];
+                    Ok(Box::new(items.into_iter())
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                        >)
+                })
+            }
+            fn get<'a>(
+                &'a self,
+                _req: GetRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, Result<GetResponse, GetError>> {
+                Box::pin(async { Err(GetError::NotFound) })
+            }
+            fn probe<'a>(
+                &'a self,
+                req: ProbeRequest,
+                _ctoken: &'a (dyn Cancellable + Send + Sync),
+            ) -> BoxFuture<'a, anyhow::Result<ProbeResponse>> {
+                let pkg = req.package.clone();
+                Box::pin(async move {
+                    Ok(ProbeResponse {
+                        states: vec![State {
+                            package: pkg,
+                            provider: "rec".to_string(),
+                            state: Default::default(),
+                        }],
+                    })
+                })
+            }
+        }
+
+        let root = tempdir()?;
+        let list_states = Arc::new(Mutex::new(Vec::<Vec<State>>::new()));
+        let list_states_clone = Arc::clone(&list_states);
+        let mut engine = Engine::new(Config {
+            root: root.path().to_path_buf(),
+            home_dir: std::path::PathBuf::new(),
+            parallelism: None,
+            ..Default::default()
+        })?;
+        engine.register_provider(move |_| {
+            Box::new(Recorder {
+                list_states: Arc::clone(&list_states_clone),
+            })
+        })?;
+        let engine = Arc::new(engine);
+        let rs = engine.new_state();
+
+        let _: Vec<Addr> = engine
+            .query(rs, &Matcher::Package(PkgBuf::from("a/b/c")))
+            .try_collect()
+            .await?;
+
+        let recorded = list_states.lock().unwrap();
+        assert_eq!(recorded.len(), 1, "list called once");
+        let pkgs: Vec<String> = recorded[0]
+            .iter()
+            .map(|s| s.package.as_str().to_string())
+            .collect();
+        assert_eq!(pkgs, vec!["a/b/c", "a/b", "a", ""]);
         Ok(())
     }
 

@@ -28,6 +28,26 @@ impl PkgBuf {
         }
         self.0 == p || self.0.starts_with(&format!("{}/", p))
     }
+
+    /// Iterator yielding this package, then each ancestor up to (and including)
+    /// the root package `""`. For `a/b/c` yields `a/b/c`, `a/b`, `a`, `""`.
+    /// For `""` yields just `""`.
+    pub fn parent_packages(&self) -> impl Iterator<Item = PkgBuf> + '_ {
+        let mut next: Option<&str> = Some(self.0.as_str());
+        std::iter::from_fn(move || {
+            let cur = next?;
+            let out = PkgBuf::from(cur);
+            next = if cur.is_empty() {
+                None
+            } else {
+                Some(match cur.rsplit_once('/') {
+                    Some((parent, _)) => parent,
+                    None => "",
+                })
+            };
+            Some(out)
+        })
+    }
 }
 
 impl fmt::Display for PkgBuf {
@@ -107,5 +127,32 @@ mod tests {
         assert!(pkg("").has_prefix(&pkg("")));
         assert!(pkg("foo/bar").has_prefix(&pkg("")));
         assert!(pkg("foo/bar/baz").has_prefix(&pkg("")));
+    }
+
+    #[test]
+    fn parent_packages_walks_to_root() {
+        let got: Vec<String> = pkg("a/b/c")
+            .parent_packages()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(got, vec!["a/b/c", "a/b", "a", ""]);
+    }
+
+    #[test]
+    fn parent_packages_root_only() {
+        let got: Vec<String> = pkg("")
+            .parent_packages()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(got, vec![""]);
+    }
+
+    #[test]
+    fn parent_packages_single_level() {
+        let got: Vec<String> = pkg("a")
+            .parent_packages()
+            .map(|p| p.as_str().to_string())
+            .collect();
+        assert_eq!(got, vec!["a", ""]);
     }
 }

@@ -133,6 +133,32 @@ impl EProvider for Provider {
 
 const BUILT_IN_GLOB_EXCLUDES: &[&str] = &["**/.git/**", "**/.heph3/**", "**/.heph/**"];
 
+/// Collapses `.`, empty, and `..` components in a forward-slash path.
+///
+/// `wax` accepts patterns like `a/./b` or `a/b/../c` at parse time but its
+/// walker matches them against on-disk paths that never contain literal `.` or
+/// `..` segments, so the pattern matches nothing. Normalizing before compile +
+/// hash keeps semantically equivalent patterns behaving identically and stable
+/// in the cache.
+///
+/// Fails if `..` would pop past the root — the fs root is the heph workspace
+/// root and targets must not escape it.
+fn normalize_path(path: &str) -> anyhow::Result<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if out.pop().is_none() {
+                    anyhow::bail!("path '{}' escapes workspace root", path);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out.join("/"))
+}
+
 struct CompiledGlob {
     glob: wax::Glob<'static>,
     not: wax::Any<'static>,
@@ -220,8 +246,14 @@ impl crate::engine::driver::Driver for Driver {
             }
         };
 
-        let file_path = get_str("f")?;
-        let glob_pattern = get_str("p")?;
+        let file_path = get_str("f")?
+            .map(|p| normalize_path(&p))
+            .transpose()
+            .context("normalizing fs file path")?;
+        let glob_pattern = get_str("p")?
+            .map(|p| normalize_path(&p))
+            .transpose()
+            .context("normalizing fs glob pattern")?;
         let exclude_raw = get_str("e")?.unwrap_or_default();
 
         // "e" arg is comma-separated glob patterns.
@@ -968,6 +1000,189 @@ mod tests {
         // Roundtrip again to confirm format output is itself parseable.
         let reparsed = parse_addr(&formatted).unwrap();
         assert_eq!(reparsed, parsed);
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_dot_segment_in_middle_matches() {
+        // Pattern with `/./` in the middle previously compiled in wax but
+        // matched nothing because wax walks on-disk paths that never contain
+        // literal `.` segments. Driver normalizes before compile.
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        let nested = tmp.path().join("mgmt/protos/x/bsdiff/v1");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("proto.proto"), b"").unwrap();
+        fs::write(tmp.path().join("mgmt/protos/x/bsdiff/BUILD"), b"").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("mgmt/protos/x/bsdiff/./**/*".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let mut out_paths: Vec<String> = res
+            .artifacts
+            .iter()
+            .map(|a| match &a.content {
+                Content::File(f) => f.out_path.clone(),
+                _ => panic!("expected File"),
+            })
+            .collect();
+        out_paths.sort();
+        assert_eq!(
+            out_paths,
+            vec![
+                "mgmt/protos/x/bsdiff/BUILD".to_string(),
+                "mgmt/protos/x/bsdiff/v1/proto.proto".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_parent_segment_in_middle_matches() {
+        // `a/b/../c` is equivalent to `a/c` on disk; wax does not collapse
+        // `..` so driver normalizes before compile.
+        let driver = Driver;
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("mgmt/protos/x")).unwrap();
+        fs::write(tmp.path().join("mgmt/protos/x/go.mod"), b"").unwrap();
+        fs::write(tmp.path().join("mgmt/protos/x/other.txt"), b"").unwrap();
+
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("mgmt/protos/x/bsdiff/../go.mod".to_string()),
+        )]);
+        let parse_res = driver
+            .parse(make_parse_req(config), &ctoken())
+            .await
+            .unwrap();
+
+        let request_id = "test".to_string();
+        let hashin = String::new();
+        let req = make_run_req(
+            &parse_res.target_def,
+            &request_id,
+            tmp.path().to_path_buf(),
+            &hashin,
+        );
+        let res = driver.run(req, &ctoken()).await.unwrap();
+
+        let names: Vec<_> = res.artifacts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["mgmt_protos_x_go.mod"]);
+    }
+
+    #[tokio::test]
+    async fn test_driver_parse_glob_rejects_root_escape() {
+        let driver = Driver;
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("some/../../file".to_string()),
+        )]);
+        let result = driver.parse(make_parse_req(config), &ctoken()).await;
+        let Err(err) = result else {
+            panic!("expected escape error")
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escapes workspace root"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_parse_glob_rejects_leading_parent() {
+        let driver = Driver;
+        let config = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("../escape/**".to_string()),
+        )]);
+        let result = driver.parse(make_parse_req(config), &ctoken()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_driver_parse_file_rejects_root_escape() {
+        let driver = Driver;
+        let config = std::collections::HashMap::from([(
+            "f".to_string(),
+            TargetSpecValue::String("a/../../file.txt".to_string()),
+        )]);
+        let result = driver.parse(make_parse_req(config), &ctoken()).await;
+        let Err(err) = result else {
+            panic!("expected escape error")
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("escapes workspace root"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_parent_segments_hash_equivalence() {
+        let driver = Driver;
+        let with_parent = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("a/b/../c/**/*.rs".to_string()),
+        )]);
+        let collapsed = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("a/c/**/*.rs".to_string()),
+        )]);
+        let h1 = driver
+            .parse(make_parse_req(with_parent), &ctoken())
+            .await
+            .unwrap()
+            .target_def
+            .hash;
+        let h2 = driver
+            .parse(make_parse_req(collapsed), &ctoken())
+            .await
+            .unwrap()
+            .target_def
+            .hash;
+        assert_eq!(h1, h2);
+    }
+
+    #[tokio::test]
+    async fn test_driver_run_glob_dot_segments_hash_equivalence() {
+        // Two semantically equal patterns must produce the same hash, so the
+        // cache key is stable regardless of how the user wrote the path.
+        let driver = Driver;
+        let with_dot = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("a/./b/**/*.rs".to_string()),
+        )]);
+        let without_dot = std::collections::HashMap::from([(
+            "p".to_string(),
+            TargetSpecValue::String("a/b/**/*.rs".to_string()),
+        )]);
+        let h1 = driver
+            .parse(make_parse_req(with_dot), &ctoken())
+            .await
+            .unwrap()
+            .target_def
+            .hash;
+        let h2 = driver
+            .parse(make_parse_req(without_dot), &ctoken())
+            .await
+            .unwrap()
+            .target_def
+            .hash;
+        assert_eq!(h1, h2);
     }
 
     #[tokio::test]

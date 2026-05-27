@@ -2,11 +2,13 @@ use crate::engine::Engine;
 use crate::engine::error::CycleError;
 use crate::engine::local_cache::CacheArtifact;
 use crate::engine::meta::ResultMeta;
+use crate::engine::provider::State;
 use crate::engine::result::{ArtifactMeta, ExtendedTargetDef, OutputMatcher};
 use crate::engine::spec::EngineTargetSpec;
 use crate::hasync::StdCancellationToken;
 use crate::hmemoizer::Memoizer;
 use crate::htaddr::{Addr, AddrInner};
+use crate::htpkg::PkgBuf;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
@@ -15,6 +17,7 @@ use std::sync::{Arc, Weak};
 
 type ArcErr = Arc<anyhow::Error>;
 type ExecuteCacheResult = Result<(Vec<CacheArtifact>, Vec<ArtifactMeta>), ArcErr>;
+type ProbeStatesResult = Result<Arc<Vec<State>>, ArcErr>;
 
 /// Pointer-keyed map entry for `DepDag` nodes.
 ///
@@ -171,6 +174,13 @@ pub struct RequestStateData {
     pub mem_expanded_inputs:
         Memoizer<Addr, Result<Arc<Vec<crate::engine::driver::targetdef::Input>>, ArcErr>>,
     pub mem_packages: Memoizer<String, Result<Arc<Vec<String>>, ArcErr>>,
+    /// Outer memoizer for `Engine::probe_segments`. Keyed by the target package;
+    /// the cached value is the flat accumulation of every provider's probe across
+    /// every parent package.
+    pub mem_probe: Memoizer<PkgBuf, ProbeStatesResult>,
+    /// Inner memoizer for `Engine::probe_segments`. Keyed by `(provider_name, pkg)`
+    /// so a given provider's probe of a given package runs at most once per request.
+    pub mem_probe_inner: Memoizer<(String, PkgBuf), ProbeStatesResult>,
     /// When false, fanout sites await every concurrent child instead of
     /// short-circuiting on the first error; errors are aggregated into a
     /// `MultiError`. Defaults to true (current behavior).
@@ -250,6 +260,8 @@ impl Engine {
             mem_def: Memoizer::with_tag("def"),
             mem_expanded_inputs: Memoizer::with_tag("expanded_inputs"),
             mem_packages: Memoizer::with_tag("packages"),
+            mem_probe: Memoizer::with_tag("probe"),
+            mem_probe_inner: Memoizer::with_tag("probe_inner"),
             fail_fast,
         });
 
