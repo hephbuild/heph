@@ -32,7 +32,7 @@ pub struct Driver {
     name: String,
     /// PATH the driver injects into target processes. Empty falls back to a hardcoded default.
     search_path: Vec<String>,
-    wrap_run: fn(&[String]) -> Vec<String>,
+    wrap_run: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
     wrap_run_shell: fn(&std::path::Path, &[String]) -> anyhow::Result<Vec<String>>,
 }
 
@@ -107,26 +107,46 @@ fn bash_args_shell(sandbox_dir: &std::path::Path, run: &[String]) -> anyhow::Res
     ))
 }
 
-pub fn bash_args_public(cmd: &str, termargs: Vec<String>) -> Vec<String> {
-    let mut args = bash_args(
-        vec![
-            "-u".to_string(),
-            "-e".to_string(),
-            "-c".to_string(),
-            cmd.to_string(),
-        ],
-        vec!["--norc".to_string()],
-    );
+/// Threshold above which the bash command body is spilled to a script file
+/// in the sandbox instead of being passed inline via `-c`. Keeps argv small
+/// for tall generated scripts.
+const BASH_C_INLINE_MAX: usize = 500;
 
-    if termargs.is_empty() {
-        args
+pub fn bash_args_public(
+    sandbox_dir: &std::path::Path,
+    cmd: &str,
+    termargs: Vec<String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut args = if cmd.len() > BASH_C_INLINE_MAX {
+        let script_path = sandbox_dir.join("cmd.sh");
+        std::fs::write(&script_path, cmd).context("write cmd.sh")?;
+        bash_args(
+            vec![
+                "-u".to_string(),
+                "-e".to_string(),
+                script_path.to_string_lossy().into_owned(),
+            ],
+            vec!["--norc".to_string()],
+        )
     } else {
+        bash_args(
+            vec![
+                "-u".to_string(),
+                "-e".to_string(),
+                "-c".to_string(),
+                cmd.to_string(),
+            ],
+            vec!["--norc".to_string()],
+        )
+    };
+
+    if !termargs.is_empty() {
         // https://unix.stackexchange.com/a/144519
         // We push "bash" as a placeholder for $0 before appending termargs
         args.push("bash".to_string());
         args.extend(termargs);
-        args
     }
+    Ok(args)
 }
 
 impl Driver {
@@ -134,7 +154,7 @@ impl Driver {
         Self {
             name: "exec".to_string(),
             search_path: vec![],
-            wrap_run: |run| run.to_vec(),
+            wrap_run: |_, run| Ok(run.to_vec()),
             wrap_run_shell: |sandbox_dir, run| bash_args_shell(sandbox_dir, &[run.join(" ")]),
         }
     }
@@ -142,7 +162,9 @@ impl Driver {
         Self {
             name: "bash".to_string(),
             search_path: vec![],
-            wrap_run: |run| bash_args_public(run.join("\n").as_str(), vec![]),
+            wrap_run: |sandbox_dir, run| {
+                bash_args_public(sandbox_dir, run.join("\n").as_str(), vec![])
+            },
             wrap_run_shell: bash_args_shell,
         }
     }
@@ -561,6 +583,10 @@ impl engine::driver_managed::ManagedDriver for Driver {
         self.run_inner(req, ctoken, false).await
     }
 
+    fn supports_shell(&self) -> bool {
+        true
+    }
+
     async fn run_shell<'a, 'io>(
         &self,
         req: ManagedRunRequest<'a, 'io>,
@@ -585,7 +611,7 @@ impl Driver {
             if shell {
                 (self.wrap_run_shell)(&rreq.sandbox_dir, &def.run)?
             } else {
-                (self.wrap_run)(&def.run)
+                (self.wrap_run)(&rreq.sandbox_dir, &def.run)?
             }
         };
 
@@ -1178,6 +1204,28 @@ mod tests {
             sandbox_pkg_dir: path,
             inputs: vec![],
         }
+    }
+
+    #[test]
+    fn bash_args_public_spills_long_cmd_to_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let short = "echo hi";
+        let short_args = bash_args_public(dir.path(), short, vec![]).expect("short");
+        assert!(short_args.iter().any(|a| a == "-c"));
+        assert!(short_args.iter().any(|a| a == short));
+        assert!(!dir.path().join("cmd.sh").exists());
+
+        let long = "x".repeat(BASH_C_INLINE_MAX + 1);
+        let long_args = bash_args_public(dir.path(), &long, vec![]).expect("long");
+        assert!(!long_args.iter().any(|a| a == "-c"));
+        let script = dir.path().join("cmd.sh");
+        assert!(script.exists());
+        assert_eq!(std::fs::read_to_string(&script).expect("read"), long);
+        assert!(
+            long_args
+                .iter()
+                .any(|a| a == script.to_string_lossy().as_ref())
+        );
     }
 
     #[test]

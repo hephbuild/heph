@@ -475,14 +475,6 @@ impl ManagedDriver for Driver {
         // with `collect: true`. Nothing to add here.
         Ok(ManagedRunResponse { artifacts: vec![] })
     }
-
-    async fn run_shell<'a, 'io>(
-        &self,
-        _req: ManagedRunRequest<'a, 'io>,
-        _ctoken: &(dyn Cancellable + Send + Sync),
-    ) -> anyhow::Result<ManagedRunResponse> {
-        anyhow::bail!("run_shell not implemented for nix driver")
-    }
 }
 
 #[cfg(test)]

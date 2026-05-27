@@ -1,7 +1,7 @@
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::driver_managed::{
-    ManagedDriver, ManagedRunInput, build_source_map, collect_outputs, invoke_inner, list_path_for,
-    resolve_unpack_root,
+    ManagedDriver, ManagedRunInput, ShellFallback, build_source_map, collect_outputs, invoke_inner,
+    list_path_for, resolve_unpack_root,
 };
 use crate::hartifactcontent;
 use crate::hasync::Cancellable;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// `hartifactcontent::unpack`. No FUSE involvement.
 pub struct ManagedDriverOs {
     pub(crate) driver: Arc<Box<dyn ManagedDriver>>,
+    pub(crate) shell_fallback: Arc<ShellFallback>,
 }
 
 impl ManagedDriverOs {
@@ -96,6 +97,7 @@ impl ManagedDriverOs {
             ws_dir.clone(),
             sandbox_pkg_dir.clone(),
             inputs,
+            &self.shell_fallback,
         )
         .await?;
 

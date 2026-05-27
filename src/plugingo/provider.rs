@@ -1233,18 +1233,9 @@ impl ProviderInner {
                 } else {
                     format!("{}/**/*", pkg)
                 };
-                let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &[]);
-                let non_go_codegen_query_addr = Addr::new(
-                    crate::htpkg::PkgBuf::from(crate::pluginquery::PACKAGE),
-                    "q".to_string(),
-                    BTreeMap::from([
-                        ("package".to_string(), pkg_str.clone()),
-                        ("tree_output_to".to_string(), pkg_str),
-                    ]),
-                );
+                let non_go_glob_addr = pluginfs::glob_addr(&non_go_glob, &["**/*.go"]);
                 let mut non_go_src_addrs = vec![
                     non_go_glob_addr.format(),
-                    non_go_codegen_query_addr.format(),
                 ];
                 if let Some(deps_state) = pick_codegen_deps(states)
                     && let Some(deps_val) = deps_state.state.get("go_codegen_deps")

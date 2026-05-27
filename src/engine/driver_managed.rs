@@ -9,11 +9,13 @@ use crate::engine::driver::{
 };
 use crate::engine::driver_managed_fuse::ManagedDriverFuse;
 use crate::engine::driver_managed_os::ManagedDriverOs;
+use crate::engine::provider::TargetSpec;
 use crate::hartifactcontent;
 use crate::hasync::{self, Cancellable};
+use crate::loosespecparser::TargetSpecValue;
 use anyhow::Context;
 use async_trait::async_trait;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -76,11 +78,22 @@ pub trait ManagedDriver: Send + Sync {
         req: ManagedRunRequest<'a, 'io>,
         ctoken: &(dyn hasync::Cancellable + Send + Sync),
     ) -> anyhow::Result<ManagedRunResponse>;
+    /// Whether this driver implements its own `run_shell`. Default false:
+    /// the bridge substitutes a synthetic shell `TargetSpec`, parses it
+    /// on the configured shell fallback driver, and dispatches that
+    /// driver's `run_shell` inside the already-materialized sandbox.
+    fn supports_shell(&self) -> bool {
+        false
+    }
     async fn run_shell<'a, 'io>(
         &self,
-        req: ManagedRunRequest<'a, 'io>,
-        ctoken: &(dyn hasync::Cancellable + Send + Sync),
-    ) -> anyhow::Result<ManagedRunResponse>;
+        _req: ManagedRunRequest<'a, 'io>,
+        _ctoken: &(dyn hasync::Cancellable + Send + Sync),
+    ) -> anyhow::Result<ManagedRunResponse> {
+        anyhow::bail!(
+            "run_shell called on a ManagedDriver with supports_shell()=false; the bridge must dispatch to the shell fallback"
+        )
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -98,14 +111,49 @@ pub struct ManagedDriverBridge {
     fuse: Option<ManagedDriverFuse>,
 }
 
+/// Fallback used when the wrapped `ManagedDriver` returns false from
+/// `supports_shell()`. The bridge swaps in `spec_template` (with the
+/// original target's addr) and dispatches `run_shell` on `driver`
+/// inside the already-materialized sandbox.
+pub struct ShellFallback {
+    pub driver: Arc<dyn ManagedDriver>,
+    pub spec_template: Arc<TargetSpec>,
+}
+
+impl ShellFallback {
+    /// Default: pluginexec with `run = ["bash"]`. `wrap_run_shell` turns
+    /// the single `bash` command into an interactive bash session via
+    /// `bash_args_shell` + `init.sh`.
+    pub fn default_exec() -> Arc<Self> {
+        let mut config: HashMap<String, TargetSpecValue> = HashMap::new();
+        config.insert(
+            "run".to_string(),
+            TargetSpecValue::List(vec![TargetSpecValue::String("bash".to_string())]),
+        );
+        Arc::new(Self {
+            driver: Arc::new(crate::pluginexec::Driver::new_exec()),
+            spec_template: Arc::new(TargetSpec {
+                addr: Default::default(),
+                driver: "exec".to_string(),
+                config,
+                labels: vec![],
+                transitive: Default::default(),
+            }),
+        })
+    }
+}
+
 impl Engine {
     pub fn new_managed_driver(&self, driver: Box<dyn ManagedDriver>) -> ManagedDriverBridge {
         let driver = Arc::new(driver);
+        let shell_fallback = ShellFallback::default_exec();
         let os = ManagedDriverOs {
             driver: driver.clone(),
+            shell_fallback: shell_fallback.clone(),
         };
         let fuse = self.fuse.layered_fs().map(|fs| ManagedDriverFuse {
             driver: driver.clone(),
+            shell_fallback: shell_fallback.clone(),
             home: self.home.clone(),
             fs,
             fuse_lower: self.fuse.lower.clone(),
@@ -124,12 +172,21 @@ impl ManagedDriverBridge {
     /// Production code paths construct bridges via `Engine::new_managed_driver`.
     #[cfg(test)]
     pub(crate) fn new_os_for_test(driver: Box<dyn ManagedDriver>) -> Self {
+        Self::new_os_for_test_with_shell_fallback(driver, ShellFallback::default_exec())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_os_for_test_with_shell_fallback(
+        driver: Box<dyn ManagedDriver>,
+        shell_fallback: Arc<ShellFallback>,
+    ) -> Self {
         Self {
             cfg: FuseConfig {
                 enabled: Some(false),
             },
             os: ManagedDriverOs {
                 driver: Arc::new(driver),
+                shell_fallback,
             },
             fuse: None,
         }
@@ -241,6 +298,7 @@ pub(crate) async fn invoke_inner<'a, 'io>(
     ws_dir: PathBuf,
     sandbox_pkg_dir: PathBuf,
     inputs: Vec<ManagedRunInput>,
+    shell_fallback: &ShellFallback,
 ) -> anyhow::Result<ManagedRunResponse> {
     // Some inner drivers (e.g. pluginexec writing `init.sh`) read
     // `req.request.sandbox_dir` for filesystem ops. Keep both consistent
@@ -254,13 +312,95 @@ pub(crate) async fn invoke_inner<'a, 'io>(
         inputs,
     };
     let res = if shell {
-        driver.run_shell(mreq, ctoken)
+        if driver.supports_shell() {
+            driver
+                .run_shell(mreq, ctoken)
+                .await
+                .with_context(|| "driver run_shell")?
+        } else {
+            run_shell_fallback(mreq, ctoken, shell_fallback)
+                .await
+                .with_context(|| "shell fallback")?
+        }
     } else {
-        driver.run(mreq, ctoken)
-    }
-    .await
-    .with_context(|| "driver run")?;
+        driver
+            .run(mreq, ctoken)
+            .await
+            .with_context(|| "driver run")?
+    };
     Ok(res)
+}
+
+/// Run an interactive shell on `shell_fallback` inside the
+/// already-materialized sandbox. The fallback parses a synthetic
+/// `TargetSpec` (the configured template stamped with the original
+/// target's `addr`), then runs its own `run_shell` against that def
+/// reusing every sandbox path and input the original driver was given.
+async fn run_shell_fallback<'a, 'io>(
+    mreq: ManagedRunRequest<'a, 'io>,
+    ctoken: &(dyn Cancellable + Send + Sync),
+    shell_fallback: &ShellFallback,
+) -> anyhow::Result<ManagedRunResponse> {
+    let ManagedRunRequest {
+        request,
+        sandbox_dir,
+        sandbox_ws_dir,
+        sandbox_pkg_dir,
+        inputs,
+    } = mreq;
+    let RunRequest {
+        request_id,
+        target,
+        tree_root_path,
+        inputs: run_inputs,
+        hashin,
+        stdin,
+        stdout,
+        stderr,
+        sandbox_dir: req_sandbox_dir,
+    } = request;
+
+    let mut synthetic = (*shell_fallback.spec_template).clone();
+    synthetic.addr = target.addr.clone();
+
+    let parse_resp = shell_fallback
+        .driver
+        .parse(
+            ParseRequest {
+                request_id: request_id.clone(),
+                target_spec: Arc::new(synthetic),
+            },
+            ctoken,
+        )
+        .await
+        .with_context(|| "parse synthetic shell spec on fallback driver")?;
+
+    // Reuse the original `TargetDef` (preserves addr/inputs/outputs/hash
+    // metadata the fallback's `run_shell` may read off of `req.target`)
+    // but swap `raw_def` so pluginexec's `def::<TargetDef>()` downcast
+    // sees its own type.
+    let mut new_target = target.clone();
+    new_target.raw_def = parse_resp.target_def.raw_def;
+
+    let new_req = RunRequest {
+        request_id,
+        target: &new_target,
+        tree_root_path,
+        inputs: run_inputs,
+        hashin,
+        stdin,
+        stdout,
+        stderr,
+        sandbox_dir: req_sandbox_dir,
+    };
+    let new_mreq = ManagedRunRequest {
+        request: new_req,
+        sandbox_dir,
+        sandbox_ws_dir,
+        sandbox_pkg_dir,
+        inputs,
+    };
+    shell_fallback.driver.run_shell(new_mreq, ctoken).await
 }
 
 pub(crate) fn collect_outputs(
@@ -465,4 +605,171 @@ fn pack_to_artifact_tar(
     tar.pack(&mut hw).with_context(|| "pack")?;
 
     Ok((tarpath, format!("{:x}", hw.hasher.digest())))
+}
+
+#[cfg(test)]
+mod shell_fallback_tests {
+    use super::*;
+    use crate::engine::driver::targetdef::TargetDef;
+    use crate::hasync::StdCancellationToken;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct NoShellDriver;
+
+    #[async_trait]
+    impl ManagedDriver for NoShellDriver {
+        fn config(&self, _: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "noshell".to_string(),
+            })
+        }
+        async fn parse(
+            &self,
+            _: ParseRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            unimplemented!("parse not exercised by shell fallback test")
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _: ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            unimplemented!("run not exercised by shell fallback test")
+        }
+        // supports_shell + run_shell inherit defaults — the bridge must
+        // never invoke this driver's run_shell.
+    }
+
+    struct RecordingShellDriver {
+        parse_called: Arc<AtomicBool>,
+        run_shell_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ManagedDriver for RecordingShellDriver {
+        fn config(&self, _: ConfigRequest) -> anyhow::Result<ConfigResponse> {
+            Ok(ConfigResponse {
+                name: "recording".to_string(),
+            })
+        }
+        async fn parse(
+            &self,
+            _: ParseRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ParseResponse> {
+            self.parse_called.store(true, Ordering::SeqCst);
+            Ok(ParseResponse {
+                target_def: TargetDef {
+                    addr: Default::default(),
+                    labels: vec![],
+                    raw_def: Arc::new("recorded-shell-def".to_string()),
+                    inputs: vec![],
+                    outputs: vec![],
+                    support_files: vec![],
+                    cache: false,
+                    disable_remote_cache: false,
+                    pty: false,
+                    hash: vec![],
+                    transparent: false,
+                },
+            })
+        }
+        async fn apply_transitive(
+            &self,
+            req: ApplyTransitiveRequest,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ApplyTransitiveResponse> {
+            Ok(ApplyTransitiveResponse {
+                target_def: req.target_def,
+            })
+        }
+        async fn run<'a, 'io>(
+            &self,
+            _: ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            unimplemented!()
+        }
+        fn supports_shell(&self) -> bool {
+            true
+        }
+        async fn run_shell<'a, 'io>(
+            &self,
+            _: ManagedRunRequest<'a, 'io>,
+            _: &(dyn Cancellable + Send + Sync),
+        ) -> anyhow::Result<ManagedRunResponse> {
+            self.run_shell_called.store(true, Ordering::SeqCst);
+            Ok(ManagedRunResponse { artifacts: vec![] })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_shell_dispatches_to_fallback_when_driver_does_not_support() -> anyhow::Result<()> {
+        let parse_called = Arc::new(AtomicBool::new(false));
+        let run_shell_called = Arc::new(AtomicBool::new(false));
+        let fallback = Arc::new(ShellFallback {
+            driver: Arc::new(RecordingShellDriver {
+                parse_called: parse_called.clone(),
+                run_shell_called: run_shell_called.clone(),
+            }),
+            spec_template: ShellFallback::default_exec().spec_template.clone(),
+        });
+        let bridge = ManagedDriverBridge::new_os_for_test_with_shell_fallback(
+            Box::new(NoShellDriver),
+            fallback,
+        );
+
+        let ctoken = StdCancellationToken::new();
+        let tmp = tempfile::tempdir()?;
+        let sandbox = tmp.path().join("sandbox");
+        fs::create_dir_all(&sandbox)?;
+
+        let target_def = TargetDef {
+            addr: Default::default(),
+            labels: vec![],
+            raw_def: Arc::new(()),
+            inputs: vec![],
+            outputs: vec![],
+            support_files: vec![],
+            cache: false,
+            disable_remote_cache: false,
+            pty: false,
+            hash: vec![],
+            transparent: false,
+        };
+        let request_id = "shell-fallback-test".to_string();
+        let req = RunRequest {
+            request_id: &request_id,
+            target: &target_def,
+            tree_root_path: tmp.path().to_path_buf(),
+            inputs: vec![],
+            hashin: "",
+            stdin: None,
+            stdout: None,
+            stderr: None,
+            sandbox_dir: sandbox.clone(),
+        };
+
+        bridge.run_shell(req, &ctoken).await?;
+
+        assert!(
+            parse_called.load(Ordering::SeqCst),
+            "fallback driver's parse must be called",
+        );
+        assert!(
+            run_shell_called.load(Ordering::SeqCst),
+            "fallback driver's run_shell must be called",
+        );
+        Ok(())
+    }
 }

@@ -1,7 +1,7 @@
 use crate::engine::driver::{RunInput, RunRequest, RunResponse};
 use crate::engine::driver_managed::{
-    ManagedDriver, ManagedRunInput, build_source_map, collect_outputs, invoke_inner, list_path_for,
-    resolve_unpack_root,
+    ManagedDriver, ManagedRunInput, ShellFallback, build_source_map, collect_outputs, invoke_inner,
+    list_path_for, resolve_unpack_root,
 };
 use crate::hartifactcontent;
 use crate::hartifactcontent::tar_index::TarIndex;
@@ -18,6 +18,7 @@ use std::sync::Arc;
 /// slots in that filesystem instead of being copied to disk.
 pub struct ManagedDriverFuse {
     pub(crate) driver: Arc<Box<dyn ManagedDriver>>,
+    pub(crate) shell_fallback: Arc<ShellFallback>,
     pub(crate) home: PathBuf,
     pub(crate) fs: Arc<sandboxfuse::LayeredFs>,
     pub(crate) fuse_lower: PathBuf,
@@ -141,6 +142,7 @@ impl ManagedDriverFuse {
             ws_dir.clone(),
             sandbox_pkg_dir.clone(),
             inputs,
+            &self.shell_fallback,
         )
         .await?;
 
