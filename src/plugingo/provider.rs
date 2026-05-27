@@ -492,6 +492,30 @@ fn is_test_target_name(name: &str) -> bool {
     TEST_TARGET_NAMES.contains(&name)
 }
 
+/// Choose which lib variant of P (the current package) to expose in the
+/// xtest_lib compile and the build_xtest link, so both agree.
+///
+/// xtest bin's importcfg must reference the SAME .a for P that xtest_lib's
+/// compile embedded — otherwise the linker rejects the fingerprint mismatch.
+///
+/// - GoFiles non-empty → `build_lib` (normal). Required by the cycle-safety
+///   rule documented on `build_xtest`: all consumers of P agree on normal.
+/// - GoFiles empty, TestGoFiles non-empty → `build_test_lib`. test-only and
+///   test+xtest-only packages have no normal lib, so the test-augmented lib
+///   is the only available flavor; no cycle is possible because nothing else
+///   in the build can import P (it has no buildable non-test sources).
+/// - both empty (xtest-only) → `None`. P has no lib at all; xtest source
+///   can't legitimately reference symbols from a package with no declarations.
+fn pick_xtest_p_lib_name(pkg: &GoPackage) -> Option<&'static str> {
+    if !pkg.go_files.is_empty() {
+        Some("build_lib")
+    } else if !pkg.test_go_files.is_empty() {
+        Some("build_test_lib")
+    } else {
+        None
+    }
+}
+
 /// Return true if the closest (deepest) ancestor `provider_state(provider="go", ...)`
 /// that carries a `test = {...}` map sets `skip = True`. Deeper states fully
 /// override shallower ones — a `test = {"skip": False}` closer to the target
@@ -910,12 +934,18 @@ impl ProviderInner {
                     error: None,
                 };
                 // xtest (`package P_test`) imports P as a normal external import.
-                // xtest_lib's compile uses P=normal build_lib so its embedded
-                // fingerprint matches the xtest bin's link-time view (which
-                // also uses P=normal — xtest doesn't need P's test variant).
-                // This is what makes the xtest cycle (Q→P) work without
-                // recompile flavoring: all consumers of P agree on the normal
-                // variant.
+                // Normally xtest_lib's compile uses P=normal build_lib so its
+                // embedded fingerprint matches the xtest bin's link-time view
+                // (which also uses P=normal — xtest doesn't need P's test
+                // variant). That keeps the xtest cycle (Q→P) consistent.
+                //
+                // Test-only flavors break the "P=normal" rule because P has no
+                // GoFiles, so build_lib doesn't exist:
+                //   - go_files empty, test_go_files non-empty (test+xtest-only)
+                //     → use build_test_lib for P. No cycle is possible because
+                //     nothing can import P normally.
+                //   - both empty (xtest-only) → drop P from importcfg; xtest
+                //     source can't reference symbols that don't exist.
                 let transitive = Arc::clone(&self)
                     .collect_direct_libs(
                         Arc::clone(&req.executor),
@@ -926,6 +956,20 @@ impl ProviderInner {
                     )
                     .await
                     .map_err(GetError::Other)?;
+
+                let p_lib_name = pick_xtest_p_lib_name(&pkg);
+                let rewritten_libs: Vec<(String, Addr)> = transitive
+                    .libs
+                    .into_iter()
+                    .filter_map(|(ip, a)| {
+                        if ip != import_path {
+                            return Some((ip, a));
+                        }
+                        p_lib_name.map(|name| {
+                            (ip, self.make_addr_with_name(&addr.package, name, &factors))
+                        })
+                    })
+                    .collect();
 
                 let pkg_addrs = self
                     .read_golist_package_addrs(Arc::clone(&req.executor), &golist_addr)
@@ -944,7 +988,7 @@ impl ProviderInner {
                     &import_path,
                     pkg.name.as_deref().unwrap_or(""),
                     &factors,
-                    &transitive.libs,
+                    &rewritten_libs,
                     &pkg_addrs.xtest_go_files,
                     &self.go_bin_addr,
                     &self.goroot,
@@ -1158,11 +1202,20 @@ impl ProviderInner {
 
                 let mut all_libs: Vec<(String, Addr)> = Vec::new();
                 let mut seen: HashSet<String> = HashSet::new();
-                // P uses normal build_lib in the xtest bin. Reserve its slot
-                // and add it first so other entries don't accidentally claim it.
-                let p_normal = self.build_lib_addr(addr, &factors);
-                all_libs.push((import_path.clone(), p_normal));
-                seen.insert(import_path.clone());
+                // P's flavor in xtest bin must match xtest_lib's compile-time
+                // view (see `pick_xtest_p_lib_name`). For pure xtest-only
+                // packages P has no lib at all — skip the slot entirely so we
+                // don't request a non-existent target.
+                if let Some(p_lib_name) = pick_xtest_p_lib_name(&pkg) {
+                    let p_addr = self.make_addr_with_name(&addr.package, p_lib_name, &factors);
+                    all_libs.push((import_path.clone(), p_addr));
+                    seen.insert(import_path.clone());
+                } else {
+                    // Still reserve the slot so a transitive resolution of P
+                    // (resolves to build_lib addr that doesn't exist) doesn't
+                    // sneak into the importcfg.
+                    seen.insert(import_path.clone());
+                }
                 let p_test = format!("{}_test", import_path);
                 seen.insert(p_test.clone()); // reserve for xtest_lib below
                 for (ip, a) in transitive.libs {
@@ -3024,6 +3077,205 @@ mod tests {
         let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
         let result = provider_get(&p, make_addr("pkg", "build_test")).await;
         assert!(matches!(result, Err(GetError::NotFound)));
+    }
+
+    // Regression: xtest-only package's `build_xtest` previously hard-coded P =
+    // build_lib in importcfg, even though build_lib doesn't exist for a pkg
+    // with no GoFiles. `pick_xtest_p_lib_name` now skips the P slot entirely.
+    #[tokio::test]
+    async fn xtest_only_build_xtest_omits_p_slot() {
+        require_go!();
+        let sandbox = copy_fixture("test_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!(),
+        };
+        let p_group =
+            crate::plugingo::addr_util::import_path_to_dep_group("example.com/testonly/pkg");
+        assert!(
+            !deps.contains_key(&p_group),
+            "xtest-only bin must not reference build_lib for P: {:?}",
+            deps.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ---- test_only_internal ----
+    // Only internal `package pkg` _test.go file. GoFiles is empty;
+    // TestGoFiles is non-empty. build_lib/build_xtest/build_xtest_lib must
+    // resolve NotFound; build_test/test/build_test_lib must succeed.
+
+    #[tokio::test]
+    async fn test_only_internal_build_lib_not_found() {
+        require_go!();
+        let sandbox = copy_fixture("test_only_internal");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        assert!(matches!(
+            provider_get(&p, make_addr("pkg", "build_lib")).await,
+            Err(GetError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_only_internal_build_test_lib_exists() {
+        require_go!();
+        let sandbox = copy_fixture("test_only_internal");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_test_lib"))
+            .await
+            .unwrap();
+        assert_eq!(resp.target_spec.driver, "bash");
+    }
+
+    #[tokio::test]
+    async fn test_only_internal_build_test_exists() {
+        require_go!();
+        let sandbox = copy_fixture("test_only_internal");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_test"))
+            .await
+            .unwrap();
+        let out = match resp.target_spec.config.get("out").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!(),
+        };
+        assert!(out.contains_key("bin"));
+    }
+
+    #[tokio::test]
+    async fn test_only_internal_test_exists() {
+        require_go!();
+        let sandbox = copy_fixture("test_only_internal");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let _ = provider_get(&p, make_addr("pkg", "test")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_only_internal_xtest_variants_not_found() {
+        require_go!();
+        let sandbox = copy_fixture("test_only_internal");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        for name in [
+            "build_xtest",
+            "build_xtest_lib",
+            "build_xtestmain_lib",
+            "xtest",
+            "xtestmain",
+        ] {
+            assert!(
+                matches!(
+                    provider_get(&p, make_addr("pkg", name)).await,
+                    Err(GetError::NotFound)
+                ),
+                "{name} must be NotFound for test-only-internal package"
+            );
+        }
+    }
+
+    // ---- test_xtest_only ----
+    // Both internal _test.go (package pkg) and external x_test.go
+    // (package pkg_test) present. xtest imports the internal package, which
+    // has no GoFiles → P's xtest slot must use build_test_lib, not build_lib.
+
+    #[tokio::test]
+    async fn test_xtest_only_build_lib_not_found() {
+        require_go!();
+        let sandbox = copy_fixture("test_xtest_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        assert!(matches!(
+            provider_get(&p, make_addr("pkg", "build_lib")).await,
+            Err(GetError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_xtest_only_build_test_exists() {
+        require_go!();
+        let sandbox = copy_fixture("test_xtest_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let _ = provider_get(&p, make_addr("pkg", "build_test"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_xtest_only_build_xtest_exists() {
+        require_go!();
+        let sandbox = copy_fixture("test_xtest_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let _ = provider_get(&p, make_addr("pkg", "build_xtest"))
+            .await
+            .unwrap();
+    }
+
+    // P (the internal pkg) has only TestGoFiles, so xtest_lib and xtest bin
+    // must both reference build_test_lib for P (not build_lib, which doesn't
+    // exist).
+    #[tokio::test]
+    async fn test_xtest_only_build_xtest_p_slot_uses_test_lib() {
+        require_go!();
+        let sandbox = copy_fixture("test_xtest_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_xtest"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!(),
+        };
+        let p_group =
+            crate::plugingo::addr_util::import_path_to_dep_group("example.com/testxtestonly/pkg");
+        let entry = deps
+            .get(&p_group)
+            .expect("xtest bin must include P's lib group");
+        let s = match entry {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.clone(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        assert!(
+            s.contains("build_test_lib"),
+            "P in xtest bin must reference build_test_lib for test+xtest-only pkg: {s}"
+        );
+        assert!(
+            !s.contains(":build_lib"),
+            "P must NOT reference normal build_lib: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_xtest_only_build_xtest_lib_p_in_importcfg_uses_test_lib() {
+        require_go!();
+        let sandbox = copy_fixture("test_xtest_only");
+        let p = Provider::new(sandbox.path().to_path_buf()).unwrap();
+        let resp = provider_get(&p, make_addr("pkg", "build_xtest_lib"))
+            .await
+            .unwrap();
+        let deps = match resp.target_spec.config.get("deps").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!(),
+        };
+        let p_group =
+            crate::plugingo::addr_util::import_path_to_dep_group("example.com/testxtestonly/pkg");
+        let entry = deps
+            .get(&p_group)
+            .expect("xtest_lib must include P in importcfg (xtest source imports P)");
+        let s = match entry {
+            TargetSpecValue::List(v) => match &v[0] {
+                TargetSpecValue::String(s) => s.clone(),
+                _ => panic!(),
+            },
+            _ => panic!(),
+        };
+        assert!(
+            s.contains("build_test_lib"),
+            "P in xtest_lib must reference build_test_lib for test+xtest-only pkg: {s}"
+        );
     }
 
     // ---- mod-asm ----
