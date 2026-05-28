@@ -691,12 +691,7 @@ impl Driver {
             env.insert("TERM".to_string(), term);
         }
         let path_value = if self.search_path.is_empty() {
-            [
-                "/usr/local/bin",
-                "/usr/bin",
-                "/bin",
-            ]
-            .join(":")
+            ["/usr/local/bin", "/usr/bin", "/bin"].join(":")
         } else {
             self.search_path.join(":")
         };
