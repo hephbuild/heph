@@ -79,6 +79,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fuse_sandbox_is_a_default_feature() {
+        // The FUSE sandbox ships on by default (Linux: pure-Rust, no libfuse
+        // link; macOS: libfuse). If someone drops `fuse-sandbox` from
+        // `default` in Cargo.toml, this default-features `cargo test` build
+        // stops seeing the feature and fails here.
+        assert!(
+            cfg!(feature = "fuse-sandbox"),
+            "fuse-sandbox must remain a default Cargo feature"
+        );
+    }
+
+    #[test]
     fn support_check_returns_stable_outcome() {
         let a = support_check();
         let b = support_check();

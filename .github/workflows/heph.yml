@@ -108,7 +108,16 @@ jobs:
           HEPH_BUILD_VERSION: "${{needs.gen.outputs.version}}"
         run: |
           echo "bin_name=$BIN_NAME" >> $GITHUB_OUTPUT
-          cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rheph
+          # FUSE (default feature) on Linux is pure-Rust (no libfuse link), so
+          # zigbuild cross-compiles cleanly. On macOS it links libfuse via the
+          # devenv macfuse-stubs; zig mangles the nix `-L` path under its SDK
+          # syslibroot and fails to find `-lfuse`, so the (native arm64) macOS
+          # runner uses plain `cargo build` — no cross needed there.
+          if [ "${{ matrix.os }}" = "darwin" ]; then
+            cargo build --release --locked --target ${{ matrix.target }} --bin rheph
+          else
+            cargo zigbuild --release --locked --target ${{ matrix.target }} --bin rheph
+          fi
           cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
 
       - name: Upload artifact
