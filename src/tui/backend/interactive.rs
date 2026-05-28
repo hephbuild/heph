@@ -42,7 +42,7 @@ pub async fn run<A: App + 'static>(
     .context("building inline terminal")?;
     terminal.autoresize()?;
 
-    let mut events = EventStream::new();
+    let mut events: Option<EventStream> = Some(EventStream::new());
     let suppression = shutdown.suppression();
 
     let ctx = AppContext::with_control(sink.clone(), control_tx);
@@ -80,6 +80,12 @@ pub async fn run<A: App + 'static>(
                             drain_logs_to_terminal(&mut terminal, &mut rx, cols);
                             drop(terminal.clear());
                             drop(terminal.show_cursor());
+                            // Drop EventStream so its background reader thread
+                            // releases the internal event lock; cursor::position
+                            // (DSR query in Terminal::with_options on resume)
+                            // shares crossterm's internal reader and races
+                            // otherwise.
+                            events = None;
                             drop(disable_raw_mode());
                             sink.switch_to_direct();
                             paused = true;
@@ -90,6 +96,21 @@ pub async fn run<A: App + 'static>(
                     }
                     Some(Control::Resume) if paused => {
                         drop(enable_raw_mode());
+                        // Cooked-mode writes during pause moved the cursor by an
+                        // unknown amount; ratatui's internal state (viewport_area,
+                        // last_known_cursor_pos, both buffers) is stale. Rebuild
+                        // the terminal so `with_options`+`compute_inline_size`
+                        // re-queries the cursor and positions the viewport below
+                        // the printed output instead of clobbering it.
+                        if let Ok(new_term) = Terminal::with_options(
+                            CrosstermBackend::new(io::stderr()),
+                            TerminalOptions {
+                                viewport: Viewport::Inline(1),
+                            },
+                        ) {
+                            terminal = new_term;
+                        }
+                        events = Some(EventStream::new());
                         rx = sink.switch_to_buffered();
                         cols = terminal_cols(&terminal);
                         paused = false;
@@ -99,7 +120,12 @@ pub async fn run<A: App + 'static>(
                     None => {}
                 }
             }
-            maybe_evt = events.next(), if !paused => {
+            maybe_evt = async {
+                match events.as_mut() {
+                    Some(s) => s.next().await,
+                    None => std::future::pending().await,
+                }
+            }, if !paused => {
                 match maybe_evt {
                     Some(Ok(Event::Key(KeyEvent {
                         code: KeyCode::Char('c'),

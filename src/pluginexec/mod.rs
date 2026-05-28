@@ -692,7 +692,6 @@ impl Driver {
         }
         let path_value = if self.search_path.is_empty() {
             [
-                "/nix/var/nix/profiles/default/bin", // TODO: figure out how to make plugins provide that
                 "/usr/local/bin",
                 "/usr/bin",
                 "/bin",
