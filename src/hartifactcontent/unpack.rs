@@ -260,12 +260,18 @@ mod tests {
 
         let script = out.path().join("script.sh");
         let mode = std::fs::metadata(&script).unwrap().permissions().mode();
-        assert!(mode & 0o111 != 0, "script must be executable, mode={mode:o}");
+        assert!(
+            mode & 0o111 != 0,
+            "script must be executable, mode={mode:o}"
+        );
 
         let output = std::process::Command::new(&script)
             .output()
             .expect("exec unpacked script");
-        assert!(output.status.success(), "script exited non-zero: {output:?}");
+        assert!(
+            output.status.success(),
+            "script exited non-zero: {output:?}"
+        );
         assert_eq!(String::from_utf8_lossy(&output.stdout), "ok\n");
     }
 
