@@ -13,8 +13,7 @@ use std::thread::JoinHandle;
 use tempfile::SpooledTempFile;
 
 const SPOOL_MEM_THRESHOLD: usize = 1024 * 1024;
-const MAX_CONCURRENT_PIPES: usize = 64;
-const READ_POOL_SIZE: u32 = MAX_CONCURRENT_PIPES as u32;
+pub const DEFAULT_MAX_CONCURRENT_PIPES: usize = 64;
 const WRITE_BATCH_MAX: usize = 64;
 
 type Key = (String, String, String);
@@ -32,6 +31,14 @@ impl PipeSemaphore {
         })
     }
 
+    /// Blocks the calling thread until a permit is available.
+    ///
+    /// **Contract:** callers must be on a thread that may block — either a
+    /// dedicated OS thread (e.g. the sqlite writer thread, rayon pool) or a
+    /// tokio worker that has handed off its core via
+    /// `crate::process_supervisor::block_or_inline` /
+    /// `tokio::task::block_in_place`. Calling this directly from a tokio task
+    /// parks the worker and can starve the runtime.
     fn acquire(self: &Arc<Self>) -> PipePermit {
         let mut count = self.count.lock().expect("pipe semaphore mutex poisoned");
         while *count == 0 {
@@ -169,7 +176,13 @@ pub struct LocalCacheSQLite {
 }
 
 impl LocalCacheSQLite {
-    pub fn new(db_path: PathBuf, inline_threshold: usize) -> Result<Self> {
+    pub fn with_pipe_limit(
+        db_path: PathBuf,
+        inline_threshold: usize,
+        pipe_limit: usize,
+    ) -> Result<Self> {
+        let pipe_limit = pipe_limit.max(DEFAULT_MAX_CONCURRENT_PIPES);
+        let read_pool_size = u32::try_from(pipe_limit).unwrap_or(u32::MAX);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating sqlite cache dir {parent:?}"))?;
@@ -213,7 +226,7 @@ impl LocalCacheSQLite {
             });
 
         let read_pool = r2d2::Pool::builder()
-            .max_size(READ_POOL_SIZE)
+            .max_size(read_pool_size)
             .min_idle(Some(1))
             .build(manager)
             .context("building sqlite read connection pool")?;
@@ -231,7 +244,7 @@ impl LocalCacheSQLite {
             writer_tx: Some(writer_tx),
             writer_handle: Some(writer_handle),
             pending,
-            pipe_sem: PipeSemaphore::new(MAX_CONCURRENT_PIPES),
+            pipe_sem: PipeSemaphore::new(pipe_limit),
             inline_threshold,
         })
     }
@@ -641,7 +654,7 @@ mod tests {
     #[test]
     fn test_local_cache_sqlite() -> Result<()> {
         let dir = tempdir()?;
-        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?;
+        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES)?;
 
         let addr = make_addr("test_pkg", "test_target");
         let hashin = "abc123hash";
@@ -672,7 +685,7 @@ mod tests {
     fn test_seekable_reader_pread_in_middle() -> Result<()> {
         use io::{Read, Seek, SeekFrom};
         let dir = tempdir()?;
-        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024)?;
+        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES)?;
 
         let addr = make_addr("pkg", "t");
         let payload: Vec<u8> = (0..1024u16).map(|i| (i & 0xff) as u8).collect();
@@ -698,7 +711,7 @@ mod tests {
     #[test]
     fn test_seekable_reader_missing_returns_not_found() {
         let dir = tempdir().expect("tempdir");
-        let cache = LocalCacheSQLite::new(dir.path().join("cache.db"), 16 * 1024).expect("cache");
+        let cache = LocalCacheSQLite::with_pipe_limit(dir.path().join("cache.db"), 16 * 1024, DEFAULT_MAX_CONCURRENT_PIPES).expect("cache");
         let addr = make_addr("pkg", "t");
         let err = match cache.seekable_reader(&addr, "missing", "blob") {
             Ok(_) => panic!("must error"),
@@ -712,9 +725,10 @@ mod tests {
         use std::sync::Arc;
 
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
             dir.path().join("cache.db"),
             16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
         )?);
 
         let addr = make_addr("test_pkg", "concurrent");
@@ -752,9 +766,10 @@ mod tests {
         // Reader started before the writer Drop returns from enqueue must still observe
         // the write once it lands. This exercises the PendingTracker wait path.
         let dir = tempdir()?;
-        let cache = Arc::new(LocalCacheSQLite::new(
+        let cache = Arc::new(LocalCacheSQLite::with_pipe_limit(
             dir.path().join("cache.db"),
             16 * 1024,
+            DEFAULT_MAX_CONCURRENT_PIPES,
         )?);
         let addr = make_addr("pkg", "tgt");
         let hashin = "h1";

@@ -271,9 +271,10 @@ impl Engine {
                 .unwrap_or(1)
         });
 
-        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::new(
+        let sqlite: Arc<dyn LocalCache> = Arc::new(LocalCacheSQLite::with_pipe_limit(
             home.join("cache").join("cache.db"),
             cfg.mem_cache.per_entry_bytes,
+            2 * parallelism,
         )?);
         let local_cache: Arc<dyn LocalCache> = if cfg.mem_cache.capacity_bytes == 0 {
             sqlite

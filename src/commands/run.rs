@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
+use anyhow::Context;
 use async_trait::async_trait;
 use clap::Args;
 
@@ -153,10 +154,10 @@ impl App for RunApp {
 }
 
 pub fn execute(args: &RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
-    execute_async(args.clone(), sink, no_tui)
+    let rt = bootstrap::build_runtime().context("build tokio runtime")?;
+    rt.block_on(execute_async(args.clone(), sink, no_tui))
 }
 
-#[tokio::main]
 async fn execute_async(args: RunArgs, sink: LogSink, no_tui: bool) -> anyhow::Result<()> {
     let base_pkg = get_cwp()?;
     let m = matcher_from_args(&args.arg1, &args.arg2, &args.exclude, &base_pkg, false)?;

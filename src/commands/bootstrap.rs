@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
+use std::thread::available_parallelism;
 
+use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc;
 
 use crate::engine::config_file;
@@ -8,6 +10,23 @@ use crate::{
     engine, pluginbuildfile, pluginexec, pluginfs, plugingo, pluginhostbin, pluginnix,
     plugintextfile,
 };
+
+/// Builds the multi-thread runtime used by every command entry point.
+///
+/// `max_blocking_threads` is sized generously above the engine's `2 × parallelism`
+/// execute permits, since every `block_in_place` site parks a runtime worker and
+/// spawns a replacement from the blocking pool. Default `512` is enough today but
+/// silently degrades to inline execution if saturated; the explicit `8 × N + 64`
+/// gives clear headroom for nested `block_or_inline` chains (execute → cache →
+/// plugingo) without ever hitting the cliff.
+pub fn build_runtime() -> std::io::Result<Runtime> {
+    let n = available_parallelism().map(|p| p.get()).unwrap_or(8);
+    Builder::new_multi_thread()
+        .worker_threads(n)
+        .max_blocking_threads(8 * n + 64)
+        .enable_all()
+        .build()
+}
 
 /// Producer-side handle for the in-process shutdown signal. Both the SIGINT
 /// listener and the TUI's Ctrl+C key handler call `trigger()` on this; the
