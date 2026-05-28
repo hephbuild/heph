@@ -120,6 +120,15 @@ jobs:
           fi
           cp $CARGO_TARGET_DIR/${{ matrix.target }}/release/rheph $BIN_NAME
 
+      # macFUSE is NOT installed on this runner. libfuse is weak-linked, so the
+      # binary must still launch — this proves the shipped macOS artifact runs
+      # on machines without macFUSE (dyld would abort here if it were hard-linked).
+      - name: Smoke test launch (darwin)
+        if: matrix.os == 'darwin'
+        run: ./$BIN_NAME version
+        env:
+          BIN_NAME: "heph_${{ matrix.os }}_${{ matrix.arch }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -219,6 +228,10 @@ jobs:
       - name: Install devenv.sh
         run: nix profile add nixpkgs#devenv
 
+      # No macFUSE on the runner: the macOS binaries weak-link libfuse, so they
+      # launch with the dylib absent. `support_check` finds no macfuse.fs and
+      # reports Unavailable, so FUSE mount tests skip. Linux exercises the real
+      # pure-Rust FUSE path.
       - name: Test
         shell: devenv shell bash -- -e {0}
         run: tst
