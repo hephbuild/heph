@@ -73,6 +73,7 @@ pub fn make_workspace(dir: TempDir) -> anyhow::Result<Workspace> {
             Box::new(plugingo::Provider::new(root.to_path_buf()).expect("plugingo provider"))
         })
         .with_managed_driver(Box::new(pluginexec::Driver::new_bash()))
+        .with_managed_driver(Box::new(pluginexec::Driver::new_sh()))
         .with_managed_driver(Box::new(pluginexec::Driver::new_exec()))
         .with_managed_driver(Box::new(plugingo::GoGolistDriver::new("//@heph/bin:go")))
         .with_managed_driver(Box::new(plugingo::GoEmbedDriver))

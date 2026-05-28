@@ -1444,6 +1444,8 @@ impl Drop for Mount {
 // wrapper is safe. macOS already auto-derives both traits.
 #[cfg(target_os = "linux")]
 unsafe impl Send for Mount {}
+// SAFETY: same reasoning as the `Send` impl above — the inert libfuse handle
+// is never accessed after construction, so cross-thread sharing is safe.
 #[cfg(target_os = "linux")]
 unsafe impl Sync for Mount {}
 

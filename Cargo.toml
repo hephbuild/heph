@@ -136,7 +136,11 @@ quick_cache = "0.6"
 fuser = { version = "0.17", optional = true, features = ["libfuse"] }
 
 [features]
-default = ["fuse-sandbox"]
+default = []
+# Opt-in: dynamically links libfuse, which only resolves in a native dev
+# environment (nix-provided libfuse3 on Linux, macfuse on macOS). Cross-built
+# release binaries and the macOS CI runner cannot link/load it, so it is gated
+# behind this feature and enabled explicitly in the native-Linux test job.
 fuse-sandbox = ["dep:fuser"]
 
 [dev-dependencies]
