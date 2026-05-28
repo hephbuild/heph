@@ -156,10 +156,9 @@ impl ManagedDriver for GoEmbedDriver {
             .collect();
 
         let hash = {
-            let mut h = DebugHasher::new(
-                Xxh3Default::new(),
-                &format!("go_embed_{}", req.target_spec.addr.format()),
-            );
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("go_embed_{}", req.target_spec.addr.format())
+            });
             def.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };

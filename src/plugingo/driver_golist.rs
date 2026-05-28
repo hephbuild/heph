@@ -167,10 +167,9 @@ impl ManagedDriver for GoGolistDriver {
         };
 
         let hash = {
-            let mut h = DebugHasher::new(
-                Xxh3Default::new(),
-                &format!("go_golist_{}", req.target_spec.addr.format()),
-            );
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("go_golist_{}", req.target_spec.addr.format())
+            });
             def.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };

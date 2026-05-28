@@ -66,10 +66,9 @@ impl Engine {
         def: &ExtendedTargetDef,
         results: Box<dyn Iterator<Item = String>>,
     ) -> anyhow::Result<String> {
-        let mut h = DebugHasher::new(
-            Xxh3Default::new(),
-            format!("hashin_{}", def.target_def.addr.format()).as_str(),
-        );
+        let mut h = DebugHasher::new(Xxh3Default::new(), || {
+            format!("hashin_{}", def.target_def.addr.format())
+        });
 
         // Driver name is part of the cache key: swapping drivers under the
         // same addr (e.g. `bash` → `sh`, or a custom driver re-registration)

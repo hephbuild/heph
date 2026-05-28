@@ -517,10 +517,9 @@ impl engine::driver_managed::ManagedDriver for Driver {
         };
 
         let hash = {
-            let mut h = DebugHasher::new(
-                Xxh3Default::new(),
-                &format!("exec_def_{}", req.target_spec.addr.format()),
-            );
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("exec_def_{}", req.target_spec.addr.format())
+            });
             def.hash(&mut h);
 
             format!("{:x}", h.finish()).into_bytes()
@@ -631,10 +630,9 @@ impl engine::driver_managed::ManagedDriver for Driver {
         }
 
         def.hash = {
-            let mut h = DebugHasher::new(
-                Xxh3Default::new(),
-                &format!("exec_def_tr_{}", def.addr.format()),
-            );
+            let mut h = DebugHasher::new(Xxh3Default::new(), || {
+                format!("exec_def_tr_{}", def.addr.format())
+            });
             xdef.hash(&mut h);
             format!("{:x}", h.finish()).into_bytes()
         };

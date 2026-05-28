@@ -45,9 +45,9 @@ pub struct DebugHasher<H: Hasher> {
 }
 
 impl<H: Hasher> DebugHasher<H> {
-    pub fn new(inner: H, target: &str) -> Self {
+    pub fn new(inner: H, target: impl FnOnce() -> String) -> Self {
         let file = if is_debug_enabled() {
-            open_debug_file(target).map(RefCell::new)
+            open_debug_file(&target()).map(RefCell::new)
         } else {
             None
         };
