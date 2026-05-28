@@ -85,10 +85,13 @@ impl EProvider for Provider {
         &'a self,
         _req: ListRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
         Box::pin(async {
             Ok(Box::new(std::iter::empty())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -96,12 +99,14 @@ impl EProvider for Provider {
         &'a self,
         _req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
-    {
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
         Box::pin(async {
             Ok(Box::new(std::iter::empty())
                 as Box<
-                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                 >)
         })
     }

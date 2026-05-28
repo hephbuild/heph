@@ -189,13 +189,15 @@ mod tests {
                 &'a self,
                 req: ListRequest,
                 _ctoken: &'a (dyn Cancellable + Send + Sync),
-            ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
-            {
+            ) -> BoxFuture<
+                'a,
+                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+            > {
                 let states = req.states.clone();
                 let rec = Arc::clone(&self.list_states);
                 Box::pin(async move {
                     rec.lock().unwrap().push(states);
-                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>)
+                    Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
                 })
             }
             fn list_packages<'a>(
@@ -204,7 +206,9 @@ mod tests {
                 _ctoken: &'a (dyn Cancellable + Send + Sync),
             ) -> BoxFuture<
                 'a,
-                anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+                anyhow::Result<
+                    Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>,
+                >,
             > {
                 Box::pin(async {
                     let items: Vec<anyhow::Result<ListPackageResponse>> =
@@ -213,7 +217,7 @@ mod tests {
                         })];
                     Ok(Box::new(items.into_iter())
                         as Box<
-                            dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                            dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                         >)
                 })
             }

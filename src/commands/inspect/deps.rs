@@ -19,7 +19,7 @@ struct DepsApp {
     addr: Addr,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for DepsApp {
     type Output = ();
 

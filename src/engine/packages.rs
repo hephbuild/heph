@@ -32,7 +32,7 @@ impl Engine {
         &self,
         m: &htmatcher::Matcher,
         rs: &Arc<RequestState>,
-    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>>>> {
+    ) -> anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<String>> + Send>> {
         let prefix = narrowing_prefix(m);
 
         let mut all_packages = Vec::new();

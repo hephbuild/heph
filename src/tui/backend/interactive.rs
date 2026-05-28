@@ -23,7 +23,7 @@ const TICK: Duration = Duration::from_millis(80);
 
 type StderrTerminal = Terminal<CrosstermBackend<io::Stderr>>;
 
-pub async fn run<A: App>(
+pub async fn run<A: App + 'static>(
     app: A,
     sink: LogSink,
     shutdown: ShutdownTrigger,
@@ -46,8 +46,11 @@ pub async fn run<A: App>(
     let suppression = shutdown.suppression();
 
     let ctx = AppContext::with_control(sink.clone(), control_tx);
-    let app_fut = app.run(ctx);
-    tokio::pin!(app_fut);
+    // App runs on its own task so heavy sync work inside the app
+    // (e.g. `block_in_place` for filesystem scans, Starlark eval) does
+    // not block this task's ticker — the renderer task is re-polled
+    // on another worker and the spinner keeps ticking.
+    let mut app_handle = tokio::spawn(app.run(ctx));
 
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -57,8 +60,15 @@ pub async fn run<A: App>(
 
     let result: anyhow::Result<A::Output> = loop {
         tokio::select! {
-            biased;
-            res = &mut app_fut => break res,
+            res = &mut app_handle => {
+                break match res {
+                    Ok(inner) => inner,
+                    Err(join_err) if join_err.is_panic() => {
+                        std::panic::resume_unwind(join_err.into_panic())
+                    }
+                    Err(join_err) => Err(anyhow::Error::new(join_err).context("app task")),
+                };
+            }
             ctrl = control_rx.recv() => {
                 match ctrl {
                     Some(Control::Pause(ack)) => {
@@ -178,7 +188,48 @@ fn drain_logs_to_stderr(rx: &mut mpsc::UnboundedReceiver<Vec<u8>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntoText, rows_needed};
+    use super::{IntoText, TICK, rows_needed};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// Regression: while the app future does CPU-bound sync work between
+    /// awaits (e.g. `block_in_place` for a filesystem walk or Starlark
+    /// eval), the render ticker must keep firing. Pre-fix the app and the
+    /// renderer shared a `tokio::select!` task; a sync chunk inside the
+    /// app starved the ticker. Post-fix the app is `tokio::spawn`ed so
+    /// the renderer task is re-polled on another worker.
+    ///
+    /// This mirrors the architecture of `interactive::run` (spawn the app,
+    /// drive a ticker alongside) without pulling in a real terminal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn renderer_ticks_while_app_blocks_in_place() {
+        const BLOCK_MS: u64 = 400;
+        let app = tokio::spawn(async {
+            tokio::task::block_in_place(|| std::thread::sleep(Duration::from_millis(BLOCK_MS)));
+        });
+        tokio::pin!(app);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let mut interval = tokio::time::interval(TICK);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                res = &mut app => { res.expect("app task"); break; }
+                _ = interval.tick() => { ticks.fetch_add(1, Ordering::SeqCst); }
+            }
+        }
+
+        // 400 ms at TICK=80 ms ⇒ ~5 ticks. Allow slack for scheduler
+        // jitter and the initial immediate tick; require ≥3 to clearly
+        // distinguish from pre-fix behaviour (which would yield 0–1).
+        let observed = ticks.load(Ordering::SeqCst);
+        assert!(
+            observed >= 3,
+            "renderer must keep ticking while app is in block_in_place; got {observed} ticks during {BLOCK_MS} ms"
+        );
+    }
 
     #[test]
     fn rows_needed_handles_boundaries() {

@@ -215,15 +215,17 @@ mod tests {
             &'a self,
             _req: ListRequest,
             _ctoken: &'a (dyn Cancellable + Send + Sync),
-        ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
-        {
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
             let specs = self.specs.clone();
             Box::pin(async move {
                 Ok(Box::new(specs.into_iter().map(|s| {
                     Ok(ListResponse {
                         addr: s.addr.clone(),
                     })
-                })) as Box<dyn Iterator<Item = _>>)
+                })) as Box<dyn Iterator<Item = _> + Send>)
             })
         }
         fn list_packages<'a>(
@@ -232,9 +234,11 @@ mod tests {
             _ctoken: &'a (dyn Cancellable + Send + Sync),
         ) -> BoxFuture<
             'a,
-            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
         > {
-            Box::pin(async move { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+            Box::pin(async move {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
         }
         fn get<'a>(
             &'a self,

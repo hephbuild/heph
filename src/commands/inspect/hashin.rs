@@ -19,7 +19,7 @@ struct HashinApp {
     addr: Addr,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for HashinApp {
     type Output = ();
 

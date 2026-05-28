@@ -116,12 +116,15 @@ pub trait Provider: Send + Sync {
         &'a self,
         req: ListRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>;
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>;
     fn list_packages<'a>(
         &'a self,
         req: ListPackagesRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>;
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    >;
     fn get<'a>(
         &'a self,
         req: GetRequest,

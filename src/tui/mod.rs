@@ -17,7 +17,7 @@ pub fn should_use_tui(force_off: bool) -> bool {
     !force_off && io::stderr().is_terminal()
 }
 
-pub async fn run_app<A: App>(
+pub async fn run_app<A: App + 'static>(
     app: A,
     sink: LogSink,
     interactive: bool,

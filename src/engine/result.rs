@@ -953,10 +953,14 @@ mod tests {
             &'a self,
             _req: ListRequest,
             _ctoken: &'a (dyn Cancellable + Send + Sync),
-        ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
-        {
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
             self.list_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
         }
         fn list_packages<'a>(
             &'a self,
@@ -964,9 +968,11 @@ mod tests {
             _ctoken: &'a (dyn Cancellable + Send + Sync),
         ) -> BoxFuture<
             'a,
-            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
         > {
-            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
         }
         fn get<'a>(
             &'a self,
@@ -1002,9 +1008,13 @@ mod tests {
             &'a self,
             _req: ListRequest,
             _ctoken: &'a (dyn Cancellable + Send + Sync),
-        ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>>
-        {
-            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+        ) -> BoxFuture<
+            'a,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>,
+        > {
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
         }
         fn list_packages<'a>(
             &'a self,
@@ -1012,9 +1022,11 @@ mod tests {
             _ctoken: &'a (dyn Cancellable + Send + Sync),
         ) -> BoxFuture<
             'a,
-            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>,
+            anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
         > {
-            Box::pin(async { Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _>>) })
+            Box::pin(async {
+                Ok(Box::new(std::iter::empty()) as Box<dyn Iterator<Item = _> + Send>)
+            })
         }
         fn get<'a>(
             &'a self,

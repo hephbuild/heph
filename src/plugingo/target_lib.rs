@@ -116,6 +116,16 @@ pub fn build_spec(
             ),
         ])),
     );
+    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // cache lookups. `runtime_env` is intentionally excluded from the def hash
+    // (see pluginexec/mod.rs:70).
+    config.insert(
+        "env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "CGO_ENABLED".to_string(),
+            TargetSpecValue::String("0".to_string()),
+        )])),
+    );
     config.insert(
         "pass_env".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
@@ -509,6 +519,32 @@ mod tests {
             _ => panic!(),
         };
         assert_eq!(run1, run2);
+    }
+
+    #[test]
+    fn test_env_pins_cgo_disabled() {
+        let spec = build_spec(
+            test_addr(),
+            "example.com/mylib",
+            "mylib",
+            &test_factors(),
+            &[],
+            &src_addrs(),
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+            None,
+            &[],
+        );
+        let env = match spec.config.get("env").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            "CGO_ENABLED must be pinned to 0 in the hashed `env` map: {:?}",
+            env.get("CGO_ENABLED")
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ struct DefApp {
     no_transitive: bool,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for DefApp {
     type Output = ();
 

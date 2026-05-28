@@ -19,7 +19,7 @@ struct SpecApp {
     addr: Addr,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for SpecApp {
     type Output = ();
 

@@ -45,7 +45,7 @@ struct RunApp {
     matcher: Matcher,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for RunApp {
     type Output = ();
 

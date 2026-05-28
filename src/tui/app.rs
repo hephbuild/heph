@@ -104,9 +104,9 @@ fn resume_inner(control: &Option<mpsc::UnboundedSender<Control>>) {
     }
 }
 
-#[async_trait(?Send)]
-pub trait App {
-    type Output;
+#[async_trait]
+pub trait App: Send {
+    type Output: Send;
 
     /// Shown next to the spinner in interactive mode; logged once in CI mode.
     fn label(&self) -> String;

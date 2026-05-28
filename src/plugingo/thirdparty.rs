@@ -75,6 +75,17 @@ pub fn build_download_spec(
             TargetSpecValue::String(goroot.to_string()),
         )])),
     );
+    // CGO pin lives in `env` (hashed; pluginexec/mod.rs:70 excludes runtime_env
+    // from the def hash). `go mod download` itself does not invoke the C
+    // toolchain, but pinning here keeps the global rule simple: no Go process
+    // in rheph ever autodetects CGO.
+    config.insert(
+        "env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "CGO_ENABLED".to_string(),
+            TargetSpecValue::String("0".to_string()),
+        )])),
+    );
     config.insert(
         "pass_env".to_string(),
         TargetSpecValue::List(vec![TargetSpecValue::String("GOROOT".to_string())]),
@@ -252,6 +263,15 @@ pub fn build_lib_spec(
                 TargetSpecValue::String(gocache.to_string()),
             ),
         ])),
+    );
+    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
+    config.insert(
+        "env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "CGO_ENABLED".to_string(),
+            TargetSpecValue::String("0".to_string()),
+        )])),
     );
     config.insert(
         "pass_env".to_string(),
@@ -506,6 +526,53 @@ mod tests {
     }
 
     // ---- build_lib_spec ----
+
+    #[test]
+    fn test_download_spec_env_pins_cgo_disabled() {
+        let spec = build_download_spec(
+            download_addr(),
+            "github.com/go-logr/logr",
+            "v1.4.2",
+            "//@heph/bin:go",
+            "/usr/local/go",
+        );
+        let env = match spec.config.get("env").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            "download env must pin CGO_ENABLED=0 in the hashed map: {:?}",
+            env.get("CGO_ENABLED")
+        );
+    }
+
+    #[test]
+    fn test_build_lib_env_pins_cgo_disabled() {
+        let spec = build_lib_spec(
+            test_addr(),
+            &test_pkg(vec!["logr.go".to_string()]),
+            &test_factors(),
+            &[],
+            &[filter_src_addr("logr.go")],
+            &[],
+            &[],
+            None,
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+        );
+        let env = match spec.config.get("env").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            "thirdparty build_lib env must pin CGO_ENABLED=0 in the hashed map: {:?}",
+            env.get("CGO_ENABLED")
+        );
+    }
 
     #[test]
     fn test_build_lib_driver_is_bash() {

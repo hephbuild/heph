@@ -19,7 +19,7 @@ struct HashoutApp {
     addr: Addr,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for HashoutApp {
     type Output = ();
 

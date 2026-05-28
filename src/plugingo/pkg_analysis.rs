@@ -320,6 +320,7 @@ pub(crate) async fn run_go_list(
         .current_dir(module_root)
         .env("GOOS", &factors.goos)
         .env("GOARCH", &factors.goarch)
+        .env("CGO_ENABLED", "0")
         .env_remove("GOFLAGS");
 
     for var in &["GOROOT", "GOPATH", "GOMODCACHE", "HOME", "PATH", "GOCACHE"] {

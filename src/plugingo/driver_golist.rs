@@ -52,7 +52,7 @@ struct GoGolistDef {
 
 /// Bump to invalidate every cached `_golist` artifact whenever the driver's
 /// output format (package.bin layout, package_addrs.bin schema, …) changes.
-const GO_GOLIST_FORMAT_VERSION: u32 = 9;
+const GO_GOLIST_FORMAT_VERSION: u32 = 10;
 
 impl Hash for GoGolistDef {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -262,6 +262,12 @@ impl ManagedDriver for GoGolistDriver {
         env.insert("GOOS".to_string(), def.goos.clone());
         env.insert("GOARCH".to_string(), def.goarch.clone());
         env.insert("GOROOT".to_string(), def.goroot.clone());
+        // Pin CGO_ENABLED=0 to keep this list call's view of transitive deps
+        // consistent with the bash-driven compile/link sandboxes. Letting Go
+        // autodetect produces drift across hosts (PATH-dependent) — e.g. an
+        // Ubuntu host with gcc on PATH pulls runtime/cgo here but later link
+        // steps run without it, breaking importcfg.
+        env.insert("CGO_ENABLED".to_string(), "0".to_string());
         for name in &[
             "GOPATH",
             "GOMODCACHE",

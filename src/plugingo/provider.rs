@@ -249,7 +249,8 @@ impl ProviderTrait for Provider {
         &'a self,
         req: ListRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
         self.inner.list(req, ctoken)
     }
 
@@ -257,8 +258,10 @@ impl ProviderTrait for Provider {
         &'a self,
         req: ListPackagesRequest,
         ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
-    {
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
         self.inner.list_packages(req, ctoken)
     }
 
@@ -291,7 +294,8 @@ impl ProviderInner {
         &'a self,
         req: ListRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
         Box::pin(async move {
             let factors = Factors {
                 goos: current_goos(),
@@ -303,7 +307,7 @@ impl ProviderInner {
                 Some(k) => k,
                 None => {
                     return Ok(Box::new(std::iter::empty())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>);
+                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>);
                 }
             };
 
@@ -326,7 +330,9 @@ impl ProviderInner {
                         .map(|addr| Ok(ListResponse { addr }))
                         .collect();
                     Ok(Box::new(responses.into_iter())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                        >)
                 }
                 GoPackageKind::ThirdParty { subpath, .. } => {
                     let mut addrs = vec![
@@ -355,7 +361,9 @@ impl ProviderInner {
                         .map(|addr| Ok(ListResponse { addr }))
                         .collect();
                     Ok(Box::new(responses.into_iter())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                        >)
                 }
                 GoPackageKind::FirstParty { .. } => {
                     // Emit the full candidate set unconditionally for any dir
@@ -392,7 +400,9 @@ impl ProviderInner {
                         .collect();
 
                     Ok(Box::new(responses.into_iter())
-                        as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+                        as Box<
+                            dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                        >)
                 }
             }
         })
@@ -402,15 +412,19 @@ impl ProviderInner {
         &'a self,
         req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
-    {
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
         Box::pin(async move {
             let prefix = req.prefix.as_str();
 
             // Can't enumerate stdlib or thirdparty packages
             if prefix.starts_with("@heph/go/") {
                 return Ok(Box::new(std::iter::empty())
-                    as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>);
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                    >);
             }
 
             let search_dir = if prefix.is_empty() {
@@ -421,7 +435,9 @@ impl ProviderInner {
 
             if !search_dir.exists() {
                 return Ok(Box::new(std::iter::empty())
-                    as Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>);
+                    as Box<
+                        dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
+                    >);
             }
 
             let packages = crate::process_supervisor::block_or_inline(
@@ -434,7 +450,7 @@ impl ProviderInner {
 
             Ok(Box::new(packages.into_iter())
                 as Box<
-                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                 >)
         })
     }

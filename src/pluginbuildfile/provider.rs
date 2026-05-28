@@ -151,7 +151,8 @@ impl EProvider for Provider {
         &'a self,
         req: ListRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>>> {
+    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListResponse>> + Send>>>
+    {
         Box::pin(async move {
             let res = self.run_pkg(req.package.as_str()).await?;
 
@@ -166,7 +167,9 @@ impl EProvider for Provider {
                 .collect();
 
             Ok(Box::new(items.into_iter())
-                as Box<dyn Iterator<Item = anyhow::Result<ListResponse>>>)
+                as Box<
+                    dyn Iterator<Item = anyhow::Result<ListResponse>> + Send,
+                >)
         })
     }
 
@@ -174,8 +177,10 @@ impl EProvider for Provider {
         &'a self,
         _req: ListPackagesRequest,
         _ctoken: &'a (dyn Cancellable + Send + Sync),
-    ) -> BoxFuture<'a, anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>>>>>
-    {
+    ) -> BoxFuture<
+        'a,
+        anyhow::Result<Box<dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send>>,
+    > {
         Box::pin(async move {
             let packages = self
                 .packages_cache
@@ -204,7 +209,7 @@ impl EProvider for Provider {
 
             Ok(Box::new(items.into_iter())
                 as Box<
-                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>>,
+                    dyn Iterator<Item = anyhow::Result<ListPackageResponse>> + Send,
                 >)
         })
     }

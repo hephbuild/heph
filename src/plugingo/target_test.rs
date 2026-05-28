@@ -210,6 +210,15 @@ pub fn build_test_spec(
             ),
         ])),
     );
+    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
+    config.insert(
+        "env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "CGO_ENABLED".to_string(),
+            TargetSpecValue::String("0".to_string()),
+        )])),
+    );
     config.insert(
         "pass_env".to_string(),
         TargetSpecValue::List(vec![
@@ -371,6 +380,15 @@ fn build_lib_spec_inner(
                 TargetSpecValue::String(gocache.to_string()),
             ),
         ])),
+    );
+    // CGO pin lives in `env` (hashed) so stale CGO=1 archives don't survive
+    // cache lookups (pluginexec/mod.rs:70 excludes runtime_env from the def hash).
+    config.insert(
+        "env".to_string(),
+        TargetSpecValue::Map(HashMap::from([(
+            "CGO_ENABLED".to_string(),
+            TargetSpecValue::String("0".to_string()),
+        )])),
     );
     config.insert(
         "pass_env".to_string(),
@@ -673,6 +691,55 @@ mod tests {
         assert!(
             !run.contains("test -c"),
             "build_test run must NOT use go test -c: {run}"
+        );
+    }
+
+    #[test]
+    fn test_build_test_spec_env_pins_cgo_disabled() {
+        let testmain_lib = mk_addr("pkg", "build_testmain_lib");
+        let spec = build_test_spec(
+            mk_addr("pkg", "build_test"),
+            &test_factors(),
+            "//@heph/bin:go",
+            &go_env(),
+            &testmain_lib,
+            &[],
+        );
+        let env = match spec.config.get("env").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            "link env must pin CGO_ENABLED=0 in the hashed map: {:?}",
+            env.get("CGO_ENABLED")
+        );
+    }
+
+    #[test]
+    fn test_build_test_lib_spec_env_pins_cgo_disabled() {
+        let spec = build_test_lib_spec(
+            mk_addr("pkg", "build_test_lib"),
+            "example.com/pkg",
+            "mypkg",
+            &test_factors(),
+            &[],
+            &src_addrs("pkg"),
+            &[],
+            "//@heph/bin:go",
+            "/usr/local/go",
+            "/tmp/gocache",
+            None,
+            &[],
+        );
+        let env = match spec.config.get("env").unwrap() {
+            TargetSpecValue::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            matches!(env.get("CGO_ENABLED"), Some(TargetSpecValue::String(s)) if s == "0"),
+            "compile env must pin CGO_ENABLED=0 in the hashed map: {:?}",
+            env.get("CGO_ENABLED")
         );
     }
 

@@ -28,7 +28,7 @@ struct QueryApp {
     matcher: Matcher,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl App for QueryApp {
     type Output = ();
 
