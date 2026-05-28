@@ -8,6 +8,7 @@ pub use engine::Engine;
 pub use engine::EngineFuse;
 pub use engine::MemCacheOptions;
 pub mod config_file;
+pub use config_file::{FuseConfig, FuseMode};
 mod cwd;
 mod result;
 pub use cwd::get_cwd;

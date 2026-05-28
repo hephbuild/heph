@@ -1,4 +1,6 @@
 use crate::engine::Engine;
+#[cfg(test)]
+use crate::engine::config_file::FuseEnabled;
 use crate::engine::config_file::{FuseConfig, FuseMode};
 use crate::engine::driver::inputartifact;
 use crate::engine::driver::outputartifact::Content::TarPath;
@@ -179,7 +181,7 @@ impl ManagedDriverBridge {
     ) -> Self {
         Self {
             cfg: FuseConfig {
-                enabled: Some(false),
+                enabled: Some(FuseEnabled::Off),
             },
             os: ManagedDriverOs {
                 driver: Arc::new(driver),

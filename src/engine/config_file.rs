@@ -1,6 +1,8 @@
 use anyhow::Context;
 use serde::Deserialize;
+use serde::de::{Deserializer, Error as DeError, Visitor};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub type Options = BTreeMap<String, serde_yaml::Value>;
@@ -28,14 +30,48 @@ pub struct MemCacheConfig {
     pub capacity_bytes: u64,
 }
 
-/// Sandbox FUSE-overlay mode. `fuse: { enabled: true|false }` forces on/off.
-/// Omit `enabled` (or the entire `fuse:` block) for auto mode, where the
-/// engine inspects each target's inputs to decide per-target.
+/// Sandbox FUSE-overlay mode. `fuse: { enabled: true | false | auto }`
+/// selects mode explicitly. Omit `enabled` (or the entire `fuse:` block) to
+/// default to off; FUSE is opt-in.
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct FuseConfig {
     #[serde(default)]
-    pub enabled: Option<bool>,
+    pub enabled: Option<FuseEnabled>,
+}
+
+/// Tri-state config value. Parses YAML `true`, `false`, or `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuseEnabled {
+    On,
+    Off,
+    Auto,
+}
+
+impl<'de> Deserialize<'de> for FuseEnabled {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = FuseEnabled;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "true, false, or \"auto\"")
+            }
+            fn visit_bool<E: DeError>(self, v: bool) -> Result<FuseEnabled, E> {
+                Ok(if v { FuseEnabled::On } else { FuseEnabled::Off })
+            }
+            fn visit_str<E: DeError>(self, v: &str) -> Result<FuseEnabled, E> {
+                match v {
+                    "auto" => Ok(FuseEnabled::Auto),
+                    "true" | "on" => Ok(FuseEnabled::On),
+                    "false" | "off" => Ok(FuseEnabled::Off),
+                    other => Err(E::custom(format!(
+                        "expected true/false/auto, got {other:?}"
+                    ))),
+                }
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// Resolved decision used by Engine + bridge. Independent of YAML shape.
@@ -52,20 +88,20 @@ pub enum FuseMode {
 impl FuseConfig {
     pub fn mode(&self) -> FuseMode {
         match self.enabled {
-            Some(true) => FuseMode::On,
-            Some(false) => FuseMode::Off,
-            None => FuseMode::Off,
+            Some(FuseEnabled::On) => FuseMode::On,
+            Some(FuseEnabled::Auto) => FuseMode::Auto,
+            Some(FuseEnabled::Off) | None => FuseMode::Off,
         }
     }
 
-    /// Convenience: is FUSE forced off by config?
+    /// Convenience: FUSE off (explicit `enabled: false` or omitted).
     pub fn is_off(&self) -> bool {
-        matches!(self.enabled, Some(false))
+        matches!(self.mode(), FuseMode::Off)
     }
 
     /// Convenience: is FUSE forced on by config?
     pub fn is_on(&self) -> bool {
-        matches!(self.enabled, Some(true))
+        matches!(self.mode(), FuseMode::On)
     }
 }
 
@@ -217,7 +253,9 @@ drivers:
         let yaml = "fuse: {}\n";
         let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
         let f = cfg.fuse.expect("fuse present");
-        assert_eq!(f.mode(), FuseMode::Auto);
+        assert_eq!(f.mode(), FuseMode::Off);
+        assert!(f.is_off());
+        assert!(!f.is_on());
     }
 
     #[test]
@@ -225,5 +263,29 @@ drivers:
         let yaml = "fuse:\n  bogus: 1\n";
         let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
         assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn fuse_config_enabled_auto() {
+        let yaml = "fuse:\n  enabled: auto\n";
+        let cfg: ConfigFile = serde_yaml::from_str(yaml).expect("parse");
+        let f = cfg.fuse.expect("fuse present");
+        assert_eq!(f.mode(), FuseMode::Auto);
+        assert!(!f.is_off());
+        assert!(!f.is_on());
+    }
+
+    #[test]
+    fn fuse_config_enabled_rejects_unknown_string() {
+        let yaml = "fuse:\n  enabled: maybe\n";
+        let err = serde_yaml::from_str::<ConfigFile>(yaml).expect_err("must reject");
+        assert!(err.to_string().contains("maybe"), "{err}");
+    }
+
+    #[test]
+    fn fuse_config_default_struct_is_off() {
+        let f = FuseConfig::default();
+        assert_eq!(f.mode(), FuseMode::Off);
+        assert!(f.is_off());
     }
 }

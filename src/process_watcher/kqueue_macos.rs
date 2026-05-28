@@ -139,11 +139,18 @@ fn poll_pending(pending: &mut HashMap<i32, mpsc::Sender<io::Result<ExitStatus>>>
         } else if r < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::ECHILD) {
+                // Status lost — surface as error rather than fabricating
+                // success. Pid stays in `pending` until removed below.
                 tracing::warn!(
                     pid,
-                    "process_watcher: backstop poll hit ECHILD; another reaper got it"
+                    "process_watcher: backstop poll hit ECHILD; another reaper got it — status lost"
                 );
-                resolved.push((pid, Ok(ExitStatus::from_raw(0))));
+                resolved.push((
+                    pid,
+                    Err(io::Error::other(format!(
+                        "process_watcher: ECHILD reaping pid {pid} in backstop; status lost"
+                    ))),
+                ));
             }
         }
     }
@@ -205,31 +212,40 @@ fn drain_registrations(
 }
 
 fn reap(pid: i32) -> io::Result<ExitStatus> {
-    let mut status: libc::c_int = 0;
-    // SAFETY: WNOHANG waitpid is non-blocking. The kernel has just told us
-    // the child exited (NOTE_EXIT) or `EV_ADD` returned ESRCH meaning it
-    // exited before registration; either way a zombie should be collectable
-    // unless another reaper got there first.
-    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-    if r > 0 {
-        return Ok(ExitStatus::from_raw(status));
+    // NOTE_EXIT (or ESRCH on EV_ADD) guarantees the child exited, but under
+    // load the zombie sometimes isn't reapable on the very next syscall.
+    // Poll briefly before giving up — synthesizing a 0 status here would
+    // silently corrupt the caller's exit code (real bug surfaced by the
+    // stress test). Total wait is bounded so a truly missing zombie
+    // surfaces as an error rather than parking the watcher.
+    const ATTEMPTS: u32 = 50;
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(2);
+    let mut attempt = 0;
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: WNOHANG waitpid is non-blocking; pid is one we registered.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return Ok(ExitStatus::from_raw(status));
+        }
+        if r < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ECHILD) {
+                return Err(io::Error::other(format!(
+                    "process_watcher: ECHILD reaping pid {pid}; status lost (no other reaper expected)"
+                )));
+            }
+            return Err(err);
+        }
+        // r == 0: NOTE_EXIT fired but zombie not yet reapable. Retry.
+        attempt += 1;
+        if attempt >= ATTEMPTS {
+            return Err(io::Error::other(format!(
+                "process_watcher: NOTE_EXIT fired for pid {pid} but waitpid never returned a zombie after {ATTEMPTS} polls"
+            )));
+        }
+        std::thread::sleep(SLEEP);
     }
-    if r == 0 {
-        tracing::debug!(
-            pid,
-            "process_watcher: NOTE_EXIT fired but waitpid returned 0; status lost"
-        );
-        return Ok(ExitStatus::from_raw(0));
-    }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::ECHILD) {
-        tracing::debug!(
-            pid,
-            "process_watcher: ECHILD; another reaper got the child first"
-        );
-        return Ok(ExitStatus::from_raw(0));
-    }
-    Err(err)
 }
 
 fn make_kevent(

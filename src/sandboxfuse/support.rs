@@ -58,6 +58,22 @@ fn probe() -> FuseSupport {
     )
 }
 
+/// Skip the enclosing `#[test]` when FUSE is unavailable on this host. Use
+/// in tests that actually exercise a real FUSE mount; the body returns
+/// early after printing a one-line skip reason.
+#[macro_export]
+macro_rules! require_fuse {
+    () => {
+        match $crate::sandboxfuse::support_check() {
+            $crate::sandboxfuse::FuseSupport::Available => {}
+            $crate::sandboxfuse::FuseSupport::Unavailable(reason) => {
+                eprintln!("skipping: FUSE unavailable: {reason}");
+                return;
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
